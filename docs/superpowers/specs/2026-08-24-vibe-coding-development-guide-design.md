@@ -143,6 +143,8 @@ vibe resume     # 从快照恢复
 
 桌面 App 适配器优先通过 `VisibleTaskProvider` 为每个 developer 和 reviewer 创建独立任务。创建成功后任务必须出现在该 App 的任务/会话列表，用户可以进入查看过程。监工通过精确平台任务 ID 和 host 下发后续输入并用逐任务 cursor/token 等待；不得用全局任务列表轮询代替精确登记。Codex App 的具体映射为 `create_thread`、`threadId`、`hostId` 和 cursor。若 provider 明确返回“不支持”，才可在授权卡中声明 `background` 降级并使用 subagent。
 
+配置中的任务对上限表示同时活跃并发量，不表示整个 DAG 期间累计只能创建这么多任务。一个 Issue 的 developer/reviewer 已完成、独立 Review 的 P0–P2 清零且证据已登记后，监工关闭或归档对应会话，释放并发名额；任务 ID、host、worktree、branch、状态/交付路径和最终 cursor 继续作为历史证据保留。仍可能返工或复审的原任务不得提前归档，也不得通过删除登记绕过唯一 writer 或续接要求。新解锁的 Issue 使用释放后的名额创建新的独立 developer/reviewer。
+
 三组同义触发词，均不超过 10 个字：
 
 - `启动监工`；
@@ -188,6 +190,8 @@ planned → ready → running → delivered → review → accepted
 5. 实现缺陷退回原 developer 任务，修复后复审回到原 reviewer 任务；
 6. 节点通过 Review 后锁定成果，解锁后续节点；
 7. 全部节点完成后执行最终 DAG 验收。
+
+调度容量按活跃任务对计算：已完成且归档的任务不阻塞后续 ready 节点；同一时刻不得超过授权卡列明的活跃 developer/reviewer 对数。
 
 一个节点只允许一个有效 writer。reviewer 只读审查，不能代改业务代码。developer 与 reviewer 必须是两个不同的显式独立任务；不得因不确定的线程索引、短暂超时或状态延迟创建第二 writer，也不得用内部 subagent 替代已登记的可见任务。
 

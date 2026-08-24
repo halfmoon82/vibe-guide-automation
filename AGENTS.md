@@ -75,11 +75,14 @@
 
 通用任务登记必须保存 `provider`、`mode=visible|background`、平台任务 ID（如有）、host、worktree、branch、状态/交付路径和续接 cursor/token；Codex 可见绑定具体保存 `threadId`、`hostId` 和 cursor。完整可见模式中，可见、可进入、可追溯是验收条件。无等价能力的平台可降级为 background subagent，但能力报告、授权卡和交付必须明确标识降级及限制。
 
+任务数量上限默认约束“同时活跃”的 developer/reviewer 对，不是整个 DAG 生命周期内累计创建的任务数。一个 Issue 的 developer 与 reviewer 均完成、P0–P2 清零且证据登记完成后，应关闭或归档其独立任务；历史身份和 handoff 仍保留在任务登记中，但不再占活跃并发名额。归档不得发生在返工或复审仍可能回到原任务之前，也不得通过删除登记来伪造空闲容量。后续 ready Issue 可以在释放的名额内创建新的独立任务。
+
 监工规则：
 
 - 一个 DAG 节点只允许一个有效 writer；
 - developer 与 reviewer 必须是两个不同的可见独立任务，reviewer 只读审查且不得代改业务代码；
 - 优先启动所有没有硬依赖冲突的 ready 节点；
+- 并发上限按当前未完成、未归档的活跃 developer/reviewer 对计算；已完成并归档的任务不占名额；
 - Review 缺陷优先退回同一 worker；
 - 返工后复审回到同一 reviewer，保留任务身份、cursor 和证据链；
 - 保留旧证据，新增返工和验收证据；

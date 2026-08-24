@@ -1,6 +1,6 @@
 # Vibe Coding 辅助开发向导 Implementation Plan
 
-> **Revision 2 — 2026-08-24:** 显式独立 developer/reviewer 是通用产品的首选合同。七个平台优先在对应桌面 App 中创建用户可见、可进入、可续接的独立任务；Codex App 使用 `create_thread`。无等价桥接的平台可明确降级为 background subagent，但不能冒充完整可见自动化。当前项目的旧内部 subagent 拓扑已停止。
+> **Revision 2 — 2026-08-24:** 显式独立 developer/reviewer 是通用产品的首选合同。七个平台优先在对应桌面 App 中创建用户可见、可进入、可续接的独立任务；Codex App 使用 `create_thread`。无等价桥接的平台可明确降级为 background subagent，但不能冒充完整可见自动化。当前项目的旧内部 subagent 拓扑已停止。任务对上限按同时活跃并发量计算；完成并归档的任务保留证据但释放名额。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
@@ -60,7 +60,7 @@ M0 更新设计/计划/项目规则（本次主会话完成）
 R1 + R2 + R3 + R4 → D5 可见 developer：N5 集成 → R5 可见 reviewer：全分支验收
 ```
 
-首批 ready 集合为 `R0、R1、D2、D3、D4`。授权容量为最多 5 对 developer/reviewer，即最多 10 个可见独立任务；只创建 DAG 已 ready 的任务。R0 是 N0 的补充复核证据；N5 的硬门只要求 N1–N4 分别通过可见 reviewer，但最终 R5 必须覆盖 N0–N5 全分支。任一 Review 的 P0–P2 问题回到原 developer，修复后回到原 reviewer，不新建替代任务。
+首批 ready 集合为 `R0、R1、D2、D3、D4`。授权容量为同时活跃最多 5 对 developer/reviewer，即同一时刻最多 10 个可见独立任务；只创建 DAG 已 ready 的任务。Issue 的 developer/reviewer 完成、P0–P2 清零且证据登记后关闭或归档并释放名额，历史任务身份和 cursor 继续保留。R0 是 N0 的补充复核证据；N5 的硬门只要求 N1–N4 分别通过可见 reviewer，但最终 R5 必须覆盖 N0–N5 全分支。任一 Review 的 P0–P2 问题回到原 developer，修复后回到原 reviewer，不新建替代任务。
 
 ### 迁移保留证据
 
@@ -474,7 +474,7 @@ Deploy, system-permission changes, and actions not listed in the authorization c
 
 重新授权后允许：
 
-- 按新版 DAG 最多并行创建 5 对（10 个）Codex App 左侧可见独立任务；只启动 ready 节点；
+- 按新版 DAG 同时最多保持 5 对（10 个）活跃 Codex App 左侧可见独立任务；完成并归档后释放并发名额，只启动 ready 节点；
 - 使用已登记的精确 thread 继续开发、Review、返工和复审；
 - 使用上述隔离 worktree/branch，并恢复 N3 的精确封存对象；
 - 在当前项目白名单内编辑、测试、生成报告和本地 commit；
