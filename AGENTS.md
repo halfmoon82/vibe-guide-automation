@@ -1,0 +1,145 @@
+# Vibe Coding 辅助开发向导
+
+## 1. 项目目标与边界
+
+本项目提供一个通用的辅助开发向导：
+
+- 用统一 CLI 连接 Codex、Claude Code、Cursor、Grok、WorkBuddy、Kimi Code 和 DeepSeek Harness 等 Agent；
+- 帮项目生成或适配开发规则；
+- 对简单任务保持轻量，对复杂任务先完成需求讨论、PRD、Spec/Issue 和 DAG；
+- 经一次明确授权后，自动并行开发、测试、Review、返工和验收；
+- 只在产品设计变化、需要外部授权或 deploy 时请求人类。
+
+当前逻辑项目根是本目录。上层 CFO 仓库的 `AGENTS.md` 仍然适用；本文件只增加本项目规则，不替代或修改上层规则。
+
+设计基线：`docs/superpowers/specs/2026-08-24-vibe-coding-development-guide-design.md`。
+实施计划：`docs/superpowers/plans/2026-08-24-vibe-coding-guide-implementation-plan.md`。
+
+## 2. 工作方式
+
+- 先想清楚再动手；需求、范围、成功标准或授权不清时先提一个高信息问题。
+- 能简单就简单；不要为了未来可能使用而增加模块、依赖或门禁。
+- 输出优先使用产品经理能理解的语言；只在必要时提及代码、接口、worktree 等术语。
+- 只改当前任务直接涉及的文件；发现无关问题只提醒，不顺手修改。
+- 技术完成、Review 通过、交付授权、merge 和 deploy 分开表达。
+
+## 3. 目录与模块边界
+
+- `vibe_guide/`：CLI、扫描、规划、DAG、授权、状态、监工和 Agent 适配器。
+- `tests/`：单元、契约、状态恢复、权限降级和端到端夹具。
+- `.vibe/`：项目运行配置、项目知识、计划、授权、状态快照和事件日志；不得保存凭据。
+- `docs/superpowers/specs/`：已确认设计和需求合同。
+- `docs/superpowers/plans/`：实施计划和 DAG。
+- `README.md`：面向用户的安装、扫描、规划、授权、监工和恢复说明。
+
+模块只通过明确的数据结构和接口交互。CLI 负责参数和输出，不能把扫描、规划或监工逻辑全部写进 `cli.py`。Agent 适配器只描述能力和调用方式，不复制核心流程。
+
+## 4. 复杂任务流程
+
+每条请求先经过 S0 规则预筛；疑似复杂时进入 S1 五维评分：步骤数量、知识域、不确定性、失败代价、工具链复杂度。
+
+- `<=8`：直接执行；
+- `9-15`：轻规划；
+- `>15`：进入复杂流程。
+
+复杂流程必须按以下顺序推进：
+
+```text
+需求讨论 → 产品决策卡 → PRD → Spec/Issue → DAG 审计
+→ 开发计划确认 → 一次授权 → 监工执行 → 独立验收
+```
+
+产品取舍不能留到监工阶段。未闭合的产品决策不得进入 `authorized`。
+
+## 5. DAG 与并行规则
+
+默认优先并行，只把真正阻塞启动的关系写成硬依赖：
+
+- `depends_on`：硬依赖；未完成时不能启动；
+- `integration_after`：联调或收口关系，不阻塞独立开发；
+- `contract`：占位实现必须满足的输入、输出、错误行为和验收示例；
+- `parallel_group`：可以同时启动的节点组。
+
+可用 stub、fixture 或 fake service 时，应先并行开发，再做适配联调。共享文件或潜在冲突不是天然串行理由，优先使用隔离 worktree。
+
+## 6. 监工与授权
+
+短触发词：`启动监工`、`推进开发`、`执行DAG`。
+
+触发词只启动预检。必须先展示授权卡，列明：DAG 范围、ready 节点、并行组、worker、worktree、文件范围、测试/Review/返工/验收权限，以及 commit、push、MR、merge 是否包含。
+
+用户明确授权后，一次授权覆盖当前 DAG 已列明的全部非 deploy 动作。deploy、未列明动作、扩大范围或系统权限变更必须单独授权。
+
+监工规则：
+
+- 一个 DAG 节点只允许一个有效 writer；
+- 优先启动所有没有硬依赖冲突的 ready 节点；
+- Review 缺陷优先退回同一 worker；
+- 保留旧证据，新增返工和验收证据；
+- 计划或范围变化使旧授权失效；
+- 未知状态不能当成无事项或成功；
+- 无法验证时记录 `blocked_unknown`，不得伪造完成；
+- 设计变化只重建受影响的 DAG 后缀，已锁定成果不重做；
+- 监工中断后从 `.vibe/runs/` 的快照和事件日志恢复。
+
+## 7. 配置与外部 Skill
+
+- `architecture-skill-pack` 必装；`akasha-grimoire` 和 `aligning-with-johari-windows` 可选。
+- Skill 只能从已配置 GitHub 地址拉取，记录来源和提交 SHA；不把 Skill 源码复制进本项目。
+- 用户级共享缓存由 `VIBE_HOME` 指定；项目只保存引用和版本，不保存 token、密码或绝对用户路径。
+- `scan` 只读；`init`、Skill 安装和 `.vibe/knowledge/` 初始化必须经确认。
+- 已有 `AGENTS.md` 只生成补丁建议，不直接覆盖、追加或删除。
+
+## 8. 测试与验证
+
+开发采用测试先行：先写能复现问题的失败测试，再做最小实现，最后运行定向和完整测试。
+
+默认验证命令：
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m vibe_guide --help
+git diff --check
+```
+
+必须覆盖：S0/S1 边界、产品决策门、占位契约并行、DAG 环检测、授权摘要和 deploy 排除、唯一 writer、同 worker 返工、快照恢复、未知状态、桌面 App 权限降级、扫描不写入和初始化幂等。
+
+不能只用 mock 宣称完成真实能力；真实 Agent、GitHub Skill 拉取或桌面 App 权限未验证时，报告为“未验证”并说明缺口。
+
+## 9. 日志与证据
+
+- `.vibe/runs/<run-id>/events.jsonl` 追加记录状态变化、worker、节点、时间、结果和阻塞原因；
+- `state.json` 保存可恢复快照；写入必须原子替换；
+- 每个节点保留交付、Review、返工和最终验收证据；
+- 超时、worker 不可用、状态查询失败和权限不足必须记录具体原因；
+- 不依赖某个 Agent 的全局线程索引作为唯一状态源；
+- 不在日志、计划或聊天中写入凭据、token、密码、私有邮箱正文或无关个人信息。
+
+## 10. Git、worktree 与交付
+
+- 开发节点优先使用独立 worktree 或等价隔离目录；一个节点一个有效 writer。
+- 提交前只暂存当前任务白名单；禁止 `git add .` 和 `git add -A`。
+- 提交、push、创建 MR、merge 和 deploy 是不同动作；不得把其中一个描述成另一个。
+- 未经明确授权，不 push、merge、deploy 或修改上层 CFO 仓库文件。
+- 交付必须说明：改动范围、验证命令和结果、未验证项、未纳入路径、当前 Git 状态及是否执行 push。
+
+## 11. 安全与禁止事项
+
+- 不绕过 Agent 沙箱、系统权限、Git 认证或外部平台审批。
+- 不猜测 Agent 私有 API、平台能力、登录状态或 merge 权限。
+- 不把网络/线程超时解释为没有任务。
+- 不在未确认 writer、worktree 和文件白名单时重复派发。
+- 不自动覆盖项目规则、外部配置、真实业务数据或用户原始证据。
+- 不把测试通过、`PASS`、`CANMERGE`、marker 或文件存在当成业务批准、付款、发布或 merge 事实。
+
+## 12. 短提示协议
+
+当本文件、Spec、计划、测试和运行状态已经存在时，用户可以使用短提示：
+
+- “扫描适配”；
+- “初始化项目”；
+- “继续规划”；
+- “启动监工”；
+- “继续监工”。
+
+短提示不能绕过需求决策、DAG 确认、一次性授权、deploy 授权或安全边界。
