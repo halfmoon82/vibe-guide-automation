@@ -7,6 +7,7 @@ from vibe_guide.adapters.base import Environment, ManifestError
 from vibe_guide.adapters.registry import AdapterRegistry
 from vibe_guide.adapters.task_provider import (
     BackgroundTaskProvider,
+    BackgroundTaskRouting,
     CodexAppBridge,
     ProviderPending,
     ProviderUnavailable,
@@ -42,8 +43,12 @@ def codex_bridge(**overrides):
             "timedOut": False,
             "wake": "completed",
             "polls": [{
-                "threadId": "thread-1", "hostId": "host-1", "cursor": "c2",
-                "thread": {"status": "complete"},
+                "schemaVersion": 1, "cursor": "c2", "revision": 2, "changed": True,
+                "thread": {
+                    "id": "thread-1", "hostId": "host-1",
+                    "status": {"type": "complete", "activeFlags": []},
+                },
+                "latestTurn": {"status": "complete", "error": None},
             }],
         },
         "list_threads": lambda request: {
@@ -75,6 +80,13 @@ def background_result(role="developer", issue_id="N4"):
         "status_file": "status.txt",
         "handoff_file": "handoff.md",
     }
+
+
+def background_routing():
+    return BackgroundTaskRouting(
+        host="local", worktree="/repo-wt", branch="codex/n4",
+        status_file="status.txt", handoff_file="handoff.md",
+    )
 
 
 class AdapterTests(unittest.TestCase):
@@ -189,7 +201,11 @@ class AdapterTests(unittest.TestCase):
             send_message_to_thread=lambda request: calls.append(("send", request)),
             wait_threads=lambda request: calls.append(("wait", request)) or {
                 "timedOut": False,
-                "polls": [{"threadId": "thread-1", "hostId": "host-1", "cursor": "c2", "thread": {"status": "complete"}}],
+                "polls": [{
+                    "schemaVersion": 1, "cursor": "c2", "revision": 2, "changed": True,
+                    "thread": {"id": "thread-1", "hostId": "host-1", "status": {"type": "complete", "activeFlags": []}},
+                    "latestTurn": {"status": "complete", "error": None},
+                }],
             },
         )
         provider = routed_codex_provider(bridge)
@@ -203,15 +219,27 @@ class AdapterTests(unittest.TestCase):
 
     def test_codex_wait_parses_public_polls_error_and_timeout(self):
         responses = iter([
-            {"timedOut": False, "wake": "attention", "polls": [{"threadId": "t1", "hostId": "h1", "cursor": "c3", "latestTurn": {"status": "needs_attention"}}]},
-            {"timedOut": False, "polls": [{"threadId": "t1", "hostId": "h1", "cursor": "c4", "error": {"message": "lost"}}]},
-            {"timedOut": True, "polls": [{"threadId": "t1", "hostId": "h1", "cursor": "c5", "timedOut": True}]},
+            {"timedOut": False, "wake": "attention", "polls": [{"schemaVersion": 1, "cursor": "c3", "thread": {"id": "t1", "hostId": "h1", "status": {"type": "active", "activeFlags": []}}, "latestTurn": {"status": "needs_attention", "error": None}}]},
+            {"timedOut": False, "polls": [{"schemaVersion": 1, "cursor": "c4", "thread": {"id": "t1", "hostId": "h1", "status": {"type": "active", "activeFlags": []}}, "latestTurn": {"status": "failed", "error": {"message": "lost"}}}]},
+            {"timedOut": True, "polls": [{"schemaVersion": 1, "cursor": "c5", "thread": {"id": "t1", "hostId": "h1", "status": {"type": "active", "activeFlags": []}}, "latestTurn": None}]},
         ])
         bridge, _ = codex_bridge(wait_threads=lambda request: next(responses))
         binding = TaskBinding("codex-app-visible", "visible", "developer", "N4", task_id="t1", host="h1")
         updates = [bridge.wait(binding, None) for _ in range(3)]
         self.assertEqual([(u.cursor, u.status) for u in updates], [("c3", "needs_attention"), ("c4", "error"), ("c5", "timeout")])
-        self.assertEqual(updates[1].payload["error"]["message"], "lost")
+        self.assertEqual(updates[1].payload["latestTurn"]["error"]["message"], "lost")
+
+    def test_codex_wait_uses_thread_status_object_and_rejects_wrong_poll(self):
+        responses = iter([
+            {"timedOut": False, "polls": [{"cursor": "fresh", "thread": {"id": "t1", "hostId": "h1", "status": {"type": "active", "activeFlags": ["running"]}}, "latestTurn": None}]},
+            {"timedOut": True, "polls": [{"cursor": "other", "thread": {"id": "different", "hostId": "h1", "status": {"type": "active", "activeFlags": []}}, "latestTurn": None}]},
+        ])
+        bridge, _ = codex_bridge(wait_threads=lambda request: next(responses))
+        binding = TaskBinding("codex-app-visible", "visible", "developer", "N4", task_id="t1", host="h1")
+        update = bridge.wait(binding, "old")
+        self.assertEqual((update.cursor, update.status), ("fresh", "active"))
+        with self.assertRaises(ProviderUnavailable):
+            bridge.wait(binding, "fresh")
 
     def test_codex_list_visibility_uses_public_id_and_host(self):
         provider = routed_codex_provider()
@@ -236,10 +264,10 @@ class AdapterTests(unittest.TestCase):
 
     def test_background_create_requires_verified_launcher_and_durable_routing(self):
         with self.assertRaises(ProviderUnavailable):
-            BackgroundTaskProvider("cursor-background").create("developer", "N4", Path("contract.md"))
+            BackgroundTaskProvider("cursor-background", expected_routing=background_routing()).create("developer", "N4", Path("contract.md"))
         with self.assertRaises(ProviderUnavailable):
-            BackgroundTaskProvider("cursor-background", lambda *args: {"handle": "ghost"}).create("developer", "N4", Path("contract.md"))
-        binding = BackgroundTaskProvider("cursor-background", lambda *args: background_result()).create("developer", "N4", Path("contract.md"))
+            BackgroundTaskProvider("cursor-background", lambda *args: {"handle": "ghost"}, background_routing()).create("developer", "N4", Path("contract.md"))
+        binding = BackgroundTaskProvider("cursor-background", lambda *args: background_result(), background_routing()).create("developer", "N4", Path("contract.md"))
         self.assertEqual((binding.task_id, binding.worktree, binding.branch), ("bg-1", "/repo-wt", "codex/n4"))
 
     def test_background_binding_validates_provider_mode_role_and_issue(self):
@@ -248,16 +276,26 @@ class AdapterTests(unittest.TestCase):
             worktree="/wt", branch="b", status_file="status", handoff_file="handoff",
         )
         with self.assertRaises(ProviderUnavailable):
-            BackgroundTaskProvider("grok-background", lambda *args: wrong).create("developer", "N4", Path("contract.md"))
+            BackgroundTaskProvider("grok-background", lambda *args: wrong, background_routing()).create("developer", "N4", Path("contract.md"))
         wrong_provider = TaskBinding(
             "other", "background", "developer", "N4", task_id="x",
             worktree="/wt", branch="b", status_file="status", handoff_file="handoff",
         )
         with self.assertRaises(ProviderUnavailable):
-            BackgroundTaskProvider("grok-background", lambda *args: wrong_provider).create("developer", "N4", Path("contract.md"))
+            BackgroundTaskProvider("grok-background", lambda *args: wrong_provider, background_routing()).create("developer", "N4", Path("contract.md"))
         wrong_mapping = background_result(); wrong_mapping["mode"] = "visible"
         with self.assertRaises(ProviderUnavailable):
-            BackgroundTaskProvider("cursor-background", lambda *args: wrong_mapping).create("developer", "N4", Path("contract.md"))
+            BackgroundTaskProvider("cursor-background", lambda *args: wrong_mapping, background_routing()).create("developer", "N4", Path("contract.md"))
+
+    def test_background_routing_rejects_each_non_empty_mismatch(self):
+        expected = background_routing()
+        for field in ("host", "worktree", "branch", "status_file", "handoff_file"):
+            returned = background_result()
+            returned[field] = "wrong-" + field
+            with self.subTest(field=field), self.assertRaises(ProviderUnavailable):
+                BackgroundTaskProvider(
+                    "cursor-background", lambda *args, value=returned: value, expected
+                ).create("developer", "N4", Path("contract.md"))
 
     def test_session_prompt_and_monitor_command_remain_short_stable(self):
         adapter = AdapterRegistry().get("codex")

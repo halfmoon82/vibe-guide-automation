@@ -49,6 +49,29 @@ class RepositoryTaskRouting:
 
 
 @dataclass(frozen=True)
+class BackgroundTaskRouting:
+    """Immutable authorized routing expected from a background launcher."""
+
+    host: str
+    worktree: str
+    branch: str
+    status_file: str
+    handoff_file: str
+
+    def __post_init__(self):
+        for name in ("host", "worktree", "branch", "status_file", "handoff_file"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("background routing %s is required" % name)
+
+    def matches(self, binding: "TaskBinding") -> bool:
+        return all(
+            getattr(binding, name) == getattr(self, name)
+            for name in ("host", "worktree", "branch", "status_file", "handoff_file")
+        )
+
+
+@dataclass(frozen=True)
 class TaskBinding:
     provider: str
     mode: str
@@ -167,19 +190,17 @@ class CodexAppBridge:
             (
                 item for item in polls
                 if isinstance(item, Mapping)
-                and item.get("threadId") == binding.task_id
-                and (not binding.host or item.get("hostId") in (None, binding.host))
+                and isinstance(item.get("thread"), Mapping)
+                and item["thread"].get("id") == binding.task_id
+                and (not binding.host or item["thread"].get("hostId") == binding.host)
             ),
             None,
         )
         if poll is None:
-            errors = raw.get("errors")
-            if errors:
-                return TaskUpdate(cursor, "error", {"errors": errors, "raw": dict(raw)})
-            if raw.get("timedOut"):
-                return TaskUpdate(cursor, "timeout", dict(raw))
             raise ProviderUnavailable("Codex wait_threads result has no matching poll")
-        if poll.get("error"):
+        latest_turn = poll.get("latestTurn")
+        turn_error = latest_turn.get("error") if isinstance(latest_turn, Mapping) else None
+        if turn_error:
             status = "error"
         elif poll.get("timedOut") or raw.get("timedOut"):
             status = "timeout"
@@ -352,11 +373,23 @@ class VisibleTaskProvider:
 class BackgroundTaskProvider:
     mode = "background"
 
-    def __init__(self, provider: str, launcher: Optional[Callable[..., Any]] = None):
+    def __init__(
+        self,
+        provider: str,
+        launcher: Optional[Callable[..., Any]] = None,
+        expected_routing: Optional[BackgroundTaskRouting] = None,
+    ):
         self.provider = provider
         self.launcher = launcher
+        self.expected_routing = expected_routing
+
+    def with_routing(self, expected_routing: BackgroundTaskRouting):
+        """Bind an immutable authorized route before task creation."""
+        return BackgroundTaskProvider(self.provider, self.launcher, expected_routing)
 
     def create(self, role: str, issue_id: str, contract_path: Path) -> TaskBinding:
+        if not isinstance(self.expected_routing, BackgroundTaskRouting):
+            raise ProviderUnavailable("authorized background routing is required")
         launch = self.launcher
         if not callable(launch) and callable(getattr(launch, "launch", None)):
             launch = launch.launch
@@ -401,6 +434,8 @@ class BackgroundTaskProvider:
         for name in ("host", "worktree", "branch", "status_file", "handoff_file"):
             if not getattr(binding, name):
                 raise ProviderUnavailable("background binding missing routing field: %s" % name)
+        if not self.expected_routing.matches(binding):
+            raise ProviderUnavailable("background binding does not match authorized routing")
         return binding
 
     def resume(self, binding: TaskBinding, contract_path: Path) -> None:
@@ -423,10 +458,15 @@ def _require_keys(value: Mapping[str, Any], keys, operation: str):
 
 
 def _poll_status(poll: Mapping[str, Any]) -> str:
+    thread = poll.get("thread")
+    thread_status = thread.get("status") if isinstance(thread, Mapping) else None
+    thread_status_type = (
+        thread_status.get("type") if isinstance(thread_status, Mapping) else None
+    )
     for value in (
         poll.get("status"),
         poll.get("latestTurn", {}).get("status") if isinstance(poll.get("latestTurn"), Mapping) else None,
-        poll.get("thread", {}).get("status") if isinstance(poll.get("thread"), Mapping) else None,
+        thread_status_type,
     ):
         if isinstance(value, str) and value:
             return value
