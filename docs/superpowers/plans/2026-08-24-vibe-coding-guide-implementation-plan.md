@@ -1,12 +1,12 @@
 # Vibe Coding 辅助开发向导 Implementation Plan
 
-> **Revision 2 — 2026-08-24:** developer 与 reviewer 必须由 Codex App `create_thread` 创建为左侧任务列表可见的 user-owned thread。旧的内部 subagent 拓扑已停止；此前授权因产品设计与执行拓扑变化而失效。
+> **Revision 2 — 2026-08-24:** 显式独立 developer/reviewer 是通用产品合同。七个平台的完整自动化模式都必须在对应桌面 App 中创建用户可见、可进入、可续接的独立任务；Codex App 使用 `create_thread`。旧的内部 subagent 拓扑已停止。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 **Goal:** 在当前“开发辅助”目录实现一个统一 CLI 和桌面 Agent 会话适配层，完成项目扫描/初始化、Skill 安装、S0/S1 分流、PRD/Spec/DAG 规划和一次授权后的可恢复监工核心。
 
-**Architecture:** 使用 Python 3.9+ 的小型模块化 CLI。`models.py` 和 `contracts.py` 先定义配置、DAG、授权和运行事件的稳定接口；扫描/初始化/Skill 安装、规划引擎、监工状态机和 Agent 适配器分别作为可独立测试的模块。项目运行状态保存在 `.vibe/`，调度器通过事件日志、原子快照和 `tasks.json` 恢复。Codex App 是全自动参考控制面：每个 developer/reviewer 都由 `create_thread` 创建为可见独立任务，并按精确任务身份续接，不使用父会话内部 background subagent。
+**Architecture:** 使用 Python 3.9+ 的小型模块化 CLI。`models.py` 和 `contracts.py` 先定义配置、DAG、授权和运行事件的稳定接口；扫描/初始化/Skill 安装、规划引擎、监工状态机和 Agent 适配器分别作为可独立测试的模块。项目运行状态保存在 `.vibe/`，调度器通过事件日志、原子快照和 `tasks.json` 恢复。核心通过平台无关的 `VisibleTaskProvider` 管理 developer/reviewer；各适配器负责创建、定位、续接和等待其桌面 App 中的显式独立任务。Codex App provider 使用 `create_thread`，任何平台都不得用父会话内部 background subagent 冒充完整自动化。
 
 **Tech Stack:** Python 3.9+；`argparse`、`dataclasses`、`json`、`pathlib`、`subprocess`、`hashlib`、`tempfile`、`unittest`；配置解析使用 `PyYAML>=6.0`；CLI 入口通过 `pyproject.toml` 的 console script 暴露为 `vibe`。
 
@@ -24,9 +24,9 @@
 - 未知状态不得转换为无事项或成功；无法验证时进入 `blocked_unknown`。
 - 实现缺陷优先退回同一 worker；设计变化只重建受影响 DAG 后缀。
 - 桌面 App 适配必须检测权限并如实降级，不能绕过沙箱或伪造完整自动化。
-- Codex App 全自动路径中，开发 Issue 和独立 Review 必须分别映射为 user-owned thread；左侧任务列表可见、可进入、可追溯是验收条件。
-- 每个任务登记 `threadId`、`hostId`、worktree、branch、`status_file`、`handoff_file` 和 cursor；返工回到原 developer，复审回到原 reviewer。
-- 禁止用内部 subagent 充当 developer 或 reviewer；其他桌面 App 无等价可见任务能力时降级为引导模式。
+- 七个平台的完整自动化路径中，开发 Issue 和独立 Review 必须分别映射为对应 App 的可见独立任务；可见、可进入、可追溯是验收条件。
+- 每个任务登记 provider、平台任务 ID、host、worktree、branch、`status_file`、`handoff_file` 和 cursor/token；Codex 具体登记 `threadId`、`hostId` 和 cursor。返工回到原 developer，复审回到原 reviewer。
+- 禁止用内部 subagent 充当 developer 或 reviewer；任一桌面 App 无等价可见任务能力时降级为引导模式。
 - 任务创建也是授权动作；只有新版授权卡确认后才能调用 `create_thread`。设计或执行拓扑变化使授权失效。
 
 ## Implementation DAG
@@ -47,7 +47,7 @@ N1、N2、N3、N4 在 N0 的契约完成后可并行开发；N3 使用 N0 的 ru
 
 ### Revision 2 可见任务执行 DAG
 
-代码依赖关系仍为 `N0 → N1/N2/N3/N4 → N5`，但每个 Issue 拆为“可见 developer → 可见 reviewer”两个不同的 Codex App 任务。迁移后的执行图为：
+代码依赖关系仍为 `N0 → N1/N2/N3/N4 → N5`，但每个 Issue 拆为“可见 developer → 可见 reviewer”两个不同的桌面 App 任务。当前项目使用 Codex App `create_thread` 实施；迁移后的执行图为：
 
 ```text
 M0 更新设计/计划/项目规则（本次主会话完成）
@@ -60,7 +60,7 @@ M0 更新设计/计划/项目规则（本次主会话完成）
 R1 + R2 + R3 + R4 → D5 可见 developer：N5 集成 → R5 可见 reviewer：全分支验收
 ```
 
-首批 ready 集合为 `R0、R1、D2、D3、D4`，可并行上限为 5。R0 是 N0 的补充复核证据；N5 的硬门只要求 N1–N4 分别通过可见 reviewer，但最终 R5 必须覆盖 N0–N5 全分支。任一 Review 的 P0–P2 问题回到原 developer，修复后回到原 reviewer，不新建替代任务。
+首批 ready 集合为 `R0、R1、D2、D3、D4`。授权容量为最多 5 对 developer/reviewer，即最多 10 个可见独立任务；只创建 DAG 已 ready 的任务。R0 是 N0 的补充复核证据；N5 的硬门只要求 N1–N4 分别通过可见 reviewer，但最终 R5 必须覆盖 N0–N5 全分支。任一 Review 的 P0–P2 问题回到原 developer，修复后回到原 reviewer，不新建替代任务。
 
 ### 迁移保留证据
 
@@ -337,6 +337,7 @@ R1 + R2 + R3 + R4 → D5 可见 developer：N5 集成 → R5 可见 reviewer：�
 **Files:**
 
 - Create: `vibe_guide/adapters/base.py`
+- Create: `vibe_guide/adapters/task_provider.py`
 - Create: `vibe_guide/adapters/registry.py`
 - Create: `vibe_guide/adapters/manifests/codex.yaml`
 - Create: `vibe_guide/adapters/manifests/claude-code.yaml`
@@ -356,10 +357,14 @@ R1 + R2 + R3 + R4 → D5 可见 developer：N5 集成 → R5 可见 reviewer：�
 - `Adapter.monitor_command(plan_id: str, json_output: bool) -> list[str]`
 - `Adapter.downgrade_reason(capabilities: AgentCapabilities) -> Optional[str]`
 - `AdapterRegistry.detect_all(environment: Environment) -> list[DetectionResult]`
+- `VisibleTaskProvider.create(role: str, issue_id: str, contract_path: Path) -> TaskBinding`
+- `VisibleTaskProvider.resume(binding: TaskBinding, contract_path: Path) -> None`
+- `VisibleTaskProvider.wait(binding: TaskBinding, cursor: Optional[str]) -> TaskUpdate`
+- `VisibleTaskProvider.visibility(binding: TaskBinding) -> VisibilityResult`
 
 - [ ] **Step 1: Write failing adapter tests**
 
-  Use fake command probes to assert each manifest has an ID, probe definition, session prompt, and capability mapping. Assert a fully capable fake environment yields `full`, a shell-only environment yields `standard`, and a no-subprocess environment yields `guide`.
+  Use fake command probes to assert each manifest has an ID, probe definition, session prompt, capability mapping, and visible-task provider declaration. Assert a fully capable environment with verified create/enter/resume/wait yields `full`; missing visible-task capability cannot exceed `standard`; a no-subprocess environment yields `guide`.
 
 - [ ] **Step 2: Run adapter tests and verify failure**
 
@@ -369,7 +374,7 @@ R1 + R2 + R3 + R4 → D5 可见 developer：N5 集成 → R5 可见 reviewer：�
 
 - [ ] **Step 3: Implement manifest-driven capability detection**
 
-  Do not guess proprietary app paths or APIs. Read probes from manifests, report observed command/path/permission facts, and map them to the three capability levels. Session prompts must contain only the short trigger and current plan reference. Codex App 的完整自动化能力还必须包含可创建并续接 user-owned thread；不能核验时降级，不得回退到内部 subagent。
+  Do not guess proprietary app paths or APIs. Read probes from manifests, report observed command/path/permission facts, and map them to the three capability levels. Session prompts must contain only the short trigger and current plan reference. 七个平台的完整自动化能力都必须包含可创建、进入、续接和等待显式独立任务的 provider；Codex App 映射到 user-owned thread。不能核验时降级，不得回退到内部 subagent。
 
 - [ ] **Step 4: Implement session bridge commands**
 
@@ -446,7 +451,7 @@ R1 + R2 + R3 + R4 → D5 可见 developer：N5 集成 → R5 可见 reviewer：�
 | Parallel placeholders | DAG ready/contract tests | N2 |
 | One-time non-deploy authorization | Digest and exclusion tests | N3 |
 | Unique writer and same-worker rework | Fake runner monitor tests | N3 |
-| Developer/reviewer visible independent tasks | Task registry, exact thread continuation and App capability tests | N3/N4/N5 |
+| Cross-platform developer/reviewer visible independent tasks | Generic task registry, provider contracts, exact continuation and per-App capability tests | N3/N4/N5 |
 | Unknown state is not no-op | `blocked_unknown` test | N3 |
 | Desktop session and permission downgrade | Adapter fixture tests | N4 |
 | Resume after interruption | Snapshot recovery and E2E test | N3/N5 |
@@ -468,7 +473,7 @@ Deploy, system-permission changes, and actions not listed in the authorization c
 
 重新授权后允许：
 
-- 按新版 DAG 最多并行创建 5 个左侧可见的 developer/reviewer 独立任务；
+- 按新版 DAG 最多并行创建 5 对（10 个）Codex App 左侧可见独立任务；只启动 ready 节点；
 - 使用已登记的精确 thread 继续开发、Review、返工和复审；
 - 使用上述隔离 worktree/branch，并恢复 N3 的精确封存对象；
 - 在当前项目白名单内编辑、测试、生成报告和本地 commit；

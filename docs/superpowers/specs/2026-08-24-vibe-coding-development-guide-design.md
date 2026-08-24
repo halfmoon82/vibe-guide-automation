@@ -9,7 +9,7 @@
 - 根据任务复杂度选择轻流程或复杂流程；
 - 在复杂任务中先完成需求讨论、PRD、Spec/Issue 和 DAG；
 - 通过一次明确授权，自动并行开发、测试、Review、返工和验收；
-- 将每个开发 Issue 和每次独立 Review 映射为 Codex App 左侧任务列表可见、可进入、可继续的 user-owned thread；
+- 将每个开发 Issue 和每次独立 Review 映射为对应桌面 App 中用户可见、可进入、可继续的独立任务；
 - 只在产品设计变化、需要明确外部授权或 deploy 时请求人类介入；未知关键事实先自动做最小验证，无法验证则记录阻塞，不伪造完成。
 
 设计原则是“能简单就简单、默认优先并行、状态可恢复、证据可复核、技术完成不等于业务批准”。
@@ -30,7 +30,7 @@
 
 统一 CLI 是核心；每个 Agent 通过轻量适配器在桌面 App 会话中调用 CLI。适配器不复制核心流程，只声明调用方式和能力差异。
 
-Codex App 是首版全自动监工的参考控制面。developer 和 reviewer 必须使用 App 的 `create_thread` 创建为显式独立任务，不得使用只存在于父会话内部的 background subagent。其他 Agent 仍可通过统一 CLI 和适配器参与开发，但只有在其桌面 App 能提供等价的用户可见、可进入、可继续任务时才可声明完整自动化；否则降级为引导模式。
+显式独立任务是七个平台共同的产品合同。每个 Agent 适配器必须实现或声明一个 `VisibleTaskProvider`：创建 developer/reviewer、返回平台任务 ID 和 host、让用户在桌面 App 中进入任务、按原任务续接返工/复审，并提供精确等待 cursor/token。Codex App 的 provider 使用 `create_thread`；Claude Code、Cursor、Grok、WorkBuddy、Kimi Code 和 DeepSeek Harness 使用各自可验证的等价能力。不得使用只存在于父会话内部的 background subagent。缺少等价能力的平台仍可使用统一 CLI 的扫描、规划和引导功能，但必须降级，不能声明完整自动化。
 
 在各家桌面 App 的最高可授予权限下，验收目标是：用户在会话中输入触发词，Agent 能调用 CLI、展示授权卡、自动运行已授权 DAG，并在会话中回传进度和结果。权限不足时必须检测并如实降级，不绕过沙箱。
 
@@ -123,7 +123,7 @@ S1 使用五个维度评分：
         └── events.jsonl
 ```
 
-`state.json` 是当前运行快照，`tasks.json` 登记每个开发/Review 任务的 `threadId`、`hostId`、worktree、branch、状态/交付路径和 cursor，`events.jsonl` 是追加式轮转证据。恢复时以项目快照、任务登记和事件为准；App 线程索引用于可见性核验，不作为唯一事实源。
+`state.json` 是当前运行快照，`tasks.json` 登记每个开发/Review 任务的 provider、平台任务 ID、host、worktree、branch、状态/交付路径和 cursor/token；Codex 额外使用 `threadId`、`hostId`。`events.jsonl` 是追加式轮转证据。恢复时以项目快照、任务登记和事件为准；App 任务索引用于可见性核验，不作为唯一事实源。
 
 ## 6. CLI 与桌面会话
 
@@ -141,7 +141,7 @@ vibe resume     # 从快照恢复
 
 桌面 App 会话负责需求讨论、展示决策卡和授权卡、接收短触发词、展示进度；CLI 负责真实状态、调度和证据写入。
 
-在 Codex App 中，监工通过 `create_thread` 为每个 developer 和 reviewer 创建独立任务。创建成功后任务必须出现在左侧任务列表，用户可以进入查看过程。监工通过精确 `threadId`/`hostId` 下发后续输入并用逐任务 cursor 等待；不得用全局任务列表轮询代替精确登记。
+桌面 App 适配器通过 `VisibleTaskProvider` 为每个 developer 和 reviewer 创建独立任务。创建成功后任务必须出现在该 App 的任务/会话列表，用户可以进入查看过程。监工通过精确平台任务 ID 和 host 下发后续输入并用逐任务 cursor/token 等待；不得用全局任务列表轮询代替精确登记。Codex App 的具体映射为 `create_thread`、`threadId`、`hostId` 和 cursor。
 
 三组同义触发词，均不超过 10 个字：
 
@@ -195,7 +195,7 @@ planned → ready → running → delivered → review → accepted
 
 - 网络或线程超时：标记未知并进行有限恢复，不直接变成 no-op；
 - worker 启动失败：记录具体失败原因，不留下假 `running`；
-- 独立任务创建后未能取得 `threadId`/`hostId` 或未能核验可见性：保持 `blocked_unknown`，不得降格为后台 worker 继续；
+- 独立任务创建后未能取得平台任务 ID/host（Codex 为 `threadId`/`hostId`）或未能核验可见性：保持 `blocked_unknown`，不得降格为后台 worker 继续；
 - 状态查询失败：不能解释成“没有任务”；
 - 监工中断：保存快照，`resume` 从上次状态继续；
 - 重复失败且没有新证据：进入 `blocked_unknown`，不伪造完成；
@@ -236,7 +236,7 @@ developer/reviewer 的任务可见性、独立性或控制面拓扑变化属于�
 
 ### 任务可见性
 
-Codex App 全自动路径中的开发和 Review 均应在左侧任务列表显示为独立任务。用户进入任务后可看到过程并继续返工；仅在父会话内部可见的 background subagent 不满足验收。
+任一受支持桌面 App 的完整自动化路径中，开发和 Review 均应在其任务/会话列表显示为独立任务。用户进入任务后可看到过程并继续返工；仅在父会话内部可见的 background subagent 不满足验收。Codex App 以左侧任务列表作为具体验收入口。
 
 ### 设计变化
 
@@ -267,7 +267,7 @@ Codex App 全自动路径中的开发和 Review 均应在左侧任务列表显�
 - 需求、边界、用户、输入、输出、成功标准和失败行为明确；
 - S0/S1 分流、DAG 并行规则、授权边界和人类介入边界明确；
 - 桌面 App 兼容和权限降级有可验收定义；
-- Codex App developer/reviewer 独立任务的可见性、任务身份登记、返工与复审续接可验证；
+- 七个平台 adapter 都能报告显式独立任务能力；声明完整自动化的平台，其 developer/reviewer 可见性、任务身份登记、返工与复审续接必须可验证；
 - 项目产物、状态和证据位置明确；
 - 不做事项已列出；
 - 没有未决的产品取舍被带入监工阶段。
