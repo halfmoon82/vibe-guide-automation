@@ -241,6 +241,7 @@ class EndToEndTests(unittest.TestCase):
 
         observed_tools = set()
         wait_counts = {"developer": 0, "reviewer": 0}
+        consistency_bindings = {}
         for _ in range(40):
             for action in store.pending():
                 observed_tools.add(action["native_tool"])
@@ -251,6 +252,11 @@ class EndToEndTests(unittest.TestCase):
                     self.assertEqual(
                         set(action["request"]), {"prompt", "target"}
                     )
+                    marker = "一致性纠偏证据必须原样绑定："
+                    self.assertIn(marker, action["request"]["prompt"])
+                    consistency_bindings[role] = json.loads(
+                        action["request"]["prompt"].split(marker, 1)[1]
+                    )
                     payload = {
                         "binding": {"threadId": task_id, "hostId": "local"}
                     }
@@ -259,6 +265,12 @@ class EndToEndTests(unittest.TestCase):
                 elif operation == "visibility":
                     payload = {"visible": True, "direct_enter": True}
                 elif operation == "resume":
+                    marker = "一致性纠偏证据必须原样绑定："
+                    self.assertIn(marker, action["request"]["prompt"])
+                    self.assertEqual(
+                        json.loads(action["request"]["prompt"].split(marker, 1)[1]),
+                        consistency_bindings[role],
+                    )
                     payload = {"resumed": True}
                 elif operation == "wait":
                     wait_counts[role] += 1
@@ -306,6 +318,7 @@ class EndToEndTests(unittest.TestCase):
                                     {
                                         "source": "approved_prd",
                                         "value": "契约并行",
+                                        "binding": consistency_bindings["reviewer"],
                                     },
                                     {
                                         "source": "implementation",
@@ -363,6 +376,12 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(
             snapshot["nodes"]["api"]["contract_overrides"],
             {"naming": "契约并行"},
+        )
+        self.assertEqual(
+            snapshot["nodes"]["api"]["corrections"][0][
+                "consistency_binding"
+            ],
+            consistency_bindings["reviewer"],
         )
 
     def test_doctor_accepts_verified_provider_bridge_without_local_agent_command(self):
@@ -477,6 +496,84 @@ class EndToEndTests(unittest.TestCase):
         self.assertIn("excluded", rejected.payload["reason"])
         self.assertFalse((self.root / ".vibe/plans/deploy-plan").exists())
 
+    def test_public_reauthorization_continues_same_plan_run_and_preserves_cursor(self):
+        from vibe_guide.authorization import AuthorizationRecord
+        from vibe_guide.paths import ProjectPaths
+        from vibe_guide.runners.fake import FakeRunner
+        from vibe_guide.state import load_events, load_snapshot
+        from vibe_guide.task_registry import load_task_binding, save_task_binding
+
+        self.initialize()
+        source = json.loads((self.root / "plan-source.json").read_text(encoding="utf-8"))
+        source["nodes"] = [source["nodes"][0]]
+        source_path = self.root / "reauth-plan.json"
+        source_path.write_text(json.dumps(source), encoding="utf-8")
+        self.create_plan("reauth-plan", "reauth-plan.json")
+        runner = FakeRunner()
+        started = self.run_cli(
+            ["monitor", "--plan", "reauth-plan", "--authorize", "AUTHORIZE", "--json"],
+            runner=runner,
+        )
+        self.assertEqual(started.exit_code, 0)
+        run_id = started.payload["run_id"]
+        paths = ProjectPaths(self.root)
+        old_snapshot = load_snapshot(paths, run_id)
+        old_authorization = dict(old_snapshot.authorization)
+        binding = load_task_binding(paths, "api", "developer", run_id=run_id)
+        binding.cursor = "cursor-before-reauthorization"
+        save_task_binding(paths, binding)
+
+        nodes_path = self.root / ".vibe/plans/reauth-plan/nodes.json"
+        nodes = json.loads(nodes_path.read_text(encoding="utf-8"))
+        nodes[0]["contract"]["acceptance_example"] = "corrected unique implementation outcome"
+        nodes_path.write_text(json.dumps(nodes), encoding="utf-8")
+        invalidated = self.run_cli(
+            ["resume", "--plan", "reauth-plan", "--json"], runner=runner
+        )
+        self.assertEqual(
+            (invalidated.exit_code, invalidated.payload["status"]),
+            (3, "blocked_design"),
+        )
+
+        reauthorized = self.run_cli(
+            ["monitor", "--plan", "reauth-plan", "--authorize", "AUTHORIZE", "--json"],
+            runner=runner,
+        )
+
+        self.assertEqual(reauthorized.exit_code, 0, reauthorized.text)
+        self.assertEqual(reauthorized.payload["run_id"], run_id)
+        self.assertEqual(reauthorized.payload["status"], "running")
+        self.assertFalse(
+            (self.root / ".vibe/plans/reauth-plan/authorization-invalidated.json").exists()
+        )
+        current = load_snapshot(paths, run_id)
+        self.assertNotEqual(current.authorization_digest, old_snapshot.authorization_digest)
+        self.assertEqual(runner.start_calls[-1]["task_id"], binding.task_id)
+        self.assertEqual(runner.start_calls[-1]["phase"], "rework")
+        self.assertTrue(runner.start_calls[-1]["continuation"])
+
+        transition = [
+            record for record in load_events(paths, run_id)
+            if record["event"] == "authorization_reauthorized"
+        ][0]["data"]
+        self.assertEqual(
+            AuthorizationRecord.from_dict(
+                transition["previous_authorization"]
+            ).to_dict(),
+            old_authorization,
+        )
+        self.assertEqual(
+            transition["new_authorization"]["digest"], current.authorization_digest
+        )
+        self.assertIn("contract", transition["change_reason"])
+        self.assertEqual(
+            transition["continuation"]["api:developer"]["cursor"],
+            "cursor-before-reauthorization",
+        )
+
+        visible = self.run_cli(["status", "--plan", "reauth-plan", "--json"])
+        self.assertEqual((visible.exit_code, visible.payload["status"]), (0, "running"))
+
     def test_local_runner_rejects_unconfirmed_command_stops_and_persists_only_safe_metadata(self):
         runner = self.local_runner()
         with self.assertRaises(PermissionError):
@@ -506,6 +603,44 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn("stdout", metadata)
         self.assertNotIn("stderr", metadata)
         self.assertNotIn("token", metadata.casefold())
+
+    def test_local_runner_stop_fails_closed_when_persisted_identity_is_stale(self):
+        from vibe_guide.contracts import RunHandle
+        from vibe_guide.runners.local import LocalRunner, _process_start_token
+
+        command = [sys.executable, "-c", "import time; time.sleep(5)"]
+        runner = LocalRunner(
+            confirmed_commands={"fixture-agent": command}
+        )
+        handle = runner.start(
+            {
+                "adapter_id": "fixture-agent",
+                "command": command,
+                "node_id": "stale-identity",
+                "role": "developer",
+                "task_id": "developer:slow-stale-identity",
+                "generation": 1,
+            },
+            self.root,
+        )
+        metadata_path = self.root / ".vibe/local-runner" / (handle.run_id + ".json")
+        result_path = metadata_path.with_name(handle.run_id + ".result.json")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        original_identity = metadata["process_identity"]
+        pid = metadata["pid"]
+        metadata["process_identity"] = "tampered-or-reused-process-identity"
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        try:
+            with self.assertRaisesRegex(ValueError, "identity"):
+                runner.stop(handle)
+            self.assertEqual(_process_start_token(pid), original_identity)
+            self.assertFalse(result_path.exists())
+        finally:
+            metadata["process_identity"] = original_identity
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            runner.stop(RunHandle(handle.run_id))
+            runner.poll(RunHandle(handle.run_id))
 
     def test_local_runner_process_b_reattaches_without_duplicate_writer(self):
         command = [

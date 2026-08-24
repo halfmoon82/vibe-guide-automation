@@ -1,5 +1,6 @@
 import json
 import io
+import shutil
 import tempfile
 import subprocess
 import sys
@@ -122,12 +123,40 @@ class CliContractTests(unittest.TestCase):
             check=True,
         ).stdout.strip()
         setup_text = (root / "setup.py").read_text(encoding="utf-8")
-        readme_text = (root / "README.md").read_text(encoding="utf-8")
 
         self.assertEqual((name, version), ("vibe-guide", "0.1.0"))
         self.assertIn("vibe=vibe_guide.cli:main", setup_text)
         self.assertIn('python_requires=">=3.9"', setup_text)
-        self.assertIn("pip install --no-build-isolation -e .", readme_text)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            environment = Path(temporary) / "venv"
+            shutil.copytree(
+                root,
+                source,
+                ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+            )
+            subprocess.run(
+                [sys.executable, "-m", "venv", str(environment)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            installed = subprocess.run(
+                [str(environment / "bin/python"), "setup.py", "develop"],
+                cwd=str(source),
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            console = subprocess.run(
+                [str(environment / "bin/vibe"), "--help"],
+                cwd=str(source),
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(console.returncode, 0, console.stderr)
+            self.assertIn("monitor", console.stdout)
 
     def test_agents_contract_contains_visible_successor_recovery_rule(self):
         text = (Path(__file__).resolve().parents[1] / "AGENTS.md").read_text(

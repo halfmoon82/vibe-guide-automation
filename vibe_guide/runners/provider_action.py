@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -39,6 +40,17 @@ class ProviderActionRunner(Runner):
                 "wait": "codex_app__wait_threads",
             }[operation]
         return self.provider + "." + operation
+
+    @staticmethod
+    def _consistency_instruction(contract: Dict[str, Any]) -> str:
+        return "一致性纠偏证据必须原样绑定：{}".format(
+            json.dumps(
+                contract.get("consistency_binding", {}),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
 
     def _action(
         self,
@@ -99,7 +111,11 @@ class ProviderActionRunner(Runner):
         project_id = contract.get("project_id")
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("visible provider contract requires project_id")
-        prompt = "请执行 {} 任务，Issue {}。".format(role, node_id)
+        prompt = "请执行 {} 任务，Issue {}。{}".format(
+            role,
+            node_id,
+            self._consistency_instruction(contract),
+        )
         create_request = {
             "prompt": prompt,
             "target": {
@@ -205,7 +221,9 @@ class ProviderActionRunner(Runner):
             request = {
                 "threadId": binding.task_id,
                 "hostId": binding.host,
-                "prompt": "请继续处理 Issue {}。".format(contract["node_id"]),
+                "prompt": "请继续处理 Issue {}。{}".format(
+                    contract["node_id"], self._consistency_instruction(contract)
+                ),
             }
             action = self._action(contract, run_id, "resume", request)
             metadata["pending_action"] = action["action_id"]

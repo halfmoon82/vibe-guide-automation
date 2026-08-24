@@ -101,6 +101,7 @@ class ConsistencyResolution:
     source: str
     action: str
     files: List[str]
+    consistency_binding: Dict[str, Any]
 
 
 def resolve_consistency(
@@ -109,6 +110,7 @@ def resolve_consistency(
     issue_contract: Dict[str, Any],
     authorized_actions: List[str],
     authorized_files: List[str],
+    expected_binding: Dict[str, Any],
 ) -> Optional[ConsistencyResolution]:
     """Resolve only one evidence-determined, authorized non-deploy correction."""
 
@@ -131,11 +133,19 @@ def resolve_consistency(
         return None
     normalized = []
     for candidate in candidates:
-        if (
-            not isinstance(candidate, dict)
-            or set(candidate) != {"source", "value"}
-            or candidate["source"] not in EVIDENCE_PRIORITY
-        ):
+        if not isinstance(candidate, dict) or candidate.get("source") not in EVIDENCE_PRIORITY:
+            return None
+        source = candidate["source"]
+        allowed_keys = {"source", "value"}
+        if source != "implementation":
+            allowed_keys.add("binding")
+            if candidate.get("binding") != expected_binding:
+                return None
+        elif "binding" in candidate:
+            allowed_keys.add("binding")
+            if candidate["binding"] != expected_binding:
+                return None
+        if set(candidate) != allowed_keys:
             return None
         try:
             value_key = json.dumps(
@@ -146,7 +156,7 @@ def resolve_consistency(
             )
         except (TypeError, ValueError):
             return None
-        normalized.append((candidate["source"], candidate["value"], value_key))
+        normalized.append((source, candidate["value"], value_key))
     highest = min(EVIDENCE_PRIORITY.index(item[0]) for item in normalized)
     winners = [
         item for item in normalized if EVIDENCE_PRIORITY.index(item[0]) == highest
@@ -156,22 +166,32 @@ def resolve_consistency(
     source, value, _key = winners[0]
     if source == "implementation":
         return None
-    if source == "approved_prd":
-        approved_values = {
-            json.dumps(
-                item.get("selected"),
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            for item in decisions
-            if isinstance(item, dict) and item.get("status") == "approved"
-        }
-        if _key not in approved_values:
+    approved_values = {
+        json.dumps(
+            item.get("selected"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for item in decisions
+        if isinstance(item, dict) and item.get("status") == "approved"
+    }
+    if source in {"current_user", "approved_prd"} and _key not in approved_values:
+        return None
+    if source == "authorization":
+        contract_value = issue_contract.get(field_name)
+        if _key not in approved_values and contract_value != value:
             return None
     if source == "issue_contract" and issue_contract.get(field_name) != value:
         return None
-    return ConsistencyResolution(field_name, value, source, action, list(files))
+    return ConsistencyResolution(
+        field_name,
+        value,
+        source,
+        action,
+        list(files),
+        dict(expected_binding),
+    )
 
 
 _S1_MARKERS = (

@@ -9,6 +9,7 @@ from vibe_guide.planner import (
     approve_prd,
     classify_s0,
     create_decision_card,
+    resolve_consistency,
     route_task,
     score_s1,
 )
@@ -99,6 +100,39 @@ class PlannerTests(unittest.TestCase):
         result = approve_prd(prd, [card])
         self.assertTrue(result.approved)
         self.assertEqual(result.prd.status, "approved")
+
+    def test_bound_current_user_candidate_must_exist_in_persisted_approved_decisions(self):
+        binding = {
+            "schema_version": 1,
+            "project_digest": "1" * 64,
+            "plan_id": "plan-1",
+            "plan_version": 1,
+            "decision_digest": "2" * 64,
+            "authorization_digest": "3" * 64,
+            "issue_contract_digest": "4" * 64,
+        }
+        result = resolve_consistency(
+            {
+                "field": "naming",
+                "action": "rework",
+                "files": ["n1.py"],
+                "candidates": [
+                    {
+                        "source": "current_user",
+                        "value": "unapproved-name",
+                        "binding": binding,
+                    },
+                    {"source": "implementation", "value": "stale-name"},
+                ],
+            },
+            decisions=[{"status": "approved", "selected": "approved-name"}],
+            issue_contract={"naming": "approved-name"},
+            authorized_actions=["rework"],
+            authorized_files=["n1.py"],
+            expected_binding=binding,
+        )
+
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

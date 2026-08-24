@@ -54,8 +54,18 @@ _PROVENANCE_KEYS = {
     "authorization_digest",
     "node_contract_digest",
 }
+CONSISTENCY_CORRECTION_KEYS = (
+    "field",
+    "value",
+    "source",
+    "action",
+    "files",
+    "consistency_binding",
+)
 _EVENT_DATA_KEYS = {
+    *CONSISTENCY_CORRECTION_KEYS,
     "authorization_digest",
+    "change_reason",
     "continuation",
     "evidence",
     "finding",
@@ -66,7 +76,11 @@ _EVENT_DATA_KEYS = {
     "node_contract_digest",
     "node_id",
     "node_ids",
+    "new_authorization",
     "phase",
+    "previous_authorization",
+    "previous_authorization_digest",
+    "previous_node_contract_digest",
     "reason",
     "role",
     "run_id",
@@ -568,18 +582,58 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
     first = records[0] if records else None
     if first is None or first["event"] != "run_started":
         raise ValueError("snapshot has no run-start event lineage")
-    if first["data"].get("authorization_digest") != snapshot.authorization_digest:
+    current_authorization_digest = first["data"].get("authorization_digest")
+    current_node_contract_digest = first["data"].get("node_contract_digest")
+    if not isinstance(current_authorization_digest, str) or not _DIGEST.fullmatch(
+        current_authorization_digest
+    ):
         raise ValueError("run-start authorization lineage is inconsistent")
-    if first["data"].get("node_contract_digest") != snapshot.node_contract_digest:
+    if not isinstance(current_node_contract_digest, str) or not _DIGEST.fullmatch(
+        current_node_contract_digest
+    ):
         raise ValueError("run-start contract lineage is inconsistent")
     if sorted(first["data"].get("node_ids", [])) != sorted(snapshot.nodes):
         raise ValueError("run-start node lineage is inconsistent")
     for record in records[: snapshot.event_sequence]:
         provenance = record["provenance"]
-        if provenance["authorization_digest"] != snapshot.authorization_digest:
+        if provenance["authorization_digest"] != current_authorization_digest:
             raise ValueError("event authorization provenance is inconsistent")
-        if provenance["node_contract_digest"] != snapshot.node_contract_digest:
+        if provenance["node_contract_digest"] != current_node_contract_digest:
             raise ValueError("event contract provenance is inconsistent")
+        if record["event"] != "authorization_reauthorized":
+            continue
+        data = record["data"]
+        if (
+            data.get("previous_authorization_digest")
+            != current_authorization_digest
+            or data.get("previous_node_contract_digest")
+            != current_node_contract_digest
+        ):
+            raise ValueError("reauthorization previous lineage is inconsistent")
+        previous = AuthorizationRecord.from_dict(data.get("previous_authorization"))
+        replacement = AuthorizationRecord.from_dict(data.get("new_authorization"))
+        if (
+            not is_authorization_integrity_valid(previous)
+            or previous.digest != current_authorization_digest
+            or previous.node_contract_digest != current_node_contract_digest
+        ):
+            raise ValueError("reauthorization previous record is invalid")
+        if (
+            not is_authorization_integrity_valid(replacement)
+            or replacement.plan_id != snapshot.plan_id
+            or replacement.plan_version != snapshot.plan_version
+            or set(replacement.node_ids) != set(snapshot.nodes)
+            or data.get("authorization_digest") != replacement.digest
+            or data.get("node_contract_digest")
+            != replacement.node_contract_digest
+        ):
+            raise ValueError("reauthorization replacement record is invalid")
+        current_authorization_digest = replacement.digest
+        current_node_contract_digest = replacement.node_contract_digest
+    if current_authorization_digest != snapshot.authorization_digest:
+        raise ValueError("snapshot final authorization lineage is inconsistent")
+    if current_node_contract_digest != snapshot.node_contract_digest:
+        raise ValueError("snapshot final contract lineage is inconsistent")
 
     for node_id, node in snapshot.nodes.items():
         if node.get("status") != "accepted":

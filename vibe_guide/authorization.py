@@ -353,6 +353,37 @@ def build_authorization_card(
     return AuthorizationCard(digest=_canonical_digest(canonical), **canonical)
 
 
+def refresh_authorization_card(
+    plan: Plan,
+    nodes: List[DAGNode],
+    previous: AuthorizationCard,
+) -> AuthorizationCard:
+    """Rebuild a same-plan card while retaining its approved agent/capacity scope."""
+
+    authorize(previous, "AUTHORIZE")
+    if (
+        previous.plan_id != plan.plan_id
+        or previous.plan_version != plan.version
+        or previous.node_ids != tuple(sorted(plan.node_ids))
+    ):
+        raise ValueError("reauthorization must remain on the same plan revision")
+    capabilities = AgentCapabilities(
+        previous.agent_id,
+        False,
+        False,
+        False,
+        False,
+        False,
+        "guide",
+    )
+    return build_authorization_card(
+        plan,
+        nodes,
+        capabilities,
+        active_pair_limit=previous.active_pair_limit,
+    )
+
+
 def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord:
     if confirmation != "AUTHORIZE":
         raise ValueError("authorization requires exact AUTHORIZE confirmation")

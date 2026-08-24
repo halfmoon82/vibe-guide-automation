@@ -11,7 +11,7 @@ from vibe_guide.models import AgentCapabilities, DAGNode, Plan
 from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
-from vibe_guide.state import acquire_writer_lease, append_event
+from vibe_guide.state import acquire_writer_lease, append_event, load_events
 from vibe_guide.task_registry import load_task_binding
 
 
@@ -275,35 +275,37 @@ class MonitorTests(unittest.TestCase):
             events={
                 ("n1", "developer"): [
                     ("complete", {"evidence": "delivery"})
-                ],
-                ("n1", "reviewer"): [
-                    (
-                        "review_finding",
-                        {
-                            "finding": "stale lower contract name",
-                            "in_contract": False,
-                            "consistency": {
-                                "field": "naming",
-                                "action": "rework",
-                                "files": ["n1.py"],
-                                "candidates": [
-                                    {
-                                        "source": "approved_prd",
-                                        "value": "approved-name",
-                                    },
-                                    {
-                                        "source": "implementation",
-                                        "value": "stale-name",
-                                    },
-                                ],
-                            },
-                        },
-                    )
-                ],
+                ]
             }
         )
         snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
         snapshot = monitor.tick(snapshot.run_id, runner)
+        binding = runner.start_calls[-1]["consistency_binding"]
+        runner.events[("n1", "reviewer")] = [
+            (
+                "review_finding",
+                {
+                    "finding": "stale lower contract name",
+                    "in_contract": False,
+                    "consistency": {
+                        "field": "naming",
+                        "action": "rework",
+                        "files": ["n1.py"],
+                        "candidates": [
+                            {
+                                "source": "approved_prd",
+                                "value": "approved-name",
+                                "binding": binding,
+                            },
+                            {
+                                "source": "implementation",
+                                "value": "stale-name",
+                            },
+                        ],
+                    },
+                },
+            )
+        ]
         snapshot = monitor.tick(snapshot.run_id, runner)
 
         self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
@@ -314,6 +316,10 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(
             snapshot.nodes["n1"]["corrections"][0]["source"],
             "approved_prd",
+        )
+        self.assertEqual(
+            snapshot.nodes["n1"]["corrections"][0]["consistency_binding"],
+            binding,
         )
 
         ambiguous = node("n2")
@@ -326,20 +332,84 @@ class MonitorTests(unittest.TestCase):
             events={
                 ("n2", "developer"): [
                     ("complete", {"evidence": "delivery"})
-                ],
-                ("n2", "reviewer"): [
+                ]
+            }
+        )
+        blocked = ambiguous_monitor.start(
+            authorize(ambiguous_card, "AUTHORIZE"), ambiguous_runner
+        )
+        blocked = ambiguous_monitor.tick(blocked.run_id, ambiguous_runner)
+        ambiguous_binding = ambiguous_runner.start_calls[-1]["consistency_binding"]
+        ambiguous_runner.events[("n2", "reviewer")] = [
+            (
+                "review_finding",
+                {
+                    "finding": "two approved outcomes",
+                    "in_contract": False,
+                    "consistency": {
+                        "field": "naming",
+                        "action": "rework",
+                        "files": ["n2.py"],
+                        "candidates": [
+                            {
+                                "source": "approved_prd",
+                                "value": "a",
+                                "binding": ambiguous_binding,
+                            },
+                            {
+                                "source": "approved_prd",
+                                "value": "b",
+                                "binding": ambiguous_binding,
+                            },
+                        ],
+                    },
+                },
+            )
+        ]
+        blocked = ambiguous_monitor.tick(blocked.run_id, ambiguous_runner)
+        self.assertEqual(blocked.nodes["n2"]["status"], "blocked_design")
+
+    def test_unbound_current_user_text_cannot_override_approved_decision(self):
+        target = node("n1")
+        target.contract["naming"] = "approved-name"
+        plan = Plan(
+            "plan-1",
+            1,
+            "docs/prd.md",
+            ["n1"],
+            "draft",
+            decisions=[
+                {
+                    "question": "canonical name",
+                    "selected": "approved-name",
+                    "status": "approved",
+                }
+            ],
+        )
+        card = build_authorization_card(plan, [target], self.capabilities)
+        monitor = Monitor(self.paths, plan, [target])
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+                ("n1", "reviewer"): [
                     (
                         "review_finding",
                         {
-                            "finding": "two approved outcomes",
+                            "finding": "unbound text claims a user override",
                             "in_contract": False,
                             "consistency": {
                                 "field": "naming",
                                 "action": "rework",
-                                "files": ["n2.py"],
+                                "files": ["n1.py"],
                                 "candidates": [
-                                    {"source": "approved_prd", "value": "a"},
-                                    {"source": "approved_prd", "value": "b"},
+                                    {
+                                        "source": "current_user",
+                                        "value": "unapproved-name",
+                                    },
+                                    {
+                                        "source": "approved_prd",
+                                        "value": "approved-name",
+                                    },
                                 ],
                             },
                         },
@@ -347,12 +417,156 @@ class MonitorTests(unittest.TestCase):
                 ],
             }
         )
-        blocked = ambiguous_monitor.start(
-            authorize(ambiguous_card, "AUTHORIZE"), ambiguous_runner
+
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
+        self.assertNotIn("naming", snapshot.nodes["n1"]["contract_overrides"])
+
+    def test_consistency_correction_event_recovers_after_interrupted_snapshot_save(self):
+        target = node("n1")
+        target.contract["naming"] = "approved-name"
+        plan = Plan(
+            "plan-1",
+            1,
+            "docs/prd.md",
+            ["n1"],
+            "draft",
+            decisions=[
+                {
+                    "question": "canonical name",
+                    "selected": "approved-name",
+                    "status": "approved",
+                }
+            ],
         )
-        blocked = ambiguous_monitor.tick(blocked.run_id, ambiguous_runner)
-        blocked = ambiguous_monitor.tick(blocked.run_id, ambiguous_runner)
-        self.assertEqual(blocked.nodes["n2"]["status"], "blocked_design")
+        card = build_authorization_card(plan, [target], self.capabilities)
+        monitor = Monitor(self.paths, plan, [target])
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery"})]
+            }
+        )
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        binding = runner.start_calls[-1]["consistency_binding"]
+        runner.events[("n1", "reviewer")] = [
+            (
+                "review_finding",
+                {
+                    "finding": "stale lower contract name",
+                    "in_contract": False,
+                    "consistency": {
+                        "field": "naming",
+                        "action": "rework",
+                        "files": ["n1.py"],
+                        "candidates": [
+                            {
+                                "source": "approved_prd",
+                                "value": "approved-name",
+                                "binding": binding,
+                            },
+                            {
+                                "source": "implementation",
+                                "value": "stale-name",
+                            },
+                        ],
+                    },
+                },
+            )
+        ]
+
+        with patch.object(
+            monitor,
+            "_start_task",
+            side_effect=RuntimeError("interrupted after correction event"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                monitor.tick(snapshot.run_id, runner)
+
+        recovery_runner = FakeRunner()
+        recovered = monitor.resume(snapshot.run_id, recovery_runner)
+        correction = recovered.nodes["n1"]["corrections"][0]
+        self.assertEqual(recovered.nodes["n1"]["contract_overrides"], {"naming": "approved-name"})
+        self.assertEqual(correction["consistency_binding"], binding)
+        self.assertEqual(recovered.nodes["n1"]["status"], "rework")
+        self.assertEqual(recovery_runner.start_calls[-1]["phase"], "rework")
+
+        persisted = [
+            record for record in load_events(self.paths, snapshot.run_id)
+            if record["event"] == "consistency_corrected"
+        ][0]["data"]
+        self.assertEqual(
+            set(persisted),
+            {
+                "run_id",
+                "node_id",
+                "field",
+                "value",
+                "source",
+                "action",
+                "files",
+                "consistency_binding",
+            },
+        )
+
+    def test_reauthorization_event_recovers_before_snapshot_and_is_not_duplicated(self):
+        original = node("n1")
+        original_plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+        original_record = authorize(
+            build_authorization_card(
+                original_plan, [original], self.capabilities
+            ),
+            "AUTHORIZE",
+        )
+        original_monitor = Monitor(self.paths, original_plan, [original])
+        runner = FakeRunner()
+        snapshot = original_monitor.start(original_record, runner)
+
+        corrected = node("n1")
+        corrected.contract["acceptance_example"] = "corrected implementation outcome"
+        corrected_record = authorize(
+            build_authorization_card(
+                original_plan, [corrected], self.capabilities
+            ),
+            "AUTHORIZE",
+        )
+        corrected_monitor = Monitor(self.paths, original_plan, [corrected])
+        with patch.object(
+            corrected_monitor,
+            "_schedule_ready",
+            side_effect=RuntimeError("interrupted after reauthorization event"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                corrected_monitor.reauthorize(
+                    snapshot.run_id,
+                    corrected_record,
+                    runner,
+                    "executable_contract_changed",
+                )
+
+        recovery_runner = FakeRunner()
+        recovered = corrected_monitor.reauthorize(
+            snapshot.run_id,
+            corrected_record,
+            recovery_runner,
+            "executable_contract_changed",
+        )
+
+        self.assertEqual(recovered.authorization_digest, corrected_record.digest)
+        self.assertEqual(recovered.nodes["n1"]["status"], "rework")
+        self.assertEqual(recovery_runner.start_calls[-1]["phase"], "rework")
+        self.assertEqual(
+            len(
+                [
+                    event for event in load_events(self.paths, snapshot.run_id)
+                    if event["event"] == "authorization_reauthorized"
+                ]
+            ),
+            1,
+        )
 
     def test_unknown_is_blocked_unknown_not_completed(self):
         nodes = [node("n1")]

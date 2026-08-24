@@ -1,11 +1,13 @@
 """Authorization-bound, write-ahead monitor for developer/reviewer DAG tasks."""
 
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import uuid
 
 from .authorization import (
     AuthorizationRecord,
+    executable_contract_digest,
     is_authorization_valid,
     validate_runtime_contract,
 )
@@ -15,6 +17,7 @@ from .paths import ProjectPaths
 from .planner import resolve_consistency
 from .adapters.task_provider import ProviderPending
 from .state import (
+    CONSISTENCY_CORRECTION_KEYS,
     RunSnapshot,
     acquire_writer_lease,
     append_event,
@@ -117,6 +120,82 @@ class Monitor:
         save_snapshot(self.paths, snapshot)
         return snapshot
 
+    def reauthorize(
+        self,
+        run_id: str,
+        record: AuthorizationRecord,
+        runner: Runner,
+        change_reason: str,
+    ) -> RunSnapshot:
+        """Continue the same run under a newly confirmed same-plan contract."""
+
+        self._require_record(record)
+        snapshot = load_snapshot(self.paths, run_id)
+        self._reconcile_unapplied_events(snapshot)
+        if (
+            snapshot.plan_id != self.plan.plan_id
+            or snapshot.plan_version != self.plan.version
+            or set(snapshot.nodes) != set(self.nodes)
+        ):
+            raise PermissionError("reauthorization must remain on the same plan revision")
+        if snapshot.authorization_digest == record.digest:
+            self._require_snapshot_authorization(snapshot)
+            self._schedule_ready(snapshot, runner)
+            self._refresh_run_status(snapshot)
+            save_snapshot(self.paths, snapshot)
+            return snapshot
+
+        previous = self._snapshot_record(snapshot)
+        for node_id, handle_id in list(snapshot.handles.items()):
+            current = snapshot.nodes[node_id]
+            active = current.get("active_task")
+            if not isinstance(active, dict) or active.get("handle_id") != handle_id:
+                raise RuntimeError("active task cannot be reconciled for reauthorization")
+            if not self._stop_active_for_transition(
+                snapshot,
+                node_id,
+                str(active["role"]),
+                handle_id,
+                runner,
+                "stopped",
+            ):
+                save_snapshot(self.paths, snapshot)
+                raise RuntimeError("active task stop cannot be proven for reauthorization")
+
+        continuation: Dict[str, Any] = {}
+        for node_id in sorted(snapshot.nodes):
+            for role in ("developer", "reviewer"):
+                key = "{}:{}".format(node_id, role)
+                try:
+                    binding = load_task_binding(
+                        self.paths, node_id, role, run_id=snapshot.run_id
+                    )
+                except FileNotFoundError:
+                    continue
+                snapshot.tasks[key] = binding.to_dict()
+                continuation[key] = {
+                    "task_id": binding.task_id,
+                    "cursor": binding.cursor,
+                }
+
+        transition = {
+            "run_id": snapshot.run_id,
+            "previous_authorization": previous.to_dict(),
+            "previous_authorization_digest": previous.digest,
+            "previous_node_contract_digest": previous.node_contract_digest,
+            "new_authorization": record.to_dict(),
+            "authorization_digest": record.digest,
+            "node_contract_digest": record.node_contract_digest,
+            "change_reason": change_reason,
+            "continuation": continuation,
+        }
+        self._record(snapshot, "authorization_reauthorized", transition)
+        self._apply_reauthorization_transition(snapshot, transition)
+        self._schedule_ready(snapshot, runner)
+        self._refresh_run_status(snapshot)
+        save_snapshot(self.paths, snapshot)
+        return snapshot
+
     def tick(self, run_id: str, runner: Runner) -> RunSnapshot:
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
@@ -153,6 +232,20 @@ class Monitor:
         except (TypeError, ValueError) as error:
             raise PermissionError("snapshot authorization record is invalid") from error
 
+    def _consistency_binding(
+        self, record: AuthorizationRecord, node: DAGNode
+    ) -> Dict[str, Any]:
+        project_root = str(self.paths.root.resolve())
+        return {
+            "schema_version": 1,
+            "project_digest": hashlib.sha256(project_root.encode("utf-8")).hexdigest(),
+            "plan_id": self.plan.plan_id,
+            "plan_version": self.plan.version,
+            "decision_digest": record.decision_digest,
+            "authorization_digest": record.digest,
+            "issue_contract_digest": executable_contract_digest([node]),
+        }
+
     def _require_snapshot_authorization(self, snapshot: RunSnapshot) -> AuthorizationRecord:
         record = self._snapshot_record(snapshot)
         if snapshot.plan_id != self.plan.plan_id or snapshot.plan_version != self.plan.version:
@@ -163,6 +256,69 @@ class Monitor:
             raise PermissionError("snapshot contract digest is inconsistent")
         self._require_record(record)
         return record
+
+    def _apply_reauthorization_transition(
+        self, snapshot: RunSnapshot, data: Dict[str, Any]
+    ) -> None:
+        previous = AuthorizationRecord.from_dict(data.get("previous_authorization"))
+        replacement = AuthorizationRecord.from_dict(data.get("new_authorization"))
+        if (
+            previous.to_dict() != snapshot.authorization
+            or data.get("previous_authorization_digest")
+            != snapshot.authorization_digest
+            or data.get("previous_node_contract_digest")
+            != snapshot.node_contract_digest
+        ):
+            raise ValueError("reauthorization previous lineage is inconsistent")
+        self._require_record(replacement)
+        if (
+            data.get("authorization_digest") != replacement.digest
+            or data.get("node_contract_digest")
+            != replacement.node_contract_digest
+            or data.get("change_reason") != "executable_contract_changed"
+        ):
+            raise ValueError("reauthorization replacement lineage is inconsistent")
+        continuation = data.get("continuation")
+        if not isinstance(continuation, dict):
+            raise ValueError("reauthorization continuation evidence is invalid")
+        for key, evidence in continuation.items():
+            if not isinstance(key, str) or ":" not in key or not isinstance(evidence, dict):
+                raise ValueError("reauthorization continuation evidence is invalid")
+            node_id, role = key.rsplit(":", 1)
+            if node_id not in snapshot.nodes or role not in {"developer", "reviewer"}:
+                raise ValueError("reauthorization continuation identity is invalid")
+            binding = load_task_binding(
+                self.paths, node_id, role, run_id=snapshot.run_id
+            )
+            if (
+                set(evidence) != {"task_id", "cursor"}
+                or evidence["task_id"] != binding.task_id
+                or evidence["cursor"] != binding.cursor
+            ):
+                raise ValueError("reauthorization continuation cursor is inconsistent")
+            snapshot.tasks[key] = binding.to_dict()
+
+        snapshot.authorization = replacement.to_dict()
+        snapshot.authorization_digest = replacement.digest
+        snapshot.node_contract_digest = replacement.node_contract_digest
+        snapshot.handles.clear()
+        for current in snapshot.nodes.values():
+            current["active_role"] = None
+            current["active_task"] = None
+            current["start_intent"] = None
+            current["quarantine"] = None
+            if current.get("status") == "accepted":
+                continue
+            if int(current.get("developer_generation", 0)) > 0:
+                current["status"] = "blocked_unknown"
+                current["retryable_action"] = {
+                    "role": "developer",
+                    "phase": "rework",
+                    "continuation": True,
+                }
+            else:
+                current["status"] = "planned"
+                current["retryable_action"] = None
 
     @staticmethod
     def _identity_from_contract(node: DAGNode, role: str) -> Optional[str]:
@@ -293,6 +449,7 @@ class Monitor:
                 "continuation": continuation,
                 "action": phase,
                 "run_id": snapshot.run_id,
+                "consistency_binding": self._consistency_binding(record, node),
             }
         )
         try:
@@ -618,6 +775,7 @@ class Monitor:
                     self.nodes[node_id].contract,
                     list(record.allowed_actions),
                     list(record.file_scope),
+                    self._consistency_binding(record, self.nodes[node_id]),
                 )
                 if resolution is not None:
                     if not self._stop_active_for_transition(
@@ -627,12 +785,19 @@ class Monitor:
                     current.setdefault("contract_overrides", {})[
                         resolution.field
                     ] = resolution.value
-                    correction = {
+                    correction_values = {
                         "field": resolution.field,
                         "value": resolution.value,
                         "source": resolution.source,
                         "action": resolution.action,
                         "files": list(resolution.files),
+                        "consistency_binding": dict(
+                            resolution.consistency_binding
+                        ),
+                    }
+                    correction = {
+                        key: correction_values[key]
+                        for key in CONSISTENCY_CORRECTION_KEYS
                     }
                     current.setdefault("corrections", []).append(correction)
                     self._record(
@@ -1012,6 +1177,10 @@ class Monitor:
             data = record["data"]
             if data.get("run_id") != snapshot.run_id:
                 raise ValueError("unapplied event run lineage is inconsistent")
+            if record["event"] == "authorization_reauthorized":
+                self._apply_reauthorization_transition(snapshot, data)
+                snapshot.event_sequence = record["sequence"]
+                continue
             node_id = data.get("node_id")
             if node_id not in snapshot.nodes:
                 raise ValueError("unapplied event references an unknown node")
@@ -1121,7 +1290,7 @@ class Monitor:
             elif record["event"] == "consistency_corrected":
                 correction = {
                     key: data[key]
-                    for key in ("field", "value", "source", "action", "files")
+                    for key in CONSISTENCY_CORRECTION_KEYS
                 }
                 current.setdefault("contract_overrides", {})[
                     correction["field"]
@@ -1131,6 +1300,12 @@ class Monitor:
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
+                current["status"] = "blocked_unknown"
+                current["retryable_action"] = {
+                    "role": "developer",
+                    "phase": "rework",
+                    "continuation": True,
+                }
             elif record["event"] == "blocked_design":
                 current["status"] = "blocked_design"
                 current["reason"] = data.get("reason", "design decision required")

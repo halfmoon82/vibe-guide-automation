@@ -25,6 +25,7 @@
 - 未知状态不得转换为无事项或成功；无法验证时进入 `blocked_unknown`。
 - 实现缺陷优先退回同一 worker；设计变化只重建受影响 DAG 后缀。
 - 一致性纠偏按“用户当前明确决定 → 已批准 PRD/Design Spec → 授权卡 → Issue 合同 → 下层实现”取证；若只有一个答案且仍在已授权项目、DAG 和非 deploy 边界内，记录纠偏、更新受影响后缀或合同并自动继续。只有多种结果仍会实质改变产品、范围或方向变化、需要外部/deploy/系统权限授权，或证据无法区分安全结果时暂停。
+- **已确认规则能够唯一判断的事项由监工自动执行并记录，不得作为盲区或产品取舍再次询问；只有无法唯一判断且会改变产品方向、授权边界或外部承诺的事项才中断。** 纠偏候选必须绑定当前项目摘要、plan/revision、已批准决策摘要、授权摘要和单个 Issue 合同摘要；`current_user`/`approved_prd` 值必须存在于持久化批准决定。授权失效后的同 plan 重新授权保留旧授权、变更原因、原任务身份/cursor 和新授权摘要，再继续修正 DAG。
 - 桌面 App 适配必须检测权限并如实降级，不能绕过沙箱或伪造完整自动化。
 - 七个平台的完整可见自动化路径中，开发 Issue 和独立 Review 必须分别映射为对应 App 的可见独立任务；可见、可进入、可追溯是验收条件。
 - 每个任务登记 provider、平台任务 ID、host、worktree、branch、`status_file`、`handoff_file` 和 cursor/token；Codex 具体登记 `threadId`、`hostId` 和 cursor。返工回到原 developer，复审回到原 reviewer。

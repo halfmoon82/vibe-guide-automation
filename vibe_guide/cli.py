@@ -14,6 +14,7 @@ from .authorization import (
     AuthorizationRecord,
     authorize,
     build_authorization_card,
+    refresh_authorization_card,
 )
 from .adapters.base import Environment
 from .adapters.registry import AdapterRegistry
@@ -342,11 +343,15 @@ def _invalidation_path(directory: Path) -> Path:
     return directory / "authorization-invalidated.json"
 
 
-def _persist_invalidation(directory: Optional[Path]) -> None:
+def _persist_invalidation(directory: Optional[Path], reason: str) -> None:
     if directory is not None:
         _atomic_json(
             _invalidation_path(directory),
-            {"status": "blocked_design", "reason": "authorization invalidated"},
+            {
+                "status": "blocked_design",
+                "reason": reason,
+                "change_reason": "executable_contract_changed",
+            },
         )
 
 
@@ -540,14 +545,39 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             )
         try:
             directory, plan, nodes, card = _load_plan(paths, args.plan)
-            record = authorize(card, args.authorize)
-            if runner is None:
-                runner = _public_runner(paths, card, nodes)
-            snapshot = Monitor(paths, plan, nodes).start(record, runner)
+            invalidation_path = _invalidation_path(directory)
+            invalidation_to_clear = None
+            if invalidation_path.exists():
+                invalidation = _read_json(invalidation_path)
+                if not isinstance(invalidation, dict):
+                    raise ValueError("authorization invalidation record is invalid")
+                card = refresh_authorization_card(plan, nodes, card)
+                record = authorize(card, args.authorize)
+                if runner is None:
+                    runner = _public_runner(paths, card, nodes)
+                snapshot = Monitor(paths, plan, nodes).reauthorize(
+                    _run_id(directory, None),
+                    record,
+                    runner,
+                    str(
+                        invalidation.get(
+                            "change_reason", "executable_contract_changed"
+                        )
+                    ),
+                )
+                _atomic_json(directory / "authorization-card.json", card.to_dict())
+                invalidation_to_clear = invalidation_path
+            else:
+                record = authorize(card, args.authorize)
+                if runner is None:
+                    runner = _public_runner(paths, card, nodes)
+                snapshot = Monitor(paths, plan, nodes).start(record, runner)
             _atomic_json(directory / "authorization.json", record.to_dict())
             _atomic_json(
                 _current_run_path(directory), {"run_id": snapshot.run_id}
             )
+            if invalidation_to_clear is not None:
+                invalidation_to_clear.unlink()
         except PermissionError as error:
             return _result(
                 BLOCKED,
@@ -559,7 +589,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工已暂停：" + str(error),
                 args.as_json,
             )
-        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
             return _result(
                 UNKNOWN,
                 {
@@ -618,7 +648,9 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 snapshot = monitor.resume(run_id, runner)
                 snapshot = monitor.tick(run_id, runner)
         except PermissionError as error:
-            _persist_invalidation(directory)
+            _persist_invalidation(
+                directory, "authorization invalidated: " + str(error)
+            )
             return _result(
                 BLOCKED,
                 {
@@ -647,7 +679,9 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 or "contract" in message
                 or "plan no longer" in message
             ):
-                _persist_invalidation(directory)
+                _persist_invalidation(
+                    directory, "authorization invalidated: " + message
+                )
                 return _result(
                     BLOCKED,
                     {

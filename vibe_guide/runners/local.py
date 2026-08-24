@@ -320,11 +320,14 @@ class LocalRunner(Runner):
         result_path = metadata_path.with_name(handle.run_id + ".result.json")
         pid = int(metadata["pid"])
         current_token = _process_start_token(pid)
-        if current_token and current_token == metadata["process_identity"]:
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+        if metadata["status"] == "exited" and result_path.exists():
+            return
+        if not current_token or current_token != metadata["process_identity"]:
+            raise ValueError("local runner process identity cannot be proven")
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         process_pid = self._processes.get(handle.run_id)
         if process_pid is not None:
             try:
