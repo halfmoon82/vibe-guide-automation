@@ -137,6 +137,30 @@ def executable_contract_digest(nodes: List[DAGNode]) -> str:
     return _canonical_digest({"nodes": canonical_node_contracts(nodes)})
 
 
+def affected_node_closure(
+    nodes: List[DAGNode], changed_nodes: List[str]
+) -> List[str]:
+    """Return changed nodes plus hard/integration descendants."""
+
+    node_ids = {node.id for node in nodes}
+    if any(node_id not in node_ids for node_id in changed_nodes):
+        raise ValueError("changed node is outside the authorized DAG")
+    reverse_edges = {node_id: set() for node_id in node_ids}
+    for child in nodes:
+        for parent_id in set(child.depends_on + child.integration_after):
+            if parent_id in reverse_edges:
+                reverse_edges[parent_id].add(child.id)
+    affected = set(changed_nodes)
+    pending = list(changed_nodes)
+    while pending:
+        parent_id = pending.pop()
+        for child_id in sorted(reverse_edges[parent_id]):
+            if child_id not in affected:
+                affected.add(child_id)
+                pending.append(child_id)
+    return sorted(affected)
+
+
 def _scoped_values(value: Any, key_name: str) -> List[str]:
     result: List[str] = []
     if isinstance(value, dict):

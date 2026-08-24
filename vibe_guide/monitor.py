@@ -1,12 +1,15 @@
 """Authorization-bound, write-ahead monitor for developer/reviewer DAG tasks."""
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import uuid
 
 from .authorization import (
     AuthorizationRecord,
+    affected_node_closure,
+    canonical_node_contracts,
     executable_contract_digest,
     is_authorization_valid,
     validate_runtime_contract,
@@ -162,7 +165,18 @@ class Monitor:
             if previous_node_contract_digests[node_id]
             != new_node_contract_digests[node_id]
         )
-        affected_nodes = self._affected_nodes(changed_nodes)
+        affected_nodes = affected_node_closure(
+            list(self.nodes.values()), changed_nodes
+        )
+        authorized_node_contracts = {
+            item["id"]: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for item in canonical_node_contracts(list(self.nodes.values()))
+        }
         accepted_nodes = sorted(
             node_id
             for node_id, current in snapshot.nodes.items()
@@ -232,6 +246,7 @@ class Monitor:
             "node_contract_digest": record.node_contract_digest,
             "previous_node_contract_digests": previous_node_contract_digests,
             "node_contract_digests": new_node_contract_digests,
+            "authorized_node_contracts": authorized_node_contracts,
             "changed_nodes": changed_nodes,
             "affected_nodes": affected_nodes,
             "accepted_nodes": accepted_nodes,
@@ -246,24 +261,6 @@ class Monitor:
         self._refresh_run_status(snapshot)
         save_snapshot(self.paths, snapshot)
         return snapshot
-
-    def _affected_nodes(self, changed_nodes: List[str]) -> List[str]:
-        """Return changed nodes plus all hard/integration descendants."""
-
-        reverse_edges = {node_id: set() for node_id in self.nodes}
-        for child_id, node in self.nodes.items():
-            for parent_id in set(node.depends_on + node.integration_after):
-                if parent_id in reverse_edges:
-                    reverse_edges[parent_id].add(child_id)
-        affected = set(changed_nodes)
-        pending = list(changed_nodes)
-        while pending:
-            parent_id = pending.pop()
-            for child_id in sorted(reverse_edges.get(parent_id, ())):
-                if child_id not in affected:
-                    affected.add(child_id)
-                    pending.append(child_id)
-        return sorted(affected)
 
     def tick(self, run_id: str, runner: Runner) -> RunSnapshot:
         snapshot = load_snapshot(self.paths, run_id)
@@ -388,8 +385,14 @@ class Monitor:
         changed_nodes = data.get("changed_nodes")
         affected_nodes = data.get("affected_nodes")
         accepted_nodes = data.get("accepted_nodes")
+        authorized_node_contracts = data.get("authorized_node_contracts")
         if not isinstance(retained_acceptances, dict) or not isinstance(
             invalidated_acceptances, dict
+        ) or not isinstance(authorized_node_contracts, dict) or set(
+            authorized_node_contracts
+        ) != set(snapshot.nodes) or any(
+            not isinstance(value, str)
+            for value in authorized_node_contracts.values()
         ) or any(
             not isinstance(items, list)
             or any(not isinstance(node_id, str) for node_id in items)
@@ -409,7 +412,20 @@ class Monitor:
         )
         if changed_nodes != expected_changed_nodes:
             raise ValueError("reauthorization changed node lineage is invalid")
-        if affected_nodes != self._affected_nodes(changed_nodes):
+        expected_authorized_node_contracts = {
+            item["id"]: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for item in canonical_node_contracts(list(self.nodes.values()))
+        }
+        if authorized_node_contracts != expected_authorized_node_contracts:
+            raise ValueError("reauthorization authorized DAG proof is invalid")
+        if affected_nodes != affected_node_closure(
+            list(self.nodes.values()), changed_nodes
+        ):
             raise ValueError("reauthorization affected suffix lineage is invalid")
         retained_ids = set(retained_acceptances)
         invalidated_ids = set(invalidated_acceptances)
@@ -469,12 +485,13 @@ class Monitor:
                     continue
                 if node_id in invalidated_acceptances:
                     current["acceptance"] = None
-                    current["pair_archived"] = False
+                    current["pair_archived"] = True
                     current["status"] = "blocked_unknown"
                     current["retryable_action"] = {
                         "role": "developer",
                         "phase": "rework",
                         "continuation": True,
+                        "pending_schedule": True,
                     }
                     continue
                 raise ValueError("accepted node lacks reauthorization disposition")
@@ -530,6 +547,15 @@ class Monitor:
                 and isinstance(retry, dict)
                 and node_id not in snapshot.handles
             ):
+                pending_schedule = retry.get("pending_schedule") is True
+                if pending_schedule and (
+                    active_pairs >= record.active_pair_limit
+                    or not all(
+                        snapshot.nodes[dependency].get("status") == "accepted"
+                        for dependency in node.depends_on
+                    )
+                ):
+                    continue
                 if not acquire_writer_lease(
                     self.paths,
                     node_id,
@@ -542,6 +568,9 @@ class Monitor:
                         "writer lease is already owned by another run",
                     )
                     continue
+                if pending_schedule:
+                    current["pair_archived"] = False
+                    active_pairs += 1
                 if self._start_task(
                     snapshot,
                     node_id,

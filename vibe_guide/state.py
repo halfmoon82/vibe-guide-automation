@@ -15,8 +15,14 @@ import time
 from typing import Any, Dict, Iterator, List, Optional
 import uuid
 
-from .authorization import AuthorizationRecord, is_authorization_integrity_valid
+from .authorization import (
+    AuthorizationRecord,
+    affected_node_closure,
+    executable_contract_digest,
+    is_authorization_integrity_valid,
+)
 from .contracts import RunEvent
+from .models import DAGNode
 from .paths import ProjectPaths
 
 
@@ -67,6 +73,7 @@ _EVENT_DATA_KEYS = {
     *CONSISTENCY_CORRECTION_KEYS,
     "authorization_digest",
     "authorization_epoch",
+    "authorized_node_contracts",
     "accepted_nodes",
     "affected_nodes",
     "changed_nodes",
@@ -647,6 +654,7 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         changed_nodes = data.get("changed_nodes")
         affected_nodes = data.get("affected_nodes")
         accepted_nodes = data.get("accepted_nodes")
+        authorized_node_contracts = data.get("authorized_node_contracts")
         if (
             not isinstance(previous_node_contract_digests, dict)
             or not isinstance(node_contract_digests, dict)
@@ -655,6 +663,12 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
             or not isinstance(retained_acceptances, dict)
             or not isinstance(invalidated_acceptances, dict)
             or set(retained_acceptances) & set(invalidated_acceptances)
+            or not isinstance(authorized_node_contracts, dict)
+            or set(authorized_node_contracts) != set(snapshot.nodes)
+            or any(
+                not isinstance(value, str)
+                for value in authorized_node_contracts.values()
+            )
             or any(
                 not isinstance(items, list)
                 or any(not isinstance(node_id, str) for node_id in items)
@@ -671,6 +685,26 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 for value in mapping.values()
             ):
                 raise ValueError("reauthorization node contract digest is invalid")
+        try:
+            authorized_nodes = []
+            for node_id, encoded_node in authorized_node_contracts.items():
+                decoded_node = json.loads(encoded_node)
+                authorized_node = DAGNode.from_dict(decoded_node)
+                if authorized_node.id != node_id:
+                    raise ValueError("authorized DAG node identity is inconsistent")
+                authorized_nodes.append(authorized_node)
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise ValueError("reauthorization authorized DAG proof is invalid") from error
+        if (
+            executable_contract_digest(authorized_nodes)
+            != replacement.node_contract_digest
+            or any(
+                executable_contract_digest([node])
+                != node_contract_digests[node.id]
+                for node in authorized_nodes
+            )
+        ):
+            raise ValueError("reauthorization authorized DAG proof is invalid")
         expected_changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
@@ -681,6 +715,8 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         invalidated_ids = set(invalidated_acceptances)
         if (
             changed_nodes != expected_changed_nodes
+            or affected_nodes
+            != affected_node_closure(authorized_nodes, changed_nodes)
             or accepted_nodes != sorted(retained_ids | invalidated_ids)
             or set(changed_nodes) - set(affected_nodes)
             or retained_ids & set(affected_nodes)

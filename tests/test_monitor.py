@@ -1,4 +1,5 @@
 from copy import deepcopy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -11,8 +12,13 @@ from vibe_guide.models import AgentCapabilities, DAGNode, Plan
 from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
-from vibe_guide.state import acquire_writer_lease, append_event, load_events
-from vibe_guide.task_registry import load_task_binding, save_task_binding
+from vibe_guide.state import (
+    acquire_writer_lease,
+    append_event,
+    load_events,
+    load_snapshot,
+)
+from vibe_guide.task_registry import TaskBinding, load_task_binding, save_task_binding
 
 
 class StartResponseLostRunner(FakeRunner):
@@ -46,6 +52,27 @@ class SecretStartResponseLostRunner(FakeRunner):
 class SecretPollResponseLostRunner(FakeRunner):
     def poll(self, handle: RunHandle):
         raise ConnectionError("POLL_EXCEPTION_SECRET_SENTINEL")
+
+
+class ObservedContinuationRunner(FakeRunner):
+    def __init__(self, task_id=None, cursor=None):
+        super().__init__()
+        self.observed_task_id = task_id
+        self.observed_cursor = cursor
+
+    def task_binding(self, contract, worktree, run_id, status):
+        return TaskBinding(
+            provider="runner",
+            mode="background",
+            issue_id=contract["node_id"],
+            role=contract["role"],
+            task_id=self.observed_task_id or contract["task_id"],
+            worktree=str(worktree),
+            run_id=run_id,
+            status=status,
+            generation=contract["generation"],
+            cursor=self.observed_cursor,
+        )
 
 
 def node(node_id, depends_on=None, worker=None):
@@ -662,6 +689,55 @@ class MonitorTests(unittest.TestCase):
         )
         self.assertEqual(reauthorized.nodes["n1"]["status"], "rework")
 
+    def _assert_reauthorization_rejects_observed_continuation_mismatch(
+        self, task_id=None, cursor=None
+    ):
+        original = node("n1")
+        monitor, record = self.authorized_monitor([original])
+        initial = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+                ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+            }
+        )
+        snapshot = monitor.start(record, initial)
+        snapshot = monitor.tick(snapshot.run_id, initial)
+        snapshot = monitor.tick(snapshot.run_id, initial)
+        binding = load_task_binding(
+            self.paths, "n1", "developer", run_id=snapshot.run_id
+        )
+        binding.cursor = "original-cursor"
+        save_task_binding(self.paths, binding)
+
+        changed = node("n1")
+        changed.contract["acceptance_example"] = "changed contract"
+        changed_plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+        changed_record = authorize(
+            build_authorization_card(changed_plan, [changed], self.capabilities),
+            "AUTHORIZE",
+        )
+        observed = ObservedContinuationRunner(task_id=task_id, cursor=cursor)
+        reauthorized = Monitor(self.paths, changed_plan, [changed]).reauthorize(
+            snapshot.run_id,
+            changed_record,
+            observed,
+            "executable_contract_changed",
+        )
+
+        self.assertEqual(reauthorized.nodes["n1"]["status"], "blocked_unknown")
+        self.assertEqual(observed.start_calls, [])
+
+    def test_reauthorization_rejects_observed_continuation_identity_mismatch(self):
+        self._assert_reauthorization_rejects_observed_continuation_mismatch(
+            task_id="wrong-task-id",
+            cursor="original-cursor",
+        )
+
+    def test_reauthorization_rejects_observed_continuation_cursor_mismatch(self):
+        self._assert_reauthorization_rejects_observed_continuation_mismatch(
+            cursor="wrong-cursor"
+        )
+
     def test_reauthorization_invalidates_accepted_downstream_suffix_and_recovers(self):
         upstream = node("n1")
         downstream = node("n2", ["n1"])
@@ -733,8 +809,11 @@ class MonitorTests(unittest.TestCase):
             "executable_contract_changed",
         )
 
-        self.assertEqual(recovered.nodes["n2"]["status"], "rework")
+        self.assertEqual(recovered.nodes["n2"]["status"], "blocked_unknown")
         self.assertIsNone(recovered.nodes["n2"]["acceptance"])
+        self.assertTrue(
+            recovered.nodes["n2"]["retryable_action"]["pending_schedule"]
+        )
         self.assertEqual(recovered.nodes["n3"]["status"], "accepted")
         self.assertEqual(
             (
@@ -768,6 +847,309 @@ class MonitorTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_reauthorization_waits_for_hard_dependency_before_downstream_rework(self):
+        nodes = [node("n1"), node("n2", ["n1"]), node("n3")]
+        monitor, record = self.authorized_monitor(nodes)
+        initial = FakeRunner(
+            events={
+                (node_id, "developer"): [("complete", {"evidence": node_id})]
+                for node_id in ("n1", "n2", "n3")
+            }
+        )
+        initial.events.update(
+            {
+                (node_id, "reviewer"): [("accepted", {"evidence": node_id})]
+                for node_id in ("n1", "n2", "n3")
+            }
+        )
+        snapshot = monitor.start(record, initial)
+        for _ in range(6):
+            snapshot = monitor.tick(snapshot.run_id, initial)
+        self.assertTrue(
+            all(current["status"] == "accepted" for current in snapshot.nodes.values())
+        )
+
+        changed = node("n1")
+        changed.contract["acceptance_example"] = "changed upstream"
+        changed_nodes = [changed, node("n2", ["n1"]), node("n3")]
+        changed_plan = Plan(
+            "plan-1", 1, "docs/prd.md", [item.id for item in changed_nodes], "draft"
+        )
+        changed_record = authorize(
+            build_authorization_card(changed_plan, changed_nodes, self.capabilities),
+            "AUTHORIZE",
+        )
+        changed_monitor = Monitor(self.paths, changed_plan, changed_nodes)
+        recovery = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "new-n1"})],
+                ("n1", "reviewer"): [("accepted", {"evidence": "new-n1"})],
+            }
+        )
+
+        snapshot = changed_monitor.reauthorize(
+            snapshot.run_id,
+            changed_record,
+            recovery,
+            "executable_contract_changed",
+        )
+
+        self.assertEqual([call["node_id"] for call in recovery.start_calls], ["n1"])
+        transition_sequence = next(
+            event["sequence"]
+            for event in load_events(self.paths, snapshot.run_id)
+            if event["event"] == "authorization_reauthorized"
+        )
+        n2_start_events = [
+            event
+            for event in load_events(self.paths, snapshot.run_id)
+            if event["event"] == "start_intent"
+            and event["data"].get("node_id") == "n2"
+            and event["sequence"] > transition_sequence
+        ]
+        self.assertEqual(n2_start_events, [])
+        snapshot = changed_monitor.tick(snapshot.run_id, recovery)
+        self.assertEqual([call["node_id"] for call in recovery.start_calls], ["n1", "n1"])
+        snapshot = changed_monitor.tick(snapshot.run_id, recovery)
+        self.assertEqual(
+            [call["node_id"] for call in recovery.start_calls],
+            ["n1", "n1", "n2"],
+        )
+
+    def test_reauthorization_retry_obeys_capacity_but_not_integration_after(self):
+        independent = [node("n1"), node("n2")]
+        monitor, record = self.authorized_monitor(independent, active_pair_limit=1)
+        initial = FakeRunner(
+            events={
+                (node_id, "developer"): [("complete", {"evidence": node_id})]
+                for node_id in ("n1", "n2")
+            }
+        )
+        initial.events.update(
+            {
+                (node_id, "reviewer"): [("accepted", {"evidence": node_id})]
+                for node_id in ("n1", "n2")
+            }
+        )
+        snapshot = monitor.start(record, initial)
+        for _ in range(5):
+            snapshot = monitor.tick(snapshot.run_id, initial)
+        self.assertEqual(snapshot.status, "complete")
+
+        changed_nodes = [node("n1"), node("n2")]
+        for item in changed_nodes:
+            item.contract["acceptance_example"] = "changed-" + item.id
+        changed_plan = Plan(
+            "plan-1", 1, "docs/prd.md", [item.id for item in changed_nodes], "draft"
+        )
+        changed_record = authorize(
+            build_authorization_card(
+                changed_plan, changed_nodes, self.capabilities, active_pair_limit=1
+            ),
+            "AUTHORIZE",
+        )
+        recovery = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "new-n1"})],
+                ("n1", "reviewer"): [("accepted", {"evidence": "new-n1"})],
+            }
+        )
+        changed_monitor = Monitor(self.paths, changed_plan, changed_nodes)
+        snapshot = changed_monitor.reauthorize(
+            snapshot.run_id,
+            changed_record,
+            recovery,
+            "executable_contract_changed",
+        )
+        self.assertEqual([call["node_id"] for call in recovery.start_calls], ["n1"])
+        transition_sequence = next(
+            event["sequence"]
+            for event in load_events(self.paths, snapshot.run_id)
+            if event["event"] == "authorization_reauthorized"
+        )
+        self.assertFalse(
+            any(
+                event["event"] == "start_intent"
+                and event["data"].get("node_id") == "n2"
+                and event["sequence"] > transition_sequence
+                for event in load_events(self.paths, snapshot.run_id)
+            )
+        )
+        snapshot = changed_monitor.tick(snapshot.run_id, recovery)
+        self.assertEqual([call["node_id"] for call in recovery.start_calls], ["n1", "n1"])
+        changed_monitor.tick(snapshot.run_id, recovery)
+        self.assertEqual(
+            [call["node_id"] for call in recovery.start_calls],
+            ["n1", "n1", "n2"],
+        )
+
+        integration_upstream = node("i1")
+        integration_downstream = node("i2")
+        integration_downstream.integration_after = ["i1"]
+        integration_monitor, integration_record = self.authorized_monitor(
+            [integration_upstream, integration_downstream], active_pair_limit=2
+        )
+        integration_runner = FakeRunner(
+            events={
+                (node_id, "developer"): [("complete", {"evidence": node_id})]
+                for node_id in ("i1", "i2")
+            }
+        )
+        integration_runner.events.update(
+            {
+                (node_id, "reviewer"): [("accepted", {"evidence": node_id})]
+                for node_id in ("i1", "i2")
+            }
+        )
+        integration_snapshot = integration_monitor.start(
+            integration_record, integration_runner
+        )
+        self.assertEqual(
+            [call["node_id"] for call in integration_runner.start_calls],
+            ["i1", "i2"],
+        )
+        for _ in range(3):
+            integration_snapshot = integration_monitor.tick(
+                integration_snapshot.run_id, integration_runner
+            )
+        self.assertEqual(integration_snapshot.status, "complete")
+
+        changed_i1 = node("i1")
+        changed_i1.contract["acceptance_example"] = "changed integration upstream"
+        changed_i2 = node("i2")
+        changed_i2.integration_after = ["i1"]
+        changed_integration_nodes = [changed_i1, changed_i2]
+        changed_integration_plan = Plan(
+            "plan-1", 1, "docs/prd.md", ["i1", "i2"], "draft"
+        )
+        changed_integration_record = authorize(
+            build_authorization_card(
+                changed_integration_plan,
+                changed_integration_nodes,
+                self.capabilities,
+                active_pair_limit=2,
+            ),
+            "AUTHORIZE",
+        )
+        integration_recovery = FakeRunner()
+        Monitor(
+            self.paths, changed_integration_plan, changed_integration_nodes
+        ).reauthorize(
+            integration_snapshot.run_id,
+            changed_integration_record,
+            integration_recovery,
+            "executable_contract_changed",
+        )
+        self.assertEqual(
+            [call["node_id"] for call in integration_recovery.start_calls],
+            ["i1", "i2"],
+        )
+
+    def test_applied_reauthorization_rejects_forged_retained_downstream(self):
+        nodes = [node("n1"), node("n2", ["n1"]), node("n3")]
+        monitor, record = self.authorized_monitor(nodes)
+        initial = FakeRunner(
+            events={
+                (node_id, "developer"): [("complete", {"evidence": node_id})]
+                for node_id in ("n1", "n2", "n3")
+            }
+        )
+        initial.events.update(
+            {
+                (node_id, "reviewer"): [("accepted", {"evidence": node_id})]
+                for node_id in ("n1", "n2", "n3")
+            }
+        )
+        snapshot = monitor.start(record, initial)
+        for _ in range(6):
+            snapshot = monitor.tick(snapshot.run_id, initial)
+
+        changed = node("n1")
+        changed.contract["acceptance_example"] = "changed upstream"
+        changed_nodes = [changed, node("n2", ["n1"]), node("n3")]
+        changed_plan = Plan(
+            "plan-1", 1, "docs/prd.md", [item.id for item in changed_nodes], "draft"
+        )
+        changed_record = authorize(
+            build_authorization_card(changed_plan, changed_nodes, self.capabilities),
+            "AUTHORIZE",
+        )
+        changed_monitor = Monitor(self.paths, changed_plan, changed_nodes)
+        with patch.object(changed_monitor, "_schedule_ready", return_value=None):
+            applied = changed_monitor.reauthorize(
+                snapshot.run_id,
+                changed_record,
+                FakeRunner(),
+                "executable_contract_changed",
+            )
+
+        run_directory = Path(self.temporary.name) / ".vibe/runs" / applied.run_id
+        event_path = run_directory / "events.jsonl"
+        records = [json.loads(line) for line in event_path.read_text().splitlines()]
+        transition_index = next(
+            index
+            for index, event in enumerate(records)
+            if event["event"] == "authorization_reauthorized"
+        )
+        transition = records[transition_index]["data"]
+        transition["affected_nodes"] = ["n1"]
+        transition["retained_acceptances"]["n2"] = transition[
+            "invalidated_acceptances"
+        ].pop("n2")
+        forged_n2_contract = json.loads(
+            transition["authorized_node_contracts"]["n2"]
+        )
+        forged_n2_contract["depends_on"] = []
+        transition["authorized_node_contracts"]["n2"] = json.dumps(
+            forged_n2_contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        previous_digest = (
+            records[transition_index - 1]["event_digest"]
+            if transition_index
+            else None
+        )
+        for event in records[transition_index:]:
+            event["previous_event_digest"] = previous_digest
+            payload = dict(event)
+            payload.pop("event_digest", None)
+            event["event_digest"] = hashlib.sha256(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            previous_digest = event["event_digest"]
+        event_path.write_text(
+            "".join(
+                json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n"
+                for event in records
+            ),
+            encoding="utf-8",
+        )
+
+        forged = applied.to_dict()
+        forged_n2 = forged["nodes"]["n2"]
+        forged_n2["status"] = "accepted"
+        forged_n2["acceptance"] = {
+            "contract_digest": transition["node_contract_digests"]["n2"],
+            "authorization_epoch": transition["authorization_digest"],
+        }
+        forged_n2["pair_archived"] = True
+        forged_n2["retryable_action"] = None
+        encoded = json.dumps(
+            forged, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        for state_name in ("state.json", "state.previous.json"):
+            (run_directory / state_name).write_text(encoded, encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "no valid snapshot"):
+            load_snapshot(self.paths, applied.run_id)
 
     def test_unknown_is_blocked_unknown_not_completed(self):
         nodes = [node("n1")]
