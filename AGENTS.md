@@ -92,6 +92,8 @@
 - 设计变化只重建受影响的 DAG 后缀，已锁定成果不重做；
 - 监工中断后从 `.vibe/runs/` 的快照和事件日志恢复。
 
+可见任务发生工具丢失时采用 `visible successor` 恢复：先确认原任务 aborted/archived 并保留 thread/cursor 与零写入证据；successor 写入前必须复核原任务已终止、唯一 writer、指定 writer worktree/branch、冻结 HEAD 和 clean state。App 自动创建的 host worktree 只作为工具宿主，不能替代或修改合同指定 writer root；任一证据不匹配即 fail closed，不创建第二 writer 或额外 worktree。
+
 一致性纠偏按“用户当前明确决定 → 已批准 PRD/Design Spec → 授权卡 → Issue 合同 → 下层实现”取证。若这些证据只产生一个答案，且修正仍在已授权项目、DAG 和非 deploy 边界内，监工应记录纠偏、更新受影响的 DAG 后缀或合同并自动继续；不得因可唯一解决的实现不一致、命名不一致或过期下层合同中断用户。只有仍存在多个会实质改变产品结果的答案、产品范围或方向变化、需要外部/deploy/系统权限授权，或证据无法区分安全结果时才暂停。
 
 ## 7. 配置与外部 Skill

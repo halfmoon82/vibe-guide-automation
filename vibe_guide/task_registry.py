@@ -24,6 +24,8 @@ _STATUSES = {
     "review",
     "rework",
     "accepted",
+    "archived",
+    "blocked_design",
     "blocked_unknown",
     "failed",
     "stopped",
@@ -294,13 +296,6 @@ def _all_bindings(paths: ProjectPaths) -> List[TaskBinding]:
         expected_run_id = validate_run_id(path.parent.name)
         _revision, bindings = _read_registry(path, expected_run_id)
         result.extend(bindings)
-    seen: Dict[Tuple[str, str], TaskBinding] = {}
-    for binding in result:
-        key = (binding.issue_id, binding.role)
-        current = seen.get(key)
-        if current is not None and current.composite_identity != binding.composite_identity:
-            raise ValueError("historical task identity conflict")
-        seen[key] = binding
     return result
 
 
@@ -319,7 +314,14 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding) -> None:
             if current.issue_id != persistent.issue_id:
                 continue
             if current.role == persistent.role:
-                if current.composite_identity != persistent.composite_identity:
+                terminal = {"archived", "blocked_design", "failed", "stopped"}
+                if (
+                    current.composite_identity != persistent.composite_identity
+                    and (
+                        current.run_id == persistent.run_id
+                        or current.status not in terminal
+                    )
+                ):
                     raise ValueError("immutable task identity drift")
             elif current.task_id and current.task_id == persistent.task_id:
                 raise ValueError("developer and reviewer tasks must be distinct")

@@ -1,13 +1,37 @@
 import json
+import multiprocessing
 import shutil
+import sys
 import tempfile
 import time
 import unittest
 from collections import Counter
 from pathlib import Path
+from unittest import mock
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "e2e-project"
+
+
+def _start_local_runner_in_process(root, command, result_queue):
+    from vibe_guide.runners.local import LocalRunner
+
+    runner = LocalRunner({"fixture-agent": command}, roots=[Path(root)])
+    handle = runner.start(
+        {
+            "adapter_id": "fixture-agent",
+            "command": command,
+            "node_id": "cross-process",
+            "role": "developer",
+            "phase": "develop",
+            "action": "develop",
+            "task_id": "developer:cross-process",
+            "generation": 1,
+            "files": ["result.txt"],
+        },
+        Path(root),
+    )
+    result_queue.put(handle.run_id)
 
 
 def byte_snapshot(root):
@@ -164,6 +188,226 @@ class EndToEndTests(unittest.TestCase):
             self.assertNotEqual(identities["developer"], identities["reviewer"])
         self.assertGreater(len((run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()), 4)
 
+    def test_public_cli_uses_provider_action_bridge_without_injected_runner(self):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        from vibe_guide.paths import ProjectPaths
+
+        self.initialize()
+        store = ProviderActionStore(ProjectPaths(self.root))
+        store.publish_capabilities(
+            "codex",
+            {
+                "codex.shell": True,
+                "codex.subprocess": True,
+                "codex.worktree": True,
+                "codex.visible_task.create": True,
+                "codex.visible_task.enter": True,
+                "codex.visible_task.resume": True,
+                "codex.visible_task.wait": True,
+            },
+            provenance="codex-app-session-bridge",
+        )
+        source = json.loads((self.root / "plan-source.json").read_text(encoding="utf-8"))
+        source["capabilities"]["agent_id"] = "codex"
+        source["active_pair_limit"] = 1
+        source["nodes"] = [source["nodes"][0]]
+        source["nodes"][0]["contract"].update(
+            {
+                "adapter_id": "codex",
+                "project_id": "project-fixture",
+                "host": "local",
+                "naming": "契约并行",
+            }
+        )
+        source["nodes"][0]["contract"].pop("command", None)
+        source["nodes"][0]["contract"].pop("provider", None)
+        source["nodes"][0]["contract"].pop("mode", None)
+        visible_spec = self.root / "visible-plan.json"
+        visible_spec.write_text(json.dumps(source), encoding="utf-8")
+        self.create_plan("visible-plan", "visible-plan.json")
+
+        result = self.run_cli(
+            [
+                "monitor",
+                "--plan",
+                "visible-plan",
+                "--authorize",
+                "AUTHORIZE",
+                "--json",
+            ]
+        )
+        self.assertEqual(result.exit_code, 4)
+        self.assertNotEqual(result.payload.get("reason"), "runner unavailable")
+
+        observed_tools = set()
+        wait_counts = {"developer": 0, "reviewer": 0}
+        for _ in range(40):
+            for action in store.pending():
+                observed_tools.add(action["native_tool"])
+                role = action["role"]
+                task_id = "thread-api-" + role
+                operation = action["operation"]
+                if operation == "create":
+                    self.assertEqual(
+                        set(action["request"]), {"prompt", "target"}
+                    )
+                    payload = {
+                        "binding": {"threadId": task_id, "hostId": "local"}
+                    }
+                elif operation == "locate":
+                    payload = {"located": True}
+                elif operation == "visibility":
+                    payload = {"visible": True, "direct_enter": True}
+                elif operation == "resume":
+                    payload = {"resumed": True}
+                elif operation == "wait":
+                    wait_counts[role] += 1
+                    target = action["request"]["targets"][0]
+                    if role == "developer" and wait_counts[role] == 1:
+                        self.assertNotIn("afterCursor", target)
+                        payload = {
+                            "status": "timeout",
+                            "cursor": "cursor-developer-timeout",
+                        }
+                    elif role == "developer" and wait_counts[role] == 2:
+                        self.assertEqual(
+                            target.get("afterCursor"),
+                            "cursor-developer-timeout",
+                        )
+                        payload = {
+                            "status": "completed",
+                            "cursor": "cursor-developer-complete",
+                            "event": "complete",
+                            "evidence": "verified-developer",
+                        }
+                    elif role == "developer":
+                        self.assertEqual(
+                            target.get("afterCursor"),
+                            "cursor-developer-complete",
+                        )
+                        payload = {
+                            "status": "completed",
+                            "cursor": "cursor-developer-rework",
+                            "event": "complete",
+                            "evidence": "verified-developer-rework",
+                        }
+                    elif wait_counts[role] == 1:
+                        payload = {
+                            "status": "completed",
+                            "cursor": "cursor-review-finding",
+                            "event": "review_finding",
+                            "finding": "stale lower-priority name",
+                            "in_contract": False,
+                            "consistency": {
+                                "field": "naming",
+                                "action": "rework",
+                                "files": ["api.txt"],
+                                "candidates": [
+                                    {
+                                        "source": "approved_prd",
+                                        "value": "契约并行",
+                                    },
+                                    {
+                                        "source": "implementation",
+                                        "value": "stale-name",
+                                    },
+                                ],
+                            },
+                        }
+                    else:
+                        payload = {
+                            "status": "completed",
+                            "cursor": "cursor-{}-{}".format(
+                                role, wait_counts[role]
+                            ),
+                            "event": (
+                                "complete" if role == "developer" else "accepted"
+                            ),
+                            "evidence": "verified-" + role,
+                        }
+                else:
+                    self.fail("unexpected provider action: %r" % action)
+                store.complete(action["action_id"], payload)
+            result = self.run_cli(
+                ["resume", "--plan", "visible-plan", "--json"]
+            )
+            if result.payload.get("status") == "complete":
+                break
+
+        self.assertEqual((result.exit_code, result.payload["status"]), (0, "complete"))
+        self.assertTrue(
+            {
+                "codex_app__create_thread",
+                "codex_app__navigate_to_codex_page",
+                "codex_app__send_message_to_thread",
+                "codex_app__wait_threads",
+            }.issubset(observed_tools)
+        )
+        run_id = result.payload["run_id"]
+        bindings = json.loads(
+            (self.root / ".vibe/runs" / run_id / "tasks.json").read_text(
+                encoding="utf-8"
+            )
+        )["bindings"]
+        self.assertEqual({item["status"] for item in bindings}, {"archived"})
+        self.assertEqual(
+            {item["task_id"] for item in bindings},
+            {"thread-api-developer", "thread-api-reviewer"},
+        )
+        self.assertGreaterEqual(wait_counts["developer"], 2)
+        snapshot = json.loads(
+            (self.root / ".vibe/runs" / run_id / "state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            snapshot["nodes"]["api"]["contract_overrides"],
+            {"naming": "契约并行"},
+        )
+
+    def test_doctor_accepts_verified_provider_bridge_without_local_agent_command(self):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        from vibe_guide.paths import ProjectPaths
+
+        self.initialize()
+        (self.root / ".vibe/config.json").write_text(
+            json.dumps(
+                {
+                    "skills": [
+                        {
+                            "name": "architecture-skill-pack",
+                            "source": (
+                                "https://github.com/lov-team/"
+                                "architecture-skill-pack"
+                            ),
+                            "commit": "a" * 40,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        ProviderActionStore(ProjectPaths(self.root)).publish_capabilities(
+            "codex",
+            {
+                "codex.shell": True,
+                "codex.subprocess": True,
+                "codex.worktree": True,
+                "codex.visible_task.create": True,
+                "codex.visible_task.enter": True,
+                "codex.visible_task.resume": True,
+                "codex.visible_task.wait": True,
+            },
+            provenance="codex-app-session-bridge",
+        )
+
+        with mock.patch("vibe_guide.scanner.shutil.which", return_value=None):
+            result = self.run_cli(["doctor", "--json"])
+
+        self.assertEqual((result.exit_code, result.payload["status"]), (0, "ok"))
+        self.assertIsNotNone(result.payload["provider_bridge"])
+        self.assertNotIn("no candidate Agent command found", result.payload["issues"])
+
     def test_design_change_invalidates_authorization_unknown_is_not_success_and_deploy_is_excluded(self):
         self.initialize()
         self.create_plan("design-plan")
@@ -262,6 +506,43 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotIn("stdout", metadata)
         self.assertNotIn("stderr", metadata)
         self.assertNotIn("token", metadata.casefold())
+
+    def test_local_runner_process_b_reattaches_without_duplicate_writer(self):
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import json,time; time.sleep(0.3); "
+                "print(json.dumps({'event':'complete','data':{'evidence':'done'}}))"
+            ),
+        ]
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process_a = context.Process(
+            target=_start_local_runner_in_process,
+            args=(str(self.root), command, result_queue),
+        )
+        process_a.start()
+        handle_id = result_queue.get(timeout=10)
+        process_a.join(timeout=10)
+        self.assertEqual(process_a.exitcode, 0)
+
+        from vibe_guide.contracts import RunHandle
+        from vibe_guide.runners.local import LocalRunner
+
+        process_b = LocalRunner(
+            {"fixture-agent": command}, roots=[self.root]
+        )
+        events = []
+        for _ in range(100):
+            events = process_b.poll(RunHandle(handle_id))
+            if events:
+                break
+            time.sleep(0.05)
+
+        self.assertEqual([event.event for event in events], ["complete"])
+        self.assertEqual(events[0].data["node_id"], "cross-process")
+        self.assertEqual(process_b.start_count, 0)
 
 
 if __name__ == "__main__":

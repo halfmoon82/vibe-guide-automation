@@ -73,9 +73,14 @@ class MonitorTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def authorized_monitor(self, nodes):
+    def authorized_monitor(self, nodes, active_pair_limit=None):
         plan = Plan("plan-1", 1, "docs/prd.md", [item.id for item in nodes], "draft")
-        card = build_authorization_card(plan, nodes, self.capabilities)
+        card = build_authorization_card(
+            plan,
+            nodes,
+            self.capabilities,
+            active_pair_limit=active_pair_limit,
+        )
         return Monitor(self.paths, plan, nodes), authorize(card, "AUTHORIZE")
 
     def test_starts_independent_nodes_together_and_waits_for_hard_dependency(self):
@@ -89,6 +94,61 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(snapshot.nodes["n1"]["status"], "running")
         self.assertEqual(snapshot.nodes["n2"]["status"], "running")
         self.assertEqual(snapshot.nodes["n3"]["status"], "planned")
+
+    def test_active_pair_capacity_archives_accepted_pair_and_starts_next(self):
+        nodes = [node("n1"), node("n2")]
+        monitor, record = self.authorized_monitor(nodes, active_pair_limit=1)
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+                ("n1", "reviewer"): [
+                    ("accepted", {"evidence": "P0-P2 clear"})
+                ],
+            }
+        )
+
+        snapshot = monitor.start(record, runner)
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1"])
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertTrue(snapshot.nodes["n1"]["pair_archived"])
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+        self.assertEqual(snapshot.nodes["n2"]["status"], "running")
+        self.assertEqual(
+            load_task_binding(
+                self.paths, "n1", "developer", snapshot.run_id
+            ).status,
+            "archived",
+        )
+        self.assertEqual(
+            load_task_binding(
+                self.paths, "n1", "reviewer", snapshot.run_id
+            ).status,
+            "archived",
+        )
+
+    def test_node_provider_self_claims_do_not_become_visible_task_evidence(self):
+        claimed = node("n1")
+        claimed.contract.update(
+            {
+                "provider": "codex",
+                "mode": "visible",
+                "hostId": "fake-host",
+                "developer_task_id": "fabricated-thread",
+            }
+        )
+        monitor, record = self.authorized_monitor([claimed])
+
+        snapshot = monitor.start(record, FakeRunner())
+        binding = load_task_binding(
+            self.paths, "n1", "developer", snapshot.run_id
+        )
+
+        self.assertEqual(binding.provider, "runner")
+        self.assertEqual(binding.mode, "background")
+        self.assertFalse(binding.visible)
+        self.assertNotEqual(binding.task_id, "fabricated-thread")
 
     def test_provider_complete_is_delivery_and_does_not_unlock_dependent_node(self):
         nodes = [node("n1"), node("n2", ["n1"])]
@@ -156,6 +216,143 @@ class MonitorTests(unittest.TestCase):
                 "[REDACTED_PROVIDER_TEXT]",
             ],
         )
+
+    def test_blocked_design_stops_old_task_and_releases_lease_for_new_authorization(self):
+        original = node("n1")
+        monitor, record = self.authorized_monitor([original])
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [
+                    ("complete", {"evidence": "delivery"})
+                ],
+                ("n1", "reviewer"): [
+                    (
+                        "review_finding",
+                        {
+                            "finding": "genuine product choice",
+                            "in_contract": False,
+                        },
+                    )
+                ],
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        old_reviewer_handle = snapshot.handles["n1"]
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
+        self.assertIn(old_reviewer_handle, runner.stop_calls)
+        self.assertTrue(snapshot.nodes["n1"]["old_task_reconciled"])
+
+        corrected = node("n1")
+        corrected.contract["acceptance_example"] = "approved corrected outcome"
+        new_monitor, new_record = self.authorized_monitor([corrected])
+        restarted = new_monitor.start(new_record, FakeRunner())
+        self.assertEqual(restarted.nodes["n1"]["status"], "running")
+
+    def test_unique_in_scope_consistency_is_corrected_but_real_choice_blocks(self):
+        target = node("n1")
+        target.contract["naming"] = "approved-name"
+        decisions = [
+            {
+                "question": "canonical name",
+                "selected": "approved-name",
+                "status": "approved",
+            }
+        ]
+        plan = Plan(
+            "plan-1",
+            1,
+            "docs/prd.md",
+            ["n1"],
+            "draft",
+            decisions=decisions,
+        )
+        card = build_authorization_card(plan, [target], self.capabilities)
+        monitor = Monitor(self.paths, plan, [target])
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [
+                    ("complete", {"evidence": "delivery"})
+                ],
+                ("n1", "reviewer"): [
+                    (
+                        "review_finding",
+                        {
+                            "finding": "stale lower contract name",
+                            "in_contract": False,
+                            "consistency": {
+                                "field": "naming",
+                                "action": "rework",
+                                "files": ["n1.py"],
+                                "candidates": [
+                                    {
+                                        "source": "approved_prd",
+                                        "value": "approved-name",
+                                    },
+                                    {
+                                        "source": "implementation",
+                                        "value": "stale-name",
+                                    },
+                                ],
+                            },
+                        },
+                    )
+                ],
+            }
+        )
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+        self.assertEqual(
+            snapshot.nodes["n1"]["contract_overrides"],
+            {"naming": "approved-name"},
+        )
+        self.assertEqual(
+            snapshot.nodes["n1"]["corrections"][0]["source"],
+            "approved_prd",
+        )
+
+        ambiguous = node("n2")
+        ambiguous_plan = Plan("plan-2", 1, "docs/prd.md", ["n2"], "draft")
+        ambiguous_card = build_authorization_card(
+            ambiguous_plan, [ambiguous], self.capabilities
+        )
+        ambiguous_monitor = Monitor(self.paths, ambiguous_plan, [ambiguous])
+        ambiguous_runner = FakeRunner(
+            events={
+                ("n2", "developer"): [
+                    ("complete", {"evidence": "delivery"})
+                ],
+                ("n2", "reviewer"): [
+                    (
+                        "review_finding",
+                        {
+                            "finding": "two approved outcomes",
+                            "in_contract": False,
+                            "consistency": {
+                                "field": "naming",
+                                "action": "rework",
+                                "files": ["n2.py"],
+                                "candidates": [
+                                    {"source": "approved_prd", "value": "a"},
+                                    {"source": "approved_prd", "value": "b"},
+                                ],
+                            },
+                        },
+                    )
+                ],
+            }
+        )
+        blocked = ambiguous_monitor.start(
+            authorize(ambiguous_card, "AUTHORIZE"), ambiguous_runner
+        )
+        blocked = ambiguous_monitor.tick(blocked.run_id, ambiguous_runner)
+        blocked = ambiguous_monitor.tick(blocked.run_id, ambiguous_runner)
+        self.assertEqual(blocked.nodes["n2"]["status"], "blocked_design")
 
     def test_unknown_is_blocked_unknown_not_completed(self):
         nodes = [node("n1")]
@@ -401,7 +598,13 @@ class MonitorTests(unittest.TestCase):
             load_task_binding(
                 self.paths, "n1", "reviewer", run_id=snapshot.run_id
             ).status,
-            "accepted",
+            "archived",
+        )
+        self.assertEqual(
+            load_task_binding(
+                self.paths, "n1", "developer", run_id=snapshot.run_id
+            ).status,
+            "archived",
         )
 
     def test_recovery_rejects_forged_terminal_before_releasing_lease(self):

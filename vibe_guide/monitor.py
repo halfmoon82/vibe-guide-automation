@@ -12,6 +12,8 @@ from .authorization import (
 from .contracts import RunEvent, RunHandle, Runner
 from .models import DAGNode, Plan
 from .paths import ProjectPaths
+from .planner import resolve_consistency
+from .adapters.task_provider import ProviderPending
 from .state import (
     RunSnapshot,
     acquire_writer_lease,
@@ -52,11 +54,16 @@ class Monitor:
                 "active_task": None,
                 "start_intent": None,
                 "quarantine": None,
-                "developer_identity": self._identity_from_contract(node, "developer"),
-                "reviewer_identity": self._identity_from_contract(node, "reviewer"),
+                "developer_identity": None,
+                "reviewer_identity": None,
                 "developer_generation": 0,
                 "review_generation": 0,
                 "reviewer_started": False,
+                "pair_archived": False,
+                "old_task_reconciled": False,
+                "retryable_action": None,
+                "contract_overrides": {},
+                "corrections": [],
             }
         snapshot = RunSnapshot(
             run_id=run_id,
@@ -180,9 +187,34 @@ class Monitor:
         return None
 
     def _schedule_ready(self, snapshot: RunSnapshot, runner: Runner) -> None:
-        self._require_snapshot_authorization(snapshot)
+        record = self._require_snapshot_authorization(snapshot)
+        active_pairs = sum(
+            1
+            for current in snapshot.nodes.values()
+            if not current.get("pair_archived")
+            and (
+                int(current.get("developer_generation", 0)) > 0
+                or current.get("retryable_action") is not None
+            )
+        )
         for node_id, node in self.nodes.items():
             current = snapshot.nodes[node_id]
+            retry = current.get("retryable_action")
+            if (
+                current.get("status") == "blocked_unknown"
+                and isinstance(retry, dict)
+                and node_id not in snapshot.handles
+            ):
+                if self._start_task(
+                    snapshot,
+                    node_id,
+                    str(retry["role"]),
+                    str(retry["phase"]),
+                    runner,
+                    bool(retry.get("continuation")),
+                ):
+                    current["retryable_action"] = None
+                continue
             if current.get("status") == "delivered" and not current.get("reviewer_started"):
                 if not acquire_writer_lease(
                     self.paths,
@@ -199,6 +231,8 @@ class Monitor:
                 self._start_task(snapshot, node_id, "reviewer", "review", runner, False)
                 continue
             if current.get("status") != "planned":
+                continue
+            if active_pairs >= record.active_pair_limit:
                 continue
             if not all(
                 snapshot.nodes[dependency].get("status") == "accepted"
@@ -217,7 +251,10 @@ class Monitor:
                     "writer lease is already owned by another run",
                 )
                 continue
-            self._start_task(snapshot, node_id, "developer", "develop", runner, False)
+            if self._start_task(
+                snapshot, node_id, "developer", "develop", runner, False
+            ):
+                active_pairs += 1
 
     def _start_task(
         self,
@@ -228,14 +265,11 @@ class Monitor:
         runner: Runner,
         continuation: bool,
     ) -> bool:
-        self._require_snapshot_authorization(snapshot)
+        record = self._require_snapshot_authorization(snapshot)
         node = self.nodes[node_id]
         current = snapshot.nodes[node_id]
         identity_key = role + "_identity"
-        identity = current.get(identity_key)
-        if not identity:
-            identity = "{}:{}".format(role, node_id)
-            current[identity_key] = identity
+        identity = current.get(identity_key) or "{}:{}".format(role, node_id)
         generation_key = "review_generation" if role == "reviewer" else "developer_generation"
         generation = int(current.get(generation_key, 0)) + 1
         current[generation_key] = generation
@@ -243,6 +277,7 @@ class Monitor:
             current["reviewer_started"] = True
 
         contract = dict(node.contract)
+        contract.update(current.get("contract_overrides", {}))
         contract.update(
             {
                 "node_id": node_id,
@@ -256,14 +291,44 @@ class Monitor:
                 "task_id": identity,
                 "generation": generation,
                 "continuation": continuation,
+                "action": phase,
+                "run_id": snapshot.run_id,
             }
         )
         try:
-            validate_runtime_contract(contract)
-            binding = self._binding_for(
-                snapshot, node_id, role, identity, generation, "start_pending"
+            contract = validate_runtime_contract(
+                contract,
+                authorized_actions=record.allowed_actions,
+                authorized_files=record.file_scope,
             )
+            binding = self._binding_for(
+                snapshot,
+                node_id,
+                role,
+                identity,
+                generation,
+                "start_pending",
+                runner,
+                contract,
+            )
+            identity = str(binding.task_id)
+            current[identity_key] = identity
+            contract["task_id"] = identity
             save_task_binding(self.paths, binding)
+        except ProviderPending as error:
+            current[generation_key] = generation - 1
+            if role == "reviewer" and generation == 1:
+                current["reviewer_started"] = False
+            current["retryable_action"] = {
+                "role": role,
+                "phase": phase,
+                "continuation": continuation,
+            }
+            self._mark_blocked_unknown(
+                snapshot, node_id, "provider action pending"
+            )
+            current["reason"] = str(error)
+            return False
         except (OSError, TypeError, ValueError) as error:
             self._mark_blocked_unknown(
                 snapshot,
@@ -360,6 +425,12 @@ class Monitor:
             save_snapshot(self.paths, snapshot)
             return False
         save_snapshot(self.paths, snapshot)
+        pending = getattr(runner, "is_pending", None)
+        if callable(pending) and pending(handle):
+            self._mark_blocked_unknown(
+                snapshot, node_id, "provider action pending"
+            )
+            save_snapshot(self.paths, snapshot)
         return True
 
     @staticmethod
@@ -378,27 +449,39 @@ class Monitor:
         identity: str,
         generation: int,
         status: str,
+        runner: Runner,
+        contract: Dict[str, Any],
     ) -> TaskBinding:
-        node = self.nodes[node_id]
         current = snapshot.nodes[node_id]
-        provider = str(node.contract.get("provider", "runner"))
-        mode = str(node.contract.get("mode", "background"))
-        host = node.contract.get("host") or node.contract.get("hostId")
+        observed_binding = getattr(runner, "task_binding", None)
+        if callable(observed_binding):
+            binding = observed_binding(
+                contract,
+                self._worktree_path(current),
+                snapshot.run_id,
+                status,
+            )
+            if not isinstance(binding, TaskBinding):
+                raise ValueError("runner returned an invalid observed task binding")
+            if (
+                binding.issue_id != node_id
+                or binding.role != role
+                or binding.run_id != snapshot.run_id
+                or binding.generation != generation
+            ):
+                raise ValueError("observed task binding does not match runtime scope")
+            return binding
         return TaskBinding(
-            provider=provider,
-            mode=mode,
+            provider="runner",
+            mode="background",
             issue_id=node_id,
             role=role,
             task_id=identity,
-            host=str(host) if host else None,
+            host=None,
             worktree=str(current["worktree"]),
             branch=str(current["branch"]),
             status_file=str(current.get("status_file", "")),
             handoff_file=str(current.get("handoff_file", "")),
-            cursor=node.contract.get(role + "_cursor") or node.contract.get("cursor"),
-            token=node.contract.get(role + "_token") or node.contract.get("token"),
-            threadId=identity if provider == "codex" else None,
-            hostId=str(host) if provider == "codex" and host else None,
             run_id=snapshot.run_id,
             status=status,
             generation=generation,
@@ -528,13 +611,71 @@ class Monitor:
                 return
             self._record_runner_event(snapshot, node_id, event, active)
             if not event.data.get("in_contract", False):
+                record = self._snapshot_record(snapshot)
+                resolution = resolve_consistency(
+                    event.data.get("consistency"),
+                    self.plan.decisions,
+                    self.nodes[node_id].contract,
+                    list(record.allowed_actions),
+                    list(record.file_scope),
+                )
+                if resolution is not None:
+                    if not self._stop_active_for_transition(
+                        snapshot, node_id, role, handle_id, runner, "stopped"
+                    ):
+                        return
+                    current.setdefault("contract_overrides", {})[
+                        resolution.field
+                    ] = resolution.value
+                    correction = {
+                        "field": resolution.field,
+                        "value": resolution.value,
+                        "source": resolution.source,
+                        "action": resolution.action,
+                        "files": list(resolution.files),
+                    }
+                    current.setdefault("corrections", []).append(correction)
+                    self._record(
+                        snapshot,
+                        "consistency_corrected",
+                        {
+                            "run_id": snapshot.run_id,
+                            "node_id": node_id,
+                            **correction,
+                        },
+                    )
+                    self._start_task(
+                        snapshot, node_id, "developer", "rework", runner, True
+                    )
+                    return
+                if not self._stop_active_for_transition(
+                    snapshot,
+                    node_id,
+                    role,
+                    handle_id,
+                    runner,
+                    "blocked_design",
+                ):
+                    return
                 current["status"] = "blocked_design"
                 current["reason"] = redact_provider_text(
                     event.data.get("finding", "out-of-contract finding")
                 )
+                current["old_task_reconciled"] = True
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
+                self._release_node_lease(snapshot, node_id)
+                self._record(
+                    snapshot,
+                    "blocked_design",
+                    {
+                        "run_id": snapshot.run_id,
+                        "node_id": node_id,
+                        "reason": current["reason"],
+                        "old_task_reconciled": True,
+                    },
+                )
                 return
             current["active_role"] = None
             current["active_task"] = None
@@ -584,6 +725,15 @@ class Monitor:
             current["active_task"] = None
             current["quarantine"] = None
             snapshot.handles.pop(node_id, None)
+            if evidence is None:
+                self._mark_blocked_unknown(
+                    snapshot,
+                    node_id,
+                    "review acceptance has no registered P0-P2 clearance evidence",
+                )
+                return
+            current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
+            self._archive_pair(snapshot, node_id)
             self._release_node_lease(snapshot, node_id)
         elif event.event in {"unknown", "timeout", "state_unknown", "visibility_unknown"}:
             self._mark_blocked_unknown(
@@ -618,6 +768,47 @@ class Monitor:
             self._mark_blocked_unknown(
                 snapshot, node_id, "unrecognized runner event: " + event.event
             )
+
+    def _stop_active_for_transition(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        role: str,
+        handle_id: str,
+        runner: Runner,
+        terminal_status: str,
+    ) -> bool:
+        try:
+            runner.stop(RunHandle(handle_id))
+            self._set_binding_status(snapshot, node_id, role, terminal_status)
+        except Exception as error:
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "old task stop cannot be proven ({})".format(
+                    type(error).__name__
+                ),
+            )
+            return False
+        snapshot.handles.pop(node_id, None)
+        snapshot.nodes[node_id]["active_role"] = None
+        snapshot.nodes[node_id]["active_task"] = None
+        return True
+
+    def _archive_pair(self, snapshot: RunSnapshot, node_id: str) -> None:
+        current = snapshot.nodes[node_id]
+        for role in ("developer", "reviewer"):
+            self._set_binding_status(snapshot, node_id, role, "archived")
+        current["pair_archived"] = True
+        self._record(
+            snapshot,
+            "pair_archived",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "clearance": current["review_clearance"],
+            },
+        )
 
     @staticmethod
     def _event_claims_match(
@@ -880,6 +1071,22 @@ class Monitor:
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
+                if not data.get("evidence"):
+                    current["status"] = "blocked_unknown"
+                    current["reason"] = (
+                        "review acceptance has no registered P0-P2 clearance evidence"
+                    )
+                else:
+                    current["review_clearance"] = {
+                        "p0": 0,
+                        "p1": 0,
+                        "p2": 0,
+                    }
+                    for role in ("developer", "reviewer"):
+                        self._set_binding_status(
+                            snapshot, node_id, role, "archived"
+                        )
+                    current["pair_archived"] = True
                 self._release_node_lease(snapshot, node_id)
             elif record["event"] in {"failed", "stopped", "terminal_failed"}:
                 self._registered_active_binding(snapshot, node_id, provenance)
@@ -908,6 +1115,34 @@ class Monitor:
                     current["active_role"] = None
                     current["active_task"] = None
                     snapshot.handles.pop(node_id, None)
+            elif record["event"] == "review_finding":
+                # The following transition event/start intent is authoritative.
+                self._registered_active_binding(snapshot, node_id, provenance)
+            elif record["event"] == "consistency_corrected":
+                correction = {
+                    key: data[key]
+                    for key in ("field", "value", "source", "action", "files")
+                }
+                current.setdefault("contract_overrides", {})[
+                    correction["field"]
+                ] = correction["value"]
+                if correction not in current.setdefault("corrections", []):
+                    current["corrections"].append(correction)
+                current["active_role"] = None
+                current["active_task"] = None
+                snapshot.handles.pop(node_id, None)
+            elif record["event"] == "blocked_design":
+                current["status"] = "blocked_design"
+                current["reason"] = data.get("reason", "design decision required")
+                current["old_task_reconciled"] = bool(
+                    data.get("old_task_reconciled")
+                )
+                current["active_role"] = None
+                current["active_task"] = None
+                snapshot.handles.pop(node_id, None)
+                self._release_node_lease(snapshot, node_id)
+            elif record["event"] == "pair_archived":
+                current["pair_archived"] = True
             else:
                 current["status"] = "blocked_unknown"
                 current["reason"] = "unapplied event needs manual reconciliation"

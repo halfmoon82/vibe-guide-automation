@@ -6,6 +6,7 @@ from vibe_guide.authorization import (
     authorize,
     build_authorization_card,
     is_authorization_valid,
+    validate_runtime_contract,
 )
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan
 
@@ -154,6 +155,58 @@ class AuthorizationTests(unittest.TestCase):
                 candidate.contract.update(contract_update)
                 with self.assertRaises(ValueError):
                     build_authorization_card(plan, [candidate], self.capabilities)
+
+    def test_runtime_actions_are_closed_and_files_are_normalized_lists(self):
+        for action in (
+            "production-deploy",
+            "install-skill",
+            "grant-system-permission",
+            "external-write",
+        ):
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                validate_runtime_contract(
+                    {"action": action, "files": ["src/app.py"]}
+                )
+
+        for files in (
+            "src/app.py",
+            ["../outside.py"],
+            ["/absolute.py"],
+            ["src/app.py", "src/app.py"],
+        ):
+            with self.subTest(files=files), self.assertRaises(ValueError):
+                validate_runtime_contract({"action": "test", "files": files})
+
+        for actions in ([], [["test"]], ["test", 1]):
+            with self.subTest(actions=actions), self.assertRaises(ValueError):
+                validate_runtime_contract(
+                    {"actions": actions, "files": ["src/app.py"]}
+                )
+
+        normalized = validate_runtime_contract(
+            {"actions": ["TEST", "develop"], "files": ["src/./app.py"]},
+            authorized_actions=("develop", "test"),
+            authorized_files=("src/app.py",),
+        )
+        self.assertEqual(normalized["actions"], ["test", "develop"])
+        self.assertEqual(normalized["files"], ["src/app.py"])
+
+    def test_authorization_binds_active_pair_limit_and_normalized_file_scope(self):
+        normalized_node = node("n1", ["src/./app.py"])
+        normalized_node.contract["provider_scope"] = {
+            "files": ["tests/./test_app.py"]
+        }
+        plan = Plan("plan-capacity", 1, "docs/prd.md", ["n1"], "draft")
+
+        card = build_authorization_card(
+            plan, [normalized_node], self.capabilities, active_pair_limit=1
+        )
+
+        self.assertEqual(
+            card.file_scope, ("src/app.py", "tests/test_app.py")
+        )
+        self.assertEqual(card.active_pair_limit, 1)
+        self.assertEqual(authorize(card, "AUTHORIZE").active_pair_limit, 1)
 
 
 if __name__ == "__main__":

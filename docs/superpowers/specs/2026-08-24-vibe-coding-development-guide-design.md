@@ -204,6 +204,7 @@ planned → ready → running → delivered → review → accepted
 - 独立任务创建后未能取得平台任务 ID/host（Codex 为 `threadId`/`hostId`）或未能核验可见性：保持 `blocked_unknown`，不得降格为后台 worker 继续；
 - 状态查询失败：不能解释成“没有任务”；
 - 监工中断：保存快照，`resume` 从上次状态继续；
+- 可见任务丢失终端/文件能力：先将原任务 aborted/archived 并保留 thread/cursor、冻结 HEAD 与零写入证据；只有在原任务已终止、writer worktree/branch/HEAD/clean state 精确匹配且无第二 writer 时，才允许一个 visible successor 复用原 writer root。App host worktree 仅提供工具，不是新的 writer root；不满足时保持阻塞；
 - 重复失败且没有新证据：进入 `blocked_unknown`，不伪造完成；
 - 技术完成、Review 通过、交付授权和最终发布分开表达。
 

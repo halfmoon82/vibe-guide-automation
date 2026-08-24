@@ -75,6 +75,33 @@ class ModelsContractTests(unittest.TestCase):
         restored = Plan.from_dict(json.loads(json.dumps(plan.to_dict())))
         self.assertEqual(restored, plan)
 
+    def test_plan_persists_approved_decisions_and_evidence_priority(self):
+        decisions = [
+            {"question": "name", "status": "approved", "selected": "vibe"}
+        ]
+        plan = Plan(
+            "plan-1",
+            1,
+            "docs/prd.md",
+            ["n1"],
+            "draft",
+            decisions=decisions,
+        )
+
+        restored = Plan.from_dict(plan.to_dict())
+
+        self.assertEqual(restored.decisions, decisions)
+        self.assertEqual(
+            restored.evidence_priority,
+            [
+                "current_user",
+                "approved_prd",
+                "authorization",
+                "issue_contract",
+                "implementation",
+            ],
+        )
+
     def test_project_root_uses_marker_from_nested_cwd(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -5,8 +5,14 @@ package never imports or fabricates the desktop tool implementation.
 """
 
 from dataclasses import dataclass, field
+import hashlib
+import json
+import os
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Tuple
+import tempfile
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+
+from ..paths import ProjectPaths
 
 
 class ProviderUnavailable(RuntimeError):
@@ -15,6 +21,207 @@ class ProviderUnavailable(RuntimeError):
 
 class ProviderPending(RuntimeError):
     """A provider returned a pending task handle without a real task id."""
+
+
+_PROVIDER_ACTIONS = {"create", "locate", "visibility", "resume", "wait"}
+
+
+def _canonical_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+class ProviderActionStore:
+    """Bounded request/result mailbox between the CLI and a desktop session."""
+
+    schema_version = 1
+
+    def __init__(self, paths: ProjectPaths):
+        self.paths = paths
+        self.root = paths.resolve_vibe_path("provider-actions")
+
+    def _directory(self, name: str) -> Path:
+        directory = self.root / name
+        if self.root.is_symlink() or directory.is_symlink():
+            raise ValueError("provider action path may not be a symlink")
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    @staticmethod
+    def _atomic(path: Path, payload: Dict[str, Any]) -> None:
+        if path.parent.is_symlink() or path.is_symlink():
+            raise ValueError("provider action path may not be a symlink")
+        encoded = (
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        if len(encoded) > 64 * 1024:
+            raise ValueError("provider action record exceeds the size bound")
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix="." + path.name + ".", dir=str(path.parent)
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(str(temporary), str(path))
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    @staticmethod
+    def _read(path: Path) -> Dict[str, Any]:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("provider action record must be a regular file")
+        raw = path.read_bytes()
+        if len(raw) > 64 * 1024:
+            raise ValueError("provider action record exceeds the size bound")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("provider action record is invalid") from error
+        if not isinstance(value, dict):
+            raise ValueError("provider action record must be an object")
+        return value
+
+    def publish_capabilities(
+        self,
+        adapter_id: str,
+        facts: Mapping[str, Any],
+        provenance: str,
+    ) -> None:
+        if not isinstance(adapter_id, str) or not adapter_id:
+            raise ValueError("adapter id is required")
+        if (
+            not isinstance(facts, Mapping)
+            or not facts
+            or any(
+                not isinstance(key, str)
+                or not key.startswith(adapter_id + ".")
+                or type(value) is not bool
+                for key, value in facts.items()
+            )
+        ):
+            raise ValueError("provider capability facts are invalid")
+        if not isinstance(provenance, str) or not provenance:
+            raise ValueError("provider capability provenance is required")
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._atomic(
+            self.root / "capabilities.json",
+            {
+                "schema_version": self.schema_version,
+                "adapter_id": adapter_id,
+                "facts": dict(facts),
+                "provenance": provenance,
+            },
+        )
+
+    def capabilities(self) -> Dict[str, Any]:
+        value = self._read(self.root / "capabilities.json")
+        if set(value) != {"schema_version", "adapter_id", "facts", "provenance"}:
+            raise ValueError("provider capability schema is invalid")
+        if value["schema_version"] != self.schema_version:
+            raise ValueError("provider capability schema is unsupported")
+        return value
+
+    def request(
+        self,
+        *,
+        operation: str,
+        provider: str,
+        run_id: str,
+        issue_id: str,
+        role: str,
+        generation: int,
+        native_tool: str,
+        request: Dict[str, Any],
+        sequence: int = 0,
+    ) -> Dict[str, Any]:
+        if operation not in _PROVIDER_ACTIONS:
+            raise ValueError("provider action is unsupported")
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+            raise ValueError("provider action sequence is invalid")
+        basis = {
+            "operation": operation,
+            "provider": provider,
+            "run_id": run_id,
+            "issue_id": issue_id,
+            "role": role,
+            "generation": generation,
+            "sequence": sequence,
+        }
+        action_id = "action-" + _canonical_digest(basis)[:32]
+        payload = {
+            "schema_version": self.schema_version,
+            "action_id": action_id,
+            **basis,
+            "native_tool": native_tool,
+            "request": request,
+        }
+        payload["request_digest"] = _canonical_digest(payload)
+        directory = self._directory("requests")
+        path = directory / (action_id + ".json")
+        if path.exists():
+            existing = self._read(path)
+            if existing != payload:
+                raise ValueError("provider action request identity drift")
+        else:
+            self._atomic(path, payload)
+        return payload
+
+    def result(self, action_id: str) -> Optional[Dict[str, Any]]:
+        path = self._directory("results") / (action_id + ".json")
+        if not path.exists():
+            return None
+        result = self._read(path)
+        request = self._read(
+            self._directory("requests") / (action_id + ".json")
+        )
+        if (
+            set(result)
+            != {"schema_version", "action_id", "request_digest", "payload"}
+            or result["schema_version"] != self.schema_version
+            or result["action_id"] != action_id
+            or result["request_digest"] != request["request_digest"]
+            or not isinstance(result["payload"], dict)
+        ):
+            raise ValueError("provider action result is not bound to its request")
+        return result["payload"]
+
+    def complete(self, action_id: str, payload: Dict[str, Any]) -> None:
+        request = self._read(
+            self._directory("requests") / (action_id + ".json")
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("provider action result payload must be an object")
+        self._atomic(
+            self._directory("results") / (action_id + ".json"),
+            {
+                "schema_version": self.schema_version,
+                "action_id": action_id,
+                "request_digest": request["request_digest"],
+                "payload": payload,
+            },
+        )
+
+    def pending(self) -> List[Dict[str, Any]]:
+        request_dir = self._directory("requests")
+        result_dir = self._directory("results")
+        result = []
+        for path in sorted(request_dir.glob("action-*.json")):
+            if not (result_dir / path.name).exists():
+                result.append(self._read(path))
+        return result
 
 
 @dataclass(frozen=True)

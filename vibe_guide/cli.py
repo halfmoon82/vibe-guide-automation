@@ -15,6 +15,9 @@ from .authorization import (
     authorize,
     build_authorization_card,
 )
+from .adapters.base import Environment
+from .adapters.registry import AdapterRegistry
+from .adapters.task_provider import ProviderActionStore
 from .dag import render_plan_artifacts, validate_dag
 from .doctor import doctor
 from .initializer import init_project
@@ -32,6 +35,7 @@ from .planner import (
 )
 from .scanner import scan_project
 from .state import load_snapshot
+from .runners.provider_action import ProviderActionRunner
 
 
 SUCCESS = 0
@@ -160,6 +164,41 @@ def _authorization_card(data: Dict[str, Any]) -> AuthorizationCard:
     return AuthorizationCard(**converted)
 
 
+def _observed_adapter(paths: ProjectPaths, adapter_id: str):
+    capabilities = ProviderActionStore(paths).capabilities()
+    if capabilities["adapter_id"] != adapter_id:
+        raise ValueError("observed provider does not match the selected adapter")
+    facts = capabilities["facts"]
+    environment = Environment(
+        facts=facts,
+        provenance={key: capabilities["provenance"] for key in facts},
+        available_agents=(adapter_id,),
+    )
+    result = AdapterRegistry().get(adapter_id).detect(environment)
+    if (
+        not result.detected
+        or result.capabilities.mode != "visible"
+        or not result.capabilities.visible_automation
+    ):
+        raise ValueError("selected provider has no verified visible lifecycle")
+    return result
+
+
+def _public_runner(
+    paths: ProjectPaths,
+    card: AuthorizationCard,
+    nodes: List[DAGNode],
+) -> ProviderActionRunner:
+    if any(node.contract.get("adapter_id") != card.agent_id for node in nodes):
+        raise ValueError("node adapter routing does not match authorization")
+    observed = _observed_adapter(paths, card.agent_id)
+    return ProviderActionRunner(
+        paths,
+        observed.adapter_id,
+        observed.capabilities.provider,
+    )
+
+
 def _publish_plan(
     paths: ProjectPaths, plan_id: str, source_path: Path
 ) -> Tuple[Plan, List[DAGNode], AuthorizationCard]:
@@ -190,9 +229,21 @@ def _publish_plan(
         str(Path(".vibe") / "plans" / plan_id / "prd.md"),
         [node.id for node in nodes],
         "draft",
+        decisions=[asdict(item) for item in decisions],
     )
     capabilities = AgentCapabilities.from_dict(source.get("capabilities", {}))
-    card = build_authorization_card(plan, nodes, capabilities)
+    try:
+        capabilities = _observed_adapter(paths, capabilities.agent_id).capabilities
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        # Planning remains usable for explicitly injected/background test paths;
+        # the public monitor rechecks live observed capability before execution.
+        pass
+    card = build_authorization_card(
+        plan,
+        nodes,
+        capabilities,
+        active_pair_limit=source.get("active_pair_limit"),
+    )
 
     plans_root = destination.parent
     if plans_root.is_symlink():
@@ -206,8 +257,15 @@ def _publish_plan(
         (staging / "specs").mkdir()
         (staging / "issues").mkdir()
         (staging / "prd.md").write_text(
-            "# {}\n\n状态：approved\n\n目标：{}\n".format(
-                prd.title, prd.objective
+            "# {}\n\n状态：approved\n\n目标：{}\n\n## 已批准产品决策\n\n{}\n\n"
+            "证据优先级：{}\n".format(
+                prd.title,
+                prd.objective,
+                "\n".join(
+                    "- {} → {}".format(item.question, item.selected)
+                    for item in decisions
+                ),
+                " > ".join(plan.evidence_priority),
             ),
             encoding="utf-8",
         )
@@ -367,18 +425,37 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
 
     if args.command == "doctor":
         report = doctor(scan_project(paths))
+        bridge_payload = None
+        try:
+            bridge = ProviderActionStore(paths).capabilities()
+            bridge_payload = _observed_adapter(
+                paths, bridge["adapter_id"]
+            ).to_dict()
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            pass
+        issues = list(report.issues)
+        if bridge_payload is not None:
+            issues = [
+                issue
+                for issue in issues
+                if issue != "no candidate Agent command found"
+            ]
+        ready = not issues
         payload = {
             "command": "doctor",
-            "status": "ok" if report.ok else "blocked",
-            **asdict(report),
+            "status": "ok" if ready else "blocked",
+            "ok": ready,
+            "issues": issues,
+            "facts": report.facts,
+            "provider_bridge": bridge_payload,
         }
         text = (
             "环境检查通过"
-            if report.ok
-            else "环境检查发现问题：" + "；".join(report.issues)
+            if ready
+            else "环境检查发现问题：" + "；".join(issues)
         )
         return _result(
-            SUCCESS if report.ok else BLOCKED, payload, text, args.as_json
+            SUCCESS if ready else BLOCKED, payload, text, args.as_json
         )
 
     if args.command == "plan":
@@ -461,20 +538,11 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工未启动：需要精确 AUTHORIZE",
                 args.as_json,
             )
-        if runner is None:
-            return _result(
-                UNKNOWN,
-                {
-                    "command": "monitor",
-                    "status": "unknown",
-                    "reason": "runner unavailable",
-                },
-                "监工状态未知：runner 不可用",
-                args.as_json,
-            )
         try:
             directory, plan, nodes, card = _load_plan(paths, args.plan)
             record = authorize(card, args.authorize)
+            if runner is None:
+                runner = _public_runner(paths, card, nodes)
             snapshot = Monitor(paths, plan, nodes).start(record, runner)
             _atomic_json(directory / "authorization.json", record.to_dict())
             _atomic_json(
@@ -542,7 +610,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 snapshot = load_snapshot(paths, run_id)
             else:
                 if runner is None:
-                    raise RuntimeError("runner unavailable")
+                    runner = _public_runner(paths, _card, nodes)
                 AuthorizationRecord.from_dict(
                     _read_json(directory / "authorization.json")
                 )

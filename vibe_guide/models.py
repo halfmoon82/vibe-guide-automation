@@ -1,6 +1,6 @@
 """JSON-safe shared data models for the guide contracts."""
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import re
@@ -22,6 +22,13 @@ _NODE_STATUSES = frozenset(
 )
 _PLAN_STATUSES = frozenset({"draft", "authorized", "running", "complete", "blocked", "failed"})
 _CAPABILITY_LEVELS = frozenset({"guide", "background", "full"})
+EVIDENCE_PRIORITY = (
+    "current_user",
+    "approved_prd",
+    "authorization",
+    "issue_contract",
+    "implementation",
+)
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
@@ -103,6 +110,10 @@ class Plan:
     prd_path: str
     node_ids: List[str]
     status: str
+    decisions: List[Dict[str, Any]] = field(default_factory=list)
+    evidence_priority: List[str] = field(
+        default_factory=lambda: list(EVIDENCE_PRIORITY)
+    )
 
     def __post_init__(self):
         self.plan_id = _identifier(self.plan_id, "plan id")
@@ -113,6 +124,13 @@ class Plan:
         self.node_ids = _identifier_list(self.node_ids, "node ids")
         if not isinstance(self.status, str) or self.status not in _PLAN_STATUSES:
             raise ValueError("unsupported plan status")
+        if not isinstance(self.decisions, list) or not all(
+            isinstance(item, dict) for item in self.decisions
+        ):
+            raise TypeError("plan decisions must be a list of dictionaries")
+        self.decisions = _json_safe(self.decisions)
+        if self.evidence_priority != list(EVIDENCE_PRIORITY):
+            raise ValueError("plan evidence priority is fixed")
 
     def to_dict(self) -> Dict[str, Any]:
         return _json_dict(self)

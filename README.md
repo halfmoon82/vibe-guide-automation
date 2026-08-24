@@ -8,9 +8,11 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install -e .
+.venv/bin/python -m pip install --no-build-isolation -e .
 .venv/bin/vibe --help
 ```
+
+项目同时提供 legacy `setup.py` metadata；上述同一命令兼容声明的 Python 3.9、pip 21.2、setuptools 58，以及现代 Python/setuptools。安装测试不需要升级或修改系统 Python。
 
 也可以直接运行：
 
@@ -84,6 +86,10 @@ vibe resume --plan example-plan --json
 节点从 `planned` 开始。provider 的 `complete` 只映射为 developer 的 `delivered`；随后必须由不同 reviewer 任务给出 `accepted`，硬依赖才会解锁。全部节点 accepted 后，run 才是 `complete`。
 
 恢复以 `.vibe/runs/<run-id>/state.json`、`tasks.json` 和 `events.jsonl` 为准。已登记的活动 handle 不会因重复 `resume` 创建第二 writer。计划或节点合同变化会持久化为 `blocked_design` 并使旧授权失效；provider unknown/timeout 会保持 `blocked_unknown`，不会转成成功或无事项。
+
+桌面 App 原生能力不能由 Python 直接调用时，public CLI 使用 `.vibe/provider-actions/` 的 provider-neutral request/result bridge。`monitor/resume` 会写入有界、digest 绑定的 `create/locate/visibility/resume/wait` 请求；App 会话按 `native_tool` 调用公开能力并回写绑定结果。Codex 映射到 `create_thread`、`navigate_to_codex_page`、`send_message_to_thread` 和 `wait_threads`。在真实 task ID、host、定位和可见性全部核验前，状态保持 `blocked_unknown`；node-spec 中的 provider/mode/thread/host 自声明不会成为证据。
+
+授权 action 是 closed allowlist；未列明、deploy-like、外部安装和系统权限动作一律拒绝。`files` 必须是规范化的项目内相对路径列表，并与授权卡的 file scope 精确绑定。授权卡还绑定同时活跃的 developer/reviewer pair 上限；只有 reviewer 接受、P0–P2 清零且证据登记后才归档 pair 并释放容量。
 
 ## LocalRunner 边界
 

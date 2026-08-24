@@ -104,3 +104,36 @@ class CliContractTests(unittest.TestCase):
                     self.assertTrue(text_result.text.strip())
                     self.assertIsInstance(json_result.payload, dict)
                     json.dumps(json_result.payload)
+
+    def test_legacy_setup_metadata_exposes_real_name_version_and_console_entry(self):
+        root = Path(__file__).resolve().parents[1]
+        name = subprocess.run(
+            [sys.executable, "setup.py", "--name"],
+            cwd=str(root),
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        version = subprocess.run(
+            [sys.executable, "setup.py", "--version"],
+            cwd=str(root),
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        setup_text = (root / "setup.py").read_text(encoding="utf-8")
+        readme_text = (root / "README.md").read_text(encoding="utf-8")
+
+        self.assertEqual((name, version), ("vibe-guide", "0.1.0"))
+        self.assertIn("vibe=vibe_guide.cli:main", setup_text)
+        self.assertIn('python_requires=">=3.9"', setup_text)
+        self.assertIn("pip install --no-build-isolation -e .", readme_text)
+
+    def test_agents_contract_contains_visible_successor_recovery_rule(self):
+        text = (Path(__file__).resolve().parents[1] / "AGENTS.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("visible successor", text)
+        self.assertIn("原任务 aborted/archived", text)
+        self.assertIn("冻结 HEAD", text)

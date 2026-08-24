@@ -30,6 +30,7 @@
 - 每个任务登记 provider、平台任务 ID、host、worktree、branch、`status_file`、`handoff_file` 和 cursor/token；Codex 具体登记 `threadId`、`hostId` 和 cursor。返工回到原 developer，复审回到原 reviewer。
 - 只有 adapter 明确无等价可见任务能力时，才可把 developer/reviewer 降级为 background subagent；授权卡和交付必须披露限制，不能标为完整可见自动化。
 - 任务创建也是授权动作；只有新版授权卡确认后才能调用 `create_thread`。设计或执行拓扑变化使授权失效。
+- 可见 worker 因工具丢失而无法继续时，先记录并验证原 thread aborted/archived、cursor、零写入、冻结 HEAD、clean writer worktree 和唯一 writer；随后仅允许一个 visible successor 复用原 writer root。App 自动 host worktree 不得成为第二 writer root，也不得因此创建额外 worktree。
 
 ## Implementation DAG
 

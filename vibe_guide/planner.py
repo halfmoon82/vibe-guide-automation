@@ -1,8 +1,11 @@
 """Deterministic task routing and product-decision gates."""
 
 from dataclasses import dataclass, field, replace
+import json
 import re
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+
+from .models import EVIDENCE_PRIORITY
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,86 @@ class PRDResult:
     prd: PRD
     approved: bool
     blockers: List[str]
+
+
+@dataclass(frozen=True)
+class ConsistencyResolution:
+    field: str
+    value: Any
+    source: str
+    action: str
+    files: List[str]
+
+
+def resolve_consistency(
+    inconsistency: Any,
+    decisions: List[Dict[str, Any]],
+    issue_contract: Dict[str, Any],
+    authorized_actions: List[str],
+    authorized_files: List[str],
+) -> Optional[ConsistencyResolution]:
+    """Resolve only one evidence-determined, authorized non-deploy correction."""
+
+    if not isinstance(inconsistency, dict):
+        return None
+    field_name = inconsistency.get("field")
+    action = inconsistency.get("action")
+    files = inconsistency.get("files")
+    candidates = inconsistency.get("candidates")
+    if (
+        not isinstance(field_name, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", field_name)
+        or action not in set(authorized_actions)
+        or not isinstance(files, list)
+        or not files
+        or any(item not in set(authorized_files) for item in files)
+        or not isinstance(candidates, list)
+        or not candidates
+    ):
+        return None
+    normalized = []
+    for candidate in candidates:
+        if (
+            not isinstance(candidate, dict)
+            or set(candidate) != {"source", "value"}
+            or candidate["source"] not in EVIDENCE_PRIORITY
+        ):
+            return None
+        try:
+            value_key = json.dumps(
+                candidate["value"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            return None
+        normalized.append((candidate["source"], candidate["value"], value_key))
+    highest = min(EVIDENCE_PRIORITY.index(item[0]) for item in normalized)
+    winners = [
+        item for item in normalized if EVIDENCE_PRIORITY.index(item[0]) == highest
+    ]
+    if len({item[2] for item in winners}) != 1:
+        return None
+    source, value, _key = winners[0]
+    if source == "implementation":
+        return None
+    if source == "approved_prd":
+        approved_values = {
+            json.dumps(
+                item.get("selected"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for item in decisions
+            if isinstance(item, dict) and item.get("status") == "approved"
+        }
+        if _key not in approved_values:
+            return None
+    if source == "issue_contract" and issue_contract.get(field_name) != value:
+        return None
+    return ConsistencyResolution(field_name, value, source, action, list(files))
 
 
 _S1_MARKERS = (

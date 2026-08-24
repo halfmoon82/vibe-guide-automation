@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 import time
 from typing import Any, Dict, Iterator, List, Optional
@@ -348,11 +349,8 @@ def _normalize_provenance(
     return normalized
 
 
-def _read_event_records(path: Path) -> List[Dict[str, Any]]:
-    try:
-        raw_lines = [line for line in path.read_bytes().splitlines() if line.strip()]
-    except FileNotFoundError:
-        return []
+def _decode_event_records(raw: bytes) -> List[Dict[str, Any]]:
+    raw_lines = [line for line in raw.splitlines() if line.strip()]
     records: List[Dict[str, Any]] = []
     expected_keys = {
         "schema_version",
@@ -417,6 +415,16 @@ def _read_event_records(path: Path) -> List[Dict[str, Any]]:
     return records
 
 
+def _read_event_records(path: Path) -> List[Dict[str, Any]]:
+    try:
+        if path.is_symlink():
+            raise ValueError("event log may not be a symlink")
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    return _decode_event_records(raw)
+
+
 def load_events(paths: ProjectPaths, run_id: str) -> List[Dict[str, Any]]:
     directory = run_dir(paths, run_id, create=False)
     records = _read_event_records(directory / "events.jsonl")
@@ -437,28 +445,58 @@ def append_event(
     event_path = directory / "events.jsonl"
     normalized_provenance = _normalize_provenance(event, provenance)
     with interprocess_lock(_event_lock(paths, run_id)):
-        records = _read_event_records(event_path)
-        sequence = len(records) + 1
-        record = {
-            "schema_version": EVENT_SCHEMA_VERSION,
-            "sequence": sequence,
-            "event_id": uuid.uuid4().hex,
-            "run_id": run_id,
-            "event": event.event,
-            "provenance": normalized_provenance,
-            "data": sanitized_data,
-            "previous_event_digest": records[-1]["event_digest"] if records else None,
-        }
-        record["event_digest"] = hashlib.sha256(
-            json.dumps(
-                record,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-        with event_path.open("a", encoding="utf-8") as stream:
-            stream.write(
+        directory_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        directory_descriptor = os.open(str(directory), directory_flags)
+        descriptor = None
+        try:
+            flags = os.O_CREAT | os.O_RDWR | os.O_APPEND
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(
+                    event_path.name, flags, 0o600, dir_fd=directory_descriptor
+                )
+            except OSError as error:
+                if error.errno in {errno.ELOOP, getattr(errno, "EFTYPE", -1)}:
+                    raise ValueError("event log may not be a symlink") from error
+                raise
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("event log must be a regular file")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            chunks = []
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            records = _decode_event_records(b"".join(chunks))
+            sequence = len(records) + 1
+            record = {
+                "schema_version": EVENT_SCHEMA_VERSION,
+                "sequence": sequence,
+                "event_id": uuid.uuid4().hex,
+                "run_id": run_id,
+                "event": event.event,
+                "provenance": normalized_provenance,
+                "data": sanitized_data,
+                "previous_event_digest": (
+                    records[-1]["event_digest"] if records else None
+                ),
+            }
+            record["event_digest"] = hashlib.sha256(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            encoded = (
                 json.dumps(
                     record,
                     ensure_ascii=False,
@@ -466,10 +504,17 @@ def append_event(
                     separators=(",", ":"),
                 )
                 + "\n"
-            )
-            stream.flush()
-            os.fsync(stream.fileno())
-        return sequence
+            ).encode("utf-8")
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+            return sequence
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(directory_descriptor)
 
 
 def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> None:

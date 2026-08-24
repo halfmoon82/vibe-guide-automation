@@ -119,6 +119,21 @@ class StateTests(unittest.TestCase):
         self.assertIsNone(records[0]["previous_event_digest"])
         self.assertEqual(records[1]["previous_event_digest"], records[0]["event_digest"])
 
+    def test_event_append_rejects_symlink_leaf_without_touching_outside_file(self):
+        run_path = Path(self.temporary.name) / ".vibe/runs/run-symlink"
+        run_path.mkdir(parents=True)
+        outside = Path(self.temporary.name) / "outside-events.jsonl"
+        outside.write_bytes(b"")
+        (run_path / "events.jsonl").symlink_to(outside)
+
+        with self.assertRaises(ValueError):
+            append_event(
+                self.paths,
+                RunEvent("started", {"run_id": "run-symlink", "node_id": "n1"}),
+            )
+
+        self.assertEqual(outside.read_bytes(), b"")
+
     def test_atomic_snapshot_ignores_interrupted_temporary_file(self):
         expected = self.snapshot()
         save_snapshot(self.paths, expected)
