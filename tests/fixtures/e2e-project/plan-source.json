@@ -1,0 +1,73 @@
+{
+  "title": "契约并行示例",
+  "objective": "通过两个兼容契约的节点证明并行开发和独立审查闭环。",
+  "decisions": [
+    {
+      "question": "两个节点如何启动？",
+      "options": ["契约并行", "串行等待"],
+      "impact": "决定是否在没有硬依赖时同时启动。",
+      "recommendation": "契约并行",
+      "status": "approved",
+      "selected": "契约并行"
+    }
+  ],
+  "capabilities": {
+    "agent_id": "fixture-agent",
+    "shell": true,
+    "subprocess": true,
+    "worktree": true,
+    "background": true,
+    "session_resume": true,
+    "level": "background"
+  },
+  "nodes": [
+    {
+      "id": "api",
+      "title": "API contract node",
+      "depends_on": [],
+      "integration_after": [],
+      "parallel_group": "build",
+      "status": "planned",
+      "contract": {
+        "input": "approved request",
+        "output": "API delivery",
+        "error_behavior": "report unknown without success",
+        "acceptance_example": "independent reviewer accepts API delivery",
+        "adapter_id": "fixture-agent",
+        "command": ["python3", "fake_agent.py"],
+        "provider": "fixture-agent",
+        "mode": "background",
+        "worker": "fixture-api-developer",
+        "reviewer_worker": "fixture-api-reviewer",
+        "worktree": ".",
+        "branch": "fixture/api",
+        "files": ["api.txt"],
+        "actions": ["develop", "test", "review"]
+      }
+    },
+    {
+      "id": "ui",
+      "title": "UI contract node",
+      "depends_on": [],
+      "integration_after": ["api"],
+      "parallel_group": "build",
+      "status": "planned",
+      "contract": {
+        "input": "approved request",
+        "output": "UI delivery",
+        "error_behavior": "report unknown without success",
+        "acceptance_example": "independent reviewer accepts UI delivery",
+        "adapter_id": "fixture-agent",
+        "command": ["python3", "fake_agent.py"],
+        "provider": "fixture-agent",
+        "mode": "background",
+        "worker": "fixture-ui-developer",
+        "reviewer_worker": "fixture-ui-reviewer",
+        "worktree": ".",
+        "branch": "fixture/ui",
+        "files": ["ui.txt"],
+        "actions": ["develop", "test", "review"]
+      }
+    }
+  ]
+}
