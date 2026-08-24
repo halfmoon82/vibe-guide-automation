@@ -1,1 +1,1 @@
-{"commands":{"grok":true},"facts":{"shell":true,"subprocess":false}}
+{"commands":{"grok.agent":true},"facts":{"grok.shell":true,"grok.subprocess":false},"provenance":{"grok.shell":"fixture","grok.subprocess":"fixture"}}
