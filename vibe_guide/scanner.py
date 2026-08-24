@@ -139,7 +139,10 @@ def scan_project(paths):
     agentsmd = root / 'AGENTS.md'
     vibe = root / '.vibe'
     agentsmd_exists = agentsmd.is_file() and not agentsmd.is_symlink()
-    skills, skill_records_error = _configured_skills(vibe)
+    if not vibe.exists() or vibe.is_symlink() or not vibe.is_dir():
+        skills, skill_records_error = [], 'invalid .vibe directory'
+    else:
+        skills, skill_records_error = _configured_skills(vibe)
     commands = {
         command: shutil.which(command) is not None for command in _AGENT_COMMANDS
     }

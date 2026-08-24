@@ -88,6 +88,36 @@ class ScannerTests(unittest.TestCase):
                 getattr(report, 'skill_records_error', None), 'config too large'
             )
 
+    def test_top_level_vibe_symlink_does_not_read_external_skill_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            project = base / 'project'
+            outside = base / 'outside'
+            project.mkdir()
+            outside.mkdir()
+            (outside / 'config.json').write_text(
+                json.dumps(
+                    {
+                        'skills': [
+                            {
+                                'name': 'outside-secret-record',
+                                'source': 'https://github.com/example/outside',
+                                'commit': 'c' * 40,
+                            }
+                        ]
+                    }
+                ),
+                encoding='utf-8',
+            )
+            (project / '.vibe').symlink_to(outside, target_is_directory=True)
+
+            report = scan_project(ProjectPaths.from_cwd(project))
+
+            self.assertFalse(report.vibe_exists)
+            self.assertEqual(report.skills, [])
+            self.assertEqual(report.skill_records_error, 'invalid .vibe directory')
+            self.assertNotIn('outside-secret-record', repr(report))
+
     def test_doctor_reports_observable_facts_without_authority_inference(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
