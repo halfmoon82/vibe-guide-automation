@@ -175,6 +175,8 @@ planned → ready → running → delivered → review → accepted
                               └── rework ───┘
 ```
 
+`planned` 是正常待执行状态，`ready` 可以显式保存，也可以由契约和依赖条件推导。`delivered` 只表示 developer 已技术交付、独立 Review 尚未接受；只有 `accepted` 才是节点成功终态并能解锁硬依赖。`complete` 只用于全部节点均为 `accepted` 后的 run-level 状态；provider 名为 `complete` 的事件只能映射为 developer delivery。`start_pending` 仅是私有启动意图状态，不属于规划生命周期。
+
 暂停状态：
 
 - `blocked_design`：需要修改 PRD、Spec、Issue、验收标准或 DAG；
@@ -207,6 +209,8 @@ planned → ready → running → delivered → review → accepted
 
 ## 8. 人类介入边界
 
+监工处理规则或合同冲突时，按“用户当前明确决定 → 已批准 PRD/Design Spec → 授权卡 → Issue 合同 → 下层实现”确定优先级。若证据只产生一个答案，且纠偏仍在已授权项目、DAG 和非 deploy 边界内，监工记录纠偏、更新受影响的 DAG 后缀或合同并自动继续；可唯一解决的实现不一致、命名不一致或过期下层合同不单独请求用户。
+
 只有以下情况请求人类：
 
 1. 用户目标或产品方案变化；
@@ -215,6 +219,8 @@ planned → ready → running → delivered → review → accepted
 4. 扩大文件、数据、权限或外部系统范围；
 5. deploy；
 6. 需要产品取舍或明确外部授权。
+
+上述暂停边界只在仍有多个会实质改变产品结果的答案、产品范围或方向变化、需要外部/deploy/系统权限授权，或证据无法区分安全结果时触发。
 
 developer/reviewer 的任务可见性、独立性或控制面拓扑变化属于产品设计变化，会使既有授权失效。
 

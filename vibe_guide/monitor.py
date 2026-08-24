@@ -40,9 +40,8 @@ class Monitor:
         run_id = "run-" + uuid.uuid4().hex
         node_state: Dict[str, Dict[str, Any]] = {}
         for node_id, node in self.nodes.items():
-            technical_complete = node.status == "complete"
             node_state[node_id] = {
-                "status": "delivered" if technical_complete else "pending",
+                "status": "delivered" if node.status == "delivered" else "planned",
                 "worker": node.contract.get("worker"),
                 "worktree": node.contract.get("worktree", ".worktrees/" + node_id),
                 "branch": node.contract.get("branch", "node/" + node_id),
@@ -199,7 +198,7 @@ class Monitor:
                     continue
                 self._start_task(snapshot, node_id, "reviewer", "review", runner, False)
                 continue
-            if current.get("status") != "pending":
+            if current.get("status") != "planned":
                 continue
             if not all(
                 snapshot.nodes[dependency].get("status") == "accepted"

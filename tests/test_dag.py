@@ -9,7 +9,7 @@ from vibe_guide.dag import ready_nodes, render_plan_artifacts, validate_dag
 from vibe_guide.models import DAGNode, Plan
 
 
-def node(node_id, depends=None, integration=None, group=None, status="pending", contract=None):
+def node(node_id, depends=None, integration=None, group=None, status="planned", contract=None):
     default_contract = {
         "input": "request",
         "output": "result",
@@ -28,6 +28,15 @@ class DAGTests(unittest.TestCase):
         dep = node("dep", status="running")
         child = node("child", depends=["dep"])
         self.assertEqual(ready_nodes([dep, child]), [])
+
+    def test_only_accepted_hard_dependency_unlocks_dependent_node(self):
+        child = node("child", depends=["dep"])
+
+        self.assertEqual(ready_nodes([node("dep", status="delivered"), child]), [])
+        self.assertEqual(
+            ready_nodes([node("dep", status="accepted"), child]),
+            [child],
+        )
 
     def test_duplicate_ids_and_cycles_fail_validation(self):
         duplicate = validate_dag([node("n1"), node("n1")])

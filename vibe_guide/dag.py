@@ -103,11 +103,11 @@ def ready_nodes(nodes: List[DAGNode]) -> List[DAGNode]:
     by_id: Dict[str, DAGNode] = {node.id: node for node in nodes}
     ready = []
     for node in nodes:
-        if node.status not in ("pending", "ready"):
+        if node.status not in ("planned", "ready"):
             continue
         if _contract_error(node):
             continue
-        if all(by_id[dependency].status == "complete" for dependency in node.depends_on):
+        if all(by_id[dependency].status == "accepted" for dependency in node.depends_on):
             ready.append(node)
     return ready
 

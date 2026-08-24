@@ -21,8 +21,10 @@
 - DAG 默认优先并行；只有硬依赖阻塞启动，联调关系记录为 `integration_after`。
 - 一次授权覆盖当前 DAG 已列明的全部非 deploy 动作；deploy 永远单独授权。
 - 技术完成、Review 通过、交付授权和最终发布必须分开记录。
+- DAG 节点以 `planned` 进入执行；developer 交付只到 `delivered`，独立 Review 后的 `accepted` 才能解锁硬依赖；`complete` 只表示所有节点均 accepted 的运行状态，`start_pending` 仅是私有启动意图。
 - 未知状态不得转换为无事项或成功；无法验证时进入 `blocked_unknown`。
 - 实现缺陷优先退回同一 worker；设计变化只重建受影响 DAG 后缀。
+- 一致性纠偏按“用户当前明确决定 → 已批准 PRD/Design Spec → 授权卡 → Issue 合同 → 下层实现”取证；若只有一个答案且仍在已授权项目、DAG 和非 deploy 边界内，记录纠偏、更新受影响后缀或合同并自动继续。只有多种结果仍会实质改变产品、范围或方向变化、需要外部/deploy/系统权限授权，或证据无法区分安全结果时暂停。
 - 桌面 App 适配必须检测权限并如实降级，不能绕过沙箱或伪造完整自动化。
 - 七个平台的完整可见自动化路径中，开发 Issue 和独立 Review 必须分别映射为对应 App 的可见独立任务；可见、可进入、可追溯是验收条件。
 - 每个任务登记 provider、平台任务 ID、host、worktree、branch、`status_file`、`handoff_file` 和 cursor/token；Codex 具体登记 `threadId`、`hostId` 和 cursor。返工回到原 developer，复审回到原 reviewer。

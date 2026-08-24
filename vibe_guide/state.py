@@ -33,7 +33,7 @@ _RUN_STATUSES = {
     "failed",
 }
 _NODE_STATUSES = {
-    "pending",
+    "planned",
     "start_pending",
     "running",
     "delivered",

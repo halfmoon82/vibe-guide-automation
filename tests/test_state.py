@@ -129,7 +129,7 @@ class StateTests(unittest.TestCase):
 
     def test_load_falls_back_to_last_valid_snapshot(self):
         first = self.snapshot()
-        second = self.snapshot(node_status="pending")
+        second = self.snapshot(node_status="planned")
         save_snapshot(self.paths, first)
         save_snapshot(self.paths, second)
         state_path = Path(self.temporary.name) / ".vibe/runs/run-1/state.json"
@@ -139,7 +139,7 @@ class StateTests(unittest.TestCase):
 
     def test_semantically_invalid_current_snapshot_falls_back(self):
         first = self.snapshot()
-        second = self.snapshot(node_status="pending")
+        second = self.snapshot(node_status="planned")
         save_snapshot(self.paths, first)
         save_snapshot(self.paths, second)
         state_path = Path(self.temporary.name) / ".vibe/runs/run-1/state.json"
@@ -152,7 +152,7 @@ class StateTests(unittest.TestCase):
 
     def test_snapshot_with_tampered_authorization_record_falls_back(self):
         first = self.snapshot()
-        second = self.snapshot(node_status="pending")
+        second = self.snapshot(node_status="planned")
         save_snapshot(self.paths, first)
         save_snapshot(self.paths, second)
         state_path = Path(self.temporary.name) / ".vibe/runs/run-1/state.json"

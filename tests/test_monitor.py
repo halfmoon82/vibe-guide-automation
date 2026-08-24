@@ -88,7 +88,24 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1", "n2"])
         self.assertEqual(snapshot.nodes["n1"]["status"], "running")
         self.assertEqual(snapshot.nodes["n2"]["status"], "running")
-        self.assertEqual(snapshot.nodes["n3"]["status"], "pending")
+        self.assertEqual(snapshot.nodes["n3"]["status"], "planned")
+
+    def test_provider_complete_is_delivery_and_does_not_unlock_dependent_node(self):
+        nodes = [node("n1"), node("n2", ["n1"])]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner(
+            events={("n1", "developer"): [("complete", {"evidence": "delivery"})]}
+        )
+
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "review")
+        self.assertEqual(snapshot.nodes["n2"]["status"], "planned")
+        self.assertEqual(
+            [(call["node_id"], call["role"]) for call in runner.start_calls],
+            [("n1", "developer"), ("n1", "reviewer")],
+        )
 
     def test_missing_authorization_never_starts_runner(self):
         nodes = [node("n1")]
@@ -271,7 +288,7 @@ class MonitorTests(unittest.TestCase):
                     "status": "running",
                     "nodes": {
                         "n1": {
-                            "status": "pending",
+                            "status": "planned",
                             "worker": "worker-n1",
                             "worktree": ".worktrees/n1",
                             "evidence": [],
@@ -305,10 +322,10 @@ class MonitorTests(unittest.TestCase):
             )
         )
 
-    def test_technical_complete_still_requires_independent_review(self):
-        completed = node("n1")
-        completed.status = "complete"
-        monitor, record = self.authorized_monitor([completed])
+    def test_delivered_node_still_requires_independent_review(self):
+        delivered = node("n1")
+        delivered.status = "delivered"
+        monitor, record = self.authorized_monitor([delivered])
         runner = FakeRunner()
 
         snapshot = monitor.start(record, runner)
