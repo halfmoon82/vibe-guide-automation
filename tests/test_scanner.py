@@ -13,4 +13,3 @@ class ScannerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d); (p/'AGENTS.md').write_text('keep', encoding='utf-8')
             self.assertEqual(scan_project(ProjectPaths.from_cwd(p)).agentsmd_content, 'keep')
-

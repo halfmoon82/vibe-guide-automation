@@ -7,4 +7,3 @@ class SkillsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             r=install_skill(SkillSpec('demo','not-a-url','deadbeef'), Path(d), True)
             self.assertEqual(r.status, 'pending'); self.assertFalse(r.installed)
-

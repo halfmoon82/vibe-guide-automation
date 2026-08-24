@@ -6,4 +6,3 @@ def doctor(report):
     issues=[]
     if not report.knowledge_exists: issues.append('missing .vibe/knowledge')
     return DoctorReport(not issues, issues)
-

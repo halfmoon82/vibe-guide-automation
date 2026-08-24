@@ -28,4 +28,3 @@ def scan_project(paths):
 def build_agentsmd_patch(existing, report):
     if existing is not None: return PatchProposal(False, '')
     return PatchProposal(True, '# Vibe Guide\n\nProject guidance is maintained through the Vibe Guide.\n')
-

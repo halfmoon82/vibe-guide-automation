@@ -11,4 +11,3 @@ class InitializerTests(unittest.TestCase):
             self.assertTrue(first.changed); self.assertFalse(second.changed)
             self.assertTrue((p.root/'.vibe/knowledge').is_dir())
             self.assertFalse((p.root/'AGENTS.md').exists())
-
