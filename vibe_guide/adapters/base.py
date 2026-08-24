@@ -215,12 +215,15 @@ class ManifestAdapter:
         elif visible:
             level, mode, provider = "full", "visible", self.manifest["provider"]
             limitations = ()
-        elif self.manifest["background_fallback"]:
+        elif self.manifest["background_fallback"] and _verified_launcher(self.background_launcher):
             level, mode, provider = "background", "background", self.manifest["background_provider"]
             limitations = ("不可见", "不可直接进入", "返工续接受限")
         else:
             level, mode, provider = "guide", "guide", ""
-            limitations = ("未验证显式任务桥接",)
+            limitations = (
+                "后台启动器未验证" if self.manifest["background_fallback"]
+                else "未验证显式任务桥接",
+            )
         capabilities = AdapterCapabilities(
             agent_id=self.id, shell=shell, subprocess=subprocess, worktree=worktree,
             background=mode == "background", session_resume=resume, level=level,
@@ -278,3 +281,7 @@ class ManifestAdapter:
 
 
 Adapter = ManifestAdapter
+
+
+def _verified_launcher(launcher) -> bool:
+    return callable(launcher) or callable(getattr(launcher, "launch", None))

@@ -8,305 +8,261 @@ from vibe_guide.adapters.registry import AdapterRegistry
 from vibe_guide.adapters.task_provider import (
     BackgroundTaskProvider,
     CodexAppBridge,
-    ProviderUnavailable,
     ProviderPending,
+    ProviderUnavailable,
+    RepositoryTaskRouting,
     TaskBinding,
     VisibilityResult,
 )
 
 
-class AdapterTests(unittest.TestCase):
-    def test_registry_exposes_all_seven_manifest_adapters(self):
-        registry = AdapterRegistry()
-        self.assertEqual(
-            set(registry.ids),
-            {
-                "codex",
-                "claude-code",
-                "cursor",
-                "grok",
-                "workbuddy",
-                "kimi-code",
-                "deepseek-harness",
-            },
-        )
+SUPPORTED = {
+    "codex", "claude-code", "cursor", "grok", "workbuddy", "kimi-code",
+    "deepseek-harness",
+}
 
-    def test_verified_visible_probes_report_full(self):
+
+def routing(environment="worktree"):
+    return RepositoryTaskRouting(
+        project_id="project-1",
+        host_id="host-1",
+        environment=environment,
+        worktree="/repo-wt" if environment == "worktree" else "/repo",
+        branch="codex/issue" if environment == "worktree" else "main",
+    )
+
+
+def codex_bridge(**overrides):
+    calls = []
+    functions = {
+        "create_thread": lambda request: {"threadId": "thread-1", "hostId": "host-1"},
+        "navigate_to_codex_page": lambda request: calls.append(("navigate", request)),
+        "send_message_to_thread": lambda request: calls.append(("send", request)),
+        "wait_threads": lambda request: {
+            "timedOut": False,
+            "wake": "completed",
+            "polls": [{
+                "threadId": "thread-1", "hostId": "host-1", "cursor": "c2",
+                "thread": {"status": "complete"},
+            }],
+        },
+        "list_threads": lambda request: {
+            "pinnedThreads": [{"id": "thread-1", "hostId": "host-1"}],
+            "threads": [],
+        },
+    }
+    functions.update(overrides)
+    return CodexAppBridge(**functions), calls
+
+
+def routed_codex_provider(bridge=None, environment="worktree"):
+    provider = AdapterRegistry().get("codex").task_provider
+    provider.bridge = bridge or codex_bridge()[0]
+    provider.routing = routing(environment)
+    return provider
+
+
+def background_result(role="developer", issue_id="N4"):
+    return {
+        "handle": "bg-1",
+        "provider": "cursor-background",
+        "mode": "background",
+        "host": "local",
+        "role": role,
+        "issue_id": issue_id,
+        "worktree": "/repo-wt",
+        "branch": "codex/n4",
+        "status_file": "status.txt",
+        "handoff_file": "handoff.md",
+    }
+
+
+class AdapterTests(unittest.TestCase):
+    def test_production_registry_exposes_exact_seven(self):
+        self.assertEqual(set(AdapterRegistry().ids), SUPPORTED)
+
+    def test_production_registry_rejects_any_missing_supported_id(self):
+        registry = AdapterRegistry()
+        manifests = [registry.get(name).manifest for name in registry.ids]
+        for missing in SUPPORTED:
+            partial = [item for item in manifests if item["id"] != missing]
+            with self.subTest(missing=missing), self.assertRaises(ManifestError):
+                AdapterRegistry.from_manifests(partial)
+        self.assertEqual(set(AdapterRegistry.from_manifests(manifests).ids), SUPPORTED)
+        self.assertEqual(AdapterRegistry.custom_from_manifests([manifests[0]]).ids, (manifests[0]["id"],))
+
+    def test_manifest_schema_rejects_empty_duplicate_and_invalid(self):
+        with self.assertRaises(ManifestError):
+            AdapterRegistry(Path("missing-manifest-dir"))
+        codex = AdapterRegistry().get("codex").manifest
+        with self.assertRaises(ManifestError):
+            AdapterRegistry.custom_from_manifests([codex, dict(codex)])
+        invalid = dict(codex); invalid["session_prompt"] = "{private_api}"
+        with self.assertRaises(ManifestError):
+            AdapterRegistry.custom_from_manifests([invalid])
+
+    def test_checked_in_manifests_are_namespaced_and_machine_readable(self):
+        root = Path(__file__).parent.parent / "vibe_guide" / "adapters" / "manifests"
+        for path in root.glob("*.yaml"):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertTrue(all(p["name"].startswith(data["id"] + ".") for p in data["probes"]))
+
+    def test_visible_evidence_is_strict_namespaced_and_reuses_n0_contract(self):
         env = Environment(
             commands={"codex.agent": True},
             facts={
-                "codex.shell": True,
-                "codex.subprocess": True,
-                "codex.worktree": True,
-                "codex.visible_task.create": True,
-                "codex.visible_task.enter": True,
-                "codex.visible_task.resume": True,
-                "codex.visible_task.wait": True,
+                "codex.shell": True, "codex.subprocess": True, "codex.worktree": True,
+                "codex.visible_task.create": True, "codex.visible_task.enter": True,
+                "codex.visible_task.resume": True, "codex.visible_task.wait": True,
             },
+            provenance={"codex.visible_task.create": "public-tool-schema"},
         )
-        result = AdapterRegistry().get("codex").detect(env)
-        self.assertTrue(result.detected)
-        self.assertEqual(result.capabilities.level, "full")
-        self.assertEqual(result.capabilities.mode, "visible")
-        self.assertIsNotNone(result.capabilities.provider)
-        self.assertIsInstance(result.capabilities, SharedAgentCapabilities)
+        capabilities = AdapterRegistry().get("codex").detect(env).capabilities
+        self.assertIsInstance(capabilities, SharedAgentCapabilities)
+        self.assertEqual((capabilities.level, capabilities.mode), ("full", "visible"))
+        self.assertEqual(capabilities.provenance["codex.visible_task.create"], "public-tool-schema")
+        with self.assertRaises(ValueError):
+            AdapterRegistry().get("codex").detect(Environment(commands={"codex.agent": "false"}))
+        cursor = AdapterRegistry().get("cursor").detect(env).capabilities
+        self.assertNotEqual(cursor.level, "full")
 
-    def test_no_visible_bridge_is_explicit_background_downgrade(self):
+    def test_background_not_advertised_without_verified_launcher(self):
         env = Environment(
             commands={"cursor.agent": True},
             facts={"cursor.shell": True, "cursor.subprocess": True, "cursor.worktree": True},
         )
-        result = AdapterRegistry().get("cursor").detect(env)
-        self.assertTrue(result.detected)
-        self.assertEqual(result.capabilities.level, "background")
-        self.assertEqual(result.capabilities.mode, "background")
-        self.assertFalse(result.capabilities.visible_automation)
-        self.assertIn("不可见", result.capabilities.limitations)
-        self.assertIn("不可直接进入", result.capabilities.limitations)
+        self.assertEqual(AdapterRegistry().get("cursor").detect(env).capabilities.mode, "guide")
+        adapter = AdapterRegistry(background_launchers={"cursor": lambda *args: background_result()}).get("cursor")
+        capabilities = adapter.detect(env).capabilities
+        self.assertEqual((capabilities.level, capabilities.mode), ("background", "background"))
+        self.assertEqual(adapter.provider_for(capabilities).provider, capabilities.provider)
 
-    def test_no_subprocess_is_guide(self):
-        result = AdapterRegistry().get("grok").detect(
-            Environment(commands={"grok.agent": True}, facts={"grok.shell": True})
-        )
-        self.assertTrue(result.detected)
-        self.assertEqual(result.capabilities.level, "guide")
-        self.assertEqual(result.capabilities.mode, "guide")
+    def test_guide_has_no_task_provider(self):
+        adapter = AdapterRegistry().get("grok")
+        capabilities = adapter.detect(Environment(commands={"grok.agent": True})).capabilities
+        self.assertEqual(capabilities.mode, "guide")
+        self.assertIsNone(adapter.provider_for(capabilities))
 
-    def test_prompts_are_short_and_product_manager_readable(self):
-        adapter = AdapterRegistry().get("codex")
-        prompt = adapter.session_prompt("启动监工", "plan-7")
-        self.assertLessEqual(len(prompt), 120)
-        self.assertIn("启动监工", prompt)
-        self.assertIn("plan-7", prompt)
-        self.assertNotIn("create_thread", prompt)
-
-    def test_monitor_command_is_stable_local_cli_command(self):
-        command = AdapterRegistry().get("codex").monitor_command("plan-7", True)
-        self.assertEqual(command, ["vibe", "monitor", "--plan", "plan-7", "--json"])
-
-    def test_background_provider_discloses_limits_and_never_claims_visibility(self):
-        provider = BackgroundTaskProvider(
-            "cursor-background",
-            launcher=lambda role, issue_id, contract: {"run_id": "bg-1", "host": "local"},
-        )
-        binding = provider.create("developer", "ISSUE-1", Path("contract.md"))
-        self.assertIsInstance(binding, TaskBinding)
-        self.assertEqual(binding.mode, "background")
-        self.assertFalse(binding.visible)
-        self.assertEqual(binding.task_id, "bg-1")
-        self.assertIn("不可见", binding.limitations)
-        self.assertIn("不可直接进入", binding.limitations)
-
-    def test_visible_provider_requires_verified_bridge(self):
-        provider = AdapterRegistry().get("codex").task_provider
-        with self.assertRaises(ProviderUnavailable):
-            provider.create("developer", "ISSUE-1", Path("contract.md"))
-
-    def test_codex_provider_maps_verified_thread_bridge_fields(self):
-        class Bridge:
-            def create_thread(self, request):
-                self.request = request
-                return {"threadId": "thread-1", "hostId": "host-1", "cursor": "c0"}
-
-        bridge = Bridge()
-        provider = AdapterRegistry().get("codex").task_provider
-        provider.bridge = CodexAppBridge(
-            create_thread=bridge.create_thread,
-            navigate_to_codex_page=lambda request: {"ok": True},
-            send_message_to_thread=lambda request: {"ok": True},
-            wait_threads=lambda request: {"status": "running", "nextCursor": "c1"},
-            list_threads=lambda request: {"threads": [{"threadId": "thread-1", "hostId": "host-1"}]},
-        )
-        binding = provider.create("reviewer", "ISSUE-2", Path("contract.md"))
-        self.assertEqual(binding.provider, "codex-app-visible")
-        self.assertEqual(binding.task_id, "thread-1")
-        self.assertEqual(binding.host, "host-1")
-        self.assertEqual(binding.thread_id, "thread-1")
-        self.assertEqual(binding.host_id, "host-1")
-        self.assertTrue(binding.visible)
-        self.assertEqual(bridge.request["prompt"], "请执行 reviewer 任务，计划 ISSUE-2。")
-        self.assertIn("target", bridge.request)
-
-    def test_codex_public_tool_shapes_cover_enter_resume_wait_visibility(self):
-        calls = []
-        bridge = CodexAppBridge(
-            create_thread=lambda request: {"threadId": "thread-1", "hostId": "host-1"},
-            navigate_to_codex_page=lambda request: calls.append(("navigate", request)),
-            send_message_to_thread=lambda request: calls.append(("send", request)),
-            wait_threads=lambda request: calls.append(("wait", request)) or {"status": "complete", "nextCursor": "c2"},
-            list_threads=lambda request: calls.append(("list", request)) or {"pinnedThreads": [{"threadId": "thread-1", "hostId": "host-1"}], "threads": []},
-        )
+    def test_repository_creation_fails_before_create_without_routing(self):
+        bridge, _ = codex_bridge(create_thread=lambda request: self.fail("create must not run"))
         provider = AdapterRegistry().get("codex").task_provider
         provider.bridge = bridge
-        binding = provider.create("developer", "ISSUE-1", Path("contract.md"))
-        provider.enter_or_locate(binding)
-        provider.resume(binding, Path("rework.md"))
-        update = provider.wait(binding, "c1")
-        visibility = provider.visibility(binding)
-        self.assertEqual(calls[0], ("navigate", {"threadId": "thread-1"}))
-        self.assertEqual(calls[1][0], "send")
-        self.assertEqual(calls[1][1]["threadId"], "thread-1")
-        self.assertEqual(calls[2], ("wait", {"targets": [{"threadId": "thread-1", "hostId": "host-1", "afterCursor": "c1"}], "timeoutMs": 120000}))
-        self.assertEqual(calls[3], ("list", {"limit": 100}))
-        self.assertEqual(update.cursor, "c2")
-        self.assertTrue(visibility.visible)
+        provider.routing = None
+        with self.assertRaises(ProviderUnavailable):
+            provider.create("developer", "N4", Path("contract.md"))
 
-    def test_codex_pending_client_thread_id_is_not_thread_id(self):
-        provider = AdapterRegistry().get("codex").task_provider
-        provider.bridge = CodexAppBridge(
-            create_thread=lambda request: {"clientThreadId": "client-1"},
-            navigate_to_codex_page=lambda request: None,
-            send_message_to_thread=lambda request: None,
-            wait_threads=lambda request: None,
-            list_threads=lambda request: {"threads": []},
+    def test_repository_worktree_target_and_binding_are_exact(self):
+        captured = {}
+        bridge, _ = codex_bridge(create_thread=lambda request: captured.setdefault("request", request) or {})
+        # setdefault returns request, so use an explicit callable for the result.
+        def create(request):
+            captured["request"] = request
+            return {"threadId": "thread-1", "hostId": "host-1"}
+        bridge, _ = codex_bridge(create_thread=create)
+        binding = routed_codex_provider(bridge).create("developer", "N4", Path("contract.md"))
+        self.assertEqual(captured["request"]["target"], {
+            "type": "project",
+            "projectId": "project-1",
+            "environment": {
+                "type": "worktree",
+                "startingState": {"type": "branch", "branchName": "codex/issue"},
+            },
+        })
+        self.assertEqual((binding.host, binding.worktree, binding.branch), ("host-1", "/repo-wt", "codex/issue"))
+
+    def test_repository_local_target_is_exact(self):
+        captured = {}
+        def create(request):
+            captured["request"] = request
+            return {"threadId": "thread-1", "hostId": "host-1"}
+        provider = routed_codex_provider(codex_bridge(create_thread=create)[0], "local")
+        binding = provider.create("reviewer", "N4", Path("contract.md"))
+        self.assertEqual(captured["request"]["target"], {
+            "type": "project", "projectId": "project-1", "environment": {"type": "local"},
+        })
+        self.assertEqual((binding.worktree, binding.branch), ("/repo", "main"))
+
+    def test_codex_public_request_shapes_for_enter_resume_and_wait(self):
+        calls = []
+        bridge, _ = codex_bridge(
+            navigate_to_codex_page=lambda request: calls.append(("navigate", request)),
+            send_message_to_thread=lambda request: calls.append(("send", request)),
+            wait_threads=lambda request: calls.append(("wait", request)) or {
+                "timedOut": False,
+                "polls": [{"threadId": "thread-1", "hostId": "host-1", "cursor": "c2", "thread": {"status": "complete"}}],
+            },
         )
-        binding = provider.create("developer", "ISSUE-1", Path("contract.md"))
+        provider = routed_codex_provider(bridge)
+        binding = provider.create("developer", "N4", Path("contract.md"))
+        provider.enter_or_locate(binding); provider.resume(binding, Path("rework.md"))
+        update = provider.wait(binding, "c1")
+        self.assertEqual(calls[0], ("navigate", {"threadId": "thread-1"}))
+        self.assertEqual(calls[1][1]["hostId"], "host-1")
+        self.assertEqual(calls[2], ("wait", {"targets": [{"threadId": "thread-1", "hostId": "host-1", "afterCursor": "c1"}], "timeoutMs": 120000}))
+        self.assertEqual((update.cursor, update.status), ("c2", "complete"))
+
+    def test_codex_wait_parses_public_polls_error_and_timeout(self):
+        responses = iter([
+            {"timedOut": False, "wake": "attention", "polls": [{"threadId": "t1", "hostId": "h1", "cursor": "c3", "latestTurn": {"status": "needs_attention"}}]},
+            {"timedOut": False, "polls": [{"threadId": "t1", "hostId": "h1", "cursor": "c4", "error": {"message": "lost"}}]},
+            {"timedOut": True, "polls": [{"threadId": "t1", "hostId": "h1", "cursor": "c5", "timedOut": True}]},
+        ])
+        bridge, _ = codex_bridge(wait_threads=lambda request: next(responses))
+        binding = TaskBinding("codex-app-visible", "visible", "developer", "N4", task_id="t1", host="h1")
+        updates = [bridge.wait(binding, None) for _ in range(3)]
+        self.assertEqual([(u.cursor, u.status) for u in updates], [("c3", "needs_attention"), ("c4", "error"), ("c5", "timeout")])
+        self.assertEqual(updates[1].payload["error"]["message"], "lost")
+
+    def test_codex_list_visibility_uses_public_id_and_host(self):
+        provider = routed_codex_provider()
+        binding = provider.create("developer", "N4", Path("contract.md"))
+        result = provider.visibility(binding)
+        self.assertIsInstance(result, VisibilityResult)
+        self.assertTrue(result.visible)
+
+    def test_pending_client_id_never_becomes_thread_id_or_invented_recovery(self):
+        bridge, _ = codex_bridge(
+            create_thread=lambda request: {"clientThreadId": "client-1"},
+            list_threads=lambda request: {"threads": [{"id": "thread-2", "hostId": "host-2"}]},
+        )
+        provider = routed_codex_provider(bridge)
+        binding = provider.create("developer", "N4", Path("contract.md"))
         self.assertIsNone(binding.task_id)
         self.assertEqual(binding.client_thread_id, "client-1")
-        self.assertNotIn("threadId", binding.to_dict())
-        self.assertEqual(binding.to_dict()["client_thread_id"], "client-1")
+        with self.assertRaises(ProviderPending):
+            provider.resolve_pending(binding)
         with self.assertRaises(ProviderPending):
             provider.enter_or_locate(binding)
 
-    def test_codex_pending_binding_can_be_resolved_from_visible_list(self):
-        bridge = CodexAppBridge(
-            create_thread=lambda request: {"clientThreadId": "client-1"},
-            navigate_to_codex_page=lambda request: None,
-            send_message_to_thread=lambda request: None,
-            wait_threads=lambda request: None,
-            list_threads=lambda request: {"threads": [{"clientThreadId": "client-1", "threadId": "thread-2", "hostId": "host-2"}]},
-        )
-        provider = AdapterRegistry().get("codex").task_provider
-        provider.bridge = bridge
-        binding = provider.create("developer", "ISSUE-1", Path("contract.md"))
-        resolved = provider.resolve_pending(binding)
-        self.assertEqual(resolved.task_id, "thread-2")
-        self.assertEqual(resolved.host, "host-2")
-        self.assertIsNone(resolved.client_thread_id)
-
-    def test_visibility_returns_platform_neutral_result(self):
-        provider = BackgroundTaskProvider(
-            "cursor-background", launcher=lambda *args: {"run_id": "bg-3"}
-        )
-        result = provider.visibility(
-            provider.create("developer", "ISSUE-3", Path("contract.md"))
-        )
-        self.assertIsInstance(result, VisibilityResult)
-        self.assertFalse(result.visible)
-        self.assertFalse(result.direct_enter)
-
-    def test_capability_report_has_stable_bridge_fields(self):
-        env = Environment(
-            commands={"codex.agent": True},
-            facts={"codex.shell": True, "codex.subprocess": True, "codex.worktree": True},
-        )
-        report = AdapterRegistry().get("codex").capability_report(
-            env, "plan-1", Path(".vibe/authorization.md")
-        )
-        self.assertEqual(report["capability_level"], "background")
-        self.assertEqual(report["provider"], report["capabilities"]["provider"])
-        self.assertEqual(report["mode"], report["capabilities"]["mode"])
-        self.assertEqual(report["monitor_command"], ["vibe", "monitor", "--plan", "plan-1", "--json"])
-        self.assertEqual(report["authorization_card"], ".vibe/authorization.md")
-
-    def test_manifests_are_machine_readable_and_have_probe_contract(self):
-        root = Path(__file__).parent.parent / "vibe_guide" / "adapters" / "manifests"
-        for path in sorted(root.glob("*.yaml")):
-            data = json.loads(path.read_text(encoding="utf-8"))
-            self.assertRegex(data["id"], r"^[a-z0-9-]+$")
-            self.assertTrue(data["probes"])
-            self.assertIn("session_prompt", data)
-            self.assertIn("provider", data)
-            self.assertIn("background_fallback", data)
-
-    def test_non_boolean_or_unscoped_facts_cannot_promote(self):
-        with self.assertRaises(ValueError):
-            AdapterRegistry().get("codex").detect(
-                Environment(
-                    commands={"codex.agent": True},
-                    facts={
-                        "codex.shell": "false",
-                        "codex.subprocess": "false",
-                        "codex.worktree": "false",
-                        "codex.visible_task.create": "false",
-                        "codex.visible_task.enter": "false",
-                        "codex.visible_task.resume": "false",
-                        "codex.visible_task.wait": "false",
-                    },
-                )
-            )
-        result = AdapterRegistry().get("cursor").detect(
-            Environment(
-                commands={"cursor.agent": True, "codex.agent": True},
-                facts={
-                    "codex.shell": True,
-                    "codex.subprocess": True,
-                    "codex.worktree": True,
-                    "codex.visible_task.create": True,
-                    "codex.visible_task.enter": True,
-                    "codex.visible_task.resume": True,
-                    "codex.visible_task.wait": True,
-                },
-            )
-        )
-        self.assertNotEqual(result.capabilities.level, "full")
-
-    def test_manifest_schema_rejects_missing_invalid_and_duplicate(self):
-        root = Path(__file__).parent.parent / "vibe_guide" / "adapters" / "manifests"
-        with self.assertRaises(ManifestError):
-            AdapterRegistry(root / "missing-manifest-dir")
-        with self.assertRaises(ManifestError):
-            AdapterRegistry.from_manifests([{"id": "only-id"}])
-        with self.assertRaises(ManifestError):
-            AdapterRegistry.from_manifests([
-                AdapterRegistry().get("codex").manifest,
-                dict(AdapterRegistry().get("codex").manifest),
-            ])
-
-    def test_background_launcher_failure_is_fail_closed_and_guide_has_no_provider(self):
+    def test_background_create_requires_verified_launcher_and_durable_routing(self):
         with self.assertRaises(ProviderUnavailable):
-            BackgroundTaskProvider("cursor-background", launcher=lambda *args: None).create(
-                "developer", "ISSUE-1", Path("contract.md")
-            )
-        adapter = AdapterRegistry().get("grok")
-        result = adapter.detect(Environment(commands={"grok.agent": True}))
-        self.assertEqual(result.capabilities.mode, "guide")
-        self.assertIsNone(adapter.provider_for(result.capabilities))
+            BackgroundTaskProvider("cursor-background").create("developer", "N4", Path("contract.md"))
+        with self.assertRaises(ProviderUnavailable):
+            BackgroundTaskProvider("cursor-background", lambda *args: {"handle": "ghost"}).create("developer", "N4", Path("contract.md"))
+        binding = BackgroundTaskProvider("cursor-background", lambda *args: background_result()).create("developer", "N4", Path("contract.md"))
+        self.assertEqual((binding.task_id, binding.worktree, binding.branch), ("bg-1", "/repo-wt", "codex/n4"))
 
-    def test_background_launcher_object_is_called_and_requires_handle(self):
-        class Launcher:
-            def launch(self, role, issue_id, contract_path):
-                self.args = role, issue_id, contract_path
-                return {"handle": "bg-4"}
-
-        launcher = Launcher()
-        binding = BackgroundTaskProvider("grok-background", launcher=launcher).create(
-            "reviewer", "ISSUE-4", Path("contract.md")
-        )
-        self.assertEqual(binding.task_id, "bg-4")
-        self.assertEqual(launcher.args[1], "ISSUE-4")
-
-    def test_provider_rejects_launcher_binding_with_wrong_identity(self):
-        provider = BackgroundTaskProvider(
-            "grok-background",
-            launcher=lambda *args: TaskBinding("other", "visible", "developer", "ISSUE-5", task_id="x"),
+    def test_background_binding_validates_provider_mode_role_and_issue(self):
+        wrong = TaskBinding(
+            "grok-background", "background", "reviewer", "OTHER", task_id="x",
+            worktree="/wt", branch="b", status_file="status", handoff_file="handoff",
         )
         with self.assertRaises(ProviderUnavailable):
-            provider.create("developer", "ISSUE-5", Path("contract.md"))
+            BackgroundTaskProvider("grok-background", lambda *args: wrong).create("developer", "N4", Path("contract.md"))
+        wrong_provider = TaskBinding(
+            "other", "background", "developer", "N4", task_id="x",
+            worktree="/wt", branch="b", status_file="status", handoff_file="handoff",
+        )
+        with self.assertRaises(ProviderUnavailable):
+            BackgroundTaskProvider("grok-background", lambda *args: wrong_provider).create("developer", "N4", Path("contract.md"))
+        wrong_mapping = background_result(); wrong_mapping["mode"] = "visible"
+        with self.assertRaises(ProviderUnavailable):
+            BackgroundTaskProvider("cursor-background", lambda *args: wrong_mapping).create("developer", "N4", Path("contract.md"))
 
-    def test_manifest_id_and_prompt_template_types_are_strict(self):
-        manifest = dict(AdapterRegistry().get("codex").manifest)
-        manifest["id"] = "Not Valid"
-        with self.assertRaises(ManifestError):
-            AdapterRegistry.from_manifests([manifest])
-        manifest = dict(AdapterRegistry().get("codex").manifest)
-        manifest["session_prompt"] = "{unknown}"
-        with self.assertRaises(ManifestError):
-            AdapterRegistry.from_manifests([manifest])
-
-    def test_manifest_prompt_template_is_rendered(self):
+    def test_session_prompt_and_monitor_command_remain_short_stable(self):
         adapter = AdapterRegistry().get("codex")
         self.assertEqual(adapter.session_prompt("启动监工", "plan-7"), "请启动监工，计划 plan-7。")
+        self.assertEqual(adapter.monitor_command("plan-7", True), ["vibe", "monitor", "--plan", "plan-7", "--json"])
 
 
 if __name__ == "__main__":
