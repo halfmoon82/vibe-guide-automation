@@ -13,6 +13,7 @@ from vibe_guide.state import (
     RunSnapshot,
     acquire_writer_lease,
     append_event,
+    interprocess_lock,
     load_snapshot,
     release_writer_lease,
     save_snapshot,
@@ -39,6 +40,13 @@ def _leave_dead_event_lock(root):
         json.dumps({"pid": os.getpid(), "owner": "dead-owner"}),
         encoding="utf-8",
     )
+    os._exit(0)
+
+
+def _crash_after_empty_lock_create(lock_path):
+    path = Path(lock_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os._exit(0)
 
 
@@ -230,7 +238,74 @@ class StateTests(unittest.TestCase):
             RunEvent("recovered", {"run_id": "run-dead-lock"}),
         )
 
-        self.assertFalse(lock_path.exists())
+        self.assertTrue(lock_path.exists())
+        append_event(
+            self.paths,
+            RunEvent("recovered-again", {"run_id": "run-dead-lock"}),
+        )
+
+    def test_every_durable_event_class_redacts_secrets_and_provider_text(self):
+        sentinel = "EVENT_SECRET_SENTINEL"
+        event_names = (
+            "run_started",
+            "start_intent",
+            "start_confirmed",
+            "delivered",
+            "complete",
+            "review_finding",
+            "accepted",
+            "unknown",
+            "timeout",
+            "blocked_unknown",
+            "failed",
+            "stopped",
+            "terminal_failed",
+        )
+        for index, event_name in enumerate(event_names):
+            append_event(
+                self.paths,
+                RunEvent(
+                    event_name,
+                    {
+                        "run_id": "run-redaction",
+                        "node_id": "n1",
+                        "Token": sentinel,
+                        "nested": {"Api-Key": sentinel, "safe": sentinel},
+                        "evidence": sentinel,
+                        "finding": sentinel,
+                        "reason": sentinel,
+                        "exception": sentinel,
+                        "offset": index,
+                    },
+                ),
+            )
+
+        event_path = Path(self.temporary.name) / ".vibe/runs/run-redaction/events.jsonl"
+        self.assertNotIn(sentinel, event_path.read_text(encoding="utf-8"))
+
+    def test_empty_lock_initialization_crash_recovers_for_all_lock_classes(self):
+        root = Path(self.temporary.name)
+        lock_paths = (
+            root / ".vibe/runs/run-empty/.events.lock",
+            root / ".vibe/runs/run-empty/.state.lock",
+            root / ".vibe/.leases.lock",
+            root / ".vibe/.task-registry.lock",
+        )
+        context = multiprocessing.get_context("fork")
+        for lock_path in lock_paths:
+            with self.subTest(lock_path=lock_path):
+                process = context.Process(
+                    target=_crash_after_empty_lock_create, args=(str(lock_path),)
+                )
+                process.start()
+                process.join(5)
+                self.assertEqual(process.exitcode, 0)
+                self.assertEqual(lock_path.read_bytes(), b"")
+
+                with interprocess_lock(lock_path, timeout=0.5):
+                    self.assertTrue(lock_path.exists())
+
+                self.assertTrue(lock_path.exists())
 
 
 if __name__ == "__main__":

@@ -210,7 +210,21 @@ class TaskRegistryTests(unittest.TestCase):
 
         save_task_binding(self.paths, self.binding())
 
-        self.assertFalse(lock_path.exists())
+        self.assertTrue(lock_path.exists())
+        save_task_binding(self.paths, self.binding())
+
+    def test_binding_run_id_must_match_its_parent_registry_directory(self):
+        save_task_binding(self.paths, self.binding())
+        current = Path(self.temporary.name) / ".vibe/runs/run-1/tasks.json"
+        foreign = Path(self.temporary.name) / ".vibe/runs/foreign-run/tasks.json"
+        foreign.parent.mkdir(parents=True)
+        foreign.write_bytes(current.read_bytes())
+        current.unlink()
+
+        with self.assertRaises((FileNotFoundError, ValueError)):
+            load_task_binding(
+                self.paths, "N3", "developer", run_id="run-1"
+            )
 
 
 if __name__ == "__main__":

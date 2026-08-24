@@ -19,6 +19,7 @@ from .state import (
     load_events,
     load_snapshot,
     quarantine_writer_lease,
+    redact_provider_text,
     release_writer_lease,
     save_snapshot,
 )
@@ -122,7 +123,7 @@ class Monitor:
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
-                    "runner poll failed: " + str(error),
+                    "runner poll failed ({})".format(type(error).__name__),
                 )
                 continue
             for event in events:
@@ -268,7 +269,9 @@ class Monitor:
             self._mark_blocked_unknown(
                 snapshot,
                 node_id,
-                "task binding rejected before start: " + str(error),
+                "task binding rejected before start ({})".format(
+                    type(error).__name__
+                ),
             )
             return False
 
@@ -304,7 +307,22 @@ class Monitor:
             self._mark_blocked_unknown(
                 snapshot,
                 node_id,
-                "worker start outcome is unknown: " + str(error),
+                "worker start outcome is unknown ({})".format(
+                    type(error).__name__
+                ),
+            )
+            save_snapshot(self.paths, snapshot)
+            return False
+
+        if (
+            not isinstance(handle.run_id, str)
+            or not handle.run_id
+            or handle.run_id in snapshot.handles.values()
+        ):
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "provider returned a duplicate or invalid active handle",
             )
             save_snapshot(self.paths, snapshot)
             return False
@@ -336,7 +354,9 @@ class Monitor:
             self._mark_blocked_unknown(
                 snapshot,
                 node_id,
-                "confirmed task binding cannot be updated: " + str(error),
+                "confirmed task binding cannot be updated ({})".format(
+                    type(error).__name__
+                ),
             )
             save_snapshot(self.paths, snapshot)
             return False
@@ -451,7 +471,7 @@ class Monitor:
                 snapshot, node_id, "event arrived from an unregistered handle"
             )
             return
-        if not self._event_claims_match(event, active):
+        if not self._event_claims_match(event, node_id, active):
             self._mark_blocked_unknown(
                 snapshot, node_id, "event provenance conflicts with the registered task"
             )
@@ -459,7 +479,7 @@ class Monitor:
 
         evidence = event.data.get("evidence") or event.data.get("finding")
         if evidence is not None:
-            current.setdefault("evidence", []).append(evidence)
+            current.setdefault("evidence", []).append(redact_provider_text(evidence))
         role = active["role"]
 
         if event.event in {"delivered", "complete"}:
@@ -471,7 +491,9 @@ class Monitor:
                     self._mark_blocked_unknown(
                         snapshot,
                         node_id,
-                        "task binding cannot record review state: " + str(error),
+                        "task binding cannot record review state ({})".format(
+                            type(error).__name__
+                        ),
                     )
                     return
                 current["status"] = "review"
@@ -482,7 +504,9 @@ class Monitor:
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
-                    "task binding cannot record delivery: " + str(error),
+                    "task binding cannot record delivery ({})".format(
+                        type(error).__name__
+                    ),
                 )
                 return
             current["status"] = "delivered"
@@ -506,8 +530,8 @@ class Monitor:
             self._record_runner_event(snapshot, node_id, event, active)
             if not event.data.get("in_contract", False):
                 current["status"] = "blocked_design"
-                current["reason"] = event.data.get(
-                    "finding", "out-of-contract finding"
+                current["reason"] = redact_provider_text(
+                    event.data.get("finding", "out-of-contract finding")
                 )
                 current["active_role"] = None
                 current["active_task"] = None
@@ -531,7 +555,9 @@ class Monitor:
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
-                    "reviewer binding cannot be verified: " + str(error),
+                    "reviewer binding cannot be verified ({})".format(
+                        type(error).__name__
+                    ),
                 )
                 return
             if (
@@ -549,7 +575,9 @@ class Monitor:
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
-                    "task binding cannot record acceptance: " + str(error),
+                    "task binding cannot record acceptance ({})".format(
+                        type(error).__name__
+                    ),
                 )
                 return
             current["status"] = "accepted"
@@ -560,7 +588,9 @@ class Monitor:
             self._release_node_lease(snapshot, node_id)
         elif event.event in {"unknown", "timeout", "state_unknown", "visibility_unknown"}:
             self._mark_blocked_unknown(
-                snapshot, node_id, event.data.get("reason", event.event)
+                snapshot,
+                node_id,
+                str(redact_provider_text(event.data.get("reason", event.event))),
             )
         elif event.event in {"failed", "stopped", "terminal_failed"}:
             self._record_runner_event(snapshot, node_id, event, active)
@@ -571,11 +601,15 @@ class Monitor:
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
-                    "task binding cannot record terminal state: " + str(error),
+                    "task binding cannot record terminal state ({})".format(
+                        type(error).__name__
+                    ),
                 )
                 return
             current["status"] = terminal_status
-            current["reason"] = event.data.get("reason", event.event)
+            current["reason"] = redact_provider_text(
+                event.data.get("reason", event.event)
+            )
             current["active_role"] = None
             current["active_task"] = None
             current["quarantine"] = None
@@ -587,17 +621,17 @@ class Monitor:
             )
 
     @staticmethod
-    def _event_claims_match(event: RunEvent, active: Dict[str, Any]) -> bool:
+    def _event_claims_match(
+        event: RunEvent, node_id: str, active: Dict[str, Any]
+    ) -> bool:
         claims = {
+            "node_id": node_id,
             "role": active.get("role"),
             "task_id": active.get("task_id"),
             "handle_id": active.get("handle_id"),
             "generation": active.get("generation"),
         }
-        return all(
-            key not in event.data or event.data[key] == value
-            for key, value in claims.items()
-        )
+        return all(event.data.get(key) == value for key, value in claims.items())
 
     def _record_runner_event(
         self,
@@ -752,6 +786,11 @@ class Monitor:
             or provenance.get("handle_id") != handle_id
         ):
             raise ValueError("start confirmation provenance is invalid")
+        if any(
+            other_node != node_id and other_handle == handle_id
+            for other_node, other_handle in snapshot.handles.items()
+        ):
+            raise ValueError("start confirmation duplicates an active handle")
         binding = load_task_binding(
             self.paths,
             node_id,
@@ -852,6 +891,7 @@ class Monitor:
                     snapshot, node_id, str(provenance["role"]), terminal_status
                 )
                 current["status"] = terminal_status
+                current["reason"] = data.get("reason", record["event"])
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
@@ -898,7 +938,7 @@ class Monitor:
             snapshot.status = "blocked_unknown"
         elif "blocked_design" in statuses:
             snapshot.status = "blocked_design"
-        elif "failed" in statuses:
+        elif "failed" in statuses or "stopped" in statuses:
             snapshot.status = "failed"
         else:
             snapshot.status = "running"

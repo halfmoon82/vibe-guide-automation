@@ -130,6 +130,31 @@ class AuthorizationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_authorization_card(plan, [secret_node], self.capabilities)
 
+    def test_action_values_are_canonicalized_and_all_deploy_shapes_are_rejected(self):
+        plan = Plan("plan-actions", 1, "docs/prd.md", ["n1"], "draft")
+        canonical = node("n1", ["safe.py"])
+        canonical.contract["action"] = "develop"
+        decorated = deepcopy(canonical)
+        decorated.contract["action"] = "  DeVeLoP  "
+
+        self.assertEqual(
+            build_authorization_card(plan, [canonical], self.capabilities).digest,
+            build_authorization_card(plan, [decorated], self.capabilities).digest,
+        )
+
+        variants = (
+            {"action": "DEPLOY"},
+            {"actions": ["test", " Deploy "]},
+            {"provider": {"requested_actions": ["commit", "dEpLoY"]}},
+            {"provider": {"nested": {"allowed-actions": " DEPLOY "}}},
+        )
+        for contract_update in variants:
+            with self.subTest(contract=contract_update):
+                candidate = node("n1", ["safe.py"])
+                candidate.contract.update(contract_update)
+                with self.assertRaises(ValueError):
+                    build_authorization_card(plan, [candidate], self.capabilities)
+
 
 if __name__ == "__main__":
     unittest.main()

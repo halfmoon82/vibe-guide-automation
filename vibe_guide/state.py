@@ -2,6 +2,8 @@
 
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -51,6 +53,108 @@ _PROVENANCE_KEYS = {
     "authorization_digest",
     "node_contract_digest",
 }
+_EVENT_DATA_KEYS = {
+    "authorization_digest",
+    "continuation",
+    "evidence",
+    "finding",
+    "generation",
+    "handle_id",
+    "in_contract",
+    "intent_id",
+    "node_contract_digest",
+    "node_id",
+    "node_ids",
+    "phase",
+    "reason",
+    "role",
+    "run_id",
+    "status",
+    "task_id",
+    "worker",
+}
+_SENSITIVE_DATA_NAMES = (
+    "api_key",
+    "credential",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+)
+_PROVIDER_TEXT_KEYS = {
+    "detail",
+    "error",
+    "evidence",
+    "exception",
+    "finding",
+    "message",
+    "output",
+    "reason",
+    "stderr",
+    "stdout",
+    "traceback",
+}
+_REDACTED = "[REDACTED]"
+_REDACTED_PROVIDER_TEXT = "[REDACTED_PROVIDER_TEXT]"
+
+
+def _normalize_data_key(key: str) -> str:
+    return key.strip().casefold().replace("-", "_")
+
+
+def _is_sensitive_data_key(key: str) -> bool:
+    normalized = _normalize_data_key(key)
+    if normalized.endswith("_digest") or normalized.endswith("_ref"):
+        return False
+    return any(name in normalized for name in _SENSITIVE_DATA_NAMES)
+
+
+def redact_provider_text(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [redact_provider_text(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_provider_text(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): redact_provider_text(item)
+            for key, item in value.items()
+            if not _is_sensitive_data_key(str(key))
+        }
+    return _REDACTED_PROVIDER_TEXT
+
+
+def _sanitize_durable_value(value: Any, key: Optional[str] = None) -> Any:
+    if key is not None:
+        if _is_sensitive_data_key(key):
+            return _REDACTED
+        if _normalize_data_key(key) in _PROVIDER_TEXT_KEYS:
+            return redact_provider_text(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_durable_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(item_key): _sanitize_durable_value(item_value, str(item_key))
+            for item_key, item_value in value.items()
+        }
+    return _REDACTED
+
+
+def _sanitize_event_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("event data is invalid")
+    result: Dict[str, Any] = {}
+    for key, value in data.items():
+        if not isinstance(key, str):
+            continue
+        normalized = _normalize_data_key(key)
+        if normalized not in _EVENT_DATA_KEYS or _is_sensitive_data_key(key):
+            continue
+        result[normalized] = _sanitize_durable_value(value, normalized)
+    return result
 
 
 @dataclass
@@ -155,21 +259,9 @@ def _atomic_bytes(path: Path, data: bytes) -> None:
             temporary_path.unlink()
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 @contextmanager
 def interprocess_lock(lock_path: Path, timeout: float = 10.0) -> Iterator[None]:
-    """Exclusive local-process lock with dead-PID recovery.
+    """Exclusive advisory lock whose kernel ownership survives partial metadata.
 
     This is intentionally a filesystem-local mutex, not a distributed lock.
     """
@@ -184,51 +276,41 @@ def interprocess_lock(lock_path: Path, timeout: float = 10.0) -> Iterator[None]:
         separators=(",", ":"),
     ).encode("utf-8")
     deadline = time.monotonic() + timeout
-    while True:
-        try:
-            descriptor = os.open(
-                str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
-            )
-        except FileExistsError:
-            if lock_path.is_symlink():
-                raise ValueError("lock path may not be a symlink")
-            try:
-                observed = lock_path.read_bytes()
-                holder = json.loads(observed.decode("utf-8"))
-                holder_pid = holder["pid"]
-                holder_owner = holder["owner"]
-                valid = (
-                    isinstance(holder_pid, int)
-                    and isinstance(holder_owner, str)
-                    and bool(holder_owner)
-                )
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
-                valid = False
-                holder_pid = -1
-            if valid and not _pid_alive(holder_pid):
-                try:
-                    if lock_path.read_bytes() == observed:
-                        lock_path.unlink()
-                        continue
-                except (FileNotFoundError, OSError):
-                    continue
-            if time.monotonic() >= deadline:
-                raise TimeoutError("timed out waiting for persistence lock")
-            time.sleep(0.01)
-            continue
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        break
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        yield
-    finally:
+        descriptor = os.open(str(lock_path), flags, 0o600)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError("lock path may not be a symlink") from error
+        raise
+    try:
         try:
-            if lock_path.read_bytes() == payload:
-                lock_path.unlink()
-        except FileNotFoundError:
-            pass
+            os.fchmod(descriptor, 0o600)
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("timed out waiting for persistence lock")
+                    time.sleep(0.01)
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(descriptor)
 
 
 def _event_lock(paths: ProjectPaths, run_id: str) -> Path:
@@ -348,7 +430,8 @@ def append_event(
     event: RunEvent,
     provenance: Optional[Dict[str, Any]] = None,
 ) -> int:
-    run_id = event.data.get("run_id")
+    sanitized_data = _sanitize_event_data(event.data)
+    run_id = sanitized_data.get("run_id")
     validate_run_id(run_id)
     directory = run_dir(paths, run_id, create=True)
     event_path = directory / "events.jsonl"
@@ -363,7 +446,7 @@ def append_event(
             "run_id": run_id,
             "event": event.event,
             "provenance": normalized_provenance,
-            "data": dict(event.data),
+            "data": sanitized_data,
             "previous_event_digest": records[-1]["event_digest"] if records else None,
         }
         record["event_digest"] = hashlib.sha256(
@@ -427,6 +510,8 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         raise ValueError("snapshot handles are invalid")
     if not set(snapshot.handles).issubset(snapshot.nodes):
         raise ValueError("snapshot handle node is unknown")
+    if len(set(snapshot.handles.values())) != len(snapshot.handles):
+        raise ValueError("snapshot active handles must be unique")
     for node_id, node in snapshot.nodes.items():
         if not isinstance(node, dict) or node.get("status") not in _NODE_STATUSES:
             raise ValueError("snapshot node state is invalid for " + node_id)
@@ -488,8 +573,9 @@ def save_snapshot(paths: ProjectPaths, snapshot: RunSnapshot) -> None:
     state_path = directory / "state.json"
     previous_path = directory / "state.previous.json"
     lock_path = directory / ".state.lock"
+    sanitized_snapshot = _sanitize_durable_value(snapshot.to_dict())
     serialized = json.dumps(
-        snapshot.to_dict(),
+        sanitized_snapshot,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -498,11 +584,19 @@ def save_snapshot(paths: ProjectPaths, snapshot: RunSnapshot) -> None:
         if state_path.exists():
             current = state_path.read_bytes()
             try:
-                _decode_snapshot(current, records)
+                previous_snapshot = _decode_snapshot(current, records)
             except (TypeError, ValueError):
                 pass
             else:
-                _atomic_bytes(previous_path, current)
+                _atomic_bytes(
+                    previous_path,
+                    json.dumps(
+                        _sanitize_durable_value(previous_snapshot.to_dict()),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8"),
+                )
         _atomic_bytes(state_path, serialized)
 
 
@@ -582,7 +676,7 @@ def quarantine_writer_lease(
         if payload.get("run_id") != run_id:
             return False
         payload["status"] = "quarantined"
-        payload["reason"] = reason
+        payload["reason"] = redact_provider_text(reason)
         _atomic_bytes(
             lease_path,
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),

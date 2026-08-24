@@ -239,7 +239,9 @@ def _run_tasks_path(paths: ProjectPaths, run_id: Optional[str], create: bool) ->
     return run_dir(paths, run_id, create=create) / "tasks.json"
 
 
-def _read_registry(path: Path) -> Tuple[int, List[TaskBinding]]:
+def _read_registry(
+    path: Path, expected_run_id: Optional[str] = None
+) -> Tuple[int, List[TaskBinding]]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -254,7 +256,12 @@ def _read_registry(path: Path) -> Tuple[int, List[TaskBinding]]:
         raise ValueError("task registry revision is invalid")
     if not isinstance(raw["bindings"], list):
         raise ValueError("task registry bindings must be a list")
-    return raw["revision"], [TaskBinding.from_dict(item) for item in raw["bindings"]]
+    bindings = [TaskBinding.from_dict(item) for item in raw["bindings"]]
+    if expected_run_id is not None:
+        validate_run_id(expected_run_id)
+        if any(binding.run_id != expected_run_id for binding in bindings):
+            raise ValueError("task binding run lineage does not match registry path")
+    return raw["revision"], bindings
 
 
 def _registry_paths(paths: ProjectPaths) -> Iterable[Path]:
@@ -284,7 +291,8 @@ def _registry_lock(paths: ProjectPaths) -> Path:
 def _all_bindings(paths: ProjectPaths) -> List[TaskBinding]:
     result: List[TaskBinding] = []
     for path in _registry_paths(paths):
-        _revision, bindings = _read_registry(path)
+        expected_run_id = validate_run_id(path.parent.name)
+        _revision, bindings = _read_registry(path, expected_run_id)
         result.extend(bindings)
     seen: Dict[Tuple[str, str], TaskBinding] = {}
     for binding in result:
@@ -316,7 +324,9 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding) -> None:
             elif current.task_id and current.task_id == persistent.task_id:
                 raise ValueError("developer and reviewer tasks must be distinct")
 
-        revision, destination_values = _read_registry(destination)
+        revision, destination_values = _read_registry(
+            destination, persistent.run_id
+        )
         replaced = False
         for index, current in enumerate(destination_values):
             if current.issue_id == persistent.issue_id and current.role == persistent.role:
@@ -350,11 +360,16 @@ def load_task_binding(
     lock_path = _registry_lock(paths)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with interprocess_lock(lock_path):
+        if run_id is None:
+            candidates = _all_bindings(paths)
+        else:
+            _revision, candidates = _read_registry(
+                _run_tasks_path(paths, run_id, create=False), run_id
+            )
         matches = [
             item
-            for item in _all_bindings(paths)
+            for item in candidates
             if item.issue_id == issue_id and item.role == role
-            and (run_id is None or item.run_id == run_id)
         ]
     if not matches:
         raise FileNotFoundError("no task binding for {} {}".format(issue_id, role))

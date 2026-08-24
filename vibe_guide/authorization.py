@@ -37,6 +37,22 @@ def _is_sensitive_key(key: str) -> bool:
     return any(name in normalized for name in _SENSITIVE_NAMES)
 
 
+def _normalize_action_value(value: Any, path: str) -> Any:
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if not normalized:
+            raise ValueError("executable action must not be empty at " + path)
+        if normalized in _EXCLUDED_ACTIONS:
+            raise ValueError("executable contract requests an excluded action")
+        return normalized
+    if isinstance(value, (list, tuple)):
+        return [
+            _normalize_action_value(item, "{}[{}]".format(path, index))
+            for index, item in enumerate(value)
+        ]
+    raise ValueError("executable action must be a string or list at " + path)
+
+
 def _normalize_contract(value: Any, path: str = "contract") -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -52,11 +68,11 @@ def _normalize_contract(value: Any, path: str = "contract") -> Any:
                 raise ValueError("executable contract keys must be strings")
             if _is_sensitive_key(key):
                 raise ValueError("raw secret fields are forbidden in executable contracts")
-            item = _normalize_contract(value[key], path + "." + key)
+            item_path = path + "." + key
             if key.casefold().replace("-", "_") in _ACTION_KEYS:
-                requested = item if isinstance(item, list) else [item]
-                if any(str(action) in _EXCLUDED_ACTIONS for action in requested):
-                    raise ValueError("executable contract requests an excluded action")
+                item = _normalize_action_value(value[key], item_path)
+            else:
+                item = _normalize_contract(value[key], item_path)
             result[key] = item
         return result
     raise ValueError("executable contract must be JSON-safe at " + path)

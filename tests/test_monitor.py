@@ -12,7 +12,7 @@ from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.state import acquire_writer_lease, append_event
-from vibe_guide.task_registry import TaskBinding, load_task_binding, save_task_binding
+from vibe_guide.task_registry import load_task_binding
 
 
 class StartResponseLostRunner(FakeRunner):
@@ -24,6 +24,28 @@ class StartResponseLostRunner(FakeRunner):
 class PollResponseLostRunner(FakeRunner):
     def poll(self, handle: RunHandle):
         raise ConnectionError("poll response lost")
+
+
+class DuplicateHandleRunner(FakeRunner):
+    def start(self, contract, worktree):
+        super().start(contract, worktree)
+        return RunHandle("shared-handle")
+
+
+class UnclaimedEventRunner(FakeRunner):
+    def poll(self, handle: RunHandle):
+        return [RunEvent("delivered", {"evidence": "unclaimed"})]
+
+
+class SecretStartResponseLostRunner(FakeRunner):
+    def start(self, contract, worktree):
+        super().start(contract, worktree)
+        raise ConnectionError("START_EXCEPTION_SECRET_SENTINEL")
+
+
+class SecretPollResponseLostRunner(FakeRunner):
+    def poll(self, handle: RunHandle):
+        raise ConnectionError("POLL_EXCEPTION_SECRET_SENTINEL")
 
 
 def node(node_id, depends_on=None, worker=None):
@@ -100,14 +122,22 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(runner.start_calls[-1]["worker"], "worker-original")
         self.assertEqual(runner.start_calls[-1]["phase"], "rework")
         self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
-        self.assertEqual(snapshot.nodes["n1"]["evidence"], ["delivery-1", "fix test"])
+        self.assertEqual(
+            snapshot.nodes["n1"]["evidence"],
+            ["[REDACTED_PROVIDER_TEXT]", "[REDACTED_PROVIDER_TEXT]"],
+        )
 
         snapshot = monitor.tick(snapshot.run_id, runner)
         snapshot = monitor.tick(snapshot.run_id, runner)
         self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
         self.assertEqual(
             snapshot.nodes["n1"]["evidence"],
-            ["delivery-1", "fix test", "delivery-2", "review-2"],
+            [
+                "[REDACTED_PROVIDER_TEXT]",
+                "[REDACTED_PROVIDER_TEXT]",
+                "[REDACTED_PROVIDER_TEXT]",
+                "[REDACTED_PROVIDER_TEXT]",
+            ],
         )
 
     def test_unknown_is_blocked_unknown_not_completed(self):
@@ -391,22 +421,6 @@ class MonitorTests(unittest.TestCase):
         )
         snapshot = monitor.start(record, runner)
         snapshot = monitor.tick(snapshot.run_id, runner)
-        active = snapshot.nodes["n1"]["active_task"]
-        save_task_binding(
-            self.paths,
-            TaskBinding(
-                provider="runner",
-                mode="background",
-                issue_id="n1",
-                role="reviewer",
-                task_id=active["task_id"],
-                worktree=".worktrees/n1",
-                branch="node/n1",
-                run_id="zzzz-foreign-run",
-                status="review",
-                generation=active["generation"],
-            ),
-        )
         current_registry = (
             Path(self.temporary.name)
             / ".vibe"
@@ -414,11 +428,124 @@ class MonitorTests(unittest.TestCase):
             / snapshot.run_id
             / "tasks.json"
         )
+        foreign_registry = (
+            Path(self.temporary.name)
+            / ".vibe"
+            / "runs"
+            / "zzzz-foreign-run"
+            / "tasks.json"
+        )
+        foreign_registry.parent.mkdir(parents=True)
+        foreign_registry.write_bytes(current_registry.read_bytes())
         current_registry.unlink()
 
         snapshot = monitor.tick(snapshot.run_id, runner)
 
         self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+
+    def test_duplicate_active_handle_quarantines_second_node(self):
+        nodes = [node("n1"), node("n2")]
+        monitor, record = self.authorized_monitor(nodes)
+
+        snapshot = monitor.start(record, DuplicateHandleRunner())
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "running")
+        self.assertEqual(snapshot.nodes["n2"]["status"], "blocked_unknown")
+        self.assertEqual(list(snapshot.handles.values()), ["shared-handle"])
+        self.assertFalse(
+            acquire_writer_lease(
+                self.paths, "n2", ".worktrees/n2", "run-second"
+            )
+        )
+
+    def test_state_transition_requires_complete_provider_claims(self):
+        nodes = [node("n1")]
+        monitor, record = self.authorized_monitor(nodes)
+        snapshot = monitor.start(record, UnclaimedEventRunner())
+
+        snapshot = monitor.tick(snapshot.run_id, UnclaimedEventRunner())
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertFalse(snapshot.nodes["n1"]["reviewer_started"])
+        self.assertFalse(
+            acquire_writer_lease(
+                self.paths, "n1", ".worktrees/n1", "run-second"
+            )
+        )
+
+    def test_provider_payloads_and_exceptions_never_reach_persisted_artifacts(self):
+        cases = (
+            (
+                "EVENT_SECRET_SENTINEL",
+                FakeRunner(
+                    events={
+                        ("n1", "developer"): [
+                            (
+                                "delivered",
+                                {
+                                    "evidence": "EVENT_SECRET_SENTINEL",
+                                    "nested": {"Api-Key": "EVENT_SECRET_SENTINEL"},
+                                },
+                            )
+                        ]
+                    }
+                ),
+                True,
+            ),
+            (
+                "START_EXCEPTION_SECRET_SENTINEL",
+                SecretStartResponseLostRunner(),
+                False,
+            ),
+            (
+                "POLL_EXCEPTION_SECRET_SENTINEL",
+                SecretPollResponseLostRunner(),
+                True,
+            ),
+        )
+        for sentinel, runner, tick in cases:
+            with self.subTest(sentinel=sentinel), tempfile.TemporaryDirectory() as root:
+                paths = ProjectPaths(Path(root))
+                nodes = [node("n1")]
+                plan = Plan("plan-secret", 1, "docs/prd.md", ["n1"], "draft")
+                record = authorize(
+                    build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+                )
+                monitor = Monitor(paths, plan, nodes)
+                snapshot = monitor.start(record, runner)
+                if tick:
+                    snapshot = monitor.tick(snapshot.run_id, runner)
+
+                durable = b"".join(
+                    path.read_bytes()
+                    for path in sorted((Path(root) / ".vibe").rglob("*"))
+                    if path.is_file()
+                )
+                self.assertNotIn(sentinel.encode("utf-8"), durable)
+
+    def test_provider_confirmed_stop_is_persisted_as_failed_terminal_run(self):
+        nodes = [node("n1")]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [
+                    ("stopped", {"reason": "provider stopped task"})
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+
+        stopped = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(stopped.nodes["n1"]["status"], "stopped")
+        self.assertEqual(stopped.status, "failed")
+        self.assertNotIn("n1", stopped.handles)
+        self.assertTrue(stopped.nodes["n1"]["reason"])
+        resumed = monitor.resume(stopped.run_id, runner)
+        ticked = monitor.tick(stopped.run_id, runner)
+        self.assertEqual(resumed.status, "failed")
+        self.assertEqual(ticked.status, "failed")
+        self.assertEqual(len(runner.start_calls), 1)
 
     def test_poll_loss_and_repeated_unknown_keep_writer_quarantined(self):
         nodes = [node("n1")]

@@ -11,6 +11,7 @@ class FakeRunner(Runner):
         self.stop_calls = []
         self._nodes_by_handle = {}
         self._roles_by_handle = {}
+        self._claims_by_handle = {}
 
     def start(self, contract: dict, worktree: Path) -> RunHandle:
         call = dict(contract)
@@ -19,6 +20,13 @@ class FakeRunner(Runner):
         handle = RunHandle("fake-{}-{}".format(contract["node_id"], len(self.start_calls)))
         self._nodes_by_handle[handle.run_id] = contract["node_id"]
         self._roles_by_handle[handle.run_id] = contract.get("role", "developer")
+        self._claims_by_handle[handle.run_id] = {
+            "node_id": contract["node_id"],
+            "role": contract.get("role", "developer"),
+            "task_id": contract.get("task_id"),
+            "handle_id": handle.run_id,
+            "generation": contract.get("generation"),
+        }
         return handle
 
     def poll(self, handle: RunHandle) -> List[RunEvent]:
@@ -32,9 +40,14 @@ class FakeRunner(Runner):
             return []
         item = queue.pop(0)
         if isinstance(item, RunEvent):
-            return [item]
-        event, data = item
-        return [RunEvent(event, dict(data))]
+            event = item.event
+            data = dict(item.data)
+        else:
+            event, data = item
+            data = dict(data)
+        for key, value in self._claims_by_handle.get(handle.run_id, {}).items():
+            data.setdefault(key, value)
+        return [RunEvent(event, data)]
 
     def stop(self, handle: RunHandle) -> None:
         self.stop_calls.append(handle.run_id)
