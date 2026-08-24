@@ -1,0 +1,80 @@
+import unittest
+
+from vibe_guide.planner import (
+    DecisionCard,
+    PRD,
+    ProductQuestion,
+    S1Score,
+    TaskContext,
+    approve_prd,
+    classify_s0,
+    create_decision_card,
+    route_task,
+    score_s1,
+)
+
+
+class PlannerTests(unittest.TestCase):
+    def test_obvious_one_step_request_is_simple(self):
+        result = classify_s0("把 README 里的错别字改掉")
+        self.assertTrue(result.simple)
+        self.assertEqual(result.route, "simple")
+
+    def test_multi_step_request_enters_s1(self):
+        result = classify_s0("设计并实现一个支付系统，编写测试并部署")
+        self.assertFalse(result.simple)
+        self.assertTrue(result.needs_s1)
+
+    def test_score_boundaries(self):
+        for total, route in ((8, "simple"), (9, "light_plan"), (15, "light_plan"), (16, "complex")):
+            score = S1Score(total=total, steps=1, domains=1, uncertainty=1, failure_cost=1, toolchain=1)
+            self.assertEqual(route_task(score), route)
+
+    def test_s1_score_keeps_five_dimensions_and_rationale(self):
+        context = TaskContext(
+            steps=3,
+            domains=2,
+            uncertainty=4,
+            failure_cost=5,
+            toolchain=1,
+            rationale={"uncertainty": "外部接口尚未验证"},
+        )
+        score = score_s1(context)
+        self.assertEqual(score.total, 15)
+        self.assertEqual(
+            (score.steps, score.domains, score.uncertainty, score.failure_cost, score.toolchain),
+            (3, 2, 4, 5, 1),
+        )
+        self.assertEqual(score.rationale["uncertainty"], "外部接口尚未验证")
+
+    def test_decision_card_is_plain_language_and_unresolved_by_default(self):
+        card = create_decision_card(
+            ProductQuestion(
+                "使用实时数据还是脱敏样例？",
+                ["实时数据", "脱敏样例"],
+                "实时数据增加权限和隐私风险",
+                recommendation="脱敏样例",
+            )
+        )
+        rendered = card.render()
+        self.assertEqual(card.status, "unresolved")
+        for expected in ("使用实时数据还是脱敏样例？", "实时数据", "脱敏样例", "权限和隐私风险", "建议：脱敏样例", "状态：待决定"):
+            self.assertIn(expected, rendered)
+
+    def test_unresolved_product_decision_does_not_approve_prd(self):
+        prd = PRD(title="示例", objective="目标")
+        card = create_decision_card(ProductQuestion("实时数据还是脱敏样例？", ["实时数据", "脱敏样例"], "影响数据风险"))
+        result = approve_prd(prd, [card])
+        self.assertFalse(result.approved)
+        self.assertNotEqual(result.prd.status, "approved")
+
+    def test_resolved_product_decision_approves_prd(self):
+        prd = PRD(title="示例", objective="目标")
+        card = DecisionCard("选哪种数据？", ["A", "B"], "影响范围", "A", status="approved", selected="A")
+        result = approve_prd(prd, [card])
+        self.assertTrue(result.approved)
+        self.assertEqual(result.prd.status, "approved")
+
+
+if __name__ == "__main__":
+    unittest.main()
