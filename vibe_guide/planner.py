@@ -1,6 +1,7 @@
 """Deterministic task routing and product-decision gates."""
 
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import re
 from typing import Any, Dict, List, Optional
@@ -67,6 +68,30 @@ class DecisionCard:
     recommendation: str
     status: str = "unresolved"
     selected: Optional[str] = None
+    id: str = ""
+    field: str = ""
+    revision: int = 1
+
+    def __post_init__(self):
+        if not isinstance(self.id, str):
+            raise TypeError("decision id must be a string")
+        if not self.id:
+            digest = hashlib.sha256(
+                (self.question + "\0" + self.field).encode("utf-8")
+            ).hexdigest()[:16]
+            object.__setattr__(self, "id", "decision-" + digest)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", self.id):
+            raise ValueError("decision id must be a simple identifier")
+        if not isinstance(self.field, str):
+            raise TypeError("decision field must be a string")
+        if self.field and not re.fullmatch(r"[A-Za-z0-9_.-]+", self.field):
+            raise ValueError("decision field must be a contract path")
+        if (
+            isinstance(self.revision, bool)
+            or not isinstance(self.revision, int)
+            or self.revision < 1
+        ):
+            raise ValueError("decision revision must be a positive integer")
 
     def render(self) -> str:
         option_lines = "\n".join("- {}".format(option) for option in self.options)
@@ -102,6 +127,34 @@ class ConsistencyResolution:
     action: str
     files: List[str]
     consistency_binding: Dict[str, Any]
+    decision: Optional[Dict[str, Any]] = None
+
+
+def _decision_reference(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
+    decision_id = item.get("id")
+    field = item.get("field")
+    revision = item.get("revision")
+    status = item.get("status")
+    if (
+        not isinstance(decision_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", decision_id)
+        or not isinstance(field, str)
+        or not re.fullmatch(r"[A-Za-z0-9_.-]+", field)
+        or isinstance(revision, bool)
+        or not isinstance(revision, int)
+        or revision < 1
+        or not isinstance(status, str)
+    ):
+        return None
+    return {
+        "id": decision_id,
+        "field": field,
+        "revision": revision,
+        "status": status,
+        "selected": item.get("selected"),
+    }
 
 
 def resolve_consistency(
@@ -141,6 +194,10 @@ def resolve_consistency(
             allowed_keys.add("binding")
             if candidate.get("binding") != expected_binding:
                 return None
+            if source in {"current_user", "approved_prd"}:
+                allowed_keys.add("decision")
+                if not isinstance(candidate.get("decision"), dict):
+                    return None
         elif "binding" in candidate:
             allowed_keys.add("binding")
             if candidate["binding"] != expected_binding:
@@ -156,14 +213,16 @@ def resolve_consistency(
             )
         except (TypeError, ValueError):
             return None
-        normalized.append((source, candidate["value"], value_key))
+        normalized.append(
+            (source, candidate["value"], value_key, candidate.get("decision"))
+        )
     highest = min(EVIDENCE_PRIORITY.index(item[0]) for item in normalized)
     winners = [
         item for item in normalized if EVIDENCE_PRIORITY.index(item[0]) == highest
     ]
     if len({item[2] for item in winners}) != 1:
         return None
-    source, value, _key = winners[0]
+    source, value, _key, decision = winners[0]
     if source == "implementation":
         return None
     approved_values = {
@@ -176,8 +235,23 @@ def resolve_consistency(
         for item in decisions
         if isinstance(item, dict) and item.get("status") == "approved"
     }
-    if source in {"current_user", "approved_prd"} and _key not in approved_values:
-        return None
+    decision_reference = None
+    if source in {"current_user", "approved_prd"}:
+        decision_reference = _decision_reference(decision)
+        if decision_reference is None:
+            return None
+        matching = [
+            _decision_reference(item)
+            for item in decisions
+            if _decision_reference(item) == decision_reference
+        ]
+        if (
+            not matching
+            or decision_reference["status"] != "approved"
+            or decision_reference["field"] != field_name
+            or decision_reference["selected"] != value
+        ):
+            return None
     if source == "authorization":
         contract_value = issue_contract.get(field_name)
         if _key not in approved_values and contract_value != value:
@@ -191,6 +265,7 @@ def resolve_consistency(
         action,
         list(files),
         dict(expected_binding),
+        decision_reference,
     )
 
 
@@ -273,7 +348,11 @@ def create_decision_card(question: ProductQuestion) -> DecisionCard:
 def approve_prd(prd: PRD, decisions: List[DecisionCard]) -> PRDResult:
     blockers = []
     for card in decisions:
-        if card.status != "approved" or card.selected not in card.options:
+        if (
+            card.status != "approved"
+            or card.selected not in card.options
+            or not card.field
+        ):
             blockers.append(card.question)
     if blockers:
         return PRDResult(replace(prd, status="blocked_decision"), False, blockers)

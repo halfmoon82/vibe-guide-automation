@@ -3,12 +3,15 @@
   "objective": "通过两个兼容契约的节点证明并行开发和独立审查闭环。",
   "decisions": [
     {
+      "id": "decision-naming",
       "question": "两个节点如何启动？",
       "options": ["契约并行", "串行等待"],
       "impact": "决定是否在没有硬依赖时同时启动。",
       "recommendation": "契约并行",
       "status": "approved",
-      "selected": "契约并行"
+      "selected": "契约并行",
+      "field": "naming",
+      "revision": 1
     }
   ],
   "capabilities": {

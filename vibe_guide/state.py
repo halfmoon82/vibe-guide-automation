@@ -61,11 +61,14 @@ CONSISTENCY_CORRECTION_KEYS = (
     "action",
     "files",
     "consistency_binding",
+    "decision",
 )
 _EVENT_DATA_KEYS = {
     *CONSISTENCY_CORRECTION_KEYS,
     "authorization_digest",
+    "authorization_epoch",
     "change_reason",
+    "contract_digest",
     "continuation",
     "evidence",
     "finding",
@@ -74,6 +77,7 @@ _EVENT_DATA_KEYS = {
     "in_contract",
     "intent_id",
     "node_contract_digest",
+    "node_contract_digests",
     "node_id",
     "node_ids",
     "new_authorization",
@@ -81,7 +85,10 @@ _EVENT_DATA_KEYS = {
     "previous_authorization",
     "previous_authorization_digest",
     "previous_node_contract_digest",
+    "previous_node_contract_digests",
     "reason",
+    "retained_acceptances",
+    "invalidated_acceptances",
     "role",
     "run_id",
     "status",
@@ -594,6 +601,8 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         raise ValueError("run-start contract lineage is inconsistent")
     if sorted(first["data"].get("node_ids", [])) != sorted(snapshot.nodes):
         raise ValueError("run-start node lineage is inconsistent")
+    retained_acceptance_proofs = []
+    latest_node_contract_digests = None
     for record in records[: snapshot.event_sequence]:
         provenance = record["provenance"]
         if provenance["authorization_digest"] != current_authorization_digest:
@@ -628,16 +637,76 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
             != replacement.node_contract_digest
         ):
             raise ValueError("reauthorization replacement record is invalid")
+        previous_node_contract_digests = data.get("previous_node_contract_digests")
+        node_contract_digests = data.get("node_contract_digests")
+        retained_acceptances = data.get("retained_acceptances")
+        invalidated_acceptances = data.get("invalidated_acceptances")
+        if (
+            not isinstance(previous_node_contract_digests, dict)
+            or not isinstance(node_contract_digests, dict)
+            or set(previous_node_contract_digests) != set(snapshot.nodes)
+            or set(node_contract_digests) != set(snapshot.nodes)
+            or not isinstance(retained_acceptances, dict)
+            or not isinstance(invalidated_acceptances, dict)
+            or set(retained_acceptances) & set(invalidated_acceptances)
+        ):
+            raise ValueError("reauthorization node acceptance lineage is invalid")
+        for mapping in (previous_node_contract_digests, node_contract_digests):
+            if any(
+                not isinstance(value, str) or not _DIGEST.fullmatch(value)
+                for value in mapping.values()
+            ):
+                raise ValueError("reauthorization node contract digest is invalid")
+        for node_id, evidence in retained_acceptances.items():
+            if (
+                node_id not in snapshot.nodes
+                or not isinstance(evidence, dict)
+                or set(evidence) != {"contract_digest", "authorization_epoch"}
+                or evidence["contract_digest"] != previous_node_contract_digests[node_id]
+                or evidence["contract_digest"] != node_contract_digests[node_id]
+                or evidence["authorization_epoch"] != previous.digest
+            ):
+                raise ValueError("retained acceptance proof is invalid")
+            retained_acceptance_proofs.append(
+                (node_id, evidence["contract_digest"], replacement.digest)
+            )
+        for node_id, evidence in invalidated_acceptances.items():
+            if (
+                node_id not in snapshot.nodes
+                or not isinstance(evidence, dict)
+                or set(evidence) != {"contract_digest", "authorization_epoch"}
+                or evidence["contract_digest"] != previous_node_contract_digests[node_id]
+                or evidence["contract_digest"] == node_contract_digests[node_id]
+                or evidence["authorization_epoch"] != previous.digest
+            ):
+                raise ValueError("invalidated acceptance proof is invalid")
+        latest_node_contract_digests = node_contract_digests
         current_authorization_digest = replacement.digest
         current_node_contract_digest = replacement.node_contract_digest
     if current_authorization_digest != snapshot.authorization_digest:
         raise ValueError("snapshot final authorization lineage is inconsistent")
     if current_node_contract_digest != snapshot.node_contract_digest:
         raise ValueError("snapshot final contract lineage is inconsistent")
+    if latest_node_contract_digests is not None and any(
+        snapshot.nodes[node_id].get("contract_digest") != digest
+        for node_id, digest in latest_node_contract_digests.items()
+    ):
+        raise ValueError("snapshot final node contract lineage is inconsistent")
 
     for node_id, node in snapshot.nodes.items():
         if node.get("status") != "accepted":
             continue
+        contract_digest = node.get("contract_digest")
+        acceptance = node.get("acceptance")
+        if (
+            not isinstance(contract_digest, str)
+            or not _DIGEST.fullmatch(contract_digest)
+            or not isinstance(acceptance, dict)
+            or set(acceptance) != {"contract_digest", "authorization_epoch"}
+            or acceptance["contract_digest"] != contract_digest
+            or acceptance["authorization_epoch"] != snapshot.authorization_digest
+        ):
+            raise ValueError("accepted node acceptance contract epoch is invalid")
         matching = [
             record
             for record in records[: snapshot.event_sequence]
@@ -646,6 +715,18 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         ]
         if not matching:
             raise ValueError("accepted node lacks an acceptance event")
+        current_acceptance_event = matching[-1]
+        if not (
+            current_acceptance_event["data"].get("contract_digest")
+            == acceptance["contract_digest"]
+            and current_acceptance_event["data"].get("authorization_epoch")
+            == acceptance["authorization_epoch"]
+        ) and not any(
+            proof
+            == (node_id, acceptance["contract_digest"], acceptance["authorization_epoch"])
+            for proof in retained_acceptance_proofs
+        ):
+            raise ValueError("accepted node acceptance evidence is stale")
         provenance = matching[-1]["provenance"]
         if provenance["role"] != "reviewer":
             raise ValueError("accepted node lacks reviewer provenance")

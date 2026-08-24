@@ -379,4 +379,37 @@ class ProviderActionRunner(Runner):
         metadata = self.store._read(self._handle_path(handle.run_id))
         if metadata.get("terminal_confirmed") is True:
             return
-        raise ProviderPending("provider stop requires explicit bridge reconciliation")
+        pending_action = metadata.get("pending_action")
+        if not isinstance(pending_action, str) or not pending_action:
+            raise ProviderPending(
+                "provider stop requires a pending terminal wait reconciliation"
+            )
+        if metadata.get("pending_operation") != "wait":
+            raise ProviderPending(
+                "provider stop cannot reconcile a non-terminal provider action"
+            )
+        result = self.store.result(pending_action)
+        if result is None:
+            raise ProviderPending("provider terminal wait is still pending")
+        if result.get("status") not in {"stopped", "complete", "completed"} or result.get(
+            "event"
+        ) != "stopped":
+            raise ProviderPending("provider terminal wait did not prove a stop")
+        cursor = result.get("cursor")
+        if cursor is not None and (
+            not isinstance(cursor, str)
+            or not cursor
+            or len(cursor) > 4096
+            or "\x00" in cursor
+        ):
+            raise ProviderPending("provider terminal wait cursor is invalid")
+        claims = {
+            "node_id": metadata["node_id"],
+            "role": metadata["role"],
+            "task_id": metadata["task_id"],
+            "handle_id": handle.run_id,
+            "generation": metadata["generation"],
+        }
+        events = self._wait_result(handle, metadata, claims, result)
+        if len(events) != 1 or events[0].event != "stopped":
+            raise ProviderPending("provider terminal wait did not prove a stop")

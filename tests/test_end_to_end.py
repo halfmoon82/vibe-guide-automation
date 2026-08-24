@@ -89,6 +89,81 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.text)
         return result
 
+    def prepare_public_single_plan(self, plan_id):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        from vibe_guide.paths import ProjectPaths
+
+        self.initialize()
+        store = ProviderActionStore(ProjectPaths(self.root))
+        store.publish_capabilities(
+            "codex",
+            {
+                "codex.shell": True,
+                "codex.subprocess": True,
+                "codex.worktree": True,
+                "codex.visible_task.create": True,
+                "codex.visible_task.enter": True,
+                "codex.visible_task.resume": True,
+                "codex.visible_task.wait": True,
+            },
+            provenance="codex-app-session-bridge",
+        )
+        source = json.loads((self.root / "plan-source.json").read_text(encoding="utf-8"))
+        source["capabilities"]["agent_id"] = "codex"
+        source["active_pair_limit"] = 1
+        source["nodes"] = [source["nodes"][0]]
+        source["decisions"][0].update(
+            {"id": "decision-naming", "field": "naming", "revision": 1}
+        )
+        source["nodes"][0]["contract"].update(
+            {
+                "adapter_id": "codex",
+                "project_id": "project-fixture",
+                "host": "local",
+                "naming": "契约并行",
+            }
+        )
+        source["nodes"][0]["contract"].pop("command", None)
+        source["nodes"][0]["contract"].pop("provider", None)
+        source["nodes"][0]["contract"].pop("mode", None)
+        visible_spec = self.root / (plan_id + ".json")
+        visible_spec.write_text(json.dumps(source), encoding="utf-8")
+        self.create_plan(plan_id, visible_spec.name)
+        return store
+
+    @staticmethod
+    def complete_public_action(store, action, wait_state):
+        operation = action["operation"]
+        role = action["role"]
+        task_id = "thread-api-" + role
+        if operation == "create":
+            payload = {"binding": {"threadId": task_id, "hostId": "local"}}
+        elif operation == "locate":
+            payload = {"located": True}
+        elif operation == "visibility":
+            payload = {"visible": True, "direct_enter": True}
+        elif operation == "resume":
+            payload = {"resumed": True}
+        elif operation == "wait":
+            wait_state[role] = wait_state.get(role, 0) + 1
+            if role == "developer":
+                payload = {
+                    "status": "completed",
+                    "cursor": "cursor-developer-{}".format(wait_state[role]),
+                    "event": "complete",
+                    "evidence": "verified-developer",
+                }
+            else:
+                payload = {
+                    "status": "completed",
+                    "cursor": "cursor-reviewer-{}".format(wait_state[role]),
+                    "event": "accepted",
+                    "evidence": "verified-reviewer",
+                }
+        else:
+            raise AssertionError("unexpected provider action: %r" % action)
+        store.complete(action["action_id"], payload)
+
     def drive_to_terminal(self, plan_id, runner, limit=20):
         latest = None
         for _ in range(limit):
@@ -319,6 +394,13 @@ class EndToEndTests(unittest.TestCase):
                                         "source": "approved_prd",
                                         "value": "契约并行",
                                         "binding": consistency_bindings["reviewer"],
+                                        "decision": {
+                                            "id": "decision-naming",
+                                            "field": "naming",
+                                            "revision": 1,
+                                            "status": "approved",
+                                            "selected": "契约并行",
+                                        },
                                     },
                                     {
                                         "source": "implementation",
@@ -573,6 +655,200 @@ class EndToEndTests(unittest.TestCase):
 
         visible = self.run_cli(["status", "--plan", "reauth-plan", "--json"])
         self.assertEqual((visible.exit_code, visible.payload["status"]), (0, "running"))
+
+    def test_public_provider_reauthorization_reconciles_terminal_wait_after_retry(self):
+        from vibe_guide.paths import ProjectPaths
+        from vibe_guide.state import load_events, load_snapshot
+
+        store = self.prepare_public_single_plan("public-reauth-reconcile")
+        started = self.run_cli(
+            [
+                "monitor",
+                "--plan",
+                "public-reauth-reconcile",
+                "--authorize",
+                "AUTHORIZE",
+                "--json",
+            ]
+        )
+        self.assertEqual(started.exit_code, 4, started.text)
+
+        for _ in range(12):
+            for action in list(store.pending()):
+                self.complete_public_action(store, action, {})
+            started = self.run_cli(
+                ["resume", "--plan", "public-reauth-reconcile", "--json"]
+            )
+            if any(action["operation"] == "wait" for action in store.pending()):
+                break
+        self.assertEqual((started.exit_code, started.payload["status"]), (4, "blocked_unknown"))
+        run_id = started.payload["run_id"]
+
+        waiting = self.run_cli(
+            ["resume", "--plan", "public-reauth-reconcile", "--json"]
+        )
+        self.assertEqual((waiting.exit_code, waiting.payload["status"]), (4, "blocked_unknown"))
+        pending_wait = [action for action in store.pending() if action["operation"] == "wait"]
+        self.assertEqual(len(pending_wait), 1)
+
+        nodes_path = self.root / ".vibe/plans/public-reauth-reconcile/nodes.json"
+        nodes = json.loads(nodes_path.read_text(encoding="utf-8"))
+        nodes[0]["contract"]["acceptance_example"] = "changed implementation outcome"
+        nodes_path.write_text(json.dumps(nodes), encoding="utf-8")
+        invalidated = self.run_cli(
+            ["resume", "--plan", "public-reauth-reconcile", "--json"]
+        )
+        self.assertEqual((invalidated.exit_code, invalidated.payload["status"]), (3, "blocked_design"))
+
+        first_retry = self.run_cli(
+            [
+                "monitor",
+                "--plan",
+                "public-reauth-reconcile",
+                "--authorize",
+                "AUTHORIZE",
+                "--json",
+            ]
+        )
+        self.assertEqual(first_retry.exit_code, 4)
+        self.assertIn("stop", first_retry.payload["reason"])
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in load_events(
+                        ProjectPaths(self.root), run_id
+                    )
+                    if event["event"] == "authorization_reauthorized"
+                ]
+            ),
+            0,
+        )
+
+        store.complete(
+            pending_wait[0]["action_id"],
+            {
+                "status": "stopped",
+                "cursor": "terminal-cursor",
+                "event": "stopped",
+                "reason": "terminal evidence",
+            },
+        )
+        second_retry = self.run_cli(
+            [
+                "monitor",
+                "--plan",
+                "public-reauth-reconcile",
+                "--authorize",
+                "AUTHORIZE",
+                "--json",
+            ]
+        )
+        self.assertEqual(second_retry.exit_code, 4)
+        self.assertEqual(second_retry.payload["status"], "blocked_unknown")
+        events = load_events(ProjectPaths(self.root), run_id)
+        self.assertEqual(
+            len([event for event in events if event["event"] == "authorization_reauthorized"]),
+            1,
+        )
+        current = load_snapshot(ProjectPaths(self.root), run_id)
+        self.assertEqual(current.nodes["api"]["status"], "blocked_unknown")
+        bindings = json.loads(
+            (self.root / ".vibe/runs" / run_id / "tasks.json").read_text(encoding="utf-8")
+        )["bindings"]
+        developer = [item for item in bindings if item["role"] == "developer"][0]
+        self.assertEqual(developer["cursor"], "terminal-cursor")
+        self.assertFalse(
+            (self.root / ".vibe/plans/public-reauth-reconcile/authorization-invalidated.json").exists()
+        )
+
+    def test_public_reauthorization_restarts_accepted_node_when_contract_changes(self):
+        from vibe_guide.paths import ProjectPaths
+        from vibe_guide.state import load_snapshot
+
+        store = self.prepare_public_single_plan("public-reauth-accepted")
+        wait_state = {}
+        result = self.run_cli(
+            [
+                "monitor",
+                "--plan",
+                "public-reauth-accepted",
+                "--authorize",
+                "AUTHORIZE",
+                "--json",
+            ]
+        )
+        for _ in range(30):
+            for action in list(store.pending()):
+                self.complete_public_action(store, action, wait_state)
+            result = self.run_cli(
+                ["resume", "--plan", "public-reauth-accepted", "--json"]
+            )
+            if result.payload.get("status") == "complete":
+                break
+        self.assertEqual((result.exit_code, result.payload["status"]), (0, "complete"))
+
+        nodes_path = self.root / ".vibe/plans/public-reauth-accepted/nodes.json"
+        nodes = json.loads(nodes_path.read_text(encoding="utf-8"))
+        nodes[0]["contract"]["acceptance_example"] = "changed after acceptance"
+        nodes_path.write_text(json.dumps(nodes), encoding="utf-8")
+        invalidated = self.run_cli(
+            ["resume", "--plan", "public-reauth-accepted", "--json"]
+        )
+        self.assertEqual((invalidated.exit_code, invalidated.payload["status"]), (3, "blocked_design"))
+
+        reauthorized = self.run_cli(
+            [
+                "monitor",
+                "--plan",
+                "public-reauth-accepted",
+                "--authorize",
+                "AUTHORIZE",
+                "--json",
+            ]
+        )
+        self.assertNotEqual(reauthorized.payload["status"], "complete")
+        self.assertNotEqual(reauthorized.exit_code, 0)
+        snapshot = load_snapshot(ProjectPaths(self.root), reauthorized.payload["run_id"])
+        self.assertEqual(snapshot.nodes["api"]["status"], "blocked_unknown")
+        self.assertEqual(snapshot.nodes["api"]["retryable_action"]["phase"], "rework")
+        self.assertTrue(
+            any(action["operation"] == "resume" for action in store.pending())
+        )
+
+    def test_state_rejects_accepted_evidence_from_an_older_authorization_epoch(self):
+        from vibe_guide.paths import ProjectPaths
+        from vibe_guide.state import load_snapshot
+
+        store = self.prepare_public_single_plan("public-acceptance-epoch")
+        wait_state = {}
+        result = self.run_cli(
+            [
+                "monitor",
+                "--plan",
+                "public-acceptance-epoch",
+                "--authorize",
+                "AUTHORIZE",
+                "--json",
+            ]
+        )
+        for _ in range(30):
+            for action in list(store.pending()):
+                self.complete_public_action(store, action, wait_state)
+            result = self.run_cli(
+                ["resume", "--plan", "public-acceptance-epoch", "--json"]
+            )
+            if result.payload.get("status") == "complete":
+                break
+        self.assertEqual((result.exit_code, result.payload["status"]), (0, "complete"))
+        state_path = self.root / ".vibe/runs" / result.payload["run_id"] / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["nodes"]["api"]["acceptance"]["authorization_epoch"] = "0" * 64
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        previous_path = state_path.with_name("state.previous.json")
+        previous_path.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            load_snapshot(ProjectPaths(self.root), result.payload["run_id"])
 
     def test_local_runner_rejects_unconfirmed_command_stops_and_persists_only_safe_metadata(self):
         runner = self.local_runner()

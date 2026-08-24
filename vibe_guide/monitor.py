@@ -67,6 +67,8 @@ class Monitor:
                 "retryable_action": None,
                 "contract_overrides": {},
                 "corrections": [],
+                "contract_digest": executable_contract_digest([node]),
+                "acceptance": None,
             }
         snapshot = RunSnapshot(
             run_id=run_id,
@@ -146,6 +148,35 @@ class Monitor:
             return snapshot
 
         previous = self._snapshot_record(snapshot)
+        previous_node_contract_digests = {
+            node_id: snapshot.nodes[node_id].get("contract_digest")
+            for node_id in snapshot.nodes
+        }
+        new_node_contract_digests = {
+            node_id: executable_contract_digest([self.nodes[node_id]])
+            for node_id in snapshot.nodes
+        }
+        retained_acceptances = {}
+        invalidated_acceptances = {}
+        for node_id, current in snapshot.nodes.items():
+            if current.get("status") != "accepted":
+                continue
+            acceptance = current.get("acceptance")
+            if not isinstance(acceptance, dict):
+                raise RuntimeError("accepted node acceptance evidence is missing")
+            evidence = {
+                "contract_digest": acceptance.get("contract_digest"),
+                "authorization_epoch": acceptance.get("authorization_epoch"),
+            }
+            if (
+                previous_node_contract_digests.get(node_id)
+                == new_node_contract_digests[node_id]
+                and evidence["contract_digest"]
+                == new_node_contract_digests[node_id]
+            ):
+                retained_acceptances[node_id] = evidence
+            else:
+                invalidated_acceptances[node_id] = evidence
         for node_id, handle_id in list(snapshot.handles.items()):
             current = snapshot.nodes[node_id]
             active = current.get("active_task")
@@ -186,6 +217,10 @@ class Monitor:
             "new_authorization": record.to_dict(),
             "authorization_digest": record.digest,
             "node_contract_digest": record.node_contract_digest,
+            "previous_node_contract_digests": previous_node_contract_digests,
+            "node_contract_digests": new_node_contract_digests,
+            "retained_acceptances": retained_acceptances,
+            "invalidated_acceptances": invalidated_acceptances,
             "change_reason": change_reason,
             "continuation": continuation,
         }
@@ -298,17 +333,81 @@ class Monitor:
                 raise ValueError("reauthorization continuation cursor is inconsistent")
             snapshot.tasks[key] = binding.to_dict()
 
+        previous_node_contract_digests = data.get("previous_node_contract_digests")
+        node_contract_digests = data.get("node_contract_digests")
+        if (
+            not isinstance(previous_node_contract_digests, dict)
+            or not isinstance(node_contract_digests, dict)
+            or set(previous_node_contract_digests) != set(snapshot.nodes)
+            or set(node_contract_digests) != set(snapshot.nodes)
+            or any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for mapping in (previous_node_contract_digests, node_contract_digests)
+                for value in mapping.values()
+            )
+        ):
+            raise ValueError("reauthorization node contract lineage is invalid")
+        retained_acceptances = data.get("retained_acceptances")
+        invalidated_acceptances = data.get("invalidated_acceptances")
+        if not isinstance(retained_acceptances, dict) or not isinstance(
+            invalidated_acceptances, dict
+        ):
+            raise ValueError("reauthorization acceptance lineage is invalid")
+        if set(retained_acceptances) & set(invalidated_acceptances):
+            raise ValueError("reauthorization acceptance lineage overlaps")
+
         snapshot.authorization = replacement.to_dict()
         snapshot.authorization_digest = replacement.digest
         snapshot.node_contract_digest = replacement.node_contract_digest
+        snapshot.status = "running"
         snapshot.handles.clear()
-        for current in snapshot.nodes.values():
+        for node_id, current in snapshot.nodes.items():
+            current["contract_digest"] = node_contract_digests[node_id]
             current["active_role"] = None
             current["active_task"] = None
             current["start_intent"] = None
             current["quarantine"] = None
             if current.get("status") == "accepted":
-                continue
+                if node_id in retained_acceptances:
+                    evidence = retained_acceptances[node_id]
+                    if (
+                        not isinstance(evidence, dict)
+                        or set(evidence)
+                        != {"contract_digest", "authorization_epoch"}
+                        or evidence["contract_digest"] != node_contract_digests[node_id]
+                        or evidence["authorization_epoch"]
+                        != snapshot.authorization_digest
+                    ):
+                        raise ValueError("retained acceptance evidence is invalid")
+                    current["acceptance"] = {
+                        "contract_digest": evidence["contract_digest"],
+                        "authorization_epoch": replacement.digest,
+                    }
+                    continue
+                if node_id in invalidated_acceptances:
+                    evidence = invalidated_acceptances[node_id]
+                    if (
+                        not isinstance(evidence, dict)
+                        or set(evidence)
+                        != {"contract_digest", "authorization_epoch"}
+                        or evidence["contract_digest"]
+                        != previous_node_contract_digests[node_id]
+                        or evidence["authorization_epoch"]
+                        != previous.digest
+                    ):
+                        raise ValueError("invalidated acceptance evidence is invalid")
+                    current["acceptance"] = None
+                    current["pair_archived"] = False
+                    current["status"] = "blocked_unknown"
+                    current["retryable_action"] = {
+                        "role": "developer",
+                        "phase": "rework",
+                        "continuation": True,
+                    }
+                    continue
+                raise ValueError("accepted node lacks reauthorization disposition")
             if int(current.get("developer_generation", 0)) > 0:
                 current["status"] = "blocked_unknown"
                 current["retryable_action"] = {
@@ -361,6 +460,18 @@ class Monitor:
                 and isinstance(retry, dict)
                 and node_id not in snapshot.handles
             ):
+                if not acquire_writer_lease(
+                    self.paths,
+                    node_id,
+                    str(current["worktree"]),
+                    snapshot.run_id,
+                ):
+                    self._mark_blocked_unknown(
+                        snapshot,
+                        node_id,
+                        "writer lease is already owned by another run",
+                    )
+                    continue
                 if self._start_task(
                     snapshot,
                     node_id,
@@ -369,7 +480,8 @@ class Monitor:
                     runner,
                     bool(retry.get("continuation")),
                 ):
-                    current["retryable_action"] = None
+                    if current.get("status") != "blocked_unknown":
+                        current["retryable_action"] = None
                 continue
             if current.get("status") == "delivered" and not current.get("reviewer_started"):
                 if not acquire_writer_lease(
@@ -794,6 +906,11 @@ class Monitor:
                         "consistency_binding": dict(
                             resolution.consistency_binding
                         ),
+                        "decision": (
+                            dict(resolution.decision)
+                            if resolution.decision is not None
+                            else None
+                        ),
                     }
                     correction = {
                         key: correction_values[key]
@@ -873,7 +990,15 @@ class Monitor:
                     snapshot, node_id, "reviewer identity or generation is stale"
                 )
                 return
-            self._record_runner_event(snapshot, node_id, event, active)
+            acceptance_event = RunEvent(
+                event.event,
+                {
+                    **event.data,
+                    "contract_digest": current["contract_digest"],
+                    "authorization_epoch": snapshot.authorization_digest,
+                },
+            )
+            self._record_runner_event(snapshot, node_id, acceptance_event, active)
             try:
                 self._set_binding_status(snapshot, node_id, role, "accepted")
             except (FileNotFoundError, OSError, TypeError, ValueError) as error:
@@ -886,6 +1011,10 @@ class Monitor:
                 )
                 return
             current["status"] = "accepted"
+            current["acceptance"] = {
+                "contract_digest": current["contract_digest"],
+                "authorization_epoch": snapshot.authorization_digest,
+            }
             current["active_role"] = None
             current["active_task"] = None
             current["quarantine"] = None
@@ -1237,6 +1366,20 @@ class Monitor:
                     snapshot, node_id, "reviewer", "accepted"
                 )
                 current["status"] = "accepted"
+                contract_digest = data.get("contract_digest")
+                authorization_epoch = data.get("authorization_epoch")
+                if (
+                    not isinstance(contract_digest, str)
+                    or len(contract_digest) != 64
+                    or any(character not in "0123456789abcdef" for character in contract_digest)
+                    or contract_digest != current.get("contract_digest")
+                    or authorization_epoch != snapshot.authorization_digest
+                ):
+                    raise ValueError("unapplied acceptance contract epoch is stale")
+                current["acceptance"] = {
+                    "contract_digest": contract_digest,
+                    "authorization_epoch": authorization_epoch,
+                }
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)

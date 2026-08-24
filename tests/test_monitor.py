@@ -256,7 +256,10 @@ class MonitorTests(unittest.TestCase):
         target.contract["naming"] = "approved-name"
         decisions = [
             {
+                "id": "decision-naming",
                 "question": "canonical name",
+                "field": "naming",
+                "revision": 1,
                 "selected": "approved-name",
                 "status": "approved",
             }
@@ -296,6 +299,13 @@ class MonitorTests(unittest.TestCase):
                                 "source": "approved_prd",
                                 "value": "approved-name",
                                 "binding": binding,
+                                "decision": {
+                                    "id": "decision-naming",
+                                    "field": "naming",
+                                    "revision": 1,
+                                    "status": "approved",
+                                    "selected": "approved-name",
+                                },
                             },
                             {
                                 "source": "implementation",
@@ -355,11 +365,25 @@ class MonitorTests(unittest.TestCase):
                                 "source": "approved_prd",
                                 "value": "a",
                                 "binding": ambiguous_binding,
+                                "decision": {
+                                    "id": "decision-a",
+                                    "field": "naming",
+                                    "revision": 1,
+                                    "status": "approved",
+                                    "selected": "a",
+                                },
                             },
                             {
                                 "source": "approved_prd",
                                 "value": "b",
                                 "binding": ambiguous_binding,
+                                "decision": {
+                                    "id": "decision-b",
+                                    "field": "naming",
+                                    "revision": 1,
+                                    "status": "approved",
+                                    "selected": "b",
+                                },
                             },
                         ],
                     },
@@ -380,7 +404,10 @@ class MonitorTests(unittest.TestCase):
             "draft",
             decisions=[
                 {
+                    "id": "decision-naming",
                     "question": "canonical name",
+                    "field": "naming",
+                    "revision": 1,
                     "selected": "approved-name",
                     "status": "approved",
                 }
@@ -409,6 +436,14 @@ class MonitorTests(unittest.TestCase):
                                     {
                                         "source": "approved_prd",
                                         "value": "approved-name",
+                                        "binding": {},
+                                        "decision": {
+                                            "id": "decision-naming",
+                                            "field": "naming",
+                                            "revision": 1,
+                                            "status": "approved",
+                                            "selected": "approved-name",
+                                        },
                                     },
                                 ],
                             },
@@ -436,7 +471,10 @@ class MonitorTests(unittest.TestCase):
             "draft",
             decisions=[
                 {
+                    "id": "decision-naming",
                     "question": "canonical name",
+                    "field": "naming",
+                    "revision": 1,
                     "selected": "approved-name",
                     "status": "approved",
                 }
@@ -467,6 +505,13 @@ class MonitorTests(unittest.TestCase):
                                 "source": "approved_prd",
                                 "value": "approved-name",
                                 "binding": binding,
+                                "decision": {
+                                    "id": "decision-naming",
+                                    "field": "naming",
+                                    "revision": 1,
+                                    "status": "approved",
+                                    "selected": "approved-name",
+                                },
                             },
                             {
                                 "source": "implementation",
@@ -509,6 +554,7 @@ class MonitorTests(unittest.TestCase):
                 "action",
                 "files",
                 "consistency_binding",
+                "decision",
             },
         )
 

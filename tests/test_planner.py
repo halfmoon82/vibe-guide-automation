@@ -96,7 +96,15 @@ class PlannerTests(unittest.TestCase):
 
     def test_resolved_product_decision_approves_prd(self):
         prd = PRD(title="示例", objective="目标")
-        card = DecisionCard("选哪种数据？", ["A", "B"], "影响范围", "A", status="approved", selected="A")
+        card = DecisionCard(
+            "选哪种数据？",
+            ["A", "B"],
+            "影响范围",
+            "A",
+            status="approved",
+            selected="A",
+            field="data.source",
+        )
         result = approve_prd(prd, [card])
         self.assertTrue(result.approved)
         self.assertEqual(result.prd.status, "approved")
@@ -126,6 +134,106 @@ class PlannerTests(unittest.TestCase):
                 ],
             },
             decisions=[{"status": "approved", "selected": "approved-name"}],
+            issue_contract={"naming": "approved-name"},
+            authorized_actions=["rework"],
+            authorized_files=["n1.py"],
+            expected_binding=binding,
+        )
+
+        self.assertIsNone(result)
+
+        exact = resolve_consistency(
+            {
+                "field": "naming",
+                "action": "rework",
+                "files": ["n1.py"],
+                "candidates": [
+                    {
+                        "source": "current_user",
+                        "value": "approved-name",
+                        "binding": binding,
+                        "decision": {
+                            "id": "decision-name",
+                            "field": "naming",
+                            "revision": 1,
+                            "status": "approved",
+                            "selected": "approved-name",
+                        },
+                    },
+                    {"source": "implementation", "value": "stale-name"},
+                ],
+            },
+            decisions=[
+                {
+                    "id": "decision-name",
+                    "field": "naming",
+                    "revision": 1,
+                    "status": "approved",
+                    "selected": "approved-name",
+                },
+                {
+                    "id": "decision-database",
+                    "field": "database.engine",
+                    "revision": 2,
+                    "status": "approved",
+                    "selected": "postgres",
+                },
+            ],
+            issue_contract={"naming": "approved-name"},
+            authorized_actions=["rework"],
+            authorized_files=["n1.py"],
+            expected_binding=binding,
+        )
+
+        self.assertIsNotNone(exact)
+
+    def test_approved_decision_reference_cannot_inject_value_into_another_field(self):
+        binding = {
+            "schema_version": 1,
+            "project_digest": "1" * 64,
+            "plan_id": "plan-1",
+            "plan_version": 1,
+            "decision_digest": "2" * 64,
+            "authorization_digest": "3" * 64,
+            "issue_contract_digest": "4" * 64,
+        }
+        result = resolve_consistency(
+            {
+                "field": "naming",
+                "action": "rework",
+                "files": ["n1.py"],
+                "candidates": [
+                    {
+                        "source": "current_user",
+                        "value": "postgres",
+                        "binding": binding,
+                        "decision": {
+                            "id": "decision-database",
+                            "field": "database.engine",
+                            "revision": 2,
+                            "status": "approved",
+                            "selected": "postgres",
+                        },
+                    },
+                    {"source": "implementation", "value": "stale-name"},
+                ],
+            },
+            decisions=[
+                {
+                    "id": "decision-name",
+                    "field": "naming",
+                    "revision": 1,
+                    "status": "approved",
+                    "selected": "approved-name",
+                },
+                {
+                    "id": "decision-database",
+                    "field": "database.engine",
+                    "revision": 2,
+                    "status": "approved",
+                    "selected": "postgres",
+                },
+            ],
             issue_contract={"naming": "approved-name"},
             authorized_actions=["rework"],
             authorized_files=["n1.py"],
