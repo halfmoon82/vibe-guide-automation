@@ -1,6 +1,7 @@
 """Deterministic task routing and product-decision gates."""
 
 from dataclasses import dataclass, field, replace
+import re
 from typing import Dict, List, Optional
 
 
@@ -109,6 +110,23 @@ _S1_MARKERS = (
     "pipeline",
 )
 
+_ENGLISH_ACTIONS = {
+    "add",
+    "build",
+    "create",
+    "deploy",
+    "design",
+    "fix",
+    "implement",
+    "integrate",
+    "migrate",
+    "refactor",
+    "rename",
+    "test",
+    "update",
+    "write",
+}
+
 
 def classify_s0(message: str) -> S0Result:
     """Apply a cheap rule screen; uncertain or multi-step text proceeds to S1."""
@@ -116,6 +134,9 @@ def classify_s0(message: str) -> S0Result:
     if not normalized:
         return S0Result(False, True, "s1", "任务内容为空，需要进一步判断")
     markers = [marker for marker in _S1_MARKERS if marker in normalized]
+    english_actions = [word for word in re.findall(r"[a-z]+", normalized) if word in _ENGLISH_ACTIONS]
+    if len(english_actions) >= 2:
+        markers.extend(english_actions)
     if markers:
         return S0Result(False, True, "s1", "检测到可能的多步骤或复杂任务：{}".format("、".join(markers)))
     return S0Result(True, False, "simple", "未检测到复杂任务标记")

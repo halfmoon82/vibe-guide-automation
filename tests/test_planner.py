@@ -25,6 +25,31 @@ class PlannerTests(unittest.TestCase):
         self.assertFalse(result.simple)
         self.assertTrue(result.needs_s1)
 
+    def test_common_english_multi_step_requests_enter_s1(self):
+        messages = (
+            "implement a payment system and write tests",
+            "fix the bug and add a regression test",
+            "refactor module, migrate data, deploy",
+        )
+
+        for message in messages:
+            with self.subTest(message=message):
+                result = classify_s0(message)
+                self.assertFalse(result.simple)
+                self.assertTrue(result.needs_s1)
+
+    def test_ordinary_one_step_english_requests_remain_simple(self):
+        messages = (
+            "fix the typo in README",
+            "rename the account and profile labels",
+        )
+
+        for message in messages:
+            with self.subTest(message=message):
+                result = classify_s0(message)
+                self.assertTrue(result.simple)
+                self.assertFalse(result.needs_s1)
+
     def test_score_boundaries(self):
         for total, route in ((8, "simple"), (9, "light_plan"), (15, "light_plan"), (16, "complex")):
             score = S1Score(total=total, steps=1, domains=1, uncertainty=1, failure_cost=1, toolchain=1)
