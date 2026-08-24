@@ -12,7 +12,7 @@ from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.state import acquire_writer_lease, append_event, load_events
-from vibe_guide.task_registry import load_task_binding
+from vibe_guide.task_registry import load_task_binding, save_task_binding
 
 
 class StartResponseLostRunner(FakeRunner):
@@ -608,6 +608,161 @@ class MonitorTests(unittest.TestCase):
             len(
                 [
                     event for event in load_events(self.paths, snapshot.run_id)
+                    if event["event"] == "authorization_reauthorized"
+                ]
+            ),
+            1,
+        )
+
+    def test_reauthorization_retains_independent_accepted_epoch(self):
+        nodes = [node("n1"), node("n2")]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery-n1"})],
+                ("n1", "reviewer"): [("accepted", {"evidence": "review-n1"})],
+                ("n2", "developer"): [("complete", {"evidence": "delivery-n2"})],
+                ("n2", "reviewer"): [("accepted", {"evidence": "review-n2"})],
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        for _ in range(3):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+        self.assertEqual(snapshot.nodes["n2"]["status"], "accepted")
+        old_n2_acceptance = dict(snapshot.nodes["n2"]["acceptance"])
+
+        changed = node("n1")
+        changed.contract["acceptance_example"] = "changed n1 contract"
+        changed_nodes = [changed, node("n2")]
+        changed_plan = Plan(
+            "plan-1", 1, "docs/prd.md", [item.id for item in changed_nodes], "draft"
+        )
+        changed_record = authorize(
+            build_authorization_card(changed_plan, changed_nodes, self.capabilities),
+            "AUTHORIZE",
+        )
+        changed_monitor = Monitor(self.paths, changed_plan, changed_nodes)
+
+        reauthorized = changed_monitor.reauthorize(
+            snapshot.run_id,
+            changed_record,
+            FakeRunner(),
+            "executable_contract_changed",
+        )
+
+        self.assertEqual(reauthorized.nodes["n2"]["status"], "accepted")
+        self.assertEqual(
+            reauthorized.nodes["n2"]["acceptance"]["contract_digest"],
+            old_n2_acceptance["contract_digest"],
+        )
+        self.assertEqual(
+            reauthorized.nodes["n2"]["acceptance"]["authorization_epoch"],
+            changed_record.digest,
+        )
+        self.assertEqual(reauthorized.nodes["n1"]["status"], "rework")
+
+    def test_reauthorization_invalidates_accepted_downstream_suffix_and_recovers(self):
+        upstream = node("n1")
+        downstream = node("n2", ["n1"])
+        independent = node("n3")
+        nodes = [upstream, downstream, independent]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery-n1"})],
+                ("n1", "reviewer"): [("accepted", {"evidence": "review-n1"})],
+                ("n2", "developer"): [("complete", {"evidence": "delivery-n2"})],
+                ("n2", "reviewer"): [("accepted", {"evidence": "review-n2"})],
+                ("n3", "developer"): [("complete", {"evidence": "delivery-n3"})],
+                ("n3", "reviewer"): [("accepted", {"evidence": "review-n3"})],
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        for _ in range(6):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertTrue(
+            all(item["status"] == "accepted" for item in snapshot.nodes.values())
+        )
+        old_identities = {
+            node_id: (
+                snapshot.nodes[node_id]["developer_identity"],
+                snapshot.nodes[node_id]["reviewer_identity"],
+            )
+            for node_id in ("n2", "n3")
+        }
+        old_cursors = {}
+        for node_id in ("n2", "n3"):
+            for role in ("developer", "reviewer"):
+                binding = load_task_binding(
+                    self.paths, node_id, role, run_id=snapshot.run_id
+                )
+                binding.cursor = "cursor-{}-{}".format(node_id, role)
+                save_task_binding(self.paths, binding)
+                old_cursors["{}:{}".format(node_id, role)] = binding.cursor
+
+        changed = node("n1")
+        changed.contract["acceptance_example"] = "changed upstream contract"
+        changed_nodes = [changed, node("n2", ["n1"]), node("n3")]
+        changed_plan = Plan(
+            "plan-1", 1, "docs/prd.md", [item.id for item in changed_nodes], "draft"
+        )
+        changed_record = authorize(
+            build_authorization_card(changed_plan, changed_nodes, self.capabilities),
+            "AUTHORIZE",
+        )
+        changed_monitor = Monitor(self.paths, changed_plan, changed_nodes)
+
+        with patch.object(
+            changed_monitor,
+            "_schedule_ready",
+            side_effect=RuntimeError("interrupted after reauthorization event"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                changed_monitor.reauthorize(
+                    snapshot.run_id,
+                    changed_record,
+                    FakeRunner(),
+                    "executable_contract_changed",
+                )
+
+        recovered = changed_monitor.reauthorize(
+            snapshot.run_id,
+            changed_record,
+            FakeRunner(),
+            "executable_contract_changed",
+        )
+
+        self.assertEqual(recovered.nodes["n2"]["status"], "rework")
+        self.assertIsNone(recovered.nodes["n2"]["acceptance"])
+        self.assertEqual(recovered.nodes["n3"]["status"], "accepted")
+        self.assertEqual(
+            (
+                recovered.nodes["n2"]["developer_identity"],
+                recovered.nodes["n2"]["reviewer_identity"],
+            ),
+            old_identities["n2"],
+        )
+        self.assertEqual(
+            (
+                recovered.nodes["n3"]["developer_identity"],
+                recovered.nodes["n3"]["reviewer_identity"],
+            ),
+            old_identities["n3"],
+        )
+        for node_id in ("n2", "n3"):
+            for role in ("developer", "reviewer"):
+                self.assertEqual(
+                    load_task_binding(
+                        self.paths, node_id, role, run_id=snapshot.run_id
+                    ).cursor,
+                    old_cursors["{}:{}".format(node_id, role)],
+                )
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in load_events(self.paths, snapshot.run_id)
                     if event["event"] == "authorization_reauthorized"
                 ]
             ),

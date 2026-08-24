@@ -156,6 +156,18 @@ class Monitor:
             node_id: executable_contract_digest([self.nodes[node_id]])
             for node_id in snapshot.nodes
         }
+        changed_nodes = sorted(
+            node_id
+            for node_id in snapshot.nodes
+            if previous_node_contract_digests[node_id]
+            != new_node_contract_digests[node_id]
+        )
+        affected_nodes = self._affected_nodes(changed_nodes)
+        accepted_nodes = sorted(
+            node_id
+            for node_id, current in snapshot.nodes.items()
+            if current.get("status") == "accepted"
+        )
         retained_acceptances = {}
         invalidated_acceptances = {}
         for node_id, current in snapshot.nodes.items():
@@ -169,10 +181,11 @@ class Monitor:
                 "authorization_epoch": acceptance.get("authorization_epoch"),
             }
             if (
-                previous_node_contract_digests.get(node_id)
+                node_id not in affected_nodes
+                and previous_node_contract_digests.get(node_id)
                 == new_node_contract_digests[node_id]
                 and evidence["contract_digest"]
-                == new_node_contract_digests[node_id]
+                == previous_node_contract_digests[node_id]
             ):
                 retained_acceptances[node_id] = evidence
             else:
@@ -219,6 +232,9 @@ class Monitor:
             "node_contract_digest": record.node_contract_digest,
             "previous_node_contract_digests": previous_node_contract_digests,
             "node_contract_digests": new_node_contract_digests,
+            "changed_nodes": changed_nodes,
+            "affected_nodes": affected_nodes,
+            "accepted_nodes": accepted_nodes,
             "retained_acceptances": retained_acceptances,
             "invalidated_acceptances": invalidated_acceptances,
             "change_reason": change_reason,
@@ -230,6 +246,24 @@ class Monitor:
         self._refresh_run_status(snapshot)
         save_snapshot(self.paths, snapshot)
         return snapshot
+
+    def _affected_nodes(self, changed_nodes: List[str]) -> List[str]:
+        """Return changed nodes plus all hard/integration descendants."""
+
+        reverse_edges = {node_id: set() for node_id in self.nodes}
+        for child_id, node in self.nodes.items():
+            for parent_id in set(node.depends_on + node.integration_after):
+                if parent_id in reverse_edges:
+                    reverse_edges[parent_id].add(child_id)
+        affected = set(changed_nodes)
+        pending = list(changed_nodes)
+        while pending:
+            parent_id = pending.pop()
+            for child_id in sorted(reverse_edges.get(parent_id, ())):
+                if child_id not in affected:
+                    affected.add(child_id)
+                    pending.append(child_id)
+        return sorted(affected)
 
     def tick(self, run_id: str, runner: Runner) -> RunSnapshot:
         snapshot = load_snapshot(self.paths, run_id)
@@ -351,12 +385,68 @@ class Monitor:
             raise ValueError("reauthorization node contract lineage is invalid")
         retained_acceptances = data.get("retained_acceptances")
         invalidated_acceptances = data.get("invalidated_acceptances")
+        changed_nodes = data.get("changed_nodes")
+        affected_nodes = data.get("affected_nodes")
+        accepted_nodes = data.get("accepted_nodes")
         if not isinstance(retained_acceptances, dict) or not isinstance(
             invalidated_acceptances, dict
+        ) or any(
+            not isinstance(items, list)
+            or any(not isinstance(node_id, str) for node_id in items)
+            or len(items) != len(set(items))
+            or items != sorted(items)
+            or any(node_id not in snapshot.nodes for node_id in items)
+            for items in (changed_nodes, affected_nodes, accepted_nodes)
         ):
             raise ValueError("reauthorization acceptance lineage is invalid")
         if set(retained_acceptances) & set(invalidated_acceptances):
             raise ValueError("reauthorization acceptance lineage overlaps")
+        expected_changed_nodes = sorted(
+            node_id
+            for node_id in snapshot.nodes
+            if previous_node_contract_digests[node_id]
+            != node_contract_digests[node_id]
+        )
+        if changed_nodes != expected_changed_nodes:
+            raise ValueError("reauthorization changed node lineage is invalid")
+        if affected_nodes != self._affected_nodes(changed_nodes):
+            raise ValueError("reauthorization affected suffix lineage is invalid")
+        retained_ids = set(retained_acceptances)
+        invalidated_ids = set(invalidated_acceptances)
+        current_accepted_ids = {
+            node_id
+            for node_id, current in snapshot.nodes.items()
+            if current.get("status") == "accepted"
+        }
+        if (
+            accepted_nodes != sorted(retained_ids | invalidated_ids)
+            or current_accepted_ids != set(accepted_nodes)
+            or set(changed_nodes) - set(affected_nodes)
+            or retained_ids & set(affected_nodes)
+            or not invalidated_ids.issubset(set(affected_nodes))
+            or retained_ids | invalidated_ids != set(accepted_nodes)
+        ):
+            raise ValueError("reauthorization affected suffix disposition is invalid")
+
+        for node_id, evidence in retained_acceptances.items():
+            if (
+                not isinstance(evidence, dict)
+                or set(evidence) != {"contract_digest", "authorization_epoch"}
+                or evidence["contract_digest"]
+                != previous_node_contract_digests[node_id]
+                or evidence["contract_digest"] != node_contract_digests[node_id]
+                or evidence["authorization_epoch"] != previous.digest
+            ):
+                raise ValueError("retained acceptance evidence is invalid")
+        for node_id, evidence in invalidated_acceptances.items():
+            if (
+                not isinstance(evidence, dict)
+                or set(evidence) != {"contract_digest", "authorization_epoch"}
+                or evidence["contract_digest"]
+                != previous_node_contract_digests[node_id]
+                or evidence["authorization_epoch"] != previous.digest
+            ):
+                raise ValueError("invalidated acceptance evidence is invalid")
 
         snapshot.authorization = replacement.to_dict()
         snapshot.authorization_digest = replacement.digest
@@ -372,32 +462,12 @@ class Monitor:
             if current.get("status") == "accepted":
                 if node_id in retained_acceptances:
                     evidence = retained_acceptances[node_id]
-                    if (
-                        not isinstance(evidence, dict)
-                        or set(evidence)
-                        != {"contract_digest", "authorization_epoch"}
-                        or evidence["contract_digest"] != node_contract_digests[node_id]
-                        or evidence["authorization_epoch"]
-                        != snapshot.authorization_digest
-                    ):
-                        raise ValueError("retained acceptance evidence is invalid")
                     current["acceptance"] = {
                         "contract_digest": evidence["contract_digest"],
                         "authorization_epoch": replacement.digest,
                     }
                     continue
                 if node_id in invalidated_acceptances:
-                    evidence = invalidated_acceptances[node_id]
-                    if (
-                        not isinstance(evidence, dict)
-                        or set(evidence)
-                        != {"contract_digest", "authorization_epoch"}
-                        or evidence["contract_digest"]
-                        != previous_node_contract_digests[node_id]
-                        or evidence["authorization_epoch"]
-                        != previous.digest
-                    ):
-                        raise ValueError("invalidated acceptance evidence is invalid")
                     current["acceptance"] = None
                     current["pair_archived"] = False
                     current["status"] = "blocked_unknown"
@@ -579,6 +649,7 @@ class Monitor:
                 "start_pending",
                 runner,
                 contract,
+                continuation,
             )
             identity = str(binding.task_id)
             current[identity_key] = identity
@@ -720,8 +791,19 @@ class Monitor:
         status: str,
         runner: Runner,
         contract: Dict[str, Any],
+        continuation: bool,
     ) -> TaskBinding:
         current = snapshot.nodes[node_id]
+        previous_binding = None
+        if continuation:
+            try:
+                previous_binding = load_task_binding(
+                    self.paths, node_id, role, run_id=snapshot.run_id
+                )
+            except FileNotFoundError:
+                previous_binding = None
+            if previous_binding is None or previous_binding.task_id != identity:
+                raise ValueError("continuation task identity is stale")
         observed_binding = getattr(runner, "task_binding", None)
         if callable(observed_binding):
             binding = observed_binding(
@@ -737,24 +819,33 @@ class Monitor:
                 or binding.role != role
                 or binding.run_id != snapshot.run_id
                 or binding.generation != generation
+                or (continuation and binding.task_id != identity)
             ):
                 raise ValueError("observed task binding does not match runtime scope")
-            return binding
-        return TaskBinding(
-            provider="runner",
-            mode="background",
-            issue_id=node_id,
-            role=role,
-            task_id=identity,
-            host=None,
-            worktree=str(current["worktree"]),
-            branch=str(current["branch"]),
-            status_file=str(current.get("status_file", "")),
-            handoff_file=str(current.get("handoff_file", "")),
-            run_id=snapshot.run_id,
-            status=status,
-            generation=generation,
-        )
+        else:
+            binding = TaskBinding(
+                provider="runner",
+                mode="background",
+                issue_id=node_id,
+                role=role,
+                task_id=identity,
+                host=None,
+                worktree=str(current["worktree"]),
+                branch=str(current["branch"]),
+                status_file=str(current.get("status_file", "")),
+                handoff_file=str(current.get("handoff_file", "")),
+                run_id=snapshot.run_id,
+                status=status,
+                generation=generation,
+            )
+        if continuation and previous_binding is not None:
+            if (
+                binding.cursor is not None
+                and binding.cursor != previous_binding.cursor
+            ):
+                raise ValueError("continuation cursor is stale")
+            binding.cursor = previous_binding.cursor
+        return binding
 
     def _set_binding_status(
         self, snapshot: RunSnapshot, node_id: str, role: str, status: str

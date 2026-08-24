@@ -67,6 +67,9 @@ _EVENT_DATA_KEYS = {
     *CONSISTENCY_CORRECTION_KEYS,
     "authorization_digest",
     "authorization_epoch",
+    "accepted_nodes",
+    "affected_nodes",
+    "changed_nodes",
     "change_reason",
     "contract_digest",
     "continuation",
@@ -641,6 +644,9 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         node_contract_digests = data.get("node_contract_digests")
         retained_acceptances = data.get("retained_acceptances")
         invalidated_acceptances = data.get("invalidated_acceptances")
+        changed_nodes = data.get("changed_nodes")
+        affected_nodes = data.get("affected_nodes")
+        accepted_nodes = data.get("accepted_nodes")
         if (
             not isinstance(previous_node_contract_digests, dict)
             or not isinstance(node_contract_digests, dict)
@@ -649,6 +655,14 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
             or not isinstance(retained_acceptances, dict)
             or not isinstance(invalidated_acceptances, dict)
             or set(retained_acceptances) & set(invalidated_acceptances)
+            or any(
+                not isinstance(items, list)
+                or any(not isinstance(node_id, str) for node_id in items)
+                or len(items) != len(set(items))
+                or items != sorted(items)
+                or any(node_id not in snapshot.nodes for node_id in items)
+                for items in (changed_nodes, affected_nodes, accepted_nodes)
+            )
         ):
             raise ValueError("reauthorization node acceptance lineage is invalid")
         for mapping in (previous_node_contract_digests, node_contract_digests):
@@ -657,6 +671,23 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 for value in mapping.values()
             ):
                 raise ValueError("reauthorization node contract digest is invalid")
+        expected_changed_nodes = sorted(
+            node_id
+            for node_id in snapshot.nodes
+            if previous_node_contract_digests[node_id]
+            != node_contract_digests[node_id]
+        )
+        retained_ids = set(retained_acceptances)
+        invalidated_ids = set(invalidated_acceptances)
+        if (
+            changed_nodes != expected_changed_nodes
+            or accepted_nodes != sorted(retained_ids | invalidated_ids)
+            or set(changed_nodes) - set(affected_nodes)
+            or retained_ids & set(affected_nodes)
+            or not invalidated_ids.issubset(set(affected_nodes))
+            or retained_ids | invalidated_ids != set(accepted_nodes)
+        ):
+            raise ValueError("reauthorization affected suffix disposition is invalid")
         for node_id, evidence in retained_acceptances.items():
             if (
                 node_id not in snapshot.nodes
@@ -676,7 +707,6 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 or not isinstance(evidence, dict)
                 or set(evidence) != {"contract_digest", "authorization_epoch"}
                 or evidence["contract_digest"] != previous_node_contract_digests[node_id]
-                or evidence["contract_digest"] == node_contract_digests[node_id]
                 or evidence["authorization_epoch"] != previous.digest
             ):
                 raise ValueError("invalidated acceptance proof is invalid")
