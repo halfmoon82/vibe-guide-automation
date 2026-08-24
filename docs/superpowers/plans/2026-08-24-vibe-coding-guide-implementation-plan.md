@@ -1,10 +1,12 @@
 # Vibe Coding 辅助开发向导 Implementation Plan
 
+> **Revision 2 — 2026-08-24:** developer 与 reviewer 必须由 Codex App `create_thread` 创建为左侧任务列表可见的 user-owned thread。旧的内部 subagent 拓扑已停止；此前授权因产品设计与执行拓扑变化而失效。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 **Goal:** 在当前“开发辅助”目录实现一个统一 CLI 和桌面 Agent 会话适配层，完成项目扫描/初始化、Skill 安装、S0/S1 分流、PRD/Spec/DAG 规划和一次授权后的可恢复监工核心。
 
-**Architecture:** 使用 Python 3.9+ 的小型模块化 CLI。`models.py` 和 `contracts.py` 先定义配置、DAG、授权和运行事件的稳定接口；扫描/初始化/Skill 安装、规划引擎、监工状态机和 Agent 适配器分别作为可独立测试的模块。项目运行状态保存在 `.vibe/`，调度器通过事件日志和原子快照恢复，不依赖某个 Agent 的全局会话索引。
+**Architecture:** 使用 Python 3.9+ 的小型模块化 CLI。`models.py` 和 `contracts.py` 先定义配置、DAG、授权和运行事件的稳定接口；扫描/初始化/Skill 安装、规划引擎、监工状态机和 Agent 适配器分别作为可独立测试的模块。项目运行状态保存在 `.vibe/`，调度器通过事件日志、原子快照和 `tasks.json` 恢复。Codex App 是全自动参考控制面：每个 developer/reviewer 都由 `create_thread` 创建为可见独立任务，并按精确任务身份续接，不使用父会话内部 background subagent。
 
 **Tech Stack:** Python 3.9+；`argparse`、`dataclasses`、`json`、`pathlib`、`subprocess`、`hashlib`、`tempfile`、`unittest`；配置解析使用 `PyYAML>=6.0`；CLI 入口通过 `pyproject.toml` 的 console script 暴露为 `vibe`。
 
@@ -22,6 +24,10 @@
 - 未知状态不得转换为无事项或成功；无法验证时进入 `blocked_unknown`。
 - 实现缺陷优先退回同一 worker；设计变化只重建受影响 DAG 后缀。
 - 桌面 App 适配必须检测权限并如实降级，不能绕过沙箱或伪造完整自动化。
+- Codex App 全自动路径中，开发 Issue 和独立 Review 必须分别映射为 user-owned thread；左侧任务列表可见、可进入、可追溯是验收条件。
+- 每个任务登记 `threadId`、`hostId`、worktree、branch、`status_file`、`handoff_file` 和 cursor；返工回到原 developer，复审回到原 reviewer。
+- 禁止用内部 subagent 充当 developer 或 reviewer；其他桌面 App 无等价可见任务能力时降级为引导模式。
+- 任务创建也是授权动作；只有新版授权卡确认后才能调用 `create_thread`。设计或执行拓扑变化使授权失效。
 
 ## Implementation DAG
 
@@ -38,6 +44,35 @@ N4 ─┘
 ```
 
 N1、N2、N3、N4 在 N0 的契约完成后可并行开发；N3 使用 N0 的 runner/事件占位接口，不等待具体 Agent 适配器；N5 只在四条工作流都通过定向测试后启动。
+
+### Revision 2 可见任务执行 DAG
+
+代码依赖关系仍为 `N0 → N1/N2/N3/N4 → N5`，但每个 Issue 拆为“可见 developer → 可见 reviewer”两个不同的 Codex App 任务。迁移后的执行图为：
+
+```text
+M0 更新设计/计划/项目规则（本次主会话完成）
+├── R0 可见 reviewer：重新核验 N0@7d8ba5d
+├── R1 可见 reviewer：重新核验 N1@22819a9
+├── D2 可见 developer：从 N2@9916c2c 续作/补报告 → R2 可见 reviewer
+├── D3 可见 developer：从封存对象 41c16c26… 续作 → R3 可见 reviewer
+└── D4 可见 developer：实现 N4 → R4 可见 reviewer
+
+R1 + R2 + R3 + R4 → D5 可见 developer：N5 集成 → R5 可见 reviewer：全分支验收
+```
+
+首批 ready 集合为 `R0、R1、D2、D3、D4`，可并行上限为 5。R0 是 N0 的补充复核证据；N5 的硬门只要求 N1–N4 分别通过可见 reviewer，但最终 R5 必须覆盖 N0–N5 全分支。任一 Review 的 P0–P2 问题回到原 developer，修复后回到原 reviewer，不新建替代任务。
+
+### 迁移保留证据
+
+| 节点 | 保留成果 | 当前处理 |
+|---|---|---|
+| N0 | commit `7d8ba5d`，原报告和 Review 包 | 不重复实现；由新建可见 R0 重新核验 |
+| N1 | commits `21c961d`、`22819a9`，报告和 Review 包 | 不重复实现；由新建可见 R1 重新核验 |
+| N2 | commit `9916c2c`，定向测试 15 项通过，尚无正式报告/Review | D2 从该 commit 继续补齐交付，再交 R2 |
+| N3 | 未完成文件封存为 Git stash object `41c16c26a66fb91be2df9d24900b387cd926a983` | D3 在原隔离 worktree 恢复后继续；旧 worker 已停止 |
+| N4/N5 | 尚未开始 | 仅在新版授权后创建可见任务 |
+
+旧内部 worker/reviewer 不再拥有 writer 或 Review 权；不得与新可见任务同时运行。
 
 ## File Responsibility Map
 
@@ -242,10 +277,12 @@ N1、N2、N3、N4 在 N0 的契约完成后可并行开发；N3 使用 N0 的 ru
 
 - Create: `vibe_guide/authorization.py`
 - Create: `vibe_guide/state.py`
+- Create: `vibe_guide/task_registry.py`
 - Create: `vibe_guide/monitor.py`
 - Create: `vibe_guide/runners/fake.py`
 - Create: `tests/test_authorization.py`
 - Create: `tests/test_state.py`
+- Create: `tests/test_task_registry.py`
 - Create: `tests/test_monitor.py`
 
 **Interfaces:**
@@ -254,14 +291,16 @@ N1、N2、N3、N4 在 N0 的契约完成后可并行开发；N3 使用 N0 的 ru
 - `authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord`
 - `is_authorization_valid(record: AuthorizationRecord, plan: Plan) -> bool`
 - `append_event(paths: ProjectPaths, event: RunEvent) -> None`
+- `save_task_binding(paths: ProjectPaths, binding: TaskBinding) -> None`
+- `load_task_binding(paths: ProjectPaths, issue_id: str, role: str) -> TaskBinding`
 - `load_snapshot(paths: ProjectPaths, run_id: str) -> RunSnapshot`
 - `Monitor.start(record: AuthorizationRecord, runner: Runner) -> RunSnapshot`
 - `Monitor.resume(run_id: str, runner: Runner) -> RunSnapshot`
 - `Monitor.tick(run_id: str, runner: Runner) -> RunSnapshot`
 
-- [ ] **Step 1: Write failing authorization and state tests**
+- [ ] **Step 1: Write failing authorization, task registry, and state tests**
 
-  Assert authorization cards list every allowed action, explicitly exclude deploy, bind to the plan version, invalidate on plan changes, append events without rewriting history, and recover the last valid snapshot after process interruption.
+  Assert authorization cards list every allowed action, explicitly exclude deploy, bind to the plan version, invalidate on plan changes, append events without rewriting history, recover the last valid snapshot after process interruption, and preserve exact developer/reviewer task identities without allowing duplicate writers.
 
 - [ ] **Step 2: Write failing monitor tests with fake runner**
 
@@ -269,13 +308,13 @@ N1、N2、N3、N4 在 N0 的契约完成后可并行开发；N3 使用 N0 的 ru
 
 - [ ] **Step 3: Run N3 tests and verify failure**
 
-  Run: `python3 -m unittest tests.test_authorization tests.test_state tests.test_monitor -v`
+  Run: `python3 -m unittest tests.test_authorization tests.test_state tests.test_task_registry tests.test_monitor -v`
 
   Expected: FAIL because state, authorization, and monitor modules are absent.
 
 - [ ] **Step 4: Implement atomic state and event persistence**
 
-  Write snapshots to a temporary file in the same directory and replace atomically. Append JSONL events with sequence numbers. Use an exclusive lease file per node/worktree and clear only leases owned by the current run.
+  Write snapshots and `tasks.json` to a temporary file in the same directory and replace atomically. Append JSONL events with sequence numbers. Persist `threadId`, `hostId`, worktree, branch, status/handoff paths and cursor. Use an exclusive lease file per node/worktree and clear only leases owned by the current run.
 
 - [ ] **Step 5: Implement authorization binding**
 
@@ -287,7 +326,7 @@ N1、N2、N3、N4 在 N0 的契约完成后可并行开发；N3 使用 N0 的 ru
 
 - [ ] **Step 7: Run N3 tests and verify pass**
 
-  Run: `python3 -m unittest tests.test_authorization tests.test_state tests.test_monitor -v`
+  Run: `python3 -m unittest tests.test_authorization tests.test_state tests.test_task_registry tests.test_monitor -v`
 
   Expected: PASS, including parallel dispatch, unique writer, resume, and unknown-state behavior.
 
@@ -330,7 +369,7 @@ N1、N2、N3、N4 在 N0 的契约完成后可并行开发；N3 使用 N0 的 ru
 
 - [ ] **Step 3: Implement manifest-driven capability detection**
 
-  Do not guess proprietary app paths or APIs. Read probes from manifests, report observed command/path/permission facts, and map them to the three capability levels. Session prompts must contain only the short trigger and current plan reference.
+  Do not guess proprietary app paths or APIs. Read probes from manifests, report observed command/path/permission facts, and map them to the three capability levels. Session prompts must contain only the short trigger and current plan reference. Codex App 的完整自动化能力还必须包含可创建并续接 user-owned thread；不能核验时降级，不得回退到内部 subagent。
 
 - [ ] **Step 4: Implement session bridge commands**
 
@@ -407,6 +446,7 @@ N1、N2、N3、N4 在 N0 的契约完成后可并行开发；N3 使用 N0 的 ru
 | Parallel placeholders | DAG ready/contract tests | N2 |
 | One-time non-deploy authorization | Digest and exclusion tests | N3 |
 | Unique writer and same-worker rework | Fake runner monitor tests | N3 |
+| Developer/reviewer visible independent tasks | Task registry, exact thread continuation and App capability tests | N3/N4/N5 |
 | Unknown state is not no-op | `blocked_unknown` test | N3 |
 | Desktop session and permission downgrade | Adapter fixture tests | N4 |
 | Resume after interruption | Snapshot recovery and E2E test | N3/N5 |
@@ -421,3 +461,17 @@ The implementation worker must not start before:
 3. The user explicitly authorizes the listed non-deploy actions.
 
 Deploy, system-permission changes, and actions not listed in the authorization card remain outside this authorization.
+
+### Revision 2 重新授权卡
+
+旧授权状态：**invalidated**，原因是 developer/reviewer 从内部 subagent 改为 Codex App user-owned thread，属于产品设计与执行拓扑变化。
+
+重新授权后允许：
+
+- 按新版 DAG 最多并行创建 5 个左侧可见的 developer/reviewer 独立任务；
+- 使用已登记的精确 thread 继续开发、Review、返工和复审；
+- 使用上述隔离 worktree/branch，并恢复 N3 的精确封存对象；
+- 在当前项目白名单内编辑、测试、生成报告和本地 commit；
+- 由监工等待可动作终态、核验证据、更新 DAG 状态，并持续轮转到 R5 完成。
+
+明确不包含：push、创建 MR、merge、deploy、系统权限变更、扩大项目/文件/数据范围、替用户做新的产品取舍。任何一项出现时再次暂停。
