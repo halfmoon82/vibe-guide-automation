@@ -1,4 +1,5 @@
 from dataclasses import replace
+from copy import deepcopy
 import unittest
 
 from vibe_guide.authorization import (
@@ -86,6 +87,48 @@ class AuthorizationTests(unittest.TestCase):
                 self.plan,
             )
         )
+
+    def test_full_executable_contract_is_bound_and_excluded_actions_are_rejected(self):
+        base = node("n1", ["safe.py"])
+        base.contract.update(
+            {
+                "branch": "codex/safe",
+                "provider": "codex",
+                "mode": "visible",
+                "hostId": "local",
+                "developer_task_id": "thread-safe",
+            }
+        )
+        plan = Plan("plan-contract", 1, "docs/prd.md", ["n1"], "draft")
+        baseline = build_authorization_card(plan, [base], self.capabilities)
+
+        mutations = {
+            "files": ["outside.py"],
+            "worker": "worker-evil",
+            "worktree": "../outside",
+            "branch": "codex/evil",
+            "provider": "other-provider",
+            "developer_task_id": "thread-other",
+        }
+        for key, value in mutations.items():
+            with self.subTest(field=key):
+                changed = deepcopy(base)
+                changed.contract[key] = value
+                card = build_authorization_card(plan, [changed], self.capabilities)
+                self.assertNotEqual(card.digest, baseline.digest)
+
+        excluded = deepcopy(base)
+        excluded.contract["action"] = "deploy"
+        with self.assertRaises(ValueError):
+            build_authorization_card(plan, [excluded], self.capabilities)
+
+    def test_authorization_rejects_raw_secret_fields(self):
+        secret_node = node("n1", ["safe.py"])
+        secret_node.contract["token"] = "raw-secret-sentinel"
+        plan = Plan("plan-secret", 1, "docs/prd.md", ["n1"], "draft")
+
+        with self.assertRaises(ValueError):
+            build_authorization_card(plan, [secret_node], self.capabilities)
 
 
 if __name__ == "__main__":
