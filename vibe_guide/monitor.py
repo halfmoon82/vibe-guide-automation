@@ -485,26 +485,25 @@ class Monitor:
                     continue
                 if node_id in invalidated_acceptances:
                     current["acceptance"] = None
-                    current["pair_archived"] = True
-                    current["status"] = "blocked_unknown"
-                    current["retryable_action"] = {
-                        "role": "developer",
-                        "phase": "rework",
-                        "continuation": True,
-                        "pending_schedule": True,
-                    }
+                    self._queue_reauthorization_continuation(current)
                     continue
                 raise ValueError("accepted node lacks reauthorization disposition")
             if int(current.get("developer_generation", 0)) > 0:
-                current["status"] = "blocked_unknown"
-                current["retryable_action"] = {
-                    "role": "developer",
-                    "phase": "rework",
-                    "continuation": True,
-                }
+                self._queue_reauthorization_continuation(current)
             else:
                 current["status"] = "planned"
                 current["retryable_action"] = None
+
+    @staticmethod
+    def _queue_reauthorization_continuation(current: Dict[str, Any]) -> None:
+        current["pair_archived"] = True
+        current["status"] = "blocked_unknown"
+        current["retryable_action"] = {
+            "role": "developer",
+            "phase": "rework",
+            "continuation": True,
+            "pending_schedule": True,
+        }
 
     @staticmethod
     def _identity_from_contract(node: DAGNode, role: str) -> Optional[str]:

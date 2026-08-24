@@ -917,6 +917,93 @@ class MonitorTests(unittest.TestCase):
             ["n1", "n1", "n2"],
         )
 
+    def test_reauthorization_active_downstream_waits_for_reaccepted_dependency_and_capacity(
+        self,
+    ):
+        nodes = [node("n1"), node("n2", ["n1"])]
+        monitor, record = self.authorized_monitor(nodes, active_pair_limit=1)
+        initial = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "old-n1"})],
+                ("n1", "reviewer"): [("accepted", {"evidence": "old-n1"})],
+            }
+        )
+        snapshot = monitor.start(record, initial)
+        snapshot = monitor.tick(snapshot.run_id, initial)
+        snapshot = monitor.tick(snapshot.run_id, initial)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+        self.assertEqual(snapshot.nodes["n2"]["status"], "running")
+
+        original_handle = snapshot.handles["n2"]
+        original_identity = snapshot.nodes["n2"]["developer_identity"]
+        downstream_binding = load_task_binding(
+            self.paths, "n2", "developer", run_id=snapshot.run_id
+        )
+        downstream_binding.cursor = "active-downstream-cursor"
+        save_task_binding(self.paths, downstream_binding)
+
+        changed_upstream = node("n1")
+        changed_upstream.contract["acceptance_example"] = "changed upstream"
+        changed_nodes = [changed_upstream, node("n2", ["n1"])]
+        changed_plan = Plan("plan-1", 1, "docs/prd.md", ["n1", "n2"], "draft")
+        changed_record = authorize(
+            build_authorization_card(
+                changed_plan,
+                changed_nodes,
+                self.capabilities,
+                active_pair_limit=1,
+            ),
+            "AUTHORIZE",
+        )
+        recovery = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "new-n1"})],
+                ("n1", "reviewer"): [("accepted", {"evidence": "new-n1"})],
+            }
+        )
+        changed_monitor = Monitor(self.paths, changed_plan, changed_nodes)
+
+        snapshot = changed_monitor.reauthorize(
+            snapshot.run_id,
+            changed_record,
+            recovery,
+            "executable_contract_changed",
+        )
+
+        self.assertIn(original_handle, recovery.stop_calls)
+        self.assertEqual([call["node_id"] for call in recovery.start_calls], ["n1"])
+        self.assertEqual(snapshot.nodes["n2"]["status"], "blocked_unknown")
+        self.assertTrue(snapshot.nodes["n2"]["retryable_action"]["pending_schedule"])
+        transition_sequence = next(
+            event["sequence"]
+            for event in load_events(self.paths, snapshot.run_id)
+            if event["event"] == "authorization_reauthorized"
+        )
+
+        snapshot = changed_monitor.tick(snapshot.run_id, recovery)
+        before_acceptance = [
+            event
+            for event in load_events(self.paths, snapshot.run_id)
+            if event["event"] == "start_intent"
+            and event["data"].get("node_id") == "n2"
+            and event["sequence"] > transition_sequence
+        ]
+        self.assertEqual(before_acceptance, [])
+        self.assertEqual([call["node_id"] for call in recovery.start_calls], ["n1", "n1"])
+
+        snapshot = changed_monitor.tick(snapshot.run_id, recovery)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+        self.assertEqual(
+            [call["node_id"] for call in recovery.start_calls],
+            ["n1", "n1", "n2"],
+        )
+        self.assertEqual(recovery.start_calls[-1]["task_id"], original_identity)
+        continued_binding = load_task_binding(
+            self.paths, "n2", "developer", run_id=snapshot.run_id
+        )
+        self.assertEqual(continued_binding.task_id, original_identity)
+        self.assertEqual(continued_binding.cursor, "active-downstream-cursor")
+
     def test_reauthorization_retry_obeys_capacity_but_not_integration_after(self):
         independent = [node("n1"), node("n2")]
         monitor, record = self.authorized_monitor(independent, active_pair_limit=1)
