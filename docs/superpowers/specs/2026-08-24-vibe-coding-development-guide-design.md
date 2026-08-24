@@ -30,7 +30,7 @@
 
 统一 CLI 是核心；每个 Agent 通过轻量适配器在桌面 App 会话中调用 CLI。适配器不复制核心流程，只声明调用方式和能力差异。
 
-显式独立任务是七个平台共同的产品合同。每个 Agent 适配器必须实现或声明一个 `VisibleTaskProvider`：创建 developer/reviewer、返回平台任务 ID 和 host、让用户在桌面 App 中进入任务、按原任务续接返工/复审，并提供精确等待 cursor/token。Codex App 的 provider 使用 `create_thread`；Claude Code、Cursor、Grok、WorkBuddy、Kimi Code 和 DeepSeek Harness 使用各自可验证的等价能力。不得使用只存在于父会话内部的 background subagent。缺少等价能力的平台仍可使用统一 CLI 的扫描、规划和引导功能，但必须降级，不能声明完整自动化。
+显式独立任务是七个平台共同的首选产品合同。每个 Agent 适配器必须实现或声明一个 `VisibleTaskProvider`：创建 developer/reviewer、返回平台任务 ID 和 host、让用户在桌面 App 中进入任务、按原任务续接返工/复审，并提供精确等待 cursor/token。Codex App 的 provider 使用 `create_thread`；Claude Code、Cursor、Grok、WorkBuddy、Kimi Code 和 DeepSeek Harness 使用各自可验证的等价能力。平台确认没有等价桥接时，可以降级为 `background` 模式使用 subagent；授权卡和能力报告必须披露任务不可见、不可直接进入及返工续接限制，不能把它描述为完整可见自动化。
 
 在各家桌面 App 的最高可授予权限下，验收目标是：用户在会话中输入触发词，Agent 能调用 CLI、展示授权卡、自动运行已授权 DAG，并在会话中回传进度和结果。权限不足时必须检测并如实降级，不绕过沙箱。
 
@@ -141,7 +141,7 @@ vibe resume     # 从快照恢复
 
 桌面 App 会话负责需求讨论、展示决策卡和授权卡、接收短触发词、展示进度；CLI 负责真实状态、调度和证据写入。
 
-桌面 App 适配器通过 `VisibleTaskProvider` 为每个 developer 和 reviewer 创建独立任务。创建成功后任务必须出现在该 App 的任务/会话列表，用户可以进入查看过程。监工通过精确平台任务 ID 和 host 下发后续输入并用逐任务 cursor/token 等待；不得用全局任务列表轮询代替精确登记。Codex App 的具体映射为 `create_thread`、`threadId`、`hostId` 和 cursor。
+桌面 App 适配器优先通过 `VisibleTaskProvider` 为每个 developer 和 reviewer 创建独立任务。创建成功后任务必须出现在该 App 的任务/会话列表，用户可以进入查看过程。监工通过精确平台任务 ID 和 host 下发后续输入并用逐任务 cursor/token 等待；不得用全局任务列表轮询代替精确登记。Codex App 的具体映射为 `create_thread`、`threadId`、`hostId` 和 cursor。若 provider 明确返回“不支持”，才可在授权卡中声明 `background` 降级并使用 subagent。
 
 三组同义触发词，均不超过 10 个字：
 
@@ -236,7 +236,7 @@ developer/reviewer 的任务可见性、独立性或控制面拓扑变化属于�
 
 ### 任务可见性
 
-任一受支持桌面 App 的完整自动化路径中，开发和 Review 均应在其任务/会话列表显示为独立任务。用户进入任务后可看到过程并继续返工；仅在父会话内部可见的 background subagent 不满足验收。Codex App 以左侧任务列表作为具体验收入口。
+任一受支持桌面 App 的完整可见自动化路径中，开发和 Review 均应在其任务/会话列表显示为独立任务。用户进入任务后可看到过程并继续返工。Codex App 以左侧任务列表作为具体验收入口。background subagent 只满足明确标识的降级模式验收，不能满足“用户可见、可进入”的验收项。
 
 ### 设计变化
 
@@ -257,7 +257,7 @@ developer/reviewer 的任务可见性、独立性或控制面拓扑变化属于�
 - 不把 CODING、MR、定时任务或 ActionLoop ledger 固定写入核心；
 - 不建设完整云端任务平台；
 - 不追求七个平台完全同构的原生 UI；
-- 不用父会话内部 background subagent 充当开发或独立 Review 任务；
+- 不静默使用 background subagent 冒充可见独立开发或 Review 任务；
 - 不为未来场景预先添加大量插件和门禁。
 
 ## 11. 完成定义
@@ -267,7 +267,7 @@ developer/reviewer 的任务可见性、独立性或控制面拓扑变化属于�
 - 需求、边界、用户、输入、输出、成功标准和失败行为明确；
 - S0/S1 分流、DAG 并行规则、授权边界和人类介入边界明确；
 - 桌面 App 兼容和权限降级有可验收定义；
-- 七个平台 adapter 都能报告显式独立任务能力；声明完整自动化的平台，其 developer/reviewer 可见性、任务身份登记、返工与复审续接必须可验证；
+- 七个平台 adapter 都能报告显式独立任务能力或明确的 background 降级；声明完整可见自动化的平台，其 developer/reviewer 可见性、任务身份登记、返工与复审续接必须可验证；
 - 项目产物、状态和证据位置明确；
 - 不做事项已列出；
 - 没有未决的产品取舍被带入监工阶段。

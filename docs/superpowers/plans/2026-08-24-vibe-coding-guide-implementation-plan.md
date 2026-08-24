@@ -1,12 +1,12 @@
 # Vibe Coding 辅助开发向导 Implementation Plan
 
-> **Revision 2 — 2026-08-24:** 显式独立 developer/reviewer 是通用产品合同。七个平台的完整自动化模式都必须在对应桌面 App 中创建用户可见、可进入、可续接的独立任务；Codex App 使用 `create_thread`。旧的内部 subagent 拓扑已停止。
+> **Revision 2 — 2026-08-24:** 显式独立 developer/reviewer 是通用产品的首选合同。七个平台优先在对应桌面 App 中创建用户可见、可进入、可续接的独立任务；Codex App 使用 `create_thread`。无等价桥接的平台可明确降级为 background subagent，但不能冒充完整可见自动化。当前项目的旧内部 subagent 拓扑已停止。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox syntax for tracking.
 
 **Goal:** 在当前“开发辅助”目录实现一个统一 CLI 和桌面 Agent 会话适配层，完成项目扫描/初始化、Skill 安装、S0/S1 分流、PRD/Spec/DAG 规划和一次授权后的可恢复监工核心。
 
-**Architecture:** 使用 Python 3.9+ 的小型模块化 CLI。`models.py` 和 `contracts.py` 先定义配置、DAG、授权和运行事件的稳定接口；扫描/初始化/Skill 安装、规划引擎、监工状态机和 Agent 适配器分别作为可独立测试的模块。项目运行状态保存在 `.vibe/`，调度器通过事件日志、原子快照和 `tasks.json` 恢复。核心通过平台无关的 `VisibleTaskProvider` 管理 developer/reviewer；各适配器负责创建、定位、续接和等待其桌面 App 中的显式独立任务。Codex App provider 使用 `create_thread`，任何平台都不得用父会话内部 background subagent 冒充完整自动化。
+**Architecture:** 使用 Python 3.9+ 的小型模块化 CLI。`models.py` 和 `contracts.py` 先定义配置、DAG、授权和运行事件的稳定接口；扫描/初始化/Skill 安装、规划引擎、监工状态机和 Agent 适配器分别作为可独立测试的模块。项目运行状态保存在 `.vibe/`，调度器通过事件日志、原子快照和 `tasks.json` 恢复。核心通过平台无关的 `VisibleTaskProvider` 管理 developer/reviewer；各适配器负责创建、定位、续接和等待其桌面 App 中的显式独立任务。Codex App provider 使用 `create_thread`。provider 明确不支持时可回退 `BackgroundTaskProvider`，但状态、授权和交付必须保留降级标识。
 
 **Tech Stack:** Python 3.9+；`argparse`、`dataclasses`、`json`、`pathlib`、`subprocess`、`hashlib`、`tempfile`、`unittest`；配置解析使用 `PyYAML>=6.0`；CLI 入口通过 `pyproject.toml` 的 console script 暴露为 `vibe`。
 
@@ -24,9 +24,9 @@
 - 未知状态不得转换为无事项或成功；无法验证时进入 `blocked_unknown`。
 - 实现缺陷优先退回同一 worker；设计变化只重建受影响 DAG 后缀。
 - 桌面 App 适配必须检测权限并如实降级，不能绕过沙箱或伪造完整自动化。
-- 七个平台的完整自动化路径中，开发 Issue 和独立 Review 必须分别映射为对应 App 的可见独立任务；可见、可进入、可追溯是验收条件。
+- 七个平台的完整可见自动化路径中，开发 Issue 和独立 Review 必须分别映射为对应 App 的可见独立任务；可见、可进入、可追溯是验收条件。
 - 每个任务登记 provider、平台任务 ID、host、worktree、branch、`status_file`、`handoff_file` 和 cursor/token；Codex 具体登记 `threadId`、`hostId` 和 cursor。返工回到原 developer，复审回到原 reviewer。
-- 禁止用内部 subagent 充当 developer 或 reviewer；任一桌面 App 无等价可见任务能力时降级为引导模式。
+- 只有 adapter 明确无等价可见任务能力时，才可把 developer/reviewer 降级为 background subagent；授权卡和交付必须披露限制，不能标为完整可见自动化。
 - 任务创建也是授权动作；只有新版授权卡确认后才能调用 `create_thread`。设计或执行拓扑变化使授权失效。
 
 ## Implementation DAG
@@ -361,10 +361,11 @@ R1 + R2 + R3 + R4 → D5 可见 developer：N5 集成 → R5 可见 reviewer：�
 - `VisibleTaskProvider.resume(binding: TaskBinding, contract_path: Path) -> None`
 - `VisibleTaskProvider.wait(binding: TaskBinding, cursor: Optional[str]) -> TaskUpdate`
 - `VisibleTaskProvider.visibility(binding: TaskBinding) -> VisibilityResult`
+- `BackgroundTaskProvider.create(role: str, issue_id: str, contract_path: Path) -> TaskBinding`
 
 - [ ] **Step 1: Write failing adapter tests**
 
-  Use fake command probes to assert each manifest has an ID, probe definition, session prompt, capability mapping, and visible-task provider declaration. Assert a fully capable environment with verified create/enter/resume/wait yields `full`; missing visible-task capability cannot exceed `standard`; a no-subprocess environment yields `guide`.
+  Use fake command probes to assert each manifest has an ID, probe definition, session prompt, capability mapping, and visible-task provider declaration. Assert a fully capable environment with verified create/enter/resume/wait yields `full`; missing visible-task capability selects an explicitly labelled `background` downgrade and cannot claim visible automation; a no-subprocess environment yields `guide`.
 
 - [ ] **Step 2: Run adapter tests and verify failure**
 
@@ -374,7 +375,7 @@ R1 + R2 + R3 + R4 → D5 可见 developer：N5 集成 → R5 可见 reviewer：�
 
 - [ ] **Step 3: Implement manifest-driven capability detection**
 
-  Do not guess proprietary app paths or APIs. Read probes from manifests, report observed command/path/permission facts, and map them to the three capability levels. Session prompts must contain only the short trigger and current plan reference. 七个平台的完整自动化能力都必须包含可创建、进入、续接和等待显式独立任务的 provider；Codex App 映射到 user-owned thread。不能核验时降级，不得回退到内部 subagent。
+  Do not guess proprietary app paths or APIs. Read probes from manifests, report observed command/path/permission facts, and map them to the three capability levels. Session prompts must contain only the short trigger and current plan reference. 七个平台优先使用可创建、进入、续接和等待显式独立任务的 provider；Codex App 映射到 user-owned thread。只有确认无等价桥接时才使用明确标识的 background provider。
 
 - [ ] **Step 4: Implement session bridge commands**
 

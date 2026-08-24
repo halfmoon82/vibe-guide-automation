@@ -8,7 +8,7 @@
 - 帮项目生成或适配开发规则；
 - 对简单任务保持轻量，对复杂任务先完成需求讨论、PRD、Spec/Issue 和 DAG；
 - 经一次明确授权后，自动并行开发、测试、Review、返工和验收；
-- 在所有受支持桌面 App 的完整自动化路径中，每个 developer 和 reviewer 都是用户可见、可进入、可继续的独立任务；
+- 在所有受支持桌面 App 的完整可见自动化路径中，每个 developer 和 reviewer 都是用户可见、可进入、可继续的独立任务；
 - 只在产品设计变化、需要外部授权或 deploy 时请求人类。
 
 当前逻辑项目根是本目录。上层 CFO 仓库的 `AGENTS.md` 仍然适用；本文件只增加本项目规则，不替代或修改上层规则。
@@ -71,9 +71,9 @@
 
 用户明确授权后，一次授权覆盖当前 DAG 已列明的全部非 deploy 动作。deploy、未列明动作、扩大范围或系统权限变更必须单独授权。
 
-“显式独立任务”是通用产品合同，不是当前项目的临时执行规则。所有受支持 Agent 的完整自动化模式都必须通过对应桌面 App 的原生任务能力创建用户可见任务，禁止使用仅嵌在监工会话中的 background subagent 代替。Codex App 使用 `create_thread` 创建 user-owned thread；Claude Code、Cursor、Grok、WorkBuddy、Kimi Code 和 DeepSeek Harness 必须由各自适配器提供等价的创建、进入、续接和状态定位能力。每个 Issue 固定绑定一个开发任务；每次独立 Review 固定绑定另一个 reviewer 任务。返工只回到原开发任务，复审只回到原 reviewer 任务。
+“显式独立任务”是通用产品的首选合同，不是当前项目的临时执行规则。受支持 Agent 应优先通过对应桌面 App 的原生任务能力创建用户可见任务。Codex App 使用 `create_thread` 创建 user-owned thread；Claude Code、Cursor、Grok、WorkBuddy、Kimi Code 和 DeepSeek Harness 由各自适配器探测等价的创建、进入、续接和状态定位能力。平台确认没有等价桥接时，可以明确降级为 background subagent，但必须披露不可见、不可直接进入和返工续接受限，不得把降级模式标成完整可见自动化。每个 Issue 固定绑定一个开发任务；每次独立 Review 固定绑定另一个 reviewer 任务。可续接时返工回到原开发任务、复审回到原 reviewer 任务；降级模式无法保证时必须提前披露。
 
-通用任务登记必须保存 `provider`、平台任务 ID、host、worktree、branch、状态/交付路径和续接 cursor/token；Codex 绑定具体保存 `threadId`、`hostId` 和 cursor。桌面 App 中可见、可进入、可追溯是验收条件，不是可选展示功能。任一 Agent 或桌面 App 若不能提供等价的独立可见任务，只能降级为引导模式，不得以后台 subagent 冒充完整自动化。
+通用任务登记必须保存 `provider`、`mode=visible|background`、平台任务 ID（如有）、host、worktree、branch、状态/交付路径和续接 cursor/token；Codex 可见绑定具体保存 `threadId`、`hostId` 和 cursor。完整可见模式中，可见、可进入、可追溯是验收条件。无等价能力的平台可降级为 background subagent，但能力报告、授权卡和交付必须明确标识降级及限制。
 
 监工规则：
 
