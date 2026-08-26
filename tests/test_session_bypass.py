@@ -182,6 +182,19 @@ class SessionBypassTests(unittest.TestCase):
             self.assertEqual(events.count("session_bypass_granted"), 1)
             self.assertEqual(events.count("wizard_bypassed"), 1)
 
+    def test_pending_event_recovery_rejects_after_session_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            record = create_challenge("entry-1", self.now)
+            save_challenge(paths, record)
+            command = "BYPASS VIBE " + record.challenge
+            with patch("vibe_guide.session_bypass._append_events", side_effect=OSError("disk")):
+                with self.assertRaises(OSError):
+                    consume_bypass(paths, "entry-1", command, now=self.now)
+            end_session(paths, "entry-1")
+            with self.assertRaises(BypassError):
+                consume_bypass(paths, "entry-1", command, now=self.now)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -339,6 +339,9 @@ def consume_bypass(
             raise BypassError("no challenge for session")
         record = ChallengeRecord.from_dict(data[session_id])
         if record.consumed and record.pending_events:
+            current = _clock(now)
+            if record.session_ended or current >= _parse_timestamp(record.expires_at):
+                raise BypassError("challenge expired")
             match = _COMMAND.fullmatch(command) if isinstance(command, str) else None
             if not match or not secrets.compare_digest(
                 _digest(match.group(1)), record.challenge_digest
