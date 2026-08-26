@@ -18,6 +18,7 @@ from vibe_guide.state import (
     append_event,
     load_events,
     load_snapshot,
+    save_snapshot,
 )
 from vibe_guide.task_registry import TaskBinding, load_task_binding, save_task_binding
 from vibe_guide.capability_contract import build_contract, save_contract
@@ -38,6 +39,24 @@ class ProviderRetryRunner(FakeRunner):
         self.binding_attempts += 1
         if self.binding_attempts == 1:
             raise ProviderPending("provider capability bridge is pending")
+        return TaskBinding(
+            provider="fake",
+            mode="background",
+            issue_id=contract["node_id"],
+            role=contract["role"],
+            task_id=contract["task_id"],
+            worktree=str(worktree),
+            branch=contract.get("branch", "branch-" + contract["node_id"]),
+            run_id=run_id,
+            status=status,
+            generation=contract["generation"],
+        )
+
+
+class ReviewerBindingFailureRunner(FakeRunner):
+    def task_binding(self, contract, worktree, run_id, status):
+        if contract["role"] == "reviewer":
+            raise ValueError("reviewer binding unavailable during recovery")
         return TaskBinding(
             provider="fake",
             mode="background",
@@ -100,6 +119,38 @@ class ObservedContinuationRunner(FakeRunner):
         )
 
 
+class ProviderStyleContinuationRunner(FakeRunner):
+    """Return the persisted provider binding, including its old allowlist."""
+
+    def __init__(self, paths, old_allowlist, task_id, host, cursor):
+        super().__init__()
+        self.paths = paths
+        self.old_allowlist = list(old_allowlist)
+        self.task_id = task_id
+        self.host = host
+        self.cursor = cursor
+
+    def task_binding(self, contract, worktree, run_id, status):
+        return TaskBinding(
+            provider="codex-app-visible",
+            mode="visible",
+            issue_id=contract["node_id"],
+            role=contract["role"],
+            task_id=self.task_id,
+            host=self.host,
+            worktree=str(worktree),
+            branch=contract.get("branch", "branch-" + contract["node_id"]),
+            run_id=run_id,
+            status=status,
+            visible=True,
+            threadId=self.task_id,
+            hostId=self.host,
+            generation=contract["generation"],
+            cursor=self.cursor,
+            allowlist=list(self.old_allowlist),
+        )
+
+
 def node(node_id, depends_on=None, worker=None):
     return DAGNode(
         node_id,
@@ -154,6 +205,80 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(snapshot.nodes["n2"]["status"], "running")
         self.assertEqual(snapshot.nodes["n3"]["status"], "planned")
 
+    def test_historical_reviewer_flag_without_current_binding_starts_successor(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        current = snapshot.nodes["n1"]
+        historical_reviewer = "reviewer:n1:historical"
+        current["reviewer_started"] = True
+        current["reviewer_identity"] = historical_reviewer
+        save_snapshot(self.paths, snapshot)
+
+        resumed = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(resumed.nodes["n1"]["status"], "review")
+        reviewer_calls = [
+            call for call in runner.start_calls if call.get("role") == "reviewer"
+        ]
+        self.assertEqual(len(reviewer_calls), 1)
+        reviewer_call = reviewer_calls[0]
+        self.assertFalse(reviewer_call["continuation"])
+        self.assertTrue(reviewer_call["successor"])
+        self.assertNotEqual(reviewer_call["task_id"], historical_reviewer)
+        self.assertEqual(
+            reviewer_call["predecessor_task_id"], historical_reviewer
+        )
+        reviewer_binding = load_task_binding(
+            self.paths, "n1", "reviewer", run_id=snapshot.run_id
+        )
+        self.assertEqual(reviewer_binding.successor_of, historical_reviewer)
+
+    def test_resume_recovers_reviewer_started_without_current_binding(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        failed_runner = ReviewerBindingFailureRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+            }
+        )
+        snapshot = monitor.start(record, failed_runner)
+        blocked = monitor.tick(snapshot.run_id, failed_runner)
+
+        current = blocked.nodes["n1"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertEqual(current["developer_generation"], 1)
+        self.assertEqual(
+            load_task_binding(
+                self.paths, "n1", "developer", run_id=blocked.run_id
+            ).status,
+            "delivered",
+        )
+        self.assertTrue(current["reviewer_started"])
+        self.assertIsNone(current["active_task"])
+        self.assertIsNone(current["retryable_action"])
+        self.assertEqual(blocked.handles, {})
+        with self.assertRaises(FileNotFoundError):
+            load_task_binding(self.paths, "n1", "reviewer", run_id=blocked.run_id)
+
+        recovery_runner = FakeRunner()
+        resumed = monitor.resume(blocked.run_id, recovery_runner)
+
+        self.assertEqual(resumed.nodes["n1"]["status"], "review")
+        reviewer_calls = [
+            call for call in recovery_runner.start_calls if call.get("role") == "reviewer"
+        ]
+        self.assertEqual(len(reviewer_calls), 1)
+        reviewer_call = reviewer_calls[0]
+        self.assertFalse(reviewer_call["continuation"])
+        self.assertTrue(reviewer_call["successor"])
+        self.assertEqual(
+            reviewer_call["predecessor_task_id"], current["reviewer_identity"]
+        )
+
     def test_v2_run_and_child_binding_lock_the_same_capability_contract_digest(self):
         monitor, record = self.authorized_monitor([node("n1")])
         runner = FakeRunner()
@@ -189,6 +314,455 @@ class MonitorTests(unittest.TestCase):
         snapshot = monitor.resume(snapshot.run_id, runner)
         self.assertEqual(runner.binding_attempts, 2)
         self.assertEqual(snapshot.nodes["n1"]["status"], "running")
+
+    def test_fresh_capability_contract_requires_explicit_reauthorization(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        previous_digest = snapshot.capability_contract_digest
+        fresh = build_contract(
+            self.paths.root,
+            provider="fake",
+            host_id="local",
+            facts={
+                "runtime.exec": {
+                    "status": "verified_available",
+                    "scope": "task",
+                    "route": "functions.exec",
+                    "evidence_ref": "live:test-refresh",
+                }
+            },
+        )
+        save_contract(self.paths, fresh)
+
+        with self.assertRaisesRegex(PermissionError, "run binding mismatch"):
+            monitor.resume(snapshot.run_id, FakeRunner())
+
+        with patch.object(monitor, "_schedule_ready", return_value=None):
+            rebound = monitor.reauthorize(
+                snapshot.run_id,
+                record,
+                FakeRunner(),
+                "capability_contract_changed",
+            )
+
+        self.assertNotEqual(previous_digest, fresh.contract_digest)
+        self.assertEqual(rebound.capability_contract_digest, fresh.contract_digest)
+        transition = [
+            event
+            for event in load_events(self.paths, snapshot.run_id)
+            if event["event"] == "authorization_reauthorized"
+        ][-1]
+        self.assertEqual(
+            transition["data"]["previous_capability_contract_digest"],
+            previous_digest,
+        )
+        self.assertEqual(
+            transition["data"]["capability_contract_digest"],
+            fresh.contract_digest,
+        )
+
+        persisted = load_snapshot(self.paths, snapshot.run_id)
+        self.assertEqual(
+            persisted.capability_contract_digest, fresh.contract_digest
+        )
+        resumed = monitor.resume(snapshot.run_id, FakeRunner())
+        self.assertEqual(
+            resumed.capability_contract_digest, fresh.contract_digest
+        )
+
+    def test_old_task_reconciled_event_preserves_proof_fields(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        snapshot = monitor.start(record, FakeRunner())
+        append_event(
+            self.paths,
+            RunEvent(
+                "old_task_reconciled",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": "n1",
+                    "role": "developer",
+                    "predecessor_task_id": "developer:n1:old",
+                    "proof": "absent",
+                    "successor": True,
+                },
+            ),
+            {
+                "role": "system",
+                "task_id": None,
+                "handle_id": None,
+                "generation": 0,
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+            },
+        )
+        persisted = load_events(self.paths, snapshot.run_id)[-1]["data"]
+        self.assertEqual(persisted["predecessor_task_id"], "developer:n1:old")
+        self.assertEqual(persisted["proof"], "absent")
+        self.assertTrue(persisted["successor"])
+
+    def test_reauthorization_reuses_delivered_developer_binding_identity(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        failed_runner = ReviewerBindingFailureRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+            }
+        )
+        snapshot = monitor.start(record, failed_runner)
+        blocked = monitor.tick(snapshot.run_id, failed_runner)
+        old_identity = blocked.nodes["n1"]["developer_identity"]
+        self.assertEqual(
+            load_task_binding(
+                self.paths, "n1", "developer", run_id=blocked.run_id
+            ).status,
+            "delivered",
+        )
+
+        fresh = build_contract(
+            self.paths.root,
+            provider="fake",
+            host_id="local",
+            facts={
+                "runtime.exec": {
+                    "status": "verified_available",
+                    "scope": "task",
+                    "route": "functions.exec",
+                    "evidence_ref": "live:test-delivered-continuation",
+                }
+            },
+        )
+        save_contract(self.paths, fresh)
+        recovery_runner = ReviewerBindingFailureRunner()
+        rebound = monitor.reauthorize(
+            blocked.run_id,
+            record,
+            recovery_runner,
+            "capability_contract_changed",
+        )
+
+        developer_calls = [
+            call
+            for call in recovery_runner.start_calls
+            if call.get("role") == "developer"
+        ]
+        self.assertEqual(len(developer_calls), 1)
+        self.assertTrue(developer_calls[0]["continuation"])
+        self.assertFalse(developer_calls[0]["successor"])
+        self.assertEqual(developer_calls[0]["task_id"], old_identity)
+        self.assertEqual(rebound.nodes["n1"]["status"], "rework")
+
+    def test_reauthorization_widens_provider_binding_allowlist_without_new_identity(self):
+        original = node("n1")
+        plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+        card = build_authorization_card(plan, [original], self.capabilities)
+        record = authorize(card, "AUTHORIZE")
+        monitor = Monitor(self.paths, plan, [original])
+        initial_runner = ProviderStyleContinuationRunner(
+            self.paths,
+            ["n1.py"],
+            "thread-developer-n1",
+            "host-1",
+            "cursor-before-allowlist",
+        )
+        snapshot = monitor.start(record, initial_runner)
+        binding = load_task_binding(
+            self.paths, "n1", "developer", run_id=snapshot.run_id
+        )
+        binding.status = "delivered"
+        save_task_binding(self.paths, binding)
+        current = snapshot.nodes["n1"]
+        current["status"] = "delivered"
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = None
+        snapshot.handles.clear()
+        save_snapshot(self.paths, snapshot)
+
+        changed = node("n1")
+        changed.contract["files"] = ["n1.py", "vibe_guide/state.py"]
+        changed_plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+        changed_record = authorize(
+            build_authorization_card(
+                changed_plan, [changed], self.capabilities
+            ),
+            "AUTHORIZE",
+        )
+        provider_runner = ProviderStyleContinuationRunner(
+            self.paths,
+            ["n1.py"],
+            "thread-developer-n1",
+            "host-1",
+            "cursor-before-allowlist",
+        )
+        rebound = Monitor(self.paths, changed_plan, [changed]).reauthorize(
+            snapshot.run_id,
+            changed_record,
+            provider_runner,
+            "executable_contract_changed",
+        )
+
+        self.assertEqual(len(provider_runner.start_calls), 1)
+        call = provider_runner.start_calls[0]
+        self.assertEqual(call["task_id"], "thread-developer-n1")
+        self.assertTrue(call["continuation"])
+        self.assertFalse(call["successor"])
+        rebound_binding = load_task_binding(
+            self.paths, "n1", "developer", run_id=snapshot.run_id
+        )
+        self.assertEqual(rebound_binding.task_id, "thread-developer-n1")
+        self.assertEqual(rebound_binding.host, "host-1")
+        self.assertEqual(rebound_binding.cursor, "cursor-before-allowlist")
+        self.assertEqual(
+            rebound_binding.allowlist, ["n1.py", "vibe_guide/state.py"]
+        )
+        self.assertEqual(rebound.nodes["n1"]["status"], "rework")
+
+    def test_quarantined_node_without_request_binding_or_handle_never_resumes_old_task(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        initial_runner = FakeRunner()
+        snapshot = monitor.start(record, initial_runner)
+        current = snapshot.nodes["n1"]
+        current["status"] = "blocked_unknown"
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = {
+            "run_id": snapshot.run_id,
+            "handle_id": None,
+            "reason": "old task has no durable binding",
+        }
+        current["retryable_action"] = {
+            "role": "developer",
+            "phase": "rework",
+            "continuation": False,
+        }
+        snapshot.handles.clear()
+        tasks_path = Path(self.temporary.name) / ".vibe/runs" / snapshot.run_id / "tasks.json"
+        tasks_path.unlink()
+        from vibe_guide import monitor as monitor_module
+
+        with patch.object(monitor_module, "save_snapshot", wraps=monitor_module.save_snapshot):
+            monitor_module.save_snapshot(self.paths, snapshot)
+
+        recovery_runner = FakeRunner()
+        resumed = monitor.resume(snapshot.run_id, recovery_runner)
+
+        self.assertEqual(recovery_runner.start_calls, [])
+        self.assertEqual(resumed.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIsNotNone(resumed.nodes["n1"].get("quarantine"))
+
+    def test_reauthorization_creates_visible_successor_only_after_absence_is_proven(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        initial_runner = FakeRunner()
+        snapshot = monitor.start(record, initial_runner)
+        old_identity = snapshot.nodes["n1"]["developer_identity"]
+        current = snapshot.nodes["n1"]
+        current["status"] = "blocked_unknown"
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = {
+            "run_id": snapshot.run_id,
+            "handle_id": None,
+            "reason": "old task has no durable binding",
+        }
+        current["retryable_action"] = {
+            "role": "developer",
+            "phase": "rework",
+            "continuation": True,
+        }
+        snapshot.handles.clear()
+        tasks_path = Path(self.temporary.name) / ".vibe/runs" / snapshot.run_id / "tasks.json"
+        tasks_path.unlink()
+        from vibe_guide import monitor as monitor_module
+
+        monitor_module.save_snapshot(self.paths, snapshot)
+        fresh = build_contract(
+            self.paths.root,
+            provider="fake",
+            host_id="local",
+            facts={
+                "runtime.exec": {
+                    "status": "verified_available",
+                    "scope": "task",
+                    "route": "functions.exec",
+                    "evidence_ref": "live:test-successor",
+                }
+            },
+        )
+        save_contract(self.paths, fresh)
+
+        recovery_runner = FakeRunner()
+        rebound = monitor.reauthorize(
+            snapshot.run_id,
+            record,
+            recovery_runner,
+            "capability_contract_changed",
+        )
+
+        self.assertEqual(len(recovery_runner.start_calls), 1)
+        call = recovery_runner.start_calls[0]
+        self.assertNotEqual(call["task_id"], old_identity)
+        self.assertTrue(call["successor"])
+        self.assertEqual(call["capability_contract_digest"], fresh.contract_digest)
+        self.assertEqual(call["child_binding"]["worktree"], ".worktrees/n1")
+        self.assertEqual(call["branch"], "node/n1")
+        self.assertEqual(
+            call["child_binding"]["capability_contract_digest"],
+            fresh.contract_digest,
+        )
+        self.assertEqual(rebound.nodes["n1"]["status"], "rework")
+
+    def test_reauthorization_keeps_ambiguous_old_binding_blocked_without_successor(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        initial_runner = FakeRunner()
+        snapshot = monitor.start(record, initial_runner)
+        current = snapshot.nodes["n1"]
+        current["status"] = "blocked_unknown"
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = {
+            "run_id": snapshot.run_id,
+            "handle_id": None,
+            "reason": "old task status is ambiguous",
+        }
+        current["retryable_action"] = {
+            "role": "developer",
+            "phase": "rework",
+            "continuation": True,
+        }
+        snapshot.handles.clear()
+        binding = load_task_binding(
+            self.paths, "n1", "developer", run_id=snapshot.run_id
+        )
+        binding.status = "running"
+        save_task_binding(self.paths, binding)
+        from vibe_guide import monitor as monitor_module
+
+        monitor_module.save_snapshot(self.paths, snapshot)
+        fresh = build_contract(
+            self.paths.root,
+            provider="fake",
+            host_id="local",
+            facts={
+                "runtime.exec": {
+                    "status": "verified_available",
+                    "scope": "task",
+                    "route": "functions.exec",
+                    "evidence_ref": "live:test-ambiguous",
+                }
+            },
+        )
+        save_contract(self.paths, fresh)
+
+        recovery_runner = FakeRunner()
+        rebound = monitor.reauthorize(
+            snapshot.run_id,
+            record,
+            recovery_runner,
+            "capability_contract_changed",
+        )
+
+        self.assertEqual(recovery_runner.start_calls, [])
+        self.assertEqual(rebound.nodes["n1"]["status"], "blocked_unknown")
+        self.assertEqual(
+            rebound.nodes["n1"]["retryable_action"]["continuation"], True
+        )
+
+    def test_replayed_old_task_reconciled_forged_predecessor_never_starts_successor(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        snapshot = monitor.start(record, FakeRunner())
+        current = snapshot.nodes["n1"]
+        current.update(
+            {
+                "status": "blocked_unknown",
+                "active_role": None,
+                "active_task": None,
+                "quarantine": {"run_id": snapshot.run_id, "handle_id": None, "reason": "replay"},
+                "retryable_action": {
+                    "role": "developer",
+                    "phase": "rework",
+                    "continuation": True,
+                    "pending_schedule": True,
+                    "successor_candidate": True,
+                },
+            }
+        )
+        snapshot.handles.clear()
+        (Path(self.temporary.name) / ".vibe/runs" / snapshot.run_id / "tasks.json").unlink()
+        save_snapshot(self.paths, snapshot)
+        append_event(
+            self.paths,
+            RunEvent(
+                "old_task_reconciled",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": "n1",
+                    "role": "developer",
+                    "proof": "absent",
+                    "predecessor_task_id": "evil-predecessor",
+                },
+            ),
+            {
+                "role": "system",
+                "task_id": None,
+                "handle_id": None,
+                "generation": 0,
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+            },
+        )
+
+        recovery = FakeRunner()
+        resumed = monitor.resume(snapshot.run_id, recovery)
+
+        self.assertEqual(recovery.start_calls, [])
+        self.assertEqual(resumed.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIsNone(resumed.nodes["n1"].get("retryable_action"))
+
+    def test_reauthorization_replay_is_idempotent_for_transition_and_reconciliation_events(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        snapshot = monitor.start(record, FakeRunner())
+        current = snapshot.nodes["n1"]
+        current.update(
+            {
+                "status": "blocked_unknown",
+                "active_role": None,
+                "active_task": None,
+                "quarantine": {"run_id": snapshot.run_id, "handle_id": None, "reason": "replay"},
+                "retryable_action": {
+                    "role": "developer",
+                    "phase": "rework",
+                    "continuation": True,
+                    "pending_schedule": True,
+                    "successor_candidate": True,
+                },
+            }
+        )
+        snapshot.handles.clear()
+        (Path(self.temporary.name) / ".vibe/runs" / snapshot.run_id / "tasks.json").unlink()
+        save_snapshot(self.paths, snapshot)
+        fresh = build_contract(
+            self.paths.root,
+            provider="fake",
+            host_id="local",
+            facts={
+                "runtime.exec": {
+                    "status": "verified_available",
+                    "scope": "task",
+                    "route": "functions.exec",
+                    "evidence_ref": "live:idempotent-refresh",
+                }
+            },
+        )
+        save_contract(self.paths, fresh)
+        with patch.object(monitor, "_schedule_ready", side_effect=RuntimeError("interrupted")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                monitor.reauthorize(snapshot.run_id, record, FakeRunner(), "capability_contract_changed")
+
+        resumed = monitor.reauthorize(snapshot.run_id, record, FakeRunner(), "capability_contract_changed")
+        events = load_events(self.paths, snapshot.run_id)
+        self.assertEqual(sum(event["event"] == "authorization_reauthorized" for event in events), 1)
+        self.assertEqual(sum(event["event"] == "old_task_reconciled" for event in events), 1)
+        self.assertEqual(resumed.nodes["n1"]["status"], "rework")
 
     def test_active_pair_capacity_archives_accepted_pair_and_starts_next(self):
         nodes = [node("n1"), node("n2")]

@@ -22,7 +22,7 @@ from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
 from .dag import render_plan_artifacts, validate_dag
 from .doctor import doctor
-from .initializer import init_project
+from .initializer import apply_agentsmd_proposal, init_project
 from .models import AgentCapabilities, DAGNode, Plan
 from .monitor import Monitor
 from .change_requests import ChangeRequest, classify_merge_capability
@@ -38,9 +38,9 @@ from .planner import (
 )
 from .scanner import scan_project
 from .diagnostics import screen_session, require_session_screened
-from .diagnostics import assert_planning_gate
+from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
 from .workflow_gate import require_capability_contract
-from .state import load_snapshot
+from .state import load_events, load_snapshot
 from .runners.provider_action import ProviderActionRunner
 
 
@@ -71,7 +71,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "doctor", "plan", "monitor", "status", "resume", "change-request"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "plan", "monitor", "status", "resume", "change-request"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -313,7 +313,7 @@ def _publish_plan(
         _atomic_json(staging / "nodes.json", [node.to_dict() for node in nodes])
         _atomic_json(staging / "authorization-card.json", card.to_dict())
         _atomic_json(staging / "dag-audit.json", {"status": "reviewed", "node_count": len(nodes), "plan_revision": str(plan.version), "node_ids": [node.id for node in nodes]})
-        _atomic_json(staging / "plan-confirmation.json", {"status": "confirmed", "plan_revision": str(plan.version), "authorization_digest": card.digest, "authorization_required": True})
+        _atomic_json(staging / "plan-confirmation.json", {"status": "confirmed", "plan_id": plan.plan_id, "plan_revision": str(plan.version), "authorization_digest": card.digest, "authorization_required": True})
         os.replace(str(staging), str(destination))
     except BaseException:
         if staging.exists():
@@ -333,6 +333,86 @@ def _load_plan(paths: ProjectPaths, plan_id: str):
     if plan.plan_id != plan_id or card.plan_id != plan_id:
         raise ValueError("plan identity does not match its directory")
     return directory, plan, nodes, card
+
+
+def _verified_same_run_reauthorization(
+    paths: ProjectPaths,
+    directory: Path,
+    plan: Plan,
+    nodes: List[DAGNode],
+    card: AuthorizationCard,
+) -> bool:
+    """Allow only a validated current-run reauthorization past stale publication.
+
+    A stale plan-confirmation is bypassed only when the current card and
+    authorization record match a loadable snapshot whose event lineage
+    contains that same-run reauthorization.  Missing, forged, or mismatched
+    evidence remains a planning gate failure.
+    """
+    try:
+        record = AuthorizationRecord.from_dict(
+            _read_json(directory / "authorization.json")
+        )
+        if record.digest != card.digest:
+            return False
+        if not _current_run_path(directory).is_file():
+            return False
+        run_id = _run_id(directory, None)
+        snapshot = load_snapshot(paths, run_id)
+        if snapshot.plan_id != plan.plan_id or snapshot.plan_version != plan.version:
+            return False
+        if snapshot.authorization_digest != card.digest:
+            return False
+        if snapshot.node_contract_digest != record.node_contract_digest:
+            return False
+        events = load_events(paths, run_id)[: snapshot.event_sequence]
+        confirmation = _read_json(directory / "plan-confirmation.json")
+        if (
+            not isinstance(confirmation, dict)
+            or confirmation.get("status") != "confirmed"
+            or confirmation.get("plan_revision") != str(plan.version)
+        ):
+            return False
+        if not _valid_plan_confirmation_binding(
+            paths,
+            directory,
+            plan.to_dict(),
+            card.to_dict(),
+            confirmation,
+        ):
+            return False
+        lineage_digests = {events[0]["data"].get("authorization_digest")}
+        lineage_digests.update(
+            event["data"].get("previous_authorization_digest")
+            for event in events
+            if event["event"] == "authorization_reauthorized"
+        )
+        if confirmation.get("authorization_digest") not in lineage_digests:
+            return False
+        return any(
+            event["event"] == "authorization_reauthorized"
+            and event["data"].get("authorization_digest") == card.digest
+            for event in events
+        )
+    except (FileNotFoundError, OSError, TypeError, ValueError, KeyError):
+        return False
+
+
+def _require_public_execution_gate(
+    paths: ProjectPaths,
+    directory: Path,
+    plan: Plan,
+    nodes: List[DAGNode],
+    card: AuthorizationCard,
+) -> None:
+    gate = assert_planning_gate(paths, plan.plan_id)
+    if gate.status == "execution_ready":
+        return
+    if gate.missing == ["plan-confirmation.invalid"] and _verified_same_run_reauthorization(
+        paths, directory, plan, nodes, card
+    ):
+        return
+    raise PermissionError("planning_required: " + ", ".join(gate.missing))
 
 
 def _snapshot_result(command: str, snapshot: Any, as_json: bool) -> CLIResult:
@@ -383,6 +463,10 @@ def _persist_invalidation(directory: Optional[Path], reason: str) -> None:
                 "change_reason": "executable_contract_changed",
             },
         )
+
+
+def _is_capability_contract_unknown(error: BaseException) -> bool:
+    return "capability_contract_unknown" in str(error)
 
 
 def _run_id(directory: Path, requested: Optional[str]) -> str:
@@ -480,6 +564,46 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             SUCCESS,
             payload,
             "初始化完成" if initialized.changed else "初始化无需变更",
+            args.as_json,
+        )
+
+    if args.command == "apply-agentsmd":
+        if not args.confirm:
+            return _result(
+                BLOCKED,
+                {
+                    "command": "apply-agentsmd",
+                    "status": "blocked",
+                    "reason": "confirmation required",
+                },
+                "AGENTS.md 规则应用已暂停：需要明确确认",
+                args.as_json,
+            )
+        try:
+            applied = apply_agentsmd_proposal(paths, True)
+        except (OSError, TypeError, ValueError) as error:
+            return _result(
+                BLOCKED,
+                {
+                    "command": "apply-agentsmd",
+                    "status": "blocked",
+                    "reason": str(error),
+                },
+                "AGENTS.md 规则应用已阻塞：" + str(error),
+                args.as_json,
+            )
+        payload = {
+            "command": "apply-agentsmd",
+            "status": "ok",
+            "changed": applied.changed,
+            "paths": applied.paths,
+        }
+        return _result(
+            SUCCESS,
+            payload,
+            "AGENTS.md 能力规则已生效"
+            if applied.changed
+            else "AGENTS.md 能力规则无需变更",
             args.as_json,
         )
 
@@ -602,6 +726,17 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             source_path = paths.resolve_relative(args.node_spec)
             plan, nodes, card = _publish_plan(paths, args.plan_id, source_path)
         except PermissionError as error:
+            if _is_capability_contract_unknown(error):
+                return _result(
+                    UNKNOWN,
+                    {
+                        "command": "monitor",
+                        "status": "blocked_unknown",
+                        "reason": str(error),
+                    },
+                    "能力合同状态未知：" + str(error),
+                    args.as_json,
+                )
             return _result(
                 BLOCKED,
                 {"command": "plan", "status": "blocked", "reason": str(error)},
@@ -673,9 +808,9 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 except ValueError:
                     state_data = {}
                 if isinstance(state_data, dict) and state_data.get("workflow_version") == 2:
-                    gate = assert_planning_gate(paths, args.plan)
-                    if gate.status != "execution_ready":
-                        raise PermissionError("planning_required: " + ", ".join(gate.missing))
+                    _require_public_execution_gate(
+                        paths, directory, plan, nodes, card
+                    )
             invalidation_path = _invalidation_path(directory)
             invalidation_to_clear = None
             if invalidation_path.exists():
@@ -698,12 +833,40 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 )
                 _atomic_json(directory / "authorization-card.json", card.to_dict())
                 invalidation_to_clear = invalidation_path
+            elif _current_run_path(directory).exists():
+                # A capability-only mismatch is deliberately reported as
+                # unknown by public resume, so it has no invalidation marker
+                # to select this branch.  An existing current run is still
+                # authoritative: reauthorize it in place rather than
+                # creating a second writer and colliding on the old lease.
+                record = authorize(card, args.authorize)
+                if runner is None:
+                    runner = _public_runner(paths, card, nodes)
+                snapshot = Monitor(paths, plan, nodes).reauthorize(
+                    _run_id(directory, None),
+                    record,
+                    runner,
+                    "capability_contract_changed",
+                )
             else:
                 record = authorize(card, args.authorize)
                 if runner is None:
                     runner = _public_runner(paths, card, nodes)
                 snapshot = Monitor(paths, plan, nodes).start(record, runner)
             _atomic_json(directory / "authorization.json", record.to_dict())
+            _atomic_json(
+                directory / "plan-confirmation.json",
+                {
+                    "status": "confirmed",
+                    "plan_id": plan.plan_id,
+                    "plan_revision": str(plan.version),
+                    "authorization_digest": record.digest,
+                    "authorization_required": True,
+                    "run_id": snapshot.run_id,
+                    "event_sequence": snapshot.event_sequence,
+                    "publication": "same_run_reauthorization",
+                },
+            )
             _atomic_json(
                 _current_run_path(directory), {"run_id": snapshot.run_id}
             )
@@ -774,6 +937,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         try:
             directory, plan, nodes, _card = _load_plan(paths, args.plan)
             run_id = _run_id(directory, args.run_id)
+            if args.command == "resume" and v2_state:
+                _require_public_execution_gate(
+                    paths, directory, plan, nodes, _card
+                )
             invalidation = _invalidation_path(directory)
             if invalidation.exists():
                 persisted = _read_json(invalidation)
@@ -804,6 +971,17 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 snapshot = monitor.resume(run_id, runner)
                 snapshot = monitor.tick(run_id, runner)
         except PermissionError as error:
+            if _is_capability_contract_unknown(error):
+                return _result(
+                    UNKNOWN,
+                    {
+                        "command": args.command,
+                        "status": "blocked_unknown",
+                        "reason": str(error),
+                    },
+                    "能力合同状态未知：" + str(error),
+                    args.as_json,
+                )
             _persist_invalidation(
                 directory, "authorization invalidated: " + str(error)
             )
