@@ -11,6 +11,8 @@ from vibe_guide.diagnostics import (
     validate_child_session_binding,
 )
 from vibe_guide.initializer import init_project
+from vibe_guide.capability_contract import build_contract, save_contract
+from vibe_guide.workflow_gate import require_capability_contract, session_contract_prompt
 
 
 class V2DiagnosticsTests(unittest.TestCase):
@@ -89,3 +91,73 @@ class V2DiagnosticsTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 from vibe_guide.workflow_gate import require_entry
                 require_entry(ProjectPaths.from_cwd(root), "scan:session", "scan")
+
+    def test_required_v2_entry_without_contract_is_unknown_not_unavailable(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".vibe").mkdir()
+            (root / ".vibe" / "state.json").write_text(
+                '{"workflow_version": 2, "session_gate": "s0_required", '
+                '"capability_contract_required": true}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(PermissionError, "capability_contract_unknown"):
+                require_capability_contract(ProjectPaths.from_cwd(root))
+
+    def test_v2_entry_requires_contract_even_when_legacy_flag_is_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".vibe").mkdir()
+            (root / ".vibe" / "state.json").write_text(
+                '{"workflow_version": 2, "session_gate": "s0_required"}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(PermissionError, "capability_contract_unknown"):
+                from vibe_guide.workflow_gate import require_entry
+                require_entry(ProjectPaths.from_cwd(root), "monitor:missing", "monitor")
+
+    def test_session_contract_prompt_is_scoped_and_redacted(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            contract = build_contract(
+                root,
+                provider="codex",
+                host_id="host-a",
+                facts={
+                    "terminal.exec": {
+                        "status": "verified_available",
+                        "scope": "task",
+                        "route": "runtime.exec",
+                        "evidence_ref": "probe-1",
+                    }
+                },
+            )
+            prompt = session_contract_prompt(contract)
+            self.assertIn(contract.contract_digest, prompt)
+            self.assertIn("verified_available", prompt)
+            self.assertNotIn(str(root), prompt)
+            self.assertNotIn("probe-1", prompt)
+            self.assertNotIn("host-a", prompt)
+            self.assertNotIn("codex", prompt)
+
+    def test_session_contract_prompt_downgrades_expired_fact_to_stale(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            checked = __import__("datetime").datetime(
+                2026, 8, 26, 10, 0, tzinfo=__import__("datetime").timezone.utc
+            )
+            contract = build_contract(
+                root,
+                facts={
+                    "terminal.exec": {
+                        "status": "verified_available",
+                        "scope": "task",
+                        "route": "runtime.exec",
+                        "evidence_ref": "probe-expired",
+                        "expires_at": "2026-08-26T09:59:00+00:00",
+                    }
+                },
+                now=checked,
+            )
+            prompt = session_contract_prompt(contract, now=checked)
+            self.assertIn('"terminal.exec":"stale"', prompt)

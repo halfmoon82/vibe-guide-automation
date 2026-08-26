@@ -1,0 +1,965 @@
+"""Versioned, recoverable state, event, lock, and writer-lease persistence."""
+
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+import errno
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import tempfile
+import time
+from typing import Any, Dict, Iterator, List, Optional
+import uuid
+
+from .authorization import (
+    AuthorizationRecord,
+    affected_node_closure,
+    executable_contract_digest,
+    is_authorization_integrity_valid,
+)
+from .contracts import RunEvent
+from .models import DAGNode
+from .paths import ProjectPaths
+
+
+STATE_SCHEMA_VERSION = 1
+EVENT_SCHEMA_VERSION = 1
+LEASE_SCHEMA_VERSION = 1
+_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_RUN_STATUSES = {
+    "initialized",
+    "running",
+    "complete",
+    "blocked_unknown",
+    "blocked_design",
+    "failed",
+}
+_NODE_STATUSES = {
+    "planned",
+    "start_pending",
+    "running",
+    "delivered",
+    "review",
+    "rework",
+    "accepted",
+    "blocked_unknown",
+    "blocked_design",
+    "failed",
+    "stopped",
+}
+_PROVENANCE_KEYS = {
+    "role",
+    "task_id",
+    "handle_id",
+    "generation",
+    "authorization_digest",
+    "node_contract_digest",
+}
+CONSISTENCY_CORRECTION_KEYS = (
+    "field",
+    "value",
+    "source",
+    "action",
+    "files",
+    "consistency_binding",
+    "decision",
+)
+_EVENT_DATA_KEYS = {
+    *CONSISTENCY_CORRECTION_KEYS,
+    "authorization_digest",
+    "authorization_epoch",
+    "capability_contract_digest",
+    "authorized_node_contracts",
+    "accepted_nodes",
+    "affected_nodes",
+    "changed_nodes",
+    "change_reason",
+    "contract_digest",
+    "continuation",
+    "evidence",
+    "finding",
+    "generation",
+    "handle_id",
+    "in_contract",
+    "intent_id",
+    "node_contract_digest",
+    "node_contract_digests",
+    "node_id",
+    "node_ids",
+    "new_authorization",
+    "phase",
+    "previous_authorization",
+    "previous_authorization_digest",
+    "previous_node_contract_digest",
+    "previous_node_contract_digests",
+    "reason",
+    "retained_acceptances",
+    "invalidated_acceptances",
+    "role",
+    "run_id",
+    "status",
+    "task_id",
+    "worker",
+}
+_SENSITIVE_DATA_NAMES = (
+    "api_key",
+    "credential",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+)
+_PROVIDER_TEXT_KEYS = {
+    "detail",
+    "error",
+    "evidence",
+    "exception",
+    "finding",
+    "message",
+    "output",
+    "reason",
+    "stderr",
+    "stdout",
+    "traceback",
+}
+_REDACTED = "[REDACTED]"
+_REDACTED_PROVIDER_TEXT = "[REDACTED_PROVIDER_TEXT]"
+
+
+def _normalize_data_key(key: str) -> str:
+    return key.strip().casefold().replace("-", "_")
+
+
+def _is_sensitive_data_key(key: str) -> bool:
+    normalized = _normalize_data_key(key)
+    if normalized.endswith("_digest") or normalized.endswith("_ref"):
+        return False
+    return any(name in normalized for name in _SENSITIVE_DATA_NAMES)
+
+
+def redact_provider_text(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [redact_provider_text(item) for item in value]
+    if isinstance(value, tuple):
+        return [redact_provider_text(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): redact_provider_text(item)
+            for key, item in value.items()
+            if not _is_sensitive_data_key(str(key))
+        }
+    return _REDACTED_PROVIDER_TEXT
+
+
+def _sanitize_durable_value(value: Any, key: Optional[str] = None) -> Any:
+    if key is not None:
+        if _is_sensitive_data_key(key):
+            return _REDACTED
+        if _normalize_data_key(key) in _PROVIDER_TEXT_KEYS:
+            return redact_provider_text(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_durable_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(item_key): _sanitize_durable_value(item_value, str(item_key))
+            for item_key, item_value in value.items()
+        }
+    return _REDACTED
+
+
+def _sanitize_event_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("event data is invalid")
+    result: Dict[str, Any] = {}
+    for key, value in data.items():
+        if not isinstance(key, str):
+            continue
+        normalized = _normalize_data_key(key)
+        if normalized not in _EVENT_DATA_KEYS or _is_sensitive_data_key(key):
+            continue
+        result[normalized] = _sanitize_durable_value(value, normalized)
+    return result
+
+
+@dataclass
+class RunSnapshot:
+    run_id: str
+    plan_id: str
+    plan_version: int
+    status: str
+    nodes: Dict[str, Dict[str, Any]]
+    handles: Dict[str, str]
+    tasks: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    authorization: Dict[str, Any] = field(default_factory=dict)
+    authorization_digest: str = ""
+    node_contract_digest: str = ""
+    # A V2 run is bound to the exact capability evidence contract used when
+    # its child tasks were dispatched.  Empty keeps pre-contract snapshots
+    # loadable for legacy, non-V2 runs; V2 monitor paths always populate it.
+    capability_contract_digest: str = ""
+    event_sequence: int = 0
+    schema_version: int = STATE_SCHEMA_VERSION
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RunSnapshot":
+        expected = {
+            "schema_version",
+            "run_id",
+            "plan_id",
+            "plan_version",
+            "status",
+            "nodes",
+            "handles",
+            "tasks",
+            "authorization",
+            "authorization_digest",
+            "node_contract_digest",
+            "event_sequence",
+        }
+        with_capability = expected | {"capability_contract_digest"}
+        if not isinstance(data, dict) or set(data) not in (expected, with_capability):
+            raise ValueError("snapshot schema is invalid")
+        normalized = dict(data)
+        normalized.setdefault("capability_contract_digest", "")
+        normalized["authorization"] = AuthorizationRecord.from_dict(
+            normalized["authorization"]
+        ).to_dict()
+        return cls(**normalized)
+
+
+def validate_run_id(run_id: str) -> str:
+    if not isinstance(run_id, str) or not _RUN_ID.fullmatch(run_id):
+        raise ValueError("run id must be a simple identifier")
+    return run_id
+
+
+def _safe_project_path(paths: ProjectPaths, *parts: str) -> Path:
+    root = paths.root.resolve()
+    candidate = root.joinpath(*parts)
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("persistence path may not traverse a symlink")
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValueError("persistence path escapes the project root") from error
+    return candidate
+
+
+def run_dir(paths: ProjectPaths, run_id: str, create: bool = False) -> Path:
+    validate_run_id(run_id)
+    directory = _safe_project_path(paths, ".vibe", "runs", run_id)
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
+        # Revalidate after mkdir to catch a concurrently inserted symlink.
+        directory = _safe_project_path(paths, ".vibe", "runs", run_id)
+    return directory
+
+
+def _atomic_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink():
+        raise ValueError("atomic write parent may not be a symlink")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="." + path.name + ".", dir=str(path.parent)
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(str(temporary_path), str(path))
+        try:
+            parent_descriptor = os.open(str(path.parent), os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+@contextmanager
+def interprocess_lock(lock_path: Path, timeout: float = 10.0) -> Iterator[None]:
+    """Exclusive advisory lock whose kernel ownership survives partial metadata.
+
+    This is intentionally a filesystem-local mutex, not a distributed lock.
+    """
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if lock_path.parent.is_symlink() or lock_path.is_symlink():
+        raise ValueError("lock path may not be a symlink")
+    owner = uuid.uuid4().hex
+    payload = json.dumps(
+        {"pid": os.getpid(), "owner": owner},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    deadline = time.monotonic() + timeout
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(str(lock_path), flags, 0o600)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError("lock path may not be a symlink") from error
+        raise
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("timed out waiting for persistence lock")
+                    time.sleep(0.01)
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            view = memoryview(payload)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+            yield
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(descriptor)
+
+
+def _event_lock(paths: ProjectPaths, run_id: str) -> Path:
+    return run_dir(paths, run_id, create=True) / ".events.lock"
+
+
+def _normalize_provenance(
+    event: RunEvent, provenance: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    supplied = dict(provenance or {})
+    normalized = {
+        "role": supplied.get("role", "system"),
+        "task_id": supplied.get("task_id"),
+        "handle_id": supplied.get("handle_id"),
+        "generation": supplied.get("generation", 0),
+        "authorization_digest": supplied.get(
+            "authorization_digest", event.data.get("authorization_digest", "")
+        ),
+        "node_contract_digest": supplied.get(
+            "node_contract_digest", event.data.get("node_contract_digest", "")
+        ),
+    }
+    if set(normalized) != _PROVENANCE_KEYS:
+        raise ValueError("event provenance schema is invalid")
+    if normalized["role"] not in {"system", "developer", "reviewer"}:
+        raise ValueError("event provenance role is invalid")
+    if not isinstance(normalized["generation"], int) or normalized["generation"] < 0:
+        raise ValueError("event provenance generation is invalid")
+    for key in ("task_id", "handle_id"):
+        if normalized[key] is not None and not isinstance(normalized[key], str):
+            raise ValueError("event provenance task/handle identity is invalid")
+    for key in ("authorization_digest", "node_contract_digest"):
+        if not isinstance(normalized[key], str):
+            raise ValueError("event provenance digest is invalid")
+    return normalized
+
+
+def _decode_event_records(raw: bytes) -> List[Dict[str, Any]]:
+    raw_lines = [line for line in raw.splitlines() if line.strip()]
+    records: List[Dict[str, Any]] = []
+    expected_keys = {
+        "schema_version",
+        "sequence",
+        "event_id",
+        "run_id",
+        "event",
+        "provenance",
+        "data",
+        "previous_event_digest",
+        "event_digest",
+    }
+    previous_digest: Optional[str] = None
+    for raw_line in raw_lines:
+        try:
+            record = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("event log is not valid JSONL") from error
+        if not isinstance(record, dict) or set(record) != expected_keys:
+            raise ValueError("event record schema is invalid")
+        if record["schema_version"] != EVENT_SCHEMA_VERSION:
+            raise ValueError("unsupported event record schema")
+        if not isinstance(record["sequence"], int) or record["sequence"] < 1:
+            raise ValueError("event sequence is invalid")
+        if not isinstance(record["event_id"], str) or not record["event_id"]:
+            raise ValueError("event id is invalid")
+        if not isinstance(record["run_id"], str) or not isinstance(record["event"], str):
+            raise ValueError("event identity is invalid")
+        if not isinstance(record["data"], dict):
+            raise ValueError("event data is invalid")
+        provenance = record["provenance"]
+        if not isinstance(provenance, dict) or set(provenance) != _PROVENANCE_KEYS:
+            raise ValueError("event provenance schema is invalid")
+        if provenance["role"] not in {"system", "developer", "reviewer"}:
+            raise ValueError("event provenance role is invalid")
+        if not isinstance(provenance["generation"], int) or provenance["generation"] < 0:
+            raise ValueError("event provenance generation is invalid")
+        if record["previous_event_digest"] != previous_digest:
+            raise ValueError("event hash chain is inconsistent")
+        if not isinstance(record["event_digest"], str) or not _DIGEST.fullmatch(
+            record["event_digest"]
+        ):
+            raise ValueError("event digest is invalid")
+        digest_payload = dict(record)
+        digest_payload.pop("event_digest")
+        expected_digest = hashlib.sha256(
+            json.dumps(
+                digest_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if record["event_digest"] != expected_digest:
+            raise ValueError("event record digest is inconsistent")
+        records.append(record)
+        previous_digest = record["event_digest"]
+    if [item["sequence"] for item in records] != list(range(1, len(records) + 1)):
+        raise ValueError("event log sequence is not ordered")
+    if len({item["event_id"] for item in records}) != len(records):
+        raise ValueError("event ids must be unique")
+    return records
+
+
+def _read_event_records(path: Path) -> List[Dict[str, Any]]:
+    try:
+        if path.is_symlink():
+            raise ValueError("event log may not be a symlink")
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    return _decode_event_records(raw)
+
+
+def load_events(paths: ProjectPaths, run_id: str) -> List[Dict[str, Any]]:
+    directory = run_dir(paths, run_id, create=False)
+    records = _read_event_records(directory / "events.jsonl")
+    if any(record["run_id"] != run_id for record in records):
+        raise ValueError("event run lineage is inconsistent")
+    return records
+
+
+def append_event(
+    paths: ProjectPaths,
+    event: RunEvent,
+    provenance: Optional[Dict[str, Any]] = None,
+) -> int:
+    sanitized_data = _sanitize_event_data(event.data)
+    run_id = sanitized_data.get("run_id")
+    validate_run_id(run_id)
+    directory = run_dir(paths, run_id, create=True)
+    event_path = directory / "events.jsonl"
+    normalized_provenance = _normalize_provenance(event, provenance)
+    with interprocess_lock(_event_lock(paths, run_id)):
+        directory_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            directory_flags |= os.O_NOFOLLOW
+        directory_descriptor = os.open(str(directory), directory_flags)
+        descriptor = None
+        try:
+            flags = os.O_CREAT | os.O_RDWR | os.O_APPEND
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(
+                    event_path.name, flags, 0o600, dir_fd=directory_descriptor
+                )
+            except OSError as error:
+                if error.errno in {errno.ELOOP, getattr(errno, "EFTYPE", -1)}:
+                    raise ValueError("event log may not be a symlink") from error
+                raise
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("event log must be a regular file")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            chunks = []
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            records = _decode_event_records(b"".join(chunks))
+            sequence = len(records) + 1
+            record = {
+                "schema_version": EVENT_SCHEMA_VERSION,
+                "sequence": sequence,
+                "event_id": uuid.uuid4().hex,
+                "run_id": run_id,
+                "event": event.event,
+                "provenance": normalized_provenance,
+                "data": sanitized_data,
+                "previous_event_digest": (
+                    records[-1]["event_digest"] if records else None
+                ),
+            }
+            record["event_digest"] = hashlib.sha256(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            encoded = (
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            view = memoryview(encoded)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+            return sequence
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(directory_descriptor)
+
+
+def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> None:
+    if snapshot.schema_version != STATE_SCHEMA_VERSION:
+        raise ValueError("unsupported snapshot schema")
+    validate_run_id(snapshot.run_id)
+    if not isinstance(snapshot.plan_id, str) or not snapshot.plan_id:
+        raise ValueError("snapshot plan id is invalid")
+    if not isinstance(snapshot.plan_version, int) or snapshot.plan_version < 1:
+        raise ValueError("snapshot plan version is invalid")
+    if snapshot.status not in _RUN_STATUSES:
+        raise ValueError("snapshot run status is invalid")
+    if not isinstance(snapshot.nodes, dict) or not snapshot.nodes:
+        raise ValueError("snapshot nodes must be a non-empty object")
+    if not isinstance(snapshot.handles, dict) or not isinstance(snapshot.tasks, dict):
+        raise ValueError("snapshot handle/task registries are invalid")
+    if not isinstance(snapshot.event_sequence, int) or snapshot.event_sequence < 1:
+        raise ValueError("snapshot event sequence is invalid")
+    if snapshot.event_sequence > len(records):
+        raise ValueError("snapshot references missing events")
+    if not _DIGEST.fullmatch(snapshot.authorization_digest):
+        raise ValueError("snapshot authorization digest is invalid")
+    if not _DIGEST.fullmatch(snapshot.node_contract_digest):
+        raise ValueError("snapshot node contract digest is invalid")
+    if snapshot.capability_contract_digest and not _DIGEST.fullmatch(
+        snapshot.capability_contract_digest
+    ):
+        raise ValueError("snapshot capability contract digest is invalid")
+
+    authorization = AuthorizationRecord.from_dict(snapshot.authorization)
+    if not is_authorization_integrity_valid(authorization):
+        raise ValueError("snapshot authorization record digest is invalid")
+    if authorization.digest != snapshot.authorization_digest:
+        raise ValueError("snapshot authorization lineage is inconsistent")
+    if authorization.node_contract_digest != snapshot.node_contract_digest:
+        raise ValueError("snapshot contract lineage is inconsistent")
+    if authorization.plan_id != snapshot.plan_id or authorization.plan_version != snapshot.plan_version:
+        raise ValueError("snapshot plan lineage is inconsistent")
+    if set(snapshot.nodes) != set(authorization.node_ids):
+        raise ValueError("snapshot node set is inconsistent")
+    if any(not isinstance(key, str) or not isinstance(value, str) for key, value in snapshot.handles.items()):
+        raise ValueError("snapshot handles are invalid")
+    if not set(snapshot.handles).issubset(snapshot.nodes):
+        raise ValueError("snapshot handle node is unknown")
+    if len(set(snapshot.handles.values())) != len(snapshot.handles):
+        raise ValueError("snapshot active handles must be unique")
+    for node_id, node in snapshot.nodes.items():
+        if not isinstance(node, dict) or node.get("status") not in _NODE_STATUSES:
+            raise ValueError("snapshot node state is invalid for " + node_id)
+    if snapshot.status == "complete" and not all(
+        node.get("status") == "accepted" for node in snapshot.nodes.values()
+    ):
+        raise ValueError("complete run contains unaccepted nodes")
+
+    first = records[0] if records else None
+    if first is None or first["event"] != "run_started":
+        raise ValueError("snapshot has no run-start event lineage")
+    current_authorization_digest = first["data"].get("authorization_digest")
+    current_node_contract_digest = first["data"].get("node_contract_digest")
+    first_capability_contract_digest = first["data"].get(
+        "capability_contract_digest", ""
+    )
+    if not isinstance(current_authorization_digest, str) or not _DIGEST.fullmatch(
+        current_authorization_digest
+    ):
+        raise ValueError("run-start authorization lineage is inconsistent")
+    if not isinstance(current_node_contract_digest, str) or not _DIGEST.fullmatch(
+        current_node_contract_digest
+    ):
+        raise ValueError("run-start contract lineage is inconsistent")
+    if first_capability_contract_digest and not _DIGEST.fullmatch(
+        first_capability_contract_digest
+    ):
+        raise ValueError("run-start capability contract lineage is inconsistent")
+    if snapshot.capability_contract_digest != first_capability_contract_digest:
+        raise ValueError("snapshot capability contract lineage is inconsistent")
+    if sorted(first["data"].get("node_ids", [])) != sorted(snapshot.nodes):
+        raise ValueError("run-start node lineage is inconsistent")
+    retained_acceptance_proofs = []
+    latest_node_contract_digests = None
+    for record in records[: snapshot.event_sequence]:
+        provenance = record["provenance"]
+        if provenance["authorization_digest"] != current_authorization_digest:
+            raise ValueError("event authorization provenance is inconsistent")
+        if provenance["node_contract_digest"] != current_node_contract_digest:
+            raise ValueError("event contract provenance is inconsistent")
+        if record["event"] != "authorization_reauthorized":
+            continue
+        data = record["data"]
+        if (
+            data.get("previous_authorization_digest")
+            != current_authorization_digest
+            or data.get("previous_node_contract_digest")
+            != current_node_contract_digest
+        ):
+            raise ValueError("reauthorization previous lineage is inconsistent")
+        previous = AuthorizationRecord.from_dict(data.get("previous_authorization"))
+        replacement = AuthorizationRecord.from_dict(data.get("new_authorization"))
+        if (
+            not is_authorization_integrity_valid(previous)
+            or previous.digest != current_authorization_digest
+            or previous.node_contract_digest != current_node_contract_digest
+        ):
+            raise ValueError("reauthorization previous record is invalid")
+        if (
+            not is_authorization_integrity_valid(replacement)
+            or replacement.plan_id != snapshot.plan_id
+            or replacement.plan_version != snapshot.plan_version
+            or set(replacement.node_ids) != set(snapshot.nodes)
+            or data.get("authorization_digest") != replacement.digest
+            or data.get("node_contract_digest")
+            != replacement.node_contract_digest
+        ):
+            raise ValueError("reauthorization replacement record is invalid")
+        previous_node_contract_digests = data.get("previous_node_contract_digests")
+        node_contract_digests = data.get("node_contract_digests")
+        retained_acceptances = data.get("retained_acceptances")
+        invalidated_acceptances = data.get("invalidated_acceptances")
+        changed_nodes = data.get("changed_nodes")
+        affected_nodes = data.get("affected_nodes")
+        accepted_nodes = data.get("accepted_nodes")
+        authorized_node_contracts = data.get("authorized_node_contracts")
+        if (
+            not isinstance(previous_node_contract_digests, dict)
+            or not isinstance(node_contract_digests, dict)
+            or set(previous_node_contract_digests) != set(snapshot.nodes)
+            or set(node_contract_digests) != set(snapshot.nodes)
+            or not isinstance(retained_acceptances, dict)
+            or not isinstance(invalidated_acceptances, dict)
+            or set(retained_acceptances) & set(invalidated_acceptances)
+            or not isinstance(authorized_node_contracts, dict)
+            or set(authorized_node_contracts) != set(snapshot.nodes)
+            or any(
+                not isinstance(value, str)
+                for value in authorized_node_contracts.values()
+            )
+            or any(
+                not isinstance(items, list)
+                or any(not isinstance(node_id, str) for node_id in items)
+                or len(items) != len(set(items))
+                or items != sorted(items)
+                or any(node_id not in snapshot.nodes for node_id in items)
+                for items in (changed_nodes, affected_nodes, accepted_nodes)
+            )
+        ):
+            raise ValueError("reauthorization node acceptance lineage is invalid")
+        for mapping in (previous_node_contract_digests, node_contract_digests):
+            if any(
+                not isinstance(value, str) or not _DIGEST.fullmatch(value)
+                for value in mapping.values()
+            ):
+                raise ValueError("reauthorization node contract digest is invalid")
+        try:
+            authorized_nodes = []
+            for node_id, encoded_node in authorized_node_contracts.items():
+                decoded_node = json.loads(encoded_node)
+                authorized_node = DAGNode.from_dict(decoded_node)
+                if authorized_node.id != node_id:
+                    raise ValueError("authorized DAG node identity is inconsistent")
+                authorized_nodes.append(authorized_node)
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise ValueError("reauthorization authorized DAG proof is invalid") from error
+        if (
+            executable_contract_digest(authorized_nodes)
+            != replacement.node_contract_digest
+            or any(
+                executable_contract_digest([node])
+                != node_contract_digests[node.id]
+                for node in authorized_nodes
+            )
+        ):
+            raise ValueError("reauthorization authorized DAG proof is invalid")
+        expected_changed_nodes = sorted(
+            node_id
+            for node_id in snapshot.nodes
+            if previous_node_contract_digests[node_id]
+            != node_contract_digests[node_id]
+        )
+        retained_ids = set(retained_acceptances)
+        invalidated_ids = set(invalidated_acceptances)
+        if (
+            changed_nodes != expected_changed_nodes
+            or affected_nodes
+            != affected_node_closure(authorized_nodes, changed_nodes)
+            or accepted_nodes != sorted(retained_ids | invalidated_ids)
+            or set(changed_nodes) - set(affected_nodes)
+            or retained_ids & set(affected_nodes)
+            or not invalidated_ids.issubset(set(affected_nodes))
+            or retained_ids | invalidated_ids != set(accepted_nodes)
+        ):
+            raise ValueError("reauthorization affected suffix disposition is invalid")
+        for node_id, evidence in retained_acceptances.items():
+            if (
+                node_id not in snapshot.nodes
+                or not isinstance(evidence, dict)
+                or set(evidence) != {"contract_digest", "authorization_epoch"}
+                or evidence["contract_digest"] != previous_node_contract_digests[node_id]
+                or evidence["contract_digest"] != node_contract_digests[node_id]
+                or evidence["authorization_epoch"] != previous.digest
+            ):
+                raise ValueError("retained acceptance proof is invalid")
+            retained_acceptance_proofs.append(
+                (node_id, evidence["contract_digest"], replacement.digest)
+            )
+        for node_id, evidence in invalidated_acceptances.items():
+            if (
+                node_id not in snapshot.nodes
+                or not isinstance(evidence, dict)
+                or set(evidence) != {"contract_digest", "authorization_epoch"}
+                or evidence["contract_digest"] != previous_node_contract_digests[node_id]
+                or evidence["authorization_epoch"] != previous.digest
+            ):
+                raise ValueError("invalidated acceptance proof is invalid")
+        latest_node_contract_digests = node_contract_digests
+        current_authorization_digest = replacement.digest
+        current_node_contract_digest = replacement.node_contract_digest
+    if current_authorization_digest != snapshot.authorization_digest:
+        raise ValueError("snapshot final authorization lineage is inconsistent")
+    if current_node_contract_digest != snapshot.node_contract_digest:
+        raise ValueError("snapshot final contract lineage is inconsistent")
+    if latest_node_contract_digests is not None and any(
+        snapshot.nodes[node_id].get("contract_digest") != digest
+        for node_id, digest in latest_node_contract_digests.items()
+    ):
+        raise ValueError("snapshot final node contract lineage is inconsistent")
+
+    for node_id, node in snapshot.nodes.items():
+        if node.get("status") != "accepted":
+            continue
+        contract_digest = node.get("contract_digest")
+        acceptance = node.get("acceptance")
+        if (
+            not isinstance(contract_digest, str)
+            or not _DIGEST.fullmatch(contract_digest)
+            or not isinstance(acceptance, dict)
+            or set(acceptance) != {"contract_digest", "authorization_epoch"}
+            or acceptance["contract_digest"] != contract_digest
+            or acceptance["authorization_epoch"] != snapshot.authorization_digest
+        ):
+            raise ValueError("accepted node acceptance contract epoch is invalid")
+        matching = [
+            record
+            for record in records[: snapshot.event_sequence]
+            if record["event"] == "accepted"
+            and record["data"].get("node_id") == node_id
+        ]
+        if not matching:
+            raise ValueError("accepted node lacks an acceptance event")
+        current_acceptance_event = matching[-1]
+        if not (
+            current_acceptance_event["data"].get("contract_digest")
+            == acceptance["contract_digest"]
+            and current_acceptance_event["data"].get("authorization_epoch")
+            == acceptance["authorization_epoch"]
+        ) and not any(
+            proof
+            == (node_id, acceptance["contract_digest"], acceptance["authorization_epoch"])
+            for proof in retained_acceptance_proofs
+        ):
+            raise ValueError("accepted node acceptance evidence is stale")
+        provenance = matching[-1]["provenance"]
+        if provenance["role"] != "reviewer":
+            raise ValueError("accepted node lacks reviewer provenance")
+        if provenance["task_id"] != node.get("reviewer_identity"):
+            raise ValueError("accepted node reviewer identity is inconsistent")
+        if provenance["generation"] != node.get("review_generation"):
+            raise ValueError("accepted node review generation is inconsistent")
+
+
+def _decode_snapshot(data: bytes, records: List[Dict[str, Any]]) -> RunSnapshot:
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("snapshot is not valid JSON") from error
+    snapshot = RunSnapshot.from_dict(raw)
+    _validate_snapshot(snapshot, records)
+    return snapshot
+
+
+def save_snapshot(paths: ProjectPaths, snapshot: RunSnapshot) -> None:
+    directory = run_dir(paths, snapshot.run_id, create=True)
+    records = load_events(paths, snapshot.run_id)
+    _validate_snapshot(snapshot, records)
+    state_path = directory / "state.json"
+    previous_path = directory / "state.previous.json"
+    lock_path = directory / ".state.lock"
+    sanitized_snapshot = _sanitize_durable_value(snapshot.to_dict())
+    serialized = json.dumps(
+        sanitized_snapshot,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    with interprocess_lock(lock_path):
+        if state_path.exists():
+            current = state_path.read_bytes()
+            try:
+                previous_snapshot = _decode_snapshot(current, records)
+            except (TypeError, ValueError):
+                pass
+            else:
+                _atomic_bytes(
+                    previous_path,
+                    json.dumps(
+                        _sanitize_durable_value(previous_snapshot.to_dict()),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8"),
+                )
+        _atomic_bytes(state_path, serialized)
+
+
+def load_snapshot(paths: ProjectPaths, run_id: str) -> RunSnapshot:
+    directory = run_dir(paths, run_id, create=False)
+    records = load_events(paths, run_id)
+    failures: List[Exception] = []
+    for path in (directory / "state.json", directory / "state.previous.json"):
+        try:
+            snapshot = _decode_snapshot(path.read_bytes(), records)
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            failures.append(error)
+            continue
+        if snapshot.run_id != run_id:
+            failures.append(ValueError("snapshot run id does not match its path"))
+            continue
+        return snapshot
+    if failures:
+        raise ValueError("no valid snapshot for run " + run_id) from failures[-1]
+    raise ValueError("no valid snapshot for run " + run_id)
+
+
+def _lease_path(paths: ProjectPaths, node_id: str, worktree: str) -> Path:
+    key = hashlib.sha256((node_id + "\0" + worktree).encode("utf-8")).hexdigest()
+    return _safe_project_path(paths, ".vibe", "leases", key + ".json")
+
+
+def _lease_lock(paths: ProjectPaths) -> Path:
+    return _safe_project_path(paths, ".vibe", ".leases.lock")
+
+
+def acquire_writer_lease(
+    paths: ProjectPaths, node_id: str, worktree: str, run_id: str
+) -> bool:
+    validate_run_id(run_id)
+    lease_path = _lease_path(paths, node_id, worktree)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": LEASE_SCHEMA_VERSION,
+        "node_id": node_id,
+        "worktree": worktree,
+        "run_id": run_id,
+        "status": "active",
+    }
+    with interprocess_lock(_lease_lock(paths)):
+        if lease_path.exists():
+            try:
+                existing = json.loads(lease_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return False
+            return (
+                existing.get("schema_version") == LEASE_SCHEMA_VERSION
+                and existing.get("run_id") == run_id
+                and existing.get("node_id") == node_id
+                and existing.get("worktree") == worktree
+            )
+        _atomic_bytes(
+            lease_path,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        return True
+
+
+def quarantine_writer_lease(
+    paths: ProjectPaths,
+    node_id: str,
+    worktree: str,
+    run_id: str,
+    reason: str,
+) -> bool:
+    lease_path = _lease_path(paths, node_id, worktree)
+    with interprocess_lock(_lease_lock(paths)):
+        try:
+            payload = json.loads(lease_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            return False
+        if payload.get("run_id") != run_id:
+            return False
+        payload["status"] = "quarantined"
+        payload["reason"] = redact_provider_text(reason)
+        _atomic_bytes(
+            lease_path,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        return True
+
+
+def release_writer_lease(
+    paths: ProjectPaths, node_id: str, worktree: str, run_id: str
+) -> bool:
+    lease_path = _lease_path(paths, node_id, worktree)
+    with interprocess_lock(_lease_lock(paths)):
+        try:
+            owner = json.loads(lease_path.read_text(encoding="utf-8")).get("run_id")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return False
+        if owner != run_id:
+            return False
+        lease_path.unlink()
+        return True

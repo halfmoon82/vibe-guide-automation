@@ -23,6 +23,7 @@ from .capability_contract import (
     load_contract,
     save_contract,
 )
+from .workflow_gate import require_capability_contract, session_contract_prompt
 
 
 @dataclass(frozen=True)

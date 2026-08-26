@@ -14,10 +14,95 @@ from vibe_guide.capability_contract import (
     load_contract,
     save_contract,
 )
+from vibe_guide.adapters.task_provider import ProviderActionStore, ProviderUnavailable
+from vibe_guide.models import WorkerProfile
 from vibe_guide.paths import ProjectPaths
 
 
 class CapabilityContractTests(unittest.TestCase):
+    @staticmethod
+    def _child_binding(contract_digest):
+        profile = WorkerProfile(
+            "codex",
+            "gpt-5.6-sol",
+            "medium",
+            [],
+            {
+                "issue_complexity_ref": "n1",
+                "complexity_band": "standard",
+                "risk_tags": [],
+                "availability_evidence": "test",
+            },
+            worktree=".worktrees/n1",
+            branch="codex/n1",
+            writer="developer",
+            allowlist=["vibe_guide/n1.py"],
+        )
+        return {
+            "parent_run_id": "run-1",
+            "plan_revision": "1",
+            "authorization_digest": "a" * 64,
+            "node_id": "n1",
+            "role": "developer",
+            "writer": profile.writer,
+            "worktree": profile.worktree,
+            "branch": profile.branch,
+            "allowlist": profile.allowlist,
+            "worker_profile": profile.to_dict(),
+            "capability_contract_digest": contract_digest,
+        }
+
+    def test_worker_dispatch_without_contract_is_unknown_not_provider_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = ProjectPaths(root)
+            (root / ".vibe").mkdir()
+            (root / ".vibe" / "state.json").write_text(
+                '{"workflow_version":2,"session_gate":"s0_required"}\n',
+                encoding="utf-8",
+            )
+            request = {
+                "origin": "worker_dispatch",
+                "child_binding": self._child_binding("b" * 64),
+            }
+            with self.assertRaisesRegex(ProviderUnavailable, "session_gate_blocked"):
+                ProviderActionStore(paths).request(
+                    operation="create",
+                    provider="codex-app-visible",
+                    run_id="run-1",
+                    issue_id="n1",
+                    role="developer",
+                    generation=1,
+                    native_tool="codex_app__create_thread",
+                    request=request,
+                )
+
+    def test_worker_dispatch_must_bind_current_contract_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = ProjectPaths(root)
+            (root / ".vibe").mkdir()
+            (root / ".vibe" / "state.json").write_text(
+                '{"workflow_version":2,"session_gate":"s0_required"}\n',
+                encoding="utf-8",
+            )
+            contract = build_contract(root, provider="codex-app-visible", host_id="local")
+            save_contract(paths, contract)
+            request = {
+                "origin": "worker_dispatch",
+                "child_binding": self._child_binding("c" * 64),
+            }
+            with self.assertRaisesRegex(ProviderUnavailable, "session_gate_blocked"):
+                ProviderActionStore(paths).request(
+                    operation="create",
+                    provider="codex-app-visible",
+                    run_id="run-1",
+                    issue_id="n1",
+                    role="developer",
+                    generation=1,
+                    native_tool="codex_app__create_thread",
+                    request=request,
+                )
     def test_build_round_trip_recomputes_stable_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
