@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,10 +9,12 @@ from vibe_guide.paths import ProjectPaths
 from vibe_guide.session_bypass import (
     BypassError,
     create_challenge,
+    consume_bypass,
     grant_bypass,
     is_bypass_valid,
     load_challenge,
     save_challenge,
+    end_session,
 )
 
 
@@ -73,6 +76,52 @@ class SessionBypassTests(unittest.TestCase):
         result = grant_bypass(record, "BYPASS VIBE " + record.challenge, "x", self.now)
         self.assertFalse(is_bypass_valid(result.record, "other-entry", self.now))
         self.assertFalse(is_bypass_valid(result.record, "entry-1", self.now + timedelta(minutes=16)))
+
+    def test_concurrent_consumers_can_grant_only_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            record = create_challenge("entry-1", self.now)
+            save_challenge(paths, record)
+            command = "BYPASS VIBE " + record.challenge
+            barrier = threading.Barrier(2)
+            results = []
+
+            def consume():
+                barrier.wait()
+                try:
+                    results.append(("ok", consume_bypass(paths, "entry-1", command, now=self.now)))
+                except BypassError:
+                    results.append(("error", None))
+
+            workers = [threading.Thread(target=consume) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+            self.assertEqual(sum(status == "ok" for status, _ in results), 1)
+            self.assertEqual(sum(status == "error" for status, _ in results), 1)
+
+    def test_stale_record_cannot_reopen_consumed_challenge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            record = create_challenge("entry-1", self.now)
+            save_challenge(paths, record)
+            consume_bypass(paths, "entry-1", "BYPASS VIBE " + record.challenge, now=self.now)
+            with self.assertRaises(BypassError):
+                save_challenge(paths, record)
+            persisted = load_challenge(paths, "entry-1")
+            self.assertTrue(persisted.consumed)
+
+    def test_stale_record_cannot_reopen_ended_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            record = create_challenge("entry-1", self.now)
+            save_challenge(paths, record)
+            end_session(paths, "entry-1")
+            with self.assertRaises(BypassError):
+                save_challenge(paths, record)
+            persisted = load_challenge(paths, "entry-1")
+            self.assertTrue(persisted.session_ended)
 
 
 if __name__ == "__main__":

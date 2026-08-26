@@ -7,6 +7,7 @@ for the entry session until expiry; the challenge itself cannot be replayed.
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -235,38 +236,59 @@ def _write_json(path: Path, data: Dict[str, Any]) -> None:
             os.unlink(temporary)
 
 
+def _read_store(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise BypassError("challenge store is invalid") from error
+    if not isinstance(data, dict):
+        raise BypassError("challenge store is invalid")
+    return data
+
+
+@contextmanager
+def _store_lock(paths: Any):
+    path = _store_path(paths)
+    lock_path = path.parent / ".session-bypass.lock"
+    with open(lock_path, "a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield path
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _save_record_unlocked(path: Path, record: ChallengeRecord) -> None:
+    data = _read_store(path)
+    existing_data = data.get(record.session_id)
+    if existing_data is not None:
+        existing = ChallengeRecord.from_dict(existing_data)
+        same_challenge = existing.challenge_digest == record.challenge_digest
+        if same_challenge and (
+            (existing.consumed and not record.consumed)
+            or (existing.session_ended and not record.session_ended)
+        ):
+            raise BypassError("challenge state regression")
+    data[record.session_id] = record.to_dict()
+    _write_json(path, data)
+
+
 def save_challenge(paths: Any, record: ChallengeRecord) -> None:
     if not isinstance(record, ChallengeRecord):
         raise TypeError("record must be a ChallengeRecord")
-    path = _store_path(paths)
-    lock = path.parent / ".session-bypass.lock"
-    with open(lock, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        data: Dict[str, Any] = {}
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError) as error:
-                raise BypassError("challenge store is invalid") from error
-        if not isinstance(data, dict):
-            raise BypassError("challenge store is invalid")
-        data[record.session_id] = record.to_dict()
-        _write_json(path, data)
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with _store_lock(paths) as path:
+        _save_record_unlocked(path, record)
 
 
 def load_challenge(paths: Any, session_id: str) -> Optional[ChallengeRecord]:
     _validate_session(session_id)
-    path = _store_path(paths)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or session_id not in data:
+    with _store_lock(paths) as path:
+        data = _read_store(path)
+        if session_id not in data:
             return None
         return ChallengeRecord.from_dict(data[session_id])
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        raise BypassError("challenge store is invalid") from error
 
 
 def issue_challenge(paths: Any, session_id: str, now: Optional[datetime] = None) -> ChallengeRecord:
@@ -285,11 +307,13 @@ def consume_bypass(
 ) -> BypassResult:
     if origin != "user_entry":
         raise BypassError("child session cannot request bypass")
-    record = load_challenge(paths, session_id)
-    if record is None:
-        raise BypassError("no challenge for session")
-    result = grant_bypass(record, command, reason, _clock(now))
-    save_challenge(paths, result.record)
+    with _store_lock(paths) as path:
+        data = _read_store(path)
+        if session_id not in data:
+            raise BypassError("no challenge for session")
+        record = ChallengeRecord.from_dict(data[session_id])
+        result = grant_bypass(record, command, reason, _clock(now))
+        _save_record_unlocked(path, result.record)
     _append_events(paths, result.events)
     return result
 
