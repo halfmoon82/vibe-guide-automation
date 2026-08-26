@@ -66,6 +66,11 @@ def _digest(challenge: str) -> str:
     return hashlib.sha256(challenge.encode("utf-8")).hexdigest()
 
 
+def _event_identity(event: Dict[str, Any]) -> str:
+    encoded = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return _digest(encoded)
+
+
 @dataclass(frozen=True)
 class ChallengeRecord:
     session_id: str
@@ -78,6 +83,8 @@ class ChallengeRecord:
     session_ended: bool = False
     # The raw challenge is intentionally transient and excluded from to_dict.
     challenge: Optional[str] = None
+    # Events are staged here until the durable event log acknowledges them.
+    pending_events: Tuple[Dict[str, Any], ...] = ()
 
     @property
     def used(self) -> bool:
@@ -97,6 +104,7 @@ class ChallengeRecord:
             "reason": self.reason,
             "consumed": self.consumed,
             "session_ended": self.session_ended,
+            "pending_events": [dict(event) for event in self.pending_events],
         }
 
     @classmethod
@@ -107,7 +115,7 @@ class ChallengeRecord:
             "session_id", "challenge_digest", "created_at", "expires_at",
             "scope", "reason", "consumed", "session_ended",
         }
-        if set(data) != required:
+        if set(data) - required - {"pending_events"} or not required.issubset(data):
             raise ValueError("challenge record schema is invalid")
         session_id = _validate_session(data["session_id"])
         digest = data["challenge_digest"]
@@ -121,6 +129,16 @@ class ChallengeRecord:
             raise ValueError("challenge scope or reason is invalid")
         if not isinstance(data["consumed"], bool) or not isinstance(data["session_ended"], bool):
             raise ValueError("challenge state is invalid")
+        pending_data = data.get("pending_events", [])
+        if not isinstance(pending_data, list):
+            raise ValueError("pending events are invalid")
+        pending_events = []
+        for event in pending_data:
+            if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+                raise ValueError("pending events are invalid")
+            if not isinstance(event.get("data"), dict):
+                raise ValueError("pending events are invalid")
+            pending_events.append(dict(event))
         return cls(
             session_id=session_id,
             challenge_digest=digest,
@@ -130,6 +148,7 @@ class ChallengeRecord:
             reason=data["reason"],
             consumed=data["consumed"],
             session_ended=data["session_ended"],
+            pending_events=tuple(pending_events),
             challenge=None,
         )
 
@@ -206,9 +225,9 @@ def grant_bypass(
         "expiry": updated.expires_at,
         "previous_state": "challenge_issued",
     }
-    events = (
-        {"event": "session_bypass_granted", "data": dict(event_data)},
-        {"event": "wizard_bypassed", "data": dict(event_data)},
+    events = tuple(
+        {"event": event_name, "data": dict(event_data)}
+        for event_name in ("session_bypass_granted", "wizard_bypassed")
     )
     return BypassResult(True, updated, events)
 
@@ -260,7 +279,12 @@ def _store_lock(paths: Any):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _save_record_unlocked(path: Path, record: ChallengeRecord) -> None:
+def _save_record_unlocked(
+    path: Path,
+    record: ChallengeRecord,
+    *,
+    allow_pending_clear: bool = False,
+) -> None:
     data = _read_store(path)
     existing_data = data.get(record.session_id)
     if existing_data is not None:
@@ -271,6 +295,8 @@ def _save_record_unlocked(path: Path, record: ChallengeRecord) -> None:
             or (existing.session_ended and not record.session_ended)
         ):
             raise BypassError("challenge state regression")
+        if same_challenge and existing.pending_events and not record.pending_events and not allow_pending_clear:
+            record = replace(record, pending_events=existing.pending_events)
     data[record.session_id] = record.to_dict()
     _write_json(path, data)
 
@@ -312,10 +338,24 @@ def consume_bypass(
         if session_id not in data:
             raise BypassError("no challenge for session")
         record = ChallengeRecord.from_dict(data[session_id])
+        if record.consumed and record.pending_events:
+            match = _COMMAND.fullmatch(command) if isinstance(command, str) else None
+            if not match or not secrets.compare_digest(
+                _digest(match.group(1)), record.challenge_digest
+            ):
+                raise BypassError("challenge command is invalid")
+            pending = record.pending_events
+            _append_events(paths, pending)
+            completed = replace(record, pending_events=())
+            _save_record_unlocked(path, completed, allow_pending_clear=True)
+            return BypassResult(True, completed, pending)
         result = grant_bypass(record, command, reason, _clock(now))
-        _save_record_unlocked(path, result.record)
-    _append_events(paths, result.events)
-    return result
+        staged = replace(result.record, pending_events=result.events)
+        _save_record_unlocked(path, staged)
+        _append_events(paths, staged.pending_events)
+        completed = replace(staged, pending_events=())
+        _save_record_unlocked(path, completed, allow_pending_clear=True)
+        return BypassResult(True, completed, result.events)
 
 
 def _append_events(paths: Any, events: Tuple[Dict[str, Any], ...]) -> None:
@@ -327,16 +367,39 @@ def _append_events(paths: Any, events: Tuple[Dict[str, Any], ...]) -> None:
     lock = directory / ".session-events.lock"
     with open(lock, "a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        existing_ids = set()
+        if path.exists():
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError as error:
+                raise BypassError("session event log is unreadable") from error
+            for line in lines:
+                try:
+                    decoded = json.loads(line)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(decoded, dict):
+                    existing_ids.add(_event_identity(decoded))
         with open(path, "a", encoding="utf-8") as stream:
             for event in events:
+                event_id = _event_identity(event) if isinstance(event, dict) else None
+                if event_id is not None and event_id in existing_ids:
+                    continue
                 stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
                 stream.write("\n")
+                if event_id is not None:
+                    existing_ids.add(event_id)
             stream.flush()
             os.fsync(stream.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def end_session(paths: Any, session_id: str) -> None:
-    record = load_challenge(paths, session_id)
-    if record is not None:
-        save_challenge(paths, replace(record, session_ended=True, challenge=None))
+    _validate_session(session_id)
+    with _store_lock(paths) as path:
+        data = _read_store(path)
+        if session_id not in data:
+            return
+        record = ChallengeRecord.from_dict(data[session_id])
+        if not record.session_ended:
+            _save_record_unlocked(path, replace(record, session_ended=True, challenge=None))

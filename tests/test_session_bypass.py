@@ -2,8 +2,10 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import vibe_guide.session_bypass as session_bypass
 
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.session_bypass import (
@@ -122,6 +124,63 @@ class SessionBypassTests(unittest.TestCase):
                 save_challenge(paths, record)
             persisted = load_challenge(paths, "entry-1")
             self.assertTrue(persisted.session_ended)
+
+    def test_session_end_and_consume_race_always_ends_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            record = create_challenge("entry-1", self.now)
+            save_challenge(paths, record)
+            barrier = threading.Barrier(2)
+            outcomes = []
+
+            def end():
+                barrier.wait()
+                try:
+                    end_session(paths, "entry-1")
+                    outcomes.append("ended")
+                except BypassError:
+                    outcomes.append("error")
+
+            def consume():
+                barrier.wait()
+                try:
+                    consume_bypass(paths, "entry-1", "BYPASS VIBE " + record.challenge, now=self.now)
+                    outcomes.append("consumed")
+                except BypassError:
+                    outcomes.append("rejected")
+
+            workers = [threading.Thread(target=end), threading.Thread(target=consume)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+            persisted = load_challenge(paths, "entry-1")
+            self.assertTrue(persisted.session_ended)
+            self.assertFalse(is_bypass_valid(persisted, "entry-1", self.now))
+            self.assertNotIn("error", outcomes)
+
+    def test_event_write_failure_leaves_recoverable_outbox(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            record = create_challenge("entry-1", self.now)
+            save_challenge(paths, record)
+            command = "BYPASS VIBE " + record.challenge
+            original_append = session_bypass._append_events
+
+            def fail_after_first_event(event_paths, events):
+                original_append(event_paths, events[:1])
+                raise OSError("disk")
+
+            with patch("vibe_guide.session_bypass._append_events", side_effect=fail_after_first_event):
+                with self.assertRaises(OSError):
+                    consume_bypass(paths, "entry-1", command, now=self.now)
+            persisted = load_challenge(paths, "entry-1")
+            self.assertTrue(persisted.consumed)
+            result = consume_bypass(paths, "entry-1", command, now=self.now)
+            self.assertTrue(result.granted)
+            events = (paths.vibe / "session-events.jsonl").read_text(encoding="utf-8")
+            self.assertEqual(events.count("session_bypass_granted"), 1)
+            self.assertEqual(events.count("wizard_bypassed"), 1)
 
 
 if __name__ == "__main__":
