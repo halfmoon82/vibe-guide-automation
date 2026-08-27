@@ -365,6 +365,43 @@ class MonitorTests(unittest.TestCase):
             ],
         )
 
+    def test_p1_review_finding_without_contract_flag_returns_to_same_developer(self):
+        nodes = [node("n1", worker="worker-original")]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [
+                    ("delivered", {"evidence": "delivery-1"}),
+                ],
+                ("n1", "reviewer"): [
+                    (
+                        "review_finding",
+                        {"finding": {"severity": "P1", "summary": "fix"}},
+                    ),
+                ],
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        original_developer = runner.start_calls[0]
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+        rework = runner.start_calls[-1]
+        self.assertEqual(rework["role"], "developer")
+        self.assertEqual(rework["phase"], "rework")
+        self.assertTrue(rework["continuation"])
+        self.assertFalse(rework.get("successor", False))
+        self.assertEqual(rework["task_id"], original_developer["task_id"])
+        self.assertEqual(rework["worker"], original_developer["worker"])
+        for key in ("worktree", "branch", "worker_profile"):
+            self.assertEqual(rework.get(key), original_developer.get(key))
+        self.assertEqual(
+            snapshot.nodes["n1"]["reviewer_identity"],
+            runner.start_calls[1]["task_id"],
+        )
+
     def test_blocked_design_stops_old_task_and_releases_lease_for_new_authorization(self):
         original = node("n1")
         monitor, record = self.authorized_monitor([original])
@@ -967,6 +1004,52 @@ class MonitorTests(unittest.TestCase):
                 ]
             ),
             1,
+        )
+
+    def test_reauthorization_retains_unrelated_active_handle(self):
+        nodes = [node("n1"), node("n2", ["n1"]), node("n3")]
+        monitor, record = self.authorized_monitor(nodes, active_pair_limit=3)
+        initial = FakeRunner()
+        snapshot = monitor.start(record, initial)
+        self.assertEqual(
+            [call["node_id"] for call in initial.start_calls],
+            ["n1", "n3"],
+        )
+        unrelated_handle = snapshot.handles["n3"]
+        unrelated_task = snapshot.nodes["n3"]["active_task"].copy()
+
+        changed_n1 = node("n1")
+        changed_n1.contract["acceptance_example"] = "changed n1"
+        changed_nodes = [changed_n1, node("n2", ["n1"]), node("n3")]
+        changed_plan = Plan(
+            "plan-1", 1, "docs/prd.md", ["n1", "n2", "n3"], "draft"
+        )
+        changed_record = authorize(
+            build_authorization_card(
+                changed_plan,
+                changed_nodes,
+                self.capabilities,
+                active_pair_limit=3,
+            ),
+            "AUTHORIZE",
+        )
+        recovery = FakeRunner()
+
+        reauthorized = Monitor(
+            self.paths, changed_plan, changed_nodes
+        ).reauthorize(
+            snapshot.run_id,
+            changed_record,
+            recovery,
+            "executable_contract_changed",
+        )
+
+        self.assertIn("n3", reauthorized.handles)
+        self.assertEqual(reauthorized.handles["n3"], unrelated_handle)
+        self.assertEqual(reauthorized.nodes["n3"]["active_task"], unrelated_task)
+        self.assertNotIn(unrelated_handle, recovery.stop_calls)
+        self.assertFalse(
+            any(call["node_id"] == "n3" for call in recovery.start_calls)
         )
 
     def test_reauthorization_waits_for_hard_dependency_before_downstream_rework(self):

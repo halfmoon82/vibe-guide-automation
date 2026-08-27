@@ -255,6 +255,85 @@ class ProviderActionStore:
                 result.append(self._read(path))
         return result
 
+    def has_request(
+        self,
+        run_id: str,
+        issue_id: str,
+        role: str,
+        operation: Optional[str] = None,
+    ) -> bool:
+        """Check for a valid request without creating the mailbox."""
+        if not all(
+            isinstance(value, str) and value
+            for value in (run_id, issue_id, role)
+        ):
+            raise ValueError("provider request identity is required")
+        if operation is not None and (
+            not isinstance(operation, str) or operation not in _PROVIDER_ACTIONS
+        ):
+            raise ValueError("provider request operation is invalid")
+
+        if self.root.is_symlink() or (
+            self.root.exists() and not self.root.is_dir()
+        ):
+            raise ValueError("provider action path may not be a symlink")
+        request_dir = self.root / "requests"
+        if request_dir.is_symlink() or (
+            request_dir.exists() and not request_dir.is_dir()
+        ):
+            raise ValueError("provider request directory may not be a symlink")
+        if not request_dir.is_dir():
+            return False
+
+        expected_keys = {
+            "schema_version",
+            "action_id",
+            "operation",
+            "provider",
+            "run_id",
+            "issue_id",
+            "role",
+            "generation",
+            "sequence",
+            "native_tool",
+            "request",
+            "request_digest",
+        }
+        for path in sorted(request_dir.glob("action-*.json")):
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("provider action request must be a regular file")
+            record = self._read(path)
+            if set(record) != expected_keys:
+                raise ValueError("provider action request schema is invalid")
+            if (
+                record["schema_version"] != self.schema_version
+                or record["action_id"] != path.stem
+                or not isinstance(record["operation"], str)
+                or record["operation"] not in _PROVIDER_ACTIONS
+                or any(
+                    not isinstance(record[key], str) or not record[key]
+                    for key in ("action_id", "provider", "run_id", "issue_id", "role", "native_tool", "request_digest")
+                )
+                or any(
+                    isinstance(record[key], bool)
+                    or not isinstance(record[key], int)
+                    or record[key] < 0
+                    for key in ("generation", "sequence")
+                )
+                or not isinstance(record["request"], dict)
+                or record["request_digest"]
+                != _canonical_digest({key: record[key] for key in expected_keys if key != "request_digest"})
+            ):
+                raise ValueError("provider action request schema is invalid")
+            if (
+                record["run_id"] == run_id
+                and record["issue_id"] == issue_id
+                and record["role"] == role
+                and (operation is None or record["operation"] == operation)
+            ):
+                return True
+        return False
+
 
 @dataclass(frozen=True)
 class RepositoryTaskRouting:
