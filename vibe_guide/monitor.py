@@ -600,11 +600,14 @@ class Monitor:
         record = self._require_snapshot_authorization(snapshot)
         active_pairs = sum(
             1
-            for current in snapshot.nodes.values()
-            if not current.get("pair_archived")
+            for node_id, current in snapshot.nodes.items()
+            if current.get("status") not in {"stopped", "failed"}
+            and not current.get("pair_archived")
             and (
                 int(current.get("developer_generation", 0)) > 0
                 or current.get("retryable_action") is not None
+                or isinstance(current.get("active_task"), dict)
+                or node_id in snapshot.handles
             )
         )
         for node_id, node in self.nodes.items():

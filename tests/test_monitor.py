@@ -18,6 +18,7 @@ from vibe_guide.state import (
     append_event,
     load_events,
     load_snapshot,
+    save_snapshot,
 )
 from vibe_guide.task_registry import TaskBinding, load_task_binding, save_task_binding
 from vibe_guide.capability_contract import build_contract, save_contract
@@ -153,6 +154,41 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(snapshot.nodes["n1"]["status"], "running")
         self.assertEqual(snapshot.nodes["n2"]["status"], "running")
         self.assertEqual(snapshot.nodes["n3"]["status"], "planned")
+
+    def test_stopped_pair_releases_capacity_without_archiving_pair(self):
+        nodes = [node("n1"), node("n2")]
+        monitor, record = self.authorized_monitor(nodes, active_pair_limit=1)
+        runner = FakeRunner(
+            events={("n1", "developer"): [("stopped", {"reason": "provider stopped task"})]}
+        )
+
+        snapshot = monitor.start(record, runner)
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1"])
+
+        stopped = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(stopped.nodes["n1"]["status"], "stopped")
+        self.assertFalse(stopped.nodes["n1"]["pair_archived"])
+        self.assertEqual(stopped.nodes["n2"]["status"], "running")
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1", "n2"])
+
+    def test_blocked_unknown_with_active_handle_still_uses_capacity(self):
+        nodes = [node("n1"), node("n2")]
+        monitor, record = self.authorized_monitor(nodes, active_pair_limit=1)
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        current = snapshot.nodes["n1"]
+        current["status"] = "blocked_unknown"
+        current["developer_generation"] = 0
+        current["retryable_action"] = None
+        self.assertIn("n1", snapshot.handles)
+        save_snapshot(self.paths, snapshot)
+
+        blocked = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(blocked.nodes["n1"]["status"], "blocked_unknown")
+        self.assertEqual(blocked.nodes["n2"]["status"], "planned")
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1"])
 
     def test_v2_run_and_child_binding_lock_the_same_capability_contract_digest(self):
         monitor, record = self.authorized_monitor([node("n1")])
