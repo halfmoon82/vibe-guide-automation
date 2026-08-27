@@ -172,6 +172,23 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(stopped.nodes["n2"]["status"], "running")
         self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1", "n2"])
 
+    def test_failed_pair_releases_capacity_without_archiving_pair(self):
+        nodes = [node("n1"), node("n2")]
+        monitor, record = self.authorized_monitor(nodes, active_pair_limit=1)
+        runner = FakeRunner(
+            events={("n1", "developer"): [("failed", {"reason": "provider failed task"})]}
+        )
+
+        snapshot = monitor.start(record, runner)
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1"])
+
+        failed = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(failed.nodes["n1"]["status"], "failed")
+        self.assertFalse(failed.nodes["n1"]["pair_archived"])
+        self.assertEqual(failed.nodes["n2"]["status"], "running")
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1", "n2"])
+
     def test_blocked_unknown_with_active_handle_still_uses_capacity(self):
         nodes = [node("n1"), node("n2")]
         monitor, record = self.authorized_monitor(nodes, active_pair_limit=1)
