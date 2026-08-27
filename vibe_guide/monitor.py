@@ -36,13 +36,15 @@ from .workflow_gate import require_capability_contract, require_entry
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
 from .change_requests import ChangeRequest, LocalMergeEvidence, merge_local
+from .checkpoint import ContextBudgetEstimator, ContextBudgetPolicy, MonitorCheckpoint, resume_from_checkpoint, write_checkpoint
 
 
 class Monitor:
-    def __init__(self, paths: ProjectPaths, plan: Plan, nodes: List[DAGNode]):
+    def __init__(self, paths: ProjectPaths, plan: Plan, nodes: List[DAGNode], context_policy: Optional[ContextBudgetPolicy] = None):
         self.paths = paths
         self.plan = plan
         self.nodes = {node.id: node for node in nodes}
+        self.context_policy = context_policy
 
     def merge_change_request_local(
         self,
@@ -145,14 +147,20 @@ class Monitor:
             },
         )
         save_snapshot(self.paths, snapshot)
+        if not self._context_allows_dispatch(snapshot, runner):
+            save_snapshot(self.paths, snapshot)
+            return snapshot
         self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
         save_snapshot(self.paths, snapshot)
         return snapshot
 
-    def resume(self, run_id: str, runner: Runner) -> RunSnapshot:
+    def resume(self, run_id: str, runner: Runner, poll_handles: bool = True) -> RunSnapshot:
         require_entry(self.paths, "resume:" + str(run_id), "resume")
         snapshot = load_snapshot(self.paths, run_id)
+        checkpoint_path = self.paths.root / ".vibe" / "runs" / run_id / "monitor_checkpoint.json"
+        if checkpoint_path.is_file():
+            resume_from_checkpoint(self.paths, run_id)
         current_capability_contract = require_capability_contract(self.paths)
         if (
             not snapshot.capability_contract_digest
@@ -178,7 +186,10 @@ class Monitor:
                         node_id,
                         "active task handle is missing during resume",
                     )
-        self._schedule_ready(snapshot, runner)
+        if poll_handles:
+            self._poll_active_handles(snapshot, runner)
+        if self._context_allows_dispatch(snapshot, runner):
+            self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
         save_snapshot(self.paths, snapshot)
         return snapshot
@@ -214,7 +225,8 @@ class Monitor:
             raise PermissionError("reauthorization must remain on the same plan revision")
         if snapshot.authorization_digest == record.digest:
             self._require_snapshot_authorization(snapshot)
-            self._schedule_ready(snapshot, runner)
+            if self._context_allows_dispatch(snapshot, runner):
+                self._schedule_ready(snapshot, runner)
             self._refresh_run_status(snapshot)
             save_snapshot(self.paths, snapshot)
             return snapshot
@@ -326,7 +338,8 @@ class Monitor:
         }
         self._record(snapshot, "authorization_reauthorized", transition)
         self._apply_reauthorization_transition(snapshot, transition)
-        self._schedule_ready(snapshot, runner)
+        if self._context_allows_dispatch(snapshot, runner):
+            self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
         save_snapshot(self.paths, snapshot)
         return snapshot
@@ -335,6 +348,14 @@ class Monitor:
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
         self._reconcile_unapplied_events(snapshot)
+        self._poll_active_handles(snapshot, runner)
+        if self._context_allows_dispatch(snapshot, runner):
+            self._schedule_ready(snapshot, runner)
+        self._refresh_run_status(snapshot)
+        save_snapshot(self.paths, snapshot)
+        return snapshot
+
+    def _poll_active_handles(self, snapshot: RunSnapshot, runner: Runner) -> None:
         for node_id, handle_id in list(snapshot.handles.items()):
             self._require_snapshot_authorization(snapshot)
             try:
@@ -347,11 +368,11 @@ class Monitor:
                 )
                 continue
             for event in events:
-                self._apply_event(snapshot, node_id, handle_id, event, runner)
-        self._schedule_ready(snapshot, runner)
-        self._refresh_run_status(snapshot)
-        save_snapshot(self.paths, snapshot)
-        return snapshot
+                if event.event in {"context_overflow", "context_exhausted", "overflow"}:
+                    self._record_runner_event(snapshot, node_id, event, snapshot.nodes[node_id].get("active_task") or {})
+                    self._checkpoint_context(snapshot, "provider reported context overflow", exhausted=True)
+                else:
+                    self._apply_event(snapshot, node_id, handle_id, event, runner)
 
     def _require_record(self, record: Optional[AuthorizationRecord]) -> None:
         if record is None or not is_authorization_valid(
@@ -1384,6 +1405,140 @@ class Monitor:
         snapshot.event_sequence = append_event(
             self.paths, RunEvent(event_name, data), provenance
         )
+
+    def _context_estimate(self, snapshot: RunSnapshot, runner: Runner):
+        policy = self.context_policy
+        missing = object()
+        supplied = getattr(runner, "context_budget", missing)
+        observed_budget = supplied is not missing
+        if callable(supplied):
+            try:
+                supplied = supplied()
+            except Exception:
+                # An observation failure invalidates any caller-supplied
+                # policy for this action; never dispatch on stale limits.
+                policy = ContextBudgetPolicy("observed-model-limit")
+                supplied = None
+        if observed_budget and supplied is None:
+            policy = ContextBudgetPolicy("observed-model-limit")
+        elif observed_budget and not isinstance(supplied, dict):
+            policy = ContextBudgetPolicy("observed-model-limit")
+            supplied = None
+        fields = dict(getattr(runner, "context_input", {}) or {})
+        if observed_budget and isinstance(supplied, dict):
+            fields.update(supplied)
+            try:
+                observed_policy = ContextBudgetPolicy(
+                    supplied.get("context_limit_tokens", "observed-model-limit"),
+                    supplied.get("reserve_tokens"),
+                    supplied.get("warning_ratio", 0.70),
+                    supplied.get("checkpoint_ratio", 0.80),
+                    supplied.get("hard_stop_ratio", 0.90),
+                )
+            except (TypeError, ValueError):
+                observed_policy = ContextBudgetPolicy("observed-model-limit")
+            if observed_policy.context_limit_tokens == "observed-model-limit":
+                policy = observed_policy
+            elif policy is None:
+                policy = observed_policy
+        elif not observed_budget and getattr(runner, "context_limit_tokens", None) is not None:
+            if policy is None:
+                try:
+                    policy = ContextBudgetPolicy(getattr(runner, "context_limit_tokens"))
+                except (TypeError, ValueError):
+                    policy = ContextBudgetPolicy("observed-model-limit")
+        # Every dispatch must have an evidence-bound limit. If neither the
+        # monitor nor the runner can provide one, keep an explicit unknown
+        # policy so dispatch checkpoints and fails closed.
+        if policy is None:
+            policy = ContextBudgetPolicy("observed-model-limit")
+        if "event_summary" not in fields:
+            try:
+                fields["event_summary"] = json.dumps(
+                    load_events(self.paths, snapshot.run_id)[-5:],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            except (OSError, TypeError, ValueError):
+                fields["event_summary"] = ""
+        if "checkpoint" not in fields:
+            checkpoint_path = self.paths.root / ".vibe" / "runs" / snapshot.run_id / "monitor_checkpoint.json"
+            try:
+                fields["checkpoint"] = (
+                    checkpoint_path.read_text(encoding="utf-8")
+                    if checkpoint_path.is_file()
+                    else ""
+                )
+            except (OSError, UnicodeError):
+                fields["checkpoint"] = ""
+        return ContextBudgetEstimator(policy).estimate(
+            str(fields.get("system_prompt", "")),
+            str(fields.get("current_input", "")),
+            str(fields.get("event_summary", "")),
+            str(fields.get("checkpoint", "")),
+            str(fields.get("expected_output", "")),
+            fields.get("tokenizer"),
+            int(fields.get("next_action_tokens", 0) or 0),
+        )
+
+    def _checkpoint_context(self, snapshot: RunSnapshot, reason: str, exhausted: bool = False, estimate: Any = None):
+        profiles = {}
+        for node_id, node in self.nodes.items():
+            profile = node.contract.get("worker_profile")
+            if isinstance(profile, dict):
+                profiles[node_id] = profile
+        checkpoint = MonitorCheckpoint(
+            run_id=snapshot.run_id,
+            plan_revision="{}@{}".format(snapshot.plan_id, snapshot.plan_version),
+            state_version=snapshot.schema_version,
+            last_event_seq=snapshot.event_sequence,
+            next_action="resume",
+            stop_conditions=["preserve writer lease", "do not duplicate writer"],
+            authorization_digest=snapshot.authorization_digest,
+            node_contract_digest=snapshot.node_contract_digest,
+            capability_contract_digest=getattr(snapshot, "capability_contract_digest", ""),
+            nodes=snapshot.nodes,
+            handles=snapshot.handles,
+            worker_profiles=profiles,
+            evidence=[{"reason": reason}],
+            estimate=estimate.__dict__ if estimate is not None else None,
+        )
+        write_checkpoint(self.paths, checkpoint)
+        self._record(snapshot, "monitor_context_exhausted" if exhausted else "monitor_context_checkpoint", {
+            "run_id": snapshot.run_id,
+            "reason": reason,
+            "checkpoint_sha": checkpoint.sha256,
+            "last_event_seq": snapshot.event_sequence,
+        })
+        if exhausted:
+            for node_id, current in snapshot.nodes.items():
+                if current.get("active_task"):
+                    current["status"] = "blocked_unknown"
+            snapshot.status = "blocked_unknown"
+
+    def _context_allows_dispatch(self, snapshot: RunSnapshot, runner: Runner) -> bool:
+        estimate = self._context_estimate(snapshot, runner)
+        if estimate is None or estimate.status == "normal":
+            return True
+        if estimate.status == "warning":
+            try:
+                warned = any(
+                    item.get("event") == "monitor_context_warning"
+                    for item in load_events(self.paths, snapshot.run_id)
+                )
+            except (OSError, TypeError, ValueError):
+                warned = False
+            if not warned:
+                self._record(snapshot, "monitor_context_warning", {
+                    "run_id": snapshot.run_id,
+                    "total_tokens": estimate.total_tokens,
+                    "limit_tokens": estimate.limit_tokens,
+                    "ratio": estimate.ratio,
+                    "source": estimate.source,
+                })
+            return True
+        self._checkpoint_context(snapshot, "context budget status: " + estimate.status, estimate.status in {"hard_stop", "blocked_unknown"}, estimate)
+        return False
 
     def _reconcile_start_intent(
         self,

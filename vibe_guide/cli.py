@@ -25,6 +25,7 @@ from .doctor import doctor
 from .initializer import init_project
 from .models import AgentCapabilities, DAGNode, Plan
 from .monitor import Monitor
+from .checkpoint import ContextBudgetPolicy
 from .change_requests import ChangeRequest, classify_merge_capability
 from .paths import ProjectPaths
 from .planner import (
@@ -215,6 +216,37 @@ def _public_runner(
         observed.adapter_id,
         observed.capabilities.provider,
     )
+
+
+def _context_policy_for_runner(runner: Any) -> ContextBudgetPolicy:
+    """Build an evidence-bound context budget contract from runner facts."""
+    missing = object()
+    supplied = getattr(runner, "context_budget", missing)
+    if callable(supplied):
+        try:
+            supplied = supplied()
+        except Exception:
+            return ContextBudgetPolicy("observed-model-limit")
+    if supplied is not missing and not isinstance(supplied, dict):
+        return ContextBudgetPolicy("observed-model-limit")
+    if isinstance(supplied, dict):
+        try:
+            return ContextBudgetPolicy(
+                supplied.get("context_limit_tokens", "observed-model-limit"),
+                supplied.get("reserve_tokens"),
+                supplied.get("warning_ratio", 0.70),
+                supplied.get("checkpoint_ratio", 0.80),
+                supplied.get("hard_stop_ratio", 0.90),
+            )
+        except (TypeError, ValueError):
+            return ContextBudgetPolicy("observed-model-limit")
+    limit = getattr(runner, "context_limit_tokens", None)
+    if limit is None:
+        return ContextBudgetPolicy("observed-model-limit")
+    try:
+        return ContextBudgetPolicy(limit)
+    except (TypeError, ValueError):
+        return ContextBudgetPolicy("observed-model-limit")
 
 
 def _publish_plan(
@@ -686,7 +718,8 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 record = authorize(card, args.authorize)
                 if runner is None:
                     runner = _public_runner(paths, card, nodes)
-                snapshot = Monitor(paths, plan, nodes).reauthorize(
+                context_policy = _context_policy_for_runner(runner)
+                snapshot = Monitor(paths, plan, nodes, context_policy=context_policy).reauthorize(
                     _run_id(directory, None),
                     record,
                     runner,
@@ -702,7 +735,8 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 record = authorize(card, args.authorize)
                 if runner is None:
                     runner = _public_runner(paths, card, nodes)
-                snapshot = Monitor(paths, plan, nodes).start(record, runner)
+                context_policy = _context_policy_for_runner(runner)
+                snapshot = Monitor(paths, plan, nodes, context_policy=context_policy).start(record, runner)
             _atomic_json(directory / "authorization.json", record.to_dict())
             _atomic_json(
                 _current_run_path(directory), {"run_id": snapshot.run_id}
@@ -800,8 +834,9 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 AuthorizationRecord.from_dict(
                     _read_json(directory / "authorization.json")
                 )
-                monitor = Monitor(paths, plan, nodes)
-                snapshot = monitor.resume(run_id, runner)
+                context_policy = _context_policy_for_runner(runner)
+                monitor = Monitor(paths, plan, nodes, context_policy=context_policy)
+                snapshot = monitor.resume(run_id, runner, poll_handles=False)
                 snapshot = monitor.tick(run_id, runner)
         except PermissionError as error:
             _persist_invalidation(
