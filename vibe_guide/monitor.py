@@ -286,6 +286,8 @@ class Monitor:
             else:
                 invalidated_acceptances[node_id] = evidence
         for node_id, handle_id in list(snapshot.handles.items()):
+            if node_id not in affected_nodes:
+                continue
             current = snapshot.nodes[node_id]
             active = current.get("active_task")
             if not isinstance(active, dict) or active.get("handle_id") != handle_id:
@@ -558,13 +560,11 @@ class Monitor:
         snapshot.authorization_digest = replacement.digest
         snapshot.node_contract_digest = replacement.node_contract_digest
         snapshot.status = "running"
-        snapshot.handles.clear()
+        affected_set = set(affected_nodes)
+        for node_id in affected_set:
+            snapshot.handles.pop(node_id, None)
         for node_id, current in snapshot.nodes.items():
             current["contract_digest"] = node_contract_digests[node_id]
-            current["active_role"] = None
-            current["active_task"] = None
-            current["start_intent"] = None
-            current["quarantine"] = None
             if current.get("status") == "accepted":
                 if node_id in retained_acceptances:
                     evidence = retained_acceptances[node_id]
@@ -575,9 +575,17 @@ class Monitor:
                     continue
                 if node_id in invalidated_acceptances:
                     current["acceptance"] = None
+                    if node_id not in affected_set:
+                        raise ValueError("invalidated acceptance is outside affected suffix")
                     self._queue_reauthorization_continuation(current)
                     continue
                 raise ValueError("accepted node lacks reauthorization disposition")
+            if node_id not in affected_set:
+                continue
+            current["active_role"] = None
+            current["active_task"] = None
+            current["start_intent"] = None
+            current["quarantine"] = None
             if int(current.get("developer_generation", 0)) > 0:
                 self._queue_reauthorization_continuation(current)
             else:
@@ -621,11 +629,14 @@ class Monitor:
         record = self._require_snapshot_authorization(snapshot)
         active_pairs = sum(
             1
-            for current in snapshot.nodes.values()
-            if not current.get("pair_archived")
+            for node_id, current in snapshot.nodes.items()
+            if current.get("status") not in {"stopped", "failed"}
+            and not current.get("pair_archived")
             and (
                 int(current.get("developer_generation", 0)) > 0
                 or current.get("retryable_action") is not None
+                or isinstance(current.get("active_task"), dict)
+                or node_id in snapshot.handles
             )
         )
         for node_id, node in self.nodes.items():
@@ -1104,6 +1115,14 @@ class Monitor:
                 )
                 return
             self._record_runner_event(snapshot, node_id, event, active)
+            if self._is_implementation_finding(event.data):
+                current["active_role"] = None
+                current["active_task"] = None
+                snapshot.handles.pop(node_id, None)
+                self._start_task(
+                    snapshot, node_id, "developer", "rework", runner, True
+                )
+                return
             if not event.data.get("in_contract", False):
                 record = self._snapshot_record(snapshot)
                 resolution = resolve_consistency(
@@ -1327,6 +1346,24 @@ class Monitor:
                 "node_id": node_id,
                 "clearance": current["review_clearance"],
             },
+        )
+
+    @staticmethod
+    def _is_implementation_finding(data: Dict[str, Any]) -> bool:
+        """Recognize an explicit P0-P2 implementation defect from review data."""
+        values = [data.get("severity")]
+        finding = data.get("finding")
+        if isinstance(finding, dict):
+            values.append(finding.get("severity"))
+            nested = finding.get("finding")
+            if isinstance(nested, dict):
+                values.append(nested.get("severity"))
+        nested_review = data.get("review_finding")
+        if isinstance(nested_review, dict):
+            values.append(nested_review.get("severity"))
+        return any(
+            isinstance(value, str) and value.strip().upper() in {"P0", "P1", "P2"}
+            for value in values
         )
 
     @staticmethod
