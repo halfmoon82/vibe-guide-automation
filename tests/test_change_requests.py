@@ -417,6 +417,8 @@ class ChangeRequestTests(unittest.TestCase):
             {"push_succeeded": True},
             {"push_status": "succeeded"},
             {"pushed": "true"},
+            {"pushed": 1},
+            {"push_status": 0},
         ):
             with self.subTest(provider_facts=provider_facts):
                 result = merge_remote(

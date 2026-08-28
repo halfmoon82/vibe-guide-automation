@@ -154,11 +154,17 @@ def _push_contract_conflict(facts: Mapping[str, Any]) -> bool:
         for value in _nested_values(facts, key):
             if value is True:
                 return True
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value != 0:
+                return True
             if isinstance(value, str) and value.strip().casefold() in {
                 "true", "yes", "1", "succeeded", "success",
             }:
                 return True
     for value in _nested_values(facts, "push_status"):
+        if value is True:
+            return True
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            return True
         if isinstance(value, str) and value.strip().casefold() not in {
             "", "false", "not_attempted", "not_attempted_or_unknown", "none", "no",
         }:
