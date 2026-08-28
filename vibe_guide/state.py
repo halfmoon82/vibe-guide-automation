@@ -73,6 +73,13 @@ _EVENT_DATA_KEYS = {
     *CONSISTENCY_CORRECTION_KEYS,
     "authorization_digest",
     "authorization_epoch",
+    "capability_contract_digest",
+    "checkpoint_sha",
+    "last_event_seq",
+    "limit_tokens",
+    "ratio",
+    "source",
+    "total_tokens",
     "authorized_node_contracts",
     "accepted_nodes",
     "affected_nodes",
@@ -104,7 +111,6 @@ _EVENT_DATA_KEYS = {
     "status",
     "task_id",
     "worker",
-    "worker_profile",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",
@@ -202,6 +208,10 @@ class RunSnapshot:
     authorization: Dict[str, Any] = field(default_factory=dict)
     authorization_digest: str = ""
     node_contract_digest: str = ""
+    # A V2 run is bound to the exact capability evidence contract used when
+    # its child tasks were dispatched.  Empty keeps pre-contract snapshots
+    # loadable for legacy, non-V2 runs; V2 monitor paths always populate it.
+    capability_contract_digest: str = ""
     event_sequence: int = 0
     schema_version: int = STATE_SCHEMA_VERSION
 
@@ -224,9 +234,11 @@ class RunSnapshot:
             "node_contract_digest",
             "event_sequence",
         }
-        if not isinstance(data, dict) or set(data) != expected:
+        with_capability = expected | {"capability_contract_digest"}
+        if not isinstance(data, dict) or set(data) not in (expected, with_capability):
             raise ValueError("snapshot schema is invalid")
         normalized = dict(data)
+        normalized.setdefault("capability_contract_digest", "")
         normalized["authorization"] = AuthorizationRecord.from_dict(
             normalized["authorization"]
         ).to_dict()
@@ -571,6 +583,10 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         raise ValueError("snapshot authorization digest is invalid")
     if not _DIGEST.fullmatch(snapshot.node_contract_digest):
         raise ValueError("snapshot node contract digest is invalid")
+    if snapshot.capability_contract_digest and not _DIGEST.fullmatch(
+        snapshot.capability_contract_digest
+    ):
+        raise ValueError("snapshot capability contract digest is invalid")
 
     authorization = AuthorizationRecord.from_dict(snapshot.authorization)
     if not is_authorization_integrity_valid(authorization):
@@ -602,6 +618,9 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         raise ValueError("snapshot has no run-start event lineage")
     current_authorization_digest = first["data"].get("authorization_digest")
     current_node_contract_digest = first["data"].get("node_contract_digest")
+    first_capability_contract_digest = first["data"].get(
+        "capability_contract_digest", ""
+    )
     if not isinstance(current_authorization_digest, str) or not _DIGEST.fullmatch(
         current_authorization_digest
     ):
@@ -610,6 +629,12 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         current_node_contract_digest
     ):
         raise ValueError("run-start contract lineage is inconsistent")
+    if first_capability_contract_digest and not _DIGEST.fullmatch(
+        first_capability_contract_digest
+    ):
+        raise ValueError("run-start capability contract lineage is inconsistent")
+    if snapshot.capability_contract_digest != first_capability_contract_digest:
+        raise ValueError("snapshot capability contract lineage is inconsistent")
     if sorted(first["data"].get("node_ids", [])) != sorted(snapshot.nodes):
         raise ValueError("run-start node lineage is inconsistent")
     retained_acceptance_proofs = []

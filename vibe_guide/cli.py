@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .authorization import (
@@ -16,25 +17,16 @@ from .authorization import (
     build_authorization_card,
     refresh_authorization_card,
 )
-from .deploy import (
-    DeployManifest,
-    DeployState,
-    authorize_deploy,
-    deploy_manifest_digest,
-    is_deploy_authorization_valid,
-    plan_deploy,
-    prepare_deploy,
-    start_deploy,
-    verify_deploy,
-)
 from .adapters.base import Environment
 from .adapters.registry import AdapterRegistry
-from .adapters.task_provider import ProviderActionStore
+from .adapters.task_provider import ProviderActionStore, ProviderPending
 from .dag import render_plan_artifacts, validate_dag
 from .doctor import doctor
 from .initializer import init_project
 from .models import AgentCapabilities, DAGNode, Plan
 from .monitor import Monitor
+from .checkpoint import ContextBudgetPolicy
+from .change_requests import ChangeRequest, classify_merge_capability
 from .paths import ProjectPaths
 from .planner import (
     DecisionCard,
@@ -46,6 +38,9 @@ from .planner import (
     score_s1,
 )
 from .scanner import scan_project
+from .diagnostics import screen_session, require_session_screened
+from .diagnostics import assert_planning_gate
+from .workflow_gate import require_capability_contract
 from .state import load_snapshot
 from .runners.provider_action import ProviderActionRunner
 
@@ -77,7 +72,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "doctor", "plan", "monitor", "deploy", "status", "resume"),
+        choices=("scan", "init", "doctor", "plan", "monitor", "status", "resume", "change-request"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -89,8 +84,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--node-spec")
     parser.add_argument("--authorize")
     parser.add_argument("--authorization-token", dest="legacy_authorization")
-    parser.add_argument("--deploy-authorize")
-    parser.add_argument("--deploy-observations")
     return parser
 
 
@@ -179,7 +172,19 @@ def _authorization_card(data: Dict[str, Any]) -> AuthorizationCard:
 
 
 def _observed_adapter(paths: ProjectPaths, adapter_id: str):
-    capabilities = ProviderActionStore(paths).capabilities()
+    store = ProviderActionStore(paths)
+    capabilities = None
+    last_error = None
+    for attempt in range(3):
+        try:
+            capabilities = store.capabilities()
+            break
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(0.05)
+    if capabilities is None:
+        raise ProviderPending("provider capability observation pending") from last_error
     if capabilities["adapter_id"] != adapter_id:
         raise ValueError("observed provider does not match the selected adapter")
     facts = capabilities["facts"]
@@ -213,6 +218,37 @@ def _public_runner(
     )
 
 
+def _context_policy_for_runner(runner: Any) -> ContextBudgetPolicy:
+    """Build an evidence-bound context budget contract from runner facts."""
+    missing = object()
+    supplied = getattr(runner, "context_budget", missing)
+    if callable(supplied):
+        try:
+            supplied = supplied()
+        except Exception:
+            return ContextBudgetPolicy("observed-model-limit")
+    if supplied is not missing and not isinstance(supplied, dict):
+        return ContextBudgetPolicy("observed-model-limit")
+    if isinstance(supplied, dict):
+        try:
+            return ContextBudgetPolicy(
+                supplied.get("context_limit_tokens", "observed-model-limit"),
+                supplied.get("reserve_tokens"),
+                supplied.get("warning_ratio", 0.70),
+                supplied.get("checkpoint_ratio", 0.80),
+                supplied.get("hard_stop_ratio", 0.90),
+            )
+        except (TypeError, ValueError):
+            return ContextBudgetPolicy("observed-model-limit")
+    limit = getattr(runner, "context_limit_tokens", None)
+    if limit is None:
+        return ContextBudgetPolicy("observed-model-limit")
+    try:
+        return ContextBudgetPolicy(limit)
+    except (TypeError, ValueError):
+        return ContextBudgetPolicy("observed-model-limit")
+
+
 def _publish_plan(
     paths: ProjectPaths, plan_id: str, source_path: Path
 ) -> Tuple[Plan, List[DAGNode], AuthorizationCard]:
@@ -229,7 +265,11 @@ def _publish_plan(
     approval = approve_prd(prd, decisions)
     if not approval.approved:
         raise PermissionError("product decisions remain unresolved")
-    nodes = [DAGNode.from_dict(item) for item in source.get("nodes", [])]
+    raw_nodes = source.get("nodes", [])
+    for item in raw_nodes:
+        contract = item.setdefault("contract", {})
+        contract.setdefault("worker_profile", {"worker": "default", "model": "default", "reasoning": "normal", "fallbacks": [], "selection_basis": {"issue_complexity_ref": item.get("id", "node"), "complexity_band": "standard", "risk_tags": [], "availability_evidence": "configured"}, "writer": "worker", "worktree": contract.get("worktree", "."), "branch": contract.get("branch", "main"), "allowlist": contract.get("files", []) or ["."]})
+    nodes = [DAGNode.from_dict(item) for item in raw_nodes]
     if not nodes:
         raise ValueError("node spec must contain at least one node")
     validation = validate_dag(nodes)
@@ -237,22 +277,18 @@ def _publish_plan(
         raise ValueError("DAG is invalid: " + "; ".join(validation.errors))
 
     destination = _plan_root(paths, plan_id)
-    deploy_manifest = None
-    if source.get("deploy") is not None:
-        deploy_manifest = DeployManifest.from_dict(source["deploy"])
     plan = Plan(
         plan_id,
         1,
         str(Path(".vibe") / "plans" / plan_id / "prd.md"),
         [node.id for node in nodes],
-        "draft",
+        "authorized",
         decisions=[asdict(item) for item in decisions],
-        deploy=deploy_manifest.to_dict() if deploy_manifest else None,
     )
     capabilities = AgentCapabilities.from_dict(source.get("capabilities", {}))
     try:
         capabilities = _observed_adapter(paths, capabilities.agent_id).capabilities
-    except (FileNotFoundError, OSError, TypeError, ValueError):
+    except (FileNotFoundError, OSError, TypeError, ValueError, ProviderPending):
         # Planning remains usable for explicitly injected/background test paths;
         # the public monitor rechecks live observed capability before execution.
         pass
@@ -275,7 +311,7 @@ def _publish_plan(
         (staging / "specs").mkdir()
         (staging / "issues").mkdir()
         (staging / "prd.md").write_text(
-            "# {}\n\n状态：approved\n\n目标：{}\n\n## 已批准产品决策\n\n{}\n\n"
+            "# {}\n\n状态：approved\n审核：reviewed\n\n目标：{}\n\n## 已批准产品决策\n\n{}\n\n"
             "证据优先级：{}\n".format(
                 prd.title,
                 prd.objective,
@@ -290,8 +326,8 @@ def _publish_plan(
         for node in nodes:
             contract = node.contract
             (staging / "specs" / (node.id + ".md")).write_text(
-                "# Spec: {}\n\n输入：{}\n\n输出：{}\n\n错误行为：{}\n\n验收示例：{}\n".format(
-                    node.title,
+                "# Spec: {}\n\nnode_id: {}\n状态：published\n审核：reviewed\n\n输入：{}\n\n输出：{}\n\n错误行为：{}\n\n验收示例：{}\n".format(
+                    node.title, node.id,
                     contract.get("input"),
                     contract.get("output"),
                     contract.get("error_behavior"),
@@ -300,16 +336,16 @@ def _publish_plan(
                 encoding="utf-8",
             )
             (staging / "issues" / (node.id + ".md")).write_text(
-                "# Issue: {}\n\n状态：planned\n\n并行组：{}\n".format(
-                    node.title, node.parallel_group or "none"
+                "# Issue: {}\n\nissue_id: {}\n状态：published\n审核：reviewed\n\n并行组：{}\n".format(
+                    node.title, node.id, node.parallel_group or "none"
                 ),
                 encoding="utf-8",
             )
         _atomic_json(staging / "plan.json", plan.to_dict())
         _atomic_json(staging / "nodes.json", [node.to_dict() for node in nodes])
         _atomic_json(staging / "authorization-card.json", card.to_dict())
-        if deploy_manifest is not None:
-            _atomic_json(staging / "deploy-manifest.json", deploy_manifest.to_dict())
+        _atomic_json(staging / "dag-audit.json", {"status": "reviewed", "node_count": len(nodes), "plan_revision": str(plan.version), "node_ids": [node.id for node in nodes]})
+        _atomic_json(staging / "plan-confirmation.json", {"status": "confirmed", "plan_revision": str(plan.version), "authorization_digest": card.digest, "authorization_required": True})
         os.replace(str(staging), str(destination))
     except BaseException:
         if staging.exists():
@@ -332,13 +368,20 @@ def _load_plan(paths: ProjectPaths, plan_id: str):
 
 
 def _snapshot_result(command: str, snapshot: Any, as_json: bool) -> CLIResult:
+    retry_pending = any(
+        isinstance(node.get("retryable_action"), dict)
+        and node.get("status") == "running"
+        and not node.get("active_task")
+        for node in snapshot.nodes.values()
+    )
+    result_status = "retry_pending" if retry_pending else snapshot.status
     payload = {
         "command": command,
-        "status": snapshot.status,
+        "status": result_status,
         "run_id": snapshot.run_id,
         "nodes": snapshot.nodes,
     }
-    if snapshot.status == "blocked_unknown":
+    if retry_pending or snapshot.status == "blocked_unknown":
         code = UNKNOWN
     elif snapshot.status == "blocked_design":
         code = BLOCKED
@@ -349,7 +392,7 @@ def _snapshot_result(command: str, snapshot: Any, as_json: bool) -> CLIResult:
     return _result(
         code,
         payload,
-        "{}：运行 {}，状态 {}".format(command, snapshot.run_id, snapshot.status),
+        "{}：运行 {}，状态 {}".format(command, snapshot.run_id, result_status),
         as_json,
     )
 
@@ -404,6 +447,31 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             USAGE_ERROR, {"status": "usage_error"}, "参数错误", False
         )
     paths = ProjectPaths.from_cwd(Path(cwd))
+
+    v2_state = False
+    state_probe = paths.vibe / "state.json"
+    if state_probe.is_file():
+        try:
+            state_data = _read_json(state_probe)
+            v2_state = isinstance(state_data, dict) and state_data.get("workflow_version") == 2
+        except (OSError, ValueError, AttributeError):
+            v2_state = False
+    if (v2_state or args.command == "init") and (args.command != "init" or args.confirm):
+        try:
+            session_id = args.command + ":" + str(args.run_id or args.plan_id or args.plan or "session")
+            # CLI persistence binds the route, not raw user/provider text.
+            screen_session(paths, str(session_id), args.command)
+        except (OSError, ValueError, PermissionError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": str(error)}, "会话筛选已阻塞：" + str(error), args.as_json)
+    if args.command in {"monitor", "resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
+        return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": "V2 state.json is missing"}, "会话筛选已阻塞：V2 state.json 缺失", args.as_json)
+    if args.command == "scan" and paths.vibe.exists():
+        try:
+            state_data = _read_json(state_probe)
+            if not isinstance(state_data, dict) or state_data.get("workflow_version") != 2 or state_data.get("session_gate") != "s0_required":
+                raise ValueError("invalid V2 state")
+        except (OSError, ValueError, AttributeError):
+            return _result(BLOCKED, {"command": "scan", "status": "session_gate_blocked", "reason": "V2 state.json invalid"}, "扫描已阻塞：V2 state.json 无效", args.as_json)
 
     if args.command == "scan":
         payload = {
@@ -465,13 +533,20 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 if issue != "no candidate Agent command found"
             ]
         ready = not issues
+        status = report.status
+        if ready:
+            status = "ready"
+        elif status != "blocked":
+            status = "attention"
         payload = {
             "command": "doctor",
-            "status": "ok" if ready else "blocked",
+            "status": "ok" if status == "ready" else status,
+            "diagnostic_status": status,
             "ok": ready,
             "issues": issues,
             "facts": report.facts,
             "provider_bridge": bridge_payload,
+            "proposals": report.proposals,
         }
         text = (
             "环境检查通过"
@@ -479,8 +554,53 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             else "环境检查发现问题：" + "；".join(issues)
         )
         return _result(
-            SUCCESS if ready else BLOCKED, payload, text, args.as_json
+            SUCCESS if status == "attention" or ready else BLOCKED, payload, text, args.as_json
         )
+
+    if args.command == "change-request":
+        if not args.request:
+            return _result(
+                BLOCKED,
+                {"command": "change-request", "status": "blocked", "reason": "request facts required"},
+                "Change Request 状态未知：需要事实文件",
+                args.as_json,
+            )
+        try:
+            facts_path = paths.resolve_relative(args.request)
+            data = _read_json(facts_path)
+            if not isinstance(data, dict):
+                raise ValueError("Change Request facts must be an object")
+            cr_data = data.get("change_request", data)
+            observed = data.get("observed_facts", data)
+            if not isinstance(cr_data, dict) or not isinstance(observed, dict):
+                raise ValueError("Change Request facts are invalid")
+            capability = classify_merge_capability(observed)
+            cr = ChangeRequest(
+                cr_data["provider"], cr_data["kind"], cr_data["source"],
+                cr_data["target"], cr_data["head_sha"], cr_data["tree_sha"],
+                capability, cr_data.get("status", ""),
+            )
+            payload = {
+                "command": "change-request",
+                "status": "blocked_unknown" if capability == "unknown_remote" else capability,
+                "merge_capability": capability,
+                "change_request": cr.to_dict(),
+                "remote_merge": capability == "verified_remote",
+                "local_merge": capability in {"denied_remote", "unsupported_remote"},
+            }
+            text = (
+                "Change Request 远端能力未知，保持 blocked_unknown"
+                if capability == "unknown_remote"
+                else "Change Request 能力已分类：" + capability
+            )
+            return _result(SUCCESS, payload, text, args.as_json)
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            return _result(
+                UNKNOWN,
+                {"command": "change-request", "status": "unknown", "reason": str(error)},
+                "Change Request 状态未知：" + str(error),
+                args.as_json,
+            )
 
     if args.command == "plan":
         screen = classify_s0(args.request or "")
@@ -562,8 +682,32 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工未启动：需要精确 AUTHORIZE",
                 args.as_json,
             )
+        if v2_state:
+            try:
+                require_capability_contract(paths)
+            except PermissionError as error:
+                return _result(
+                    UNKNOWN,
+                    {
+                        "command": "monitor",
+                        "status": "blocked_unknown",
+                        "reason": str(error),
+                    },
+                    "能力合同状态未知：" + str(error),
+                    args.as_json,
+                )
         try:
             directory, plan, nodes, card = _load_plan(paths, args.plan)
+            state_path = paths.vibe / "state.json"
+            if state_path.is_file():
+                try:
+                    state_data = _read_json(state_path)
+                except ValueError:
+                    state_data = {}
+                if isinstance(state_data, dict) and state_data.get("workflow_version") == 2:
+                    gate = assert_planning_gate(paths, args.plan)
+                    if gate.status != "execution_ready":
+                        raise PermissionError("planning_required: " + ", ".join(gate.missing))
             invalidation_path = _invalidation_path(directory)
             invalidation_to_clear = None
             if invalidation_path.exists():
@@ -574,7 +718,8 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 record = authorize(card, args.authorize)
                 if runner is None:
                     runner = _public_runner(paths, card, nodes)
-                snapshot = Monitor(paths, plan, nodes).reauthorize(
+                context_policy = _context_policy_for_runner(runner)
+                snapshot = Monitor(paths, plan, nodes, context_policy=context_policy).reauthorize(
                     _run_id(directory, None),
                     record,
                     runner,
@@ -590,7 +735,8 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 record = authorize(card, args.authorize)
                 if runner is None:
                     runner = _public_runner(paths, card, nodes)
-                snapshot = Monitor(paths, plan, nodes).start(record, runner)
+                context_policy = _context_policy_for_runner(runner)
+                snapshot = Monitor(paths, plan, nodes, context_policy=context_policy).start(record, runner)
             _atomic_json(directory / "authorization.json", record.to_dict())
             _atomic_json(
                 _current_run_path(directory), {"run_id": snapshot.run_id}
@@ -608,6 +754,17 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工已暂停：" + str(error),
                 args.as_json,
             )
+        except ProviderPending as error:
+            return _result(
+                UNKNOWN,
+                {
+                    "command": "monitor",
+                    "status": "retry_pending",
+                    "reason": str(error),
+                },
+                "监工等待能力观测，自动重试",
+                args.as_json,
+            )
         except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
             return _result(
                 UNKNOWN,
@@ -621,69 +778,6 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             )
         return _snapshot_result("monitor", snapshot, args.as_json)
 
-    if args.command == "deploy":
-        if not args.plan or args.deploy_authorize != "AUTHORIZE_DEPLOY":
-            return _result(
-                BLOCKED,
-                {"command": "deploy", "status": "blocked_deploy", "reason": "separate Deploy authorization required"},
-                "Deploy 已暂停：需要独立 AUTHORIZE_DEPLOY 授权",
-                args.as_json,
-            )
-        directory = None
-        try:
-            directory, plan, _nodes, _card = _load_plan(paths, args.plan)
-            manifest_path = directory / "deploy-manifest.json"
-            if not manifest_path.exists():
-                raise PermissionError("Deploy was not selected for this plan")
-            manifest = DeployManifest.from_dict(_read_json(manifest_path))
-            run_id = _run_id(directory, None)
-            snapshot = load_snapshot(paths, run_id)
-            if snapshot.status != "complete":
-                raise PermissionError("independent acceptance is required before Deploy")
-            record = authorize_deploy(manifest, args.deploy_authorize)
-            if args.deploy_observations:
-                state = prepare_deploy(manifest, plan_deploy(manifest, "accepted"), record)
-                observation_path = paths.resolve_relative(args.deploy_observations)
-                observations = _read_json(observation_path)
-                running = start_deploy(manifest, state, record)
-                verified = verify_deploy(manifest, observations)
-                evidence = dict(verified.evidence)
-                evidence.setdefault("authorization_digest", running.evidence.get("authorization_digest"))
-                state = DeployState(verified.status, verified.manifest, verified.reason, evidence)
-            else:
-                # A deploy command without observable health/version evidence
-                # must fail closed.  Do not persist the intermediate ready
-                # state as if an unobserved deployment had succeeded.
-                unknown = verify_deploy(manifest, {})
-                evidence = dict(unknown.evidence)
-                evidence["authorization_digest"] = record.digest
-                state = DeployState(unknown.status, unknown.manifest, unknown.reason, evidence)
-            _atomic_json(directory / "deploy-authorization.json", record.to_dict())
-            _atomic_json(directory / "deploy-state.json", state.to_dict())
-        except PermissionError as error:
-            return _result(
-                BLOCKED,
-                {"command": "deploy", "status": "blocked_deploy", "reason": str(error)},
-                "Deploy 已阻塞：" + str(error),
-                args.as_json,
-            )
-        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
-            return _result(
-                UNKNOWN,
-                {"command": "deploy", "status": "blocked_unknown", "reason": str(error)},
-                "Deploy 状态未知：" + str(error),
-                args.as_json,
-            )
-        payload = {
-            "command": "deploy",
-            "status": state.status,
-            "manifest_digest": deploy_manifest_digest(manifest),
-            "reason": state.reason,
-            "evidence": state.evidence,
-        }
-        code = UNKNOWN if state.status == "blocked_unknown" else (BLOCKED if state.status == "blocked_deploy" else SUCCESS)
-        return _result(code, payload, "Deploy 状态：" + state.status, args.as_json)
-
     if args.command in {"resume", "status"}:
         if not args.plan:
             return _result(
@@ -696,6 +790,20 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "状态未知：需要计划标识",
                 args.as_json,
             )
+        if args.command == "resume" and v2_state:
+            try:
+                require_capability_contract(paths)
+            except PermissionError as error:
+                return _result(
+                    UNKNOWN,
+                    {
+                        "command": "resume",
+                        "status": "blocked_unknown",
+                        "reason": str(error),
+                    },
+                    "能力合同状态未知：" + str(error),
+                    args.as_json,
+                )
         directory = None
         try:
             directory, plan, nodes, _card = _load_plan(paths, args.plan)
@@ -726,8 +834,9 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 AuthorizationRecord.from_dict(
                     _read_json(directory / "authorization.json")
                 )
-                monitor = Monitor(paths, plan, nodes)
-                snapshot = monitor.resume(run_id, runner)
+                context_policy = _context_policy_for_runner(runner)
+                monitor = Monitor(paths, plan, nodes, context_policy=context_policy)
+                snapshot = monitor.resume(run_id, runner, poll_handles=False)
                 snapshot = monitor.tick(run_id, runner)
         except PermissionError as error:
             _persist_invalidation(
