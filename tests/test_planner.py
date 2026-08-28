@@ -1,4 +1,5 @@
 import unittest
+import json
 
 from vibe_guide.planner import (
     DecisionCard,
@@ -13,9 +14,33 @@ from vibe_guide.planner import (
     route_task,
     score_s1,
 )
+from vibe_guide.models import DAGNode, Plan
 
 
 class PlannerTests(unittest.TestCase):
+    def test_plan_roundtrip_preserves_v2_dag_nodes(self):
+        contract = {
+            "input": "request",
+            "output": "result",
+            "error_behavior": "return blocked_dag",
+            "acceptance_examples": ["ready set is observable"],
+            "risk_tags": ["scheduling"],
+            "writer": "developer-v2-2",
+            "worktree": ".vibe/worktrees/v2-2",
+            "allowlist": ["vibe_guide/dag.py"],
+        }
+        original = Plan(
+            "v2-plan", 2, "prd.md", ["V2-0", "V2-2"], "authorized",
+            nodes=[
+                DAGNode("V2-0", "baseline", [], [], "baseline", dict(contract), "accepted"),
+                DAGNode("V2-2", "dag audit", ["V2-0"], ["V2-3"], "dag", dict(contract), "planned"),
+            ],
+        )
+        restored = Plan.from_dict(json.loads(json.dumps(original.to_dict())))
+        self.assertEqual([node.id for node in restored.nodes], ["V2-0", "V2-2"])
+        self.assertEqual(restored.nodes[1].depends_on, ["V2-0"])
+        self.assertEqual(restored.nodes[1].contract["risk_tags"], ["scheduling"])
+
     def test_obvious_one_step_request_is_simple(self):
         result = classify_s0("把 README 里的错别字改掉")
         self.assertTrue(result.simple)
