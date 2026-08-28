@@ -3,7 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import uuid
 
 from .authorization import (
@@ -17,8 +17,8 @@ from .authorization import (
 from .contracts import RunEvent, RunHandle, Runner
 from .models import DAGNode, Plan
 from .paths import ProjectPaths
-from .planner import resolve_consistency
-from .adapters.task_provider import ProviderActionStore, ProviderPending
+from .planner import build_runtime_stage_handoff, resolve_consistency
+from .adapters.task_provider import ProviderPending
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
     RunSnapshot,
@@ -32,10 +32,6 @@ from .state import (
     save_snapshot,
 )
 from .task_registry import TaskBinding, load_task_binding, save_task_binding
-from .workflow_gate import require_capability_contract, require_entry
-from .diagnostics import validate_child_session_binding
-from .models import WorkerProfile
-from .change_requests import ChangeRequest, LocalMergeEvidence, merge_local
 
 
 class Monitor:
@@ -43,80 +39,11 @@ class Monitor:
         self.paths = paths
         self.plan = plan
         self.nodes = {node.id: node for node in nodes}
-        # Bindings remain durable in the task registry, while this small
-        # operation-scoped cache prevents duplicate reads during one public
-        # monitor call.  It is cleared at every start/resume/reauthorize/tick
-        # boundary so a later tick, run, or generation cannot reuse stale
-        # lineage.
-        self._binding_cache: Dict[Tuple[str, str, str], TaskBinding] = {}
-
-    def _reset_binding_cache(self) -> None:
-        self._binding_cache.clear()
-
-    def _load_task_binding(
-        self, snapshot: RunSnapshot, node_id: str, role: str
-    ) -> TaskBinding:
-        key = (snapshot.run_id, node_id, role)
-        binding = self._binding_cache.get(key)
-        if binding is None:
-            binding = load_task_binding(
-                self.paths, node_id, role, run_id=snapshot.run_id
-            )
-            self._binding_cache[key] = binding
-        return binding
-
-    def _save_task_binding(self, binding: TaskBinding) -> None:
-        save_task_binding(self.paths, binding)
-        if binding.run_id is not None:
-            self._binding_cache[(binding.run_id, binding.issue_id, binding.role)] = binding
-
-    def merge_change_request_local(
-        self,
-        run_id: str,
-        change_request: ChangeRequest,
-        local_facts: Optional[Dict[str, Any]] = None,
-    ) -> LocalMergeEvidence:
-        """Record a local-only Change Request outcome for an existing run.
-
-        The method never invokes Git or a provider.  It only validates the
-        persisted authorization and appends the evidence returned by
-        :func:`merge_local` to the run event log.
-        """
-        snapshot = load_snapshot(self.paths, run_id)
-        record = self._require_snapshot_authorization(snapshot)
-        evidence = merge_local(change_request, record, local_facts)
-        self._record(
-            snapshot,
-            "change_request_" + evidence.status,
-            {
-                "run_id": snapshot.run_id,
-                "change_request": change_request.to_dict(),
-                "evidence": evidence.to_dict(),
-            },
-        )
-        save_snapshot(self.paths, snapshot)
-        return evidence
-
-    # Short alias for callers that already operate in the Monitor boundary.
-    merge_local = merge_change_request_local
 
     def start(
         self, record: Optional[AuthorizationRecord], runner: Runner
     ) -> RunSnapshot:
-        self._reset_binding_cache()
         self._require_record(record)
-        state = self.paths.vibe / "state.json"
-        capability_contract_digest = ""
-        if state.is_file():
-            try:
-                require_entry(self.paths, "monitor:" + self.plan.plan_id, "monitor")
-            except (OSError, ValueError, json.JSONDecodeError) as error:
-                raise PermissionError("session_gate_blocked") from error
-            capability_contract_digest = require_capability_contract(
-                self.paths
-            ).contract_digest
-        elif self.paths.vibe.exists():
-            raise PermissionError("session_gate_blocked: V2 state.json is missing")
         assert record is not None
         run_id = "run-" + uuid.uuid4().hex
         node_state: Dict[str, Dict[str, Any]] = {}
@@ -141,6 +68,8 @@ class Monitor:
                 "pair_archived": False,
                 "old_task_reconciled": False,
                 "retryable_action": None,
+                "retry_pending": False,
+                "stage_handoff": None,
                 "contract_overrides": {},
                 "corrections": [],
                 "contract_digest": executable_contract_digest([node]),
@@ -157,7 +86,6 @@ class Monitor:
             authorization=record.to_dict(),
             authorization_digest=record.digest,
             node_contract_digest=record.node_contract_digest,
-            capability_contract_digest=capability_contract_digest,
             event_sequence=0,
         )
         self._record(
@@ -167,7 +95,6 @@ class Monitor:
                 "run_id": run_id,
                 "authorization_digest": record.digest,
                 "node_contract_digest": record.node_contract_digest,
-                "capability_contract_digest": capability_contract_digest,
                 "node_ids": sorted(self.nodes),
             },
         )
@@ -178,16 +105,7 @@ class Monitor:
         return snapshot
 
     def resume(self, run_id: str, runner: Runner) -> RunSnapshot:
-        self._reset_binding_cache()
-        require_entry(self.paths, "resume:" + str(run_id), "resume")
         snapshot = load_snapshot(self.paths, run_id)
-        current_capability_contract = require_capability_contract(self.paths)
-        if (
-            not snapshot.capability_contract_digest
-            or snapshot.capability_contract_digest
-            != current_capability_contract.contract_digest
-        ):
-            raise PermissionError("capability_contract_unknown: run binding mismatch")
         self._require_snapshot_authorization(snapshot)
         self._reconcile_unapplied_events(snapshot)
         for node_id, current in snapshot.nodes.items():
@@ -198,15 +116,13 @@ class Monitor:
                     "start intent has no provider-confirmed result",
                 )
             elif current.get("status") in {"running", "review", "rework"}:
-                if node_id not in snapshot.handles and not isinstance(
-                    current.get("retryable_action"), dict
-                ):
+                if node_id not in snapshot.handles:
                     self._mark_blocked_unknown(
                         snapshot,
                         node_id,
                         "active task handle is missing during resume",
                     )
-        self._schedule_ready(snapshot, runner, recover_missing_reviewer=True)
+        self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
         save_snapshot(self.paths, snapshot)
         return snapshot
@@ -220,44 +136,16 @@ class Monitor:
     ) -> RunSnapshot:
         """Continue the same run under a newly confirmed same-plan contract."""
 
-        self._reset_binding_cache()
         self._require_record(record)
         snapshot = load_snapshot(self.paths, run_id)
-        state = self.paths.vibe / "state.json"
-        current_capability_contract_digest = snapshot.capability_contract_digest
-        capability_contract_changed = False
-        if state.is_file():
-            current_capability_contract = require_capability_contract(self.paths)
-            current_capability_contract_digest = current_capability_contract.contract_digest
-            capability_contract_changed = (
-                snapshot.capability_contract_digest
-                != current_capability_contract_digest
-            )
-            if capability_contract_changed and change_reason not in {
-                "capability_contract_changed",
-                "executable_contract_changed",
-            }:
-                raise PermissionError(
-                    "capability_contract_unknown: explicit recovery reason required"
-                )
         self._reconcile_unapplied_events(snapshot)
-        # The replay may already have applied this exact authorization and
-        # capability transition.  Re-read the live contract after replay so
-        # an interrupted call cannot append the same transition again.
-        if state.is_file():
-            current_capability_contract = require_capability_contract(self.paths)
-            current_capability_contract_digest = current_capability_contract.contract_digest
-            capability_contract_changed = (
-                snapshot.capability_contract_digest
-                != current_capability_contract_digest
-            )
         if (
             snapshot.plan_id != self.plan.plan_id
             or snapshot.plan_version != self.plan.version
             or set(snapshot.nodes) != set(self.nodes)
         ):
             raise PermissionError("reauthorization must remain on the same plan revision")
-        if snapshot.authorization_digest == record.digest and not capability_contract_changed:
+        if snapshot.authorization_digest == record.digest:
             self._require_snapshot_authorization(snapshot)
             self._schedule_ready(snapshot, runner)
             self._refresh_run_status(snapshot)
@@ -333,14 +221,15 @@ class Monitor:
             ):
                 save_snapshot(self.paths, snapshot)
                 raise RuntimeError("active task stop cannot be proven for reauthorization")
-            snapshot.nodes[node_id]["old_task_reconciled"] = True
 
         continuation: Dict[str, Any] = {}
         for node_id in sorted(snapshot.nodes):
             for role in ("developer", "reviewer"):
                 key = "{}:{}".format(node_id, role)
                 try:
-                    binding = self._load_task_binding(snapshot, node_id, role)
+                    binding = load_task_binding(
+                        self.paths, node_id, role, run_id=snapshot.run_id
+                    )
                 except FileNotFoundError:
                     continue
                 snapshot.tasks[key] = binding.to_dict()
@@ -354,11 +243,9 @@ class Monitor:
             "previous_authorization": previous.to_dict(),
             "previous_authorization_digest": previous.digest,
             "previous_node_contract_digest": previous.node_contract_digest,
-            "previous_capability_contract_digest": snapshot.capability_contract_digest,
             "new_authorization": record.to_dict(),
             "authorization_digest": record.digest,
             "node_contract_digest": record.node_contract_digest,
-            "capability_contract_digest": current_capability_contract_digest,
             "previous_node_contract_digests": previous_node_contract_digests,
             "node_contract_digests": new_node_contract_digests,
             "authorized_node_contracts": authorized_node_contracts,
@@ -378,7 +265,6 @@ class Monitor:
         return snapshot
 
     def tick(self, run_id: str, runner: Runner) -> RunSnapshot:
-        self._reset_binding_cache()
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
         self._reconcile_unapplied_events(snapshot)
@@ -387,7 +273,7 @@ class Monitor:
             try:
                 events = runner.poll(RunHandle(handle_id))
             except Exception as error:
-                self._mark_blocked_unknown(
+                self._mark_retry_pending(
                     snapshot,
                     node_id,
                     "runner poll failed ({})".format(type(error).__name__),
@@ -450,8 +336,6 @@ class Monitor:
             != snapshot.authorization_digest
             or data.get("previous_node_contract_digest")
             != snapshot.node_contract_digest
-            or data.get("previous_capability_contract_digest")
-            != snapshot.capability_contract_digest
         ):
             raise ValueError("reauthorization previous lineage is inconsistent")
         self._require_record(replacement)
@@ -459,23 +343,9 @@ class Monitor:
             data.get("authorization_digest") != replacement.digest
             or data.get("node_contract_digest")
             != replacement.node_contract_digest
-            or data.get("change_reason")
-            not in {"executable_contract_changed", "capability_contract_changed"}
+            or data.get("change_reason") != "executable_contract_changed"
         ):
             raise ValueError("reauthorization replacement lineage is inconsistent")
-        replacement_capability_digest = data.get("capability_contract_digest")
-        if replacement_capability_digest:
-            if (
-                not isinstance(replacement_capability_digest, str)
-                or len(replacement_capability_digest) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in replacement_capability_digest
-                )
-            ):
-                raise ValueError("reauthorization capability contract lineage is invalid")
-        elif snapshot.capability_contract_digest:
-            raise ValueError("reauthorization capability contract lineage is missing")
         continuation = data.get("continuation")
         if not isinstance(continuation, dict):
             raise ValueError("reauthorization continuation evidence is invalid")
@@ -485,7 +355,9 @@ class Monitor:
             node_id, role = key.rsplit(":", 1)
             if node_id not in snapshot.nodes or role not in {"developer", "reviewer"}:
                 raise ValueError("reauthorization continuation identity is invalid")
-            binding = self._load_task_binding(snapshot, node_id, role)
+            binding = load_task_binding(
+                self.paths, node_id, role, run_id=snapshot.run_id
+            )
             if (
                 set(evidence) != {"task_id", "cursor"}
                 or evidence["task_id"] != binding.task_id
@@ -597,7 +469,6 @@ class Monitor:
         snapshot.authorization = replacement.to_dict()
         snapshot.authorization_digest = replacement.digest
         snapshot.node_contract_digest = replacement.node_contract_digest
-        snapshot.capability_contract_digest = replacement_capability_digest or ""
         snapshot.status = "running"
         snapshot.handles.clear()
         for node_id, current in snapshot.nodes.items():
@@ -616,93 +487,17 @@ class Monitor:
                     continue
                 if node_id in invalidated_acceptances:
                     current["acceptance"] = None
-                    self._queue_reauthorization_continuation(
-                        current,
-                        self._continuation_requires_successor(
-                            snapshot, node_id, "developer"
-                        ),
-                    )
+                    self._queue_reauthorization_continuation(current)
                     continue
                 raise ValueError("accepted node lacks reauthorization disposition")
             if int(current.get("developer_generation", 0)) > 0:
-                self._queue_reauthorization_continuation(
-                    current,
-                    self._continuation_requires_successor(
-                        snapshot, node_id, "developer"
-                    ),
-                )
+                self._queue_reauthorization_continuation(current)
             else:
                 current["status"] = "planned"
                 current["retryable_action"] = None
 
-    def _continuation_requires_successor(
-        self, snapshot: RunSnapshot, node_id: str, role: str
-    ) -> bool:
-        """Return whether reauthorization needs a new task identity.
-
-        A provider-confirmed terminal binding is still a canonical task that
-        can be continued.  Only a missing binding (or a non-terminal binding
-        whose state must be reconciled by the scheduler) is a successor
-        candidate.  Malformed registry data remains fail-closed: the
-        scheduler will keep the node blocked rather than guessing.
-        """
-        try:
-            binding = self._load_task_binding(snapshot, node_id, role)
-        except FileNotFoundError:
-            return True
-        except (OSError, TypeError, ValueError):
-            return True
-        if role == "developer" and (
-            self._continuation_binding_generation_matches(snapshot, node_id, role)
-            is False
-        ):
-            return True
-        if role == "developer" and binding.status == "delivered":
-            return False
-        return binding.status not in {"stopped", "failed", "archived"}
-
-    def _continuation_binding_generation_matches(
-        self, snapshot: RunSnapshot, node_id: str, role: str
-    ) -> Optional[bool]:
-        """Verify an existing continuation binding belongs to this generation.
-
-        ``None`` means no durable binding could be loaded, leaving the existing
-        successor/absence-proof path to decide whether a new task is safe.
-        ``False`` is a verified lineage mismatch and must never be dispatched.
-        """
-        try:
-            binding = self._load_task_binding(snapshot, node_id, role)
-        except FileNotFoundError:
-            return None
-        except (OSError, TypeError, ValueError):
-            return False
-        try:
-            generation = int(
-                snapshot.nodes[node_id].get(
-                    "review_generation"
-                    if role == "reviewer"
-                    else "developer_generation",
-                    0,
-                )
-            )
-        except (TypeError, ValueError):
-            return False
-        current = snapshot.nodes[node_id]
-        identity = current.get(role + "_identity")
-        if (
-            binding.run_id != snapshot.run_id
-            or not isinstance(identity, str)
-            or not identity
-            or binding.task_id != identity
-            or generation <= 0
-        ):
-            return False
-        return binding.generation == generation
-
     @staticmethod
-    def _queue_reauthorization_continuation(
-        current: Dict[str, Any], successor_candidate: bool
-    ) -> None:
+    def _queue_reauthorization_continuation(current: Dict[str, Any]) -> None:
         current["pair_archived"] = True
         current["status"] = "blocked_unknown"
         current["retryable_action"] = {
@@ -710,7 +505,6 @@ class Monitor:
             "phase": "rework",
             "continuation": True,
             "pending_schedule": True,
-            "successor_candidate": successor_candidate,
         }
 
     @staticmethod
@@ -735,256 +529,43 @@ class Monitor:
                     return str(node.contract[key])
         return None
 
-    def _prove_old_task_stopped_or_absent(
-        self,
-        snapshot: RunSnapshot,
-        node_id: str,
-        retry: Dict[str, Any],
-    ) -> Optional[str]:
-        """Return the predecessor identity only when a successor is safe.
-
-        ``None`` means the old task remains ambiguous.  An empty string is a
-        durable absence proof: there is no current-run registry binding and
-        no provider request that could have created a task.  A terminal
-        binding is accepted only for an already provider-confirmed terminal
-        state; running/blocked bindings never authorize a new writer.
-        """
-        current = snapshot.nodes[node_id]
-        if retry.get("successor_candidate") is not True:
-            return None
-        if (
-            current.get("active_task") is not None
-            or node_id in snapshot.handles
-            or current.get("start_intent") is not None
-        ):
-            return None
-        role = retry.get("role")
-        if role not in {"developer", "reviewer"}:
-            return None
-        try:
-            binding = self._load_task_binding(snapshot, node_id, str(role))
-        except FileNotFoundError:
-            try:
-                requested = ProviderActionStore(self.paths).has_request(
-                    snapshot.run_id, node_id, str(role)
-                )
-            except (OSError, TypeError, ValueError):
-                return None
-            return "" if requested is False else None
-        except (OSError, TypeError, ValueError):
-            return None
-        if binding.status in {"stopped", "failed", "archived"}:
-            return binding.task_id or ""
-        return None
-
-    def _recover_quarantined_delivered_developer(
-        self, snapshot: RunSnapshot, node_id: str, record_event: bool = True
-    ) -> bool:
-        """Rebuild a lost continuation marker from a delivered binding.
-
-        An interrupted recovery can leave a legacy quarantine marker while
-        dropping ``retryable_action``.  A current-run delivered developer
-        binding is sufficient proof to continue that same visible task; it is
-        never evidence for creating a successor or a second writer.
-        """
-        current = snapshot.nodes[node_id]
-        if (
-            current.get("status") != "blocked_unknown"
-            or not isinstance(current.get("quarantine"), dict)
-            or current.get("active_task") is not None
-            or current.get("active_role") is not None
-            or current.get("start_intent") is not None
-            or node_id in snapshot.handles
-            or current.get("retryable_action") is not None
-            or current.get("reviewer_started") is True
-        ):
-            return False
-        try:
-            binding = self._load_task_binding(snapshot, node_id, "developer")
-            generation = int(current.get("developer_generation", 0))
-        except (FileNotFoundError, OSError, TypeError, ValueError):
-            return False
-        if (
-            binding.status != "delivered"
-            or not binding.task_id
-            or binding.task_id != current.get("developer_identity")
-            or generation <= 0
-            or binding.generation <= 0
-            or binding.generation != generation
-        ):
-            return False
-        current["retryable_action"] = {
-            "role": "developer",
-            "phase": "rework",
-            "continuation": True,
-            "pending_schedule": True,
-            "successor_candidate": False,
-        }
-        current["pair_archived"] = True
-        current["quarantine"] = None
-        current["reason"] = "quarantined delivered continuation recovered"
-        if record_event:
-            self._record(
-                snapshot,
-                "quarantine_continuation_recovered",
-                {
-                    "run_id": snapshot.run_id,
-                    "node_id": node_id,
-                    "role": "developer",
-                    "task_id": binding.task_id,
-                    "generation": generation,
-                },
-            )
-        return True
-
-    def _reject_replayed_old_task_reconciliation(
-        self, snapshot: RunSnapshot, node_id: str, data: Dict[str, Any]
-    ) -> None:
-        """Consume an untrusted reconciliation event without starting a writer."""
-        current = snapshot.nodes[node_id]
-        current["status"] = "blocked_unknown"
-        current["reason"] = "replayed old task reconciliation proof is invalid"
-        current["quarantine"] = {
-            "run_id": snapshot.run_id,
-            "handle_id": snapshot.handles.get(node_id),
-            "reason": current["reason"],
-        }
-        current["old_task_reconciled"] = False
-        current["retryable_action"] = None
-
-    def _schedule_ready(
-        self,
-        snapshot: RunSnapshot,
-        runner: Runner,
-        recover_missing_reviewer: bool = False,
-    ) -> None:
+    def _schedule_ready(self, snapshot: RunSnapshot, runner: Runner) -> None:
         record = self._require_snapshot_authorization(snapshot)
         active_pairs = sum(
             1
             for node_id, current in snapshot.nodes.items()
-            if current.get("status") not in {"stopped", "failed"}
-            and not current.get("pair_archived")
+            if not current.get("pair_archived")
             and (
-                int(current.get("developer_generation", 0)) > 0
-                or current.get("retryable_action") is not None
-                or isinstance(current.get("active_task"), dict)
-                or node_id in snapshot.handles
+                (
+                    current.get("retry_pending", False)
+                    and isinstance(current.get("active_task"), dict)
+                    and snapshot.handles.get(node_id)
+                    == current.get("active_task", {}).get("handle_id")
+                )
+                or (
+                    not current.get("retry_pending", False)
+                    and (
+                        int(current.get("developer_generation", 0)) > 0
+                        or current.get("retryable_action") is not None
+                    )
+                )
             )
         )
         for node_id, node in self.nodes.items():
             current = snapshot.nodes[node_id]
-            was_active_pair = not current.get("pair_archived") and (
-                int(current.get("developer_generation", 0)) > 0
-                or current.get("retryable_action") is not None
-                or isinstance(current.get("active_task"), dict)
-                or node_id in snapshot.handles
-            )
-            if self._recover_quarantined_delivered_developer(snapshot, node_id):
-                if was_active_pair:
-                    active_pairs -= 1
-            if recover_missing_reviewer:
-                self._recover_missing_reviewer_successor(snapshot, node_id)
             retry = current.get("retryable_action")
             if (
-                current.get("status") in {"blocked_unknown", "running"}
+                current.get("status") == "blocked_unknown"
                 and isinstance(retry, dict)
                 and node_id not in snapshot.handles
             ):
-                # Older snapshots could retain a successor-candidate marker
-                # even though the developer binding was provider-confirmed
-                # delivered.  That binding is sufficient to continue the
-                # same visible task; normalize the stale marker before the
-                # fail-closed quarantine branch so no successor is created.
-                legacy_developer_marker = (
-                    retry.get("continuation") is True
-                    and retry.get("role") == "developer"
-                )
-                if legacy_developer_marker and (
-                    self._continuation_binding_generation_matches(
-                        snapshot, node_id, "developer"
-                    )
-                    is False
-                ):
-                    current["status"] = "blocked_unknown"
-                    current["reason"] = (
-                        "developer continuation binding generation mismatch"
-                    )
-                    if not isinstance(current.get("quarantine"), dict):
-                        current["quarantine"] = {
-                            "run_id": snapshot.run_id,
-                            "handle_id": snapshot.handles.get(node_id),
-                            "reason": current["reason"],
-                        }
-                    continue
-                resumable_developer = (
-                    legacy_developer_marker
-                    and not self._continuation_requires_successor(
-                        snapshot, node_id, "developer"
-                    )
-                )
-                if resumable_developer:
-                    retry = dict(retry)
-                    retry["successor_candidate"] = False
-                    current["retryable_action"] = retry
-                    if (
-                        isinstance(current.get("quarantine"), dict)
-                        and current.get("active_task") is None
-                    ):
-                        current["quarantine"] = None
-                if (
-                    current.get("status") == "blocked_unknown"
-                    and isinstance(current.get("quarantine"), dict)
-                    and retry.get("successor_candidate") is not True
-                    and current.get("active_task") is None
-                    and not resumable_developer
-                ):
-                    current["retryable_action"] = None
-                    current["reason"] = (
-                        "quarantined task has no proven active binding to resume"
-                    )
-                    continue
-                if retry.get("successor_candidate") is True and retry.get(
-                    "continuation"
-                ):
-                    predecessor = self._prove_old_task_stopped_or_absent(
-                        snapshot, node_id, retry
-                    )
-                    if predecessor is None:
-                        current["status"] = "blocked_unknown"
-                        current["reason"] = (
-                            "old task stop or absence cannot be proven for successor"
-                        )
-                        continue
-                    retry = dict(retry)
-                    retry["continuation"] = False
-                    retry["successor"] = True
-                    retry["predecessor_task_id"] = predecessor or None
-                    retry["old_task_reconciled"] = True
-                    current["retryable_action"] = retry
-                    current["old_task_reconciled"] = True
-                    self._record(
-                        snapshot,
-                        "old_task_reconciled",
-                        {
-                            "run_id": snapshot.run_id,
-                            "node_id": node_id,
-                            "role": retry["role"],
-                            "predecessor_task_id": predecessor or None,
-                            "proof": "absent" if not predecessor else "stopped",
-                            "successor": True,
-                        },
-                    )
                 pending_schedule = retry.get("pending_schedule") is True
-                reviewer_recovery = retry.get("missing_binding_recovery") is True
-                if (
-                    pending_schedule
-                    and active_pairs >= record.active_pair_limit
-                    and not reviewer_recovery
-                ):
-                    continue
-                if pending_schedule and not all(
-                    snapshot.nodes[dependency].get("status") == "accepted"
-                    for dependency in node.depends_on
+                if pending_schedule and (
+                    active_pairs >= record.active_pair_limit
+                    or not all(
+                        snapshot.nodes[dependency].get("status") == "accepted"
+                        for dependency in node.depends_on
+                    )
                 ):
                     continue
                 if not acquire_writer_lease(
@@ -1009,7 +590,6 @@ class Monitor:
                     str(retry["phase"]),
                     runner,
                     bool(retry.get("continuation")),
-                    bool(retry.get("successor")),
                 ):
                     if current.get("status") != "blocked_unknown":
                         current["retryable_action"] = None
@@ -1055,86 +635,6 @@ class Monitor:
             ):
                 active_pairs += 1
 
-    def _recover_missing_reviewer_successor(
-        self, snapshot: RunSnapshot, node_id: str
-    ) -> None:
-        """Queue a reviewer successor only from a fully proven recovery state.
-
-        A historical ``reviewer_started`` flag is not proof that this run has
-        a reviewer task to continue.  Recovery may create a successor only
-        when the delivered developer binding is current, the reviewer binding
-        is explicitly absent, and neither a provider request nor an active
-        task/handle/start intent could represent an unresolved side effect.
-        Any malformed or unavailable registry/provider probe remains blocked.
-        """
-        current = snapshot.nodes[node_id]
-        if current.get("status") != "blocked_unknown":
-            return
-        if current.get("reviewer_started") is not True:
-            return
-        if current.get("retryable_action") is not None:
-            return
-        if (
-            current.get("active_task") is not None
-            or current.get("active_role") is not None
-            or current.get("start_intent") is not None
-            or node_id in snapshot.handles
-        ):
-            return
-
-        try:
-            developer = self._load_task_binding(snapshot, node_id, "developer")
-        except (FileNotFoundError, OSError, TypeError, ValueError):
-            return
-        if not isinstance(developer, TaskBinding):
-            return
-
-        try:
-            self._load_task_binding(snapshot, node_id, "reviewer")
-        except FileNotFoundError:
-            pass
-        except (OSError, TypeError, ValueError):
-            return
-        else:
-            return
-
-        try:
-            requested = ProviderActionStore(self.paths).has_request(
-                snapshot.run_id, node_id, "reviewer"
-            )
-        except (OSError, TypeError, ValueError):
-            return
-        if requested is not False:
-            return
-
-        try:
-            developer_generation = int(current.get("developer_generation", 0))
-        except (TypeError, ValueError):
-            return
-        if (
-            developer.status != "delivered"
-            or developer.task_id != current.get("developer_identity")
-            or developer.generation != developer_generation
-        ):
-            return
-
-        predecessor = current.get("reviewer_identity")
-        if predecessor is not None and (
-            not isinstance(predecessor, str) or not predecessor
-        ):
-            return
-        current["retryable_action"] = {
-            "role": "reviewer",
-            "phase": "review",
-            "continuation": False,
-            "successor": True,
-            "successor_candidate": True,
-            "pending_schedule": True,
-            "missing_binding_recovery": True,
-            "predecessor_task_id": predecessor,
-        }
-        current["reason"] = "reviewer successor queued after missing binding recovery"
-
     def _start_task(
         self,
         snapshot: RunSnapshot,
@@ -1143,20 +643,14 @@ class Monitor:
         phase: str,
         runner: Runner,
         continuation: bool,
-        successor: bool = False,
     ) -> bool:
         record = self._require_snapshot_authorization(snapshot)
         node = self.nodes[node_id]
         current = snapshot.nodes[node_id]
         identity_key = role + "_identity"
-        predecessor_identity = current.get(identity_key) or "{}:{}".format(
-            role, node_id
-        )
-        identity = predecessor_identity
+        identity = current.get(identity_key) or "{}:{}".format(role, node_id)
         generation_key = "review_generation" if role == "reviewer" else "developer_generation"
         generation = int(current.get(generation_key, 0)) + 1
-        if successor:
-            identity = "{}:successor:{}".format(predecessor_identity, generation)
         current[generation_key] = generation
         if role == "reviewer":
             current["reviewer_started"] = True
@@ -1176,40 +670,11 @@ class Monitor:
                 "task_id": identity,
                 "generation": generation,
                 "continuation": continuation,
-                "successor": successor,
                 "action": phase,
                 "run_id": snapshot.run_id,
                 "consistency_binding": self._consistency_binding(record, node),
             }
         )
-        retry = current.get("retryable_action")
-        if successor:
-            predecessor_task_id = None
-            if isinstance(retry, dict):
-                predecessor_task_id = retry.get("predecessor_task_id")
-            if not predecessor_task_id:
-                predecessor_task_id = current.get(identity_key)
-            contract["predecessor_task_id"] = predecessor_task_id
-        contract.setdefault("worktree", str(current["worktree"]))
-        contract.setdefault("branch", str(current["branch"]))
-        contract.setdefault(
-            "files", list((contract.get("worker_profile") or {}).get("allowlist", []))
-        )
-        if snapshot.capability_contract_digest:
-            contract["capability_contract_digest"] = snapshot.capability_contract_digest
-        if (self.paths.vibe / "state.json").is_file():
-            try:
-                v2 = json.loads((self.paths.vibe / "state.json").read_text(encoding="utf-8")).get("workflow_version") == 2
-            except (OSError, ValueError, json.JSONDecodeError):
-                v2 = True
-            if v2:
-                profile_data = contract.get("worker_profile") or {}
-                if not profile_data:
-                    profile_data = {"worker": str(contract.get("worker", "worker")), "model": "default", "reasoning": "normal", "fallbacks": [], "selection_basis": {"issue_complexity_ref": node_id, "complexity_band": "standard", "risk_tags": [], "availability_evidence": "runtime"}, "writer": str(contract.get("worker", "writer")), "worktree": str(contract.get("worktree", ".")), "branch": str(contract.get("branch", "branch-" + node_id)), "allowlist": list(contract.get("files", [node_id + ".py"]))}
-                profile = WorkerProfile(**profile_data)
-                validate_child_session_binding(snapshot.run_id, str(self.plan.version), record.digest, node_id, role, profile)
-                contract["child_origin"] = "worker_dispatch"
-                contract["child_binding"] = {"parent_run_id": snapshot.run_id, "plan_revision": str(self.plan.version), "authorization_digest": record.digest, "node_id": node_id, "role": role, "writer": profile.writer, "worktree": profile.worktree, "branch": profile.branch, "allowlist": profile.allowlist, "worker_profile": profile.to_dict(), "capability_contract_digest": snapshot.capability_contract_digest}
         try:
             contract = validate_runtime_contract(
                 contract,
@@ -1226,12 +691,11 @@ class Monitor:
                 runner,
                 contract,
                 continuation,
-                successor,
             )
             identity = str(binding.task_id)
             current[identity_key] = identity
             contract["task_id"] = identity
-            self._save_task_binding(binding)
+            save_task_binding(self.paths, binding)
         except ProviderPending as error:
             current[generation_key] = generation - 1
             if role == "reviewer" and generation == 1:
@@ -1240,11 +704,9 @@ class Monitor:
                 "role": role,
                 "phase": phase,
                 "continuation": continuation,
-                "successor": successor,
+                "pending_schedule": True,
             }
-            # An asynchronous bridge response is a retry condition, not
-            # evidence that the provider capability is unavailable.
-            current["status"] = "running"
+            self._mark_retry_pending(snapshot, node_id, "provider action pending")
             current["reason"] = str(error)
             return False
         except (OSError, TypeError, ValueError) as error:
@@ -1309,7 +771,9 @@ class Monitor:
             save_snapshot(self.paths, snapshot)
             return False
 
+        recovered = bool(current.get("retry_pending"))
         current["status"] = self._running_status(role, phase)
+        current["retry_pending"] = False
         current["active_task"]["handle_id"] = handle.run_id
         current["start_intent"] = None
         current["quarantine"] = None
@@ -1342,20 +806,20 @@ class Monitor:
             )
             save_snapshot(self.paths, snapshot)
             return False
+        if recovered:
+            self._set_stage_handoff(
+                snapshot,
+                node_id,
+                self._running_status(role, phase),
+                "Provider 结果已恢复，继续当前任务",
+                evidence_ref="recovered",
+            )
         save_snapshot(self.paths, snapshot)
         pending = getattr(runner, "is_pending", None)
         if callable(pending) and pending(handle):
-            # Keep the active lease, but expose the unresolved bridge action
-            # as unknown until a provider-confirmed result is observed.  The
-            # handle remains durable so the next tick can poll it; no second
-            # writer is scheduled while this side effect is pending.
-            current["status"] = "blocked_unknown"
-            current["quarantine"] = {
-                "run_id": snapshot.run_id,
-                "handle_id": handle.run_id,
-                "reason": "provider action pending; result not yet confirmed",
-            }
-            current["reason"] = "provider action pending; result not yet confirmed"
+            self._mark_blocked_unknown(
+                snapshot, node_id, "provider action pending"
+            )
             save_snapshot(self.paths, snapshot)
         return True
 
@@ -1378,19 +842,18 @@ class Monitor:
         runner: Runner,
         contract: Dict[str, Any],
         continuation: bool,
-        successor: bool = False,
     ) -> TaskBinding:
         current = snapshot.nodes[node_id]
         previous_binding = None
         if continuation:
             try:
-                previous_binding = self._load_task_binding(snapshot, node_id, role)
+                previous_binding = load_task_binding(
+                    self.paths, node_id, role, run_id=snapshot.run_id
+                )
             except FileNotFoundError:
                 previous_binding = None
             if previous_binding is None or previous_binding.task_id != identity:
                 raise ValueError("continuation task identity is stale")
-            if previous_binding.generation != generation - 1:
-                raise ValueError("continuation task generation is stale")
         observed_binding = getattr(runner, "task_binding", None)
         if callable(observed_binding):
             binding = observed_binding(
@@ -1424,48 +887,7 @@ class Monitor:
                 run_id=snapshot.run_id,
                 status=status,
                 generation=generation,
-                allowlist=list(contract.get("files", [])),
-                capability_contract_digest=contract.get("capability_contract_digest"),
-                successor_of=contract.get("predecessor_task_id") if successor else None,
             )
-        if successor:
-            predecessor = contract.get("predecessor_task_id")
-            if predecessor and binding.task_id == predecessor:
-                raise ValueError("successor task identity reused the predecessor")
-            if predecessor and binding.successor_of not in {None, predecessor}:
-                raise ValueError("successor task predecessor does not match contract")
-            if binding.successor_of is None:
-                binding.successor_of = predecessor
-        expected_capability_digest = contract.get("capability_contract_digest")
-        if expected_capability_digest:
-            if binding.capability_contract_digest not in {
-                None,
-                expected_capability_digest,
-            } and not continuation:
-                raise ValueError("task binding capability contract digest is stale")
-            binding.capability_contract_digest = expected_capability_digest
-        expected_allowlist = list(contract.get("files", []))
-        if expected_allowlist:
-            if binding.allowlist:
-                if binding.allowlist != expected_allowlist:
-                    if not continuation or not set(binding.allowlist).issubset(
-                        set(expected_allowlist)
-                    ):
-                        raise ValueError(
-                            "task binding allowlist does not match contract"
-                        )
-                    binding.allowlist = expected_allowlist
-            else:
-                binding.allowlist = expected_allowlist
-        expected_worktree = self._worktree_path(current)
-        observed_worktree = Path(str(binding.worktree))
-        if not observed_worktree.is_absolute():
-            observed_worktree = self.paths.root / observed_worktree
-        if (
-            observed_worktree.resolve() != expected_worktree.resolve()
-            or binding.branch != str(current["branch"])
-        ):
-            raise ValueError("task binding worktree or branch does not match contract")
         if continuation and previous_binding is not None:
             if (
                 binding.cursor is not None
@@ -1478,7 +900,9 @@ class Monitor:
     def _set_binding_status(
         self, snapshot: RunSnapshot, node_id: str, role: str, status: str
     ) -> TaskBinding:
-        binding = self._load_task_binding(snapshot, node_id, role)
+        binding = load_task_binding(
+            self.paths, node_id, role, run_id=snapshot.run_id
+        )
         current = snapshot.nodes[node_id]
         generation_key = (
             "review_generation" if role == "reviewer" else "developer_generation"
@@ -1489,7 +913,7 @@ class Monitor:
         ):
             raise ValueError("task binding identity or generation is stale")
         binding.status = status
-        self._save_task_binding(binding)
+        save_task_binding(self.paths, binding)
         snapshot.tasks["{}:{}".format(node_id, role)] = binding.to_dict()
         return binding
 
@@ -1510,7 +934,12 @@ class Monitor:
             raise ValueError("event provenance is stale or unregistered")
         if snapshot.handles.get(node_id) != active.get("handle_id"):
             raise ValueError("event handle is not the active run handle")
-        binding = self._load_task_binding(snapshot, node_id, str(active["role"]))
+        binding = load_task_binding(
+            self.paths,
+            node_id,
+            str(active["role"]),
+            run_id=snapshot.run_id,
+        )
         if (
             binding.task_id != active.get("task_id")
             or binding.generation != active.get("generation")
@@ -1544,18 +973,10 @@ class Monitor:
         if evidence is not None:
             current.setdefault("evidence", []).append(redact_provider_text(evidence))
         role = active["role"]
-        if event.event not in {
-            "unknown",
-            "timeout",
-            "state_unknown",
-            "visibility_unknown",
-        }:
-            # A provider-confirmed event consumes any reauthorization retry
-            # marker; the active handle now carries the durable continuation.
-            current["retryable_action"] = None
 
         if event.event in {"delivered", "complete"}:
             self._record_runner_event(snapshot, node_id, event, active)
+            current["retry_pending"] = False
             if role != "developer":
                 try:
                     self._set_binding_status(snapshot, node_id, role, "review")
@@ -1569,6 +990,13 @@ class Monitor:
                     )
                     return
                 current["status"] = "review"
+                self._set_stage_handoff(
+                    snapshot,
+                    node_id,
+                    "review",
+                    "Reviewer 已完成本轮审查，等待验收结论",
+                    evidence_ref="review",
+                )
                 return
             try:
                 self._set_binding_status(snapshot, node_id, role, "delivered")
@@ -1582,48 +1010,23 @@ class Monitor:
                 )
                 return
             current["status"] = "delivered"
+            self._set_stage_handoff(
+                snapshot,
+                node_id,
+                "delivered",
+                "Developer 已完成技术交付，进入独立审查",
+                evidence_ref="delivered",
+            )
             current["active_role"] = None
             current["active_task"] = None
             snapshot.handles.pop(node_id, None)
-            reviewer_continuation = False
-            reviewer_successor = False
-            if current.get("reviewer_started"):
-                try:
-                    reviewer_binding = self._load_task_binding(
-                        snapshot, node_id, "reviewer"
-                    )
-                except FileNotFoundError:
-                    reviewer_successor = True
-                except (OSError, TypeError, ValueError) as error:
-                    self._mark_blocked_unknown(
-                        snapshot,
-                        node_id,
-                        "reviewer task binding cannot be verified ({})".format(
-                            type(error).__name__
-                        ),
-                    )
-                    return
-                else:
-                    expected_reviewer_identity = current.get("reviewer_identity")
-                    if (
-                        not expected_reviewer_identity
-                        or reviewer_binding.task_id != expected_reviewer_identity
-                    ):
-                        self._mark_blocked_unknown(
-                            snapshot,
-                            node_id,
-                            "reviewer task binding identity is stale",
-                        )
-                        return
-                    reviewer_continuation = True
             self._start_task(
                 snapshot,
                 node_id,
                 "reviewer",
                 "review",
                 runner,
-                reviewer_continuation,
-                reviewer_successor,
+                bool(current.get("reviewer_started")),
             )
         elif event.event == "review_finding":
             if role != "reviewer":
@@ -1679,6 +1082,13 @@ class Monitor:
                             **correction,
                         },
                     )
+                    self._set_stage_handoff(
+                        snapshot,
+                        node_id,
+                        "auto_corrected",
+                        "唯一可验证的合同不一致已纠偏，继续同一任务",
+                        evidence_ref="consistency_corrected",
+                    )
                     self._start_task(
                         snapshot, node_id, "developer", "rework", runner, True
                     )
@@ -1711,6 +1121,16 @@ class Monitor:
                         "old_task_reconciled": True,
                     },
                 )
+                self._set_stage_handoff(
+                    snapshot,
+                    node_id,
+                    "blocked_design",
+                    "发现会改变产品结果的冲突，请确认产品选择",
+                    evidence_ref="blocked_design",
+                    readiness="blocked_design",
+                    required_user_action="answer_question",
+                    open_questions=[current["reason"]],
+                )
                 return
             current["active_role"] = None
             current["active_task"] = None
@@ -1723,7 +1143,9 @@ class Monitor:
                 )
                 return
             try:
-                registered = self._load_task_binding(snapshot, node_id, "reviewer")
+                registered = load_task_binding(
+                    self.paths, node_id, "reviewer", run_id=snapshot.run_id
+                )
             except (FileNotFoundError, OSError, TypeError, ValueError) as error:
                 self._mark_blocked_unknown(
                     snapshot,
@@ -1750,6 +1172,7 @@ class Monitor:
                 },
             )
             self._record_runner_event(snapshot, node_id, acceptance_event, active)
+            current["retry_pending"] = False
             try:
                 self._set_binding_status(snapshot, node_id, role, "accepted")
             except (FileNotFoundError, OSError, TypeError, ValueError) as error:
@@ -1778,6 +1201,13 @@ class Monitor:
                 )
                 return
             current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
+            self._set_stage_handoff(
+                snapshot,
+                node_id,
+                "accepted",
+                "Reviewer 已验收通过，节点完成",
+                evidence_ref="accepted",
+            )
             self._archive_pair(snapshot, node_id)
             self._release_node_lease(snapshot, node_id)
         elif event.event in {"unknown", "timeout", "state_unknown", "visibility_unknown"}:
@@ -1912,6 +1342,77 @@ class Monitor:
             {"run_id": snapshot.run_id, "node_id": node_id, "reason": reason},
             active if isinstance(active, dict) else None,
         )
+        self._set_stage_handoff(
+            snapshot,
+            node_id,
+            "blocked_unknown",
+            "当前状态无法安全核验，请补充证据后再继续",
+            evidence_ref="blocked_unknown",
+            readiness="blocked_unknown",
+            required_user_action="answer_question",
+            open_questions=["请提供可验证的运行状态或授权证据"],
+        )
+
+    def _mark_retry_pending(
+        self, snapshot: RunSnapshot, node_id: str, reason: str
+    ) -> None:
+        """Keep transient provider uncertainty retryable without a second writer."""
+        current = snapshot.nodes[node_id]
+        current["status"] = "blocked_unknown"
+        current["retry_pending"] = True
+        current["reason"] = redact_provider_text(reason)
+        current["quarantine"] = {
+            "run_id": snapshot.run_id,
+            "handle_id": snapshot.handles.get(node_id),
+            "reason": current["reason"],
+        }
+        active = current.get("active_task")
+        if isinstance(active, dict) and active.get("role") in {"developer", "reviewer"}:
+            try:
+                self._set_binding_status(snapshot, node_id, str(active["role"]), "blocked_unknown")
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                pass
+        self._record(
+            snapshot,
+            "retry_pending",
+            {"run_id": snapshot.run_id, "node_id": node_id, "reason": current["reason"]},
+            active if isinstance(active, dict) else None,
+        )
+        self._set_stage_handoff(
+            snapshot,
+            node_id,
+            "retry_pending",
+            "Provider 结果暂未确认，将继续轮询/重试原任务",
+            evidence_ref="retry_pending",
+        )
+
+    def _set_stage_handoff(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        status: str,
+        prompt: str,
+        *,
+        evidence_ref: str,
+        readiness: str = "ready",
+        required_user_action: str = "none",
+        open_questions: Optional[List[str]] = None,
+    ) -> None:
+        handoff = build_runtime_stage_handoff(
+            status,
+            ["run:{}:event:{}".format(snapshot.run_id, snapshot.event_sequence)],
+            prompt,
+            readiness=readiness,
+            required_user_action=required_user_action,
+            open_questions=open_questions,
+            prd_revision=self.plan.version,
+        )
+        snapshot.nodes[node_id]["stage_handoff"] = handoff.to_dict()
+        self._record(
+            snapshot,
+            "stage_handoff",
+            {"run_id": snapshot.run_id, "node_id": node_id, "status": handoff.to_dict()},
+        )
 
     def _record(
         self,
@@ -1967,7 +1468,9 @@ class Monitor:
             or provenance.get("handle_id") is not None
         ):
             raise ValueError("start intent provenance is invalid")
-        binding = self._load_task_binding(snapshot, node_id, role)
+        binding = load_task_binding(
+            self.paths, node_id, role, run_id=snapshot.run_id
+        )
         if (
             binding.task_id != identity
             or binding.generation != expected_generation
@@ -2024,7 +1527,12 @@ class Monitor:
             for other_node, other_handle in snapshot.handles.items()
         ):
             raise ValueError("start confirmation duplicates an active handle")
-        binding = self._load_task_binding(snapshot, node_id, str(expected["role"]))
+        binding = load_task_binding(
+            self.paths,
+            node_id,
+            str(expected["role"]),
+            run_id=snapshot.run_id,
+        )
         desired_status = self._running_status(str(expected["role"]), str(data.get("phase")))
         if binding.status not in {"start_pending", desired_status}:
             raise ValueError("start confirmation task binding status is invalid")
@@ -2078,48 +1586,6 @@ class Monitor:
                     "handle_id": snapshot.handles.get(node_id),
                     "reason": current["reason"],
                 }
-            elif record["event"] == "old_task_reconciled":
-                if provenance["role"] != "system":
-                    raise ValueError("old task reconciliation lacks system provenance")
-                role = data.get("role")
-                retry = current.get("retryable_action")
-                valid = (
-                    isinstance(retry, dict)
-                    and retry.get("role") == role
-                    and retry.get("successor_candidate") is True
-                    and data.get("proof") in {"absent", "stopped"}
-                    and data.get("successor") is True
-                )
-                predecessor = data.get("predecessor_task_id")
-                proof_identity = None
-                if valid:
-                    proof_identity = self._prove_old_task_stopped_or_absent(
-                        snapshot,
-                        node_id,
-                        retry,
-                    )
-                    if data.get("proof") == "absent":
-                        valid = proof_identity == "" and predecessor in {None, ""}
-                    else:
-                        valid = (
-                            isinstance(predecessor, str)
-                            and bool(predecessor)
-                            and proof_identity == predecessor
-                        )
-                if not valid:
-                    self._reject_replayed_old_task_reconciliation(
-                        snapshot, node_id, data
-                    )
-                    snapshot.event_sequence = record["sequence"]
-                    continue
-                current["old_task_reconciled"] = True
-                if isinstance(retry, dict):
-                    retry = dict(retry)
-                    retry["old_task_reconciled"] = True
-                    retry["successor"] = True
-                    retry["continuation"] = False
-                    retry["predecessor_task_id"] = predecessor
-                    current["retryable_action"] = retry
             elif record["event"] == "accepted":
                 if provenance["role"] != "reviewer":
                     raise ValueError("unapplied acceptance lacks reviewer provenance")
@@ -2133,7 +1599,12 @@ class Monitor:
                         "unapplied acceptance reviewer identity or generation is stale"
                     )
                 try:
-                    registered = self._load_task_binding(snapshot, node_id, "reviewer")
+                    registered = load_task_binding(
+                        self.paths,
+                        node_id,
+                        "reviewer",
+                        run_id=snapshot.run_id,
+                    )
                 except (FileNotFoundError, OSError, TypeError, ValueError) as error:
                     raise ValueError(
                         "unapplied acceptance reviewer binding is unavailable"
@@ -2146,6 +1617,7 @@ class Monitor:
                 self._set_binding_status(
                     snapshot, node_id, "reviewer", "accepted"
                 )
+                current["retry_pending"] = False
                 current["status"] = "accepted"
                 contract_digest = data.get("contract_digest")
                 authorization_epoch = data.get("authorization_epoch")
@@ -2197,6 +1669,7 @@ class Monitor:
                 self._release_node_lease(snapshot, node_id)
             elif record["event"] in {"delivered", "complete"}:
                 self._registered_active_binding(snapshot, node_id, provenance)
+                current["retry_pending"] = False
                 if provenance["role"] != "developer":
                     current["status"] = "blocked_unknown"
                     current["reason"] = "unapplied reviewer delivery needs reconciliation"
@@ -2208,23 +1681,6 @@ class Monitor:
                     current["active_role"] = None
                     current["active_task"] = None
                     snapshot.handles.pop(node_id, None)
-            elif record["event"] == "quarantine_continuation_recovered":
-                if provenance["role"] != "system":
-                    raise ValueError(
-                        "quarantine continuation recovery lacks system provenance"
-                    )
-                if (
-                    data.get("role") != "developer"
-                    or data.get("task_id") != current.get("developer_identity")
-                    or data.get("generation") != current.get("developer_generation")
-                ):
-                    raise ValueError("quarantine continuation recovery is stale")
-                if not self._recover_quarantined_delivered_developer(
-                    snapshot, node_id, record_event=False
-                ):
-                    raise ValueError(
-                        "quarantine continuation recovery cannot be verified"
-                    )
             elif record["event"] == "review_finding":
                 # The following transition event/start intent is authoritative.
                 self._registered_active_binding(snapshot, node_id, provenance)
@@ -2247,6 +1703,18 @@ class Monitor:
                     "phase": "rework",
                     "continuation": True,
                 }
+            elif record["event"] == "retry_pending":
+                current["status"] = "blocked_unknown"
+                current["retry_pending"] = True
+                current["reason"] = data.get("reason", "provider action pending")
+                current.setdefault(
+                    "retryable_action",
+                    {"role": "developer", "phase": "develop", "continuation": False, "pending_schedule": True},
+                )
+            elif record["event"] == "stage_handoff":
+                handoff = data.get("status")
+                if isinstance(handoff, dict):
+                    current["stage_handoff"] = handoff
             elif record["event"] == "blocked_design":
                 current["status"] = "blocked_design"
                 current["reason"] = data.get("reason", "design decision required")

@@ -8,6 +8,7 @@
 - 帮项目生成或适配开发规则；
 - 对简单任务保持轻量，对复杂任务先完成需求讨论、PRD、Spec/Issue 和 DAG；
 - 经一次明确授权后，自动并行开发、测试、Review、返工和验收；
+- 在所有受支持桌面 App 的完整可见自动化路径中，每个 developer 和 reviewer 都是用户可见、可进入、可继续的独立任务；
 - 只在产品设计变化、需要外部授权或 deploy 时请求人类。
 
 当前逻辑项目根是本目录。上层 CFO 仓库的 `AGENTS.md` 仍然适用；本文件只增加本项目规则，不替代或修改上层规则。
@@ -70,17 +71,32 @@
 
 用户明确授权后，一次授权覆盖当前 DAG 已列明的全部非 deploy 动作。deploy、未列明动作、扩大范围或系统权限变更必须单独授权。
 
+“显式独立任务”是通用产品的首选合同，不是当前项目的临时执行规则。受支持 Agent 应优先通过对应桌面 App 的原生任务能力创建用户可见任务。Codex App 使用 `create_thread` 创建 user-owned thread；Claude Code、Cursor、Grok、WorkBuddy、Kimi Code 和 DeepSeek Harness 由各自适配器探测等价的创建、进入、续接和状态定位能力。平台确认没有等价桥接时，可以明确降级为 background subagent，但必须披露不可见、不可直接进入和返工续接受限，不得把降级模式标成完整可见自动化。每个 Issue 固定绑定一个开发任务；每次独立 Review 固定绑定另一个 reviewer 任务。可续接时返工回到原开发任务、复审回到原 reviewer 任务；降级模式无法保证时必须提前披露。
+
+通用任务登记必须保存 `provider`、`mode=visible|background`、平台任务 ID（如有）、host、worktree、branch、状态/交付路径和续接 cursor/token；Codex 可见绑定具体保存 `threadId`、`hostId` 和 cursor。完整可见模式中，可见、可进入、可追溯是验收条件。无等价能力的平台可降级为 background subagent，但能力报告、授权卡和交付必须明确标识降级及限制。
+
+任务数量上限默认约束“同时活跃”的 developer/reviewer 对，不是整个 DAG 生命周期内累计创建的任务数。一个 Issue 的 developer 与 reviewer 均完成、P0–P2 清零且证据登记完成后，应关闭或归档其独立任务；历史身份和 handoff 仍保留在任务登记中，但不再占活跃并发名额。归档不得发生在返工或复审仍可能回到原任务之前，也不得通过删除登记来伪造空闲容量。后续 ready Issue 可以在释放的名额内创建新的独立任务。
+
 监工规则：
 
 - 一个 DAG 节点只允许一个有效 writer；
+- developer 与 reviewer 必须是两个不同的可见独立任务，reviewer 只读审查且不得代改业务代码；
 - 优先启动所有没有硬依赖冲突的 ready 节点；
+- 并发上限按当前未完成、未归档的活跃 developer/reviewer 对计算；已完成并归档的任务不占名额；
 - Review 缺陷优先退回同一 worker；
+- 返工后复审回到同一 reviewer，保留任务身份、cursor 和证据链；
 - 保留旧证据，新增返工和验收证据；
 - 计划或范围变化使旧授权失效；
 - 未知状态不能当成无事项或成功；
 - 无法验证时记录 `blocked_unknown`，不得伪造完成；
 - 设计变化只重建受影响的 DAG 后缀，已锁定成果不重做；
 - 监工中断后从 `.vibe/runs/` 的快照和事件日志恢复。
+
+可见任务发生工具丢失时采用 `visible successor` 恢复：先确认原任务 aborted/archived 并保留 thread/cursor 与零写入证据；successor 写入前必须复核原任务已终止、唯一 writer、指定 writer worktree/branch、冻结 HEAD 和 clean state。App 自动创建的 host worktree 只作为工具宿主，不能替代或修改合同指定 writer root；任一证据不匹配即 fail closed，不创建第二 writer 或额外 worktree。
+
+一致性纠偏按“用户当前明确决定 → 已批准 PRD/Design Spec → 授权卡 → Issue 合同 → 下层实现”取证。若这些证据只产生一个答案，且修正仍在已授权项目、DAG 和非 deploy 边界内，监工应记录纠偏、更新受影响的 DAG 后缀或合同并自动继续；不得因可唯一解决的实现不一致、命名不一致或过期下层合同中断用户。只有仍存在多个会实质改变产品结果的答案、产品范围或方向变化、需要外部/deploy/系统权限授权，或证据无法区分安全结果时才暂停。
+
+**已确认规则能够唯一判断的事项由监工自动执行并记录，不得作为盲区或产品取舍再次询问；只有无法唯一判断且会改变产品方向、授权边界或外部承诺的事项才中断。** 自动纠偏证据必须绑定当前项目摘要、plan/revision、已批准决策摘要、授权摘要和 Issue 合同摘要；未绑定文本不能冒充当前用户决定。授权因合同变化失效后，公开重新授权应在同一 plan/run 上保留旧授权、变更原因、新授权摘要、原任务身份和 cursor，继续修正后的 DAG。
 
 ## 7. 配置与外部 Skill
 
@@ -110,6 +126,7 @@ git diff --check
 
 - `.vibe/runs/<run-id>/events.jsonl` 追加记录状态变化、worker、节点、时间、结果和阻塞原因；
 - `state.json` 保存可恢复快照；写入必须原子替换；
+- `tasks.json` 保存每个开发/Review 可见任务的 `threadId`、`hostId`、worktree、branch、状态/交付路径和 cursor；
 - 每个节点保留交付、Review、返工和最终验收证据；
 - 超时、worker 不可用、状态查询失败和权限不足必须记录具体原因；
 - 不依赖某个 Agent 的全局线程索引作为唯一状态源；
@@ -118,6 +135,7 @@ git diff --check
 ## 10. Git、worktree 与交付
 
 - 开发节点优先使用独立 worktree 或等价隔离目录；一个节点一个有效 writer。
+- 创建任一桌面 App 独立任务前先确认 provider、目标项目、起始分支和 worktree；Codex App 使用 `create_thread`。同一 Issue 不得同时存在内部 subagent 与可见任务两个 writer。
 - 提交前只暂存当前任务白名单；禁止 `git add .` 和 `git add -A`。
 - 提交、push、创建 MR、merge 和 deploy 是不同动作；不得把其中一个描述成另一个。
 - 未经明确授权，不 push、merge、deploy 或修改上层 CFO 仓库文件。
@@ -143,3 +161,5 @@ git diff --check
 - “继续监工”。
 
 短提示不能绕过需求决策、DAG 确认、一次性授权、deploy 授权或安全边界。
+
+任何产品设计、执行拓扑或任务可见性要求变化都会使当前 DAG 授权失效。此时先暂停旧任务、封存提交/未提交证据、更新 Spec/计划/授权卡，经用户重新确认后才可创建新任务继续。

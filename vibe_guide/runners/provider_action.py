@@ -8,14 +8,12 @@ from typing import Any, Dict, Optional
 
 from ..adapters.task_provider import ProviderActionStore, ProviderPending
 from ..contracts import RunEvent, RunHandle, Runner
-from ..capability_contract import load_contract
 from ..paths import ProjectPaths
 from ..task_registry import (
     TaskBinding,
     load_task_binding,
     save_task_binding,
 )
-from ..workflow_gate import session_contract_prompt
 
 
 class ProviderActionRunner(Runner):
@@ -43,12 +41,9 @@ class ProviderActionRunner(Runner):
             }[operation]
         return self.provider + "." + operation
 
-    def _consistency_instruction(self, contract: Dict[str, Any]) -> str:
-        try:
-            capability = session_contract_prompt(load_contract(self.paths))
-        except (FileNotFoundError, OSError, TypeError, ValueError):
-            capability = "Capability contract: {\"status\":\"unknown\"}"
-        consistency = "一致性纠偏证据必须原样绑定：{}".format(
+    @staticmethod
+    def _consistency_instruction(contract: Dict[str, Any]) -> str:
+        return "一致性纠偏证据必须原样绑定：{}".format(
             json.dumps(
                 contract.get("consistency_binding", {}),
                 ensure_ascii=False,
@@ -56,7 +51,6 @@ class ProviderActionRunner(Runner):
                 separators=(",", ":"),
             )
         )
-        return capability + "\n" + consistency
 
     def _action(
         self,
@@ -66,10 +60,6 @@ class ProviderActionRunner(Runner):
         request: Dict[str, Any],
         sequence: int = 0,
     ) -> Dict[str, Any]:
-        request = dict(request)
-        if contract.get("child_origin") == "worker_dispatch":
-            request["origin"] = "worker_dispatch"
-            request["child_binding"] = contract.get("child_binding")
         return self.store.request(
             operation=operation,
             provider=self.provider,
@@ -113,33 +103,10 @@ class ProviderActionRunner(Runner):
             )
         except FileNotFoundError:
             existing = None
-        successor = bool(contract.get("successor"))
-        if existing is not None and not successor:
-            expected_allowlist = list(contract.get("files", []))
-            if existing.allowlist != expected_allowlist:
-                if (
-                    not contract.get("continuation")
-                    or not existing.allowlist
-                    or not set(existing.allowlist).issubset(
-                        set(expected_allowlist)
-                    )
-                ):
-                    raise ValueError(
-                        "provider continuation allowlist is not a narrow expansion"
-                    )
-                existing.allowlist = expected_allowlist
+        if existing is not None:
             existing.status = status
             existing.generation = generation
             return existing
-        if existing is not None and existing.status not in {
-            "stopped",
-            "failed",
-            "archived",
-        }:
-            raise ValueError("visible successor requires a stopped predecessor")
-        predecessor = contract.get("predecessor_task_id")
-        if predecessor is None and existing is not None:
-            predecessor = existing.task_id
 
         project_id = contract.get("project_id")
         if not isinstance(project_id, str) or not project_id:
@@ -157,9 +124,6 @@ class ProviderActionRunner(Runner):
                 "environment": {"type": "local"},
             },
         }
-        if successor:
-            create_request["successor"] = True
-            create_request["predecessor_task_id"] = predecessor
         created = self._require_result(
             contract, run_id, "create", create_request
         )
@@ -172,8 +136,6 @@ class ProviderActionRunner(Runner):
             raise ValueError("provider create result has no task identity")
         if not isinstance(host, str) or not host:
             raise ValueError("provider create result has no host identity")
-        if successor and predecessor and task_id == predecessor:
-            raise ValueError("provider successor reused predecessor identity")
 
         located = self._require_result(
             contract,
@@ -211,9 +173,6 @@ class ProviderActionRunner(Runner):
             status=status,
             visible=True,
             generation=generation,
-            allowlist=list(contract.get("files", [])),
-            capability_contract_digest=contract.get("capability_contract_digest"),
-            successor_of=predecessor if successor else None,
         )
 
     @staticmethod
@@ -243,13 +202,6 @@ class ProviderActionRunner(Runner):
             str(contract["role"]),
             run_id=run_id,
         )
-        expected_capability_digest = contract.get("capability_contract_digest")
-        if expected_capability_digest and binding.capability_contract_digest != expected_capability_digest:
-            raise ValueError("task binding capability contract digest is stale")
-        if contract.get("successor") is True:
-            predecessor = contract.get("predecessor_task_id")
-            if predecessor and binding.task_id == predecessor:
-                raise ValueError("successor task identity reused the predecessor")
         metadata = {
             "schema_version": 1,
             "handle_id": handle.run_id,
@@ -264,9 +216,6 @@ class ProviderActionRunner(Runner):
             "wait_sequence": 0,
             "cursor": binding.cursor,
             "terminal_confirmed": False,
-            "successor": bool(contract.get("successor")),
-            "predecessor_task_id": contract.get("predecessor_task_id"),
-            "capability_contract_digest": expected_capability_digest,
         }
         if contract.get("continuation"):
             request = {

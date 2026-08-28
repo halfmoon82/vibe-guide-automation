@@ -25,19 +25,6 @@ _FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
-CAPABILITY_RULE_MARKER = "Capability and Tool Truth"
-CAPABILITY_RULES = """## Capability and Tool Truth
-
-- 不得根据记忆、README、工具未被提及或一次失败判断能力不存在。
-- “当前会话未暴露”不等于“平台不具备该能力”。
-- 超时、空响应和格式异常统一保持 UNKNOWN；`unknown_timeout` 不得转成 UNAVAILABLE。
-- 监工和 worker 的自然语言自报不是能力证据。
-- 能力判断必须引用 session contract 的 evidence_ref。
-- 没有证据时请求 refresh 或报告 UNKNOWN，不得直接终止。
-- 只有 runtime/provider 的结构化结果才能进入能力阻断状态。
-"""
-
-
 @dataclass
 class ScanReport:
     root: str
@@ -181,23 +168,9 @@ def scan_project(paths):
 
 
 def build_agentsmd_patch(existing, report):
-    if (
-        existing is not None
-        and 'Vibe Guide' in existing
-        and 'project' in existing.lower()
-        and CAPABILITY_RULE_MARKER in existing
-        and 'evidence_ref' in existing
-        and 'unknown_timeout' in existing
-    ):
+    if existing is not None:
         return PatchProposal(False, '')
-    if existing is None:
-        content = '# Vibe Guide\n\nProject guidance is maintained through the Vibe Guide.\n\n' + CAPABILITY_RULES
-    else:
-        content = (
-            '# Vibe Guide capability contract proposal\n\n'
-            + CAPABILITY_RULES
-        )
     return PatchProposal(
         True,
-        content,
+        '# Vibe Guide\n\nProject guidance is maintained through the Vibe Guide.\n',
     )

@@ -1,5 +1,4 @@
 import tempfile, unittest
-import json
 from pathlib import Path
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.initializer import init_project
@@ -12,23 +11,6 @@ class InitializerTests(unittest.TestCase):
             self.assertTrue(first.changed); self.assertFalse(second.changed)
             self.assertTrue((p.root/'.vibe/knowledge').is_dir())
             self.assertFalse((p.root/'AGENTS.md').exists())
-
-    def test_init_creates_capability_contract_once_and_preserves_it(self):
-        with tempfile.TemporaryDirectory() as d:
-            root = Path(d)
-            paths = ProjectPaths.from_cwd(root)
-            first = init_project(paths, True)
-            contract = root / '.vibe' / 'session-contract.json'
-            self.assertIn('.vibe/session-contract.json', first.paths)
-            self.assertTrue(contract.is_file())
-            first_bytes = contract.read_bytes()
-            second = init_project(paths, True)
-            self.assertFalse(second.changed)
-            self.assertEqual(first_bytes, contract.read_bytes())
-            payload = json.loads(first_bytes.decode('utf-8'))
-            self.assertEqual(payload['scope'], 'project')
-            self.assertIn('task.terminal', payload['capabilities'])
-            self.assertEqual(payload['capabilities']['task.terminal']['status'], 'unknown')
 
     def test_symlinked_vibe_is_rejected_without_outside_write(self):
         with tempfile.TemporaryDirectory() as d:
@@ -77,18 +59,3 @@ class InitializerTests(unittest.TestCase):
                 self.fail('non-directory .vibe must be rejected')
 
             self.assertEqual(marker.read_text(encoding='utf-8'), 'keep\n')
-
-    def test_symlinked_capability_contract_is_rejected_without_external_write(self):
-        with tempfile.TemporaryDirectory() as d:
-            base = Path(d)
-            project = base / 'project'
-            outside = base / 'outside'
-            project.mkdir()
-            outside.mkdir()
-            (project / '.vibe').mkdir()
-            (project / '.vibe' / 'session-contract.json').symlink_to(
-                outside / 'contract.json'
-            )
-            with self.assertRaises(ValueError):
-                init_project(ProjectPaths.from_cwd(project), True)
-            self.assertEqual(list(outside.iterdir()), [])

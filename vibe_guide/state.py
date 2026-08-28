@@ -73,7 +73,6 @@ _EVENT_DATA_KEYS = {
     *CONSISTENCY_CORRECTION_KEYS,
     "authorization_digest",
     "authorization_epoch",
-    "capability_contract_digest",
     "authorized_node_contracts",
     "accepted_nodes",
     "affected_nodes",
@@ -92,22 +91,17 @@ _EVENT_DATA_KEYS = {
     "node_id",
     "node_ids",
     "new_authorization",
-    "old_task_reconciled",
     "phase",
     "previous_authorization",
     "previous_authorization_digest",
-    "previous_capability_contract_digest",
     "previous_node_contract_digest",
     "previous_node_contract_digests",
-    "predecessor_task_id",
-    "proof",
     "reason",
     "retained_acceptances",
     "invalidated_acceptances",
     "role",
     "run_id",
     "status",
-    "successor",
     "task_id",
     "worker",
 }
@@ -207,10 +201,6 @@ class RunSnapshot:
     authorization: Dict[str, Any] = field(default_factory=dict)
     authorization_digest: str = ""
     node_contract_digest: str = ""
-    # A V2 run is bound to the exact capability evidence contract used when
-    # its child tasks were dispatched.  Empty keeps pre-contract snapshots
-    # loadable for legacy, non-V2 runs; V2 monitor paths always populate it.
-    capability_contract_digest: str = ""
     event_sequence: int = 0
     schema_version: int = STATE_SCHEMA_VERSION
 
@@ -233,11 +223,9 @@ class RunSnapshot:
             "node_contract_digest",
             "event_sequence",
         }
-        with_capability = expected | {"capability_contract_digest"}
-        if not isinstance(data, dict) or set(data) not in (expected, with_capability):
+        if not isinstance(data, dict) or set(data) != expected:
             raise ValueError("snapshot schema is invalid")
         normalized = dict(data)
-        normalized.setdefault("capability_contract_digest", "")
         normalized["authorization"] = AuthorizationRecord.from_dict(
             normalized["authorization"]
         ).to_dict()
@@ -582,10 +570,6 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         raise ValueError("snapshot authorization digest is invalid")
     if not _DIGEST.fullmatch(snapshot.node_contract_digest):
         raise ValueError("snapshot node contract digest is invalid")
-    if snapshot.capability_contract_digest and not _DIGEST.fullmatch(
-        snapshot.capability_contract_digest
-    ):
-        raise ValueError("snapshot capability contract digest is invalid")
 
     authorization = AuthorizationRecord.from_dict(snapshot.authorization)
     if not is_authorization_integrity_valid(authorization):
@@ -617,9 +601,6 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         raise ValueError("snapshot has no run-start event lineage")
     current_authorization_digest = first["data"].get("authorization_digest")
     current_node_contract_digest = first["data"].get("node_contract_digest")
-    first_capability_contract_digest = first["data"].get(
-        "capability_contract_digest", ""
-    )
     if not isinstance(current_authorization_digest, str) or not _DIGEST.fullmatch(
         current_authorization_digest
     ):
@@ -628,15 +609,10 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         current_node_contract_digest
     ):
         raise ValueError("run-start contract lineage is inconsistent")
-    if first_capability_contract_digest and not _DIGEST.fullmatch(
-        first_capability_contract_digest
-    ):
-        raise ValueError("run-start capability contract lineage is inconsistent")
     if sorted(first["data"].get("node_ids", [])) != sorted(snapshot.nodes):
         raise ValueError("run-start node lineage is inconsistent")
     retained_acceptance_proofs = []
     latest_node_contract_digests = None
-    current_capability_contract_digest = first_capability_contract_digest
     for record in records[: snapshot.event_sequence]:
         provenance = record["provenance"]
         if provenance["authorization_digest"] != current_authorization_digest:
@@ -651,26 +627,8 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
             != current_authorization_digest
             or data.get("previous_node_contract_digest")
             != current_node_contract_digest
-            or data.get("previous_capability_contract_digest")
-            != current_capability_contract_digest
         ):
             raise ValueError("reauthorization previous lineage is inconsistent")
-        if current_capability_contract_digest and (
-            "previous_capability_contract_digest" not in data
-            or "capability_contract_digest" not in data
-        ):
-            raise ValueError("reauthorization capability contract lineage is missing")
-        replacement_capability_contract_digest = data.get(
-            "capability_contract_digest", ""
-        )
-        if (
-            not isinstance(replacement_capability_contract_digest, str)
-            or (
-                replacement_capability_contract_digest
-                and not _DIGEST.fullmatch(replacement_capability_contract_digest)
-            )
-        ):
-            raise ValueError("reauthorization capability contract lineage is invalid")
         previous = AuthorizationRecord.from_dict(data.get("previous_authorization"))
         replacement = AuthorizationRecord.from_dict(data.get("new_authorization"))
         if (
@@ -791,13 +749,10 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         latest_node_contract_digests = node_contract_digests
         current_authorization_digest = replacement.digest
         current_node_contract_digest = replacement.node_contract_digest
-        current_capability_contract_digest = replacement_capability_contract_digest
     if current_authorization_digest != snapshot.authorization_digest:
         raise ValueError("snapshot final authorization lineage is inconsistent")
     if current_node_contract_digest != snapshot.node_contract_digest:
         raise ValueError("snapshot final contract lineage is inconsistent")
-    if snapshot.capability_contract_digest != current_capability_contract_digest:
-        raise ValueError("snapshot final capability contract lineage is inconsistent")
     if latest_node_contract_digests is not None and any(
         snapshot.nodes[node_id].get("contract_digest") != digest
         for node_id, digest in latest_node_contract_digests.items()

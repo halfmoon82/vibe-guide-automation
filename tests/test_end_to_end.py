@@ -317,9 +317,6 @@ class EndToEndTests(unittest.TestCase):
         observed_tools = set()
         wait_counts = {"developer": 0, "reviewer": 0}
         consistency_bindings = {}
-        capability_contract_digest = json.loads(
-            (self.root / ".vibe/session-contract.json").read_text(encoding="utf-8")
-        )["contract_digest"]
         for _ in range(40):
             for action in store.pending():
                 observed_tools.add(action["native_tool"])
@@ -327,15 +324,9 @@ class EndToEndTests(unittest.TestCase):
                 task_id = "thread-api-" + role
                 operation = action["operation"]
                 if operation == "create":
-                    self.assertTrue({"prompt", "target", "origin", "child_binding"}.issubset(action["request"]))
-                    self.assertEqual(action["request"]["origin"], "worker_dispatch")
-                    self.assertTrue({"parent_run_id", "plan_revision", "authorization_digest", "node_id", "role", "writer", "worktree", "branch", "allowlist", "worker_profile"}.issubset(action["request"]["child_binding"]))
                     self.assertEqual(
-                        action["request"]["child_binding"]["capability_contract_digest"],
-                        capability_contract_digest,
+                        set(action["request"]), {"prompt", "target"}
                     )
-                    self.assertIn("Capability contract: ", action["request"]["prompt"])
-                    self.assertIn(capability_contract_digest, action["request"]["prompt"])
                     marker = "一致性纠偏证据必须原样绑定："
                     self.assertIn(marker, action["request"]["prompt"])
                     consistency_bindings[role] = json.loads(
@@ -349,8 +340,6 @@ class EndToEndTests(unittest.TestCase):
                 elif operation == "visibility":
                     payload = {"visible": True, "direct_enter": True}
                 elif operation == "resume":
-                    self.assertIn("Capability contract: ", action["request"]["prompt"])
-                    self.assertIn(capability_contract_digest, action["request"]["prompt"])
                     marker = "一致性纠偏证据必须原样绑定："
                     self.assertIn(marker, action["request"]["prompt"])
                     self.assertEqual(

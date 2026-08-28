@@ -54,14 +54,6 @@ vibe init --confirm       # 创建缺失的最小 .vibe/ 结构
 
 已有 `AGENTS.md` 不会被覆盖。缺失规则时只在 `.vibe/proposals/agentsmd/` 生成建议。外部 Skill 的安装不由 `init` 隐式触发。
 
-### V2 能力合同（监工与 worker 共用）
-
-确认初始化后，`.vibe/session-contract.json` 是当前项目会话的唯一能力事实源；监工入口和 worker/provider action 都读取同一份合同。初始化只记录安全、有限且当场可验证的运行时事实，任务终端、浏览器控制和可见会话在未探测前保持 `unknown`。
-
-合同中的能力状态包括 `verified_available`、`not_exposed`、`permission_denied`、`probe_failed`、`unknown_timeout`、`unknown` 和过期后的 `stale`。合同缺失、损坏或无法核验会安全映射为 `blocked_unknown`；过期能力只会降为 `stale` 并要求刷新，不会被解释成“没有工具/能力”或成功；`unknown_timeout` 也不会降级为 `unavailable`。
-
-`AGENTS.md` 不会被初始化直接改写，能力真相规则只生成到 `.vibe/proposals/agentsmd/proposal.md`。规则要求监工和 worker 不得根据记忆、README、工具未被提及或自然语言自报判断能力存在与否，必须引用合同事实；没有证据时保持未知并重试或阻断。真实 provider 的权限、登录、任务可见性、创建/续接和外部故障仍须在真实平台核验，合同和本地测试不能替代该核验。
-
 ## 简单任务和复杂计划
 
 明显简单的请求直接走轻量路径，不生成 PRD 或 DAG：
@@ -85,13 +77,13 @@ node-spec 是 JSON 对象，包含 `title`、`objective`、已批准的 `decisio
 
 ## 授权、监工和恢复
 
-在 revision 5 运行时，确认授权卡即启动 Monitor；不再需要第二个启动动作。旧版 CLI 兼容路径仍可接受显式 `--authorize`：
+触发 `monitor` 本身不构成授权：
 
 ```bash
 vibe monitor --plan example-plan --json
 ```
 
-没有授权的显式兼容调用仍退出 `3`，且不会启动 runner。确认授权卡范围后，确认动作应直接调用等价的 Monitor 启动路径：
+上面的命令退出 `3`，且不会启动 runner。确认授权卡范围后，使用精确确认词：
 
 ```bash
 vibe monitor --plan example-plan --authorize AUTHORIZE --json
@@ -99,7 +91,7 @@ vibe status --plan example-plan --json
 vibe resume --plan example-plan --json
 ```
 
-节点从 `planned` 开始。授权确认启动 Monitor 后，当前无硬依赖节点立即调度；provider 的 `complete` 只映射为 developer 的 `delivered`；随后必须由不同 reviewer 任务给出 `accepted`，硬依赖才会解锁。全部节点 accepted 后，run 才是 `complete`。
+节点从 `planned` 开始。provider 的 `complete` 只映射为 developer 的 `delivered`；随后必须由不同 reviewer 任务给出 `accepted`，硬依赖才会解锁。全部节点 accepted 后，run 才是 `complete`。
 
 恢复以 `.vibe/runs/<run-id>/state.json`、`tasks.json` 和 `events.jsonl` 为准。已登记的活动 handle 不会因重复 `resume` 创建第二 writer。计划或节点合同变化会持久化为 `blocked_design` 并使旧授权失效；provider unknown/timeout 会保持 `blocked_unknown`，不会转成成功或无事项。
 
