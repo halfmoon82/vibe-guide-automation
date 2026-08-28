@@ -224,6 +224,71 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual([node["status"] for node in nodes], ["planned", "planned"])
         self.assertEqual({node["parallel_group"] for node in nodes}, {"build"})
         self.assertTrue(all(node["contract"]["acceptance_example"] for node in nodes))
+        self.assertFalse((plan_dir / "deploy-manifest.json").exists())
+
+    def test_selected_deploy_is_manifested_but_requires_independent_acceptance_and_separate_authorization(self):
+        self.initialize()
+        source = json.loads((self.root / "plan-source.json").read_text(encoding="utf-8"))
+        source["deploy"] = {
+            "target": "staging",
+            "commit": "a" * 40,
+            "command_allowlist": ["deploy", "restart"],
+            "health_checks": [{"name": "http", "url": "https://staging/health"}],
+            "rollback": {"version": "previous", "command": "rollback"},
+            "stop_conditions": ["health check fails"],
+        }
+        selected = self.root / "selected-deploy.json"
+        selected.write_text(json.dumps(source), encoding="utf-8")
+        self.create_plan("selected-deploy", selected.name)
+        plan_dir = self.root / ".vibe/plans/selected-deploy"
+        self.assertTrue((plan_dir / "deploy-manifest.json").exists())
+        blocked = self.run_cli(["deploy", "--plan", "selected-deploy", "--json"])
+        self.assertEqual(blocked.exit_code, 3)
+        self.assertEqual(blocked.payload["status"], "blocked_deploy")
+
+    def test_deploy_without_observations_is_blocked_unknown_and_not_persisted_ready(self):
+        self.initialize()
+        source = json.loads((self.root / "plan-source.json").read_text(encoding="utf-8"))
+        source["deploy"] = {
+            "target": "staging",
+            "commit": "a" * 40,
+            "command_allowlist": ["deploy", "restart"],
+            "health_checks": [{"name": "http", "url": "https://staging/health"}],
+            "rollback": {"version": "previous", "command": "rollback"},
+            "stop_conditions": ["health check fails"],
+        }
+        selected = self.root / "selected-deploy-no-observation.json"
+        selected.write_text(json.dumps(source), encoding="utf-8")
+        self.create_plan("selected-deploy-no-observation", selected.name)
+        runner = self.local_runner()
+        started = self.run_cli(
+            [
+                "monitor",
+                "--plan",
+                "selected-deploy-no-observation",
+                "--authorize",
+                "AUTHORIZE",
+                "--json",
+            ],
+            runner=runner,
+        )
+        self.assertEqual(started.exit_code, 0, started.text)
+        finished = self.drive_to_terminal("selected-deploy-no-observation", runner)
+        self.assertEqual((finished.exit_code, finished.payload["status"]), (0, "complete"))
+
+        blocked = self.run_cli(
+            [
+                "deploy",
+                "--plan",
+                "selected-deploy-no-observation",
+                "--deploy-authorize",
+                "AUTHORIZE_DEPLOY",
+                "--json",
+            ]
+        )
+        self.assertEqual((blocked.exit_code, blocked.payload["status"]), (4, "blocked_unknown"))
+        state_path = self.root / ".vibe/plans/selected-deploy-no-observation/deploy-state.json"
+        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["status"], "blocked_unknown")
 
     def test_authorized_flow_uses_developer_then_independent_reviewer_and_resumes_without_duplicate_writer(self):
         self.initialize()
