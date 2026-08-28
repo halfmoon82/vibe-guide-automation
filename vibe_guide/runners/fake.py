@@ -5,6 +5,10 @@ from ..contracts import RunEvent, RunHandle, Runner
 
 
 class FakeRunner(Runner):
+    # Test-only local provider evidence: the fixture has a bounded synthetic
+    # context limit, while real providers remain unknown until observed.
+    context_limit_tokens = 100000
+
     def __init__(self, events: Optional[Dict[Any, List[Any]]] = None):
         self.events = {node_id: list(queue) for node_id, queue in (events or {}).items()}
         self.start_calls = []

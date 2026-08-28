@@ -13,8 +13,12 @@ import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from ..paths import ProjectPaths
-from ..workflow_gate import require_entry, require_child_origin
-from ..diagnostics import validate_persisted_child_binding
+from ..workflow_gate import (
+    require_capability_contract,
+    require_entry,
+    require_child_origin,
+)
+from ..diagnostics import validate_child_session_binding
 from ..models import WorkerProfile
 
 
@@ -159,9 +163,18 @@ class ProviderActionStore:
                 if origin == "worker_dispatch":
                     require_child_origin(origin)
                     binding = request.get("child_binding")
-                    validate_persisted_child_binding(
-                        self.paths, binding, run_id, issue_id, role
-                    )
+                    capability_contract = require_capability_contract(self.paths)
+                    required = {"parent_run_id", "plan_revision", "authorization_digest", "node_id", "role", "writer", "worktree", "branch", "allowlist", "worker_profile", "capability_contract_digest"}
+                    if not isinstance(binding, dict) or not required.issubset(binding):
+                        raise PermissionError("child binding is incomplete")
+                    if binding.get("capability_contract_digest") != capability_contract.contract_digest:
+                        raise PermissionError("child capability contract digest mismatch")
+                    if binding.get("parent_run_id") != run_id or binding.get("node_id") != issue_id or binding.get("role") != role:
+                        raise PermissionError("child binding identity mismatch")
+                    if not (isinstance(binding.get("plan_revision"), str) and binding["plan_revision"].isdigit() and int(binding["plan_revision"]) > 0 and isinstance(binding.get("authorization_digest"), str) and len(binding["authorization_digest"]) == 64 and all(ch in "0123456789abcdef" for ch in binding["authorization_digest"].lower())):
+                        raise PermissionError("child binding parent context is unverifiable")
+                    profile = WorkerProfile(**binding["worker_profile"])
+                    validate_child_session_binding(binding["parent_run_id"], binding["plan_revision"], binding["authorization_digest"], binding["node_id"], binding["role"], profile)
                 elif origin != "user_entry":
                     raise PermissionError("invalid session origin")
                 else:
@@ -277,6 +290,13 @@ class ProviderActionStore:
             if path.is_symlink() or not path.is_file():
                 raise ValueError("provider action request must be a regular file")
             record = self._read(path)
+            required = {
+                "schema_version", "action_id", "operation", "provider",
+                "run_id", "issue_id", "role", "generation", "sequence",
+                "native_tool", "request", "request_digest",
+            }
+            if set(record) != required or record.get("schema_version") != self.schema_version:
+                raise ValueError("provider action request schema is invalid")
             if (
                 record.get("run_id") == run_id
                 and record.get("issue_id") == issue_id

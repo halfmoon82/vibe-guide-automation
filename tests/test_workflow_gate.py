@@ -31,10 +31,10 @@ class WorkflowGateBypassTests(unittest.TestCase):
             record = create_challenge("entry-1", self.now)
             save_challenge(paths, record)
             gate = require_entry(
-                paths, "entry-1", "BYPASS VIBE " + record.challenge
+                paths, "entry-1", "BYPASS VIBE " + record.challenge, now=self.now
             )
             self.assertEqual(gate.status, "wizard_bypassed")
-            follow_up = require_entry(paths, "entry-1", "complex request")
+            follow_up = require_entry(paths, "entry-1", "complex request", now=self.now)
             self.assertEqual(follow_up.status, "wizard_bypassed")
             # The raw command is not persisted in the challenge record.
             raw = (paths.vibe / "session-bypass.json").read_text(encoding="utf-8")
@@ -52,13 +52,13 @@ class WorkflowGateBypassTests(unittest.TestCase):
         directory, paths = self._paths()
         try:
             self.assertEqual(
-                require_entry(paths, "entry-1", "complex request").status,
+                require_entry(paths, "entry-1", "complex request", now=self.now).status,
                 "session_screened",
             )
             record = create_challenge("entry-1", self.now)
             save_challenge(paths, record)
             gate = require_entry(
-                paths, "entry-1", "BYPASS VIBE " + record.challenge
+                paths, "entry-1", "BYPASS VIBE " + record.challenge, now=self.now
             )
             self.assertEqual(gate.status, "wizard_bypassed")
         finally:

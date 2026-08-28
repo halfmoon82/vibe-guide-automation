@@ -6,7 +6,8 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
-from .models import EVIDENCE_PRIORITY
+from .models import EVIDENCE_PRIORITY, PRD, PRDCheckpoint, SkillProfile, StageHandoff
+from .prd_profiles import evaluate_prd_checkpoints, select_prd_profiles
 
 
 @dataclass(frozen=True)
@@ -106,17 +107,14 @@ class DecisionCard:
 
 
 @dataclass(frozen=True)
-class PRD:
-    title: str
-    objective: str
-    status: str = "draft"
-
-
-@dataclass(frozen=True)
 class PRDResult:
     prd: PRD
     approved: bool
     blockers: List[str]
+    status: str = "draft"
+    questions: List[str] = field(default_factory=list)
+    continue_planning: bool = False
+    downstream_artifact: Optional[Any] = None
 
 
 @dataclass(frozen=True)
@@ -355,5 +353,67 @@ def approve_prd(prd: PRD, decisions: List[DecisionCard]) -> PRDResult:
         ):
             blockers.append(card.question)
     if blockers:
-        return PRDResult(replace(prd, status="blocked_decision"), False, blockers)
-    return PRDResult(replace(prd, status="approved"), True, [])
+        return PRDResult(replace(prd, status="blocked_design"), False, blockers, "blocked_design", blockers[:1], False, None)
+    return PRDResult(replace(prd, status="approved"), True, [], "approved", [], True, None)
+
+
+def build_stage_handoff(
+    prd: PRD,
+    open_questions: List[str],
+    evidence_refs: List[str],
+) -> StageHandoff:
+    """Build a read-only PRD-to-planning handoff; it never grants authorization."""
+    questions = [str(item) for item in open_questions if str(item).strip()]
+    if prd.status == "approved" and not questions:
+        readiness, action = "ready", "continue_planning"
+        prompt = "PRD 已批准；如需进入 Spec/Issue/DAG，请继续规划。"
+    elif prd.status in {"blocked_design", "blocked_decision"} or questions:
+        readiness, action = "blocked_design", "answer_question"
+        questions = questions[:1] or ["请回答未闭合的产品问题"]
+        prompt = "请先回答一个高信息产品问题：{}".format(questions[0])
+    elif prd.status == "blocked_unknown":
+        readiness, action = "blocked_unknown", "answer_question"
+        prompt = "请补充可验证的 PRD 证据后再继续规划。"
+    elif prd.status == "review_required":
+        readiness, action = "awaiting_user", "confirm_plan"
+        prompt = "请确认 PRD 检查点后再发布规划产物。"
+    else:
+        readiness, action = "awaiting_user", "continue_planning"
+        prompt = "请确认 PRD 检查点后继续规划。"
+    return StageHandoff(
+        from_stage="prd",
+        from_status="blocked_design" if prd.status == "blocked_decision" else prd.status,
+        to_stage="spec_issue_dag",
+        readiness=readiness,
+        evidence_refs=list(evidence_refs),
+        open_questions=questions,
+        required_user_action=action,
+        forbidden_automatic_actions=["create_spec", "create_issue", "create_dag", "create_worker", "authorize", "deploy"],
+        prompt=prompt,
+        prd_revision=prd.revision,
+    )
+
+
+def render_stage_handoff(handoff: StageHandoff) -> str:
+    return handoff.render()
+
+
+def build_runtime_stage_handoff(
+    from_status: str,
+    evidence_refs: List[str],
+    prompt: str,
+    *,
+    to_stage: str = "monitor",
+    readiness: str = "ready",
+    open_questions: Optional[List[str]] = None,
+    required_user_action: str = "none",
+    prd_revision: Optional[int] = None,
+) -> StageHandoff:
+    return StageHandoff(
+        from_stage="monitor", from_status=from_status, to_stage=to_stage,
+        readiness=readiness, evidence_refs=list(evidence_refs),
+        open_questions=list(open_questions or []),
+        required_user_action=required_user_action, prompt=prompt,
+        forbidden_automatic_actions=["expand_scope", "create_worker", "authorize", "deploy"],
+        prd_revision=prd_revision,
+    )

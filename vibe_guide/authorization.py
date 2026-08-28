@@ -5,7 +5,7 @@ import hashlib
 import json
 from pathlib import PurePosixPath
 import secrets
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .models import AgentCapabilities, DAGNode, Plan
 from .deploy import (
@@ -28,6 +28,85 @@ _SENSITIVE_NAMES = (
     "secret",
     "token",
 )
+
+# Compatibility primitives retained from the accepted V2-4 authorization
+# source. They are used by Change Request validation and do not widen the
+# current executable card or deploy boundaries.
+_VALID_ACTIONS = frozenset(_ALLOWED_ACTIONS + ("push", "create_mr", "merge", "merge_local"))
+_MERGE_ACTIONS = frozenset(("merge", "merge_local"))
+_SCOPE_ALIASES = {
+    "issue": "issue_id", "issue_id": "issue_id", "source": "source_sha",
+    "source_sha": "source_sha", "target": "target_branch", "target_ref": "target_branch",
+    "target_branch": "target_branch", "change_request": "change_request_id",
+    "change_request_id": "change_request_id", "request_id": "change_request_id",
+    "mr_id": "change_request_id", "pr_id": "change_request_id", "name": "change_request_id",
+}
+
+
+def _action(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("authorization action scope is invalid")
+    return {"local_merge": "merge_local", "remote_merge": "merge"}.get(value.strip().lower(), value.strip().lower())
+
+
+def _normalize_scope(scope: Any) -> Optional[Dict[str, str]]:
+    if scope is None:
+        return None
+    if hasattr(scope, "to_dict") and callable(scope.to_dict):
+        scope = scope.to_dict()
+    if not isinstance(scope, Mapping):
+        raise ValueError("merge scope must be a mapping")
+    normalized: Dict[str, str] = {}
+    for key, value in scope.items():
+        canonical = _SCOPE_ALIASES.get(str(key).strip().lower())
+        if canonical is None or not isinstance(value, str) or not value.strip():
+            raise ValueError("merge scope is invalid")
+        if canonical in normalized and normalized[canonical] != value.strip():
+            raise ValueError("merge scope contains conflicting aliases")
+        normalized[canonical] = value.strip()
+    required = ("issue_id", "source_sha", "target_branch", "change_request_id")
+    if any(field not in normalized for field in required):
+        raise ValueError("merge scope requires issue, source SHA, target branch and Change Request")
+    return {field: normalized[field] for field in required}
+
+
+def _scope_from(authorization: Any) -> Optional[Dict[str, str]]:
+    scope = authorization.get("merge_scope") if isinstance(authorization, Mapping) else getattr(authorization, "merge_scope", None)
+    return _normalize_scope(scope)
+
+
+def _authorized_actions(authorization: Any) -> set:
+    values = authorization.get("allowed_actions", ()) if isinstance(authorization, Mapping) else getattr(authorization, "allowed_actions", ())
+    if not isinstance(values, (tuple, list, set, frozenset)):
+        return set()
+    try:
+        return {_action(value) for value in values}
+    except ValueError:
+        return set()
+
+
+def is_action_authorized(authorization: Any, action: str, merge_scope: Optional[Mapping[str, Any]] = None) -> bool:
+    try:
+        normalized = _action(action)
+    except ValueError:
+        return False
+    if normalized not in _VALID_ACTIONS or normalized == "deploy" or normalized not in _authorized_actions(authorization):
+        return False
+    if normalized in _MERGE_ACTIONS:
+        card_scope = _scope_from(authorization)
+        if card_scope is None:
+            return False
+        if merge_scope is not None:
+            try:
+                return card_scope == _normalize_scope(merge_scope)
+            except ValueError:
+                return False
+    return True
+
+
+def require_action_authorized(authorization: Any, action: str, merge_scope: Optional[Mapping[str, Any]] = None) -> None:
+    if not is_action_authorized(authorization, action, merge_scope):
+        raise PermissionError("authorization does not allow %s" % action)
 
 
 def _canonical_digest(data: Dict[str, Any]) -> str:
