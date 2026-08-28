@@ -1,11 +1,4 @@
 [build-system]
-requires = ["setuptools>=58", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["setuptools>=40.8.0", "wheel"]
+build-backend = "setuptools.build_meta:__legacy__"
 
-[project]
-name = "vibe-guide"
-version = "0.1.0"
-requires-python = ">=3.9"
-
-[project.scripts]
-vibe = "vibe_guide.cli:main"

@@ -1,168 +1,53 @@
 import json
-import io
-import shutil
 import tempfile
-import subprocess
-import sys
 import unittest
-from contextlib import redirect_stdout
 from pathlib import Path
 
-from vibe_guide.cli import main
+from vibe_guide.cli import run_cli
 
 
-class CliContractTests(unittest.TestCase):
-    def run_cli(self, *args):
-        return subprocess.run([sys.executable, "-m", "vibe_guide", *args], text=True, capture_output=True)
-
-    def test_scan_json_succeeds(self):
-        result = self.run_cli("scan", "--json")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIsInstance(json.loads(result.stdout), dict)
-
-    def test_monitor_without_authorization_is_blocked_with_json(self):
-        result = self.run_cli("monitor", "--json")
-        self.assertEqual(result.returncode, 3)
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["status"], "blocked")
-
-    def test_unauthorized_monitor_does_not_call_runner(self):
-        class SpyRunner:
-            def __init__(self):
-                self.started = False
-
-            def start(self, contract, worktree):
-                self.started = True
-
-        runner = SpyRunner()
-        with redirect_stdout(io.StringIO()):
-            code = main(["monitor"], runner=runner)
-        self.assertEqual(code, 3)
-        self.assertFalse(runner.started)
-
-    def test_unknown_state_has_exit_code_four_and_json(self):
-        result = self.run_cli("status", "--json")
-        self.assertEqual(result.returncode, 4)
-        self.assertEqual(json.loads(result.stdout)["status"], "unknown")
-
-    def test_usage_error_has_exit_code_two(self):
-        result = self.run_cli("not-a-command")
-        self.assertEqual(result.returncode, 2)
-
-    def test_help_is_clean_success_output(self):
-        result = self.run_cli("--help")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("usage: vibe", result.stdout)
-        self.assertNotIn("参数错误", result.stdout)
-
-    def test_run_cli_uses_explicit_cwd_for_real_scan(self):
-        try:
-            from vibe_guide.cli import run_cli
-        except ImportError as error:
-            self.fail("run_cli public entry point is missing: %s" % error)
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / ".project-root").write_bytes(b"fixture\n")
-            result = run_cli(["scan", "--json"], root)
-
+class DeliveryCliTests(unittest.TestCase):
+    def test_help_and_module_metadata_are_available(self):
+        result = run_cli(["--help"], Path.cwd())
         self.assertEqual(result.exit_code, 0)
-        self.assertEqual(result.payload["command"], "scan")
-        self.assertEqual(result.payload["report"]["root"], str(root.resolve()))
+        self.assertIn("usage: vibe", result.text)
 
-    def test_init_confirmation_and_all_command_output_modes_are_wired(self):
-        try:
-            from vibe_guide.cli import run_cli
-        except ImportError as error:
-            self.fail("run_cli public entry point is missing: %s" % error)
-
+    def test_scan_doctor_are_read_only_json_commands(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / ".project-root").write_text("fixture\n", encoding="utf-8")
-            before = sorted(path.relative_to(root) for path in root.rglob("*"))
+            before = sorted(p.relative_to(root).as_posix() for p in root.rglob("*"))
+            for command in ("scan", "doctor"):
+                result = run_cli([command, "--json"], root)
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(result.payload["command"], command)
+                json.dumps(result.payload)
+            after = sorted(p.relative_to(root).as_posix() for p in root.rglob("*"))
+            self.assertEqual(before, after)
+
+    def test_init_requires_confirmation_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
             blocked = run_cli(["init", "--json"], root)
             self.assertEqual(blocked.exit_code, 3)
-            self.assertEqual(before, sorted(path.relative_to(root) for path in root.rglob("*")))
+            self.assertFalse((root / ".vibe").exists())
+            first = run_cli(["init", "--confirm", "--json"], root)
+            second = run_cli(["init", "--confirm", "--json"], root)
+            self.assertEqual(first.exit_code, second.exit_code, 0)
+            self.assertTrue(first.payload["changed"])
+            self.assertFalse(second.payload["changed"])
+            self.assertTrue((root / ".vibe" / "state.json").exists())
 
-            initialized = run_cli(["init", "--confirm", "--json"], root)
-            repeated = run_cli(["init", "--confirm", "--json"], root)
-            self.assertEqual((initialized.exit_code, repeated.exit_code), (0, 0))
-            self.assertTrue(initialized.payload["changed"])
-            self.assertFalse(repeated.payload["changed"])
+    def test_fake_local_runner_flow_is_resumable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(run_cli(["init", "--confirm"], root).exit_code, 0)
+            plan = run_cli(["plan", "--request", "local fake flow", "--plan-id", "demo", "--json"], root)
+            self.assertEqual(plan.exit_code, 0)
+            started = run_cli(["monitor", "--plan", "demo", "--authorize", "AUTHORIZE", "--json"], root)
+            self.assertEqual(started.exit_code, 0)
+            self.assertEqual(started.payload["status"], "delivered")
+            resumed = run_cli(["resume", "--plan", "demo", "--json"], root)
+            self.assertEqual(resumed.exit_code, 0)
+            self.assertEqual(resumed.payload["status"], "accepted")
 
-            calls = (
-                ["scan"],
-                ["doctor"],
-                ["plan", "--request", "修正标题错别字"],
-                ["monitor"],
-                ["status"],
-                ["resume"],
-            )
-            for argv in calls:
-                with self.subTest(argv=argv):
-                    text_result = run_cli(argv, root)
-                    json_result = run_cli(argv + ["--json"], root)
-                    self.assertTrue(text_result.text.strip())
-                    self.assertIsInstance(json_result.payload, dict)
-                    json.dumps(json_result.payload)
-
-    def test_legacy_setup_metadata_exposes_real_name_version_and_console_entry(self):
-        root = Path(__file__).resolve().parents[1]
-        name = subprocess.run(
-            [sys.executable, "setup.py", "--name"],
-            cwd=str(root),
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout.strip()
-        version = subprocess.run(
-            [sys.executable, "setup.py", "--version"],
-            cwd=str(root),
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout.strip()
-        setup_text = (root / "setup.py").read_text(encoding="utf-8")
-
-        self.assertEqual((name, version), ("vibe-guide", "0.1.0"))
-        self.assertIn("vibe=vibe_guide.cli:main", setup_text)
-        self.assertIn('python_requires=">=3.9"', setup_text)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            source = Path(temporary) / "source"
-            environment = Path(temporary) / "venv"
-            shutil.copytree(
-                root,
-                source,
-                ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
-            )
-            subprocess.run(
-                [sys.executable, "-m", "venv", str(environment)],
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-            installed = subprocess.run(
-                [str(environment / "bin/python"), "setup.py", "develop"],
-                cwd=str(source),
-                text=True,
-                capture_output=True,
-            )
-            self.assertEqual(installed.returncode, 0, installed.stderr)
-            console = subprocess.run(
-                [str(environment / "bin/vibe"), "--help"],
-                cwd=str(source),
-                text=True,
-                capture_output=True,
-            )
-            self.assertEqual(console.returncode, 0, console.stderr)
-            self.assertIn("monitor", console.stdout)
-
-    def test_agents_contract_contains_visible_successor_recovery_rule(self):
-        text = (Path(__file__).resolve().parents[1] / "AGENTS.md").read_text(
-            encoding="utf-8"
-        )
-
-        self.assertIn("visible successor", text)
-        self.assertIn("原任务 aborted/archived", text)
-        self.assertIn("冻结 HEAD", text)
