@@ -3,7 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from .authorization import (
@@ -43,6 +43,32 @@ class Monitor:
         self.paths = paths
         self.plan = plan
         self.nodes = {node.id: node for node in nodes}
+        # Bindings remain durable in the task registry, while this small
+        # operation-scoped cache prevents duplicate reads during one public
+        # monitor call.  It is cleared at every start/resume/reauthorize/tick
+        # boundary so a later tick, run, or generation cannot reuse stale
+        # lineage.
+        self._binding_cache: Dict[Tuple[str, str, str], TaskBinding] = {}
+
+    def _reset_binding_cache(self) -> None:
+        self._binding_cache.clear()
+
+    def _load_task_binding(
+        self, snapshot: RunSnapshot, node_id: str, role: str
+    ) -> TaskBinding:
+        key = (snapshot.run_id, node_id, role)
+        binding = self._binding_cache.get(key)
+        if binding is None:
+            binding = load_task_binding(
+                self.paths, node_id, role, run_id=snapshot.run_id
+            )
+            self._binding_cache[key] = binding
+        return binding
+
+    def _save_task_binding(self, binding: TaskBinding) -> None:
+        save_task_binding(self.paths, binding)
+        if binding.run_id is not None:
+            self._binding_cache[(binding.run_id, binding.issue_id, binding.role)] = binding
 
     def merge_change_request_local(
         self,
@@ -77,6 +103,7 @@ class Monitor:
     def start(
         self, record: Optional[AuthorizationRecord], runner: Runner
     ) -> RunSnapshot:
+        self._reset_binding_cache()
         self._require_record(record)
         state = self.paths.vibe / "state.json"
         capability_contract_digest = ""
@@ -151,6 +178,7 @@ class Monitor:
         return snapshot
 
     def resume(self, run_id: str, runner: Runner) -> RunSnapshot:
+        self._reset_binding_cache()
         require_entry(self.paths, "resume:" + str(run_id), "resume")
         snapshot = load_snapshot(self.paths, run_id)
         current_capability_contract = require_capability_contract(self.paths)
@@ -192,6 +220,7 @@ class Monitor:
     ) -> RunSnapshot:
         """Continue the same run under a newly confirmed same-plan contract."""
 
+        self._reset_binding_cache()
         self._require_record(record)
         snapshot = load_snapshot(self.paths, run_id)
         state = self.paths.vibe / "state.json"
@@ -311,9 +340,7 @@ class Monitor:
             for role in ("developer", "reviewer"):
                 key = "{}:{}".format(node_id, role)
                 try:
-                    binding = load_task_binding(
-                        self.paths, node_id, role, run_id=snapshot.run_id
-                    )
+                    binding = self._load_task_binding(snapshot, node_id, role)
                 except FileNotFoundError:
                     continue
                 snapshot.tasks[key] = binding.to_dict()
@@ -351,6 +378,7 @@ class Monitor:
         return snapshot
 
     def tick(self, run_id: str, runner: Runner) -> RunSnapshot:
+        self._reset_binding_cache()
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
         self._reconcile_unapplied_events(snapshot)
@@ -457,9 +485,7 @@ class Monitor:
             node_id, role = key.rsplit(":", 1)
             if node_id not in snapshot.nodes or role not in {"developer", "reviewer"}:
                 raise ValueError("reauthorization continuation identity is invalid")
-            binding = load_task_binding(
-                self.paths, node_id, role, run_id=snapshot.run_id
-            )
+            binding = self._load_task_binding(snapshot, node_id, role)
             if (
                 set(evidence) != {"task_id", "cursor"}
                 or evidence["task_id"] != binding.task_id
@@ -621,16 +647,57 @@ class Monitor:
         scheduler will keep the node blocked rather than guessing.
         """
         try:
-            binding = load_task_binding(
-                self.paths, node_id, role, run_id=snapshot.run_id
-            )
+            binding = self._load_task_binding(snapshot, node_id, role)
         except FileNotFoundError:
             return True
         except (OSError, TypeError, ValueError):
             return True
+        if role == "developer" and (
+            self._continuation_binding_generation_matches(snapshot, node_id, role)
+            is False
+        ):
+            return True
         if role == "developer" and binding.status == "delivered":
             return False
         return binding.status not in {"stopped", "failed", "archived"}
+
+    def _continuation_binding_generation_matches(
+        self, snapshot: RunSnapshot, node_id: str, role: str
+    ) -> Optional[bool]:
+        """Verify an existing continuation binding belongs to this generation.
+
+        ``None`` means no durable binding could be loaded, leaving the existing
+        successor/absence-proof path to decide whether a new task is safe.
+        ``False`` is a verified lineage mismatch and must never be dispatched.
+        """
+        try:
+            binding = self._load_task_binding(snapshot, node_id, role)
+        except FileNotFoundError:
+            return None
+        except (OSError, TypeError, ValueError):
+            return False
+        try:
+            generation = int(
+                snapshot.nodes[node_id].get(
+                    "review_generation"
+                    if role == "reviewer"
+                    else "developer_generation",
+                    0,
+                )
+            )
+        except (TypeError, ValueError):
+            return False
+        current = snapshot.nodes[node_id]
+        identity = current.get(role + "_identity")
+        if (
+            binding.run_id != snapshot.run_id
+            or not isinstance(identity, str)
+            or not identity
+            or binding.task_id != identity
+            or generation <= 0
+        ):
+            return False
+        return binding.generation == generation
 
     @staticmethod
     def _queue_reauthorization_continuation(
@@ -695,9 +762,7 @@ class Monitor:
         if role not in {"developer", "reviewer"}:
             return None
         try:
-            binding = load_task_binding(
-                self.paths, node_id, str(role), run_id=snapshot.run_id
-            )
+            binding = self._load_task_binding(snapshot, node_id, str(role))
         except FileNotFoundError:
             try:
                 requested = ProviderActionStore(self.paths).has_request(
@@ -711,6 +776,66 @@ class Monitor:
         if binding.status in {"stopped", "failed", "archived"}:
             return binding.task_id or ""
         return None
+
+    def _recover_quarantined_delivered_developer(
+        self, snapshot: RunSnapshot, node_id: str, record_event: bool = True
+    ) -> bool:
+        """Rebuild a lost continuation marker from a delivered binding.
+
+        An interrupted recovery can leave a legacy quarantine marker while
+        dropping ``retryable_action``.  A current-run delivered developer
+        binding is sufficient proof to continue that same visible task; it is
+        never evidence for creating a successor or a second writer.
+        """
+        current = snapshot.nodes[node_id]
+        if (
+            current.get("status") != "blocked_unknown"
+            or not isinstance(current.get("quarantine"), dict)
+            or current.get("active_task") is not None
+            or current.get("active_role") is not None
+            or current.get("start_intent") is not None
+            or node_id in snapshot.handles
+            or current.get("retryable_action") is not None
+            or current.get("reviewer_started") is True
+        ):
+            return False
+        try:
+            binding = self._load_task_binding(snapshot, node_id, "developer")
+            generation = int(current.get("developer_generation", 0))
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return False
+        if (
+            binding.status != "delivered"
+            or not binding.task_id
+            or binding.task_id != current.get("developer_identity")
+            or generation <= 0
+            or binding.generation <= 0
+            or binding.generation != generation
+        ):
+            return False
+        current["retryable_action"] = {
+            "role": "developer",
+            "phase": "rework",
+            "continuation": True,
+            "pending_schedule": True,
+            "successor_candidate": False,
+        }
+        current["pair_archived"] = True
+        current["quarantine"] = None
+        current["reason"] = "quarantined delivered continuation recovered"
+        if record_event:
+            self._record(
+                snapshot,
+                "quarantine_continuation_recovered",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "role": "developer",
+                    "task_id": binding.task_id,
+                    "generation": generation,
+                },
+            )
+        return True
 
     def _reject_replayed_old_task_reconciliation(
         self, snapshot: RunSnapshot, node_id: str, data: Dict[str, Any]
@@ -736,15 +861,27 @@ class Monitor:
         record = self._require_snapshot_authorization(snapshot)
         active_pairs = sum(
             1
-            for current in snapshot.nodes.values()
-            if not current.get("pair_archived")
+            for node_id, current in snapshot.nodes.items()
+            if current.get("status") not in {"stopped", "failed"}
+            and not current.get("pair_archived")
             and (
                 int(current.get("developer_generation", 0)) > 0
                 or current.get("retryable_action") is not None
+                or isinstance(current.get("active_task"), dict)
+                or node_id in snapshot.handles
             )
         )
         for node_id, node in self.nodes.items():
             current = snapshot.nodes[node_id]
+            was_active_pair = not current.get("pair_archived") and (
+                int(current.get("developer_generation", 0)) > 0
+                or current.get("retryable_action") is not None
+                or isinstance(current.get("active_task"), dict)
+                or node_id in snapshot.handles
+            )
+            if self._recover_quarantined_delivered_developer(snapshot, node_id):
+                if was_active_pair:
+                    active_pairs -= 1
             if recover_missing_reviewer:
                 self._recover_missing_reviewer_successor(snapshot, node_id)
             retry = current.get("retryable_action")
@@ -753,12 +890,53 @@ class Monitor:
                 and isinstance(retry, dict)
                 and node_id not in snapshot.handles
             ):
+                # Older snapshots could retain a successor-candidate marker
+                # even though the developer binding was provider-confirmed
+                # delivered.  That binding is sufficient to continue the
+                # same visible task; normalize the stale marker before the
+                # fail-closed quarantine branch so no successor is created.
+                legacy_developer_marker = (
+                    retry.get("continuation") is True
+                    and retry.get("role") == "developer"
+                )
+                if legacy_developer_marker and (
+                    self._continuation_binding_generation_matches(
+                        snapshot, node_id, "developer"
+                    )
+                    is False
+                ):
+                    current["status"] = "blocked_unknown"
+                    current["reason"] = (
+                        "developer continuation binding generation mismatch"
+                    )
+                    if not isinstance(current.get("quarantine"), dict):
+                        current["quarantine"] = {
+                            "run_id": snapshot.run_id,
+                            "handle_id": snapshot.handles.get(node_id),
+                            "reason": current["reason"],
+                        }
+                    continue
+                resumable_developer = (
+                    legacy_developer_marker
+                    and not self._continuation_requires_successor(
+                        snapshot, node_id, "developer"
+                    )
+                )
+                if resumable_developer:
+                    retry = dict(retry)
+                    retry["successor_candidate"] = False
+                    current["retryable_action"] = retry
+                    if (
+                        isinstance(current.get("quarantine"), dict)
+                        and current.get("active_task") is None
+                    ):
+                        current["quarantine"] = None
                 if (
                     current.get("status") == "blocked_unknown"
                     and isinstance(current.get("quarantine"), dict)
                     and retry.get("successor_candidate") is not True
                     and current.get("active_task") is None
-                    and retry.get("continuation") is not True
+                    and not resumable_developer
                 ):
                     current["retryable_action"] = None
                     current["reason"] = (
@@ -905,16 +1083,14 @@ class Monitor:
             return
 
         try:
-            developer = load_task_binding(
-                self.paths, node_id, "developer", run_id=snapshot.run_id
-            )
+            developer = self._load_task_binding(snapshot, node_id, "developer")
         except (FileNotFoundError, OSError, TypeError, ValueError):
             return
         if not isinstance(developer, TaskBinding):
             return
 
         try:
-            load_task_binding(self.paths, node_id, "reviewer", run_id=snapshot.run_id)
+            self._load_task_binding(snapshot, node_id, "reviewer")
         except FileNotFoundError:
             pass
         except (OSError, TypeError, ValueError):
@@ -1055,7 +1231,7 @@ class Monitor:
             identity = str(binding.task_id)
             current[identity_key] = identity
             contract["task_id"] = identity
-            save_task_binding(self.paths, binding)
+            self._save_task_binding(binding)
         except ProviderPending as error:
             current[generation_key] = generation - 1
             if role == "reviewer" and generation == 1:
@@ -1208,13 +1384,13 @@ class Monitor:
         previous_binding = None
         if continuation:
             try:
-                previous_binding = load_task_binding(
-                    self.paths, node_id, role, run_id=snapshot.run_id
-                )
+                previous_binding = self._load_task_binding(snapshot, node_id, role)
             except FileNotFoundError:
                 previous_binding = None
             if previous_binding is None or previous_binding.task_id != identity:
                 raise ValueError("continuation task identity is stale")
+            if previous_binding.generation != generation - 1:
+                raise ValueError("continuation task generation is stale")
         observed_binding = getattr(runner, "task_binding", None)
         if callable(observed_binding):
             binding = observed_binding(
@@ -1302,9 +1478,7 @@ class Monitor:
     def _set_binding_status(
         self, snapshot: RunSnapshot, node_id: str, role: str, status: str
     ) -> TaskBinding:
-        binding = load_task_binding(
-            self.paths, node_id, role, run_id=snapshot.run_id
-        )
+        binding = self._load_task_binding(snapshot, node_id, role)
         current = snapshot.nodes[node_id]
         generation_key = (
             "review_generation" if role == "reviewer" else "developer_generation"
@@ -1315,7 +1489,7 @@ class Monitor:
         ):
             raise ValueError("task binding identity or generation is stale")
         binding.status = status
-        save_task_binding(self.paths, binding)
+        self._save_task_binding(binding)
         snapshot.tasks["{}:{}".format(node_id, role)] = binding.to_dict()
         return binding
 
@@ -1336,12 +1510,7 @@ class Monitor:
             raise ValueError("event provenance is stale or unregistered")
         if snapshot.handles.get(node_id) != active.get("handle_id"):
             raise ValueError("event handle is not the active run handle")
-        binding = load_task_binding(
-            self.paths,
-            node_id,
-            str(active["role"]),
-            run_id=snapshot.run_id,
-        )
+        binding = self._load_task_binding(snapshot, node_id, str(active["role"]))
         if (
             binding.task_id != active.get("task_id")
             or binding.generation != active.get("generation")
@@ -1420,8 +1589,8 @@ class Monitor:
             reviewer_successor = False
             if current.get("reviewer_started"):
                 try:
-                    reviewer_binding = load_task_binding(
-                        self.paths, node_id, "reviewer", run_id=snapshot.run_id
+                    reviewer_binding = self._load_task_binding(
+                        snapshot, node_id, "reviewer"
                     )
                 except FileNotFoundError:
                     reviewer_successor = True
@@ -1554,9 +1723,7 @@ class Monitor:
                 )
                 return
             try:
-                registered = load_task_binding(
-                    self.paths, node_id, "reviewer", run_id=snapshot.run_id
-                )
+                registered = self._load_task_binding(snapshot, node_id, "reviewer")
             except (FileNotFoundError, OSError, TypeError, ValueError) as error:
                 self._mark_blocked_unknown(
                     snapshot,
@@ -1800,9 +1967,7 @@ class Monitor:
             or provenance.get("handle_id") is not None
         ):
             raise ValueError("start intent provenance is invalid")
-        binding = load_task_binding(
-            self.paths, node_id, role, run_id=snapshot.run_id
-        )
+        binding = self._load_task_binding(snapshot, node_id, role)
         if (
             binding.task_id != identity
             or binding.generation != expected_generation
@@ -1859,12 +2024,7 @@ class Monitor:
             for other_node, other_handle in snapshot.handles.items()
         ):
             raise ValueError("start confirmation duplicates an active handle")
-        binding = load_task_binding(
-            self.paths,
-            node_id,
-            str(expected["role"]),
-            run_id=snapshot.run_id,
-        )
+        binding = self._load_task_binding(snapshot, node_id, str(expected["role"]))
         desired_status = self._running_status(str(expected["role"]), str(data.get("phase")))
         if binding.status not in {"start_pending", desired_status}:
             raise ValueError("start confirmation task binding status is invalid")
@@ -1973,12 +2133,7 @@ class Monitor:
                         "unapplied acceptance reviewer identity or generation is stale"
                     )
                 try:
-                    registered = load_task_binding(
-                        self.paths,
-                        node_id,
-                        "reviewer",
-                        run_id=snapshot.run_id,
-                    )
+                    registered = self._load_task_binding(snapshot, node_id, "reviewer")
                 except (FileNotFoundError, OSError, TypeError, ValueError) as error:
                     raise ValueError(
                         "unapplied acceptance reviewer binding is unavailable"
@@ -2053,6 +2208,23 @@ class Monitor:
                     current["active_role"] = None
                     current["active_task"] = None
                     snapshot.handles.pop(node_id, None)
+            elif record["event"] == "quarantine_continuation_recovered":
+                if provenance["role"] != "system":
+                    raise ValueError(
+                        "quarantine continuation recovery lacks system provenance"
+                    )
+                if (
+                    data.get("role") != "developer"
+                    or data.get("task_id") != current.get("developer_identity")
+                    or data.get("generation") != current.get("developer_generation")
+                ):
+                    raise ValueError("quarantine continuation recovery is stale")
+                if not self._recover_quarantined_delivered_developer(
+                    snapshot, node_id, record_event=False
+                ):
+                    raise ValueError(
+                        "quarantine continuation recovery cannot be verified"
+                    )
             elif record["event"] == "review_finding":
                 # The following transition event/start intent is authoritative.
                 self._registered_active_binding(snapshot, node_id, provenance)
