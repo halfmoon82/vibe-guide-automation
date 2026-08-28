@@ -13,6 +13,9 @@ import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from ..paths import ProjectPaths
+from ..workflow_gate import require_entry, require_child_origin
+from ..diagnostics import validate_persisted_child_binding
+from ..models import WorkerProfile
 
 
 class ProviderUnavailable(RuntimeError):
@@ -147,6 +150,26 @@ class ProviderActionStore:
         request: Dict[str, Any],
         sequence: int = 0,
     ) -> Dict[str, Any]:
+        state = self.paths.vibe / "state.json"
+        if state.is_symlink():
+            raise ProviderUnavailable("session_gate_blocked")
+        if state.is_file():
+            try:
+                origin = request.get("origin", "user_entry") if isinstance(request, dict) else "user_entry"
+                if origin == "worker_dispatch":
+                    require_child_origin(origin)
+                    binding = request.get("child_binding")
+                    validate_persisted_child_binding(
+                        self.paths, binding, run_id, issue_id, role
+                    )
+                elif origin != "user_entry":
+                    raise PermissionError("invalid session origin")
+                else:
+                    require_entry(self.paths, "provider:" + run_id + ":" + operation, operation)
+            except (OSError, ValueError, TypeError, PermissionError) as error:
+                raise ProviderUnavailable("session_gate_blocked") from error
+        elif self.paths.vibe.exists():
+            raise ProviderUnavailable("session_gate_blocked")
         if operation not in _PROVIDER_ACTIONS:
             raise ValueError("provider action is unsupported")
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:

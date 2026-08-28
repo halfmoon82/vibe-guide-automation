@@ -196,3 +196,117 @@ class AgentCapabilities:
         if not isinstance(data, dict):
             raise TypeError("AgentCapabilities data must be a dictionary")
         return cls(**data)
+
+
+@dataclass(frozen=True)
+class WorkerProfile:
+    worker: str
+    model: str
+    reasoning: str
+    fallbacks: List[Dict[str, Any]]
+    selection_basis: Dict[str, Any]
+    worktree: str = ""
+    branch: str = ""
+    allowlist: List[str] = field(default_factory=list)
+    writer: str = ""
+
+    def __post_init__(self):
+        for name in ("worker", "model", "reasoning"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name).strip():
+                raise ValueError("%s must be non-empty" % name)
+        if not isinstance(self.fallbacks, list) or not all(isinstance(x, dict) for x in self.fallbacks):
+            raise ValueError("fallbacks must be a list of dictionaries")
+        if not isinstance(self.selection_basis, dict):
+            raise ValueError("selection_basis must be a dictionary")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "WorkerProfile":
+        if not isinstance(data, dict):
+            raise TypeError("WorkerProfile data must be a dictionary")
+        return cls(**data)
+
+
+@dataclass(frozen=True)
+class IssueComplexity:
+    """Evidence for routing one concrete Issue/Spec to a worker."""
+
+    issue_id: str
+    spec_ref: str
+    steps: int
+    domains: int
+    uncertainty: int
+    failure_cost: int
+    toolchain: int
+    context_demand: str
+    risk_tags: List[str]
+    complexity_band: str
+    evidence_ref: str
+
+    def __post_init__(self):
+        object.__setattr__(self, "issue_id", _identifier(self.issue_id, "issue id"))
+        if not isinstance(self.spec_ref, str) or not self.spec_ref.strip():
+            raise ValueError("spec_ref must be non-empty")
+        for name in ("steps", "domains", "uncertainty", "failure_cost", "toolchain"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 5:
+                raise ValueError("%s must be an integer from 1 to 5" % name)
+        if self.context_demand not in {"small", "medium", "large", "unknown"}:
+            raise ValueError("unsupported context demand")
+        if not isinstance(self.risk_tags, list) or not all(
+            isinstance(tag, str) and tag.strip() for tag in self.risk_tags
+        ):
+            raise ValueError("risk_tags must be a list of non-empty strings")
+        if len(self.risk_tags) != len(set(self.risk_tags)):
+            raise ValueError("risk_tags must be unique")
+        if self.complexity_band not in {"simple", "light_plan", "complex"}:
+            raise ValueError("unsupported complexity band")
+        if not isinstance(self.evidence_ref, str) or not self.evidence_ref.strip():
+            raise ValueError("evidence_ref must be non-empty")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "IssueComplexity":
+        if not isinstance(data, dict):
+            raise TypeError("IssueComplexity data must be a dictionary")
+        return cls(**data)
+
+
+@dataclass(frozen=True)
+class LocalModel:
+    """Observable local model probe; ``None`` means unverifiable."""
+
+    model_id: str
+    capabilities: List[str]
+    context_limit: int
+    reasoning_levels: List[str]
+    available: Optional[bool]
+
+    def __post_init__(self):
+        object.__setattr__(self, "model_id", _identifier(self.model_id, "model id"))
+        if not isinstance(self.capabilities, list) or not all(
+            isinstance(item, str) and item.strip() for item in self.capabilities
+        ):
+            raise ValueError("capabilities must be a list of non-empty strings")
+        if isinstance(self.context_limit, bool) or not isinstance(self.context_limit, int) or self.context_limit <= 0:
+            raise ValueError("context_limit must be positive")
+        if not isinstance(self.reasoning_levels, list) or not all(
+            isinstance(item, str) and item in {"normal", "deep"}
+            for item in self.reasoning_levels
+        ):
+            raise ValueError("reasoning_levels must contain normal or deep")
+        if self.available is not None and not isinstance(self.available, bool):
+            raise ValueError("available must be true, false, or unknown")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "LocalModel":
+        if not isinstance(data, dict):
+            raise TypeError("LocalModel data must be a dictionary")
+        return cls(**data)

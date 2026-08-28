@@ -15,7 +15,7 @@ from .authorization import (
     validate_runtime_contract,
 )
 from .contracts import RunEvent, RunHandle, Runner
-from .models import DAGNode, Plan
+from .models import DAGNode, IssueComplexity, LocalModel, Plan
 from .paths import ProjectPaths
 from .planner import build_runtime_stage_handoff, resolve_consistency
 from .adapters.task_provider import ProviderPending
@@ -32,6 +32,10 @@ from .state import (
     save_snapshot,
 )
 from .task_registry import TaskBinding, load_task_binding, save_task_binding
+from .workflow_gate import require_entry
+from .diagnostics import validate_child_session_binding
+from .models import WorkerProfile
+from .model_router import ModelRouter, WorkerUnavailable
 
 
 class Monitor:
@@ -40,19 +44,133 @@ class Monitor:
         self.plan = plan
         self.nodes = {node.id: node for node in nodes}
 
+    @staticmethod
+    def _default_profile(node: DAGNode) -> Dict[str, Any]:
+        return {
+            "worker": str(node.contract.get("worker", "worker")),
+            "model": "default",
+            "reasoning": "normal",
+            "fallbacks": [],
+            "selection_basis": {
+                "issue_complexity_ref": node.id,
+                "complexity_band": "standard",
+                "risk_tags": [],
+                "availability_evidence": "runtime",
+            },
+            "writer": str(node.contract.get("worker", "writer")),
+            "worktree": str(node.contract.get("worktree", ".worktrees/" + node.id)),
+            "branch": str(node.contract.get("branch", "node/" + node.id)),
+            "allowlist": list(node.contract.get("files", [node.id + ".py"])),
+        }
+
+    @classmethod
+    def _scrub_unverified_profile(cls, node: DAGNode, current: Dict[str, Any]) -> bool:
+        """Keep only a profile produced by a successful, evidence-bound route."""
+        if not cls._is_authoritative_profile_contract(node):
+            return True
+        route_verified = True
+        try:
+            safe_profile = cls._profile_for_node(node)
+        except (WorkerUnavailable, TypeError, ValueError):
+            safe_profile = cls._default_profile(node)
+            route_verified = False
+        current["worker_profile"] = safe_profile
+        current["worktree"] = safe_profile.get(
+            "worktree", node.contract.get("worktree", ".worktrees/" + node.id)
+        )
+        current["branch"] = safe_profile.get(
+            "branch", node.contract.get("branch", "node/" + node.id)
+        )
+        return route_verified
+
+    @staticmethod
+    def _is_authoritative_profile_contract(node: DAGNode) -> bool:
+        """Require evidence routing for visible, provider-bound plan nodes."""
+        contract = node.contract
+        return (
+            isinstance(contract.get("worker_profile"), dict)
+            and contract.get("adapter_id") == "codex"
+            and contract.get("provider") == "codex-app-visible"
+            and contract.get("mode") == "visible"
+        )
+
+    @classmethod
+    def _profile_for_node(
+        cls, node: DAGNode, current: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        # A persisted profile is authoritative during resume/rework.  A new
+        # route is only selected when no profile has yet been bound.
+        if (
+            isinstance(current, dict)
+            and isinstance(current.get("worker_profile"), dict)
+            and not isinstance(node.contract.get("issue_complexity"), dict)
+            and not cls._is_authoritative_profile_contract(node)
+        ):
+            return dict(current["worker_profile"])
+        complexity_data = node.contract.get("issue_complexity")
+        if isinstance(complexity_data, dict):
+            issue = IssueComplexity.from_dict(complexity_data)
+            raw_models = node.contract.get("models", node.contract.get("local_models", []))
+            models = [
+                item if isinstance(item, LocalModel) else LocalModel.from_dict(item)
+                for item in raw_models
+            ]
+            selected = ModelRouter(str(node.contract.get("worker", "developer"))).select(
+                issue,
+                node.contract.get("required_capabilities", []),
+                models,
+            )
+            profile_data = selected.to_dict()
+            profile_data.update(
+                {
+                    "writer": str(node.contract.get("writer", node.contract.get("worker", "writer"))),
+                    "worktree": str(node.contract.get("worktree", ".worktrees/" + node.id)),
+                    "branch": str(node.contract.get("branch", "node/" + node.id)),
+                    "allowlist": list(node.contract.get("files", [node.id + ".py"])),
+                }
+            )
+            return profile_data
+        if cls._is_authoritative_profile_contract(node):
+            raise WorkerUnavailable(
+                "IssueComplexity and verified LocalModel facts are missing for %s" % node.id,
+                "blocked_unknown",
+            )
+        profile_data = node.contract.get("worker_profile")
+        if isinstance(profile_data, dict):
+            return dict(profile_data)
+        return cls._default_profile(node)
+
     def start(
         self, record: Optional[AuthorizationRecord], runner: Runner
     ) -> RunSnapshot:
         self._require_record(record)
+        state = self.paths.vibe / "state.json"
+        if state.is_file():
+            try:
+                require_entry(self.paths, "monitor:" + self.plan.plan_id, "monitor")
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                raise PermissionError("session_gate_blocked") from error
+        elif self.paths.vibe.exists():
+            raise PermissionError("session_gate_blocked: V2 state.json is missing")
         assert record is not None
         run_id = "run-" + uuid.uuid4().hex
         node_state: Dict[str, Dict[str, Any]] = {}
         for node_id, node in self.nodes.items():
+            profile_error = None
+            try:
+                profile_data = self._profile_for_node(node)
+            except (WorkerUnavailable, TypeError, ValueError) as error:
+                profile_data = self._default_profile(node)
+                profile_error = {
+                    "status": getattr(error, "status", "blocked_unknown"),
+                    "reason": str(error),
+                }
             node_state[node_id] = {
-                "status": "delivered" if node.status == "delivered" else "planned",
+                "status": "blocked_unknown" if profile_error else ("delivered" if node.status == "delivered" else "planned"),
                 "worker": node.contract.get("worker"),
-                "worktree": node.contract.get("worktree", ".worktrees/" + node_id),
-                "branch": node.contract.get("branch", "node/" + node_id),
+                "worker_profile": profile_data,
+                "worktree": profile_data.get("worktree", node.contract.get("worktree", ".worktrees/" + node_id)),
+                "branch": profile_data.get("branch", node.contract.get("branch", "node/" + node_id)),
                 "status_file": node.contract.get("status_file", ""),
                 "handoff_file": node.contract.get("handoff_file", ""),
                 "evidence": [],
@@ -75,6 +193,9 @@ class Monitor:
                 "contract_digest": executable_contract_digest([node]),
                 "acceptance": None,
             }
+            if profile_error:
+                node_state[node_id]["reason"] = profile_error["reason"]
+                node_state[node_id]["profile_error"] = profile_error
         snapshot = RunSnapshot(
             run_id=run_id,
             plan_id=self.plan.plan_id,
@@ -98,6 +219,8 @@ class Monitor:
                 "node_ids": sorted(self.nodes),
             },
         )
+        # Persist the parent snapshot before any provider action is requested.
+        # Child dispatch validation must be able to prove this is a real run.
         save_snapshot(self.paths, snapshot)
         self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
@@ -105,17 +228,27 @@ class Monitor:
         return snapshot
 
     def resume(self, run_id: str, runner: Runner) -> RunSnapshot:
+        require_entry(self.paths, "resume:" + str(run_id), "resume")
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
         self._reconcile_unapplied_events(snapshot)
         for node_id, current in snapshot.nodes.items():
-            if current.get("status") == "start_pending":
+            status = current.get("status")
+            if status in {"planned", "start_pending", "running", "review", "rework"}:
+                if not self._scrub_unverified_profile(self.nodes[node_id], current):
+                    self._mark_blocked_unknown(
+                        snapshot,
+                        node_id,
+                        "IssueComplexity or LocalModel route is unverifiable during resume",
+                    )
+                    continue
+            if status == "start_pending":
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
                     "start intent has no provider-confirmed result",
                 )
-            elif current.get("status") in {"running", "review", "rework"}:
+            elif status in {"running", "review", "rework"}:
                 if node_id not in snapshot.handles:
                     self._mark_blocked_unknown(
                         snapshot,
@@ -259,6 +392,8 @@ class Monitor:
         }
         self._record(snapshot, "authorization_reauthorized", transition)
         self._apply_reauthorization_transition(snapshot, transition)
+        # The resumed child must validate the newly authorized parent lineage.
+        save_snapshot(self.paths, snapshot)
         self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
         save_snapshot(self.paths, snapshot)
@@ -472,11 +607,36 @@ class Monitor:
         snapshot.status = "running"
         snapshot.handles.clear()
         for node_id, current in snapshot.nodes.items():
+            node = self.nodes[node_id]
+            profile_error = None
+            try:
+                profile_data = self._profile_for_node(node, current)
+            except (WorkerUnavailable, TypeError, ValueError) as error:
+                profile_data = self._default_profile(node)
+                profile_error = {
+                    "status": getattr(error, "status", "blocked_unknown"),
+                    "reason": str(error),
+                }
+            current["worker"] = node.contract.get("worker")
+            current["worker_profile"] = profile_data
+            current["worktree"] = profile_data.get(
+                "worktree", node.contract.get("worktree", ".worktrees/" + node_id)
+            )
+            current["branch"] = profile_data.get(
+                "branch", node.contract.get("branch", "node/" + node_id)
+            )
             current["contract_digest"] = node_contract_digests[node_id]
             current["active_role"] = None
             current["active_task"] = None
             current["start_intent"] = None
             current["quarantine"] = None
+            if profile_error:
+                current["status"] = "blocked_unknown"
+                current["reason"] = profile_error["reason"]
+                current["profile_error"] = profile_error
+                current["retryable_action"] = None
+                current["acceptance"] = None
+                continue
             if current.get("status") == "accepted":
                 if node_id in retained_acceptances:
                     evidence = retained_acceptances[node_id]
@@ -675,6 +835,26 @@ class Monitor:
                 "consistency_binding": self._consistency_binding(record, node),
             }
         )
+        if (self.paths.vibe / "state.json").is_file():
+            try:
+                v2 = json.loads((self.paths.vibe / "state.json").read_text(encoding="utf-8")).get("workflow_version") == 2
+            except (OSError, ValueError, json.JSONDecodeError):
+                v2 = True
+            if v2:
+                try:
+                    profile_data = self._profile_for_node(node, current)
+                    profile = WorkerProfile(**profile_data)
+                except (WorkerUnavailable, TypeError, ValueError) as error:
+                    # Never retain an unverified preset as if it were a
+                    # routed profile when recovery discovers missing facts.
+                    self._scrub_unverified_profile(node, current)
+                    self._mark_blocked_unknown(snapshot, node_id, str(error))
+                    save_snapshot(self.paths, snapshot)
+                    return False
+                validate_child_session_binding(snapshot.run_id, str(self.plan.version), record.digest, node_id, role, profile)
+                contract["worker_profile"] = profile.to_dict()
+                contract["child_origin"] = "worker_dispatch"
+                contract["child_binding"] = {"parent_run_id": snapshot.run_id, "plan_revision": str(self.plan.version), "authorization_digest": record.digest, "node_contract_digest": current["contract_digest"], "node_id": node_id, "role": role, "writer": profile.writer, "worktree": profile.worktree, "branch": profile.branch, "allowlist": profile.allowlist, "worker_profile": profile.to_dict()}
         try:
             contract = validate_runtime_contract(
                 contract,
@@ -739,7 +919,12 @@ class Monitor:
         self._record(
             snapshot,
             "start_intent",
-            {"run_id": snapshot.run_id, "node_id": node_id, **intent},
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "worker_profile": current.get("worker_profile"),
+                **intent,
+            },
             current["active_task"],
         )
         # The intent and lease are durable before the external side effect.
@@ -789,6 +974,7 @@ class Monitor:
                 "task_id": identity,
                 "generation": generation,
                 "handle_id": handle.run_id,
+                "worker_profile": current.get("worker_profile"),
             },
             current["active_task"],
         )

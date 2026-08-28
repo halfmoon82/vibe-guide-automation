@@ -104,6 +104,7 @@ _EVENT_DATA_KEYS = {
     "status",
     "task_id",
     "worker",
+    "worker_profile",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",
