@@ -262,24 +262,23 @@ class ProviderActionStore:
         role: str,
         operation: Optional[str] = None,
     ) -> bool:
-        """Check for a request without creating an absent mailbox."""
-        if not all(
-            isinstance(value, str) and value
-            for value in (run_id, issue_id, role)
-        ):
+        """Read-only check for a durable provider request in one run scope.
+
+        Recovery uses this to distinguish a missing canonical task from an
+        unresolved provider side effect.  Unlike :meth:`pending`, this probe
+        does not create the mailbox directories while checking an absent
+        request.
+        """
+        if not all(isinstance(value, str) and value for value in (run_id, issue_id, role)):
             raise ValueError("provider request identity is required")
         if operation is not None and (
             not isinstance(operation, str) or operation not in _PROVIDER_ACTIONS
         ):
             raise ValueError("provider request operation is invalid")
-        if self.root.is_symlink() or (
-            self.root.exists() and not self.root.is_dir()
-        ):
+        if self.root.is_symlink() or (self.root.exists() and not self.root.is_dir()):
             raise ValueError("provider action path may not be a symlink")
         request_dir = self.root / "requests"
-        if request_dir.is_symlink() or (
-            request_dir.exists() and not request_dir.is_dir()
-        ):
+        if request_dir.is_symlink() or (request_dir.exists() and not request_dir.is_dir()):
             raise ValueError("provider request directory may not be a symlink")
         if not request_dir.is_dir():
             return False
@@ -367,6 +366,9 @@ class TaskBinding:
     client_thread_id: Optional[str] = None
     visible: bool = False
     limitations: Tuple[str, ...] = field(default_factory=tuple)
+    allowlist: Tuple[str, ...] = field(default_factory=tuple)
+    capability_contract_digest: Optional[str] = None
+    successor_of: Optional[str] = None
 
     @property
     def thread_id(self):
@@ -383,6 +385,9 @@ class TaskBinding:
     def to_dict(self):
         result = self.__dict__.copy()
         result["limitations"] = list(self.limitations)
+        result["allowlist"] = list(self.allowlist)
+        result["capability_contract_digest"] = self.capability_contract_digest
+        result["successor_of"] = self.successor_of
         if self.provider == "codex-app-visible" and self.task_id:
             result["threadId"] = self.task_id
             result["hostId"] = self.host
