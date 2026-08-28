@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import re
+from urllib.parse import urlparse
 
 
 _NODE_STATUSES = frozenset(
@@ -30,6 +31,7 @@ EVIDENCE_PRIORITY = (
     "implementation",
 )
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_SHA = re.compile(r"^[0-9a-fA-F]{40,64}$")
 
 
 def _identifier(value: Any, field: str) -> str:
@@ -168,3 +170,210 @@ class AgentCapabilities:
         if not isinstance(data, dict):
             raise TypeError("AgentCapabilities data must be a dictionary")
         return cls(**data)
+
+
+@dataclass
+class PRD:
+    title: str
+    objective: str
+    revision: int = 1
+    status: str = "draft"
+
+    def __post_init__(self):
+        if not isinstance(self.title, str) or not self.title.strip():
+            raise ValueError("PRD title must be non-empty")
+        if not isinstance(self.objective, str) or not self.objective.strip():
+            raise ValueError("PRD objective must be non-empty")
+        if isinstance(self.revision, bool) or not isinstance(self.revision, int) or self.revision < 1:
+            raise ValueError("PRD revision must be a positive integer")
+        if self.status not in {"draft", "approved", "blocked_design", "blocked_decision", "review_required", "blocked_unknown"}:
+            raise ValueError("unsupported PRD status")
+
+    @property
+    def continue_planning(self) -> bool:
+        return self.status == "approved"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PRD":
+        if not isinstance(data, dict):
+            raise TypeError("PRD data must be a dictionary")
+        return cls(**data)
+
+
+@dataclass
+class PRDCheckpoint:
+    kind: str
+    fields: Dict[str, Any]
+    evidence: List[Any]
+    status: str
+
+    def __post_init__(self):
+        if self.kind not in {"framing", "solution", "solution_tradeoffs", "flow", "flow_rules", "acceptance", "acceptance_handoff", "decision_pending", "open_question"}:
+            raise ValueError("unsupported PRD checkpoint kind")
+        if not isinstance(self.fields, dict):
+            raise TypeError("PRD checkpoint fields must be a dictionary")
+        if not isinstance(self.evidence, list):
+            raise TypeError("PRD checkpoint evidence must be a list")
+        if self.status not in {"approved", "ready", "blocked_design", "review_required", "blocked_unknown"}:
+            raise ValueError("unsupported PRD checkpoint status")
+        self.fields = _json_safe(self.fields)
+        self.evidence = _json_safe(self.evidence)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PRDCheckpoint":
+        if not isinstance(data, dict):
+            raise TypeError("PRDCheckpoint data must be a dictionary")
+        return cls(**data)
+
+
+@dataclass
+class SkillProfile:
+    name: str
+    source_url: str
+    commit_sha: str
+    license: str
+    selected_paths: List[str]
+    status: str = "candidate"
+    installed_at: str = ""
+    verification_status: str = "unverified"
+    install_time: Optional[str] = None
+
+    def __post_init__(self):
+        self.name = _identifier(self.name, "Skill profile name")
+        if not isinstance(self.source_url, str):
+            raise TypeError("Skill profile source_url must be a string")
+        if not isinstance(self.commit_sha, str):
+            raise TypeError("Skill profile commit_sha must be a string")
+        if not isinstance(self.license, str):
+            raise TypeError("Skill profile license must be a string")
+        if not isinstance(self.selected_paths, list):
+            raise TypeError("Skill profile selected_paths must be a list")
+        if self.status not in {"candidate", "selected", "skipped", "later", "deferred", "needs_recheck"}:
+            raise ValueError("unsupported Skill profile status")
+        for value, field_name in ((self.installed_at, "installed_at"), (self.verification_status, "verification_status")):
+            if not isinstance(value, str):
+                raise TypeError("Skill profile %s must be a string" % field_name)
+        if self.install_time is not None and not isinstance(self.install_time, str):
+            raise TypeError("Skill profile install_time must be a string or None")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SkillProfile":
+        if not isinstance(data, dict):
+            raise TypeError("SkillProfile data must be a dictionary")
+        return cls(**data)
+
+
+@dataclass
+class StageHandoff:
+    from_stage: str
+    from_status: str
+    to_stage: str
+    readiness: str
+    evidence_refs: List[str]
+    open_questions: List[str]
+    required_user_action: str
+    prompt: str
+    forbidden_automatic_actions: List[str] = field(default_factory=lambda: [
+        "create_spec", "create_issue", "create_dag", "create_worker", "authorize", "deploy"
+    ])
+    prd_revision: Optional[int] = None
+
+    @property
+    def authorizes(self) -> bool:
+        return False
+
+    @property
+    def creates_worker(self) -> bool:
+        return False
+
+    def __post_init__(self):
+        if self.from_stage not in {"prd", "monitor", "acceptance", "change_request", "deploy"}:
+            raise ValueError("unsupported StageHandoff source stage")
+        if self.from_status not in {
+            "approved",
+            "review_required",
+            "blocked_design",
+            "blocked_unknown",
+            "auto_corrected",
+            "retry_pending",
+            "running",
+            "rework",
+            "delivered",
+            "review",
+            "accepted",
+        }:
+            raise ValueError("unsupported StageHandoff source status")
+        if self.to_stage not in {"spec_issue_dag", "development_plan", "authorization", "monitor", "acceptance", "change_request", "deploy"}:
+            raise ValueError("unsupported StageHandoff target stage")
+        if self.readiness not in {"ready", "blocked_design", "blocked_dag", "blocked_unknown", "awaiting_user"}:
+            raise ValueError("unsupported StageHandoff readiness")
+        if self.required_user_action not in {"continue_planning", "answer_question", "confirm_plan", "authorize", "confirm_authorization_card", "none"}:
+            raise ValueError("unsupported StageHandoff user action")
+        if not isinstance(self.evidence_refs, list) or not all(isinstance(item, str) for item in self.evidence_refs):
+            raise TypeError("evidence_refs must be a list of strings")
+        if not isinstance(self.open_questions, list) or not all(isinstance(item, str) for item in self.open_questions):
+            raise TypeError("open_questions must be a list of strings")
+        if not isinstance(self.forbidden_automatic_actions, list) or not all(isinstance(item, str) for item in self.forbidden_automatic_actions):
+            raise TypeError("forbidden_automatic_actions must be a list of strings")
+        if not isinstance(self.prompt, str) or not self.prompt.strip():
+            raise ValueError("StageHandoff prompt must be non-empty")
+        if self.prd_revision is not None and (
+            isinstance(self.prd_revision, bool)
+            or not isinstance(self.prd_revision, int)
+            or self.prd_revision < 1
+        ):
+            raise ValueError("StageHandoff PRD revision must be a positive integer")
+        if "create_worker" not in self.forbidden_automatic_actions or "authorize" not in self.forbidden_automatic_actions:
+            raise ValueError("StageHandoff must forbid worker creation and authorization")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "StageHandoff":
+        if not isinstance(data, dict):
+            raise TypeError("StageHandoff data must be a dictionary")
+        return cls(**data)
+
+    @classmethod
+    def for_blocked_prd(
+        cls, evidence_refs: List[str], question: str, prd_revision: Optional[int] = None
+    ) -> "StageHandoff":
+        return cls(
+            from_stage="prd",
+            from_status="blocked_design",
+            to_stage="spec_issue_dag",
+            readiness="blocked_design",
+            evidence_refs=list(evidence_refs),
+            open_questions=[question],
+            required_user_action="answer_question",
+            prompt=question,
+            prd_revision=prd_revision,
+        )
+
+    def render(self) -> str:
+        questions = "；".join(self.open_questions) if self.open_questions else "无"
+        return (
+            "阶段衔接：{} (revision={}) ({}) → {}\n状态：{}\n证据：{}\n开放问题：{}\n"
+            "用户下一步：{}\n提示：{}\n禁止自动动作：{}\n不会自动创建 Spec/Issue/DAG、授权卡或 Worker。"
+        ).format(
+            self.from_stage,
+            self.prd_revision if self.prd_revision is not None else "unknown",
+            self.from_status,
+            self.to_stage,
+            self.readiness,
+            ", ".join(self.evidence_refs) or "无",
+            questions,
+            self.required_user_action,
+            self.prompt,
+            ", ".join(self.forbidden_automatic_actions),
+        )

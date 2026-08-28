@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from vibe_guide.authorization import authorize, build_authorization_card
+from vibe_guide.adapters.task_provider import ProviderPending
 from vibe_guide.contracts import RunEvent, RunHandle
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan
 from vibe_guide.monitor import Monitor
@@ -32,6 +33,32 @@ class PollResponseLostRunner(FakeRunner):
         raise ConnectionError("poll response lost")
 
 
+class PollFailsOnceRunner(FakeRunner):
+    def __init__(self):
+        super().__init__()
+        self.failed_handles = set()
+
+    def poll(self, handle: RunHandle):
+        if handle.run_id not in self.failed_handles:
+            self.failed_handles.add(handle.run_id)
+            raise ConnectionError("poll response lost once")
+        return []
+
+
+class ReviewerPollRecoversRunner(FakeRunner):
+    def __init__(self):
+        super().__init__()
+        self.failed_handles = set()
+
+    def poll(self, handle: RunHandle):
+        node_id = self._nodes_by_handle.get(handle.run_id)
+        role = self._roles_by_handle.get(handle.run_id, "developer")
+        if role == "reviewer" and handle.run_id not in self.failed_handles:
+            self.failed_handles.add(handle.run_id)
+            raise ConnectionError("reviewer poll response lost once")
+        return super().poll(handle)
+
+
 class DuplicateHandleRunner(FakeRunner):
     def start(self, contract, worktree):
         super().start(contract, worktree)
@@ -52,6 +79,29 @@ class SecretStartResponseLostRunner(FakeRunner):
 class SecretPollResponseLostRunner(FakeRunner):
     def poll(self, handle: RunHandle):
         raise ConnectionError("POLL_EXCEPTION_SECRET_SENTINEL")
+
+
+class PendingBindingRunner(FakeRunner):
+    def __init__(self):
+        super().__init__()
+        self.binding_attempts = 0
+
+    def task_binding(self, contract, worktree, run_id, status):
+        self.binding_attempts += 1
+        if self.binding_attempts == 1:
+            raise ProviderPending("provider result pending")
+        return TaskBinding(
+            provider="runner",
+            mode="background",
+            issue_id=contract["node_id"],
+            role=contract["role"],
+            task_id=contract["task_id"],
+            worktree=str(worktree),
+            branch=contract.get("branch", "node/n1"),
+            run_id=run_id,
+            status=status,
+            generation=contract["generation"],
+        )
 
 
 class ObservedContinuationRunner(FakeRunner):
@@ -109,6 +159,92 @@ class MonitorTests(unittest.TestCase):
             active_pair_limit=active_pair_limit,
         )
         return Monitor(self.paths, plan, nodes), authorize(card, "AUTHORIZE")
+
+    def test_provider_pending_is_retryable_and_emits_runtime_handoff(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        runner = PendingBindingRunner()
+
+        first = monitor.start(record, runner)
+
+        self.assertEqual(first.nodes["n1"]["status"], "blocked_unknown")
+        self.assertTrue(first.nodes["n1"]["retry_pending"])
+        self.assertEqual(first.nodes["n1"]["stage_handoff"]["from_status"], "retry_pending")
+        self.assertEqual(first.nodes["n1"]["stage_handoff"]["required_user_action"], "none")
+        self.assertEqual(len(runner.start_calls), 0)
+
+        second = monitor.tick(first.run_id, runner)
+
+        self.assertEqual(second.nodes["n1"]["status"], "running")
+        self.assertFalse(second.nodes["n1"].get("retry_pending", False))
+        self.assertEqual(len(runner.start_calls), 1)
+        self.assertEqual(second.nodes["n1"]["stage_handoff"]["from_status"], "running")
+        handoff_events = [
+            event for event in load_events(self.paths, first.run_id)
+            if event["event"] == "stage_handoff"
+        ]
+        self.assertEqual(
+            [event["data"]["status"]["from_status"] for event in handoff_events],
+            ["retry_pending", "running"],
+        )
+
+    def test_completion_refreshes_readable_stage_handoff(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+                ("n1", "reviewer"): [("accepted", {"evidence": "P0-P2 clear"})],
+            }
+        )
+
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+        self.assertEqual(snapshot.nodes["n1"]["stage_handoff"]["from_status"], "accepted")
+        self.assertEqual(snapshot.nodes["n1"]["stage_handoff"]["to_stage"], "monitor")
+        evidence_ref = snapshot.nodes["n1"]["stage_handoff"]["evidence_refs"][0]
+        self.assertRegex(evidence_ref, r"^run:run-[^:]+:event:[0-9]+$")
+        self.assertTrue(
+            any(
+                event["event"] == "stage_handoff"
+                and event["data"]["status"]["from_status"] == "accepted"
+                for event in load_events(self.paths, snapshot.run_id)
+            )
+        )
+
+    def test_active_retry_handle_consumes_pair_capacity(self):
+        monitor, record = self.authorized_monitor(
+            [node("n1"), node("n2")], active_pair_limit=1
+        )
+        runner = PollFailsOnceRunner()
+
+        snapshot = monitor.start(record, runner)
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1"])
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertTrue(snapshot.nodes["n1"]["retry_pending"])
+        self.assertIn("n1", snapshot.handles)
+        self.assertEqual(snapshot.nodes["n2"]["status"], "planned")
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1"])
+
+    def test_reviewer_poll_recovery_to_acceptance_clears_retry_pending(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        runner = ReviewerPollRecoversRunner()
+        runner.events[("n1", "developer")] = [("complete", {"evidence": "delivery"})]
+        runner.events[("n1", "reviewer")] = [("accepted", {"evidence": "P0-P2 clear"})]
+
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertTrue(snapshot.nodes["n1"]["retry_pending"])
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+        self.assertFalse(snapshot.nodes["n1"]["retry_pending"])
+        self.assertEqual(snapshot.nodes["n1"]["stage_handoff"]["from_status"], "accepted")
 
     def test_starts_independent_nodes_together_and_waits_for_hard_dependency(self):
         nodes = [node("n1"), node("n2"), node("n3", ["n1"])]
@@ -346,6 +482,8 @@ class MonitorTests(unittest.TestCase):
         snapshot = monitor.tick(snapshot.run_id, runner)
 
         self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+        self.assertEqual(snapshot.nodes["n1"]["stage_handoff"]["from_status"], "auto_corrected")
+        self.assertEqual(snapshot.nodes["n1"]["stage_handoff"]["required_user_action"], "none")
         self.assertEqual(
             snapshot.nodes["n1"]["contract_overrides"],
             {"naming": "approved-name"},

@@ -22,21 +22,26 @@ from .adapters.task_provider import ProviderActionStore
 from .dag import render_plan_artifacts, validate_dag
 from .doctor import doctor
 from .initializer import init_project
-from .models import AgentCapabilities, DAGNode, Plan
+from .models import AgentCapabilities, DAGNode, Plan, PRDCheckpoint, SkillProfile
 from .monitor import Monitor
 from .paths import ProjectPaths
 from .planner import (
     DecisionCard,
     PRD,
+    ProductQuestion,
     TaskContext,
     approve_prd,
+    build_stage_handoff,
+    evaluate_prd_checkpoints,
     classify_s0,
+    render_stage_handoff,
     route_task,
     score_s1,
 )
 from .scanner import scan_project
 from .state import load_snapshot
 from .runners.provider_action import ProviderActionRunner
+from .prd_profiles import validate_skill_profile
 
 
 SUCCESS = 0
@@ -299,6 +304,80 @@ def _publish_plan(
     return plan, nodes, card
 
 
+def _prd_preview(source: Dict[str, Any]) -> Tuple[List[PRDCheckpoint], List[SkillProfile]]:
+    """Read optional V2-1 PRD/profile input without creating downstream artifacts."""
+
+    rationale = source.get("rationale")
+    if rationale is None:
+        rationale = source.get("prd_context")
+    if rationale is None:
+        rationale = {} if "product_question" in source else None
+    if rationale is not None and not isinstance(rationale, dict):
+        raise ValueError("PRD rationale must be an object")
+    rationale = dict(rationale) if rationale is not None else None
+    question = source.get("product_question")
+    if question is not None:
+        if not isinstance(question, dict):
+            raise ValueError("product_question must be an object")
+        if rationale is None:
+            rationale = {}
+        rationale["product_question"] = ProductQuestion(
+            question=str(question.get("question", "")),
+            options=list(question.get("options", [])),
+            impact=str(question.get("impact", "")),
+            recommendation=question.get("recommendation"),
+        )
+    if rationale is None:
+        checkpoints = []
+    else:
+        context = TaskContext(
+            int(source.get("steps", 0)),
+            int(source.get("domains", 0)),
+            int(source.get("uncertainty", 0)),
+            int(source.get("failure_cost", 0)),
+            int(source.get("toolchain", 0)),
+            rationale=rationale,
+        )
+        checkpoints = evaluate_prd_checkpoints(context)
+    profiles = []
+    for item in source.get("skill_profiles", []):
+        profiles.append(validate_skill_profile(SkillProfile.from_dict(item)))
+    return checkpoints, profiles
+
+
+def _prd_handoff(
+    source: Dict[str, Any], plan_id: str, checkpoints: List[PRDCheckpoint]
+):
+    """Create a readable PRD-to-planning handoff without authorizing work."""
+
+    revision = source.get("prd_revision", 1)
+    prd = PRD(
+        str(source.get("title", "PRD")).strip() or "PRD",
+        str(source.get("objective", "待补充目标")).strip() or "待补充目标",
+        revision=int(revision),
+        status=(
+            "blocked_design"
+            if any(item.status == "blocked_design" for item in checkpoints)
+            else "review_required"
+            if any(item.status == "review_required" for item in checkpoints)
+            else "approved"
+        ),
+    )
+    questions = []
+    for item in checkpoints:
+        question = item.fields.get("question")
+        if isinstance(question, str) and question.strip():
+            questions.append(question)
+    handoff = build_stage_handoff(
+        prd,
+        questions,
+        ["prd:{}@{}".format(plan_id, prd.revision)],
+    )
+    payload = handoff.to_dict()
+    payload.update({"authorizes": handoff.authorizes, "creates_worker": handoff.creates_worker})
+    return payload, render_stage_handoff(handoff)
+
+
 def _load_plan(paths: ProjectPaths, plan_id: str):
     directory = _plan_root(paths, plan_id)
     plan = Plan.from_dict(_read_json(directory / "plan.json"))
@@ -493,6 +572,34 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     "complex planning requires a plan id and explicit node spec"
                 )
             source_path = paths.resolve_relative(args.node_spec)
+            source_preview = _read_json(source_path)
+            if isinstance(source_preview, dict):
+                checkpoints, profiles = _prd_preview(source_preview)
+                blocked_checkpoints = [item for item in checkpoints if item.status == "blocked_design"]
+                review_checkpoints = [item for item in checkpoints if item.status == "review_required"]
+                if blocked_checkpoints or review_checkpoints:
+                    checkpoint = blocked_checkpoints[0] if blocked_checkpoints else review_checkpoints[0]
+                    handoff, handoff_text = _prd_handoff(source_preview, args.plan_id, checkpoints)
+                    status = "blocked_design" if blocked_checkpoints else "review_required"
+                    question = checkpoint.fields.get("question") if blocked_checkpoints else None
+                    action = "answer_question" if blocked_checkpoints else "confirm_plan"
+                    payload = {
+                        "command": "plan",
+                        "status": status,
+                        "question": question,
+                        "checkpoints": [item.to_dict() for item in checkpoints],
+                        "profiles": [item.to_dict() for item in profiles],
+                        "downstream_artifact": None,
+                        "required_user_action": action,
+                        "handoff": handoff,
+                        "handoff_text": handoff_text,
+                    }
+                    return _result(
+                        BLOCKED,
+                        payload,
+                        "规划已暂停：" + (str(question) if question else "请确认 PRD 检查点"),
+                        args.as_json,
+                    )
             plan, nodes, card = _publish_plan(paths, args.plan_id, source_path)
         except PermissionError as error:
             return _result(
@@ -513,9 +620,15 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             "status": "ok",
             "route": "complex",
             "plan": plan.to_dict(),
+            "continue_planning": True,
             "nodes": [node.id for node in nodes],
             "authorization_digest": card.digest,
         }
+        if isinstance(source_preview, dict):
+            checkpoints, _profiles = _prd_preview(source_preview)
+            handoff, handoff_text = _prd_handoff(source_preview, args.plan_id, checkpoints)
+            payload["handoff"] = handoff
+            payload["handoff_text"] = handoff_text
         return _result(
             SUCCESS, payload, "复杂计划产物已生成，等待一次授权", args.as_json
         )

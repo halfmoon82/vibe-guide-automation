@@ -17,7 +17,7 @@ from .authorization import (
 from .contracts import RunEvent, RunHandle, Runner
 from .models import DAGNode, Plan
 from .paths import ProjectPaths
-from .planner import resolve_consistency
+from .planner import build_runtime_stage_handoff, resolve_consistency
 from .adapters.task_provider import ProviderPending
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
@@ -68,6 +68,8 @@ class Monitor:
                 "pair_archived": False,
                 "old_task_reconciled": False,
                 "retryable_action": None,
+                "retry_pending": False,
+                "stage_handoff": None,
                 "contract_overrides": {},
                 "corrections": [],
                 "contract_digest": executable_contract_digest([node]),
@@ -271,7 +273,7 @@ class Monitor:
             try:
                 events = runner.poll(RunHandle(handle_id))
             except Exception as error:
-                self._mark_blocked_unknown(
+                self._mark_retry_pending(
                     snapshot,
                     node_id,
                     "runner poll failed ({})".format(type(error).__name__),
@@ -531,11 +533,22 @@ class Monitor:
         record = self._require_snapshot_authorization(snapshot)
         active_pairs = sum(
             1
-            for current in snapshot.nodes.values()
+            for node_id, current in snapshot.nodes.items()
             if not current.get("pair_archived")
             and (
-                int(current.get("developer_generation", 0)) > 0
-                or current.get("retryable_action") is not None
+                (
+                    current.get("retry_pending", False)
+                    and isinstance(current.get("active_task"), dict)
+                    and snapshot.handles.get(node_id)
+                    == current.get("active_task", {}).get("handle_id")
+                )
+                or (
+                    not current.get("retry_pending", False)
+                    and (
+                        int(current.get("developer_generation", 0)) > 0
+                        or current.get("retryable_action") is not None
+                    )
+                )
             )
         )
         for node_id, node in self.nodes.items():
@@ -691,10 +704,9 @@ class Monitor:
                 "role": role,
                 "phase": phase,
                 "continuation": continuation,
+                "pending_schedule": True,
             }
-            self._mark_blocked_unknown(
-                snapshot, node_id, "provider action pending"
-            )
+            self._mark_retry_pending(snapshot, node_id, "provider action pending")
             current["reason"] = str(error)
             return False
         except (OSError, TypeError, ValueError) as error:
@@ -759,7 +771,9 @@ class Monitor:
             save_snapshot(self.paths, snapshot)
             return False
 
+        recovered = bool(current.get("retry_pending"))
         current["status"] = self._running_status(role, phase)
+        current["retry_pending"] = False
         current["active_task"]["handle_id"] = handle.run_id
         current["start_intent"] = None
         current["quarantine"] = None
@@ -792,6 +806,14 @@ class Monitor:
             )
             save_snapshot(self.paths, snapshot)
             return False
+        if recovered:
+            self._set_stage_handoff(
+                snapshot,
+                node_id,
+                self._running_status(role, phase),
+                "Provider 结果已恢复，继续当前任务",
+                evidence_ref="recovered",
+            )
         save_snapshot(self.paths, snapshot)
         pending = getattr(runner, "is_pending", None)
         if callable(pending) and pending(handle):
@@ -954,6 +976,7 @@ class Monitor:
 
         if event.event in {"delivered", "complete"}:
             self._record_runner_event(snapshot, node_id, event, active)
+            current["retry_pending"] = False
             if role != "developer":
                 try:
                     self._set_binding_status(snapshot, node_id, role, "review")
@@ -967,6 +990,13 @@ class Monitor:
                     )
                     return
                 current["status"] = "review"
+                self._set_stage_handoff(
+                    snapshot,
+                    node_id,
+                    "review",
+                    "Reviewer 已完成本轮审查，等待验收结论",
+                    evidence_ref="review",
+                )
                 return
             try:
                 self._set_binding_status(snapshot, node_id, role, "delivered")
@@ -980,6 +1010,13 @@ class Monitor:
                 )
                 return
             current["status"] = "delivered"
+            self._set_stage_handoff(
+                snapshot,
+                node_id,
+                "delivered",
+                "Developer 已完成技术交付，进入独立审查",
+                evidence_ref="delivered",
+            )
             current["active_role"] = None
             current["active_task"] = None
             snapshot.handles.pop(node_id, None)
@@ -1045,6 +1082,13 @@ class Monitor:
                             **correction,
                         },
                     )
+                    self._set_stage_handoff(
+                        snapshot,
+                        node_id,
+                        "auto_corrected",
+                        "唯一可验证的合同不一致已纠偏，继续同一任务",
+                        evidence_ref="consistency_corrected",
+                    )
                     self._start_task(
                         snapshot, node_id, "developer", "rework", runner, True
                     )
@@ -1076,6 +1120,16 @@ class Monitor:
                         "reason": current["reason"],
                         "old_task_reconciled": True,
                     },
+                )
+                self._set_stage_handoff(
+                    snapshot,
+                    node_id,
+                    "blocked_design",
+                    "发现会改变产品结果的冲突，请确认产品选择",
+                    evidence_ref="blocked_design",
+                    readiness="blocked_design",
+                    required_user_action="answer_question",
+                    open_questions=[current["reason"]],
                 )
                 return
             current["active_role"] = None
@@ -1118,6 +1172,7 @@ class Monitor:
                 },
             )
             self._record_runner_event(snapshot, node_id, acceptance_event, active)
+            current["retry_pending"] = False
             try:
                 self._set_binding_status(snapshot, node_id, role, "accepted")
             except (FileNotFoundError, OSError, TypeError, ValueError) as error:
@@ -1146,6 +1201,13 @@ class Monitor:
                 )
                 return
             current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
+            self._set_stage_handoff(
+                snapshot,
+                node_id,
+                "accepted",
+                "Reviewer 已验收通过，节点完成",
+                evidence_ref="accepted",
+            )
             self._archive_pair(snapshot, node_id)
             self._release_node_lease(snapshot, node_id)
         elif event.event in {"unknown", "timeout", "state_unknown", "visibility_unknown"}:
@@ -1279,6 +1341,77 @@ class Monitor:
             "blocked_unknown",
             {"run_id": snapshot.run_id, "node_id": node_id, "reason": reason},
             active if isinstance(active, dict) else None,
+        )
+        self._set_stage_handoff(
+            snapshot,
+            node_id,
+            "blocked_unknown",
+            "当前状态无法安全核验，请补充证据后再继续",
+            evidence_ref="blocked_unknown",
+            readiness="blocked_unknown",
+            required_user_action="answer_question",
+            open_questions=["请提供可验证的运行状态或授权证据"],
+        )
+
+    def _mark_retry_pending(
+        self, snapshot: RunSnapshot, node_id: str, reason: str
+    ) -> None:
+        """Keep transient provider uncertainty retryable without a second writer."""
+        current = snapshot.nodes[node_id]
+        current["status"] = "blocked_unknown"
+        current["retry_pending"] = True
+        current["reason"] = redact_provider_text(reason)
+        current["quarantine"] = {
+            "run_id": snapshot.run_id,
+            "handle_id": snapshot.handles.get(node_id),
+            "reason": current["reason"],
+        }
+        active = current.get("active_task")
+        if isinstance(active, dict) and active.get("role") in {"developer", "reviewer"}:
+            try:
+                self._set_binding_status(snapshot, node_id, str(active["role"]), "blocked_unknown")
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                pass
+        self._record(
+            snapshot,
+            "retry_pending",
+            {"run_id": snapshot.run_id, "node_id": node_id, "reason": current["reason"]},
+            active if isinstance(active, dict) else None,
+        )
+        self._set_stage_handoff(
+            snapshot,
+            node_id,
+            "retry_pending",
+            "Provider 结果暂未确认，将继续轮询/重试原任务",
+            evidence_ref="retry_pending",
+        )
+
+    def _set_stage_handoff(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        status: str,
+        prompt: str,
+        *,
+        evidence_ref: str,
+        readiness: str = "ready",
+        required_user_action: str = "none",
+        open_questions: Optional[List[str]] = None,
+    ) -> None:
+        handoff = build_runtime_stage_handoff(
+            status,
+            ["run:{}:event:{}".format(snapshot.run_id, snapshot.event_sequence)],
+            prompt,
+            readiness=readiness,
+            required_user_action=required_user_action,
+            open_questions=open_questions,
+            prd_revision=self.plan.version,
+        )
+        snapshot.nodes[node_id]["stage_handoff"] = handoff.to_dict()
+        self._record(
+            snapshot,
+            "stage_handoff",
+            {"run_id": snapshot.run_id, "node_id": node_id, "status": handoff.to_dict()},
         )
 
     def _record(
@@ -1484,6 +1617,7 @@ class Monitor:
                 self._set_binding_status(
                     snapshot, node_id, "reviewer", "accepted"
                 )
+                current["retry_pending"] = False
                 current["status"] = "accepted"
                 contract_digest = data.get("contract_digest")
                 authorization_epoch = data.get("authorization_epoch")
@@ -1535,6 +1669,7 @@ class Monitor:
                 self._release_node_lease(snapshot, node_id)
             elif record["event"] in {"delivered", "complete"}:
                 self._registered_active_binding(snapshot, node_id, provenance)
+                current["retry_pending"] = False
                 if provenance["role"] != "developer":
                     current["status"] = "blocked_unknown"
                     current["reason"] = "unapplied reviewer delivery needs reconciliation"
@@ -1568,6 +1703,18 @@ class Monitor:
                     "phase": "rework",
                     "continuation": True,
                 }
+            elif record["event"] == "retry_pending":
+                current["status"] = "blocked_unknown"
+                current["retry_pending"] = True
+                current["reason"] = data.get("reason", "provider action pending")
+                current.setdefault(
+                    "retryable_action",
+                    {"role": "developer", "phase": "develop", "continuation": False, "pending_schedule": True},
+                )
+            elif record["event"] == "stage_handoff":
+                handoff = data.get("status")
+                if isinstance(handoff, dict):
+                    current["stage_handoff"] = handoff
             elif record["event"] == "blocked_design":
                 current["status"] = "blocked_design"
                 current["reason"] = data.get("reason", "design decision required")
