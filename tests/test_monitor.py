@@ -8,7 +8,8 @@ from unittest.mock import patch
 
 from vibe_guide.authorization import authorize, build_authorization_card
 from vibe_guide.contracts import RunEvent, RunHandle
-from vibe_guide.models import AgentCapabilities, DAGNode, Plan
+from vibe_guide.models import AgentCapabilities, DAGNode, IssueComplexity, LocalModel, Plan, WorkerProfile
+from vibe_guide.model_router import WorkerUnavailable
 from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
@@ -17,6 +18,7 @@ from vibe_guide.state import (
     append_event,
     load_events,
     load_snapshot,
+    save_snapshot,
 )
 from vibe_guide.task_registry import TaskBinding, load_task_binding, save_task_binding
 
@@ -86,6 +88,7 @@ def node(node_id, depends_on=None, worker=None):
             "files": [node_id + ".py"],
             "worker": worker or "worker-" + node_id,
             "worktree": ".worktrees/" + node_id,
+            "worker_profile": {"worker": "codex", "model": "test", "reasoning": "normal", "fallbacks": [], "selection_basis": {"issue_complexity_ref": node_id, "complexity_band": "standard", "risk_tags": [], "availability_evidence": "test"}, "writer": "writer", "worktree": ".worktrees/" + node_id, "branch": "branch-" + node_id, "allowlist": [node_id + ".py"]},
         },
         "ready",
     )
@@ -95,6 +98,8 @@ class MonitorTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.paths = ProjectPaths(Path(self.temporary.name))
+        (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (self.paths.vibe / "state.json").write_text('{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8")
         self.capabilities = AgentCapabilities("fake", True, True, True, True, True, "full")
 
     def tearDown(self):
@@ -1743,6 +1748,384 @@ class MonitorTests(unittest.TestCase):
         self.assertFalse(
             acquire_writer_lease(self.paths, "n1", ".worktrees/n1", "run-second")
         )
+
+    def test_dispatch_routes_from_issue_complexity_and_persists_profile(self):
+        target = node("n1")
+        target.contract.pop("worker_profile")
+        target.contract.update(
+            {
+                "issue_complexity": IssueComplexity(
+                    "n1", "spec:n1", 4, 2, 3, 4, 2, "large", ["security"], "complex", "evidence:n1"
+                ).to_dict(),
+                "required_capabilities": ["shell", "security"],
+                "models": [
+                    LocalModel("fast", ["shell"], 16000, ["normal"], True).to_dict(),
+                    LocalModel("secure", ["shell", "security"], 64000, ["normal", "deep"], True).to_dict(),
+                ],
+            }
+        )
+        monitor, record = self.authorized_monitor([target])
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        profile = snapshot.nodes["n1"]["worker_profile"]
+        self.assertEqual(profile["model"], "secure")
+        self.assertEqual(profile["reasoning"], "deep")
+        self.assertEqual(profile["selection_basis"]["issue_complexity_ref"], "n1")
+        self.assertEqual(runner.start_calls[0]["child_binding"]["worker_profile"], profile)
+
+    def test_authoritative_worker_profile_cannot_bypass_issue_complexity_route(self):
+        target = node("n1")
+        target.contract.update(
+            {
+                "issue_complexity": IssueComplexity(
+                    "n1", "spec:n1", 3, 2, 2, 2, 2, "medium", ["cross_module"], "light_plan", "evidence:n1"
+                ).to_dict(),
+                "required_capabilities": ["shell"],
+                "models": [
+                    LocalModel("fast", ["shell"], 16000, ["normal", "deep"], True).to_dict(),
+                    LocalModel("deep", ["shell"], 64000, ["normal", "deep"], True).to_dict(),
+                ],
+            }
+        )
+        monitor, record = self.authorized_monitor([target])
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        profile = snapshot.nodes["n1"]["worker_profile"]
+        self.assertEqual(profile["model"], "deep")
+        self.assertEqual(profile["reasoning"], "deep")
+        self.assertEqual(profile["selection_basis"]["complexity_band"], "light_plan")
+        self.assertEqual(profile["selection_basis"]["context_demand"], "medium")
+        self.assertEqual(profile["selection_basis"]["steps"], 3)
+        self.assertEqual(runner.start_calls[0]["worker_profile"], profile)
+        self.assertEqual(runner.start_calls[0]["child_binding"]["worker_profile"], profile)
+
+    def test_resume_and_rework_keep_bound_worker_profile(self):
+        target = node("n1")
+        original = deepcopy(target.contract["worker_profile"])
+        monitor, record = self.authorized_monitor([target])
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("delivered", {"evidence": "delivery"}), ("delivered", {"evidence": "rework"})],
+                ("n1", "reviewer"): [("review_finding", {"finding": "fix", "in_contract": True}), ("accepted", {"evidence": "clear"})],
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["n1"]["worker_profile"], original)
+        self.assertEqual(
+            [call["worker_profile"] for call in runner.start_calls if "worker_profile" in call],
+            [original, original, original, original],
+        )
+
+    def test_resume_rework_replays_complete_issue_complexity_basis(self):
+        target = node("n1")
+        target.contract.update(
+            {
+                "issue_complexity": IssueComplexity(
+                    "n1", "spec:n1", 4, 3, 2, 3, 2, "medium", ["cross_module"], "light_plan", "evidence:n1"
+                ).to_dict(),
+                "required_capabilities": ["shell"],
+                "models": [
+                    LocalModel("fast", ["shell"], 16000, ["normal", "deep"], True).to_dict(),
+                    LocalModel("deep", ["shell"], 64000, ["normal", "deep"], True).to_dict(),
+                ],
+            }
+        )
+        monitor, record = self.authorized_monitor([target])
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("delivered", {"evidence": "delivery"}), ("delivered", {"evidence": "rework"})],
+                ("n1", "reviewer"): [("review_finding", {"finding": "fix", "in_contract": True}), ("accepted", {"evidence": "clear"})],
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        expected = snapshot.nodes["n1"]["worker_profile"]
+        for field, value in {
+            "steps": 4,
+            "domains": 3,
+            "uncertainty": 2,
+            "failure_cost": 3,
+            "toolchain": 2,
+            "context_demand": "medium",
+        }.items():
+            self.assertEqual(expected["selection_basis"][field], value)
+        self.assertEqual(expected["selection_basis"]["complexity_band"], "light_plan")
+        self.assertEqual(snapshot.nodes["n1"]["worker_profile"], WorkerProfile.from_dict(expected).to_dict())
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["n1"]["worker_profile"], expected)
+        self.assertTrue(all(call["worker_profile"] == expected for call in runner.start_calls if "worker_profile" in call))
+
+    def test_unverifiable_model_probe_blocks_without_dispatch(self):
+        target = node("n1")
+        target.contract.pop("worker_profile")
+        target.contract.update(
+            {
+                "issue_complexity": IssueComplexity(
+                    "n1", "spec:n1", 3, 2, 3, 4, 2, "large", ["security"], "complex", "evidence:n1"
+                ).to_dict(),
+                "required_capabilities": ["security"],
+                "models": [LocalModel("secure", ["security"], 64000, ["deep"], None).to_dict()],
+            }
+        )
+        monitor, record = self.authorized_monitor([target])
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("unverifiable", snapshot.nodes["n1"]["reason"])
+        self.assertEqual(runner.start_calls, [])
+
+    def test_authority_nodes_json_missing_route_facts_blocks_unknown(self):
+        authority_path = Path(
+            "/Users/smy/Desktop/CFO/黑客松/开发辅助/.vibe/plans/"
+            "vibe-guide-v2-spec-issue-dag/nodes.json"
+        )
+        records = json.loads(authority_path.read_text(encoding="utf-8"))
+        authority = next(item for item in records if item["id"] == "V2-3")
+        target = DAGNode.from_dict(authority)
+
+        self.assertNotIn("issue_complexity", target.contract)
+        self.assertNotIn("models", target.contract)
+        self.assertNotIn("local_models", target.contract)
+        with self.assertRaises(WorkerUnavailable) as raised:
+            Monitor._profile_for_node(target)
+        self.assertEqual(raised.exception.status, "blocked_unknown")
+
+        monitor, record = self.authorized_monitor([target])
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        self.assertEqual(snapshot.nodes["V2-3"]["status"], "blocked_unknown")
+        self.assertNotEqual(snapshot.nodes["V2-3"]["worker_profile"], target.contract["worker_profile"])
+        self.assertNotEqual(snapshot.nodes["V2-3"]["worker_profile"]["model"], target.contract["worker_profile"]["model"])
+        self.assertEqual(runner.start_calls, [])
+        persisted = load_snapshot(self.paths, snapshot.run_id)
+        self.assertNotEqual(persisted.nodes["V2-3"]["worker_profile"], target.contract["worker_profile"])
+
+    @staticmethod
+    def _authority_v23_node():
+        authority_path = Path(
+            "/Users/smy/Desktop/CFO/黑客松/开发辅助/.vibe/plans/"
+            "vibe-guide-v2-spec-issue-dag/nodes.json"
+        )
+        records = json.loads(authority_path.read_text(encoding="utf-8"))
+        return DAGNode.from_dict(next(item for item in records if item["id"] == "V2-3"))
+
+    def test_authority_nodes_json_reauthorize_does_not_promote_preset_profile(self):
+        original = self._authority_v23_node()
+        original.depends_on = []
+        plan = Plan("vibe-guide-v2-spec-issue-dag", 5, "docs/prd.md", ["V2-3"], "draft")
+        original_record = authorize(
+            build_authorization_card(plan, [original], self.capabilities), "AUTHORIZE"
+        )
+        monitor = Monitor(self.paths, plan, [original])
+        initial_runner = FakeRunner()
+        snapshot = monitor.start(original_record, initial_runner)
+        self.assertEqual(snapshot.nodes["V2-3"]["status"], "blocked_unknown")
+
+        changed = DAGNode.from_dict(deepcopy(original.to_dict()))
+        changed.contract["acceptance_example"] += " changed"
+        changed_record = authorize(
+            build_authorization_card(plan, [changed], self.capabilities), "AUTHORIZE"
+        )
+        changed_monitor = Monitor(self.paths, plan, [changed])
+        resumed_runner = FakeRunner()
+        reauthorized = changed_monitor.reauthorize(
+            snapshot.run_id,
+            changed_record,
+            resumed_runner,
+            "executable_contract_changed",
+        )
+        self.assertEqual(reauthorized.nodes["V2-3"]["status"], "blocked_unknown")
+        self.assertNotEqual(reauthorized.nodes["V2-3"]["worker_profile"], original.contract["worker_profile"])
+        self.assertNotEqual(reauthorized.nodes["V2-3"]["worker_profile"]["model"], original.contract["worker_profile"]["model"])
+        self.assertEqual(resumed_runner.start_calls, [])
+        persisted = load_snapshot(self.paths, reauthorized.run_id)
+        self.assertNotEqual(persisted.nodes["V2-3"]["worker_profile"], original.contract["worker_profile"])
+
+    def test_authority_nodes_json_resume_revalidates_stale_preset_profile(self):
+        target = self._authority_v23_node()
+        target.depends_on = []
+        plan = Plan("vibe-guide-v2-spec-issue-dag", 5, "docs/prd.md", ["V2-3"], "draft")
+        record = authorize(
+            build_authorization_card(plan, [target], self.capabilities), "AUTHORIZE"
+        )
+        monitor = Monitor(self.paths, plan, [target])
+        snapshot = monitor.start(record, FakeRunner())
+        snapshot.nodes["V2-3"]["status"] = "planned"
+        snapshot.nodes["V2-3"]["worker_profile"] = target.contract["worker_profile"]
+        save_snapshot(self.paths, snapshot)
+
+        runner = FakeRunner()
+        resumed = monitor.resume(snapshot.run_id, runner)
+        self.assertEqual(resumed.nodes["V2-3"]["status"], "blocked_unknown")
+        self.assertNotEqual(resumed.nodes["V2-3"]["worker_profile"], target.contract["worker_profile"])
+        self.assertNotEqual(resumed.nodes["V2-3"]["worker_profile"]["model"], target.contract["worker_profile"]["model"])
+        self.assertEqual(runner.start_calls, [])
+        persisted = load_snapshot(self.paths, snapshot.run_id)
+        self.assertNotEqual(persisted.nodes["V2-3"]["worker_profile"], target.contract["worker_profile"])
+
+    def test_authority_nodes_json_recovery_states_scrub_stale_preset_profile(self):
+        target = self._authority_v23_node()
+        target.depends_on = []
+        plan = Plan("vibe-guide-v2-spec-issue-dag", 5, "docs/prd.md", ["V2-3"], "draft")
+        record = authorize(
+            build_authorization_card(plan, [target], self.capabilities), "AUTHORIZE"
+        )
+        monitor = Monitor(self.paths, plan, [target])
+
+        for recovery_status in ("running", "review", "rework", "start_pending"):
+            snapshot = monitor.start(record, FakeRunner())
+            snapshot.nodes["V2-3"]["status"] = recovery_status
+            snapshot.nodes["V2-3"]["worker_profile"] = target.contract["worker_profile"]
+            snapshot.handles.clear()
+            save_snapshot(self.paths, snapshot)
+
+            runner = FakeRunner()
+            recovered = monitor.resume(snapshot.run_id, runner)
+            self.assertEqual(recovered.nodes["V2-3"]["status"], "blocked_unknown")
+            self.assertNotEqual(recovered.nodes["V2-3"]["worker_profile"], target.contract["worker_profile"])
+            self.assertNotEqual(recovered.nodes["V2-3"]["worker_profile"]["model"], target.contract["worker_profile"]["model"])
+            self.assertEqual(runner.start_calls, [])
+            persisted = load_snapshot(self.paths, snapshot.run_id)
+            self.assertNotEqual(persisted.nodes["V2-3"]["worker_profile"], target.contract["worker_profile"])
+
+    def test_authority_nodes_json_invalid_route_facts_scrub_all_dispatch_and_recovery_paths(self):
+        base = self._authority_v23_node()
+        base.depends_on = []
+        complexity = IssueComplexity(
+            "V2-3", "spec:v2-3", 3, 2, 3, 4, 2, "large", ["security"], "complex", "evidence:v2-3"
+        ).to_dict()
+        invalid_facts = [
+            {"models": []},
+            {"local_models": []},
+            {"models": [LocalModel("unknown", ["security"], 64000, ["deep"], None).to_dict()]},
+            {"models": [LocalModel("offline", ["security"], 64000, ["deep"], False).to_dict()]},
+        ]
+
+        for facts in invalid_facts:
+            target = DAGNode.from_dict(deepcopy(base.to_dict()))
+            target.contract["issue_complexity"] = complexity
+            target.contract["required_capabilities"] = ["security"]
+            target.contract.update(facts)
+            monitor = Monitor(
+                self.paths,
+                Plan("vibe-guide-v2-spec-issue-dag", 5, "docs/prd.md", ["V2-3"], "draft"),
+                [target],
+            )
+            record = authorize(
+                build_authorization_card(monitor.plan, [target], self.capabilities), "AUTHORIZE"
+            )
+            preset = target.contract["worker_profile"]
+
+            initial_runner = FakeRunner()
+            initial = monitor.start(record, initial_runner)
+            self.assertEqual(initial.nodes["V2-3"]["status"], "blocked_unknown")
+            self.assertEqual(initial_runner.start_calls, [])
+            self.assertNotEqual(initial.nodes["V2-3"]["worker_profile"], preset)
+            self.assertNotEqual(load_snapshot(self.paths, initial.run_id).nodes["V2-3"]["worker_profile"], preset)
+
+            changed = DAGNode.from_dict(deepcopy(target.to_dict()))
+            changed.contract["acceptance_example"] = changed.contract.get("acceptance_example", "") + " changed"
+            changed_monitor = Monitor(self.paths, monitor.plan, [changed])
+            changed_record = authorize(
+                build_authorization_card(changed_monitor.plan, [changed], self.capabilities), "AUTHORIZE"
+            )
+            reauthorized_runner = FakeRunner()
+            reauthorized = changed_monitor.reauthorize(
+                initial.run_id, changed_record, reauthorized_runner, "executable_contract_changed"
+            )
+            self.assertEqual(reauthorized.nodes["V2-3"]["status"], "blocked_unknown")
+            self.assertEqual(reauthorized_runner.start_calls, [])
+            self.assertNotEqual(reauthorized.nodes["V2-3"]["worker_profile"], preset)
+            self.assertNotEqual(load_snapshot(self.paths, initial.run_id).nodes["V2-3"]["worker_profile"], preset)
+
+            for recovery_status in ("planned", "running", "review", "rework", "start_pending"):
+                snapshot = monitor.start(record, FakeRunner())
+                snapshot.nodes["V2-3"]["status"] = recovery_status
+                snapshot.nodes["V2-3"]["worker_profile"] = preset
+                snapshot.handles.clear()
+                save_snapshot(self.paths, snapshot)
+
+                runner = FakeRunner()
+                recovered = monitor.resume(snapshot.run_id, runner)
+                self.assertEqual(recovered.nodes["V2-3"]["status"], "blocked_unknown")
+                self.assertEqual(runner.start_calls, [])
+                self.assertNotEqual(recovered.nodes["V2-3"]["worker_profile"], preset)
+                self.assertNotEqual(
+                    load_snapshot(self.paths, snapshot.run_id).nodes["V2-3"]["worker_profile"], preset
+                )
+
+    def test_authority_nodes_json_malformed_availability_fails_closed_everywhere(self):
+        base = self._authority_v23_node()
+        base.depends_on = []
+        complexity = IssueComplexity(
+            "V2-3", "spec:v2-3", 3, 2, 3, 4, 2, "large", ["security"], "complex", "evidence:v2-3"
+        ).to_dict()
+        malformed_values = ["stale", 1, [], {}]
+
+        for malformed in malformed_values:
+            target = DAGNode.from_dict(deepcopy(base.to_dict()))
+            target.contract["issue_complexity"] = complexity
+            target.contract["required_capabilities"] = ["security"]
+            target.contract["models"] = [
+                {
+                    "model_id": "malformed",
+                    "capabilities": ["security"],
+                    "context_limit": 64000,
+                    "reasoning_levels": ["deep"],
+                    "available": malformed,
+                }
+            ]
+            monitor = Monitor(
+                self.paths,
+                Plan("vibe-guide-v2-spec-issue-dag", 5, "docs/prd.md", ["V2-3"], "draft"),
+                [target],
+            )
+            record = authorize(
+                build_authorization_card(monitor.plan, [target], self.capabilities), "AUTHORIZE"
+            )
+            preset = target.contract["worker_profile"]
+
+            initial_runner = FakeRunner()
+            initial = monitor.start(record, initial_runner)
+            self.assertEqual(initial.nodes["V2-3"]["status"], "blocked_unknown")
+            self.assertEqual(initial_runner.start_calls, [])
+            self.assertNotEqual(initial.nodes["V2-3"]["worker_profile"], preset)
+            self.assertNotEqual(load_snapshot(self.paths, initial.run_id).nodes["V2-3"]["worker_profile"], preset)
+
+            changed = DAGNode.from_dict(deepcopy(target.to_dict()))
+            changed.contract["acceptance_example"] = changed.contract.get("acceptance_example", "") + " changed"
+            changed_monitor = Monitor(self.paths, monitor.plan, [changed])
+            changed_record = authorize(
+                build_authorization_card(changed_monitor.plan, [changed], self.capabilities), "AUTHORIZE"
+            )
+            reauthorized_runner = FakeRunner()
+            reauthorized = changed_monitor.reauthorize(
+                initial.run_id, changed_record, reauthorized_runner, "executable_contract_changed"
+            )
+            self.assertEqual(reauthorized.nodes["V2-3"]["status"], "blocked_unknown")
+            self.assertEqual(reauthorized_runner.start_calls, [])
+            self.assertNotEqual(reauthorized.nodes["V2-3"]["worker_profile"], preset)
+            self.assertNotEqual(load_snapshot(self.paths, initial.run_id).nodes["V2-3"]["worker_profile"], preset)
+
+            for recovery_status in ("planned", "running", "review", "rework", "start_pending"):
+                snapshot = monitor.start(record, FakeRunner())
+                snapshot.nodes["V2-3"]["status"] = recovery_status
+                snapshot.nodes["V2-3"]["worker_profile"] = preset
+                snapshot.handles.clear()
+                save_snapshot(self.paths, snapshot)
+
+                runner = FakeRunner()
+                recovered = monitor.resume(snapshot.run_id, runner)
+                self.assertEqual(recovered.nodes["V2-3"]["status"], "blocked_unknown")
+                self.assertEqual(runner.start_calls, [])
+                self.assertNotEqual(recovered.nodes["V2-3"]["worker_profile"], preset)
+                self.assertNotEqual(
+                    load_snapshot(self.paths, snapshot.run_id).nodes["V2-3"]["worker_profile"], preset
+                )
 
 
 if __name__ == "__main__":
