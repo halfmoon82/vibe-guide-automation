@@ -255,6 +255,47 @@ class ProviderActionStore:
                 result.append(self._read(path))
         return result
 
+    def has_request(
+        self,
+        run_id: str,
+        issue_id: str,
+        role: str,
+        operation: Optional[str] = None,
+    ) -> bool:
+        """Check for a request without creating an absent mailbox."""
+        if not all(
+            isinstance(value, str) and value
+            for value in (run_id, issue_id, role)
+        ):
+            raise ValueError("provider request identity is required")
+        if operation is not None and (
+            not isinstance(operation, str) or operation not in _PROVIDER_ACTIONS
+        ):
+            raise ValueError("provider request operation is invalid")
+        if self.root.is_symlink() or (
+            self.root.exists() and not self.root.is_dir()
+        ):
+            raise ValueError("provider action path may not be a symlink")
+        request_dir = self.root / "requests"
+        if request_dir.is_symlink() or (
+            request_dir.exists() and not request_dir.is_dir()
+        ):
+            raise ValueError("provider request directory may not be a symlink")
+        if not request_dir.is_dir():
+            return False
+        for path in sorted(request_dir.glob("action-*.json")):
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("provider action request must be a regular file")
+            record = self._read(path)
+            if (
+                record.get("run_id") == run_id
+                and record.get("issue_id") == issue_id
+                and record.get("role") == role
+                and (operation is None or record.get("operation") == operation)
+            ):
+                return True
+        return False
+
 
 @dataclass(frozen=True)
 class RepositoryTaskRouting:
