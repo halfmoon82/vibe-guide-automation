@@ -10,24 +10,25 @@ import tempfile
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .authorization import (
+try:
+    from .authorization import (
     AuthorizationCard,
     AuthorizationRecord,
     authorize,
     build_authorization_card,
     refresh_authorization_card,
-)
-from .adapters.base import Environment
-from .adapters.registry import AdapterRegistry
-from .adapters.task_provider import ProviderActionStore, ProviderPending
-from .dag import render_plan_artifacts, validate_dag
-from .doctor import doctor
-from .initializer import init_project
-from .models import AgentCapabilities, DAGNode, Plan
-from .monitor import Monitor
-from .change_requests import ChangeRequest, classify_merge_capability
-from .paths import ProjectPaths
-from .planner import (
+    )
+    from .adapters.base import Environment
+    from .adapters.registry import AdapterRegistry
+    from .adapters.task_provider import ProviderActionStore, ProviderPending
+    from .dag import render_plan_artifacts, validate_dag
+    from .doctor import doctor
+    from .initializer import init_project
+    from .models import AgentCapabilities, DAGNode, Plan
+    from .monitor import Monitor
+    from .change_requests import ChangeRequest, classify_merge_capability
+    from .paths import ProjectPaths
+    from .planner import (
     DecisionCard,
     PRD,
     TaskContext,
@@ -35,13 +36,23 @@ from .planner import (
     classify_s0,
     route_task,
     score_s1,
-)
-from .scanner import scan_project
-from .diagnostics import screen_session, require_session_screened
-from .diagnostics import assert_planning_gate
-from .workflow_gate import require_capability_contract
-from .state import load_snapshot
-from .runners.provider_action import ProviderActionRunner
+    )
+    from .scanner import scan_project
+    from .diagnostics import screen_session, require_session_screened
+    from .diagnostics import assert_planning_gate
+    from .workflow_gate import require_capability_contract
+    from .state import load_snapshot
+    from .runners.provider_action import ProviderActionRunner
+    _V2_IMPORT_ERROR = None
+except ImportError as error:  # V3 baseline can be used without optional V2 modules.
+    _V2_IMPORT_ERROR = error
+    from .models import AgentCapabilities, DAGNode, Plan, PRD, Action, Phase
+    DecisionCard = TaskContext = Any
+    approve_prd = classify_s0 = route_task = score_s1 = None
+    Environment = AdapterRegistry = ChangeRequest = Any
+    doctor = init_project = scan_project = assert_planning_gate = screen_session = require_session_screened = None
+    AuthorizationCard = AuthorizationRecord = ProviderActionStore = ProviderActionRunner = Monitor = ProjectPaths = Any
+    ProviderPending = Exception
 
 
 SUCCESS = 0
@@ -414,6 +425,12 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         return _result(
             USAGE_ERROR, {"status": "usage_error"}, "参数错误", False
         )
+    if _V2_IMPORT_ERROR is not None:
+        # Keep the control-plane CLI importable in a V3-only installation. No
+        # command is allowed to imply confirmation or create execution state.
+        status = "blocked" if args.command in {"monitor", "plan", "init"} else "unknown"
+        code = BLOCKED if status == "blocked" else UNKNOWN
+        return _result(code, {"command": args.command, "status": status, "reason": "V2 runtime modules unavailable"}, "V3 阶段门已保持 fail-closed", args.as_json)
     paths = ProjectPaths.from_cwd(Path(cwd))
 
     v2_state = False
