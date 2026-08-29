@@ -5,6 +5,7 @@ package never imports or fabricates the desktop tool implementation.
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -12,13 +13,31 @@ from pathlib import Path
 import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-from ..paths import ProjectPaths
-from ..workflow_gate import (
-    require_capability_contract,
-    require_entry,
-    require_child_origin,
-)
-from ..diagnostics import validate_child_session_binding
+try:
+    from ..paths import ProjectPaths
+except ImportError:  # isolated V3 worker worktrees may omit later modules
+    class ProjectPaths:
+        def __init__(self, root):
+            self.root = Path(root).resolve()
+            self.vibe = self.root / ".vibe"
+            self.vibe_dir = self.vibe
+        def resolve_vibe_path(self, name):
+            return self.vibe / name
+try:
+    from ..workflow_gate import require_capability_contract, require_entry, require_child_origin
+except ImportError:  # pragma: no cover
+    def require_capability_contract(paths):
+        raise ValueError("capability contract is unavailable")
+    def require_entry(*args, **kwargs):
+        return None
+    def require_child_origin(origin):
+        if origin != "worker_dispatch":
+            raise PermissionError("invalid child origin")
+try:
+    from ..diagnostics import validate_child_session_binding
+except ImportError:  # pragma: no cover
+    def validate_child_session_binding(*args, **kwargs):
+        return None
 from ..models import WorkerProfile
 
 
@@ -31,6 +50,170 @@ class ProviderPending(RuntimeError):
 
 
 _PROVIDER_ACTIONS = {"create", "locate", "visibility", "resume", "wait"}
+PROVIDER_ADAPTER_IDS = {
+    "codex-app-visible": "codex", "claude-code-visible": "claude-code",
+    "cursor-visible": "cursor", "grok-visible": "grok",
+    "workbuddy-visible": "workbuddy", "kimi-code-visible": "kimi-code",
+    "deepseek-harness-visible": "deepseek-harness",
+}
+CAPABILITY_OPERATIONS = ("create", "enter", "resume", "wait", "terminal", "mailbox")
+_OBSERVATION_STATUSES = {
+    "verified_available", "not_exposed", "permission_denied", "probe_failed",
+    "unknown_timeout", "unknown", "stale",
+}
+
+
+def _utc(value=None):
+    value = value or datetime.now(timezone.utc)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp must include a timezone")
+    return value.astimezone(timezone.utc)
+
+
+def _parse_time(value, field):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("%s is required" % field)
+    try:
+        return _utc(datetime.fromisoformat(value))
+    except ValueError as exc:
+        raise ValueError("%s is not a valid timestamp" % field) from exc
+
+
+@dataclass(frozen=True)
+class CapabilityObservation:
+    """Structured observation returned by a real provider probe."""
+    name: str
+    status: str
+    evidence_ref: str
+    observed_at: str
+    expires_at: str
+    source: str
+    payload: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.name not in CAPABILITY_OPERATIONS:
+            raise ValueError("unsupported capability observation")
+        if self.status not in _OBSERVATION_STATUSES:
+            raise ValueError("unsupported capability observation status")
+        for field_name in ("evidence_ref", "source"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip() or "\x00" in value:
+                raise ValueError("%s is required" % field_name)
+        if self.evidence_ref.lower().startswith(("agent:", "self:", "readme:")) or self.source.lower().startswith(("agent:", "self:", "readme:")):
+            raise ValueError("agent self-report is not evidence")
+        observed = _parse_time(self.observed_at, "observed_at")
+        expires = _parse_time(self.expires_at, "expires_at")
+        if expires <= observed:
+            raise ValueError("observation expires_at must be after observed_at")
+        if not isinstance(self.payload, Mapping):
+            raise ValueError("observation payload must be an object")
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "status": self.status,
+            "evidence_ref": self.evidence_ref,
+            "observed_at": _parse_time(self.observed_at, "observed_at").isoformat(),
+            "expires_at": _parse_time(self.expires_at, "expires_at").isoformat(),
+            "source": self.source,
+            "payload": dict(self.payload),
+        }
+
+
+@dataclass(frozen=True)
+class CapabilityEvaluation:
+    provider: str
+    host_id: str
+    status: str
+    capabilities: Mapping[str, CapabilityObservation]
+    checked_at: str
+    expires_at: str
+    evidence_refs: Tuple[str, ...] = ()
+    remediation: Tuple[str, ...] = ()
+    attempts: int = 0
+    failure_observation: Optional[Mapping[str, Any]] = None
+    last_operation: Optional[str] = None
+    governance_action: Optional[str] = None
+    next_action: Optional[str] = None
+    recovery_entry: Optional[str] = None
+
+    def to_dict(self):
+        return {
+            "schema_version": 2,
+            "provider": self.provider,
+            "host_id": self.host_id,
+            "status": self.status,
+            "checked_at": self.checked_at,
+            "expires_at": self.expires_at,
+            "capabilities": {name: value.to_dict() for name, value in sorted(self.capabilities.items())},
+            "evidence_refs": list(self.evidence_refs),
+            "remediation": list(self.remediation),
+            "attempts": self.attempts,
+            "failure_observation": dict(self.failure_observation or {}),
+            "last_operation": self.last_operation,
+            "governance_action": self.governance_action,
+            "next_action": self.next_action,
+            "recovery_entry": self.recovery_entry,
+        }
+
+
+def validate_mailbox_evidence(observations: Mapping[str, Any], *, now=None, required=CAPABILITY_OPERATIONS):
+    if not isinstance(observations, Mapping):
+        raise ValueError("mailbox evidence must be an object")
+    current = _utc(now)
+    normalized = {}
+    for name in required:
+        if name not in observations:
+            raise ValueError("mailbox evidence missing capability: %s" % name)
+        raw = observations[name]
+        if isinstance(raw, CapabilityObservation):
+            item = raw
+        elif isinstance(raw, Mapping):
+            values = dict(raw)
+            supplied_name = values.pop("name", name)
+            if supplied_name != name:
+                raise ValueError("mailbox evidence capability name mismatch")
+            try:
+                item = CapabilityObservation(name=name, **values)
+            except TypeError as exc:
+                raise ValueError("mailbox evidence is incomplete for %s" % name) from exc
+        else:
+            raise ValueError("mailbox evidence must be structured")
+        if _parse_time(item.expires_at, "expires_at") <= current:
+            item = CapabilityObservation(item.name, "stale", item.evidence_ref, item.observed_at, item.expires_at, item.source, item.payload)
+        normalized[name] = item
+    return normalized
+
+
+def evaluate_provider_capabilities(provider: str, host_id: str, observations: Mapping[str, Any], *, now=None, attempts=0, max_attempts=2, required=CAPABILITY_OPERATIONS):
+    if not isinstance(provider, str) or not provider.strip() or not isinstance(host_id, str) or not host_id.strip():
+        raise ValueError("provider and host_id are required")
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
+        raise ValueError("attempts must be a non-negative integer")
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+        raise ValueError("max_attempts must be a positive integer")
+    normalized = validate_mailbox_evidence(observations, now=now, required=required)
+    current = _utc(now)
+    bad = {name: item for name, item in normalized.items() if item.status != "verified_available"}
+    status = "verified_available" if not bad else ("blocked_unknown" if attempts >= max_attempts else "retry_pending")
+    remediation = () if not bad else tuple("refresh real provider evidence for %s" % name for name in sorted(bad))
+    expiry = min(_parse_time(item.expires_at, "expires_at") for item in normalized.values())
+    first_bad = normalized[sorted(bad)[0]] if bad else None
+    return CapabilityEvaluation(
+        provider, host_id, status, normalized, current.isoformat(), expiry.isoformat(),
+        tuple(item.evidence_ref for item in normalized.values()), remediation, attempts,
+        failure_observation=first_bad.to_dict() if first_bad else None,
+        last_operation=first_bad.name if first_bad else None,
+        governance_action="bounded provider capability refresh" if bad else None,
+        next_action=("retry provider capability probe" if status == "retry_pending" else "repair provider evidence and resume from recovery entry") if bad else None,
+        recovery_entry="provider-capability-refresh" if bad else None,
+    )
+
+
+ProviderCapabilityObservation = CapabilityObservation
+MailboxEvidence = CapabilityObservation
+build_capability_evidence = evaluate_provider_capabilities
+classify_provider_capabilities = evaluate_provider_capabilities
 
 
 def _canonical_digest(value: Any) -> str:
@@ -134,12 +317,74 @@ class ProviderActionStore:
         )
 
     def capabilities(self) -> Dict[str, Any]:
-        value = self._read(self.root / "capabilities.json")
+        legacy_path = self.root / "capabilities.json"
+        if legacy_path.exists():
+            value = self._read(legacy_path)
+        else:
+            v3_path = self.root / "capabilities-v2.json"
+            if not v3_path.is_file():
+                raise ValueError("provider capability record is missing")
+            v3 = self._read(v3_path)
+            capabilities = v3.get("capabilities", {})
+            if not isinstance(capabilities, dict):
+                raise ValueError("provider capability evidence is invalid")
+            adapter = PROVIDER_ADAPTER_IDS.get(str(v3.get("provider", "")))
+            if not adapter:
+                raise ValueError("provider has no explicit adapter mapping")
+            value = {
+                "schema_version": self.schema_version,
+                "adapter_id": adapter,
+                "facts": {
+                    "%s.%s" % (adapter, name): item.get("status") == "verified_available"
+                    for name, item in capabilities.items() if isinstance(item, dict)
+                },
+                "provenance": ";".join(
+                    str(item.get("evidence_ref", "")) for item in capabilities.values()
+                    if isinstance(item, dict)
+                ),
+            }
         if set(value) != {"schema_version", "adapter_id", "facts", "provenance"}:
             raise ValueError("provider capability schema is invalid")
         if value["schema_version"] != self.schema_version:
             raise ValueError("provider capability schema is unsupported")
         return value
+
+    def publish_capability_observations(
+        self, provider: str, host_id: str, observations: Mapping[str, Any],
+        *, attempts: int = 0, max_attempts: int = 2, now=None,
+    ) -> CapabilityEvaluation:
+        evaluation = evaluate_provider_capabilities(
+            provider, host_id, observations, now=now,
+            attempts=attempts, max_attempts=max_attempts,
+        )
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._atomic(self.root / "capabilities-v2.json", evaluation.to_dict())
+        return evaluation
+
+    def capability_evaluation(self, *, now=None) -> CapabilityEvaluation:
+        value = self._read(self.root / "capabilities-v2.json")
+        if value.get("schema_version") != 2:
+            raise ValueError("provider capability evidence is not a V3 structured record")
+        raw = value.get("capabilities", {})
+        if not isinstance(raw, dict):
+            raise ValueError("provider capability evidence is invalid")
+        if raw:
+            capabilities = validate_mailbox_evidence(raw, now=now)
+        else:
+            capabilities = {}
+        status = value.get("status", "blocked_unknown")
+        if capabilities and any(item.status != "verified_available" for item in capabilities.values()) and status != "blocked_unknown":
+            status = "retry_pending"
+        return CapabilityEvaluation(
+            provider=value.get("provider", ""), host_id=value.get("host_id", ""),
+            status=status, capabilities=capabilities,
+            checked_at=value.get("checked_at", ""), expires_at=value.get("expires_at", ""),
+            evidence_refs=tuple(value.get("evidence_refs", ())),
+            remediation=tuple(value.get("remediation", ())), attempts=int(value.get("attempts", 0)),
+            failure_observation=value.get("failure_observation"),
+            last_operation=value.get("last_operation"), governance_action=value.get("governance_action"),
+            next_action=value.get("next_action"), recovery_entry=value.get("recovery_entry"),
+        )
 
     def request(
         self,
