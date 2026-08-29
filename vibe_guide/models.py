@@ -19,6 +19,10 @@ _NODE_STATUSES = frozenset({
 _PLAN_STATUSES = frozenset({"draft", "authorized", "running", "complete", "blocked", "failed"})
 _CAPABILITY_LEVELS = frozenset({"guide", "background", "full"})
 EVIDENCE_PRIORITY = ("current_user", "approved_prd", "authorization", "issue_contract", "implementation")
+_BLOCKED_HANDOFF_QUESTIONS = {
+    "blocked_design": "请补充或确认导致设计阻塞的产品决策",
+    "blocked_unknown": "请提供可验证的缺失证据或确认下一次最小重试动作",
+}
 
 
 def _identifier(value: Any, field_name: str) -> str:
@@ -480,6 +484,12 @@ class StageHandoff:
             self.to_stage = tuple(item.value for item in Phase)[next_index]
         if self.readiness is None:
             self.readiness = "ready" if self.status in {"approved", "ready_for_plan_confirmation", "ready_for_authorization", "monitor_ready"} else self.status
+        if self.status in _BLOCKED_HANDOFF_QUESTIONS:
+            if not self.open_questions:
+                self.open_questions = [_BLOCKED_HANDOFF_QUESTIONS[self.status]]
+            # A blocked card must always stop for an answer, even when a
+            # caller supplied an incompatible action.
+            self.required_user_action = "answer_question"
         if self.stage not in {item.value for item in Phase}:
             raise ValueError("unsupported stage")
         if not isinstance(self.status, str) or not self.status.strip():
@@ -493,10 +503,18 @@ class StageHandoff:
             values = getattr(self, name)
             if not isinstance(values, list) or any(not isinstance(x, str) for x in values):
                 raise TypeError("%s must be a list of strings" % name)
+            setattr(self, name, list(values))
         if not self.forbidden_automatic_actions:
-            self.forbidden_automatic_actions = ["create_spec", "create_issue", "create_dag", "create_authorization_card", "create_worker", "authorize", "monitor", "deploy"]
+            self.forbidden_automatic_actions = [
+                "create_spec", "create_issue", "create_dag",
+                "create_authorization_card", "create_authorization",
+                "create_run", "create_worker", "authorize", "monitor",
+                "archive", "deploy",
+            ]
         if not isinstance(self.prompt, str):
             raise TypeError("prompt must be a string")
+        if not isinstance(self.context, dict):
+            raise TypeError("context must be a dictionary")
         self.context = _json_safe(self.context)
 
     @property
@@ -506,6 +524,16 @@ class StageHandoff:
     @property
     def creates_worker(self):
         return False
+
+    @property
+    def next_stage(self):
+        """The stage this card hands control to, without implying execution."""
+        return self.to_stage
+
+    @property
+    def ready(self):
+        """Whether the card reports a stage ready for its next gated action."""
+        return self.readiness == "ready"
 
     def to_dict(self):
         return _json_dict(self)
@@ -531,6 +559,7 @@ class StageHandoff:
     def render(self):
         return (
             "阶段：{stage}\n状态：{status}\n计划：{plan_id}@{revision} (revision={revision})\n"
+            "下一阶段：{next_stage}\n就绪：{readiness}\n"
             "证据：{evidence}\n用户下一步：{action}\n开放问题：{questions}\n"
             "禁止自动动作：{forbidden}"
         ).format(
@@ -538,6 +567,8 @@ class StageHandoff:
             status=self.status,
             plan_id=self.plan_id,
             revision=self.plan_revision,
+            next_stage=self.to_stage,
+            readiness=self.readiness,
             evidence=", ".join(self.evidence_refs) or "无",
             action=self.required_user_action,
             questions="；".join(self.open_questions) or "无",

@@ -11,8 +11,13 @@ from .models import Action, Phase, PRD, StageHandoff
 
 _PLANNING_FORBIDDEN = [
     "create_spec", "create_issue", "create_dag", "create_authorization_card",
-    "create_authorization", "create_run", "create_worker", "authorize", "monitor", "deploy",
+    "create_authorization", "create_run", "create_worker", "authorize", "monitor", "archive", "deploy",
 ]
+
+_BLOCKED_QUESTION = {
+    "blocked_design": "请补充或确认导致设计阻塞的产品决策",
+    "blocked_unknown": "请提供可验证的缺失证据或确认下一次最小重试动作",
+}
 
 
 def build_stage_handoff(
@@ -31,16 +36,24 @@ def build_stage_handoff(
     if isinstance(stage, PRD):
         return handoff_for_prd(stage, evidence_refs=evidence_refs, open_questions=open_questions, plan_id=plan_id)
     stage = stage.value if isinstance(stage, Phase) else stage
+    if status is None:
+        status = "blocked_unknown"
+    questions = list(open_questions or [])
+    if status in _BLOCKED_QUESTION and not questions:
+        questions = [_BLOCKED_QUESTION[status]]
     if required_user_action is None:
-        required_user_action = (
-            Action.CONTINUE_PLANNING.value
-            if stage in (Phase.PRD_APPROVED.value, Phase.SPEC_ISSUE_DAG.value)
-            else "none"
-        )
+        if status in {"blocked_design", "blocked_unknown"}:
+            required_user_action = "answer_question"
+        elif stage in (Phase.PRD_APPROVED.value, Phase.SPEC_ISSUE_DAG.value):
+            required_user_action = Action.CONTINUE_PLANNING.value
+        else:
+            required_user_action = "none"
     if stage == Phase.PRD_APPROVED.value and status == "approved":
         required_user_action = Action.CONTINUE_PLANNING.value
         prompt = prompt or "继续规划 Spec/Issue/DAG"
-    forbidden = list(forbidden_automatic_actions or _PLANNING_FORBIDDEN)
+    # Caller additions are allowed, but cannot weaken the mandatory safety
+    # boundary carried by every non-authorizing handoff.
+    forbidden = list(dict.fromkeys(_PLANNING_FORBIDDEN + list(forbidden_automatic_actions or [])))
     return StageHandoff(
         stage=stage,
         status=status,
@@ -49,7 +62,7 @@ def build_stage_handoff(
         evidence_refs=list(evidence_refs or []),
         required_user_action=required_user_action,
         forbidden_automatic_actions=forbidden,
-        open_questions=list(open_questions or []),
+        open_questions=questions,
         prompt=prompt,
         context=dict(context or {}),
     )
@@ -61,8 +74,10 @@ def handoff_for_prd(prd: PRD, evidence_refs=None, open_questions=None, plan_id="
     questions = list(open_questions or [])
     status = prd.status
     action = Action.CONTINUE_PLANNING.value if status == "approved" else "none"
+    if status in _BLOCKED_QUESTION and not questions:
+        questions = [_BLOCKED_QUESTION[status]]
     if status in {"draft", "blocked_design", "blocked_unknown"} and questions:
-        action = Action.CONTINUE_PLANNING.value
+        action = "answer_question"
     return build_stage_handoff(
         Phase.PRD_APPROVED.value,
         status,

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from vibe_guide.models import Action, Phase, PRD
 from vibe_guide.workflow_gate import (
+    _published_reviewed,
     evaluate_planning_gate,
     legal_actions,
     next_phase,
@@ -12,6 +13,129 @@ from vibe_guide.workflow_gate import (
 
 
 class V3StageGateTests(unittest.TestCase):
+    def test_status_evidence_requires_exact_terminal_status_and_review_marker(self):
+        self.assertTrue(_published_reviewed("status: published\nreviewed: yes\n"))
+        self.assertTrue(_published_reviewed("status: approved\n"))
+        self.assertTrue(_published_reviewed({"status": "reviewed"}))
+        self.assertTrue(_published_reviewed({"status": "published", "reviewed": True}))
+        self.assertFalse(_published_reviewed({"status": "published"}))
+        self.assertFalse(_published_reviewed(True))
+        self.assertFalse(_published_reviewed([True]))
+        for value in (
+            "status: unapproved\n",
+            "status: disapproved\n",
+            "status: published\nbody says approved\n",
+            "status: draft\nbody says approved\n",
+            "approved text without a status field",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(_published_reviewed(value))
+
+    def test_phase_action_mapper_covers_every_transition_and_rejects_fast_forward(self):
+        expected = (
+            (Phase.PRD_APPROVED, Action.CONTINUE_PLANNING, Phase.SPEC_ISSUE_DAG),
+            (Phase.SPEC_ISSUE_DAG, Action.CONTINUE_PLANNING, Phase.DEVELOPMENT_PLAN_CONFIRMATION),
+            (Phase.DEVELOPMENT_PLAN_CONFIRMATION, Action.CONFIRM_PLAN, Phase.AUTHORIZATION),
+            (Phase.AUTHORIZATION, Action.AUTHORIZE_EXECUTION, Phase.MONITOR),
+        )
+        for phase, action, target in expected:
+            with self.subTest(phase=phase):
+                self.assertEqual(next_phase(phase, action), target)
+        wrong_actions = {
+            Phase.PRD_APPROVED: Action.AUTHORIZE_EXECUTION,
+            Phase.SPEC_ISSUE_DAG: Action.AUTHORIZE_EXECUTION,
+            Phase.DEVELOPMENT_PLAN_CONFIRMATION: Action.CONTINUE_PLANNING,
+            Phase.AUTHORIZATION: Action.CONFIRM_PLAN,
+        }
+        for phase, wrong_action in wrong_actions.items():
+            with self.subTest(phase=phase, wrong_action=wrong_action):
+                with self.assertRaises(ValueError):
+                    next_phase(phase, wrong_action)
+        with self.assertRaises(ValueError):
+            next_phase(Phase.MONITOR, Action.CONTINUE_PLANNING)
+
+    def test_plan_revision_must_match_approved_prd_and_all_planning_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "spec.md").write_text("状态：published\n审核：reviewed\n", encoding="utf-8")
+            (root / "issue.md").write_text("状态：published\n审核：reviewed\n", encoding="utf-8")
+            (root / "dag-audit.json").write_text(json.dumps({"status": "reviewed", "plan_revision": 2}), encoding="utf-8")
+            (root / "plan-confirmation.json").write_text(json.dumps({"status": "confirmed", "plan_revision": 2}), encoding="utf-8")
+            result = evaluate_planning_gate(
+                PRD("Approved", "Objective", revision=3, status="approved"),
+                {
+                    "prd": {"status": "approved", "revision": 2},
+                    "spec": "状态：published\n审核：reviewed\n",
+                    "issue": "状态：published\n审核：reviewed\n",
+                    "dag_audit": {"status": "reviewed", "plan_revision": 2},
+                    "plan_confirmation": {"status": "confirmed", "plan_revision": 2},
+                },
+                plan_id="plan-1",
+                plan_revision=3,
+            )
+        self.assertEqual(result.status, "planning_required")
+        self.assertIn("prd.revision", result.missing)
+        self.assertIn("dag-audit.plan_revision", result.missing)
+        self.assertIn("plan-confirmation.plan_revision", result.missing)
+
+    def test_explicit_unpublished_prd_artifact_cannot_be_overridden_by_approved_object(self):
+        result = evaluate_planning_gate(
+            PRD("Approved", "Objective", revision=3, status="approved"),
+            {
+                "prd": {"status": "draft", "revision": 3},
+                "spec": "状态：published\n审核：reviewed\n",
+                "issue": "状态：published\n审核：reviewed\n",
+                "dag_audit": {"status": "reviewed", "plan_revision": 3},
+                "plan_confirmation": {"status": "confirmed", "plan_revision": 3},
+            },
+            plan_id="plan-1",
+            plan_revision=3,
+        )
+        self.assertEqual(result.status, "planning_required")
+        self.assertIn("prd", result.missing)
+
+    def test_approved_markdown_prd_is_valid_evidence_when_revision_matches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "prd.md").write_text("状态：approved\nRevision：3\n", encoding="utf-8")
+            (root / "spec.md").write_text("状态：published\n审核：reviewed\n", encoding="utf-8")
+            (root / "issue.md").write_text("状态：published\n审核：reviewed\n", encoding="utf-8")
+            (root / "dag-audit.json").write_text(json.dumps({"status": "reviewed", "plan_revision": 3}), encoding="utf-8")
+            (root / "plan-confirmation.json").write_text(json.dumps({"status": "confirmed", "plan_revision": 3}), encoding="utf-8")
+            result = evaluate_planning_gate(
+                PRD("Approved", "Objective", revision=3, status="approved"),
+                root,
+                plan_id="plan-1",
+                plan_revision=3,
+            )
+        self.assertEqual(result.status, "ready_for_authorization")
+
+    def test_prd_artifact_requires_explicit_revision_even_when_object_matches(self):
+        result = evaluate_planning_gate(
+            PRD("Approved", "Objective", revision=3, status="approved"),
+            {
+                "prd": {"status": "approved"},
+                "spec": "状态：published\n审核：reviewed\n",
+                "issue": "状态：published\n审核：reviewed\n",
+                "dag_audit": {"status": "reviewed", "plan_revision": 3},
+                "plan_confirmation": {"status": "confirmed", "plan_revision": 3},
+            },
+            plan_id="plan-1",
+            plan_revision=3,
+        )
+        self.assertEqual(result.status, "planning_required")
+        self.assertIn("prd.revision", result.missing)
+
+    def test_planning_gate_serialization_retains_stage_handoff(self):
+        result = evaluate_planning_gate(
+            PRD("Approved", "Objective", status="approved"),
+            {},
+            plan_id="plan-1",
+            plan_revision=1,
+        )
+        payload = result.to_dict()
+        self.assertIsInstance(payload["handoff"], dict)
+        self.assertEqual(payload["handoff"]["plan_revision"], 1)
     def test_unapproved_prd_never_exposes_continue_planning(self):
         with tempfile.TemporaryDirectory() as directory:
             result = evaluate_planning_gate(

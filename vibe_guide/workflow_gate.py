@@ -149,6 +149,7 @@ class PlanningGate:
             "evidence_refs": list(self.evidence_refs),
             "run_created": self.run_created,
             "worker_created": self.worker_created,
+            "handoff": self.handoff.to_dict() if hasattr(self.handoff, "to_dict") else self.handoff,
             "context": self.context,
         }
 
@@ -188,30 +189,81 @@ def _artifact_value(source, name):
     return None
 
 
+def _explicit_revision(value):
+    """Read a revision only when an artifact explicitly records one."""
+    if isinstance(value, Mapping):
+        return value.get("plan_revision", value.get("revision"))
+    if isinstance(value, str):
+        import re
+        match = re.search(r"(?:plan[ _-]revision|revision|版本)\s*[:：@]?\s*(\d+)", value, re.I)
+        return int(match.group(1)) if match else None
+    return None
+
+
 def _published_reviewed(value):
     if isinstance(value, list):
         return bool(value) and all(_published_reviewed(item) for item in value)
     if isinstance(value, Mapping):
-        return value.get("status") in {"published", "reviewed", "approved"} and value.get("reviewed", True) is not False
+        status = value.get("status")
+        if not isinstance(status, str):
+            return False
+        status = status.strip().casefold()
+        if status in {"approved", "已批准"}:
+            return True
+        if status in {"reviewed", "已审核"}:
+            return True
+        if status not in {"published", "已发布"}:
+            return False
+        # Published evidence must carry an explicit review marker.  A missing
+        # marker is not equivalent to an affirmative one.
+        reviewed = value.get("reviewed")
+        return reviewed is True or (isinstance(reviewed, str) and reviewed.strip().casefold() in {"true", "yes", "reviewed", "已审核"})
     if not isinstance(value, str):
-        return bool(value)
-    text = value.lower()
-    return ("status:" in text or "状态：" in value or "状态:" in value) and "published" in text and ("review" in text or "审核：" in value or "审核:" in value)
+        # Evidence must carry a structured or textual status field; truthy
+        # sentinels are not an acceptable substitute.
+        return False
+    import re
+    status_match = re.search(r"(?im)^[ \t]*(?:status|状态)[ \t]*[:：][ \t]*([^\r\n]+?)[ \t]*$", value)
+    if not status_match:
+        return False
+    status = status_match.group(1).strip().casefold()
+    if status in {"approved", "已批准"}:
+        return True
+    if status in {"reviewed", "已审核"}:
+        return True
+    if status not in {"published", "已发布"}:
+        return False
+    # Match a dedicated marker line, rather than any occurrence of review or
+    # approved in the document body.
+    return bool(re.search(r"(?im)^[ \t]*(?:reviewed|review|审核)[ \t]*[:：][ \t]*(?:true|yes|reviewed|已审核)[ \t]*$", value))
 
 
 def evaluate_planning_gate(prd: PRD, artifacts=None, plan_id="unplanned", plan_revision=1, for_confirmation=False, execution_context=None):
     """Read planning evidence and fail closed before any run/Worker side effect."""
     if not isinstance(prd, PRD):
         raise TypeError("prd must be a PRD")
+    if isinstance(plan_revision, bool) or not isinstance(plan_revision, int) or plan_revision < 1:
+        raise ValueError("plan_revision must be a positive integer")
     from .stage_handoff import build_stage_handoff
     if prd.status != "approved":
-        handoff = build_stage_handoff(Phase.PRD_APPROVED.value, "planning_required", plan_id, plan_revision, ("prd",), required_user_action="answer_question", open_questions=("PRD 必须先获批",), context=execution_context)
+        handoff_status = prd.status if prd.status in {"blocked_design", "blocked_unknown"} else "planning_required"
+        handoff = build_stage_handoff(Phase.PRD_APPROVED.value, handoff_status, plan_id, plan_revision, ("prd",), required_user_action="answer_question", open_questions=("PRD 必须先获批",), context=execution_context)
         return PlanningGate("planning_required", plan_id, plan_revision, ("prd.approved",), ("prd",), handoff=handoff, context=dict(execution_context or {}))
     missing: List[str] = []
     values = {name: _artifact_value(artifacts, name) if artifacts is not None else None for name in ("prd", "spec", "issue", "dag_audit", "plan_confirmation")}
+    prd_artifact_present = artifacts is not None and values["prd"] is not None
     if artifacts is not None and values["prd"] is None:
         # A PRD object supplied by the caller is itself the approved PRD evidence.
         values["prd"] = True
+    if prd.revision != plan_revision:
+        missing.append("prd.revision")
+    artifact_revision = _explicit_revision(values["prd"])
+    if prd_artifact_present and artifact_revision is None:
+        missing.append("prd.revision")
+    elif artifact_revision is not None and artifact_revision != plan_revision:
+        missing.append("prd.revision")
+    if values["prd"] is not True and values["prd"] is not None and not _published_reviewed(values["prd"]):
+        missing.append("prd")
     for name in ("spec", "issue"):
         value = values[name]
         if not _published_reviewed(value):
@@ -219,7 +271,9 @@ def evaluate_planning_gate(prd: PRD, artifacts=None, plan_id="unplanned", plan_r
     audit = values["dag_audit"]
     if not isinstance(audit, dict) or audit.get("status") not in {"reviewed", "audited", "pass", "passed"}:
         missing.append("dag-audit")
-    elif str(audit.get("plan_revision", plan_revision)) != str(plan_revision):
+    elif "plan_revision" not in audit:
+        missing.append("dag-audit.plan_revision")
+    elif str(audit.get("plan_revision")) != str(plan_revision):
         missing.append("dag-audit.plan_revision")
     confirmation = values["plan_confirmation"]
     if confirmation is None and for_confirmation and not missing:
@@ -230,11 +284,15 @@ def evaluate_planning_gate(prd: PRD, artifacts=None, plan_id="unplanned", plan_r
     else:
         if not isinstance(confirmation, dict) or confirmation.get("status") != "confirmed":
             missing.append("plan-confirmation")
-        elif str(confirmation.get("plan_revision", plan_revision)) != str(plan_revision):
+        elif "plan_revision" not in confirmation:
+            missing.append("plan-confirmation.plan_revision")
+        elif str(confirmation.get("plan_revision")) != str(plan_revision):
             missing.append("plan-confirmation.plan_revision")
     if missing:
         missing = tuple(dict.fromkeys(missing))
-        handoff = build_stage_handoff(Phase.SPEC_ISSUE_DAG.value, "planning_required", plan_id, plan_revision, ("prd",), open_questions=("补齐：" + ", ".join(missing),), context=execution_context)
+        handoff_stage = Phase.DEVELOPMENT_PLAN_CONFIRMATION.value if missing == ("plan-confirmation",) else Phase.SPEC_ISSUE_DAG.value
+        handoff_action = Action.CONFIRM_PLAN.value if handoff_stage == Phase.DEVELOPMENT_PLAN_CONFIRMATION.value else Action.CONTINUE_PLANNING.value
+        handoff = build_stage_handoff(handoff_stage, "planning_required", plan_id, plan_revision, ("prd",), required_user_action=handoff_action, open_questions=("补齐：" + ", ".join(missing),), context=execution_context)
         return PlanningGate("planning_required", plan_id, plan_revision, missing, ("prd",), False, False, handoff, dict(execution_context or {}))
     status = "ready_for_authorization" if confirmation is not None else "ready_for_plan_confirmation"
     refs = ("prd", "spec", "issue", "dag-audit", "plan-confirmation")
@@ -250,3 +308,8 @@ def require_planning_gate(*args, **kwargs):
 
 
 planning_gate = evaluate_planning_gate
+
+# Explicit names make the two independent layers discoverable to callers while
+# preserving the historical aliases used by V2 integrations.
+stage_action_map = LEGAL_ACTIONS
+phase_action_map = LEGAL_ACTIONS
