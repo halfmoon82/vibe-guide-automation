@@ -65,7 +65,8 @@ except ImportError as error:  # V3 baseline can be used without optional V2 modu
         build_routing_decision,
         score_s1,
     )
-    Environment = AdapterRegistry = ChangeRequest = Any
+    Environment = AdapterRegistry = Any
+    from .change_requests import ChangeRequest, classify_merge_capability
     doctor = init_project = scan_project = assert_planning_gate = screen_session = require_session_screened = None
     AuthorizationCard = AuthorizationRecord = ProviderActionStore = ProviderActionRunner = Monitor = ProjectPaths = Any
     ProviderPending = Exception
@@ -479,6 +480,26 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         return _result(
             USAGE_ERROR, {"status": "usage_error"}, "参数错误", False
         )
+    if _V2_IMPORT_ERROR is not None and args.command == "change-request":
+        if not args.request:
+            return _result(BLOCKED, {"command": "change-request", "status": "blocked", "reason": "request facts required"}, "Change Request 状态未知：需要事实文件", args.as_json)
+        try:
+            request_path = Path(args.request)
+            if not request_path.is_absolute():
+                request_path = Path(cwd) / request_path
+            data = _read_json(request_path)
+            if not isinstance(data, dict):
+                raise ValueError("Change Request facts must be an object")
+            cr_data = data.get("change_request", data)
+            observed = data.get("observed_facts", data)
+            if not isinstance(cr_data, dict) or not isinstance(observed, dict):
+                raise ValueError("Change Request facts are invalid")
+            capability = classify_merge_capability(observed)
+            request = ChangeRequest.from_dict(dict(cr_data, merge_capability=capability))
+            payload = {"command": "change-request", "status": "blocked_unknown" if capability == "unknown_remote" else capability, "merge_capability": capability, "change_request": request.to_dict(), "remote_merge": capability == "verified_remote", "local_merge": capability in {"denied_remote", "unsupported_remote"}}
+            return _result(SUCCESS, payload, "Change Request 远端能力未知，保持 blocked_unknown" if capability == "unknown_remote" else "Change Request 能力已分类：" + capability, args.as_json)
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            return _result(UNKNOWN, {"command": "change-request", "status": "unknown", "reason": str(error)}, "Change Request 状态未知：" + str(error), args.as_json)
     if _V2_IMPORT_ERROR is not None:
         # Keep the control-plane CLI importable in a V3-only installation. No
         # command is allowed to imply confirmation or create execution state.
@@ -506,7 +527,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             screen_session(paths, str(session_id), args.command)
         except (OSError, ValueError, PermissionError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": str(error)}, "会话筛选已阻塞：" + str(error), args.as_json)
-    if args.command in {"resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
+    if args.command in {"monitor", "resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
         return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": "V2 state.json is missing"}, "会话筛选已阻塞：V2 state.json 缺失", args.as_json)
     if args.command == "scan" and paths.vibe.exists():
         try:
@@ -648,49 +669,29 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if args.command == "plan":
         screen = classify_s0(args.request or "")
         if screen.simple:
-            decision = build_routing_decision(screen)
             payload = {
                 "command": "plan",
                 "status": "ok",
                 "route": "simple",
                 "rationale": screen.rationale,
-                "routing_decision": decision,
             }
             return _result(
-                SUCCESS, payload, render_routing_decision(decision), args.as_json
+                SUCCESS, payload, "该请求走轻量直接执行路径", args.as_json
             )
         try:
-            context = _scores(args.s1)
-        except ValueError as error:
-            return _result(
-                USAGE_ERROR,
-                {"command": "plan", "status": "usage_error", "reason": str(error)},
-                "参数错误：" + str(error),
-                args.as_json,
-            )
-        try:
-            score = score_s1(context)
+            score = score_s1(_scores(args.s1))
             route = route_task(score)
-            decision = build_routing_decision(screen, score)
             if route != "complex":
                 payload = {
                     "command": "plan",
                     "status": "ok",
                     "route": route,
                     "score": score.total,
-                    "routing_decision": decision,
                 }
                 return _result(
-                    SUCCESS, payload, render_routing_decision(decision), args.as_json
+                    SUCCESS, payload, "任务已进入轻规划", args.as_json
                 )
             if not args.plan_id or not args.node_spec:
-                decision = build_routing_decision(
-                    screen,
-                    score,
-                    next_action="provide_plan_id_and_node_spec",
-                    evidence_ref="planner:s1:{}:plan-input-missing".format(score.total),
-                    unavailable=True,
-                )
                 raise PermissionError(
                     "complex planning requires a plan id and explicit node spec"
                 )
@@ -699,15 +700,15 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         except PermissionError as error:
             return _result(
                 BLOCKED,
-                {"command": "plan", "status": "blocked", "route": "complex", "routing_decision": decision, "reason": str(error)},
-                render_routing_decision(decision) + "；规划已暂停：" + str(error),
+                {"command": "plan", "status": "blocked", "reason": str(error)},
+                "规划已暂停：" + str(error),
                 args.as_json,
             )
         except (FileExistsError, OSError, TypeError, ValueError) as error:
             return _result(
                 BLOCKED,
-                {"command": "plan", "status": "blocked", "route": "complex", "routing_decision": decision, "reason": str(error)},
-                render_routing_decision(decision) + "；规划已阻塞：" + str(error),
+                {"command": "plan", "status": "blocked", "reason": str(error)},
+                "规划已阻塞：" + str(error),
                 args.as_json,
             )
         payload = {
@@ -717,10 +718,9 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             "plan": plan.to_dict(),
             "nodes": [node.id for node in nodes],
             "authorization_digest": card.digest,
-            "routing_decision": decision,
         }
         return _result(
-            SUCCESS, payload, render_routing_decision(decision) + "；复杂计划产物已生成，等待一次授权", args.as_json
+            SUCCESS, payload, "复杂计划产物已生成，等待一次授权", args.as_json
         )
 
     if args.command == "monitor":
@@ -827,19 +827,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工等待能力观测，自动重试",
                 args.as_json,
             )
-        except FileNotFoundError as error:
-            diagnostic = planning_required_diagnostic(
-                args.plan,
-                ["plan", "nodes", "authorization-card"],
-                "规划产物缺失：" + str(error),
-            )
-            return _result(
-                BLOCKED,
-                {"command": args.command, "status": "planning_required", "diagnostic": diagnostic},
-                render_planning_required_diagnostic(diagnostic),
-                args.as_json,
-            )
-        except (OSError, RuntimeError, TypeError, ValueError) as error:
+        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
             return _result(
                 UNKNOWN,
                 {
