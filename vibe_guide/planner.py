@@ -6,10 +6,14 @@ what artifacts a route may create; publishing and monitoring stay in the CLI.
 
 from dataclasses import dataclass, field, replace
 import hashlib
+import json
+import os
 import re
-from typing import Any, Dict, List, Optional
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-from .models import PRD
+from .models import PRD, Plan
 
 
 @dataclass(frozen=True)
@@ -293,6 +297,138 @@ def approve_prd(prd: PRD, decisions: List[DecisionCard]) -> PRDResult:
     return PRDResult(replace(prd, status="approved" if not blockers else "blocked_decision"), not blockers, blockers)
 
 
+@dataclass(frozen=True)
+class PlanConfirmation:
+    """Exact, non-authorizing acknowledgement of one audited plan revision."""
+
+    plan_id: str
+    plan_revision: int
+    node_ids: Tuple[str, ...]
+    dag_audit_digest: str
+    plan_binding_digest: str
+    user_confirmation: str
+    digest: str
+    status: str = "confirmed"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "status": self.status,
+            "plan_id": self.plan_id,
+            "plan_revision": self.plan_revision,
+            "node_ids": list(self.node_ids),
+            "dag_audit_digest": self.dag_audit_digest,
+            "plan_binding_digest": self.plan_binding_digest,
+            "user_confirmation": self.user_confirmation,
+            "digest": self.digest,
+        }
+
+    @property
+    def user_action(self) -> str:
+        return self.user_confirmation
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PlanConfirmation":
+        if not isinstance(data, dict):
+            raise TypeError("plan confirmation must be an object")
+        required = {"schema_version", "status", "plan_id", "plan_revision", "node_ids",
+                    "dag_audit_digest", "plan_binding_digest", "user_confirmation", "digest"}
+        if set(data) != required or data.get("schema_version") != 1 or data.get("status") != "confirmed":
+            raise ValueError("plan confirmation schema is invalid")
+        if data.get("user_confirmation") != "CONFIRM_PLAN":
+            raise ValueError("plan confirmation requires exact CONFIRM_PLAN confirmation")
+        if (not isinstance(data.get("plan_id"), str) or not data["plan_id"].strip()
+                or isinstance(data.get("plan_revision"), bool)
+                or not isinstance(data.get("plan_revision"), int) or data["plan_revision"] < 1
+                or not isinstance(data.get("node_ids"), list)
+                or not all(isinstance(item, str) and item for item in data["node_ids"])
+                or len(set(data["node_ids"])) != len(data["node_ids"])
+                or any(not isinstance(data[key], str) or not data[key].strip()
+                       for key in ("dag_audit_digest", "plan_binding_digest", "digest"))):
+            raise ValueError("plan confirmation fields are invalid")
+        return cls(data["plan_id"], data["plan_revision"], tuple(data["node_ids"]),
+                    data["dag_audit_digest"], data["plan_binding_digest"],
+                    data["user_confirmation"], data["digest"], data["status"])
+
+
+def plan_binding_digest(plan: Plan) -> str:
+    """Hash plan identity and executable node contracts in canonical order."""
+    nodes = [{"id": node.id, "depends_on": sorted(node.depends_on),
+              "integration_after": sorted(node.integration_after),
+              "parallel_group": node.parallel_group, "status": node.status,
+              "contract": node.contract, "risk_tags": node.risk_tags,
+              "writer": node.writer, "worktree": node.worktree,
+              "allowlist": node.allowlist}
+             for node in sorted(plan.nodes, key=lambda item: item.id)]
+    payload = {"plan_id": plan.plan_id, "plan_revision": plan.version,
+               "node_ids": sorted(plan.node_ids), "nodes": nodes}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _confirmation_payload(plan: Plan, audit: Any, user_confirmation: str) -> Dict[str, Any]:
+    if user_confirmation != "CONFIRM_PLAN":
+        raise ValueError("plan confirmation requires exact CONFIRM_PLAN confirmation")
+    if getattr(audit, "status", None) != "ready":
+        raise ValueError("plan must have a ready DAG audit")
+    from .dag import audit_dag
+    expected = audit_dag(plan)
+    if (getattr(audit, "plan_id", "") != plan.plan_id
+            or getattr(audit, "plan_revision", None) != plan.version
+            or tuple(getattr(audit, "node_ids", ())) != tuple(plan.node_ids)
+            or getattr(audit, "digest", "") != expected.digest):
+        raise ValueError("DAG audit does not match the current plan")
+    return {"plan_id": plan.plan_id, "plan_revision": plan.version,
+            "node_ids": tuple(sorted(plan.node_ids)),
+            "dag_audit_digest": audit.digest,
+            "plan_binding_digest": plan_binding_digest(plan),
+            "user_confirmation": user_confirmation}
+
+
+def build_plan_confirmation(plan: Plan, audit: Any, user_confirmation: str) -> PlanConfirmation:
+    payload = _confirmation_payload(plan, audit, user_confirmation)
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=list,
+                                       separators=(",", ":")).encode()).hexdigest()
+    return PlanConfirmation(digest=digest, **payload)
+
+
+def confirm_plan(plan: Plan, audit: Any, confirmation: str) -> PlanConfirmation:
+    return build_plan_confirmation(plan, audit, confirmation)
+
+
+def is_plan_confirmation_valid(confirmation: Any, plan: Plan, audit: Any) -> bool:
+    if not isinstance(confirmation, PlanConfirmation) or confirmation.status != "confirmed":
+        return False
+    try:
+        expected = build_plan_confirmation(plan, audit, confirmation.user_confirmation)
+    except (TypeError, ValueError):
+        return False
+    return confirmation.to_dict() == expected.to_dict()
+
+
+def save_plan_confirmation(path: Path, confirmation: PlanConfirmation) -> None:
+    if not isinstance(confirmation, PlanConfirmation):
+        raise TypeError("confirmation must be a PlanConfirmation")
+    target = Path(path)
+    if target.parent.is_symlink() or target.is_symlink():
+        raise ValueError("plan confirmation path may not be a symlink")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix="." + target.name + ".", dir=str(target.parent))
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(confirmation.to_dict(), stream, ensure_ascii=False, sort_keys=True, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_name, str(target))
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def load_plan_confirmation(path: Path) -> PlanConfirmation:
+    return PlanConfirmation.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
 def planning_required_diagnostic(plan_id: str, missing=None, reason: str = "") -> Dict[str, Any]:
     """Describe a missing/incomplete plan; callers must not start a run."""
     missing_items = list(missing or ["plan"])
@@ -312,6 +448,8 @@ def planning_required_diagnostic(plan_id: str, missing=None, reason: str = "") -
 
 __all__ = [
     "S0Result", "TaskContext", "S1Score", "ProductQuestion", "DecisionCard", "PRD", "PRDResult",
+    "PlanConfirmation", "build_plan_confirmation", "confirm_plan", "is_plan_confirmation_valid", "plan_binding_digest",
+    "save_plan_confirmation", "load_plan_confirmation",
     "classify_s0", "score_s1", "route_task", "artifact_policy", "build_routing_decision", "routing_decision", "render_routing_decision",
     "planning_required_diagnostic", "render_planning_required_diagnostic", "create_decision_card", "approve_prd",
 ]
