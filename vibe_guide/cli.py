@@ -35,6 +35,11 @@ try:
     approve_prd,
     classify_s0,
     route_task,
+    routing_decision,
+    render_routing_decision,
+    planning_required_diagnostic,
+    render_planning_required_diagnostic,
+    build_routing_decision,
     score_s1,
     )
     from .scanner import scan_project
@@ -47,8 +52,19 @@ try:
 except ImportError as error:  # V3 baseline can be used without optional V2 modules.
     _V2_IMPORT_ERROR = error
     from .models import AgentCapabilities, DAGNode, Plan, PRD, Action, Phase
-    DecisionCard = TaskContext = Any
-    approve_prd = classify_s0 = route_task = score_s1 = None
+    from .planner import (
+        DecisionCard,
+        TaskContext,
+        approve_prd,
+        classify_s0,
+        route_task,
+        routing_decision,
+        render_routing_decision,
+        planning_required_diagnostic,
+        render_planning_required_diagnostic,
+        build_routing_decision,
+        score_s1,
+    )
     Environment = AdapterRegistry = ChangeRequest = Any
     doctor = init_project = scan_project = assert_planning_gate = screen_session = require_session_screened = None
     AuthorizationCard = AuthorizationRecord = ProviderActionStore = ProviderActionRunner = Monitor = ProjectPaths = Any
@@ -74,6 +90,44 @@ def _result(
     code: int, payload: Dict[str, Any], text: str, as_json: bool
 ) -> CLIResult:
     return CLIResult(code, payload, text, as_json)
+
+
+def _v3_fallback_plan(args: Any) -> CLIResult:
+    """Keep S0/S1 route visibility available without optional V2 runtime."""
+    screen = classify_s0(args.request or "")
+    if screen.simple:
+        decision = build_routing_decision(screen)
+        payload = {"command": "plan", "status": "ok", "route": "simple", "rationale": screen.rationale, "routing_decision": decision}
+        return _result(SUCCESS, payload, render_routing_decision(decision), args.as_json)
+    try:
+        context = _scores(args.s1)
+    except ValueError as error:
+        return _result(USAGE_ERROR, {"command": "plan", "status": "usage_error", "reason": str(error)}, "参数错误：" + str(error), args.as_json)
+    score = score_s1(context)
+    route = route_task(score)
+    decision = build_routing_decision(
+        screen,
+        score,
+        unavailable=(route == "complex"),
+        evidence_ref="planner:s1:{}:v2-unavailable".format(score.total) if route == "complex" else None,
+    )
+    if route == "complex":
+        return _result(BLOCKED, {"command": "plan", "status": "blocked", "route": route, "routing_decision": decision, "reason": "V2 runtime modules unavailable"}, render_routing_decision(decision) + "；V2 runtime 不可用", args.as_json)
+    payload = {"command": "plan", "status": "ok", "route": route, "score": score.total, "routing_decision": decision}
+    return _result(SUCCESS, payload, render_routing_decision(decision), args.as_json)
+
+
+def _v3_fallback_monitor(args: Any, cwd: Path) -> CLIResult:
+    plan_id = str(args.plan)
+    if not plan_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-" for character in plan_id):
+        diagnostic = planning_required_diagnostic(plan_id or "unknown", ["plan"], "计划标识无效，需先提供有效规划")
+        return _result(BLOCKED, {"command": "monitor", "status": "planning_required", "diagnostic": diagnostic}, render_planning_required_diagnostic(diagnostic), args.as_json)
+    plan_root = cwd.resolve() / ".vibe" / "plans" / plan_id
+    required = (plan_root / "plan.json", plan_root / "nodes.json", plan_root / "authorization-card.json")
+    if not all(path.is_file() and not path.is_symlink() for path in required):
+        diagnostic = planning_required_diagnostic(args.plan, ["plan", "nodes", "authorization-card"], "规划产物缺失")
+        return _result(BLOCKED, {"command": "monitor", "status": "planning_required", "diagnostic": diagnostic}, render_planning_required_diagnostic(diagnostic), args.as_json)
+    return _result(UNKNOWN, {"command": "monitor", "status": "unknown", "reason": "V2 runtime modules unavailable"}, "监工状态未知：V2 runtime modules unavailable", args.as_json)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -428,6 +482,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if _V2_IMPORT_ERROR is not None:
         # Keep the control-plane CLI importable in a V3-only installation. No
         # command is allowed to imply confirmation or create execution state.
+        if args.command == "plan":
+            return _v3_fallback_plan(args)
+        if args.command == "monitor" and args.plan and args.authorize == "AUTHORIZE":
+            return _v3_fallback_monitor(args, Path(cwd))
         status = "blocked" if args.command in {"monitor", "plan", "init"} else "unknown"
         code = BLOCKED if status == "blocked" else UNKNOWN
         return _result(code, {"command": args.command, "status": status, "reason": "V2 runtime modules unavailable"}, "V3 阶段门已保持 fail-closed", args.as_json)
@@ -448,7 +506,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             screen_session(paths, str(session_id), args.command)
         except (OSError, ValueError, PermissionError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": str(error)}, "会话筛选已阻塞：" + str(error), args.as_json)
-    if args.command in {"monitor", "resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
+    if args.command in {"resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
         return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": "V2 state.json is missing"}, "会话筛选已阻塞：V2 state.json 缺失", args.as_json)
     if args.command == "scan" and paths.vibe.exists():
         try:
@@ -590,29 +648,49 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if args.command == "plan":
         screen = classify_s0(args.request or "")
         if screen.simple:
+            decision = build_routing_decision(screen)
             payload = {
                 "command": "plan",
                 "status": "ok",
                 "route": "simple",
                 "rationale": screen.rationale,
+                "routing_decision": decision,
             }
             return _result(
-                SUCCESS, payload, "该请求走轻量直接执行路径", args.as_json
+                SUCCESS, payload, render_routing_decision(decision), args.as_json
             )
         try:
-            score = score_s1(_scores(args.s1))
+            context = _scores(args.s1)
+        except ValueError as error:
+            return _result(
+                USAGE_ERROR,
+                {"command": "plan", "status": "usage_error", "reason": str(error)},
+                "参数错误：" + str(error),
+                args.as_json,
+            )
+        try:
+            score = score_s1(context)
             route = route_task(score)
+            decision = build_routing_decision(screen, score)
             if route != "complex":
                 payload = {
                     "command": "plan",
                     "status": "ok",
                     "route": route,
                     "score": score.total,
+                    "routing_decision": decision,
                 }
                 return _result(
-                    SUCCESS, payload, "任务已进入轻规划", args.as_json
+                    SUCCESS, payload, render_routing_decision(decision), args.as_json
                 )
             if not args.plan_id or not args.node_spec:
+                decision = build_routing_decision(
+                    screen,
+                    score,
+                    next_action="provide_plan_id_and_node_spec",
+                    evidence_ref="planner:s1:{}:plan-input-missing".format(score.total),
+                    unavailable=True,
+                )
                 raise PermissionError(
                     "complex planning requires a plan id and explicit node spec"
                 )
@@ -621,15 +699,15 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         except PermissionError as error:
             return _result(
                 BLOCKED,
-                {"command": "plan", "status": "blocked", "reason": str(error)},
-                "规划已暂停：" + str(error),
+                {"command": "plan", "status": "blocked", "route": "complex", "routing_decision": decision, "reason": str(error)},
+                render_routing_decision(decision) + "；规划已暂停：" + str(error),
                 args.as_json,
             )
         except (FileExistsError, OSError, TypeError, ValueError) as error:
             return _result(
                 BLOCKED,
-                {"command": "plan", "status": "blocked", "reason": str(error)},
-                "规划已阻塞：" + str(error),
+                {"command": "plan", "status": "blocked", "route": "complex", "routing_decision": decision, "reason": str(error)},
+                render_routing_decision(decision) + "；规划已阻塞：" + str(error),
                 args.as_json,
             )
         payload = {
@@ -639,9 +717,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             "plan": plan.to_dict(),
             "nodes": [node.id for node in nodes],
             "authorization_digest": card.digest,
+            "routing_decision": decision,
         }
         return _result(
-            SUCCESS, payload, "复杂计划产物已生成，等待一次授权", args.as_json
+            SUCCESS, payload, render_routing_decision(decision) + "；复杂计划产物已生成，等待一次授权", args.as_json
         )
 
     if args.command == "monitor":
@@ -748,7 +827,19 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工等待能力观测，自动重试",
                 args.as_json,
             )
-        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
+        except FileNotFoundError as error:
+            diagnostic = planning_required_diagnostic(
+                args.plan,
+                ["plan", "nodes", "authorization-card"],
+                "规划产物缺失：" + str(error),
+            )
+            return _result(
+                BLOCKED,
+                {"command": args.command, "status": "planning_required", "diagnostic": diagnostic},
+                render_planning_required_diagnostic(diagnostic),
+                args.as_json,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
             return _result(
                 UNKNOWN,
                 {
