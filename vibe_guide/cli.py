@@ -66,7 +66,8 @@ except ImportError as error:  # V3 baseline can be used without optional V2 modu
         build_routing_decision,
         score_s1,
     )
-    Environment = AdapterRegistry = ChangeRequest = Any
+    Environment = AdapterRegistry = Any
+    from .change_requests import ChangeRequest, classify_merge_capability
     doctor = init_project = scan_project = assert_planning_gate = screen_session = require_session_screened = None
     AuthorizationCard = AuthorizationRecord = ProviderActionStore = ProviderActionRunner = Monitor = ProjectPaths = Any
     ProviderPending = Exception
@@ -141,6 +142,37 @@ def _v3_fallback_monitor(args: Any, cwd: Path) -> CLIResult:
         diagnostic = planning_required_diagnostic(args.plan, ["plan", "nodes", "authorization-card"], "规划产物缺失")
         return _result(BLOCKED, {"command": "monitor", "status": "planning_required", "diagnostic": diagnostic}, render_planning_required_diagnostic(diagnostic), args.as_json)
     return _result(UNKNOWN, {"command": "monitor", "status": "unknown", "reason": "V2 runtime modules unavailable"}, "监工状态未知：V2 runtime modules unavailable", args.as_json)
+
+
+def _v3_fallback_change_request(args: Any, cwd: Path) -> CLIResult:
+    """Classify provider facts without requiring or mutating the V2 runtime."""
+    if not args.request:
+        return _result(BLOCKED, {"command": "change-request", "status": "blocked", "reason": "request facts required"}, "Change Request 状态未知：需要事实文件", args.as_json)
+    try:
+        request_path = Path(args.request)
+        if not request_path.is_absolute():
+            request_path = cwd / request_path
+        data = _read_json(request_path)
+        if not isinstance(data, dict):
+            raise ValueError("Change Request facts must be an object")
+        request_data = data.get("change_request", data)
+        observed = data.get("observed_facts", data)
+        if not isinstance(request_data, dict) or not isinstance(observed, dict):
+            raise ValueError("Change Request facts are invalid")
+        capability = classify_merge_capability(observed)
+        request = ChangeRequest.from_dict(dict(request_data, merge_capability=capability))
+        payload = {
+            "command": "change-request",
+            "status": "blocked_unknown" if capability == "unknown_remote" else capability,
+            "merge_capability": capability,
+            "change_request": request.to_dict(),
+            "remote_merge": capability == "verified_remote",
+            "local_merge": capability in {"denied_remote", "unsupported_remote"},
+        }
+        text = "Change Request 远端能力未知，保持 blocked_unknown" if capability == "unknown_remote" else "Change Request 能力已分类：" + capability
+        return _result(SUCCESS, payload, text, args.as_json)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        return _result(UNKNOWN, {"command": "change-request", "status": "unknown", "reason": str(error)}, "Change Request 状态未知：" + str(error), args.as_json)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -483,6 +515,8 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if _V2_IMPORT_ERROR is not None:
         # Keep the control-plane CLI importable in a V3-only installation. No
         # command is allowed to imply confirmation or create execution state.
+        if args.command == "change-request":
+            return _v3_fallback_change_request(args, Path(cwd))
         if args.command == "plan":
             return _v3_fallback_plan(args)
         if args.command == "monitor" and args.plan and args.authorize == "AUTHORIZE":
