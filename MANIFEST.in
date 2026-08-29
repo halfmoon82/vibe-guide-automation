@@ -1,0 +1,2 @@
+recursive-include vibe_guide/adapters/manifests *.yaml
+recursive-include vibe_guide/guidance *.json
