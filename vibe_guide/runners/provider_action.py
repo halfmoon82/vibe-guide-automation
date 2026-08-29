@@ -6,16 +6,42 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from ..adapters.task_provider import ProviderActionStore, ProviderPending
-from ..contracts import RunEvent, RunHandle, Runner
-from ..capability_contract import load_contract
-from ..paths import ProjectPaths
-from ..task_registry import (
-    TaskBinding,
-    load_task_binding,
-    save_task_binding,
-)
-from ..workflow_gate import session_contract_prompt
+from ..adapters.task_provider import ProviderActionStore, ProviderPending, CapabilityEvaluation
+try:
+    from ..adapters.registry import load_guidance_contract
+except ImportError:  # pragma: no cover
+    load_guidance_contract = None
+try:
+    from ..contracts import RunEvent, RunHandle, Runner
+except ImportError:  # isolated V3 worker worktree
+    from dataclasses import dataclass
+    @dataclass(frozen=True)
+    class RunEvent:
+        event: str
+        data: Dict[str, Any]
+    @dataclass(frozen=True)
+    class RunHandle:
+        run_id: str
+    class Runner: pass
+try:
+    from ..capability_contract import load_contract
+except ImportError:  # pragma: no cover
+    def load_contract(paths):
+        raise ValueError("capability contract unavailable")
+try:
+    from ..paths import ProjectPaths
+except ImportError:  # pragma: no cover
+    ProjectPaths = Any
+try:
+    from ..task_registry import TaskBinding, load_task_binding, save_task_binding
+except ImportError:  # pragma: no cover
+    TaskBinding = Any
+    def load_task_binding(*args, **kwargs): raise FileNotFoundError
+    def save_task_binding(*args, **kwargs): return None
+try:
+    from ..workflow_gate import session_contract_prompt
+except ImportError:  # pragma: no cover
+    def session_contract_prompt(contract): return 'Capability contract: {"status":"unknown"}'
 
 
 class ProviderActionRunner(Runner):
@@ -56,7 +82,13 @@ class ProviderActionRunner(Runner):
                 separators=(",", ":"),
             )
         )
-        return capability + "\n" + consistency
+        guidance = 'Guidance Contract: {"status":"unknown"}'
+        if callable(load_guidance_contract):
+            try:
+                guidance = "Guidance Contract: " + json.dumps(load_guidance_contract(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            except (OSError, TypeError, ValueError):
+                pass
+        return capability + "\n" + guidance + "\n" + consistency
 
     def _action(
         self,
@@ -131,7 +163,13 @@ class ProviderActionRunner(Runner):
             "target": {
                 "type": "project",
                 "projectId": project_id,
-                "environment": {"type": "local"},
+                "environment": {
+                    "type": "worktree",
+                    "startingState": {
+                        "type": "branch",
+                        "branchName": str(contract.get("branch", "")),
+                    },
+                },
             },
         }
         created = self._require_result(
@@ -423,3 +461,44 @@ class ProviderActionRunner(Runner):
         events = self._wait_result(handle, metadata, claims, result)
         if len(events) != 1 or events[0].event != "stopped":
             raise ProviderPending("provider terminal wait did not prove a stop")
+
+
+class ProviderCapabilityGovernance:
+    """Bounded, evidence-only refresh for the provider execution gate."""
+
+    def __init__(self, store: ProviderActionStore, provider: str, host_id: str):
+        self.store = store
+        self.provider = provider
+        self.host_id = host_id
+
+    def refresh(self, probe=None, *, attempts=0, max_attempts=2, now=None) -> CapabilityEvaluation:
+        if not callable(probe):
+            evaluation = CapabilityEvaluation(
+                self.provider, self.host_id,
+                "blocked_unknown" if attempts >= max_attempts else "retry_pending",
+                {}, "", "", remediation=("run a real visible-provider capability refresh",), attempts=attempts,
+                failure_observation={"status": "unknown", "reason": "probe_missing"},
+                last_operation="capability_refresh", governance_action="probe_missing",
+                next_action="attach a real provider probe and retry", recovery_entry="provider-capability-refresh",
+            )
+            self.store.root.mkdir(parents=True, exist_ok=True)
+            self.store._atomic(self.store.root / "capabilities-v2.json", evaluation.to_dict())
+            return evaluation
+        try:
+            observations = probe()
+            return self.store.publish_capability_observations(
+                self.provider, self.host_id, observations,
+                attempts=attempts, max_attempts=max_attempts, now=now,
+            )
+        except Exception as exc:  # provider boundary remains unknown
+            evaluation = CapabilityEvaluation(
+                self.provider, self.host_id,
+                "blocked_unknown" if attempts >= max_attempts else "retry_pending",
+                {}, "", "", remediation=("retry provider capability probe: %s" % type(exc).__name__,), attempts=attempts,
+                failure_observation={"status": "unknown", "reason": str(exc)[:200]},
+                last_operation="capability_refresh", governance_action="provider_probe_failed",
+                next_action="retry the same provider probe", recovery_entry="provider-capability-refresh",
+            )
+            self.store.root.mkdir(parents=True, exist_ok=True)
+            self.store._atomic(self.store.root / "capabilities-v2.json", evaluation.to_dict())
+            return evaluation

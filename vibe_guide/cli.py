@@ -51,6 +51,7 @@ try:
     _V2_IMPORT_ERROR = None
 except ImportError as error:  # V3 baseline can be used without optional V2 modules.
     _V2_IMPORT_ERROR = error
+    from .dag import render_plan_artifacts, validate_dag
     from .models import AgentCapabilities, DAGNode, Plan, PRD, Action, Phase
     from .planner import (
         DecisionCard,
@@ -93,6 +94,18 @@ def _result(
     return CLIResult(code, payload, text, as_json)
 
 
+def _planning_payload(plan: Plan, nodes: List[DAGNode]) -> Dict[str, Any]:
+    """Expose the plan-confirmation handoff without implying authorization."""
+    return {
+        "command": "plan",
+        "status": "ready_for_plan_confirmation",
+        "route": "complex",
+        "plan": plan.to_dict(),
+        "nodes": [node.id for node in nodes],
+        "required_user_action": "confirm_plan",
+    }
+
+
 def _v3_fallback_plan(args: Any) -> CLIResult:
     """Keep S0/S1 route visibility available without optional V2 runtime."""
     screen = classify_s0(args.request or "")
@@ -129,6 +142,37 @@ def _v3_fallback_monitor(args: Any, cwd: Path) -> CLIResult:
         diagnostic = planning_required_diagnostic(args.plan, ["plan", "nodes", "authorization-card"], "规划产物缺失")
         return _result(BLOCKED, {"command": "monitor", "status": "planning_required", "diagnostic": diagnostic}, render_planning_required_diagnostic(diagnostic), args.as_json)
     return _result(UNKNOWN, {"command": "monitor", "status": "unknown", "reason": "V2 runtime modules unavailable"}, "监工状态未知：V2 runtime modules unavailable", args.as_json)
+
+
+def _v3_fallback_change_request(args: Any, cwd: Path) -> CLIResult:
+    """Classify provider facts without requiring or mutating the V2 runtime."""
+    if not args.request:
+        return _result(BLOCKED, {"command": "change-request", "status": "blocked", "reason": "request facts required"}, "Change Request 状态未知：需要事实文件", args.as_json)
+    try:
+        request_path = Path(args.request)
+        if not request_path.is_absolute():
+            request_path = cwd / request_path
+        data = _read_json(request_path)
+        if not isinstance(data, dict):
+            raise ValueError("Change Request facts must be an object")
+        request_data = data.get("change_request", data)
+        observed = data.get("observed_facts", data)
+        if not isinstance(request_data, dict) or not isinstance(observed, dict):
+            raise ValueError("Change Request facts are invalid")
+        capability = classify_merge_capability(observed)
+        request = ChangeRequest.from_dict(dict(request_data, merge_capability=capability))
+        payload = {
+            "command": "change-request",
+            "status": "blocked_unknown" if capability == "unknown_remote" else capability,
+            "merge_capability": capability,
+            "change_request": request.to_dict(),
+            "remote_merge": capability == "verified_remote",
+            "local_merge": capability in {"denied_remote", "unsupported_remote"},
+        }
+        text = "Change Request 远端能力未知，保持 blocked_unknown" if capability == "unknown_remote" else "Change Request 能力已分类：" + capability
+        return _result(SUCCESS, payload, text, args.as_json)
+    except (KeyError, OSError, TypeError, ValueError) as error:
+        return _result(UNKNOWN, {"command": "change-request", "status": "unknown", "reason": str(error)}, "Change Request 状态未知：" + str(error), args.as_json)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -285,14 +329,16 @@ def _public_runner(
 
 def _publish_plan(
     paths: ProjectPaths, plan_id: str, source_path: Path
-) -> Tuple[Plan, List[DAGNode], AuthorizationCard]:
+) -> Tuple[Plan, List[DAGNode], Optional[AuthorizationCard]]:
     source = _read_json(source_path)
     if not isinstance(source, dict):
         raise ValueError("node spec must be a JSON object")
     decisions = [DecisionCard(**item) for item in source.get("decisions", [])]
+    revision = source.get("plan_revision", source.get("revision", 1))
     prd = PRD(
         str(source.get("title", "")).strip(),
         str(source.get("objective", "")).strip(),
+        revision=revision,
     )
     if not prd.title or not prd.objective:
         raise ValueError("approved PRD title and objective are required")
@@ -300,9 +346,6 @@ def _publish_plan(
     if not approval.approved:
         raise PermissionError("product decisions remain unresolved")
     raw_nodes = source.get("nodes", [])
-    for item in raw_nodes:
-        contract = item.setdefault("contract", {})
-        contract.setdefault("worker_profile", {"worker": "default", "model": "default", "reasoning": "normal", "fallbacks": [], "selection_basis": {"issue_complexity_ref": item.get("id", "node"), "complexity_band": "standard", "risk_tags": [], "availability_evidence": "configured"}, "writer": "worker", "worktree": contract.get("worktree", "."), "branch": contract.get("branch", "main"), "allowlist": contract.get("files", []) or ["."]})
     nodes = [DAGNode.from_dict(item) for item in raw_nodes]
     if not nodes:
         raise ValueError("node spec must contain at least one node")
@@ -313,24 +356,12 @@ def _publish_plan(
     destination = _plan_root(paths, plan_id)
     plan = Plan(
         plan_id,
-        1,
+        revision,
         str(Path(".vibe") / "plans" / plan_id / "prd.md"),
         [node.id for node in nodes],
-        "authorized",
+        "draft",
         decisions=[asdict(item) for item in decisions],
-    )
-    capabilities = AgentCapabilities.from_dict(source.get("capabilities", {}))
-    try:
-        capabilities = _observed_adapter(paths, capabilities.agent_id).capabilities
-    except (FileNotFoundError, OSError, TypeError, ValueError, ProviderPending):
-        # Planning remains usable for explicitly injected/background test paths;
-        # the public monitor rechecks live observed capability before execution.
-        pass
-    card = build_authorization_card(
-        plan,
-        nodes,
-        capabilities,
-        active_pair_limit=source.get("active_pair_limit"),
+        nodes=nodes,
     )
 
     plans_root = destination.parent
@@ -345,9 +376,11 @@ def _publish_plan(
         (staging / "specs").mkdir()
         (staging / "issues").mkdir()
         (staging / "prd.md").write_text(
-            "# {}\n\n状态：approved\n审核：reviewed\n\n目标：{}\n\n## 已批准产品决策\n\n{}\n\n"
+            "# {}\n\n状态：approved\n审核：reviewed\nrevision: {}\nplan_revision: {}\n\n目标：{}\n\n## 已批准产品决策\n\n{}\n\n"
             "证据优先级：{}\n".format(
                 prd.title,
+                revision,
+                revision,
                 prd.objective,
                 "\n".join(
                     "- {} → {}".format(item.question, item.selected)
@@ -365,7 +398,7 @@ def _publish_plan(
                     contract.get("input"),
                     contract.get("output"),
                     contract.get("error_behavior"),
-                    contract.get("acceptance_example"),
+                    contract.get("acceptance_example", contract.get("acceptance_examples")),
                 ),
                 encoding="utf-8",
             )
@@ -377,15 +410,14 @@ def _publish_plan(
             )
         _atomic_json(staging / "plan.json", plan.to_dict())
         _atomic_json(staging / "nodes.json", [node.to_dict() for node in nodes])
-        _atomic_json(staging / "authorization-card.json", card.to_dict())
-        _atomic_json(staging / "dag-audit.json", {"status": "reviewed", "node_count": len(nodes), "plan_revision": str(plan.version), "node_ids": [node.id for node in nodes]})
-        _atomic_json(staging / "plan-confirmation.json", {"status": "confirmed", "plan_revision": str(plan.version), "authorization_digest": card.digest, "authorization_required": True})
+        # V3-1 publishes only the reviewed DAG audit.  Authorization and
+        # plan-confirmation artifacts require their own later user action.
         os.replace(str(staging), str(destination))
     except BaseException:
         if staging.exists():
             shutil.rmtree(staging)
         raise
-    return plan, nodes, card
+    return plan, nodes, None
 
 
 def _load_plan(paths: ProjectPaths, plan_id: str):
@@ -480,29 +512,11 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         return _result(
             USAGE_ERROR, {"status": "usage_error"}, "参数错误", False
         )
-    if _V2_IMPORT_ERROR is not None and args.command == "change-request":
-        if not args.request:
-            return _result(BLOCKED, {"command": "change-request", "status": "blocked", "reason": "request facts required"}, "Change Request 状态未知：需要事实文件", args.as_json)
-        try:
-            request_path = Path(args.request)
-            if not request_path.is_absolute():
-                request_path = Path(cwd) / request_path
-            data = _read_json(request_path)
-            if not isinstance(data, dict):
-                raise ValueError("Change Request facts must be an object")
-            cr_data = data.get("change_request", data)
-            observed = data.get("observed_facts", data)
-            if not isinstance(cr_data, dict) or not isinstance(observed, dict):
-                raise ValueError("Change Request facts are invalid")
-            capability = classify_merge_capability(observed)
-            request = ChangeRequest.from_dict(dict(cr_data, merge_capability=capability))
-            payload = {"command": "change-request", "status": "blocked_unknown" if capability == "unknown_remote" else capability, "merge_capability": capability, "change_request": request.to_dict(), "remote_merge": capability == "verified_remote", "local_merge": capability in {"denied_remote", "unsupported_remote"}}
-            return _result(SUCCESS, payload, "Change Request 远端能力未知，保持 blocked_unknown" if capability == "unknown_remote" else "Change Request 能力已分类：" + capability, args.as_json)
-        except (KeyError, OSError, TypeError, ValueError) as error:
-            return _result(UNKNOWN, {"command": "change-request", "status": "unknown", "reason": str(error)}, "Change Request 状态未知：" + str(error), args.as_json)
     if _V2_IMPORT_ERROR is not None:
         # Keep the control-plane CLI importable in a V3-only installation. No
         # command is allowed to imply confirmation or create execution state.
+        if args.command == "change-request":
+            return _v3_fallback_change_request(args, Path(cwd))
         if args.command == "plan":
             return _v3_fallback_plan(args)
         if args.command == "monitor" and args.plan and args.authorize == "AUTHORIZE":
@@ -527,7 +541,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             screen_session(paths, str(session_id), args.command)
         except (OSError, ValueError, PermissionError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": str(error)}, "会话筛选已阻塞：" + str(error), args.as_json)
-    if args.command in {"monitor", "resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
+    if args.command in {"resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
         return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": "V2 state.json is missing"}, "会话筛选已阻塞：V2 state.json 缺失", args.as_json)
     if args.command == "scan" and paths.vibe.exists():
         try:
@@ -669,58 +683,72 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if args.command == "plan":
         screen = classify_s0(args.request or "")
         if screen.simple:
+            decision = build_routing_decision(screen)
             payload = {
                 "command": "plan",
                 "status": "ok",
                 "route": "simple",
                 "rationale": screen.rationale,
+                "routing_decision": decision,
             }
             return _result(
-                SUCCESS, payload, "该请求走轻量直接执行路径", args.as_json
+                SUCCESS, payload, render_routing_decision(decision), args.as_json
             )
         try:
-            score = score_s1(_scores(args.s1))
+            context = _scores(args.s1)
+        except ValueError as error:
+            return _result(
+                USAGE_ERROR,
+                {"command": "plan", "status": "usage_error", "reason": str(error)},
+                "参数错误：" + str(error),
+                args.as_json,
+            )
+        try:
+            score = score_s1(context)
             route = route_task(score)
+            decision = build_routing_decision(screen, score)
             if route != "complex":
                 payload = {
                     "command": "plan",
                     "status": "ok",
                     "route": route,
                     "score": score.total,
+                    "routing_decision": decision,
                 }
                 return _result(
-                    SUCCESS, payload, "任务已进入轻规划", args.as_json
+                    SUCCESS, payload, render_routing_decision(decision), args.as_json
                 )
             if not args.plan_id or not args.node_spec:
+                decision = build_routing_decision(
+                    screen,
+                    score,
+                    next_action="provide_plan_id_and_node_spec",
+                    evidence_ref="planner:s1:{}:plan-input-missing".format(score.total),
+                    unavailable=True,
+                )
                 raise PermissionError(
                     "complex planning requires a plan id and explicit node spec"
                 )
             source_path = paths.resolve_relative(args.node_spec)
-            plan, nodes, card = _publish_plan(paths, args.plan_id, source_path)
+            plan, nodes, _card = _publish_plan(paths, args.plan_id, source_path)
         except PermissionError as error:
             return _result(
                 BLOCKED,
-                {"command": "plan", "status": "blocked", "reason": str(error)},
-                "规划已暂停：" + str(error),
+                {"command": "plan", "status": "blocked", "route": "complex", "routing_decision": decision, "reason": str(error)},
+                render_routing_decision(decision) + "；规划已暂停：" + str(error),
                 args.as_json,
             )
         except (FileExistsError, OSError, TypeError, ValueError) as error:
             return _result(
                 BLOCKED,
-                {"command": "plan", "status": "blocked", "reason": str(error)},
-                "规划已阻塞：" + str(error),
+                {"command": "plan", "status": "blocked", "route": "complex", "routing_decision": decision, "reason": str(error)},
+                render_routing_decision(decision) + "；规划已阻塞：" + str(error),
                 args.as_json,
             )
-        payload = {
-            "command": "plan",
-            "status": "ok",
-            "route": "complex",
-            "plan": plan.to_dict(),
-            "nodes": [node.id for node in nodes],
-            "authorization_digest": card.digest,
-        }
+        payload = _planning_payload(plan, nodes)
+        payload["routing_decision"] = decision
         return _result(
-            SUCCESS, payload, "复杂计划产物已生成，等待一次授权", args.as_json
+            SUCCESS, payload, render_routing_decision(decision) + "；复杂计划产物已生成，等待用户确认开发计划", args.as_json
         )
 
     if args.command == "monitor":
@@ -827,7 +855,19 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工等待能力观测，自动重试",
                 args.as_json,
             )
-        except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
+        except FileNotFoundError as error:
+            diagnostic = planning_required_diagnostic(
+                args.plan,
+                ["plan", "nodes", "authorization-card"],
+                "规划产物缺失：" + str(error),
+            )
+            return _result(
+                BLOCKED,
+                {"command": args.command, "status": "planning_required", "diagnostic": diagnostic},
+                render_planning_required_diagnostic(diagnostic),
+                args.as_json,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
             return _result(
                 UNKNOWN,
                 {
