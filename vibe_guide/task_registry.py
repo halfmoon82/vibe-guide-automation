@@ -183,6 +183,11 @@ def _run_file(paths, run_id, create=False):
         raise ValueError("task run directory may not be a symlink")
     if create:
         root.mkdir(parents=True, exist_ok=True)
+    elif not root.exists():
+        # A read of an as-yet unused run is an empty registry, not a
+        # malformed path.  Keep the path non-mutating so callers can
+        # distinguish "no binding yet" via the existing FileNotFoundError.
+        return root / "tasks.json"
     if not root.is_dir() or root.is_symlink():
         raise ValueError("task run directory is invalid")
     return root / "tasks.json"
