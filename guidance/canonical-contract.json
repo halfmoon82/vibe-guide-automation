@@ -1,0 +1,11 @@
+{
+  "actions": ["continue_planning", "confirm_plan", "authorize_execution"],
+  "authorization_defaults": {"commit": "allowed", "create_mr": "allowed", "deploy": "excluded", "merge": "allowed", "push": "allowed"},
+  "contract_hash": "4fd86d1b0bf9b9760de0ccd9bb02b0cd0ba9a230008d9aef4c176448728f6662",
+  "forbidden_automatic_actions": ["create_worker", "monitor", "commit", "push", "create_mr", "merge", "deploy"],
+  "s1_complex_rules": {"parallel_ready": true, "requires": ["independent_supervisor", "developer_worker", "independent_reviewer", "unique_writer"]},
+  "stage_handoff_required": ["stage", "status", "plan_id", "plan_revision", "evidence_refs", "required_user_action", "forbidden_automatic_actions", "open_questions"],
+  "stages": ["prd_approved", "spec_issue_dag", "development_plan_confirmation", "authorization", "monitor"],
+  "statuses": ["planning_required", "governance_pending", "retry_pending", "blocked_unknown"],
+  "version": "v3"
+}

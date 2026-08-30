@@ -10,6 +10,8 @@ import tempfile
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from .guidance import conformance_report
+
 try:
     from .authorization import (
     AuthorizationCard,
@@ -92,6 +94,23 @@ def _result(
     code: int, payload: Dict[str, Any], text: str, as_json: bool
 ) -> CLIResult:
     return CLIResult(code, payload, text, as_json)
+
+
+def _governance_pending_result(command: str, error: BaseException, as_json: bool) -> Optional[CLIResult]:
+    """Preserve structured Guidance governance state at the CLI boundary."""
+    if getattr(error, "status", None) != "governance_pending":
+        return None
+    return _result(
+        UNKNOWN,
+        {
+            "command": command,
+            "status": "governance_pending",
+            "reason": getattr(error, "reason", str(error)),
+            "remediation": list(getattr(error, "remediation", ())),
+        },
+        "{} 等待 Guidance Contract 治理".format(command),
+        as_json,
+    )
 
 
 def _planning_payload(plan: Plan, nodes: List[DAGNode]) -> Dict[str, Any]:
@@ -181,7 +200,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "doctor", "plan", "monitor", "status", "resume", "change-request"),
+        choices=("scan", "init", "doctor", "conformance", "plan", "monitor", "status", "resume", "change-request"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -511,6 +530,15 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if args.command is None:
         return _result(
             USAGE_ERROR, {"status": "usage_error"}, "参数错误", False
+        )
+    if args.command == "conformance":
+        report = conformance_report()
+        passed = report.get("status") == "passed"
+        return _result(
+            SUCCESS if passed else UNKNOWN,
+            {"command": "conformance", **report},
+            "Guidance Contract conformance 通过" if passed else "Guidance Contract conformance 待治理",
+            args.as_json,
         )
     if _V2_IMPORT_ERROR is not None:
         # Keep the control-plane CLI importable in a V3-only installation. No
@@ -868,6 +896,9 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 args.as_json,
             )
         except (OSError, RuntimeError, TypeError, ValueError) as error:
+            governance_result = _governance_pending_result("monitor", error, args.as_json)
+            if governance_result is not None:
+                return governance_result
             return _result(
                 UNKNOWN,
                 {
@@ -954,6 +985,9 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 args.as_json,
             )
         except RuntimeError as error:
+            governance_result = _governance_pending_result(args.command, error, args.as_json)
+            if governance_result is not None:
+                return governance_result
             return _result(
                 UNKNOWN,
                 {
