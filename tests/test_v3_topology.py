@@ -115,6 +115,13 @@ class V3TopologyTests(unittest.TestCase):
         restored = TaskBinding.from_dict(binding.to_dict())
         self.assertEqual(restored.client_thread_id, "client-1")
 
+    def test_loading_missing_run_is_a_normal_empty_registry(self):
+        with tempfile.TemporaryDirectory() as root:
+            class Paths:
+                vibe = Path(root) / ".vibe"
+            with self.assertRaises(FileNotFoundError):
+                load_task_binding(Paths(), "n1", "developer", run_id="run-1")
+
     def test_registry_rejects_ancestor_symlink_without_external_side_effect(self):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
             root_path = Path(root)
