@@ -836,8 +836,6 @@ class VisibleTaskProvider:
     def create(self, role: str, issue_id: str, contract_path: Path) -> TaskBinding:
         if self.bridge is None:
             raise ProviderUnavailable("visible task bridge is not configured")
-        if self.provider != "codex-app-visible":
-            raise ProviderUnavailable("visible provider must be codex-app-visible")
         if not isinstance(self.routing, RepositoryTaskRouting):
             raise ProviderUnavailable("confirmed repository task routing is required")
         if self.routing.environment != "worktree":

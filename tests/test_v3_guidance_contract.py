@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from vibe_guide.guidance import GuidanceContractError, conformance_report, guidance_for_stage, load_guidance_contract
+from vibe_guide.guidance import GuidanceContractError, canonical_contract_path, conformance_report, guidance_for_stage, load_guidance_contract
 from vibe_guide.adapters.task_provider import CodexAppBridge, ProviderUnavailable, RepositoryTaskRouting, VisibleTaskProvider
 from vibe_guide.runners.provider_action import ProviderActionRunner
 from vibe_guide.cli import _governance_pending_result
@@ -32,6 +32,11 @@ class GuidanceContractTests(unittest.TestCase):
         self.assertEqual(guidance_for_stage(contract, "prd_approved", "approved")["required_user_action"], "continue_planning")
         self.assertEqual(contract["authorization_defaults"]["deploy"], "excluded")
         self.assertIn("create_worker", contract["forbidden_automatic_actions"])
+
+    def test_canonical_contract_path_is_available_from_source_or_package_asset(self):
+        path = canonical_contract_path()
+        self.assertTrue(path.is_file())
+        self.assertTrue(path.name == "canonical-contract.json")
 
     def test_invalid_or_missing_contract_is_governance_pending_with_remediation(self):
         with tempfile.TemporaryDirectory() as directory:
