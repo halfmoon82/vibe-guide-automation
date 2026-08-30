@@ -43,10 +43,12 @@ def _digest(value: Mapping[str, Any]) -> str:
 def canonical_contract_path(path: Optional[Path] = None) -> Path:
     if path is not None:
         return Path(path)
-    project_asset = Path(__file__).resolve().parent.parent / "guidance" / "canonical-contract.json"
-    if project_asset.is_file():
-        return project_asset
-    return Path(__file__).resolve().parent / "guidance" / "canonical-contract.json"
+    package_asset = Path(__file__).resolve().parent / "guidance" / "canonical-contract.json"
+    if package_asset.is_file():
+        return package_asset
+    # Source checkouts retain the repository-level asset; installed wheels
+    # use the package data above.
+    return Path(__file__).resolve().parent.parent / "guidance" / "canonical-contract.json"
 
 
 def _validated(value: Mapping[str, Any]) -> Dict[str, Any]:

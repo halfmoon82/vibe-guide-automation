@@ -797,6 +797,8 @@ class VisibleTaskProvider:
     def create(self, role: str, issue_id: str, contract_path: Path) -> TaskBinding:
         if self.bridge is None:
             raise ProviderUnavailable("visible task bridge is not configured")
+        # Visible provider adapters share the same contract boundary; the
+        # concrete bridge, not this common provider, selects the platform.
         if not isinstance(self.routing, RepositoryTaskRouting):
             raise ProviderUnavailable("confirmed repository task routing is required")
         contract_path = Path(contract_path)
