@@ -23,7 +23,10 @@ from .authorization import (
 )
 from .contracts import RunEvent
 from .models import DAGNode
-from .paths import ProjectPaths
+try:
+    from .paths import ProjectPaths
+except ImportError:  # The V3-6 base omits the optional path helper module.
+    ProjectPaths = Any  # type: ignore
 
 
 STATE_SCHEMA_VERSION = 1
@@ -963,3 +966,291 @@ def release_writer_lease(
             return False
         lease_path.unlink()
         return True
+
+
+# --- Legacy evidence retention (V3-6) -----------------------------------
+
+def _trusted_absolute(path: Any) -> Path:
+    """Make a lexical absolute path, expanding only macOS system aliases."""
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    for alias in (Path("/var"), Path("/tmp")):
+        try:
+            remainder = absolute.relative_to(alias)
+        except ValueError:
+            continue
+        if alias.is_symlink():
+            target = Path(os.readlink(alias))
+            if not target.is_absolute():
+                target = alias.parent / target
+            absolute = target.joinpath(*remainder.parts)
+        break
+    return absolute
+
+def build_preserved_evidence_map(source_root: Path) -> Dict[str, Dict[str, Any]]:
+    """Hash every regular historical file without modifying the source."""
+    root = Path(source_root)
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("evidence source must be a real directory")
+    probe = root.absolute()
+    while probe != probe.parent:
+        if probe.is_symlink() and str(probe) not in {"/var", "/tmp"}:
+            raise ValueError("evidence source may not traverse symlinks")
+        probe = probe.parent
+    result: Dict[str, Dict[str, Any]] = {}
+    for candidate in sorted(root.rglob("*")):
+        if candidate.is_symlink():
+            raise ValueError("evidence source may not contain symlinks")
+        if not candidate.is_file():
+            continue
+        payload = candidate.read_bytes()
+        result[candidate.relative_to(root).as_posix()] = {
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "size": len(payload),
+            "historical": True,
+            "read_only": True,
+        }
+    return result
+
+
+def _assert_evidence_destination(destination_root: Path, path: Optional[Path] = None) -> None:
+    """Reject symlink traversal beneath the destination boundary."""
+    base = Path(destination_root)
+    candidate = base if path is None else Path(path)
+    if base.is_symlink():
+        raise ValueError("evidence destination may not traverse symlinks")
+    probe = base
+    while probe != probe.parent:
+        if probe.is_symlink() and str(probe) not in {"/var", "/tmp"}:
+            raise ValueError("evidence destination may not traverse symlinks")
+        probe = probe.parent
+    try:
+        candidate.relative_to(base)
+    except ValueError as error:
+        raise ValueError("evidence destination escapes its root") from error
+    current = base
+    for part in candidate.relative_to(base).parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("evidence destination may not traverse symlinks")
+
+
+def _copy_evidence_file(
+    source: Path,
+    target: Path,
+    expected_digest: str,
+    parent_fd: Optional[int] = None,
+) -> None:
+    if source.is_symlink() or not source.is_file() or (
+        parent_fd is None and target.is_symlink()
+    ):
+        raise ValueError("evidence changed during preservation")
+    source_fd = os.open(str(source), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    source_stat = os.fstat(source_fd)
+    if not stat.S_ISREG(source_stat.st_mode):
+        os.close(source_fd)
+        raise ValueError("evidence must be a regular file")
+    owns_parent = parent_fd is None
+    if owns_parent:
+        try:
+            parent_fd = _open_evidence_directory(target.parent)
+        except Exception:
+            os.close(source_fd)
+            raise
+    assert parent_fd is not None
+    temporary = "." + target.name + "." + uuid.uuid4().hex
+    descriptor = None
+    digest = hashlib.sha256()
+    try:
+        try:
+            existing = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and stat.S_ISLNK(existing.st_mode):
+            raise ValueError("evidence destination may not be a symlink")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                stream.write(chunk)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if digest.hexdigest() != expected_digest:
+            raise ValueError("evidence changed during preservation")
+        os.replace(temporary, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temporary = None
+        os.fsync(parent_fd)
+    finally:
+        os.close(source_fd)
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        if owns_parent:
+            os.close(parent_fd)
+
+
+def _open_evidence_directory(path: Path) -> int:
+    """Open/create a destination directory without following symlink entries."""
+    absolute = _trusted_absolute(path)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(os.sep, flags)
+    try:
+        for part in absolute.parts[1:]:
+            try:
+                os.mkdir(part, 0o700, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_evidence_relative_directory(parent_fd: int, parts: Any) -> int:
+    """Open/create a child directory exclusively through ``parent_fd``."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.dup(parent_fd)
+    try:
+        for part in parts:
+            part = os.fspath(part)
+            if part in ("", "."):
+                continue
+            if part == ".." or os.sep in part or (os.altsep and os.altsep in part):
+                raise ValueError("relative evidence path escapes its root")
+            try:
+                os.mkdir(part, 0o700, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _atomic_bytes_at(parent_fd: int, name: str, data: bytes) -> None:
+    """Atomically replace a direct child while retaining its parent dirfd."""
+    if not isinstance(name, str) or not name or name in {".", ".."} or os.sep in name:
+        raise ValueError("atomic filename must be a direct child")
+    temporary = "." + name + "." + uuid.uuid4().hex
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=parent_fd,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        temporary = None
+        os.fsync(parent_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+
+
+def preserve_evidence(source_root: Path, destination_root: Path) -> Dict[str, Dict[str, Any]]:
+    """Copy legacy evidence into a new revision and persist its digest map."""
+    source = Path(source_root)
+    destination = Path(destination_root)
+    evidence = build_preserved_evidence_map(source)
+    if destination.exists() and (destination.is_symlink() or not destination.is_dir()):
+        raise ValueError("evidence destination must be a real directory")
+    try:
+        _trusted_absolute(destination).relative_to(_trusted_absolute(source))
+    except ValueError:
+        pass
+    else:
+        raise ValueError("evidence destination may not be inside the source")
+    _assert_evidence_destination(destination)
+    destination_fd = _open_evidence_directory(destination)
+    try:
+        if destination.is_symlink():
+            raise ValueError("evidence destination changed during validation")
+        _assert_evidence_destination(destination, destination / "legacy-evidence")
+        evidence_fd = _open_evidence_relative_directory(destination_fd, ("legacy-evidence",))
+        try:
+            for relative, metadata in evidence.items():
+                relative_path = Path(relative)
+                if (
+                    relative_path.is_absolute()
+                    or not relative_path.parts
+                    or ".." in relative_path.parts
+                ):
+                    raise ValueError("evidence path escapes its root")
+                source_file = source.joinpath(*relative_path.parts)
+                target_file = destination / "legacy-evidence" / relative_path
+                parent_fd = _open_evidence_relative_directory(
+                    evidence_fd, relative_path.parts[:-1]
+                )
+                try:
+                    _assert_evidence_destination(destination, target_file.parent)
+                    if target_file.parent.is_symlink():
+                        raise ValueError("evidence destination may not traverse symlinks")
+                    _copy_evidence_file(
+                        source_file,
+                        relative_path,
+                        metadata["sha256"],
+                        parent_fd=parent_fd,
+                    )
+                finally:
+                    os.close(parent_fd)
+        finally:
+            os.close(evidence_fd)
+        _atomic_bytes_at(
+            destination_fd,
+            "evidence-map.json",
+            json.dumps(evidence, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8"),
+        )
+    finally:
+        os.close(destination_fd)
+    return evidence
+
+
+def load_evidence_map(path: Path) -> Dict[str, Dict[str, Any]]:
+    target = Path(path)
+    if target.is_symlink() or not target.is_file():
+        raise FileNotFoundError(str(target))
+    try:
+        value = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("evidence map is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError("evidence map must be an object")
+    for relative, metadata in value.items():
+        if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts:
+            raise ValueError("evidence map path is invalid")
+        if not isinstance(metadata, dict) or not _DIGEST.fullmatch(str(metadata.get("sha256", ""))):
+            raise ValueError("evidence map digest is invalid")
+    return value
+
+
+preserve_legacy_evidence = preserve_evidence
+load_preserved_evidence_map = load_evidence_map
+evidence_digest_map = build_preserved_evidence_map
