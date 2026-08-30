@@ -13,16 +13,10 @@ from pathlib import Path
 import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-try:
+try:  # The V3 topology module is also usable in a minimal source checkout.
     from ..paths import ProjectPaths
-except ImportError:  # isolated V3 worker worktrees may omit later modules
-    class ProjectPaths:
-        def __init__(self, root):
-            self.root = Path(root).resolve()
-            self.vibe = self.root / ".vibe"
-            self.vibe_dir = self.vibe
-        def resolve_vibe_path(self, name):
-            return self.vibe / name
+except ImportError:  # pragma: no cover - full package installs provide paths
+    ProjectPaths = Any
 try:
     from ..workflow_gate import require_capability_contract, require_entry, require_child_origin
 except ImportError:  # pragma: no cover
@@ -35,7 +29,7 @@ except ImportError:  # pragma: no cover
             raise PermissionError("invalid child origin")
 try:
     from ..diagnostics import validate_child_session_binding
-except ImportError:  # pragma: no cover
+except ImportError:  # pragma: no cover - optional V2 diagnostics
     def validate_child_session_binding(*args, **kwargs):
         return None
 from ..models import WorkerProfile
@@ -50,6 +44,12 @@ class ProviderPending(RuntimeError):
 
 
 _PROVIDER_ACTIONS = {"create", "locate", "visibility", "resume", "wait"}
+_OBSERVED_PROVIDER_ROUTES = {}
+
+
+def observed_provider_route(task_id):
+    """Return the route observed in the latest provider create result."""
+    return _OBSERVED_PROVIDER_ROUTES.get(task_id)
 PROVIDER_ADAPTER_IDS = {
     "codex-app-visible": "codex", "claude-code-visible": "claude-code",
     "cursor-visible": "cursor", "grok-visible": "grok",
@@ -473,7 +473,28 @@ class ProviderActionStore:
             or not isinstance(result["payload"], dict)
         ):
             raise ValueError("provider action result is not bound to its request")
-        return result["payload"]
+        payload = result["payload"]
+        binding = payload.get("binding") if isinstance(payload, dict) else None
+        if isinstance(binding, dict):
+            aliases = [binding.get("threadId"), binding.get("task_id")]
+            aliases = [value for value in aliases if value not in (None, "")]
+            if len(set(aliases)) > 1:
+                raise ValueError("provider task identity aliases disagree")
+            host_aliases = [binding.get("hostId"), binding.get("host")]
+            host_aliases = [value for value in host_aliases if value not in (None, "")]
+            if len(set(host_aliases)) > 1:
+                raise ValueError("provider host identity aliases disagree")
+            task_id = aliases[0] if aliases else None
+            route = {
+                "host": host_aliases[0] if host_aliases else None,
+                "worktree": binding.get("worktree"),
+                "branch": binding.get("branch"),
+            }
+            if isinstance(task_id, str):
+                if any(not isinstance(value, str) or not value.strip() for value in route.values()):
+                    raise ValueError("provider route binding is incomplete")
+                _OBSERVED_PROVIDER_ROUTES[task_id] = route
+        return payload
 
     def complete(self, action_id: str, payload: Dict[str, Any]) -> None:
         request = self._read(
@@ -569,8 +590,26 @@ class TaskBinding:
     handoff_file: Optional[str] = None
     cursor: Optional[str] = None
     client_thread_id: Optional[str] = None
-    visible: bool = False
+    visible: Optional[bool] = None
     limitations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self):
+        if not isinstance(self.provider, str) or not self.provider.strip():
+            raise ValueError("provider is required")
+        if self.mode not in {"visible", "background"}:
+            raise ValueError("task mode must be visible or background")
+        if self.role not in {"developer", "reviewer"}:
+            raise ValueError("task role must be developer or reviewer")
+        if not isinstance(self.issue_id, str) or not self.issue_id.strip():
+            raise ValueError("issue_id is required")
+        if self.mode == "visible" and not self.task_id and not self.client_thread_id:
+            raise ValueError("visible task binding requires threadId or clientThreadId")
+        expected_visible = self.mode == "visible" and bool(self.task_id)
+        if self.visible is not None and self.visible != expected_visible:
+            raise ValueError("task visibility disagrees with mode")
+        object.__setattr__(self, "visible", expected_visible)
+        if self.provider == "codex-app-visible" and self.task_id and not self.host:
+            raise ValueError("visible Codex task binding requires hostId")
 
     @property
     def thread_id(self):
@@ -748,8 +787,14 @@ class VisibleTaskProvider:
     def create(self, role: str, issue_id: str, contract_path: Path) -> TaskBinding:
         if self.bridge is None:
             raise ProviderUnavailable("visible task bridge is not configured")
+        if self.provider != "codex-app-visible":
+            raise ProviderUnavailable("visible provider must be codex-app-visible")
         if not isinstance(self.routing, RepositoryTaskRouting):
             raise ProviderUnavailable("confirmed repository task routing is required")
+        if self.routing.environment != "worktree":
+            raise ProviderUnavailable("visible task routing must target a worktree")
+        if not self.routing.project_id.strip():
+            raise ProviderUnavailable("visible task routing requires a project")
         contract_path = Path(contract_path)
         prompt = (
             self.prompt_factory(role, issue_id, contract_path)
@@ -831,10 +876,30 @@ class VisibleTaskProvider:
             return raw
         if not isinstance(raw, Mapping):
             raise ProviderUnavailable("visible task creation returned invalid binding")
-        task_id = raw.get("task_id") or raw.get("threadId")
-        host = raw.get("host") or raw.get("hostId") or self.routing.host_id
+        task_aliases = [raw.get("task_id"), raw.get("threadId")]
+        task_aliases = [value for value in task_aliases if value not in (None, "")]
+        if len(set(task_aliases)) > 1:
+            raise ProviderUnavailable("visible task identity aliases disagree")
+        host_aliases = [raw.get("host"), raw.get("hostId")]
+        host_aliases = [value for value in host_aliases if value not in (None, "")]
+        if len(set(host_aliases)) > 1:
+            raise ProviderUnavailable("visible task host identity aliases disagree")
+        task_id = task_aliases[0] if task_aliases else None
+        host = host_aliases[0] if host_aliases else None
+        if not isinstance(host, str) or not host:
+            raise ProviderUnavailable("visible task host is missing")
         if host != self.routing.host_id:
             raise ProviderUnavailable("visible task host does not match confirmed routing")
+        worktree = raw.get("worktree")
+        branch = raw.get("branch")
+        if not isinstance(worktree, str) or not worktree.strip():
+            raise ProviderUnavailable("visible task worktree is missing")
+        if worktree != self.routing.worktree:
+            raise ProviderUnavailable("visible task worktree does not match confirmed routing")
+        if not isinstance(branch, str) or not branch.strip():
+            raise ProviderUnavailable("visible task branch is missing")
+        if branch != self.routing.branch:
+            raise ProviderUnavailable("visible task branch does not match confirmed routing")
         client_thread_id = raw.get("client_thread_id") or raw.get("clientThreadId")
         return TaskBinding(
             provider=self.provider,
@@ -843,8 +908,8 @@ class VisibleTaskProvider:
             issue_id=issue_id,
             task_id=task_id,
             host=host,
-            worktree=self.routing.worktree,
-            branch=self.routing.branch,
+            worktree=worktree,
+            branch=branch,
             status_file=raw.get("status_file"),
             handoff_file=raw.get("handoff_file"),
             cursor=raw.get("cursor"),

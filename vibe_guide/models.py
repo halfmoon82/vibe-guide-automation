@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -113,6 +113,250 @@ class DAGNode:
     @classmethod
     def from_dict(cls, data):
         return cls(**data)
+
+
+@dataclass(frozen=True)
+class TopologyValidation:
+    """Evidence-bounded S1 execution topology decision."""
+
+    status: str
+    reasons: Tuple[str, ...] = ()
+    ready_nodes: Tuple[str, ...] = ()
+    parallel_groups: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    applies: bool = True
+
+    def __post_init__(self):
+        if self.status not in {"valid", "governance_pending", "bypassed"}:
+            raise ValueError("unsupported topology status")
+        object.__setattr__(self, "reasons", tuple(str(item) for item in self.reasons))
+        object.__setattr__(self, "ready_nodes", tuple(str(item) for item in self.ready_nodes))
+        object.__setattr__(self, "parallel_groups", {
+            str(key): tuple(str(item) for item in values)
+            for key, values in (self.parallel_groups or {}).items()
+        })
+
+    @property
+    def valid(self):
+        return self.status in {"valid", "bypassed"}
+
+    def to_dict(self):
+        return {
+            "status": self.status,
+            "reasons": list(self.reasons),
+            "ready_nodes": list(self.ready_nodes),
+            "parallel_groups": {key: list(values) for key, values in self.parallel_groups.items()},
+            "applies": self.applies,
+        }
+
+
+@dataclass(frozen=True)
+class DispatchedPair:
+    node_id: str
+    developer: Any
+    reviewer: Any
+
+
+class TopologyError(ValueError):
+    """Raised when an S1 topology cannot be dispatched safely."""
+
+
+def _topology_value(node: DAGNode, name: str, default=None):
+    contract = node.contract if isinstance(node.contract, Mapping) else {}
+    value = contract.get(name)
+    if value in (None, "", []):
+        value = getattr(node, name, default)
+    profile = contract.get("worker_profile")
+    if value in (None, "", []) and isinstance(profile, Mapping):
+        value = profile.get(name, default)
+    if value in (None, "", []) and isinstance(contract.get("routing"), Mapping):
+        value = contract["routing"].get(name, default)
+    if value in (None, "", []) and isinstance(contract.get("repository_routing"), Mapping):
+        value = contract["repository_routing"].get(name, default)
+    return value
+
+
+def _node_scope(node: DAGNode):
+    value = _topology_value(node, "allowlist", [])
+    return {str(item) for item in value} if isinstance(value, (list, tuple, set)) else set()
+
+
+def _ready_node_ids(nodes):
+    by_id = {node.id: node for node in nodes}
+    return [
+        node.id for node in nodes
+        if node.status in {"planned", "ready"}
+        and all(by_id.get(dep) is not None and by_id[dep].status in {"accepted", "delivered"}
+                for dep in node.depends_on)
+    ]
+
+
+def validate_topology(plan_or_nodes, complexity="complex", supervisor=None,
+                      host=None, parent_run_id=None):
+    """Validate S1 role separation and expose the ready set for dispatch.
+
+    Simple and light-plan work deliberately bypasses this governance layer.
+    The function accepts either a Plan or an iterable of DAG nodes.
+    """
+    inferred = getattr(plan_or_nodes, "complexity", None) or getattr(plan_or_nodes, "complexity_band", None)
+    mode = str(inferred or complexity or "complex").strip().casefold()
+    nodes = list(getattr(plan_or_nodes, "nodes", plan_or_nodes) or [])
+    if mode in {"simple", "light", "light_plan", "light-plan"}:
+        return TopologyValidation("bypassed", applies=False)
+    if mode not in {"complex", "s1", "s1_complex", "s1-complex"}:
+        return TopologyValidation("governance_pending", ("complexity band is unknown",), applies=True)
+
+    reasons = []
+    if not nodes:
+        reasons.append("topology has no nodes")
+    if supervisor in (None, ""):
+        supervisor = getattr(plan_or_nodes, "supervisor", None)
+    if supervisor in (None, "") and nodes:
+        supervisor = _topology_value(nodes[0], "supervisor")
+    if not isinstance(supervisor, str) or not supervisor.strip():
+        reasons.append("missing supervisor")
+        supervisor = None
+
+    writers = []
+    worktrees = []
+    for node in nodes:
+        writer = _topology_value(node, "writer")
+        reviewer = _topology_value(node, "reviewer")
+        if not isinstance(writer, str) or not writer.strip():
+            reasons.append("node %s missing writer" % node.id)
+        else:
+            writers.append(writer)
+        if not isinstance(reviewer, str) or not reviewer.strip():
+            reasons.append("node %s missing reviewer" % node.id)
+        if supervisor and (writer == supervisor or reviewer == supervisor):
+            reasons.append("supervisor must be independent from node %s" % node.id)
+        if writer and reviewer and writer == reviewer:
+            reasons.append("node %s writer and reviewer must be distinct" % node.id)
+        provider = _topology_value(node, "provider")
+        adapter_id = _topology_value(node, "adapter_id")
+        if adapter_id != "codex":
+            reasons.append("node %s adapter_id must be codex" % node.id)
+        environment = _topology_value(node, "environment")
+        if provider != "codex-app-visible":
+            reasons.append("node %s provider must be codex-app-visible" % node.id)
+        if environment != "worktree":
+            reasons.append("node %s environment must be worktree" % node.id)
+        worktree = _topology_value(node, "worktree")
+        if not isinstance(worktree, str) or not worktree.strip():
+            reasons.append("node %s missing worktree" % node.id)
+        else:
+            worktrees.append(worktree)
+        branch = _topology_value(node, "branch")
+        if not isinstance(branch, str) or not branch.strip():
+            reasons.append("node %s missing branch" % node.id)
+        node_host = _topology_value(node, "host")
+        if not isinstance(node_host, str) or not node_host.strip():
+            reasons.append("node %s missing host" % node.id)
+        elif host is not None and node_host != host:
+            reasons.append("node %s host does not match parent binding" % node.id)
+        node_parent_run_id = _topology_value(node, "parent_run_id")
+        if not isinstance(node_parent_run_id, str) or not node_parent_run_id.startswith("run-"):
+            reasons.append("node %s parent-run binding is invalid" % node.id)
+        elif parent_run_id is not None and node_parent_run_id != parent_run_id:
+            reasons.append("node %s parent-run binding does not match" % node.id)
+        allowlist = _topology_value(node, "allowlist", [])
+        if not isinstance(allowlist, (list, tuple)) or not allowlist:
+            reasons.append("node %s missing allowlist" % node.id)
+
+    if len(writers) != len(set(writers)):
+        reasons.append("duplicate writer")
+    if len(worktrees) != len(set(worktrees)):
+        reasons.append("duplicate worktree")
+    if supervisor and supervisor in writers:
+        reasons.append("writer-as-supervisor")
+
+    by_id = {node.id: node for node in nodes}
+    for node in nodes:
+        child_scope = _node_scope(node)
+        for dependency in node.depends_on:
+            parent = by_id.get(dependency)
+            if parent is None:
+                continue
+            if child_scope.isdisjoint(_node_scope(parent)):
+                contract = node.contract if isinstance(node.contract, Mapping) else {}
+                justification = (contract.get("dependency_reason") or
+                                 contract.get("serialization_justification") or
+                                 contract.get("dependency_justification"))
+                if not justification:
+                    reasons.append("unjustified serialization %s -> %s" % (dependency, node.id))
+
+    ready = _ready_node_ids(nodes)
+    groups = {}
+    for node in nodes:
+        if node.id in ready:
+            groups.setdefault(node.parallel_group or "default", []).append(node.id)
+    status = "governance_pending" if reasons else "valid"
+    return TopologyValidation(status, tuple(dict.fromkeys(reasons)), tuple(ready), groups)
+
+
+def dispatch_ready_nodes(nodes: Iterable[DAGNode], provider, contract_path,
+                        complexity="complex", supervisor=None):
+    """Create visible developer/reviewer pairs for every ready node."""
+    nodes = list(nodes or [])
+    validation = validate_topology(nodes, complexity=complexity, supervisor=supervisor)
+    if not validation.valid:
+        raise TopologyError("topology is %s: %s" %
+                            (validation.status, "; ".join(validation.reasons)))
+    if not validation.applies:
+        return []
+    if getattr(provider, "provider", None) != "codex-app-visible" or getattr(provider, "mode", None) != "visible":
+        raise TopologyError("S1 topology requires codex-app-visible provider")
+    routing = getattr(provider, "routing", None)
+    if getattr(routing, "environment", None) != "worktree" or not getattr(routing, "project_id", None):
+        raise TopologyError("S1 topology requires a project worktree route")
+    for node_id in validation.ready_nodes:
+        node = next(item for item in nodes if item.id == node_id)
+        if (_topology_value(node, "host") != getattr(routing, "host_id", None)
+                or _topology_value(node, "worktree") != getattr(routing, "worktree", None)
+                or _topology_value(node, "branch") != getattr(routing, "branch", None)):
+            raise TopologyError("node and provider routing do not match")
+    developers = {
+        node_id: provider.create("developer", node_id, contract_path)
+        for node_id in validation.ready_nodes
+    }
+    reviewers = {
+        node_id: provider.create("reviewer", node_id, contract_path)
+        for node_id in validation.ready_nodes
+    }
+    pairs = []
+    for node_id in validation.ready_nodes:
+        developer = developers[node_id]
+        reviewer = reviewers[node_id]
+        developer_id = getattr(developer, "task_id", None)
+        reviewer_id = getattr(reviewer, "task_id", None)
+        if not developer_id or not reviewer_id or developer_id == reviewer_id:
+            raise TopologyError("developer and reviewer tasks must be distinct")
+        if not getattr(developer, "visible", False) or not getattr(reviewer, "visible", False):
+            raise TopologyError("developer and reviewer tasks must be visible")
+        node = next(item for item in nodes if item.id == node_id)
+        for task in (developer, reviewer):
+            if any(getattr(task, name, None) != _topology_value(node, name)
+                   for name in ("host", "worktree", "branch")):
+                raise TopologyError("provider returned route does not match node contract")
+        pairs.append(DispatchedPair(node_id, developer, reviewer))
+    return pairs
+
+
+def assert_supervisor_boundary(caller_identity, plan_or_nodes):
+    """Require the caller to be the explicitly bound independent supervisor."""
+    nodes = list(getattr(plan_or_nodes, "nodes", plan_or_nodes) or [])
+    supervisors = {_topology_value(node, "supervisor") for node in nodes}
+    writers = {_topology_value(node, "writer") for node in nodes}
+    if len(supervisors) != 1 or not caller_identity or caller_identity in writers or caller_identity not in supervisors:
+        raise PermissionError("monitor caller must be the designated independent supervisor")
+    return True
+
+
+validate_execution_topology = validate_topology
+
+
+def dispatch_ready_set(*args, **kwargs):
+    """Fail-closed compatibility name; dispatch belongs to Monitor runtime."""
+    raise PermissionError("dispatch_ready_set requires an authorized Monitor run")
 
 
 @dataclass

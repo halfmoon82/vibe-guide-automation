@@ -15,7 +15,13 @@ from .authorization import (
     validate_runtime_contract,
 )
 from .contracts import RunEvent, RunHandle, Runner
-from .models import DAGNode, Plan
+from .models import (
+    DAGNode,
+    Plan,
+    assert_supervisor_boundary,
+    dispatch_ready_nodes,
+    validate_topology,
+)
 from .paths import ProjectPaths
 from .planner import resolve_consistency
 from .adapters.task_provider import ProviderPending
@@ -31,7 +37,12 @@ from .state import (
     release_writer_lease,
     save_snapshot,
 )
-from .task_registry import TaskBinding, load_task_binding, save_task_binding
+from .task_registry import (
+    TaskBinding,
+    load_task_binding,
+    register_expected_binding_route,
+    save_task_binding,
+)
 from .workflow_gate import require_capability_contract, require_entry
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
@@ -43,6 +54,116 @@ class Monitor:
         self.paths = paths
         self.plan = plan
         self.nodes = {node.id: node for node in nodes}
+
+    def validate_topology(self, complexity="complex", supervisor=None):
+        """Return the S1 topology decision without creating a run."""
+        return validate_topology(self.nodes.values(), complexity=complexity, supervisor=supervisor)
+
+    def _topology_complexity(self):
+        value = getattr(self.plan, "complexity", None) or getattr(self.plan, "complexity_band", None)
+        if value:
+            return value
+        for node in self.nodes.values():
+            if isinstance(node.contract, dict) and node.contract.get("complexity_band"):
+                return node.contract["complexity_band"]
+            if isinstance(node.contract, dict) and any(
+                key in node.contract for key in ("reviewer", "supervisor", "provider", "adapter_id", "parent_run_id")
+            ):
+                return "complex"
+        # Legacy plans without S1 topology metadata retain their existing API.
+        return None
+
+    def dispatch_ready_set(
+        self, provider, contract_path, complexity="complex", supervisor=None,
+        *, record=None, run_id=None, caller_identity=None, caller=None,
+    ):
+        """Dispatch authorized ready pairs and persist their task bindings.
+
+        Unlike the planning helper, this runtime entry point always requires an
+        existing authorized run.  It consumes the same active-pair and writer
+        lease boundaries as normal monitor scheduling before calling a provider.
+        """
+        if record is None or not isinstance(run_id, str) or not run_id:
+            raise PermissionError("dispatch requires an authorized run")
+        self._require_record(record)
+        snapshot = load_snapshot(self.paths, run_id)
+        self._require_snapshot_authorization(snapshot)
+        caller_identity = caller_identity if caller_identity is not None else caller
+        assert_supervisor_boundary(caller_identity, self.nodes.values())
+        topology = validate_topology(
+            self.nodes.values(), complexity=complexity, supervisor=supervisor,
+            parent_run_id=run_id,
+        )
+        if not topology.valid:
+            raise PermissionError("governance_pending: " + "; ".join(topology.reasons))
+        if not topology.applies:
+            return []
+        if getattr(provider, "provider", None) != "codex-app-visible" or getattr(provider, "mode", None) != "visible":
+            raise PermissionError("S1 topology requires codex-app-visible provider")
+        active_pairs = sum(
+            1 for current in snapshot.nodes.values()
+            if not current.get("pair_archived") and (
+                int(current.get("developer_generation", 0)) > 0
+                or current.get("retryable_action") is not None
+            )
+        )
+        capacity = max(0, record.active_pair_limit - active_pairs)
+        if capacity == 0:
+            return []
+        dispatched = []
+        for node_id in topology.ready_nodes[:capacity]:
+            current = snapshot.nodes[node_id]
+            if current.get("status") not in {"planned", "ready"}:
+                continue
+            if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), run_id):
+                raise PermissionError("writer lease is already owned by another run")
+            try:
+                pair = dispatch_ready_nodes(
+                    [self.nodes[node_id]], provider, contract_path,
+                    complexity=complexity, supervisor=supervisor,
+                )[0]
+                for role, task in (("developer", pair.developer), ("reviewer", pair.reviewer)):
+                    expected_route = {
+                        "host": self.nodes[node_id].contract.get("host"),
+                        "worktree": self.nodes[node_id].contract.get("worktree"),
+                        "branch": self.nodes[node_id].contract.get("branch"),
+                    }
+                    if any(
+                        not isinstance(getattr(task, name, None), str)
+                        or not getattr(task, name).strip()
+                        or getattr(task, name) != value
+                        for name, value in expected_route.items()
+                    ):
+                        raise ValueError("provider returned an incomplete or mismatched task route")
+                    register_expected_binding_route(
+                        run_id, node_id, role,
+                        expected_route["host"], expected_route["worktree"], expected_route["branch"],
+                    )
+                    binding = TaskBinding(
+                        provider=task.provider, mode=task.mode, issue_id=node_id,
+                        role=role, task_id=task.task_id, host=task.host,
+                        worktree=task.worktree,
+                        branch=task.branch,
+                        status_file=task.status_file or current.get("status_file", ""),
+                        handoff_file=task.handoff_file or current.get("handoff_file", ""),
+                        cursor=task.cursor, client_thread_id=task.client_thread_id,
+                        run_id=run_id, status="running", visible=task.visible,
+                        limitations=list(task.limitations), generation=1,
+                    )
+                    save_task_binding(self.paths, binding)
+                    snapshot.tasks["{}:{}".format(node_id, role)] = binding.to_dict()
+                current["developer_identity"] = pair.developer.task_id
+                current["reviewer_identity"] = pair.reviewer.task_id
+                current["developer_generation"] = 1
+                current["review_generation"] = 1
+                current["reviewer_started"] = True
+                current["status"] = "running"
+                dispatched.append(pair)
+            except Exception:
+                release_writer_lease(self.paths, node_id, str(current["worktree"]), run_id)
+                raise
+        save_snapshot(self.paths, snapshot)
+        return dispatched
 
     def merge_change_request_local(
         self,
@@ -75,9 +196,54 @@ class Monitor:
     merge_local = merge_change_request_local
 
     def start(
-        self, record: Optional[AuthorizationRecord], runner: Runner
+        self, record: Optional[AuthorizationRecord], runner: Runner,
+        caller_identity: Optional[str] = None,
+        caller: Optional[str] = None,
     ) -> RunSnapshot:
         self._require_record(record)
+        complexity = self._topology_complexity()
+        topology = self.validate_topology(complexity=complexity or "complex") if complexity else None
+        if topology is not None and topology.applies:
+            if not topology.valid:
+                raise PermissionError("governance_pending: " + "; ".join(topology.reasons))
+            assert_supervisor_boundary(
+                caller_identity if caller_identity is not None else caller,
+                self.nodes.values(),
+            )
+            provider = getattr(runner, "provider", None)
+            mode = getattr(runner, "mode", None)
+            if provider != "codex-app-visible" or (mode not in (None, "visible")):
+                raise PermissionError("S1 monitor requires a visible codex-app provider")
+            if not callable(getattr(runner, "task_binding", None)):
+                raise PermissionError("S1 monitor requires visible task binding support")
+            parent_ids = {
+                self._topology_parent(node) for node in self.nodes.values()
+            }
+            if len(parent_ids) != 1 or None in parent_ids:
+                raise PermissionError("S1 monitor requires one parent run binding")
+            parent_id = next(iter(parent_ids))
+            topology = validate_topology(
+                self.nodes.values(), complexity=complexity or "complex",
+                supervisor=caller_identity if caller_identity else None,
+                parent_run_id=str(parent_id),
+            )
+            if not topology.valid:
+                raise PermissionError("governance_pending: " + "; ".join(topology.reasons))
+            parent_state = self.paths.vibe / "runs" / str(parent_id) / "state.json"
+            if not parent_state.is_file() or parent_state.is_symlink():
+                raise PermissionError("S1 parent run is not an existing snapshot")
+            try:
+                parent_snapshot = load_snapshot(self.paths, str(parent_id))
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                raise PermissionError("S1 parent run snapshot is invalid") from error
+            if (
+                parent_snapshot.plan_id != self.plan.plan_id
+                or parent_snapshot.plan_version != self.plan.version
+                or parent_snapshot.authorization_digest != record.digest
+                or parent_snapshot.node_contract_digest != record.node_contract_digest
+                or set(parent_snapshot.nodes) != set(self.nodes)
+            ):
+                raise PermissionError("S1 parent run is foreign to this plan and authorization")
         state = self.paths.vibe / "state.json"
         capability_contract_digest = ""
         if state.is_file():
@@ -149,6 +315,14 @@ class Monitor:
         self._refresh_run_status(snapshot)
         save_snapshot(self.paths, snapshot)
         return snapshot
+
+    @staticmethod
+    def _topology_parent(node):
+        contract = node.contract if isinstance(node.contract, dict) else {}
+        value = contract.get("parent_run_id")
+        if value in (None, ""):
+            value = getattr(node, "parent_run_id", None)
+        return value
 
     def resume(self, run_id: str, runner: Runner) -> RunSnapshot:
         require_entry(self.paths, "resume:" + str(run_id), "resume")
@@ -919,6 +1093,13 @@ class Monitor:
                 raise ValueError("continuation task identity is stale")
         observed_binding = getattr(runner, "task_binding", None)
         if callable(observed_binding):
+            if self._topology_complexity():
+                register_expected_binding_route(
+                    snapshot.run_id, node_id, role,
+                    str(contract.get("host", "")),
+                    str(contract.get("worktree", "")),
+                    str(contract.get("branch", "")),
+                )
             binding = observed_binding(
                 contract,
                 self._worktree_path(current),
@@ -935,6 +1116,17 @@ class Monitor:
                 or (continuation and binding.task_id != identity)
             ):
                 raise ValueError("observed task binding does not match runtime scope")
+            if self._topology_complexity():
+                expected = {
+                    "provider": "codex-app-visible",
+                    "mode": "visible",
+                    "visible": True,
+                    "host": contract.get("host"),
+                    "worktree": contract.get("worktree"),
+                    "branch": contract.get("branch"),
+                }
+                if any(getattr(binding, key, None) != value for key, value in expected.items()):
+                    raise ValueError("S1 task binding is not a visible contract-bound route")
         else:
             binding = TaskBinding(
                 provider="runner",
