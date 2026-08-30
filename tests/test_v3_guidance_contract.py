@@ -82,7 +82,12 @@ class GuidanceContractTests(unittest.TestCase):
         calls = []
 
         bridge = CodexAppBridge(
-            create_thread=lambda request: (calls.append(request) or {"task_id": "thread-1", "host": "local"}),
+            create_thread=lambda request: (calls.append(request) or {
+                "task_id": "thread-1",
+                "host": "local",
+                "worktree": "/tmp/v3-8",
+                "branch": "codex/v3-8-rev5",
+            }),
             navigate_to_codex_page=lambda request: None,
             send_message_to_thread=lambda request: None,
             wait_threads=lambda request: {"polls": []},

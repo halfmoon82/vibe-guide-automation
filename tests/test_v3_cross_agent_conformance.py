@@ -45,7 +45,12 @@ class CrossAgentConformanceTests(unittest.TestCase):
             class Bridge:
                 def create(self, role, issue_id, contract_path, *, prompt=None, guidance=None):
                     calls.append({"prompt": prompt, "guidance": guidance})
-                    return {"task_id": "task-1", "host": "local"}
+                    return {
+                        "task_id": "task-1",
+                        "host": "local",
+                        "worktree": "/tmp/v3-8",
+                        "branch": "codex/v3-8-rev5",
+                    }
 
             provider = VisibleTaskProvider(
                 provider_name,
