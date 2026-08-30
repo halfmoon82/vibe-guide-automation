@@ -176,7 +176,12 @@ def _provider_injection_evidence(selected, contract):
         class Bridge:
             def create(self, role, issue_id, contract_path, **kwargs):
                 calls.append(kwargs)
-                return {"task_id": "conformance-%s" % adapter_id, "host": "local"}
+                return {
+                    "task_id": "conformance-%s" % adapter_id,
+                    "host": "local",
+                    "worktree": "/tmp/conformance",
+                    "branch": "codex/v3-8-rev5",
+                }
 
         try:
             provider = VisibleTaskProvider(
