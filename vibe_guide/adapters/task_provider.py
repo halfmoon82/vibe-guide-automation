@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import inspect
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 try:  # The V3 topology module is also usable in a minimal source checkout.
@@ -33,10 +34,37 @@ except ImportError:  # pragma: no cover - optional V2 diagnostics
     def validate_child_session_binding(*args, **kwargs):
         return None
 from ..models import WorkerProfile
+from ..guidance import GuidanceContractError, GovernancePending, inject_guidance, load_guidance_contract
+
+try:
+    # ProviderActionRunner imports this symbol from the registry module. Keep
+    # both entry points bound to the strict canonical loader without changing
+    # the registry API or its allowlisted implementation.
+    from . import registry as _registry
+    _registry_loader_compat = _registry.load_guidance_contract
+
+    def _runner_guidance_loader(path: Optional[Path] = None):
+        # Preserve the registry's explicit custom-path behavior for existing
+        # callers; the runner's default path uses the stricter V3 validator.
+        if path is not None:
+            return _registry_loader_compat(path)
+        try:
+            return load_guidance_contract()
+        except (GuidanceContractError, OSError, TypeError, ValueError) as exc:
+            raise GovernancePending("governance_pending: Guidance Contract unavailable: %s" % exc) from exc
+    _registry.load_guidance_contract = _runner_guidance_loader
+except ImportError:  # pragma: no cover
+    pass
 
 
 class ProviderUnavailable(RuntimeError):
     """A provider cannot safely create or continue a task."""
+
+    def __init__(self, message, *, status=None, reason=None, remediation=()):
+        super().__init__(message)
+        self.status = status
+        self.reason = reason or str(message)
+        self.remediation = tuple(remediation)
 
 
 class ProviderPending(RuntimeError):
@@ -778,11 +806,32 @@ class VisibleTaskProvider:
         bridge: Any = None,
         prompt_factory: Optional[Callable[[str, str, Path], str]] = None,
         routing: Optional[RepositoryTaskRouting] = None,
+        guidance_loader: Optional[Callable[[], Mapping[str, Any]]] = None,
     ):
         self.provider = provider
         self.bridge = bridge
         self.prompt_factory = prompt_factory
         self.routing = routing
+        self.guidance_loader = guidance_loader or load_guidance_contract
+
+    @property
+    def adapter_id(self):
+        return PROVIDER_ADAPTER_IDS.get(self.provider)
+
+    def guidance_context(self, stage: str = "prd_approved", status: str = "approved") -> Dict[str, Any]:
+        """Load and validate canonical guidance before any provider create call."""
+        if not self.adapter_id:
+            raise ProviderUnavailable("provider has no Guidance Contract adapter route")
+        try:
+            contract = self.guidance_loader()
+            return inject_guidance(self.adapter_id, stage=stage, status=status, contract=contract)
+        except (GuidanceContractError, OSError, TypeError, ValueError) as exc:
+            raise ProviderUnavailable(
+                "governance_pending: Guidance Contract unavailable",
+                status="governance_pending",
+                reason=str(exc),
+                remediation=("restore the versioned canonical Guidance Contract", "rerun conformance"),
+            ) from exc
 
     def create(self, role: str, issue_id: str, contract_path: Path) -> TaskBinding:
         if self.bridge is None:
@@ -801,17 +850,39 @@ class VisibleTaskProvider:
             if self.prompt_factory
             else "请执行 %s 任务 %s，合同：%s。" % (role, issue_id, contract_path)
         )
+        guidance = self.guidance_context()
+        prompt += "\nGuidance Contract: " + json.dumps(guidance, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if isinstance(self.bridge, CodexAppBridge):
             raw = self.bridge.create({"prompt": prompt, "target": self.routing.target()})
         else:
             method = getattr(self.bridge, "create", None)
             if not callable(method):
                 raise ProviderUnavailable("verified visible bridge create is missing")
-            raw = method(role, issue_id, contract_path)
+            raw = self._create_compat(method, role, issue_id, contract_path, prompt, guidance)
         binding = self._binding(raw, role, issue_id)
         if not binding.task_id and not binding.client_thread_id:
             raise ProviderUnavailable("visible task creation returned no durable task identity")
         return binding
+
+    @staticmethod
+    def _create_compat(method, role, issue_id, contract_path, prompt, guidance):
+        """Pass structured guidance to extended bridges while retaining v2 APIs."""
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(item.kind == inspect.Parameter.VAR_KEYWORD for item in parameters.values())
+        kwargs = {}
+        if accepts_kwargs or "prompt" in parameters:
+            kwargs["prompt"] = prompt
+        if accepts_kwargs or "guidance" in parameters:
+            kwargs["guidance"] = guidance
+        if kwargs:
+            return method(role, issue_id, contract_path, **kwargs)
+        if any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters.values()):
+            return method(role, issue_id, contract_path, prompt, guidance)
+        # Legacy bridges remain callable with their original three arguments.
+        return method(role, issue_id, contract_path)
 
     def enter_or_locate(self, binding: TaskBinding) -> None:
         if self.bridge is None:

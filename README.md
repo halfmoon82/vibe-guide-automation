@@ -34,6 +34,7 @@ python3 -m vibe_guide --help
 vibe scan                         只读扫描项目，不创建 .vibe/
 vibe init --confirm               确认后初始化最小项目状态；重复执行不改写
 vibe doctor                       报告可观察的环境、Skill 和 Agent 命令事实
+vibe conformance                  校验 Guidance Contract 及七个适配器一致性
 vibe plan --request <请求>        先走 S0；需要时使用显式 S1 与 node-spec
 vibe monitor --plan <ID>          没有精确授权时拒绝启动
 vibe status --plan <ID>           读取当前快照，不轮询外部 provider
@@ -41,6 +42,11 @@ vibe resume --plan <ID>           从快照、任务登记和事件证据继续
 ```
 
 每个命令都支持 `--json`。默认文本面向产品经理；JSON 适合桌面 App 适配器和自动化调用。退出码为：`0` 命令成功执行，`2` 参数错误，`3` 需要确认或因设计变化阻塞，`4` 外部/运行状态未知。
+
+### V3 Guidance Contract conformance
+
+发行物携带版本化、可校验哈希的 `guidance/canonical-contract.json`。`vibe conformance`
+以同一 fixture 检查七个受支持适配器的阶段动作、状态语义、StageHandoff 字段、授权默认值和禁止自动动作；`deploy` 始终为 `excluded`。合同缺失、损坏或漂移时返回 `governance_pending` 及修复提示；该命令只读，不创建 Worker 或 Monitor。
 
 ## 扫描和初始化
 
