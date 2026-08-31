@@ -1,0 +1,1 @@
+{"commands":{"cursor.agent":true},"facts":{"cursor.shell":true,"cursor.subprocess":true,"cursor.worktree":true},"provenance":{"cursor.shell":"fixture","cursor.subprocess":"fixture","cursor.worktree":"fixture"}}

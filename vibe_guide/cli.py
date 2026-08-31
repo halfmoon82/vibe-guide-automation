@@ -22,10 +22,11 @@ from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
 from .dag import render_plan_artifacts, validate_dag
 from .doctor import doctor
-from .initializer import init_project
-from .models import AgentCapabilities, DAGNode, Plan
+from .initializer import apply_agentsmd_proposal, init_project
+from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState
 from .monitor import Monitor
 from .change_requests import ChangeRequest, classify_merge_capability
+from .deploy import authorize_deploy, plan_deploy, verify_deploy, start_deploy
 from .paths import ProjectPaths
 from .planner import (
     DecisionCard,
@@ -38,10 +39,11 @@ from .planner import (
 )
 from .scanner import scan_project
 from .diagnostics import screen_session, require_session_screened
-from .diagnostics import assert_planning_gate
+from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
 from .workflow_gate import require_capability_contract
-from .state import load_snapshot
+from .state import load_events, load_snapshot
 from .runners.provider_action import ProviderActionRunner
+from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
 
 
 SUCCESS = 0
@@ -71,7 +73,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "doctor", "plan", "monitor", "status", "resume", "change-request"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "plan", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -79,10 +81,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan-id")
     parser.add_argument("--plan")
     parser.add_argument("--run-id")
+    parser.add_argument("--evidence")
     parser.add_argument("--s1")
     parser.add_argument("--node-spec")
     parser.add_argument("--authorize")
     parser.add_argument("--authorization-token", dest="legacy_authorization")
+    parser.add_argument("--manifest")
+    parser.add_argument("--acceptance-state")
+    parser.add_argument("--observations")
     return parser
 
 
@@ -313,7 +319,7 @@ def _publish_plan(
         _atomic_json(staging / "nodes.json", [node.to_dict() for node in nodes])
         _atomic_json(staging / "authorization-card.json", card.to_dict())
         _atomic_json(staging / "dag-audit.json", {"status": "reviewed", "node_count": len(nodes), "plan_revision": str(plan.version), "node_ids": [node.id for node in nodes]})
-        _atomic_json(staging / "plan-confirmation.json", {"status": "confirmed", "plan_revision": str(plan.version), "authorization_digest": card.digest, "authorization_required": True})
+        _atomic_json(staging / "plan-confirmation.json", {"status": "confirmed", "plan_id": plan.plan_id, "plan_revision": str(plan.version), "authorization_digest": card.digest, "authorization_required": True})
         os.replace(str(staging), str(destination))
     except BaseException:
         if staging.exists():
@@ -333,6 +339,85 @@ def _load_plan(paths: ProjectPaths, plan_id: str):
     if plan.plan_id != plan_id or card.plan_id != plan_id:
         raise ValueError("plan identity does not match its directory")
     return directory, plan, nodes, card
+
+
+def _verified_same_run_reauthorization(
+    paths: ProjectPaths,
+    directory: Path,
+    plan: Plan,
+    nodes: List[DAGNode],
+    card: AuthorizationCard,
+) -> bool:
+    """Allow a stale publication only with verified same-run reauthorization."""
+    try:
+        record = AuthorizationRecord.from_dict(
+            _read_json(directory / "authorization.json")
+        )
+        if record.digest != card.digest or not _current_run_path(directory).is_file():
+            return False
+        run_id = _run_id(directory, None)
+        snapshot = load_snapshot(paths, run_id)
+        if (
+            snapshot.plan_id != plan.plan_id
+            or snapshot.plan_version != plan.version
+            or snapshot.authorization_digest != card.digest
+            or snapshot.node_contract_digest != record.node_contract_digest
+        ):
+            return False
+        events = load_events(paths, run_id)[: snapshot.event_sequence]
+        confirmation = _read_json(directory / "plan-confirmation.json")
+        if (
+            not isinstance(confirmation, dict)
+            or confirmation.get("status") != "confirmed"
+            or confirmation.get("plan_revision") != str(plan.version)
+            or not _valid_plan_confirmation_binding(
+                paths, directory, plan.to_dict(), card.to_dict(), confirmation
+            )
+        ):
+            return False
+        lineage_digests = {events[0]["data"].get("authorization_digest")}
+        for event in events:
+            if event["event"] != "authorization_reauthorized":
+                continue
+            lineage_digests.add(event["data"].get("previous_authorization_digest"))
+            lineage_digests.add(event["data"].get("authorization_digest"))
+        return confirmation.get("authorization_digest") in lineage_digests and any(
+            event["event"] == "authorization_reauthorized"
+            and event["data"].get("authorization_digest") == card.digest
+            for event in events
+        )
+    except (FileNotFoundError, OSError, TypeError, ValueError, KeyError):
+        return False
+
+
+def _require_public_execution_gate(
+    paths: ProjectPaths,
+    directory: Path,
+    plan: Plan,
+    nodes: List[DAGNode],
+    card: AuthorizationCard,
+) -> None:
+    gate = assert_planning_gate(paths, plan.plan_id)
+    if gate.status == "execution_ready":
+        return
+    if gate.missing == ["plan-confirmation.invalid"] and _verified_same_run_reauthorization(
+        paths, directory, plan, nodes, card
+    ):
+        return
+    # A prior same-run reauthorization can have refreshed authorization.json
+    # while publication of authorization-card.json was interrupted.  Rebuild
+    # the card in memory and re-check the durable lineage; the caller will
+    # atomically publish it after Monitor.reauthorize succeeds.
+    if gate.missing == ["plan-confirmation.invalid"] and _current_run_path(directory).is_file():
+        try:
+            refreshed = refresh_authorization_card(plan, nodes, card)
+            if _verified_same_run_reauthorization(
+                paths, directory, plan, nodes, refreshed
+            ):
+                return
+        except (OSError, TypeError, ValueError):
+            pass
+    raise PermissionError("planning_required: " + ", ".join(gate.missing))
 
 
 def _snapshot_result(command: str, snapshot: Any, as_json: bool) -> CLIResult:
@@ -385,6 +470,37 @@ def _persist_invalidation(directory: Optional[Path], reason: str) -> None:
         )
 
 
+def _is_capability_contract_unknown(error: BaseException) -> bool:
+    return "capability_contract_unknown" in str(error)
+
+
+def _require_v38_preflight(paths: ProjectPaths, directory: Path, plan, nodes, card) -> None:
+    """Gate V3.8 worker/authorization actions before any provider call."""
+    if not ("v3.8" in plan.plan_id.casefold() or any(str(node.id).startswith("V38-") for node in nodes)):
+        return
+    baseline = None
+    run_pointer = directory / "current-run.json"
+    if run_pointer.is_file():
+        try:
+            pointer = _read_json(run_pointer)
+            run_id = pointer.get("run_id") if isinstance(pointer, dict) else None
+            if run_id:
+                candidate = paths.vibe / "runs" / str(run_id) / "baseline-health.json"
+                if candidate.is_file() and not candidate.is_symlink():
+                    baseline = _read_json(candidate)
+        except (OSError, TypeError, ValueError):
+            baseline = None
+    observations = {}
+    for node in nodes:
+        contract = node.contract if isinstance(node.contract, dict) else {}
+        candidate = contract.get("preflight_observations")
+        if isinstance(candidate, dict):
+            observations.update(candidate)
+    observations.setdefault("baseline_manifest", baseline)
+    report = run_preflight(PreflightContext.from_mapping(observations))
+    assert_authorizable(report)
+
+
 def _run_id(directory: Path, requested: Optional[str]) -> str:
     if requested:
         return requested
@@ -431,7 +547,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             screen_session(paths, str(session_id), args.command)
         except (OSError, ValueError, PermissionError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": str(error)}, "会话筛选已阻塞：" + str(error), args.as_json)
-    if args.command in {"monitor", "resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
+    if args.command in {"monitor", "reconcile", "resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
         return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": "V2 state.json is missing"}, "会话筛选已阻塞：V2 state.json 缺失", args.as_json)
     if args.command == "scan" and paths.vibe.exists():
         try:
@@ -480,6 +596,46 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             SUCCESS,
             payload,
             "初始化完成" if initialized.changed else "初始化无需变更",
+            args.as_json,
+        )
+
+    if args.command == "apply-agentsmd":
+        if not args.confirm:
+            return _result(
+                BLOCKED,
+                {
+                    "command": "apply-agentsmd",
+                    "status": "blocked",
+                    "reason": "confirmation required",
+                },
+                "AGENTS.md 规则应用已暂停：需要明确确认",
+                args.as_json,
+            )
+        try:
+            applied = apply_agentsmd_proposal(paths, True)
+        except (OSError, TypeError, ValueError) as error:
+            return _result(
+                BLOCKED,
+                {
+                    "command": "apply-agentsmd",
+                    "status": "blocked",
+                    "reason": str(error),
+                },
+                "AGENTS.md 规则应用已阻塞：" + str(error),
+                args.as_json,
+            )
+        payload = {
+            "command": "apply-agentsmd",
+            "status": "ok",
+            "changed": applied.changed,
+            "paths": applied.paths,
+        }
+        return _result(
+            SUCCESS,
+            payload,
+            "AGENTS.md 能力规则已生效"
+            if applied.changed
+            else "AGENTS.md 能力规则无需变更",
             args.as_json,
         )
 
@@ -561,7 +717,12 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 if capability == "unknown_remote"
                 else "Change Request 能力已分类：" + capability
             )
-            return _result(SUCCESS, payload, text, args.as_json)
+            return _result(
+                UNKNOWN if capability == "unknown_remote" else SUCCESS,
+                payload,
+                text,
+                args.as_json,
+            )
         except (KeyError, OSError, TypeError, ValueError) as error:
             return _result(
                 UNKNOWN,
@@ -569,6 +730,76 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "Change Request 状态未知：" + str(error),
                 args.as_json,
             )
+
+    if args.command == "deploy":
+        if not args.manifest:
+            return _result(
+                BLOCKED,
+                {"command": "deploy", "status": "blocked_deploy", "reason": "manifest required"},
+                "Deploy 已暂停：需要显式 manifest",
+                args.as_json,
+            )
+        try:
+            manifest_path = paths.resolve_relative(args.manifest)
+            source = _read_json(manifest_path)
+            if not isinstance(source, dict):
+                raise ValueError("Deploy manifest must be an object")
+            manifest_data = source.get("manifest", source)
+            if not isinstance(manifest_data, dict):
+                raise ValueError("Deploy manifest is invalid")
+            manifest = DeployManifest.from_dict(manifest_data)
+            if not args.acceptance_state:
+                raise PermissionError("independent acceptance state is required")
+            state = plan_deploy(manifest, args.acceptance_state)
+            if state.status == "blocked_deploy":
+                return _result(
+                    BLOCKED,
+                    {"command": "deploy", **state.to_dict()},
+                    "Deploy 已阻塞：独立验收尚未完成",
+                    args.as_json,
+                )
+            deploy_dir = paths.resolve_vibe_path("deploy")
+            deploy_dir.mkdir(parents=True, exist_ok=True)
+            _atomic_json(deploy_dir / "manifest.json", manifest.to_dict())
+            authorization = None
+            if args.authorize is not None:
+                authorization = authorize_deploy(manifest, args.authorize)
+                state = DeployState(
+                    "deploy_ready",
+                    state.manifest_digest,
+                    state.target,
+                    evidence=state.evidence,
+                    authorization_digest=authorization.digest,
+                )
+                _atomic_json(deploy_dir / "authorization.json", authorization.to_dict())
+            if args.observations:
+                if authorization is None:
+                    raise PermissionError("Deploy observations require separate Deploy authorization")
+                observations_path = paths.resolve_relative(args.observations)
+                observations = _read_json(observations_path)
+                running = start_deploy(manifest, state, authorization)
+                state = verify_deploy(manifest, observations)
+                if state.status in {"deployed", "rolled_back", "blocked_deploy", "blocked_unknown"}:
+                    state = DeployState(
+                        state.status,
+                        state.manifest_digest,
+                        state.target,
+                        evidence=state.evidence,
+                        authorization_digest=running.authorization_digest,
+                        reason=state.reason,
+                    )
+            _atomic_json(deploy_dir / "state.json", state.to_dict())
+            if state.status in {"deploy_planned", "deploy_ready", "deployed", "rolled_back"}:
+                code = SUCCESS
+            elif state.status == "blocked_deploy":
+                code = BLOCKED
+            else:
+                code = UNKNOWN
+            return _result(code, {"command": "deploy", **state.to_dict()}, "Deploy 状态：" + state.status, args.as_json)
+        except PermissionError as error:
+            return _result(BLOCKED, {"command": "deploy", "status": "blocked_deploy", "reason": str(error)}, "Deploy 已暂停：" + str(error), args.as_json)
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            return _result(UNKNOWN, {"command": "deploy", "status": "blocked_unknown", "reason": str(error)}, "Deploy 状态未知：" + str(error), args.as_json)
 
     if args.command == "plan":
         screen = classify_s0(args.request or "")
@@ -602,6 +833,17 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             source_path = paths.resolve_relative(args.node_spec)
             plan, nodes, card = _publish_plan(paths, args.plan_id, source_path)
         except PermissionError as error:
+            if _is_capability_contract_unknown(error):
+                return _result(
+                    UNKNOWN,
+                    {
+                        "command": "monitor",
+                        "status": "blocked_unknown",
+                        "reason": str(error),
+                    },
+                    "能力合同状态未知：" + str(error),
+                    args.as_json,
+                )
             return _result(
                 BLOCKED,
                 {"command": "plan", "status": "blocked", "reason": str(error)},
@@ -666,6 +908,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 )
         try:
             directory, plan, nodes, card = _load_plan(paths, args.plan)
+            _require_v38_preflight(paths, directory, plan, nodes, card)
             state_path = paths.vibe / "state.json"
             if state_path.is_file():
                 try:
@@ -673,9 +916,9 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 except ValueError:
                     state_data = {}
                 if isinstance(state_data, dict) and state_data.get("workflow_version") == 2:
-                    gate = assert_planning_gate(paths, args.plan)
-                    if gate.status != "execution_ready":
-                        raise PermissionError("planning_required: " + ", ".join(gate.missing))
+                    _require_public_execution_gate(
+                        paths, directory, plan, nodes, card
+                    )
             invalidation_path = _invalidation_path(directory)
             invalidation_to_clear = None
             if invalidation_path.exists():
@@ -698,6 +941,26 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 )
                 _atomic_json(directory / "authorization-card.json", card.to_dict())
                 invalidation_to_clear = invalidation_path
+            elif _current_run_path(directory).exists():
+                # A capability-only mismatch is deliberately reported as
+                # unknown by public resume, so it has no invalidation marker
+                # to select this branch.  An existing current run is still
+                # authoritative: reauthorize it in place rather than
+                # creating a second writer and colliding on the old lease.
+                # Refresh the card as well: a delivered contract correction
+                # may have changed the executable node digest without writing
+                # an invalidation marker yet.
+                card = refresh_authorization_card(plan, nodes, card)
+                _atomic_json(directory / "authorization-card.json", card.to_dict())
+                record = authorize(card, args.authorize)
+                if runner is None:
+                    runner = _public_runner(paths, card, nodes)
+                snapshot = Monitor(paths, plan, nodes).reauthorize(
+                    _run_id(directory, None),
+                    record,
+                    runner,
+                    "capability_contract_changed",
+                )
             else:
                 record = authorize(card, args.authorize)
                 if runner is None:
@@ -705,10 +968,30 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 snapshot = Monitor(paths, plan, nodes).start(record, runner)
             _atomic_json(directory / "authorization.json", record.to_dict())
             _atomic_json(
+                directory / "plan-confirmation.json",
+                {
+                    "status": "confirmed",
+                    "plan_id": plan.plan_id,
+                    "plan_revision": str(plan.version),
+                    "authorization_digest": record.digest,
+                    "authorization_required": True,
+                    "run_id": snapshot.run_id,
+                    "event_sequence": snapshot.event_sequence,
+                    "publication": "same_run_reauthorization",
+                },
+            )
+            _atomic_json(
                 _current_run_path(directory), {"run_id": snapshot.run_id}
             )
             if invalidation_to_clear is not None:
                 invalidation_to_clear.unlink()
+        except PreflightBlockedError as error:
+            return _result(
+                BLOCKED,
+                {"command": "monitor", "status": "preflight_blocked", "check_ids": list(error.check_ids), "reason": str(error)},
+                "预检已阻塞：" + ", ".join(error.check_ids),
+                args.as_json,
+            )
         except PermissionError as error:
             return _result(
                 BLOCKED,
@@ -744,6 +1027,23 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             )
         return _snapshot_result("monitor", snapshot, args.as_json)
 
+    if args.command == "reconcile":
+        try:
+            if not args.plan or not args.run_id or not args.evidence:
+                raise ValueError("reconcile requires --plan, --run-id and --evidence")
+            directory, plan, nodes, _card = _load_plan(paths, args.plan)
+            evidence_path = paths.resolve_relative(args.evidence)
+            package = _read_json(evidence_path)
+            snapshot = Monitor(paths, plan, nodes).reconcile_evidence(args.run_id, package)
+            return _snapshot_result("reconcile", snapshot, args.as_json)
+        except (FileNotFoundError, OSError, TypeError, ValueError, PermissionError) as error:
+            return _result(
+                UNKNOWN,
+                {"command": "reconcile", "status": "blocked_unknown", "reason": str(error)},
+                "对账已暂停：" + str(error),
+                args.as_json,
+            )
+
     if args.command in {"resume", "status"}:
         if not args.plan:
             return _result(
@@ -774,6 +1074,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         try:
             directory, plan, nodes, _card = _load_plan(paths, args.plan)
             run_id = _run_id(directory, args.run_id)
+            if args.command == "resume" and v2_state:
+                _require_public_execution_gate(
+                    paths, directory, plan, nodes, _card
+                )
             invalidation = _invalidation_path(directory)
             if invalidation.exists():
                 persisted = _read_json(invalidation)
@@ -801,9 +1105,22 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     _read_json(directory / "authorization.json")
                 )
                 monitor = Monitor(paths, plan, nodes)
-                snapshot = monitor.resume(run_id, runner)
+                # The CLI performs the normal resume tick immediately after
+                # reattachment; let that tick own the single provider poll.
+                snapshot = monitor.resume(run_id, runner, poll_handles=False)
                 snapshot = monitor.tick(run_id, runner)
         except PermissionError as error:
+            if _is_capability_contract_unknown(error):
+                return _result(
+                    UNKNOWN,
+                    {
+                        "command": args.command,
+                        "status": "blocked_unknown",
+                        "reason": str(error),
+                    },
+                    "能力合同状态未知：" + str(error),
+                    args.as_json,
+                )
             _persist_invalidation(
                 directory, "authorization invalidated: " + str(error)
             )
