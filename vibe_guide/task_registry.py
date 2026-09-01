@@ -83,6 +83,9 @@ class TaskBinding:
     continuation_digest: Optional[str] = None
     generation: int = 0
     allowlist: List[str] = field(default_factory=list)
+    route_digest: Optional[str] = None
+    model: Optional[str] = None
+    reasoning: Optional[str] = None
     capability_contract_digest: Optional[str] = None
     successor_of: Optional[str] = None
     binding_intent: Optional[Dict[str, Any]] = None
@@ -128,6 +131,17 @@ class TaskBinding:
             ):
                 raise ValueError("task binding capability contract digest is invalid")
             self.capability_contract_digest = self.capability_contract_digest.lower()
+        for name in ("route_digest", "model", "reasoning"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError("task binding %s is invalid" % name)
+        if self.route_digest is not None and (
+            len(self.route_digest) != 64
+            or any(char not in _DIGEST_HEX for char in self.route_digest.lower())
+        ):
+            raise ValueError("task binding route digest is invalid")
+        if self.route_digest is not None:
+            self.route_digest = self.route_digest.lower()
         if self.successor_of is not None and (
             not isinstance(self.successor_of, str) or not self.successor_of
         ):
@@ -282,6 +296,9 @@ class TaskBinding:
             "allowlist": list(self.allowlist),
             "capability_contract_digest": self.capability_contract_digest,
             "successor_of": self.successor_of,
+            "route_digest": self.route_digest,
+            "model": self.model,
+            "reasoning": self.reasoning,
         }
         if self.binding_intent is not None:
             result["binding_intent"] = (
@@ -326,13 +343,16 @@ class TaskBinding:
             "generation",
         }
         optional = {"binding_intent", "binding_observation", "binding_state", "business_write_allowed"}
-        allowed = expected | {"allowlist", "capability_contract_digest", "successor_of"} | optional
+        allowed = expected | {"allowlist", "capability_contract_digest", "successor_of", "route_digest", "model", "reasoning"} | optional
         if not isinstance(data, dict) or not set(data).issubset(allowed) or not expected.issubset(data):
             raise ValueError("task binding record schema is invalid")
         normalized = dict(data)
         normalized.setdefault("allowlist", [])
         normalized.setdefault("capability_contract_digest", None)
         normalized.setdefault("successor_of", None)
+        normalized.setdefault("route_digest", None)
+        normalized.setdefault("model", None)
+        normalized.setdefault("reasoning", None)
         normalized.setdefault("binding_intent", None)
         normalized.setdefault("binding_observation", None)
         normalized.setdefault("binding_state", "blocked_unknown")

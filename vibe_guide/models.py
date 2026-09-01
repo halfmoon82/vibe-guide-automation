@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, dataclass, field
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import re
@@ -232,6 +233,7 @@ class WorkerProfile:
     branch: str = ""
     allowlist: List[str] = field(default_factory=list)
     writer: str = ""
+    route_digest: str = ""
 
     def __post_init__(self):
         for name in ("worker", "model", "reasoning"):
@@ -241,6 +243,23 @@ class WorkerProfile:
             raise ValueError("fallbacks must be a list of dictionaries")
         if not isinstance(self.selection_basis, dict):
             raise ValueError("selection_basis must be a dictionary")
+        digest = hashlib.sha256(
+            json.dumps(
+                self.selection_basis,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if self.route_digest:
+            if (
+                not isinstance(self.route_digest, str)
+                or len(self.route_digest) != 64
+                or any(char not in "0123456789abcdefABCDEF" for char in self.route_digest)
+                or self.route_digest.lower() != digest
+            ):
+                raise ValueError("route_digest does not match selection_basis")
+        object.__setattr__(self, "route_digest", digest)
 
     def to_dict(self) -> Dict[str, Any]:
         return _json_dict(self)

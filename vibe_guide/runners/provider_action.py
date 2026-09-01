@@ -15,7 +15,9 @@ from ..models import (
     BindingObservation,
     BindingVerification,
     WaitThreadsCursorObservation,
+    WorkerProfile,
 )
+from ..model_router import provider_thinking_for
 from ..paths import ProjectPaths
 from ..task_registry import (
     TaskBinding,
@@ -69,40 +71,75 @@ class ProviderActionRunner(Runner):
         return capability + "\n" + consistency
 
     def _validate_v39_create_binding(
-        self, contract: Dict[str, Any], worktree: Path
+        self, contract: Dict[str, Any], runtime_worktree: Path
     ) -> None:
-        """Reject incomplete or drifting repository routing before create."""
-        project_id = contract.get("project_id")
-        declared_worktree = contract.get("worktree")
-        managed_root = contract.get("managed_root")
-        branch = contract.get("branch")
-        base_sha = contract.get("base_sha")
-        if not isinstance(project_id, str) or not project_id.strip():
+        """Fail closed before a V3.9 provider create request is emitted."""
+        required = ("project_id", "worktree", "managed_root", "branch", "base_sha")
+        values = {name: contract.get(name) for name in required}
+        project_id = values["project_id"]
+        if not isinstance(project_id, str) or not project_id.strip() or "\x00" in project_id:
             raise ProviderUnavailable("provider binding project_id is blocked_unknown")
-        if not isinstance(declared_worktree, str) or not declared_worktree.strip():
-            raise ProviderUnavailable("provider binding worktree is blocked_unknown")
-        if not isinstance(managed_root, str) or not managed_root.strip():
-            raise ProviderUnavailable("provider binding managed_root is blocked_unknown")
-        if not isinstance(branch, str) or not branch.strip():
+        for name in ("worktree", "managed_root"):
+            value = values[name]
+            if not isinstance(value, str) or not value.strip() or "\x00" in value:
+                raise ProviderUnavailable("provider binding %s is blocked_unknown" % name)
+            if not Path(value).is_absolute():
+                raise ProviderUnavailable("provider binding %s is blocked_unknown" % name)
+
+        branch = values["branch"]
+        invalid_branch = (
+            not isinstance(branch, str)
+            or not branch.strip()
+            or branch != branch.strip()
+            or "\x00" in branch
+            or any(char.isspace() for char in branch)
+            or Path(branch).is_absolute()
+            or branch.startswith("-")
+            or branch.endswith("/")
+            or branch.endswith(".")
+            or branch.startswith(".")
+            or branch.endswith(".lock")
+            or branch in {".", "..", "@"}
+            or "//" in branch
+            or ".." in branch
+            or "@{" in branch
+            or any(char in branch for char in "~^:?*[\\")
+            or any(part.startswith(".") or part.endswith(".lock") for part in branch.split("/"))
+        )
+        if invalid_branch:
             raise ProviderUnavailable("provider binding branch is blocked_unknown")
-        if not isinstance(base_sha, str) or len(base_sha) != 40:
+
+        base_sha = values["base_sha"]
+        if not isinstance(base_sha, str) or len(base_sha) != 40 or any(
+            char not in "0123456789abcdefABCDEF" for char in base_sha
+        ):
             raise ProviderUnavailable("provider binding base_sha is blocked_unknown")
-        if any(char not in "0123456789abcdefABCDEF" for char in base_sha):
-            raise ProviderUnavailable("provider binding base_sha is blocked_unknown")
-        try:
-            current_worktree = Path(worktree).resolve()
-            bound_worktree = Path(declared_worktree)
-            managed = Path(managed_root)
-            if not bound_worktree.is_absolute() or not managed.is_absolute():
-                raise ValueError
-            managed_resolved = managed.resolve()
-            if managed_resolved == Path(managed_resolved.anchor):
-                raise ValueError
-            if bound_worktree.resolve() != current_worktree:
-                raise ValueError
-            current_worktree.relative_to(managed_resolved)
-        except (OSError, RuntimeError, ValueError):
+        if not isinstance(runtime_worktree, (str, Path)):
             raise ProviderUnavailable("provider binding path is blocked_unknown")
+        try:
+            contract_worktree = Path(values["worktree"]).resolve()
+            managed_root = Path(values["managed_root"]).resolve()
+            if contract_worktree == Path(contract_worktree.anchor) or managed_root == Path(managed_root.anchor):
+                raise ValueError
+            if contract_worktree.exists() and not contract_worktree.is_dir():
+                raise ValueError
+            if managed_root.exists() and not managed_root.is_dir():
+                raise ValueError
+            contract_worktree.relative_to(managed_root)
+            runtime = Path(runtime_worktree)
+            if not runtime.is_absolute() or runtime.resolve() != contract_worktree:
+                raise ValueError
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise ProviderUnavailable("provider binding path is blocked_unknown")
+        if "project" in contract and contract["project"] != project_id:
+            raise ProviderUnavailable("provider binding alias is blocked_unknown")
+        nested = contract.get("binding_contract")
+        if nested is not None:
+            if not isinstance(nested, dict):
+                raise ProviderUnavailable("provider binding contract is blocked_unknown")
+            for name in required:
+                if name in nested and nested[name] != values[name]:
+                    raise ProviderUnavailable("provider binding contract is blocked_unknown")
 
     def _action(
         self,
@@ -127,6 +164,46 @@ class ProviderActionRunner(Runner):
             request=request,
             sequence=sequence,
         )
+
+    @staticmethod
+    def _routing_profile(contract: Dict[str, Any]) -> Optional[WorkerProfile]:
+        """Validate the selected profile before any provider request."""
+        raw = contract.get("worker_profile")
+        child = contract.get("child_binding")
+        child_raw = child.get("worker_profile") if isinstance(child, dict) else None
+        if raw is None:
+            raw = child_raw
+        if raw is None:
+            if contract.get("routing_required") is True or any(
+                key in contract for key in ("issue_complexity", "model_probes", "models", "required_capabilities")
+            ):
+                raise ProviderUnavailable("worker model routing is missing")
+            return None
+        if isinstance(raw, WorkerProfile):
+            profile = raw
+        elif isinstance(raw, dict):
+            try:
+                profile = WorkerProfile.from_dict(raw)
+            except (TypeError, ValueError) as error:
+                raise ProviderUnavailable("worker model routing is invalid") from error
+        else:
+            raise ProviderUnavailable("worker model routing is invalid")
+        if child_raw is not None and raw is not child_raw:
+            try:
+                child_profile = child_raw if isinstance(child_raw, WorkerProfile) else WorkerProfile.from_dict(child_raw)
+            except (TypeError, ValueError) as error:
+                raise ProviderUnavailable("child worker model routing is invalid") from error
+            if child_profile != profile:
+                raise ProviderUnavailable("worker model route conflicts with child binding")
+        if isinstance(child, dict):
+            for key, expected in (("model", profile.model), ("reasoning", profile.reasoning), ("route_digest", profile.route_digest)):
+                if child.get(key) not in (None, "", expected):
+                    raise ProviderUnavailable("worker model route conflicts with child binding")
+        # A profile may only be used for the same Issue and child binding.
+        basis_ref = profile.selection_basis.get("issue_complexity_ref")
+        if basis_ref not in (None, contract.get("node_id")):
+            raise ProviderUnavailable("worker model route Issue identity conflicts")
+        return profile
 
     def _require_result(
         self,
@@ -231,16 +308,33 @@ class ProviderActionRunner(Runner):
                 "environment": {"type": "local"},
             },
         }
+        profile = self._routing_profile(contract)
+        if profile is not None:
+            thinking = provider_thinking_for(profile.reasoning)
+            create_request.update(
+                {
+                    "model": profile.model,
+                    "thinking": thinking,
+                    "issue_id": node_id,
+                    "route_digest": profile.route_digest,
+                    "worker_profile": profile.to_dict(),
+                }
+            )
         if v39:
             # Carry the supervisor contract as routing intent.  This is
             # request metadata only; the provider response never becomes
             # binding evidence and the live gate still runs after create.
-            create_request["target"]["binding_contract"] = {
+            binding_contract = {
                 "project_id": project_id,
                 "worktree": contract.get("worktree"),
                 "managed_root": contract.get("managed_root"),
                 "branch": contract.get("branch"),
                 "base_sha": contract.get("base_sha"),
+            }
+            create_request["target"]["binding_contract"] = binding_contract
+            create_request["binding"] = {
+                key: binding_contract[key]
+                for key in ("worktree", "managed_root", "branch", "base_sha")
             }
             create_request.update(
                 {
@@ -255,6 +349,27 @@ class ProviderActionRunner(Runner):
         created = self._require_result(
             contract, run_id, "create", create_request
         )
+        routed_profile = profile is not None and (
+            contract.get("routing_required") is True
+            or "selected_model" in profile.selection_basis
+        )
+        if routed_profile:
+            actual_model = created.get("actual_model")
+            actual_thinking = created.get("actual_thinking")
+            if (
+                not isinstance(actual_model, str)
+                or not actual_model.strip()
+                or actual_model.casefold() == "unknown"
+                or actual_model != profile.model
+            ):
+                raise ProviderUnavailable("provider actual model is blocked_unknown")
+            if (
+                not isinstance(actual_thinking, str)
+                or not actual_thinking.strip()
+                or actual_thinking.casefold() == "unknown"
+                or actual_thinking != create_request["thinking"]
+            ):
+                raise ProviderUnavailable("provider actual thinking is blocked_unknown")
         binding_data = created.get("binding")
         if not isinstance(binding_data, dict):
             raise ValueError("provider create result has no verified binding")
@@ -323,6 +438,10 @@ class ProviderActionRunner(Runner):
             capability_contract_digest=contract.get("capability_contract_digest"),
             successor_of=predecessor if successor else None,
         )
+        if profile is not None:
+            binding.route_digest = profile.route_digest
+            binding.model = profile.model
+            binding.reasoning = profile.reasoning
         # Provider-returned host/project/lease/cursor and nested dictionaries
         # are self-report only.  Only supervisor-injected protected objects
         # from the contract can attest this final task binding.
@@ -724,6 +843,15 @@ class ProviderActionRunner(Runner):
             ):
                 binding.binding_intent = live_intent
                 binding.binding_observation = live_observation
+        profile = self._routing_profile(contract)
+        if profile is not None:
+            for field_name, expected in (
+                ("route_digest", profile.route_digest),
+                ("model", profile.model),
+                ("reasoning", profile.reasoning),
+            ):
+                if getattr(binding, field_name, None) not in (None, "", expected):
+                    raise ProviderUnavailable("task binding worker model route is stale")
         verification = self.binding_gate(contract, binding)
         if binding_contract_enabled(contract) and not verification.verified:
             raise ProviderUnavailable(
@@ -749,6 +877,15 @@ class ProviderActionRunner(Runner):
             "predecessor_task_id": contract.get("predecessor_task_id"),
             "capability_contract_digest": expected_capability_digest,
         }
+        if profile is not None:
+            metadata.update(
+                {
+                    "model": profile.model,
+                    "reasoning": profile.reasoning,
+                    "thinking": provider_thinking_for(profile.reasoning),
+                    "route_digest": profile.route_digest,
+                }
+            )
         if contract.get("continuation"):
             request = {
                 "threadId": binding.task_id,
