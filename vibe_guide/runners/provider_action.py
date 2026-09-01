@@ -68,6 +68,42 @@ class ProviderActionRunner(Runner):
         )
         return capability + "\n" + consistency
 
+    def _validate_v39_create_binding(
+        self, contract: Dict[str, Any], worktree: Path
+    ) -> None:
+        """Reject incomplete or drifting repository routing before create."""
+        project_id = contract.get("project_id")
+        declared_worktree = contract.get("worktree")
+        managed_root = contract.get("managed_root")
+        branch = contract.get("branch")
+        base_sha = contract.get("base_sha")
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise ProviderUnavailable("provider binding project_id is blocked_unknown")
+        if not isinstance(declared_worktree, str) or not declared_worktree.strip():
+            raise ProviderUnavailable("provider binding worktree is blocked_unknown")
+        if not isinstance(managed_root, str) or not managed_root.strip():
+            raise ProviderUnavailable("provider binding managed_root is blocked_unknown")
+        if not isinstance(branch, str) or not branch.strip():
+            raise ProviderUnavailable("provider binding branch is blocked_unknown")
+        if not isinstance(base_sha, str) or len(base_sha) != 40:
+            raise ProviderUnavailable("provider binding base_sha is blocked_unknown")
+        if any(char not in "0123456789abcdefABCDEF" for char in base_sha):
+            raise ProviderUnavailable("provider binding base_sha is blocked_unknown")
+        try:
+            current_worktree = Path(worktree).resolve()
+            bound_worktree = Path(declared_worktree)
+            managed = Path(managed_root)
+            if not bound_worktree.is_absolute() or not managed.is_absolute():
+                raise ValueError
+            managed_resolved = managed.resolve()
+            if managed_resolved == Path(managed_resolved.anchor):
+                raise ValueError
+            if bound_worktree.resolve() != current_worktree:
+                raise ValueError
+            current_worktree.relative_to(managed_resolved)
+        except (OSError, RuntimeError, ValueError):
+            raise ProviderUnavailable("provider binding path is blocked_unknown")
+
     def _action(
         self,
         contract: Dict[str, Any],
@@ -106,41 +142,6 @@ class ProviderActionRunner(Runner):
                 "provider %s action is pending" % operation
             )
         return result
-
-    @staticmethod
-    def _validate_v39_create_binding_contract(
-        contract: Dict[str, Any], worktree: Path
-    ) -> Dict[str, str]:
-        """Validate supervisor routing before emitting a V3.9 create probe.
-
-        The runtime ``worktree`` argument is only an observation target; it
-        must never fill a missing contract field.  Creation is therefore
-        rejected unless the complete repository binding is present and the
-        declared worktree is within the declared managed root.
-        """
-        fields = ("project_id", "worktree", "managed_root", "branch", "base_sha")
-        values = {field: contract.get(field) for field in fields}
-        for field, value in values.items():
-            if not isinstance(value, str) or not value.strip():
-                raise ProviderUnavailable(
-                    "V3.9 provider create requires non-empty {}".format(field)
-                )
-        base_sha = values["base_sha"]
-        if len(base_sha) != 40 or any(char not in "0123456789abcdefABCDEF" for char in base_sha):
-            raise ProviderUnavailable("V3.9 provider create base_sha is invalid")
-        try:
-            declared_worktree = Path(values["worktree"]).resolve(strict=False)
-            declared_managed_root = Path(values["managed_root"]).resolve(strict=False)
-            runtime_worktree = Path(worktree).resolve(strict=False)
-            runtime_worktree.relative_to(declared_managed_root)
-            declared_worktree.relative_to(declared_managed_root)
-        except (OSError, RuntimeError, ValueError) as error:
-            raise ProviderUnavailable(
-                "V3.9 provider create repository path drift"
-            ) from error
-        if declared_worktree != runtime_worktree:
-            raise ProviderUnavailable("V3.9 provider create worktree path drift")
-        return values
 
     def task_binding(
         self,
@@ -208,11 +209,8 @@ class ProviderActionRunner(Runner):
             raise ProviderUnavailable(
                 "V3.9 provider create requires explicit binding_probe=true"
             )
-        v39_binding_contract = (
-            self._validate_v39_create_binding_contract(contract, worktree)
-            if v39
-            else None
-        )
+        if v39:
+            self._validate_v39_create_binding(contract, worktree)
         predecessor = contract.get("predecessor_task_id")
         if predecessor is None and existing is not None:
             predecessor = existing.task_id
@@ -234,7 +232,16 @@ class ProviderActionRunner(Runner):
             },
         }
         if v39:
-            create_request["target"]["binding_contract"] = dict(v39_binding_contract)
+            # Carry the supervisor contract as routing intent.  This is
+            # request metadata only; the provider response never becomes
+            # binding evidence and the live gate still runs after create.
+            create_request["target"]["binding_contract"] = {
+                "project_id": project_id,
+                "worktree": contract.get("worktree"),
+                "managed_root": contract.get("managed_root"),
+                "branch": contract.get("branch"),
+                "base_sha": contract.get("base_sha"),
+            }
             create_request.update(
                 {
                     "binding_probe": True,
