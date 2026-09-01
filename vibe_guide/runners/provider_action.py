@@ -95,9 +95,12 @@ class ProviderActionRunner(Runner):
             managed = Path(managed_root)
             if not bound_worktree.is_absolute() or not managed.is_absolute():
                 raise ValueError
+            managed_resolved = managed.resolve()
+            if managed_resolved == Path(managed_resolved.anchor):
+                raise ValueError
             if bound_worktree.resolve() != current_worktree:
                 raise ValueError
-            current_worktree.relative_to(managed.resolve())
+            current_worktree.relative_to(managed_resolved)
         except (OSError, RuntimeError, ValueError):
             raise ProviderUnavailable("provider binding path is blocked_unknown")
 
