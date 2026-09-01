@@ -1,0 +1,340 @@
+spec_id: vibe-guide-v3.8-spec
+spec_revision: 2
+prd_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-prd.md@2
+baseline_spec_ref: docs/superpowers/specs/2026-08-29-vibe-coding-development-guide-v3-spec-rev3.md@3
+status: reviewed
+stage: spec_issue_dag
+common_mode: visible_required
+common_provider: codex-app-visible
+common_adapter_id: codex
+capability_evidence: runtime_required_before_dispatch
+authorization_defaults:
+  commit: false
+  push: false
+  create_change_request: false
+  merge_to_target_branch: false
+  merge_target_branch: null
+  merge_to_main: false
+  deploy: false
+inherited_context_only: [V3-0, V3-1, V3-2, V3-3, V3-4, V3-5, V3-6, V3-7, V3-8, V3-9, V3-10]
+preserved_history: [rev3, rev4, rev5, rev6]
+issues:
+  - id: V38-1
+    title: Run Manifest and execution epoch binding
+    prd_refs: [FR-801, FR-803]
+    acceptance_refs: [AC-801, AC-807]
+    depends_on: []
+    integration_after: []
+    parallel_group: foundation
+    writer: developer_worker
+    reviewer: independent_reviewer
+    adapter_id: codex
+    provider: codex-app-visible
+    mode: visible_required
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/manifest.py, vibe_guide/models.py, vibe_guide/state.py, vibe_guide/task_registry.py, tests/test_v38_manifest.py, tests/test_v38_recovery.py]
+    owned_paths: [vibe_guide/manifest.py, vibe_guide/models.py, vibe_guide/state.py, vibe_guide/task_registry.py, tests/test_v38_manifest.py, tests/test_v38_recovery.py]
+    read_paths: []
+    input: [plan identity, base SHA, historical bindings, execution epoch]
+    output: [atomic run-manifest.json, epoch transition, invalidated authorization reference]
+    error_behavior: [unknown binding stays blocked_unknown, old resources remain read-only, no successor on uncertain state]
+    acceptance_examples:
+      - rebind increments execution_epoch and invalidates the old authorization digest
+      - repeated resume preserves one writer and all historical task identity fields
+    risk_tags: [state, concurrency, provenance, recovery]
+    contract:
+      writer: developer_worker
+      reviewer: independent_reviewer
+      adapter_id: codex
+      provider: codex-app-visible
+      mode: visible_required
+      worktree_strategy: provider_managed_runtime
+      worktree: null
+      branch_policy: node_unique_branch_before_first_write
+      binding_status: pending_until_provider_create
+      allowlist: [vibe_guide/manifest.py, vibe_guide/models.py, vibe_guide/state.py, vibe_guide/task_registry.py, tests/test_v38_manifest.py, tests/test_v38_recovery.py]
+    delivery_evidence: .vibe/evidence/v38-1
+
+  - id: V38-2
+    title: Preflight and Contract Closure gate
+    prd_refs: [FR-802, FR-805]
+    acceptance_refs: [AC-801, AC-802, AC-803]
+    depends_on: [V38-1, V38-4]
+    integration_after: []
+    parallel_group: preflight
+    writer: developer_worker
+    reviewer: independent_reviewer
+    adapter_id: codex
+    provider: codex-app-visible
+    mode: visible_required
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/preflight.py, vibe_guide/contracts.py, vibe_guide/authorization.py, vibe_guide/cli.py, tests/test_v38_preflight.py, tests/test_v38_contract_closure.py]
+    owned_paths: [vibe_guide/preflight.py, vibe_guide/contracts.py, tests/test_v38_preflight.py, tests/test_v38_contract_closure.py]
+    read_paths: [vibe_guide/authorization.py, vibe_guide/cli.py]
+    input: [run manifest, node contracts, allowlists, baseline health, structured capability observations]
+    output: [preflight-report.json, contract_closure.json, ready_to_authorize or preflight_blocked]
+    error_behavior: [mismatch/unknown blocks before worker creation, missing production entrypoint returns contract_not_closed, preflight has zero side effects]
+    acceptance_examples:
+      - SHA mismatch and occupied binding are listed before any task or worktree is created
+      - a required provider bridge missing from allowlist blocks contract closure
+    risk_tags: [authorization, allowlist, provider, fail_closed]
+    contract:
+      writer: developer_worker
+      reviewer: independent_reviewer
+      adapter_id: codex
+      provider: codex-app-visible
+      mode: visible_required
+      worktree_strategy: provider_managed_runtime
+      worktree: null
+      branch_policy: node_unique_branch_before_first_write
+      binding_status: pending_until_provider_create
+      allowlist: [vibe_guide/preflight.py, vibe_guide/contracts.py, vibe_guide/authorization.py, vibe_guide/cli.py, tests/test_v38_preflight.py, tests/test_v38_contract_closure.py]
+    delivery_evidence: .vibe/evidence/v38-2
+
+  - id: V38-3
+    title: Implementation Brief write gate
+    prd_refs: [FR-804]
+    acceptance_refs: [AC-803]
+    depends_on: [V38-2]
+    integration_after: []
+    parallel_group: execution-gates
+    writer: developer_worker
+    reviewer: independent_reviewer
+    adapter_id: codex
+    provider: codex-app-visible
+    mode: visible_required
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/brief.py, vibe_guide/monitor.py, vibe_guide/state.py, tests/test_v38_brief_gate.py, tests/test_monitor.py]
+    owned_paths: [vibe_guide/brief.py, vibe_guide/monitor.py, tests/test_v38_brief_gate.py, tests/test_monitor.py]
+    read_paths: [vibe_guide/state.py]
+    input: [Issue acceptance, manifest, allowlist, worktree identity, implementation brief]
+    output: [brief_pending or implementing, brief evidence]
+    error_behavior: [missing invariant or out-of-scope call chain blocks business writes]
+    acceptance_examples:
+      - missing negative_case keeps the node brief_pending and leaves business files unchanged
+      - matching brief enters implementing without a second user authorization
+    risk_tags: [write_gate, contract, tdd]
+    contract:
+      writer: developer_worker
+      reviewer: independent_reviewer
+      adapter_id: codex
+      provider: codex-app-visible
+      mode: visible_required
+      worktree_strategy: provider_managed_runtime
+      worktree: null
+      branch_policy: node_unique_branch_before_first_write
+      binding_status: pending_until_provider_create
+      allowlist: [vibe_guide/brief.py, vibe_guide/monitor.py, vibe_guide/state.py, tests/test_v38_brief_gate.py, tests/test_monitor.py]
+    delivery_evidence: .vibe/evidence/v38-3
+
+  - id: V38-4
+    title: Path ownership and Baseline Health Manifest
+    prd_refs: [FR-806, FR-807]
+    acceptance_refs: [AC-804, AC-806]
+    depends_on: [V38-1]
+    integration_after: []
+    parallel_group: foundation
+    writer: developer_worker
+    reviewer: independent_reviewer
+    adapter_id: codex
+    provider: codex-app-visible
+    mode: visible_required
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/path_ownership.py, vibe_guide/baseline_health.py, vibe_guide/dag.py, tests/test_v38_path_ownership.py, tests/test_v38_baseline_health.py]
+    owned_paths: [vibe_guide/path_ownership.py, vibe_guide/baseline_health.py, vibe_guide/dag.py, tests/test_v38_path_ownership.py, tests/test_v38_baseline_health.py]
+    read_paths: []
+    input: [node owned_paths/read_paths, frozen base, test collection/import results]
+    output: [path conflict report, one baseline-health.json, scope classification]
+    error_behavior: [undeclared write overlap blocks parallel readiness, baseline defect is not relabeled as node defect]
+    acceptance_examples:
+      - two owned_paths intersect and only the declared owner remains writable
+      - repeated node checks reference one baseline health digest
+    risk_tags: [parallelism, baseline, ownership]
+    contract:
+      writer: developer_worker
+      reviewer: independent_reviewer
+      adapter_id: codex
+      provider: codex-app-visible
+      mode: visible_required
+      worktree_strategy: provider_managed_runtime
+      worktree: null
+      branch_policy: node_unique_branch_before_first_write
+      binding_status: pending_until_provider_create
+      allowlist: [vibe_guide/path_ownership.py, vibe_guide/baseline_health.py, vibe_guide/dag.py, tests/test_v38_path_ownership.py, tests/test_v38_baseline_health.py]
+    delivery_evidence: .vibe/evidence/v38-4
+
+  - id: V38-5
+    title: Review Matrix and Finding Bundle
+    prd_refs: [FR-808]
+    acceptance_refs: [AC-805]
+    depends_on: [V38-2, V38-3]
+    integration_after: []
+    parallel_group: review
+    writer: developer_worker
+    reviewer: independent_reviewer
+    adapter_id: codex
+    provider: codex-app-visible
+    mode: visible_required
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/review.py, vibe_guide/monitor.py, tests/test_v38_review_matrix.py, tests/test_monitor.py]
+    owned_paths: [vibe_guide/review.py, tests/test_v38_review_matrix.py]
+    read_paths: [vibe_guide/monitor.py, tests/test_monitor.py]
+    input: [manifest, brief, contract closure, current code, immutable evidence]
+    output: [review matrix, merged finding bundles, technical acceptance]
+    error_behavior: [evidence conflict remains blocked_unknown, reviewer cannot modify business code, missing invariant is not PASS]
+    acceptance_examples:
+      - two symptoms with one root cause produce one bundle with one verification command
+      - provider timeout remains blocked_unknown and retains retry evidence
+    risk_tags: [review, evidence, provider]
+    contract:
+      writer: developer_worker
+      reviewer: independent_reviewer
+      adapter_id: codex
+      provider: codex-app-visible
+      mode: visible_required
+      worktree_strategy: provider_managed_runtime
+      worktree: null
+      branch_policy: node_unique_branch_before_first_write
+      binding_status: pending_until_provider_create
+      allowlist: [vibe_guide/review.py, vibe_guide/monitor.py, tests/test_v38_review_matrix.py, tests/test_monitor.py]
+    delivery_evidence: .vibe/evidence/v38-5
+
+  - id: V38-6
+    title: Rework escalation and evidence replay
+    prd_refs: [FR-809, FR-810]
+    acceptance_refs: [AC-805, AC-807]
+    depends_on: [V38-1, V38-5]
+    integration_after: []
+    parallel_group: review
+    writer: developer_worker
+    reviewer: independent_reviewer
+    adapter_id: codex
+    provider: codex-app-visible
+    mode: visible_required
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/evidence.py, vibe_guide/monitor.py, vibe_guide/task_registry.py, tests/test_v38_rework_escalation.py, tests/test_v38_evidence_replay.py]
+    owned_paths: [vibe_guide/evidence.py, tests/test_v38_rework_escalation.py, tests/test_v38_evidence_replay.py]
+    read_paths: [vibe_guide/monitor.py, vibe_guide/task_registry.py]
+    input: [finding bundles, historical generations, original identities, summary and replay evidence]
+    output: [same-worker rework/review, immutable generation evidence, contract review escalation]
+    error_behavior: [second same-class failure pauses rework, contract change invalidates authorization, no successor on uncertain identity]
+    acceptance_examples:
+      - generation-1 keeps the original task, cursor, worktree and branch references
+      - repeated resume does not duplicate evidence or create a second writer
+    risk_tags: [rework, recovery, provenance]
+    contract:
+      writer: developer_worker
+      reviewer: independent_reviewer
+      adapter_id: codex
+      provider: codex-app-visible
+      mode: visible_required
+      worktree_strategy: provider_managed_runtime
+      worktree: null
+      branch_policy: node_unique_branch_before_first_write
+      binding_status: pending_until_provider_create
+      allowlist: [vibe_guide/evidence.py, vibe_guide/monitor.py, vibe_guide/task_registry.py, tests/test_v38_rework_escalation.py, tests/test_v38_evidence_replay.py]
+    delivery_evidence: .vibe/evidence/v38-6
+
+  - id: V38-7
+    title: Structured Git action target
+    prd_refs: [FR-811]
+    acceptance_refs: [AC-808]
+    depends_on: [V38-1]
+    integration_after: []
+    parallel_group: execution-gates
+    writer: developer_worker
+    reviewer: independent_reviewer
+    adapter_id: codex
+    provider: codex-app-visible
+    mode: visible_required
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/authorization.py, vibe_guide/change_requests.py, tests/test_v38_git_targets.py, tests/test_authorization.py, tests/test_change_requests.py]
+    owned_paths: [vibe_guide/authorization.py, vibe_guide/change_requests.py, tests/test_v38_git_targets.py]
+    read_paths: [tests/test_authorization.py, tests/test_change_requests.py]
+    input: [authorized action set, merge target branch, Change Request contract]
+    output: [explicit merge_to_target_branch and merge_target_branch fields]
+    error_behavior: [missing target branch, merge=true shorthand and implicit main are rejected]
+    acceptance_examples:
+      - codex/v38-7 is accepted as an explicit target and main remains false
+      - deploy remains false even when commit or push is true
+    risk_tags: [git, authorization, deploy]
+    contract:
+      writer: developer_worker
+      reviewer: independent_reviewer
+      adapter_id: codex
+      provider: codex-app-visible
+      mode: visible_required
+      worktree_strategy: provider_managed_runtime
+      worktree: null
+      branch_policy: node_unique_branch_before_first_write
+      binding_status: pending_until_provider_create
+      allowlist: [vibe_guide/authorization.py, vibe_guide/change_requests.py, tests/test_v38_git_targets.py, tests/test_authorization.py, tests/test_change_requests.py]
+    delivery_evidence: .vibe/evidence/v38-7
+
+  - id: V38-8
+    title: V3.8 integration and acceptance mapping
+    prd_refs: [FR-801, FR-802, FR-803, FR-804, FR-805, FR-806, FR-807, FR-808, FR-809, FR-810, FR-811]
+    acceptance_refs: [AC-801, AC-802, AC-803, AC-804, AC-805, AC-806, AC-807, AC-808]
+    depends_on: [V38-1, V38-2, V38-3, V38-4, V38-5, V38-6, V38-7]
+    integration_after: []
+    parallel_group: integration
+    writer: developer_worker
+    reviewer: independent_reviewer
+    adapter_id: codex
+    provider: codex-app-visible
+    mode: visible_required
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/cli.py, vibe_guide/monitor.py, vibe_guide/dag.py, tests/test_v38_acceptance.py, tests/test_end_to_end.py, README.md]
+    owned_paths: [tests/test_v38_acceptance.py, README.md]
+    read_paths: [vibe_guide/cli.py, vibe_guide/monitor.py, vibe_guide/dag.py, tests/test_end_to_end.py]
+    input: [all V3.8 contracts, focused test evidence, current implementation]
+    output: [end-to-end acceptance evidence, PRD coverage report, documentation update proposal]
+    error_behavior: [unmapped requirement, DAG cycle, authorization drift or unverified provider claim blocks acceptance]
+    acceptance_examples:
+      - every FR and AC has one Issue and one test/evidence reference
+      - no integration test creates external worker/provider/Git/deploy side effects
+    risk_tags: [integration, acceptance, scope]
+    contract:
+      writer: developer_worker
+      reviewer: independent_reviewer
+      adapter_id: codex
+      provider: codex-app-visible
+      mode: visible_required
+      worktree_strategy: provider_managed_runtime
+      worktree: null
+      branch_policy: node_unique_branch_before_first_write
+      binding_status: pending_until_provider_create
+      allowlist: [vibe_guide/cli.py, vibe_guide/monitor.py, vibe_guide/dag.py, tests/test_v38_acceptance.py, tests/test_end_to_end.py, README.md]
+    delivery_evidence: .vibe/evidence/v38-8
+
+audit_requirements:
+  - every PRD FR-801..FR-811 maps to one or more issues and acceptance references
+  - every PRD AC-801..AC-808 maps to a focused test and an integration assertion
+  - all issues have input/output/error_behavior/acceptance_examples/risk_tags and exact writer/reviewer/provider/worktree/branch/allowlist
+  - no old V3 authorization, plan confirmation, run, task binding or provider result is reused as current V3.8 evidence
+  - visible provider capability is required but remains unverified until real runtime observation
+  - no issue permits deploy, merge-to-main, external installation or system permission changes

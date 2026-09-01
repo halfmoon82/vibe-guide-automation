@@ -162,3 +162,57 @@ def init_project(paths, confirm):
         _write_new(skill_proposal, '# Skill proposal\n\n- architecture-skill-pack\n')
         created.append(str(skill_proposal.relative_to(root)))
     return InitResult(bool(created), created)
+
+
+def apply_agentsmd_proposal(paths, confirm):
+    """Apply the generated capability rules only after explicit confirmation.
+
+    Initialization remains proposal-only.  This separate operation preserves
+    the existing AGENTS.md bytes and appends the reviewed proposal exactly
+    once, so the rules become part of the supervisor's project context without
+    silently overwriting user instructions.
+    """
+    if not confirm:
+        return InitResult(False, [])
+    root = Path(paths.root).resolve()
+    if not root.is_dir():
+        raise ValueError("project root must be a directory")
+    proposal_path = root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+    if proposal_path.is_symlink() or not proposal_path.is_file():
+        raise ValueError("AGENTS.md proposal is missing or not a regular file")
+    proposal_raw = proposal_path.read_bytes()
+    if len(proposal_raw) > 64 * 1024:
+        raise ValueError("AGENTS.md proposal exceeds the size bound")
+    try:
+        proposal = proposal_raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("AGENTS.md proposal is not valid UTF-8") from error
+    if not proposal.strip() or "## Capability and Tool Truth" not in proposal:
+        raise ValueError("AGENTS.md proposal does not contain capability rules")
+
+    target = root / "AGENTS.md"
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise ValueError("AGENTS.md must be a regular file")
+    existing = target.read_text(encoding="utf-8") if target.exists() else ""
+    if "## Capability and Tool Truth" in existing:
+        return InitResult(False, [])
+
+    if existing:
+        separator = "" if existing.endswith("\n") else "\n"
+        content = existing + separator + "\n" + proposal.lstrip("\n")
+    else:
+        content = proposal
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".AGENTS.md.", dir=str(root)
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(str(temporary), str(target))
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return InitResult(True, ["AGENTS.md"])

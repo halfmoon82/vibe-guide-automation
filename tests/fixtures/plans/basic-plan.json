@@ -1,0 +1,7 @@
+{
+  "plan_id": "p1",
+  "version": 1,
+  "prd_path": "prd.md",
+  "node_ids": ["n1"],
+  "status": "draft"
+}
