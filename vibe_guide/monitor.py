@@ -16,7 +16,7 @@ from .authorization import (
     validate_runtime_contract,
 )
 from .contracts import RunEvent, RunHandle, Runner
-from .models import DAGNode, Plan, BindingIntent, BindingObservation, BindingVerification
+from .models import DAGNode, Plan, BindingIntent, BindingObservation, BindingVerification, IssueComplexity, LocalModel
 from .paths import ProjectPaths
 from .planner import resolve_consistency
 from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
@@ -44,6 +44,7 @@ from .task_registry import (
 from .workflow_gate import require_capability_contract, require_entry
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
+from .model_router import ModelRouter
 from .change_requests import ChangeRequest, LocalMergeEvidence, merge_local
 from .checkpoint import (
     ContextBudgetEstimator,
@@ -54,6 +55,25 @@ from .checkpoint import (
 )
 from .brief import ImplementationBrief, validate_implementation_brief
 from .manifest import RunManifest
+
+
+def _user_status(record: Dict[str, Any]) -> str:
+    """Keep internal recovery detail behind the four public statuses."""
+    reason = str(record.get("reason") or "").casefold()
+    if any(marker in reason for marker in ("product", "scope", "permission", "credential", "irreversible", "security", "产品", "范围", "权限", "凭据", "不可逆", "安全")):
+        return "需要你决定"
+    if record.get("binding_phase") in {"retry_pending", "binding_probe_pending", "binding_repair_pending", "binding_repairing", "blocked_unknown", "unknown", "timeout", "failed", "stopped"}:
+        return "自动修复中"
+    if isinstance(record.get("retryable_action"), dict) and not record.get("active_task"):
+        return "自动修复中"
+    status = record.get("status")
+    if status in {"blocked_design", "blocked_deploy"}:
+        return "需要你决定"
+    if status in {"initialized", "planned", "brief_pending", "start_pending"}:
+        return "准备中"
+    if status in {"running", "review", "rework", "delivered", "accepted", "complete"}:
+        return "已启动"
+    return "自动修复中"
 
 
 class Monitor:
@@ -1555,6 +1575,77 @@ class Monitor:
         }
         current["reason"] = "reviewer successor queued after missing binding recovery"
 
+    def _prepare_worker_profile(
+        self, node: DAGNode, contract: Dict[str, Any], current: Dict[str, Any], role: str
+    ) -> Optional[WorkerProfile]:
+        """Resolve an evidence-bound profile for the real dispatch path.
+
+        Legacy nodes keep their configured profile/default behavior.  A node
+        that declares routing inputs must provide a complete IssueComplexity
+        and structured LocalModel probes; no default model is synthesized.
+        """
+        routing_keys = {"routing_required", "issue_complexity", "model_probes", "models", "required_capabilities"}
+        routing_requested = any(key in contract for key in routing_keys)
+        raw = contract.get("worker_profile")
+        if raw is None and isinstance(contract.get("child_binding"), dict):
+            raw = contract["child_binding"].get("worker_profile")
+        if role != "developer" and raw is None:
+            raw = current.get("contract_overrides", {}).get("worker_profile")
+        if raw is not None:
+            try:
+                profile = raw if isinstance(raw, WorkerProfile) else WorkerProfile.from_dict(raw)
+            except (TypeError, ValueError) as error:
+                raise ValueError("worker model profile is invalid") from error
+            issue_data = contract.get("issue_complexity")
+            probes = contract.get("model_probes", contract.get("models"))
+            if routing_requested and contract.get("routing_required") is True:
+                # An explicitly routed node cannot silently accept an
+                # unrelated preconfigured/default profile.
+                if issue_data is None or probes is None:
+                    raise ValueError("worker model routing evidence is incomplete")
+            if routing_requested and issue_data is not None and probes is not None:
+                issue = issue_data if isinstance(issue_data, IssueComplexity) else IssueComplexity.from_dict(issue_data)
+                if not isinstance(probes, (list, tuple)):
+                    raise TypeError("model probes must be a list")
+                models = [item if isinstance(item, LocalModel) else LocalModel.from_dict(item) for item in probes]
+                expected = ModelRouter(worker=profile.worker).select(
+                    issue, contract.get("required_capabilities", []), models
+                )
+                if (
+                    profile.model != expected.model
+                    or profile.reasoning != expected.reasoning
+                    or profile.route_digest != expected.route_digest
+                ):
+                    raise ValueError("worker model profile conflicts with routing evidence")
+            return profile
+        if not routing_requested:
+            return None
+        issue_data = contract.get("issue_complexity")
+        probes = contract.get("model_probes", contract.get("models"))
+        if issue_data is None or probes is None:
+            raise ValueError("worker model routing evidence is incomplete")
+        issue = issue_data if isinstance(issue_data, IssueComplexity) else IssueComplexity.from_dict(issue_data)
+        if not isinstance(probes, (list, tuple)):
+            raise TypeError("model probes must be a list")
+        models = [item if isinstance(item, LocalModel) else LocalModel.from_dict(item) for item in probes]
+        profile = ModelRouter(worker=str(contract.get("worker") or node.contract.get("worker") or "developer")).select(
+            issue, contract.get("required_capabilities", []), models
+        )
+        profile = WorkerProfile(
+            profile.worker,
+            profile.model,
+            profile.reasoning,
+            profile.fallbacks,
+            profile.selection_basis,
+            worktree=str(contract.get("worktree") or current.get("worktree", "")),
+            branch=str(contract.get("branch") or current.get("branch", "")),
+            allowlist=list(contract.get("files", [])),
+            writer=str(contract.get("writer") or profile.worker),
+            route_digest=profile.route_digest,
+        )
+        current.setdefault("contract_overrides", {})["worker_profile"] = profile.to_dict()
+        return profile
+
     def _start_task(
         self,
         snapshot: RunSnapshot,
@@ -1615,15 +1706,19 @@ class Monitor:
         contract.setdefault(
             "files", list((contract.get("worker_profile") or {}).get("allowlist", []))
         )
-        # V3.9 provider creation is itself an internal, non-business probe.
-        # The authorization contract must not require the user to add this
-        # implementation detail.  On retries the deterministic action id is
-        # reused (same run/node/role/generation), so setting the flag again is
-        # idempotent and cannot create a successor writer.
+        routing_requested = any(
+            key in contract
+            for key in ("routing_required", "issue_complexity", "model_probes", "models", "required_capabilities")
+        )
+        profile = self._prepare_worker_profile(node, contract, current, role)
+        if profile is not None:
+            contract["worker_profile"] = profile.to_dict()
+            if routing_requested:
+                contract["routing_required"] = True
         if binding_contract_enabled(contract):
-            has_live_evidence = isinstance(
-                contract.get("binding_intent"), BindingIntent
-            ) and isinstance(contract.get("binding_observation"), BindingObservation)
+            has_live_evidence = isinstance(contract.get("binding_intent"), BindingIntent) and isinstance(
+                contract.get("binding_observation"), BindingObservation
+            )
             if not has_live_evidence:
                 if continuation:
                     contract.setdefault("binding_bootstrap", True)
@@ -1647,7 +1742,7 @@ class Monitor:
                 profile = WorkerProfile(**profile_data)
                 validate_child_session_binding(snapshot.run_id, str(self.plan.version), record.digest, node_id, role, profile)
                 contract["child_origin"] = "worker_dispatch"
-                contract["child_binding"] = {"parent_run_id": snapshot.run_id, "plan_revision": str(self.plan.version), "authorization_digest": record.digest, "node_id": node_id, "role": role, "writer": profile.writer, "worktree": profile.worktree, "branch": profile.branch, "allowlist": profile.allowlist, "worker_profile": profile.to_dict(), "capability_contract_digest": snapshot.capability_contract_digest}
+                contract["child_binding"] = {"parent_run_id": snapshot.run_id, "plan_revision": str(self.plan.version), "authorization_digest": record.digest, "node_id": node_id, "role": role, "writer": profile.writer, "worktree": profile.worktree, "branch": profile.branch, "allowlist": profile.allowlist, "worker_profile": profile.to_dict(), "model": profile.model, "reasoning": profile.reasoning, "route_digest": profile.route_digest, "capability_contract_digest": snapshot.capability_contract_digest}
         try:
             contract = validate_runtime_contract(
                 contract,
@@ -1946,6 +2041,18 @@ class Monitor:
                     binding.allowlist = expected_allowlist
             else:
                 binding.allowlist = expected_allowlist
+        profile_data = contract.get("worker_profile")
+        if profile_data is not None:
+            profile = profile_data if isinstance(profile_data, WorkerProfile) else WorkerProfile.from_dict(profile_data)
+            for field_name, expected in (
+                ("route_digest", profile.route_digest),
+                ("model", profile.model),
+                ("reasoning", profile.reasoning),
+            ):
+                current_value = getattr(binding, field_name, None)
+                if current_value not in (None, "", expected):
+                    raise ValueError("task binding {} does not match worker profile".format(field_name))
+                setattr(binding, field_name, expected)
         expected_worktree = self._worktree_path(current)
         observed_worktree = Path(str(binding.worktree))
         if not observed_worktree.is_absolute():

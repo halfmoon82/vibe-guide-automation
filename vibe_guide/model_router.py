@@ -30,6 +30,14 @@ _CONTEXT_REQUIREMENTS = {
 }
 
 
+def provider_thinking_for(reasoning: str) -> str:
+    """Map the internal reasoning contract to the Codex provider enum."""
+    mapping = {"normal": "medium", "deep": "high"}
+    if not isinstance(reasoning, str) or reasoning not in mapping:
+        raise ValueError("unsupported reasoning level: %s" % reasoning)
+    return mapping[reasoning]
+
+
 def _validate_capabilities(required: Sequence[str]) -> List[str]:
     if not isinstance(required, (list, tuple)):
         raise TypeError("required_capabilities must be a list")
@@ -156,6 +164,9 @@ class ModelRouter:
                 if desired_reasoning == "deep"
                 else "issue_complexity_default"
             ),
+            "reasoning": desired_reasoning,
+            "selected_model": selected.model_id,
+            "selected_context_limit": selected.context_limit,
             "availability_evidence": "probe:%s" % selected.model_id,
             "evidence_ref": issue_complexity.evidence_ref,
         }
@@ -168,10 +179,22 @@ class ModelRouter:
         )
 
 
+def build_worker_profile(
+    issue: IssueComplexity,
+    required_capabilities: Sequence[str],
+    models: Iterable[LocalModel],
+    worker: str = "local",
+) -> WorkerProfile:
+    """Build one evidence-bound profile through the canonical router."""
+    return ModelRouter(worker=worker).select(issue, required_capabilities, models)
+
+
 __all__ = [
     "IssueComplexity",
     "LocalModel",
     "ModelRouter",
     "WorkerProfile",
     "WorkerUnavailable",
+    "build_worker_profile",
+    "provider_thinking_for",
 ]
