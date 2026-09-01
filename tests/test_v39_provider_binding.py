@@ -181,7 +181,14 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             paths = ProjectPaths(Path(directory))
             runner = ProviderActionRunner(paths, "codex-app-visible", "codex-app-visible")
-            contract = {"run_id": "run-v39", "node_id": "BUG-V3-005", "role": "developer", "generation": 1, "binding_contract_version": "3.9", "binding_probe": True, "project_id": "project-1"}
+            contract = {
+                "run_id": "run-v39", "node_id": "BUG-V3-005", "role": "developer",
+                "generation": 1, "binding_contract_version": "3.9",
+                "binding_probe": True, "project_id": "project-1",
+                "worktree": str(paths.root / "worker"),
+                "managed_root": str(paths.root),
+                "branch": "codex/bug-v3-005", "base_sha": "a" * 40,
+            }
             captured = []
             def probe_then_pending(c, r, op, req):
                 captured.append(req)
@@ -193,6 +200,100 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
             self.assertEqual(len(captured), 1)
             self.assertTrue(captured[0].get("binding_probe"))
             self.assertFalse(captured[0].get("business_write_allowed", True))
+
+    def test_create_probe_request_carries_structured_repository_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = ProviderActionRunner(paths, "codex-app-visible", "codex-app-visible")
+            contract = {
+                "run_id": "run-v39",
+                "node_id": "BUG-V3-005",
+                "role": "developer",
+                "generation": 1,
+                "binding_contract_version": "3.9",
+                "binding_probe": True,
+                "project_id": "project-1",
+                "worktree": str(paths.root / "worker"),
+                "managed_root": str(paths.root),
+                "branch": "codex/bug-v3-005",
+                "base_sha": "a" * 40,
+            }
+            captured = []
+
+            def probe_then_pending(c, r, op, req):
+                captured.append(req)
+                raise ProviderPending("probe pending")
+
+            with patch.object(runner, "_require_result", side_effect=probe_then_pending):
+                with self.assertRaises(ProviderPending):
+                    runner.task_binding(
+                        contract,
+                        paths.root / "worker",
+                        "run-v39",
+                        "start_pending",
+                    )
+            self.assertEqual(len(captured), 1)
+            target = captured[0]["target"]
+            self.assertEqual(target["projectId"], "project-1")
+            binding_contract = target["binding_contract"]
+            self.assertEqual(binding_contract["project_id"], contract["project_id"])
+            self.assertEqual(binding_contract["worktree"], contract["worktree"])
+            self.assertEqual(binding_contract["managed_root"], contract["managed_root"])
+            self.assertEqual(binding_contract["branch"], contract["branch"])
+            self.assertEqual(binding_contract["base_sha"], contract["base_sha"])
+
+    def test_create_probe_blocks_incomplete_or_drifting_repository_binding_before_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = ProviderActionRunner(paths, "codex-app-visible", "codex-app-visible")
+            worktree = str(paths.root / "worker")
+            base_contract = {
+                "run_id": "run-v39",
+                "node_id": "BUG-V3-005",
+                "role": "developer",
+                "generation": 1,
+                "binding_contract_version": "3.9",
+                "binding_probe": True,
+                "project_id": "project-1",
+                "worktree": worktree,
+                "managed_root": str(paths.root),
+                "branch": "codex/bug-v3-005",
+                "base_sha": "a" * 40,
+            }
+            invalid = {
+                "missing_worktree": lambda c: c.pop("worktree"),
+                "missing_managed_root": lambda c: c.pop("managed_root"),
+                "missing_branch": lambda c: c.pop("branch"),
+                "missing_base_sha": lambda c: c.pop("base_sha"),
+                "empty_project_id": lambda c: c.update(project_id=""),
+                "empty_managed_root": lambda c: c.update(managed_root=""),
+                "empty_branch": lambda c: c.update(branch=""),
+                "empty_base_sha": lambda c: c.update(base_sha=""),
+                "wrong_type_project_id": lambda c: c.update(project_id=7),
+                "wrong_type_worktree": lambda c: c.update(worktree=7),
+                "wrong_type_managed_root": lambda c: c.update(managed_root=7),
+                "wrong_type_branch": lambda c: c.update(branch=7),
+                "wrong_type_base_sha": lambda c: c.update(base_sha=7),
+                "worktree_drift": lambda c: c.update(worktree=str(paths.root / "other")),
+                "managed_root_drift": lambda c: c.update(managed_root=str(paths.root / "other")),
+            }
+            for name, mutate in invalid.items():
+                with self.subTest(name=name):
+                    contract = dict(base_contract)
+                    mutate(contract)
+                    with patch.object(
+                        runner,
+                        "_require_result",
+                        side_effect=ProviderPending("create must not be reached"),
+                    ) as require_result:
+                        with self.assertRaises((ProviderUnavailable, ProviderPending, ValueError)):
+                            runner.task_binding(
+                                contract,
+                                Path(worktree),
+                                "run-v39",
+                                "start_pending",
+                            )
+                    self.assertEqual(require_result.call_count, 0)
 
     def test_provider_self_reported_nested_evidence_is_ignored(self):
         with tempfile.TemporaryDirectory() as directory:
