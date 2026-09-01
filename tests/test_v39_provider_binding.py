@@ -242,6 +242,59 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
             self.assertEqual(binding_contract["branch"], contract["branch"])
             self.assertEqual(binding_contract["base_sha"], contract["base_sha"])
 
+    def test_create_probe_allows_restricted_parent_managed_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = ProviderActionRunner(paths, "codex-app-visible", "codex-app-visible")
+            worktree = paths.root / "worker"
+            contract = {
+                "run_id": "run-v39",
+                "node_id": "BUG-V3-005",
+                "role": "developer",
+                "generation": 1,
+                "binding_contract_version": "3.9",
+                "binding_probe": True,
+                "project_id": "project-1",
+                "worktree": str(worktree),
+                "managed_root": str(paths.root.parent),
+                "branch": "codex/bug-v3-005",
+                "base_sha": "a" * 40,
+            }
+            with patch.object(
+                runner, "_require_result", side_effect=ProviderPending("probe pending")
+            ) as require_result:
+                with self.assertRaises(ProviderPending):
+                    runner.task_binding(contract, worktree, "run-v39", "start_pending")
+            self.assertEqual(require_result.call_count, 1)
+            request = require_result.call_args.args[3]
+            self.assertEqual(request["target"]["binding_contract"]["managed_root"], str(paths.root.parent))
+
+    def test_create_probe_allows_managed_root_unrelated_to_project_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = ProviderActionRunner(paths, "codex-app-visible", "codex-app-visible")
+            managed_root = paths.root.parent / "provider-managed"
+            worktree = managed_root / "c3ad" / "开发辅助"
+            contract = {
+                "run_id": "run-v39",
+                "node_id": "BUG-V3-005",
+                "role": "developer",
+                "generation": 1,
+                "binding_contract_version": "3.9",
+                "binding_probe": True,
+                "project_id": "project-1",
+                "worktree": str(worktree),
+                "managed_root": str(managed_root),
+                "branch": "codex/bug-v3-005",
+                "base_sha": "a" * 40,
+            }
+            with patch.object(
+                runner, "_require_result", side_effect=ProviderPending("probe pending")
+            ) as require_result:
+                with self.assertRaises(ProviderPending):
+                    runner.task_binding(contract, worktree, "run-v39", "start_pending")
+            self.assertEqual(require_result.call_count, 1)
+
     def test_create_probe_blocks_incomplete_or_drifting_repository_binding_before_request(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = ProjectPaths(Path(directory))
@@ -276,6 +329,9 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
                 "wrong_type_base_sha": lambda c: c.update(base_sha=7),
                 "worktree_drift": lambda c: c.update(worktree=str(paths.root / "other")),
                 "managed_root_drift": lambda c: c.update(managed_root=str(paths.root / "other")),
+                "managed_root_filesystem_root": lambda c: c.update(
+                    managed_root=str(Path(c["managed_root"]).anchor)
+                ),
             }
             for name, mutate in invalid.items():
                 with self.subTest(name=name):
