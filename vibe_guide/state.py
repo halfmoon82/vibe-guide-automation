@@ -176,6 +176,7 @@ _EVENT_DATA_KEYS = {
     "invalidated_acceptances",
     "role",
     "run_id",
+    "retryable_same_task",
     "status",
     "successor",
     "task_id",

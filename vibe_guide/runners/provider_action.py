@@ -255,12 +255,12 @@ class ProviderActionRunner(Runner):
             raise ProviderUnavailable(
                 "V3.9 provider create requires explicit binding_probe=true"
             )
+        if v39:
+            self._validate_v39_create_binding(contract, worktree)
         predecessor = contract.get("predecessor_task_id")
         if predecessor is None and existing is not None:
             predecessor = existing.task_id
 
-        if v39:
-            self._validate_v39_create_binding(contract, worktree)
         project_id = contract.get("project_id")
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("visible provider contract requires project_id")
@@ -296,7 +296,6 @@ class ProviderActionRunner(Runner):
                 key: binding_contract[key]
                 for key in ("worktree", "managed_root", "branch", "base_sha")
             }
-        if v39:
             create_request.update(
                 {
                     "binding_probe": True,
