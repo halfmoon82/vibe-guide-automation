@@ -107,6 +107,41 @@ class ProviderActionRunner(Runner):
             )
         return result
 
+    @staticmethod
+    def _validate_v39_create_binding_contract(
+        contract: Dict[str, Any], worktree: Path
+    ) -> Dict[str, str]:
+        """Validate supervisor routing before emitting a V3.9 create probe.
+
+        The runtime ``worktree`` argument is only an observation target; it
+        must never fill a missing contract field.  Creation is therefore
+        rejected unless the complete repository binding is present and the
+        declared worktree is within the declared managed root.
+        """
+        fields = ("project_id", "worktree", "managed_root", "branch", "base_sha")
+        values = {field: contract.get(field) for field in fields}
+        for field, value in values.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ProviderUnavailable(
+                    "V3.9 provider create requires non-empty {}".format(field)
+                )
+        base_sha = values["base_sha"]
+        if len(base_sha) != 40 or any(char not in "0123456789abcdefABCDEF" for char in base_sha):
+            raise ProviderUnavailable("V3.9 provider create base_sha is invalid")
+        try:
+            declared_worktree = Path(values["worktree"]).resolve(strict=False)
+            declared_managed_root = Path(values["managed_root"]).resolve(strict=False)
+            runtime_worktree = Path(worktree).resolve(strict=False)
+            runtime_worktree.relative_to(declared_managed_root)
+            declared_worktree.relative_to(declared_managed_root)
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ProviderUnavailable(
+                "V3.9 provider create repository path drift"
+            ) from error
+        if declared_worktree != runtime_worktree:
+            raise ProviderUnavailable("V3.9 provider create worktree path drift")
+        return values
+
     def task_binding(
         self,
         contract: Dict[str, Any],
@@ -173,6 +208,11 @@ class ProviderActionRunner(Runner):
             raise ProviderUnavailable(
                 "V3.9 provider create requires explicit binding_probe=true"
             )
+        v39_binding_contract = (
+            self._validate_v39_create_binding_contract(contract, worktree)
+            if v39
+            else None
+        )
         predecessor = contract.get("predecessor_task_id")
         if predecessor is None and existing is not None:
             predecessor = existing.task_id
@@ -194,6 +234,7 @@ class ProviderActionRunner(Runner):
             },
         }
         if v39:
+            create_request["target"]["binding_contract"] = dict(v39_binding_contract)
             create_request.update(
                 {
                     "binding_probe": True,
