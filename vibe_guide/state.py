@@ -61,6 +61,62 @@ _NODE_STATUSES = {
     "stopped",
     "brief_pending",
 }
+
+# V3.9 deliberately keeps the durable/internal node statuses precise while
+# exposing a small, stable vocabulary to end users.  This mapping is pure so
+# callers (CLI, desktop bridges and tests) can derive the same label without
+# mutating the snapshot or interpreting provider details themselves.
+USER_VISIBLE_STATES = ("准备中", "自动修复中", "已启动", "需要你决定")
+_USER_DECISION_STATUSES = {"blocked_design", "blocked_deploy"}
+_USER_PREPARING_STATUSES = {"initialized", "planned", "brief_pending", "start_pending"}
+_USER_ACTIVE_STATUSES = {
+    "running", "review", "rework", "delivered", "accepted", "complete",
+}
+_USER_RECOVERY_STATUSES = {
+    "retry_pending", "binding_probe_pending", "binding_repair_pending",
+    "binding_repairing", "blocked_unknown", "unknown", "timeout", "failed", "stopped",
+}
+_USER_DECISION_MARKERS = (
+    "product", "scope", "permission", "credential", "irreversible", "security",
+    "产品", "范围", "权限", "凭据", "不可逆", "安全",
+)
+
+
+def map_user_status(status: Any, reason: Any = "") -> str:
+    """Map internal V3.9 state to one of the four user-facing statuses.
+
+    A mapping/dict is accepted as a convenience for snapshot node records;
+    technical fields remain untouched and are never surfaced by this helper.
+    Unknown states fail safe to the recoverable ``自动修复中`` label.
+    """
+    if isinstance(status, dict):
+        record = status
+        reason = record.get("reason", reason)
+        text = str(reason or "").casefold()
+        if any(marker in text for marker in _USER_DECISION_MARKERS):
+            return "需要你决定"
+        if record.get("binding_phase") in _USER_RECOVERY_STATUSES:
+            return "自动修复中"
+        # A running node with no active handle but a durable retry marker is
+        # not business-started yet; it is the internal recovery phase.
+        if isinstance(record.get("retryable_action"), dict) and not record.get("active_task"):
+            return "自动修复中"
+        status = record.get("status")
+    value = str(status or "")
+    text = str(reason or "").casefold()
+    if value in _USER_DECISION_STATUSES or any(marker in text for marker in _USER_DECISION_MARKERS):
+        return "需要你决定"
+    if value in _USER_PREPARING_STATUSES:
+        return "准备中"
+    if value in _USER_ACTIVE_STATUSES:
+        return "已启动"
+    if value in _USER_RECOVERY_STATUSES:
+        return "自动修复中"
+    return "自动修复中"
+
+
+# Descriptive alias used by UI integrations.
+user_visible_status = map_user_status
 _PROVENANCE_KEYS = {
     "role",
     "task_id",

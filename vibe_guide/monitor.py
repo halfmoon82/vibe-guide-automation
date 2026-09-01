@@ -27,6 +27,7 @@ from .state import (
     append_event,
     load_events,
     load_snapshot,
+    map_user_status,
     quarantine_writer_lease,
     read_writer_lease,
     redact_provider_text,
@@ -3098,7 +3099,7 @@ class Monitor:
     @staticmethod
     def _refresh_run_status(snapshot: RunSnapshot) -> None:
         for current in snapshot.nodes.values():
-            current["user_status"] = _user_status(current)
+            current["user_status"] = map_user_status(current)
         statuses = [node.get("status") for node in snapshot.nodes.values()]
         if statuses and all(status == "accepted" for status in statuses):
             snapshot.status = "complete"
