@@ -616,5 +616,109 @@ def validate_binding(
     )
 
 
+def binding_contract_enabled(contract: Any) -> bool:
+    """Return whether a contract opted into the V3.9 runtime binding gate.
+
+    Legacy contracts deliberately remain untouched.  V3.9 callers may use the
+    explicit version flag or the equivalent boolean used by early revisions.
+    The presence of structured evidence also opts in, while a plain mapping is
+    never accepted as evidence by :func:`runtime_binding_gate`.
+    """
+    if not isinstance(contract, dict):
+        return False
+    version = contract.get("binding_contract_version")
+    if isinstance(version, (int, str)) and version in {39, "39", "3.9", "v3.9", "V3.9"}:
+        return True
+    return bool(
+        contract.get("v39_binding") is True
+        or contract.get("binding_required") is True
+        or "binding_intent" in contract
+        or "binding_observation" in contract
+    )
+
+
+def runtime_binding_gate(
+    contract: Any, binding: Any = None
+) -> BindingVerification:
+    """Evaluate the V3.9 gate using only protected provenance objects.
+
+    A caller may pass evidence on the live ``TaskBinding`` or directly on the
+    runtime contract.  JSON dictionaries are intentionally rejected: persisted
+    records do not carry the private provenance token issued by the lease and
+    wait_threads readers.
+    """
+    if not binding_contract_enabled(contract):
+        return BindingVerification("binding_verified", True, [], [])
+    binding_intent = getattr(binding, "binding_intent", None)
+    binding_observation = getattr(binding, "binding_observation", None)
+    contract_intent = contract.get("binding_intent") if isinstance(contract, dict) else None
+    contract_observation = contract.get("binding_observation") if isinstance(contract, dict) else None
+    # Contract and binding evidence must describe the same live observation;
+    # persisted JSON/dict values never count as provenance.
+    if contract_intent is not None and not isinstance(contract_intent, BindingIntent):
+        return BindingVerification("blocked_unknown", False, ["binding_provenance"], [])
+    if contract_observation is not None and not isinstance(contract_observation, BindingObservation):
+        return BindingVerification("blocked_unknown", False, ["binding_provenance"], [])
+    if binding_intent is not None and contract_intent is not None and binding_intent != contract_intent:
+        return BindingVerification("blocked_unknown", False, [], ["binding_intent"])
+    if binding_observation is not None and contract_observation is not None and binding_observation != contract_observation:
+        return BindingVerification("blocked_unknown", False, [], ["binding_observation"])
+    intent = binding_intent if binding_intent is not None else contract_intent
+    observation = binding_observation if binding_observation is not None else contract_observation
+    if not isinstance(intent, BindingIntent) or not isinstance(observation, BindingObservation):
+        return BindingVerification("blocked_unknown", False, ["binding_provenance"], [])
+    verification = validate_binding(intent, observation)
+    extra_conflicts = []
+    if binding is not None:
+        for attr, field in (("task_id", "task_id"), ("host", "host_id"), ("worktree", "worktree"), ("branch", "branch")):
+            actual = getattr(binding, attr, None)
+            expected = getattr(intent, field, None)
+            if actual not in (None, "") and actual != expected:
+                extra_conflicts.append(field)
+    if isinstance(contract, dict):
+        # ``task_id`` in a monitor contract is the logical Issue identity
+        # before provider creation; the provider task id is checked through
+        # the binding itself.  Do not compare those two namespaces.
+        for key, field in (("project_id", "project_id"), ("host_id", "host_id"), ("worktree", "worktree"), ("managed_root", "managed_root"), ("branch", "branch"), ("base_sha", "base_sha")):
+            expected = contract.get(key)
+            if expected not in (None, "") and expected != getattr(intent, field, None):
+                extra_conflicts.append(field)
+        provider_task_id = contract.get("provider_task_id")
+        contract_task_id = contract.get("task_id")
+        if provider_task_id in (None, "") and contract_task_id not in (
+            None,
+            "",
+            contract.get("node_id"),
+            "{}:{}".format(contract.get("role"), contract.get("node_id")),
+        ):
+            provider_task_id = contract_task_id
+        if provider_task_id not in (None, "") and provider_task_id != intent.task_id:
+            extra_conflicts.append("task_id")
+        for key, observed_field in (("head_sha", "head_sha"), ("clean", "clean"), ("cursor", "cursor")):
+            expected = contract.get(key)
+            if expected not in (None, "") and expected != getattr(observation, observed_field, None):
+                extra_conflicts.append(key)
+        if "lease" in contract and contract.get("lease") != getattr(observation, "lease", None):
+            extra_conflicts.append("lease")
+    if extra_conflicts:
+        verification = BindingVerification(
+            "blocked_unknown", False, list(verification.missing),
+            list(dict.fromkeys(verification.conflicts + extra_conflicts)),
+        )
+    if verification.verified and binding is not None:
+        # TaskBinding is mutable even though its evidence records are frozen;
+        # retain the live proof for the immediate start/write decision.
+        try:
+            binding.binding_intent = intent
+            binding.binding_observation = observation
+            binding.binding_state = verification.binding_state
+            binding.business_write_allowed = verification.business_write_allowed
+        except (AttributeError, TypeError):
+            pass
+    return verification
+
+
 verify_binding = validate_binding
 validate_task_binding = validate_binding
+verify_runtime_binding = runtime_binding_gate
+require_runtime_binding = runtime_binding_gate
