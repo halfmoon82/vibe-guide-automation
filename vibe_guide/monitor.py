@@ -16,10 +16,10 @@ from .authorization import (
     validate_runtime_contract,
 )
 from .contracts import RunEvent, RunHandle, Runner
-from .models import DAGNode, Plan
+from .models import DAGNode, Plan, BindingIntent, BindingObservation, BindingVerification
 from .paths import ProjectPaths
 from .planner import resolve_consistency
-from .adapters.task_provider import ProviderActionStore, ProviderPending
+from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
     RunSnapshot,
@@ -28,11 +28,18 @@ from .state import (
     load_events,
     load_snapshot,
     quarantine_writer_lease,
+    read_writer_lease,
     redact_provider_text,
     release_writer_lease,
     save_snapshot,
 )
-from .task_registry import TaskBinding, load_task_binding, save_task_binding
+from .task_registry import (
+    TaskBinding,
+    binding_contract_enabled,
+    load_task_binding,
+    runtime_binding_gate,
+    save_task_binding,
+)
 from .workflow_gate import require_capability_contract, require_entry
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
@@ -84,6 +91,188 @@ class Monitor:
         save_task_binding(self.paths, binding)
         if binding.run_id is not None:
             self._binding_cache[(binding.run_id, binding.issue_id, binding.role)] = binding
+
+    def _require_binding_gate(
+        self, contract: Dict[str, Any], binding: TaskBinding, runner: Runner
+    ) -> None:
+        """Fail closed before a real runner can start or write.
+
+        ProviderActionRunner exposes the same gate so both boundaries execute
+        it.  A generic runner is checked here as well, preserving legacy
+        contracts that do not opt into V3.9.
+        """
+        if not binding_contract_enabled(contract):
+            return
+        verification = runtime_binding_gate(contract, binding)
+        if not isinstance(verification, BindingVerification):
+            raise ValueError("local provider binding gate returned invalid verification")
+        if verification.binding_state != "binding_verified" or not verification.business_write_allowed:
+            raise ValueError(
+                "provider binding gate blocked_unknown: missing={} conflicts={}".format(
+                    ",".join(verification.missing), ",".join(verification.conflicts)
+                )
+            )
+        # Refresh the supervisor-owned lease at the write boundary.  A cached
+        # observation is not sufficient for generic runners that expose no
+        # provider hook; a released/expired lease must fail closed.
+        node_id = str(contract.get("node_id") or binding.issue_id)
+        fresh_lease = read_writer_lease(self.paths, node_id, binding.worktree)
+        observed = getattr(binding, "binding_observation", None)
+        if fresh_lease is None or observed is None or observed.lease != fresh_lease:
+            raise ValueError("supervisor lease is stale or unavailable")
+        refreshed = runtime_binding_gate(contract, binding)
+        if (
+            not isinstance(refreshed, BindingVerification)
+            or refreshed.binding_state != "binding_verified"
+            or not refreshed.business_write_allowed
+        ):
+            raise ValueError("provider binding gate blocked after lease refresh")
+        # Provider hooks are advisory consistency checks only.  A provider
+        # cannot manufacture permission by returning an object with
+        # ``verified=True`` or another untrusted shape.
+        probe = getattr(runner, "provider_binding_probe", None)
+        if callable(probe):
+            provider_probe = probe(contract, binding)
+            if (
+                not isinstance(provider_probe, BindingVerification)
+                or provider_probe.binding_state != "binding_verified"
+                or not provider_probe.verified
+                or provider_probe != refreshed
+            ):
+                raise ValueError("provider binding probe returned invalid verification")
+        gate = getattr(runner, "binding_gate", None)
+        if callable(gate):
+            provider_verification = gate(contract, binding)
+            if not isinstance(provider_verification, BindingVerification):
+                raise ValueError("provider binding gate returned invalid verification")
+            if provider_verification != refreshed:
+                raise ValueError("provider binding gate disagrees with local evidence")
+
+    def _preflight_binding_before_provider(self, contract: Dict[str, Any]) -> None:
+        """Gate provider actions before ``task_binding`` can emit a request.
+
+        Unknown provider task ids are the sole exception: an explicit
+        ``binding_probe`` may be emitted, and is marked non-business in its
+        request.  Any ordinary V3.9 start requires complete protected live
+        evidence first.
+        """
+        if not binding_contract_enabled(contract):
+            return
+        verification = runtime_binding_gate(contract)
+        if not isinstance(verification, BindingVerification):
+            raise ValueError("provider binding preflight returned invalid verification")
+        if contract.get("binding_probe") is True:
+            # An unknown provider task id is the sole controlled exception:
+            # invoke the local gate first, then permit a non-business probe
+            # only when no untrusted evidence was supplied.
+            if verification.verified:
+                return
+            if (
+                verification.missing == ["binding_provenance"]
+                and "binding_intent" not in contract
+                and "binding_observation" not in contract
+            ):
+                return
+            raise ValueError("provider binding probe preflight blocked_unknown")
+        if not verification.verified:
+            raise ValueError("provider binding preflight blocked_unknown")
+
+    @staticmethod
+    def _binding_recovery_requested(contract: Dict[str, Any]) -> bool:
+        """Identify the narrow JSON-restored continuation recovery path."""
+        if not binding_contract_enabled(contract):
+            return False
+        if contract.get("continuation") is not True or contract.get("binding_bootstrap") is not True:
+            return False
+        return not (
+            isinstance(contract.get("binding_intent"), BindingIntent)
+            and isinstance(contract.get("binding_observation"), BindingObservation)
+        )
+
+    def _preflight_binding_recovery(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        role: str,
+        contract: Dict[str, Any],
+        current: Dict[str, Any],
+    ) -> None:
+        """Validate only the durable identity needed to enter bootstrap.
+
+        A persisted binding has intentionally lost its private lease/cursor
+        provenance.  This preflight therefore never returns a verified gate;
+        it only proves that recovery will address the same task and the same
+        constrained worktree.  The runner bootstrap performs the fresh Git
+        observation and the subsequent full protected-evidence gate.
+        """
+        try:
+            binding = self._load_task_binding(snapshot, node_id, role)
+            root = self._worktree_path(current).resolve(strict=True)
+            bound = Path(str(binding.worktree))
+            if not bound.is_absolute():
+                bound = self.paths.root / bound
+            bound = bound.resolve(strict=True)
+            managed_root = contract.get("managed_root")
+            branch = contract.get("branch")
+            base_sha = contract.get("base_sha")
+            if not isinstance(managed_root, str) or not managed_root:
+                raise ProviderUnavailable("binding recovery managed_root is missing")
+            if not isinstance(branch, str) or not branch:
+                raise ProviderUnavailable("binding recovery branch is missing")
+            if not isinstance(base_sha, str) or not base_sha:
+                raise ProviderUnavailable("binding recovery base_sha is missing")
+            managed = Path(managed_root).resolve(strict=True)
+            root.relative_to(managed)
+            if bound != root:
+                raise ProviderUnavailable("binding recovery worktree drift")
+            if binding.issue_id != node_id or binding.role != role:
+                raise ProviderUnavailable("binding recovery task scope drift")
+            if binding.run_id != snapshot.run_id:
+                raise ProviderUnavailable("binding recovery run drift")
+            if binding.task_id != contract.get("task_id"):
+                raise ProviderUnavailable("binding recovery task identity drift")
+            if binding.branch != branch:
+                raise ProviderUnavailable("binding recovery branch drift")
+            expected_host = contract.get("host_id")
+            if expected_host not in (None, "") and binding.host != expected_host:
+                raise ProviderUnavailable("binding recovery host drift")
+            expected_project = contract.get("project_id")
+            if expected_project not in (None, ""):
+                persisted_intent = binding.binding_intent
+                if isinstance(persisted_intent, BindingIntent) and persisted_intent.project_id != expected_project:
+                    raise ProviderUnavailable("binding recovery project drift")
+        except ProviderUnavailable:
+            raise
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise ProviderUnavailable("binding recovery preflight blocked_unknown") from error
+
+    def _run_binding_bootstrap(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        role: str,
+        contract: Dict[str, Any],
+        runner: Runner,
+        current: Dict[str, Any],
+    ) -> None:
+        """Invoke the real runner bootstrap only for an explicit recovery."""
+        if not binding_contract_enabled(contract) or (
+            contract.get("binding_bootstrap") is not True
+            and contract.get("continuation") is not True
+        ):
+            return
+        bootstrap = getattr(runner, "binding_bootstrap", None)
+        if not callable(bootstrap):
+            raise ProviderUnavailable("binding bootstrap is unavailable")
+        try:
+            binding = self._load_task_binding(snapshot, node_id, role)
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise ProviderUnavailable("binding bootstrap has no same-task binding") from error
+        result = bootstrap(contract, binding, self._worktree_path(current))
+        if not isinstance(result, BindingVerification) or not result.verified:
+            raise ProviderUnavailable("binding bootstrap remains blocked_unknown")
+        contract["binding_intent"] = binding.binding_intent
+        contract["binding_observation"] = binding.binding_observation
 
     def merge_change_request_local(
         self,
@@ -1074,6 +1263,14 @@ class Monitor:
             if recover_missing_reviewer:
                 self._recover_missing_reviewer_successor(snapshot, node_id)
             retry = current.get("retryable_action")
+            if isinstance(retry, dict) and retry.get("same_task") is True:
+                # Unknown side effects are never eligible for successor
+                # creation, even if an older persisted marker said so.
+                if retry.get("successor") is not False or retry.get("successor_candidate") is True:
+                    retry = dict(retry)
+                    retry["successor"] = False
+                    retry["successor_candidate"] = False
+                    current["retryable_action"] = retry
             if (
                 current.get("status") in {"blocked_unknown", "running"}
                 and isinstance(retry, dict)
@@ -1429,6 +1626,13 @@ class Monitor:
                 authorized_actions=record.allowed_actions,
                 authorized_files=record.file_scope,
             )
+            if self._binding_recovery_requested(contract):
+                self._preflight_binding_recovery(
+                    snapshot, node_id, role, contract, current
+                )
+            else:
+                self._preflight_binding_before_provider(contract)
+            self._run_binding_bootstrap(snapshot, node_id, role, contract, runner, current)
             binding = self._binding_for(
                 snapshot,
                 node_id,
@@ -1441,6 +1645,14 @@ class Monitor:
                 continuation,
                 successor,
             )
+            self._require_binding_gate(contract, binding, runner)
+            if binding_contract_enabled(contract):
+                # Registry persistence intentionally strips private provenance
+                # tokens.  Carry the live, verified objects through this
+                # in-process call so ProviderActionRunner.start() rechecks the
+                # same evidence instead of trusting a downgraded JSON row.
+                contract["binding_intent"] = binding.binding_intent
+                contract["binding_observation"] = binding.binding_observation
             identity = str(binding.task_id)
             current[identity_key] = identity
             contract["task_id"] = identity
@@ -1453,12 +1665,36 @@ class Monitor:
                 "role": role,
                 "phase": phase,
                 "continuation": continuation,
-                "successor": successor,
+                "successor": False,
+                "same_task": True,
             }
             # An asynchronous bridge response is a retry condition, not
             # evidence that the provider capability is unavailable.
-            current["status"] = "running"
+            current["status"] = "blocked_unknown" if successor else "running"
             current["reason"] = str(error)
+            if successor:
+                current["active_task"] = None
+                current["active_role"] = None
+                current["start_intent"] = None
+                self._mark_blocked_unknown(snapshot, node_id, str(error))
+                save_snapshot(self.paths, snapshot)
+            return False
+        except ProviderUnavailable as error:
+            current[generation_key] = generation - 1
+            if role == "reviewer" and generation == 1:
+                current["reviewer_started"] = False
+            current["retryable_action"] = {
+                "role": role,
+                "phase": phase,
+                "continuation": continuation,
+                "successor": False,
+                "same_task": True,
+            }
+            current["active_task"] = None
+            current["active_role"] = None
+            current["start_intent"] = None
+            self._mark_blocked_unknown(snapshot, node_id, str(error))
+            save_snapshot(self.paths, snapshot)
             return False
         except (OSError, TypeError, ValueError) as error:
             self._mark_blocked_unknown(
@@ -1499,6 +1735,14 @@ class Monitor:
         try:
             handle = runner.start(contract, self._worktree_path(current))
         except Exception as error:
+            if successor:
+                current["retryable_action"] = {
+                    "role": role,
+                    "phase": phase,
+                    "continuation": continuation,
+                    "successor": False,
+                    "same_task": True,
+                }
             self._mark_blocked_unknown(
                 snapshot,
                 node_id,
