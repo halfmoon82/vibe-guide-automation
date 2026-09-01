@@ -68,42 +68,6 @@ class ProviderActionRunner(Runner):
         )
         return capability + "\n" + consistency
 
-    def _validate_v39_create_binding(
-        self, contract: Dict[str, Any], worktree: Path
-    ) -> None:
-        """Reject incomplete or drifting repository routing before create."""
-        project_id = contract.get("project_id")
-        declared_worktree = contract.get("worktree")
-        managed_root = contract.get("managed_root")
-        branch = contract.get("branch")
-        base_sha = contract.get("base_sha")
-        if not isinstance(project_id, str) or not project_id.strip():
-            raise ProviderUnavailable("provider binding project_id is blocked_unknown")
-        if not isinstance(declared_worktree, str) or not declared_worktree.strip():
-            raise ProviderUnavailable("provider binding worktree is blocked_unknown")
-        if not isinstance(managed_root, str) or not managed_root.strip():
-            raise ProviderUnavailable("provider binding managed_root is blocked_unknown")
-        if not isinstance(branch, str) or not branch.strip():
-            raise ProviderUnavailable("provider binding branch is blocked_unknown")
-        if not isinstance(base_sha, str) or len(base_sha) != 40:
-            raise ProviderUnavailable("provider binding base_sha is blocked_unknown")
-        if any(char not in "0123456789abcdefABCDEF" for char in base_sha):
-            raise ProviderUnavailable("provider binding base_sha is blocked_unknown")
-        try:
-            current_worktree = Path(worktree).resolve()
-            bound_worktree = Path(declared_worktree)
-            managed = Path(managed_root)
-            if not bound_worktree.is_absolute() or not managed.is_absolute():
-                raise ValueError
-            managed_resolved = managed.resolve()
-            if managed_resolved == Path(managed_resolved.anchor):
-                raise ValueError
-            if bound_worktree.resolve() != current_worktree:
-                raise ValueError
-            current_worktree.relative_to(managed_resolved)
-        except (OSError, RuntimeError, ValueError):
-            raise ProviderUnavailable("provider binding path is blocked_unknown")
-
     def _action(
         self,
         contract: Dict[str, Any],
@@ -142,6 +106,88 @@ class ProviderActionRunner(Runner):
                 "provider %s action is pending" % operation
             )
         return result
+
+    def _validate_v39_create_binding(
+        self, contract: Dict[str, Any], runtime_worktree: Path
+    ) -> None:
+        """Fail closed before a V3.9 provider create request is emitted.
+
+        The create probe is still an external side effect, so every target
+        constraint must come from the supervisor-owned contract.  In
+        particular, the runtime ``worktree`` argument is only compared with
+        the contract value and is never used to fill a missing value.
+        """
+        required = ("project_id", "worktree", "managed_root", "branch", "base_sha")
+        values = {name: contract.get(name) for name in required}
+        if (
+            not isinstance(values["project_id"], str)
+            or not values["project_id"].strip()
+            or "\x00" in values["project_id"]
+        ):
+            raise ProviderUnavailable("provider binding project_id is blocked_unknown")
+
+        for name in ("worktree", "managed_root"):
+            value = values[name]
+            if not isinstance(value, str) or not value.strip():
+                raise ProviderUnavailable("provider binding %s is blocked_unknown" % name)
+            path = Path(value)
+            if not path.is_absolute():
+                raise ProviderUnavailable("provider binding %s is blocked_unknown" % name)
+            if "\x00" in value:
+                raise ProviderUnavailable("provider binding %s is blocked_unknown" % name)
+
+        branch = values["branch"]
+        if (
+            not isinstance(branch, str)
+            or not branch.strip()
+            or branch != branch.strip()
+            or "\x00" in branch
+            or any(char.isspace() for char in branch)
+            or Path(branch).is_absolute()
+        ):
+            raise ProviderUnavailable("provider binding branch is blocked_unknown")
+
+        base_sha = values["base_sha"]
+        if not isinstance(base_sha, str) or len(base_sha) != 40 or any(
+            char not in "0123456789abcdefABCDEF" for char in base_sha
+        ):
+            raise ProviderUnavailable("provider binding base_sha is blocked_unknown")
+        if not isinstance(runtime_worktree, (str, Path)):
+            raise ProviderUnavailable("provider binding path is blocked_unknown")
+
+        try:
+            contract_worktree = Path(values["worktree"]).resolve()
+            managed_root = Path(values["managed_root"]).resolve()
+            if contract_worktree == Path(contract_worktree.anchor):
+                raise ValueError
+            if managed_root == Path(managed_root.anchor):
+                raise ValueError
+            if contract_worktree.exists() and not contract_worktree.is_dir():
+                raise ValueError
+            if managed_root.exists() and not managed_root.is_dir():
+                raise ValueError
+            contract_worktree.relative_to(managed_root)
+            runtime = Path(runtime_worktree)
+            if not runtime.is_absolute() or runtime.resolve() != contract_worktree:
+                raise ValueError
+        except (OSError, RuntimeError, TypeError, ValueError):
+            raise ProviderUnavailable("provider binding path is blocked_unknown")
+
+        # The runtime argument is an identity check only.  It is never used
+        # to repair or populate a missing contract worktree.
+        # Accept legacy aliases only when they agree with the canonical
+        # supervisor fields; never promote an alias or nested provider value.
+        aliases = {"project": "project_id"}
+        for alias, canonical in aliases.items():
+            if alias in contract and contract[alias] != values[canonical]:
+                raise ProviderUnavailable("provider binding alias is blocked_unknown")
+        nested = contract.get("binding_contract")
+        if nested is not None:
+            if not isinstance(nested, dict):
+                raise ProviderUnavailable("provider binding contract is blocked_unknown")
+            for name in ("project_id", "worktree", "managed_root", "branch", "base_sha"):
+                if name in nested and nested[name] != values[name]:
+                    raise ProviderUnavailable("provider binding contract is blocked_unknown")
 
     def task_binding(
         self,
@@ -232,15 +278,23 @@ class ProviderActionRunner(Runner):
             },
         }
         if v39:
-            # Carry the supervisor contract as routing intent.  This is
-            # request metadata only; the provider response never becomes
-            # binding evidence and the live gate still runs after create.
-            create_request["target"]["binding_contract"] = {
+            # Keep the provider request bound to the same supervisor target
+            # that will later be checked against live binding evidence.  These
+            # are constraints, not evidence; the provider response can never
+            # promote them to verified state by echoing them back.
+            binding_contract = {
                 "project_id": project_id,
                 "worktree": contract.get("worktree"),
                 "managed_root": contract.get("managed_root"),
                 "branch": contract.get("branch"),
                 "base_sha": contract.get("base_sha"),
+            }
+            create_request["target"]["binding_contract"] = binding_contract
+            # Keep the original top-level shape for bridge consumers that
+            # already inspect probe constraints there.
+            create_request["binding"] = {
+                key: binding_contract[key]
+                for key in ("worktree", "managed_root", "branch", "base_sha")
             }
             create_request.update(
                 {

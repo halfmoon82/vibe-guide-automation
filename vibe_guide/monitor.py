@@ -27,6 +27,7 @@ from .state import (
     append_event,
     load_events,
     load_snapshot,
+    map_user_status,
     quarantine_writer_lease,
     read_writer_lease,
     redact_provider_text,
@@ -345,6 +346,7 @@ class Monitor:
                 "pair_archived": False,
                 "old_task_reconciled": False,
                 "retryable_action": None,
+                "binding_phase": None,
                 "contract_overrides": {},
                 "corrections": [],
                 "contract_digest": executable_contract_digest([node]),
@@ -1308,6 +1310,7 @@ class Monitor:
                     current.get("status") == "blocked_unknown"
                     and isinstance(current.get("quarantine"), dict)
                     and retry.get("successor_candidate") is not True
+                    and retry.get("same_task") is not True
                     and current.get("active_task") is None
                     and not resumable_developer
                 ):
@@ -1612,6 +1615,24 @@ class Monitor:
         contract.setdefault(
             "files", list((contract.get("worker_profile") or {}).get("allowlist", []))
         )
+        # V3.9 provider creation is itself an internal, non-business probe.
+        # The authorization contract must not require the user to add this
+        # implementation detail.  On retries the deterministic action id is
+        # reused (same run/node/role/generation), so setting the flag again is
+        # idempotent and cannot create a successor writer.
+        if binding_contract_enabled(contract):
+            has_live_evidence = isinstance(
+                contract.get("binding_intent"), BindingIntent
+            ) and isinstance(contract.get("binding_observation"), BindingObservation)
+            if not has_live_evidence:
+                if continuation:
+                    contract.setdefault("binding_bootstrap", True)
+                    current["binding_phase"] = "binding_repair_pending"
+                else:
+                    contract.setdefault("binding_probe", True)
+                    current["binding_phase"] = "binding_probe_pending"
+            else:
+                current["binding_phase"] = "binding_verified"
         if snapshot.capability_contract_digest:
             contract["capability_contract_digest"] = snapshot.capability_contract_digest
         if (self.paths.vibe / "state.json").is_file():
@@ -1678,6 +1699,8 @@ class Monitor:
             # An asynchronous bridge response is a retry condition, not
             # evidence that the provider capability is unavailable.
             current["status"] = "blocked_unknown" if successor else "running"
+            if binding_contract_enabled(contract):
+                current["binding_phase"] = "retry_pending"
             current["reason"] = str(error)
             if successor:
                 current["active_task"] = None
@@ -1701,6 +1724,8 @@ class Monitor:
             current["active_role"] = None
             current["start_intent"] = None
             self._mark_blocked_unknown(snapshot, node_id, str(error))
+            if binding_contract_enabled(contract):
+                current["binding_phase"] = "binding_repair_pending"
             save_snapshot(self.paths, snapshot)
             return False
         except (OSError, TypeError, ValueError) as error:
@@ -1722,6 +1747,8 @@ class Monitor:
             "generation": generation,
         }
         current["status"] = "start_pending"
+        if binding_contract_enabled(contract) and current.get("binding_phase") is None:
+            current["binding_phase"] = "binding_verified"
         current["active_role"] = role
         current["active_task"] = {
             "role": role,
@@ -1774,6 +1801,8 @@ class Monitor:
             return False
 
         current["status"] = self._running_status(role, phase)
+        if binding_contract_enabled(contract):
+            current["binding_phase"] = "business_work_allowed"
         current["active_task"]["handle_id"] = handle.run_id
         current["start_intent"] = None
         current["quarantine"] = None
@@ -2962,6 +2991,8 @@ class Monitor:
 
     @staticmethod
     def _refresh_run_status(snapshot: RunSnapshot) -> None:
+        for current in snapshot.nodes.values():
+            current["user_status"] = map_user_status(current)
         statuses = [node.get("status") for node in snapshot.nodes.values()]
         if statuses and all(status == "accepted" for status in statuses):
             snapshot.status = "complete"
