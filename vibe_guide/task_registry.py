@@ -9,7 +9,21 @@ import tempfile
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .paths import ProjectPaths
-from .state import _safe_project_path, interprocess_lock, run_dir, validate_run_id
+from .state import (
+    LEASE_SCHEMA_VERSION,
+    _safe_project_path,
+    interprocess_lock,
+    run_dir,
+    supervisor_lease_id,
+    validate_run_id,
+)
+from .models import (
+    BindingIntent,
+    BindingObservation,
+    BindingVerification,
+    SupervisorLeaseObservation,
+    WaitThreadsCursorObservation,
+)
 
 
 REGISTRY_SCHEMA_VERSION = 1
@@ -71,6 +85,10 @@ class TaskBinding:
     allowlist: List[str] = field(default_factory=list)
     capability_contract_digest: Optional[str] = None
     successor_of: Optional[str] = None
+    binding_intent: Optional[Dict[str, Any]] = None
+    binding_observation: Optional[Dict[str, Any]] = None
+    binding_state: str = "blocked_unknown"
+    business_write_allowed: bool = False
     schema_version: int = BINDING_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -114,6 +132,55 @@ class TaskBinding:
             not isinstance(self.successor_of, str) or not self.successor_of
         ):
             raise ValueError("task binding successor predecessor is invalid")
+        for name in ("binding_intent", "binding_observation"):
+            value = getattr(self, name)
+            if value is not None:
+                validator = BindingIntent if name == "binding_intent" else BindingObservation
+                if isinstance(value, validator):
+                    continue
+                if not isinstance(value, dict):
+                    raise ValueError("%s must be a JSON object" % name)
+                try:
+                    setattr(self, name, validator.from_dict(value).to_dict())
+                except (TypeError, ValueError) as error:
+                    raise ValueError("%s is invalid" % name) from error
+        if self.binding_state not in {"blocked_unknown", "binding_verified"}:
+            raise ValueError("task binding state is invalid")
+        if type(self.business_write_allowed) is not bool:
+            raise ValueError("task binding business write flag is invalid")
+        if self.business_write_allowed and self.binding_state != "binding_verified":
+            raise ValueError("business write requires verified binding")
+        if self.binding_state == "binding_verified":
+            if not isinstance(self.binding_intent, BindingIntent) or not isinstance(
+                self.binding_observation, BindingObservation
+            ):
+                raise ValueError("verified task binding requires binding evidence")
+            intent = self.binding_intent
+            observation = self.binding_observation
+            if not isinstance(observation.lease, SupervisorLeaseObservation):
+                raise ValueError("verified task binding lease lacks provenance")
+            if not isinstance(observation.cursor_observation, WaitThreadsCursorObservation):
+                raise ValueError("verified task binding cursor lacks provenance")
+            if not observation.lease.active or observation.lease.status != "active":
+                raise ValueError("verified task binding lease is not active")
+            if any(
+                getattr(intent, field, None) in (None, "")
+                for field in ("node_id", "lease_id", "head_sha", "clean", "cursor")
+            ):
+                raise ValueError("verified task binding intent is incomplete")
+            if any(
+                getattr(observation, field, None) in (None, "")
+                for field in (
+                    "project_id", "task_id", "node_id", "host_id", "worktree",
+                    "managed_root", "branch", "base_sha", "head_sha", "lease",
+                    "cursor", "cursor_source", "cursor_task_id", "cursor_host_id",
+                    "cursor_lineage",
+                )
+            ):
+                raise ValueError("verified task binding observation is incomplete")
+            verification = validate_binding(intent, observation)
+            if not verification.verified:
+                raise ValueError("verified task binding evidence failed validation")
 
         ids = [
             item
@@ -190,7 +257,7 @@ class TaskBinding:
         continuation_digest = self.continuation_digest
         if self.token is not None:
             continuation_digest = _digest_reference(self.token)
-        return {
+        result = {
             "schema_version": self.schema_version,
             "provider": self.provider,
             "mode": self.mode,
@@ -216,6 +283,22 @@ class TaskBinding:
             "capability_contract_digest": self.capability_contract_digest,
             "successor_of": self.successor_of,
         }
+        if self.binding_intent is not None:
+            result["binding_intent"] = (
+                self.binding_intent.to_dict()
+                if isinstance(self.binding_intent, BindingIntent)
+                else dict(self.binding_intent)
+            )
+        if self.binding_observation is not None:
+            result["binding_observation"] = (
+                self.binding_observation.to_dict()
+                if isinstance(self.binding_observation, BindingObservation)
+                else dict(self.binding_observation)
+            )
+        if self.binding_state != "blocked_unknown" or self.business_write_allowed:
+            result["binding_state"] = self.binding_state
+            result["business_write_allowed"] = self.business_write_allowed
+        return result
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TaskBinding":
@@ -242,15 +325,25 @@ class TaskBinding:
             "limitations",
             "generation",
         }
-        if not isinstance(data, dict) or set(data) not in (
-            expected,
-            expected | {"allowlist", "capability_contract_digest", "successor_of"},
-        ):
+        optional = {"binding_intent", "binding_observation", "binding_state", "business_write_allowed"}
+        allowed = expected | {"allowlist", "capability_contract_digest", "successor_of"} | optional
+        if not isinstance(data, dict) or not set(data).issubset(allowed) or not expected.issubset(data):
             raise ValueError("task binding record schema is invalid")
         normalized = dict(data)
         normalized.setdefault("allowlist", [])
         normalized.setdefault("capability_contract_digest", None)
         normalized.setdefault("successor_of", None)
+        normalized.setdefault("binding_intent", None)
+        normalized.setdefault("binding_observation", None)
+        normalized.setdefault("binding_state", "blocked_unknown")
+        normalized.setdefault("business_write_allowed", False)
+        if normalized["binding_state"] == "binding_verified":
+            normalized["binding_state"] = "blocked_unknown"
+            normalized["business_write_allowed"] = False
+        elif normalized["binding_state"] != "binding_verified" and normalized[
+            "business_write_allowed"
+        ]:
+            normalized["business_write_allowed"] = False
         return cls(**normalized)
 
 
@@ -422,3 +515,106 @@ def load_task_binding(
         raise FileNotFoundError("no task binding for {} {}".format(issue_id, role))
     matches.sort(key=lambda item: item.generation)
     return matches[-1]
+
+
+def validate_binding(
+    intent: BindingIntent, observation: BindingObservation
+) -> BindingVerification:
+    """Pure fail-closed gate for supervisor-owned provider task bindings.
+
+    Provider-private lease metadata is intentionally not required.  The lease
+    must instead be an active local supervisor observation, while the cursor
+    must come from a current ``wait_threads`` observation.
+    """
+
+    missing: List[str] = []
+    conflicts: List[str] = []
+    if not isinstance(intent, BindingIntent) or not isinstance(observation, BindingObservation):
+        return BindingVerification("blocked_unknown", False, ["binding_observation"], [])
+
+    for field in ("node_id", "lease_id", "head_sha", "clean", "cursor"):
+        if getattr(intent, field, None) in (None, ""):
+            missing.append(field)
+
+    for field in (
+        "project_id",
+        "task_id",
+        "node_id",
+        "host_id",
+        "worktree",
+        "managed_root",
+        "branch",
+        "base_sha",
+    ):
+        observed = getattr(observation, field)
+        expected = getattr(intent, field)
+        if observed in (None, ""):
+            missing.append(field)
+        elif observed != expected:
+            conflicts.append(field)
+
+    if observation.head_sha in (None, ""):
+        missing.append("head_sha")
+    elif intent.head_sha is not None and observation.head_sha != intent.head_sha:
+        conflicts.append("head_sha")
+    if type(observation.clean) is not bool:
+        missing.append("clean")
+    elif not observation.clean:
+        conflicts.append("clean")
+    elif intent.clean is not None and observation.clean != intent.clean:
+        conflicts.append("clean")
+
+    lease = observation.lease
+    if not isinstance(lease, SupervisorLeaseObservation):
+        missing.append("lease")
+    else:
+        expected_lease_id = supervisor_lease_id(
+            lease.node_id, lease.worktree, lease.run_id
+        )
+        if (
+            not lease.active
+            or lease.status != "active"
+            or lease.schema_version != LEASE_SCHEMA_VERSION
+            or lease.node_id != intent.node_id
+            or lease.worktree != intent.worktree
+            or lease.lease_id != expected_lease_id
+        ):
+            conflicts.append("lease")
+        if intent.lease_id is not None and lease.lease_id != intent.lease_id:
+            conflicts.append("lease")
+        if intent.lease is not None and lease.to_dict() != intent.lease:
+            conflicts.append("lease")
+
+    if observation.cursor in (None, ""):
+        missing.append("cursor")
+    elif observation.source != "codex_app__wait_threads":
+        conflicts.append("cursor")
+    elif not isinstance(observation.cursor_observation, WaitThreadsCursorObservation):
+        conflicts.append("cursor")
+    elif (
+        observation.cursor_source != "codex_app__wait_threads"
+        or observation.cursor_task_id != observation.task_id
+        or observation.cursor_host_id != observation.host_id
+        or observation.cursor_lineage != observation.cursor_observation.lineage
+        or observation.cursor_observation.task_id != observation.task_id
+        or observation.cursor_observation.host_id != observation.host_id
+        or observation.cursor_observation.cursor != observation.cursor
+    ):
+        conflicts.append("cursor")
+    elif observation.cursor != intent.cursor:
+        conflicts.append("cursor")
+
+    # Preserve stable ordering for JSON evidence and deterministic tests.
+    missing = list(dict.fromkeys(missing))
+    conflicts = list(dict.fromkeys(conflicts))
+    verified = not missing and not conflicts
+    return BindingVerification(
+        "binding_verified" if verified else "blocked_unknown",
+        verified,
+        missing,
+        conflicts,
+    )
+
+
+verify_binding = validate_binding
+validate_task_binding = validate_binding
