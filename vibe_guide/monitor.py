@@ -802,10 +802,17 @@ class Monitor:
             try:
                 events = runner.poll(RunHandle(handle_id))
             except Exception as error:
+                self._queue_active_retry(
+                    snapshot,
+                    node_id,
+                    "runner poll failed ({})".format(type(error).__name__),
+                )
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
                     "runner poll failed ({})".format(type(error).__name__),
+                    quarantine_lease=False,
+                    retryable_same_task=True,
                 )
                 continue
             for event in events:
@@ -2240,10 +2247,17 @@ class Monitor:
             self._archive_pair(snapshot, node_id)
             self._release_node_lease(snapshot, node_id)
         elif event.event in {"unknown", "timeout", "state_unknown", "visibility_unknown"}:
+            self._queue_active_retry(
+                snapshot,
+                node_id,
+                str(redact_provider_text(event.data.get("reason", event.event))),
+            )
             self._mark_blocked_unknown(
                 snapshot,
                 node_id,
                 str(redact_provider_text(event.data.get("reason", event.event))),
+                quarantine_lease=False,
+                retryable_same_task=True,
             )
         elif event.event in {"failed", "stopped", "terminal_failed"}:
             self._record_runner_event(snapshot, node_id, event, active)
@@ -2358,8 +2372,57 @@ class Monitor:
         data.update({"run_id": snapshot.run_id, "node_id": node_id})
         self._record(snapshot, event.event, data, active)
 
-    def _mark_blocked_unknown(
+    def _queue_active_retry(
         self, snapshot: RunSnapshot, node_id: str, reason: str
+    ) -> None:
+        """Record a retry intent without allocating a new task identity.
+
+        A transient provider result is still unknown, but an active handle is
+        durable evidence that the same task may be polled again.  Persist the
+        logical retry alongside that handle so snapshot recovery can resume
+        the original task even when the next poll happens in a new process.
+        """
+        current = snapshot.nodes[node_id]
+        active = current.get("active_task")
+        handle_id = snapshot.handles.get(node_id)
+        if not isinstance(active, dict) or not isinstance(handle_id, str):
+            return
+        role = active.get("role")
+        task_id = active.get("task_id")
+        generation = active.get("generation")
+        if role not in {"developer", "reviewer"} or not isinstance(task_id, str):
+            return
+        phase = "review" if role == "reviewer" else (
+            "rework" if current.get("status") == "rework" else "develop"
+        )
+        previous = current.get("retryable_action")
+        attempt = 1
+        if isinstance(previous, dict) and previous.get("same_task") is True:
+            try:
+                attempt = int(previous.get("attempt", 0)) + 1
+            except (TypeError, ValueError):
+                attempt = 1
+        current["retryable_action"] = {
+            "role": role,
+            "phase": phase,
+            "continuation": True,
+            "successor": False,
+            "successor_candidate": False,
+            "same_task": True,
+            "task_id": task_id,
+            "handle_id": handle_id,
+            "generation": generation,
+            "attempt": attempt,
+            "reason": redact_provider_text(reason),
+        }
+
+    def _mark_blocked_unknown(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        reason: str,
+        quarantine_lease: bool = True,
+        retryable_same_task: bool = False,
     ) -> None:
         current = snapshot.nodes[node_id]
         active = current.get("active_task")
@@ -2378,17 +2441,25 @@ class Monitor:
                 )
             except (FileNotFoundError, OSError, TypeError, ValueError):
                 pass
-        quarantine_writer_lease(
-            self.paths,
-            node_id,
-            str(current.get("worktree", "")),
-            snapshot.run_id,
-            reason,
-        )
+        if quarantine_lease:
+            quarantine_writer_lease(
+                self.paths,
+                node_id,
+                str(current.get("worktree", "")),
+                snapshot.run_id,
+                reason,
+            )
+        event_data = {
+            "run_id": snapshot.run_id,
+            "node_id": node_id,
+            "reason": reason,
+        }
+        if retryable_same_task:
+            event_data["retryable_same_task"] = True
         self._record(
             snapshot,
             "blocked_unknown",
-            {"run_id": snapshot.run_id, "node_id": node_id, "reason": reason},
+            event_data,
             active if isinstance(active, dict) else None,
         )
 
@@ -2666,8 +2737,20 @@ class Monitor:
                 )
             elif record["event"] in {"blocked_unknown", "unknown", "timeout"}:
                 if provenance["role"] != "system":
-                    self._registered_active_binding(
+                    binding = self._registered_active_binding(
                         snapshot, node_id, provenance
+                    )
+                    self._set_binding_status(
+                        snapshot, node_id, str(provenance["role"]), "blocked_unknown"
+                    )
+                if (
+                    record["event"] in {"unknown", "timeout"}
+                    or data.get("retryable_same_task") is True
+                ):
+                    self._queue_active_retry(
+                        snapshot,
+                        node_id,
+                        str(data.get("reason", record["event"])),
                     )
                 current["status"] = "blocked_unknown"
                 current["reason"] = data.get("reason", record["event"])

@@ -237,7 +237,7 @@ class ProviderActionRunner(Runner):
             # binding evidence and the live gate still runs after create.
             create_request["target"]["binding_contract"] = {
                 "project_id": project_id,
-                "worktree": str(contract.get("worktree") or worktree),
+                "worktree": contract.get("worktree"),
                 "managed_root": contract.get("managed_root"),
                 "branch": contract.get("branch"),
                 "base_sha": contract.get("base_sha"),
