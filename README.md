@@ -4,7 +4,7 @@
 
 ## 安装与交付物核验
 
-项目使用单一版本 `0.1.0`，同时支持源码包、wheel 和 sdist。构建机可以在临时目录生成三种形态并记录 SHA-256：
+项目使用单一版本 `2.0.0`，同时支持源码包、wheel 和 sdist。构建机可以在临时目录生成三种形态并记录 SHA-256：
 
 ```bash
 python3 -m pip install --upgrade build
@@ -18,8 +18,8 @@ shasum -a 256 /tmp/vibe-guide-dist/* /tmp/vibe-guide-source-0.1.0.tar.gz
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install /path/to/vibe_guide-0.1.0-py3-none-any.whl
-# 或：.venv/bin/python -m pip install /path/to/vibe-guide-0.1.0.tar.gz
+.venv/bin/python -m pip install /path/to/vibe_guide-2.0.0-py3-none-any.whl
+# 或：.venv/bin/python -m pip install /path/to/vibe-guide-2.0.0.tar.gz
 # 源码目录也可执行：.venv/bin/python -m pip install /path/to/source
 ```
 
@@ -48,4 +48,3 @@ python3 -m venv .venv
 ## 能力边界
 
 `scan` 和 `doctor` 是只读命令。`init` 只在明确 `--confirm` 后写入最小 `.vibe` 状态，并使用原子替换；不会覆盖既有 `AGENTS.md`。本包不执行 commit、push、MR、merge、Deploy，也不保存凭据。真实 provider 的登录、可见任务、创建/续接和远端权限必须在真实平台单独核验。
-

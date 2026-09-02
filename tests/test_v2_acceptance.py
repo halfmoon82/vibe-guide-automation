@@ -22,7 +22,7 @@ class PackagingAcceptanceTests(unittest.TestCase):
             wheel = list(out.glob("*.whl"))
             self.assertEqual(len(wheel), 1)
             version = re.search(r"-(\d+\.\d+\.\d+)-", wheel[0].name).group(1)
-            self.assertEqual(version, "0.1.0")
+            self.assertEqual(version, "2.0.0")
             digest = hashlib.sha256(wheel[0].read_bytes()).hexdigest()
             self.assertEqual(len(digest), 64)
 
@@ -36,7 +36,7 @@ class PackagingAcceptanceTests(unittest.TestCase):
                 cwd=str(root), text=True, capture_output=True, check=False,
             )
             self.assertEqual(build.returncode, 0, build.stderr)
-            sdist = out / "vibe-guide-0.1.0.tar.gz"
+            sdist = out / "vibe-guide-2.0.0.tar.gz"
             self.assertTrue(sdist.exists())
             wheel_build = subprocess.run(
                 [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation", "-w", str(out), str(root)],
