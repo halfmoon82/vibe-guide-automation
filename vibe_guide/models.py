@@ -23,7 +23,7 @@ _NODE_STATUSES = frozenset(
         "brief_pending",
     }
 )
-_PLAN_STATUSES = frozenset({"draft", "authorized", "running", "complete", "blocked", "failed"})
+_PLAN_STATUSES = frozenset({"draft", "authorized", "running", "complete", "blocked", "failed", "confirmed_pending_authorization"})
 _CAPABILITY_LEVELS = frozenset({"guide", "background", "full"})
 _DEPLOY_STATUSES = frozenset(
     {
@@ -43,6 +43,47 @@ EVIDENCE_PRIORITY = (
     "issue_contract",
     "implementation",
 )
+
+
+@dataclass(frozen=True)
+class ObservationDisposition:
+    """Fail-closed classification of one provider/runtime observation."""
+
+    status: str
+    action: str
+    reason: str = ""
+
+    def __post_init__(self):
+        if self.status not in {"repairable", "unknown", "degraded"}:
+            raise ValueError("unsupported observation disposition")
+        if self.action not in {"repair", "isolate", "continue"}:
+            raise ValueError("unsupported observation action")
+        if not isinstance(self.reason, str):
+            raise TypeError("observation reason must be a string")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_dict(self)
+
+
+@dataclass(frozen=True)
+class HealingResult:
+    """Bounded result for repair of a single node binding."""
+
+    repaired: bool
+    degraded: bool = False
+    isolated: bool = False
+    reason: str = ""
+    task_id: Optional[str] = None
+
+    def __post_init__(self):
+        for name in ("repaired", "degraded", "isolated"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError("%s must be a bool" % name)
+        if not isinstance(self.reason, str):
+            raise TypeError("healing reason must be a string")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_dict(self)
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA40 = re.compile(r"^[0-9a-fA-F]{40}$")
 
@@ -101,6 +142,14 @@ class DAGNode:
     allowlist: List[str] = field(default_factory=list)
     owned_paths: List[str] = field(default_factory=list)
     read_paths: List[str] = field(default_factory=list)
+    reviewer: str = ""
+    provider: str = ""
+    mode: str = ""
+    worktree_strategy: str = ""
+    automatic_recovery_actions: List[str] = field(default_factory=list)
+    branch_policy: str = ""
+    binding_status: str = ""
+    delivery_evidence: str = ""
 
     def __post_init__(self):
         self.id = _identifier(self.id, "node id")
@@ -150,7 +199,44 @@ class Plan:
     prd_path: str
     node_ids: List[str]
     status: str
+    # Optional source lineage metadata used by published revisioned plans.
+    spec_path: str = ""
+    issues_path: str = ""
+    dag_path: str = ""
+    implementation_plan_path: str = ""
+    release_gate: str = ""
+    plan_confirmation: str = ""
+    authorization_required: bool = False
+    authorization_status: str = ""
+    preflight_status: str = ""
+    preflight_report: str = ""
+    preflight_block_reasons: List[str] = field(default_factory=list)
+    amendment_path: str = ""
+    exploration_report: str = ""
+    new_issue_proposed: str = ""
+    new_release_gate: str = ""
+    provider_probe_thread_id: str = ""
+    provider_probe_result: str = ""
+    canonical_base_sha: str = ""
+    canonical_base_selection: str = ""
+    scope_change_reason: str = ""
+    revision2_confirmation_evidence: str = ""
+    deploy: bool = False
+    worktree_policy: str = ""
+    ready_nodes: List[str] = field(default_factory=list)
+    automatic_recovery_actions: List[str] = field(default_factory=list)
+    business_write_gate: str = ""
+    old_authorization_reuse: bool = False
+    confirmation_evidence: str = ""
     decisions: List[Dict[str, Any]] = field(default_factory=list)
+    # V3.10 routing and authorization-time target projection.  These fields
+    # are optional so legacy plan constructors remain wire-compatible.
+    routing_result: Dict[str, Any] = field(default_factory=dict)
+    target_contract: Dict[str, Any] = field(default_factory=dict)
+    target_contract_digest: str = ""
+    complexity_band: str = ""
+    route_result: Dict[str, Any] = field(default_factory=dict)
+    force_upgrade_flags: List[str] = field(default_factory=list)
     evidence_priority: List[str] = field(
         default_factory=lambda: list(EVIDENCE_PRIORITY)
     )
@@ -170,6 +256,81 @@ class Plan:
         ):
             raise TypeError("plan decisions must be a list of dictionaries")
         self.decisions = _json_safe(self.decisions)
+        for name in ("routing_result", "target_contract"):
+            value = getattr(self, name)
+            if not isinstance(value, dict):
+                raise TypeError("%s must be a dictionary" % name)
+            setattr(self, name, _json_safe(value))
+        if not isinstance(self.route_result, dict):
+            raise TypeError("route_result must be a dictionary")
+        self.route_result = _json_safe(self.route_result)
+        if not isinstance(self.force_upgrade_flags, list) or not all(isinstance(item, str) and item.strip() for item in self.force_upgrade_flags):
+            raise TypeError("force_upgrade_flags must be a list of strings")
+        if self.routing_result and not self.route_result:
+            self.route_result = dict(self.routing_result)
+        elif self.route_result and not self.routing_result:
+            self.routing_result = dict(self.route_result)
+        route_payload = self.routing_result or self.route_result
+        if self.routing_result and self.route_result:
+            def _canon(payload):
+                route = payload.get("route")
+                band = payload.get("complexity_band", route)
+                if route == "light" and band == "light_plan":
+                    route = "light_plan"
+                if band == "light" and route == "light_plan":
+                    band = "light_plan"
+                return (route, band, payload.get("score"), tuple(payload.get("force_upgrade_flags", [])))
+            if _canon(self.routing_result) != _canon(self.route_result):
+                raise ValueError("plan route projections disagree")
+        if route_payload:
+            route = route_payload.get("route")
+            band = route_payload.get("complexity_band", route)
+            if route not in {"simple", "light_plan", "complex", "light"} or band not in {"simple", "light_plan", "complex", "light"}:
+                raise ValueError("invalid route projection band")
+            flags = route_payload.get("force_upgrade_flags", [])
+            if not isinstance(flags, list) or len(flags) != len(set(flags)) or not all(isinstance(item, str) and item.strip() for item in flags):
+                raise ValueError("invalid route projection force flags")
+            score = route_payload.get("score")
+            if score is not None and (isinstance(score, bool) or not isinstance(score, int) or score < 0):
+                raise ValueError("invalid route projection score")
+            if score is not None:
+                expected = "simple" if score <= 8 else "light_plan" if score <= 15 else "complex"
+                actual = "light_plan" if route == "light" else route
+                if actual != expected:
+                    raise ValueError("route projection score does not match route")
+            if flags and route != "complex":
+                raise ValueError("force upgrade flags require complex route")
+        if route_payload.get("route") and route_payload.get("complexity_band"):
+            route_band = route_payload["route"]
+            payload_band = route_payload["complexity_band"]
+            if route_band != payload_band and not (route_band == "light_plan" and payload_band == "light"):
+                raise ValueError("route projection route and complexity band disagree")
+        projected_band = route_payload.get("complexity_band") or route_payload.get("route")
+        if projected_band == "light_plan":
+            projected_band = "light_plan"
+        if projected_band:
+            if self.complexity_band and self.complexity_band != projected_band:
+                raise ValueError("plan complexity band conflicts with routing projection")
+            self.complexity_band = projected_band
+        for left, right in ((self.routing_result, self.route_result),):
+            if left and right and left.get("force_upgrade_flags", []) != right.get("force_upgrade_flags", []):
+                raise ValueError("plan route projections disagree on force flags")
+        payload_flags = route_payload.get("force_upgrade_flags", [])
+        if self.force_upgrade_flags and payload_flags and list(self.force_upgrade_flags) != list(payload_flags):
+            raise ValueError("plan force flags conflict with routing projection")
+        if not self.force_upgrade_flags and payload_flags:
+            self.force_upgrade_flags = list(payload_flags)
+        if self.target_contract:
+            contract = TargetContract.from_dict(self.target_contract)
+            computed = contract.digest
+            supplied = self.target_contract.get("digest")
+            if supplied and supplied != computed:
+                raise ValueError("target contract digest mismatch")
+            if self.target_contract_digest and self.target_contract_digest != computed:
+                raise ValueError("plan target contract digest mismatch")
+            self.target_contract_digest = computed
+        if not isinstance(self.target_contract_digest, str) or not isinstance(self.complexity_band, str):
+            raise TypeError("target contract projection fields must be strings")
         if self.evidence_priority != list(EVIDENCE_PRIORITY):
             raise ValueError("plan evidence priority is fixed")
         if not isinstance(self.nodes, list):
@@ -192,6 +353,115 @@ class Plan:
         if not isinstance(data, dict):
             raise TypeError("Plan data must be a dictionary")
         return cls(**data)
+
+
+@dataclass(frozen=True)
+class TargetContract:
+    """Authorization-time, immutable engineering target projection.
+
+    Missing or ambiguous fields are retained in ``missing_fields`` and keep
+    the contract unfrozen; once supplied by the one user selection, the same
+    serialized contract can be reused by later monitor entries.
+    """
+
+    provider: str = ""
+    repository: str = ""
+    target_branch: str = ""
+    issue_type: str = ""
+    source_branch: str = ""
+    file_scope: tuple = field(default_factory=tuple)
+    merge_method: str = ""
+    project: str = ""
+    frozen: bool = False
+    missing_fields: tuple = field(default_factory=tuple)
+    status: str = "pending_selection"
+
+    def __post_init__(self):
+        for name in ("provider", "repository", "target_branch", "issue_type", "source_branch", "merge_method", "project", "status"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise TypeError("%s must be a string" % name)
+            if any(ch in value for ch in "\x00\r\n"):
+                raise ValueError("%s contains invalid characters" % name)
+        if not isinstance(self.file_scope, (list, tuple)) or not all(isinstance(item, str) and item.strip() for item in self.file_scope):
+            raise TypeError("file_scope must be a list/tuple of non-empty strings")
+        object.__setattr__(self, "file_scope", tuple(item.strip() for item in self.file_scope))
+        if len(set(self.file_scope)) != len(self.file_scope):
+            raise ValueError("file_scope must not contain duplicates")
+        if not isinstance(self.frozen, bool):
+            raise TypeError("frozen must be a bool")
+        if not isinstance(self.missing_fields, (list, tuple)) or not all(isinstance(item, str) and item.strip() for item in self.missing_fields):
+            raise TypeError("missing_fields must be a list/tuple of strings")
+        object.__setattr__(self, "missing_fields", tuple(item.strip() for item in self.missing_fields))
+        if len(set(self.missing_fields)) != len(self.missing_fields):
+            raise ValueError("missing_fields must not contain duplicates")
+        if self.frozen and self.missing_fields:
+            raise ValueError("frozen target contract cannot have missing fields")
+        if self.status not in {"pending_selection", "frozen"}:
+            raise ValueError("unsupported target contract status")
+        if self.frozen and self.status != "frozen":
+            raise ValueError("frozen target contract must have frozen status")
+        if not self.frozen and self.status == "frozen":
+            raise ValueError("pending target contract cannot have frozen status")
+        if self.frozen:
+            required = (self.provider, self.target_branch, self.issue_type, self.source_branch, self.merge_method, self.repository_project)
+            if not all(value.strip() for value in required) or not self.file_scope:
+                raise ValueError("frozen target contract requires all target fields")
+
+    @property
+    def repository_project(self) -> str:
+        return self.repository or self.project
+
+    @property
+    def requires_selection(self) -> bool:
+        return not self.frozen
+
+    @property
+    def needs_user_selection(self) -> bool:
+        return self.requires_selection
+
+    @property
+    def issue_or_pr_type(self) -> str:
+        return self.issue_type
+
+    @property
+    def files(self) -> List[str]:
+        return list(self.file_scope)
+
+    @property
+    def is_frozen(self) -> bool:
+        return self.frozen
+
+    @property
+    def digest(self) -> str:
+        import hashlib
+        import json
+
+        payload = {
+            "provider": self.provider,
+            "repository": self.repository,
+            "project": self.project,
+            "target_branch": self.target_branch,
+            "issue_type": self.issue_type,
+            "source_branch": self.source_branch,
+            "file_scope": list(self.file_scope),
+            "merge_method": self.merge_method,
+        }
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = _json_dict(self)
+        data["digest"] = self.digest
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TargetContract":
+        if not isinstance(data, dict):
+            raise TypeError("TargetContract data must be a dictionary")
+        values = dict(data)
+        values.pop("digest", None)
+        values.pop("repository_project", None)
+        return cls(**values)
 
 
 @dataclass
@@ -219,6 +489,80 @@ class AgentCapabilities:
     def from_dict(cls, data: Dict[str, Any]) -> "AgentCapabilities":
         if not isinstance(data, dict):
             raise TypeError("AgentCapabilities data must be a dictionary")
+        return cls(**data)
+
+
+@dataclass
+class InstallRequest:
+    """User/Agent request consumed by the V3.10 installation state machine."""
+
+    mode: str
+    json_output: bool
+    project_root: Path
+
+    def __post_init__(self):
+        if self.mode not in ("layered", "bundled"):
+            raise ValueError("unsupported installation mode")
+        if type(self.json_output) is not bool:
+            raise TypeError("json_output must be a bool")
+        self.project_root = Path(self.project_root).expanduser().resolve(strict=False)
+        if not self.project_root.is_absolute():
+            raise ValueError("project_root must be absolute")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_dict(self)
+
+
+@dataclass
+class InstallResult:
+    """JSON-safe, shared result rendered by interactive and JSON entry points."""
+
+    status: str
+    phase: str
+    version_before: str
+    version_after: str
+    capabilities: Dict[str, Any] = field(default_factory=dict)
+    migration: Dict[str, Any] = field(default_factory=dict)
+    backup: Dict[str, Any] = field(default_factory=dict)
+    errors: List[str] = field(default_factory=list)
+    evidence_refs: List[str] = field(default_factory=list)
+    mode: str = ""
+    target: str = ""
+    error: Optional[str] = None
+
+    def __post_init__(self):
+        valid = {"pending", "running", "complete", "blocked_unknown", "blocked_invalid", "retry_pending", "failed"}
+        if self.status not in valid:
+            raise ValueError("unsupported installation status")
+        phases = {"preflight", "probe", "authorize", "backup", "migrate", "finalize", "complete", "blocked"}
+        if self.phase not in phases:
+            raise ValueError("unsupported installation phase")
+        for name in ("version_before", "version_after"):
+            if not isinstance(getattr(self, name), str):
+                raise TypeError("%s must be a string" % name)
+        for name in ("capabilities", "migration", "backup"):
+            value = getattr(self, name)
+            if not isinstance(value, dict):
+                raise TypeError("%s must be a dictionary" % name)
+            setattr(self, name, _json_safe(value))
+        for name in ("errors", "evidence_refs"):
+            value = getattr(self, name)
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise TypeError("%s must be a list of strings" % name)
+        if self.mode and self.mode not in ("layered", "bundled"):
+            raise ValueError("unsupported installation mode")
+        if not isinstance(self.target, str):
+            raise TypeError("target must be a string")
+        if self.error is not None and not isinstance(self.error, str):
+            raise TypeError("error must be a string or None")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _json_dict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "InstallResult":
+        if not isinstance(data, dict):
+            raise TypeError("InstallResult data must be a dictionary")
         return cls(**data)
 
 

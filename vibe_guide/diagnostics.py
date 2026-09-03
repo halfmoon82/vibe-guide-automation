@@ -186,7 +186,10 @@ def assert_planning_gate(paths, plan_id: str) -> PlanningGate:
             plan = json.loads((root / "plan.json").read_text(encoding="utf-8"))
             if "approved" not in prd.lower() or "review" not in prd.lower():
                 missing.append("prd.reviewed")
-            if plan.get("status") not in ("authorized", "running", "complete"):
+            # A freshly published complex plan is executable after the caller
+            # supplies the separate exact authorization token; publication
+            # completeness must not require that token to be persisted yet.
+            if plan.get("status") not in ("authorized", "confirmed_pending_authorization", "running", "complete"):
                 missing.append("plan.published")
             nodes = json.loads((root / "nodes.json").read_text(encoding="utf-8"))
             if not isinstance(nodes, list) or not nodes:

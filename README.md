@@ -4,6 +4,10 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 ## 安装
 
+当前发行版本为 `3.10.0`。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
+
+升级与回滚必须显式指定已验证的版本：从 V2.0.0 安装后执行 `pip install --upgrade` 到 V3.10.0，确认版本和 CLI，再使用 V2.0.0 构建产物 `--force-reinstall` 回滚并重新确认版本。`.vibe/` 迁移另按 V3.10 安装流程执行；provider、缺失 Python 版本和远端 Release 能力未验证时保持未验证。
+
 Python 3.9 legacy 环境（已验证为 pip 21.2、setuptools 58，且未预装 wheel）使用 setuptools 自带的 editable `develop` 命令，不依赖环境偶然存在的 wheel：
 
 ```bash

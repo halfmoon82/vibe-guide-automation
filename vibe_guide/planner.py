@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
-from .models import EVIDENCE_PRIORITY
+from .models import EVIDENCE_PRIORITY, IssueComplexity, TargetContract
 
 
 @dataclass(frozen=True)
@@ -25,12 +25,17 @@ class TaskContext:
     failure_cost: int
     toolchain: int
     rationale: Dict[str, str] = field(default_factory=dict)
+    force_upgrade_flags: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         for name in ("steps", "domains", "uncertainty", "failure_cost", "toolchain"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 5:
                 raise ValueError("S1 dimensions must be integers from 0 to 5")
+        if not isinstance(self.force_upgrade_flags, list) or not all(isinstance(item, str) and item.strip() for item in self.force_upgrade_flags):
+            raise TypeError("force_upgrade_flags must be a list of non-empty strings")
+        if len(set(self.force_upgrade_flags)) != len(self.force_upgrade_flags):
+            raise ValueError("force_upgrade_flags must be unique")
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,62 @@ class S1Score:
     failure_cost: int
     toolchain: int
     rationale: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RouteResult:
+    """Machine-readable S0/S1 route, safe to persist before execution."""
+
+    route: str
+    complexity_band: str
+    screen: str = "s1"
+    score: Optional[int] = None
+    dimensions: Dict[str, int] = field(default_factory=dict)
+    force_upgrade_flags: List[str] = field(default_factory=list)
+    evidence_ref: str = "planner:s0-s1"
+
+    def __post_init__(self):
+        if self.route not in {"simple", "light_plan", "complex"} or self.complexity_band != self.route:
+            raise ValueError("unsupported route result")
+        if self.screen not in {"s0", "s1"}:
+            raise ValueError("unsupported routing screen")
+        if self.score is not None and (isinstance(self.score, bool) or not isinstance(self.score, int) or self.score < 0):
+            raise ValueError("route score must be a non-negative integer")
+        if self.score is not None and not self.force_upgrade_flags:
+            expected = "simple" if self.score <= 8 else "light_plan" if self.score <= 15 else "complex"
+            if self.route != expected:
+                raise ValueError("route score does not match route")
+        if self.force_upgrade_flags and self.route != "complex":
+            raise ValueError("force upgrade flags require complex route")
+        if not isinstance(self.dimensions, dict) or not all(isinstance(k, str) and isinstance(v, int) for k, v in self.dimensions.items()):
+            raise TypeError("route dimensions must be a string/integer dictionary")
+        if not isinstance(self.force_upgrade_flags, list) or not all(isinstance(item, str) and item.strip() for item in self.force_upgrade_flags):
+            raise TypeError("force_upgrade_flags must be a list of strings")
+        if len(self.force_upgrade_flags) != len(set(self.force_upgrade_flags)):
+            raise ValueError("force_upgrade_flags must be unique")
+        if not isinstance(self.evidence_ref, str) or not self.evidence_ref.strip():
+            raise ValueError("evidence_ref must be non-empty")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"route": self.route, "complexity_band": self.complexity_band, "screen": self.screen, "score": self.score, "dimensions": dict(self.dimensions), "force_upgrade_flags": list(self.force_upgrade_flags), "evidence_ref": self.evidence_ref}
+
+    @property
+    def band(self) -> str:
+        return self.complexity_band
+
+    @property
+    def s1_total(self) -> Optional[int]:
+        return self.score
+
+    @property
+    def persisted(self) -> bool:
+        return True
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RouteResult":
+        if not isinstance(data, dict):
+            raise TypeError("RouteResult data must be a dictionary")
+        return cls(**data)
 
 
 @dataclass(frozen=True)
@@ -325,14 +386,108 @@ def score_s1(context: TaskContext) -> S1Score:
     return S1Score(sum(values), *values, rationale=dict(context.rationale))
 
 
-def route_task(score: S1Score) -> str:
+def _route_result_from_score(score: S1Score, force_upgrade_flags: Optional[List[str]] = None) -> RouteResult:
     if score.total < 0:
         raise ValueError("S1 total cannot be negative")
-    if score.total <= 8:
-        return "simple"
-    if score.total <= 15:
-        return "light_plan"
-    return "complex"
+    flags = list(dict.fromkeys(force_upgrade_flags or []))
+    route = "complex" if flags else ("simple" if score.total <= 8 else "light_plan" if score.total <= 15 else "complex")
+    return RouteResult(
+        route=route,
+        complexity_band=route,
+        score=score.total,
+        dimensions={"steps": score.steps, "domains": score.domains, "uncertainty": score.uncertainty, "failure_cost": score.failure_cost, "toolchain": score.toolchain},
+        force_upgrade_flags=flags,
+    )
+
+
+def route_task(context: Any):
+    """Route a TaskContext to a persisted result; retain legacy S1Score API."""
+    if isinstance(context, TaskContext):
+        return _route_result_from_score(score_s1(context), context.force_upgrade_flags)
+    if isinstance(context, S1Score):
+        # Existing CLI/V2 callers consume the string route.
+        return _route_result_from_score(context).route
+    raise TypeError("route_task expects TaskContext or S1Score")
+
+
+def classify_v310_task(s0: Any, s1: Optional[S1Score], force_upgrade_flags: Optional[List[str]] = None) -> IssueComplexity:
+    """Create an evidence-bound IssueComplexity with an immutable band."""
+    flags = list(force_upgrade_flags or [])
+    if isinstance(s1, TaskContext):
+        score = score_s1(s1)
+        flags = list(dict.fromkeys(list(s1.force_upgrade_flags) + flags))
+    elif isinstance(s1, S1Score):
+        score = s1
+    else:
+        raise TypeError("s1 must be S1Score or TaskContext")
+    band = _route_result_from_score(score, flags).route
+    issue_band = "light" if band == "light_plan" else band
+    if isinstance(s0, str) and s0 == "simple" and not flags and score.total <= 8:
+        band = "simple"
+    return IssueComplexity(
+        issue_id="task",
+        spec_ref="planner:s0-s1",
+        steps=max(1, score.steps), domains=max(1, score.domains), uncertainty=max(1, score.uncertainty),
+        failure_cost=max(1, score.failure_cost), toolchain=max(1, score.toolchain), context_demand="unknown",
+        risk_tags=list(dict.fromkeys(flags)), complexity_band=issue_band, evidence_ref="planner:s0-s1",
+    )
+
+
+_TARGET_FIELDS = ("provider", "repository", "project", "target_branch", "issue_type", "source_branch", "file_scope", "merge_method")
+_TARGET_ALIASES = {"repository_project": "repository", "repo": "repository", "repositories": "repository", "branch": "target_branch", "target_branches": "target_branch", "change_type": "issue_type", "issue_or_pr_type": "issue_type", "files": "file_scope", "scope": "file_scope", "method": "merge_method"}
+
+
+def _candidate(environment: Dict[str, Any], field_name: str):
+    aliases = [field_name] + [key for key, value in _TARGET_ALIASES.items() if value == field_name]
+    found = [environment[key] for key in aliases if key in environment]
+    if found:
+        normalized = []
+        for value in found:
+            if field_name == "file_scope":
+                if isinstance(value, str):
+                    candidate = [value.strip()] if value.strip() else None
+                elif isinstance(value, (list, tuple)) and all(isinstance(item, str) and item.strip() for item in value):
+                    candidate = [item.strip() for item in value]
+                else:
+                    candidate = None
+            elif isinstance(value, str) and value.strip():
+                candidate = value.strip()
+            elif isinstance(value, (list, tuple, set)) and len(value) == 1 and isinstance(next(iter(value)), str) and next(iter(value)).strip():
+                candidate = next(iter(value)).strip()
+            else:
+                candidate = None
+            if candidate is None:
+                return None
+            normalized.append(candidate)
+        if all(item == normalized[0] for item in normalized[1:]):
+            return normalized[0]
+        return None
+    return None
+
+
+def collect_target_contract(environment: Dict[str, Any], user_selection: Optional[Dict[str, Any]] = None) -> TargetContract:
+    """Collect target fields once, auto-filling only uniquely observed values."""
+    if not isinstance(environment, dict):
+        raise TypeError("environment must be a dictionary")
+    if isinstance(environment.get("target_contract"), dict) and user_selection is None:
+        return TargetContract.from_dict(environment["target_contract"])
+    selection = user_selection if isinstance(user_selection, dict) else {}
+    values = {}
+    missing = []
+    for field_name in _TARGET_FIELDS:
+        # A target may be identified by either repository or project; the
+        # provider-specific side that is absent is not a missing choice.
+        if field_name == "project" and ("repository" in values or any(key in selection for key in ("repository", "repo", "repository_project")) or any(key in environment for key in ("repository", "repo", "repository_project"))):
+            continue
+        if field_name == "repository" and ("project" in values or _candidate(selection, "project") is not None or _candidate(environment, "project") is not None):
+            continue
+        selected = _candidate(selection, field_name)
+        value = selected if selected is not None else _candidate(environment, field_name)
+        if value is None:
+            missing.append(field_name)
+        else:
+            values[field_name] = value
+    return TargetContract(**values, frozen=not missing, missing_fields=missing, status="frozen" if not missing else "pending_selection")
 
 
 def create_decision_card(question: ProductQuestion) -> DecisionCard:

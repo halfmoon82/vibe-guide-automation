@@ -181,6 +181,12 @@ _EVENT_DATA_KEYS = {
     "successor",
     "task_id",
     "worker",
+    "observation_kind",
+    "disposition",
+    "action",
+    "isolated",
+    "repaired",
+    "binding",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",

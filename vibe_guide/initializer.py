@@ -5,12 +5,18 @@ import json, tempfile
 
 from .scanner import build_agentsmd_patch, scan_project
 from .capability_contract import build_contract, contract_path, load_contract, save_contract
+from .migration import migrate_v2_to_v310
 
 
 @dataclass
 class InitResult:
     changed: bool
     paths: list
+
+
+def migrate_project(source, destination):
+    """Initializer-facing entry point for explicit, backup-first upgrades."""
+    return migrate_v2_to_v310(source, destination)
 
 
 def _is_within(root, path):

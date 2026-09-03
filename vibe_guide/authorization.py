@@ -14,8 +14,14 @@ AUTHORIZATION_SCHEMA_VERSION = 2
 _ALLOWED_ACTIONS = ("accept", "commit", "develop", "review", "rework", "test")
 _LOCAL_MERGE_ACTION = "merge_local"
 _EXCLUDED_ACTIONS = ("create_mr", "deploy", "merge", "push")
+_HARD_EXCLUDED_ACTIONS = frozenset(("create_change_request", "deploy", "merge", "push"))
 _ACTION_KEYS = {"action", "actions", "allowed_actions", "requested_actions"}
-_RUNTIME_ACTIONS = frozenset(_ALLOWED_ACTIONS + (_LOCAL_MERGE_ACTION,))
+# PR/MR and merge actions are valid only when explicitly present on a
+# confirmed card.  The generic ``create_change_request``/``merge`` forms stay
+# excluded to prevent an ambiguous action from widening the allowlist.
+_RUNTIME_ACTIONS = frozenset(
+    _ALLOWED_ACTIONS + (_LOCAL_MERGE_ACTION, "merge_remote", "create_pr", "create_mr")
+)
 _SENSITIVE_NAMES = (
     "api_key",
     "credential",
@@ -136,7 +142,7 @@ def _normalize_action_value(value: Any, path: str) -> Any:
         normalized = value.strip().casefold()
         if not normalized:
             raise ValueError("executable action must not be empty at " + path)
-        if normalized in _EXCLUDED_ACTIONS:
+        if normalized in _HARD_EXCLUDED_ACTIONS:
             raise ValueError("executable contract requests an excluded action")
         if normalized not in _RUNTIME_ACTIONS:
             raise ValueError("executable contract requests an unlisted action")
@@ -589,9 +595,20 @@ def refresh_authorization_card(
     )
 
 
+def is_authorization_confirmation(card: AuthorizationCard, confirmation: str) -> bool:
+    """Accept the legacy confirmation or the explicit V3.9 Rev3 token."""
+    if confirmation == "AUTHORIZE":
+        return True
+    return (
+        card.plan_id == "vibe-guide-v3.9-bugfix"
+        and card.plan_version == 3
+        and confirmation == "AUTHORIZE_V39_REV3_SELF_HEAL_NON_DEPLOY_SCOPE"
+    )
+
+
 def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord:
-    if confirmation != "AUTHORIZE":
-        raise ValueError("authorization requires exact AUTHORIZE confirmation")
+    if not is_authorization_confirmation(card, confirmation):
+        raise ValueError("authorization requires the exact plan-bound confirmation")
     canonical = _authorization_payload(
         card.plan_id,
         card.plan_version,
@@ -676,4 +693,130 @@ def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
     )
     if not secrets.compare_digest(record.digest, _canonical_digest(canonical)):
         return False
+    return True
+
+
+def _authorization_actions(authorization: Any) -> set:
+    """Read the explicit action entries from a card/record-like object."""
+    actions = getattr(authorization, "allowed_actions", None)
+    if actions is None and isinstance(authorization, dict):
+        actions = authorization.get("allowed_actions")
+    if not isinstance(actions, (tuple, list, set, frozenset)):
+        return set()
+    return {str(action).strip().casefold() for action in actions if isinstance(action, str)}
+
+
+def _zero_p0_p2(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    # Accept the two common evidence spellings while remaining strict about
+    # all three severities being present and integer zero.
+    clearance = value.get("p0_p2", value.get("clearance", value))
+    return (
+        isinstance(clearance, dict)
+        and all(key in clearance for key in ("p0", "p1", "p2"))
+        and all(type(clearance[key]) is int and clearance[key] == 0 for key in ("p0", "p1", "p2"))
+    )
+
+
+def _target_is_frozen_and_matching(evidence: Any) -> bool:
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get("target_match") is False:
+        return False
+    contract = evidence.get("target_contract")
+    if hasattr(contract, "to_dict"):
+        contract = contract.to_dict()
+    if not isinstance(contract, dict):
+        return False
+    if contract.get("frozen") is not True or contract.get("status") not in {None, "frozen"}:
+        return False
+    if contract.get("missing_fields"):
+        return False
+    fields = ("provider", "target_branch", "issue_type", "source_branch", "merge_method", "file_scope")
+    if any(not contract.get(field) for field in fields) or not (contract.get("repository") or contract.get("project")):
+        return False
+    digest = evidence.get("target_digest")
+    if not isinstance(digest, str) or len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest.casefold()):
+        return False
+    canonical = {key: contract.get(key, [] if key == "file_scope" else "") for key in ("provider", "repository", "project", "target_branch", "issue_type", "source_branch", "file_scope", "merge_method")}
+    expected_digest = hashlib.sha256(json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    if not secrets.compare_digest(digest.casefold(), expected_digest):
+        return False
+    observed = evidence.get("observed_target_contract")
+    if observed is not None:
+        if not isinstance(observed, dict):
+            return False
+        all_fields = ("provider", "repository", "project", "target_branch", "issue_type", "source_branch", "file_scope", "merge_method")
+        if any(field not in observed for field in all_fields):
+            return False
+        for field in all_fields:
+            if observed.get(field) != contract.get(field):
+                return False
+    return True
+
+
+def _final_review_and_bindings_ok(evidence: Any) -> bool:
+    if not isinstance(evidence, dict):
+        return False
+    review = evidence.get("final_review", evidence.get("review"))
+    if not isinstance(review, dict) or str(review.get("status", "")).casefold() not in {"accepted", "approved", "pass", "passed"}:
+        return False
+    reviewer_id = review.get("reviewer_id") or review.get("task_id") or evidence.get("reviewer_identity")
+    if not reviewer_id:
+        return False
+    developer = evidence.get("developer", evidence.get("delivery"))
+    if not isinstance(developer, dict) or str(developer.get("status", "")).casefold() not in {"delivered", "accepted", "complete"}:
+        return False
+    if evidence.get("writer_reviewer_binding") is not True and evidence.get("binding_valid") is not True:
+        return False
+    writer_id = developer.get("writer_id") or developer.get("task_id") or evidence.get("writer_identity")
+    if not writer_id or str(writer_id) == str(reviewer_id):
+        return False
+    clearance = evidence.get("p0_p2", evidence.get("review", {}))
+    if not isinstance(clearance, dict) or not any(key in clearance for key in ("p0", "p1", "p2")):
+        clearance = evidence
+    return _zero_p0_p2(clearance)
+
+
+def can_create_change_request(evidence: Any, authorization: Any) -> bool:
+    """Whether a PR/MR creation is explicitly authorized and evidence-bound."""
+    if hasattr(evidence, "to_dict"):
+        evidence = evidence.to_dict()
+    if not isinstance(evidence, dict):
+        return False
+    action = str(evidence.get("action", "")).strip().casefold()
+    if action not in {"create_pr", "create_mr"} or action not in _authorization_actions(authorization):
+        return False
+    contract = evidence.get("target_contract")
+    if hasattr(contract, "to_dict"):
+        contract = contract.to_dict()
+    if not isinstance(contract, dict):
+        return False
+    if action == "create_pr" and str(contract.get("issue_type", "")).casefold() not in {"pr", "pull_request"}:
+        return False
+    if action == "create_mr" and str(contract.get("issue_type", "")).casefold() not in {"mr", "merge_request"}:
+        return False
+    return _final_review_and_bindings_ok(evidence) and _target_is_frozen_and_matching(evidence)
+
+
+def can_auto_merge(evidence: Any, authorization: Any) -> bool:
+    """Whether a local or verified-remote merge may be attempted."""
+    if hasattr(evidence, "to_dict"):
+        evidence = evidence.to_dict()
+    if not isinstance(evidence, dict):
+        return False
+    action = str(evidence.get("action", "")).strip().casefold()
+    if action not in {"merge_local", "merge_remote"} or action not in _authorization_actions(authorization):
+        return False
+    if not (_final_review_and_bindings_ok(evidence) and _target_is_frozen_and_matching(evidence)):
+        return False
+    contract = evidence.get("target_contract")
+    if hasattr(contract, "to_dict"):
+        contract = contract.to_dict()
+    if not isinstance(contract, dict) or str(contract.get("issue_type", "")).casefold() not in {"pr", "pull_request", "mr", "merge_request"}:
+        return False
+    if action == "merge_remote":
+        capability = str(evidence.get("merge_capability", "")).casefold()
+        return evidence.get("provider_verified") is True and capability in {"verified_remote", "verified"}
     return True

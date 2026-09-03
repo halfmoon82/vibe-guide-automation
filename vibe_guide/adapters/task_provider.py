@@ -33,6 +33,54 @@ class ProviderPending(RuntimeError):
 _PROVIDER_ACTIONS = {"create", "locate", "visibility", "resume", "wait"}
 
 
+class TaskProviderAdapter:
+    """Provider-neutral Agent-session upgrade entry.
+
+    This small bridge delegates to a verified provider callback/object and
+    never reimplements installation or migration. Provider observations,
+    including ``unknown`` and ``unknown_timeout``, are returned unchanged.
+    """
+
+    def __init__(self, provider: str, delegate: Any = None, *, mode: str = "visible"):
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError("provider is required")
+        if mode not in {"visible", "background", "guide"}:
+            raise ValueError("unsupported task provider mode")
+        self.provider = provider.strip()
+        self.delegate = delegate
+        self.mode = mode
+
+    def describe_upgrade_entry(self) -> Dict[str, Any]:
+        return {
+            "entry": "upgrade",
+            "entrypoint": "upgrade",
+            "provider": self.provider,
+            "mode": self.mode,
+            "provider_neutral": True,
+            "limitations": (["不可见", "不可直接进入", "返工续接受限"] if self.mode == "background" else []),
+            "evidence": {"provider": "adapter-manifest", "mode": "capability-observation"},
+        }
+
+    def invoke_upgrade(self, request: Mapping[str, Any]) -> Dict[str, Any]:
+        if not isinstance(request, Mapping):
+            raise TypeError("upgrade request must be a mapping")
+        target = self.delegate
+        method = getattr(target, "invoke_upgrade", None)
+        if callable(method):
+            result = method(dict(request))
+        elif callable(target):
+            result = target(dict(request))
+        else:
+            return {
+                "status": "unknown",
+                "provider": self.provider,
+                "evidence": ["provider adapter delegate is not configured"],
+            }
+        if isinstance(result, Mapping):
+            return dict(result)
+        raise ProviderUnavailable("provider upgrade entry returned invalid result")
+
+
 def _canonical_digest(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(

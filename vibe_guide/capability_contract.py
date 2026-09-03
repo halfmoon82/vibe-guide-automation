@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 CONTRACT_SCHEMA_VERSION = 1
@@ -24,6 +24,70 @@ CAPABILITY_STATUSES = frozenset(
         "stale",
     }
 )
+CAPABILITY_LAYERS = frozenset({"local_required", "optional_development", "sensitive_external"})
+
+
+@dataclass(frozen=True)
+class CapabilityItem:
+    """A capability advertised by the current, evidence-bearing scan."""
+
+    id: str
+    layer: str
+    purpose: str = ""
+    action: str = ""
+    permissions: Tuple[str, ...] = ()
+    failure_impact: str = ""
+    reversible: bool = True
+    status: str = "unknown"
+    evidence_ref: str = "scan"
+
+    def __post_init__(self):
+        object.__setattr__(self, "id", _validate_text(self.id, "id"))
+        if self.layer not in CAPABILITY_LAYERS:
+            raise ValueError("unsupported capability layer")
+        if self.status not in CAPABILITY_STATUSES:
+            raise ValueError("unsupported capability status")
+        object.__setattr__(self, "evidence_ref", _validate_text(self.evidence_ref, "evidence_ref"))
+
+    @property
+    def name(self) -> str:
+        return self.id
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"id": self.id, "name": self.id, "layer": self.layer, "purpose": self.purpose,
+                "action": self.action, "permissions": list(self.permissions),
+                "failure_impact": self.failure_impact, "reversible": self.reversible,
+                "status": self.status, "evidence_ref": self.evidence_ref}
+
+
+@dataclass(frozen=True)
+class CapabilityAuthorization:
+    mode: str
+    granted: Tuple[str, ...] = ()
+    pending: Tuple[str, ...] = ()
+    capability_states: Dict[str, str] = None
+    evidence_refs: Dict[str, str] = None
+
+    def __post_init__(self):
+        if self.mode not in {"layered", "bundled"}:
+            raise ValueError("unsupported capability authorization mode")
+        object.__setattr__(self, "granted", tuple(self.granted))
+        object.__setattr__(self, "pending", tuple(self.pending))
+        object.__setattr__(self, "capability_states", dict(self.capability_states or {}))
+        object.__setattr__(self, "evidence_refs", dict(self.evidence_refs or {}))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"mode": self.mode, "granted": list(self.granted), "pending": list(self.pending),
+                "capability_states": dict(self.capability_states), "evidence_refs": dict(self.evidence_refs),
+                "approved_ids": list(self.granted), "sensitive_pending": list(self.pending)}
+
+    @property
+    def approved_ids(self) -> Tuple[str, ...]:
+        return self.granted
+
+    @property
+    def sensitive_pending(self) -> Tuple[str, ...]:
+        return self.pending
 _HEX64 = set("0123456789abcdef")
 
 
@@ -384,4 +448,3 @@ def capability_status(
     if _parse_timestamp(fact.expires_at, "expires_at") <= current:
         return "stale"
     return fact.status
-

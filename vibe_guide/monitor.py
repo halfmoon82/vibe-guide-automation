@@ -16,7 +16,17 @@ from .authorization import (
     validate_runtime_contract,
 )
 from .contracts import RunEvent, RunHandle, Runner
-from .models import DAGNode, Plan, BindingIntent, BindingObservation, BindingVerification, IssueComplexity, LocalModel
+from .models import (
+    DAGNode,
+    Plan,
+    BindingIntent,
+    BindingObservation,
+    BindingVerification,
+    IssueComplexity,
+    LocalModel,
+    HealingResult,
+    ObservationDisposition,
+)
 from .paths import ProjectPaths
 from .planner import resolve_consistency
 from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
@@ -45,7 +55,14 @@ from .workflow_gate import require_capability_contract, require_entry
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
 from .model_router import ModelRouter
-from .change_requests import ChangeRequest, LocalMergeEvidence, merge_local
+from .change_requests import (
+    ChangeRequest,
+    ChangeRequestEvidence,
+    LocalMergeEvidence,
+    execute_change_request,
+    merge_local,
+)
+from .authorization import can_create_change_request, can_auto_merge
 from .checkpoint import (
     ContextBudgetEstimator,
     ContextBudgetPolicy,
@@ -74,6 +91,76 @@ def _user_status(record: Dict[str, Any]) -> str:
     if status in {"running", "review", "rework", "delivered", "accepted", "complete"}:
         return "已启动"
     return "自动修复中"
+
+
+def classify_observation(observation: Any) -> ObservationDisposition:
+    """Classify provider drift without claiming unavailable capability."""
+    if not isinstance(observation, dict):
+        return ObservationDisposition("unknown", "isolate", "observation is malformed")
+    kind = str(observation.get("kind", observation.get("type", "unknown"))).strip().lower()
+    repairable = {"worktree_branch_drift", "worktree_drift", "branch_drift", "stale_cursor"}
+    uncertain = {
+        "missing_visible_locate_evidence", "provider_timeout", "timeout",
+        "permission_denied", "missing_locate_evidence", "unknown",
+    }
+    if kind in repairable and observation.get("repairable", True) is not False:
+        return ObservationDisposition("repairable", "repair", kind)
+    if kind in uncertain or not kind:
+        return ObservationDisposition("degraded", "isolate", kind or "unknown observation")
+    return ObservationDisposition("unknown", "isolate", kind)
+
+
+def self_heal_binding(snapshot: Any, node_id: str, observation: Any) -> HealingResult:
+    """Repair only fields proven by the frozen node contract, in place.
+
+    This deliberately accepts a plain snapshot mapping so recovery and replay
+    callers can use the same fail-closed operation before persistence.
+    """
+    nodes = snapshot.get("nodes") if isinstance(snapshot, dict) else getattr(snapshot, "nodes", None)
+    if not isinstance(nodes, dict):
+        return HealingResult(False, degraded=True, isolated=True, reason="snapshot is malformed")
+    node = nodes.get(node_id)
+    if not isinstance(node, dict):
+        return HealingResult(False, degraded=True, isolated=True, reason="node is unknown")
+    disposition = classify_observation(observation)
+    if disposition.status != "repairable" or not isinstance(observation, dict):
+        isolate_affected_action(snapshot, node_id, disposition.reason)
+        return HealingResult(False, degraded=True, isolated=True, reason=disposition.reason,
+                             task_id=node.get("task_id") or node.get("developer_identity"))
+    # Current facts may identify drift, but never become the new contract.
+    expected = node.get("binding")
+    if not isinstance(expected, dict):
+        expected = node.get("frozen_binding")
+    if not isinstance(expected, dict):
+        expected = node.get("binding_contract")
+    if not isinstance(expected, dict) and isinstance(node.get("contract"), dict):
+        nested = node["contract"].get("binding")
+        expected = nested if isinstance(nested, dict) else node["contract"]
+    if not isinstance(expected, dict):
+        isolate_affected_action(snapshot, node_id, "frozen binding evidence is missing")
+        return HealingResult(False, degraded=True, isolated=True,
+                             reason="frozen binding evidence is missing",
+                             task_id=node.get("task_id") or node.get("developer_identity"))
+    for field in ("task_id", "worktree", "branch", "allowlist", "cursor",
+                  "token", "continuation_token", "continuation_digest"):
+        if field in expected:
+            node[field] = expected[field]
+    node["healing"] = {"status": "repaired", "observation_kind": disposition.reason}
+    return HealingResult(True, reason=disposition.reason, task_id=node.get("task_id"))
+
+
+def isolate_affected_action(snapshot: Any, node_id: str, reason: str) -> None:
+    """Quarantine one node/action while leaving all other nodes untouched."""
+    nodes = snapshot.get("nodes") if isinstance(snapshot, dict) else getattr(snapshot, "nodes", None)
+    if not isinstance(nodes, dict):
+        return
+    node = nodes.get(node_id)
+    if not isinstance(node, dict):
+        return
+    node["status"] = "blocked_unknown"
+    node["reason"] = str(reason)
+    node["isolated"] = True
+    node["retryable_action"] = None
 
 
 class Monitor:
@@ -295,6 +382,39 @@ class Monitor:
         contract["binding_intent"] = binding.binding_intent
         contract["binding_observation"] = binding.binding_observation
 
+    @staticmethod
+    def classify_observation(observation: Any) -> ObservationDisposition:
+        return classify_observation(observation)
+
+    def self_heal_binding(self, snapshot: RunSnapshot, node_id: str, observation: Any) -> HealingResult:
+        result = self_heal_binding(snapshot, node_id, observation)
+        node_state = snapshot.nodes[node_id]
+        frozen_binding = node_state.get("binding")
+        if not isinstance(frozen_binding, dict):
+            frozen_binding = {
+                key: node_state.get(key)
+                for key in ("task_id", "worktree", "branch", "allowlist", "cursor", "continuation_digest")
+                if key in node_state
+            }
+        self._record(snapshot, "binding_self_healed" if result.repaired else "binding_degraded", {
+            "run_id": snapshot.run_id, "node_id": node_id,
+            "observation_kind": classify_observation(observation).reason,
+            "disposition": "repaired" if result.repaired else "degraded",
+            "action": "repair" if result.repaired else "isolate",
+            "repaired": result.repaired, "isolated": result.isolated,
+            "binding": frozen_binding,
+        })
+        save_snapshot(self.paths, snapshot)
+        return result
+
+    def isolate_affected_action(self, snapshot: RunSnapshot, node_id: str, reason: str) -> None:
+        isolate_affected_action(snapshot, node_id, reason)
+        self._record(snapshot, "action_isolated", {
+            "run_id": snapshot.run_id, "node_id": node_id,
+            "reason": reason, "disposition": "degraded", "action": "isolate", "isolated": True,
+        })
+        save_snapshot(self.paths, snapshot)
+
     def merge_change_request_local(
         self,
         run_id: str,
@@ -324,6 +444,53 @@ class Monitor:
 
     # Short alias for callers that already operate in the Monitor boundary.
     merge_local = merge_change_request_local
+
+    def record_change_request_action(
+        self,
+        run_id: str,
+        action: str,
+        target_contract: Any,
+        evidence: Optional[Dict[str, Any]] = None,
+        node_id: Optional[str] = None,
+    ) -> ChangeRequestEvidence:
+        """Record a target-bound PR/MR or merge action without calling a provider.
+
+        A failed precondition quarantines only this external action.  When a
+        node observation is supplied, callers may invoke ``self_heal_binding``
+        first; this method never widens the frozen contract or authorization.
+        """
+        snapshot = load_snapshot(self.paths, run_id)
+        record = self._require_snapshot_authorization(snapshot)
+        prepared = execute_change_request(action, target_contract)
+        payload = dict(evidence or {})
+        payload.setdefault("action", action)
+        payload.setdefault("target_contract", prepared.target_contract)
+        allowed = (
+            can_create_change_request(payload, record)
+            if str(action).casefold() in {"create_pr", "create_mr"}
+            else can_auto_merge(payload, record)
+            if str(action).casefold() in {"merge_local", "merge_remote"}
+            else False
+        )
+        status = "authorized" if allowed and prepared.status == "prepared" else "blocked_unknown"
+        if not allowed:
+            prepared = ChangeRequestEvidence(
+                prepared.action, status, prepared.target_contract,
+                prepared.target_digest, prepared.provider,
+                remote_mutated=False,
+                details={"reason": "authorization or evidence precondition failed"},
+            )
+            if node_id:
+                self.isolate_affected_action(snapshot, node_id, "change request action evidence is incomplete")
+        self._record(snapshot, "change_request_" + prepared.status, {
+            "run_id": run_id, "action": prepared.action,
+            "target_contract": prepared.target_contract,
+            "target_digest": prepared.target_digest,
+            "evidence": prepared.to_dict(),
+            "external_execution": "not_performed",
+        })
+        save_snapshot(self.paths, snapshot)
+        return prepared
 
     def start(
         self, record: Optional[AuthorizationRecord], runner: Runner
@@ -2859,6 +3026,39 @@ class Monitor:
                 self._apply_reauthorization_transition(snapshot, data)
                 snapshot.event_sequence = record["sequence"]
                 continue
+            if str(record["event"]).startswith("change_request_"):
+                # Change-request evidence is a system-level, target-bound
+                # observation.  Replay must be idempotent and preserve it
+                # even when the originating node was removed from a newer
+                # snapshot; unlike worker events this is not an unknown-node
+                # failure.
+                if provenance.get("role") != "system":
+                    raise ValueError("change request replay lacks system provenance")
+                evidence = data.get("evidence")
+                if not isinstance(evidence, dict):
+                    raise ValueError("change request replay evidence is invalid")
+                try:
+                    validated = ChangeRequestEvidence.from_dict(evidence)
+                    prepared_check = execute_change_request(validated.action, validated.target_contract)
+                    if prepared_check.target_digest != validated.target_digest or validated.remote_mutated:
+                        raise ValueError("change request replay target evidence is inconsistent")
+                except (TypeError, ValueError) as error:
+                    raise ValueError("change request replay evidence is invalid") from error
+                if not str(record["event"]).startswith("change_request_") or str(record["event"])[len("change_request_"):] != validated.status:
+                    raise ValueError("change request replay status is inconsistent")
+                node_id = data.get("node_id")
+                if isinstance(node_id, str) and node_id in snapshot.nodes:
+                    bucket = snapshot.nodes[node_id].setdefault("change_request_evidence", [])
+                    if evidence not in bucket:
+                        bucket.append(evidence)
+                else:
+                    bucket = snapshot.tasks.setdefault("_change_request_evidence", {"records": []})
+                    if isinstance(bucket, dict):
+                        records_bucket = bucket.setdefault("records", [])
+                        if evidence not in records_bucket:
+                            records_bucket.append(evidence)
+                snapshot.event_sequence = record["sequence"]
+                continue
             node_id = data.get("node_id")
             if node_id not in snapshot.nodes:
                 raise ValueError("unapplied event references an unknown node")
@@ -3045,6 +3245,36 @@ class Monitor:
             elif record["event"] == "review_finding":
                 # The following transition event/start intent is authoritative.
                 self._registered_active_binding(snapshot, node_id, provenance)
+            elif record["event"] in {"binding_self_healed", "binding_degraded", "action_isolated"}:
+                if provenance["role"] != "system":
+                    raise ValueError("self-healing event lacks system provenance")
+                if record["event"] == "binding_self_healed":
+                    binding = data.get("binding", {})
+                    frozen = current.get("binding")
+                    if not isinstance(binding, dict):
+                        raise ValueError("self-healing binding evidence is invalid")
+                    if isinstance(frozen, dict):
+                        for field in ("task_id", "worktree", "branch", "allowlist", "cursor", "token", "continuation_token", "continuation_digest"):
+                            if field in binding and field in frozen and binding[field] != frozen[field]:
+                                raise ValueError("self-healing replay binding drift")
+                    # Restore the frozen values after validating the event;
+                    # observations are never used as replacement facts.
+                    if isinstance(frozen, dict):
+                        for field in ("task_id", "worktree", "branch", "allowlist", "cursor", "token", "continuation_token", "continuation_digest"):
+                            if field in frozen:
+                                current[field] = frozen[field]
+                    else:
+                        current["binding"] = dict(binding)
+                        for field in ("task_id", "worktree", "branch", "allowlist", "cursor", "continuation_digest"):
+                            if field in binding:
+                                current[field] = binding[field]
+                    current["healing"] = {"status": "repaired", "observation_kind": data.get("observation_kind", "unknown")}
+                else:
+                    current["status"] = "blocked_unknown"
+                    current["reason"] = data.get("reason", data.get("observation_kind", record["event"]))
+                    current["isolated"] = True
+                    current["retryable_action"] = None
+                    current["quarantine"] = {"run_id": snapshot.run_id, "handle_id": snapshot.handles.get(node_id), "reason": current["reason"]}
             elif record["event"] == "consistency_corrected":
                 correction = {
                     key: data[key]

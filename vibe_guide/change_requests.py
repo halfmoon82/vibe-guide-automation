@@ -6,6 +6,8 @@ record is evidence, not a claim about remote platform state.
 """
 
 from dataclasses import dataclass, asdict
+import hashlib
+import json
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 
@@ -69,6 +71,62 @@ class ChangeRequest:
             data["head_sha"], data["tree_sha"], data.get("merge_capability", "unknown_remote"),
             data.get("status", ""),
         )
+
+
+@dataclass(frozen=True)
+class ChangeRequestEvidence:
+    """Target-bound, provider-neutral evidence for a requested lifecycle action.
+
+    This record is intentionally an observation only: creating a record does
+    not call Git or mutate a remote provider.  ``remote_mutated`` therefore
+    defaults to ``False`` and local outcomes never imply remote success.
+    """
+
+    action: str
+    status: str
+    target_contract: Dict[str, Any]
+    target_digest: str
+    provider: str
+    remote_mutated: bool = False
+    details: Dict[str, Any] = None
+
+    def __post_init__(self) -> None:
+        action = _text(self.action, "action").casefold()
+        if action not in {"create_pr", "create_mr", "merge_local", "merge_remote"}:
+            raise ValueError("unsupported change request action")
+        object.__setattr__(self, "action", action)
+        status = _text(self.status, "status").casefold()
+        if status not in {"prepared", "blocked_unknown", "authorized"}:
+            raise ValueError("unsupported change request evidence status")
+        object.__setattr__(self, "status", status)
+        if not isinstance(self.target_contract, Mapping):
+            raise TypeError("target_contract must be a mapping")
+        object.__setattr__(self, "target_contract", dict(self.target_contract))
+        digest = _text(self.target_digest, "target_digest").casefold()
+        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            raise ValueError("target_digest must be a 64-character SHA-256 digest")
+        object.__setattr__(self, "target_digest", digest)
+        object.__setattr__(self, "provider", _text(self.provider, "provider"))
+        if not isinstance(self.remote_mutated, bool) or self.remote_mutated:
+            raise TypeError("remote_mutated must be a bool")
+        if self.details is None:
+            object.__setattr__(self, "details", {})
+        elif not isinstance(self.details, Mapping):
+            raise TypeError("details must be a mapping")
+        else:
+            object.__setattr__(self, "details", dict(self.details))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ChangeRequestEvidence":
+        if not isinstance(data, Mapping):
+            raise TypeError("ChangeRequestEvidence data must be a mapping")
+        required = {"action", "status", "target_contract", "target_digest", "provider", "remote_mutated", "details"}
+        if not required.issubset(data):
+            raise ValueError("ChangeRequestEvidence data is missing required fields")
+        return cls(data["action"], data["status"], data["target_contract"], data["target_digest"], data["provider"], data["remote_mutated"], data["details"])
 
 
 def _status_text(facts: Mapping[str, Any]) -> str:
@@ -233,4 +291,57 @@ def merge_local(
         change_request.head_sha, merge_base, merge_commit, merge_tree,
         tests, change_request.merge_capability,
         pushed=False, remote_mutated=False,
+    )
+
+
+def execute_change_request(action: str, target_contract: Any) -> ChangeRequestEvidence:
+    """Prepare a target-bound change-request action without external side effects.
+
+    The implementation deliberately stops at an evidence record.  A caller
+    with a separately verified provider may consume that record to perform a
+    provider-specific operation; this function itself never invokes Git,
+    pushes, merges, or deploys.
+    """
+    normalized_action = _text(action, "action").casefold()
+    if normalized_action not in {"create_pr", "create_mr", "merge_local", "merge_remote"}:
+        raise PermissionError("action is outside the V3.10 change-request scope")
+    if isinstance(target_contract, Mapping):
+        contract = dict(target_contract)
+        target_digest = str(contract.get("digest", ""))
+        provider = contract.get("provider", "")
+        frozen = contract.get("frozen") is True
+    else:
+        contract = target_contract.to_dict() if hasattr(target_contract, "to_dict") else {}
+        target_digest = str(getattr(target_contract, "digest", ""))
+        provider = getattr(target_contract, "provider", "")
+        frozen = getattr(target_contract, "frozen", False) is True
+    if not target_digest and hasattr(target_contract, "digest"):
+        target_digest = str(target_contract.digest)
+    required = ("provider", "target_branch", "issue_type", "source_branch", "merge_method", "file_scope")
+    complete = frozen and not contract.get("missing_fields") and all(contract.get(key) for key in required) and bool(contract.get("repository") or contract.get("project"))
+    digest_payload = {
+        key: contract.get(key, [] if key == "file_scope" else "")
+        for key in ("provider", "repository", "project", "target_branch", "issue_type", "source_branch", "file_scope", "merge_method")
+    }
+    canonical_digest = hashlib.sha256(json.dumps(digest_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest() if complete else ""
+    if not target_digest:
+        target_digest = canonical_digest
+    digest_valid = isinstance(target_digest, str) and len(target_digest) == 64 and all(c in "0123456789abcdef" for c in target_digest.casefold()) and target_digest.casefold() == canonical_digest
+    if not complete or not digest_valid or not isinstance(provider, str) or not provider.strip():
+        return ChangeRequestEvidence(
+            normalized_action, "blocked_unknown", contract, target_digest if isinstance(target_digest, str) and len(target_digest) == 64 else "0" * 64, provider or "unknown",
+            remote_mutated=False, details={"reason": "target contract is not frozen"},
+        )
+    issue_type = str(contract.get("issue_type", "")).casefold()
+    if normalized_action == "create_pr" and issue_type not in {"pr", "pull_request"}:
+        return ChangeRequestEvidence(normalized_action, "blocked_unknown", contract, target_digest, provider, details={"reason": "action and issue_type mismatch"})
+    if normalized_action == "create_mr" and issue_type not in {"mr", "merge_request"}:
+        return ChangeRequestEvidence(normalized_action, "blocked_unknown", contract, target_digest, provider, details={"reason": "action and issue_type mismatch"})
+    if normalized_action in {"merge_local", "merge_remote"} and issue_type not in {"pr", "pull_request", "mr", "merge_request"}:
+        return ChangeRequestEvidence(normalized_action, "blocked_unknown", contract, target_digest, provider, details={"reason": "merge requires PR/MR issue_type"})
+    # ``prepared`` is intentionally not ``merged_remote``/``created``: no
+    # external lifecycle operation has occurred at this layer.
+    return ChangeRequestEvidence(
+        normalized_action, "prepared", contract, target_digest, provider,
+        remote_mutated=False, details={"external_execution": "not_performed"},
     )
