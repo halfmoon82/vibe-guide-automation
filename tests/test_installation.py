@@ -44,14 +44,14 @@ class InstallationContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             request = InstallRequest("layered", True, Path(directory))
             self.assertEqual(Path(request.to_dict()["project_root"]), Path(directory).resolve())
-        result = InstallResult("blocked_unknown", "blocked", "unknown", "3.10.0", errors=["x"])
+        result = InstallResult("blocked_unknown", "blocked", "unknown", "4.0.0", errors=["x"])
         self.assertEqual(json.loads(json.dumps(result.to_dict()))["status"], "blocked_unknown")
 
     def test_invalid_mode_and_status_rejected(self):
         with self.assertRaises(ValueError):
             InstallRequest("unsafe", False, Path.cwd())
         with self.assertRaises(ValueError):
-            InstallResult("unavailable", "blocked", "none", "3.10.0")
+            InstallResult("unavailable", "blocked", "none", "4.0.0")
 
     def test_install_persists_phase_and_does_not_write_before_callbacks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -87,7 +87,7 @@ class InstallationContractTests(unittest.TestCase):
             (root / ".vibe" / "config.json").write_text(json.dumps({"version": "2.0.0"}))
             result = run_upgrade(InstallRequest("layered", True, root), ProjectPaths(root), lambda *_: {"status": "approved"}, lambda *_: {"status": "verified"})
             self.assertEqual(result.version_before, "2.0.0")
-            self.assertEqual(result.migration["target_version"], "3.10.0")
+            self.assertEqual(result.migration["target_version"], "4.0.0")
 
 
 if __name__ == "__main__":

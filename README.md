@@ -4,9 +4,11 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 ## 安装
 
-当前发行版本为 `3.10.0`。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
+当前发行版本为 `4.0.0`。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
 
-升级与回滚必须显式指定已验证的版本：从 V2.0.0 安装后执行 `pip install --upgrade` 到 V3.10.0，确认版本和 CLI，再使用 V2.0.0 构建产物 `--force-reinstall` 回滚并重新确认版本。`.vibe/` 迁移另按 V3.10 安装流程执行；provider、缺失 Python 版本和远端 Release 能力未验证时保持未验证。
+升级与回滚必须显式指定已验证的版本：V2.0.0 和 V3.10.0 项目都可执行 `pip install --upgrade` 到 V4.0.0，确认版本和 CLI，再使用对应旧版本构建产物 `--force-reinstall` 回滚并重新确认版本。`.vibe/` 迁移保留 V2/V3.10 备份优先路径；provider、缺失 Python 版本和远端 Release 能力未验证时保持未验证。
+
+安装或升级向导会在 `.vibe/config.json` 与 `.vibe/installation/state.json` 登记 V4 SDD-first 所需的 `subagent-driven-development`、`test-driven-development`、`writing-plans` 和 `verification-before-completion` Skill。它们由 provider 管理，登记状态初始为 `unknown`；向导不会伪造已下载或已启用，真实 Skill 能力仍须单独探针核验。
 
 Python 3.9 legacy 环境（已验证为 pip 21.2、setuptools 58，且未预装 wheel）使用 setuptools 自带的 editable `develop` 命令，不依赖环境偶然存在的 wheel：
 
@@ -127,3 +129,19 @@ python3 -m vibe_guide --help
 python3 -m compileall -q vibe_guide tests
 git diff --check
 ```
+
+### V4 SDD-first 验收夹具
+
+V4 验收测试以六个节点演示硬依赖、最多五对活跃 developer/reviewer、
+provider timeout 的节点级隔离、P1 缺陷回到原 developer/reviewer 任务、
+allowlist/workspace 写入冲突和 accepted 节点交付清单；同时回归 S0/S1 路由
+及历史 run 快照的只读恢复。V3.10 兼容性测试分别在干净环境验证 wheel、
+sdist、源码安装，并覆盖 V2.0.0/V3.10.0 → V4.0.0 升级/回滚和 layered/bundled 两种
+安装模式：
+
+```bash
+python3 -m unittest tests.test_v4_end_to_end tests.test_v4_packaging_compatibility -v
+```
+
+这些本地夹具不证明真实 provider 的登录、可见任务创建/续接、远端 PR/MR、
+merge 或 deploy；相关能力仍需在目标平台以结构化运行时证据核验。

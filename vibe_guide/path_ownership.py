@@ -47,3 +47,13 @@ def validate_path_ownership(nodes: Sequence[object]) -> PathOwnershipResult:
             owners.setdefault(normalized, []).append(node_id)
     conflicts = [OwnershipConflict(path, tuple(ids)) for path, ids in sorted(owners.items()) if len(ids) > 1]
     return PathOwnershipResult(not conflicts and not missing, conflicts, missing)
+
+
+def normalize_allowlist(paths: Sequence[str]) -> List[str]:
+    """Normalize a node allowlist and reject paths escaping the project."""
+    if not isinstance(paths, (list, tuple)):
+        raise ValueError("allowlist must be a list")
+    result = [normalize_project_path(item) for item in paths]
+    if len(result) != len(set(result)):
+        raise ValueError("allowlist contains duplicates")
+    return result

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .paths import ProjectPaths
@@ -51,6 +52,39 @@ _TERMINAL_STATUSES = {
     "stopped",
 }
 _DIGEST_HEX = set("0123456789abcdef")
+
+# Node-local writer claims.  Claims are deliberately independent of provider
+# lease/cursor evidence; the V4 safe gate only needs local uniqueness.
+_V4_WRITER_CLAIMS: Dict[Tuple[str, str], str] = {}
+_V4_WRITER_ISSUES: Dict[Tuple[str, str], str] = {}
+_V4_CLAIM_LOCK = threading.Lock()
+
+
+def claim_v4_writer(run_id: str, issue_id: str, writer: str) -> bool:
+    with _V4_CLAIM_LOCK:
+        key = (str(run_id), str(issue_id))
+        owner = _V4_WRITER_CLAIMS.get(key)
+        writer = str(writer)
+        if owner is not None:
+            return owner == writer
+        writer_key = (str(run_id), writer)
+        claimed_issue = _V4_WRITER_ISSUES.get(writer_key)
+        if claimed_issue is not None and claimed_issue != str(issue_id):
+            return False
+        _V4_WRITER_CLAIMS[key] = writer
+        _V4_WRITER_ISSUES[writer_key] = str(issue_id)
+        return True
+
+
+def release_v4_writer(run_id: str, issue_id: str, writer: str = "") -> bool:
+    with _V4_CLAIM_LOCK:
+        key = (str(run_id), str(issue_id))
+        owner = _V4_WRITER_CLAIMS.get(key)
+        if owner is None or (writer and owner != str(writer)):
+            return False
+        _V4_WRITER_CLAIMS.pop(key, None)
+        _V4_WRITER_ISSUES.pop((str(run_id), owner), None)
+        return True
 
 
 def _digest_reference(value: str) -> str:

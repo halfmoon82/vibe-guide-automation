@@ -18,6 +18,23 @@ _KINDS = {"pr": "PR", "mr": "MR"}
 _SHA_LENGTH = 40
 
 
+def build_v4_delivery_manifest(snapshot: Any) -> Dict[str, Any]:
+    """Project accepted node evidence without performing an external action."""
+    nodes = snapshot.get("nodes", {}) if isinstance(snapshot, Mapping) else getattr(snapshot, "nodes", {})
+    if not isinstance(nodes, Mapping):
+        raise TypeError("snapshot nodes must be a mapping")
+    accepted = sorted(
+        str(node_id) for node_id, node in nodes.items()
+        if isinstance(node, Mapping) and node.get("status") in {"accepted", "archived"}
+    )
+    return {
+        "status": "ready" if bool(nodes) and len(accepted) == len(nodes) else "incomplete",
+        "accepted_nodes": accepted,
+        "node_count": len(nodes),
+        "external_actions": "not_executed",
+    }
+
+
 def _text(value: Any, field: str, required: bool = True) -> str:
     if not isinstance(value, str) or (required and not value.strip()):
         raise ValueError("{} must be a non-empty string".format(field))

@@ -43,7 +43,9 @@ from .state import (
     redact_provider_text,
     release_writer_lease,
     save_snapshot,
+    append_v4_healing_event,
 )
+from .binding_lifecycle import recovery_observation_is_safe
 from .task_registry import (
     TaskBinding,
     binding_contract_enabled,
@@ -108,6 +110,152 @@ def classify_observation(observation: Any) -> ObservationDisposition:
     if kind in uncertain or not kind:
         return ObservationDisposition("degraded", "isolate", kind or "unknown observation")
     return ObservationDisposition("unknown", "isolate", kind)
+
+
+def classify_v4_observation(observation: Dict[str, Any]) -> ObservationDisposition:
+    """Classify a V4 runtime fact without making provider status global."""
+    if not isinstance(observation, dict):
+        return ObservationDisposition("unknown", "isolate", "malformed observation")
+    kind = str(observation.get("kind", observation.get("type", "unknown"))).strip().lower()
+    repairable = {
+        "binding_probe", "binding_drift", "worktree_drift", "worktree_branch_drift",
+        "stale_cursor", "missing_binding", "missing_visible_locate_evidence",
+    }
+    if kind in repairable:
+        return ObservationDisposition("repairable", "repair", kind)
+    if kind in {"unknown", "provider_unknown"}:
+        return ObservationDisposition("unknown", "isolate", kind)
+    if kind in {"provider_timeout", "timeout", "permission_denied"} or not kind:
+        return ObservationDisposition("degraded", "isolate", kind or "unknown")
+    return ObservationDisposition("unknown", "isolate", kind)
+
+
+def record_v4_healing(snapshot: Any, node_id: str, result: HealingResult) -> None:
+    """Append immutable, node-scoped healing evidence to a snapshot."""
+    if not isinstance(result, HealingResult):
+        raise TypeError("result must be HealingResult")
+    node = snapshot.get("nodes", {}).get(node_id) if isinstance(snapshot, dict) else getattr(snapshot, "nodes", {}).get(node_id)
+    if not isinstance(node, dict):
+        raise ValueError("node is unknown")
+    payload = {
+        "kind": "v4_healing",
+        "status": "repaired" if result.repaired else ("isolated" if result.isolated else "degraded"),
+        "repaired": result.repaired,
+        "degraded": result.degraded,
+        "isolated": result.isolated,
+        "reason": result.reason,
+        "task_id": result.task_id or node.get("task_id"),
+        "generation": node.get("generation", 0),
+        "run_id": snapshot.get("run_id") if isinstance(snapshot, dict) else getattr(snapshot, "run_id", None),
+    }
+    append_v4_healing_event(snapshot, node_id, payload)
+
+
+def _v4_step_status(value: Any) -> str:
+    if isinstance(value, bool):
+        return "ok" if value else "failed"
+    if isinstance(value, str):
+        return value.strip().lower()
+    if isinstance(value, dict):
+        if "status" in value:
+            return _v4_step_status(value["status"])
+        if value.get("verified") is True or value.get("ok") is True or value.get("success") is True:
+            return "ok"
+    return "unknown"
+
+
+def heal_v4_node(snapshot: Any, node_id: str, observation: Dict[str, Any]) -> HealingResult:
+    """Execute the bounded Rev3 recovery order for one V4 node.
+
+    Provider binding evidence is an input to recovery, never a global write
+    gate. Every successful continuation must retain the original task identity.
+    """
+    nodes = snapshot.get("nodes") if isinstance(snapshot, dict) else getattr(snapshot, "nodes", None)
+    node = nodes.get(node_id) if isinstance(nodes, dict) else None
+    if not isinstance(node, dict):
+        return HealingResult(False, degraded=True, isolated=True, reason="node is unknown")
+    if not isinstance(observation, dict):
+        isolate_affected_action(snapshot, node_id, "malformed observation")
+        result = HealingResult(False, degraded=True, isolated=True, reason="malformed observation", task_id=node.get("task_id"))
+        record_v4_healing(snapshot, node_id, result)
+        return result
+    safe, unsafe_reason = recovery_observation_is_safe(observation)
+    if not safe:
+        isolate_affected_action(snapshot, node_id, "unsafe recovery action: " + unsafe_reason)
+        result = HealingResult(False, degraded=True, isolated=True, reason="unsafe recovery action: " + unsafe_reason, task_id=node.get("task_id"))
+        record_v4_healing(snapshot, node_id, result)
+        return result
+    original_task = node.get("task_id") or node.get("developer_identity")
+    disposition = classify_v4_observation(observation)
+    # A proposed allowlist/target is never accepted as a replacement contract.
+    if "allowlist" in observation and observation.get("allowlist") not in (None, node.get("allowlist"), ()):
+        isolate_affected_action(snapshot, node_id, "allowlist drift")
+        result = HealingResult(False, degraded=True, isolated=True, reason="allowlist drift", task_id=original_task)
+        record_v4_healing(snapshot, node_id, result)
+        return result
+    # A provider may report a proposed task identity, but continuation may only
+    # use the identity already recorded for this node.
+    for section in ("same_task", "native", "bootstrap", "local"):
+        item = observation.get(section)
+        if isinstance(item, dict) and item.get("task_id") not in (None, "", original_task):
+            isolate_affected_action(snapshot, node_id, "same-task identity drift")
+            result = HealingResult(False, degraded=True, isolated=True, reason="same-task identity drift", task_id=original_task)
+            record_v4_healing(snapshot, node_id, result)
+            return result
+    # Read current facts first; they are retained as evidence, never promoted
+    # to a replacement contract.
+    facts = observation.get("current_facts", observation.get("probe"))
+    if facts is not None:
+        node.setdefault("healing_facts", []).append(facts)
+    # Accept the provider-neutral aliases used by older Rev3 adapters.
+    aliases = {
+        "same_task_retry": "same_task", "retry": "same_task", "locate": "same_task",
+        "resume": "same_task", "native_handoff": "native", "metadata_bootstrap": "bootstrap",
+        "fallback": "local",
+    }
+    normalized_observation = dict(observation)
+    # Some adapters return an ordered list rather than named fields. Preserve
+    # that order while normalizing names to the same provider-neutral stages.
+    steps = observation.get("steps") or observation.get("actions")
+    if isinstance(steps, (list, tuple)):
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            name = str(step.get("name", step.get("action", ""))).strip().lower().replace("-", "_")
+            name = aliases.get(name, name)
+            if name in {"probe", "same_task", "native", "bootstrap", "local"} and name not in normalized_observation:
+                normalized_observation[name] = step
+    for source, target in aliases.items():
+        if target not in normalized_observation and source in observation:
+            normalized_observation[target] = observation[source]
+    ordered = ("probe", "same_task", "native", "bootstrap", "repair", "local")
+    for section in ordered:
+        if section not in normalized_observation:
+            continue
+        status = _v4_step_status(normalized_observation[section])
+        if disposition.status == "repairable" and status in {"ok", "success", "verified", "complete", "resumed", "located"}:
+            node["status"] = "running"
+            node["binding_phase"] = "binding_observed" if section != "local" else "degraded"
+            result = HealingResult(True, degraded=(section == "local"), reason=section, task_id=original_task)
+            record_v4_healing(snapshot, node_id, result)
+            return result
+    # Pure binding drift can be repaired from the frozen node contract without
+    # requiring provider lease/cursor evidence or invoking the legacy global
+    # binding gate.
+    frozen = node.get("binding") or node.get("frozen_binding") or node.get("binding_contract")
+    if disposition.status == "repairable" and isinstance(frozen, dict):
+        for field in ("task_id", "generation", "worktree", "branch", "allowlist", "cursor", "token", "continuation_token", "continuation_digest"):
+            if field in frozen:
+                node[field] = frozen[field]
+        node["status"] = "running"
+        node["binding_phase"] = "binding_observed"
+        result = HealingResult(True, reason=disposition.reason, task_id=original_task)
+        record_v4_healing(snapshot, node_id, result)
+        return result
+    isolate_affected_action(snapshot, node_id, disposition.reason)
+    result = HealingResult(False, degraded=True, isolated=True, reason=disposition.reason, task_id=original_task)
+    record_v4_healing(snapshot, node_id, result)
+    return result
 
 
 def self_heal_binding(snapshot: Any, node_id: str, observation: Any) -> HealingResult:

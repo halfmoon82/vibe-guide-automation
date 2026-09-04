@@ -29,7 +29,7 @@ class MigrationTests(unittest.TestCase):
             root = Path(d); source = self.fixture(root); destination = root / "v310"
             result = migrate_v2_to_v310(source, destination)
             self.assertEqual(result.status, "migrated")
-            self.assertEqual(result.to_dict()["target_version"], "3.10.0")
+            self.assertEqual(result.to_dict()["target_version"], "4.0.0")
             self.assertEqual(json.loads((destination / ".vibe" / "state.json").read_text())["unknown"], "retain")
             self.assertTrue((destination / ".vibe" / "runs" / "run-1" / "evidence.json").exists())
             self.assertFalse((destination / ".vibe" / "E2E_MAILBOX").exists())

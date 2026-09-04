@@ -5,7 +5,7 @@ import hashlib
 import json
 from pathlib import PurePosixPath
 import secrets
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from .models import AgentCapabilities, DAGNode, Plan
 
@@ -30,6 +30,64 @@ _SENSITIVE_NAMES = (
     "secret",
     "token",
 )
+
+
+@dataclass(frozen=True)
+class CloseoutDecision:
+    """V4 closeout projection; it never performs Git/provider operations."""
+
+    status: str
+    can_execute_external: bool
+    allowed_actions: Tuple[str, ...]
+    excluded_actions: Tuple[str, ...]
+    delivery_manifest: Dict[str, Any]
+    reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def evaluate_v4_closeout(snapshot: Any, authorization: Any) -> CloseoutDecision:
+    """Evaluate accepted-node closeout and a separate explicit action record."""
+    from .change_requests import build_v4_delivery_manifest
+
+    manifest = build_v4_delivery_manifest(snapshot)
+    actions = authorization.get("allowed_actions", ()) if isinstance(authorization, dict) else getattr(authorization, "allowed_actions", ())
+    if not isinstance(actions, (list, tuple, set, frozenset)):
+        actions = ()
+    normalized = tuple(dict.fromkeys(str(action).strip().casefold() for action in actions if isinstance(action, str) and action.strip()))
+    always_excluded = ("deploy", "credential", "credentials", "system_permission_change")
+    external = {"commit", "create_pr", "create_mr", "merge_local", "merge_remote"}
+    safe_actions = tuple(action for action in normalized if action in external)
+    excluded = tuple(dict.fromkeys(
+        always_excluded
+        + tuple(action for action in external if action not in safe_actions)
+        + ("push",)
+        + tuple(action for action in normalized if action not in external and action not in always_excluded)
+    ))
+    complete = manifest["status"] == "ready"
+    if isinstance(snapshot, Mapping):
+        target_expected = snapshot.get("target_digest", snapshot.get("target_contract_digest"))
+    else:
+        target_expected = getattr(snapshot, "target_digest", getattr(snapshot, "target_contract_digest", None))
+    if isinstance(authorization, dict):
+        target_actual = authorization.get("target_digest", authorization.get("target_contract_digest"))
+    else:
+        target_actual = getattr(authorization, "target_digest", getattr(authorization, "target_contract_digest", None))
+    target_drift = target_expected not in (None, "") and target_actual not in (None, "") and target_expected != target_actual
+    if target_drift:
+        return CloseoutDecision("blocked", False, safe_actions, excluded, manifest, "target contract drift requires node isolation")
+    can_execute = complete and bool(safe_actions)
+    if not complete:
+        reason = "all nodes must be accepted before closeout"
+        status = "blocked"
+    elif not safe_actions:
+        reason = "external actions require separate explicit authorization"
+        status = "ready"
+    else:
+        reason = "external execution remains caller-controlled"
+        status = "authorized"
+    return CloseoutDecision(status, can_execute, safe_actions, excluded, manifest, reason)
 
 
 def validate_git_action_target(action: Dict[str, Any]) -> None:

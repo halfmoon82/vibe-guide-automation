@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping
 from pathlib import PurePosixPath
 
-from .models import _identifier, _json_safe
+from .models import _identifier, _json_safe, V4ExecutionPolicy
 # V2 boundary contracts are re-exported here for callers that use the shared
 # contracts module as their public import surface.
 from .diagnostics import (

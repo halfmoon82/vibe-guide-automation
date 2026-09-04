@@ -31,7 +31,7 @@ class V310CLITests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = run_cli(["upgrade", "--mode", "layered", "--json"], Path(directory))
             self.assertEqual(result.payload["command"], "upgrade")
-            self.assertIn(result.payload["status"], {"complete", "blocked_unknown", "retry_pending", "blocked_invalid", "failed"})
+            self.assertIn(result.payload["status"], {"blocked", "complete", "blocked_unknown", "retry_pending", "blocked_invalid", "failed"})
             self.assertNotIn("worktree", result.text)
 
 

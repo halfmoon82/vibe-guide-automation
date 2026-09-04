@@ -356,6 +356,96 @@ class Plan:
 
 
 @dataclass(frozen=True)
+class V4ExecutionPolicy:
+    """JSON-safe V4 execution contract layered over a legacy Plan."""
+
+    workflow_version: int = 4
+    execution_mode: str = "sdd_first"
+    capabilities: Dict[str, bool] = field(default_factory=dict)
+    hard_gates: Dict[str, bool] = field(default_factory=dict)
+    node_ids: List[str] = field(default_factory=list)
+    legacy_fields: Dict[str, Any] = field(default_factory=dict)
+    # Frozen node-local contract projection used by the SDD write gate.  The
+    # top-level fields are retained for single-node callers; multi-node plans
+    # use ``node_contracts`` keyed by node id.
+    project_root: str = ""
+    worktree: str = ""
+    allowlist: List[str] = field(default_factory=list)
+    writer: str = ""
+    issue_id: str = ""
+    plan_revision: int = 1
+    node_contracts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    CANONICAL_HARD_GATES = frozenset({"stage_a", "stage_b", "stage_c", "stage_d", "stage_e", "provider", "provider_hard_gate"})
+
+    def __post_init__(self):
+        if self.workflow_version != 4:
+            raise ValueError("V4 policy workflow_version must be 4")
+        if self.execution_mode != "sdd_first":
+            raise ValueError("unsupported V4 execution mode")
+        for name in ("capabilities", "hard_gates", "legacy_fields"):
+            value = getattr(self, name)
+            if not isinstance(value, dict):
+                raise TypeError("%s must be a dictionary" % name)
+            object.__setattr__(self, name, _json_safe(value))
+        for name in ("project_root", "worktree", "writer", "issue_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise TypeError("%s must be a string" % name)
+            object.__setattr__(self, name, value)
+        if isinstance(self.plan_revision, bool) or not isinstance(self.plan_revision, int) or self.plan_revision < 1:
+            raise ValueError("plan_revision must be a positive integer")
+        if not isinstance(self.allowlist, list) or not all(isinstance(item, str) and item.strip() for item in self.allowlist):
+            raise TypeError("allowlist must be a list of strings")
+        object.__setattr__(self, "allowlist", list(self.allowlist))
+        if not isinstance(self.node_contracts, dict) or not all(isinstance(k, str) and isinstance(v, dict) for k, v in self.node_contracts.items()):
+            raise TypeError("node_contracts must be a mapping of objects")
+        object.__setattr__(self, "node_contracts", _json_safe(self.node_contracts))
+        if set(self.hard_gates) != set(self.CANONICAL_HARD_GATES):
+            raise ValueError("hard_gates must contain exactly the canonical V4 gate set")
+        if not all(type(value) is bool for value in self.hard_gates.values()):
+            raise TypeError("hard_gates values must be bool")
+        if not all(type(value) is bool for value in self.capabilities.values()):
+            raise TypeError("capabilities values must be bool")
+        if not isinstance(self.node_ids, list) or not all(isinstance(x, str) for x in self.node_ids):
+            raise TypeError("node_ids must be a list of strings")
+        object.__setattr__(self, "node_ids", list(self.node_ids))
+
+    @property
+    def digest(self) -> str:
+        payload = _json_dict(self)
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    @property
+    def v310_capabilities(self) -> Dict[str, bool]:
+        return dict(self.capabilities)
+
+    @property
+    def v4_overrides(self) -> Dict[str, bool]:
+        return dict(self.hard_gates)
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = _json_dict(self)
+        data["digest"] = self.digest
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "V4ExecutionPolicy":
+        if not isinstance(data, dict):
+            raise TypeError("V4ExecutionPolicy data must be a dictionary")
+        values = dict(data)
+        supplied = values.pop("digest", None)
+        if not isinstance(supplied, str):
+            raise ValueError("V4 policy digest is required")
+        if len(supplied) != 64 or any(c not in "0123456789abcdefABCDEF" for c in supplied):
+            raise ValueError("V4 policy digest is invalid")
+        expected = cls(**values).digest
+        if supplied.lower() != expected:
+            raise ValueError("V4 policy digest mismatch")
+        return cls(**values)
+
+
+@dataclass(frozen=True)
 class TargetContract:
     """Authorization-time, immutable engineering target projection.
 
@@ -529,6 +619,7 @@ class InstallResult:
     mode: str = ""
     target: str = ""
     error: Optional[str] = None
+    required_skills: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self):
         valid = {"pending", "running", "complete", "blocked_unknown", "blocked_invalid", "retry_pending", "failed"}
@@ -555,6 +646,9 @@ class InstallResult:
             raise TypeError("target must be a string")
         if self.error is not None and not isinstance(self.error, str):
             raise TypeError("error must be a string or None")
+        if not isinstance(self.required_skills, list) or not all(isinstance(item, dict) for item in self.required_skills):
+            raise TypeError("required_skills must be a list of dictionaries")
+        self.required_skills = _json_safe(self.required_skills)
 
     def to_dict(self) -> Dict[str, Any]:
         return _json_dict(self)

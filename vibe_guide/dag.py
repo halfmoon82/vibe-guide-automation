@@ -11,6 +11,127 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from .models import DAGNode, Plan
 
 
+# V4's public lifecycle uses ``developing`` while V3 snapshots used
+# ``running``.  Both spellings are accepted at this boundary so old snapshots
+# remain replayable without creating a second task or writer.
+_LIFECYCLE_TRANSITIONS = {
+    "planned": {"ready"},
+    "ready": {"running"},
+    "running": {"delivered", "review"},
+    "delivered": {"review"},
+    "review": {"rework", "accepted"},
+    "rework": {"review"},
+    "accepted": {"archived"},
+    "archived": set(),
+}
+
+
+def transition_node_status(node: Any, target: str) -> Any:
+    """Apply one legal SDD lifecycle transition in place.
+
+    ``node`` may be a snapshot mapping or a :class:`DAGNode`.  The function
+    deliberately performs no provider calls and never allocates task IDs;
+    rework therefore remains on the same developer/reviewer pair.
+    """
+    # ``developing`` was used in an early V4 draft; persist the existing
+    # model's ``running`` status while accepting that spelling at the API
+    # boundary for replay compatibility.
+    target = "running" if target == "developing" else target
+    if target not in _LIFECYCLE_TRANSITIONS:
+        raise ValueError("unsupported lifecycle status: %s" % target)
+    current = node.get("status") if isinstance(node, Mapping) else getattr(node, "status", None)
+    current = "running" if current == "developing" else current
+    if current not in _LIFECYCLE_TRANSITIONS or target not in _LIFECYCLE_TRANSITIONS[current]:
+        raise ValueError("invalid lifecycle transition: %s -> %s" % (current, target))
+    if isinstance(node, Mapping):
+        node["status"] = target
+    else:
+        node.status = target
+    return node
+
+
+def _field(node: Any, name: str, default: Any = None) -> Any:
+    return node.get(name, default) if isinstance(node, Mapping) else getattr(node, name, default)
+
+
+def schedule_ready_nodes(nodes: Sequence[Any], active_pairs: Optional[int] = None,
+                         capacity: int = 5) -> List[str]:
+    """Start the next independent ready nodes, up to five active pairs.
+
+    Hard dependencies must be accepted.  ``integration_after`` is never
+    consulted for admission.  Isolated nodes are skipped without consuming a
+    global slot, allowing unrelated nodes to refill the queue.
+    """
+    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
+        raise ValueError("capacity must be a positive integer")
+    capacity = min(capacity, 5)
+    by_id = {_field(node, "id"): node for node in nodes if _field(node, "id") is not None}
+    if active_pairs is None:
+        active_pairs = sum(
+            _field(node, "status") in {"developing", "running", "delivered", "review", "rework"}
+            for node in nodes
+            if not _field(node, "isolated", False)
+        )
+    if isinstance(active_pairs, bool) or not isinstance(active_pairs, int) or active_pairs < 0:
+        raise ValueError("active_pairs must be a non-negative integer")
+    slots = max(0, capacity - active_pairs)
+    # Build the whole admission batch first.  Validation must be atomic: a
+    # later bad identity/writer may not leave an earlier node already started.
+    candidates: List[Tuple[Any, str]] = []
+    for node in nodes:
+        if _field(node, "status") != "ready" or _field(node, "isolated", False):
+            continue
+        dependencies = list(_field(node, "depends_on", []) or [])
+        if any(dep not in by_id or _field(by_id[dep], "status") != "accepted" for dep in dependencies):
+            continue
+        candidates.append((node, _field(node, "id")))
+
+    from .evidence import validate_task_pair
+    active_writers = {
+        _field(item, "writer", _field(item, "developer_task_id"))
+        for item in nodes
+        if _field(item, "status") in {"running", "delivered", "review", "rework"}
+        and not _field(item, "isolated", False)
+    }
+    batch_writers = set(active_writers)
+    # Only nodes admitted in this batch are validated here.  Nodes beyond the
+    # available capacity remain queued and must not block unrelated work; they
+    # will be validated when a later refill actually attempts to start them.
+    for node, _node_id in candidates[:slots]:
+        developer = _field(node, "developer_task_id", _field(node, "developer_task"))
+        reviewer = _field(node, "reviewer_task_id", _field(node, "reviewer_task"))
+        # New V4 scheduling requires both visible task identities.  This is
+        # intentionally stricter than replaying legacy ready_nodes snapshots.
+        validate_task_pair(developer, reviewer)
+        writer = _field(node, "writer", developer)
+        if writer and writer in batch_writers:
+            raise ValueError("duplicate active writer: %s" % writer)
+        if writer:
+            batch_writers.add(writer)
+
+    started: List[str] = []
+    for node, node_id in candidates[:slots]:
+        transition_node_status(node, "running")
+        started.append(node_id)
+    return started
+
+
+# Short names used by integrations that treat the scheduler as an orchestration
+# primitive.  Keeping aliases here avoids a second implementation (and hence a
+# second place where capacity or isolation rules could drift).
+advance_node = transition_node_status
+schedule_nodes = schedule_ready_nodes
+
+
+def active_pair_count(nodes: Sequence[Any]) -> int:
+    """Count non-isolated pairs occupying a scheduler slot."""
+    return sum(
+        _field(node, "status") in {"developing", "running", "delivered", "review", "rework"}
+        for node in nodes
+        if not _field(node, "isolated", False)
+    )
+
+
 @dataclass(frozen=True)
 class DAGValidation:
     valid: bool

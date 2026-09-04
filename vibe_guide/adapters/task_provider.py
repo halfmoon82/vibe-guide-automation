@@ -33,6 +33,33 @@ class ProviderPending(RuntimeError):
 _PROVIDER_ACTIONS = {"create", "locate", "visibility", "resume", "wait"}
 
 
+def classify_provider_for_v4(observation: Mapping[str, Any]) -> str:
+    """Classify one provider observation without escalating it to run-global state.
+
+    ``verified`` requires an explicit positive observation (or a successful
+    visible locate).  Timeouts are recoverable ``degraded`` observations;
+    missing/ambiguous evidence remains ``unknown``.
+    """
+    if not isinstance(observation, Mapping):
+        return "unknown"
+    status = str(observation.get("status", observation.get("provider_status", ""))).strip().casefold()
+    if status in {"verified", "healthy", "available", "ok", "success"}:
+        return "verified"
+    if status in {"timeout", "timed_out", "transient", "degraded", "retry_pending"}:
+        return "degraded"
+    if observation.get("action") == "locate":
+        task_id = observation.get("task_id") or observation.get("threadId")
+        if observation.get("visible") is True and isinstance(task_id, str) and task_id.strip():
+            return "verified"
+        return "unknown"
+    if observation.get("timeout") is True or any(observation.get(key) in {"timeout", "timed_out"} for key in ("error", "reason")):
+        return "degraded"
+    nested = observation.get("provider_response")
+    if isinstance(nested, Mapping) and nested is not observation:
+        return classify_provider_for_v4(nested)
+    return "unknown"
+
+
 class TaskProviderAdapter:
     """Provider-neutral Agent-session upgrade entry.
 

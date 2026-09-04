@@ -60,7 +60,45 @@ _NODE_STATUSES = {
     "failed",
     "stopped",
     "brief_pending",
+    # V4 keeps degradation node-local.  These states are additive so legacy
+    # snapshots continue to deserialize unchanged.
+    "degraded",
+    "isolated",
+    "retry_pending",
 }
+
+
+def append_v4_healing_event(snapshot: Any, node_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Append node-local healing evidence without replacing prior history.
+
+    The helper intentionally works with both a JSON mapping (used during
+    recovery/replay) and a :class:`RunSnapshot`; persistence remains the
+    caller's responsibility.  It never mutates unrelated nodes.
+    """
+    if isinstance(snapshot, dict):
+        events = snapshot.setdefault("healing_events", [])
+        nodes = snapshot.get("nodes", {})
+    else:
+        events = getattr(snapshot, "healing_events", None)
+        if events is None:
+            events = []
+            setattr(snapshot, "healing_events", events)
+        nodes = getattr(snapshot, "nodes", {})
+    if not isinstance(events, list):
+        raise ValueError("healing event history must be a list")
+    if not isinstance(nodes, dict) or node_id not in nodes:
+        raise ValueError("healing event node is unknown")
+    record = dict(payload)
+    record.setdefault("node_id", node_id)
+    record.setdefault("sequence", len(events) + 1)
+    events.append(record)
+    node = nodes.get(node_id)
+    if isinstance(node, dict):
+        history = node.setdefault("healing_history", [])
+        if not isinstance(history, list):
+            raise ValueError("node healing history must be a list")
+        history.append(dict(record))
+    return record
 
 # V3.9 deliberately keeps the durable/internal node statuses precise while
 # exposing a small, stable vocabulary to end users.  This mapping is pure so
@@ -295,6 +333,8 @@ class RunSnapshot:
     binding_observation: Optional[Dict[str, Any]] = None
     binding_state: str = "blocked_unknown"
     business_write_allowed: bool = False
+    # Append-only V4 node healing evidence. Optional for legacy snapshots.
+    healing_events: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.binding_state not in {"blocked_unknown", "binding_verified"}:
@@ -374,6 +414,7 @@ class RunSnapshot:
             "binding_observation",
             "binding_state",
             "business_write_allowed",
+            "healing_events",
         }
         allowed = with_capability | binding_fields
         if not isinstance(data, dict) or not set(data).issubset(allowed) or not expected.issubset(data):
@@ -384,6 +425,11 @@ class RunSnapshot:
         normalized.setdefault("binding_observation", None)
         normalized.setdefault("binding_state", "blocked_unknown")
         normalized.setdefault("business_write_allowed", False)
+        normalized.setdefault("healing_events", [])
+        if not isinstance(normalized["healing_events"], list) or any(
+            not isinstance(item, dict) for item in normalized["healing_events"]
+        ):
+            raise ValueError("snapshot healing events are invalid")
         if normalized["binding_state"] == "binding_verified":
             normalized["binding_state"] = "blocked_unknown"
             normalized["business_write_allowed"] = False

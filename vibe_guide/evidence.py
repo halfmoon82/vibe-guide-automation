@@ -49,6 +49,25 @@ class ReviewResult:
     status: str
 
 
+def validate_task_pair(developer_task_id: Any, reviewer_task_id: Any) -> bool:
+    """Validate the distinct identities required for one Issue pair."""
+    if not isinstance(developer_task_id, str) or not developer_task_id.strip():
+        raise ValueError("developer task identity is required")
+    if not isinstance(reviewer_task_id, str) or not reviewer_task_id.strip():
+        raise ValueError("reviewer task identity is required")
+    if developer_task_id == reviewer_task_id:
+        raise ValueError("developer and reviewer tasks must be distinct")
+    return True
+
+
+def task_pair_is_distinct(developer_task_id: Any, reviewer_task_id: Any) -> bool:
+    """Boolean convenience wrapper for admission checks."""
+    try:
+        return validate_task_pair(developer_task_id, reviewer_task_id)
+    except ValueError:
+        return False
+
+
 def _path(paths: ProjectPaths, evidence: GenerationEvidence) -> Path:
     directory = run_dir(paths, evidence.run_id, create=True) / "evidence" / evidence.issue_id
     directory.mkdir(parents=True, exist_ok=True)

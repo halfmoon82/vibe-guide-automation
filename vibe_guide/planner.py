@@ -6,7 +6,70 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
-from .models import EVIDENCE_PRIORITY, IssueComplexity, TargetContract
+from .models import EVIDENCE_PRIORITY, IssueComplexity, TargetContract, Plan, DAGNode, V4ExecutionPolicy, _json_safe
+
+
+_V310_CAPABILITIES = {
+    "installation": True,
+    "upgrade": True,
+    "capability": True,
+    "s0_s1": True,
+    "dag": True,
+    "review": True,
+    "release_evidence": True,
+}
+
+
+def project_v310_capabilities(plan: Plan) -> Dict[str, Any]:
+    """Project legacy capabilities without mutating or deserializing a Plan."""
+    if not isinstance(plan, Plan):
+        raise TypeError("plan must be a Plan")
+    result = dict(_V310_CAPABILITIES)
+    result.update({"workflow_version": 4, "execution_mode": "sdd_first"})
+    # V4 supersedes only the old binding/provider hard front-door gates.
+    result.update({"stage_a": False, "stage_b": False, "stage_c": False,
+                   "stage_d": False, "stage_e": False, "provider_hard_gate": False})
+    known = set(Plan.__dataclass_fields__)
+    extras = {k: v for k, v in getattr(plan, "__dict__", {}).items() if k not in known}
+    result["legacy_fields"] = extras
+    return _json_safe(result)
+
+
+def build_v4_execution_policy(plan: Plan, nodes: list[DAGNode]) -> V4ExecutionPolicy:
+    if not isinstance(plan, Plan):
+        raise TypeError("plan must be a Plan")
+    if not isinstance(nodes, list) or not all(isinstance(node, DAGNode) for node in nodes):
+        raise TypeError("nodes must be a list of DAGNode")
+    projection = project_v310_capabilities(plan)
+    capabilities = {key: value for key, value in projection.items() if key in _V310_CAPABILITIES}
+    hard_gates = {key: projection[key] for key in ("stage_a", "stage_b", "stage_c", "stage_d", "stage_e", "provider_hard_gate")}
+    hard_gates["provider"] = hard_gates["provider_hard_gate"]
+    node_contracts = {}
+    for node in nodes:
+        contract = node.contract if isinstance(node.contract, dict) else {}
+        node_contracts[node.id] = {
+            "project_root": contract.get("project_root"),
+            "worktree": contract.get("worktree", node.worktree),
+            "allowlist": contract.get("allowlist", node.allowlist),
+            "writer": contract.get("writer", node.writer),
+            "run_id": contract.get("run_id"),
+            "issue_id": contract.get("issue_id", node.id),
+            "plan_revision": contract.get("plan_revision", plan.version),
+        }
+        node_contracts[node.id] = {k: v for k, v in node_contracts[node.id].items() if v not in (None, "", [])}
+    # Single-node callers get convenient top-level projections while the
+    # canonical multi-node contract remains keyed by node id.
+    first = node_contracts.get(nodes[0].id, {}) if len(nodes) == 1 else {}
+    return V4ExecutionPolicy(capabilities=capabilities, hard_gates=hard_gates,
+                             node_ids=[node.id for node in nodes],
+                             legacy_fields=projection["legacy_fields"],
+                             project_root=str(first.get("project_root", "")),
+                             worktree=str(first.get("worktree", "")),
+                             allowlist=list(first.get("allowlist", [])),
+                             writer=str(first.get("writer", "")),
+                             issue_id=str(first.get("issue_id", nodes[0].id if len(nodes) == 1 else "")),
+                             plan_revision=int(first.get("plan_revision", plan.version)),
+                             node_contracts=node_contracts)
 
 
 @dataclass(frozen=True)

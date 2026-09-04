@@ -10,8 +10,10 @@ import tempfile
 import stat
 from typing import Any, Dict, List
 
+from .installation import SDD_SKILL_DEPENDENCIES
 
-TARGET_VERSION = "3.10.0"
+
+TARGET_VERSION = "4.0.0"
 _EXCLUDED = {"e2e_mailbox", "e2e-mailbox-verification"}
 
 
@@ -185,6 +187,14 @@ def migrate_v2_to_v310(source, destination) -> MigrationResult:
         if destination == source or destination == base or destination.is_relative_to(source):
             raise ValueError("destination must not be inside source")
         marker = destination / ("migration-result.json" if source.name == ".vibe" else ".vibe/migration-result.json")
+        source_config = base / ".vibe" / "config.json" if source.name != ".vibe" else base / "config.json"
+        try:
+            source_data = json.loads(source_config.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("invalid source config") from error
+        if not isinstance(source_data, dict) or source_data.get("version") not in {"2.0.0", "3.10.0"}:
+            raise ValueError("source is not a V2.0.0 or V3.10.0 project")
+        source_version = str(source_data["version"])
         if marker.is_file():
             try:
                 recorded = json.loads(marker.read_text(encoding="utf-8"))
@@ -204,13 +214,9 @@ def migrate_v2_to_v310(source, destination) -> MigrationResult:
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 complete = False
             if complete:
-                return MigrationResult("already_current", source=str(source), destination=str(destination), backup_path=recorded["backup_path"], backup_manifest=recorded["backup_manifest"], migrated_files=recorded["migrated_files"], idempotent=True)
+                return MigrationResult("already_current", source_version=str(recorded.get("source_version", source_version)), source=str(source), destination=str(destination), backup_path=recorded["backup_path"], backup_manifest=recorded["backup_manifest"], migrated_files=recorded["migrated_files"], idempotent=True)
         if destination.exists() and any(destination.iterdir()):
             raise ValueError("destination already contains data")
-        config = base / ".vibe" / "config.json" if source.name != ".vibe" else base / "config.json"
-        version_data = json.loads(config.read_text(encoding="utf-8"))
-        if not isinstance(version_data, dict) or version_data.get("version") != "2.0.0":
-            raise ValueError("source is not a V2.0.0 project")
         backup, manifest = _backup(base, destination.parent)
         backup_path, backup_manifest = str(backup), manifest
         staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.migration-", dir=str(destination.parent)))
@@ -229,11 +235,13 @@ def migrate_v2_to_v310(source, destination) -> MigrationResult:
                         raise ValueError(f"{name} must be an object")
                     value.setdefault("legacy_workflow_version", value.get("workflow_version", 2))
                     value["version"] = TARGET_VERSION
-                    value["workflow_version"] = 3.10
+                    value["workflow_version"] = 4
+                    value["execution_mode"] = "sdd_first"
+                    value["required_skills"] = [dict(item) for item in SDD_SKILL_DEPENDENCIES]
                     _atomic_json(path, value)
             marker_relative = Path("migration-result.json") if source.name == ".vibe" else Path(".vibe/migration-result.json")
             (staging / marker_relative).parent.mkdir(parents=True, exist_ok=True)
-            result = MigrationResult("migrated", source=str(source), destination=str(destination), backup_path=str(backup), backup_manifest=manifest, migrated_files=[entry["path"] for entry in manifest["files"]])
+            result = MigrationResult("migrated", source_version=source_version, source=str(source), destination=str(destination), backup_path=str(backup), backup_manifest=manifest, migrated_files=[entry["path"] for entry in manifest["files"]])
             _atomic_json(staging / marker_relative, result.to_dict())
             if destination.exists():
                 destination.rmdir()
@@ -243,4 +251,4 @@ def migrate_v2_to_v310(source, destination) -> MigrationResult:
             shutil.rmtree(staging, ignore_errors=True)
             raise
     except (OSError, ValueError, json.JSONDecodeError) as error:
-        return MigrationResult("blocked_invalid", source=str(source), destination=str(destination), backup_path=backup_path, backup_manifest=backup_manifest, errors=[str(error)])
+        return MigrationResult("blocked_invalid", source_version=locals().get("source_version", "2.0.0"), source=str(source), destination=str(destination), backup_path=backup_path, backup_manifest=backup_manifest, errors=[str(error)])

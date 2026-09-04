@@ -349,7 +349,7 @@ class CliContractTests(unittest.TestCase):
         ).stdout.strip()
         setup_text = (root / "setup.py").read_text(encoding="utf-8")
 
-        self.assertEqual((name, version), ("vibe-guide", "3.10.0"))
+        self.assertEqual((name, version), ("vibe-guide", "4.0.0"))
         self.assertIn("vibe=vibe_guide.cli:main", setup_text)
         self.assertIn('python_requires=">=3.9"', setup_text)
 

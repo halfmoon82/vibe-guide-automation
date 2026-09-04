@@ -19,8 +19,8 @@ from .authorization import (
 )
 from .adapters.base import Environment
 from .adapters.registry import AdapterRegistry
-from .adapters.task_provider import ProviderActionStore, ProviderPending
-from .dag import render_plan_artifacts, validate_dag
+from .adapters.task_provider import ProviderActionStore, ProviderPending, classify_provider_for_v4
+from .dag import render_plan_artifacts, validate_dag, schedule_ready_nodes
 from .doctor import doctor
 from .initializer import apply_agentsmd_proposal, init_project
 from .upgrade import upgrade_project
@@ -42,7 +42,7 @@ from .scanner import scan_project
 from .diagnostics import screen_session, require_session_screened
 from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
 from .workflow_gate import require_capability_contract
-from .state import load_events, load_snapshot
+from .state import load_events, load_snapshot, map_user_status
 from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
 from .installation import run_install, run_upgrade
@@ -54,6 +54,134 @@ USAGE_ERROR = 2
 BLOCKED = 3
 UNKNOWN = 4
 _DOCUMENT_LIMIT = 1024 * 1024
+
+
+def run_v4_sdd(request: Dict[str, Any], json_output: bool = False) -> Dict[str, Any]:
+    """Return the provider-neutral V4 SDD-first user projection.
+
+    Provider lease/cursor/path fields are advisory in V4.  Missing values are
+    recorded as observations, never converted into repeated user prompts.
+    """
+    if not isinstance(request, dict):
+        raise TypeError("V4 SDD request must be a mapping")
+    workflow_version = request.get("workflow_version", 4)
+    if workflow_version != 4:
+        raise ValueError("V4 SDD requires workflow_version=4")
+    execution_mode = request.get("execution_mode", request.get("mode", "sdd_first"))
+    if execution_mode != "sdd_first":
+        raise ValueError("V4 SDD requires execution_mode=sdd_first")
+    nodes = request.get("nodes", [])
+    if nodes is None:
+        nodes = []
+    if not isinstance(nodes, list):
+        raise TypeError("V4 SDD nodes must be a list")
+    status = request.get("status")
+    if status is None and nodes:
+        statuses = [node.get("status") for node in nodes if isinstance(node, dict)]
+        if statuses and all(item in {"accepted", "archived"} for item in statuses):
+            status = "accepted"
+        elif any(item in {"running", "review", "rework", "delivered"} for item in statuses):
+            status = "running"
+        else:
+            status = "planned"
+    status = str(status or "planned")
+    observations = []
+    for key in ("lease", "cursor", "path", "worktree"):
+        if not request.get(key):
+            observations.append("missing_provider_" + key)
+    provider_observations = request.get("provider_observations", request.get("provider", []))
+    if isinstance(provider_observations, dict):
+        provider_observations = [provider_observations]
+    provider_results = []
+    node_effects = {}
+    if isinstance(provider_observations, list):
+        for observation in provider_observations:
+            if isinstance(observation, dict):
+                item = {
+                    "node_id": observation.get("node_id"),
+                    "action": observation.get("action"),
+                    "status": classify_provider_for_v4(observation),
+                }
+                provider_results.append(item)
+                if item["node_id"]:
+                    node_effects[str(item["node_id"])] = item["status"]
+    admitted_nodes = []
+    persistence = None
+    if request.get("orchestrate"):
+        # This local seam exercises V4 admission and node isolation without
+        # invoking a provider or performing any remote side effect.
+        from .monitor import heal_v4_node
+        mutable_nodes = [dict(node) for node in nodes if isinstance(node, dict)]
+        by_id = {str(node.get("id")): node for node in mutable_nodes if node.get("id")}
+        local_snapshot = {"run_id": str(request.get("run_id", "v4-local")), "nodes": by_id, "healing_events": []}
+        for observation in provider_observations if isinstance(provider_observations, list) else []:
+            if isinstance(observation, dict) and observation.get("node_id"):
+                provider_status = classify_provider_for_v4(observation)
+                is_timeout = str(observation.get("status", "")).strip().casefold() in {"timeout", "timed_out"} or observation.get("kind") in {"provider_timeout", "timeout"}
+                if provider_status == "unknown" or is_timeout:
+                    healing = heal_v4_node(local_snapshot, str(observation["node_id"]), observation)
+                    node_effects[str(observation["node_id"])] = "unknown" if is_timeout else provider_status
+        admitted_nodes = schedule_ready_nodes(mutable_nodes, active_pairs=None, capacity=5)
+        for node in mutable_nodes:
+            if node.get("id") in by_id:
+                by_id[str(node["id"])] = node
+        # Return the orchestrated mutable projection, including node-local
+        # isolation changes, rather than the original request payload.
+        nodes = mutable_nodes
+        state_dir = request.get("state_dir")
+        if state_dir:
+            run_dir = Path(state_dir).resolve() / local_snapshot["run_id"]
+            run_dir.mkdir(parents=True, exist_ok=True)
+            state_path = run_dir / "state.json"
+            event_path = run_dir / "events.jsonl"
+            payload = {"run_id": local_snapshot["run_id"], "nodes": by_id, "healing_events": local_snapshot["healing_events"], "admitted_nodes": admitted_nodes}
+            temporary = state_path.with_name("." + state_path.name + ".tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            os.replace(str(temporary), str(state_path))
+            event_tmp = event_path.with_name("." + event_path.name + ".tmp")
+            existing_records = []
+            if event_path.is_file() and not event_path.is_symlink():
+                for line in event_path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        try:
+                            existing_records.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            existing_records.append({"event": "legacy", "raw": line})
+            event_records = list(existing_records)
+            event_records.append({"event": "v4_admission", "run_id": local_snapshot["run_id"], "admitted_nodes": admitted_nodes})
+            isolated_ids = {
+                str(item.get("node_id"))
+                for item in local_snapshot["healing_events"]
+                if isinstance(item, dict) and (item.get("isolated") is True or item.get("status") == "isolated") and item.get("node_id")
+            }
+            existing_isolation_ids = {
+                str(record.get("node_id")) for record in existing_records
+                if isinstance(record, dict) and record.get("event") == "v4_node_isolated" and record.get("node_id")
+            }
+            event_records.extend({
+                "event": "v4_node_isolated", "run_id": local_snapshot["run_id"],
+                "node_id": node_id, "status": "blocked_unknown", "isolated": True,
+            } for node_id in sorted(isolated_ids - existing_isolation_ids))
+            event_tmp.write_text("".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in event_records), encoding="utf-8")
+            os.replace(str(event_tmp), str(event_path))
+            persistence = {"state": str(state_path), "events": str(event_path)}
+    visible = map_user_status(status, request.get("reason", ""))
+    return {
+        "workflow_version": 4,
+        "execution_mode": "sdd_first",
+        "status": visible,
+        "user_status": visible,
+        "internal_status": status,
+        "message": visible,
+        "prompts": [],
+        "required_inputs": [],
+        "observations": observations,
+        "provider": provider_results,
+        "node_effects": node_effects,
+        "nodes": nodes,
+        "admitted_nodes": admitted_nodes,
+        "persistence": persistence,
+    }
 
 
 @dataclass(frozen=True)
@@ -76,7 +204,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "plan", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "plan", "sdd", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -697,6 +825,15 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         )
     paths = ProjectPaths.from_cwd(Path(cwd))
 
+    if args.command == "sdd":
+        try:
+            request = _read_json(paths.resolve_relative(args.request)) if args.request else {}
+            payload = {"command": "sdd", **run_v4_sdd(request, args.as_json)}
+            code = BLOCKED if payload["user_status"] == "需要你决定" else SUCCESS
+            return _result(code, payload, payload["user_status"], args.as_json)
+        except (OSError, TypeError, ValueError) as error:
+            return _result(BLOCKED, {"command": "sdd", "status": "需要你决定", "reason": str(error)}, "需要你决定", args.as_json)
+
     v2_state = False
     state_probe = paths.vibe / "state.json"
     if state_probe.is_file():
@@ -723,6 +860,13 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             return _result(BLOCKED, {"command": "scan", "status": "session_gate_blocked", "reason": "V2 state.json invalid"}, "扫描已阻塞：V2 state.json 无效", args.as_json)
 
     if args.command in {"install", "upgrade"}:
+        if args.command == "upgrade" and not args.confirm:
+            return _result(
+                BLOCKED,
+                {"command": "upgrade", "status": "blocked", "reason": "confirmation required"},
+                "升级已暂停：需要明确确认",
+                args.as_json,
+            )
         try:
             payload = run_install_or_upgrade(
                 {"operation": args.command, "mode": args.mode, "project_root": paths.root},
@@ -736,6 +880,18 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "errors": [str(error)],
                 "message": "需要你决定",
             }
+        if args.command == "upgrade" and payload.get("status") == "complete":
+            try:
+                upgraded = upgrade_project(paths, True)
+                payload.update({"changed": upgraded.changed, "paths": upgraded.paths, "deploy": False})
+            except (OSError, TypeError, ValueError) as error:
+                payload = {
+                    "operation": "upgrade",
+                    "status": "blocked_invalid",
+                    "phase": "blocked",
+                    "errors": [str(error)],
+                    "message": "需要你决定",
+                }
         status = payload.get("status")
         code = SUCCESS if status == "complete" else UNKNOWN if status in {"blocked_unknown", "retry_pending", "failed"} else BLOCKED
         return _result(code, {"command": args.command, **payload}, payload.get("message", "需要你决定"), args.as_json)
@@ -1078,6 +1234,8 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             "plan": plan.to_dict(),
             "nodes": [node.id for node in nodes],
             "authorization_digest": card.digest,
+            "workflow_version": 4,
+            "execution_mode": "sdd_first",
         }
         return _result(
             SUCCESS, payload, "复杂计划产物已生成，等待一次授权", args.as_json
