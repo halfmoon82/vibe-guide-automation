@@ -54,6 +54,6 @@
 - No source files; Git state only.
 
 - [x] Run the full fresh verification suite and inspect the exact allowlist before staging.
-- [ ] Commit only the V4.0.0 release files and evidence; exclude generated `build/` and `vibe_guide.egg-info/` artifacts unless explicitly required by packaging evidence.
-- [ ] Push the current branch to `origin` and verify local/remote commit SHA equality.
+- [x] Commit only the V4.0.0 release files and evidence; exclude generated `build/` and `vibe_guide.egg-info/` artifacts unless explicitly required by packaging evidence.
+- [x] Push the current branch to `origin` and verify local/remote commit SHA equality.
 - [x] Do not create or merge PR/MR.
