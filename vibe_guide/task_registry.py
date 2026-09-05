@@ -24,6 +24,12 @@ from .models import (
     SupervisorLeaseObservation,
     WaitThreadsCursorObservation,
 )
+from .binding_lifecycle import (
+    BindingVerificationResult,
+    ProviderRuntimeBinding,
+    RequestedBindingPolicy,
+    verify_binding as verify_v4_binding,
+)
 
 
 REGISTRY_SCHEMA_VERSION = 1
@@ -655,6 +661,27 @@ def binding_contract_enabled(contract: Any) -> bool:
         or "binding_intent" in contract
         or "binding_observation" in contract
     )
+
+
+def v4_runtime_binding_gate(contract: Any) -> BindingVerificationResult:
+    """Evaluate the V4 policy/runtime binding without weakening V3 gates."""
+    if not isinstance(contract, dict):
+        return BindingVerificationResult("blocked_unknown", False, ("contract",))
+    raw_policy = contract.get("requested_binding_policy")
+    if raw_policy is None:
+        return BindingVerificationResult("blocked_unknown", False, ("requested_binding_policy",))
+    try:
+        policy = raw_policy if isinstance(raw_policy, RequestedBindingPolicy) else RequestedBindingPolicy(**raw_policy)
+    except (TypeError, ValueError):
+        return BindingVerificationResult("blocked_unknown", False, ("requested_binding_policy",))
+    raw_observed = contract.get("provider_runtime_binding")
+    if raw_observed is None:
+        return verify_v4_binding(policy, None)
+    try:
+        observed = raw_observed if isinstance(raw_observed, ProviderRuntimeBinding) else ProviderRuntimeBinding(**raw_observed)
+    except (TypeError, ValueError):
+        return BindingVerificationResult("blocked_unknown", False, ("provider_runtime_binding",))
+    return verify_v4_binding(policy, observed, prior_task_id=contract.get("prior_task_id"))
 
 
 def runtime_binding_gate(

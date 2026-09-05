@@ -89,6 +89,12 @@ node-spec 是 JSON 对象，包含 `title`、`objective`、已批准的 `decisio
 
 ## 授权、监工和恢复
 
+### V4.1 复杂任务最终整合
+
+复杂任务在授权前必须完成 PRD 阶段的范围与边界确认，并把需求、PRD、Spec/Issue、DAG 审计、计划确认、授权卡和用户授权纳入十节点强制链；节点只能通过结构化记录完成，显式跳过会记录用户指令、原因和后继策略：允许后继时继续，跳过授权节点则不能推导执行授权。所有业务节点完成后，独立 reviewer 执行只读的最终整合 Review，核验 PRD/Spec 合同、全量 diff 与 P0–P2 门禁。CLI 会区分“局部节点完成”“整合 Review 进行中”“整合 Review 返工”和“整合通过但外部动作未授权”。
+
+该整合流程只适用于 `complex`；`simple` 与 `light_plan` 仍走轻量路径，不生成最终整合 Review。整合通过不等于 merge、push 或 deploy：授权卡的 `remote_git_actions` 仅是远端 Git 总开关，deploy、凭据和系统权限始终需要独立授权与验证。
+
 在 revision 5 运行时，确认授权卡即启动 Monitor；不再需要第二个启动动作。旧版 CLI 兼容路径仍可接受显式 `--authorize`：
 
 ```bash

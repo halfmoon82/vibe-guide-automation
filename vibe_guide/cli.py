@@ -20,7 +20,7 @@ from .authorization import (
 from .adapters.base import Environment
 from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
-from .dag import render_plan_artifacts, validate_dag
+from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import doctor
 from .initializer import apply_agentsmd_proposal, init_project
 from .upgrade import upgrade_project
@@ -43,6 +43,7 @@ from .diagnostics import screen_session, require_session_screened
 from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
 from .workflow_gate import require_capability_contract
 from .state import load_events, load_snapshot
+from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
 from .installation import run_install, run_upgrade
@@ -285,6 +286,8 @@ def _publish_plan(
     if not approval.approved:
         raise PermissionError("product decisions remain unresolved")
     raw_nodes = source.get("nodes", [])
+    source_band = source.get("complexity_band", source.get("route", ""))
+    is_complex_spec = source_band == "complex" or bool(source.get("integration_contract"))
     source_capabilities = AgentCapabilities.from_dict(source.get("capabilities", {}))
     project_id = source.get("project_id")
     # Visible task routing requires a confirmed project id. Legacy/background
@@ -334,7 +337,13 @@ def _publish_plan(
         authorization_required=True,
         decisions=[asdict(item) for item in decisions],
         nodes=nodes,
+        complexity_band="complex" if is_complex_spec else "",
+        spec_path=str(source.get("spec_path", "spec.md" if is_complex_spec else "")),
+        integration_contract=source.get("integration_contract", {}),
     )
+    if is_complex_spec:
+        plan = append_integration_review_node(plan)
+    nodes = list(plan.nodes)
     capabilities = source_capabilities
     try:
         capabilities = _observed_adapter(paths, capabilities.agent_id).capabilities
@@ -571,7 +580,10 @@ def _require_public_execution_gate(
     # atomically publish it after Monitor.reauthorize succeeds.
     if gate.missing == ["plan-confirmation.invalid"] and _current_run_path(directory).is_file():
         try:
-            refreshed = refresh_authorization_card(plan, nodes, card)
+            refreshed = refresh_authorization_card(
+                plan, nodes, card,
+                workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
+            )
             if _verified_same_run_reauthorization(
                 paths, directory, plan, nodes, refreshed
             ):
@@ -594,6 +606,7 @@ def _snapshot_result(command: str, snapshot: Any, as_json: bool) -> CLIResult:
         "status": result_status,
         "run_id": snapshot.run_id,
         "nodes": snapshot.nodes,
+        "closeout_status": render_v41_closeout_status(snapshot),
     }
     if retry_pending or snapshot.status == "blocked_unknown":
         code = UNKNOWN
@@ -609,10 +622,41 @@ def _snapshot_result(command: str, snapshot: Any, as_json: bool) -> CLIResult:
         (
             "监工已启动并自动推进中：运行 {}".format(snapshot.run_id)
             if retry_pending
-            else "{}：运行 {}，状态 {}".format(command, snapshot.run_id, result_status)
+            else render_v41_closeout_status(snapshot),
         ),
         as_json,
     )
+
+
+def render_v41_closeout_status(snapshot: RunSnapshot) -> str:
+    """Project a complex-run snapshot into product-facing closeout text."""
+    nodes = getattr(snapshot, "nodes", {}) or {}
+    integration = nodes.get("integration-review") or {}
+    status = str(integration.get("status", "")).casefold()
+    if status in {"rework", "blocked_design"}:
+        return "整合 Review 返工：未闭合/不可验收"
+    if status in {"review", "running", "start_pending"}:
+        return "整合 Review 进行中：尚未验收"
+    if status in {"planned", "brief_pending"}:
+        if any(str(item.get("status", "")).casefold() in {"accepted", "delivered"} for key, item in nodes.items() if key != "integration-review"):
+            return "局部节点完成：等待整合 Review"
+        return "整合 Review 未闭合/不可验收"
+    evidence = getattr(snapshot, "integration_review_evidence", {}) or {}
+    evidence_ok = (
+        isinstance(evidence, dict)
+        and str(evidence.get("status", "")).casefold() in {"accepted", "approved", "passed"}
+        and isinstance(evidence.get("p0_p2", evidence.get("clearance")), dict)
+        and all(evidence.get("p0_p2", evidence.get("clearance", {})).get(k) == 0 for k in ("p0", "p1", "p2"))
+    )
+    if (status == "accepted" and evidence_ok) or (getattr(snapshot, "status", "") == "complete" and integration and evidence_ok):
+        auth = getattr(snapshot, "authorization", {}) or {}
+        remote = auth.get("remote_git_actions") if isinstance(auth, dict) else getattr(auth, "remote_git_actions", "deny")
+        if remote != "allow":
+            return "整合通过但外部动作未授权"
+        return "整合 Review 已通过"
+    if integration:
+        return "整合 Review 未闭合/不可验收"
+    return "运行状态：{}".format(getattr(snapshot, "status", "unknown"))
 
 
 def _current_run_path(directory: Path) -> Path:
@@ -1143,7 +1187,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 invalidation = _read_json(invalidation_path)
                 if not isinstance(invalidation, dict):
                     raise ValueError("authorization invalidation record is invalid")
-                card = refresh_authorization_card(plan, nodes, card)
+                card = refresh_authorization_card(
+                    plan, nodes, card,
+                    workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
+                )
                 record = authorize(card, args.authorize)
                 if runner is None:
                     runner = _public_runner(paths, card, nodes)
@@ -1168,7 +1215,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 # Refresh the card as well: a delivered contract correction
                 # may have changed the executable node digest without writing
                 # an invalidation marker yet.
-                card = refresh_authorization_card(plan, nodes, card)
+                card = refresh_authorization_card(
+                    plan, nodes, card,
+                    workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
+                )
                 _atomic_json(directory / "authorization-card.json", card.to_dict())
                 record = authorize(card, args.authorize)
                 if runner is None:

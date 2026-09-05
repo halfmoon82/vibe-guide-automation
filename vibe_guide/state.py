@@ -60,7 +60,20 @@ _NODE_STATUSES = {
     "failed",
     "stopped",
     "brief_pending",
+    "skipped_by_user",
+    "blocked_by_required_node",
 }
+
+
+def verify_required_workflow_state(workflow):
+    """Validate a task workflow snapshot using the monitor's hard gate."""
+    from .workflow_gate import verify_workflow
+    if not isinstance(workflow, dict) or not isinstance(workflow.get("task_id"), str):
+        raise ValueError("workflow state is invalid")
+    result = verify_workflow(workflow)
+    if result.get("status") == "complete":
+        return result
+    return result
 
 # V3.9 deliberately keeps the durable/internal node statuses precise while
 # exposing a small, stable vocabulary to end users.  This mapping is pure so
@@ -187,6 +200,7 @@ _EVENT_DATA_KEYS = {
     "isolated",
     "repaired",
     "binding",
+    "legacy_evidence_digest",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",
@@ -295,8 +309,35 @@ class RunSnapshot:
     binding_observation: Optional[Dict[str, Any]] = None
     binding_state: str = "blocked_unknown"
     business_write_allowed: bool = False
+    # V4.1 aggregate integration-review evidence. Optional for historical runs.
+    integration_review_evidence: Dict[str, Any] = field(default_factory=dict)
+    workflow: Optional[Dict[str, Any]] = None
+    prd_digest: str = ""
+    spec_digest: str = ""
+    legacy_run: bool = False
+    legacy_evidence: Optional[Dict[str, Any]] = None
+    legacy_evidence_digest: str = ""
+    execution_engine: str = ""
+    engine_mode: str = ""
+    engine_evidence_ref: str = ""
+    dag_revision: int = 0
+    ready_set: List[str] = field(default_factory=list)
+    topology_digest: str = ""
+    started_nodes: List[str] = field(default_factory=list)
+    active_concurrency: int = 0
+    capacity: int = 0
+    monitor_entry_evidence: str = ""
+    parallel_groups: Dict[str, List[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.execution_engine, str) or not isinstance(self.engine_mode, str) or not isinstance(self.engine_evidence_ref, str):
+            raise ValueError("snapshot execution engine fields are invalid")
+        if isinstance(self.dag_revision, bool) or not isinstance(self.dag_revision, int) or self.dag_revision < 0:
+            raise ValueError("snapshot DAG revision is invalid")
+        if not isinstance(self.ready_set, list) or not all(isinstance(item, str) and item.strip() for item in self.ready_set):
+            raise ValueError("snapshot ready-set is invalid")
+        if not isinstance(self.topology_digest, str):
+            raise ValueError("snapshot topology digest is invalid")
         if self.binding_state not in {"blocked_unknown", "binding_verified"}:
             raise ValueError("snapshot binding state is invalid")
         if type(self.business_write_allowed) is not bool:
@@ -375,7 +416,7 @@ class RunSnapshot:
             "binding_state",
             "business_write_allowed",
         }
-        allowed = with_capability | binding_fields
+        allowed = with_capability | binding_fields | {"integration_review_evidence", "workflow", "prd_digest", "spec_digest", "legacy_run", "legacy_evidence", "legacy_evidence_digest", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "ready_set", "topology_digest", "started_nodes", "active_concurrency", "capacity", "monitor_entry_evidence", "parallel_groups"}
         if not isinstance(data, dict) or not set(data).issubset(allowed) or not expected.issubset(data):
             raise ValueError("snapshot schema is invalid")
         normalized = dict(data)
@@ -384,6 +425,43 @@ class RunSnapshot:
         normalized.setdefault("binding_observation", None)
         normalized.setdefault("binding_state", "blocked_unknown")
         normalized.setdefault("business_write_allowed", False)
+        normalized.setdefault("integration_review_evidence", {})
+        normalized.setdefault("prd_digest", "")
+        normalized.setdefault("spec_digest", "")
+        normalized.setdefault("legacy_run", False)
+        normalized.setdefault("legacy_evidence", None)
+        normalized.setdefault("legacy_evidence_digest", "")
+        normalized.setdefault("execution_engine", "")
+        normalized.setdefault("engine_mode", "")
+        normalized.setdefault("engine_evidence_ref", "")
+        normalized.setdefault("dag_revision", 0)
+        normalized.setdefault("ready_set", [])
+        normalized.setdefault("topology_digest", "")
+        normalized.setdefault("started_nodes", [])
+        normalized.setdefault("active_concurrency", 0)
+        normalized.setdefault("capacity", 0)
+        normalized.setdefault("monitor_entry_evidence", "")
+        normalized.setdefault("parallel_groups", {})
+        if not isinstance(normalized["integration_review_evidence"], dict):
+            raise ValueError("snapshot integration review evidence is invalid")
+        if normalized.get("workflow") is not None and not isinstance(normalized["workflow"], dict):
+            raise ValueError("snapshot workflow is invalid")
+        for key in ("prd_digest", "spec_digest"):
+            if not isinstance(normalized.get(key, ""), str):
+                raise ValueError("snapshot {} is invalid".format(key))
+        if type(normalized.get("legacy_run")) is not bool:
+            raise ValueError("snapshot legacy_run is invalid")
+        if normalized.get("legacy_evidence") is not None and not isinstance(normalized["legacy_evidence"], dict):
+            raise ValueError("snapshot legacy evidence is invalid")
+        if normalized.get("legacy_run") is True:
+            evidence = normalized.get("legacy_evidence")
+            if (not isinstance(evidence, dict) or not isinstance(evidence.get("source"), str)
+                    or not evidence.get("source", "").strip() or not isinstance(evidence.get("run_id"), str)
+                    or not evidence.get("run_id", "").strip()):
+                raise ValueError("legacy snapshot evidence is missing")
+            validate_run_id(evidence["run_id"])
+            if not isinstance(normalized.get("legacy_evidence_digest"), str) or not _DIGEST.fullmatch(normalized["legacy_evidence_digest"]):
+                raise ValueError("legacy snapshot evidence digest is invalid")
         if normalized["binding_state"] == "binding_verified":
             normalized["binding_state"] = "blocked_unknown"
             normalized["business_write_allowed"] = False
@@ -782,10 +860,20 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
     for node_id, node in snapshot.nodes.items():
         if not isinstance(node, dict) or node.get("status") not in _NODE_STATUSES:
             raise ValueError("snapshot node state is invalid for " + node_id)
-    if snapshot.status == "complete" and not all(
-        node.get("status") == "accepted" for node in snapshot.nodes.values()
-    ):
-        raise ValueError("complete run contains unaccepted nodes")
+    if snapshot.status == "complete":
+        if not all(node.get("status") == "accepted" for node in snapshot.nodes.values()):
+            raise ValueError("complete run contains unaccepted nodes")
+        if "integration-review" in snapshot.nodes:
+            evidence = snapshot.integration_review_evidence
+            clearance = evidence.get("clearance") if isinstance(evidence, dict) else None
+            if not isinstance(evidence, dict) or not evidence or not isinstance(clearance, dict) or any(clearance.get(key) != 0 for key in ("p0", "p1", "p2")):
+                raise ValueError("complete run lacks accepted integration review evidence")
+            try:
+                from .evidence import validate_integration_review_evidence
+                current_evidence = {key: value for key, value in evidence.items() if key != "history"}
+                validate_integration_review_evidence(snapshot, current_evidence)
+            except (TypeError, ValueError) as error:
+                raise ValueError("complete run integration evidence is invalid") from error
 
     first = records[0] if records else None
     if first is None or first["event"] != "run_started":
@@ -810,6 +898,8 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
     current_capability_contract_digest = first_capability_contract_digest
     if sorted(first["data"].get("node_ids", [])) != sorted(snapshot.nodes):
         raise ValueError("run-start node lineage is inconsistent")
+    if snapshot.legacy_run and first["data"].get("legacy_evidence_digest") != snapshot.legacy_evidence_digest:
+        raise ValueError("legacy evidence lineage is inconsistent")
     retained_acceptance_proofs = []
     latest_node_contract_digests = None
     for record in records[: snapshot.event_sequence]:

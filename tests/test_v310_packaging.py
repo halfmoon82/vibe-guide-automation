@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET_VERSION = "3.10.0"
+TARGET_VERSION = "4.1.0"
 
 
 def _run(command, *, cwd, env=None):

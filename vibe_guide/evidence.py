@@ -6,6 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
+from copy import deepcopy
 
 from .paths import ProjectPaths
 from .state import _atomic_bytes, run_dir
@@ -47,6 +48,194 @@ class ReviewResult:
     severity: str
     root_cause: str
     status: str
+
+
+@dataclass(frozen=True)
+class CloseoutDecision:
+    """Evidence-bounded decision for a run-level V4.1 closeout."""
+
+    allowed: bool
+    status: str
+    reasons: List[str]
+
+    @property
+    def can_complete(self) -> bool:
+        return self.allowed
+
+    @property
+    def complete(self) -> bool:
+        return self.allowed
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"allowed": self.allowed, "status": self.status, "reasons": list(self.reasons)}
+
+
+_HEX_DIGEST = lambda value: isinstance(value, str) and len(value) == 64 and all(
+    character in "0123456789abcdef" for character in value.lower()
+)
+
+
+def _snapshot_value(snapshot: Any, key: str, default: Any = None) -> Any:
+    if isinstance(snapshot, dict):
+        return snapshot.get(key, default)
+    return getattr(snapshot, key, default)
+
+
+def _integration_node(snapshot: Any):
+    nodes = _snapshot_value(snapshot, "nodes", {})
+    if not isinstance(nodes, dict):
+        return None, None
+    for node_id, node in nodes.items():
+        if node_id == "integration-review" or (
+            isinstance(node, dict)
+            and node.get("integration_review") is True
+        ):
+            return node_id, node
+    return None, None
+
+
+def _lineage_reasons(snapshot: Any, evidence: Dict[str, Any]) -> List[str]:
+    reasons = []
+    expected = {
+        "run_id": _snapshot_value(snapshot, "run_id"),
+        "plan_id": _snapshot_value(snapshot, "plan_id"),
+        "plan_revision": _snapshot_value(snapshot, "plan_version"),
+        "authorization_digest": _snapshot_value(snapshot, "authorization_digest"),
+        "node_contract_digest": _snapshot_value(snapshot, "node_contract_digest"),
+    }
+    for key, value in expected.items():
+        if value in (None, ""):
+            reasons.append("integration current lineage {} is missing".format(key))
+        elif evidence.get(key) != value:
+            reasons.append("integration evidence {} mismatch".format(key))
+    # PRD/Spec digests are supplied by the plan projection when available.
+    for key in ("prd_digest", "spec_digest"):
+        expected_value = _snapshot_value(snapshot, key)
+        if expected_value in (None, ""):
+            reasons.append("integration current lineage {} is missing".format(key))
+        elif evidence.get(key) != expected_value:
+            reasons.append("integration evidence {} mismatch".format(key))
+    return reasons
+
+
+def validate_integration_review_evidence(snapshot: Any, evidence: Dict[str, Any]) -> None:
+    """Validate the immutable, run-bound integration reviewer evidence package."""
+    if not isinstance(evidence, dict):
+        raise ValueError("integration review evidence must be an object")
+    required = {
+        "schema_version", "run_id", "plan_id", "plan_revision",
+        "prd_digest", "spec_digest", "authorization_digest", "node_contract_digest",
+        "aggregated_scope", "iteration_compatibility", "agentsmd_acceptance_refs",
+        "test_runtime_delivery", "unverified_or_excluded", "findings", "clearance",
+    }
+    if set(evidence) != required or evidence.get("schema_version") != 1:
+        raise ValueError("integration review evidence schema is invalid")
+    lineage_errors = _lineage_reasons(snapshot, evidence)
+    if lineage_errors:
+        raise ValueError(lineage_errors[0])
+    for key in ("prd_digest", "spec_digest", "authorization_digest", "node_contract_digest"):
+        if not _HEX_DIGEST(evidence.get(key)):
+            raise ValueError("integration evidence {} is invalid".format(key))
+    scope = evidence["aggregated_scope"]
+    if not isinstance(scope, dict) or not isinstance(scope.get("nodes"), list):
+        raise ValueError("integration aggregated scope is invalid")
+    nodes = _snapshot_value(snapshot, "nodes", {})
+    expected_nodes = [node_id for node_id in nodes if node_id != "integration-review"] if isinstance(nodes, dict) else []
+    if scope.get("nodes") != expected_nodes or len(set(scope["nodes"])) != len(scope["nodes"]):
+        raise ValueError("integration aggregated scope conflicts with run")
+    if scope.get("out_of_scope"):
+        raise ValueError("integration aggregated scope contains out-of-scope changes")
+    compatibility = evidence["iteration_compatibility"]
+    if not isinstance(compatibility, dict) or compatibility.get("status") in {"unknown", "expired", "stale"}:
+        raise ValueError("integration compatibility evidence is unknown or expired")
+    if compatibility.get("status") not in {"verified", "compatible", "reviewed"}:
+        raise ValueError("integration compatibility evidence is incomplete")
+    if not compatibility.get("evidence"):
+        raise ValueError("integration compatibility evidence is missing")
+    refs = evidence["agentsmd_acceptance_refs"]
+    if not isinstance(refs, list) or not refs or any(not isinstance(item, (str, dict)) for item in refs):
+        raise ValueError("integration AGENTS.md evidence is missing")
+    runtime = evidence["test_runtime_delivery"]
+    if not isinstance(runtime, dict) or runtime.get("status") in {"unknown", "expired", "stale"}:
+        raise ValueError("integration test/runtime evidence is unknown or expired")
+    if runtime.get("status") not in {"verified", "reviewed"} or not runtime.get("evidence"):
+        raise ValueError("integration test/runtime evidence is incomplete")
+    if not isinstance(evidence["unverified_or_excluded"], list):
+        raise ValueError("integration unverified/excluded field is invalid")
+    if not isinstance(evidence["findings"], list):
+        raise ValueError("integration findings field is invalid")
+    clearance = evidence["clearance"]
+    if not isinstance(clearance, dict) or set(clearance) != {"p0", "p1", "p2"}:
+        raise ValueError("integration P0/P1/P2 clearance is invalid")
+    if any(type(clearance[key]) is not int or clearance[key] < 0 for key in clearance):
+        raise ValueError("integration P0/P1/P2 clearance is invalid")
+    open_counts = {"p0": 0, "p1": 0, "p2": 0}
+    for finding in evidence["findings"]:
+        if not isinstance(finding, dict) or str(finding.get("severity", "")).lower() not in open_counts:
+            raise ValueError("integration finding schema is invalid")
+        severity = str(finding["severity"]).lower()
+        status = str(finding.get("status", finding.get("resolution", ""))).lower()
+        if status not in {"open", "resolved", "accepted", "waived"}:
+            raise ValueError("integration finding status is invalid")
+        if status in {"open", "unresolved", "pending", "blocked"}:
+            open_counts[severity] += 1
+    for key in open_counts:
+        if clearance[key] != open_counts[key]:
+            raise ValueError("{} clearance does not match finding count".format(key.upper()))
+
+
+def record_integration_review(snapshot: Any, evidence: Dict[str, Any]) -> None:
+    """Append a review result to a snapshot while retaining prior evidence."""
+    validate_integration_review_evidence(snapshot, evidence)
+    prior = _snapshot_value(snapshot, "integration_review_evidence", {})
+    history = []
+    if isinstance(prior, dict) and isinstance(prior.get("history"), list):
+        history = deepcopy(prior["history"])
+    elif prior:
+        history = [deepcopy(prior)]
+    history.append(deepcopy(evidence))
+    stored = deepcopy(evidence)
+    stored["history"] = history
+    if isinstance(snapshot, dict):
+        snapshot["integration_review_evidence"] = stored
+        node = snapshot.get("nodes", {}).get("integration-review")
+    else:
+        snapshot.integration_review_evidence = stored
+        node = getattr(snapshot, "nodes", {}).get("integration-review")
+    if isinstance(node, dict):
+        node["review_clearance"] = dict(evidence["clearance"])
+        node.setdefault("evidence", []).append(deepcopy(evidence))
+        node["status"] = "accepted" if all(evidence["clearance"][key] == 0 for key in ("p0", "p1", "p2")) else "rework"
+
+
+def evaluate_v41_closeout(snapshot: Any) -> CloseoutDecision:
+    """Evaluate V4.1 closeout without mutating the supplied snapshot."""
+    nodes = _snapshot_value(snapshot, "nodes", {})
+    if not isinstance(nodes, dict) or not nodes:
+        return CloseoutDecision(False, "blocked_unknown", ["snapshot nodes are unavailable"])
+    integration_id, integration = _integration_node(snapshot)
+    if integration_id is None:
+        accepted = all(isinstance(node, dict) and node.get("status") == "accepted" for node in nodes.values())
+        return CloseoutDecision(accepted, "complete" if accepted else "running", [] if accepted else ["business nodes are not all accepted"])
+    reasons = []
+    business = [node for node_id, node in nodes.items() if node_id != integration_id]
+    if not all(isinstance(node, dict) and node.get("status") == "accepted" for node in business):
+        reasons.append("business nodes are not all accepted")
+    if not isinstance(integration, dict) or integration.get("status") != "accepted":
+        reasons.append("integration review is not accepted")
+    evidence = _snapshot_value(snapshot, "integration_review_evidence", {})
+    if not isinstance(evidence, dict) or not evidence:
+        reasons.append("integration review evidence is missing")
+    else:
+        try:
+            current_evidence = {key: value for key, value in evidence.items() if key != "history"}
+            validate_integration_review_evidence(snapshot, current_evidence)
+        except ValueError as error:
+            reasons.append(str(error))
+        clearance = evidence.get("clearance")
+        if not isinstance(clearance, dict) or any(clearance.get(key) != 0 for key in ("p0", "p1", "p2")):
+            reasons.append("integration P0/P1/P2 clearance is not zero")
+    return CloseoutDecision(not reasons, "complete" if not reasons else "running", reasons)
 
 
 def _path(paths: ProjectPaths, evidence: GenerationEvidence) -> Path:

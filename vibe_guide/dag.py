@@ -1,6 +1,6 @@
 """DAG validation, ready-node scheduling, and plan artifact rendering."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -9,6 +9,113 @@ import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .models import DAGNode, Plan
+
+
+INTEGRATION_REVIEW_NODE_ID = "integration-review"
+INTEGRATION_REVIEWER_ID = "integration-reviewer"
+
+
+def is_integration_review_node(node: DAGNode) -> bool:
+    """Return whether *node* is the reserved final integration reviewer node."""
+    return isinstance(node, DAGNode) and node.id == INTEGRATION_REVIEW_NODE_ID
+
+
+def _integration_nodes(plan: Plan) -> List[DAGNode]:
+    return [node for node in (getattr(plan, "nodes", []) or []) if is_integration_review_node(node)]
+
+
+def append_integration_review_node(plan: Plan) -> Plan:
+    """Append the deterministic, read-only integration review node to complex plans."""
+    if not isinstance(plan, Plan):
+        raise TypeError("plan is required")
+    if plan.complexity_band != "complex":
+        return plan
+    existing = _integration_nodes(plan)
+    if existing:
+        raise ValueError("plan already contains an integration review node")
+    # Import lazily to keep the planner/DAG modules independently importable.
+    from .planner import build_integration_acceptance_contract
+
+    business_nodes = [node for node in plan.nodes if not is_integration_review_node(node)]
+    projected_contract = build_integration_acceptance_contract(plan)
+    contract = dict(projected_contract)
+    contract.update({
+        "input": "all business deliveries, review/rework evidence, and aggregate diff",
+        "output": "integration review report with P0/P1/P2 clearance and evidence references",
+        "error_behavior": "unknown, out-of-scope changes, or uncleared findings block acceptance",
+        "acceptance_example": "all required evidence is present and P0/P1/P2 clearance is zero",
+        "risk_tags": ["integration", "read-only"],
+        "read_only": True,
+        "reviewer": INTEGRATION_REVIEWER_ID,
+        "allowlist": [],
+    })
+    integration = DAGNode(
+        INTEGRATION_REVIEW_NODE_ID,
+        "Final integration review",
+        [node.id for node in business_nodes],
+        [],
+        "integration",
+        contract,
+        "planned",
+        risk_tags=["integration", "read-only"],
+        reviewer=INTEGRATION_REVIEWER_ID,
+        owned_paths=[],
+        allowlist=[],
+    )
+    return replace(
+        plan,
+        node_ids=list(plan.node_ids) + [integration.id],
+        nodes=list(plan.nodes) + [integration],
+    )
+
+
+def validate_integration_review_node(plan: Plan) -> "DAGValidation":
+    """Validate the integration node's uniqueness, scope, lineage and reviewer isolation."""
+    if not isinstance(plan, Plan):
+        raise TypeError("plan is required")
+    if plan.complexity_band != "complex":
+        return DAGValidation(True, ())
+    nodes = list(plan.nodes or [])
+    integration = _integration_nodes(plan)
+    errors: List[str] = []
+    if len(integration) != 1:
+        errors.append("complex plan must contain exactly one integration review node")
+        return DAGValidation(False, tuple(errors))
+    node = integration[0]
+    business = [item for item in nodes if not is_integration_review_node(item)]
+    business_ids = [item.id for item in business]
+    contract_error = _contract_error(node)
+    if contract_error:
+        errors.append(contract_error)
+    if node.depends_on != business_ids:
+        errors.append("integration review depends_on must equal all business node IDs in plan order")
+    if node.owned_paths:
+        errors.append("integration review node must not own business paths")
+    if node.allowlist:
+        errors.append("integration review node must have an empty write allowlist")
+    if node.contract.get("allowlist"):
+        errors.append("integration review contract must have an empty write allowlist")
+    explicit_reviewer = node.reviewer
+    contract_reviewer = node.contract.get("reviewer")
+    if explicit_reviewer and contract_reviewer and explicit_reviewer != contract_reviewer:
+        errors.append("integration review reviewer mismatch between node and contract")
+    reviewer = explicit_reviewer or contract_reviewer
+    business_reviewers = {item.reviewer or item.contract.get("reviewer") for item in business}
+    business_writers = {item.writer or item.contract.get("writer") for item in business}
+    if reviewer != INTEGRATION_REVIEWER_ID:
+        errors.append("integration review reviewer must be the independent integration reviewer")
+    if reviewer in business_reviewers or reviewer in business_writers:
+        errors.append("integration review reviewer must not be reused by a business node")
+    if node.contract.get("read_only") is not True:
+        errors.append("integration review contract must be read-only")
+    try:
+        from .planner import build_integration_acceptance_contract
+        expected = build_integration_acceptance_contract(plan)
+        if node.contract.get("digest") != expected.get("digest"):
+            errors.append("integration review contract digest mismatch")
+    except (TypeError, ValueError) as exc:
+        errors.append("integration review contract is invalid: {}".format(exc))
+    return DAGValidation(not errors, tuple(dict.fromkeys(errors)))
 
 
 @dataclass(frozen=True)
@@ -265,6 +372,10 @@ def audit_dag(plan: Plan) -> DAGAuditResult:
         )
 
     reasons: Dict[str, List[str]] = {node.id: [] for node in nodes}
+    if plan.complexity_band == "complex":
+        global_validation = validate_integration_review_node(plan)
+        if not global_validation.valid:
+            reasons["__dag__"] = list(global_validation.errors)
     by_id: Dict[str, DAGNode] = {}
     duplicate_ids = set()
     for node in nodes:
@@ -297,7 +408,13 @@ def audit_dag(plan: Plan) -> DAGAuditResult:
 
     writer_bindings: Dict[Tuple[str, str], List[str]] = {}
     for node in nodes:
-        reasons[node.id].extend(_audit_contract_errors(node))
+        if is_integration_review_node(node):
+            # Integration reviewers are read-only and intentionally have no
+            # writer/worktree/write allowlist; validate their dedicated
+            # contract instead of applying the business-writer audit.
+            reasons[node.id].extend(validate_integration_review_node(plan).errors)
+        else:
+            reasons[node.id].extend(_audit_contract_errors(node))
         writer = _node_metadata(node, "writer")
         worktree = _node_metadata(node, "worktree")
         if isinstance(writer, str) and writer.strip() and isinstance(worktree, str) and worktree.strip():
@@ -317,9 +434,10 @@ def audit_dag(plan: Plan) -> DAGAuditResult:
         if node.status not in ("planned", "ready") or reasons[node.id]:
             continue
         unmet = [dependency for dependency in node.depends_on if dependency not in by_id]
+        required_statuses = ("accepted",) if is_integration_review_node(node) else ("accepted", "delivered")
         unmet.extend(
             dependency for dependency in node.depends_on
-            if dependency in by_id and by_id[dependency].status not in ("accepted", "delivered")
+            if dependency in by_id and by_id[dependency].status not in required_statuses
         )
         if unmet:
             reasons[node.id].append(

@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Mapping
 from pathlib import PurePosixPath
 
 from .models import _identifier, _json_safe
+from .models import IntegrationAcceptanceContract
+from .planner import build_integration_acceptance_contract, project_v41_integration_contract
 # V2 boundary contracts are re-exported here for callers that use the shared
 # contracts module as their public import surface.
 from .diagnostics import (

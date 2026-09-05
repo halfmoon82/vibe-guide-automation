@@ -29,6 +29,7 @@ from .models import (
 )
 from .paths import ProjectPaths
 from .planner import resolve_consistency
+from .dag import audit_dag, ready_nodes
 from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
@@ -43,6 +44,7 @@ from .state import (
     redact_provider_text,
     release_writer_lease,
     save_snapshot,
+    validate_run_id,
 )
 from .task_registry import (
     TaskBinding,
@@ -51,7 +53,7 @@ from .task_registry import (
     runtime_binding_gate,
     save_task_binding,
 )
-from .workflow_gate import require_capability_contract, require_entry
+from .workflow_gate import require_capability_contract, require_entry, verify_workflow
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
 from .model_router import ModelRouter
@@ -72,6 +74,10 @@ from .checkpoint import (
 )
 from .brief import ImplementationBrief, validate_implementation_brief
 from .manifest import RunManifest
+from .evidence import (
+    evaluate_v41_closeout,
+    record_integration_review as _record_integration_review,
+)
 
 
 def _user_status(record: Dict[str, Any]) -> str:
@@ -164,6 +170,121 @@ def isolate_affected_action(snapshot: Any, node_id: str, reason: str) -> None:
 
 
 class Monitor:
+    @staticmethod
+    def _legacy_run_allowed(state_data: Dict[str, Any]) -> bool:
+        """Accept only an explicitly evidenced historical-run marker."""
+        if not isinstance(state_data, dict) or state_data.get("legacy_run") is not True:
+            return False
+        evidence = state_data.get("legacy_evidence")
+        if not isinstance(evidence, dict):
+            return False
+        source = evidence.get("source")
+        run_id = evidence.get("run_id")
+        if not isinstance(source, str) or not source.strip() or not isinstance(run_id, str) or not run_id.strip():
+            return False
+        try:
+            validate_run_id(run_id)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _legacy_evidence_digest(evidence: Dict[str, Any]) -> str:
+        payload = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _legacy_binding_valid(cls, legacy_run: Any, evidence: Any, digest: Any) -> bool:
+        return legacy_run is True and cls._legacy_run_allowed({"legacy_run": legacy_run, "legacy_evidence": evidence}) and digest == cls._legacy_evidence_digest(evidence)
+
+    @staticmethod
+    def _lineage_matches_snapshot(snapshot: RunSnapshot, prd_digest: str, spec_digest: str) -> bool:
+        return bool(prd_digest and spec_digest and snapshot.prd_digest == prd_digest and snapshot.spec_digest == spec_digest)
+
+    def _execution_engine_binding(self, record: AuthorizationRecord) -> Tuple[str, str]:
+        """Require the V4.1 complex plan to run through the DAG Monitor."""
+        if getattr(self.plan, "complexity_band", "") != "complex":
+            return "", ""
+        override = getattr(record, "explicit_execution_mode_override", None)
+        if isinstance(override, dict) and override:
+            if not all(isinstance(override.get(key), str) and override.get(key).strip() for key in ("original_instruction", "alternative_mode")):
+                raise PermissionError("execution_engine_unverified: malformed explicit execution override")
+            raise PermissionError("execution_engine_unverified: explicit execution mode override has no V4.1 DAG guarantees")
+        if record.execution_engine != "vibeguide_monitor" or record.engine_mode != "dag":
+            raise PermissionError("execution_engine_unverified: V4.1 complex runs require vibeguide_monitor DAG")
+        if not record.engine_evidence_ref or record.engine_evidence_ref.startswith("unverified:"):
+            raise PermissionError("execution_engine_unverified: engine evidence is not verified")
+        if record.dag_revision != self.plan.version:
+            raise PermissionError("blocked_by_execution_topology_mismatch: DAG revision mismatch")
+        return record.execution_engine, record.engine_mode
+
+    def _topology_projection(self, snapshot: RunSnapshot) -> Tuple[List[str], str]:
+        """Return the current ready-set and a stable dependency projection digest."""
+        expected = []
+        for node in self.nodes.values():
+            expected.append({"id": node.id, "depends_on": list(node.depends_on), "parallel_group": node.parallel_group, "allowlist": list(node.allowlist), "owned_paths": list(node.owned_paths), "writer": node.writer, "reviewer": node.reviewer, "worktree": node.worktree})
+        digest = hashlib.sha256(json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        ready = []
+        for node in self.nodes.values():
+            current = snapshot.nodes.get(node.id, {})
+            if current.get("status") not in {"planned", "ready"}:
+                continue
+            if all(snapshot.nodes.get(dep, {}).get("status") == "accepted" for dep in node.depends_on):
+                ready.append(node.id)
+        return ready, digest
+
+    def _refresh_execution_projection(self, snapshot: RunSnapshot, entry: str = "monitor.unknown") -> None:
+        ready, digest = self._topology_projection(snapshot)
+        snapshot.ready_set = ready
+        snapshot.topology_digest = digest
+        snapshot.started_nodes = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
+        snapshot.active_concurrency = len(snapshot.started_nodes)
+        snapshot.capacity = int(getattr(self._snapshot_record(snapshot), "active_pair_limit", 0) or 0)
+        snapshot.monitor_entry_evidence = entry
+        snapshot.parallel_groups = {n: ([self.nodes[n].parallel_group] if self.nodes[n].parallel_group else []) for n in snapshot.started_nodes}
+
+    def _record_topology_projection(self, snapshot: RunSnapshot, entry: str) -> None:
+        self._refresh_execution_projection(snapshot, entry)
+        self._record(snapshot, "execution_topology_observed", {
+            "run_id": snapshot.run_id, "plan_revision": snapshot.plan_version,
+            "node_ids": sorted(self.nodes), "started_nodes": list(snapshot.started_nodes),
+            "active_concurrency": snapshot.active_concurrency, "capacity": snapshot.capacity,
+            "parallel_groups": snapshot.parallel_groups,
+            "monitor_entry_evidence": entry,
+        })
+
+    def _validate_execution_topology(self, snapshot: RunSnapshot) -> None:
+        if getattr(self.plan, "complexity_band", "") != "complex":
+            return
+        ready, digest = self._topology_projection(snapshot)
+        if snapshot.dag_revision != self.plan.version or snapshot.topology_digest != digest:
+            raise PermissionError("blocked_by_execution_topology_mismatch: topology projection drift")
+        if list(snapshot.ready_set) != ready:
+            raise PermissionError("blocked_by_execution_topology_mismatch: ready-set drift")
+        started = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
+        if list(snapshot.started_nodes) != started:
+            raise PermissionError("blocked_by_execution_topology_mismatch: started-set drift")
+        if snapshot.active_concurrency != len(started) or (snapshot.capacity and snapshot.active_concurrency > snapshot.capacity):
+            raise PermissionError("blocked_by_execution_topology_mismatch: capacity drift")
+        expected_groups = {n: ([self.nodes[n].parallel_group] if self.nodes[n].parallel_group else []) for n in started}
+        if snapshot.parallel_groups != expected_groups:
+            raise PermissionError("blocked_by_execution_topology_mismatch: parallel-group drift")
+        if not snapshot.monitor_entry_evidence.startswith("monitor."):
+            raise PermissionError("blocked_by_execution_topology_mismatch: monitor entry evidence missing")
+        if not hasattr(self, "paths"):
+            return
+        events = load_events(self.paths, snapshot.run_id)
+        observed = [e for e in events if e.get("event") == "execution_topology_observed"]
+        if not observed:
+            raise PermissionError("blocked_by_execution_topology_mismatch: topology evidence missing")
+        latest = observed[-1].get("data", {})
+        expected = {"run_id": snapshot.run_id, "plan_revision": snapshot.plan_version, "node_ids": sorted(self.nodes), "started_nodes": snapshot.started_nodes, "active_concurrency": snapshot.active_concurrency, "capacity": snapshot.capacity, "parallel_groups": snapshot.parallel_groups}
+        for key, value in expected.items():
+            if latest.get(key) != value:
+                raise PermissionError("blocked_by_execution_topology_mismatch: topology evidence drift")
+        if latest.get("monitor_entry_evidence") != snapshot.monitor_entry_evidence:
+            raise PermissionError("blocked_by_execution_topology_mismatch: monitor entry evidence drift")
+
     def __init__(
         self,
         paths: ProjectPaths,
@@ -182,6 +303,23 @@ class Monitor:
 
     def _reset_binding_cache(self) -> None:
         self._binding_cache.clear()
+
+    def _current_plan_digests(self) -> Tuple[str, str]:
+        values = []
+        for ref in ("prd", "spec"):
+            supplied = getattr(self.plan, ref + "_digest", "")
+            if supplied:
+                values.append(str(supplied))
+                continue
+            path_value = getattr(self.plan, ref + "_path", "")
+            path = Path(path_value) if path_value else Path("")
+            if path_value and not path.is_absolute():
+                path = self.paths.root / path
+            try:
+                values.append(hashlib.sha256(path.read_bytes()).hexdigest() if path_value else "")
+            except (OSError, ValueError):
+                values.append("")
+        return values[0], values[1]
 
     def _load_task_binding(
         self, snapshot: RunSnapshot, node_id: str, role: str
@@ -428,6 +566,7 @@ class Monitor:
         :func:`merge_local` to the run event log.
         """
         snapshot = load_snapshot(self.paths, run_id)
+        self._validate_execution_topology(snapshot)
         record = self._require_snapshot_authorization(snapshot)
         evidence = merge_local(change_request, record, local_facts)
         self._record(
@@ -439,6 +578,7 @@ class Monitor:
                 "evidence": evidence.to_dict(),
             },
         )
+        self._record_topology_projection(snapshot, "monitor.merge_local")
         save_snapshot(self.paths, snapshot)
         return evidence
 
@@ -499,6 +639,8 @@ class Monitor:
         self._require_record(record)
         state = self.paths.vibe / "state.json"
         capability_contract_digest = ""
+        task_workflow = None
+        state_data = {}
         if state.is_file():
             try:
                 require_entry(self.paths, "monitor:" + self.plan.plan_id, "monitor")
@@ -507,9 +649,25 @@ class Monitor:
             capability_contract_digest = require_capability_contract(
                 self.paths
             ).contract_digest
+            try:
+                state_data = json.loads(state.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                raise PermissionError("session_gate_blocked") from error
+            task_workflow = state_data.get("task_workflow") or state_data.get("workflow")
+            if task_workflow is not None:
+                workflow_result = verify_workflow(task_workflow)
+                if workflow_result.get("status") != "complete":
+                    raise PermissionError("required_workflow_blocked: {}".format(workflow_result.get("node", "unknown")))
         elif self.paths.vibe.exists():
             raise PermissionError("session_gate_blocked: V2 state.json is missing")
         assert record is not None
+        integration_run = any(node.id == "integration-review" for node in self.nodes.values())
+        legacy_run = self._legacy_run_allowed(state_data)
+        if integration_run and task_workflow is None and not legacy_run:
+            raise PermissionError("required_workflow_blocked: workflow")
+        prd_digest, spec_digest = self._current_plan_digests()
+        if integration_run and (not prd_digest or not spec_digest):
+            raise PermissionError("integration lineage blocked_unknown: PRD/Spec digest is missing")
         run_id = "run-" + uuid.uuid4().hex
         node_state: Dict[str, Dict[str, Any]] = {}
         for node_id, node in self.nodes.items():
@@ -552,7 +710,18 @@ class Monitor:
             node_contract_digest=record.node_contract_digest,
             capability_contract_digest=capability_contract_digest,
             event_sequence=0,
+            workflow=task_workflow,
+            prd_digest=prd_digest,
+            spec_digest=spec_digest,
+            legacy_run=legacy_run,
+            legacy_evidence=state_data.get("legacy_evidence") if legacy_run else None,
+            legacy_evidence_digest=self._legacy_evidence_digest(state_data.get("legacy_evidence")) if legacy_run else "",
+            execution_engine=record.execution_engine,
+            engine_mode=record.engine_mode,
+            engine_evidence_ref=record.engine_evidence_ref,
+            dag_revision=record.dag_revision,
         )
+        self._refresh_execution_projection(snapshot, "monitor.start")
         self._record(
             snapshot,
             "run_started",
@@ -562,6 +731,7 @@ class Monitor:
                 "node_contract_digest": record.node_contract_digest,
                 "capability_contract_digest": capability_contract_digest,
                 "node_ids": sorted(self.nodes),
+                "legacy_evidence_digest": snapshot.legacy_evidence_digest,
             },
         )
         save_snapshot(self.paths, snapshot)
@@ -570,6 +740,7 @@ class Monitor:
             return snapshot
         self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
+        self._record_topology_projection(snapshot, "monitor.start")
         save_snapshot(self.paths, snapshot)
         return snapshot
 
@@ -577,6 +748,17 @@ class Monitor:
         self._reset_binding_cache()
         require_entry(self.paths, "resume:" + str(run_id), "resume")
         snapshot = load_snapshot(self.paths, run_id)
+        if isinstance(snapshot.workflow, dict):
+            result = verify_workflow(snapshot.workflow)
+            if result.get("status") != "complete":
+                raise PermissionError("required_workflow_blocked: {}".format(result.get("node", "unknown")))
+        legacy_allowed = self._legacy_binding_valid(snapshot.legacy_run, snapshot.legacy_evidence, snapshot.legacy_evidence_digest)
+        if "integration-review" in snapshot.nodes and snapshot.workflow is None and not legacy_allowed:
+            raise PermissionError("required_workflow_blocked: workflow")
+        if "integration-review" in snapshot.nodes and not legacy_allowed:
+            current_prd, current_spec = self._current_plan_digests()
+            if not self._lineage_matches_snapshot(snapshot, current_prd, current_spec):
+                raise PermissionError("integration lineage blocked_unknown: PRD/Spec source drift")
         checkpoint_path = self.paths.root / ".vibe" / "runs" / run_id / "monitor_checkpoint.json"
         if checkpoint_path.is_file():
             # Validate the recovery package before touching leases or polling.
@@ -614,6 +796,7 @@ class Monitor:
         if self._context_allows_dispatch(snapshot, runner):
             self._schedule_ready(snapshot, runner, recover_missing_reviewer=True)
         self._refresh_run_status(snapshot)
+        self._record_topology_projection(snapshot, "monitor.resume")
         save_snapshot(self.paths, snapshot)
         return snapshot
 
@@ -780,6 +963,7 @@ class Monitor:
         self._apply_reauthorization_transition(snapshot, transition)
         self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
+        self._refresh_execution_projection(snapshot, "monitor.reauthorize")
         save_snapshot(self.paths, snapshot)
         return snapshot
 
@@ -787,11 +971,32 @@ class Monitor:
         self._reset_binding_cache()
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
+        self._validate_execution_topology(snapshot)
         self._reconcile_unapplied_events(snapshot)
         self._poll_active_handles(snapshot, runner)
+        self._record_topology_projection(snapshot, "monitor.tick")
         if self._context_allows_dispatch(snapshot, runner):
             self._schedule_ready(snapshot, runner)
+        self._record_topology_projection(snapshot, "monitor.tick")
         self._refresh_run_status(snapshot)
+        save_snapshot(self.paths, snapshot)
+        return snapshot
+
+    def record_integration_review(self, run_id: str, evidence: Dict[str, Any]) -> RunSnapshot:
+        """Persist a validated integration review and refresh run closeout."""
+        self._reset_binding_cache()
+        snapshot = load_snapshot(self.paths, run_id)
+        self._require_snapshot_authorization(snapshot)
+        self._validate_execution_topology(snapshot)
+        _record_integration_review(snapshot, evidence)
+        self._record(snapshot, "integration_review_recorded", {
+            "run_id": snapshot.run_id,
+            "node_id": "integration-review",
+            "evidence": evidence,
+            "clearance": evidence.get("clearance"),
+        })
+        self._refresh_run_status(snapshot)
+        self._record_topology_projection(snapshot, "monitor.record_integration_review")
         save_snapshot(self.paths, snapshot)
         return snapshot
 
@@ -1019,6 +1224,7 @@ class Monitor:
             raise PermissionError("a valid executable-contract authorization is required")
         if record.node_ids != tuple(sorted(self.nodes)):
             raise PermissionError("authorization node scope does not match monitor scope")
+        self._execution_engine_binding(record)
 
     def _snapshot_record(self, snapshot: RunSnapshot) -> AuthorizationRecord:
         try:
@@ -1435,6 +1641,7 @@ class Monitor:
         recover_missing_reviewer: bool = False,
     ) -> None:
         record = self._require_snapshot_authorization(snapshot)
+        self._validate_execution_topology(snapshot)
         active_pairs = sum(
             1
             for node_id, current in snapshot.nodes.items()
@@ -1468,7 +1675,7 @@ class Monitor:
                     retry["successor_candidate"] = False
                     current["retryable_action"] = retry
             if (
-                current.get("status") in {"blocked_unknown", "running"}
+                current.get("status") in {"blocked_unknown", "running", "rework"}
                 and isinstance(retry, dict)
                 and node_id not in snapshot.handles
             ):
@@ -2393,6 +2600,21 @@ class Monitor:
                 )
                 return
             self._record_runner_event(snapshot, node_id, event, active)
+            if node_id == "integration-review":
+                # The integration node is read-only: findings never create a
+                # business writer. Preserve the reviewer lineage and queue the
+                # same visible reviewer task for re-review.
+                current["status"] = "rework"
+                current["active_role"] = None
+                current["active_task"] = None
+                snapshot.handles.pop(node_id, None)
+                current["retryable_action"] = {
+                    "role": "reviewer", "phase": "review", "continuation": True,
+                    "pending_schedule": True, "successor": False,
+                }
+                current.setdefault("integration_findings", []).append(redact_provider_text(event.data))
+                self._release_node_lease(snapshot, node_id)
+                return
             if self._is_implementation_finding(event.data):
                 current["active_role"] = None
                 current["active_task"] = None
@@ -3022,6 +3244,11 @@ class Monitor:
             data = record["data"]
             if data.get("run_id") != snapshot.run_id:
                 raise ValueError("unapplied event run lineage is inconsistent")
+            if record["event"] == "execution_topology_observed":
+                # System projection evidence is read-only metadata; legacy
+                # V3.9 replay must not interpret it as a node lifecycle event.
+                snapshot.event_sequence = record["sequence"]
+                continue
             if record["event"] == "authorization_reauthorized":
                 self._apply_reauthorization_transition(snapshot, data)
                 snapshot.event_sequence = record["sequence"]
@@ -3331,7 +3558,8 @@ class Monitor:
         for current in snapshot.nodes.values():
             current["user_status"] = map_user_status(current)
         statuses = [node.get("status") for node in snapshot.nodes.values()]
-        if statuses and all(status == "accepted" for status in statuses):
+        closeout = evaluate_v41_closeout(snapshot)
+        if closeout.allowed:
             snapshot.status = "complete"
         elif "blocked_unknown" in statuses:
             snapshot.status = "blocked_unknown"

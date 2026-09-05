@@ -4,9 +4,10 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import re
+from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional
 
-from .models import EVIDENCE_PRIORITY, IssueComplexity, TargetContract
+from .models import EVIDENCE_PRIORITY, IssueComplexity, TargetContract, IntegrationAcceptanceContract
 
 
 @dataclass(frozen=True)
@@ -366,6 +367,17 @@ _ENGLISH_ACTIONS = {
     "write",
 }
 
+REQUIRED_COMPLEX_WORKFLOW = (
+    "s0", "s1", "requirements", "product_decision", "prd", "spec_issue",
+    "dag_audit", "plan_confirmation", "authorization_card", "user_authorization",
+)
+
+
+def required_workflow_nodes(route):
+    """Return a fresh task's applicable mandatory nodes."""
+    value = route.route if isinstance(route, RouteResult) else route
+    return list(REQUIRED_COMPLEX_WORKFLOW if value == "complex" else ("s0", "s1"))
+
 
 def classify_s0(message: str) -> S0Result:
     """Apply a cheap rule screen; uncertain or multi-step text proceeds to S1."""
@@ -512,3 +524,41 @@ def approve_prd(prd: PRD, decisions: List[DecisionCard]) -> PRDResult:
     if blockers:
         return PRDResult(replace(prd, status="blocked_decision"), False, blockers)
     return PRDResult(replace(prd, status="approved"), True, [])
+
+
+def build_integration_acceptance_contract(plan) -> Optional[Dict[str, Any]]:
+    """Validate and project the five-part contract for a complex plan."""
+    if not hasattr(plan, "complexity_band"):
+        raise TypeError("plan is required")
+    if plan.complexity_band != "complex":
+        return None
+    contract = IntegrationAcceptanceContract.from_dict(plan.integration_contract)
+    prd_ref = str(plan.prd_path)
+    spec_ref = str(plan.spec_path)
+    def _valid_ref(value):
+        if not isinstance(value, str) or not value.strip() or value.startswith(("/", "~")):
+            return False
+        path = PurePosixPath(value)
+        return not path.is_absolute() and ".." not in path.parts and str(path) not in {"", "."}
+    if not _valid_ref(prd_ref) or not _valid_ref(spec_ref):
+        raise ValueError("PRD/Spec references must be project-relative")
+    result = contract.to_dict()
+    result["digest_inputs"] = {
+        "prd_ref": prd_ref,
+        "spec_ref": spec_ref,
+        "plan_revision": plan.version,
+    }
+    result["digest"] = contract.digest(prd_ref=prd_ref, spec_ref=spec_ref, plan_revision=plan.version)
+    return result
+
+
+def project_v41_integration_contract(plan):
+    """Return the V4.1 integration contract only for complex routing."""
+    if plan.complexity_band in {"simple", "light_plan", "light"}:
+        return None
+    return build_integration_acceptance_contract(plan)
+
+
+# DAG construction lives with DAG validation; re-export these public V4.1
+# helpers here for callers that treat planning as the entry point.
+from .dag import append_integration_review_node, is_integration_review_node, validate_integration_review_node

@@ -15,6 +15,7 @@ _ALLOWED_ACTIONS = ("accept", "commit", "develop", "review", "rework", "test")
 _LOCAL_MERGE_ACTION = "merge_local"
 _EXCLUDED_ACTIONS = ("create_mr", "deploy", "merge", "push")
 _HARD_EXCLUDED_ACTIONS = frozenset(("create_change_request", "deploy", "merge", "push"))
+_REMOTE_GIT_ACTIONS = frozenset(("commit", "push", "pr", "mr", "create_pr", "create_mr", "merge"))
 _ACTION_KEYS = {"action", "actions", "allowed_actions", "requested_actions"}
 # PR/MR and merge actions are valid only when explicitly present on a
 # confirmed card.  The generic ``create_change_request``/``merge`` forms stay
@@ -30,6 +31,19 @@ _SENSITIVE_NAMES = (
     "secret",
     "token",
 )
+
+
+def remote_git_actions_allowed(authorization, action):
+    """Apply the V4.1 product-facing remote Git switch; deploy stays separate."""
+    switch = getattr(authorization, "remote_git_actions", None)
+    if switch is None and isinstance(authorization, dict):
+        switch = authorization.get("remote_git_actions")
+    if not isinstance(action, str) or action.casefold() == "deploy":
+        return False
+    normalized = action.casefold()
+    if normalized not in _REMOTE_GIT_ACTIONS:
+        return False
+    return switch == "allow"
 
 
 def validate_git_action_target(action: Dict[str, Any]) -> None:
@@ -315,6 +329,18 @@ def _authorization_payload(
     node_contract_digest: str,
     decision_digest: str,
     active_pair_limit: int,
+    remote_git_actions: str = "deny",
+    required_workflow: Tuple[str, ...] = (),
+    skipped_nodes: Tuple[str, ...] = (),
+    integration_contract_digest: str = "",
+    integration_node_id: str = "",
+    integration_review_scope: Tuple[str, ...] = (),
+    execution_engine: str = "",
+    engine_mode: str = "",
+    engine_evidence_ref: str = "",
+    dag_revision: int = 0,
+    engine_authorization_digest: str = "",
+    explicit_execution_mode_override: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "schema_version": AUTHORIZATION_SCHEMA_VERSION,
@@ -329,6 +355,21 @@ def _authorization_payload(
         "node_contract_digest": node_contract_digest,
         "decision_digest": decision_digest,
         "active_pair_limit": active_pair_limit,
+        "remote_git_actions": remote_git_actions,
+        "required_workflow": tuple(required_workflow),
+        "skipped_nodes": tuple(skipped_nodes),
+        "integration_contract_digest": integration_contract_digest,
+        "integration_node_id": integration_node_id,
+        "integration_review_scope": tuple(integration_review_scope),
+        "execution_engine": execution_engine,
+        "engine_mode": engine_mode,
+        "engine_evidence_ref": engine_evidence_ref,
+        "dag_revision": dag_revision,
+        # The card digest itself is the immutable authorization binding.  The
+        # mirrored engine field is metadata and is intentionally excluded from
+        # its own hash to avoid a circular digest.
+        "engine_authorization_digest": "",
+        "explicit_execution_mode_override": explicit_execution_mode_override or {},
     }
 
 
@@ -347,6 +388,18 @@ class AuthorizationCard:
     active_pair_limit: int
     digest: str
     schema_version: int = AUTHORIZATION_SCHEMA_VERSION
+    remote_git_actions: str = "deny"
+    required_workflow: Tuple[str, ...] = ()
+    skipped_nodes: Tuple[str, ...] = ()
+    integration_contract_digest: str = ""
+    integration_node_id: str = ""
+    integration_review_scope: Tuple[str, ...] = ()
+    execution_engine: str = ""
+    engine_mode: str = ""
+    engine_evidence_ref: str = ""
+    dag_revision: int = 0
+    engine_authorization_digest: str = ""
+    explicit_execution_mode_override: Dict[str, Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -367,6 +420,18 @@ class AuthorizationRecord:
     digest: str
     agent_id: str = ""
     schema_version: int = AUTHORIZATION_SCHEMA_VERSION
+    remote_git_actions: str = "deny"
+    required_workflow: Tuple[str, ...] = ()
+    skipped_nodes: Tuple[str, ...] = ()
+    integration_contract_digest: str = ""
+    integration_node_id: str = ""
+    integration_review_scope: Tuple[str, ...] = ()
+    execution_engine: str = ""
+    engine_mode: str = ""
+    engine_evidence_ref: str = ""
+    dag_revision: int = 0
+    engine_authorization_digest: str = ""
+    explicit_execution_mode_override: Dict[str, Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -388,11 +453,28 @@ class AuthorizationRecord:
             "digest",
             "agent_id",
         }
-        if not isinstance(data, dict) or set(data) != required:
+        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override"}
+        if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
             raise ValueError("authorization record schema is invalid")
         if data["schema_version"] != AUTHORIZATION_SCHEMA_VERSION:
             raise ValueError("unsupported authorization record schema")
         converted = dict(data)
+        converted.setdefault("remote_git_actions", "deny")
+        if converted["remote_git_actions"] not in {"allow", "deny"}:
+            raise ValueError("authorization remote git action switch is invalid")
+        for key in ("required_workflow", "skipped_nodes", "integration_review_scope"):
+            converted.setdefault(key, ())
+            if not isinstance(converted[key], (list, tuple)) or not all(isinstance(item, str) for item in converted[key]):
+                raise ValueError("authorization record workflow sequence is invalid")
+            converted[key] = tuple(converted[key])
+        converted.setdefault("integration_contract_digest", "")
+        converted.setdefault("integration_node_id", "")
+        converted.setdefault("execution_engine", "")
+        converted.setdefault("engine_mode", "")
+        converted.setdefault("engine_evidence_ref", "")
+        converted.setdefault("dag_revision", 0)
+        converted.setdefault("engine_authorization_digest", "")
+        converted.setdefault("explicit_execution_mode_override", {})
         for key in (
             "node_ids",
             "file_scope",
@@ -496,6 +578,18 @@ def build_authorization_card(
     capabilities: AgentCapabilities,
     active_pair_limit: Optional[int] = None,
     allowed_actions: Optional[Tuple[str, ...]] = None,
+    remote_git_actions: str = "deny",
+    required_workflow: Optional[Tuple[str, ...]] = None,
+    skipped_nodes: Optional[Tuple[str, ...]] = None,
+    integration_contract: Optional[Dict[str, Any]] = None,
+    integration_contract_digest: Optional[str] = None,
+    integration_node_id: str = "",
+    integration_review_scope: Optional[Tuple[str, ...]] = None,
+    workflow: Optional[Dict[str, Any]] = None,
+    execution_engine: str = "",
+    engine_mode: str = "",
+    engine_evidence_ref: str = "",
+    explicit_execution_mode_override: Optional[Dict[str, Any]] = None,
 ) -> AuthorizationCard:
     node_ids = tuple(sorted(node.id for node in nodes))
     if node_ids != tuple(sorted(plan.node_ids)):
@@ -541,6 +635,66 @@ def build_authorization_card(
         allowed_actions = tuple(action.strip().casefold() for action in allowed_actions)
     if not _valid_action_scope(allowed_actions):
         raise ValueError("authorization action scope is invalid")
+    if remote_git_actions not in {"allow", "deny"}:
+        raise ValueError("remote_git_actions must be allow or deny")
+    if getattr(plan, "complexity_band", "") == "complex":
+        if not execution_engine:
+            execution_engine = "vibeguide_monitor"
+        if not engine_mode:
+            engine_mode = "dag"
+        if not engine_evidence_ref:
+            engine_evidence_ref = "unverified:legacy"
+        if (execution_engine != "vibeguide_monitor" or engine_mode != "dag") and not explicit_execution_mode_override:
+            raise ValueError("complex plans require vibeguide_monitor DAG execution engine")
+        if not isinstance(engine_evidence_ref, str) or not engine_evidence_ref.strip():
+            raise ValueError("execution engine evidence reference is required")
+    elif execution_engine or engine_mode or engine_evidence_ref:
+        raise ValueError("execution engine binding is only valid for complex plans")
+    if required_workflow is None:
+        from .planner import required_workflow_nodes
+        required_workflow = tuple(required_workflow_nodes(getattr(plan, "complexity_band", "")))
+    else:
+        required_workflow = tuple(required_workflow)
+    if skipped_nodes is not None and workflow is None and skipped_nodes:
+        raise ValueError("skipped nodes require workflow evidence")
+    if workflow is not None and not isinstance(workflow, dict):
+        raise ValueError("workflow evidence is invalid")
+    if workflow is not None and getattr(plan, "complexity_band", "") == "complex":
+        from .workflow_gate import verify_workflow
+        verification = verify_workflow(workflow)
+        if verification.get("status") != "complete":
+            raise ValueError("workflow evidence is incomplete or invalid")
+    workflow_records = (workflow or {}).get("node_records", {}) if workflow else {}
+    derived_skips = tuple(sorted(node_id for node_id, rec in workflow_records.items() if isinstance(rec, dict) and rec.get("status") == "skipped_by_user"))
+    skipped_nodes = tuple(skipped_nodes) if skipped_nodes is not None else derived_skips
+    if workflow is not None and tuple(skipped_nodes) != derived_skips:
+        raise ValueError("skipped nodes do not match workflow evidence")
+    integration = next((node for node in nodes if node.id == "integration-review"), None)
+    integration_node_id = integration_node_id or (integration.id if integration else "")
+    if integration_contract is None:
+        integration_contract = getattr(plan, "integration_contract", {}) or (integration.contract if integration else {})
+    computed_integration_digest = _canonical_digest(integration_contract) if integration_contract else ""
+    if integration_contract_digest is not None and integration_contract_digest != computed_integration_digest:
+        raise ValueError("integration contract digest does not match projection")
+    integration_contract_digest = computed_integration_digest
+    if integration_review_scope is None:
+        integration_review_scope = ("整合 Review", "独立 reviewer", "P0–P2 清零", "只读聚合证据") if integration else ()
+    integration_review_scope = tuple(integration_review_scope)
+    if getattr(plan, "complexity_band", "") == "complex":
+        from .planner import REQUIRED_COMPLEX_WORKFLOW
+        if required_workflow != tuple(REQUIRED_COMPLEX_WORKFLOW):
+            raise ValueError("complex authorization must bind the complete required workflow")
+        if any(item not in node_ids for item in skipped_nodes):
+            raise ValueError("skipped node is outside the authorized DAG")
+        if integration is None or integration_node_id != "integration-review":
+            raise ValueError("complex authorization requires the integration review node")
+        if not integration_review_scope:
+            raise ValueError("integration review scope is required")
+        if not integration_contract:
+            raise ValueError("integration acceptance contract is required")
+        plan_contract = getattr(plan, "integration_contract", {}) or {}
+        if integration_contract != plan_contract:
+            raise ValueError("integration contract override does not match plan projection")
     decision_digest = _canonical_digest(
         {
             "decisions": plan.decisions,
@@ -559,14 +713,29 @@ def build_authorization_card(
         contract_digest,
         decision_digest,
         active_pair_limit,
+        remote_git_actions,
+        required_workflow,
+        skipped_nodes,
+        integration_contract_digest,
+        integration_node_id,
+        integration_review_scope,
+        execution_engine,
+        engine_mode,
+        engine_evidence_ref,
+        plan.version,
+        "",
+        explicit_execution_mode_override,
     )
-    return AuthorizationCard(digest=_canonical_digest(canonical), **canonical)
+    digest = _canonical_digest(canonical)
+    canonical["engine_authorization_digest"] = digest
+    return AuthorizationCard(digest=digest, **canonical)
 
 
 def refresh_authorization_card(
     plan: Plan,
     nodes: List[DAGNode],
     previous: AuthorizationCard,
+    workflow: Optional[Dict[str, Any]] = None,
 ) -> AuthorizationCard:
     """Rebuild a same-plan card while retaining its approved agent/capacity scope."""
 
@@ -586,12 +755,24 @@ def refresh_authorization_card(
         False,
         "guide",
     )
+    if getattr(plan, "complexity_band", "") == "complex" and workflow is None:
+        raise ValueError("complex reauthorization requires preserved workflow evidence")
     return build_authorization_card(
         plan,
         nodes,
         capabilities,
         active_pair_limit=previous.active_pair_limit,
         allowed_actions=previous.allowed_actions,
+        remote_git_actions=previous.remote_git_actions,
+        required_workflow=previous.required_workflow,
+        skipped_nodes=previous.skipped_nodes,
+        integration_node_id=previous.integration_node_id,
+        integration_review_scope=previous.integration_review_scope,
+        workflow=workflow,
+        execution_engine=previous.execution_engine,
+        engine_mode=previous.engine_mode,
+        engine_evidence_ref=previous.engine_evidence_ref,
+        explicit_execution_mode_override=previous.explicit_execution_mode_override,
     )
 
 
@@ -621,6 +802,15 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         card.node_contract_digest,
         card.decision_digest,
         card.active_pair_limit,
+        card.remote_git_actions,
+        card.required_workflow, card.skipped_nodes, card.integration_contract_digest,
+        card.integration_node_id, card.integration_review_scope,
+        card.execution_engine,
+        card.engine_mode,
+        card.engine_evidence_ref,
+        card.dag_revision,
+        card.engine_authorization_digest,
+        card.explicit_execution_mode_override,
     )
     if card.schema_version != AUTHORIZATION_SCHEMA_VERSION:
         raise ValueError("unsupported authorization card schema")
@@ -641,6 +831,18 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         active_pair_limit=card.active_pair_limit,
         digest=card.digest,
         agent_id=card.agent_id,
+        remote_git_actions=card.remote_git_actions,
+        required_workflow=card.required_workflow,
+        skipped_nodes=card.skipped_nodes,
+        integration_contract_digest=card.integration_contract_digest,
+        integration_node_id=card.integration_node_id,
+        integration_review_scope=card.integration_review_scope,
+        execution_engine=card.execution_engine,
+        engine_mode=card.engine_mode,
+        engine_evidence_ref=card.engine_evidence_ref,
+        dag_revision=card.dag_revision,
+        engine_authorization_digest=card.engine_authorization_digest,
+        explicit_execution_mode_override=card.explicit_execution_mode_override,
     )
 
 
@@ -676,6 +878,8 @@ def is_authorization_valid(
 def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
     if record.schema_version != AUTHORIZATION_SCHEMA_VERSION:
         return False
+    if record.remote_git_actions not in {"allow", "deny"}:
+        return False
     if not _valid_action_scope(record.allowed_actions) or record.excluded_actions != _EXCLUDED_ACTIONS:
         return False
     canonical = _authorization_payload(
@@ -690,9 +894,21 @@ def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
         record.node_contract_digest,
         record.decision_digest,
         record.active_pair_limit,
+        record.remote_git_actions,
+        record.required_workflow, record.skipped_nodes, record.integration_contract_digest,
+        record.integration_node_id, record.integration_review_scope,
+        record.execution_engine, record.engine_mode, record.engine_evidence_ref,
+        record.dag_revision, record.engine_authorization_digest,
+        record.explicit_execution_mode_override,
     )
     if not secrets.compare_digest(record.digest, _canonical_digest(canonical)):
-        return False
+        # V3/V4 records pre-dating execution-engine binding remain readable
+        # as legacy evidence; they never grant the new complex engine gate.
+        legacy = dict(canonical)
+        for key in ("execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest"):
+            legacy.pop(key, None)
+        if not secrets.compare_digest(record.digest, _canonical_digest(legacy)):
+            return False
     return True
 
 
@@ -786,6 +1002,11 @@ def can_create_change_request(evidence: Any, authorization: Any) -> bool:
     if not isinstance(evidence, dict):
         return False
     action = str(evidence.get("action", "")).strip().casefold()
+    switch = getattr(authorization, "remote_git_actions", None)
+    if switch is None and isinstance(authorization, dict):
+        switch = authorization.get("remote_git_actions")
+    if switch is not None and not remote_git_actions_allowed(authorization, action):
+        return False
     if action not in {"create_pr", "create_mr"} or action not in _authorization_actions(authorization):
         return False
     contract = evidence.get("target_contract")
@@ -807,6 +1028,12 @@ def can_auto_merge(evidence: Any, authorization: Any) -> bool:
     if not isinstance(evidence, dict):
         return False
     action = str(evidence.get("action", "")).strip().casefold()
+    if action == "merge_remote":
+        switch = getattr(authorization, "remote_git_actions", None)
+        if switch is None and isinstance(authorization, dict):
+            switch = authorization.get("remote_git_actions")
+        if switch is not None and not remote_git_actions_allowed(authorization, "merge"):
+            return False
     if action not in {"merge_local", "merge_remote"} or action not in _authorization_actions(authorization):
         return False
     if not (_final_review_and_bindings_ok(evidence) and _target_is_frozen_and_matching(evidence)):

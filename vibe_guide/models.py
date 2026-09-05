@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Dict, List, Optional
 import re
 
@@ -241,6 +242,7 @@ class Plan:
         default_factory=lambda: list(EVIDENCE_PRIORITY)
     )
     nodes: List[DAGNode] = field(default_factory=list)
+    integration_contract: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         self.plan_id = _identifier(self.plan_id, "plan id")
@@ -335,6 +337,9 @@ class Plan:
             raise ValueError("plan evidence priority is fixed")
         if not isinstance(self.nodes, list):
             raise TypeError("plan nodes must be a list")
+        if not isinstance(self.integration_contract, dict):
+            raise TypeError("integration_contract must be a dictionary")
+        self.integration_contract = _json_safe(self.integration_contract)
         normalized_nodes = []
         for item in self.nodes:
             if isinstance(item, DAGNode):
@@ -462,6 +467,104 @@ class TargetContract:
         values.pop("digest", None)
         values.pop("repository_project", None)
         return cls(**values)
+
+
+@dataclass(frozen=True)
+class IntegrationAcceptanceContract:
+    """Five-part acceptance contract required for complex V4.1 plans."""
+
+    iteration_context: Dict[str, Any]
+    compatibility_scope: List[str]
+    agentsmd_acceptance_refs: List[str]
+    integration_acceptance_contract: Dict[str, Any]
+    unverified_or_excluded: List[str]
+
+    def __post_init__(self):
+        if not isinstance(self.iteration_context, dict) or not self.iteration_context:
+            raise TypeError("iteration_context must be a non-empty dictionary")
+        if self.iteration_context.get("kind") != "iteration":
+            raise ValueError("iteration_context.kind must be iteration")
+        for name in ("compatibility_scope", "agentsmd_acceptance_refs", "unverified_or_excluded"):
+            values = getattr(self, name)
+            if not isinstance(values, list) or not values or not all(isinstance(v, str) and v.strip() for v in values):
+                raise TypeError("%s must be a non-empty list of strings" % name)
+            normalized = [v.strip() for v in values]
+            if len({v.casefold() for v in normalized}) != len(normalized):
+                raise ValueError("%s must not contain duplicates" % name)
+            object.__setattr__(self, name, tuple(normalized))
+        if not isinstance(self.integration_acceptance_contract, dict) or not self.integration_acceptance_contract:
+            raise TypeError("integration_acceptance_contract must be a non-empty dictionary")
+        def _freeze(value):
+            if isinstance(value, dict):
+                return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+            if isinstance(value, list):
+                return tuple(_freeze(item) for item in value)
+            return value
+        safe = _freeze(_json_safe(self.iteration_context))
+        object.__setattr__(self, "iteration_context", safe)
+        acceptance = _freeze(_json_safe(self.integration_acceptance_contract))
+        object.__setattr__(self, "integration_acceptance_contract", acceptance)
+        def _check(value):
+            if isinstance(value, (dict, MappingProxyType)):
+                for key, item in value.items():
+                    if any(marker in key.casefold() for marker in ("token", "password", "secret", "credential", "private_key")):
+                        raise ValueError("credentials are not allowed in integration contract")
+                    _check(item)
+            elif isinstance(value, list):
+                for item in value:
+                    _check(item)
+            elif isinstance(value, str) and (value.startswith("/") or value.startswith("~")):
+                raise ValueError("absolute user paths are not allowed in integration contract")
+        _check(safe)
+        _check(acceptance)
+        if "based_on" in safe and "previous_iteration" in safe and safe["based_on"] != safe["previous_iteration"]:
+            raise ValueError("iteration context sources disagree")
+        excluded = {item.casefold() for item in self.unverified_or_excluded}
+        scope = {item.casefold() for item in self.compatibility_scope}
+        if excluded & scope:
+            raise ValueError("compatibility scope conflicts with unverified/excluded items")
+        for item in self.agentsmd_acceptance_refs:
+            if item.startswith("/") or ".." in Path(item).parts:
+                raise ValueError("agentsmd references must be project-relative")
+
+    def to_dict(self) -> Dict[str, Any]:
+        def _thaw(value):
+            if isinstance(value, dict):
+                return {key: _thaw(item) for key, item in value.items()}
+            if isinstance(value, MappingProxyType):
+                return {key: _thaw(item) for key, item in value.items()}
+            if isinstance(value, tuple):
+                return [_thaw(item) for item in value]
+            return value
+        return _thaw({"iteration_context": self.iteration_context, "compatibility_scope": self.compatibility_scope, "agentsmd_acceptance_refs": self.agentsmd_acceptance_refs, "integration_acceptance_contract": self.integration_acceptance_contract, "unverified_or_excluded": self.unverified_or_excluded})
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "IntegrationAcceptanceContract":
+        if not isinstance(data, dict):
+            raise TypeError("integration acceptance contract data must be a dictionary")
+        required = {"iteration_context", "compatibility_scope", "agentsmd_acceptance_refs", "integration_acceptance_contract", "unverified_or_excluded"}
+        optional = {"digest_inputs", "digest"}
+        if not required.issubset(data) or set(data) - required - optional:
+            raise ValueError("integration acceptance contract schema is invalid")
+        values = {key: data[key] for key in required}
+        result = cls(**values)
+        if "digest_inputs" in data or "digest" in data:
+            if "digest_inputs" not in data or "digest" not in data:
+                raise ValueError("digest metadata must be complete")
+            inputs = data["digest_inputs"]
+            if not isinstance(inputs, dict) or set(inputs) != {"prd_ref", "spec_ref", "plan_revision"}:
+                raise ValueError("digest inputs are invalid")
+            if (not isinstance(inputs["prd_ref"], str) or not inputs["prd_ref"] or inputs["prd_ref"].startswith(("/", "~"))
+                    or not isinstance(inputs["spec_ref"], str) or not inputs["spec_ref"] or inputs["spec_ref"].startswith(("/", "~"))
+                    or isinstance(inputs["plan_revision"], bool) or not isinstance(inputs["plan_revision"], int) or inputs["plan_revision"] < 1):
+                raise ValueError("digest inputs are invalid")
+            if data["digest"] != result.digest(**inputs):
+                raise ValueError("integration contract digest mismatch")
+        return result
+
+    def digest(self, *, prd_ref: str = "", spec_ref: str = "", plan_revision: int = 1) -> str:
+        payload = {"prd_ref": prd_ref, "spec_ref": spec_ref, "plan_revision": plan_revision, "contract": self.to_dict()}
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 @dataclass
