@@ -30,6 +30,7 @@ from .binding_lifecycle import (
     RequestedBindingPolicy,
     verify_binding as verify_v4_binding,
 )
+from .lifecycle import migrate_task_record, normalize_task_status
 
 
 REGISTRY_SCHEMA_VERSION = 1
@@ -98,6 +99,7 @@ class TaskBinding:
     binding_observation: Optional[Dict[str, Any]] = None
     binding_state: str = "blocked_unknown"
     business_write_allowed: bool = False
+    legacy: Dict[str, Any] = field(default_factory=dict)
     schema_version: int = BINDING_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -305,6 +307,7 @@ class TaskBinding:
             "route_digest": self.route_digest,
             "model": self.model,
             "reasoning": self.reasoning,
+            "legacy": dict(self.legacy),
         }
         if self.binding_intent is not None:
             result["binding_intent"] = (
@@ -348,7 +351,7 @@ class TaskBinding:
             "limitations",
             "generation",
         }
-        optional = {"binding_intent", "binding_observation", "binding_state", "business_write_allowed"}
+        optional = {"binding_intent", "binding_observation", "binding_state", "business_write_allowed", "legacy"}
         allowed = expected | {"allowlist", "capability_contract_digest", "successor_of", "route_digest", "model", "reasoning"} | optional
         if not isinstance(data, dict) or not set(data).issubset(allowed) or not expected.issubset(data):
             raise ValueError("task binding record schema is invalid")
@@ -363,6 +366,7 @@ class TaskBinding:
         normalized.setdefault("binding_observation", None)
         normalized.setdefault("binding_state", "blocked_unknown")
         normalized.setdefault("business_write_allowed", False)
+        normalized.setdefault("legacy", {})
         if normalized["binding_state"] == "binding_verified":
             normalized["binding_state"] = "blocked_unknown"
             normalized["business_write_allowed"] = False
@@ -423,7 +427,36 @@ def _read_registry(
         raise ValueError("task registry revision is invalid")
     if not isinstance(raw["bindings"], list):
         raise ValueError("task registry bindings must be a list")
-    bindings = [TaskBinding.from_dict(item) for item in raw["bindings"]]
+    bindings = []
+    for item in raw["bindings"]:
+        migrated = migrate_task_record(item)
+        # The registry stores the provider binding schema; migration is the
+        # only place legacy aliases are read.  Pending setup records cannot be
+        # materialized as visible TaskBinding objects until a real identity is
+        # observed, so fail closed instead of inventing one.
+        if migrated.get("status") == "SETUP_PENDING":
+            # Provider setup placeholders are handled by the visible adapter;
+            # the registry keeps their original schema until real identity is
+            # observed, rather than inventing a TaskBinding identity.
+            migrated = dict(item)
+        # Preserve already-canonical records byte-for-byte; migration only
+        # changes records that actually carry legacy aliases.
+        if not any(key in item for key in ("clientThreadId", "client_thread_id", "threadId", "thread_id")) and item.get("status") not in {"DELIVERY_COMPLETE", "delivered"}:
+            migrated = dict(item)
+        had_legacy_alias = any(key in item for key in ("thread_id", "host_id", "client_thread_id", "clientThreadId")) or item.get("status") == "DELIVERY_COMPLETE"
+        migrated["legacy"] = dict(migrated.get("legacy") or {}) if had_legacy_alias else {}
+        if "thread_id" in migrated and "threadId" not in migrated:
+            migrated["threadId"] = migrated["thread_id"]
+        if "host_id" in migrated and "hostId" not in migrated:
+            migrated["hostId"] = migrated["host_id"]
+        migrated.pop("thread_id", None)
+        migrated.pop("host_id", None)
+        migrated.pop("clientThreadId", None)
+        migrated.pop("client_thread_id", None)
+        status = migrated.get("status")
+        if isinstance(status, str):
+            migrated["status"] = status.casefold()
+        bindings.append(TaskBinding.from_dict(migrated))
     if expected_run_id is not None:
         validate_run_id(expected_run_id)
         if any(binding.run_id != expected_run_id for binding in bindings):

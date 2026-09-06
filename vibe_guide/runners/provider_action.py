@@ -1136,7 +1136,9 @@ class ProviderActionRunner(Runner):
         metadata["terminal_confirmed"] = True
         self.store._atomic(self._handle_path(handle.run_id), metadata)
         data = dict(claims)
-        for key in ("evidence", "finding", "in_contract", "consistency"):
+        for key in ("evidence", "finding", "in_contract", "consistency",
+                    "delivery_evidence", "completion_marker", "delivery_path",
+                    "thread_status"):
             if key in result:
                 data[key] = result[key]
         return [RunEvent(str(event_name), data)]

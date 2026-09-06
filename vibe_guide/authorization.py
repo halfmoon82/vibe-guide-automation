@@ -16,6 +16,7 @@ _LOCAL_MERGE_ACTION = "merge_local"
 _EXCLUDED_ACTIONS = ("create_mr", "deploy", "merge", "push")
 _HARD_EXCLUDED_ACTIONS = frozenset(("create_change_request", "deploy", "merge", "push"))
 _REMOTE_GIT_ACTIONS = frozenset(("commit", "push", "pr", "mr", "create_pr", "create_mr", "merge"))
+_REMOTE_GIT_ACTIONS_SCOPE = ("commit", "push", "create_pr", "create_mr", "merge")
 _ACTION_KEYS = {"action", "actions", "allowed_actions", "requested_actions"}
 # PR/MR and merge actions are valid only when explicitly present on a
 # confirmed card.  The generic ``create_change_request``/``merge`` forms stay
@@ -402,7 +403,15 @@ class AuthorizationCard:
     explicit_execution_mode_override: Dict[str, Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        # Keep the signed contract unchanged while making the user-facing
+        # remote-action choice explicit in plan artifacts and authorization UI.
+        result.update({
+            "remote_git_actions_options": ["allow", "deny"],
+            "remote_git_actions_scope": list(_REMOTE_GIT_ACTIONS_SCOPE),
+            "deploy_authorization": "separate",
+        })
+        return result
 
 
 @dataclass(frozen=True)
@@ -434,7 +443,13 @@ class AuthorizationRecord:
     explicit_execution_mode_override: Dict[str, Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        result.update({
+            "remote_git_actions_options": ["allow", "deny"],
+            "remote_git_actions_scope": list(_REMOTE_GIT_ACTIONS_SCOPE),
+            "deploy_authorization": "separate",
+        })
+        return result
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AuthorizationRecord":
@@ -453,12 +468,14 @@ class AuthorizationRecord:
             "digest",
             "agent_id",
         }
-        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override"}
+        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"}
         if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
             raise ValueError("authorization record schema is invalid")
         if data["schema_version"] != AUTHORIZATION_SCHEMA_VERSION:
             raise ValueError("unsupported authorization record schema")
         converted = dict(data)
+        for key in ("remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"):
+            converted.pop(key, None)
         converted.setdefault("remote_git_actions", "deny")
         if converted["remote_git_actions"] not in {"allow", "deny"}:
             raise ValueError("authorization remote git action switch is invalid")

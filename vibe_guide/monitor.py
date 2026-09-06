@@ -76,8 +76,77 @@ from .brief import ImplementationBrief, validate_implementation_brief
 from .manifest import RunManifest
 from .evidence import (
     evaluate_v41_closeout,
+    evaluate_delivery_evidence,
     record_integration_review as _record_integration_review,
 )
+
+
+def reconcile_pending_binding(snapshot: Any, node_id: str, runner: Any) -> bool:
+    """Reconcile a provider setup placeholder without creating a successor.
+
+    A ``clientThreadId`` is only a setup handle.  Until the provider returns an
+    exact real task identity this function keeps the existing generation and
+    writer lease, marks the node retryable, and returns ``False``.
+    """
+    nodes = snapshot.get("nodes") if isinstance(snapshot, dict) else getattr(snapshot, "nodes", None)
+    if not isinstance(nodes, dict) or not isinstance(node_id, str):
+        return False
+    node = nodes.get(node_id)
+    if not isinstance(node, dict):
+        return False
+    binding = node.get("binding") or node.get("active_binding") or node.get("task")
+    client_id = None
+    if isinstance(binding, dict):
+        client_id = binding.get("clientThreadId") or binding.get("client_thread_id")
+    client_id = client_id or node.get("clientThreadId") or node.get("client_thread_id")
+    thread_id = binding.get("threadId") if isinstance(binding, dict) else node.get("threadId")
+    if not client_id or thread_id:
+        return False
+    # Only a verified provider locate/list operation may promote the identity.
+    try:
+        resolver = getattr(runner, "resolve_pending", None)
+        resolved = resolver(binding) if callable(resolver) else None
+    except Exception:
+        resolved = None
+    if not isinstance(resolved, dict) and resolved is not None and hasattr(resolved, "__dict__"):
+        resolved = dict(resolved.__dict__)
+    if isinstance(resolved, dict) and resolved.get("threadId"):
+        expected_host = binding.get("hostId") or binding.get("host") if isinstance(binding, dict) else None
+        observed_host = resolved.get("hostId") or resolved.get("host")
+        required_identity = ("provider", "status", "clientThreadId", "issue_id", "role", "generation")
+        if any(resolved.get(key) in (None, "") for key in required_identity) or not expected_host or not observed_host:
+            resolved = None
+        elif resolved.get("clientThreadId") != client_id:
+            resolved = None
+        if resolved is None:
+            pass
+        elif not isinstance(binding, dict) or not binding.get("provider") or resolved.get("provider") != binding.get("provider"):
+            resolved = None
+        elif expected_host and observed_host != expected_host:
+            resolved = None
+        elif isinstance(binding, dict) and resolved.get("clientThreadId") != client_id:
+            # A locate result for a different setup request must never be
+            # promoted in place: doing so would silently change the writer
+            # identity while retaining the old generation and lease.
+            resolved = None
+        elif isinstance(binding, dict) and resolved.get("issue_id") != binding.get("issue_id"):
+            resolved = None
+        elif isinstance(binding, dict) and resolved.get("role") != binding.get("role"):
+            resolved = None
+        elif isinstance(binding, dict) and resolved.get("generation") != binding.get("generation"):
+            resolved = None
+        elif resolved.get("status") not in ("verified", "visible"):
+            resolved = None
+    if isinstance(resolved, dict) and resolved.get("threadId"):
+        target = binding if isinstance(binding, dict) else node
+        target["threadId"] = resolved["threadId"]
+        target["clientThreadId"] = client_id
+        return True
+    node["status"] = "retry_pending"
+    node["retryable_action"] = {"action": "reconcile_pending_binding", "clientThreadId": client_id}
+    node.setdefault("generation", 1)
+    node["successor"] = None
+    return False
 
 
 def _user_status(record: Dict[str, Any]) -> str:
@@ -2525,6 +2594,16 @@ class Monitor:
             current["retryable_action"] = None
 
         if event.event in {"delivered", "complete"}:
+            if snapshot.execution_engine == "vibeguide_monitor":
+                delivery = event.data.get("delivery_evidence")
+                gate = evaluate_delivery_evidence(
+                    {**current, "status": "DELIVERED"},
+                    self._load_task_binding(snapshot, node_id, role),
+                    delivery,
+                )
+                if not gate.complete:
+                    self._mark_blocked_unknown(snapshot, node_id, "; ".join(gate.reasons))
+                    return
             self._record_runner_event(snapshot, node_id, event, active)
             if role != "developer":
                 try:

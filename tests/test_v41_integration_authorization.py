@@ -24,6 +24,31 @@ class IntegrationAuthorizationTests(unittest.TestCase):
         self.assertIn("deploy", card.excluded_actions)
         self.assertIn("merge", card.excluded_actions)
 
+    def test_card_projects_remote_action_choices_and_scope(self):
+        plan, nodes = self._plan_nodes()
+        card = build_authorization_card(
+            plan, nodes,
+            AgentCapabilities("codex", True, True, True, True, True, "full"),
+            remote_git_actions="deny",
+        )
+        projected = card.to_dict()
+        self.assertEqual(projected["remote_git_actions"], "deny")
+        self.assertEqual(projected["remote_git_actions_options"], ["allow", "deny"])
+        self.assertEqual(
+            projected["remote_git_actions_scope"],
+            ["commit", "push", "create_pr", "create_mr", "merge"],
+        )
+        self.assertEqual(projected["deploy_authorization"], "separate")
+
+    def test_card_preserves_explicit_remote_allow(self):
+        plan, nodes = self._plan_nodes()
+        card = build_authorization_card(
+            plan, nodes,
+            AgentCapabilities("codex", True, True, True, True, True, "full"),
+            remote_git_actions="allow",
+        )
+        self.assertEqual(card.to_dict()["remote_git_actions"], "allow")
+
     def test_explicit_skip_is_recorded(self):
         plan, nodes = self._plan_nodes()
         with self.assertRaises(ValueError):

@@ -13,6 +13,43 @@ from .state import _atomic_bytes, run_dir
 
 
 @dataclass(frozen=True)
+class DeliveryEvidence:
+    status: str
+    reasons: List[str]
+
+    @property
+    def complete(self) -> bool:
+        return self.status == "DELIVERED"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"status": self.status, "reasons": list(self.reasons)}
+
+
+def evaluate_delivery_evidence(node: Any, binding: Any, artifacts: Any) -> DeliveryEvidence:
+    """Require complete, current delivery evidence before dependency unlock."""
+    get = lambda value, key, default=None: value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+    reasons: List[str] = []
+    if get(node, "status") not in {"DELIVERED", "delivered"}:
+        reasons.append("canonical delivered state is missing")
+    if get(binding, "task_id") in (None, "") and get(binding, "threadId") in (None, ""):
+        reasons.append("task identity is missing")
+    if get(binding, "host") in (None, "") and get(binding, "hostId") in (None, ""):
+        reasons.append("host identity is missing")
+    if get(binding, "worktree") in (None, "") or get(binding, "branch") in (None, ""):
+        reasons.append("worktree or branch is missing")
+    if get(binding, "cursor") in (None, ""):
+        reasons.append("current cursor is missing")
+    if not isinstance(artifacts, dict) or not artifacts.get("completion_marker"):
+        reasons.append("completion marker is missing")
+    if not isinstance(artifacts, dict) or not artifacts.get("delivery_path"):
+        reasons.append("delivery path is missing")
+    thread_status = get(artifacts, "thread_status")
+    if thread_status not in {"complete", "completed", "DELIVERED"}:
+        reasons.append("terminal thread status is missing")
+    return DeliveryEvidence("DELIVERED" if not reasons else "blocked_unknown", reasons)
+
+
+@dataclass(frozen=True)
 class GenerationEvidence:
     run_id: str
     issue_id: str

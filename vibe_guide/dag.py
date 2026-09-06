@@ -49,6 +49,13 @@ def append_integration_review_node(plan: Plan) -> Plan:
         "reviewer": INTEGRATION_REVIEWER_ID,
         "allowlist": [],
     })
+    # Keep the synthetic integration reviewer on the same verified adapter
+    # route as the business nodes so authorization can enforce one binding.
+    for node in business_nodes:
+        adapter_id = str(node.contract.get("adapter_id", "")).strip()
+        if adapter_id:
+            contract["adapter_id"] = adapter_id
+            break
     integration = DAGNode(
         INTEGRATION_REVIEW_NODE_ID,
         "Final integration review",

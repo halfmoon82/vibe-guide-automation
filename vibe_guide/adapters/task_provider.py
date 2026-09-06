@@ -491,7 +491,36 @@ class CodexAppBridge:
         _require_keys(request, ("prompt", "target"), "create_thread")
         if not isinstance(request["prompt"], str) or not isinstance(request["target"], Mapping):
             raise ProviderUnavailable("Codex create_thread request has invalid types")
-        return self._create_thread(dict(request))
+        # Keep supervisor metadata in the durable action envelope, but never
+        # forward it to the native tool.  The public Codex App schema rejects
+        # unknown arguments (for example issue_id, worker_profile, binding).
+        public = {
+            key: request[key]
+            for key in ("prompt", "model", "thinking", "title")
+            if key in request
+        }
+        target = request["target"]
+        public_target = {
+            key: target[key]
+            for key in ("type", "projectId", "environment")
+            if key in target
+        }
+        if isinstance(public_target.get("environment"), Mapping):
+            environment = public_target["environment"]
+            public_target["environment"] = {
+                key: environment[key]
+                for key in ("type", "startingState")
+                if key in environment
+            }
+            if isinstance(public_target["environment"].get("startingState"), Mapping):
+                starting = public_target["environment"]["startingState"]
+                public_target["environment"]["startingState"] = {
+                    key: starting[key]
+                    for key in ("type", "branchName")
+                    if key in starting
+                }
+        public["target"] = public_target
+        return self._create_thread(public)
 
     def enter_or_locate(self, binding: TaskBinding):
         self._require_real(binding)

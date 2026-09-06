@@ -26,6 +26,7 @@ from .initializer import apply_agentsmd_proposal, init_project
 from .upgrade import upgrade_project
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState
 from .monitor import Monitor
+from .supervisor import Supervisor
 from .change_requests import ChangeRequest, classify_merge_capability
 from .deploy import authorize_deploy, plan_deploy, verify_deploy, start_deploy
 from .paths import ProjectPaths
@@ -93,6 +94,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest")
     parser.add_argument("--acceptance-state")
     parser.add_argument("--observations")
+    parser.add_argument("--watch", action="store_true", dest="watch")
     parser.add_argument("--mode", choices=("layered", "bundled"), default="layered")
     return parser
 
@@ -211,6 +213,8 @@ def _plan_root(paths: ProjectPaths, plan_id: str) -> Path:
 
 def _authorization_card(data: Dict[str, Any]) -> AuthorizationCard:
     converted = dict(data)
+    for key in ("remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"):
+        converted.pop(key, None)
     for key in (
         "node_ids",
         "file_scope",
@@ -357,6 +361,7 @@ def _publish_plan(
         capabilities,
         active_pair_limit=source.get("active_pair_limit"),
         allowed_actions=source.get("allowed_actions"),
+        remote_git_actions=source.get("remote_git_actions", "deny"),
     )
 
     plans_root = destination.parent
@@ -593,7 +598,7 @@ def _require_public_execution_gate(
     raise PermissionError("planning_required: " + ", ".join(gate.missing))
 
 
-def _snapshot_result(command: str, snapshot: Any, as_json: bool) -> CLIResult:
+def _snapshot_result(command: str, snapshot: Any, as_json: bool, continuation: str = "manual") -> CLIResult:
     retry_pending = any(
         isinstance(node.get("retryable_action"), dict)
         and node.get("status") == "running"
@@ -607,6 +612,7 @@ def _snapshot_result(command: str, snapshot: Any, as_json: bool) -> CLIResult:
         "run_id": snapshot.run_id,
         "nodes": snapshot.nodes,
         "closeout_status": render_v41_closeout_status(snapshot),
+        "continuation": continuation,
     }
     if retry_pending or snapshot.status == "blocked_unknown":
         code = UNKNOWN
@@ -1121,6 +1127,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             "route": "complex",
             "plan": plan.to_dict(),
             "nodes": [node.id for node in nodes],
+            "authorization_card": card.to_dict(),
             "authorization_digest": card.digest,
         }
         return _result(
@@ -1302,7 +1309,19 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工状态未知：" + str(error),
                 args.as_json,
             )
-        return _snapshot_result("monitor", snapshot, args.as_json)
+        if args.watch:
+            supervisor = Supervisor(paths, Monitor(paths, plan, nodes), runner, snapshot.run_id)
+            lease_result = supervisor.recover_or_start()
+            if not lease_result.get("active_supervisors"):
+                return _result(
+                    UNKNOWN,
+                    {"command": "monitor", "status": "blocked_unknown", "reason": "supervisor lease is held"},
+                    "监工租约已被其他进程持有",
+                    args.as_json,
+                )
+            snapshot = supervisor.watch()
+            return _snapshot_result("monitor", snapshot, args.as_json, "supervisor")
+        return _snapshot_result("monitor", snapshot, args.as_json, "manual")
 
     if args.command == "reconcile":
         try:

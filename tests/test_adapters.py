@@ -217,6 +217,26 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(calls[2], ("wait", {"targets": [{"threadId": "thread-1", "hostId": "host-1", "afterCursor": "c1"}], "timeoutMs": 120000}))
         self.assertEqual((update.cursor, update.status), ("c2", "complete"))
 
+    def test_codex_create_projects_only_public_tool_arguments(self):
+        captured = {}
+        def create(request):
+            captured.update(request)
+            return {"threadId": "thread-1", "hostId": "host-1"}
+
+        bridge, _ = codex_bridge(create_thread=create)
+        bridge.create({
+            "prompt": "work",
+            "target": {"type": "project", "projectId": "project-1", "environment": {"type": "local"}},
+            "model": "gpt-5.6-sol",
+            "thinking": "high",
+            "title": "Issue task",
+            "issue_id": "N4",
+            "route_digest": "digest",
+            "worker_profile": {"model": "gpt-5.6-sol"},
+            "binding": {"branch": "codex/issue"},
+        })
+        self.assertEqual(set(captured), {"prompt", "target", "model", "thinking", "title"})
+
     def test_codex_wait_parses_public_polls_error_and_timeout(self):
         responses = iter([
             {"timedOut": False, "wake": "attention", "polls": [{"schemaVersion": 1, "cursor": "c3", "thread": {"id": "t1", "hostId": "h1", "status": {"type": "active", "activeFlags": []}}, "latestTurn": {"status": "needs_attention", "error": None}}]},
