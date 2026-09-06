@@ -65,6 +65,7 @@ def _write_new(path, content):
     with path.open('x', encoding='utf-8') as handle:
         handle.write(content)
 
+
 def _migrate_state(path):
     if not path.exists():
         return False
@@ -74,22 +75,19 @@ def _migrate_state(path):
         raise ValueError('state.json is invalid') from error
     if not isinstance(data, dict):
         raise ValueError('state.json must be an object')
-    if (
-        data.get('workflow_version') == 2
-        and data.get('session_gate') == 's0_required'
-        and data.get('capability_contract_required') is True
-    ):
+    if data.get('workflow_version') == 2 and data.get('session_gate') == 's0_required':
         return False
     data.setdefault('workflow_version', 2)
     data.setdefault('session_gate', 's0_required')
-    data.setdefault('capability_contract_required', True)
     descriptor, temporary_name = tempfile.mkstemp(prefix='.state.', dir=str(path.parent))
     try:
         with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
-            json.dump(data, stream, ensure_ascii=False, sort_keys=True); stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
+            json.dump(data, stream, ensure_ascii=False, sort_keys=True)
+            stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
         os.replace(temporary_name, path)
     finally:
-        if os.path.exists(temporary_name): os.unlink(temporary_name)
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
     return True
 
 
@@ -116,45 +114,18 @@ def init_project(paths, confirm):
     for relative in ('.vibe/config.json', '.vibe/state.json'):
         path = root / relative
         if not path.exists():
-            content = '{}\n'
-            if relative == '.vibe/state.json':
-                content = '{"workflow_version": 2, "session_gate": "s0_required", "capability_contract_required": true}\n'
-            _write_new(path, content)
+            _write_new(path, '{"workflow_version": 2, "session_gate": "s0_required"}\n' if relative == '.vibe/state.json' else '{}\n')
             created.append(relative)
     capability_target = contract_path(paths)
     if capability_target.exists():
         load_contract(paths)
     else:
-        runtime_status = (
-            'verified_available'
-            if report.python_version and report.git_version
-            else 'probe_failed'
-        )
+        runtime_status = 'verified_available' if report.python_version and report.git_version else 'probe_failed'
         facts = {
-            'runtime.exec': {
-                'status': runtime_status,
-                'scope': 'init',
-                'route': 'runtime.exec' if runtime_status == 'verified_available' else '',
-                'evidence_ref': 'init:scan:runtime',
-            },
-            'task.terminal': {
-                'status': 'unknown',
-                'scope': 'task',
-                'route': '',
-                'evidence_ref': 'init:unobserved:task.terminal',
-            },
-            'task.browser.control': {
-                'status': 'unknown',
-                'scope': 'task',
-                'route': '',
-                'evidence_ref': 'init:unobserved:task.browser.control',
-            },
-            'task.visible_session': {
-                'status': 'unknown',
-                'scope': 'task',
-                'route': '',
-                'evidence_ref': 'init:unobserved:task.visible_session',
-            },
+            'runtime.exec': {'status': runtime_status, 'scope': 'init', 'route': 'runtime.exec' if runtime_status == 'verified_available' else '', 'evidence_ref': 'init:scan:runtime'},
+            'task.terminal': {'status': 'unknown', 'scope': 'task', 'route': '', 'evidence_ref': 'init:unobserved:task.terminal'},
+            'task.browser.control': {'status': 'unknown', 'scope': 'task', 'route': '', 'evidence_ref': 'init:unobserved:task.browser.control'},
+            'task.visible_session': {'status': 'unknown', 'scope': 'task', 'route': '', 'evidence_ref': 'init:unobserved:task.visible_session'},
         }
         save_contract(paths, build_contract(Path(paths.root), facts=facts))
         created.append('.vibe/session-contract.json')

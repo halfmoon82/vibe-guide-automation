@@ -24,7 +24,6 @@ _SKILL_LIMIT = 64
 _FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
-
 CAPABILITY_RULE_MARKER = "Capability and Tool Truth"
 CAPABILITY_RULES = """## Capability and Tool Truth
 
@@ -193,10 +192,7 @@ def build_agentsmd_patch(existing, report):
     if existing is None:
         content = '# Vibe Guide\n\nProject guidance is maintained through the Vibe Guide.\n\n' + CAPABILITY_RULES
     else:
-        content = (
-            '# Vibe Guide capability contract proposal\n\n'
-            + CAPABILITY_RULES
-        )
+        content = '# Vibe Guide capability contract proposal\n\n' + CAPABILITY_RULES
     return PatchProposal(
         True,
         content,
