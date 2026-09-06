@@ -1,1 +1,1 @@
-"""Execution runners for the Vibe Guide."""
+"""Local and provider-neutral runner implementations."""

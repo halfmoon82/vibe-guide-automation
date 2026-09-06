@@ -1,247 +1,143 @@
-"""Small, fail-closed contracts for the optional Deploy stage.
+"""Optional, explicitly authorized Deploy stage.
 
-Deploy is deliberately independent from the normal executable-plan
-authorization.  This module only plans and verifies a manifest; it never
-executes a command or contacts a target environment.
+Deploy is deliberately separate from the normal plan authorization.  These
+helpers only classify and verify observable state; they do not execute shell
+commands or mutate a remote environment.
 """
 
-from dataclasses import asdict, dataclass, field
-import hashlib
-import json
-import re
-import secrets
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
+
+from .authorization import (
+    DeployAuthorizationRecord,
+    build_deploy_authorization,
+    is_deploy_authorization_valid,
+)
+from .models import DeployManifest, DeployState
 
 
-_HEX = re.compile(r"^[0-9a-fA-F]{7,128}$")
-_SENSITIVE = ("password", "secret", "token", "credential", "private_key", "api_key")
+_DEPLOY_CONFIRMATION = "AUTHORIZE DEPLOY"
 
 
-def _digest(value: Any) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+def _safe_evidence(observations: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only bounded, non-provider-text observations in durable state."""
+
+    if not isinstance(observations, dict):
+        raise TypeError("deploy observations must be a dictionary")
+    evidence: Dict[str, Any] = {}
+    for key in ("health", "health_ok", "version", "commit", "rollback"):
+        if key not in observations:
+            continue
+        value = observations[key]
+        if key in {"health", "health_ok"}:
+            if isinstance(value, bool):
+                evidence[key] = value
+            elif isinstance(value, str) and value.casefold() in {"pass", "passed", "ok", "healthy", "fail", "failed", "unhealthy"}:
+                evidence[key] = value.casefold()
+        elif key == "rollback":
+            if isinstance(value, dict):
+                nested: Dict[str, Any] = {}
+                for nested_key in ("health", "health_ok", "version", "commit"):
+                    nested_value = value.get(nested_key)
+                    if nested_key in {"health", "health_ok"} and isinstance(nested_value, bool):
+                        nested[nested_key] = nested_value
+                    elif nested_key in {"version", "commit"} and isinstance(nested_value, str) and len(nested_value) <= 128:
+                        nested[nested_key] = nested_value
+                if nested:
+                    evidence[key] = nested
+        elif isinstance(value, str) and value.strip() and len(value) <= 128:
+            evidence[key] = value.strip()
+    return evidence
 
 
-def _safe_text(value: Any, field_name: str) -> str:
-    if not isinstance(value, str) or not value.strip() or "\x00" in value:
-        raise ValueError("{} is required".format(field_name))
-    return value.strip()
+def plan_deploy(manifest: DeployManifest, acceptance_state: str) -> DeployState:
+    """Create the first Deploy state only after independent acceptance."""
 
-
-def _safe_list(value: Any, field_name: str) -> List[Any]:
-    if not isinstance(value, list) or not value or len(value) > 64:
-        raise ValueError("{} must be a non-empty bounded list".format(field_name))
-    return list(value)
-
-
-def _reject_secrets(value: Any, path: str = "manifest") -> None:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            normalized = str(key).casefold().replace("-", "_")
-            if any(part in normalized for part in _SENSITIVE) and not normalized.endswith("_ref"):
-                raise ValueError("raw secret fields are forbidden at " + path)
-            _reject_secrets(item, path + "." + str(key))
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            _reject_secrets(item, "{}[{}]".format(path, index))
-
-
-@dataclass(frozen=True)
-class DeployManifest:
-    target: str
-    commit: str
-    command_allowlist: List[str]
-    health_checks: List[Dict[str, Any]]
-    rollback: Dict[str, Any]
-    tree: Optional[str] = None
-    config_refs: List[str] = field(default_factory=list)
-    migrations: List[Dict[str, Any]] = field(default_factory=list)
-    observation_window: Optional[int] = None
-    stop_conditions: List[str] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        target = _safe_text(self.target, "target")
-        commit = _safe_text(self.commit, "commit")
-        if not _HEX.fullmatch(commit):
-            raise ValueError("commit must be a hexadecimal release identifier")
-        commands = _safe_list(self.command_allowlist, "command_allowlist")
-        if any(not isinstance(item, str) or not item.strip() for item in commands):
-            raise ValueError("command_allowlist must contain command names")
-        checks = _safe_list(self.health_checks, "health_checks")
-        if any(not isinstance(item, dict) or not item.get("name") for item in checks):
-            raise ValueError("health_checks must contain named checks")
-        if not isinstance(self.rollback, dict) or not self.rollback.get("version") or not self.rollback.get("command"):
-            raise ValueError("rollback version and command are required")
-        stops = _safe_list(self.stop_conditions, "stop_conditions")
-        if any(not isinstance(item, str) or not item.strip() for item in stops):
-            raise ValueError("stop_conditions must contain descriptions")
-        if self.tree is not None:
-            _safe_text(self.tree, "tree")
-        if not isinstance(self.config_refs, list) or any(not isinstance(item, str) or not item.strip() for item in self.config_refs):
-            raise ValueError("config_refs must be a list of references")
-        if not isinstance(self.migrations, list) or any(not isinstance(item, dict) for item in self.migrations):
-            raise ValueError("migrations must be a list of objects")
-        if self.observation_window is not None and (isinstance(self.observation_window, bool) or not isinstance(self.observation_window, int) or self.observation_window < 0):
-            raise ValueError("observation_window must be a non-negative integer")
-        _reject_secrets(asdict(self))
-        object.__setattr__(self, "target", target)
-        object.__setattr__(self, "commit", commit)
-        object.__setattr__(self, "command_allowlist", [item.strip() for item in commands])
-        object.__setattr__(self, "health_checks", [dict(item) for item in checks])
-        object.__setattr__(self, "stop_conditions", [item.strip() for item in stops])
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "DeployManifest":
-        if not isinstance(data, dict):
-            raise TypeError("DeployManifest data must be an object")
-        values = dict(data)
-        aliases = {
-            "target_environment": "target",
-            "release_commit": "commit",
-            "release_tree": "tree",
-            "rollback_version": "rollback_version",
-            "rollback_commands": "rollback_commands",
-        }
-        for source, target in aliases.items():
-            if source in values and target not in values:
-                values[target] = values.pop(source)
-        if "rollback_version" in values or "rollback_commands" in values:
-            rollback = dict(values.get("rollback", {}))
-            if "rollback_version" in values:
-                rollback.setdefault("version", values.pop("rollback_version"))
-            if "rollback_commands" in values:
-                commands = values.pop("rollback_commands")
-                rollback.setdefault("command", commands[0] if isinstance(commands, list) and commands else commands)
-            values["rollback"] = rollback
-        return cls(**values)
-
-
-@dataclass(frozen=True)
-class DeployState:
-    status: str
-    manifest: DeployManifest
-    reason: str = ""
-    evidence: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {"status": self.status, "manifest": self.manifest.to_dict(), "reason": self.reason, "evidence": self.evidence}
-
-
-@dataclass(frozen=True)
-class DeployAuthorizationRecord:
-    manifest_digest: str
-    allowed_actions: Tuple[str, ...]
-    digest: str
-    schema_version: int = 1
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {"manifest_digest": self.manifest_digest, "allowed_actions": list(self.allowed_actions), "digest": self.digest, "schema_version": self.schema_version}
-
-
-def deploy_manifest_digest(manifest: DeployManifest) -> str:
     if not isinstance(manifest, DeployManifest):
         raise TypeError("manifest must be a DeployManifest")
-    return _digest(manifest.to_dict())
-
-
-def plan_deploy(manifest: Optional[DeployManifest], acceptance_state: str) -> Optional[DeployState]:
-    """Create the planned state only after independent acceptance."""
-    if manifest is None:
-        return None
-    if not isinstance(manifest, DeployManifest):
-        raise TypeError("manifest must be a DeployManifest")
-    if isinstance(acceptance_state, dict):
-        acceptance_state = acceptance_state.get("status", "")
-    if acceptance_state not in {"accepted", "complete", "independent_acceptance"}:
-        raise ValueError("Deploy requires independent acceptance")
-    return DeployState("deploy_planned", manifest)
+    if not isinstance(acceptance_state, str):
+        raise TypeError("acceptance_state must be a string")
+    normalized = acceptance_state.strip().casefold()
+    if not manifest.stop_conditions:
+        return DeployState(
+            "blocked_deploy",
+            manifest.digest,
+            manifest.target,
+            reason="Deploy stop conditions are required",
+        )
+    if normalized not in {"accepted", "independently_accepted", "independent_acceptance"}:
+        return DeployState(
+            "blocked_deploy",
+            manifest.digest,
+            manifest.target,
+            reason="independent acceptance is required before Deploy",
+        )
+    return DeployState("deploy_planned", manifest.digest, manifest.target)
 
 
 def authorize_deploy(manifest: DeployManifest, confirmation: str) -> DeployAuthorizationRecord:
-    if confirmation != "AUTHORIZE_DEPLOY":
-        raise ValueError("Deploy authorization requires exact AUTHORIZE_DEPLOY confirmation")
-    # The manifest, rather than a global default, is the source of the exact
-    # action scope.  ``deploy`` is the required primary action; auxiliary
-    # commands (restart/migrate/rollback/publish or a project-specific name)
-    # remain individually bound to this manifest digest.
-    actions = tuple(sorted(set(manifest.command_allowlist + ["deploy"])))
-    payload = {"manifest_digest": deploy_manifest_digest(manifest), "allowed_actions": actions, "schema_version": 1}
-    return DeployAuthorizationRecord(payload["manifest_digest"], actions, _digest(payload))
+    """Issue a manifest-bound authorization using a distinct confirmation."""
+
+    if not isinstance(manifest, DeployManifest):
+        raise TypeError("manifest must be a DeployManifest")
+    if confirmation != _DEPLOY_CONFIRMATION:
+        raise PermissionError("Deploy requires exact AUTHORIZE DEPLOY confirmation")
+    return build_deploy_authorization(manifest.digest, manifest.target)
 
 
-def is_deploy_authorization_valid(record: DeployAuthorizationRecord, manifest: DeployManifest) -> bool:
-    if not isinstance(record, DeployAuthorizationRecord) or not isinstance(manifest, DeployManifest):
-        return False
-    payload = {"manifest_digest": deploy_manifest_digest(manifest), "allowed_actions": tuple(record.allowed_actions), "schema_version": record.schema_version}
-    return record.schema_version == 1 and secrets.compare_digest(record.manifest_digest, payload["manifest_digest"]) and secrets.compare_digest(record.digest, _digest(payload))
+def _health_value(evidence: Dict[str, Any]) -> Optional[bool]:
+    value = evidence.get("health_ok", evidence.get("health"))
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if value in {"pass", "passed", "ok", "healthy"}:
+            return True
+        if value in {"fail", "failed", "unhealthy"}:
+            return False
+    return None
 
 
 def verify_deploy(manifest: DeployManifest, observations: Dict[str, Any]) -> DeployState:
-    if not isinstance(observations, dict):
-        return DeployState("blocked_unknown", manifest, "observations are unavailable")
-    version = observations.get("version", observations.get("release_commit"))
-    health = observations.get("health")
-    if health is None and "health_checks" in observations:
-        checks = observations.get("health_checks")
-        if isinstance(checks, dict):
-            health = all(value is True for value in checks.values()) if checks else None
-        elif isinstance(checks, list):
-            health = all(item is True or (isinstance(item, dict) and item.get("ok") is True) for item in checks) if checks else None
-    if version is None or health is None:
-        return DeployState("blocked_unknown", manifest, "health or version is unknown", dict(observations))
-    # A rollback can only be considered after the failed observation itself is
-    # bound to this manifest.  Otherwise a healthy rollback observation could
-    # mask an unrelated/mismatched release failure.
-    expected = manifest.tree or manifest.commit
-    if version != expected:
-        return DeployState("blocked_deploy", manifest, "observed version does not match manifest", dict(observations))
-    rollback = observations.get("rollback")
-    if health is not True and isinstance(rollback, dict):
-        rollback_version = rollback.get("version", rollback.get("release_commit"))
-        rollback_health = rollback.get("health")
-        if rollback_health is True and rollback_version == manifest.rollback.get("version"):
-            return DeployState("rolled_back", manifest, "rollback health and version verified", dict(observations))
-    if health is not True:
-        return DeployState("blocked_deploy", manifest, "health check failed", dict(observations))
-    return DeployState("deployed", manifest, evidence=dict(observations))
+    """Classify Deploy from independently observable health and version facts."""
 
-
-def _authorized_transition(
-    manifest: DeployManifest,
-    state: DeployState,
-    authorization: DeployAuthorizationRecord,
-    expected_status: str,
-    next_status: str,
-    command: Optional[str] = None,
-) -> DeployState:
     if not isinstance(manifest, DeployManifest):
         raise TypeError("manifest must be a DeployManifest")
-    if not isinstance(state, DeployState):
-        raise TypeError("state must be a DeployState")
-    if not is_deploy_authorization_valid(authorization, manifest):
-        raise PermissionError("a valid separate Deploy authorization is required")
-    if state.manifest.to_dict() != manifest.to_dict() or state.status != expected_status:
-        raise ValueError("Deploy state is not ready for " + next_status)
-    if command is not None and command not in manifest.command_allowlist:
-        raise ValueError("Deploy command is outside the manifest allowlist")
-    evidence = dict(state.evidence)
-    evidence["authorization_digest"] = authorization.digest
-    return DeployState(next_status, manifest, evidence=evidence)
+    evidence = _safe_evidence(observations)
+    health = _health_value(evidence)
+    version = evidence.get("version", evidence.get("commit"))
+    if health is None or not isinstance(version, str) or not version:
+        return DeployState(
+            "blocked_unknown",
+            manifest.digest,
+            manifest.target,
+            evidence=evidence,
+            reason="health or deployed version is not observable",
+        )
+    if health and version == manifest.commit:
+        return DeployState("deployed", manifest.digest, manifest.target, evidence=evidence)
 
-
-def prepare_deploy(
-    manifest: DeployManifest,
-    state: DeployState,
-    authorization: DeployAuthorizationRecord,
-) -> DeployState:
-    """Advance a planned Deploy to ready under its separate authorization."""
-
-    return _authorized_transition(
-        manifest, state, authorization, "deploy_planned", "deploy_ready"
+    rollback = evidence.get("rollback")
+    if not health and isinstance(rollback, dict):
+        rollback_health = _health_value(rollback)
+        rollback_version = rollback.get("version", rollback.get("commit"))
+        rollback_commit = manifest.rollback.get("commit")
+        if rollback_health is True and isinstance(rollback_version, str) and rollback_version == rollback_commit:
+            return DeployState("rolled_back", manifest.digest, manifest.target, evidence=evidence)
+    return DeployState(
+        "blocked_deploy",
+        manifest.digest,
+        manifest.target,
+        evidence=evidence,
+        reason="health or deployed version failed the manifest checks",
     )
+
+
+def assert_deploy_action_allowed(manifest: DeployManifest, command: str) -> None:
+    """Require an exact command from the manifest allowlist before execution."""
+
+    if not isinstance(manifest, DeployManifest):
+        raise TypeError("manifest must be a DeployManifest")
+    if not isinstance(command, str) or command.strip() not in manifest.command_allowlist:
+        raise PermissionError("Deploy command is outside the manifest allowlist")
 
 
 def start_deploy(
@@ -250,22 +146,30 @@ def start_deploy(
     authorization: DeployAuthorizationRecord,
     command: Optional[str] = None,
 ) -> DeployState:
-    """Advance a ready Deploy to running without executing external actions."""
+    """Bind a start action to both the manifest and its separate authorization."""
 
-    return _authorized_transition(
-        manifest, state, authorization, "deploy_ready", "deploy_running", command
+    if not is_deploy_authorization_valid(authorization, manifest.digest, manifest.target):
+        raise PermissionError("Deploy authorization does not match the manifest")
+    if state.manifest_digest != manifest.digest or state.status not in {"deploy_planned", "deploy_ready"}:
+        raise ValueError("Deploy state is not ready for execution")
+    if command is not None:
+        assert_deploy_action_allowed(manifest, command)
+    return DeployState(
+        "deploy_running",
+        manifest.digest,
+        manifest.target,
+        evidence=state.evidence,
+        authorization_digest=authorization.digest,
     )
 
 
 __all__ = [
-    "DeployAuthorizationRecord",
     "DeployManifest",
     "DeployState",
-    "authorize_deploy",
-    "deploy_manifest_digest",
-    "is_deploy_authorization_valid",
+    "DeployAuthorizationRecord",
     "plan_deploy",
-    "prepare_deploy",
-    "start_deploy",
+    "authorize_deploy",
     "verify_deploy",
+    "assert_deploy_action_allowed",
+    "start_deploy",
 ]

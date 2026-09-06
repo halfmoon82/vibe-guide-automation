@@ -3,7 +3,8 @@
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+import subprocess
+from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 from .authorization import (
@@ -15,10 +16,21 @@ from .authorization import (
     validate_runtime_contract,
 )
 from .contracts import RunEvent, RunHandle, Runner
-from .models import DAGNode, Plan
+from .models import (
+    DAGNode,
+    Plan,
+    BindingIntent,
+    BindingObservation,
+    BindingVerification,
+    IssueComplexity,
+    LocalModel,
+    HealingResult,
+    ObservationDisposition,
+)
 from .paths import ProjectPaths
 from .planner import resolve_consistency
-from .adapters.task_provider import ProviderPending
+from .dag import audit_dag, ready_nodes
+from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
     RunSnapshot,
@@ -26,25 +38,589 @@ from .state import (
     append_event,
     load_events,
     load_snapshot,
+    map_user_status,
     quarantine_writer_lease,
+    read_writer_lease,
     redact_provider_text,
     release_writer_lease,
     save_snapshot,
+    validate_run_id,
 )
-from .task_registry import TaskBinding, load_task_binding, save_task_binding
-from .workflow_gate import require_capability_contract, require_entry
+from .task_registry import (
+    TaskBinding,
+    binding_contract_enabled,
+    load_task_binding,
+    runtime_binding_gate,
+    save_task_binding,
+)
+from .workflow_gate import require_capability_contract, require_entry, verify_workflow
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
-from .change_requests import ChangeRequest, LocalMergeEvidence, merge_local
-from .checkpoint import ContextBudgetEstimator, ContextBudgetPolicy, MonitorCheckpoint, resume_from_checkpoint, write_checkpoint
+from .model_router import ModelRouter
+from .change_requests import (
+    ChangeRequest,
+    ChangeRequestEvidence,
+    LocalMergeEvidence,
+    execute_change_request,
+    merge_local,
+)
+from .authorization import can_create_change_request, can_auto_merge
+from .checkpoint import (
+    ContextBudgetEstimator,
+    ContextBudgetPolicy,
+    MonitorCheckpoint,
+    resume_from_checkpoint,
+    write_checkpoint,
+)
+from .brief import ImplementationBrief, validate_implementation_brief
+from .manifest import RunManifest
+from .evidence import (
+    evaluate_v41_closeout,
+    evaluate_delivery_evidence,
+    record_integration_review as _record_integration_review,
+)
+
+
+def reconcile_pending_binding(snapshot: Any, node_id: str, runner: Any) -> bool:
+    """Reconcile a provider setup placeholder without creating a successor.
+
+    A ``clientThreadId`` is only a setup handle.  Until the provider returns an
+    exact real task identity this function keeps the existing generation and
+    writer lease, marks the node retryable, and returns ``False``.
+    """
+    nodes = snapshot.get("nodes") if isinstance(snapshot, dict) else getattr(snapshot, "nodes", None)
+    if not isinstance(nodes, dict) or not isinstance(node_id, str):
+        return False
+    node = nodes.get(node_id)
+    if not isinstance(node, dict):
+        return False
+    binding = node.get("binding") or node.get("active_binding") or node.get("task")
+    client_id = None
+    if isinstance(binding, dict):
+        client_id = binding.get("clientThreadId") or binding.get("client_thread_id")
+    client_id = client_id or node.get("clientThreadId") or node.get("client_thread_id")
+    thread_id = binding.get("threadId") if isinstance(binding, dict) else node.get("threadId")
+    if not client_id or thread_id:
+        return False
+    # Only a verified provider locate/list operation may promote the identity.
+    try:
+        resolver = getattr(runner, "resolve_pending", None)
+        resolved = resolver(binding) if callable(resolver) else None
+    except Exception:
+        resolved = None
+    if not isinstance(resolved, dict) and resolved is not None and hasattr(resolved, "__dict__"):
+        resolved = dict(resolved.__dict__)
+    if isinstance(resolved, dict) and resolved.get("threadId"):
+        expected_host = binding.get("hostId") or binding.get("host") if isinstance(binding, dict) else None
+        observed_host = resolved.get("hostId") or resolved.get("host")
+        required_identity = ("provider", "status", "clientThreadId", "issue_id", "role", "generation")
+        if any(resolved.get(key) in (None, "") for key in required_identity) or not expected_host or not observed_host:
+            resolved = None
+        elif resolved.get("clientThreadId") != client_id:
+            resolved = None
+        if resolved is None:
+            pass
+        elif not isinstance(binding, dict) or not binding.get("provider") or resolved.get("provider") != binding.get("provider"):
+            resolved = None
+        elif expected_host and observed_host != expected_host:
+            resolved = None
+        elif isinstance(binding, dict) and resolved.get("clientThreadId") != client_id:
+            # A locate result for a different setup request must never be
+            # promoted in place: doing so would silently change the writer
+            # identity while retaining the old generation and lease.
+            resolved = None
+        elif isinstance(binding, dict) and resolved.get("issue_id") != binding.get("issue_id"):
+            resolved = None
+        elif isinstance(binding, dict) and resolved.get("role") != binding.get("role"):
+            resolved = None
+        elif isinstance(binding, dict) and resolved.get("generation") != binding.get("generation"):
+            resolved = None
+        elif resolved.get("status") not in ("verified", "visible"):
+            resolved = None
+    if isinstance(resolved, dict) and resolved.get("threadId"):
+        target = binding if isinstance(binding, dict) else node
+        target["threadId"] = resolved["threadId"]
+        target["clientThreadId"] = client_id
+        return True
+    node["status"] = "retry_pending"
+    node["retryable_action"] = {"action": "reconcile_pending_binding", "clientThreadId": client_id}
+    node.setdefault("generation", 1)
+    node["successor"] = None
+    return False
+
+
+def _user_status(record: Dict[str, Any]) -> str:
+    """Keep internal recovery detail behind the four public statuses."""
+    reason = str(record.get("reason") or "").casefold()
+    if any(marker in reason for marker in ("product", "scope", "permission", "credential", "irreversible", "security", "产品", "范围", "权限", "凭据", "不可逆", "安全")):
+        return "需要你决定"
+    if record.get("binding_phase") in {"retry_pending", "binding_probe_pending", "binding_repair_pending", "binding_repairing", "blocked_unknown", "unknown", "timeout", "failed", "stopped"}:
+        return "自动修复中"
+    if isinstance(record.get("retryable_action"), dict) and not record.get("active_task"):
+        return "自动修复中"
+    status = record.get("status")
+    if status in {"blocked_design", "blocked_deploy"}:
+        return "需要你决定"
+    if status in {"initialized", "planned", "brief_pending", "start_pending"}:
+        return "准备中"
+    if status in {"running", "review", "rework", "delivered", "accepted", "complete"}:
+        return "已启动"
+    return "自动修复中"
+
+
+def classify_observation(observation: Any) -> ObservationDisposition:
+    """Classify provider drift without claiming unavailable capability."""
+    if not isinstance(observation, dict):
+        return ObservationDisposition("unknown", "isolate", "observation is malformed")
+    kind = str(observation.get("kind", observation.get("type", "unknown"))).strip().lower()
+    repairable = {"worktree_branch_drift", "worktree_drift", "branch_drift", "stale_cursor"}
+    uncertain = {
+        "missing_visible_locate_evidence", "provider_timeout", "timeout",
+        "permission_denied", "missing_locate_evidence", "unknown",
+    }
+    if kind in repairable and observation.get("repairable", True) is not False:
+        return ObservationDisposition("repairable", "repair", kind)
+    if kind in uncertain or not kind:
+        return ObservationDisposition("degraded", "isolate", kind or "unknown observation")
+    return ObservationDisposition("unknown", "isolate", kind)
+
+
+def self_heal_binding(snapshot: Any, node_id: str, observation: Any) -> HealingResult:
+    """Repair only fields proven by the frozen node contract, in place.
+
+    This deliberately accepts a plain snapshot mapping so recovery and replay
+    callers can use the same fail-closed operation before persistence.
+    """
+    nodes = snapshot.get("nodes") if isinstance(snapshot, dict) else getattr(snapshot, "nodes", None)
+    if not isinstance(nodes, dict):
+        return HealingResult(False, degraded=True, isolated=True, reason="snapshot is malformed")
+    node = nodes.get(node_id)
+    if not isinstance(node, dict):
+        return HealingResult(False, degraded=True, isolated=True, reason="node is unknown")
+    disposition = classify_observation(observation)
+    if disposition.status != "repairable" or not isinstance(observation, dict):
+        isolate_affected_action(snapshot, node_id, disposition.reason)
+        return HealingResult(False, degraded=True, isolated=True, reason=disposition.reason,
+                             task_id=node.get("task_id") or node.get("developer_identity"))
+    # Current facts may identify drift, but never become the new contract.
+    expected = node.get("binding")
+    if not isinstance(expected, dict):
+        expected = node.get("frozen_binding")
+    if not isinstance(expected, dict):
+        expected = node.get("binding_contract")
+    if not isinstance(expected, dict) and isinstance(node.get("contract"), dict):
+        nested = node["contract"].get("binding")
+        expected = nested if isinstance(nested, dict) else node["contract"]
+    if not isinstance(expected, dict):
+        isolate_affected_action(snapshot, node_id, "frozen binding evidence is missing")
+        return HealingResult(False, degraded=True, isolated=True,
+                             reason="frozen binding evidence is missing",
+                             task_id=node.get("task_id") or node.get("developer_identity"))
+    for field in ("task_id", "worktree", "branch", "allowlist", "cursor",
+                  "token", "continuation_token", "continuation_digest"):
+        if field in expected:
+            node[field] = expected[field]
+    node["healing"] = {"status": "repaired", "observation_kind": disposition.reason}
+    return HealingResult(True, reason=disposition.reason, task_id=node.get("task_id"))
+
+
+def isolate_affected_action(snapshot: Any, node_id: str, reason: str) -> None:
+    """Quarantine one node/action while leaving all other nodes untouched."""
+    nodes = snapshot.get("nodes") if isinstance(snapshot, dict) else getattr(snapshot, "nodes", None)
+    if not isinstance(nodes, dict):
+        return
+    node = nodes.get(node_id)
+    if not isinstance(node, dict):
+        return
+    node["status"] = "blocked_unknown"
+    node["reason"] = str(reason)
+    node["isolated"] = True
+    node["retryable_action"] = None
 
 
 class Monitor:
-    def __init__(self, paths: ProjectPaths, plan: Plan, nodes: List[DAGNode], context_policy: Optional[ContextBudgetPolicy] = None):
+    @staticmethod
+    def _legacy_run_allowed(state_data: Dict[str, Any]) -> bool:
+        """Accept only an explicitly evidenced historical-run marker."""
+        if not isinstance(state_data, dict) or state_data.get("legacy_run") is not True:
+            return False
+        evidence = state_data.get("legacy_evidence")
+        if not isinstance(evidence, dict):
+            return False
+        source = evidence.get("source")
+        run_id = evidence.get("run_id")
+        if not isinstance(source, str) or not source.strip() or not isinstance(run_id, str) or not run_id.strip():
+            return False
+        try:
+            validate_run_id(run_id)
+        except ValueError:
+            return False
+        return True
+
+    @staticmethod
+    def _legacy_evidence_digest(evidence: Dict[str, Any]) -> str:
+        payload = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _legacy_binding_valid(cls, legacy_run: Any, evidence: Any, digest: Any) -> bool:
+        return legacy_run is True and cls._legacy_run_allowed({"legacy_run": legacy_run, "legacy_evidence": evidence}) and digest == cls._legacy_evidence_digest(evidence)
+
+    @staticmethod
+    def _lineage_matches_snapshot(snapshot: RunSnapshot, prd_digest: str, spec_digest: str) -> bool:
+        return bool(prd_digest and spec_digest and snapshot.prd_digest == prd_digest and snapshot.spec_digest == spec_digest)
+
+    def _execution_engine_binding(self, record: AuthorizationRecord) -> Tuple[str, str]:
+        """Require the V4.1 complex plan to run through the DAG Monitor."""
+        if getattr(self.plan, "complexity_band", "") != "complex":
+            return "", ""
+        override = getattr(record, "explicit_execution_mode_override", None)
+        if isinstance(override, dict) and override:
+            if not all(isinstance(override.get(key), str) and override.get(key).strip() for key in ("original_instruction", "alternative_mode")):
+                raise PermissionError("execution_engine_unverified: malformed explicit execution override")
+            raise PermissionError("execution_engine_unverified: explicit execution mode override has no V4.1 DAG guarantees")
+        if record.execution_engine != "vibeguide_monitor" or record.engine_mode != "dag":
+            raise PermissionError("execution_engine_unverified: V4.1 complex runs require vibeguide_monitor DAG")
+        if not record.engine_evidence_ref or record.engine_evidence_ref.startswith("unverified:"):
+            raise PermissionError("execution_engine_unverified: engine evidence is not verified")
+        if record.dag_revision != self.plan.version:
+            raise PermissionError("blocked_by_execution_topology_mismatch: DAG revision mismatch")
+        return record.execution_engine, record.engine_mode
+
+    def _topology_projection(self, snapshot: RunSnapshot) -> Tuple[List[str], str]:
+        """Return the current ready-set and a stable dependency projection digest."""
+        expected = []
+        for node in self.nodes.values():
+            expected.append({"id": node.id, "depends_on": list(node.depends_on), "parallel_group": node.parallel_group, "allowlist": list(node.allowlist), "owned_paths": list(node.owned_paths), "writer": node.writer, "reviewer": node.reviewer, "worktree": node.worktree})
+        digest = hashlib.sha256(json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        ready = []
+        for node in self.nodes.values():
+            current = snapshot.nodes.get(node.id, {})
+            if current.get("status") not in {"planned", "ready"}:
+                continue
+            if all(snapshot.nodes.get(dep, {}).get("status") == "accepted" for dep in node.depends_on):
+                ready.append(node.id)
+        return ready, digest
+
+    def _refresh_execution_projection(self, snapshot: RunSnapshot, entry: str = "monitor.unknown") -> None:
+        ready, digest = self._topology_projection(snapshot)
+        snapshot.ready_set = ready
+        snapshot.topology_digest = digest
+        snapshot.started_nodes = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
+        snapshot.active_concurrency = len(snapshot.started_nodes)
+        snapshot.capacity = int(getattr(self._snapshot_record(snapshot), "active_pair_limit", 0) or 0)
+        snapshot.monitor_entry_evidence = entry
+        snapshot.parallel_groups = {n: ([self.nodes[n].parallel_group] if self.nodes[n].parallel_group else []) for n in snapshot.started_nodes}
+
+    def _record_topology_projection(self, snapshot: RunSnapshot, entry: str) -> None:
+        self._refresh_execution_projection(snapshot, entry)
+        self._record(snapshot, "execution_topology_observed", {
+            "run_id": snapshot.run_id, "plan_revision": snapshot.plan_version,
+            "node_ids": sorted(self.nodes), "started_nodes": list(snapshot.started_nodes),
+            "active_concurrency": snapshot.active_concurrency, "capacity": snapshot.capacity,
+            "parallel_groups": snapshot.parallel_groups,
+            "monitor_entry_evidence": entry,
+        })
+
+    def _validate_execution_topology(self, snapshot: RunSnapshot) -> None:
+        if getattr(self.plan, "complexity_band", "") != "complex":
+            return
+        ready, digest = self._topology_projection(snapshot)
+        if snapshot.dag_revision != self.plan.version or snapshot.topology_digest != digest:
+            raise PermissionError("blocked_by_execution_topology_mismatch: topology projection drift")
+        if list(snapshot.ready_set) != ready:
+            raise PermissionError("blocked_by_execution_topology_mismatch: ready-set drift")
+        started = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
+        if list(snapshot.started_nodes) != started:
+            raise PermissionError("blocked_by_execution_topology_mismatch: started-set drift")
+        if snapshot.active_concurrency != len(started) or (snapshot.capacity and snapshot.active_concurrency > snapshot.capacity):
+            raise PermissionError("blocked_by_execution_topology_mismatch: capacity drift")
+        expected_groups = {n: ([self.nodes[n].parallel_group] if self.nodes[n].parallel_group else []) for n in started}
+        if snapshot.parallel_groups != expected_groups:
+            raise PermissionError("blocked_by_execution_topology_mismatch: parallel-group drift")
+        if not snapshot.monitor_entry_evidence.startswith("monitor."):
+            raise PermissionError("blocked_by_execution_topology_mismatch: monitor entry evidence missing")
+        if not hasattr(self, "paths"):
+            return
+        events = load_events(self.paths, snapshot.run_id)
+        observed = [e for e in events if e.get("event") == "execution_topology_observed"]
+        if not observed:
+            raise PermissionError("blocked_by_execution_topology_mismatch: topology evidence missing")
+        latest = observed[-1].get("data", {})
+        expected = {"run_id": snapshot.run_id, "plan_revision": snapshot.plan_version, "node_ids": sorted(self.nodes), "started_nodes": snapshot.started_nodes, "active_concurrency": snapshot.active_concurrency, "capacity": snapshot.capacity, "parallel_groups": snapshot.parallel_groups}
+        for key, value in expected.items():
+            if latest.get(key) != value:
+                raise PermissionError("blocked_by_execution_topology_mismatch: topology evidence drift")
+        if latest.get("monitor_entry_evidence") != snapshot.monitor_entry_evidence:
+            raise PermissionError("blocked_by_execution_topology_mismatch: monitor entry evidence drift")
+
+    def __init__(
+        self,
+        paths: ProjectPaths,
+        plan: Plan,
+        nodes: List[DAGNode],
+        context_policy: Optional[ContextBudgetPolicy] = None,
+    ):
         self.paths = paths
         self.plan = plan
         self.nodes = {node.id: node for node in nodes}
+        # Binding reads are scoped to one public monitor operation.  The
+        # registry is still the durable source of truth; clearing this cache
+        # at each operation boundary prevents stale cross-tick identities.
+        self._binding_cache: Dict[Tuple[str, str, str], TaskBinding] = {}
         self.context_policy = context_policy
+
+    def _reset_binding_cache(self) -> None:
+        self._binding_cache.clear()
+
+    def _current_plan_digests(self) -> Tuple[str, str]:
+        values = []
+        for ref in ("prd", "spec"):
+            supplied = getattr(self.plan, ref + "_digest", "")
+            if supplied:
+                values.append(str(supplied))
+                continue
+            path_value = getattr(self.plan, ref + "_path", "")
+            path = Path(path_value) if path_value else Path("")
+            if path_value and not path.is_absolute():
+                path = self.paths.root / path
+            try:
+                values.append(hashlib.sha256(path.read_bytes()).hexdigest() if path_value else "")
+            except (OSError, ValueError):
+                values.append("")
+        return values[0], values[1]
+
+    def _load_task_binding(
+        self, snapshot: RunSnapshot, node_id: str, role: str
+    ) -> TaskBinding:
+        key = (snapshot.run_id, node_id, role)
+        binding = self._binding_cache.get(key)
+        if binding is None:
+            binding = load_task_binding(
+                self.paths, node_id, role, run_id=snapshot.run_id
+            )
+            self._binding_cache[key] = binding
+        return binding
+
+    def _save_task_binding(self, binding: TaskBinding) -> None:
+        save_task_binding(self.paths, binding)
+        if binding.run_id is not None:
+            self._binding_cache[(binding.run_id, binding.issue_id, binding.role)] = binding
+
+    def _require_binding_gate(
+        self, contract: Dict[str, Any], binding: TaskBinding, runner: Runner
+    ) -> None:
+        """Fail closed before a real runner can start or write.
+
+        ProviderActionRunner exposes the same gate so both boundaries execute
+        it.  A generic runner is checked here as well, preserving legacy
+        contracts that do not opt into V3.9.
+        """
+        if not binding_contract_enabled(contract):
+            return
+        verification = runtime_binding_gate(contract, binding)
+        if not isinstance(verification, BindingVerification):
+            raise ValueError("local provider binding gate returned invalid verification")
+        if verification.binding_state != "binding_verified" or not verification.business_write_allowed:
+            raise ValueError(
+                "provider binding gate blocked_unknown: missing={} conflicts={}".format(
+                    ",".join(verification.missing), ",".join(verification.conflicts)
+                )
+            )
+        # Refresh the supervisor-owned lease at the write boundary.  A cached
+        # observation is not sufficient for generic runners that expose no
+        # provider hook; a released/expired lease must fail closed.
+        node_id = str(contract.get("node_id") or binding.issue_id)
+        fresh_lease = read_writer_lease(self.paths, node_id, binding.worktree)
+        observed = getattr(binding, "binding_observation", None)
+        if fresh_lease is None or observed is None or observed.lease != fresh_lease:
+            raise ValueError("supervisor lease is stale or unavailable")
+        refreshed = runtime_binding_gate(contract, binding)
+        if (
+            not isinstance(refreshed, BindingVerification)
+            or refreshed.binding_state != "binding_verified"
+            or not refreshed.business_write_allowed
+        ):
+            raise ValueError("provider binding gate blocked after lease refresh")
+        # Provider hooks are advisory consistency checks only.  A provider
+        # cannot manufacture permission by returning an object with
+        # ``verified=True`` or another untrusted shape.
+        probe = getattr(runner, "provider_binding_probe", None)
+        if callable(probe):
+            provider_probe = probe(contract, binding)
+            if (
+                not isinstance(provider_probe, BindingVerification)
+                or provider_probe.binding_state != "binding_verified"
+                or not provider_probe.verified
+                or provider_probe != refreshed
+            ):
+                raise ValueError("provider binding probe returned invalid verification")
+        gate = getattr(runner, "binding_gate", None)
+        if callable(gate):
+            provider_verification = gate(contract, binding)
+            if not isinstance(provider_verification, BindingVerification):
+                raise ValueError("provider binding gate returned invalid verification")
+            if provider_verification != refreshed:
+                raise ValueError("provider binding gate disagrees with local evidence")
+
+    def _preflight_binding_before_provider(self, contract: Dict[str, Any]) -> None:
+        """Gate provider actions before ``task_binding`` can emit a request.
+
+        Unknown provider task ids are the sole exception: an explicit
+        ``binding_probe`` may be emitted, and is marked non-business in its
+        request.  Any ordinary V3.9 start requires complete protected live
+        evidence first.
+        """
+        if not binding_contract_enabled(contract):
+            return
+        verification = runtime_binding_gate(contract)
+        if not isinstance(verification, BindingVerification):
+            raise ValueError("provider binding preflight returned invalid verification")
+        if contract.get("binding_probe") is True:
+            # An unknown provider task id is the sole controlled exception:
+            # invoke the local gate first, then permit a non-business probe
+            # only when no untrusted evidence was supplied.
+            if verification.verified:
+                return
+            if (
+                verification.missing == ["binding_provenance"]
+                and "binding_intent" not in contract
+                and "binding_observation" not in contract
+            ):
+                return
+            raise ValueError("provider binding probe preflight blocked_unknown")
+        if not verification.verified:
+            raise ValueError("provider binding preflight blocked_unknown")
+
+    @staticmethod
+    def _binding_recovery_requested(contract: Dict[str, Any]) -> bool:
+        """Identify the narrow JSON-restored continuation recovery path."""
+        if not binding_contract_enabled(contract):
+            return False
+        if contract.get("continuation") is not True or contract.get("binding_bootstrap") is not True:
+            return False
+        return not (
+            isinstance(contract.get("binding_intent"), BindingIntent)
+            and isinstance(contract.get("binding_observation"), BindingObservation)
+        )
+
+    def _preflight_binding_recovery(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        role: str,
+        contract: Dict[str, Any],
+        current: Dict[str, Any],
+    ) -> None:
+        """Validate only the durable identity needed to enter bootstrap.
+
+        A persisted binding has intentionally lost its private lease/cursor
+        provenance.  This preflight therefore never returns a verified gate;
+        it only proves that recovery will address the same task and the same
+        constrained worktree.  The runner bootstrap performs the fresh Git
+        observation and the subsequent full protected-evidence gate.
+        """
+        try:
+            binding = self._load_task_binding(snapshot, node_id, role)
+            root = self._worktree_path(current).resolve(strict=True)
+            bound = Path(str(binding.worktree))
+            if not bound.is_absolute():
+                bound = self.paths.root / bound
+            bound = bound.resolve(strict=True)
+            managed_root = contract.get("managed_root")
+            branch = contract.get("branch")
+            base_sha = contract.get("base_sha")
+            if not isinstance(managed_root, str) or not managed_root:
+                raise ProviderUnavailable("binding recovery managed_root is missing")
+            if not isinstance(branch, str) or not branch:
+                raise ProviderUnavailable("binding recovery branch is missing")
+            if not isinstance(base_sha, str) or not base_sha:
+                raise ProviderUnavailable("binding recovery base_sha is missing")
+            managed = Path(managed_root).resolve(strict=True)
+            root.relative_to(managed)
+            if bound != root:
+                raise ProviderUnavailable("binding recovery worktree drift")
+            if binding.issue_id != node_id or binding.role != role:
+                raise ProviderUnavailable("binding recovery task scope drift")
+            if binding.run_id != snapshot.run_id:
+                raise ProviderUnavailable("binding recovery run drift")
+            if binding.task_id != contract.get("task_id"):
+                raise ProviderUnavailable("binding recovery task identity drift")
+            if binding.branch != branch:
+                raise ProviderUnavailable("binding recovery branch drift")
+            expected_host = contract.get("host_id")
+            if expected_host not in (None, "") and binding.host != expected_host:
+                raise ProviderUnavailable("binding recovery host drift")
+            expected_project = contract.get("project_id")
+            if expected_project not in (None, ""):
+                persisted_intent = binding.binding_intent
+                if isinstance(persisted_intent, BindingIntent) and persisted_intent.project_id != expected_project:
+                    raise ProviderUnavailable("binding recovery project drift")
+        except ProviderUnavailable:
+            raise
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise ProviderUnavailable("binding recovery preflight blocked_unknown") from error
+
+    def _run_binding_bootstrap(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        role: str,
+        contract: Dict[str, Any],
+        runner: Runner,
+        current: Dict[str, Any],
+    ) -> None:
+        """Invoke the real runner bootstrap only for an explicit recovery."""
+        if not binding_contract_enabled(contract) or (
+            contract.get("binding_bootstrap") is not True
+            and contract.get("continuation") is not True
+        ):
+            return
+        bootstrap = getattr(runner, "binding_bootstrap", None)
+        if not callable(bootstrap):
+            raise ProviderUnavailable("binding bootstrap is unavailable")
+        try:
+            binding = self._load_task_binding(snapshot, node_id, role)
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise ProviderUnavailable("binding bootstrap has no same-task binding") from error
+        result = bootstrap(contract, binding, self._worktree_path(current))
+        if not isinstance(result, BindingVerification) or not result.verified:
+            raise ProviderUnavailable("binding bootstrap remains blocked_unknown")
+        contract["binding_intent"] = binding.binding_intent
+        contract["binding_observation"] = binding.binding_observation
+
+    @staticmethod
+    def classify_observation(observation: Any) -> ObservationDisposition:
+        return classify_observation(observation)
+
+    def self_heal_binding(self, snapshot: RunSnapshot, node_id: str, observation: Any) -> HealingResult:
+        result = self_heal_binding(snapshot, node_id, observation)
+        node_state = snapshot.nodes[node_id]
+        frozen_binding = node_state.get("binding")
+        if not isinstance(frozen_binding, dict):
+            frozen_binding = {
+                key: node_state.get(key)
+                for key in ("task_id", "worktree", "branch", "allowlist", "cursor", "continuation_digest")
+                if key in node_state
+            }
+        self._record(snapshot, "binding_self_healed" if result.repaired else "binding_degraded", {
+            "run_id": snapshot.run_id, "node_id": node_id,
+            "observation_kind": classify_observation(observation).reason,
+            "disposition": "repaired" if result.repaired else "degraded",
+            "action": "repair" if result.repaired else "isolate",
+            "repaired": result.repaired, "isolated": result.isolated,
+            "binding": frozen_binding,
+        })
+        save_snapshot(self.paths, snapshot)
+        return result
+
+    def isolate_affected_action(self, snapshot: RunSnapshot, node_id: str, reason: str) -> None:
+        isolate_affected_action(snapshot, node_id, reason)
+        self._record(snapshot, "action_isolated", {
+            "run_id": snapshot.run_id, "node_id": node_id,
+            "reason": reason, "disposition": "degraded", "action": "isolate", "isolated": True,
+        })
+        save_snapshot(self.paths, snapshot)
 
     def merge_change_request_local(
         self,
@@ -59,6 +635,7 @@ class Monitor:
         :func:`merge_local` to the run event log.
         """
         snapshot = load_snapshot(self.paths, run_id)
+        self._validate_execution_topology(snapshot)
         record = self._require_snapshot_authorization(snapshot)
         evidence = merge_local(change_request, record, local_facts)
         self._record(
@@ -70,18 +647,69 @@ class Monitor:
                 "evidence": evidence.to_dict(),
             },
         )
+        self._record_topology_projection(snapshot, "monitor.merge_local")
         save_snapshot(self.paths, snapshot)
         return evidence
 
     # Short alias for callers that already operate in the Monitor boundary.
     merge_local = merge_change_request_local
 
+    def record_change_request_action(
+        self,
+        run_id: str,
+        action: str,
+        target_contract: Any,
+        evidence: Optional[Dict[str, Any]] = None,
+        node_id: Optional[str] = None,
+    ) -> ChangeRequestEvidence:
+        """Record a target-bound PR/MR or merge action without calling a provider.
+
+        A failed precondition quarantines only this external action.  When a
+        node observation is supplied, callers may invoke ``self_heal_binding``
+        first; this method never widens the frozen contract or authorization.
+        """
+        snapshot = load_snapshot(self.paths, run_id)
+        record = self._require_snapshot_authorization(snapshot)
+        prepared = execute_change_request(action, target_contract)
+        payload = dict(evidence or {})
+        payload.setdefault("action", action)
+        payload.setdefault("target_contract", prepared.target_contract)
+        allowed = (
+            can_create_change_request(payload, record)
+            if str(action).casefold() in {"create_pr", "create_mr"}
+            else can_auto_merge(payload, record)
+            if str(action).casefold() in {"merge_local", "merge_remote"}
+            else False
+        )
+        status = "authorized" if allowed and prepared.status == "prepared" else "blocked_unknown"
+        if not allowed:
+            prepared = ChangeRequestEvidence(
+                prepared.action, status, prepared.target_contract,
+                prepared.target_digest, prepared.provider,
+                remote_mutated=False,
+                details={"reason": "authorization or evidence precondition failed"},
+            )
+            if node_id:
+                self.isolate_affected_action(snapshot, node_id, "change request action evidence is incomplete")
+        self._record(snapshot, "change_request_" + prepared.status, {
+            "run_id": run_id, "action": prepared.action,
+            "target_contract": prepared.target_contract,
+            "target_digest": prepared.target_digest,
+            "evidence": prepared.to_dict(),
+            "external_execution": "not_performed",
+        })
+        save_snapshot(self.paths, snapshot)
+        return prepared
+
     def start(
         self, record: Optional[AuthorizationRecord], runner: Runner
     ) -> RunSnapshot:
+        self._reset_binding_cache()
         self._require_record(record)
         state = self.paths.vibe / "state.json"
         capability_contract_digest = ""
+        task_workflow = None
+        state_data = {}
         if state.is_file():
             try:
                 require_entry(self.paths, "monitor:" + self.plan.plan_id, "monitor")
@@ -90,9 +718,25 @@ class Monitor:
             capability_contract_digest = require_capability_contract(
                 self.paths
             ).contract_digest
+            try:
+                state_data = json.loads(state.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                raise PermissionError("session_gate_blocked") from error
+            task_workflow = state_data.get("task_workflow") or state_data.get("workflow")
+            if task_workflow is not None:
+                workflow_result = verify_workflow(task_workflow)
+                if workflow_result.get("status") != "complete":
+                    raise PermissionError("required_workflow_blocked: {}".format(workflow_result.get("node", "unknown")))
         elif self.paths.vibe.exists():
             raise PermissionError("session_gate_blocked: V2 state.json is missing")
         assert record is not None
+        integration_run = any(node.id == "integration-review" for node in self.nodes.values())
+        legacy_run = self._legacy_run_allowed(state_data)
+        if integration_run and task_workflow is None and not legacy_run:
+            raise PermissionError("required_workflow_blocked: workflow")
+        prd_digest, spec_digest = self._current_plan_digests()
+        if integration_run and (not prd_digest or not spec_digest):
+            raise PermissionError("integration lineage blocked_unknown: PRD/Spec digest is missing")
         run_id = "run-" + uuid.uuid4().hex
         node_state: Dict[str, Dict[str, Any]] = {}
         for node_id, node in self.nodes.items():
@@ -116,6 +760,7 @@ class Monitor:
                 "pair_archived": False,
                 "old_task_reconciled": False,
                 "retryable_action": None,
+                "binding_phase": None,
                 "contract_overrides": {},
                 "corrections": [],
                 "contract_digest": executable_contract_digest([node]),
@@ -134,7 +779,18 @@ class Monitor:
             node_contract_digest=record.node_contract_digest,
             capability_contract_digest=capability_contract_digest,
             event_sequence=0,
+            workflow=task_workflow,
+            prd_digest=prd_digest,
+            spec_digest=spec_digest,
+            legacy_run=legacy_run,
+            legacy_evidence=state_data.get("legacy_evidence") if legacy_run else None,
+            legacy_evidence_digest=self._legacy_evidence_digest(state_data.get("legacy_evidence")) if legacy_run else "",
+            execution_engine=record.execution_engine,
+            engine_mode=record.engine_mode,
+            engine_evidence_ref=record.engine_evidence_ref,
+            dag_revision=record.dag_revision,
         )
+        self._refresh_execution_projection(snapshot, "monitor.start")
         self._record(
             snapshot,
             "run_started",
@@ -144,6 +800,7 @@ class Monitor:
                 "node_contract_digest": record.node_contract_digest,
                 "capability_contract_digest": capability_contract_digest,
                 "node_ids": sorted(self.nodes),
+                "legacy_evidence_digest": snapshot.legacy_evidence_digest,
             },
         )
         save_snapshot(self.paths, snapshot)
@@ -152,14 +809,28 @@ class Monitor:
             return snapshot
         self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
+        self._record_topology_projection(snapshot, "monitor.start")
         save_snapshot(self.paths, snapshot)
         return snapshot
 
     def resume(self, run_id: str, runner: Runner, poll_handles: bool = True) -> RunSnapshot:
+        self._reset_binding_cache()
         require_entry(self.paths, "resume:" + str(run_id), "resume")
         snapshot = load_snapshot(self.paths, run_id)
+        if isinstance(snapshot.workflow, dict):
+            result = verify_workflow(snapshot.workflow)
+            if result.get("status") != "complete":
+                raise PermissionError("required_workflow_blocked: {}".format(result.get("node", "unknown")))
+        legacy_allowed = self._legacy_binding_valid(snapshot.legacy_run, snapshot.legacy_evidence, snapshot.legacy_evidence_digest)
+        if "integration-review" in snapshot.nodes and snapshot.workflow is None and not legacy_allowed:
+            raise PermissionError("required_workflow_blocked: workflow")
+        if "integration-review" in snapshot.nodes and not legacy_allowed:
+            current_prd, current_spec = self._current_plan_digests()
+            if not self._lineage_matches_snapshot(snapshot, current_prd, current_spec):
+                raise PermissionError("integration lineage blocked_unknown: PRD/Spec source drift")
         checkpoint_path = self.paths.root / ".vibe" / "runs" / run_id / "monitor_checkpoint.json"
         if checkpoint_path.is_file():
+            # Validate the recovery package before touching leases or polling.
             resume_from_checkpoint(self.paths, run_id)
         current_capability_contract = require_capability_contract(self.paths)
         if (
@@ -186,11 +857,15 @@ class Monitor:
                         node_id,
                         "active task handle is missing during resume",
                     )
+        # Poll durable handles before considering any new dispatch.  This is
+        # the recovery ordering that prevents chat/context loss from creating
+        # a second writer for an already-running provider task.
         if poll_handles:
             self._poll_active_handles(snapshot, runner)
         if self._context_allows_dispatch(snapshot, runner):
-            self._schedule_ready(snapshot, runner)
+            self._schedule_ready(snapshot, runner, recover_missing_reviewer=True)
         self._refresh_run_status(snapshot)
+        self._record_topology_projection(snapshot, "monitor.resume")
         save_snapshot(self.paths, snapshot)
         return snapshot
 
@@ -203,30 +878,46 @@ class Monitor:
     ) -> RunSnapshot:
         """Continue the same run under a newly confirmed same-plan contract."""
 
+        self._reset_binding_cache()
         self._require_record(record)
         snapshot = load_snapshot(self.paths, run_id)
         state = self.paths.vibe / "state.json"
+        current_capability_contract_digest = snapshot.capability_contract_digest
+        capability_contract_changed = False
         if state.is_file():
             current_capability_contract = require_capability_contract(self.paths)
-            if (
-                not snapshot.capability_contract_digest
-                or snapshot.capability_contract_digest
-                != current_capability_contract.contract_digest
-            ):
+            current_capability_contract_digest = current_capability_contract.contract_digest
+            capability_contract_changed = (
+                snapshot.capability_contract_digest
+                != current_capability_contract_digest
+            )
+            if capability_contract_changed and change_reason not in {
+                "capability_contract_changed",
+                "executable_contract_changed",
+            }:
                 raise PermissionError(
-                    "capability_contract_unknown: run binding mismatch"
+                    "capability_contract_unknown: explicit recovery reason required"
                 )
         self._reconcile_unapplied_events(snapshot)
+        # The replay may already have applied this exact authorization and
+        # capability transition.  Re-read the live contract after replay so
+        # an interrupted call cannot append the same transition again.
+        if state.is_file():
+            current_capability_contract = require_capability_contract(self.paths)
+            current_capability_contract_digest = current_capability_contract.contract_digest
+            capability_contract_changed = (
+                snapshot.capability_contract_digest
+                != current_capability_contract_digest
+            )
         if (
             snapshot.plan_id != self.plan.plan_id
             or snapshot.plan_version != self.plan.version
             or set(snapshot.nodes) != set(self.nodes)
         ):
             raise PermissionError("reauthorization must remain on the same plan revision")
-        if snapshot.authorization_digest == record.digest:
+        if snapshot.authorization_digest == record.digest and not capability_contract_changed:
             self._require_snapshot_authorization(snapshot)
-            if self._context_allows_dispatch(snapshot, runner):
-                self._schedule_ready(snapshot, runner)
+            self._schedule_ready(snapshot, runner)
             self._refresh_run_status(snapshot)
             save_snapshot(self.paths, snapshot)
             return snapshot
@@ -286,8 +977,6 @@ class Monitor:
             else:
                 invalidated_acceptances[node_id] = evidence
         for node_id, handle_id in list(snapshot.handles.items()):
-            if node_id not in affected_nodes:
-                continue
             current = snapshot.nodes[node_id]
             active = current.get("active_task")
             if not isinstance(active, dict) or active.get("handle_id") != handle_id:
@@ -302,15 +991,14 @@ class Monitor:
             ):
                 save_snapshot(self.paths, snapshot)
                 raise RuntimeError("active task stop cannot be proven for reauthorization")
+            snapshot.nodes[node_id]["old_task_reconciled"] = True
 
         continuation: Dict[str, Any] = {}
         for node_id in sorted(snapshot.nodes):
             for role in ("developer", "reviewer"):
                 key = "{}:{}".format(node_id, role)
                 try:
-                    binding = load_task_binding(
-                        self.paths, node_id, role, run_id=snapshot.run_id
-                    )
+                    binding = self._load_task_binding(snapshot, node_id, role)
                 except FileNotFoundError:
                     continue
                 snapshot.tasks[key] = binding.to_dict()
@@ -324,9 +1012,11 @@ class Monitor:
             "previous_authorization": previous.to_dict(),
             "previous_authorization_digest": previous.digest,
             "previous_node_contract_digest": previous.node_contract_digest,
+            "previous_capability_contract_digest": snapshot.capability_contract_digest,
             "new_authorization": record.to_dict(),
             "authorization_digest": record.digest,
             "node_contract_digest": record.node_contract_digest,
+            "capability_contract_digest": current_capability_contract_digest,
             "previous_node_contract_digests": previous_node_contract_digests,
             "node_contract_digests": new_node_contract_digests,
             "authorized_node_contracts": authorized_node_contracts,
@@ -340,22 +1030,234 @@ class Monitor:
         }
         self._record(snapshot, "authorization_reauthorized", transition)
         self._apply_reauthorization_transition(snapshot, transition)
-        if self._context_allows_dispatch(snapshot, runner):
-            self._schedule_ready(snapshot, runner)
+        self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
+        self._refresh_execution_projection(snapshot, "monitor.reauthorize")
         save_snapshot(self.paths, snapshot)
         return snapshot
 
     def tick(self, run_id: str, runner: Runner) -> RunSnapshot:
+        self._reset_binding_cache()
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
+        self._validate_execution_topology(snapshot)
         self._reconcile_unapplied_events(snapshot)
         self._poll_active_handles(snapshot, runner)
+        self._record_topology_projection(snapshot, "monitor.tick")
         if self._context_allows_dispatch(snapshot, runner):
             self._schedule_ready(snapshot, runner)
+        self._record_topology_projection(snapshot, "monitor.tick")
         self._refresh_run_status(snapshot)
         save_snapshot(self.paths, snapshot)
         return snapshot
+
+    def record_integration_review(self, run_id: str, evidence: Dict[str, Any]) -> RunSnapshot:
+        """Persist a validated integration review and refresh run closeout."""
+        self._reset_binding_cache()
+        snapshot = load_snapshot(self.paths, run_id)
+        self._require_snapshot_authorization(snapshot)
+        self._validate_execution_topology(snapshot)
+        _record_integration_review(snapshot, evidence)
+        self._record(snapshot, "integration_review_recorded", {
+            "run_id": snapshot.run_id,
+            "node_id": "integration-review",
+            "evidence": evidence,
+            "clearance": evidence.get("clearance"),
+        })
+        self._refresh_run_status(snapshot)
+        self._record_topology_projection(snapshot, "monitor.record_integration_review")
+        save_snapshot(self.paths, snapshot)
+        return snapshot
+
+    def reconcile_evidence(self, run_id: str, package: Dict[str, Any]) -> RunSnapshot:
+        """Promote a verified, same-run evidence package through normal events.
+
+        This path is deliberately provider-free: it only reuses the original
+        task bindings and appends ordinary ``delivered``/``accepted`` events.
+        Any malformed, stale, mixed, or unverifiable package is rejected before
+        the first event is appended.
+        """
+        self._reset_binding_cache()
+        snapshot = load_snapshot(self.paths, run_id)
+        self._require_snapshot_authorization(snapshot)
+        self._validate_reconciliation_package(snapshot, package)
+        if all(node.get("status") == "accepted" for node in snapshot.nodes.values()):
+            return snapshot
+        for item in package["nodes"]:
+            current = snapshot.nodes[item["node_id"]]
+            if current.get("active_task") is not None or item["node_id"] in snapshot.handles:
+                raise ValueError("reconciliation target has an active writer")
+
+        for item in package["nodes"]:
+            node_id = item["node_id"]
+            current = snapshot.nodes[node_id]
+            developer = self._load_task_binding(snapshot, node_id, "developer")
+            reviewer = self._load_task_binding(snapshot, node_id, "reviewer")
+            # Establish an in-memory active registration for event application;
+            # this is not a new task or writer and is never dispatched.
+            dev_handle = str(item["developer"].get("handle_id") or "reconcile:" + node_id + ":developer")
+            current["active_role"] = "developer"
+            current["active_task"] = {
+                "role": "developer", "task_id": developer.task_id,
+                "generation": developer.generation, "handle_id": dev_handle,
+            }
+            snapshot.handles[node_id] = dev_handle
+            previous_sequence = snapshot.event_sequence
+            self._record(
+                snapshot,
+                "delivered",
+                {"run_id": snapshot.run_id, "node_id": node_id,
+                 "evidence": item["developer"].get("evidence_ref", "reconciliation")},
+                current["active_task"],
+            )
+            snapshot.event_sequence = previous_sequence
+            self._reconcile_unapplied_events(snapshot)
+            current.setdefault("evidence", []).append(
+                redact_provider_text(item["developer"].get("evidence_ref", "reconciliation"))
+            )
+
+            reviewer_handle = str(item["reviewer"].get("handle_id") or "reconcile:" + node_id + ":reviewer")
+            current["active_role"] = "reviewer"
+            current["active_task"] = {
+                "role": "reviewer", "task_id": reviewer.task_id,
+                "generation": reviewer.generation, "handle_id": reviewer_handle,
+            }
+            snapshot.handles[node_id] = reviewer_handle
+            previous_sequence = snapshot.event_sequence
+            self._record(
+                snapshot,
+                "accepted",
+                {"run_id": snapshot.run_id, "node_id": node_id,
+                 "contract_digest": current["contract_digest"],
+                 "authorization_epoch": snapshot.authorization_digest,
+                 "evidence": {"source": "reconciliation", "clearance": item["reviewer"]["clearance"]}},
+                current["active_task"],
+            )
+            snapshot.event_sequence = previous_sequence
+            self._reconcile_unapplied_events(snapshot)
+            current.setdefault("evidence", []).append(
+                redact_provider_text(item["reviewer"].get("evidence_ref", "reconciliation"))
+            )
+            previous_sequence = snapshot.event_sequence
+            self._record(
+                snapshot,
+                "pair_archived",
+                {"run_id": snapshot.run_id, "node_id": node_id,
+                 "clearance": current.get("review_clearance", {"p0": 0, "p1": 0, "p2": 0})},
+            )
+            snapshot.event_sequence = previous_sequence
+            self._reconcile_unapplied_events(snapshot)
+
+        self._refresh_run_status(snapshot)
+        save_snapshot(self.paths, snapshot)
+        return snapshot
+
+    def _validate_reconciliation_package(
+        self, snapshot: RunSnapshot, package: Dict[str, Any]
+    ) -> None:
+        if not isinstance(package, dict):
+            raise ValueError("reconciliation package is invalid")
+        required = {
+            "schema_version", "run_id", "plan_id", "plan_revision",
+            "authorization_digest", "node_contract_digest", "nodes",
+        }
+        if set(package) != required or package.get("schema_version") != 1:
+            raise ValueError("reconciliation package schema is invalid")
+        if (
+            package["run_id"] != snapshot.run_id
+            or package["plan_id"] != self.plan.plan_id
+            or package["plan_revision"] != self.plan.version
+            or package["authorization_digest"] != snapshot.authorization_digest
+            or package["node_contract_digest"] != snapshot.node_contract_digest
+        ):
+            raise ValueError("reconciliation run or contract digest mismatch")
+        records = package["nodes"]
+        if not isinstance(records, list):
+            raise ValueError("reconciliation package nodes are invalid")
+        ids = [item.get("node_id") if isinstance(item, dict) else None for item in records]
+        all_accepted = all(current.get("status") == "accepted" for current in snapshot.nodes.values())
+        expected_ids = {
+            node_id for node_id, current in snapshot.nodes.items()
+            if current.get("status") != "accepted"
+        }
+        if all_accepted and not records:
+            return
+        if all_accepted:
+            expected_ids = set(snapshot.nodes)
+        if any(not isinstance(node_id, str) for node_id in ids) or len(ids) != len(set(ids)) or set(ids) != expected_ids:
+            raise ValueError("reconciliation package node set is invalid")
+        if all_accepted:
+            for item in records:
+                if not isinstance(item, dict) or set(item) != {"node_id", "developer", "reviewer"}:
+                    raise ValueError("reconciliation node record is invalid")
+            return
+        for item in records:
+            node_id = item["node_id"]
+            if set(item) != {"node_id", "developer", "reviewer"}:
+                raise ValueError("reconciliation node record is invalid")
+            current = snapshot.nodes[node_id]
+            for role in ("developer", "reviewer"):
+                claim = item[role]
+                if not isinstance(claim, dict):
+                    raise ValueError("reconciliation task evidence is invalid")
+                binding = self._load_task_binding(snapshot, node_id, role)
+                for key in ("task_id", "generation", "worktree", "branch", "status"):
+                    if claim.get(key) != getattr(binding, key):
+                        raise ValueError("reconciliation {} identity mismatch".format(role))
+                self._validate_head(binding, claim.get("head"))
+                if binding.task_id != current.get(role + "_identity"):
+                    raise ValueError("reconciliation {} task identity is stale".format(role))
+                if binding.worktree != str(current.get("worktree")) or binding.branch != str(current.get("branch")):
+                    raise ValueError("reconciliation {} worktree or branch mismatch".format(role))
+                self._validate_evidence_file(binding, claim.get("status_file"), "status_file")
+                self._validate_evidence_file(binding, claim.get("handoff_file"), "handoff_file")
+            reviewer_claim = item["reviewer"]
+            clearance = reviewer_claim.get("clearance")
+            if not isinstance(clearance, dict) or set(clearance) != {"p0", "p1", "p2"} or any(clearance[key] != 0 for key in clearance):
+                raise ValueError("reviewer P0-P2 clearance is not zero")
+
+    def _validate_evidence_file(self, binding: TaskBinding, value: Any, field: str) -> None:
+        if not isinstance(value, dict) or set(value) != {"path", "sha256"}:
+            raise ValueError("reconciliation {} evidence is invalid".format(field))
+        path_value = value["path"]
+        digest = value["sha256"]
+        if not isinstance(path_value, str) or not path_value or Path(path_value).is_absolute() or "\x00" in path_value:
+            raise ValueError("reconciliation {} path is invalid".format(field))
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("reconciliation {} hash is invalid".format(field))
+        expected = getattr(binding, field)
+        if expected and path_value != expected:
+            raise ValueError("reconciliation {} path does not match binding".format(field))
+        root = self._worktree_path({"worktree": binding.worktree})
+        candidate = (root / path_value).resolve(strict=False)
+        try:
+            candidate.relative_to(root.resolve())
+        except ValueError as error:
+            raise ValueError("reconciliation evidence path escapes worktree") from error
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ValueError("reconciliation evidence file is unavailable")
+        if hashlib.sha256(candidate.read_bytes()).hexdigest() != digest:
+            raise ValueError("reconciliation evidence hash mismatch")
+
+    def _validate_head(self, binding: TaskBinding, claimed: Any) -> None:
+        if not isinstance(claimed, str) or len(claimed) != 40 or any(c not in "0123456789abcdef" for c in claimed.lower()):
+            raise ValueError("reconciliation HEAD is invalid")
+        worktree = self._worktree_path({"worktree": binding.worktree})
+        try:
+            observed = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "--verify", "HEAD"],
+                check=True, capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            observed_branch = subprocess.run(
+                ["git", "-C", str(worktree), "branch", "--show-current"],
+                check=True, capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ValueError("reconciliation HEAD is unavailable") from error
+        if observed.lower() != claimed.lower():
+            raise ValueError("reconciliation HEAD mismatch")
+        if observed_branch != binding.branch:
+            raise ValueError("reconciliation branch mismatch: {} != {}".format(observed_branch, binding.branch))
 
     def _poll_active_handles(self, snapshot: RunSnapshot, runner: Runner) -> None:
         for node_id, handle_id in list(snapshot.handles.items()):
@@ -363,18 +1265,26 @@ class Monitor:
             try:
                 events = runner.poll(RunHandle(handle_id))
             except Exception as error:
-                self._mark_blocked_unknown(
+                self._queue_active_retry(
                     snapshot,
                     node_id,
                     "runner poll failed ({})".format(type(error).__name__),
                 )
+                self._mark_blocked_unknown(
+                    snapshot,
+                    node_id,
+                    "runner poll failed ({})".format(type(error).__name__),
+                    quarantine_lease=False,
+                    retryable_same_task=True,
+                )
                 continue
             for event in events:
                 if event.event in {"context_overflow", "context_exhausted", "overflow"}:
-                    self._record_runner_event(snapshot, node_id, event, snapshot.nodes[node_id].get("active_task") or {})
+                    active = snapshot.nodes[node_id].get("active_task")
+                    self._record_runner_event(snapshot, node_id, event, active or {})
                     self._checkpoint_context(snapshot, "provider reported context overflow", exhausted=True)
-                else:
-                    self._apply_event(snapshot, node_id, handle_id, event, runner)
+                    continue
+                self._apply_event(snapshot, node_id, handle_id, event, runner)
 
     def _require_record(self, record: Optional[AuthorizationRecord]) -> None:
         if record is None or not is_authorization_valid(
@@ -383,6 +1293,7 @@ class Monitor:
             raise PermissionError("a valid executable-contract authorization is required")
         if record.node_ids != tuple(sorted(self.nodes)):
             raise PermissionError("authorization node scope does not match monitor scope")
+        self._execution_engine_binding(record)
 
     def _snapshot_record(self, snapshot: RunSnapshot) -> AuthorizationRecord:
         try:
@@ -426,6 +1337,8 @@ class Monitor:
             != snapshot.authorization_digest
             or data.get("previous_node_contract_digest")
             != snapshot.node_contract_digest
+            or data.get("previous_capability_contract_digest")
+            != snapshot.capability_contract_digest
         ):
             raise ValueError("reauthorization previous lineage is inconsistent")
         self._require_record(replacement)
@@ -433,9 +1346,23 @@ class Monitor:
             data.get("authorization_digest") != replacement.digest
             or data.get("node_contract_digest")
             != replacement.node_contract_digest
-            or data.get("change_reason") != "executable_contract_changed"
+            or data.get("change_reason")
+            not in {"executable_contract_changed", "capability_contract_changed"}
         ):
             raise ValueError("reauthorization replacement lineage is inconsistent")
+        replacement_capability_digest = data.get("capability_contract_digest")
+        if replacement_capability_digest:
+            if (
+                not isinstance(replacement_capability_digest, str)
+                or len(replacement_capability_digest) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in replacement_capability_digest
+                )
+            ):
+                raise ValueError("reauthorization capability contract lineage is invalid")
+        elif snapshot.capability_contract_digest:
+            raise ValueError("reauthorization capability contract lineage is missing")
         continuation = data.get("continuation")
         if not isinstance(continuation, dict):
             raise ValueError("reauthorization continuation evidence is invalid")
@@ -445,9 +1372,7 @@ class Monitor:
             node_id, role = key.rsplit(":", 1)
             if node_id not in snapshot.nodes or role not in {"developer", "reviewer"}:
                 raise ValueError("reauthorization continuation identity is invalid")
-            binding = load_task_binding(
-                self.paths, node_id, role, run_id=snapshot.run_id
-            )
+            binding = self._load_task_binding(snapshot, node_id, role)
             if (
                 set(evidence) != {"task_id", "cursor"}
                 or evidence["task_id"] != binding.task_id
@@ -559,12 +1484,15 @@ class Monitor:
         snapshot.authorization = replacement.to_dict()
         snapshot.authorization_digest = replacement.digest
         snapshot.node_contract_digest = replacement.node_contract_digest
+        snapshot.capability_contract_digest = replacement_capability_digest or ""
         snapshot.status = "running"
-        affected_set = set(affected_nodes)
-        for node_id in affected_set:
-            snapshot.handles.pop(node_id, None)
+        snapshot.handles.clear()
         for node_id, current in snapshot.nodes.items():
             current["contract_digest"] = node_contract_digests[node_id]
+            current["active_role"] = None
+            current["active_task"] = None
+            current["start_intent"] = None
+            current["quarantine"] = None
             if current.get("status") == "accepted":
                 if node_id in retained_acceptances:
                     evidence = retained_acceptances[node_id]
@@ -575,25 +1503,54 @@ class Monitor:
                     continue
                 if node_id in invalidated_acceptances:
                     current["acceptance"] = None
-                    if node_id not in affected_set:
-                        raise ValueError("invalidated acceptance is outside affected suffix")
-                    self._queue_reauthorization_continuation(current)
+                    self._queue_reauthorization_continuation(
+                        current,
+                        self._continuation_requires_successor(
+                            snapshot, node_id, "developer"
+                        ),
+                    )
                     continue
                 raise ValueError("accepted node lacks reauthorization disposition")
-            if node_id not in affected_set:
-                continue
-            current["active_role"] = None
-            current["active_task"] = None
-            current["start_intent"] = None
-            current["quarantine"] = None
             if int(current.get("developer_generation", 0)) > 0:
-                self._queue_reauthorization_continuation(current)
+                self._queue_reauthorization_continuation(
+                    current,
+                    self._continuation_requires_successor(
+                        snapshot, node_id, "developer"
+                    ),
+                )
             else:
                 current["status"] = "planned"
                 current["retryable_action"] = None
 
+    def _continuation_requires_successor(
+        self, snapshot: RunSnapshot, node_id: str, role: str
+    ) -> bool:
+        """Return whether reauthorization needs a new task identity.
+
+        A provider-confirmed terminal binding is still a canonical task that
+        can be continued.  Only a missing binding (or a non-terminal binding
+        whose state must be reconciled by the scheduler) is a successor
+        candidate.  Malformed registry data remains fail-closed: the
+        scheduler will keep the node blocked rather than guessing.
+        """
+        try:
+            binding = self._load_task_binding(snapshot, node_id, role)
+        except FileNotFoundError:
+            return True
+        except (OSError, TypeError, ValueError):
+            return True
+        # A provider-confirmed delivery is a terminal developer handoff: the
+        # same visible task can be resumed for authorized rework.  Treating
+        # it as a successor candidate would require a stop/absence proof even
+        # though no active writer remains, leaving ordinary delivered work
+        # permanently blocked.  Unknown/running/review states remain
+        # successor candidates and still require the fail-closed proof below.
+        return binding.status not in {"delivered", "stopped", "failed", "archived"}
+
     @staticmethod
-    def _queue_reauthorization_continuation(current: Dict[str, Any]) -> None:
+    def _queue_reauthorization_continuation(
+        current: Dict[str, Any], successor_candidate: bool
+    ) -> None:
         current["pair_archived"] = True
         current["status"] = "blocked_unknown"
         current["retryable_action"] = {
@@ -601,7 +1558,71 @@ class Monitor:
             "phase": "rework",
             "continuation": True,
             "pending_schedule": True,
+            "successor_candidate": successor_candidate,
         }
+
+    def _recover_quarantined_delivered_developer(
+        self, snapshot: RunSnapshot, node_id: str, record_event: bool = True
+    ) -> bool:
+        """Rebuild a lost continuation marker from a delivered binding.
+
+        An interrupted reauthorization can persist the quarantine transition
+        after the retry marker was lost.  A current-run delivered developer
+        binding is sufficient evidence to continue that same visible task;
+        it is not evidence for creating a successor or another writer.
+        """
+        current = snapshot.nodes[node_id]
+        if (
+            current.get("status") != "blocked_unknown"
+            or not isinstance(current.get("quarantine"), dict)
+            or current.get("active_task") is not None
+            or current.get("active_role") is not None
+            or current.get("start_intent") is not None
+            or node_id in snapshot.handles
+            or current.get("retryable_action") is not None
+            # If reviewer dispatch already began, a delivered developer is
+            # not a rework candidate.  Recovery must reconstruct the missing
+            # reviewer binding and keep the node fail-closed until then.
+            or current.get("reviewer_started") is True
+        ):
+            return False
+        try:
+            binding = self._load_task_binding(snapshot, node_id, "developer")
+            generation = int(current.get("developer_generation", 0))
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return False
+        if (
+            binding.status != "delivered"
+            or not binding.task_id
+            or binding.task_id != current.get("developer_identity")
+            or generation <= 0
+            or binding.generation <= 0
+            or binding.generation > generation
+        ):
+            return False
+        current["retryable_action"] = {
+            "role": "developer",
+            "phase": "rework",
+            "continuation": True,
+            "pending_schedule": True,
+            "successor_candidate": False,
+        }
+        current["pair_archived"] = True
+        current["quarantine"] = None
+        current["reason"] = "quarantined delivered continuation recovered"
+        if record_event:
+            self._record(
+                snapshot,
+                "quarantine_continuation_recovered",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "role": "developer",
+                    "task_id": binding.task_id,
+                    "generation": generation,
+                },
+            )
+        return True
 
     @staticmethod
     def _identity_from_contract(node: DAGNode, role: str) -> Optional[str]:
@@ -625,8 +1646,71 @@ class Monitor:
                     return str(node.contract[key])
         return None
 
-    def _schedule_ready(self, snapshot: RunSnapshot, runner: Runner) -> None:
+    def _prove_old_task_stopped_or_absent(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        retry: Dict[str, Any],
+    ) -> Optional[str]:
+        """Return the predecessor identity only when a successor is safe.
+
+        ``None`` means the old task remains ambiguous.  An empty string is a
+        durable absence proof: there is no current-run registry binding and
+        no provider request that could have created a task.  A terminal
+        binding is accepted only for an already provider-confirmed terminal
+        state; running/blocked bindings never authorize a new writer.
+        """
+        current = snapshot.nodes[node_id]
+        if retry.get("successor_candidate") is not True:
+            return None
+        if (
+            current.get("active_task") is not None
+            or node_id in snapshot.handles
+            or current.get("start_intent") is not None
+        ):
+            return None
+        role = retry.get("role")
+        if role not in {"developer", "reviewer"}:
+            return None
+        try:
+            binding = self._load_task_binding(snapshot, node_id, str(role))
+        except FileNotFoundError:
+            try:
+                requested = ProviderActionStore(self.paths).has_request(
+                    snapshot.run_id, node_id, str(role)
+                )
+            except (OSError, TypeError, ValueError):
+                return None
+            return None if requested else ""
+        except (OSError, TypeError, ValueError):
+            return None
+        if binding.status in {"stopped", "failed", "archived"}:
+            return binding.task_id or ""
+        return None
+
+    def _reject_replayed_old_task_reconciliation(
+        self, snapshot: RunSnapshot, node_id: str, data: Dict[str, Any]
+    ) -> None:
+        """Consume an untrusted reconciliation event without starting a writer."""
+        current = snapshot.nodes[node_id]
+        current["status"] = "blocked_unknown"
+        current["reason"] = "replayed old task reconciliation proof is invalid"
+        current["quarantine"] = {
+            "run_id": snapshot.run_id,
+            "handle_id": snapshot.handles.get(node_id),
+            "reason": current["reason"],
+        }
+        current["old_task_reconciled"] = False
+        current["retryable_action"] = None
+
+    def _schedule_ready(
+        self,
+        snapshot: RunSnapshot,
+        runner: Runner,
+        recover_missing_reviewer: bool = False,
+    ) -> None:
         record = self._require_snapshot_authorization(snapshot)
+        self._validate_execution_topology(snapshot)
         active_pairs = sum(
             1
             for node_id, current in snapshot.nodes.items()
@@ -641,20 +1725,102 @@ class Monitor:
         )
         for node_id, node in self.nodes.items():
             current = snapshot.nodes[node_id]
+            was_active_pair = not current.get("pair_archived") and (
+                int(current.get("developer_generation", 0)) > 0
+                or current.get("retryable_action") is not None
+            )
+            if self._recover_quarantined_delivered_developer(snapshot, node_id):
+                if was_active_pair:
+                    active_pairs -= 1
+            if recover_missing_reviewer:
+                self._recover_missing_reviewer_successor(snapshot, node_id)
             retry = current.get("retryable_action")
+            if isinstance(retry, dict) and retry.get("same_task") is True:
+                # Unknown side effects are never eligible for successor
+                # creation, even if an older persisted marker said so.
+                if retry.get("successor") is not False or retry.get("successor_candidate") is True:
+                    retry = dict(retry)
+                    retry["successor"] = False
+                    retry["successor_candidate"] = False
+                    current["retryable_action"] = retry
             if (
-                current.get("status") in {"blocked_unknown", "running"}
+                current.get("status") in {"blocked_unknown", "running", "rework"}
                 and isinstance(retry, dict)
                 and node_id not in snapshot.handles
             ):
+                # A delivered developer handoff is a verified continuation
+                # even when an interrupted reauthorization left a stale
+                # quarantine marker behind.  Normalize the legacy marker
+                # before applying the fail-closed quarantine branch so the
+                # original visible task can be resumed in place.
+                resumable_developer = (
+                    retry.get("continuation")
+                    and retry.get("role") == "developer"
+                    and not self._continuation_requires_successor(
+                        snapshot, node_id, "developer"
+                    )
+                )
+                if resumable_developer:
+                    retry = dict(retry)
+                    retry["successor_candidate"] = False
+                    current["retryable_action"] = retry
+                    if (
+                        isinstance(current.get("quarantine"), dict)
+                        and current.get("active_task") is None
+                    ):
+                        current["quarantine"] = None
+                if (
+                    current.get("status") == "blocked_unknown"
+                    and isinstance(current.get("quarantine"), dict)
+                    and retry.get("successor_candidate") is not True
+                    and retry.get("same_task") is not True
+                    and current.get("active_task") is None
+                    and not resumable_developer
+                ):
+                    current["retryable_action"] = None
+                    current["reason"] = (
+                        "quarantined task has no proven active binding to resume"
+                    )
+                    continue
+                if retry.get("successor_candidate") is True and retry.get(
+                    "continuation"
+                ):
+                    predecessor = self._prove_old_task_stopped_or_absent(
+                        snapshot, node_id, retry
+                    )
+                    if predecessor is None:
+                        current["status"] = "blocked_unknown"
+                        current["reason"] = (
+                            "old task stop or absence cannot be proven for successor"
+                        )
+                        continue
+                    retry = dict(retry)
+                    retry["continuation"] = False
+                    retry["successor"] = True
+                    retry["predecessor_task_id"] = predecessor or None
+                    retry["old_task_reconciled"] = True
+                    current["retryable_action"] = retry
+                    current["old_task_reconciled"] = True
+                    self._record(
+                        snapshot,
+                        "old_task_reconciled",
+                        {
+                            "run_id": snapshot.run_id,
+                            "node_id": node_id,
+                            "role": retry["role"],
+                            "predecessor_task_id": predecessor or None,
+                            "proof": "absent" if not predecessor else "stopped",
+                        },
+                    )
                 pending_schedule = retry.get("pending_schedule") is True
+                reviewer_recovery = retry.get("missing_binding_recovery") is True
                 if pending_schedule and (
                     active_pairs >= record.active_pair_limit
                     or not all(
                         snapshot.nodes[dependency].get("status") == "accepted"
                         for dependency in node.depends_on
                     )
-                ):
+                ) and not reviewer_recovery:
                     continue
                 if not acquire_writer_lease(
                     self.paths,
@@ -678,6 +1844,7 @@ class Monitor:
                     str(retry["phase"]),
                     runner,
                     bool(retry.get("continuation")),
+                    bool(retry.get("successor")),
                 ):
                     if current.get("status") != "blocked_unknown":
                         current["retryable_action"] = None
@@ -698,6 +1865,8 @@ class Monitor:
                 self._start_task(snapshot, node_id, "reviewer", "review", runner, False)
                 continue
             if current.get("status") != "planned":
+                continue
+            if not self._brief_allows_first_write(snapshot, node_id, node):
                 continue
             if active_pairs >= record.active_pair_limit:
                 continue
@@ -723,6 +1892,203 @@ class Monitor:
             ):
                 active_pairs += 1
 
+    def _brief_allows_first_write(
+        self, snapshot: RunSnapshot, node_id: str, node: DAGNode
+    ) -> bool:
+        """Require a valid V3.8 implementation brief before a first write.
+
+        The gate is deliberately checked before acquiring a writer lease or
+        invoking the provider.  Nodes without the opt-in contract retain the
+        legacy scheduling path.
+        """
+        if node.contract.get("brief_required") is not True:
+            return True
+        current = snapshot.nodes[node_id]
+        raw = node.contract.get("implementation_brief")
+        try:
+            brief = ImplementationBrief.from_mapping(raw)
+            validation = validate_implementation_brief(
+                brief, RunManifest.from_mapping({
+                    "plan_id": snapshot.plan_id,
+                    "plan_revision": snapshot.plan_version,
+                    "run_id": snapshot.run_id,
+                    # A missing contract base is itself a mismatch.  Use a
+                    # non-zero sentinel only to let the validator report the
+                    # concrete ``base_sha`` difference without accepting it.
+                    "base_sha": node.contract.get("base_sha", "f" * 40),
+                    "target_branch": str(current.get("branch", "")),
+                    "execution_epoch": int(node.contract.get("execution_epoch", 0)),
+                    "authorization_digest": snapshot.authorization_digest,
+                    "evidence_ref": "brief-gate",
+                }),
+                node,
+                project_root=self.paths.root,
+            )
+        except (TypeError, ValueError, OSError) as error:
+            validation = None
+            missing = ["schema:" + type(error).__name__]
+            evidence = {"status": "brief_pending", "checks": {}}
+        else:
+            missing = validation.missing
+            evidence = validation.evidence
+        if missing:
+            current["status"] = "brief_pending"
+            current["brief_evidence"] = {
+                "missing": sorted(set(missing)),
+                "checks": evidence.get("checks", {}),
+            }
+            current["reason"] = "implementation brief is not valid"
+            return False
+        return True
+
+    def _recover_missing_reviewer_successor(
+        self, snapshot: RunSnapshot, node_id: str
+    ) -> None:
+        """Queue a reviewer successor only from a fully proven recovery state.
+
+        A historical ``reviewer_started`` flag is not proof that this run has
+        a reviewer task to continue. Recovery may create a successor only when
+        the delivered developer binding is current, the reviewer binding is
+        explicitly absent, and neither a provider request nor an active
+        task/handle/start intent could represent an unresolved side effect.
+        """
+        current = snapshot.nodes[node_id]
+        if current.get("status") != "blocked_unknown":
+            return
+        if current.get("reviewer_started") is not True:
+            return
+        if current.get("retryable_action") is not None:
+            return
+        if (
+            current.get("active_task") is not None
+            or current.get("active_role") is not None
+            or current.get("start_intent") is not None
+            or node_id in snapshot.handles
+        ):
+            return
+
+        try:
+            developer = self._load_task_binding(snapshot, node_id, "developer")
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return
+
+        try:
+            self._load_task_binding(snapshot, node_id, "reviewer")
+        except FileNotFoundError:
+            pass
+        except (OSError, TypeError, ValueError):
+            return
+        else:
+            return
+
+        try:
+            requested = ProviderActionStore(self.paths).has_request(
+                snapshot.run_id, node_id, "reviewer"
+            )
+        except (OSError, TypeError, ValueError):
+            return
+        if requested:
+            return
+
+        try:
+            developer_generation = int(current.get("developer_generation", 0))
+        except (TypeError, ValueError):
+            return
+        if (
+            developer.status != "delivered"
+            or developer.task_id != current.get("developer_identity")
+            or developer.generation != developer_generation
+        ):
+            return
+
+        predecessor = current.get("reviewer_identity")
+        if predecessor is not None and (
+            not isinstance(predecessor, str) or not predecessor
+        ):
+            return
+        current["retryable_action"] = {
+            "role": "reviewer",
+            "phase": "review",
+            "continuation": False,
+            "successor": True,
+            "successor_candidate": True,
+            "pending_schedule": True,
+            "missing_binding_recovery": True,
+            "predecessor_task_id": predecessor,
+        }
+        current["reason"] = "reviewer successor queued after missing binding recovery"
+
+    def _prepare_worker_profile(
+        self, node: DAGNode, contract: Dict[str, Any], current: Dict[str, Any], role: str
+    ) -> Optional[WorkerProfile]:
+        """Resolve an evidence-bound profile for the real dispatch path.
+
+        Legacy nodes keep their configured profile/default behavior.  A node
+        that declares routing inputs must provide a complete IssueComplexity
+        and structured LocalModel probes; no default model is synthesized.
+        """
+        routing_keys = {"routing_required", "issue_complexity", "model_probes", "models", "required_capabilities"}
+        routing_requested = any(key in contract for key in routing_keys)
+        raw = contract.get("worker_profile")
+        if raw is None and isinstance(contract.get("child_binding"), dict):
+            raw = contract["child_binding"].get("worker_profile")
+        if role != "developer" and raw is None:
+            raw = current.get("contract_overrides", {}).get("worker_profile")
+        if raw is not None:
+            try:
+                profile = raw if isinstance(raw, WorkerProfile) else WorkerProfile.from_dict(raw)
+            except (TypeError, ValueError) as error:
+                raise ValueError("worker model profile is invalid") from error
+            issue_data = contract.get("issue_complexity")
+            probes = contract.get("model_probes", contract.get("models"))
+            if routing_requested and contract.get("routing_required") is True:
+                # An explicitly routed node cannot silently accept an
+                # unrelated preconfigured/default profile.
+                if issue_data is None or probes is None:
+                    raise ValueError("worker model routing evidence is incomplete")
+            if routing_requested and issue_data is not None and probes is not None:
+                issue = issue_data if isinstance(issue_data, IssueComplexity) else IssueComplexity.from_dict(issue_data)
+                if not isinstance(probes, (list, tuple)):
+                    raise TypeError("model probes must be a list")
+                models = [item if isinstance(item, LocalModel) else LocalModel.from_dict(item) for item in probes]
+                expected = ModelRouter(worker=profile.worker).select(
+                    issue, contract.get("required_capabilities", []), models
+                )
+                if (
+                    profile.model != expected.model
+                    or profile.reasoning != expected.reasoning
+                    or profile.route_digest != expected.route_digest
+                ):
+                    raise ValueError("worker model profile conflicts with routing evidence")
+            return profile
+        if not routing_requested:
+            return None
+        issue_data = contract.get("issue_complexity")
+        probes = contract.get("model_probes", contract.get("models"))
+        if issue_data is None or probes is None:
+            raise ValueError("worker model routing evidence is incomplete")
+        issue = issue_data if isinstance(issue_data, IssueComplexity) else IssueComplexity.from_dict(issue_data)
+        if not isinstance(probes, (list, tuple)):
+            raise TypeError("model probes must be a list")
+        models = [item if isinstance(item, LocalModel) else LocalModel.from_dict(item) for item in probes]
+        profile = ModelRouter(worker=str(contract.get("worker") or node.contract.get("worker") or "developer")).select(
+            issue, contract.get("required_capabilities", []), models
+        )
+        profile = WorkerProfile(
+            profile.worker,
+            profile.model,
+            profile.reasoning,
+            profile.fallbacks,
+            profile.selection_basis,
+            worktree=str(contract.get("worktree") or current.get("worktree", "")),
+            branch=str(contract.get("branch") or current.get("branch", "")),
+            allowlist=list(contract.get("files", [])),
+            writer=str(contract.get("writer") or profile.worker),
+            route_digest=profile.route_digest,
+        )
+        current.setdefault("contract_overrides", {})["worker_profile"] = profile.to_dict()
+        return profile
+
     def _start_task(
         self,
         snapshot: RunSnapshot,
@@ -731,14 +2097,20 @@ class Monitor:
         phase: str,
         runner: Runner,
         continuation: bool,
+        successor: bool = False,
     ) -> bool:
         record = self._require_snapshot_authorization(snapshot)
         node = self.nodes[node_id]
         current = snapshot.nodes[node_id]
         identity_key = role + "_identity"
-        identity = current.get(identity_key) or "{}:{}".format(role, node_id)
+        predecessor_identity = current.get(identity_key) or "{}:{}".format(
+            role, node_id
+        )
+        identity = predecessor_identity
         generation_key = "review_generation" if role == "reviewer" else "developer_generation"
         generation = int(current.get(generation_key, 0)) + 1
+        if successor:
+            identity = "{}:successor:{}".format(predecessor_identity, generation)
         current[generation_key] = generation
         if role == "reviewer":
             current["reviewer_started"] = True
@@ -758,11 +2130,47 @@ class Monitor:
                 "task_id": identity,
                 "generation": generation,
                 "continuation": continuation,
+                "successor": successor,
                 "action": phase,
                 "run_id": snapshot.run_id,
                 "consistency_binding": self._consistency_binding(record, node),
             }
         )
+        retry = current.get("retryable_action")
+        if successor:
+            predecessor_task_id = None
+            if isinstance(retry, dict):
+                predecessor_task_id = retry.get("predecessor_task_id")
+            if not predecessor_task_id:
+                predecessor_task_id = current.get(identity_key)
+            contract["predecessor_task_id"] = predecessor_task_id
+        contract.setdefault("worktree", str(current["worktree"]))
+        contract.setdefault("branch", str(current["branch"]))
+        contract.setdefault(
+            "files", list((contract.get("worker_profile") or {}).get("allowlist", []))
+        )
+        routing_requested = any(
+            key in contract
+            for key in ("routing_required", "issue_complexity", "model_probes", "models", "required_capabilities")
+        )
+        profile = self._prepare_worker_profile(node, contract, current, role)
+        if profile is not None:
+            contract["worker_profile"] = profile.to_dict()
+            if routing_requested:
+                contract["routing_required"] = True
+        if binding_contract_enabled(contract):
+            has_live_evidence = isinstance(contract.get("binding_intent"), BindingIntent) and isinstance(
+                contract.get("binding_observation"), BindingObservation
+            )
+            if not has_live_evidence:
+                if continuation:
+                    contract.setdefault("binding_bootstrap", True)
+                    current["binding_phase"] = "binding_repair_pending"
+                else:
+                    contract.setdefault("binding_probe", True)
+                    current["binding_phase"] = "binding_probe_pending"
+            else:
+                current["binding_phase"] = "binding_verified"
         if snapshot.capability_contract_digest:
             contract["capability_contract_digest"] = snapshot.capability_contract_digest
         if (self.paths.vibe / "state.json").is_file():
@@ -777,13 +2185,20 @@ class Monitor:
                 profile = WorkerProfile(**profile_data)
                 validate_child_session_binding(snapshot.run_id, str(self.plan.version), record.digest, node_id, role, profile)
                 contract["child_origin"] = "worker_dispatch"
-                contract["child_binding"] = {"parent_run_id": snapshot.run_id, "plan_revision": str(self.plan.version), "authorization_digest": record.digest, "node_id": node_id, "role": role, "writer": profile.writer, "worktree": profile.worktree, "branch": profile.branch, "allowlist": profile.allowlist, "worker_profile": profile.to_dict(), "capability_contract_digest": snapshot.capability_contract_digest}
+                contract["child_binding"] = {"parent_run_id": snapshot.run_id, "plan_revision": str(self.plan.version), "authorization_digest": record.digest, "node_id": node_id, "role": role, "writer": profile.writer, "worktree": profile.worktree, "branch": profile.branch, "allowlist": profile.allowlist, "worker_profile": profile.to_dict(), "model": profile.model, "reasoning": profile.reasoning, "route_digest": profile.route_digest, "capability_contract_digest": snapshot.capability_contract_digest}
         try:
             contract = validate_runtime_contract(
                 contract,
                 authorized_actions=record.allowed_actions,
                 authorized_files=record.file_scope,
             )
+            if self._binding_recovery_requested(contract):
+                self._preflight_binding_recovery(
+                    snapshot, node_id, role, contract, current
+                )
+            else:
+                self._preflight_binding_before_provider(contract)
+            self._run_binding_bootstrap(snapshot, node_id, role, contract, runner, current)
             binding = self._binding_for(
                 snapshot,
                 node_id,
@@ -794,11 +2209,20 @@ class Monitor:
                 runner,
                 contract,
                 continuation,
+                successor,
             )
+            self._require_binding_gate(contract, binding, runner)
+            if binding_contract_enabled(contract):
+                # Registry persistence intentionally strips private provenance
+                # tokens.  Carry the live, verified objects through this
+                # in-process call so ProviderActionRunner.start() rechecks the
+                # same evidence instead of trusting a downgraded JSON row.
+                contract["binding_intent"] = binding.binding_intent
+                contract["binding_observation"] = binding.binding_observation
             identity = str(binding.task_id)
             current[identity_key] = identity
             contract["task_id"] = identity
-            save_task_binding(self.paths, binding)
+            self._save_task_binding(binding)
         except ProviderPending as error:
             current[generation_key] = generation - 1
             if role == "reviewer" and generation == 1:
@@ -807,11 +2231,40 @@ class Monitor:
                 "role": role,
                 "phase": phase,
                 "continuation": continuation,
+                "successor": False,
+                "same_task": True,
             }
             # An asynchronous bridge response is a retry condition, not
             # evidence that the provider capability is unavailable.
-            current["status"] = "running"
+            current["status"] = "blocked_unknown" if successor else "running"
+            if binding_contract_enabled(contract):
+                current["binding_phase"] = "retry_pending"
             current["reason"] = str(error)
+            if successor:
+                current["active_task"] = None
+                current["active_role"] = None
+                current["start_intent"] = None
+                self._mark_blocked_unknown(snapshot, node_id, str(error))
+                save_snapshot(self.paths, snapshot)
+            return False
+        except ProviderUnavailable as error:
+            current[generation_key] = generation - 1
+            if role == "reviewer" and generation == 1:
+                current["reviewer_started"] = False
+            current["retryable_action"] = {
+                "role": role,
+                "phase": phase,
+                "continuation": continuation,
+                "successor": False,
+                "same_task": True,
+            }
+            current["active_task"] = None
+            current["active_role"] = None
+            current["start_intent"] = None
+            self._mark_blocked_unknown(snapshot, node_id, str(error))
+            if binding_contract_enabled(contract):
+                current["binding_phase"] = "binding_repair_pending"
+            save_snapshot(self.paths, snapshot)
             return False
         except (OSError, TypeError, ValueError) as error:
             self._mark_blocked_unknown(
@@ -832,6 +2285,8 @@ class Monitor:
             "generation": generation,
         }
         current["status"] = "start_pending"
+        if binding_contract_enabled(contract) and current.get("binding_phase") is None:
+            current["binding_phase"] = "binding_verified"
         current["active_role"] = role
         current["active_task"] = {
             "role": role,
@@ -852,6 +2307,14 @@ class Monitor:
         try:
             handle = runner.start(contract, self._worktree_path(current))
         except Exception as error:
+            if successor:
+                current["retryable_action"] = {
+                    "role": role,
+                    "phase": phase,
+                    "continuation": continuation,
+                    "successor": False,
+                    "same_task": True,
+                }
             self._mark_blocked_unknown(
                 snapshot,
                 node_id,
@@ -876,6 +2339,8 @@ class Monitor:
             return False
 
         current["status"] = self._running_status(role, phase)
+        if binding_contract_enabled(contract):
+            current["binding_phase"] = "business_work_allowed"
         current["active_task"]["handle_id"] = handle.run_id
         current["start_intent"] = None
         current["quarantine"] = None
@@ -911,10 +2376,17 @@ class Monitor:
         save_snapshot(self.paths, snapshot)
         pending = getattr(runner, "is_pending", None)
         if callable(pending) and pending(handle):
-            # Keep the active lease and retry the same bridge action on the
-            # next monitor cycle; do not report capability unavailability.
-            current["status"] = self._running_status(role, phase)
-            current["reason"] = "provider action pending; retry scheduled"
+            # Keep the active lease, but expose the unresolved bridge action
+            # as unknown until a provider-confirmed result is observed.  The
+            # handle remains durable so the next tick can poll it; no second
+            # writer is scheduled while this side effect is pending.
+            current["status"] = "blocked_unknown"
+            current["quarantine"] = {
+                "run_id": snapshot.run_id,
+                "handle_id": handle.run_id,
+                "reason": "provider action pending; result not yet confirmed",
+            }
+            current["reason"] = "provider action pending; result not yet confirmed"
             save_snapshot(self.paths, snapshot)
         return True
 
@@ -937,14 +2409,13 @@ class Monitor:
         runner: Runner,
         contract: Dict[str, Any],
         continuation: bool,
+        successor: bool = False,
     ) -> TaskBinding:
         current = snapshot.nodes[node_id]
         previous_binding = None
         if continuation:
             try:
-                previous_binding = load_task_binding(
-                    self.paths, node_id, role, run_id=snapshot.run_id
-                )
+                previous_binding = self._load_task_binding(snapshot, node_id, role)
             except FileNotFoundError:
                 previous_binding = None
             if previous_binding is None or previous_binding.task_id != identity:
@@ -982,7 +2453,58 @@ class Monitor:
                 run_id=snapshot.run_id,
                 status=status,
                 generation=generation,
+                allowlist=list(contract.get("files", [])),
+                capability_contract_digest=contract.get("capability_contract_digest"),
+                successor_of=contract.get("predecessor_task_id") if successor else None,
             )
+        if successor:
+            predecessor = contract.get("predecessor_task_id")
+            if predecessor and binding.task_id == predecessor:
+                raise ValueError("successor task identity reused the predecessor")
+            if predecessor and binding.successor_of not in {None, predecessor}:
+                raise ValueError("successor task predecessor does not match contract")
+            if binding.successor_of is None:
+                binding.successor_of = predecessor
+        expected_capability_digest = contract.get("capability_contract_digest")
+        if expected_capability_digest:
+            if binding.capability_contract_digest not in {
+                None,
+                expected_capability_digest,
+            } and not continuation:
+                raise ValueError("task binding capability contract digest is stale")
+            binding.capability_contract_digest = expected_capability_digest
+        expected_allowlist = list(contract.get("files", []))
+        if expected_allowlist:
+            if binding.allowlist:
+                if binding.allowlist != expected_allowlist:
+                    if not continuation or not set(binding.allowlist).issubset(
+                        set(expected_allowlist)
+                    ):
+                        raise ValueError("task binding allowlist does not match contract")
+                    binding.allowlist = expected_allowlist
+            else:
+                binding.allowlist = expected_allowlist
+        profile_data = contract.get("worker_profile")
+        if profile_data is not None:
+            profile = profile_data if isinstance(profile_data, WorkerProfile) else WorkerProfile.from_dict(profile_data)
+            for field_name, expected in (
+                ("route_digest", profile.route_digest),
+                ("model", profile.model),
+                ("reasoning", profile.reasoning),
+            ):
+                current_value = getattr(binding, field_name, None)
+                if current_value not in (None, "", expected):
+                    raise ValueError("task binding {} does not match worker profile".format(field_name))
+                setattr(binding, field_name, expected)
+        expected_worktree = self._worktree_path(current)
+        observed_worktree = Path(str(binding.worktree))
+        if not observed_worktree.is_absolute():
+            observed_worktree = self.paths.root / observed_worktree
+        if (
+            observed_worktree.resolve() != expected_worktree.resolve()
+            or binding.branch != str(current["branch"])
+        ):
+            raise ValueError("task binding worktree or branch does not match contract")
         if continuation and previous_binding is not None:
             if (
                 binding.cursor is not None
@@ -995,9 +2517,7 @@ class Monitor:
     def _set_binding_status(
         self, snapshot: RunSnapshot, node_id: str, role: str, status: str
     ) -> TaskBinding:
-        binding = load_task_binding(
-            self.paths, node_id, role, run_id=snapshot.run_id
-        )
+        binding = self._load_task_binding(snapshot, node_id, role)
         current = snapshot.nodes[node_id]
         generation_key = (
             "review_generation" if role == "reviewer" else "developer_generation"
@@ -1008,7 +2528,7 @@ class Monitor:
         ):
             raise ValueError("task binding identity or generation is stale")
         binding.status = status
-        save_task_binding(self.paths, binding)
+        self._save_task_binding(binding)
         snapshot.tasks["{}:{}".format(node_id, role)] = binding.to_dict()
         return binding
 
@@ -1029,12 +2549,7 @@ class Monitor:
             raise ValueError("event provenance is stale or unregistered")
         if snapshot.handles.get(node_id) != active.get("handle_id"):
             raise ValueError("event handle is not the active run handle")
-        binding = load_task_binding(
-            self.paths,
-            node_id,
-            str(active["role"]),
-            run_id=snapshot.run_id,
-        )
+        binding = self._load_task_binding(snapshot, node_id, str(active["role"]))
         if (
             binding.task_id != active.get("task_id")
             or binding.generation != active.get("generation")
@@ -1068,8 +2583,27 @@ class Monitor:
         if evidence is not None:
             current.setdefault("evidence", []).append(redact_provider_text(evidence))
         role = active["role"]
+        if event.event not in {
+            "unknown",
+            "timeout",
+            "state_unknown",
+            "visibility_unknown",
+        }:
+            # A provider-confirmed event consumes any reauthorization retry
+            # marker; the active handle now carries the durable continuation.
+            current["retryable_action"] = None
 
         if event.event in {"delivered", "complete"}:
+            if snapshot.execution_engine == "vibeguide_monitor":
+                delivery = event.data.get("delivery_evidence")
+                gate = evaluate_delivery_evidence(
+                    {**current, "status": "DELIVERED"},
+                    self._load_task_binding(snapshot, node_id, role),
+                    delivery,
+                )
+                if not gate.complete:
+                    self._mark_blocked_unknown(snapshot, node_id, "; ".join(gate.reasons))
+                    return
             self._record_runner_event(snapshot, node_id, event, active)
             if role != "developer":
                 try:
@@ -1100,13 +2634,43 @@ class Monitor:
             current["active_role"] = None
             current["active_task"] = None
             snapshot.handles.pop(node_id, None)
+            reviewer_continuation = False
+            reviewer_successor = False
+            if current.get("reviewer_started"):
+                try:
+                    reviewer_binding = self._load_task_binding(snapshot, node_id, "reviewer")
+                except FileNotFoundError:
+                    reviewer_successor = True
+                except (OSError, TypeError, ValueError) as error:
+                    self._mark_blocked_unknown(
+                        snapshot,
+                        node_id,
+                        "reviewer task binding cannot be verified ({})".format(
+                            type(error).__name__
+                        ),
+                    )
+                    return
+                else:
+                    expected_reviewer_identity = current.get("reviewer_identity")
+                    if (
+                        not expected_reviewer_identity
+                        or reviewer_binding.task_id != expected_reviewer_identity
+                    ):
+                        self._mark_blocked_unknown(
+                            snapshot,
+                            node_id,
+                            "reviewer task binding identity is stale",
+                        )
+                        return
+                    reviewer_continuation = True
             self._start_task(
                 snapshot,
                 node_id,
                 "reviewer",
                 "review",
                 runner,
-                bool(current.get("reviewer_started")),
+                reviewer_continuation,
+                reviewer_successor,
             )
         elif event.event == "review_finding":
             if role != "reviewer":
@@ -1115,12 +2679,27 @@ class Monitor:
                 )
                 return
             self._record_runner_event(snapshot, node_id, event, active)
+            if node_id == "integration-review":
+                # The integration node is read-only: findings never create a
+                # business writer. Preserve the reviewer lineage and queue the
+                # same visible reviewer task for re-review.
+                current["status"] = "rework"
+                current["active_role"] = None
+                current["active_task"] = None
+                snapshot.handles.pop(node_id, None)
+                current["retryable_action"] = {
+                    "role": "reviewer", "phase": "review", "continuation": True,
+                    "pending_schedule": True, "successor": False,
+                }
+                current.setdefault("integration_findings", []).append(redact_provider_text(event.data))
+                self._release_node_lease(snapshot, node_id)
+                return
             if self._is_implementation_finding(event.data):
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
                 self._start_task(
-                    snapshot, node_id, "developer", "rework", runner, True
+                    snapshot, node_id, "developer", "rework", runner, True, False
                 )
                 return
             if not event.data.get("in_contract", False):
@@ -1214,9 +2793,7 @@ class Monitor:
                 )
                 return
             try:
-                registered = load_task_binding(
-                    self.paths, node_id, "reviewer", run_id=snapshot.run_id
-                )
+                registered = self._load_task_binding(snapshot, node_id, "reviewer")
             except (FileNotFoundError, OSError, TypeError, ValueError) as error:
                 self._mark_blocked_unknown(
                     snapshot,
@@ -1274,10 +2851,17 @@ class Monitor:
             self._archive_pair(snapshot, node_id)
             self._release_node_lease(snapshot, node_id)
         elif event.event in {"unknown", "timeout", "state_unknown", "visibility_unknown"}:
+            self._queue_active_retry(
+                snapshot,
+                node_id,
+                str(redact_provider_text(event.data.get("reason", event.event))),
+            )
             self._mark_blocked_unknown(
                 snapshot,
                 node_id,
                 str(redact_provider_text(event.data.get("reason", event.event))),
+                quarantine_lease=False,
+                retryable_same_task=True,
             )
         elif event.event in {"failed", "stopped", "terminal_failed"}:
             self._record_runner_event(snapshot, node_id, event, active)
@@ -1349,24 +2933,6 @@ class Monitor:
         )
 
     @staticmethod
-    def _is_implementation_finding(data: Dict[str, Any]) -> bool:
-        """Recognize an explicit P0-P2 implementation defect from review data."""
-        values = [data.get("severity")]
-        finding = data.get("finding")
-        if isinstance(finding, dict):
-            values.append(finding.get("severity"))
-            nested = finding.get("finding")
-            if isinstance(nested, dict):
-                values.append(nested.get("severity"))
-        nested_review = data.get("review_finding")
-        if isinstance(nested_review, dict):
-            values.append(nested_review.get("severity"))
-        return any(
-            isinstance(value, str) and value.strip().upper() in {"P0", "P1", "P2"}
-            for value in values
-        )
-
-    @staticmethod
     def _event_claims_match(
         event: RunEvent, node_id: str, active: Dict[str, Any]
     ) -> bool:
@@ -1379,6 +2945,26 @@ class Monitor:
         }
         return all(event.data.get(key) == value for key, value in claims.items())
 
+    @staticmethod
+    def _is_implementation_finding(data: Dict[str, Any]) -> bool:
+        """Recognize an explicit P0-P2 implementation defect from review data."""
+        values = []
+        if isinstance(data, dict):
+            values.append(data.get("severity"))
+            for key in ("finding", "review_finding"):
+                value = data.get(key)
+                if isinstance(value, dict):
+                    values.append(value.get("severity"))
+                    nested = value.get("finding")
+                    if isinstance(nested, dict):
+                        values.append(nested.get("severity"))
+        for value in values:
+            if isinstance(value, str):
+                severity = value.strip().upper()
+                if severity in {"P0", "P1", "P2"}:
+                    return True
+        return False
+
     def _record_runner_event(
         self,
         snapshot: RunSnapshot,
@@ -1390,8 +2976,57 @@ class Monitor:
         data.update({"run_id": snapshot.run_id, "node_id": node_id})
         self._record(snapshot, event.event, data, active)
 
-    def _mark_blocked_unknown(
+    def _queue_active_retry(
         self, snapshot: RunSnapshot, node_id: str, reason: str
+    ) -> None:
+        """Record a retry intent without allocating a new task identity.
+
+        A transient provider result is still unknown, but an active handle is
+        durable evidence that the same task may be polled again.  Persist the
+        logical retry alongside that handle so snapshot recovery can resume
+        the original task even when the next poll happens in a new process.
+        """
+        current = snapshot.nodes[node_id]
+        active = current.get("active_task")
+        handle_id = snapshot.handles.get(node_id)
+        if not isinstance(active, dict) or not isinstance(handle_id, str):
+            return
+        role = active.get("role")
+        task_id = active.get("task_id")
+        generation = active.get("generation")
+        if role not in {"developer", "reviewer"} or not isinstance(task_id, str):
+            return
+        phase = "review" if role == "reviewer" else (
+            "rework" if current.get("status") == "rework" else "develop"
+        )
+        previous = current.get("retryable_action")
+        attempt = 1
+        if isinstance(previous, dict) and previous.get("same_task") is True:
+            try:
+                attempt = int(previous.get("attempt", 0)) + 1
+            except (TypeError, ValueError):
+                attempt = 1
+        current["retryable_action"] = {
+            "role": role,
+            "phase": phase,
+            "continuation": True,
+            "successor": False,
+            "successor_candidate": False,
+            "same_task": True,
+            "task_id": task_id,
+            "handle_id": handle_id,
+            "generation": generation,
+            "attempt": attempt,
+            "reason": redact_provider_text(reason),
+        }
+
+    def _mark_blocked_unknown(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        reason: str,
+        quarantine_lease: bool = True,
+        retryable_same_task: bool = False,
     ) -> None:
         current = snapshot.nodes[node_id]
         active = current.get("active_task")
@@ -1410,17 +3045,25 @@ class Monitor:
                 )
             except (FileNotFoundError, OSError, TypeError, ValueError):
                 pass
-        quarantine_writer_lease(
-            self.paths,
-            node_id,
-            str(current.get("worktree", "")),
-            snapshot.run_id,
-            reason,
-        )
+        if quarantine_lease:
+            quarantine_writer_lease(
+                self.paths,
+                node_id,
+                str(current.get("worktree", "")),
+                snapshot.run_id,
+                reason,
+            )
+        event_data = {
+            "run_id": snapshot.run_id,
+            "node_id": node_id,
+            "reason": reason,
+        }
+        if retryable_same_task:
+            event_data["retryable_same_task"] = True
         self._record(
             snapshot,
             "blocked_unknown",
-            {"run_id": snapshot.run_id, "node_id": node_id, "reason": reason},
+            event_data,
             active if isinstance(active, dict) else None,
         )
 
@@ -1444,81 +3087,58 @@ class Monitor:
         )
 
     def _context_estimate(self, snapshot: RunSnapshot, runner: Runner):
+        """Obtain an evidence-bound context estimate when the runner exposes one.
+
+        V1 runners do not expose a context limit and therefore retain the
+        existing scheduling behavior.  V2 adapters may provide either a
+        ``context_budget`` mapping or ``context_limit_tokens`` plus optional
+        text fields; absence is intentionally not treated as zero.
+        """
         policy = self.context_policy
-        missing = object()
-        supplied = getattr(runner, "context_budget", missing)
-        observed_budget = supplied is not missing
+        supplied = getattr(runner, "context_budget", None)
         if callable(supplied):
-            try:
-                supplied = supplied()
-            except Exception:
-                # An observation failure invalidates any caller-supplied
-                # policy for this action; never dispatch on stale limits.
-                policy = ContextBudgetPolicy("observed-model-limit")
-                supplied = None
-        if observed_budget and supplied is None:
-            policy = ContextBudgetPolicy("observed-model-limit")
-        elif observed_budget and not isinstance(supplied, dict):
-            policy = ContextBudgetPolicy("observed-model-limit")
-            supplied = None
-        fields = dict(getattr(runner, "context_input", {}) or {})
-        if observed_budget and isinstance(supplied, dict):
+            supplied = supplied()
+        if isinstance(supplied, dict):
+            policy = policy or ContextBudgetPolicy(
+                supplied.get("context_limit_tokens", "observed-model-limit"),
+                supplied.get("reserve_tokens"),
+                supplied.get("warning_ratio", 0.70),
+                supplied.get("checkpoint_ratio", 0.80),
+                supplied.get("hard_stop_ratio", 0.90),
+            )
+            fields = dict(getattr(runner, "context_input", {}) or {})
             fields.update(supplied)
-            try:
-                observed_policy = ContextBudgetPolicy(
-                    supplied.get("context_limit_tokens", "observed-model-limit"),
-                    supplied.get("reserve_tokens"),
-                    supplied.get("warning_ratio", 0.70),
-                    supplied.get("checkpoint_ratio", 0.80),
-                    supplied.get("hard_stop_ratio", 0.90),
-                )
-            except (TypeError, ValueError):
-                observed_policy = ContextBudgetPolicy("observed-model-limit")
-            if observed_policy.context_limit_tokens == "observed-model-limit":
-                policy = observed_policy
-            elif policy is None:
-                policy = observed_policy
-        elif not observed_budget and getattr(runner, "context_limit_tokens", None) is not None:
-            if policy is None:
-                try:
-                    policy = ContextBudgetPolicy(getattr(runner, "context_limit_tokens"))
-                except (TypeError, ValueError):
-                    policy = ContextBudgetPolicy("observed-model-limit")
-        # Every dispatch must have an evidence-bound limit. If neither the
-        # monitor nor the runner can provide one, keep an explicit unknown
-        # policy so dispatch checkpoints and fails closed.
-        if policy is None:
-            policy = ContextBudgetPolicy("observed-model-limit")
+        else:
+            limit = getattr(runner, "context_limit_tokens", None)
+            if limit is None and policy is None:
+                return None
+            policy = policy or ContextBudgetPolicy(limit)
+            fields = getattr(runner, "context_input", {})
+            if not isinstance(fields, dict):
+                fields = {}
+        estimator = ContextBudgetEstimator(policy)
         if "event_summary" not in fields:
             try:
-                fields["event_summary"] = json.dumps(
-                    load_events(self.paths, snapshot.run_id)[-5:],
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            except (OSError, TypeError, ValueError):
+                recent = load_events(self.paths, snapshot.run_id)[-5:]
+                fields["event_summary"] = json.dumps(recent, ensure_ascii=False, sort_keys=True)
+            except (OSError, ValueError, TypeError):
                 fields["event_summary"] = ""
         if "checkpoint" not in fields:
             checkpoint_path = self.paths.root / ".vibe" / "runs" / snapshot.run_id / "monitor_checkpoint.json"
             try:
-                fields["checkpoint"] = (
-                    checkpoint_path.read_text(encoding="utf-8")
-                    if checkpoint_path.is_file()
-                    else ""
-                )
-            except (OSError, UnicodeError):
+                fields["checkpoint"] = checkpoint_path.read_text(encoding="utf-8") if checkpoint_path.is_file() else ""
+            except OSError:
                 fields["checkpoint"] = ""
-        return ContextBudgetEstimator(policy).estimate(
+        return estimator.estimate(
             str(fields.get("system_prompt", "")),
             str(fields.get("current_input", "")),
             str(fields.get("event_summary", "")),
             str(fields.get("checkpoint", "")),
             str(fields.get("expected_output", "")),
             fields.get("tokenizer"),
-            int(fields.get("next_action_tokens", 0) or 0),
         )
 
-    def _checkpoint_context(self, snapshot: RunSnapshot, reason: str, exhausted: bool = False, estimate: Any = None):
+    def _checkpoint_context(self, snapshot: RunSnapshot, reason: str, exhausted: bool = False, estimate: Any = None) -> None:
         profiles = {}
         for node_id, node in self.nodes.items():
             profile = node.contract.get("worker_profile")
@@ -1530,52 +3150,60 @@ class Monitor:
             state_version=snapshot.schema_version,
             last_event_seq=snapshot.event_sequence,
             next_action="resume",
-            stop_conditions=["preserve writer lease", "do not duplicate writer"],
+            stop_conditions=["preserve one run lease", "do not duplicate writer"],
             authorization_digest=snapshot.authorization_digest,
             node_contract_digest=snapshot.node_contract_digest,
-            capability_contract_digest=getattr(snapshot, "capability_contract_digest", ""),
+            capability_contract_digest=snapshot.capability_contract_digest,
             nodes=snapshot.nodes,
             handles=snapshot.handles,
             worker_profiles=profiles,
             evidence=[{"reason": reason}],
-            estimate=estimate.__dict__ if estimate is not None else None,
+            estimate=(estimate.__dict__ if estimate is not None else None),
         )
         write_checkpoint(self.paths, checkpoint)
-        self._record(snapshot, "monitor_context_exhausted" if exhausted else "monitor_context_checkpoint", {
-            "run_id": snapshot.run_id,
-            "reason": reason,
-            "checkpoint_sha": checkpoint.sha256,
-            "last_event_seq": snapshot.event_sequence,
-        })
+        event_name = "monitor_context_exhausted" if exhausted else "monitor_context_checkpoint"
+        self._record(
+            snapshot,
+            event_name,
+            {
+                "run_id": snapshot.run_id,
+                "reason": reason,
+                "checkpoint_sha": checkpoint.sha256,
+                "last_event_seq": snapshot.event_sequence,
+            },
+        )
         if exhausted:
-            for node_id, current in snapshot.nodes.items():
-                if current.get("active_task"):
-                    current["status"] = "blocked_unknown"
+            active_nodes = [node_id for node_id, current in snapshot.nodes.items() if current.get("active_task")]
+            for node_id in active_nodes:
+                snapshot.nodes[node_id]["status"] = "blocked_unknown"
             snapshot.status = "blocked_unknown"
 
     def _context_allows_dispatch(self, snapshot: RunSnapshot, runner: Runner) -> bool:
         estimate = self._context_estimate(snapshot, runner)
-        if estimate is None or estimate.status == "normal":
+        if estimate is None:
             return True
+        if estimate.status == "normal":
+            return True
+        events = load_events(self.paths, snapshot.run_id)
         if estimate.status == "warning":
-            try:
-                warned = any(
-                    item.get("event") == "monitor_context_warning"
-                    for item in load_events(self.paths, snapshot.run_id)
-                )
-            except (OSError, TypeError, ValueError):
-                warned = False
-            if not warned:
+            if not any(item.get("event") == "monitor_context_warning" for item in events):
                 self._record(snapshot, "monitor_context_warning", {
                     "run_id": snapshot.run_id,
+                    "ratio": estimate.ratio,
                     "total_tokens": estimate.total_tokens,
                     "limit_tokens": estimate.limit_tokens,
-                    "ratio": estimate.ratio,
                     "source": estimate.source,
                 })
             return True
-        self._checkpoint_context(snapshot, "context budget status: " + estimate.status, estimate.status in {"hard_stop", "blocked_unknown"}, estimate)
-        return False
+        if estimate.status in {"checkpoint", "hard_stop", "blocked_unknown"}:
+            self._checkpoint_context(
+                snapshot,
+                "context budget status: " + estimate.status,
+                exhausted=estimate.status in {"hard_stop", "blocked_unknown"},
+                estimate=estimate,
+            )
+            return False
+        return True
 
     def _reconcile_start_intent(
         self,
@@ -1612,9 +3240,7 @@ class Monitor:
             or provenance.get("handle_id") is not None
         ):
             raise ValueError("start intent provenance is invalid")
-        binding = load_task_binding(
-            self.paths, node_id, role, run_id=snapshot.run_id
-        )
+        binding = self._load_task_binding(snapshot, node_id, role)
         if (
             binding.task_id != identity
             or binding.generation != expected_generation
@@ -1671,12 +3297,7 @@ class Monitor:
             for other_node, other_handle in snapshot.handles.items()
         ):
             raise ValueError("start confirmation duplicates an active handle")
-        binding = load_task_binding(
-            self.paths,
-            node_id,
-            str(expected["role"]),
-            run_id=snapshot.run_id,
-        )
+        binding = self._load_task_binding(snapshot, node_id, str(expected["role"]))
         desired_status = self._running_status(str(expected["role"]), str(data.get("phase")))
         if binding.status not in {"start_pending", desired_status}:
             raise ValueError("start confirmation task binding status is invalid")
@@ -1702,8 +3323,46 @@ class Monitor:
             data = record["data"]
             if data.get("run_id") != snapshot.run_id:
                 raise ValueError("unapplied event run lineage is inconsistent")
+            if record["event"] == "execution_topology_observed":
+                # System projection evidence is read-only metadata; legacy
+                # V3.9 replay must not interpret it as a node lifecycle event.
+                snapshot.event_sequence = record["sequence"]
+                continue
             if record["event"] == "authorization_reauthorized":
                 self._apply_reauthorization_transition(snapshot, data)
+                snapshot.event_sequence = record["sequence"]
+                continue
+            if str(record["event"]).startswith("change_request_"):
+                # Change-request evidence is a system-level, target-bound
+                # observation.  Replay must be idempotent and preserve it
+                # even when the originating node was removed from a newer
+                # snapshot; unlike worker events this is not an unknown-node
+                # failure.
+                if provenance.get("role") != "system":
+                    raise ValueError("change request replay lacks system provenance")
+                evidence = data.get("evidence")
+                if not isinstance(evidence, dict):
+                    raise ValueError("change request replay evidence is invalid")
+                try:
+                    validated = ChangeRequestEvidence.from_dict(evidence)
+                    prepared_check = execute_change_request(validated.action, validated.target_contract)
+                    if prepared_check.target_digest != validated.target_digest or validated.remote_mutated:
+                        raise ValueError("change request replay target evidence is inconsistent")
+                except (TypeError, ValueError) as error:
+                    raise ValueError("change request replay evidence is invalid") from error
+                if not str(record["event"]).startswith("change_request_") or str(record["event"])[len("change_request_"):] != validated.status:
+                    raise ValueError("change request replay status is inconsistent")
+                node_id = data.get("node_id")
+                if isinstance(node_id, str) and node_id in snapshot.nodes:
+                    bucket = snapshot.nodes[node_id].setdefault("change_request_evidence", [])
+                    if evidence not in bucket:
+                        bucket.append(evidence)
+                else:
+                    bucket = snapshot.tasks.setdefault("_change_request_evidence", {"records": []})
+                    if isinstance(bucket, dict):
+                        records_bucket = bucket.setdefault("records", [])
+                        if evidence not in records_bucket:
+                            records_bucket.append(evidence)
                 snapshot.event_sequence = record["sequence"]
                 continue
             node_id = data.get("node_id")
@@ -1720,8 +3379,20 @@ class Monitor:
                 )
             elif record["event"] in {"blocked_unknown", "unknown", "timeout"}:
                 if provenance["role"] != "system":
-                    self._registered_active_binding(
+                    binding = self._registered_active_binding(
                         snapshot, node_id, provenance
+                    )
+                    self._set_binding_status(
+                        snapshot, node_id, str(provenance["role"]), "blocked_unknown"
+                    )
+                if (
+                    record["event"] in {"unknown", "timeout"}
+                    or data.get("retryable_same_task") is True
+                ):
+                    self._queue_active_retry(
+                        snapshot,
+                        node_id,
+                        str(data.get("reason", record["event"])),
                     )
                 current["status"] = "blocked_unknown"
                 current["reason"] = data.get("reason", record["event"])
@@ -1730,6 +3401,47 @@ class Monitor:
                     "handle_id": snapshot.handles.get(node_id),
                     "reason": current["reason"],
                 }
+            elif record["event"] == "old_task_reconciled":
+                if provenance["role"] != "system":
+                    raise ValueError("old task reconciliation lacks system provenance")
+                role = data.get("role")
+                retry = current.get("retryable_action")
+                valid = (
+                    isinstance(retry, dict)
+                    and retry.get("role") == role
+                    and retry.get("successor_candidate") is True
+                    and data.get("proof") in {"absent", "stopped"}
+                )
+                predecessor = data.get("predecessor_task_id")
+                proof_identity = None
+                if valid:
+                    proof_identity = self._prove_old_task_stopped_or_absent(
+                        snapshot,
+                        node_id,
+                        retry,
+                    )
+                    if data.get("proof") == "absent":
+                        valid = proof_identity == "" and predecessor in {None, ""}
+                    else:
+                        valid = (
+                            isinstance(predecessor, str)
+                            and bool(predecessor)
+                            and proof_identity == predecessor
+                        )
+                if not valid:
+                    self._reject_replayed_old_task_reconciliation(
+                        snapshot, node_id, data
+                    )
+                    snapshot.event_sequence = record["sequence"]
+                    continue
+                current["old_task_reconciled"] = True
+                if isinstance(retry, dict):
+                    retry = dict(retry)
+                    retry["old_task_reconciled"] = True
+                    retry["successor"] = True
+                    retry["continuation"] = False
+                    retry["predecessor_task_id"] = predecessor
+                    current["retryable_action"] = retry
             elif record["event"] == "accepted":
                 if provenance["role"] != "reviewer":
                     raise ValueError("unapplied acceptance lacks reviewer provenance")
@@ -1743,12 +3455,7 @@ class Monitor:
                         "unapplied acceptance reviewer identity or generation is stale"
                     )
                 try:
-                    registered = load_task_binding(
-                        self.paths,
-                        node_id,
-                        "reviewer",
-                        run_id=snapshot.run_id,
-                    )
+                    registered = self._load_task_binding(snapshot, node_id, "reviewer")
                 except (FileNotFoundError, OSError, TypeError, ValueError) as error:
                     raise ValueError(
                         "unapplied acceptance reviewer binding is unavailable"
@@ -1778,6 +3485,7 @@ class Monitor:
                 }
                 current["active_role"] = None
                 current["active_task"] = None
+                current["quarantine"] = None
                 snapshot.handles.pop(node_id, None)
                 if not data.get("evidence"):
                     current["status"] = "blocked_unknown"
@@ -1823,9 +3531,56 @@ class Monitor:
                     current["active_role"] = None
                     current["active_task"] = None
                     snapshot.handles.pop(node_id, None)
+            elif record["event"] == "quarantine_continuation_recovered":
+                if provenance["role"] != "system":
+                    raise ValueError(
+                        "quarantine continuation recovery lacks system provenance"
+                    )
+                if (
+                    data.get("role") != "developer"
+                    or data.get("task_id") != current.get("developer_identity")
+                    or data.get("generation") != current.get("developer_generation")
+                ):
+                    raise ValueError("quarantine continuation recovery is stale")
+                if not self._recover_quarantined_delivered_developer(
+                    snapshot, node_id, record_event=False
+                ):
+                    raise ValueError(
+                        "quarantine continuation recovery cannot be verified"
+                    )
             elif record["event"] == "review_finding":
                 # The following transition event/start intent is authoritative.
                 self._registered_active_binding(snapshot, node_id, provenance)
+            elif record["event"] in {"binding_self_healed", "binding_degraded", "action_isolated"}:
+                if provenance["role"] != "system":
+                    raise ValueError("self-healing event lacks system provenance")
+                if record["event"] == "binding_self_healed":
+                    binding = data.get("binding", {})
+                    frozen = current.get("binding")
+                    if not isinstance(binding, dict):
+                        raise ValueError("self-healing binding evidence is invalid")
+                    if isinstance(frozen, dict):
+                        for field in ("task_id", "worktree", "branch", "allowlist", "cursor", "token", "continuation_token", "continuation_digest"):
+                            if field in binding and field in frozen and binding[field] != frozen[field]:
+                                raise ValueError("self-healing replay binding drift")
+                    # Restore the frozen values after validating the event;
+                    # observations are never used as replacement facts.
+                    if isinstance(frozen, dict):
+                        for field in ("task_id", "worktree", "branch", "allowlist", "cursor", "token", "continuation_token", "continuation_digest"):
+                            if field in frozen:
+                                current[field] = frozen[field]
+                    else:
+                        current["binding"] = dict(binding)
+                        for field in ("task_id", "worktree", "branch", "allowlist", "cursor", "continuation_digest"):
+                            if field in binding:
+                                current[field] = binding[field]
+                    current["healing"] = {"status": "repaired", "observation_kind": data.get("observation_kind", "unknown")}
+                else:
+                    current["status"] = "blocked_unknown"
+                    current["reason"] = data.get("reason", data.get("observation_kind", record["event"]))
+                    current["isolated"] = True
+                    current["retryable_action"] = None
+                    current["quarantine"] = {"run_id": snapshot.run_id, "handle_id": snapshot.handles.get(node_id), "reason": current["reason"]}
             elif record["event"] == "consistency_corrected":
                 correction = {
                     key: data[key]
@@ -1879,8 +3634,11 @@ class Monitor:
 
     @staticmethod
     def _refresh_run_status(snapshot: RunSnapshot) -> None:
+        for current in snapshot.nodes.values():
+            current["user_status"] = map_user_status(current)
         statuses = [node.get("status") for node in snapshot.nodes.values()]
-        if statuses and all(status == "accepted" for status in statuses):
+        closeout = evaluate_v41_closeout(snapshot)
+        if closeout.allowed:
             snapshot.status = "complete"
         elif "blocked_unknown" in statuses:
             snapshot.status = "blocked_unknown"

@@ -61,13 +61,11 @@ def _valid_plan_confirmation_binding(
     card: Dict[str, Any],
     confirmation: Dict[str, Any],
 ) -> bool:
-    """Validate publication provenance when the current-run fields exist.
+    """Validate current-run publication provenance fail-closed.
 
-    The original plan publication predates run-bound metadata, so a confirmation
-    with neither field remains compatible.  Once either field is present both
-    are required and must describe the durable current run and its event
-    lineage; extra metadata is never accepted merely because the digest is
-    valid.
+    Legacy plan confirmations are compatible only when neither current-run
+    metadata field is present. Once either field appears, the publication must
+    bind plan, run, event sequence, authorization and durable event lineage.
     """
     has_run_id = "run_id" in confirmation
     has_event_sequence = "event_sequence" in confirmation
@@ -91,8 +89,6 @@ def _valid_plan_confirmation_binding(
     ):
         return False
     try:
-        # Import lazily: contracts.py consumes diagnostics during package
-        # startup, while state.py consumes contracts.
         from .state import load_events, load_snapshot
 
         current_run = json.loads(
@@ -113,11 +109,19 @@ def _valid_plan_confirmation_binding(
         if event_sequence > len(events):
             return False
         publication_event = events[event_sequence - 1]
-        if (
-            publication_event.get("provenance", {}).get("authorization_digest")
-            != snapshot.authorization_digest
-        ):
-            return False
+        publication_provenance = publication_event.get("provenance", {})
+        if publication_provenance.get("authorization_digest") != snapshot.authorization_digest:
+            # A reauthorization event is recorded under the previous epoch;
+            # its data must explicitly name the snapshot's replacement digest
+            # and link back to that previous provenance.
+            if not (
+                publication_event.get("event") == "authorization_reauthorized"
+                and publication_event.get("data", {}).get("authorization_digest")
+                == snapshot.authorization_digest
+                and publication_provenance.get("authorization_digest")
+                == publication_event.get("data", {}).get("previous_authorization_digest")
+            ):
+                return False
         lineage_digests = {events[0]["data"].get("authorization_digest")}
         current_reauthorization = False
         for event in events[:event_sequence]:
@@ -129,9 +133,6 @@ def _valid_plan_confirmation_binding(
             if data.get("authorization_digest") == card.get("digest"):
                 current_reauthorization = True
         confirmation_digest = confirmation.get("authorization_digest")
-        # A first-run publication has no reauthorization event yet.  It is
-        # valid only when it names the current snapshot authorization; any
-        # stale digest still requires a durable current reauthorization.
         return confirmation_digest in lineage_digests and (
             current_reauthorization
             or confirmation_digest == snapshot.authorization_digest
@@ -185,7 +186,10 @@ def assert_planning_gate(paths, plan_id: str) -> PlanningGate:
             plan = json.loads((root / "plan.json").read_text(encoding="utf-8"))
             if "approved" not in prd.lower() or "review" not in prd.lower():
                 missing.append("prd.reviewed")
-            if plan.get("status") not in ("authorized", "running", "complete"):
+            # A freshly published complex plan is executable after the caller
+            # supplies the separate exact authorization token; publication
+            # completeness must not require that token to be persisted yet.
+            if plan.get("status") not in ("authorized", "confirmed_pending_authorization", "running", "complete"):
                 missing.append("plan.published")
             nodes = json.loads((root / "nodes.json").read_text(encoding="utf-8"))
             if not isinstance(nodes, list) or not nodes:

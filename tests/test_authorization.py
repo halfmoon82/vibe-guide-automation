@@ -6,6 +6,7 @@ from vibe_guide.authorization import (
     authorize,
     build_authorization_card,
     is_authorization_valid,
+    refresh_authorization_card,
     validate_runtime_contract,
 )
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan
@@ -71,6 +72,23 @@ class AuthorizationTests(unittest.TestCase):
         card = build_authorization_card(self.plan, self.nodes, self.capabilities)
         with self.assertRaises(ValueError):
             authorize(card, "yes")
+
+    def test_refresh_preserves_explicit_local_merge_authorization(self):
+        plan = Plan("plan-local", 1, "docs/prd.md", ["n1"], "draft")
+        node_value = node("n1", ["safe.py"])
+        card = build_authorization_card(
+            plan,
+            [node_value],
+            self.capabilities,
+            allowed_actions=("develop", "test", "review", "merge_local"),
+        )
+        refreshed = refresh_authorization_card(plan, [node_value], card)
+
+        self.assertIn("merge_local", refreshed.allowed_actions)
+        self.assertEqual(
+            authorize(refreshed, "AUTHORIZE").allowed_actions,
+            ("develop", "test", "review", "merge_local"),
+        )
 
     def test_authorization_rejects_tampered_scope_or_actions(self):
         card = build_authorization_card(self.plan, self.nodes, self.capabilities)

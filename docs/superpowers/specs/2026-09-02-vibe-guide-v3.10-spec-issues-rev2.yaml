@@ -1,0 +1,103 @@
+version: 2
+status: confirmed_pending_authorization
+prd_ref: docs/superpowers/specs/2026-09-02-vibe-guide-v3.10-prd-design-rev2.md
+implementation_plan_ref: docs/superpowers/plans/2026-09-02-vibe-guide-v3.10-implementation-plan-rev2.md
+release_target: v3.10.0
+upgrade_baseline: v2.0.0
+global_acceptance:
+  - local package and upgrade continue when real provider lifecycle is unknown
+  - engineering drift is auto_corrected or degraded and isolated to the affected node/action
+  - create_pr/create_mr/merge_local/merge_remote require explicit card entries
+  - deploy, credentials, system_permissions and destructive_write remain excluded
+issues:
+  - id: V310-INSTALL-CONTRACT
+    title: Install and upgrade state contract
+    parallel_group: foundation
+    depends_on: []
+    integration_after: []
+    input: confirmed V3.10 Rev2 PRD
+    output: shared install/upgrade state machine
+    error_behavior: preserve source and emit structured recoverable result
+    acceptance: fixed phases, layered/bundled mode, atomic JSON and recoverable failure
+    files: [vibe_guide/installation.py, vibe_guide/models.py, tests/test_installation.py]
+  - id: V310-MIGRATION
+    title: Backup-first V2 to V3.10 migration
+    parallel_group: core
+    depends_on: [V310-INSTALL-CONTRACT]
+    integration_after: []
+    input: install/upgrade state contract and v2.0.0 fixture
+    output: backup, migration and restore evidence
+    error_behavior: preserve source and isolate invalid migration
+    acceptance: idempotent migration with unknown-field preservation and excluded E2E mailbox
+    files: [vibe_guide/migration.py, vibe_guide/initializer.py, tests/test_migration.py]
+  - id: V310-CAPABILITY
+    title: Layered and bundled capability authorization
+    parallel_group: core
+    depends_on: [V310-INSTALL-CONTRACT]
+    integration_after: []
+    input: scan report and capability contract
+    output: three-layer catalog and authorization report
+    error_behavior: unknown provider state remains evidence; sensitive actions stay separately pending
+    acceptance: bundled mode never grants credentials, system permissions or Deploy
+    files: [vibe_guide/capability_contract.py, vibe_guide/capability_wizard.py, tests/test_capability_wizard.py]
+  - id: V310-ROUTING
+    title: Persisted task grading and authorization-time target contract
+    parallel_group: core
+    depends_on: [V310-INSTALL-CONTRACT]
+    integration_after: []
+    input: S0/S1 request and development environment
+    output: persisted route and frozen target contract
+    error_behavior: ask once before authorization when target cannot be uniquely inferred
+    acceptance: S0/S1 boundaries persist and later entries reuse the target contract
+    files: [vibe_guide/planner.py, vibe_guide/models.py, tests/test_v310_routing_binding.py]
+  - id: V310-SELF-HEAL
+    title: Supervisor self-healing and node-local degradation
+    parallel_group: core
+    depends_on: [V310-INSTALL-CONTRACT]
+    integration_after: [V310-ROUTING]
+    input: snapshot, frozen target contract and current observations
+    output: auto_corrected/degraded events and isolated action state
+    error_behavior: repair original task or degrade; never block unrelated nodes
+    acceptance: worktree, task, cursor and provider drift are repaired or isolated without scope expansion
+    files: [vibe_guide/monitor.py, vibe_guide/models.py, vibe_guide/state.py, tests/test_v310_self_healing.py]
+  - id: V310-CLI
+    title: Interactive and JSON install/upgrade entry points
+    parallel_group: integration
+    depends_on: [V310-MIGRATION, V310-CAPABILITY]
+    integration_after: [V310-ROUTING, V310-SELF-HEAL]
+    input: shared state machine, capability wizard and route result
+    output: interactive and JSON equivalent entry points
+    error_behavior: show user-safe state; keep engineering fields out of repeated prompts
+    acceptance: interactive and JSON fixtures produce equivalent state transitions
+    files: [vibe_guide/cli.py, tests/test_v310_cli.py]
+  - id: V310-ADAPTERS
+    title: Provider-neutral Agent session upgrade bridge
+    parallel_group: integration
+    depends_on: [V310-CAPABILITY]
+    integration_after: [V310-ROUTING, V310-SELF-HEAL]
+    input: capability catalog and provider action store
+    output: common Agent session entry and degraded fallback metadata
+    error_behavior: preserve unknown/timeout evidence and continue local paths
+    acceptance: all registered adapters delegate without migration duplication
+    files: [vibe_guide/adapters/registry.py, vibe_guide/adapters/task_provider.py, tests/test_v310_adapters.py]
+  - id: V310-MERGE
+    title: Authorized PR/MR creation and restricted merge
+    parallel_group: delivery
+    depends_on: [V310-ROUTING, V310-SELF-HEAL]
+    integration_after: [V310-CLI, V310-ADAPTERS]
+    input: frozen target contract, authorization card and final-review evidence
+    output: target-bound PR/MR and local/remote merge evidence
+    error_behavior: self-heal target drift; isolate only the external action when ambiguity remains
+    acceptance: independent final review plus P0-P2 zero permits only explicitly card-listed actions
+    files: [vibe_guide/authorization.py, vibe_guide/change_requests.py, vibe_guide/monitor.py, tests/test_v310_merge_authorization.py]
+    actions: [create_pr, create_mr, merge_local, merge_remote]
+  - id: V310-PACKAGE
+    title: Cross-platform packaging and release evidence
+    parallel_group: release
+    depends_on: [V310-CLI, V310-ADAPTERS, V310-MERGE, V310-MIGRATION]
+    integration_after: []
+    input: accepted implementation and migration fixtures
+    output: v3.10.0 wheel, sdist, source-install, upgrade and rollback evidence
+    error_behavior: release evidence incomplete; never publish implicitly
+    acceptance: v2.0.0 to v3.10.0 clean upgrade and metadata parity
+    files: [pyproject.toml, setup.py, vibe_guide/__init__.py, README.md, tests/test_v310_packaging.py]

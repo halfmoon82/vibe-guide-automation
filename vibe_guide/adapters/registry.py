@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, Mapping, Optional, Sequence
 
 from .base import Environment, ManifestAdapter, ManifestError
+from .task_provider import TaskProviderAdapter
 
 
 SUPPORTED_ADAPTER_IDS = frozenset({
@@ -24,6 +25,7 @@ class AdapterRegistry:
             adapter = ManifestAdapter.from_path(path, background_launcher=launchers.get(path.stem))
             if adapter.id in self._adapters:
                 raise ManifestError("duplicate adapter id: %s" % adapter.id)
+            adapter.upgrade_adapter = TaskProviderAdapter(adapter.manifest["provider"], adapter.task_provider, mode="visible")
             self._adapters[adapter.id] = adapter
         self._require_complete()
 
@@ -46,6 +48,7 @@ class AdapterRegistry:
             adapter = ManifestAdapter(manifest, background_launcher=launchers.get(manifest.get("id")))
             if adapter.id in registry._adapters:
                 raise ManifestError("duplicate adapter id: %s" % adapter.id)
+            adapter.upgrade_adapter = TaskProviderAdapter(adapter.manifest["provider"], adapter.task_provider, mode="visible")
             registry._adapters[adapter.id] = adapter
         return registry
 
@@ -71,3 +74,11 @@ class AdapterRegistry:
 
     def detect_all(self, environment: Environment):
         return [adapter.detect(environment) for adapter in self._adapters.values()]
+
+    def describe_upgrade_entries(self):
+        """Return provider-neutral upgrade metadata for all registered adapters."""
+        return {adapter_id: adapter.upgrade_adapter.describe_upgrade_entry() for adapter_id, adapter in self._adapters.items()}
+
+    def invoke_upgrade(self, adapter_id: str, request: Mapping):
+        """Delegate a session upgrade without duplicating migration logic."""
+        return self.get(adapter_id).upgrade_adapter.invoke_upgrade(request)

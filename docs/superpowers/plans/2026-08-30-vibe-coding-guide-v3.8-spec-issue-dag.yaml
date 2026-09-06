@@ -1,0 +1,216 @@
+plan_id: vibe-guide-v3.8-spec-issue-dag
+revision: 3
+status: ready_to_authorize
+stage: authorization_and_preflight
+prd_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-prd.md@2
+spec_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-spec.md@2
+issues_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-issues.yaml@2
+baseline_dag_ref: docs/superpowers/plans/2026-08-29-vibe-coding-guide-v3-spec-issue-dag-rev3.yaml@3
+deploy: excluded_by_prd
+monitor: not_started
+authorization: pending_user_reauthorization
+plan_confirmation: superseded_by_contract_revision
+plan_confirmation_evidence: conversation:user-confirmed-v38.8-plan
+common_adapter_id: codex
+common_provider: codex-app-visible
+common_mode: visible_required
+evidence_priority: [current_user, approved_prd, plan_review, issue_contract, implementation]
+old_authorization_reuse: forbidden
+ready_initial: [V38-1]
+worktree_policy: provider_managed_runtime; register and verify actual task/host/worktree/managed_root/branch/HEAD/clean/base_sha/lease/cursor before first business write
+old_authorization: c41d355e37aaa0112cf7bc508e83812b9a64e539d6ad9c31d86d0ff67dc3734f
+old_authorization_status: invalidated_by_revision_3
+
+hard_dependencies:
+  - from: V38-1
+    to: [V38-2, V38-4, V38-7, V38-6]
+    reason: current manifest, epoch and provenance must exist before gates or replay can bind evidence
+  - from: V38-4
+    to: [V38-2]
+    reason: preflight consumes path ownership and the single baseline health manifest
+  - from: V38-2
+    to: [V38-3, V38-5]
+    reason: worker creation and Review require preflight and contract closure evidence
+  - from: V38-3
+    to: [V38-5]
+    reason: Review Matrix consumes the implementation brief invariants
+  - from: V38-5
+    to: [V38-6]
+    reason: rework escalation consumes normalized finding bundles
+  - from: V38-1
+    to: [V38-6]
+    reason: replay must retain current epoch and historical identity binding
+  - from: V38-1
+    to: [V38-8]
+    reason: integration must validate manifest and old-evidence isolation
+  - from: V38-2
+    to: [V38-8]
+    reason: integration must validate authorization preflight and closure gates
+  - from: V38-3
+    to: [V38-8]
+    reason: integration must validate the no-blind-write gate
+  - from: V38-4
+    to: [V38-8]
+    reason: integration must validate path and baseline governance
+  - from: V38-5
+    to: [V38-8]
+    reason: integration must validate one-shot Review closure
+  - from: V38-6
+    to: [V38-8]
+    reason: integration must validate replay and repeated-rework escalation
+  - from: V38-7
+    to: [V38-8]
+    reason: integration must validate explicit Git targets and deploy exclusion
+
+integration_after:
+  - from: V38-1
+    to: [V38-2]
+    reason: combine manifest identity with preflight without serializing independent foundation tests
+  - from: V38-4
+    to: [V38-2]
+    reason: combine path and baseline observations into the preflight report
+  - from: V38-5
+    to: [V38-6]
+    reason: combine Review bundle output with replay and rework escalation
+  - from: V38-7
+    to: [V38-8]
+    reason: combine action target validation with final acceptance
+
+parallel_groups:
+  foundation: [V38-1, V38-4]
+  execution-gates: [V38-3, V38-7]
+  preflight: [V38-2]
+  review: [V38-5]
+  rework: [V38-6]
+  integration: [V38-8]
+
+nodes:
+  - id: V38-1
+    issue_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-issues.yaml@2#V38-1
+    depends_on: []
+    integration_after: []
+    writer: developer_worker
+    reviewer: independent_reviewer
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/manifest.py, vibe_guide/models.py, vibe_guide/state.py, vibe_guide/task_registry.py, tests/test_v38_manifest.py, tests/test_v38_recovery.py]
+    owned_paths: [vibe_guide/manifest.py, vibe_guide/models.py, vibe_guide/state.py, vibe_guide/task_registry.py, tests/test_v38_manifest.py, tests/test_v38_recovery.py]
+    read_paths: []
+
+  - id: V38-2
+    issue_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-issues.yaml@2#V38-2
+    depends_on: [V38-1, V38-4]
+    integration_after: [V38-1, V38-4]
+    writer: developer_worker
+    reviewer: independent_reviewer
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/preflight.py, vibe_guide/contracts.py, vibe_guide/authorization.py, vibe_guide/cli.py, tests/test_v38_preflight.py, tests/test_v38_contract_closure.py]
+    owned_paths: [vibe_guide/preflight.py, vibe_guide/contracts.py, tests/test_v38_preflight.py, tests/test_v38_contract_closure.py]
+    read_paths: [vibe_guide/authorization.py, vibe_guide/cli.py]
+
+  - id: V38-3
+    issue_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-issues.yaml@2#V38-3
+    depends_on: [V38-2]
+    integration_after: []
+    writer: developer_worker
+    reviewer: independent_reviewer
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/brief.py, vibe_guide/monitor.py, vibe_guide/state.py, tests/test_v38_brief_gate.py, tests/test_monitor.py]
+    owned_paths: [vibe_guide/brief.py, vibe_guide/monitor.py, tests/test_v38_brief_gate.py, tests/test_monitor.py]
+    read_paths: [vibe_guide/state.py]
+
+  - id: V38-4
+    issue_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-issues.yaml@2#V38-4
+    depends_on: [V38-1]
+    integration_after: []
+    writer: developer_worker
+    reviewer: independent_reviewer
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/path_ownership.py, vibe_guide/baseline_health.py, vibe_guide/dag.py, tests/test_v38_path_ownership.py, tests/test_v38_baseline_health.py]
+    owned_paths: [vibe_guide/path_ownership.py, vibe_guide/baseline_health.py, vibe_guide/dag.py, tests/test_v38_path_ownership.py, tests/test_v38_baseline_health.py]
+    read_paths: []
+
+  - id: V38-5
+    issue_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-issues.yaml@2#V38-5
+    depends_on: [V38-2, V38-3]
+    integration_after: []
+    writer: developer_worker
+    reviewer: independent_reviewer
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/review.py, vibe_guide/monitor.py, tests/test_v38_review_matrix.py, tests/test_monitor.py]
+    owned_paths: [vibe_guide/review.py, tests/test_v38_review_matrix.py]
+    read_paths: [vibe_guide/monitor.py, tests/test_monitor.py]
+
+  - id: V38-6
+    issue_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-issues.yaml@2#V38-6
+    depends_on: [V38-1, V38-5]
+    integration_after: [V38-5]
+    writer: developer_worker
+    reviewer: independent_reviewer
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/evidence.py, vibe_guide/monitor.py, vibe_guide/task_registry.py, tests/test_v38_rework_escalation.py, tests/test_v38_evidence_replay.py]
+    owned_paths: [vibe_guide/evidence.py, tests/test_v38_rework_escalation.py, tests/test_v38_evidence_replay.py]
+    read_paths: [vibe_guide/monitor.py, vibe_guide/task_registry.py]
+
+  - id: V38-7
+    issue_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-issues.yaml@2#V38-7
+    depends_on: [V38-1]
+    integration_after: []
+    writer: developer_worker
+    reviewer: independent_reviewer
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/authorization.py, vibe_guide/change_requests.py, tests/test_v38_git_targets.py, tests/test_authorization.py, tests/test_change_requests.py]
+    owned_paths: [vibe_guide/authorization.py, vibe_guide/change_requests.py, tests/test_v38_git_targets.py]
+    read_paths: [tests/test_authorization.py, tests/test_change_requests.py]
+
+  - id: V38-8
+    issue_ref: docs/superpowers/specs/2026-08-30-vibe-coding-development-guide-v3.8-issues.yaml@2#V38-8
+    depends_on: [V38-1, V38-2, V38-3, V38-4, V38-5, V38-6, V38-7]
+    integration_after: [V38-7]
+    writer: developer_worker
+    reviewer: independent_reviewer
+    worktree_strategy: provider_managed_runtime
+    worktree: null
+    branch_policy: node_unique_branch_before_first_write
+    binding_status: pending_until_provider_create
+    allowlist: [vibe_guide/cli.py, vibe_guide/monitor.py, vibe_guide/dag.py, tests/test_v38_acceptance.py, tests/test_end_to_end.py, README.md]
+    owned_paths: [tests/test_v38_acceptance.py, README.md]
+    read_paths: [vibe_guide/cli.py, vibe_guide/monitor.py, vibe_guide/dag.py, tests/test_end_to_end.py]
+
+audit_requirements:
+  - all FR-801..FR-811 and AC-801..AC-808 are mapped to issues, nodes and tests
+  - hard dependencies form an acyclic graph and integration_after does not create readiness cycles
+  - every node has one writer, a different reviewer, provider-managed worktree strategy and an allowlist
+  - every provider task must register and verify its actual worktree/managed_root/branch/HEAD/clean/base_sha binding before first business write
+  - V38-1 is the only initial ready node; V38-4 and V38-7 become ready after V38-1
+  - preflight is read-only and blocks worker/provider/Git actions on mismatch or unknown
+  - old V3 authorization and runtime evidence are never rebound as current V3.8 facts
+  - no current artifact creates a worker, run, authorization card, commit, push, MR, merge or deploy
+
+next_stage:
+  from_stage: spec_issue_dag
+  from_status: reauthorization_required
+  to_stage: authorization_and_preflight
+  readiness: contract_revision_3_complete
+  required_user_action: reauthorize_current_revision_after_preflight
+  forbidden_automatic_actions: [deploy, merge_to_main, external_install, system_permission_change]

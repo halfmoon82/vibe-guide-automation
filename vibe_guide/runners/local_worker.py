@@ -82,6 +82,9 @@ def _safe_event(
         safe["evidence"] = "local-runner:{}:event-{}".format(handle_id, index)
     if isinstance(data.get("consistency"), dict):
         safe["consistency"] = data["consistency"]
+    for key in ("delivery_evidence", "completion_marker", "delivery_path", "thread_status"):
+        if key in data:
+            safe[key] = data[key]
     if event_name in {"unknown", "timeout", "failed", "stopped"}:
         safe["reason"] = "provider reported " + event_name
     return {"event": event_name, "data": safe}

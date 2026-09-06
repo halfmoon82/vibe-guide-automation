@@ -141,6 +141,15 @@ git diff --check
 - 未经明确授权，不 push、merge、deploy 或修改上层 CFO 仓库文件。
 - 交付必须说明：改动范围、验证命令和结果、未验证项、未纳入路径、当前 Git 状态及是否执行 push。
 
+版本交付固定规则：
+
+- 只有具备可追溯远端 Release 或 tag、对应提交和可下载构建产物的版本，才算正式完整版本；分支名、提交标题、README、自报、本地 fixture 或测试通过不能单独证明正式发布。
+- wheel、sdist 和源码安装必须分别验证；升级必须验证明确的旧版本到新版本路径。
+- 包元数据版本、tag、Release 和构建产物版本必须一致。
+- 安装、升级、迁移、回滚、push、merge 和 deploy 是独立动作，分别记录授权和验收证据。
+- 远端代码平台不预设为 GitHub；只有当前环境探针已验证的 provider 才能执行远端动作。未知、超时或缺失证据保持 `unknown`/`blocked_unknown`，不得解释为成功或永久不可用。
+- DAG 授权卡可预先列入受限 merge；用户确认该授权卡后，监工仅在独立终审通过、P0-P2 清零、目标与证据匹配且本地或远端绑定有效时自动 merge。该授权不包含 push、创建 PR、deploy、凭据或系统权限。
+
 ## 11. 安全与禁止事项
 
 - 不绕过 Agent 沙箱、系统权限、Git 认证或外部平台审批。
@@ -163,3 +172,15 @@ git diff --check
 短提示不能绕过需求决策、DAG 确认、一次性授权、deploy 授权或安全边界。
 
 任何产品设计、执行拓扑或任务可见性要求变化都会使当前 DAG 授权失效。此时先暂停旧任务、封存提交/未提交证据、更新 Spec/计划/授权卡，经用户重新确认后才可创建新任务继续。
+
+# Vibe Guide capability contract proposal
+
+## Capability and Tool Truth
+
+- 不得根据记忆、README、工具未被提及或一次失败判断能力不存在。
+- “当前会话未暴露”不等于“平台不具备该能力”。
+- 超时、空响应和格式异常统一保持 UNKNOWN；`unknown_timeout` 不得转成 UNAVAILABLE。
+- 监工和 worker 的自然语言自报不是能力证据。
+- 能力判断必须引用 session contract 的 evidence_ref。
+- 没有证据时请求 refresh 或报告 UNKNOWN，不得直接终止。
+- 只有 runtime/provider 的结构化结果才能进入能力阻断状态。

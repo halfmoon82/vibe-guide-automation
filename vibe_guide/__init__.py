@@ -1,4 +1,3 @@
-"""Vibe Guide installable package."""
+"""Shared contracts for the Vibe Coding development guide."""
 
-__version__ = "0.1.0"
-
+__version__ = "4.1.0"

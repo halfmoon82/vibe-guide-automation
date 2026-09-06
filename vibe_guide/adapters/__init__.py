@@ -1,1 +1,1 @@
-"""Agent adapter integrations for the Vibe Guide."""
+"""Provider adapter contracts and manifests."""

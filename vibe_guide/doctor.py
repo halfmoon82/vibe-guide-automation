@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import re
+from .diagnostics import diagnose_skill, build_skill_reference_proposal, build_agentsmd_proposal, check_agents_contract
 
 
 _PYTHON_VERSION = re.compile(r"Python\s+(\d+)\.(\d+)")
@@ -11,6 +12,12 @@ class DoctorReport:
     ok: bool
     issues: list
     facts: dict
+    status: str = 'ready'
+    proposals: list = None
+
+    def __post_init__(self):
+        if self.proposals is None:
+            self.proposals = []
 
 
 def doctor(report):
@@ -70,4 +77,14 @@ def doctor(report):
         },
         'agents': {'available': available_agents},
     }
-    return DoctorReport(not issues, issues, facts)
+    malformed = bool(report.skill_records_error or len(valid_skills) != len(report.skills))
+    status = 'blocked' if malformed else ('attention' if issues else 'ready')
+    proposals = []
+    skill_diag = diagnose_skill(_REQUIRED_SKILL, report, {"global_skills": []})
+    if skill_diag.status == 'attention':
+        proposals.append('.vibe/proposals/skills/proposal.md')
+    if report.agentsmd_content is not None:
+        contract = check_agents_contract(report.agentsmd_content, ['Vibe Guide', 'Project guidance'])
+        if not contract.ok:
+            proposals.append('.vibe/proposals/agentsmd/proposal.md')
+    return DoctorReport(not issues, issues, facts, status=status, proposals=proposals)

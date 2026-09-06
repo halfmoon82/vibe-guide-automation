@@ -1,0 +1,59 @@
+plan_id: vibe-guide-v3.10-rev2
+revision: 2
+status: confirmed_pending_authorization
+prd_ref: docs/superpowers/specs/2026-09-02-vibe-guide-v3.10-prd-design-rev2.md@1
+spec_ref: docs/superpowers/specs/2026-09-02-vibe-guide-v3.10-spec-issues-rev2.yaml@2
+implementation_plan_ref: docs/superpowers/plans/2026-09-02-vibe-guide-v3.10-implementation-plan-rev2.md
+release_gate: all_issue_accepted_plus_install_upgrade_acceptance
+deploy: excluded_by_prd
+startup_policy: target_contract_before_authorization_then_supervisor_self_healing
+provider_policy: unknown_provider_is_node_local_not_global_block
+ready_initial: [V310-INSTALL-CONTRACT]
+hard_dependencies:
+  - from: V310-INSTALL-CONTRACT
+    to: [V310-MIGRATION, V310-CAPABILITY, V310-ROUTING, V310-SELF-HEAL]
+  - from: V310-MIGRATION
+    to: [V310-CLI, V310-PACKAGE]
+  - from: V310-CAPABILITY
+    to: [V310-CLI, V310-ADAPTERS]
+  - from: V310-ROUTING
+    to: [V310-MERGE]
+  - from: V310-SELF-HEAL
+    to: [V310-MERGE]
+  - from: V310-CLI
+    to: [V310-PACKAGE]
+  - from: V310-ADAPTERS
+    to: [V310-PACKAGE]
+  - from: V310-MERGE
+    to: [V310-PACKAGE]
+integration_after:
+  - from: V310-ROUTING
+    to: [V310-SELF-HEAL, V310-CLI, V310-ADAPTERS]
+  - from: V310-SELF-HEAL
+    to: [V310-CLI, V310-ADAPTERS]
+  - from: V310-CLI
+    to: [V310-MERGE]
+  - from: V310-ADAPTERS
+    to: [V310-MERGE]
+parallel_groups:
+  foundation: [V310-INSTALL-CONTRACT]
+  core: [V310-MIGRATION, V310-CAPABILITY, V310-ROUTING, V310-SELF-HEAL]
+  integration: [V310-CLI, V310-ADAPTERS]
+  delivery: [V310-MERGE]
+  release: [V310-PACKAGE]
+authorization:
+  allowed_actions: [accept, develop, test, review, rework, create_pr, create_mr, merge_local, merge_remote]
+  excluded_actions: [deploy, credentials, system_permissions, destructive_write]
+  target_contract_required_before_authorization: true
+merge_policy:
+  default_for_independent_final_review: true
+  conditions: [developer_delivered, independent_final_review_accepted, p0_p2_zero, frozen_target_match, supervisor_reconciled]
+  drift_action: auto_correct_then_execute_or_isolate_external_action
+audit_requirements:
+  - every PRD Rev2 requirement maps to an Issue, node, acceptance example and test command
+  - hard dependency graph is acyclic
+  - parallel nodes have no hard dependency between them
+  - one writer per Issue and separate read-only reviewer task
+  - provider gaps cannot block unrelated local nodes
+  - target repository/branch/type/source/file scope are frozen before authorization
+  - no worker, monitor, PR/MR, merge, push or deploy starts from this artifact

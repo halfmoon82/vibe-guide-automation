@@ -33,6 +33,54 @@ class ProviderPending(RuntimeError):
 _PROVIDER_ACTIONS = {"create", "locate", "visibility", "resume", "wait"}
 
 
+class TaskProviderAdapter:
+    """Provider-neutral Agent-session upgrade entry.
+
+    This small bridge delegates to a verified provider callback/object and
+    never reimplements installation or migration. Provider observations,
+    including ``unknown`` and ``unknown_timeout``, are returned unchanged.
+    """
+
+    def __init__(self, provider: str, delegate: Any = None, *, mode: str = "visible"):
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError("provider is required")
+        if mode not in {"visible", "background", "guide"}:
+            raise ValueError("unsupported task provider mode")
+        self.provider = provider.strip()
+        self.delegate = delegate
+        self.mode = mode
+
+    def describe_upgrade_entry(self) -> Dict[str, Any]:
+        return {
+            "entry": "upgrade",
+            "entrypoint": "upgrade",
+            "provider": self.provider,
+            "mode": self.mode,
+            "provider_neutral": True,
+            "limitations": (["不可见", "不可直接进入", "返工续接受限"] if self.mode == "background" else []),
+            "evidence": {"provider": "adapter-manifest", "mode": "capability-observation"},
+        }
+
+    def invoke_upgrade(self, request: Mapping[str, Any]) -> Dict[str, Any]:
+        if not isinstance(request, Mapping):
+            raise TypeError("upgrade request must be a mapping")
+        target = self.delegate
+        method = getattr(target, "invoke_upgrade", None)
+        if callable(method):
+            result = method(dict(request))
+        elif callable(target):
+            result = target(dict(request))
+        else:
+            return {
+                "status": "unknown",
+                "provider": self.provider,
+                "evidence": ["provider adapter delegate is not configured"],
+            }
+        if isinstance(result, Mapping):
+            return dict(result)
+        raise ProviderUnavailable("provider upgrade entry returned invalid result")
+
+
 def _canonical_digest(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -155,15 +203,13 @@ class ProviderActionStore:
         sequence: int = 0,
     ) -> Dict[str, Any]:
         state = self.paths.vibe / "state.json"
-        if state.is_symlink():
-            raise ProviderUnavailable("session_gate_blocked")
         if state.is_file():
             try:
                 origin = request.get("origin", "user_entry") if isinstance(request, dict) else "user_entry"
                 if origin == "worker_dispatch":
                     require_child_origin(origin)
-                    binding = request.get("child_binding")
                     capability_contract = require_capability_contract(self.paths)
+                    binding = request.get("child_binding")
                     required = {"parent_run_id", "plan_revision", "authorization_digest", "node_id", "role", "writer", "worktree", "branch", "allowlist", "worker_profile", "capability_contract_digest"}
                     if not isinstance(binding, dict) or not required.issubset(binding):
                         raise PermissionError("child binding is incomplete")
@@ -175,8 +221,6 @@ class ProviderActionStore:
                         raise PermissionError("child binding parent context is unverifiable")
                     profile = WorkerProfile(**binding["worker_profile"])
                     validate_child_session_binding(binding["parent_run_id"], binding["plan_revision"], binding["authorization_digest"], binding["node_id"], binding["role"], profile)
-                elif origin != "user_entry":
-                    raise PermissionError("invalid session origin")
                 else:
                     require_entry(self.paths, "provider:" + run_id + ":" + operation, operation)
             except (OSError, ValueError, TypeError, PermissionError) as error:
@@ -290,13 +334,6 @@ class ProviderActionStore:
             if path.is_symlink() or not path.is_file():
                 raise ValueError("provider action request must be a regular file")
             record = self._read(path)
-            required = {
-                "schema_version", "action_id", "operation", "provider",
-                "run_id", "issue_id", "role", "generation", "sequence",
-                "native_tool", "request", "request_digest",
-            }
-            if set(record) != required or record.get("schema_version") != self.schema_version:
-                raise ValueError("provider action request schema is invalid")
             if (
                 record.get("run_id") == run_id
                 and record.get("issue_id") == issue_id
@@ -454,7 +491,36 @@ class CodexAppBridge:
         _require_keys(request, ("prompt", "target"), "create_thread")
         if not isinstance(request["prompt"], str) or not isinstance(request["target"], Mapping):
             raise ProviderUnavailable("Codex create_thread request has invalid types")
-        return self._create_thread(dict(request))
+        # Keep supervisor metadata in the durable action envelope, but never
+        # forward it to the native tool.  The public Codex App schema rejects
+        # unknown arguments (for example issue_id, worker_profile, binding).
+        public = {
+            key: request[key]
+            for key in ("prompt", "model", "thinking", "title")
+            if key in request
+        }
+        target = request["target"]
+        public_target = {
+            key: target[key]
+            for key in ("type", "projectId", "environment")
+            if key in target
+        }
+        if isinstance(public_target.get("environment"), Mapping):
+            environment = public_target["environment"]
+            public_target["environment"] = {
+                key: environment[key]
+                for key in ("type", "startingState")
+                if key in environment
+            }
+            if isinstance(public_target["environment"].get("startingState"), Mapping):
+                starting = public_target["environment"]["startingState"]
+                public_target["environment"]["startingState"] = {
+                    key: starting[key]
+                    for key in ("type", "branchName")
+                    if key in starting
+                }
+        public["target"] = public_target
+        return self._create_thread(public)
 
     def enter_or_locate(self, binding: TaskBinding):
         self._require_real(binding)

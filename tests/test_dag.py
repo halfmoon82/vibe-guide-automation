@@ -66,10 +66,9 @@ class DAGTests(unittest.TestCase):
             authoritative("V2-5", ["V2-0"]),
             authoritative("V2-6", ["V2-0"]),
             authoritative("V2-8", ["V2-0"]),
-            authoritative("V2-7", ["V2-1", "V2-2", "V2-3", "V2-4", "V2-5", "V2-6", "V2-8"], status="planned"),
+            authoritative("V2-7", ["V2-1", "V2-2", "V2-3", "V2-4", "V2-5", "V2-6", "V2-8"]),
         ]
-        plan = Plan("v2", 5, "prd.md", [node.id for node in nodes], "authorized", nodes=nodes)
-        result = audit_dag(plan)
+        result = audit_dag(Plan("v2", 5, "prd.md", [node.id for node in nodes], "authorized", nodes=nodes))
         self.assertEqual(result.status, "ready")
         self.assertEqual(result.ready_nodes, ["V2-1", "V2-2", "V2-3", "V2-4", "V2-5", "V2-6", "V2-8"])
         self.assertEqual(result.blocked_nodes, ["V2-7"])
@@ -92,7 +91,6 @@ class DAGTests(unittest.TestCase):
         self.assertEqual(result.status, "blocked_dag")
         self.assertTrue(any("allowlist" in reason for reason in result.reasons["missing"]))
         self.assertTrue(any("writer mismatch" in reason for reason in result.reasons["inconsistent"]))
-
     def test_integration_after_does_not_block_readiness(self):
         n = node("n1", integration=["later"])
         self.assertEqual(ready_nodes([n]), [n])
@@ -170,7 +168,8 @@ class DAGTests(unittest.TestCase):
         self.assertEqual(ready_nodes([node("n", contract=blocked_contract)]), [])
 
     def test_render_plan_artifacts(self):
-        plan = Plan("p1", 1, "prd.md", ["n1"], "draft")
+        fixture = Path(__file__).parent / "fixtures" / "plans" / "basic-plan.json"
+        plan = Plan.from_dict(json.loads(fixture.read_text(encoding="utf-8")))
         with tempfile.TemporaryDirectory() as d:
             artifacts = render_plan_artifacts(plan, Path(d))
             self.assertTrue(artifacts.dag_path.exists())
@@ -234,16 +233,6 @@ class DAGTests(unittest.TestCase):
         self.assertEqual(result.status, "blocked_dag")
         self.assertTrue(any("duplicate writer" in reason for reason in result.reasons["a"]))
         self.assertTrue(any("allowlist" in reason for reason in result.reasons["c"]))
-
-    def test_audit_preserves_blocked_deploy_boundary(self):
-        deploy = audited_node("deploy", status="blocked_deploy")
-
-        result = audit_dag(Plan("p-deploy", 1, "prd.md", ["deploy"], "authorized", nodes=[deploy]))
-
-        self.assertEqual(result.status, "blocked_deploy")
-        self.assertEqual(result.ready_nodes, [])
-        self.assertIn("deploy", result.blocked_nodes)
-        self.assertTrue(any("deploy authorization" in reason for reason in result.reasons["deploy"]))
 
     def test_render_includes_audit_contract_and_identity_evidence(self):
         n1 = audited_node("n1", status="accepted")

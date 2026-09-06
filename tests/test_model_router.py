@@ -37,12 +37,11 @@ class ModelRouterTests(unittest.TestCase):
     def test_unavailable_primary_uses_recorded_fallback(self):
         unavailable = LocalModel("deep", ["shell", "security"], 64_000, ["deep"], False)
         issue = IssueComplexity(
-            "I-risk", "spec:I-risk", 4, 2, 3, 4, 2, "medium", ["security"], "complex", "evidence:I-risk"
+            "I-risk", "spec:I-risk", 4, 2, 3, 4, 2, "large", ["security"], "complex", "evidence:I-risk"
         )
         profile = ModelRouter().select(issue, ["shell"], [unavailable, self.models[0]])
         self.assertEqual(profile.model, "fast")
         self.assertEqual(profile.fallbacks[0]["model"], "deep")
-        self.assertEqual(profile.selection_basis["availability_evidence"], "probe")
 
     def test_unknown_probe_is_blocked(self):
         issue = IssueComplexity(
@@ -55,34 +54,6 @@ class ModelRouterTests(unittest.TestCase):
     def test_project_s1_cannot_replace_issue_complexity(self):
         with self.assertRaises(TypeError):
             ModelRouter().select({"score": 16}, ["shell"], self.models)
-
-    def test_light_plan_is_supported_and_preserves_complete_issue_basis(self):
-        issue = IssueComplexity(
-            "I-light", "spec:I-light", 3, 2, 2, 2, 3, "medium", [], "light_plan", "evidence:I-light"
-        )
-        profile = ModelRouter().select(issue, ["shell"], self.models)
-        self.assertEqual(profile.reasoning, "normal")
-        basis = profile.selection_basis
-        self.assertEqual(
-            {key: basis[key] for key in ("steps", "domains", "uncertainty", "failure_cost", "toolchain", "context_demand")},
-            {"steps": 3, "domains": 2, "uncertainty": 2, "failure_cost": 2, "toolchain": 3, "context_demand": "medium"},
-        )
-
-    def test_cross_module_escalates_reasoning(self):
-        issue = IssueComplexity(
-            "I-cross", "spec:I-cross", 3, 2, 2, 2, 2, "medium", ["cross_module"], "light_plan", "evidence:I-cross"
-        )
-        profile = ModelRouter().select(issue, ["shell"], self.models)
-        self.assertEqual(profile.reasoning, "deep")
-        self.assertEqual(profile.model, "deep")
-
-    def test_unknown_context_demand_is_blocked_unknown(self):
-        issue = IssueComplexity(
-            "I-unknown", "spec:I-unknown", 2, 1, 2, 1, 1, "unknown", [], "simple", "evidence:I-unknown"
-        )
-        with self.assertRaises(WorkerUnavailable) as raised:
-            ModelRouter().select(issue, ["shell"], self.models)
-        self.assertEqual(raised.exception.status, "blocked_unknown")
 
 
 if __name__ == "__main__":

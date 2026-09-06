@@ -4,10 +4,10 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import re
+from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional
 
-from .models import EVIDENCE_PRIORITY, PRD, PRDCheckpoint, SkillProfile, StageHandoff
-from .prd_profiles import evaluate_prd_checkpoints, select_prd_profiles
+from .models import EVIDENCE_PRIORITY, IssueComplexity, TargetContract, IntegrationAcceptanceContract
 
 
 @dataclass(frozen=True)
@@ -26,12 +26,17 @@ class TaskContext:
     failure_cost: int
     toolchain: int
     rationale: Dict[str, str] = field(default_factory=dict)
+    force_upgrade_flags: List[str] = field(default_factory=list)
 
     def __post_init__(self):
         for name in ("steps", "domains", "uncertainty", "failure_cost", "toolchain"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 5:
                 raise ValueError("S1 dimensions must be integers from 0 to 5")
+        if not isinstance(self.force_upgrade_flags, list) or not all(isinstance(item, str) and item.strip() for item in self.force_upgrade_flags):
+            raise TypeError("force_upgrade_flags must be a list of non-empty strings")
+        if len(set(self.force_upgrade_flags)) != len(self.force_upgrade_flags):
+            raise ValueError("force_upgrade_flags must be unique")
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,62 @@ class S1Score:
     failure_cost: int
     toolchain: int
     rationale: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RouteResult:
+    """Machine-readable S0/S1 route, safe to persist before execution."""
+
+    route: str
+    complexity_band: str
+    screen: str = "s1"
+    score: Optional[int] = None
+    dimensions: Dict[str, int] = field(default_factory=dict)
+    force_upgrade_flags: List[str] = field(default_factory=list)
+    evidence_ref: str = "planner:s0-s1"
+
+    def __post_init__(self):
+        if self.route not in {"simple", "light_plan", "complex"} or self.complexity_band != self.route:
+            raise ValueError("unsupported route result")
+        if self.screen not in {"s0", "s1"}:
+            raise ValueError("unsupported routing screen")
+        if self.score is not None and (isinstance(self.score, bool) or not isinstance(self.score, int) or self.score < 0):
+            raise ValueError("route score must be a non-negative integer")
+        if self.score is not None and not self.force_upgrade_flags:
+            expected = "simple" if self.score <= 8 else "light_plan" if self.score <= 15 else "complex"
+            if self.route != expected:
+                raise ValueError("route score does not match route")
+        if self.force_upgrade_flags and self.route != "complex":
+            raise ValueError("force upgrade flags require complex route")
+        if not isinstance(self.dimensions, dict) or not all(isinstance(k, str) and isinstance(v, int) for k, v in self.dimensions.items()):
+            raise TypeError("route dimensions must be a string/integer dictionary")
+        if not isinstance(self.force_upgrade_flags, list) or not all(isinstance(item, str) and item.strip() for item in self.force_upgrade_flags):
+            raise TypeError("force_upgrade_flags must be a list of strings")
+        if len(self.force_upgrade_flags) != len(set(self.force_upgrade_flags)):
+            raise ValueError("force_upgrade_flags must be unique")
+        if not isinstance(self.evidence_ref, str) or not self.evidence_ref.strip():
+            raise ValueError("evidence_ref must be non-empty")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"route": self.route, "complexity_band": self.complexity_band, "screen": self.screen, "score": self.score, "dimensions": dict(self.dimensions), "force_upgrade_flags": list(self.force_upgrade_flags), "evidence_ref": self.evidence_ref}
+
+    @property
+    def band(self) -> str:
+        return self.complexity_band
+
+    @property
+    def s1_total(self) -> Optional[int]:
+        return self.score
+
+    @property
+    def persisted(self) -> bool:
+        return True
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RouteResult":
+        if not isinstance(data, dict):
+            raise TypeError("RouteResult data must be a dictionary")
+        return cls(**data)
 
 
 @dataclass(frozen=True)
@@ -107,14 +168,17 @@ class DecisionCard:
 
 
 @dataclass(frozen=True)
+class PRD:
+    title: str
+    objective: str
+    status: str = "draft"
+
+
+@dataclass(frozen=True)
 class PRDResult:
     prd: PRD
     approved: bool
     blockers: List[str]
-    status: str = "draft"
-    questions: List[str] = field(default_factory=list)
-    continue_planning: bool = False
-    downstream_artifact: Optional[Any] = None
 
 
 @dataclass(frozen=True)
@@ -303,6 +367,17 @@ _ENGLISH_ACTIONS = {
     "write",
 }
 
+REQUIRED_COMPLEX_WORKFLOW = (
+    "s0", "s1", "requirements", "product_decision", "prd", "spec_issue",
+    "dag_audit", "plan_confirmation", "authorization_card", "user_authorization",
+)
+
+
+def required_workflow_nodes(route):
+    """Return a fresh task's applicable mandatory nodes."""
+    value = route.route if isinstance(route, RouteResult) else route
+    return list(REQUIRED_COMPLEX_WORKFLOW if value == "complex" else ("s0", "s1"))
+
 
 def classify_s0(message: str) -> S0Result:
     """Apply a cheap rule screen; uncertain or multi-step text proceeds to S1."""
@@ -323,14 +398,108 @@ def score_s1(context: TaskContext) -> S1Score:
     return S1Score(sum(values), *values, rationale=dict(context.rationale))
 
 
-def route_task(score: S1Score) -> str:
+def _route_result_from_score(score: S1Score, force_upgrade_flags: Optional[List[str]] = None) -> RouteResult:
     if score.total < 0:
         raise ValueError("S1 total cannot be negative")
-    if score.total <= 8:
-        return "simple"
-    if score.total <= 15:
-        return "light_plan"
-    return "complex"
+    flags = list(dict.fromkeys(force_upgrade_flags or []))
+    route = "complex" if flags else ("simple" if score.total <= 8 else "light_plan" if score.total <= 15 else "complex")
+    return RouteResult(
+        route=route,
+        complexity_band=route,
+        score=score.total,
+        dimensions={"steps": score.steps, "domains": score.domains, "uncertainty": score.uncertainty, "failure_cost": score.failure_cost, "toolchain": score.toolchain},
+        force_upgrade_flags=flags,
+    )
+
+
+def route_task(context: Any):
+    """Route a TaskContext to a persisted result; retain legacy S1Score API."""
+    if isinstance(context, TaskContext):
+        return _route_result_from_score(score_s1(context), context.force_upgrade_flags)
+    if isinstance(context, S1Score):
+        # Existing CLI/V2 callers consume the string route.
+        return _route_result_from_score(context).route
+    raise TypeError("route_task expects TaskContext or S1Score")
+
+
+def classify_v310_task(s0: Any, s1: Optional[S1Score], force_upgrade_flags: Optional[List[str]] = None) -> IssueComplexity:
+    """Create an evidence-bound IssueComplexity with an immutable band."""
+    flags = list(force_upgrade_flags or [])
+    if isinstance(s1, TaskContext):
+        score = score_s1(s1)
+        flags = list(dict.fromkeys(list(s1.force_upgrade_flags) + flags))
+    elif isinstance(s1, S1Score):
+        score = s1
+    else:
+        raise TypeError("s1 must be S1Score or TaskContext")
+    band = _route_result_from_score(score, flags).route
+    issue_band = "light" if band == "light_plan" else band
+    if isinstance(s0, str) and s0 == "simple" and not flags and score.total <= 8:
+        band = "simple"
+    return IssueComplexity(
+        issue_id="task",
+        spec_ref="planner:s0-s1",
+        steps=max(1, score.steps), domains=max(1, score.domains), uncertainty=max(1, score.uncertainty),
+        failure_cost=max(1, score.failure_cost), toolchain=max(1, score.toolchain), context_demand="unknown",
+        risk_tags=list(dict.fromkeys(flags)), complexity_band=issue_band, evidence_ref="planner:s0-s1",
+    )
+
+
+_TARGET_FIELDS = ("provider", "repository", "project", "target_branch", "issue_type", "source_branch", "file_scope", "merge_method")
+_TARGET_ALIASES = {"repository_project": "repository", "repo": "repository", "repositories": "repository", "branch": "target_branch", "target_branches": "target_branch", "change_type": "issue_type", "issue_or_pr_type": "issue_type", "files": "file_scope", "scope": "file_scope", "method": "merge_method"}
+
+
+def _candidate(environment: Dict[str, Any], field_name: str):
+    aliases = [field_name] + [key for key, value in _TARGET_ALIASES.items() if value == field_name]
+    found = [environment[key] for key in aliases if key in environment]
+    if found:
+        normalized = []
+        for value in found:
+            if field_name == "file_scope":
+                if isinstance(value, str):
+                    candidate = [value.strip()] if value.strip() else None
+                elif isinstance(value, (list, tuple)) and all(isinstance(item, str) and item.strip() for item in value):
+                    candidate = [item.strip() for item in value]
+                else:
+                    candidate = None
+            elif isinstance(value, str) and value.strip():
+                candidate = value.strip()
+            elif isinstance(value, (list, tuple, set)) and len(value) == 1 and isinstance(next(iter(value)), str) and next(iter(value)).strip():
+                candidate = next(iter(value)).strip()
+            else:
+                candidate = None
+            if candidate is None:
+                return None
+            normalized.append(candidate)
+        if all(item == normalized[0] for item in normalized[1:]):
+            return normalized[0]
+        return None
+    return None
+
+
+def collect_target_contract(environment: Dict[str, Any], user_selection: Optional[Dict[str, Any]] = None) -> TargetContract:
+    """Collect target fields once, auto-filling only uniquely observed values."""
+    if not isinstance(environment, dict):
+        raise TypeError("environment must be a dictionary")
+    if isinstance(environment.get("target_contract"), dict) and user_selection is None:
+        return TargetContract.from_dict(environment["target_contract"])
+    selection = user_selection if isinstance(user_selection, dict) else {}
+    values = {}
+    missing = []
+    for field_name in _TARGET_FIELDS:
+        # A target may be identified by either repository or project; the
+        # provider-specific side that is absent is not a missing choice.
+        if field_name == "project" and ("repository" in values or any(key in selection for key in ("repository", "repo", "repository_project")) or any(key in environment for key in ("repository", "repo", "repository_project"))):
+            continue
+        if field_name == "repository" and ("project" in values or _candidate(selection, "project") is not None or _candidate(environment, "project") is not None):
+            continue
+        selected = _candidate(selection, field_name)
+        value = selected if selected is not None else _candidate(environment, field_name)
+        if value is None:
+            missing.append(field_name)
+        else:
+            values[field_name] = value
+    return TargetContract(**values, frozen=not missing, missing_fields=missing, status="frozen" if not missing else "pending_selection")
 
 
 def create_decision_card(question: ProductQuestion) -> DecisionCard:
@@ -353,67 +522,43 @@ def approve_prd(prd: PRD, decisions: List[DecisionCard]) -> PRDResult:
         ):
             blockers.append(card.question)
     if blockers:
-        return PRDResult(replace(prd, status="blocked_design"), False, blockers, "blocked_design", blockers[:1], False, None)
-    return PRDResult(replace(prd, status="approved"), True, [], "approved", [], True, None)
+        return PRDResult(replace(prd, status="blocked_decision"), False, blockers)
+    return PRDResult(replace(prd, status="approved"), True, [])
 
 
-def build_stage_handoff(
-    prd: PRD,
-    open_questions: List[str],
-    evidence_refs: List[str],
-) -> StageHandoff:
-    """Build a read-only PRD-to-planning handoff; it never grants authorization."""
-    questions = [str(item) for item in open_questions if str(item).strip()]
-    if prd.status == "approved" and not questions:
-        readiness, action = "ready", "continue_planning"
-        prompt = "PRD 已批准；如需进入 Spec/Issue/DAG，请继续规划。"
-    elif prd.status in {"blocked_design", "blocked_decision"} or questions:
-        readiness, action = "blocked_design", "answer_question"
-        questions = questions[:1] or ["请回答未闭合的产品问题"]
-        prompt = "请先回答一个高信息产品问题：{}".format(questions[0])
-    elif prd.status == "blocked_unknown":
-        readiness, action = "blocked_unknown", "answer_question"
-        prompt = "请补充可验证的 PRD 证据后再继续规划。"
-    elif prd.status == "review_required":
-        readiness, action = "awaiting_user", "confirm_plan"
-        prompt = "请确认 PRD 检查点后再发布规划产物。"
-    else:
-        readiness, action = "awaiting_user", "continue_planning"
-        prompt = "请确认 PRD 检查点后继续规划。"
-    return StageHandoff(
-        from_stage="prd",
-        from_status="blocked_design" if prd.status == "blocked_decision" else prd.status,
-        to_stage="spec_issue_dag",
-        readiness=readiness,
-        evidence_refs=list(evidence_refs),
-        open_questions=questions,
-        required_user_action=action,
-        forbidden_automatic_actions=["create_spec", "create_issue", "create_dag", "create_worker", "authorize", "deploy"],
-        prompt=prompt,
-        prd_revision=prd.revision,
-    )
+def build_integration_acceptance_contract(plan) -> Optional[Dict[str, Any]]:
+    """Validate and project the five-part contract for a complex plan."""
+    if not hasattr(plan, "complexity_band"):
+        raise TypeError("plan is required")
+    if plan.complexity_band != "complex":
+        return None
+    contract = IntegrationAcceptanceContract.from_dict(plan.integration_contract)
+    prd_ref = str(plan.prd_path)
+    spec_ref = str(plan.spec_path)
+    def _valid_ref(value):
+        if not isinstance(value, str) or not value.strip() or value.startswith(("/", "~")):
+            return False
+        path = PurePosixPath(value)
+        return not path.is_absolute() and ".." not in path.parts and str(path) not in {"", "."}
+    if not _valid_ref(prd_ref) or not _valid_ref(spec_ref):
+        raise ValueError("PRD/Spec references must be project-relative")
+    result = contract.to_dict()
+    result["digest_inputs"] = {
+        "prd_ref": prd_ref,
+        "spec_ref": spec_ref,
+        "plan_revision": plan.version,
+    }
+    result["digest"] = contract.digest(prd_ref=prd_ref, spec_ref=spec_ref, plan_revision=plan.version)
+    return result
 
 
-def render_stage_handoff(handoff: StageHandoff) -> str:
-    return handoff.render()
+def project_v41_integration_contract(plan):
+    """Return the V4.1 integration contract only for complex routing."""
+    if plan.complexity_band in {"simple", "light_plan", "light"}:
+        return None
+    return build_integration_acceptance_contract(plan)
 
 
-def build_runtime_stage_handoff(
-    from_status: str,
-    evidence_refs: List[str],
-    prompt: str,
-    *,
-    to_stage: str = "monitor",
-    readiness: str = "ready",
-    open_questions: Optional[List[str]] = None,
-    required_user_action: str = "none",
-    prd_revision: Optional[int] = None,
-) -> StageHandoff:
-    return StageHandoff(
-        from_stage="monitor", from_status=from_status, to_stage=to_stage,
-        readiness=readiness, evidence_refs=list(evidence_refs),
-        open_questions=list(open_questions or []),
-        required_user_action=required_user_action, prompt=prompt,
-        forbidden_automatic_actions=["expand_scope", "create_worker", "authorize", "deploy"],
-        prd_revision=prd_revision,
-    )
+# DAG construction lives with DAG validation; re-export these public V4.1
+# helpers here for callers that treat planning as the entry point.
+from .dag import append_integration_review_node, is_integration_review_node, validate_integration_review_node

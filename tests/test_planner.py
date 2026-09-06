@@ -40,7 +40,6 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual([node.id for node in restored.nodes], ["V2-0", "V2-2"])
         self.assertEqual(restored.nodes[1].depends_on, ["V2-0"])
         self.assertEqual(restored.nodes[1].contract["risk_tags"], ["scheduling"])
-
     def test_obvious_one_step_request_is_simple(self):
         result = classify_s0("把 README 里的错别字改掉")
         self.assertTrue(result.simple)

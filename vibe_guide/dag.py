@@ -1,14 +1,128 @@
 """DAG validation, ready-node scheduling, and plan artifact rendering."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .models import DAGNode, Plan
+
+
+INTEGRATION_REVIEW_NODE_ID = "integration-review"
+INTEGRATION_REVIEWER_ID = "integration-reviewer"
+
+
+def is_integration_review_node(node: DAGNode) -> bool:
+    """Return whether *node* is the reserved final integration reviewer node."""
+    return isinstance(node, DAGNode) and node.id == INTEGRATION_REVIEW_NODE_ID
+
+
+def _integration_nodes(plan: Plan) -> List[DAGNode]:
+    return [node for node in (getattr(plan, "nodes", []) or []) if is_integration_review_node(node)]
+
+
+def append_integration_review_node(plan: Plan) -> Plan:
+    """Append the deterministic, read-only integration review node to complex plans."""
+    if not isinstance(plan, Plan):
+        raise TypeError("plan is required")
+    if plan.complexity_band != "complex":
+        return plan
+    existing = _integration_nodes(plan)
+    if existing:
+        raise ValueError("plan already contains an integration review node")
+    # Import lazily to keep the planner/DAG modules independently importable.
+    from .planner import build_integration_acceptance_contract
+
+    business_nodes = [node for node in plan.nodes if not is_integration_review_node(node)]
+    projected_contract = build_integration_acceptance_contract(plan)
+    contract = dict(projected_contract)
+    contract.update({
+        "input": "all business deliveries, review/rework evidence, and aggregate diff",
+        "output": "integration review report with P0/P1/P2 clearance and evidence references",
+        "error_behavior": "unknown, out-of-scope changes, or uncleared findings block acceptance",
+        "acceptance_example": "all required evidence is present and P0/P1/P2 clearance is zero",
+        "risk_tags": ["integration", "read-only"],
+        "read_only": True,
+        "reviewer": INTEGRATION_REVIEWER_ID,
+        "allowlist": [],
+    })
+    # Keep the synthetic integration reviewer on the same verified adapter
+    # route as the business nodes so authorization can enforce one binding.
+    for node in business_nodes:
+        adapter_id = str(node.contract.get("adapter_id", "")).strip()
+        if adapter_id:
+            contract["adapter_id"] = adapter_id
+            break
+    integration = DAGNode(
+        INTEGRATION_REVIEW_NODE_ID,
+        "Final integration review",
+        [node.id for node in business_nodes],
+        [],
+        "integration",
+        contract,
+        "planned",
+        risk_tags=["integration", "read-only"],
+        reviewer=INTEGRATION_REVIEWER_ID,
+        owned_paths=[],
+        allowlist=[],
+    )
+    return replace(
+        plan,
+        node_ids=list(plan.node_ids) + [integration.id],
+        nodes=list(plan.nodes) + [integration],
+    )
+
+
+def validate_integration_review_node(plan: Plan) -> "DAGValidation":
+    """Validate the integration node's uniqueness, scope, lineage and reviewer isolation."""
+    if not isinstance(plan, Plan):
+        raise TypeError("plan is required")
+    if plan.complexity_band != "complex":
+        return DAGValidation(True, ())
+    nodes = list(plan.nodes or [])
+    integration = _integration_nodes(plan)
+    errors: List[str] = []
+    if len(integration) != 1:
+        errors.append("complex plan must contain exactly one integration review node")
+        return DAGValidation(False, tuple(errors))
+    node = integration[0]
+    business = [item for item in nodes if not is_integration_review_node(item)]
+    business_ids = [item.id for item in business]
+    contract_error = _contract_error(node)
+    if contract_error:
+        errors.append(contract_error)
+    if node.depends_on != business_ids:
+        errors.append("integration review depends_on must equal all business node IDs in plan order")
+    if node.owned_paths:
+        errors.append("integration review node must not own business paths")
+    if node.allowlist:
+        errors.append("integration review node must have an empty write allowlist")
+    if node.contract.get("allowlist"):
+        errors.append("integration review contract must have an empty write allowlist")
+    explicit_reviewer = node.reviewer
+    contract_reviewer = node.contract.get("reviewer")
+    if explicit_reviewer and contract_reviewer and explicit_reviewer != contract_reviewer:
+        errors.append("integration review reviewer mismatch between node and contract")
+    reviewer = explicit_reviewer or contract_reviewer
+    business_reviewers = {item.reviewer or item.contract.get("reviewer") for item in business}
+    business_writers = {item.writer or item.contract.get("writer") for item in business}
+    if reviewer != INTEGRATION_REVIEWER_ID:
+        errors.append("integration review reviewer must be the independent integration reviewer")
+    if reviewer in business_reviewers or reviewer in business_writers:
+        errors.append("integration review reviewer must not be reused by a business node")
+    if node.contract.get("read_only") is not True:
+        errors.append("integration review contract must be read-only")
+    try:
+        from .planner import build_integration_acceptance_contract
+        expected = build_integration_acceptance_contract(plan)
+        if node.contract.get("digest") != expected.get("digest"):
+            errors.append("integration review contract digest mismatch")
+    except (TypeError, ValueError) as exc:
+        errors.append("integration review contract is invalid: {}".format(exc))
+    return DAGValidation(not errors, tuple(dict.fromkeys(errors)))
 
 
 @dataclass(frozen=True)
@@ -31,16 +145,18 @@ class DAGAuditResult:
     ready_nodes: List[str]
     blocked_nodes: List[str]
     reasons: Dict[str, List[str]]
-    parallel_groups: Dict[str, List[str]] = None
+    parallel_groups: Optional[Dict[str, List[str]]] = None
 
     def __post_init__(self):
-        if self.status not in {"ready", "blocked_design", "blocked_dag", "blocked_deploy", "blocked_unknown"}:
+        if self.status not in {"ready", "blocked_design", "blocked_dag", "blocked_unknown"}:
             raise ValueError("unsupported DAG audit status")
         object.__setattr__(self, "ready_nodes", list(self.ready_nodes))
         object.__setattr__(self, "blocked_nodes", list(self.blocked_nodes))
-        object.__setattr__(self, "reasons", {key: list(value) for key, value in self.reasons.items()})
+        object.__setattr__(self, "reasons", {
+            str(key): list(value) for key, value in self.reasons.items()
+        })
         object.__setattr__(self, "parallel_groups", {
-            key: list(value) for key, value in (self.parallel_groups or {}).items()
+            str(key): list(value) for key, value in (self.parallel_groups or {}).items()
         })
 
     def to_dict(self) -> Dict[str, Any]:
@@ -87,24 +203,8 @@ def _contract_error(node: DAGNode) -> str:
     return ""
 
 
-def _node_metadata(node: DAGNode, name: str) -> Any:
-    """Read identity metadata from explicit, legacy, or authoritative fields."""
-    sources = _metadata_sources(node, name)
-    for _source, value in sources:
-        if value not in (None, "", []):
-            return value
-    return None
-
-
 def _metadata_sources(node: DAGNode, name: str) -> List[Tuple[str, Any]]:
-    """Return all supported metadata locations in precedence order.
-
-    Revision-5 ``nodes.json`` puts writer/allowlist in
-    ``contract.worker_profile`` while older V1/V2 fixtures may keep them as
-    explicit DAGNode fields or direct contract keys.  Keeping every source
-    lets the audit reject conflicting identity claims instead of silently
-    choosing one.
-    """
+    """Return explicit, legacy, and authoritative metadata claims."""
     contract = node.contract if isinstance(node.contract, Mapping) else {}
     profile = contract.get("worker_profile")
     profile_value = profile.get(name) if isinstance(profile, Mapping) else None
@@ -115,8 +215,16 @@ def _metadata_sources(node: DAGNode, name: str) -> List[Tuple[str, Any]]:
     ]
 
 
+def _node_metadata(node: DAGNode, name: str) -> Any:
+    for _source, value in _metadata_sources(node, name):
+        if value not in (None, "", []):
+            return value
+    return None
+
+
 def _audit_contract_errors(node: DAGNode) -> List[str]:
-    errors = []
+    """Validate executable contract and its writer identity claims."""
+    errors: List[str] = []
     contract_error = _contract_error(node)
     if contract_error:
         errors.append(contract_error)
@@ -130,20 +238,21 @@ def _audit_contract_errors(node: DAGNode) -> List[str]:
     for label, names in aliases.items():
         if not _has_value(contract, names):
             errors.append("node {} contract is missing {}".format(node.id, label))
-    risk_tags = _node_metadata(node, "risk_tags")
-    if not isinstance(risk_tags, list) or not risk_tags or not all(
-        isinstance(item, str) and item.strip() for item in risk_tags
-    ):
-        errors.append("node {} contract is missing risk_tags".format(node.id))
+
     profile = contract.get("worker_profile")
     if profile is not None and not isinstance(profile, Mapping):
         errors.append("node {} worker_profile must be a mapping".format(node.id))
-        profile = {}
+        profile = None
     if isinstance(profile, Mapping):
         for field_name in ("writer", "allowlist"):
             if field_name not in profile or not _has_content(profile[field_name]):
                 errors.append("node {} worker_profile is missing {}".format(node.id, field_name))
 
+    risk_tags = _node_metadata(node, "risk_tags")
+    if not isinstance(risk_tags, list) or not risk_tags or not all(
+        isinstance(item, str) and item.strip() for item in risk_tags
+    ):
+        errors.append("node {} contract is missing risk_tags".format(node.id))
     writer = _node_metadata(node, "writer")
     if not isinstance(writer, str) or not writer.strip():
         errors.append("node {} contract is missing writer".format(node.id))
@@ -158,14 +267,18 @@ def _audit_contract_errors(node: DAGNode) -> List[str]:
     elif any(Path(item).is_absolute() or ".." in Path(item).parts for item in allowlist):
         errors.append("node {} allowlist escapes the project".format(node.id))
 
-    # Explicit, legacy direct-contract, and authoritative worker_profile
-    # claims must agree whenever more than one is present.
+    # If multiple representations are present, they must make the same claim.
     for name in ("risk_tags", "writer", "worktree", "allowlist"):
-        populated = [(source, value) for source, value in _metadata_sources(node, name) if value not in (None, "", [])]
+        populated = [
+            (source, value) for source, value in _metadata_sources(node, name)
+            if value not in (None, "", [])
+        ]
         for index, (left_source, left_value) in enumerate(populated):
             for right_source, right_value in populated[index + 1:]:
                 if left_value != right_value:
-                    errors.append("node {} {} mismatch ({} vs {})".format(node.id, name, left_source, right_source))
+                    errors.append("node {} {} mismatch ({} vs {})".format(
+                        node.id, name, left_source, right_source
+                    ))
     if contract.get("design_change") or contract.get("status") == "blocked_design":
         errors.append("node {} is blocked by a design change".format(node.id))
     return list(dict.fromkeys(errors))
@@ -228,49 +341,57 @@ def ready_nodes(nodes: List[DAGNode]) -> List[DAGNode]:
 
 
 def _cycle_nodes(nodes: List[DAGNode]) -> List[str]:
+    """Return nodes participating in hard-dependency cycles."""
     graph = {node.id: list(node.depends_on) for node in nodes}
-    active = set()
-    complete = set()
+    state: Dict[str, int] = {}
+    stack: List[str] = []
     found = set()
 
     def visit(node_id: str) -> None:
-        if node_id in active:
-            found.update(active)
-            return
-        if node_id in complete:
-            return
-        active.add(node_id)
+        state[node_id] = 1
+        stack.append(node_id)
         for dependency in graph.get(node_id, []):
-            if dependency in graph:
+            if dependency not in graph:
+                continue
+            if state.get(dependency, 0) == 0:
                 visit(dependency)
-        active.discard(node_id)
-        complete.add(node_id)
+            elif state.get(dependency) == 1:
+                try:
+                    found.update(stack[stack.index(dependency):])
+                except ValueError:
+                    found.add(dependency)
+        stack.pop()
+        state[node_id] = 2
 
     for node_id in graph:
-        visit(node_id)
+        if state.get(node_id, 0) == 0:
+            visit(node_id)
     return sorted(found)
 
 
 def audit_dag(plan: Plan) -> DAGAuditResult:
-    """Audit executable readiness while keeping integration edges non-blocking."""
+    """Audit executable readiness; only hard dependencies block startup."""
     nodes = list(getattr(plan, "nodes", []) or [])
-    reasons: Dict[str, List[str]] = {node.id: [] for node in nodes}
     if not nodes:
         return DAGAuditResult(
             "blocked_dag", [], list(plan.node_ids),
             {"__dag__": ["plan has no executable DAG nodes"]}, {}
         )
 
+    reasons: Dict[str, List[str]] = {node.id: [] for node in nodes}
+    if plan.complexity_band == "complex":
+        global_validation = validate_integration_review_node(plan)
+        if not global_validation.valid:
+            reasons["__dag__"] = list(global_validation.errors)
     by_id: Dict[str, DAGNode] = {}
     duplicate_ids = set()
     for node in nodes:
         if node.id in by_id:
             duplicate_ids.add(node.id)
         by_id[node.id] = node
-    if duplicate_ids:
-        for node in nodes:
-            if node.id in duplicate_ids:
-                reasons[node.id].append("DAG node IDs must be unique")
+    for node in nodes:
+        if node.id in duplicate_ids:
+            reasons[node.id].append("DAG node IDs must be unique")
 
     plan_ids = set(plan.node_ids)
     actual_ids = set(by_id)
@@ -289,84 +410,79 @@ def audit_dag(plan: Plan) -> DAGAuditResult:
         else:
             for node_id in cycles or by_id:
                 reasons[node_id].append(error)
-    if cycles:
-        for node_id in cycles:
-            reasons[node_id].append("hard dependencies contain a cycle")
+    for node_id in cycles:
+        reasons[node_id].append("hard dependencies contain a cycle")
 
-    writers: Dict[Tuple[str, str], List[str]] = {}
+    writer_bindings: Dict[Tuple[str, str], List[str]] = {}
     for node in nodes:
-        for error in _audit_contract_errors(node):
-            reasons[node.id].append(error)
+        if is_integration_review_node(node):
+            # Integration reviewers are read-only and intentionally have no
+            # writer/worktree/write allowlist; validate their dedicated
+            # contract instead of applying the business-writer audit.
+            reasons[node.id].extend(validate_integration_review_node(plan).errors)
+        else:
+            reasons[node.id].extend(_audit_contract_errors(node))
         writer = _node_metadata(node, "writer")
         worktree = _node_metadata(node, "worktree")
         if isinstance(writer, str) and writer.strip() and isinstance(worktree, str) and worktree.strip():
-            writers.setdefault((writer, worktree), []).append(node.id)
-    for (writer, worktree), node_ids in writers.items():
+            writer_bindings.setdefault((writer, worktree), []).append(node.id)
+    for (writer, _worktree), node_ids in writer_bindings.items():
         if len(node_ids) > 1:
             allowlists = [tuple(_node_metadata(by_id[node_id], "allowlist") or ()) for node_id in node_ids]
             reason = (
                 "writer {} allowlist mismatch".format(writer)
-                if len(set(allowlists)) > 1
-                else "duplicate writer {}".format(writer)
+                if len(set(allowlists)) > 1 else "duplicate writer {}".format(writer)
             )
             for node_id in node_ids:
                 reasons[node_id].append(reason)
 
-    ready = []
+    ready: List[str] = []
     for node in nodes:
         if node.status not in ("planned", "ready") or reasons[node.id]:
             continue
         unmet = [dependency for dependency in node.depends_on if dependency not in by_id]
+        required_statuses = ("accepted",) if is_integration_review_node(node) else ("accepted", "delivered")
         unmet.extend(
             dependency for dependency in node.depends_on
-            if dependency in by_id and by_id[dependency].status not in ("accepted", "delivered")
+            if dependency in by_id and by_id[dependency].status not in required_statuses
         )
         if unmet:
             reasons[node.id].append(
-                "hard dependencies not complete (accepted or delivered): {}".format(", ".join(dict.fromkeys(unmet)))
+                "hard dependencies not complete (accepted or delivered): {}".format(
+                    ", ".join(dict.fromkeys(unmet))
+                )
             )
             continue
-        # integration_after is deliberately not consulted here.
+        # integration_after is intentionally non-blocking for startup.
         ready.append(node.id)
 
-    for node in nodes:
-        reasons[node.id] = list(dict.fromkeys(reasons[node.id]))
+    for node_id in list(reasons):
+        reasons[node_id] = list(dict.fromkeys(reasons[node_id]))
 
     blocked = [
         node.id for node in nodes
-        if reasons[node.id] or (node.status in ("blocked_design", "blocked_dag", "blocked_deploy", "blocked_unknown"))
+        if reasons[node.id] or node.status in ("blocked_design", "blocked_dag", "blocked_unknown")
     ]
     blocked.extend(missing for missing in sorted(plan_ids - actual_ids) if missing not in blocked)
     has_design = any("design change" in reason for values in reasons.values() for reason in values)
-    # A pending hard dependency is an ordinary not-yet-ready state, not a
-    # malformed DAG.  Only structural, contract, identity, or design errors
-    # make the audit itself blocked.
-    fatal_reasons = [
+    fatal = [
         reason for values in reasons.values() for reason in values
         if not reason.startswith("hard dependencies not complete")
     ]
-    has_dag_error = bool(fatal_reasons) or bool(structural)
-    explicit_unknown = any(node.status == "blocked_unknown" for node in nodes)
-    explicit_design = any(node.status == "blocked_design" for node in nodes)
-    explicit_deploy = any(node.status == "blocked_deploy" for node in nodes)
-    if explicit_deploy:
-        for node in nodes:
-            if node.status == "blocked_deploy":
-                reasons[node.id].append("deploy authorization is required")
-    if has_design or explicit_design:
+    if has_design or any(node.status == "blocked_design" for node in nodes):
         status = "blocked_design"
-    elif has_dag_error:
+    elif fatal or structural or any(node.status == "blocked_dag" for node in nodes):
         status = "blocked_dag"
-    elif explicit_deploy:
-        status = "blocked_deploy"
-    elif explicit_unknown:
+    elif any(node.status == "blocked_unknown" for node in nodes):
         status = "blocked_unknown"
     else:
         status = "ready"
+
     groups: Dict[str, List[str]] = {}
     for node in nodes:
-        if node.id in ready and _node_metadata(node, "parallel_group"):
-            groups.setdefault(str(_node_metadata(node, "parallel_group")), []).append(node.id)
+        group = _node_metadata(node, "parallel_group")
+        if node.id in ready and group:
+            groups.setdefault(str(group), []).append(node.id)
     return DAGAuditResult(status, ready, blocked, reasons, groups)
 
 
