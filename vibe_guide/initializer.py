@@ -5,7 +5,8 @@ import json, tempfile
 
 from .scanner import build_agentsmd_patch, scan_project
 from .capability_contract import build_contract, contract_path, load_contract, save_contract
-from .migration import migrate_v2_to_v310
+from .migration import migrate_v2_to_v310, migrate_v2_to_v42, _backup, _payload_is_complete
+from .workflow_gate import V42_STATE
 
 
 @dataclass
@@ -16,7 +17,7 @@ class InitResult:
 
 def migrate_project(source, destination):
     """Initializer-facing entry point for explicit, backup-first upgrades."""
-    return migrate_v2_to_v310(source, destination)
+    return migrate_v2_to_v42(source, destination)
 
 
 def _is_within(root, path):
@@ -75,11 +76,56 @@ def _migrate_state(path):
         raise ValueError('state.json is invalid') from error
     if not isinstance(data, dict):
         raise ValueError('state.json must be an object')
-    if data.get('workflow_version') == 2 and data.get('session_gate') == 's0_required':
+    if data == V42_STATE:
         return False
-    data.setdefault('workflow_version', 2)
-    data.setdefault('session_gate', 's0_required')
-    descriptor, temporary_name = tempfile.mkstemp(prefix='.state.', dir=str(path.parent))
+    if data.get('workflow_version') not in (2, 3, 3.1, 3.10):
+        raise ValueError('state.json legacy version is unknown')
+    # Preserve the complete legacy snapshot and a verified backup before the
+    # new state becomes visible. Unknown legacy fields are never discarded.
+    evidence = path.parent / 'migration-evidence.json'
+    import hashlib
+    source_bytes = json.dumps(data, ensure_ascii=False, sort_keys=True).encode('utf-8')
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    if evidence.exists():
+        try:
+            recorded = json.loads(evidence.read_text(encoding='utf-8'))
+            backup = Path(recorded['backup_path'])
+            manifest = recorded['backup_manifest']
+            valid = (
+                isinstance(recorded, dict)
+                and recorded.get('target_version') == '4.2.0'
+                and recorded.get('source_state') == data
+                and recorded.get('source_sha256') == source_sha256
+                and isinstance(manifest, dict)
+                and json.loads((backup / 'manifest.json').read_text(encoding='utf-8')) == manifest
+                and _payload_is_complete(backup / 'payload', manifest.get('files'))
+            )
+            if not valid:
+                raise ValueError('legacy migration evidence is unverifiable')
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as error:
+            raise ValueError('legacy migration evidence is unverifiable') from error
+    else:
+        project_root = path.parent.parent
+        backup, manifest = _backup(project_root, project_root.parent)
+        if not _payload_is_complete(backup / 'payload', manifest['files']):
+            raise ValueError('legacy backup failed integrity check')
+        _atomic_write(evidence, {
+            'source': str(project_root),
+            'destination': str(project_root),
+            'source_state': data,
+            'source_sha256': source_sha256,
+            'target_state': V42_STATE,
+            'target_version': '4.2.0',
+            'backup_path': str(backup),
+            'backup_manifest': manifest,
+        })
+    data = dict(V42_STATE)
+    _atomic_write(path, data)
+    return True
+
+
+def _atomic_write(path, data):
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f'.{path.name}.', dir=str(path.parent))
     try:
         with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
             json.dump(data, stream, ensure_ascii=False, sort_keys=True)
@@ -88,7 +134,6 @@ def _migrate_state(path):
     finally:
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
-    return True
 
 
 def init_project(paths, confirm):
@@ -114,7 +159,7 @@ def init_project(paths, confirm):
     for relative in ('.vibe/config.json', '.vibe/state.json'):
         path = root / relative
         if not path.exists():
-            _write_new(path, '{"workflow_version": 2, "session_gate": "s0_required"}\n' if relative == '.vibe/state.json' else '{}\n')
+            _write_new(path, (json.dumps(V42_STATE, ensure_ascii=False, sort_keys=True) + '\n') if relative == '.vibe/state.json' else '{}\n')
             created.append(relative)
     capability_target = contract_path(paths)
     if capability_target.exists():

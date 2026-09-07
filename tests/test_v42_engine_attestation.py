@@ -44,6 +44,12 @@ class EngineAttestationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "engine mode"):
             self._create(engine_mode="worker")
 
+    def test_provider_attestation_does_not_grant_external_permission(self):
+        """Engineering engine identity must not be treated as external approval."""
+        attestation = self._create(provider="codex")
+        self.assertEqual(attestation["provider"], "codex")
+        self.assertNotIn("permission_granted", attestation)
+
     def test_contract_requires_non_empty_text_and_boolean_facts(self):
         for field in ("plan_id", "provider", "provenance"):
             with self.subTest(field=field), self.assertRaises(ValueError):

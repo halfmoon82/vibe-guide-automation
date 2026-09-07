@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vibe_guide.migration import migrate_v2_to_v310, restore_backup
+from vibe_guide.migration import migrate_v2_to_v310, migrate_v2_to_v42, restore_backup
 
 
 class MigrationTests(unittest.TestCase):
@@ -136,6 +136,44 @@ class MigrationTests(unittest.TestCase):
             extra.symlink_to(source)
             restored = restore_backup(result.backup_path, root / "restored")
             self.assertEqual(restored.status, "blocked_invalid")
+
+    def test_v42_migration_records_recoverable_evidence_and_uses_target_marker(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); source = self.fixture(root); destination = root / "v42"
+            result = migrate_v2_to_v42(source, destination)
+
+            self.assertEqual(result.status, "migrated")
+            self.assertEqual(result.target_version, "4.2.0")
+            marker = json.loads((destination / ".vibe" / "migration-result.json").read_text())
+            evidence = json.loads((destination / ".vibe" / "migration-evidence.json").read_text())
+            self.assertEqual(marker["target_version"], "4.2.0")
+            self.assertEqual(evidence["target_version"], "4.2.0")
+            self.assertEqual(evidence["backup_path"], result.backup_path)
+            self.assertEqual(evidence["backup_manifest"], result.backup_manifest)
+            self.assertRegex(evidence["source_sha256"], r"^[0-9a-f]{64}$")
+            self.assertTrue(Path(evidence["backup_path"], "manifest.json").is_file())
+            self.assertEqual(marker["backup_path"], evidence["backup_path"])
+            self.assertEqual(marker["backup_manifest"], evidence["backup_manifest"])
+            self.assertEqual(marker["source_sha256"], evidence["source_sha256"])
+
+    def test_v42_isolated_state_cannot_claim_already_current(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); source = self.fixture(root); destination = root / "v42"
+            (destination / ".vibe").mkdir(parents=True)
+            (destination / ".vibe" / "state.json").write_text(
+                json.dumps({
+                    "workflow_version": 4,
+                    "execution_mode": "sdd_first",
+                    "session_gate": "s0_required",
+                    "capability_contract_required": True,
+                }),
+                encoding="utf-8",
+            )
+
+            result = migrate_v2_to_v42(source, destination)
+
+            self.assertNotEqual(result.status, "already_current")
+            self.assertEqual(result.status, "blocked_unknown")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 
 TARGET_VERSION = "4.1.0"
+V42_TARGET_VERSION = "4.2.0"
 _EXCLUDED = {"e2e_mailbox", "e2e-mailbox-verification"}
 
 
@@ -244,3 +245,111 @@ def migrate_v2_to_v310(source, destination) -> MigrationResult:
             raise
     except (OSError, ValueError, json.JSONDecodeError) as error:
         return MigrationResult("blocked_invalid", source=str(source), destination=str(destination), backup_path=backup_path, backup_manifest=backup_manifest, errors=[str(error)])
+
+
+def migrate_v2_to_v42(source, destination) -> MigrationResult:
+    """Upgrade through the historical V3.10 reader, then publish V4.2 state."""
+    source = Path(os.fspath(source)).resolve(strict=False)
+    root = Path(os.fspath(destination)).resolve(strict=False)
+    source_state = source / "state.json" if source.name == ".vibe" else source / ".vibe" / "state.json"
+    state = root / ("state.json" if source.name == ".vibe" else ".vibe/state.json")
+    marker = root / ("migration-result.json" if source.name == ".vibe" else ".vibe/migration-result.json")
+    evidence = state.parent / "migration-evidence.json"
+
+    def blocked(reason):
+        return MigrationResult("blocked_unknown", source=str(source), destination=str(root),
+                               target_version=V42_TARGET_VERSION, errors=[reason])
+
+    def canonical_hash(value):
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def valid_backup(path_value, manifest_value):
+        if not isinstance(path_value, str) or not path_value or not isinstance(manifest_value, dict):
+            return False
+        backup = Path(path_value)
+        manifest_path = backup / "manifest.json"
+        payload = backup / "payload"
+        entries = _manifest_entries(manifest_value)
+        if entries is None or not manifest_path.is_file() or not payload.is_dir():
+            return False
+        try:
+            recorded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return _manifest_entries(recorded) == entries and _payload_is_complete(payload, entries)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+
+    # A published V4.2 state is only idempotent when its migration chain is
+    # independently recoverable.  The state file alone is not evidence.
+    if state.is_file():
+        try:
+            current = json.loads(state.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            current = None
+        if current == {"workflow_version": 4, "execution_mode": "sdd_first", "session_gate": "s0_required", "capability_contract_required": True}:
+            try:
+                source_value = json.loads(source_state.read_text(encoding="utf-8"))
+                recorded = json.loads(evidence.read_text(encoding="utf-8"))
+                marker_value = json.loads(marker.read_text(encoding="utf-8"))
+                source_digest = canonical_hash(source_value)
+                valid = (
+                    isinstance(recorded, dict)
+                    and recorded.get("target_version") == V42_TARGET_VERSION
+                    and recorded.get("source") == str(source)
+                    and recorded.get("destination") == str(root)
+                    and recorded.get("source_sha256") == source_digest
+                    and valid_backup(recorded.get("backup_path"), recorded.get("backup_manifest"))
+                    and isinstance(marker_value, dict)
+                    and marker_value.get("status") == "migrated"
+                    and marker_value.get("target_version") == V42_TARGET_VERSION
+                    and marker_value.get("source") == str(source)
+                    and marker_value.get("destination") == str(root)
+                    and marker_value.get("source_sha256") == source_digest
+                    and marker_value.get("backup_path") == recorded.get("backup_path")
+                    and marker_value.get("backup_manifest") == recorded.get("backup_manifest")
+                    and isinstance(marker_value.get("migrated_files"), list)
+                    and marker_value.get("migrated_files") == recorded.get("migrated_files")
+                )
+                if valid:
+                    return MigrationResult("already_current", source=str(source), destination=str(root),
+                                           target_version=V42_TARGET_VERSION,
+                                           backup_path=recorded["backup_path"],
+                                           backup_manifest=recorded["backup_manifest"],
+                                           migrated_files=marker_value["migrated_files"], idempotent=True)
+            except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+                pass
+            return blocked("v42 migration evidence is missing or unverifiable")
+
+    try:
+        original = json.loads(source_state.read_text(encoding="utf-8"))
+        if not isinstance(original, dict):
+            return blocked("source state is invalid")
+        source_digest = canonical_hash(original)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        return blocked(f"source state is unavailable: {error}")
+
+    result = migrate_v2_to_v310(source, root)
+    if result.status not in {"migrated", "already_current"}:
+        return result
+    try:
+        value = json.loads(state.read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or not valid_backup(result.backup_path, result.backup_manifest):
+            return blocked("migration backup is missing or unverifiable")
+        metadata = {
+            "source": str(source), "destination": str(root), "source_state": original,
+            "source_sha256": source_digest, "target_state": {"workflow_version": 4, "execution_mode": "sdd_first", "session_gate": "s0_required", "capability_contract_required": True},
+            "target_version": V42_TARGET_VERSION, "backup_path": result.backup_path,
+            "backup_manifest": result.backup_manifest,
+            "migrated_files": list(result.migrated_files),
+        }
+        _atomic_json(evidence, metadata)
+        _atomic_json(state, metadata["target_state"])
+        marker_data = result.to_dict()
+        marker_data.update({"target_version": V42_TARGET_VERSION, "source_sha256": source_digest,
+                            "evidence_path": str(evidence), "backup_path": result.backup_path,
+                            "backup_manifest": result.backup_manifest})
+        _atomic_json(marker, marker_data)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        return blocked(str(error))
+    result.target_version = V42_TARGET_VERSION
+    return result

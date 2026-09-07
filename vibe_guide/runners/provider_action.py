@@ -7,7 +7,12 @@ from pathlib import Path
 import subprocess
 from typing import Any, Dict, Optional
 
-from ..adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
+from ..adapters.task_provider import (
+    ProviderActionStore,
+    ProviderPending,
+    ProviderUnavailable,
+    require_complex_monitor_dispatch,
+)
 from ..contracts import RunEvent, RunHandle, Runner
 from ..capability_contract import load_contract
 from ..models import (
@@ -150,6 +155,12 @@ class ProviderActionRunner(Runner):
         sequence: int = 0,
     ) -> Dict[str, Any]:
         request = dict(request)
+        for key in (
+            "dispatcher", "complexity_band", "execution_engine", "engine_mode",
+            "engine_evidence_ref", "authorization_digest", "plan_id", "plan_version",
+        ):
+            if key in contract:
+                request[key] = contract[key]
         if contract.get("child_origin") == "worker_dispatch":
             request["origin"] = "worker_dispatch"
             request["child_binding"] = contract.get("child_binding")
@@ -915,6 +926,8 @@ class ProviderActionRunner(Runner):
         return verification
 
     def start(self, contract: dict, worktree: Path) -> RunHandle:
+        # Reject direct complex starts before task-binding reads or Provider I/O.
+        require_complex_monitor_dispatch(contract, self.paths)
         run_id = str(contract.get("run_id", ""))
         if not run_id:
             raise ValueError("provider runner requires run_id")
@@ -973,6 +986,14 @@ class ProviderActionRunner(Runner):
             "successor": bool(contract.get("successor")),
             "predecessor_task_id": contract.get("predecessor_task_id"),
             "capability_contract_digest": expected_capability_digest,
+            "dispatcher": contract.get("dispatcher"),
+            "complexity_band": contract.get("complexity_band"),
+            "execution_engine": contract.get("execution_engine"),
+            "engine_mode": contract.get("engine_mode"),
+            "engine_evidence_ref": contract.get("engine_evidence_ref"),
+            "authorization_digest": contract.get("authorization_digest"),
+            "plan_id": contract.get("plan_id"),
+            "plan_version": contract.get("plan_version"),
         }
         if profile is not None:
             metadata.update(
@@ -1040,6 +1061,14 @@ class ProviderActionRunner(Runner):
             "node_id": metadata["node_id"],
             "role": metadata["role"],
             "generation": metadata["generation"],
+            "dispatcher": metadata.get("dispatcher"),
+            "complexity_band": metadata.get("complexity_band"),
+            "execution_engine": metadata.get("execution_engine"),
+            "engine_mode": metadata.get("engine_mode"),
+            "engine_evidence_ref": metadata.get("engine_evidence_ref"),
+            "authorization_digest": metadata.get("authorization_digest"),
+            "plan_id": metadata.get("plan_id"),
+            "plan_version": metadata.get("plan_version"),
         }
         wait_request = {
             "targets": [

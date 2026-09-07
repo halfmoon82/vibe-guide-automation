@@ -14,6 +14,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import uuid
 
 from ..authorization import validate_runtime_contract
+from ..adapters.task_provider import require_complex_monitor_dispatch
 from ..contracts import RunEvent, RunHandle, Runner
 
 
@@ -124,6 +125,8 @@ class LocalRunner(Runner):
         return directory
 
     def start(self, contract: dict, worktree: Path) -> RunHandle:
+        # Guard before command validation, process creation or metadata writes.
+        require_complex_monitor_dispatch(contract, self._project_paths(contract, worktree))
         contract = validate_runtime_contract(contract)
         adapter_id = self._adapter_id(contract.get("adapter_id"))
         command = self._command(contract.get("command"))
@@ -224,6 +227,22 @@ class LocalRunner(Runner):
             }
         )
         return handle
+
+    @staticmethod
+    def _project_paths(contract: Mapping[str, Any], worktree: Path):
+        """Resolve project paths only when a complex guard needs them."""
+        if not isinstance(contract, Mapping):
+            return None
+        raw = contract.get("project_root") or contract.get("paths_root")
+        if raw:
+            from ..paths import ProjectPaths
+            return ProjectPaths(Path(str(raw)).resolve())
+        candidate = Path(worktree).resolve()
+        for parent in (candidate, *candidate.parents):
+            if (parent / ".vibe").is_dir():
+                from ..paths import ProjectPaths
+                return ProjectPaths(parent)
+        return None
 
     def _locate_metadata(self, handle: RunHandle) -> Path:
         if not isinstance(handle, RunHandle):
