@@ -2,6 +2,7 @@
 
 import argparse
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -47,6 +48,7 @@ from .state import load_events, load_snapshot
 from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
+from .engine_attestation import create_engine_attestation
 from .installation import run_install, run_upgrade
 from .models import InstallRequest
 
@@ -349,9 +351,24 @@ def _publish_plan(
         plan = append_integration_review_node(plan)
     nodes = list(plan.nodes)
     capabilities = source_capabilities
+    engine_attestation = None
     try:
+        if is_complex_spec:
+            observed_store = ProviderActionStore(paths).capabilities()
+            engine_attestation = create_engine_attestation(
+                plan.plan_id,
+                plan.version,
+                "vibeguide_monitor",
+                "dag",
+                observed_store["adapter_id"],
+                observed_store["facts"],
+                observed_store["provenance"],
+                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            )
         capabilities = _observed_adapter(paths, capabilities.agent_id).capabilities
     except (FileNotFoundError, OSError, TypeError, ValueError, ProviderPending):
+        if is_complex_spec:
+            raise PermissionError("engine_attestation_unavailable: verified Monitor engine evidence is required")
         # Planning remains usable for explicitly injected/background test paths;
         # the public monitor rechecks live observed capability before execution.
         pass
@@ -362,6 +379,7 @@ def _publish_plan(
         active_pair_limit=source.get("active_pair_limit"),
         allowed_actions=source.get("allowed_actions"),
         remote_git_actions=source.get("remote_git_actions", "deny"),
+        engine_attestation=engine_attestation,
     )
 
     plans_root = destination.parent
@@ -375,6 +393,8 @@ def _publish_plan(
         render_plan_artifacts(plan, staging)
         (staging / "specs").mkdir()
         (staging / "issues").mkdir()
+        if engine_attestation is not None:
+            _atomic_json(staging / "engine-attestation.json", engine_attestation)
         (staging / "prd.md").write_text(
             "# {}\n\n状态：approved\n审核：reviewed\n\n目标：{}\n\n## 已批准产品决策\n\n{}\n\n"
             "证据优先级：{}\n".format(

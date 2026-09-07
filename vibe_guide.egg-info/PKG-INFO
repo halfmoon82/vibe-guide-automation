@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: vibe-guide
+Version: 4.2.0
+Requires-Python: >=3.9
+Dynamic: requires-python

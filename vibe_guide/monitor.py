@@ -3,6 +3,7 @@
 import hashlib
 import json
 from pathlib import Path
+from datetime import datetime, timezone
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
@@ -79,6 +80,7 @@ from .evidence import (
     evaluate_delivery_evidence,
     record_integration_review as _record_integration_review,
 )
+from .engine_attestation import validate_engine_attestation
 
 
 def reconcile_pending_binding(snapshot: Any, node_id: str, runner: Any) -> bool:
@@ -285,6 +287,32 @@ class Monitor:
             raise PermissionError("execution_engine_unverified: engine evidence is not verified")
         if record.dag_revision != self.plan.version:
             raise PermissionError("blocked_by_execution_topology_mismatch: DAG revision mismatch")
+        # The authorization card's reference must resolve to fresh, intact
+        # engine evidence before any provider dispatch is considered.  This
+        # check is deliberately separate from authorization validation: an
+        # attestation can prove engine identity, never grant execution rights.
+        try:
+            raw_path = self.paths.vibe / "plans" / self.plan.plan_id / "engine-attestation.json"
+            if any(part.is_symlink() for part in (self.paths.vibe / "plans", self.paths.vibe / "plans" / self.plan.plan_id, raw_path)):
+                raise ValueError("engine attestation must be a regular file")
+            path = self.paths.resolve_vibe_path(
+                Path("plans") / self.plan.plan_id / "engine-attestation.json"
+            )
+            if path.is_symlink() or not path.is_file():
+                raise ValueError("engine attestation must be a regular file")
+            attestation = json.loads(path.read_text(encoding="utf-8"))
+            validate_engine_attestation(
+                attestation, self.plan.plan_id, self.plan.version,
+                now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            )
+            if attestation.get("evidence_ref") != record.engine_evidence_ref:
+                raise ValueError("engine evidence reference mismatch")
+            if record.agent_id and attestation.get("provider") != record.agent_id:
+                raise ValueError("engine attestation provider mismatch")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            raise PermissionError(
+                "execution_engine_unverified: engine attestation is missing or invalid"
+            ) from error
         return record.execution_engine, record.engine_mode
 
     def _topology_projection(self, snapshot: RunSnapshot) -> Tuple[List[str], str]:
