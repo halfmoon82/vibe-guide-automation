@@ -606,6 +606,7 @@ def build_authorization_card(
     execution_engine: str = "",
     engine_mode: str = "",
     engine_evidence_ref: str = "",
+    engine_attestation: Optional[Dict[str, Any]] = None,
     explicit_execution_mode_override: Optional[Dict[str, Any]] = None,
 ) -> AuthorizationCard:
     node_ids = tuple(sorted(node.id for node in nodes))
@@ -659,6 +660,15 @@ def build_authorization_card(
             execution_engine = "vibeguide_monitor"
         if not engine_mode:
             engine_mode = "dag"
+        if engine_attestation is not None:
+            from .engine_attestation import validate_engine_attestation
+            validate_engine_attestation(engine_attestation, plan.plan_id, plan.version)
+            attested_ref = engine_attestation["evidence_ref"]
+            if engine_evidence_ref and engine_evidence_ref != attested_ref:
+                raise ValueError("engine evidence reference does not match attestation")
+            engine_evidence_ref = attested_ref
+        if engine_attestation is None and getattr(plan, "status", "") == "confirmed_pending_authorization":
+            raise ValueError("complex authorization requires verified engine attestation")
         if not engine_evidence_ref:
             engine_evidence_ref = "unverified:legacy"
         if (execution_engine != "vibeguide_monitor" or engine_mode != "dag") and not explicit_execution_mode_override:
