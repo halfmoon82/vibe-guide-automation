@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import vibe_guide
 from vibe_guide.installation import InstallStateMachine, PHASES, run_install, run_upgrade
 from vibe_guide.models import InstallRequest, InstallResult
 from vibe_guide.paths import ProjectPaths
@@ -87,7 +88,7 @@ class InstallationContractTests(unittest.TestCase):
             (root / ".vibe" / "config.json").write_text(json.dumps({"version": "2.0.0"}))
             result = run_upgrade(InstallRequest("layered", True, root), ProjectPaths(root), lambda *_: {"status": "approved"}, lambda *_: {"status": "verified"})
             self.assertEqual(result.version_before, "2.0.0")
-            self.assertEqual(result.migration["target_version"], "4.1.0")
+            self.assertEqual(result.migration["target_version"], vibe_guide.__version__)
 
 
 if __name__ == "__main__":

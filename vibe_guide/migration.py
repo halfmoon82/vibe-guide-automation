@@ -11,7 +11,9 @@ import stat
 from typing import Any, Dict, List
 
 
-TARGET_VERSION = "4.1.0"
+from . import __version__
+
+TARGET_VERSION = __version__
 _EXCLUDED = {"e2e_mailbox", "e2e-mailbox-verification"}
 
 
