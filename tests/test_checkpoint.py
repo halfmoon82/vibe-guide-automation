@@ -118,7 +118,7 @@ class CheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             paths = ProjectPaths(Path(root))
             (paths.vibe / "state.json").parent.mkdir(parents=True)
-            (paths.vibe / "state.json").write_text('{"workflow_version": 4, "session_gate": "s0_required"}\n', encoding="utf-8")
+            (paths.vibe / "state.json").write_text('{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8")
             save_contract(paths, build_contract(paths.root, provider="fake", host_id="local"))
             node = DAGNode("n1", "n1", [], [], "g", {"files": ["n1.py"], "worker": "w", "worktree": ".worktrees/n1"}, "ready")
             plan = Plan("p1", 1, "docs/prd.md", ["n1"], "draft")
@@ -133,7 +133,7 @@ class CheckpointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             paths = ProjectPaths(Path(root))
             (paths.vibe / "state.json").parent.mkdir(parents=True)
-            (paths.vibe / "state.json").write_text('{"workflow_version": 4, "session_gate": "s0_required"}\n', encoding="utf-8")
+            (paths.vibe / "state.json").write_text('{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8")
             save_contract(paths, build_contract(paths.root, provider="fake", host_id="local"))
             node = DAGNode("n1", "n1", [], [], "g", {"files": ["n1.py"], "worker": "w", "worktree": ".worktrees/n1"}, "ready")
             plan = Plan("p1", 1, "docs/prd.md", ["n1"], "draft")

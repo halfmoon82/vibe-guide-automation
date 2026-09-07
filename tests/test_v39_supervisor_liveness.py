@@ -54,7 +54,7 @@ class LivenessTests(unittest.TestCase):
         self.paths = ProjectPaths(Path(self.tempdir.name))
         (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
         (self.paths.vibe / "state.json").write_text(
-            '{"workflow_version": 4, "session_gate": "s0_required"}\n',
+            '{"workflow_version": 2, "session_gate": "s0_required"}\n',
             encoding="utf-8",
         )
         save_contract(

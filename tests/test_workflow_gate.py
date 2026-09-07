@@ -19,7 +19,7 @@ class WorkflowGateBypassTests(unittest.TestCase):
         paths = ProjectPaths(Path(directory.name))
         (paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
         (paths.vibe / "state.json").write_text(
-            json.dumps({"workflow_version": 4, "session_gate": "s0_required"}),
+            json.dumps({"workflow_version": 2, "session_gate": "s0_required"}),
             encoding="utf-8",
         )
         save_contract(paths, build_contract(paths.root, provider="test", host_id="local"))

@@ -97,7 +97,27 @@ class Supervisor:
     def run_once(self):
         if not self.lease.acquire(self.run_id) and not getattr(self.lease, "_run_id", None):
             raise RuntimeError("supervisor lease is held by another process")
-        append_event(self.paths, RunEvent("supervisor_heartbeat", {"run_id": self.run_id, "status": "active"}))
+        heartbeat_data = {"run_id": self.run_id, "status": "active"}
+        heartbeat_provenance = None
+        try:
+            current = load_snapshot(self.paths, self.run_id)
+            heartbeat_data.update({
+                "authorization_digest": current.authorization_digest,
+                "node_contract_digest": current.node_contract_digest,
+            })
+            heartbeat_provenance = {
+                "role": "system",
+                "task_id": None,
+                "handle_id": None,
+                "generation": 0,
+                "authorization_digest": current.authorization_digest,
+                "node_contract_digest": current.node_contract_digest,
+            }
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            # A first-cycle heartbeat has no snapshot lineage yet; Monitor
+            # start/resume will establish it before any provider write.
+            pass
+        append_event(self.paths, RunEvent("supervisor_heartbeat", heartbeat_data), heartbeat_provenance)
         self.lease.heartbeat(self.run_id)
         self.monitor.resume(self.run_id, self.runner, poll_handles=False)
         from .monitor import reconcile_pending_binding

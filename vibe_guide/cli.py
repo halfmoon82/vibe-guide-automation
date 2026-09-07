@@ -628,6 +628,7 @@ def _snapshot_result(command: str, snapshot: Any, as_json: bool, continuation: s
     result_status = "retry_pending" if retry_pending else snapshot.status
     payload = {
         "command": command,
+        "dispatcher": "monitor" if command in {"monitor", "resume", "reconcile"} else None,
         "status": result_status,
         "run_id": snapshot.run_id,
         "nodes": snapshot.nodes,
@@ -768,11 +769,13 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     paths = ProjectPaths.from_cwd(Path(cwd))
 
     v2_state = False
+    v42_state = False
     state_probe = paths.vibe / "state.json"
     if state_probe.is_file():
         try:
             state_data = _read_json(state_probe)
-            v2_state = isinstance(state_data, dict) and state_data.get("workflow_version") == 4
+            v2_state = isinstance(state_data, dict) and state_data.get("workflow_version") == 2
+            v42_state = isinstance(state_data, dict) and state_data.get("workflow_version") == 4
         except (OSError, ValueError, AttributeError):
             v2_state = False
     if (v2_state or args.command == "init") and (args.command != "init" or args.confirm):
@@ -787,7 +790,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if args.command == "scan" and paths.vibe.exists():
         try:
             state_data = _read_json(state_probe)
-            if not isinstance(state_data, dict) or state_data.get("workflow_version") != 4 or state_data.get("session_gate") != "s0_required":
+            if not isinstance(state_data, dict) or state_data.get("workflow_version") != 2 or state_data.get("session_gate") != "s0_required":
                 raise ValueError("invalid V2 state")
         except (OSError, ValueError, AttributeError):
             return _result(BLOCKED, {"command": "scan", "status": "session_gate_blocked", "reason": "V2 state.json invalid"}, "扫描已阻塞：V2 state.json 无效", args.as_json)
@@ -1122,6 +1125,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     UNKNOWN,
                     {
                         "command": "monitor",
+                        "dispatcher": "monitor",
                         "status": "blocked_unknown",
                         "reason": str(error),
                     },
@@ -1181,7 +1185,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工未启动：需要精确 AUTHORIZE",
                 args.as_json,
             )
-        if v2_state:
+        if v2_state or v42_state:
             try:
                 require_capability_contract(paths)
             except PermissionError as error:
@@ -1189,6 +1193,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     UNKNOWN,
                     {
                         "command": "monitor",
+                        "dispatcher": "monitor",
                         "status": "blocked_unknown",
                         "reason": str(error),
                     },
@@ -1204,7 +1209,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     state_data = _read_json(state_path)
                 except ValueError:
                     state_data = {}
-                if isinstance(state_data, dict) and state_data.get("workflow_version") == 4:
+                if isinstance(state_data, dict) and state_data.get("workflow_version") == 2:
                     _require_public_execution_gate(
                         paths, directory, plan, nodes, card
                     )
@@ -1297,6 +1302,18 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 args.as_json,
             )
         except PermissionError as error:
+            if _is_capability_contract_unknown(error):
+                return _result(
+                    UNKNOWN,
+                    {
+                        "command": "monitor",
+                        "dispatcher": "monitor",
+                        "status": "blocked_unknown",
+                        "reason": str(error),
+                    },
+                    "能力合同状态未知：" + str(error),
+                    args.as_json,
+                )
             return _result(
                 BLOCKED,
                 {
@@ -1319,6 +1336,17 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 args.as_json,
             )
         except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
+            if _is_capability_contract_unknown(error):
+                return _result(
+                    UNKNOWN,
+                    {
+                        "command": "monitor",
+                        "status": "blocked_unknown",
+                        "reason": str(error),
+                    },
+                    "能力合同状态未知：" + str(error),
+                    args.as_json,
+                )
             return _result(
                 UNKNOWN,
                 {

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from datetime import datetime, timezone
 import subprocess
+import time
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
@@ -187,6 +188,51 @@ def classify_observation(observation: Any) -> ObservationDisposition:
     return ObservationDisposition("unknown", "isolate", kind)
 
 
+def classify_provider_failure(observation: Any) -> Dict[str, str]:
+    """Classify provider outcomes without turning missing evidence into failure.
+
+    Provider bridges expose a mixture of structured observations and exception
+    text.  Transient/repairable outcomes are engineering conditions and may be
+    retried on the same task identity; explicit user/system authorization
+    boundaries are external and must remain blocked.  Anything else is kept
+    ``unknown`` so callers fail closed rather than inventing a category.
+    """
+    if isinstance(observation, BaseException):
+        text = str(observation)
+        kind = getattr(observation, "kind", None) or getattr(observation, "type", None)
+    elif isinstance(observation, dict):
+        values = [observation.get(key) for key in ("kind", "type", "status", "reason", "error", "message", "detail")]
+        text = " ".join(str(value) for value in values if value is not None)
+        kind = observation.get("kind") or observation.get("type")
+        if observation.get("credential_required") or observation.get("login_required") or observation.get("permission_required"):
+            return {"kind": "external"}
+    else:
+        text = str(observation or "")
+        kind = None
+    normalized = (str(kind or "") + " " + text).casefold()
+    external_markers = (
+        "login required", "log in required", "credential", "credentials",
+        "auth required", "authentication required", "permission required",
+        "permission denied", "access denied",
+        "system permission", "remote approval", "approval required",
+        "external approval", "sudo", "凭据", "登录", "系统权限", "远程批准",
+    )
+    if any(marker in normalized for marker in external_markers):
+        return {"kind": "external"}
+    engineering_markers = (
+        "timeout", "timed out", "429", "rate limit", "too many requests",
+        "disconnect", "disconnected", "connection reset", "empty response",
+        "no response", "pending", "clientthreadid", "setup", "worker exit",
+        "worker exited", "worker crash", "snapshot interruption", "snapshot interrupted",
+        "interrupted", "binding drift", "branch drift", "worktree drift",
+        "stale cursor", "temporarily unavailable", "provider unavailable",
+        "超时", "限流", "断开", "空响应", "创建中", "工作进程退出", "快照中断",
+    )
+    if any(marker in normalized for marker in engineering_markers):
+        return {"kind": "engineering"}
+    return {"kind": "unknown"}
+
+
 def self_heal_binding(snapshot: Any, node_id: str, observation: Any) -> HealingResult:
     """Repair only fields proven by the frozen node contract, in place.
 
@@ -241,6 +287,22 @@ def isolate_affected_action(snapshot: Any, node_id: str, reason: str) -> None:
 
 
 class Monitor:
+    def _v42_retry_status(self) -> str:
+        """Use the explicit retry phase only for V4.2 initialized projects.
+
+        Older snapshots retain their historical ``blocked_unknown`` label;
+        V4.2 exposes the durable engineering phase as ``retry_pending``.
+        """
+        try:
+            state_path = self.paths.vibe / "state.json"
+            if state_path.is_file():
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(state, dict) and state.get("workflow_version") == 4:
+                    return "retry_pending"
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return "blocked_unknown"
+
     @staticmethod
     def _legacy_run_allowed(state_data: Dict[str, Any]) -> bool:
         """Accept only an explicitly evidenced historical-run marker."""
@@ -891,7 +953,16 @@ class Monitor:
         if poll_handles:
             self._poll_active_handles(snapshot, runner)
         if self._context_allows_dispatch(snapshot, runner):
-            self._schedule_ready(snapshot, runner, recover_missing_reviewer=True)
+            replay_retry_pending = any(
+                isinstance(current.get("retryable_action"), dict)
+                and current.get("binding_phase") != "retry_pending"
+                for current in snapshot.nodes.values()
+            )
+            # A caller explicitly replaying events without polling must see
+            # the recovered snapshot before scheduling a new cycle. This is
+            # especially important after an interrupted timeout event.
+            if not (poll_handles is False and replay_retry_pending):
+                self._schedule_ready(snapshot, runner, recover_missing_reviewer=True)
         self._refresh_run_status(snapshot)
         self._record_topology_projection(snapshot, "monitor.resume")
         save_snapshot(self.paths, snapshot)
@@ -1290,21 +1361,32 @@ class Monitor:
     def _poll_active_handles(self, snapshot: RunSnapshot, runner: Runner) -> None:
         for node_id, handle_id in list(snapshot.handles.items()):
             self._require_snapshot_authorization(snapshot)
+            current = snapshot.nodes.get(node_id, {})
+            retry = current.get("retryable_action") if isinstance(current, dict) else None
+            if (
+                self._v42_retry_status() == "retry_pending"
+                and isinstance(retry, dict)
+                and isinstance(retry.get("next_retry_at"), (int, float))
+                and time.time() < float(retry["next_retry_at"])
+            ):
+                continue
             try:
                 events = runner.poll(RunHandle(handle_id))
             except Exception as error:
-                self._queue_active_retry(
-                    snapshot,
-                    node_id,
-                    "runner poll failed ({})".format(type(error).__name__),
-                )
-                self._mark_blocked_unknown(
-                    snapshot,
-                    node_id,
-                    "runner poll failed ({})".format(type(error).__name__),
-                    quarantine_lease=False,
-                    retryable_same_task=True,
-                )
+                reason = "runner poll failed ({})".format(type(error).__name__)
+                if classify_provider_failure({"reason": reason})["kind"] == "engineering":
+                    active = snapshot.nodes[node_id].get("active_task") or {}
+                    self._queue_active_retry(snapshot, node_id, reason)
+                    if active.get("role"):
+                        self._set_binding_status(snapshot, node_id, str(active["role"]), "blocked_unknown")
+                    snapshot.nodes[node_id]["status"] = self._v42_retry_status()
+                    snapshot.nodes[node_id]["reason"] = reason
+                else:
+                    self._mark_blocked_unknown(
+                        snapshot, node_id, reason,
+                        quarantine_lease=False,
+                        retryable_same_task=True,
+                    )
                 continue
             for event in events:
                 if event.event in {"context_overflow", "context_exhausted", "overflow"}:
@@ -1772,7 +1854,7 @@ class Monitor:
                     retry["successor_candidate"] = False
                     current["retryable_action"] = retry
             if (
-                current.get("status") in {"blocked_unknown", "running", "rework"}
+                current.get("status") in {"blocked_unknown", "retry_pending", "running", "rework"}
                 and isinstance(retry, dict)
                 and node_id not in snapshot.handles
             ):
@@ -1842,6 +1924,33 @@ class Monitor:
                     )
                 pending_schedule = retry.get("pending_schedule") is True
                 reviewer_recovery = retry.get("missing_binding_recovery") is True
+                # Respect the durable bounded-backoff deadline for V4.2
+                # engineering retries.  The marker is consumed by the
+                # scheduler; polling/starting again before this point would
+                # turn an intended retry budget into a hot loop.
+                next_retry_at = retry.get("next_retry_at")
+                if (
+                    self._v42_retry_status() == "retry_pending"
+                    and retry.get("same_task") is True
+                    and isinstance(next_retry_at, (int, float))
+                    and time.time() < float(next_retry_at)
+                ):
+                    continue
+                # Legacy V3.x replay defers one scheduling pass after an
+                # interrupted timeout. The next heartbeat can then resume
+                # the same handle/task; this preserves historical recovery
+                # ordering while V4.2 uses the explicit retry_pending phase.
+                if (
+                    self._v42_retry_status() == "blocked_unknown"
+                    and retry.get("same_task") is True
+                    and retry.get("defer_once") is True
+                    and not pending_schedule
+                    and isinstance(current.get("quarantine"), dict)
+                ):
+                    retry = dict(retry)
+                    retry["defer_once"] = False
+                    current["retryable_action"] = retry
+                    continue
                 if pending_schedule and (
                     active_pairs >= record.active_pair_limit
                     or not all(
@@ -2161,6 +2270,19 @@ class Monitor:
                 "successor": successor,
                 "action": phase,
                 "run_id": snapshot.run_id,
+                # Explicit provenance consumed by the shared complex-dispatch
+                # guard in runners and adapters.  Only Monitor creates this
+                # proof-bearing contract.
+                "dispatcher": "monitor",
+                "project_root": str(self.paths.root.resolve()),
+                "plan_id": getattr(self.plan, "plan_id", ""),
+                "plan_version": getattr(self.plan, "version", 0),
+                "complexity_band": getattr(self.plan, "complexity_band", ""),
+                "execution_engine": getattr(record, "execution_engine", "monitor"),
+                "engine_mode": getattr(record, "engine_mode", "parallel"),
+                "engine_evidence_ref": getattr(record, "engine_evidence_ref", ""),
+                "authorization_digest": getattr(record, "digest", snapshot.authorization_digest),
+                "authorized_actions": list(getattr(record, "allowed_actions", [])),
                 "consistency_binding": self._consistency_binding(record, node),
             }
         )
@@ -2203,7 +2325,7 @@ class Monitor:
             contract["capability_contract_digest"] = snapshot.capability_contract_digest
         if (self.paths.vibe / "state.json").is_file():
             try:
-                v2 = json.loads((self.paths.vibe / "state.json").read_text(encoding="utf-8")).get("workflow_version") == 4
+                v2 = json.loads((self.paths.vibe / "state.json").read_text(encoding="utf-8")).get("workflow_version") == 2
             except (OSError, ValueError, json.JSONDecodeError):
                 v2 = True
             if v2:
@@ -2255,23 +2377,35 @@ class Monitor:
             current[generation_key] = generation - 1
             if role == "reviewer" and generation == 1:
                 current["reviewer_started"] = False
+            setup_identity = contract.get("setup_identity") or contract.get("clientThreadId") or contract.get("client_thread_id")
             current["retryable_action"] = {
                 "role": role,
                 "phase": phase,
                 "continuation": continuation,
                 "successor": False,
                 "same_task": True,
+                "same_task_required": True,
+                "attempt": 1,
+                "reason_class": "engineering",
+                "next_retry_at": time.time(),
+                "binding_digest": current.get("contract_digest", ""),
+                "last_observation_ref": "provider-pending",
             }
+            if setup_identity:
+                current["retryable_action"]["setup_identity"] = str(setup_identity)
             # An asynchronous bridge response is a retry condition, not
             # evidence that the provider capability is unavailable.
             current["status"] = "blocked_unknown" if successor else "running"
             if binding_contract_enabled(contract):
                 current["binding_phase"] = "retry_pending"
             current["reason"] = str(error)
+            # A pending client handle is only a setup observation.  Do not
+            # expose it as an active/formal task; replay the durable action
+            # with the same contract and writer once the provider resolves it.
+            current["active_task"] = None
+            current["active_role"] = None
+            current["start_intent"] = None
             if successor:
-                current["active_task"] = None
-                current["active_role"] = None
-                current["start_intent"] = None
                 self._mark_blocked_unknown(snapshot, node_id, str(error))
                 save_snapshot(self.paths, snapshot)
             return False
@@ -2279,13 +2413,23 @@ class Monitor:
             current[generation_key] = generation - 1
             if role == "reviewer" and generation == 1:
                 current["reviewer_started"] = False
-            current["retryable_action"] = {
-                "role": role,
-                "phase": phase,
-                "continuation": continuation,
-                "successor": False,
-                "same_task": True,
-            }
+            failure = classify_provider_failure(error)
+            if failure["kind"] == "external":
+                current["retryable_action"] = None
+            else:
+                current["retryable_action"] = {
+                    "role": role,
+                    "phase": phase,
+                    "continuation": continuation,
+                    "successor": False,
+                    "same_task": True,
+                    "same_task_required": True,
+                    "attempt": 1,
+                    "reason_class": failure["kind"],
+                    "next_retry_at": time.time(),
+                    "binding_digest": current.get("contract_digest", ""),
+                    "last_observation_ref": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
+                }
             current["active_task"] = None
             current["active_role"] = None
             current["start_intent"] = None
@@ -2334,6 +2478,32 @@ class Monitor:
         self._require_snapshot_authorization(snapshot)
         try:
             handle = runner.start(contract, self._worktree_path(current))
+        except ProviderPending as error:
+            # A bridge setup token (clientThreadId) is not a formal task. Keep
+            # the writer lease and durable retry metadata, but clear the
+            # active/start intent until a real provider identity is observed.
+            setup_identity = contract.get("setup_identity") or contract.get("clientThreadId") or contract.get("client_thread_id")
+            current["retryable_action"] = {
+                "role": role,
+                "phase": phase,
+                "continuation": continuation,
+                "successor": False,
+                "same_task": True,
+                "same_task_required": True,
+                "attempt": 1,
+                "reason_class": "engineering",
+                "next_retry_at": time.time(),
+                "binding_digest": current.get("contract_digest", ""),
+                "last_observation_ref": "provider-pending",
+                "setup_identity": str(setup_identity or "pending"),
+            }
+            current["status"] = self._v42_retry_status()
+            current["active_task"] = None
+            current["active_role"] = None
+            current["start_intent"] = None
+            current["reason"] = str(error)
+            save_snapshot(self.paths, snapshot)
+            return False
         except Exception as error:
             if successor:
                 current["retryable_action"] = {
@@ -2408,7 +2578,7 @@ class Monitor:
             # as unknown until a provider-confirmed result is observed.  The
             # handle remains durable so the next tick can poll it; no second
             # writer is scheduled while this side effect is pending.
-            current["status"] = "blocked_unknown"
+            current["status"] = self._v42_retry_status()
             current["quarantine"] = {
                 "run_id": snapshot.run_id,
                 "handle_id": handle.run_id,
@@ -2879,19 +3049,41 @@ class Monitor:
             self._archive_pair(snapshot, node_id)
             self._release_node_lease(snapshot, node_id)
         elif event.event in {"unknown", "timeout", "state_unknown", "visibility_unknown"}:
-            self._queue_active_retry(
-                snapshot,
-                node_id,
-                str(redact_provider_text(event.data.get("reason", event.event))),
-            )
-            self._mark_blocked_unknown(
-                snapshot,
-                node_id,
-                str(redact_provider_text(event.data.get("reason", event.event))),
-                quarantine_lease=False,
-                retryable_same_task=True,
-            )
+            raw_reason = event.data.get("reason", event.event)
+            reason = str(redact_provider_text(raw_reason))
+            failure = classify_provider_failure(event.data)
+            if failure["kind"] == "engineering":
+                self._queue_active_retry(snapshot, node_id, raw_reason)
+                self._set_binding_status(snapshot, node_id, role, "blocked_unknown")
+                current["status"] = self._v42_retry_status()
+                current["reason"] = reason
+                current["quarantine"] = None
+            else:
+                # Unknown evidence and external boundaries are fail-closed;
+                # neither is allowed to consume an engineering retry budget.
+                self._mark_blocked_unknown(
+                    snapshot, node_id, reason,
+                    quarantine_lease=False,
+                    retryable_same_task=False,
+                )
         elif event.event in {"failed", "stopped", "terminal_failed"}:
+            failure = classify_provider_failure(event.data)
+            if failure["kind"] == "external":
+                current["retryable_action"] = None
+                self._mark_blocked_unknown(
+                    snapshot, node_id,
+                    str(redact_provider_text(event.data.get("reason", event.event))),
+                )
+                return
+            if failure["kind"] == "engineering" and event.event != "stopped":
+                raw_reason = event.data.get("reason", event.event)
+                reason = str(redact_provider_text(raw_reason))
+                self._queue_active_retry(snapshot, node_id, raw_reason)
+                self._set_binding_status(snapshot, node_id, role, "blocked_unknown")
+                current["status"] = self._v42_retry_status()
+                current["reason"] = reason
+                current["quarantine"] = None
+                return
             self._record_runner_event(snapshot, node_id, event, active)
             terminal_status = "failed" if event.event != "stopped" else "stopped"
             try:
@@ -3005,7 +3197,7 @@ class Monitor:
         self._record(snapshot, event.event, data, active)
 
     def _queue_active_retry(
-        self, snapshot: RunSnapshot, node_id: str, reason: str
+        self, snapshot: RunSnapshot, node_id: str, reason: str, *, record_event: bool = True
     ) -> None:
         """Record a retry intent without allocating a new task identity.
 
@@ -3024,6 +3216,10 @@ class Monitor:
         generation = active.get("generation")
         if role not in {"developer", "reviewer"} or not isinstance(task_id, str):
             return
+        classification = classify_provider_failure({"reason": reason})
+        if classification["kind"] == "external":
+            current["retryable_action"] = None
+            return
         phase = "review" if role == "reviewer" else (
             "rework" if current.get("status") == "rework" else "develop"
         )
@@ -3034,19 +3230,56 @@ class Monitor:
                 attempt = int(previous.get("attempt", 0)) + 1
             except (TypeError, ValueError):
                 attempt = 1
-        current["retryable_action"] = {
+        observation_ref = hashlib.sha256(str(reason).encode("utf-8")).hexdigest()
+        cursor = None
+        try:
+            binding = self._load_task_binding(snapshot, node_id, str(role))
+            cursor = binding.cursor
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            pass
+        retry = {
             "role": role,
             "phase": phase,
             "continuation": True,
             "successor": False,
             "successor_candidate": False,
             "same_task": True,
+            "same_task_required": True,
             "task_id": task_id,
             "handle_id": handle_id,
             "generation": generation,
+            "cursor": cursor,
             "attempt": attempt,
+            "reason_class": classification["kind"],
+            "next_retry_at": time.time() + min(60.0, float(2 ** min(attempt - 1, 5))),
+            "binding_digest": str(current.get("contract_digest") or snapshot.node_contract_digest or ""),
+            "last_observation_ref": observation_ref,
             "reason": redact_provider_text(reason),
         }
+        current["retryable_action"] = retry
+        if not record_event:
+            retry["defer_once"] = True
+        if record_event:
+            self._record(
+                snapshot,
+                "retry_scheduled",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "role": role,
+                    "task_id": task_id,
+                    "generation": generation,
+                    "cursor": cursor,
+                    "attempt": attempt,
+                    "reason_class": classification["kind"],
+                    "next_retry_at": retry["next_retry_at"],
+                    "same_task_required": True,
+                    "binding_digest": retry["binding_digest"],
+                    "last_observation_ref": observation_ref,
+                    "reason": reason,
+                },
+                active,
+            )
 
     def _mark_blocked_unknown(
         self,
@@ -3342,6 +3575,12 @@ class Monitor:
         records = load_events(self.paths, snapshot.run_id)
         pending = records[snapshot.event_sequence :]
         for record in pending:
+            if record.get("event") == "supervisor_heartbeat":
+                # Heartbeats are supervisor lease telemetry, not node
+                # lifecycle events.  They may be appended between snapshot
+                # writes and must be consumed before provider polling.
+                snapshot.event_sequence = record["sequence"]
+                continue
             provenance = record["provenance"]
             if (
                 provenance["authorization_digest"] != snapshot.authorization_digest
@@ -3421,13 +3660,62 @@ class Monitor:
                         snapshot,
                         node_id,
                         str(data.get("reason", record["event"])),
+                        record_event=False,
                     )
-                current["status"] = "blocked_unknown"
+                current["status"] = self._v42_retry_status() if data.get("retryable_same_task") is True or record["event"] in {"unknown", "timeout"} else "blocked_unknown"
                 current["reason"] = data.get("reason", record["event"])
                 current["quarantine"] = {
                     "run_id": snapshot.run_id,
                     "handle_id": snapshot.handles.get(node_id),
                     "reason": current["reason"],
+                }
+            elif record["event"] == "retry_scheduled":
+                if provenance.get("role") not in {"developer", "reviewer"}:
+                    raise ValueError("retry event lacks task provenance")
+                active = current.get("active_task")
+                if not isinstance(active, dict) or active.get("task_id") != data.get("task_id"):
+                    raise ValueError("retry event task identity is stale")
+                for field in ("task_id", "handle_id", "generation"):
+                    if provenance.get(field) != active.get(field):
+                        raise ValueError("retry event provenance is stale")
+                if data.get("generation") != active.get("generation"):
+                    raise ValueError("retry event generation is stale")
+                # The retry marker is durable supervisor state, but the
+                # provider binding must also be quarantined during replay.
+                # Without this projection the registry remains ``running``
+                # after an interrupted snapshot write, allowing a stale
+                # binding to be treated as live on the next resume.
+                self._set_binding_status(
+                    snapshot,
+                    node_id,
+                    str(provenance["role"]),
+                    "blocked_unknown",
+                )
+                current["retryable_action"] = {
+                    "role": data.get("role"),
+                    "phase": "review" if data.get("role") == "reviewer" else "develop",
+                    "continuation": True,
+                    "successor": False,
+                    "successor_candidate": False,
+                    "same_task": True,
+                    "same_task_required": bool(data.get("same_task_required", True)),
+                    "task_id": data.get("task_id"),
+                    "handle_id": active.get("handle_id"),
+                    "generation": data.get("generation"),
+                    "cursor": data.get("cursor"),
+                    "attempt": data.get("attempt", 1),
+                    "reason_class": data.get("reason_class", "unknown"),
+                    "next_retry_at": data.get("next_retry_at"),
+                    "binding_digest": data.get("binding_digest", ""),
+                    "last_observation_ref": data.get("last_observation_ref", ""),
+                    "reason": data.get("reason", "retry scheduled"),
+                    "defer_once": True,
+                }
+                current["status"] = self._v42_retry_status()
+                current["quarantine"] = {
+                    "run_id": snapshot.run_id,
+                    "handle_id": active.get("handle_id"),
+                    "reason": data.get("reason", "retry scheduled"),
                 }
             elif record["event"] == "old_task_reconciled":
                 if provenance["role"] != "system":

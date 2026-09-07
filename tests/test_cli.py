@@ -197,7 +197,7 @@ class CliContractTests(unittest.TestCase):
             (root / ".project-root").write_text("fixture\n", encoding="utf-8")
             (root / ".vibe").mkdir()
             (root / ".vibe" / "state.json").write_text(
-                '{"workflow_version":4,"session_gate":"s0_required"}\n',
+                '{"workflow_version":2,"session_gate":"s0_required"}\n',
                 encoding="utf-8",
             )
             result = run_cli(

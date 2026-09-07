@@ -10,6 +10,12 @@ REQUIRED_COMPLEX_WORKFLOW = [
     "s0", "s1", "requirements", "product_decision", "prd", "spec_issue",
     "dag_audit", "plan_confirmation", "authorization_card", "user_authorization",
 ]
+V42_STATE = {
+    "workflow_version": 4,
+    "execution_mode": "sdd_first",
+    "session_gate": "s0_required",
+    "capability_contract_required": True,
+}
 _REMOTE_GIT_ACTIONS = {"commit", "push", "pr", "mr", "create_pr", "create_mr", "merge"}
 
 
@@ -117,6 +123,19 @@ def require_capability_contract(paths) -> CapabilityContract:
         ) from error
 
 
+def require_v42_sdd_first(paths) -> dict:
+    """Require the exact V4.2 SDD-first state contract (read-only)."""
+    state = paths.vibe / "state.json"
+    try:
+        value = json.loads(state.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise PermissionError("v42_state_required") from error
+    if (not isinstance(value, dict) or set(value) != set(V42_STATE)
+            or any(value.get(key) != expected for key, expected in V42_STATE.items())):
+        raise PermissionError("v42_state_required")
+    return value
+
+
 def session_contract_prompt(contract: CapabilityContract, now=None) -> str:
     """Return a bounded prompt fragment with statuses, never raw evidence."""
     if not isinstance(contract, CapabilityContract):
@@ -149,12 +168,16 @@ def require_entry(paths, session_id, request, origin="user_entry", now=None):
         value = json.loads(state.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise PermissionError("session_gate_blocked: state.json invalid") from error
-    if not isinstance(value, dict) or value.get("workflow_version") != 4 or value.get("session_gate") != "s0_required":
+    if not isinstance(value, dict):
+        raise PermissionError("session_gate_blocked: V2 state metadata invalid")
+    if value.get("workflow_version") == 4:
+        require_v42_sdd_first(paths)
+    elif value.get("workflow_version") != 2 or value.get("session_gate") != "s0_required":
         raise PermissionError("session_gate_blocked: V2 state metadata invalid")
     # Every V2 entry is contract-bound.  The boolean flag was introduced for
     # migration, but treating a missing flag as opt-out would let an older
     # state file bypass the evidence contract entirely.
-    if value.get("workflow_version") == 4:
+    if value.get("workflow_version") == 2:
         require_capability_contract(paths)
     if origin == "worker_dispatch" and isinstance(request, str) and request.startswith("BYPASS VIBE"):
         raise PermissionError("session_bypass_rejected: child session cannot request bypass")

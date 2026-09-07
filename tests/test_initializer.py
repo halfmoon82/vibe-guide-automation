@@ -1,4 +1,5 @@
-import tempfile, unittest
+import json, tempfile, unittest
+import hashlib
 from pathlib import Path
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.initializer import init_project
@@ -59,3 +60,38 @@ class InitializerTests(unittest.TestCase):
                 self.fail('non-directory .vibe must be rejected')
 
             self.assertEqual(marker.read_text(encoding='utf-8'), 'keep\n')
+
+    def test_legacy_state_migration_evidence_has_verified_recoverable_backup(self):
+        with tempfile.TemporaryDirectory() as d:
+            project = Path(d)
+            (project / '.vibe').mkdir()
+            legacy = {"workflow_version": 3, "session_gate": "s0_required", "keep": "history"}
+            (project / '.vibe' / 'state.json').write_text(json.dumps(legacy) + '\n', encoding='utf-8')
+
+            init_project(ProjectPaths.from_cwd(project), True)
+
+            evidence = json.loads((project / '.vibe' / 'migration-evidence.json').read_text())
+            self.assertNotIn('backup_verified', evidence)
+            self.assertEqual(evidence['target_version'], '4.2.0')
+            backup_path = Path(evidence['backup_path'])
+            manifest = json.loads((backup_path / 'manifest.json').read_text())
+            state_entry = next(item for item in manifest['files'] if item['path'] == '.vibe/state.json')
+            self.assertEqual(
+                state_entry['sha256'],
+                hashlib.sha256((backup_path / 'payload' / '.vibe' / 'state.json').read_bytes()).hexdigest(),
+            )
+            self.assertEqual(evidence['backup_manifest'], {'manifest': str(backup_path / 'manifest.json'), 'files': manifest['files']})
+
+    def test_legacy_state_with_unverifiable_existing_evidence_is_blocked(self):
+        with tempfile.TemporaryDirectory() as d:
+            project = Path(d)
+            (project / '.vibe').mkdir()
+            legacy = {"workflow_version": 3, "session_gate": "s0_required"}
+            (project / '.vibe' / 'state.json').write_text(json.dumps(legacy) + '\n', encoding='utf-8')
+            (project / '.vibe' / 'migration-evidence.json').write_text(
+                json.dumps({'target_version': '4.2.0', 'backup_verified': True}), encoding='utf-8'
+            )
+
+            with self.assertRaisesRegex(ValueError, 'migration evidence is unverifiable'):
+                init_project(ProjectPaths.from_cwd(project), True)
+            self.assertEqual(json.loads((project / '.vibe' / 'state.json').read_text()), legacy)

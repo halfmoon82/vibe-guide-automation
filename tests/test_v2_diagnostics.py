@@ -69,7 +69,7 @@ class V2DiagnosticsTests(unittest.TestCase):
             root = Path(d); (root / "AGENTS.md").write_text("old rule\n", encoding="utf-8")
             (root / ".vibe").mkdir(); (root / ".vibe" / "state.json").write_text("{}\n", encoding="utf-8")
             result = init_project(ProjectPaths.from_cwd(root), True)
-            self.assertEqual(__import__("json").loads((root / ".vibe" / "state.json").read_text())["workflow_version"], 4)
+            self.assertEqual(__import__("json").loads((root / ".vibe" / "state.json").read_text())["workflow_version"], 2)
             self.assertTrue((root / ".vibe" / "proposals" / "skills").is_dir())
 
     def test_agents_capability_rules_are_proposed_without_mutating_agents(self):
@@ -97,7 +97,7 @@ class V2DiagnosticsTests(unittest.TestCase):
             root = Path(d)
             (root / ".vibe").mkdir()
             (root / ".vibe" / "state.json").write_text(
-                '{"workflow_version": 4, "session_gate": "s0_required", '
+                '{"workflow_version": 2, "session_gate": "s0_required", '
                 '"capability_contract_required": true}\n',
                 encoding="utf-8",
             )
@@ -109,7 +109,7 @@ class V2DiagnosticsTests(unittest.TestCase):
             root = Path(d)
             (root / ".vibe").mkdir()
             (root / ".vibe" / "state.json").write_text(
-                '{"workflow_version": 4, "session_gate": "s0_required"}\n',
+                '{"workflow_version": 2, "session_gate": "s0_required"}\n',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(PermissionError, "capability_contract_unknown"):

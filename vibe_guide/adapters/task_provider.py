@@ -33,6 +33,78 @@ class ProviderPending(RuntimeError):
 _PROVIDER_ACTIONS = {"create", "locate", "visibility", "resume", "wait"}
 
 
+def _is_complex_contract(value: Any) -> bool:
+    """Recognize complex execution requests without changing light routes."""
+    if not isinstance(value, Mapping):
+        return False
+    if value.get("complex") is True or value.get("is_complex") is True:
+        return True
+    band = value.get("complexity_band") or value.get("route")
+    if isinstance(band, str) and band.strip().casefold() == "complex":
+        return True
+    issue = value.get("issue_complexity")
+    if isinstance(issue, Mapping):
+        issue_band = issue.get("complexity_band") or issue.get("route")
+        if isinstance(issue_band, str) and issue_band.strip().casefold() == "complex":
+            return True
+    plan = value.get("plan")
+    if isinstance(plan, Mapping):
+        plan_band = plan.get("complexity_band") or plan.get("route")
+        if isinstance(plan_band, str) and plan_band.strip().casefold() == "complex":
+            return True
+    # An SDD-only execution mode is itself a complex-DAG bypass attempt.
+    mode = value.get("execution_mode") or value.get("engine_mode")
+    return isinstance(mode, str) and mode.strip().casefold() in {"sdd", "serial", "sdd_only"}
+
+
+def require_complex_monitor_dispatch(
+    contract: Mapping[str, Any], paths: Optional[ProjectPaths] = None
+) -> None:
+    """Fail closed for complex work unless Monitor supplied the full proof.
+
+    This guard intentionally runs before provider mailbox writes, process
+    creation, task binding or writer-lease acquisition.  Simple/light and
+    read-only callers do not enter it.
+    """
+    if not _is_complex_contract(contract):
+        return
+    dispatcher = contract.get("dispatcher") or contract.get("dispatch_origin")
+    if dispatcher != "monitor":
+        raise PermissionError("complex_monitor_required: dispatcher origin must be monitor")
+    if paths is None:
+        raise PermissionError("complex_monitor_required: project paths are required")
+    try:
+        from ..workflow_gate import require_v42_sdd_first
+        require_v42_sdd_first(paths)
+    except PermissionError as error:
+        raise PermissionError("complex_monitor_required: " + str(error)) from error
+    if contract.get("execution_engine") != "vibeguide_monitor" or contract.get("engine_mode") != "dag":
+        raise PermissionError("complex_monitor_required: execution engine is not Monitor DAG")
+    evidence_ref = contract.get("engine_evidence_ref")
+    if not isinstance(evidence_ref, str) or not evidence_ref.strip() or evidence_ref.startswith("unverified:"):
+        raise PermissionError("complex_monitor_required: engine attestation is missing")
+    authorization_digest = contract.get("authorization_digest")
+    if not isinstance(authorization_digest, str) or len(authorization_digest) != 64:
+        raise PermissionError("complex_monitor_required: executable authorization is missing")
+    plan_id = contract.get("plan_id")
+    plan_version = contract.get("plan_version")
+    if not isinstance(plan_id, str) or not plan_id.strip() or not isinstance(plan_version, int):
+        raise PermissionError("complex_monitor_required: plan binding is missing")
+    try:
+        from ..engine_attestation import validate_engine_attestation
+        attestation_path = paths.resolve_vibe_path(
+            Path("plans") / plan_id / "engine-attestation.json"
+        )
+        if attestation_path.is_symlink() or not attestation_path.is_file():
+            raise ValueError("attestation is not a regular file")
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+        validate_engine_attestation(attestation, plan_id, plan_version)
+        if attestation.get("evidence_ref") != evidence_ref:
+            raise ValueError("attestation evidence reference mismatch")
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise PermissionError("complex_monitor_required: engine attestation is invalid") from error
+
+
 class TaskProviderAdapter:
     """Provider-neutral Agent-session upgrade entry.
 
@@ -41,7 +113,7 @@ class TaskProviderAdapter:
     including ``unknown`` and ``unknown_timeout``, are returned unchanged.
     """
 
-    def __init__(self, provider: str, delegate: Any = None, *, mode: str = "visible"):
+    def __init__(self, provider: str, delegate: Any = None, *, mode: str = "visible", paths: Optional[ProjectPaths] = None):
         if not isinstance(provider, str) or not provider.strip():
             raise ValueError("provider is required")
         if mode not in {"visible", "background", "guide"}:
@@ -49,6 +121,7 @@ class TaskProviderAdapter:
         self.provider = provider.strip()
         self.delegate = delegate
         self.mode = mode
+        self.paths = paths
 
     def describe_upgrade_entry(self) -> Dict[str, Any]:
         return {
@@ -64,6 +137,7 @@ class TaskProviderAdapter:
     def invoke_upgrade(self, request: Mapping[str, Any]) -> Dict[str, Any]:
         if not isinstance(request, Mapping):
             raise TypeError("upgrade request must be a mapping")
+        require_complex_monitor_dispatch(request, self.paths)
         target = self.delegate
         method = getattr(target, "invoke_upgrade", None)
         if callable(method):
@@ -79,6 +153,19 @@ class TaskProviderAdapter:
         if isinstance(result, Mapping):
             return dict(result)
         raise ProviderUnavailable("provider upgrade entry returned invalid result")
+
+    def start(self, request: Mapping[str, Any]):
+        """Compatibility entry for task adapters, guarded for complex DAGs."""
+        if not isinstance(request, Mapping):
+            raise TypeError("task request must be a mapping")
+        require_complex_monitor_dispatch(request, self.paths)
+        target = self.delegate
+        method = getattr(target, "start", None)
+        if callable(method):
+            return method(dict(request))
+        if callable(target):
+            return target(dict(request))
+        raise ProviderUnavailable("provider task start delegate is not configured")
 
 
 def _canonical_digest(value: Any) -> str:
@@ -202,6 +289,9 @@ class ProviderActionStore:
         request: Dict[str, Any],
         sequence: int = 0,
     ) -> Dict[str, Any]:
+        # Complex requests may only be emitted by Monitor after its complete
+        # V4.2 state, engine attestation and authorization checks.
+        require_complex_monitor_dispatch(request, self.paths)
         state = self.paths.vibe / "state.json"
         if state.is_file():
             try:
