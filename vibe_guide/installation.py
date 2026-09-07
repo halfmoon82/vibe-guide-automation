@@ -10,6 +10,7 @@ from .models import InstallRequest, InstallResult
 
 PHASES = ("preflight", "probe", "authorize", "backup", "migrate", "finalize")
 _STATUSES = {"complete", "blocked_unknown", "blocked_invalid", "retry_pending", "failed"}
+PACKAGE_VERSION = "4.2.1"
 
 
 def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -66,7 +67,7 @@ def _version(root: Path) -> str:
 def _run(request: InstallRequest, paths: Any, capability_authorizer: Any, probe: Any, upgrade: bool) -> InstallResult:
     root = Path(request.project_root)
     before = _version(root) if upgrade else "none"
-    after = "4.2.0"
+    after = PACKAGE_VERSION
     state_path = root / ".vibe" / "installation" / "state.json"
     payload: Dict[str, Any] = {"status": "running", "phase": "preflight", "phase_history": ["preflight"], "version_before": before, "version_after": after}
     _atomic_json(state_path, payload)
@@ -143,7 +144,7 @@ class InstallStateMachine:
         root = Path(target).expanduser().resolve(strict=False)
         target_text = str(root)
         if root.exists() and (root.is_symlink() or not root.is_dir()):
-            return InstallResult("blocked_invalid", "blocked", "unknown", "4.2.0",
+            return InstallResult("blocked_invalid", "blocked", "unknown", PACKAGE_VERSION,
                                  errors=["installation target must be a directory"],
                                  mode=mode, target=target_text,
                                  error="installation target must be a directory")
@@ -151,7 +152,7 @@ class InstallStateMachine:
         payload: Dict[str, Any] = {
             "status": "running", "phase": PHASES[0],
             "phase_history": [PHASES[0]], "mode": mode, "target": target_text,
-            "version_before": "unknown", "version_after": "4.2.0",
+            "version_before": "unknown", "version_after": PACKAGE_VERSION,
         }
         try:
             # Include target preparation in the same recoverable error boundary
@@ -168,11 +169,11 @@ class InstallStateMachine:
             for phase in ("backup", "migrate", "finalize"):
                 payload = _transition(payload, phase)
                 _atomic_json(state_path, payload)
-            result = InstallResult("complete", "complete", "unknown", "4.2.0",
+            result = InstallResult("complete", "complete", "unknown", PACKAGE_VERSION,
                                    evidence_refs=evidence, mode=mode, target=target_text)
             return _finish(state_path, result)
         except (OSError, ValueError) as exc:
-            result = InstallResult("blocked_invalid", "blocked", "unknown", "4.2.0",
+            result = InstallResult("blocked_invalid", "blocked", "unknown", PACKAGE_VERSION,
                                    errors=[str(exc)], evidence_refs=["install:preflight"],
                                    mode=mode, target=target_text, error=str(exc))
             try:
@@ -180,7 +181,7 @@ class InstallStateMachine:
             except Exception:
                 return result
         except Exception as exc:
-            result = InstallResult("failed", "blocked", "unknown", "4.2.0",
+            result = InstallResult("failed", "blocked", "unknown", PACKAGE_VERSION,
                                    errors=[str(exc)], evidence_refs=["install:preflight"],
                                    mode=mode, target=target_text, error=str(exc))
             try:

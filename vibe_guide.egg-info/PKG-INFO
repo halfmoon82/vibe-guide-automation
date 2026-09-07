@@ -1,11 +1,5 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: vibe-guide
-Version: 4.2.0
-Summary: UNKNOWN
-Home-page: UNKNOWN
-License: UNKNOWN
-Platform: UNKNOWN
+Version: 4.2.1
 Requires-Python: >=3.9
-
-UNKNOWN
-Description-Content-Type: text/plain
+Dynamic: requires-python
