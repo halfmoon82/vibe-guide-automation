@@ -10,7 +10,7 @@ from .models import InstallRequest, InstallResult
 
 PHASES = ("preflight", "probe", "authorize", "backup", "migrate", "finalize")
 _STATUSES = {"complete", "blocked_unknown", "blocked_invalid", "retry_pending", "failed"}
-PACKAGE_VERSION = "4.2.1"
+PACKAGE_VERSION = "4.2.2"
 
 
 def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
