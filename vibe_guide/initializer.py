@@ -75,10 +75,13 @@ def _migrate_state(path):
         raise ValueError('state.json is invalid') from error
     if not isinstance(data, dict):
         raise ValueError('state.json must be an object')
-    if data.get('workflow_version') == 2 and data.get('session_gate') == 's0_required':
+    if (data.get('workflow_version') == 4 and data.get('session_gate') == 's0_required'
+            and data.get('execution_mode') == 'sdd_first' and data.get('capability_contract_required') is True):
         return False
-    data.setdefault('workflow_version', 2)
+    data['workflow_version'] = 4
     data.setdefault('session_gate', 's0_required')
+    data.setdefault('execution_mode', 'sdd_first')
+    data.setdefault('capability_contract_required', True)
     descriptor, temporary_name = tempfile.mkstemp(prefix='.state.', dir=str(path.parent))
     try:
         with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
@@ -114,7 +117,7 @@ def init_project(paths, confirm):
     for relative in ('.vibe/config.json', '.vibe/state.json'):
         path = root / relative
         if not path.exists():
-            _write_new(path, '{"workflow_version": 2, "session_gate": "s0_required"}\n' if relative == '.vibe/state.json' else '{}\n')
+            _write_new(path, '{"workflow_version": 4, "session_gate": "s0_required", "execution_mode": "sdd_first", "capability_contract_required": true}\n' if relative == '.vibe/state.json' else '{}\n')
             created.append(relative)
     capability_target = contract_path(paths)
     if capability_target.exists():

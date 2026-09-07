@@ -58,7 +58,7 @@ class CapabilityContractTests(unittest.TestCase):
             paths = ProjectPaths(root)
             (root / ".vibe").mkdir()
             (root / ".vibe" / "state.json").write_text(
-                '{"workflow_version":2,"session_gate":"s0_required"}\n',
+                '{"workflow_version":4,"session_gate":"s0_required"}\n',
                 encoding="utf-8",
             )
             request = {
@@ -83,7 +83,7 @@ class CapabilityContractTests(unittest.TestCase):
             paths = ProjectPaths(root)
             (root / ".vibe").mkdir()
             (root / ".vibe" / "state.json").write_text(
-                '{"workflow_version":2,"session_gate":"s0_required"}\n',
+                '{"workflow_version":4,"session_gate":"s0_required"}\n',
                 encoding="utf-8",
             )
             contract = build_contract(root, provider="codex-app-visible", host_id="local")

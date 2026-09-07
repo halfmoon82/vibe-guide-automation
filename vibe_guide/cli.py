@@ -772,7 +772,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if state_probe.is_file():
         try:
             state_data = _read_json(state_probe)
-            v2_state = isinstance(state_data, dict) and state_data.get("workflow_version") == 2
+            v2_state = isinstance(state_data, dict) and state_data.get("workflow_version") == 4
         except (OSError, ValueError, AttributeError):
             v2_state = False
     if (v2_state or args.command == "init") and (args.command != "init" or args.confirm):
@@ -787,7 +787,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if args.command == "scan" and paths.vibe.exists():
         try:
             state_data = _read_json(state_probe)
-            if not isinstance(state_data, dict) or state_data.get("workflow_version") != 2 or state_data.get("session_gate") != "s0_required":
+            if not isinstance(state_data, dict) or state_data.get("workflow_version") != 4 or state_data.get("session_gate") != "s0_required":
                 raise ValueError("invalid V2 state")
         except (OSError, ValueError, AttributeError):
             return _result(BLOCKED, {"command": "scan", "status": "session_gate_blocked", "reason": "V2 state.json invalid"}, "扫描已阻塞：V2 state.json 无效", args.as_json)
@@ -1204,7 +1204,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     state_data = _read_json(state_path)
                 except ValueError:
                     state_data = {}
-                if isinstance(state_data, dict) and state_data.get("workflow_version") == 2:
+                if isinstance(state_data, dict) and state_data.get("workflow_version") == 4:
                     _require_public_execution_gate(
                         paths, directory, plan, nodes, card
                     )

@@ -100,7 +100,7 @@ class AuthorizationLoopTests(unittest.TestCase):
             paths = ProjectPaths(Path(root))
             (paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
             (paths.vibe / "state.json").write_text(
-                '{"workflow_version": 2, "session_gate": "s0_required"}\n',
+                '{"workflow_version": 4, "session_gate": "s0_required"}\n',
                 encoding="utf-8",
             )
             save_contract(paths, build_contract(paths.root, provider="fake", host_id="local"))

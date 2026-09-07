@@ -149,12 +149,12 @@ def require_entry(paths, session_id, request, origin="user_entry", now=None):
         value = json.loads(state.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise PermissionError("session_gate_blocked: state.json invalid") from error
-    if not isinstance(value, dict) or value.get("workflow_version") != 2 or value.get("session_gate") != "s0_required":
+    if not isinstance(value, dict) or value.get("workflow_version") != 4 or value.get("session_gate") != "s0_required":
         raise PermissionError("session_gate_blocked: V2 state metadata invalid")
     # Every V2 entry is contract-bound.  The boolean flag was introduced for
     # migration, but treating a missing flag as opt-out would let an older
     # state file bypass the evidence contract entirely.
-    if value.get("workflow_version") == 2:
+    if value.get("workflow_version") == 4:
         require_capability_contract(paths)
     if origin == "worker_dispatch" and isinstance(request, str) and request.startswith("BYPASS VIBE"):
         raise PermissionError("session_bypass_rejected: child session cannot request bypass")

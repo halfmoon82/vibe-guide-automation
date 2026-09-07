@@ -2203,7 +2203,7 @@ class Monitor:
             contract["capability_contract_digest"] = snapshot.capability_contract_digest
         if (self.paths.vibe / "state.json").is_file():
             try:
-                v2 = json.loads((self.paths.vibe / "state.json").read_text(encoding="utf-8")).get("workflow_version") == 2
+                v2 = json.loads((self.paths.vibe / "state.json").read_text(encoding="utf-8")).get("workflow_version") == 4
             except (OSError, ValueError, json.JSONDecodeError):
                 v2 = True
             if v2:

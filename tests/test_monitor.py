@@ -143,7 +143,7 @@ class MonitorTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.paths = ProjectPaths(Path(self.temporary.name))
         (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
-        (self.paths.vibe / "state.json").write_text('{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8")
+        (self.paths.vibe / "state.json").write_text('{"workflow_version": 4, "session_gate": "s0_required"}\n', encoding="utf-8")
         save_contract(
             self.paths,
             build_contract(self.paths.root, provider="fake", host_id="local"),
