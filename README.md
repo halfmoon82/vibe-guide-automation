@@ -1,5 +1,7 @@
 # Vibe Coding 辅助开发向导
 
+[English README](README.en.md)
+
 Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次精确授权启动可恢复的开发、独立 Review 与返工流程。它把技术交付、Review 接受、push、MR、merge 和 deploy 分开记录；默认授权永远不包含 deploy。
 
 ## 安装
