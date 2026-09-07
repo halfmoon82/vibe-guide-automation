@@ -1,0 +1,2 @@
+[console_scripts]
+vibe = vibe_guide.cli:main

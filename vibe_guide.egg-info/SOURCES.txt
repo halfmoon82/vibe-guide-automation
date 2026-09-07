@@ -71,7 +71,10 @@ tests/test_v41_integration_recovery.py
 tests/test_v41_monitor_dispatch.py
 tests/test_v41_required_workflow.py
 tests/test_v41_sdd_downgrade_rejection.py
+tests/test_v42_closed_loop_contract.py
 tests/test_v42_engine_attestation.py
+tests/test_v42_no_bypass.py
+tests/test_v42_provider_self_healing.py
 tests/test_v4_binding_lifecycle.py
 tests/test_workflow_gate.py
 vibe_guide/__init__.py
