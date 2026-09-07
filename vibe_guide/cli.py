@@ -790,7 +790,23 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if args.command == "scan" and paths.vibe.exists():
         try:
             state_data = _read_json(state_probe)
-            if not isinstance(state_data, dict) or state_data.get("workflow_version") != 2 or state_data.get("session_gate") != "s0_required":
+            valid_v2 = (
+                isinstance(state_data, dict)
+                and state_data.get("workflow_version") == 2
+                and state_data.get("session_gate") == "s0_required"
+            )
+            valid_v42 = (
+                isinstance(state_data, dict)
+                and state_data.get("workflow_version") == 4
+                and state_data.get("execution_mode") == "sdd_first"
+                and state_data.get("session_gate") == "s0_required"
+                and state_data.get("capability_contract_required") is True
+                and set(state_data) == {
+                    "workflow_version", "execution_mode", "session_gate",
+                    "capability_contract_required",
+                }
+            )
+            if not (valid_v2 or valid_v42):
                 raise ValueError("invalid V2 state")
         except (OSError, ValueError, AttributeError):
             return _result(BLOCKED, {"command": "scan", "status": "session_gate_blocked", "reason": "V2 state.json invalid"}, "扫描已阻塞：V2 state.json 无效", args.as_json)

@@ -25,6 +25,17 @@ class CliContractTests(unittest.TestCase):
         self.assertIn(result.returncode, (0, 3), result.stderr)
         self.assertIsInstance(json.loads(result.stdout), dict)
 
+    def test_scan_accepts_initialized_v42_state(self):
+        from vibe_guide.cli import run_cli
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".project-root").write_text("fixture\n", encoding="utf-8")
+            initialized = run_cli(["init", "--confirm", "--json"], root)
+            self.assertEqual(initialized.exit_code, 0)
+            scanned = run_cli(["scan", "--json"], root)
+            self.assertEqual(scanned.exit_code, 0)
+            self.assertEqual(scanned.payload["command"], "scan")
+
     def test_monitor_without_authorization_is_blocked_with_json(self):
         result = self.run_cli("monitor", "--json")
         self.assertEqual(result.returncode, 3)
