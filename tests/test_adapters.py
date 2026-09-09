@@ -146,8 +146,8 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(AdapterRegistry().get("cursor").detect(env).capabilities.mode, "guide")
         adapter = AdapterRegistry(background_launchers={"cursor": lambda *args: background_result()}).get("cursor")
         capabilities = adapter.detect(env).capabilities
-        self.assertEqual((capabilities.level, capabilities.mode), ("background", "background"))
-        self.assertEqual(adapter.provider_for(capabilities).provider, capabilities.provider)
+        self.assertEqual((capabilities.level, capabilities.mode), ("guide", "guide"))
+        self.assertIsNone(adapter.provider_for(capabilities))
 
     def test_guide_has_no_task_provider(self):
         adapter = AdapterRegistry().get("grok")

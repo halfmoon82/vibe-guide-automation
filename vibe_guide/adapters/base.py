@@ -126,7 +126,7 @@ class ManifestAdapter:
 
     _allowed_fields = {
         "id", "display_name", "agent_probe", "provider", "background_provider",
-        "background_fallback", "session_prompt", "probes",
+        "background_fallback", "session_prompt", "probes", "native_control_plane",
     }
 
     def __init__(self, manifest: Mapping[str, Any], background_launcher=None):
@@ -156,7 +156,7 @@ class ManifestAdapter:
         unknown = set(manifest) - cls._allowed_fields
         if unknown:
             raise ManifestError("unsupported manifest fields: %s" % ", ".join(sorted(unknown)))
-        missing = cls._allowed_fields - set(manifest)
+        missing = (cls._allowed_fields - {"native_control_plane"}) - set(manifest)
         if missing:
             raise ManifestError("manifest missing fields: %s" % ", ".join(sorted(missing)))
         if not isinstance(manifest["id"], str) or not re.match(r"^[a-z0-9-]+$", manifest["id"]):
@@ -166,6 +166,8 @@ class ManifestAdapter:
                 raise ManifestError("manifest %s must be a non-empty string" % field_name)
         if not isinstance(manifest["background_fallback"], bool):
             raise ManifestError("manifest background_fallback must be boolean")
+        if "native_control_plane" in manifest and not isinstance(manifest["native_control_plane"], bool):
+            raise ManifestError("manifest native_control_plane must be boolean")
         if not isinstance(manifest["probes"], list) or not manifest["probes"]:
             raise ManifestError("manifest probes must be a non-empty list")
         seen = set()
@@ -183,7 +185,9 @@ class ManifestAdapter:
         fields = [item[1] for item in string.Formatter().parse(manifest["session_prompt"]) if item[1]]
         if set(fields) - {"trigger", "plan_id"} or "trigger" not in fields:
             raise ManifestError("session_prompt must use only trigger and plan_id")
-        return dict(manifest)
+        result = dict(manifest)
+        result.setdefault("native_control_plane", result["id"] == "codex")
+        return result
 
     def _probe(self, environment: Environment, probe: Mapping[str, Any]) -> bool:
         kind, name = probe["kind"], probe["name"]
@@ -208,21 +212,20 @@ class ManifestAdapter:
         shell, subprocess, worktree = fact("shell"), fact("subprocess"), fact("worktree")
         create, enter = fact("visible_task.create"), fact("visible_task.enter")
         resume, wait = fact("visible_task.resume"), fact("visible_task.wait")
-        visible = shell and subprocess and worktree and create and enter and resume and wait
+        visible = (
+            self.manifest["native_control_plane"]
+            and shell and subprocess and worktree and create and enter and resume and wait
+        )
         if not subprocess:
             level, mode, provider = "guide", "guide", ""
             limitations = ("无法启动 subprocess；仅保留向导能力",)
         elif visible:
             level, mode, provider = "full", "visible", self.manifest["provider"]
             limitations = ()
-        elif self.manifest["background_fallback"] and _verified_launcher(self.background_launcher):
-            level, mode, provider = "background", "background", self.manifest["background_provider"]
-            limitations = ("不可见", "不可直接进入", "返工续接受限")
         else:
             level, mode, provider = "guide", "guide", ""
             limitations = (
-                "后台启动器未验证" if self.manifest["background_fallback"]
-                else "未验证显式任务桥接",
+                "未验证原生桌面控制面",
             )
         capabilities = AdapterCapabilities(
             agent_id=self.id, shell=shell, subprocess=subprocess, worktree=worktree,

@@ -91,6 +91,10 @@ node-spec 是 JSON 对象，包含 `title`、`objective`、已批准的 `decisio
 
 ## 授权、监工和恢复
 
+### DAG 运行时约束
+
+每个 Agent Task 都是某个 Issue 的运行时实例；任务线程、Provider 返回值或 worker 自报不会替代 Issue/DAG 合同。节点完成独立验收后，Monitor 立即依据最新的 `depends_on` 状态重算 `ready_set`，已解锁的节点可以继续调度，不等待整批任务形成 barrier。
+
 ### V4.1 复杂任务最终整合
 
 复杂任务在授权前必须完成 PRD 阶段的范围与边界确认，并把需求、PRD、Spec/Issue、DAG 审计、计划确认、授权卡和用户授权纳入十节点强制链；节点只能通过结构化记录完成，显式跳过会记录用户指令、原因和后继策略：允许后继时继续，跳过授权节点则不能推导执行授权。所有业务节点完成后，独立 reviewer 执行只读的最终整合 Review，核验 PRD/Spec 合同、全量 diff 与 P0–P2 门禁。CLI 会区分“局部节点完成”“整合 Review 进行中”“整合 Review 返工”和“整合通过但外部动作未授权”。
@@ -117,7 +121,7 @@ vibe resume --plan example-plan --json
 
 已确认规则能够唯一判断、且仍处于当前项目、plan revision、授权文件/action 和非 deploy 边界内的实现纠偏，由监工自动执行并记录，不会再次作为产品取舍询问。纠偏证据必须绑定已批准决定、授权和 Issue 合同；未绑定文本不能冒充用户决定。合同变化后的 `monitor --plan <ID> --authorize AUTHORIZE` 会在同一 run 上审计旧授权与变更原因，保留原任务身份和 cursor，登记新授权后续接修正 DAG；旧任务终止或 continuation 无法证明时仍会 fail closed。
 
-桌面 App 原生能力不能由 Python 直接调用时，public CLI 使用 `.vibe/provider-actions/` 的 provider-neutral request/result bridge。`monitor/resume` 会写入有界、digest 绑定的 `create/locate/visibility/resume/wait` 请求；App 会话按 `native_tool` 调用公开能力并回写绑定结果。Codex 映射到 `create_thread`、`navigate_to_codex_page`、`send_message_to_thread` 和 `wait_threads`。在真实 task ID、host、定位和可见性全部核验前，状态保持 `blocked_unknown`；node-spec 中的 provider/mode/thread/host 自声明不会成为证据。
+桌面 App 原生能力不能由 Python 直接调用时，public CLI 使用 `.vibe/provider-actions/` 的 provider-neutral request/result bridge。`monitor/resume` 会写入有界、digest 绑定的 `create/locate/visibility/resume/wait` 请求；App 会话按 `native_tool` 调用公开能力并回写绑定结果。Codex 映射到 `create_thread`、`navigate_to_codex_page`、`send_message_to_thread` 和 `wait_threads`；其他 provider 必须先接入并验证自己的等价桌面控制面。未完成原生探针时不允许 background fallback；在真实 task ID、host、定位和可见性全部核验前，状态保持 `blocked_unknown`；node-spec 中的 provider/mode/thread/host 自声明不会成为证据。
 
 授权 action 是 closed allowlist；未列明、deploy-like、外部安装和系统权限动作一律拒绝。`files` 必须是规范化的项目内相对路径列表，并与授权卡的 file scope 精确绑定。授权卡还绑定同时活跃的 developer/reviewer pair 上限；只有 reviewer 接受、P0–P2 清零且证据登记后才归档 pair 并释放容量。
 
