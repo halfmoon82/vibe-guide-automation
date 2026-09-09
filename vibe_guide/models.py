@@ -45,6 +45,11 @@ EVIDENCE_PRIORITY = (
     "implementation",
 )
 
+# The reserved aggregate-review node id.  Defined here rather than in dag so
+# Plan can refuse a plan that carries it without declaring a complex band; dag
+# re-exports it for existing importers.
+INTEGRATION_REVIEW_NODE_ID = "integration-review"
+
 
 @dataclass(frozen=True)
 class ObservationDisposition:
@@ -333,6 +338,15 @@ class Plan:
             self.target_contract_digest = computed
         if not isinstance(self.target_contract_digest, str) or not isinstance(self.complexity_band, str):
             raise TypeError("target contract projection fields must be strings")
+        # A structurally complex plan may not declare itself otherwise.
+        # complexity_band gates engine attestation, topology validation and the
+        # authorization binding, so a plan holding the reserved aggregate-review
+        # node while declaring a blank band turned all three off at once.
+        if INTEGRATION_REVIEW_NODE_ID in self.node_ids and self.complexity_band != "complex":
+            raise ValueError(
+                "a plan carrying %s must declare complexity_band 'complex'"
+                % INTEGRATION_REVIEW_NODE_ID
+            )
         if self.evidence_priority != list(EVIDENCE_PRIORITY):
             raise ValueError("plan evidence priority is fixed")
         if not isinstance(self.nodes, list):

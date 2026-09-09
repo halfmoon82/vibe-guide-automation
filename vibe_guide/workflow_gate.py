@@ -78,7 +78,15 @@ def verify_workflow(workflow):
     if not isinstance(records, dict) or set(records) - set(nodes):
         return {"status": "blocked_by_required_node", "reason": "workflow records are out of scope"}
     from .planner import required_workflow_nodes
-    expected_nodes = required_workflow_nodes(workflow.get("route", "complex"))
+    # The route must be explicit.  Defaulting an absent key to "complex" here
+    # while the authorization check below compares against "complex" meant
+    # evidence that simply omitted the key satisfied the ten-node sequence and
+    # skipped the proof of human authorization -- the one node this gate exists
+    # to require.
+    try:
+        expected_nodes = required_workflow_nodes(workflow["route"])
+    except (KeyError, TypeError, ValueError):
+        return {"status": "blocked_by_required_node", "reason": "workflow route is invalid"}
     if nodes != expected_nodes:
         return {"status": "blocked_by_required_node", "reason": "workflow node sequence is invalid"}
     for index, node_id in enumerate(nodes):
