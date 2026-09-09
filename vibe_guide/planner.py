@@ -373,10 +373,25 @@ REQUIRED_COMPLEX_WORKFLOW = (
 )
 
 
+SIMPLE_ROUTES = ("", "simple", "light", "light_plan", "standard")
+
+
 def required_workflow_nodes(route):
-    """Return a fresh task's applicable mandatory nodes."""
+    """Return a fresh task's applicable mandatory nodes.
+
+    An unrecognised route fails closed.  Treating everything that is not the
+    literal ``"complex"`` as the two-node sequence meant a dropped or misspelled
+    band silently downgraded a complex task to the shortest possible workflow,
+    which in turn made the authorization binding vacuous: two nodes required,
+    two nodes present, and the eight nodes carrying the human decision never
+    expected at all.
+    """
     value = route.route if isinstance(route, RouteResult) else route
-    return list(REQUIRED_COMPLEX_WORKFLOW if value == "complex" else ("s0", "s1"))
+    if value == "complex":
+        return list(REQUIRED_COMPLEX_WORKFLOW)
+    if isinstance(value, str) and value in SIMPLE_ROUTES:
+        return ["s0", "s1"]
+    raise ValueError("unrecognised route: {!r}".format(value))
 
 
 def classify_s0(message: str) -> S0Result:
