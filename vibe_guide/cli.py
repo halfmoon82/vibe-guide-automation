@@ -778,7 +778,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             v42_state = isinstance(state_data, dict) and state_data.get("workflow_version") == 4
         except (OSError, ValueError, AttributeError):
             v2_state = False
-    if (v2_state or args.command == "init") and (args.command != "init" or args.confirm):
+    # S0/session screening is an entry-boundary requirement for both legacy
+    # V2 and current V4 runs.  Runtime workflow evidence is intentionally
+    # separate and must not be used as a substitute for this probe.
+    if (v2_state or v42_state or args.command == "init") and (args.command != "init" or args.confirm):
         try:
             session_id = args.command + ":" + str(args.run_id or args.plan_id or args.plan or "session")
             # CLI persistence binds the route, not raw user/provider text.
