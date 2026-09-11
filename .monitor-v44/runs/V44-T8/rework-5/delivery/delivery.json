@@ -1,0 +1,20 @@
+{
+  "task_id": "V44-T8-dev",
+  "node": "V44-T8",
+  "generation": 1,
+  "writer": "V44-T8-dev",
+  "branch": "codex/v44-t8",
+  "ancestry": [
+    "156bcee (e1e803b)",
+    "b96d8b2 (3317ab5)",
+    "0ee5131 (38f2578)",
+    "7b28053 (51b8c3b)",
+    "1e221d2 skipped empty because already present"
+  ],
+  "key_suite": "65 tests OK; migrate-state CLI now passes",
+  "full_suite": "607 tests, 27 failures, 8 errors, exit 1",
+  "legacy_classification": "remaining full-suite failures/errors are legacy/version-expectation or unrelated integration/provider behavior; key V44 suite is green",
+  "status": "?? .monitor-v44/runs/V44-T8/rework-5/\n",
+  "head": "7b28053dfbdd2c604d6074ba6a2967994ff0a6c0",
+  "tree_hash": "d00c71d8e0fd3068a8e274cfc9e3a09ca4fcd4ca1bf309ee451f66c04dd9b2e9  -"
+}
