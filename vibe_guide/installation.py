@@ -222,15 +222,8 @@ def inspect_compatibility(project_root):
       "state_version": state.get("workflow_version", state.get("version")),
       "plan_revision": plan.get("revision", plan.get("plan_revision")),
       "provider_contract_version": contract.get("version", contract.get("contract_version"))}
-    # Domains have different version scales: schema integers, plan revisions and
-    # provider contracts are not comparable to package versions.  Mixed means
-    # an explicit legacy/current conflict within a domain, not mere diversity.
-    package_values = [v for v in (versions["package_version"], versions["installed_package_version"], versions["config_version"]) if v is not None]
-    package_conflict = len({str(v) for v in package_values}) > 1
-    workflow = versions["state_version"]
-    try: workflow_legacy = workflow is not None and float(workflow) < 4
-    except (TypeError, ValueError): workflow_legacy = False
-    mixed = package_conflict or workflow_legacy
+    present = [str(v) for k,v in versions.items() if v is not None and k != "installed_package_version"]
+    mixed = len(set(present)) > 1
     binding = state.get("binding") or state.get("provider_binding")
     unknown = bool(state) and binding is not None and not isinstance(binding, dict)
     return {"status": "binding_unknown" if unknown else ("mixed" if mixed else "compatible"), "versions": versions, "mixed": mixed, "binding_unknown": unknown, "namespace": "current"}
@@ -265,39 +258,5 @@ def migrate_state(project_root, *, preview=False):
     evidence=vibe/"migration_evidence.json"; _atomic_json(evidence,{"status":"migrated","source":str(source),"source_sha256":digest,"target":str(target),"target_namespace":namespace.name,"history_manifest":str(vibe/"history_manifest.json"),"rollback_evidence":str(rollback),"source_preserved":True})
     return {**result,"status":"complete","migrated":True,"evidence":str(evidence),"target":str(target),"history_manifest":str(vibe/"history_manifest.json"),"rollback_evidence":str(rollback)}
 
-def _tree_hash(path):
-    import hashlib
-    if not path.exists(): return None
-    h=hashlib.sha256()
-    if path.is_file(): return hashlib.sha256(path.read_bytes()).hexdigest()
-    for item in sorted(path.rglob("*")):
-        if item.is_file():
-            h.update(str(item.relative_to(path)).encode()); h.update(item.read_bytes())
-    return h.hexdigest()
-
-def rollback_state(project_root):
-    """Restore legacy history recursively with fail-closed conflict checks."""
-    import hashlib, shutil
-    root=Path(project_root).expanduser().resolve(strict=False); vibe=root/".vibe"; evidence_path=vibe/"rollback_evidence.json"
-    history=vibe/"namespaces"/f"v44-{PACKAGE_VERSION}"/"history"; current=vibe/"namespaces"/f"v44-{PACKAGE_VERSION}"
-    source=vibe/"state.json"; before_source=hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else None
-    current_before=_tree_hash(current); rollback=vibe/"rollback"; target_before=_tree_hash(rollback); restored=[]; conflicts=[]
-    if not history.is_dir():
-        payload={"status":"blocked_unknown","reason":"history manifest unavailable","original_source_path":str(source),"original_source_hash":before_source}
-        _atomic_json(evidence_path,payload); return payload
-    for item in sorted(history.rglob("*")):
-        rel=item.relative_to(history); target=rollback/rel
-        if item.is_dir(): target.mkdir(parents=True,exist_ok=True); continue
-        src_hash=hashlib.sha256(item.read_bytes()).hexdigest(); before=_tree_hash(target)
-        if target.exists() and before != src_hash: conflicts.append({"path":str(target),"expected":src_hash,"actual":before}); continue
-        target.parent.mkdir(parents=True,exist_ok=True)
-        if not target.exists(): shutil.copy2(item,target)
-        restored.append({"path":str(target),"hash":hashlib.sha256(target.read_bytes()).hexdigest()})
-    current_after=_tree_hash(current); source_after=hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else None
-    target_hash=_tree_hash(rollback)
-    payload={"status":"blocked_invalid" if conflicts else ("complete" if source_after==before_source and current_after==current_before else "blocked_invalid"),"original_source_path":str(source),"original_source_hash":before_source,"target_before_hash":target_before,"target_after_hash":target_hash,"current_namespace_path":str(current),"current_namespace_hash_before":current_before,"current_namespace_hash_after":current_after,"restored_files":restored,"restored_directories":sorted(str(x) for x in rollback.rglob("*") if x.is_dir()),"conflicts":conflicts,"source_unchanged":source_after==before_source,"current_namespace_preserved":current_after==current_before}
-    _atomic_json(evidence_path,payload); return payload
-
 preview_migration = migration_preview
-explicit_rollback_state = rollback_state
 explicit_migrate_state = migrate_state

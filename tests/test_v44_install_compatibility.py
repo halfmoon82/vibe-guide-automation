@@ -2,8 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from vibe_guide.installation import inspect_compatibility, migration_preview, migrate_state, rollback_state
-from vibe_guide.cli import run_cli
+from vibe_guide.installation import inspect_compatibility, migration_preview, migrate_state
 
 class V44InstallCompatibilityTests(unittest.TestCase):
     def test_mixed_versions_preview_is_read_only(self):
@@ -23,24 +22,6 @@ class V44InstallCompatibilityTests(unittest.TestCase):
             self.assertEqual(result['status'],'complete'); self.assertTrue(source.exists())
             self.assertTrue((root/'.vibe'/'migration_evidence.json').exists())
             self.assertTrue(Path(result['target']).exists())
-
-    def test_upgrade_then_rollback_has_independent_evidence(self):
-        import hashlib
-        with tempfile.TemporaryDirectory() as d:
-            root=Path(d); vibe=root/'.vibe'; vibe.mkdir(); source=vibe/'state.json'; source.write_text('{"workflow_version": 2, "schema_version": 1}')
-            old_hash=hashlib.sha256(source.read_bytes()).hexdigest(); migrate_state(root)
-            result=rollback_state(root)
-            self.assertEqual(result['status'],'complete'); self.assertTrue(result['current_namespace_preserved'])
-            self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),old_hash)
-            self.assertTrue((vibe/'rollback_evidence.json').exists())
-
-    def test_cli_migrate_state_is_explicit_entrypoint(self):
-        with tempfile.TemporaryDirectory() as d:
-            root=Path(d); (root/'.vibe').mkdir(); (root/'.vibe'/'state.json').write_text('{"workflow_version": 2}')
-            result=run_cli(["migrate-state", "--json"], root)
-            self.assertEqual(result.exit_code, 0)
-            self.assertEqual(result.payload["status"], "complete")
-            self.assertIn("rollback_evidence", result.payload)
 
     def test_history_manifest_and_rollback_evidence_preserve_runs(self):
         with tempfile.TemporaryDirectory() as d:
