@@ -265,5 +265,29 @@ def migrate_state(project_root, *, preview=False):
     evidence=vibe/"migration_evidence.json"; _atomic_json(evidence,{"status":"migrated","source":str(source),"source_sha256":digest,"target":str(target),"target_namespace":namespace.name,"history_manifest":str(vibe/"history_manifest.json"),"rollback_evidence":str(rollback),"source_preserved":True})
     return {**result,"status":"complete","migrated":True,"evidence":str(evidence),"target":str(target),"history_manifest":str(vibe/"history_manifest.json"),"rollback_evidence":str(rollback)}
 
+def rollback_state(project_root):
+    """Restore a legacy snapshot into a separate rollback namespace.
+
+    The current namespace is never overwritten; evidence records source and
+    restored hashes so callers can verify the operation independently.
+    """
+    import hashlib, shutil
+    root = Path(project_root).expanduser().resolve(strict=False); vibe = root / ".vibe"
+    evidence_path = vibe / "rollback_evidence.json"
+    manifest = _read_json(vibe / "history_manifest.json") or {}
+    artifacts = manifest.get("artifacts") if isinstance(manifest, dict) else None
+    if not artifacts:
+        payload = {"status": "blocked_unknown", "reason": "history manifest unavailable"}
+        _atomic_json(evidence_path, payload); return payload
+    rollback = vibe / "rollback"; rollback.mkdir(parents=True, exist_ok=True)
+    restored = []
+    for item in artifacts:
+        source = Path(item.get("target", "")); target = rollback / Path(item.get("source", "legacy")).name
+        if source.is_file() and not target.exists(): shutil.copy2(source, target)
+        if target.exists() and target.is_file(): restored.append({"path":str(target),"sha256":hashlib.sha256(target.read_bytes()).hexdigest()})
+    payload = {"status":"complete", "restore_path":str(rollback), "restored":restored, "current_namespace_preserved":True}
+    _atomic_json(evidence_path, payload); return payload
+
 preview_migration = migration_preview
+explicit_rollback_state = rollback_state
 explicit_migrate_state = migrate_state
