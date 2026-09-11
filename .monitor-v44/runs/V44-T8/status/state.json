@@ -1,0 +1,29 @@
+{
+  "task_id": "V44-T8-dev",
+  "node": "V44-T8",
+  "generation": 1,
+  "writer": "V44-T8-dev",
+  "worktree": "/Users/smy/Desktop/CFO/黑客松/开发辅助/.monitor-v44/worktrees/V44-T8",
+  "branch": "codex/v44-t8",
+  "lease": "not-applicable-documentation-node",
+  "cursor": "local-commit:16d6267",
+  "state": "developer_complete",
+  "review_required": true,
+  "tests": {
+    "command": "python3 -m unittest discover -s tests -v",
+    "result": "FAILED",
+    "ran": 601,
+    "failures": 27,
+    "errors": 13,
+    "classification": "legacy/version-expectation and pre-existing integration failures; no documentation assertion failure isolated"
+  },
+  "help": {
+    "command": "python3 -m vibe_guide --help",
+    "result": "PASS"
+  },
+  "diff_check": {
+    "command": "git diff --check",
+    "result": "PASS"
+  },
+  "commit": "16d6267"
+}

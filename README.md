@@ -89,6 +89,16 @@ vibe plan \
 
 node-spec 是 JSON 对象，包含 `title`、`objective`、已批准的 `decisions`、Agent `capabilities` 和 `nodes`。每个节点沿用公开 `DAGNode` 合同，至少提供输入、输出、错误行为和验收示例。复杂计划会原子发布 PRD、Spec、Issue、DAG、机器可读 plan/nodes 和授权卡；已有同名计划不会被覆盖。
 
+## V4.4 恢复与兼容性
+
+V4.4 将工程故障限定在节点范围内，并保留同一任务身份。五类恢复状态是：`repairable`（修复 dirty checkout、detached HEAD 或 branch drift）、`retryable`（超时、断线、任务创建失败等可重试故障）、`capacity_wait`（429 或 provider 容量不足，按退避等待）、`binding_unknown`（无法证明原 task、writer、lease 或 cursor 身份，只阻塞该节点及其依赖闭包）和 `external_decision`（产品、权限、deploy、凭据或不可逆安全决策）。
+
+修复必须回到原 developer task、generation、writer、worktree、lease、cursor 和合同摘要；不得创建 successor 或第二 writer。Review 的 P0–P2 缺陷回到原 developer 返工，再由同一 reviewer 复审。无关节点仍按硬依赖重新计算 ready set，`integration_after` 和 workflow 证据不会阻塞可执行节点。
+
+迁移使用显式命令 `vibe migrate-state --preview`（只读预览）和 `vibe migrate-state --confirm`（生成迁移证据）。旧 V2–V4.3 snapshot、事件、授权 epoch 和 cursor 保存在历史 namespace，只读且不会恢复为当前可执行状态；迁移生成 `history_manifest.json` 与 `migration_evidence.json`，保留源文件哈希，无法完整解释时标记 `historical_incomplete`。安装、升级、迁移、回滚分别验证；回滚必须留下目标版本、来源构建产物和验证命令证据。
+
+测试通过、worker 自报、timeout、分支名或本地 fixture 都不能单独证明真实 provider 能力、任务可见性、merge、发布或 deploy。当前执行必须以匹配的 plan、授权、BindingIntent/BindingProof、lease、provider 返回和验收证据为准；缺失或冲突证据保持 `unknown`，不得转成成功。
+
 ## 授权、监工和恢复
 
 ### DAG 运行时约束

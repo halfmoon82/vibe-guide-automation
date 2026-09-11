@@ -49,7 +49,7 @@ from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
 from .engine_attestation import create_engine_attestation
-from .installation import run_install, run_upgrade
+from .installation import run_install, run_upgrade, migrate_state
 from .models import InstallRequest
 
 
@@ -80,7 +80,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "plan", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "plan", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -778,7 +778,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             v42_state = isinstance(state_data, dict) and state_data.get("workflow_version") == 4
         except (OSError, ValueError, AttributeError):
             v2_state = False
-    if (v2_state or args.command == "init") and (args.command != "init" or args.confirm):
+    # S0/session screening is an entry-boundary requirement for both legacy
+    # V2 and current V4 runs.  Runtime workflow evidence is intentionally
+    # separate and must not be used as a substitute for this probe.
+    if (v2_state or v42_state or args.command == "init") and (args.command != "init" or args.confirm):
         try:
             session_id = args.command + ":" + str(args.run_id or args.plan_id or args.plan or "session")
             # CLI persistence binds the route, not raw user/provider text.
@@ -810,6 +813,15 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 raise ValueError("invalid V2 state")
         except (OSError, ValueError, AttributeError):
             return _result(BLOCKED, {"command": "scan", "status": "session_gate_blocked", "reason": "V2 state.json invalid"}, "扫描已阻塞：V2 state.json 无效", args.as_json)
+
+    if args.command == "migrate-state":
+        try:
+            payload = migrate_state(paths.root)
+            payload = {"command": args.command, **payload}
+            return _result(SUCCESS, payload, "状态迁移完成", args.as_json)
+        except (OSError, TypeError, ValueError) as error:
+            payload = {"command": args.command, "status": "blocked_invalid", "error": str(error)}
+            return _result(BLOCKED, payload, "状态迁移已阻塞", args.as_json)
 
     if args.command in {"install", "upgrade"}:
         try:
