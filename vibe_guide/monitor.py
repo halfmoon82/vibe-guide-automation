@@ -287,6 +287,85 @@ def isolate_affected_action(snapshot: Any, node_id: str, reason: str) -> None:
 
 
 class Monitor:
+    @staticmethod
+    def _prospective_intent_digest(snapshot: RunSnapshot, node_id: str, role: str, generation: int, current: Dict[str, Any]) -> str:
+        payload = {"run_id": snapshot.run_id, "node_id": node_id, "role": role, "generation": generation, "task_id": current.get(role + "_identity") or f"{role}:{node_id}", "writer": current.get("writer") or current.get("worker") or role, "worktree": current.get("worktree", ""), "branch": current.get("branch", ""), "authorization_digest": snapshot.authorization_digest, "node_contract_digest": current.get("contract_digest") or snapshot.node_contract_digest}
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def _build_binding_intent(self, snapshot: RunSnapshot, node_id: str, role: str,
+                               generation: int, contract: Optional[Dict[str, Any]] = None):
+        """Build (or reuse) the immutable pre-dispatch identity envelope.
+
+        This helper deliberately contains no provider lease or cursor.  It is
+        safe to call repeatedly after an interrupted start and therefore keeps
+        the original task/generation stable during retries.
+        """
+        current = snapshot.nodes[node_id]
+        contract = dict(contract or {})
+        task_id = current.get(role + "_identity") or contract.get("task_id") or f"{role}:{node_id}"
+        payload = {
+            "run_id": snapshot.run_id,
+            "plan_id": getattr(self.plan, "plan_id", snapshot.plan_id),
+            "plan_revision": getattr(self.plan, "version", snapshot.plan_version),
+            "node_id": node_id,
+            "task_id": task_id,
+            "role": role,
+            "generation": int(generation),
+            "writer": contract.get("writer") or current.get("writer") or current.get("worker") or role,
+            "worktree": str(contract.get("worktree") or current.get("worktree", "")),
+            "branch": str(contract.get("branch") or current.get("branch", "")),
+            "base_sha": str(contract.get("base_sha") or current.get("base_sha", "")),
+            "authorization_digest": snapshot.authorization_digest,
+            "node_contract_digest": current.get("contract_digest") or snapshot.node_contract_digest,
+        }
+        existing = current.get("binding_intent") or current.get("start_intent")
+        if isinstance(existing, dict) and all(existing.get(k) == payload.get(k) for k in payload):
+            payload = existing
+        try:
+            from .binding_contract import BindingIntent as V44BindingIntent
+            return V44BindingIntent.from_dict(payload)
+        except (ImportError, TypeError, ValueError):
+            return payload
+
+    def _dispatch_with_intent(self, runner: Runner, contract: Dict[str, Any], intent: Any):
+        """Dispatch one provider request and accept only a matching proof.
+
+        The provider response must be structured; prose or a partial envelope
+        is retained as a retry/binding observation and never confirmed.
+        """
+        payload = dict(contract)
+        payload["binding_intent"] = intent.to_dict() if hasattr(intent, "to_dict") else dict(intent)
+        try:
+            handle = runner.start(payload, Path(str(payload.get("worktree", "."))))
+        except Exception as error:
+            return {"kind": "retryable", "reason": type(error).__name__, "intent": payload["binding_intent"]}
+        # Existing runners expose RunHandle; only V4.4 contracts require
+        # structured proof validation.  The call still traverses this helper.
+        if contract.get("binding_contract_version") != "4.4" and hasattr(handle, "run_id"):
+            return handle
+        response = handle if isinstance(handle, dict) else getattr(handle, "__dict__", None)
+        if not isinstance(response, dict):
+            return {"kind": "binding_unknown", "reason": "provider response is unstructured", "intent": payload["binding_intent"]}
+        expected = payload["binding_intent"]
+        strict_v44 = contract.get("binding_contract_version") == "4.4"
+        if strict_v44 and (not isinstance(payload.get("provider"), str) or not payload.get("provider") or not isinstance(payload.get("host") or payload.get("host_id"), str) or not (payload.get("host") or payload.get("host_id"))):
+            return {"kind": "binding_unknown", "reason": "provider/host proof expectation is missing", "intent": expected}
+        checks = {"provider": payload.get("provider"), "host": payload.get("host") or payload.get("host_id"),
+                  "task_id": expected.get("task_id"), "issue_id": expected.get("node_id"), "role": expected.get("role"),
+                  "generation": expected.get("generation"), "worktree": expected.get("worktree"),
+                  "branch": expected.get("branch"), "writer": expected.get("writer"),
+                  "authorization_digest": expected.get("authorization_digest"),
+                  "node_contract_digest": expected.get("node_contract_digest")}
+        # Cursor is runtime proof; it may be absent only while a provider
+        # reports an explicitly pending setup, never on a confirmed start.
+        required = dict(checks)
+        required["cursor"] = None
+        if strict_v44 and any(key not in response or not response.get(key) for key in required if key != "cursor"):
+            return {"kind": "binding_unknown", "reason": "provider proof field missing", "intent": expected, "proof": response}
+        if any(key not in response or (value is not None and response.get(key) != value) for key, value in checks.items()) or not response.get("cursor"):
+            return {"kind": "binding_unknown", "reason": "provider proof mismatch", "intent": expected, "proof": response}
+        return response
+
     def _v42_retry_status(self) -> str:
         """Use the explicit retry phase only for V4.2 initialized projects.
 
@@ -1959,12 +2038,10 @@ class Monitor:
                     )
                 ) and not reviewer_recovery:
                     continue
-                if not acquire_writer_lease(
-                    self.paths,
-                    node_id,
-                    str(current["worktree"]),
-                    snapshot.run_id,
-                ):
+                retry_role = str(retry["role"])
+                retry_generation = int(current.get("review_generation" if retry_role == "reviewer" else "developer_generation", 0)) + 1
+                retry_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, retry_role, retry_generation, current))
+                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation):
                     self._mark_blocked_unknown(
                         snapshot,
                         node_id,
@@ -1987,12 +2064,10 @@ class Monitor:
                         current["retryable_action"] = None
                 continue
             if current.get("status") == "delivered" and not current.get("reviewer_started"):
-                if not acquire_writer_lease(
-                    self.paths,
-                    node_id,
-                    str(current["worktree"]),
-                    snapshot.run_id,
-                ):
+                retry_role = "reviewer"
+                retry_generation = int(current.get("review_generation", 0)) + 1
+                retry_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, retry_role, retry_generation, current))
+                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation):
                     self._mark_blocked_unknown(
                         snapshot,
                         node_id,
@@ -2012,12 +2087,9 @@ class Monitor:
                 for dependency in node.depends_on
             ):
                 continue
-            if not acquire_writer_lease(
-                self.paths,
-                node_id,
-                str(current["worktree"]),
-                snapshot.run_id,
-            ):
+            developer_generation = int(current.get("developer_generation", 0)) + 1
+            developer_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, "developer", developer_generation, current))
+            if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, developer_digest, "developer", developer_generation):
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
@@ -2245,7 +2317,12 @@ class Monitor:
         )
         identity = predecessor_identity
         generation_key = "review_generation" if role == "reviewer" else "developer_generation"
-        generation = int(current.get(generation_key, 0)) + 1
+        prior_intent = current.get("start_intent")
+        if isinstance(prior_intent, dict) and prior_intent.get("role") == role:
+            generation = int(prior_intent.get("generation", current.get(generation_key, 0)))
+            identity = str(prior_intent.get("task_id") or identity)
+        else:
+            generation = int(current.get(generation_key, 0)) + 1
         if successor:
             identity = "{}:successor:{}".format(predecessor_identity, generation)
         current[generation_key] = generation
@@ -2404,7 +2481,7 @@ class Monitor:
             # with the same contract and writer once the provider resolves it.
             current["active_task"] = None
             current["active_role"] = None
-            current["start_intent"] = None
+            # Preserve the write-ahead intent for same-task retry.
             if successor:
                 self._mark_blocked_unknown(snapshot, node_id, str(error))
                 save_snapshot(self.paths, snapshot)
@@ -2432,7 +2509,7 @@ class Monitor:
                 }
             current["active_task"] = None
             current["active_role"] = None
-            current["start_intent"] = None
+            # Preserve the write-ahead intent for same-task retry.
             self._mark_blocked_unknown(snapshot, node_id, str(error))
             if binding_contract_enabled(contract):
                 current["binding_phase"] = "binding_repair_pending"
@@ -2449,13 +2526,14 @@ class Monitor:
             return False
 
         snapshot.tasks["{}:{}".format(node_id, role)] = binding.to_dict()
-        intent = {
-            "intent_id": uuid.uuid4().hex,
-            "role": role,
-            "phase": phase,
-            "task_id": identity,
-            "generation": generation,
-        }
+        # Write-ahead intent is immutable across provider retries.  Keep the
+        # legacy fields while adding the V4.4 identity digest.
+        intent = dict(current.get("start_intent") or {})
+        if intent.get("role") != role or intent.get("task_id") != identity or int(intent.get("generation", generation)) != generation:
+            intent = {"intent_id": uuid.uuid4().hex, "role": role, "phase": phase, "task_id": identity, "generation": generation}
+        intent["intent_digest"] = hashlib.sha256(json.dumps({"run_id": snapshot.run_id, "node_id": node_id, "role": role, "task_id": identity, "generation": generation, "writer": contract.get("writer") or current.get("worker"), "worktree": contract.get("worktree") or current.get("worktree"), "branch": contract.get("branch") or current.get("branch"), "authorization_digest": snapshot.authorization_digest, "node_contract_digest": current.get("contract_digest") or snapshot.node_contract_digest}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        contract["intent_digest"] = intent["intent_digest"]
+        contract["start_intent"] = dict(intent)
         current["status"] = "start_pending"
         if binding_contract_enabled(contract) and current.get("binding_phase") is None:
             current["binding_phase"] = "binding_verified"
@@ -2477,7 +2555,23 @@ class Monitor:
         save_snapshot(self.paths, snapshot)
         self._require_snapshot_authorization(snapshot)
         try:
-            handle = runner.start(contract, self._worktree_path(current))
+            # All starts pass through the intent transaction.  V4.4 providers
+            # must return a structured proof; legacy runners retain RunHandle
+            # compatibility until their contract opts into 4.4.
+            handle = self._dispatch_with_intent(runner, contract, intent)
+            if isinstance(handle, dict) and handle.get("kind") in {"binding_unknown", "retryable", "capacity_wait", "repairable"}:
+                current["status"] = "blocked_unknown"
+                current["reason"] = handle.get("reason", handle.get("kind"))
+                current["binding_phase"] = handle.get("kind")
+                current["active_task"] = None
+                self._record(snapshot, handle.get("kind", "binding_unknown"), {"run_id": snapshot.run_id, "node_id": node_id, "intent_digest": intent.get("intent_digest"), "proof": handle.get("proof")})
+                save_snapshot(self.paths, snapshot)
+                return False
+            if isinstance(handle, dict):
+                provider_run_id = handle.get("run_id") or handle.get("provider_task_id") or handle.get("task_id")
+                if not isinstance(provider_run_id, str) or not provider_run_id:
+                    current["status"] = "blocked_unknown"; current["reason"] = "provider proof has no task handle"; save_snapshot(self.paths, snapshot); return False
+                handle = RunHandle(provider_run_id)
         except ProviderPending as error:
             # A bridge setup token (clientThreadId) is not a formal task. Keep
             # the writer lease and durable retry metadata, but clear the
@@ -2500,7 +2594,7 @@ class Monitor:
             current["status"] = self._v42_retry_status()
             current["active_task"] = None
             current["active_role"] = None
-            current["start_intent"] = None
+            # Preserve the write-ahead intent for same-task retry.
             current["reason"] = str(error)
             save_snapshot(self.paths, snapshot)
             return False
