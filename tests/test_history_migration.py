@@ -81,3 +81,11 @@ class HistoryReworkTests(unittest.TestCase):
                 result=replay_history(paths,'case')
                 self.assertEqual(result['status'],'historical_incomplete')
                 self.assertTrue(result['errors'])
+
+class HistoryPathContractTests(unittest.TestCase):
+    def test_history_dir_is_project_contained_and_distinct_from_runs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)/'project'; root.mkdir(); paths=ProjectPaths(root,Path(td)/'home')
+            self.assertEqual(paths.history_dir, (root/'.vibe'/'history').resolve())
+            self.assertNotEqual(paths.history_dir, root/'.vibe'/'runs')
+            self.assertTrue(paths.history_dir.is_relative_to(paths.vibe_dir))
