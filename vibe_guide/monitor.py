@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from datetime import datetime, timezone
 import subprocess
@@ -31,7 +32,7 @@ from .models import (
 )
 from .paths import ProjectPaths
 from .planner import resolve_consistency
-from .dag import audit_dag, ready_nodes
+from .dag import audit_dag, node_scoped_ready, ready_nodes
 from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
@@ -491,13 +492,27 @@ class Monitor:
         for node in self.nodes.values():
             expected.append({"id": node.id, "depends_on": list(node.depends_on), "parallel_group": node.parallel_group, "allowlist": list(node.allowlist), "owned_paths": list(node.owned_paths), "writer": node.writer, "reviewer": node.reviewer, "worktree": node.worktree})
         digest = hashlib.sha256(json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        ready = []
+        blocked_ids = {
+            node_id for node_id, current in snapshot.nodes.items()
+            if current.get("status") in {"blocked_unknown", "blocked_design", "blocked_deploy"}
+        }
+        # Use the same node-scoped hard-dependency projection as DAG audit.
+        # A repair/waiting node remains active for identity/capacity accounting,
+        # while unrelated planned nodes stay eligible to start.
+        projected = []
         for node in self.nodes.values():
             current = snapshot.nodes.get(node.id, {})
-            if current.get("status") not in {"planned", "ready"}:
-                continue
-            if all(snapshot.nodes.get(dep, {}).get("status") == "accepted" for dep in node.depends_on):
-                ready.append(node.id)
+            runtime_status = current.get("status", node.status)
+            # Snapshot recovery phases (retry_pending, timeout, failed, ...)
+            # are intentionally richer than the DAG model. They are not
+            # rewritten into the plan; use the node's last valid plan status
+            # for readiness while retaining the snapshot phase elsewhere.
+            if runtime_status not in {"planned", "ready", "running", "delivered", "review", "accepted", "rework", "blocked_design", "blocked_deploy", "blocked_unknown", "brief_pending"}:
+                # Recovery phases such as retry_pending, timeout and failed
+                # must stay non-ready until the same binding is confirmed.
+                runtime_status = "running"
+            projected.append(replace(node, status=runtime_status))
+        ready = node_scoped_ready(projected, blocked_ids=blocked_ids)
         return ready, digest
 
     def _refresh_execution_projection(self, snapshot: RunSnapshot, entry: str = "monitor.unknown") -> None:

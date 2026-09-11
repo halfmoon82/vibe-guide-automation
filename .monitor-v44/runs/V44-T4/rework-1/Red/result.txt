@@ -1,0 +1,1 @@
+P1 reproduction: delivered dependency was treated as complete by node_scoped_ready, allowing downstream readiness before independent review acceptance.
