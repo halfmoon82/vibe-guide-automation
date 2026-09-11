@@ -8,12 +8,15 @@
   "branch": "codex/v44-t8",
   "tree_hash": "da3c8b42bec22fdbb29fafc66a13a1cd3403cb71cc2b0195a41f87e9599c5be9  -",
   "code_head": "8e6934faa225a9ce6a4e0dd8f8181a6adad427c5",
-  "evidence_commit": "PENDING_FINAL_EVIDENCE_COMMIT",
+  "evidence_commit": "9b7d1910b96cb511822cb9af2025417b2269b30e",
   "status_before_evidence_commit": {
     "command": "git status --porcelain=v1",
     "result": "",
     "clean": true
   },
-  "status_after_evidence_commit": "recorded in final-post-evidence.json after commit",
+  "status_after_evidence_commit": {
+    "result": "",
+    "clean": true
+  },
   "prior_metadata_head": "997e03151900c98f2881950682a78596beee0ec7"
 }
