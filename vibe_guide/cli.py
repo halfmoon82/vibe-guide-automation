@@ -49,7 +49,7 @@ from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
 from .engine_attestation import create_engine_attestation
-from .installation import run_install, run_upgrade
+from .installation import run_install, run_upgrade, migrate_state
 from .models import InstallRequest
 
 
@@ -80,7 +80,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "plan", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "plan", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -813,6 +813,15 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 raise ValueError("invalid V2 state")
         except (OSError, ValueError, AttributeError):
             return _result(BLOCKED, {"command": "scan", "status": "session_gate_blocked", "reason": "V2 state.json invalid"}, "扫描已阻塞：V2 state.json 无效", args.as_json)
+
+    if args.command == "migrate-state":
+        try:
+            payload = migrate_state(paths.root)
+            payload = {"command": args.command, **payload}
+            return _result(SUCCESS, payload, "状态迁移完成", args.as_json)
+        except (OSError, TypeError, ValueError) as error:
+            payload = {"command": args.command, "status": "blocked_invalid", "error": str(error)}
+            return _result(BLOCKED, payload, "状态迁移已阻塞", args.as_json)
 
     if args.command in {"install", "upgrade"}:
         try:

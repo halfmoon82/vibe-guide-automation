@@ -222,8 +222,15 @@ def inspect_compatibility(project_root):
       "state_version": state.get("workflow_version", state.get("version")),
       "plan_revision": plan.get("revision", plan.get("plan_revision")),
       "provider_contract_version": contract.get("version", contract.get("contract_version"))}
-    present = [str(v) for k,v in versions.items() if v is not None and k != "installed_package_version"]
-    mixed = len(set(present)) > 1
+    # Domains have different version scales: schema integers, plan revisions and
+    # provider contracts are not comparable to package versions.  Mixed means
+    # an explicit legacy/current conflict within a domain, not mere diversity.
+    package_values = [v for v in (versions["package_version"], versions["installed_package_version"], versions["config_version"]) if v is not None]
+    package_conflict = len({str(v) for v in package_values}) > 1
+    workflow = versions["state_version"]
+    try: workflow_legacy = workflow is not None and float(workflow) < 4
+    except (TypeError, ValueError): workflow_legacy = False
+    mixed = package_conflict or workflow_legacy
     binding = state.get("binding") or state.get("provider_binding")
     unknown = bool(state) and binding is not None and not isinstance(binding, dict)
     return {"status": "binding_unknown" if unknown else ("mixed" if mixed else "compatible"), "versions": versions, "mixed": mixed, "binding_unknown": unknown, "namespace": "current"}
