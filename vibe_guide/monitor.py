@@ -205,7 +205,7 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
         text = " ".join(str(value) for value in values if value is not None)
         kind = observation.get("kind") or observation.get("type")
         if observation.get("credential_required") or observation.get("login_required") or observation.get("permission_required"):
-            return {"kind": "external"}
+            return {"kind": "external_decision", "legacy_kind": "external"}
     else:
         text = str(observation or "")
         kind = None
@@ -216,9 +216,38 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
         "permission denied", "access denied",
         "system permission", "remote approval", "approval required",
         "external approval", "sudo", "凭据", "登录", "系统权限", "远程批准",
+        "product scope", "scope change", "deploy", "deployment", "irreversible",
+        "security", "产品范围", "范围变更", "部署", "不可逆", "安全",
+        "external decision", "external_decision", "authorization", "授权", "产品决策",
     )
     if any(marker in normalized for marker in external_markers):
-        return {"kind": "external"}
+        return {"kind": "external_decision", "legacy_kind": "external"}
+    binding_markers = (
+        "identity conflict", "identity mismatch", "writer conflict", "lease conflict",
+        "binding conflict", "binding mismatch", "task identity", "contract digest",
+        "身份冲突", "租约冲突", "绑定冲突",
+    )
+    if any(marker in normalized for marker in binding_markers):
+        return {"kind": "binding_unknown", "legacy_kind": "unknown"}
+    capacity_markers = ("429", "rate limit", "too many requests", "capacity", "quota", "限流", "容量", "配额")
+    if any(marker in normalized for marker in capacity_markers):
+        return {"kind": "capacity_wait", "legacy_kind": "engineering"}
+    retryable_markers = (
+        "task-create", "task create", "task creation", "create task failed", "创建任务失败",
+        "timeout", "timed out", "disconnect", "disconnected", "connection reset",
+        "empty response", "no response", "pending", "clientthreadid", "setup",
+        "worker exit", "worker exited", "worker crash", "snapshot interruption",
+        "snapshot interrupted", "interrupted", "temporarily unavailable",
+        "provider unavailable", "超时", "断开", "空响应", "创建中", "工作进程退出", "快照中断",
+    )
+    if any(marker in normalized for marker in retryable_markers):
+        return {"kind": "retryable", "legacy_kind": "engineering"}
+    repairable_markers = (
+        "dirty checkout", "detached head", "detached", "branch drift", "worktree drift",
+        "stale cursor", "dirty 工作树", "游离头", "分支漂移", "工作树漂移", "游标过期",
+    )
+    if any(marker in normalized for marker in repairable_markers):
+        return {"kind": "repairable", "legacy_kind": "engineering"}
     engineering_markers = (
         "timeout", "timed out", "429", "rate limit", "too many requests",
         "disconnect", "disconnected", "connection reset", "empty response",
@@ -229,8 +258,8 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
         "超时", "限流", "断开", "空响应", "创建中", "工作进程退出", "快照中断",
     )
     if any(marker in normalized for marker in engineering_markers):
-        return {"kind": "engineering"}
-    return {"kind": "unknown"}
+        return {"kind": "retryable", "legacy_kind": "engineering"}
+    return {"kind": "binding_unknown", "legacy_kind": "unknown"}
 
 
 def self_heal_binding(snapshot: Any, node_id: str, observation: Any) -> HealingResult:
@@ -1453,7 +1482,7 @@ class Monitor:
                 events = runner.poll(RunHandle(handle_id))
             except Exception as error:
                 reason = "runner poll failed ({})".format(type(error).__name__)
-                if classify_provider_failure({"reason": reason})["kind"] == "engineering":
+                if classify_provider_failure({"reason": reason}).get("legacy_kind") == "engineering":
                     active = snapshot.nodes[node_id].get("active_task") or {}
                     self._queue_active_retry(snapshot, node_id, reason)
                     if active.get("role"):
@@ -2491,7 +2520,7 @@ class Monitor:
             if role == "reviewer" and generation == 1:
                 current["reviewer_started"] = False
             failure = classify_provider_failure(error)
-            if failure["kind"] == "external":
+            if failure["kind"] == "external_decision":
                 current["retryable_action"] = None
             else:
                 current["retryable_action"] = {
@@ -3146,7 +3175,7 @@ class Monitor:
             raw_reason = event.data.get("reason", event.event)
             reason = str(redact_provider_text(raw_reason))
             failure = classify_provider_failure(event.data)
-            if failure["kind"] == "engineering":
+            if failure.get("legacy_kind") == "engineering":
                 self._queue_active_retry(snapshot, node_id, raw_reason)
                 self._set_binding_status(snapshot, node_id, role, "blocked_unknown")
                 current["status"] = self._v42_retry_status()
@@ -3162,14 +3191,14 @@ class Monitor:
                 )
         elif event.event in {"failed", "stopped", "terminal_failed"}:
             failure = classify_provider_failure(event.data)
-            if failure["kind"] == "external":
+            if failure["kind"] == "external_decision":
                 current["retryable_action"] = None
                 self._mark_blocked_unknown(
                     snapshot, node_id,
                     str(redact_provider_text(event.data.get("reason", event.event))),
                 )
                 return
-            if failure["kind"] == "engineering" and event.event != "stopped":
+            if failure.get("legacy_kind") == "engineering" and event.event != "stopped":
                 raw_reason = event.data.get("reason", event.event)
                 reason = str(redact_provider_text(raw_reason))
                 self._queue_active_retry(snapshot, node_id, raw_reason)
@@ -3311,7 +3340,7 @@ class Monitor:
         if role not in {"developer", "reviewer"} or not isinstance(task_id, str):
             return
         classification = classify_provider_failure({"reason": reason})
-        if classification["kind"] == "external":
+        if classification["kind"] == "external_decision":
             current["retryable_action"] = None
             return
         phase = "review" if role == "reviewer" else (
@@ -3374,6 +3403,93 @@ class Monitor:
                 },
                 active,
             )
+
+    def _recovery_snapshot(self, node_id: str, run_id: Optional[str] = None) -> RunSnapshot:
+        """Load the uniquely bound durable run snapshot for a node."""
+        runs = self.paths.vibe / "runs"
+        if run_id:
+            return load_snapshot(self.paths, run_id)
+        candidates = []
+        for path in runs.glob("*/state.json"):
+            try:
+                snapshot = load_snapshot(self.paths, path.parent.name)
+                if node_id in snapshot.nodes:
+                    candidates.append(snapshot)
+            except (OSError, TypeError, ValueError):
+                continue
+        if len(candidates) != 1:
+            raise ValueError("binding_unknown: run id is required for ambiguous node binding")
+        return candidates[0]
+
+    def schedule_retry(self, node_id: str, reason: str, next_retry_at: Optional[float] = None, run_id: Optional[str] = None) -> None:
+        """Persist same-task retry state with exponential backoff."""
+        snapshot = self._recovery_snapshot(node_id, run_id)
+        current = snapshot.nodes[node_id]
+        classification = classify_provider_failure({"reason": reason})
+        if classification["kind"] == "external_decision":
+            current["status"] = "blocked_design"
+            current["reason"] = redact_provider_text(reason)
+            current["retryable_action"] = None
+        else:
+            previous = current.get("retryable_action") if isinstance(current.get("retryable_action"), dict) else {}
+            attempt = int(previous.get("attempt", 0) or 0) + 1
+            delay = min(60.0, float(2 ** min(attempt - 1, 5)))
+            retry = dict(previous)
+            retry.update({"same_task": True, "same_task_required": True, "successor": False,
+                          "attempt": attempt, "reason_class": classification["kind"],
+                          "reason": redact_provider_text(reason),
+                          "next_retry_at": float(next_retry_at if next_retry_at is not None else time.time() + delay)})
+            current["retryable_action"] = retry
+            current["status"] = "retry_pending" if classification["kind"] in {"retryable", "capacity_wait"} else "blocked_unknown"
+            current["reason"] = redact_provider_text(reason)
+        self._record(snapshot, "retry_scheduled", {"run_id": snapshot.run_id, "node_id": node_id,
+            "reason_class": classification["kind"], "reason": reason,
+            "same_task_required": True, "next_retry_at": current.get("retryable_action", {}).get("next_retry_at") if isinstance(current.get("retryable_action"), dict) else None})
+        save_snapshot(self.paths, snapshot)
+
+    def repair_node(self, node_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
+        """Repair a node in place; identity fields are immutable across repair."""
+        snapshot = self._recovery_snapshot(node_id, run_id)
+        current = snapshot.nodes[node_id]
+        before = {key: current.get(key) for key in ("task_id", "generation", "writer", "lease", "cursor", "intent_digest", "contract_digest")}
+        reason = str(current.get("reason") or "repair requested")
+        classification = classify_provider_failure({"reason": reason})
+        if classification["kind"] == "binding_unknown":
+            current["status"] = "blocked_unknown"
+        elif classification["kind"] == "external_decision":
+            current["status"] = "blocked_design"
+        else:
+            current["status"] = "retry_pending"
+            self.schedule_retry(node_id, reason, run_id=snapshot.run_id)
+            snapshot = self._recovery_snapshot(node_id, snapshot.run_id)
+            current = snapshot.nodes[node_id]
+        after = {key: current.get(key) for key in before}
+        preserved = before == after
+        repair_action = "git/provider_reconcile" if classification["kind"] == "repairable" else "same_task_retry"
+        reconciliation = {"git": {"observed": False}, "provider": {"observed": False, "status": "unavailable"}}
+        if classification["kind"] == "repairable":
+            worktree = current.get("worktree")
+            if isinstance(worktree, str) and worktree:
+                try:
+                    reconciliation["git"] = {
+                        "observed": True,
+                        "worktree": worktree,
+                        "head": subprocess.check_output(["git", "-C", worktree, "rev-parse", "HEAD"], text=True, stderr=subprocess.STDOUT, timeout=5).strip(),
+                        "branch": subprocess.check_output(["git", "-C", worktree, "branch", "--show-current"], text=True, stderr=subprocess.STDOUT, timeout=5).strip(),
+                        "dirty": bool(subprocess.check_output(["git", "-C", worktree, "status", "--porcelain"], text=True, stderr=subprocess.STDOUT, timeout=5).strip()),
+                    }
+                except (OSError, subprocess.SubprocessError) as error:
+                    reconciliation["git"] = {"observed": False, "error": type(error).__name__}
+        self._record(snapshot, "node_repaired", {"run_id": snapshot.run_id, "node_id": node_id,
+            "kind": classification["kind"], "preserved_identity": preserved,
+            "repair_action": repair_action, "same_task": True,
+            "reconciliation": reconciliation,
+            "task_id": current.get("task_id"), "generation": current.get("generation")})
+        save_snapshot(self.paths, snapshot)
+        return {"node_id": node_id, "kind": classification["kind"], "preserved_identity": preserved,
+                "status": current.get("status"), "task_id": current.get("task_id"),
+                "generation": current.get("generation"), "repair_action": repair_action,
+                "run_id": snapshot.run_id, "reconciliation": reconciliation}
 
     def _mark_blocked_unknown(
         self,
