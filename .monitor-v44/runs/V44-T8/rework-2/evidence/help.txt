@@ -1,0 +1,29 @@
+usage: vibe [-h] [--json] [--confirm] [--request REQUEST] [--plan-id PLAN_ID]
+            [--plan PLAN] [--run-id RUN_ID] [--evidence EVIDENCE] [--s1 S1]
+            [--node-spec NODE_SPEC] [--authorize AUTHORIZE]
+            [--authorization-token LEGACY_AUTHORIZATION] [--manifest MANIFEST]
+            [--acceptance-state ACCEPTANCE_STATE]
+            [--observations OBSERVATIONS] [--watch] [--mode {layered,bundled}]
+            [{scan,init,apply-agentsmd,doctor,install,upgrade,plan,monitor,reconcile,status,resume,change-request,deploy}]
+
+positional arguments:
+  {scan,init,apply-agentsmd,doctor,install,upgrade,plan,monitor,reconcile,status,resume,change-request,deploy}
+
+optional arguments:
+  -h, --help
+  --json
+  --confirm
+  --request REQUEST
+  --plan-id PLAN_ID
+  --plan PLAN
+  --run-id RUN_ID
+  --evidence EVIDENCE
+  --s1 S1
+  --node-spec NODE_SPEC
+  --authorize AUTHORIZE
+  --authorization-token LEGACY_AUTHORIZATION
+  --manifest MANIFEST
+  --acceptance-state ACCEPTANCE_STATE
+  --observations OBSERVATIONS
+  --watch
+  --mode {layered,bundled}

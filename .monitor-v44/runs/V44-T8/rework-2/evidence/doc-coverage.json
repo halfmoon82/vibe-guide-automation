@@ -1,0 +1,45 @@
+{
+  "summary": true,
+  "checks": [
+    {
+      "name": "five recovery classes",
+      "required_keyword": "repairable, retryable, capacity_wait, binding_unknown, external_decision",
+      "interface_path": "README.md:94",
+      "file": "README.md",
+      "match": "V4.4 将工程故障限定在节点范围内，并保留同一任务身份。五类恢复状态是：`repairable`",
+      "result": true
+    },
+    {
+      "name": "migration commands",
+      "required_keyword": "migrate-state --preview; migrate-state --confirm",
+      "interface_path": "README.md:98",
+      "file": "README.md",
+      "match": "迁移使用显式命令 `vibe migrate-state --preview`（只读预览）和 `vibe migrate-state --confirm`",
+      "result": true
+    },
+    {
+      "name": "evidence boundary",
+      "required_keyword": "BindingIntent/BindingProof",
+      "interface_path": "README.md:100",
+      "file": "README.md",
+      "match": "当前执行必须以匹配的 plan、授权、BindingIntent/BindingProof、lease",
+      "result": true
+    },
+    {
+      "name": "history artifacts",
+      "required_keyword": "history_manifest.json; migration_evidence.json; historical_incomplete",
+      "interface_path": "docs/superpowers/specs/2026-09-11-v44-blocking-semantics-and-compatibility-design.md:119",
+      "file": "docs/superpowers/specs/2026-09-11-v44-blocking-semantics-and-compatibility-design.md",
+      "match": "迁移只生成 `history_manifest.json` 和 `migration_evidence.json`，并保留原文件哈希。旧状态无法完整解释时标记 `historical_incomplete`",
+      "result": true
+    },
+    {
+      "name": "actual interface paths",
+      "required_keyword": "history_migration.py; binding_contract.py; monitor.py; installation.py",
+      "interface_path": "vibe_guide/{history_migration,binding_contract,monitor,installation}.py",
+      "file": "vibe_guide/",
+      "match": "all four paths exist",
+      "result": true
+    }
+  ]
+}

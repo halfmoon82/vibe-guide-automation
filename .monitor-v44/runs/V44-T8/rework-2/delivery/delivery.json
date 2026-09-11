@@ -1,0 +1,17 @@
+{
+  "task_id": "V44-T8-dev",
+  "node": "V44-T8",
+  "generation": 1,
+  "writer": "V44-T8-dev",
+  "branch": "codex/v44-t8",
+  "head": "997e03151900c98f2881950682a78596beee0ec7",
+  "state": "rework_2_complete",
+  "full_suite": "rework-1 runs 1 and 2 reused; both exit 1, 601 tests, 30 failures, 13 errors; originals cross-referenced at ../rework-1/evidence/run-{1,2}-*",
+  "evidence": [
+    "metadata.json",
+    "doc-coverage.json",
+    "help.txt",
+    "diff.txt"
+  ],
+  "worktree_clean": false
+}
