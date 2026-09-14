@@ -212,6 +212,18 @@ _EVENT_DATA_KEYS = {
     "repaired",
     "binding",
     "legacy_evidence_digest",
+    # Execution-topology observation fields.  _validate_execution_topology()
+    # compares the persisted `execution_topology_observed` event field by field
+    # against the live snapshot, so omitting them here silently dropped them on
+    # write and made that comparison fail as "topology evidence drift" for every
+    # complex plan.  All six are structural counters/identifiers, never provider
+    # text or secrets.
+    "plan_revision",
+    "started_nodes",
+    "active_concurrency",
+    "capacity",
+    "parallel_groups",
+    "monitor_entry_evidence",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",

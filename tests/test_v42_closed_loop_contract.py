@@ -49,6 +49,29 @@ class V42ClosedLoopContractTests(unittest.TestCase):
             with self.assertRaisesRegex(PermissionError, "^v42_state_required$"):
                 require_v42_sdd_first(paths)
 
+    def test_v42_state_accepts_the_required_workflow_evidence_monitor_reads(self):
+        # Monitor.start() reads the required workflow evidence out of this same
+        # state file, so rejecting those keys deadlocks every integration-review
+        # plan: with the evidence the session gate fails, without it the run is
+        # blocked as required_workflow_blocked.
+        for evidence_key in ("task_workflow", "workflow", "legacy_run", "legacy_evidence"):
+            with self.subTest(evidence_key=evidence_key), tempfile.TemporaryDirectory() as root:
+                paths = ProjectPaths(Path(root))
+                paths.vibe.mkdir()
+                (paths.vibe / "state.json").write_text(
+                    json.dumps({
+                        "workflow_version": 4,
+                        "execution_mode": "sdd_first",
+                        "session_gate": "s0_required",
+                        "capability_contract_required": True,
+                        evidence_key: {"task_id": "plan"},
+                    }),
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    require_v42_sdd_first(paths)["workflow_version"], 4
+                )
+
     def test_init_materializes_v42_sdd_first_state(self):
         with tempfile.TemporaryDirectory() as root:
             project_root = Path(root)
