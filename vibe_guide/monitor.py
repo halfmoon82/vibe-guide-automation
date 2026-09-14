@@ -893,6 +893,14 @@ class Monitor:
                 "legacy_evidence_digest": snapshot.legacy_evidence_digest,
             },
         )
+        # _schedule_ready() validates the execution topology, and that check
+        # requires an `execution_topology_observed` event in this run's log.  A
+        # brand-new complex run has none yet, and the projection below was only
+        # recorded after dispatch, so the very first dispatch of every complex
+        # plan failed with "topology evidence missing".  Publish the observation
+        # now: the projection was refreshed above, so this records exactly the
+        # state the validator is about to read.
+        self._record_topology_projection(snapshot, "monitor.start")
         save_snapshot(self.paths, snapshot)
         if not self._context_allows_dispatch(snapshot, runner):
             save_snapshot(self.paths, snapshot)

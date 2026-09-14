@@ -17,6 +17,9 @@ V42_STATE = {
     "capability_contract_required": True,
 }
 _REMOTE_GIT_ACTIONS = {"commit", "push", "pr", "mr", "create_pr", "create_mr", "merge"}
+# Keys Monitor.start()/resume() read out of the same state file as evidence.
+# They carry no session-gate meaning, so they must not fail the V4.2 check.
+_V42_EVIDENCE_KEYS = {"task_workflow", "workflow", "legacy_run", "legacy_evidence"}
 
 
 def create_task_workflow(task_id, context):
@@ -130,7 +133,16 @@ def require_v42_sdd_first(paths) -> dict:
         value = json.loads(state.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise PermissionError("v42_state_required") from error
-    if (not isinstance(value, dict) or set(value) != set(V42_STATE)
+    # The four V4.2 keys are mandatory and their values are fixed, but the
+    # state file is also the only place Monitor.start() reads the required
+    # workflow evidence from (`task_workflow` / `workflow`, plus the historical
+    # `legacy_run` marker).  Rejecting any extra key made those two contracts
+    # mutually exclusive: writing the evidence broke the session gate, and
+    # omitting it blocked every integration-review plan with
+    # `required_workflow_blocked: workflow`.  Allow exactly the evidence keys
+    # Monitor reads; anything else is still rejected.
+    if (not isinstance(value, dict)
+            or set(value) - set(V42_STATE) - _V42_EVIDENCE_KEYS
             or any(value.get(key) != expected for key, expected in V42_STATE.items())):
         raise PermissionError("v42_state_required")
     return value
