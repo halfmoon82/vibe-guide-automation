@@ -194,6 +194,47 @@ class EngineAttestationTests(unittest.TestCase):
             self.assertEqual(attestation["plan_id"], "v42-attestation")
             self.assertEqual(card["engine_evidence_ref"], attestation["evidence_ref"])
 
+    def test_complex_plan_publication_works_for_every_observed_provider(self):
+        """Engine evidence follows observed lifecycle facts, not one adapter id."""
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        from vibe_guide.cli import run_cli
+        from vibe_guide.paths import ProjectPaths
+
+        fixture = Path(__file__).parent / "fixtures" / "e2e-project"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            shutil.copytree(fixture, root)
+            self.assertEqual(run_cli(["init", "--confirm", "--json"], root).exit_code, 0)
+            ProviderActionStore(ProjectPaths(root)).publish_capabilities(
+                "claude-code",
+                {"claude-code.shell": True, "claude-code.subprocess": True,
+                 "claude-code.worktree": True, "claude-code.visible_task.create": True,
+                 "claude-code.visible_task.enter": True,
+                 "claude-code.visible_task.resume": True,
+                 "claude-code.visible_task.wait": True},
+                "claude-code-desktop-session-bridge",
+            )
+            source = json.loads((root / "plan-source.json").read_text())
+            source["capabilities"] = {"agent_id": "claude-code", "shell": True, "subprocess": True,
+                                       "worktree": True, "background": True, "session_resume": True,
+                                       "level": "full"}
+            source["project_id"] = "project-fixture"
+            source["complexity_band"] = "complex"
+            source["integration_contract"] = {
+                "iteration_context": {"kind": "iteration", "based_on": "V4"},
+                "compatibility_scope": ["V4 API"],
+                "agentsmd_acceptance_refs": ["AGENTS.md#8"],
+                "integration_acceptance_contract": {"checks": ["all"]},
+                "unverified_or_excluded": ["provider"],
+            }
+            source_path = root / "claude-source.json"
+            source_path.write_text(json.dumps(source))
+            result = run_cli(["plan", "--request", "设计并实现两个契约兼容的并行节点并完成独立审查", "--plan-id", "claude-attestation",
+                              "--s1", "4,4,4,4,4", "--node-spec", source_path.name, "--json"], root)
+            self.assertEqual(result.exit_code, 0, result.text)
+            attestation = json.loads((root / ".vibe" / "plans" / "claude-attestation" / "engine-attestation.json").read_text())
+            self.assertEqual(attestation["provider"], "claude-code")
+
 
 if __name__ == "__main__":
     unittest.main()
