@@ -40,6 +40,7 @@ from .planner import (
     route_task,
     score_s1,
 )
+from .session_entry import build_session_entry, materialize_session_entry
 from .scanner import scan_project
 from .diagnostics import screen_session, require_session_screened
 from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
@@ -1117,36 +1118,60 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             return _result(UNKNOWN, {"command": "deploy", "status": "blocked_unknown", "reason": str(error)}, "Deploy 状态未知：" + str(error), args.as_json)
 
     if args.command == "plan":
-        screen = classify_s0(args.request or "")
-        if screen.simple:
+        try:
+            entry = build_session_entry(args.request or "", args.s1, args.plan_id)
+        except (TypeError, ValueError) as error:
+            return _result(
+                BLOCKED,
+                {"command": "plan", "status": "blocked", "reason": str(error)},
+                "规划已阻塞：" + str(error),
+                args.as_json,
+            )
+        screen = entry.s0
+        if screen.simple and not args.s1:
             payload = {
                 "command": "plan",
                 "status": "ok",
                 "route": "simple",
                 "rationale": screen.rationale,
+                "plan_id": entry.plan_id,
+                "node_spec": entry.node_spec,
             }
             return _result(
                 SUCCESS, payload, "该请求走轻量直接执行路径", args.as_json
             )
         try:
-            score = score_s1(_scores(args.s1))
-            route = route_task(score)
+            score = entry.s1
+            route = entry.route.route
             if route != "complex":
                 payload = {
                     "command": "plan",
                     "status": "ok",
                     "route": route,
                     "score": score.total,
+                    "plan_id": entry.plan_id,
+                    "node_spec": entry.node_spec,
                 }
                 return _result(
                     SUCCESS, payload, "任务已进入轻规划", args.as_json
                 )
-            if not args.plan_id or not args.node_spec:
-                raise PermissionError(
-                    "complex planning requires a plan id and explicit node spec"
+            if not args.node_spec:
+                materialized = materialize_session_entry(paths, entry)
+                payload = {
+                    "command": "plan",
+                    "status": "planned",
+                    "route": route,
+                    "score": score.total,
+                    "plan_id": entry.plan_id,
+                    "node_spec": entry.node_spec,
+                    "materialized_path": str(materialized.relative_to(paths.root)),
+                    "execution": "deferred_until_authorize",
+                }
+                return _result(
+                    SUCCESS, payload, "复杂请求已生成稳定计划草案，等待授权", args.as_json
                 )
             source_path = paths.resolve_relative(args.node_spec)
-            plan, nodes, card = _publish_plan(paths, args.plan_id, source_path)
+            plan, nodes, card = _publish_plan(paths, entry.plan_id, source_path)
         except PermissionError as error:
             if _is_capability_contract_unknown(error):
                 return _result(

@@ -398,6 +398,32 @@ def score_s1(context: TaskContext) -> S1Score:
     return S1Score(sum(values), *values, rationale=dict(context.rationale))
 
 
+def parse_s1_context(value: Any) -> Optional[TaskContext]:
+    """Parse an optional five-dimensional S1 override.
+
+    Invalid or absent input is deliberately represented as ``None`` so a
+    session entry can use its deterministic default instead of turning an
+    internal planning field into a user-facing blocker.
+    """
+    if isinstance(value, TaskContext):
+        return value
+    if isinstance(value, S1Score):
+        return TaskContext(
+            value.steps, value.domains, value.uncertainty,
+            value.failure_cost, value.toolchain,
+            rationale=dict(value.rationale),
+        )
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        values = [int(item.strip()) for item in value.split(",")]
+    except (TypeError, ValueError):
+        return None
+    if len(values) != 5 or any(item < 0 or item > 5 for item in values):
+        return None
+    return TaskContext(*values, rationale={"source": "explicit"})
+
+
 def _route_result_from_score(score: S1Score, force_upgrade_flags: Optional[List[str]] = None) -> RouteResult:
     if score.total < 0:
         raise ValueError("S1 total cannot be negative")
