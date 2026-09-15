@@ -9,7 +9,9 @@ class SkillsTests(unittest.TestCase):
     def test_classifies_skill_sources_without_claiming_availability(self):
         self.assertEqual(classify_skill_source('https://github.com/example/demo'), 'remote')
         self.assertEqual(classify_skill_source('./skills/demo'), 'local')
-        self.assertEqual(classify_skill_source('not-a-source'), 'unknown')
+        self.assertEqual(classify_skill_source('skills/demo'), 'local')
+        self.assertEqual(classify_skill_source('demo/SKILL.md'), 'local')
+        self.assertEqual(classify_skill_source('https://gitlab.com/example/demo'), 'unknown')
 
     def make_vendor(self, vibe_home, origin='https://github.com/example/demo'):
         vendor = vibe_home / 'vendor' / 'demo'

@@ -56,7 +56,7 @@ def classify_skill_source(source):
         pass
     if isinstance(source, (str, os.PathLike)):
         value = os.fspath(source).strip()
-        if value.startswith(('/', './', '../', '~')):
+        if value and '://' not in value and not _SCP_SOURCE.fullmatch(value):
             return 'local'
     return 'unknown'
 

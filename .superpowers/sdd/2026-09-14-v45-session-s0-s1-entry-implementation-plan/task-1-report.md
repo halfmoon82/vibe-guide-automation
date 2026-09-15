@@ -21,3 +21,9 @@ Complete.
 
 - Local Skill sources are classified for provenance only; installation remains intentionally limited to the existing verified GitHub flow.
 - Full repository test suite was not run for this scoped change.
+
+## Reviewer follow-up
+
+- Expanded source classification to recognize ordinary relative paths such as `skills/demo` and `demo/SKILL.md` as `local`; unsupported URL forms remain `unknown`.
+- `python3 -m unittest tests.test_skills tests.test_initializer -v` — 17 tests passed.
+- `git diff --check` — passed.
