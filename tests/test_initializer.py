@@ -13,6 +13,29 @@ class InitializerTests(unittest.TestCase):
             self.assertTrue((p.root/'.vibe/knowledge').is_dir())
             self.assertFalse((p.root/'AGENTS.md').exists())
 
+    def test_skill_proposal_registers_remote_source_and_repeat_preserves_bytes(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = ProjectPaths.from_cwd(Path(d))
+            first = init_project(p, True)
+            proposal = p.root / '.vibe/proposals/skills/proposal.md'
+            self.assertIn('source: https://github.com/lov-team/architecture-skill-pack', proposal.read_text())
+            self.assertIn('source_status: remote', proposal.read_text())
+            before = proposal.read_bytes()
+            init_project(p, True)
+            self.assertEqual(proposal.read_bytes(), before)
+
+    def test_symlinked_skill_proposal_is_rejected_before_initialization(self):
+        with tempfile.TemporaryDirectory() as d:
+            project = Path(d)
+            proposal_dir = project / '.vibe/proposals/skills'
+            proposal_dir.mkdir(parents=True)
+            outside = project.parent / 'outside-proposal'
+            outside.write_text('keep\n', encoding='utf-8')
+            (proposal_dir / 'proposal.md').symlink_to(outside)
+            with self.assertRaises(ValueError):
+                init_project(ProjectPaths.from_cwd(project), True)
+            self.assertEqual(outside.read_text(), 'keep\n')
+
     def test_symlinked_vibe_is_rejected_without_outside_write(self):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
