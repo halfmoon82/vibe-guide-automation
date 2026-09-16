@@ -45,6 +45,7 @@ def _validate_initialization_paths(root):
         root / '.vibe' / 'state.json',
         root / '.vibe' / 'session-contract.json',
         root / '.vibe' / 'proposals' / 'agentsmd' / 'proposal.md',
+        root / '.vibe' / 'proposals' / 'skills' / 'proposal.md',
     )
     for path in directories:
         if not _is_within(root, path):
@@ -76,6 +77,9 @@ def _migrate_state(path):
         raise ValueError('state.json is invalid') from error
     if not isinstance(data, dict):
         raise ValueError('state.json must be an object')
+    if data == {}:
+        _atomic_write(path, {"workflow_version": 2})
+        return True
     if data == V42_STATE:
         return False
     if data.get('workflow_version') not in (2, 3, 3.1, 3.10):
@@ -181,7 +185,13 @@ def init_project(paths, confirm):
         created.append(str(proposal_path.relative_to(root)))
     skill_proposal = root / '.vibe/proposals/skills/proposal.md'
     if not skill_proposal.exists() and not any(item.get('valid') and item.get('name') == 'architecture-skill-pack' for item in report.skills):
-        _write_new(skill_proposal, '# Skill proposal\n\n- architecture-skill-pack\n')
+        _write_new(
+            skill_proposal,
+            '# Skill proposal\n\n'
+            '- name: architecture-skill-pack\n'
+            '- source: https://github.com/lov-team/architecture-skill-pack\n'
+            '- source_status: remote\n',
+        )
         created.append(str(skill_proposal.relative_to(root)))
     return InitResult(bool(created), created)
 

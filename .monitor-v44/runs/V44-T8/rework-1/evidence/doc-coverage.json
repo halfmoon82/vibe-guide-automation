@@ -1,0 +1,9 @@
+{
+  "README recovery classes": true,
+  "README same task": true,
+  "README migration commands": true,
+  "README evidence boundary": true,
+  "Spec recovery classes": true,
+  "Spec migration artifacts": true,
+  "Actual interfaces": true
+}

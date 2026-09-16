@@ -1,0 +1,1 @@
+Fixed: only accepted hard dependencies unlock downstream nodes. Integration_after remains non-blocking. Runtime retry_pending/timeout/failed phases are projected as running, so they cannot re-enter ready_set while retaining identity/capacity.

@@ -22,7 +22,7 @@ _ACTION_KEYS = {"action", "actions", "allowed_actions", "requested_actions"}
 # confirmed card.  The generic ``create_change_request``/``merge`` forms stay
 # excluded to prevent an ambiguous action from widening the allowlist.
 _RUNTIME_ACTIONS = frozenset(
-    _ALLOWED_ACTIONS + (_LOCAL_MERGE_ACTION, "merge_remote", "create_pr", "create_mr")
+    _ALLOWED_ACTIONS + ("push", "merge", _LOCAL_MERGE_ACTION, "merge_remote", "create_pr", "create_mr")
 )
 _SENSITIVE_NAMES = (
     "api_key",
@@ -45,6 +45,30 @@ def remote_git_actions_allowed(authorization, action):
     if normalized not in _REMOTE_GIT_ACTIONS:
         return False
     return switch == "allow"
+
+
+def validate_remote_git_permissions(remote_git_actions, allowed_actions):
+    """Fail closed when the remote Git switch and action scope disagree."""
+    if remote_git_actions not in {"allow", "deny"}:
+        raise ValueError("remote_git_actions must be allow or deny")
+    actions = set(allowed_actions or ())
+    remote = {"commit", "push", "create_pr", "create_mr", "merge", "pr", "mr"}
+    if remote_git_actions == "allow" and not remote.issubset(actions):
+        raise ValueError("remote_git_actions=allow requires all remote Git permissions")
+    if remote_git_actions == "deny" and actions & remote:
+        raise ValueError("remote_git_actions=deny conflicts with remote Git permissions")
+    if actions & {"deploy", "production_write", "credentials", "external_communication", "release"}:
+        raise ValueError("sensitive actions are always excluded")
+
+def validate_authorization_card_consistency(card):
+    data = card.to_dict() if hasattr(card, "to_dict") else dict(card)
+    switch = data.get("remote_git_actions", "deny")
+    validate_remote_git_permissions(switch, data.get("allowed_actions", ()))
+    allowed = set(data.get("allowed_actions", ()))
+    excluded = set(data.get("excluded_actions", ()))
+    if excluded & allowed:
+        raise ValueError("authorization card has overlapping allowed and excluded actions")
+    return True
 
 
 def validate_git_action_target(action: Dict[str, Any]) -> None:
@@ -644,7 +668,7 @@ def build_authorization_card(
     ):
         raise ValueError("active pair limit must be an integer from 1 to 64")
     if allowed_actions is None:
-        allowed_actions = _ALLOWED_ACTIONS
+        allowed_actions = tuple(dict.fromkeys(_ALLOWED_ACTIONS + ((_REMOTE_GIT_ACTIONS_SCOPE) if remote_git_actions == "allow" else ())))
     else:
         if not isinstance(allowed_actions, (tuple, list)) or not all(
             isinstance(action, str) for action in allowed_actions
@@ -653,8 +677,6 @@ def build_authorization_card(
         allowed_actions = tuple(action.strip().casefold() for action in allowed_actions)
     if not _valid_action_scope(allowed_actions):
         raise ValueError("authorization action scope is invalid")
-    if remote_git_actions not in {"allow", "deny"}:
-        raise ValueError("remote_git_actions must be allow or deny")
     if getattr(plan, "complexity_band", "") == "complex":
         if not execution_engine:
             execution_engine = "vibeguide_monitor"

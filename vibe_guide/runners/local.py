@@ -343,11 +343,15 @@ class LocalRunner(Runner):
             return
         if not current_token or current_token != metadata["process_identity"]:
             raise ValueError("local runner process identity cannot be proven")
+        process_pid = self._processes.get(handle.run_id)
         try:
             os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        process_pid = self._processes.get(handle.run_id)
+        except (ProcessLookupError, PermissionError):
+            if process_pid is not None:
+                try:
+                    os.kill(process_pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
         if process_pid is not None:
             try:
                 os.waitpid(process_pid, 0)

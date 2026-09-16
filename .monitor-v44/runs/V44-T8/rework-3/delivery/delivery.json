@@ -1,0 +1,22 @@
+{
+  "task_id": "V44-T8-dev",
+  "node": "V44-T8",
+  "generation": 1,
+  "writer": "V44-T8-dev",
+  "code_head": "8e6934faa225a9ce6a4e0dd8f8181a6adad427c5",
+  "branch": "codex/v44-t8",
+  "state": "rework_3_complete",
+  "status_before_evidence_commit": {
+    "command": "git status --porcelain=v1",
+    "result": "",
+    "clean": true
+  },
+  "tree_hash_before": "698339ed7d1a669d22eb10084a85548c2fec0f26712b9e37eb1d9503f697fd8b  -",
+  "evidence_commit": "9b7d1910b96cb511822cb9af2025417b2269b30e",
+  "status_after_evidence_commit": {
+    "result": "",
+    "clean": true
+  },
+  "post_head": "9b7d1910b96cb511822cb9af2025417b2269b30e",
+  "post_tree_hash": "07a3efca85c59f82d19b623e02d9c8bd283f7f0b20f3d4b5a1472bb4c31cf395  -"
+}

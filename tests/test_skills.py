@@ -1,10 +1,17 @@
 import json, os, shutil, subprocess, tempfile, unittest
 from pathlib import Path
 from unittest import mock
-from vibe_guide.skills import SkillSpec, install_skill
+from vibe_guide.skills import SkillSpec, classify_skill_source, install_skill
 
 class SkillsTests(unittest.TestCase):
     fixture = Path(__file__).parent / 'fixtures' / 'scan-project' / 'skill-source'
+
+    def test_classifies_skill_sources_without_claiming_availability(self):
+        self.assertEqual(classify_skill_source('https://github.com/example/demo'), 'remote')
+        self.assertEqual(classify_skill_source('./skills/demo'), 'local')
+        self.assertEqual(classify_skill_source('skills/demo'), 'local')
+        self.assertEqual(classify_skill_source('demo/SKILL.md'), 'local')
+        self.assertEqual(classify_skill_source('https://gitlab.com/example/demo'), 'unknown')
 
     def make_vendor(self, vibe_home, origin='https://github.com/example/demo'):
         vendor = vibe_home / 'vendor' / 'demo'
@@ -63,6 +70,7 @@ class SkillsTests(unittest.TestCase):
             self.assertNotEqual(first, second)
             self.assertTrue(result.installed)
             self.assertEqual(result.commit, first)
+            self.assertEqual(result.source_status, 'remote')
             target = home / 'skills' / 'demo'
             self.assertFalse(target.is_symlink())
             self.assertEqual(

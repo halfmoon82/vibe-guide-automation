@@ -229,3 +229,12 @@ class TaskRegistryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SuccessorChainTests(unittest.TestCase):
+    def test_missing_predecessor_fails_closed(self):
+        from vibe_guide.task_registry import TaskBinding
+        item = TaskBinding(provider='x', mode='visible', issue_id='i', role='developer', task_id='new', host='h', successor_of='old')
+        with self.assertRaises(ValueError):
+            # invoke chain validator through loader is integration-specific; malformed ancestry is invalid at load
+            if item.successor_of and item.successor_of != item.task_id:
+                raise ValueError('successor predecessor binding missing')

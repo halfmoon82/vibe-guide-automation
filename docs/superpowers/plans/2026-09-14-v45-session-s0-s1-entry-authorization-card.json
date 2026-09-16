@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "card_id": "v45-session-s0-s1-entry-auth-3",
+  "plan_id": "v45-session-s0-s1-entry",
+  "plan_revision": 3,
+  "status": "pending_user_authorization",
+  "scope": "ISSUE-01..ISSUE-05 as listed in the V4.5 authorize-as-start implementation plan",
+  "ready_nodes": [
+    "ISSUE-01",
+    "ISSUE-02",
+    "ISSUE-04"
+  ],
+  "deferred_nodes": [
+    "ISSUE-03",
+    "ISSUE-05"
+  ],
+  "parallel_groups": {
+    "entry-foundation": [
+      "ISSUE-01",
+      "ISSUE-02"
+    ],
+    "compatibility": [
+      "ISSUE-04"
+    ]
+  },
+  "active_pair_limit": 3,
+  "allowed_actions": [
+    "develop",
+    "test",
+    "review",
+    "rework",
+    "accept",
+    "archive_task"
+  ],
+  "remote_git_actions": null,
+  "remote_git_actions_options": [
+    "allow",
+    "deny"
+  ],
+  "deploy_authorization": false,
+  "permissions": {
+    "run_targeted_tests": true,
+    "run_full_suite": true,
+    "create_visible_tasks": true,
+    "create_worktrees": true,
+    "start_monitor": "automatic_on_authorize",
+    "commit": "conditional_on_remote_git_actions_allow",
+    "push": "conditional_on_remote_git_actions_allow",
+    "create_pr": "conditional_on_remote_git_actions_allow",
+    "create_mr": "conditional_on_remote_git_actions_allow",
+    "merge": "conditional_on_remote_git_actions_allow",
+    "deploy": false,
+    "credentials": false,
+    "external_communication": false
+  },
+  "compatibility_baselines": [
+    "V4.2",
+    "V4.3",
+    "V4.4",
+    "current-4.4-cli"
+  ],
+  "evidence_refs": {
+    "design": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md",
+    "design_sha256": "e0c4ae822f5a715e83692e6872a26658dd67255803a0e960ad06714299896ed1",
+    "prd": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-prd.md",
+    "prd_sha256": "467b37ca09affed7bef9ce81a175948b7c1af326ce602d90b2f6619e3fc051b2",
+    "spec_issue": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-spec-issues.md",
+    "spec_issue_sha256": "a748715449f8ad78b0afd620e50cfea8408d7803ed11094e2d3574dcdbe4e5ad",
+    "dag_audit": "docs/superpowers/plans/2026-09-14-v45-session-s0-s1-entry-dag-audit.md",
+    "dag_audit_sha256": "f9578608b45b3f3695e4b72ae8d8a0df6cb57c0baaa80e1cae30bcd24231caf8",
+    "implementation_plan": "docs/superpowers/plans/2026-09-14-v45-session-s0-s1-entry-implementation-plan.md",
+    "implementation_plan_sha256": "63d74212992b645159a921fe91502babb79153acf22d09d2583007569bee9b98"
+  },
+  "authorization_text": "选择 remote_git_actions=allow 或 deny 后，authorize 即自动物化计划、初始化运行状态并启动 Monitor；allow 才包含 commit、push、创建 PR/MR、merge。deploy、发布、生产写入、凭据和外部通信不在本卡范围内。"
+}

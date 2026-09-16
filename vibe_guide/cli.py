@@ -25,7 +25,7 @@ from .dag import render_plan_artifacts, validate_dag, append_integration_review_
 from .doctor import doctor
 from .initializer import apply_agentsmd_proposal, init_project
 from .upgrade import upgrade_project
-from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState
+from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import Monitor
 from .supervisor import Supervisor
 from .change_requests import ChangeRequest, classify_merge_capability
@@ -39,7 +39,9 @@ from .planner import (
     classify_s0,
     route_task,
     score_s1,
+    build_stage_handoff,
 )
+from .session_entry import build_session_entry, materialize_session_entry
 from .scanner import scan_project
 from .diagnostics import screen_session, require_session_screened
 from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
@@ -48,8 +50,9 @@ from .state import load_events, load_snapshot
 from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
+from .prd_profiles import evaluate_prd_checkpoints, validate_skill_profile
 from .engine_attestation import create_engine_attestation
-from .installation import run_install, run_upgrade
+from .installation import run_install, run_upgrade, migrate_state
 from .models import InstallRequest
 
 
@@ -80,7 +83,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "plan", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "plan", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -124,10 +127,16 @@ def run_install_or_upgrade(request: Any, json_output: bool = False) -> Dict[str,
         )
     else:
         raise TypeError("installation request must be a mapping or InstallRequest")
+    installation_state = (
+        Path(install_request.project_root) / ".vibe" / "installation" / "state.json"
+    )
+    was_installed = installation_state.is_file() and not installation_state.is_symlink()
     runner = run_upgrade if operation in {"upgrade", "upg"} else run_install
     result = runner(install_request, ProjectPaths.from_cwd(install_request.project_root))
     payload = result.to_dict()
     payload["operation"] = "upgrade" if runner is run_upgrade else "install"
+    if runner is run_upgrade:
+        payload["changed"] = not was_installed
     payload["message"] = _install_message(payload.get("status"), payload.get("phase"))
     return payload
 
@@ -778,7 +787,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             v42_state = isinstance(state_data, dict) and state_data.get("workflow_version") == 4
         except (OSError, ValueError, AttributeError):
             v2_state = False
-    if (v2_state or args.command == "init") and (args.command != "init" or args.confirm):
+    # S0/session screening is an entry-boundary requirement for both legacy
+    # V2 and current V4 runs.  Runtime workflow evidence is intentionally
+    # separate and must not be used as a substitute for this probe.
+    if (v2_state or v42_state or args.command == "init") and (args.command != "init" or args.confirm):
         try:
             session_id = args.command + ":" + str(args.run_id or args.plan_id or args.plan or "session")
             # CLI persistence binds the route, not raw user/provider text.
@@ -811,7 +823,29 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         except (OSError, ValueError, AttributeError):
             return _result(BLOCKED, {"command": "scan", "status": "session_gate_blocked", "reason": "V2 state.json invalid"}, "扫描已阻塞：V2 state.json 无效", args.as_json)
 
+    if args.command == "migrate-state":
+        try:
+            payload = migrate_state(paths.root)
+            payload = {"command": args.command, **payload}
+            return _result(SUCCESS, payload, "状态迁移完成", args.as_json)
+        except (OSError, TypeError, ValueError) as error:
+            payload = {"command": args.command, "status": "blocked_invalid", "error": str(error)}
+            return _result(BLOCKED, payload, "状态迁移已阻塞", args.as_json)
+
     if args.command in {"install", "upgrade"}:
+        if args.command == "upgrade" and not args.confirm:
+            return _result(
+                BLOCKED,
+                {
+                    "command": "upgrade",
+                    "status": "blocked_invalid",
+                    "phase": "blocked",
+                    "reason": "confirmation required",
+                    "errors": ["confirmation required"],
+                },
+                "升级已暂停：需要明确确认",
+                args.as_json,
+            )
         try:
             payload = run_install_or_upgrade(
                 {"operation": args.command, "mode": args.mode, "project_root": paths.root},
@@ -1105,36 +1139,130 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             return _result(UNKNOWN, {"command": "deploy", "status": "blocked_unknown", "reason": str(error)}, "Deploy 状态未知：" + str(error), args.as_json)
 
     if args.command == "plan":
-        screen = classify_s0(args.request or "")
-        if screen.simple:
+        try:
+            entry = build_session_entry(args.request or "", args.s1, args.plan_id)
+        except (TypeError, ValueError) as error:
+            return _result(
+                BLOCKED,
+                {"command": "plan", "status": "blocked", "reason": str(error)},
+                "规划已阻塞：" + str(error),
+                args.as_json,
+            )
+        screen = entry.s0
+        if screen.simple and not args.s1:
             payload = {
                 "command": "plan",
                 "status": "ok",
                 "route": "simple",
                 "rationale": screen.rationale,
+                "plan_id": entry.plan_id,
+                "node_spec": entry.node_spec,
             }
             return _result(
                 SUCCESS, payload, "该请求走轻量直接执行路径", args.as_json
             )
         try:
-            score = score_s1(_scores(args.s1))
-            route = route_task(score)
+            score = entry.s1
+            route = entry.route.route
             if route != "complex":
                 payload = {
                     "command": "plan",
                     "status": "ok",
                     "route": route,
                     "score": score.total,
+                    "plan_id": entry.plan_id,
+                    "node_spec": entry.node_spec,
                 }
                 return _result(
                     SUCCESS, payload, "任务已进入轻规划", args.as_json
                 )
-            if not args.plan_id or not args.node_spec:
-                raise PermissionError(
-                    "complex planning requires a plan id and explicit node spec"
+            if not args.node_spec:
+                materialized = materialize_session_entry(paths, entry)
+                payload = {
+                    "command": "plan",
+                    "status": "planned",
+                    "route": route,
+                    "score": score.total,
+                    "plan_id": entry.plan_id,
+                    "node_spec": entry.node_spec,
+                    "materialized_path": str(materialized.relative_to(paths.root)),
+                    "execution": "deferred_until_authorize",
+                }
+                return _result(
+                    SUCCESS, payload, "复杂请求已生成稳定计划草案，等待授权", args.as_json
                 )
             source_path = paths.resolve_relative(args.node_spec)
-            plan, nodes, card = _publish_plan(paths, args.plan_id, source_path)
+            # Evaluate the PRD checkpoints before _publish_plan().  This gate
+            # is deliberately side-effect free: unresolved product choices,
+            # missing/unverified evidence, and invalid Skill references must
+            # not materialize plans or authorization cards.
+            source = _read_json(source_path)
+            if not isinstance(source, dict):
+                raise ValueError("node spec must be a JSON object")
+            has_prd_gate_input = any(
+                key in source for key in ("rationale", "product_question", "skill_profiles")
+            )
+            rationale = source.get("rationale", {})
+            if not isinstance(rationale, dict):
+                rationale = {"framing": rationale}
+            else:
+                rationale = dict(rationale)
+            if "product_question" in source and "product_question" not in rationale:
+                rationale["product_question"] = source["product_question"]
+            gate_context = TaskContext(
+                score.steps, score.domains, score.uncertainty,
+                score.failure_cost, toolchain=score.toolchain, rationale=rationale,
+            )
+            # Older executable node specs predate the V4.5 PRD checkpoint
+            # fields. Keep those specs compatible; once a spec opts into any
+            # checkpoint/profile field, the gate is mandatory.
+            checkpoints = evaluate_prd_checkpoints(gate_context) if has_prd_gate_input else []
+            raw_profiles = source.get("skill_profiles", [])
+            if raw_profiles is None:
+                raw_profiles = []
+            if not isinstance(raw_profiles, list):
+                raise TypeError("skill_profiles must be a list")
+            for raw_profile in raw_profiles:
+                if not isinstance(raw_profile, dict):
+                    raise TypeError("Skill profile must be an object")
+                validate_skill_profile(SkillProfile(**raw_profile))
+            evidence_refs = ["prd:{}@1".format(entry.plan_id)]
+            blocked_checkpoints = [item for item in checkpoints if item.status == "blocked_design"]
+            if has_prd_gate_input and blocked_checkpoints:
+                question = str(blocked_checkpoints[0].fields.get("question", "请补充未决产品选择"))
+                handoff = build_stage_handoff(
+                    PRD(str(source.get("title", "").strip() or "未命名 PRD"),
+                        str(source.get("objective", "").strip() or entry.request),
+                        revision=1, status="blocked_design"),
+                    [question], evidence_refs,
+                )
+                payload = {
+                    "command": "plan", "status": "blocked_design",
+                    "route": "complex", "question": question,
+                    "checkpoints": [item.to_dict() for item in checkpoints],
+                    "handoff": handoff.to_dict(),
+                    "handoff_text": handoff.render(),
+                    "downstream_artifact": None,
+                }
+                return _result(BLOCKED, payload, "规划已暂停：需要回答产品问题", args.as_json)
+            review_checkpoints = [item for item in checkpoints if item.status == "review_required"]
+            if has_prd_gate_input and review_checkpoints:
+                handoff = build_stage_handoff(
+                    PRD(str(source.get("title", "").strip() or "未命名 PRD"),
+                        str(source.get("objective", "").strip() or entry.request),
+                        revision=1, status="review_required"),
+                    [], evidence_refs,
+                )
+                payload = {
+                    "command": "plan", "status": "review_required",
+                    "route": "complex", "required_user_action": "confirm_plan",
+                    "checkpoints": [item.to_dict() for item in checkpoints],
+                    "handoff": handoff.to_dict(),
+                    "handoff_text": handoff.render(),
+                    "downstream_artifact": None,
+                }
+                return _result(BLOCKED, payload, "规划已暂停：需要确认 PRD 证据", args.as_json)
+            plan, nodes, card = _publish_plan(paths, entry.plan_id, source_path)
         except PermissionError as error:
             if _is_capability_contract_unknown(error):
                 return _result(
@@ -1170,6 +1298,17 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             "authorization_card": card.to_dict(),
             "authorization_digest": card.digest,
         }
+        approved_handoff = build_stage_handoff(
+            PRD(str(source.get("title", "").strip() or "未命名 PRD"),
+                str(source.get("objective", "").strip() or entry.request),
+                revision=1, status="approved"),
+            [], ["prd:{}@1".format(entry.plan_id)],
+        )
+        payload.update({
+            "handoff": approved_handoff.to_dict(),
+            "handoff_text": approved_handoff.render(),
+            "checkpoints": [item.to_dict() for item in checkpoints],
+        })
         return _result(
             SUCCESS, payload, "复杂计划产物已生成，等待一次授权", args.as_json
         )

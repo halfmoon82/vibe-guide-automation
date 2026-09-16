@@ -1,0 +1,19 @@
+{
+  "node": "V44-T8",
+  "task_id": "V44-T8-dev",
+  "commit": "16d6267",
+  "files": [
+    "README.md",
+    "docs/superpowers/specs/2026-09-11-v44-blocking-semantics-and-compatibility-design.md",
+    "docs/superpowers/specs/2026-09-09-v43-entry-preflight-and-complex-plan-gate-spec.md"
+  ],
+  "summary": "Documented five recovery classes, same-task repair, node-scoped workflow nonblocking semantics, migration/rollback, legacy state isolation, and evidence boundaries.",
+  "verification": {
+    "command": "python3 -m unittest discover -s tests -v",
+    "result": "FAILED",
+    "ran": 601,
+    "failures": 27,
+    "errors": 13,
+    "classification": "legacy/version-expectation and pre-existing integration failures; no documentation assertion failure isolated"
+  }
+}

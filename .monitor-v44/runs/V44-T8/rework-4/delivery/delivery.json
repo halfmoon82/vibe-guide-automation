@@ -1,0 +1,15 @@
+{
+  "task_id": "V44-T8-dev",
+  "node": "V44-T8",
+  "generation": 1,
+  "writer": "V44-T8-dev",
+  "branch": "codex/v44-t8",
+  "head": "1ce814d37085db0f75072eed9cea1513ea568e38",
+  "key_suite": "65 tests, 1 failure: CLI migrate-state entrypoint unavailable (exit 2)",
+  "full_suite": "607 tests, 29 failures, 7 errors (exit 1)",
+  "legacy_classification": "remaining failures/errors include legacy/version expectation and integration/provider tests; key new compatibility failure is explicit migrate-state CLI missing",
+  "history_path_contract": "ProjectPaths.history_dir and history_migration use same path",
+  "test_visible": true,
+  "status": "?? .monitor-v44/runs/V44-T8/rework-4/\n",
+  "tree_hash": "009b5720d04b583ab9b335119d9e86293e4836b4e4570c497d9d82559be849db  -\n"
+}

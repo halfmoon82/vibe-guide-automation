@@ -199,3 +199,105 @@ def run_upgrade(request: InstallRequest, paths: Any, capability_authorizer: Any 
 
 
 __all__ = ["InstallRequest", "InstallResult", "InstallStateMachine", "PHASES", "run_install", "run_upgrade"]
+
+
+# V4.4 compatibility helpers.
+def _read_json(path: Path):
+    if not path.is_file() or path.is_symlink(): return None
+    try: value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError): return None
+    return value if isinstance(value, dict) else None
+
+def inspect_compatibility(project_root):
+    """Read package and project metadata without mutating the project."""
+    from importlib import metadata
+    root = Path(project_root).expanduser().resolve(strict=False); vibe = root / ".vibe"
+    config = _read_json(vibe / "config.json") or {}; state = _read_json(vibe / "state.json") or {}
+    plan = _read_json(vibe / "plan.json") or {}; contract = _read_json(vibe / "session-contract.json") or {}
+    try: installed = metadata.version("vibe-guide")
+    except metadata.PackageNotFoundError: installed = None
+    versions = {"package_version": PACKAGE_VERSION, "installed_package_version": installed,
+      "config_version": config.get("version") or config.get("package_version"),
+      "state_schema": state.get("schema_version", state.get("state_schema_version")),
+      "state_version": state.get("workflow_version", state.get("version")),
+      "plan_revision": plan.get("revision", plan.get("plan_revision")),
+      "provider_contract_version": contract.get("version", contract.get("contract_version"))}
+    # Domains have different version scales: schema integers, plan revisions and
+    # provider contracts are not comparable to package versions.  Mixed means
+    # an explicit legacy/current conflict within a domain, not mere diversity.
+    package_values = [v for v in (versions["package_version"], versions["installed_package_version"], versions["config_version"]) if v is not None]
+    package_conflict = len({str(v) for v in package_values}) > 1
+    workflow = versions["state_version"]
+    try: workflow_legacy = workflow is not None and float(workflow) < 4
+    except (TypeError, ValueError): workflow_legacy = False
+    mixed = package_conflict or workflow_legacy
+    binding = state.get("binding") or state.get("provider_binding")
+    unknown = bool(state) and binding is not None and not isinstance(binding, dict)
+    return {"status": "binding_unknown" if unknown else ("mixed" if mixed else "compatible"), "versions": versions, "mixed": mixed, "binding_unknown": unknown, "namespace": "current"}
+
+def migration_preview(project_root):
+    report = inspect_compatibility(project_root); root = Path(project_root).expanduser().resolve(strict=False)
+    return {"status":"preview", "read_only":True, "source":str(root/".vibe"), "target_namespace":f"v44-{PACKAGE_VERSION}", "compatibility":report, "actions":["preserve legacy .vibe artifacts", "create isolated current namespace"]}
+
+def migrate_state(project_root, *, preview=False):
+    result = migration_preview(project_root)
+    if preview: return result
+    import hashlib, shutil
+    root = Path(project_root).expanduser().resolve(strict=False); vibe = root/".vibe"; source = vibe/"state.json"
+    if not source.exists(): return {**result, "status":"complete", "migrated":False, "evidence":"no legacy state"}
+    namespace = vibe/"namespaces"/f"v44-{PACKAGE_VERSION}"; namespace.mkdir(parents=True, exist_ok=True)
+    history = namespace/"history"; history.mkdir(exist_ok=True)
+    copied=[]
+    # Historical artifacts are copied, never moved or overwritten.
+    for item in vibe.iterdir():
+        if item.name in {"namespaces", "migration_evidence.json", "history_manifest.json"}: continue
+        target = history/item.name
+        if not target.exists():
+            if item.is_dir(): shutil.copytree(item,target)
+            else: shutil.copy2(item,target)
+        copied.append({"source":str(item),"target":str(target),"sha256":hashlib.sha256(item.read_bytes()).hexdigest() if item.is_file() else None})
+    target=namespace/"state.json"
+    if not target.exists(): shutil.copy2(source,target)
+    manifest={"status":"historical_read_only","namespace":str(history),"artifacts":copied,"source_preserved":True}
+    _atomic_json(vibe/"history_manifest.json",manifest)
+    digest=hashlib.sha256(source.read_bytes()).hexdigest()
+    rollback=vibe/"rollback_evidence.json"; _atomic_json(rollback,{"source":str(source),"source_sha256":digest,"restore_path":str(source),"verified":True})
+    evidence=vibe/"migration_evidence.json"; _atomic_json(evidence,{"status":"migrated","source":str(source),"source_sha256":digest,"target":str(target),"target_namespace":namespace.name,"history_manifest":str(vibe/"history_manifest.json"),"rollback_evidence":str(rollback),"source_preserved":True})
+    return {**result,"status":"complete","migrated":True,"evidence":str(evidence),"target":str(target),"history_manifest":str(vibe/"history_manifest.json"),"rollback_evidence":str(rollback)}
+
+def _tree_hash(path):
+    import hashlib
+    if not path.exists(): return None
+    h=hashlib.sha256()
+    if path.is_file(): return hashlib.sha256(path.read_bytes()).hexdigest()
+    for item in sorted(path.rglob("*")):
+        if item.is_file():
+            h.update(str(item.relative_to(path)).encode()); h.update(item.read_bytes())
+    return h.hexdigest()
+
+def rollback_state(project_root):
+    """Restore legacy history recursively with fail-closed conflict checks."""
+    import hashlib, shutil
+    root=Path(project_root).expanduser().resolve(strict=False); vibe=root/".vibe"; evidence_path=vibe/"rollback_evidence.json"
+    history=vibe/"namespaces"/f"v44-{PACKAGE_VERSION}"/"history"; current=vibe/"namespaces"/f"v44-{PACKAGE_VERSION}"
+    source=vibe/"state.json"; before_source=hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else None
+    current_before=_tree_hash(current); rollback=vibe/"rollback"; target_before=_tree_hash(rollback); restored=[]; conflicts=[]
+    if not history.is_dir():
+        payload={"status":"blocked_unknown","reason":"history manifest unavailable","original_source_path":str(source),"original_source_hash":before_source}
+        _atomic_json(evidence_path,payload); return payload
+    for item in sorted(history.rglob("*")):
+        rel=item.relative_to(history); target=rollback/rel
+        if item.is_dir(): target.mkdir(parents=True,exist_ok=True); continue
+        src_hash=hashlib.sha256(item.read_bytes()).hexdigest(); before=_tree_hash(target)
+        if target.exists() and before != src_hash: conflicts.append({"path":str(target),"expected":src_hash,"actual":before}); continue
+        target.parent.mkdir(parents=True,exist_ok=True)
+        if not target.exists(): shutil.copy2(item,target)
+        restored.append({"path":str(target),"hash":hashlib.sha256(target.read_bytes()).hexdigest()})
+    current_after=_tree_hash(current); source_after=hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else None
+    target_hash=_tree_hash(rollback)
+    payload={"status":"blocked_invalid" if conflicts else ("complete" if source_after==before_source and current_after==current_before else "blocked_invalid"),"original_source_path":str(source),"original_source_hash":before_source,"target_before_hash":target_before,"target_after_hash":target_hash,"current_namespace_path":str(current),"current_namespace_hash_before":current_before,"current_namespace_hash_after":current_after,"restored_files":restored,"restored_directories":sorted(str(x) for x in rollback.rglob("*") if x.is_dir()),"conflicts":conflicts,"source_unchanged":source_after==before_source,"current_namespace_preserved":current_after==current_before}
+    _atomic_json(evidence_path,payload); return payload
+
+preview_migration = migration_preview
+explicit_rollback_state = rollback_state
+explicit_migrate_state = migrate_state

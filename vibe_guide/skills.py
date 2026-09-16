@@ -38,6 +38,27 @@ class SkillInstallResult:
     installed: bool
     source: str
     commit: str
+    source_status: str = 'unknown'
+
+
+def classify_skill_source(source):
+    """Classify a Skill source without probing the filesystem or network.
+
+    ``remote`` is reserved for the credential-free GitHub identity accepted by
+    the installer.  Path-like values are ``local`` even when the path does not
+    exist yet; every other value remains ``unknown`` so callers cannot infer
+    availability from syntax alone.
+    """
+    try:
+        normalize_github_source(source)
+        return 'remote'
+    except (AttributeError, TypeError, ValueError):
+        pass
+    if isinstance(source, (str, os.PathLike)):
+        value = os.fspath(source).strip()
+        if value and '://' not in value and not _SCP_SOURCE.fullmatch(value):
+            return 'local'
+    return 'unknown'
 
 
 def _github_path(path):
@@ -295,6 +316,7 @@ def _remove_published_path(path):
 def install_skill(spec, vibe_home, fetch=False):
     safe_source = sanitize_git_url_for_display(spec.source)
     safe_commit = spec.commit.lower() if _FULL_SHA.fullmatch(spec.commit or '') else ''
+    source_status = classify_skill_source(spec.source)
     record_created = False
     publish_attempted = False
     stage = None
@@ -345,7 +367,7 @@ def install_skill(spec, vibe_home, fetch=False):
         publish_attempted = True
         os.replace(str(stage), str(target))
         stage = None
-        return SkillInstallResult('installed', True, source, actual)
+        return SkillInstallResult('installed', True, source, actual, source_status)
     except (
         _InstallError,
         OSError,
@@ -363,7 +385,7 @@ def install_skill(spec, vibe_home, fetch=False):
                 record_path.unlink()
             except OSError:
                 pass
-        return SkillInstallResult('pending', False, safe_source, safe_commit)
+        return SkillInstallResult('pending', False, safe_source, safe_commit, source_status)
     finally:
         if stage is not None:
             shutil.rmtree(stage, ignore_errors=True)

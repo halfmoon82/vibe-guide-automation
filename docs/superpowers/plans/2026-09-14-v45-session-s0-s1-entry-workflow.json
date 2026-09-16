@@ -1,0 +1,270 @@
+{
+  "kind": "planning_node_evidence",
+  "schema_version": 1,
+  "revision": 1,
+  "created_at": "2026-09-14T12:43:37.586482+00:00",
+  "project_root": "/Users/smy/Desktop/CFO/黑客松/开发辅助",
+  "code_head": "9bb454cae6a16cc8633b42fbdda4ea2a8fea0c3e",
+  "current_node": "spec_issue",
+  "status": "draft_pending_dag_audit",
+  "next_node_after_confirmation": "dag_audit",
+  "design_confirmation": {
+    "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md",
+    "sha256": "b9e96c7da8b60903244563611d23a8e34248438e4bd0e17b00e91f170b72b1da",
+    "user_confirmation": "确认/Users/smy/Desktop/CFO/黑客松/开发辅助/docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md，请按vibeguide进入下一节点",
+    "source_kind": "current_user_message"
+  },
+  "workflow": {
+    "task_id": "v45-session-s0-s1-entry",
+    "route": "complex",
+    "nodes": [
+      "s0",
+      "s1",
+      "requirements",
+      "product_decision",
+      "prd",
+      "spec_issue",
+      "dag_audit",
+      "plan_confirmation",
+      "authorization_card",
+      "user_authorization"
+    ],
+    "node_records": {
+      "s0": {
+        "task_id": "v45-session-s0-s1-entry",
+        "node_id": "s0",
+        "status": "completed",
+        "input": {
+          "request": "V4.5 会话级 S0/S1 分流与 Vibe Guide 入口设计，包含初始化、入口运行时、任务恢复、CLI 规划和多 Agent 能力合同",
+          "source": {
+            "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md",
+            "sha256": "b9e96c7da8b60903244563611d23a8e34248438e4bd0e17b00e91f170b72b1da",
+            "user_confirmation": "确认/Users/smy/Desktop/CFO/黑客松/开发辅助/docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md，请按vibeguide进入下一节点",
+            "source_kind": "current_user_message"
+          }
+        },
+        "output": {
+          "simple": false,
+          "needs_s1": true,
+          "route": "s1",
+          "rationale": "检测到可能的多步骤或复杂任务：设计"
+        },
+        "evidence": {
+          "api": "vibe_guide.planner.classify_s0",
+          "source": {
+            "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md",
+            "sha256": "b9e96c7da8b60903244563611d23a8e34248438e4bd0e17b00e91f170b72b1da",
+            "user_confirmation": "确认/Users/smy/Desktop/CFO/黑客松/开发辅助/docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md，请按vibeguide进入下一节点",
+            "source_kind": "current_user_message"
+          }
+        },
+        "sequence": 1
+      },
+      "s1": {
+        "task_id": "v45-session-s0-s1-entry",
+        "node_id": "s1",
+        "status": "completed",
+        "input": {
+          "context": {
+            "steps": 4,
+            "domains": 4,
+            "uncertainty": 4,
+            "failure_cost": 4,
+            "toolchain": 3,
+            "rationale": {
+              "steps": "涉及入口、分流、归属、恢复、初始化及兼容验证多个步骤",
+              "domains": "跨 Skill、规划、状态持久化与多 Agent 适配合同",
+              "uncertainty": "语义归属、重复调用与历史 proposal 兼容需合同验证",
+              "failure_cost": "错误归属或恢复可能导致第二 writer 或越权执行",
+              "toolchain": "Python CLI、本地 Skill、状态证据和多 Agent 能力探针"
+            },
+            "force_upgrade_flags": []
+          }
+        },
+        "output": {
+          "score": {
+            "total": 19,
+            "steps": 4,
+            "domains": 4,
+            "uncertainty": 4,
+            "failure_cost": 4,
+            "toolchain": 3,
+            "rationale": {
+              "steps": "涉及入口、分流、归属、恢复、初始化及兼容验证多个步骤",
+              "domains": "跨 Skill、规划、状态持久化与多 Agent 适配合同",
+              "uncertainty": "语义归属、重复调用与历史 proposal 兼容需合同验证",
+              "failure_cost": "错误归属或恢复可能导致第二 writer 或越权执行",
+              "toolchain": "Python CLI、本地 Skill、状态证据和多 Agent 能力探针"
+            }
+          },
+          "route": {
+            "route": "complex",
+            "complexity_band": "complex",
+            "screen": "s1",
+            "score": 19,
+            "dimensions": {
+              "steps": 4,
+              "domains": 4,
+              "uncertainty": 4,
+              "failure_cost": 4,
+              "toolchain": 3
+            },
+            "force_upgrade_flags": [],
+            "evidence_ref": "planner:s0-s1"
+          }
+        },
+        "evidence": {
+          "api": "vibe_guide.planner.score_s1/route_task",
+          "assessment_origin": "assistant_assessment_of_confirmed_design",
+          "source": {
+            "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md",
+            "sha256": "b9e96c7da8b60903244563611d23a8e34248438e4bd0e17b00e91f170b72b1da",
+            "user_confirmation": "确认/Users/smy/Desktop/CFO/黑客松/开发辅助/docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md，请按vibeguide进入下一节点",
+            "source_kind": "current_user_message"
+          }
+        },
+        "sequence": 2
+      },
+      "requirements": {
+        "task_id": "v45-session-s0-s1-entry",
+        "node_id": "requirements",
+        "status": "accepted",
+        "input": {
+          "source": {
+            "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md",
+            "sha256": "b9e96c7da8b60903244563611d23a8e34248438e4bd0e17b00e91f170b72b1da",
+            "user_confirmation": "确认/Users/smy/Desktop/CFO/黑客松/开发辅助/docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md，请按vibeguide进入下一节点",
+            "source_kind": "current_user_message"
+          }
+        },
+        "output": {
+          "status": "confirmed",
+          "scope": "approved_design_only"
+        },
+        "evidence": {
+          "source": {
+            "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md",
+            "sha256": "b9e96c7da8b60903244563611d23a8e34248438e4bd0e17b00e91f170b72b1da",
+            "user_confirmation": "确认/Users/smy/Desktop/CFO/黑客松/开发辅助/docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md，请按vibeguide进入下一节点",
+            "source_kind": "current_user_message"
+          }
+        },
+        "sequence": 3
+      },
+      "product_decision": {
+        "task_id": "v45-session-s0-s1-entry",
+        "node_id": "product_decision",
+        "status": "accepted",
+        "input": {
+          "source": {
+            "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md",
+            "sha256": "b9e96c7da8b60903244563611d23a8e34248438e4bd0e17b00e91f170b72b1da",
+            "user_confirmation": "确认/Users/smy/Desktop/CFO/黑客松/开发辅助/docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md，请按vibeguide进入下一节点",
+            "source_kind": "current_user_message"
+          }
+        },
+        "output": {
+          "status": "confirmed",
+          "unresolved_product_decisions": [],
+          "decision_summary_ref": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-prd.md#3"
+        },
+        "evidence": {
+          "source": {
+            "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md",
+            "sha256": "b9e96c7da8b60903244563611d23a8e34248438e4bd0e17b00e91f170b72b1da",
+            "user_confirmation": "确认/Users/smy/Desktop/CFO/黑客松/开发辅助/docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md，请按vibeguide进入下一节点",
+            "source_kind": "current_user_message"
+          }
+        },
+        "sequence": 4
+      },
+      "prd": {
+        "task_id": "v45-session-s0-s1-entry",
+        "node_id": "prd",
+        "status": "accepted",
+        "input": {
+          "source": {
+            "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md",
+            "sha256": "b9e96c7da8b60903244563611d23a8e34248438e4bd0e17b00e91f170b72b1da",
+            "user_confirmation": "确认/Users/smy/Desktop/CFO/黑客松/开发辅助/docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-design.md，请按vibeguide进入下一节点",
+            "source_kind": "current_user_message"
+          }
+        },
+        "output": {
+          "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-prd.md",
+          "sha256": "a92d653eead5b8c4ac837eed40957f6fb9a04b2bb153322c919eaead8469fbbb",
+          "status": "confirmed"
+        },
+        "evidence": {
+          "artifact": {
+            "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-prd.md",
+            "sha256": "4990d31e9ed231eb6703611c230d37f1b3a9cd6c19c9ec70e2e1ab60f99050b9"
+          },
+          "approval": {
+            "source": "current_user_message",
+            "text": "好的，确认该PRD，惟需额外注意的是要解决和前序版本的冲突和必要的覆盖。"
+          }
+        },
+        "sequence": 5
+      },
+      "spec_issue": {
+        "task_id": "v45-session-s0-s1-entry",
+        "node_id": "spec_issue",
+        "status": "draft_pending_dag_audit",
+        "input": {
+          "prd_path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-prd.md",
+          "prd_sha256": "a92d653eead5b8c4ac837eed40957f6fb9a04b2bb153322c919eaead8469fbbb"
+        },
+        "output": {
+          "path": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-spec-issues.md",
+          "sha256": "adbd101e89944a889c1aaccc3c85c364e2981f81c3cc86bb93ad285c32f37785",
+          "issues": [
+            "ISSUE-01",
+            "ISSUE-02",
+            "ISSUE-03",
+            "ISSUE-04",
+            "ISSUE-05"
+          ],
+          "status": "draft_pending_dag_audit"
+        },
+        "evidence": {
+          "source": "docs/superpowers/specs/2026-09-14-v45-session-s0-s1-entry-spec-issues.md",
+          "compatibility_matrix": [
+            "V4.2",
+            "V4.3",
+            "V4.4",
+            "current-4.4-cli"
+          ]
+        },
+        "sequence": 6
+      }
+    },
+    "authorization_granted": false,
+    "_sequence": 5
+  },
+  "verification": {
+    "status": "blocked_by_required_node",
+    "node": "spec_issue"
+  },
+  "execution_authorized": false,
+  "monitor_started": false,
+  "runtime_task_binding": null,
+  "engineering_observations": {
+    "package_metadata_version": "4.4.0",
+    "project_state_exists": false,
+    "entry_used": "vibe_guide.planner + vibe_guide.workflow_gate public APIs",
+    "cli_plan_limit": "Current CLI publishes a complete DAG and requires node_spec/capabilities; it does not expose a standalone PRD transition.",
+    "no_initialization_or_state_migration": true,
+    "interpretation": "verify_workflow reports the unconfirmed PRD as the first incomplete node; this is not an execution failure or provider diagnosis."
+  },
+  "compatibility_scope": {
+    "required_baselines": [
+      "V4.2",
+      "V4.3",
+      "V4.4",
+      "current-4.4-cli"
+    ],
+    "legacy_preservation": true,
+    "overwrite_means_new_behavior_and_regression_coverage_only": true
+  }
+}

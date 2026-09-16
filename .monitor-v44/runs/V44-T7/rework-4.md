@@ -1,0 +1,2 @@
+Rework-4: rollback_state now recursively restores directory trees and events with relative paths and copy metadata, performs fail-closed hash conflict checks, supports idempotent repeated rollback, and records source/current/target hashes, restored files/directories, and conflicts. Source and current namespace must remain unchanged for success.
+Validation: T7 compatibility tests 5 passed; py_compile passed. Existing directory fixture and repeated rollback path remain covered by recursive implementation; no source overwrite.

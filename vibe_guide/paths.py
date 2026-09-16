@@ -96,6 +96,15 @@ class ProjectPaths:
         return self.vibe_dir
 
     @property
+    def history_dir(self) -> Path:
+        """Canonical, project-contained namespace for read-only legacy runs.
+
+        This is deliberately distinct from ``.vibe/runs`` so migration and
+        replay can never be mistaken for current execution state.
+        """
+        return self._contained(self.vibe_dir / "history", self.vibe_dir)
+
+    @property
     def user_home(self) -> Path:
         return self.vibe_home
 

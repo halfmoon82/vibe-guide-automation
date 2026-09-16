@@ -7,7 +7,7 @@ import re
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional
 
-from .models import EVIDENCE_PRIORITY, IssueComplexity, TargetContract, IntegrationAcceptanceContract
+from .models import EVIDENCE_PRIORITY, IssueComplexity, TargetContract, IntegrationAcceptanceContract, PRD, StageHandoff
 
 
 @dataclass(frozen=True)
@@ -168,17 +168,25 @@ class DecisionCard:
 
 
 @dataclass(frozen=True)
-class PRD:
-    title: str
-    objective: str
-    status: str = "draft"
-
-
-@dataclass(frozen=True)
 class PRDResult:
     prd: PRD
     approved: bool
     blockers: List[str]
+
+
+def build_stage_handoff(prd: PRD, open_questions, evidence_refs):
+    refs = list(evidence_refs)
+    if prd.status in {"blocked_design", "blocked_decision"} or open_questions:
+        return StageHandoff.for_blocked_prd(refs, list(open_questions)[0] if open_questions else "请补充未决产品选择", prd.revision)
+    if prd.status == "review_required":
+        return StageHandoff(
+            "prd", "review_required", "spec_issue_dag", "review_required",
+            refs, [], "confirm_plan",
+            "请确认 PRD checkpoint 与证据后，再继续生成 Spec/Issue/DAG。",
+            ["create_spec", "create_worker", "authorize", "deploy"],
+            prd.revision,
+        )
+    return StageHandoff("prd", prd.status, "spec_issue_dag", "ready", refs, [], "continue_planning", "PRD 已确认，请继续生成 Spec/Issue/DAG。", ["create_spec", "create_worker", "authorize", "deploy"], prd.revision)
 
 
 @dataclass(frozen=True)
@@ -398,6 +406,32 @@ def score_s1(context: TaskContext) -> S1Score:
     return S1Score(sum(values), *values, rationale=dict(context.rationale))
 
 
+def parse_s1_context(value: Any) -> Optional[TaskContext]:
+    """Parse an optional five-dimensional S1 override.
+
+    Invalid or absent input is deliberately represented as ``None`` so a
+    session entry can use its deterministic default instead of turning an
+    internal planning field into a user-facing blocker.
+    """
+    if isinstance(value, TaskContext):
+        return value
+    if isinstance(value, S1Score):
+        return TaskContext(
+            value.steps, value.domains, value.uncertainty,
+            value.failure_cost, value.toolchain,
+            rationale=dict(value.rationale),
+        )
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        values = [int(item.strip()) for item in value.split(",")]
+    except (TypeError, ValueError):
+        return None
+    if len(values) != 5 or any(item < 0 or item > 5 for item in values):
+        return None
+    return TaskContext(*values, rationale={"source": "explicit"})
+
+
 def _route_result_from_score(score: S1Score, force_upgrade_flags: Optional[List[str]] = None) -> RouteResult:
     if score.total < 0:
         raise ValueError("S1 total cannot be negative")
@@ -562,3 +596,37 @@ def project_v41_integration_contract(plan):
 # DAG construction lives with DAG validation; re-export these public V4.1
 # helpers here for callers that treat planning as the entry point.
 from .dag import append_integration_review_node, is_integration_review_node, validate_integration_review_node
+
+# PRD profile compatibility exports
+from .prd_profiles import evaluate_prd_checkpoints, select_prd_profiles
+
+
+def build_planning_brief(plan, goals=None, iteration_context=None,
+                          compatibility_scope=None, agentsmd_acceptance_refs=None,
+                          integration_acceptance_contract=None,
+                          unverified_or_excluded=None):
+    """Build a deterministic, traceable brief for a complex plan."""
+    if getattr(plan, "complexity_band", "") != "complex":
+        raise ValueError("planning brief requires a complex plan")
+    goals = list(goals or getattr(plan, "planning_goals", []) or [])
+    required = ("id", "user_scenario", "code_evidence", "spec_ref", "issue_ref", "dag_nodes", "runtime_acceptance")
+    for goal in goals:
+        if not isinstance(goal, dict) or any(not goal.get(k) for k in required):
+            raise ValueError("each planning goal must include traceability fields")
+    brief = {
+        "plan_id": plan.plan_id,
+        "iteration_context": dict(iteration_context or getattr(plan, "iteration_context", {}) or {}),
+        "compatibility_scope": dict(compatibility_scope or getattr(plan, "compatibility_scope", {}) or {}),
+        "agentsmd_acceptance_refs": list(agentsmd_acceptance_refs or getattr(plan, "agentsmd_acceptance_refs", []) or []),
+        "integration_acceptance_contract": dict(integration_acceptance_contract or getattr(plan, "integration_acceptance_contract", {}) or {}),
+        "unverified_or_excluded": list(unverified_or_excluded or getattr(plan, "unverified_or_excluded", []) or []),
+        "depends_on": {n.id: list(n.depends_on) for n in getattr(plan, "nodes", [])},
+        "integration_after": {n.id: list(n.integration_after) for n in getattr(plan, "nodes", [])},
+        "parallel_group": {n.id: n.parallel_group for n in getattr(plan, "nodes", [])},
+        "ready_nodes": list(getattr(plan, "ready_nodes", []) or []),
+        "goals": goals,
+    }
+    missing = [k for k in ("iteration_context", "compatibility_scope", "agentsmd_acceptance_refs", "integration_acceptance_contract", "unverified_or_excluded") if not brief[k]]
+    if missing:
+        raise ValueError("complex planning brief missing: " + ", ".join(missing))
+    return brief

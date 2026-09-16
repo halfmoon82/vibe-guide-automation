@@ -1,0 +1,1 @@
+{"task_id":"V44-T4-dev","generation":1,"rework":1,"status":"delivered","files":["vibe_guide/dag.py","vibe_guide/monitor.py","tests/test_node_scoped_blocking.py"],"cursor":null,"lease":null,"tests":"25 passed"}

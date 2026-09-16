@@ -1,0 +1,2 @@
+Rework-1: reviewer P1 addressed. Compatibility inspection now includes installed package metadata, config version, state schema/workflow, plan revision, provider contract. Explicit migration preserves source artifacts, copies old runs/history into read-only namespace, writes history_manifest.json, migration_evidence.json and rollback_evidence.json. Preview remains side-effect free.
+Validation: 11 targeted tests passed; py_compile installation.py; packaging build/install not run in this rework environment (not claimed).

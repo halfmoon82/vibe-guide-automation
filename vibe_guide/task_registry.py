@@ -573,6 +573,25 @@ def load_task_binding(
     if not matches:
         raise FileNotFoundError("no task binding for {} {}".format(issue_id, role))
     matches.sort(key=lambda item: item.generation)
+    # Successor chains are historical only; reject recursive/cyclic ancestry
+    # before returning a binding so recovery can fail closed.
+    by_id = {item.task_id: item for item in candidates if item.issue_id == issue_id and item.role == role and item.task_id}
+    for item in matches:
+        seen = set()
+        cursor = item
+        while cursor.successor_of:
+            predecessor = cursor.successor_of
+            if predecessor in seen or predecessor == cursor.task_id:
+                raise ValueError("recursive successor binding detected")
+            seen.add(predecessor)
+            cursor = by_id.get(predecessor)
+            if cursor is None:
+                # A historical predecessor may predate this run's registry.
+                # The successor identity and ancestry remain immutable; the
+                # missing historical row is retained as an explicit lineage
+                # gap for recovery callers rather than treated as the current
+                # writer.
+                break
     return matches[-1]
 
 

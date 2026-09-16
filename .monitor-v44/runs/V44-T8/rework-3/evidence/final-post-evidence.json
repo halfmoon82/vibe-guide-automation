@@ -1,0 +1,15 @@
+{
+  "command_sequence": [
+    "git status --porcelain=v1",
+    "git rev-parse HEAD",
+    "git ls-files -s | sha256sum"
+  ],
+  "status_after_evidence_commit": {
+    "result": "",
+    "clean": true
+  },
+  "head_after_evidence_commit": "9b7d1910b96cb511822cb9af2025417b2269b30e",
+  "tree_hash_after_evidence_commit": "07a3efca85c59f82d19b623e02d9c8bd283f7f0b20f3d4b5a1472bb4c31cf395  -",
+  "evidence_commit": "9b7d1910b96cb511822cb9af2025417b2269b30e",
+  "note": "The evidence commit is the commit observed immediately after submission; this final file is a sealed record committed afterward and does not rewrite code_head."
+}

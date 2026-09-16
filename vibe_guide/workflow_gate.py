@@ -108,6 +108,21 @@ def verify_workflow(workflow):
     return {"status": "complete", "authorization_granted": bool(workflow.get("authorization_granted"))}
 
 
+def audit_workflow_evidence(workflow, *, entry_observed=True):
+    """Classify optional workflow evidence without making it an execution gate."""
+    if not entry_observed:
+        return {"event": "entry_enforcement_bypassed_or_unobserved", "status": "unknown"}
+    if workflow is None:
+        return {"event": "workflow_evidence_missing", "status": "missing"}
+    try:
+        result = verify_workflow(workflow)
+    except Exception as error:  # audit must never turn into a dispatch gate
+        return {"event": "workflow_evidence_generation_failed", "status": "failed", "reason": type(error).__name__}
+    if result.get("status") == "complete":
+        return {"event": "workflow_evidence_verified", "status": "complete"}
+    return {"event": "workflow_evidence_generation_failed", "status": "failed", "reason": result.get("reason", result.get("node", "invalid"))}
+
+
 # Explicit names used by integrations and tests.
 start_task_workflow = create_task_workflow
 monitor_verify_workflow = verify_workflow

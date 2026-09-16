@@ -340,6 +340,53 @@ def ready_nodes(nodes: List[DAGNode]) -> List[DAGNode]:
     return ready
 
 
+def dependency_closure(nodes: Sequence[DAGNode], blocked_ids: Sequence[str]) -> set:
+    """Return the hard-dependency descendants of blocked nodes, including roots.
+
+    ``integration_after`` is deliberately excluded: it is review/coordination
+    metadata and never makes a node part of a blocked execution closure.
+    """
+    by_id = {node.id: node for node in nodes}
+    closure = {node_id for node_id in blocked_ids if node_id in by_id}
+    changed = True
+    while changed:
+        changed = False
+        for node in nodes:
+            if node.id in closure:
+                continue
+            if any(dep in closure for dep in node.depends_on):
+                closure.add(node.id)
+                changed = True
+    return closure
+
+
+def node_scoped_ready(
+    nodes: Sequence[DAGNode], blocked_ids: Optional[Sequence[str]] = None
+) -> List[str]:
+    """Compute ready node IDs while isolating blocked dependency closures.
+
+    Only ``depends_on`` is consulted. Repair/wait states therefore consume
+    their existing identity/capacity but do not suppress unrelated ready nodes.
+    """
+    if _structural_errors(list(nodes)):
+        return []
+    by_id = {node.id: node for node in nodes}
+    closure = dependency_closure(nodes, blocked_ids or ())
+    ready: List[str] = []
+    for node in nodes:
+        if node.id in closure or node.status not in ("planned", "ready"):
+            continue
+        if _contract_error(node):
+            continue
+        if all(
+            dependency in by_id
+            and by_id[dependency].status == "accepted"
+            for dependency in node.depends_on
+        ):
+            ready.append(node.id)
+    return ready
+
+
 def _cycle_nodes(nodes: List[DAGNode]) -> List[str]:
     """Return nodes participating in hard-dependency cycles."""
     graph = {node.id: list(node.depends_on) for node in nodes}

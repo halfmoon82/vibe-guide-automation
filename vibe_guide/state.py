@@ -31,6 +31,7 @@ from .models import (
     SupervisorLeaseObservation,
     WaitThreadsCursorObservation,
 )
+from .binding_contract import BindingIntent as V44BindingIntent, BindingProof as V44BindingProof
 from .paths import ProjectPaths
 
 
@@ -339,6 +340,10 @@ class RunSnapshot:
     capacity: int = 0
     monitor_entry_evidence: str = ""
     parallel_groups: Dict[str, List[str]] = field(default_factory=dict)
+    # V4.4 two-phase binding is additive; legacy binding_intent semantics are
+    # intentionally left unchanged for old snapshots and replay.
+    v44_binding_intent: Optional[Dict[str, Any]] = None
+    v44_binding_proof: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution_engine, str) or not isinstance(self.engine_mode, str) or not isinstance(self.engine_evidence_ref, str):
@@ -402,6 +407,10 @@ class RunSnapshot:
             result["binding_intent"] = self.binding_intent.to_dict()
         if isinstance(self.binding_observation, BindingObservation):
             result["binding_observation"] = self.binding_observation.to_dict()
+        if isinstance(self.v44_binding_intent, V44BindingIntent):
+            result["v44_binding_intent"] = self.v44_binding_intent.to_dict()
+        if isinstance(self.v44_binding_proof, V44BindingProof):
+            result["v44_binding_proof"] = self.v44_binding_proof.to_dict()
         return result
 
     @classmethod
@@ -427,7 +436,7 @@ class RunSnapshot:
             "binding_state",
             "business_write_allowed",
         }
-        allowed = with_capability | binding_fields | {"integration_review_evidence", "workflow", "prd_digest", "spec_digest", "legacy_run", "legacy_evidence", "legacy_evidence_digest", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "ready_set", "topology_digest", "started_nodes", "active_concurrency", "capacity", "monitor_entry_evidence", "parallel_groups"}
+        allowed = with_capability | binding_fields | {"integration_review_evidence", "workflow", "prd_digest", "spec_digest", "legacy_run", "legacy_evidence", "legacy_evidence_digest", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "ready_set", "topology_digest", "started_nodes", "active_concurrency", "capacity", "monitor_entry_evidence", "parallel_groups", "v44_binding_intent", "v44_binding_proof"}
         if not isinstance(data, dict) or not set(data).issubset(allowed) or not expected.issubset(data):
             raise ValueError("snapshot schema is invalid")
         normalized = dict(data)
@@ -453,6 +462,16 @@ class RunSnapshot:
         normalized.setdefault("capacity", 0)
         normalized.setdefault("monitor_entry_evidence", "")
         normalized.setdefault("parallel_groups", {})
+        normalized.setdefault("v44_binding_intent", None)
+        normalized.setdefault("v44_binding_proof", None)
+        if normalized["v44_binding_intent"] is not None:
+            if not isinstance(normalized["v44_binding_intent"], dict):
+                raise ValueError("snapshot V4.4 binding intent is invalid")
+            normalized["v44_binding_intent"] = V44BindingIntent.from_dict(normalized["v44_binding_intent"]).to_dict()
+        if normalized["v44_binding_proof"] is not None:
+            if not isinstance(normalized["v44_binding_proof"], dict):
+                raise ValueError("snapshot V4.4 binding proof is invalid")
+            normalized["v44_binding_proof"] = V44BindingProof.from_dict(normalized["v44_binding_proof"]).to_dict()
         if not isinstance(normalized["integration_review_evidence"], dict):
             raise ValueError("snapshot integration review evidence is invalid")
         if normalized.get("workflow") is not None and not isinstance(normalized["workflow"], dict):
@@ -1183,8 +1202,11 @@ def load_snapshot(paths: ProjectPaths, run_id: str) -> RunSnapshot:
     raise ValueError("no valid snapshot for run " + run_id)
 
 
-def _lease_path(paths: ProjectPaths, node_id: str, worktree: str) -> Path:
-    key = hashlib.sha256((node_id + "\0" + worktree).encode("utf-8")).hexdigest()
+def _lease_path(paths: ProjectPaths, node_id: str, worktree: str, intent_digest: Optional[str] = None, role: Optional[str] = None, generation: Optional[int] = None) -> Path:
+    # V4.4 leases are keyed by the immutable intent when available.  Keep the
+    # legacy node/worktree key for old snapshots and callers.
+    material = (node_id + "\0" + worktree + (("\0" + role if role else "") + ("\0" + str(generation) if generation is not None else "") + "\0" + intent_digest if intent_digest else ""))
+    key = hashlib.sha256(material.encode("utf-8")).hexdigest()
     return _safe_project_path(paths, ".vibe", "leases", key + ".json")
 
 
@@ -1192,30 +1214,59 @@ def _lease_lock(paths: ProjectPaths) -> Path:
     return _safe_project_path(paths, ".vibe", ".leases.lock")
 
 
-def _lease_id(node_id: str, worktree: str, run_id: str) -> str:
-    return hashlib.sha256(
-        (node_id + "\0" + worktree + "\0" + run_id).encode("utf-8")
-    ).hexdigest()
+def _lease_id(node_id: str, worktree: str, run_id: str, role: Optional[str] = None, generation: Optional[int] = None, intent_digest: Optional[str] = None) -> str:
+    material = node_id + "\0" + worktree + "\0" + run_id
+    if role is not None or generation is not None or intent_digest is not None:
+        material += "\0" + str(role or "") + "\0" + str(generation if generation is not None else "") + "\0" + str(intent_digest or "")
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 supervisor_lease_id = _lease_id
 
 
 def acquire_writer_lease(
-    paths: ProjectPaths, node_id: str, worktree: str, run_id: str
+    paths: ProjectPaths, node_id: str, worktree: str, run_id: str,
+    intent_digest: Optional[str] = None, role: Optional[str] = None, generation: Optional[int] = None,
 ) -> bool:
     validate_run_id(run_id)
-    lease_path = _lease_path(paths, node_id, worktree)
+    lease_path = _lease_path(paths, node_id, worktree, intent_digest, role, generation)
     lease_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema_version": LEASE_SCHEMA_VERSION,
         "node_id": node_id,
         "worktree": worktree,
         "run_id": run_id,
-        "lease_id": _lease_id(node_id, worktree, run_id),
+        "lease_id": _lease_id(node_id, worktree, run_id, role, generation, intent_digest),
+        "role": role, "generation": generation,
+        "intent_digest": intent_digest,
         "status": "active",
     }
     with interprocess_lock(_lease_lock(paths)):
+        # No second writer may claim the same node/worktree, even with a
+        # different intent or run.  Exact same lease remains idempotent below.
+        lease_dir = _safe_project_path(paths, ".vibe", "leases")
+        for candidate in lease_dir.glob("*.json"):
+            if candidate == lease_path:
+                continue
+            try:
+                probe = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if probe.get("node_id") == node_id and probe.get("worktree") == worktree and probe.get("status") in {"active", "quarantined"}:
+                if probe.get("run_id") != run_id or (role is not None and generation is not None and probe.get("role") == role and probe.get("generation") == generation and probe.get("intent_digest") != intent_digest):
+                    return False
+        # A legacy caller must still observe any active intent-bound lease.
+        if intent_digest is None:
+            lease_dir = _safe_project_path(paths, ".vibe", "leases")
+            for candidate in lease_dir.glob("*.json"):
+                if candidate == lease_path:
+                    continue
+                try:
+                    probe = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                if probe.get("node_id") == node_id and probe.get("worktree") == worktree and probe.get("status") in {"active", "quarantined"}:
+                    return False
         if lease_path.exists():
             try:
                 existing = json.loads(lease_path.read_text(encoding="utf-8"))
@@ -1226,6 +1277,8 @@ def acquire_writer_lease(
                 and existing.get("run_id") == run_id
                 and existing.get("node_id") == node_id
                 and existing.get("worktree") == worktree
+                and existing.get("intent_digest") == intent_digest
+                and (role is None or existing.get("role") == role) and (generation is None or existing.get("generation") == generation)
             )
         _atomic_bytes(
             lease_path,
@@ -1235,7 +1288,8 @@ def acquire_writer_lease(
 
 
 def read_writer_lease(
-    paths: ProjectPaths, node_id: str, worktree: str
+    paths: ProjectPaths, node_id: str, worktree: str,
+    intent_digest: Optional[str] = None, role: Optional[str] = None, generation: Optional[int] = None,
 ) -> Optional[SupervisorLeaseObservation]:
     """Read the supervisor-owned lease without requiring provider metadata.
 
@@ -1244,28 +1298,71 @@ def read_writer_lease(
     without fabricating ownership or provenance.
     """
 
-    lease_path = _lease_path(paths, node_id, worktree)
+    lease_path = _lease_path(paths, node_id, worktree, intent_digest, role, generation)
     try:
         payload = json.loads(lease_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
+        # Intent-bound leases use a distinct filename.  A legacy read without
+        # the intent must still be able to observe the single active lease for
+        # this node/worktree; it never grants ownership and remains subject to
+        # the same schema and lease-id checks below.
+        payload = None
+        if intent_digest is None and role is None and generation is None:
+            lease_dir = _safe_project_path(paths, ".vibe", "leases")
+            try:
+                for candidate in lease_dir.glob("*.json"):
+                    try:
+                        probe = json.loads(candidate.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if (probe.get("node_id") == node_id
+                            and probe.get("worktree") == worktree
+                            and probe.get("status") == "active"):
+                        lease_path = candidate
+                        payload = probe
+                        break
+            except OSError:
+                return None
+        if payload is None:
+            return None
     if not isinstance(payload, dict):
         return None
     observed = dict(payload)
+    intent_matches = (
+        observed.get("intent_digest") == intent_digest
+        if intent_digest is not None
+        else True
+    )
+    expected_lease_id = (
+        _lease_id(
+            node_id, worktree, observed.get("run_id"),
+            observed.get("role"), observed.get("generation"),
+            observed.get("intent_digest"),
+        )
+        if (observed.get("role") is not None
+                or observed.get("generation") is not None
+                or observed.get("intent_digest") is not None)
+        else _lease_id(node_id, worktree, observed.get("run_id"))
+    )
     observed["active"] = (
         observed.get("schema_version") == LEASE_SCHEMA_VERSION
         and observed.get("node_id") == node_id
         and observed.get("worktree") == worktree
+        and intent_matches
+        and (role is None or observed.get("role") == role) and (generation is None or observed.get("generation") == generation)
         and isinstance(observed.get("run_id"), str)
-        and observed.get("lease_id") == _lease_id(node_id, worktree, observed.get("run_id"))
+        and observed.get("lease_id") == expected_lease_id
         and observed.get("status") == "active"
     )
     if not observed["active"]:
         return None
     try:
-        return SupervisorLeaseObservation._from_read(
-            observed, _token=_PROVENANCE_TOKEN
-        )
+        # ``SupervisorLeaseObservation`` exposes the stable legacy ownership
+        # proof.  Intent-bound filenames and IDs are still validated above,
+        # but are internal lease storage details and are not part of that
+        # public observation contract.
+        observed["lease_id"] = _lease_id(node_id, worktree, observed.get("run_id"))
+        return SupervisorLeaseObservation._from_read(observed, _token=_PROVENANCE_TOKEN)
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -1282,6 +1379,14 @@ def quarantine_writer_lease(
 ) -> bool:
     lease_path = _lease_path(paths, node_id, worktree)
     with interprocess_lock(_lease_lock(paths)):
+        if not lease_path.exists():
+            for candidate in (_safe_project_path(paths, ".vibe", "leases")).glob("*.json"):
+                try:
+                    probe = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                if probe.get("node_id") == node_id and probe.get("worktree") == worktree and probe.get("run_id") == run_id:
+                    lease_path = candidate; break
         try:
             payload = json.loads(lease_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError):
@@ -1302,11 +1407,28 @@ def release_writer_lease(
 ) -> bool:
     lease_path = _lease_path(paths, node_id, worktree)
     with interprocess_lock(_lease_lock(paths)):
-        try:
-            owner = json.loads(lease_path.read_text(encoding="utf-8")).get("run_id")
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return False
-        if owner != run_id:
-            return False
-        lease_path.unlink()
-        return True
+        candidates = [lease_path]
+        if not lease_path.exists():
+            try:
+                candidates.extend(
+                    candidate
+                    for candidate in _safe_project_path(paths, ".vibe", "leases").glob("*.json")
+                    if candidate != lease_path
+                )
+            except OSError:
+                return False
+        released = False
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                continue
+            if (payload.get("node_id") == node_id
+                    and payload.get("worktree") == worktree
+                    and payload.get("run_id") == run_id):
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    continue
+                released = True
+        return released
