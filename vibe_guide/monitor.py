@@ -58,6 +58,7 @@ from .task_registry import (
     save_task_binding,
 )
 from .workflow_gate import require_capability_contract, require_entry, verify_workflow
+from .authorize_entry import select_plan_workflow, verify_workflow_artifacts
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
 from .model_router import ModelRouter
@@ -987,11 +988,18 @@ class Monitor:
                 state_data = json.loads(state.read_text(encoding="utf-8"))
             except (OSError, ValueError, json.JSONDecodeError) as error:
                 raise PermissionError("session_gate_blocked") from error
-            task_workflow = state_data.get("task_workflow") or state_data.get("workflow")
+            # Evidence is selected by plan identity: a token supplied for one
+            # plan must not start a different one, so unrelated evidence reads
+            # as absent and the required-workflow gate below still blocks.
+            task_workflow = select_plan_workflow(state_data, self.plan.plan_id)
             if task_workflow is not None:
                 workflow_result = verify_workflow(task_workflow)
                 if workflow_result.get("status") != "complete":
                     raise PermissionError("required_workflow_blocked: {}".format(workflow_result.get("node", "unknown")))
+                # Recorded digests are otherwise never re-checked, so an
+                # artifact edited after authorization would execute on stale
+                # evidence.
+                verify_workflow_artifacts(self.paths, task_workflow)
         elif self.paths.vibe.exists():
             raise PermissionError("session_gate_blocked: V2 state.json is missing")
         assert record is not None

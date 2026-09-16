@@ -120,6 +120,27 @@ def publish_complex_probe(case) -> Path:
     return root
 
 
+def publish_second_plan(root: Path, plan_id: str) -> None:
+    """Publish another complex plan in the same project.
+
+    Two plans in one project is the case the original suite never covered, and
+    it is where cross-plan authorization reuse becomes observable.
+    """
+    spec = json.loads(json.dumps(_NODE_SPEC))
+    spec["spec_path"] = ".vibe/plans/{}/prd.md".format(plan_id)
+    spec["nodes"][0]["id"] = plan_id + "-node"
+    spec_name = "node-spec-{}.json".format(plan_id)
+    (root / spec_name).write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    published = run_cli(
+        [
+            "plan", "--json", "--request", _REQUEST, "--s1", "5,5,5,5,5",
+            "--plan-id", plan_id, "--node-spec", spec_name,
+        ],
+        root,
+    )
+    assert published.payload.get("status") == "ok", published.payload
+
+
 def _cleanup(root: Path) -> None:
     import shutil
     shutil.rmtree(root, ignore_errors=True)
