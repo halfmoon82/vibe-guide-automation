@@ -1186,10 +1186,34 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         try:
             workflow = materialize_workflow_evidence(paths, args.plan, args.authorize or "")
         except PermissionError as error:
+            # An OS-level permission fault is an environment problem, not a
+            # policy decision; only the latter is reported as `blocked`.
+            if getattr(error, "errno", None) is not None:
+                return _result(
+                    UNKNOWN,
+                    {
+                        "command": "authorize",
+                        "status": "blocked_unknown",
+                        "reason": "state_unreadable: " + str(error),
+                    },
+                    "授权状态未知：" + str(error),
+                    args.as_json,
+                )
             return _result(
                 BLOCKED,
                 {"command": "authorize", "status": "blocked", "reason": str(error)},
                 "授权未记录：" + str(error),
+                args.as_json,
+            )
+        except json.JSONDecodeError as error:
+            return _result(
+                UNKNOWN,
+                {
+                    "command": "authorize",
+                    "status": "blocked_unknown",
+                    "reason": "state_unreadable: " + str(error),
+                },
+                "授权状态未知：state.json 无法解析：" + str(error),
                 args.as_json,
             )
         except (OSError, ValueError, KeyError, TypeError) as error:
