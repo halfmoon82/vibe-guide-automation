@@ -5,12 +5,16 @@ mandatory ten-node workflow evidence.  These tests pin the two properties that
 make it safe: it refuses anything short of the exact token, and every node
 record it writes is derived from a published artifact rather than assumed.
 """
+import errno
 import hashlib
 import json
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vibe_guide.authorize_entry import (
+    AuthorizationDenied,
     build_workflow_evidence,
     materialize_workflow_evidence,
     select_plan_workflow,
@@ -126,8 +130,11 @@ class AuthorizeEntryContract(unittest.TestCase):
         prd = self.root / ".vibe" / "plans" / "probe-plan" / "prd.md"
         prd.write_text(prd.read_text(encoding="utf-8") + "\n附加改动\n", encoding="utf-8")
         result = run_cli(["monitor", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
-        self.assertNotEqual(result.payload.get("status"), "ok")
         self.assertIsNone(result.payload.get("run_id"))
+        # Name the file and the reason: `assertNotEqual(status, "ok")` alone
+        # would also pass if monitor blocked for some unrelated cause.
+        self.assertIn("workflow_evidence_stale", result.payload.get("reason", ""))
+        self.assertIn("prd.md", result.payload.get("reason", ""))
 
     def test_stripping_artifact_keys_does_not_disarm_the_digest_check(self):
         run_cli(["authorize", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
@@ -145,20 +152,69 @@ class AuthorizeEntryContract(unittest.TestCase):
         result = run_cli(["monitor", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
         self.assertIsNone(result.payload.get("run_id"))
 
-    def test_resume_also_rejects_an_artifact_edited_after_the_run_started(self):
+    def _authorize_and_start(self):
         run_cli(["authorize", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
         started = run_cli(["monitor", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
         run_id = started.payload.get("run_id")
         self.assertIsNotNone(run_id)
+        return run_id
+
+    def _resume(self, run_id):
+        directory, plan, nodes, card = _load_plan(self.paths, "probe-plan")
+        return Monitor(self.paths, plan, nodes).resume(run_id, runner=None)
+
+    def test_an_untampered_run_can_actually_resume(self):
+        # The positive path: without this, every rejection test below passes
+        # vacuously on a resume that is broken for unrelated reasons.  It was:
+        # `evidence` is a redacted key, so the digests in the run snapshot are
+        # all placeholders and checking that copy blocked every clean resume.
+        run_id = self._authorize_and_start()
+        self._resume(run_id)
+
+    def test_resume_rejects_an_artifact_edited_after_the_run_started(self):
+        run_id = self._authorize_and_start()
         # dag-audit.json is outside the PRD/spec lineage check, so only the
         # artifact digests can catch it.
         audit = self.root / ".vibe" / "plans" / "probe-plan" / "dag-audit.json"
         data = json.loads(audit.read_text(encoding="utf-8"))
         data["node_count"] = 999
         audit.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        directory, plan, nodes, card = _load_plan(self.paths, "probe-plan")
+        with self.assertRaises(PermissionError) as caught:
+            self._resume(run_id)
+        # Naming the file keeps this from passing on an unrelated failure.
+        self.assertIn("dag-audit.json", str(caught.exception))
+
+    def test_resume_rejects_a_decision_edited_in_a_file_dispatch_rewrites(self):
+        # plan.json is rewritten by dispatch itself, so its byte digest cannot
+        # be compared after a run starts; the decisions inside it still must be.
+        run_id = self._authorize_and_start()
+        plan_path = self.root / ".vibe" / "plans" / "probe-plan" / "plan.json"
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        options = plan["decisions"][0]["options"]
+        plan["decisions"][0]["selected"] = next(x for x in options if x != plan["decisions"][0]["selected"])
+        plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(PermissionError) as caught:
+            self._resume(run_id)
+        self.assertIn("plan.json", str(caught.exception))
+
+    def test_resume_rejects_a_confirmation_unbound_from_the_card(self):
+        run_id = self._authorize_and_start()
+        path = self.root / ".vibe" / "plans" / "probe-plan" / "plan-confirmation.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["authorization_digest"] = "0" * 64
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        with self.assertRaises(PermissionError) as caught:
+            self._resume(run_id)
+        self.assertIn("plan-confirmation.json", str(caught.exception))
+
+    def test_resume_blocks_when_the_authorizing_evidence_is_removed(self):
+        run_id = self._authorize_and_start()
+        state_path = self.paths.vibe / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.pop("task_workflow")
+        state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         with self.assertRaises(PermissionError):
-            Monitor(self.paths, plan, nodes).resume(run_id, runner=None)
+            self._resume(run_id)
 
     def test_reauthorizing_is_idempotent_for_an_unchanged_plan(self):
         first = materialize_workflow_evidence(self.paths, "probe-plan", "AUTHORIZE")
@@ -172,6 +228,48 @@ class AuthorizeEntryContract(unittest.TestCase):
         # A corrupt state file is an environment fault, not a design change.
         self.assertEqual(result.payload["status"], "blocked_unknown")
         self.assertIn("state_unreadable", result.payload["reason"])
+
+    def test_a_policy_denial_carrying_an_errno_still_reports_as_blocked(self):
+        # The classification must rest on the exception type.  When it rested on
+        # `error.errno`, a denial raised with one downgraded to the soft
+        # `blocked_unknown`, which reads as "environment problem, retry".
+        denial = AuthorizationDenied("authorization required: fabricated denial")
+        denial.errno = errno.EACCES
+        with mock.patch(
+            "vibe_guide.cli.materialize_workflow_evidence", side_effect=denial
+        ):
+            result = run_cli(["authorize", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
+        self.assertEqual(result.payload["status"], "blocked")
+
+    def test_an_os_permission_fault_reports_as_unknown(self):
+        fault = PermissionError(errno.EACCES, "Permission denied")
+        with mock.patch(
+            "vibe_guide.cli.materialize_workflow_evidence", side_effect=fault
+        ):
+            result = run_cli(["authorize", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
+        self.assertEqual(result.payload["status"], "blocked_unknown")
+
+    def test_concurrent_authorization_keeps_every_plans_evidence(self):
+        publish_second_plan(self.root, "plan-b")
+        errors = []
+
+        def authorize(plan_id):
+            try:
+                materialize_workflow_evidence(self.paths, plan_id, "AUTHORIZE")
+            except Exception as error:  # pragma: no cover - reported below
+                errors.append((plan_id, repr(error)))
+
+        threads = [threading.Thread(target=authorize, args=(p,)) for p in ("probe-plan", "plan-b") * 3]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        # An unlocked read-modify-write lets the loser write back the snapshot
+        # it read, silently dropping the other plan's evidence.
+        state = json.loads((self.paths.vibe / "state.json").read_text(encoding="utf-8"))
+        self.assertIsNotNone(select_plan_workflow(state, "probe-plan"))
+        self.assertIsNotNone(select_plan_workflow(state, "plan-b"))
 
     def test_state_stays_v42_valid_after_materialization(self):
         materialize_workflow_evidence(self.paths, "probe-plan", "AUTHORIZE")

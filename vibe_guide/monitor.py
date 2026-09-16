@@ -58,7 +58,7 @@ from .task_registry import (
     save_task_binding,
 )
 from .workflow_gate import require_capability_contract, require_entry, verify_workflow
-from .authorize_entry import select_plan_workflow, verify_workflow_artifacts
+from .authorize_entry import load_live_workflow, select_plan_workflow, verify_workflow_artifacts
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
 from .model_router import ModelRouter
@@ -1105,8 +1105,15 @@ class Monitor:
             # Symmetric with start(): the lineage check below covers prd.md and
             # the spec path only, so without this a post-authorization edit to
             # nodes.json, dag-audit.json, plan-confirmation.json or the card
-            # would go undetected on every tick after the first.
-            verify_workflow_artifacts(self.paths, snapshot.workflow)
+            # would go undetected on every tick after the first.  The digests
+            # must be read from `.vibe/state.json`, not from
+            # `snapshot.workflow`: `evidence` is one of the redacted keys, so
+            # the copy saved with the run has every `ref` and `sha256` replaced
+            # by a placeholder and could never match.
+            live_workflow = load_live_workflow(self.paths, snapshot.plan_id)
+            if live_workflow is None:
+                raise PermissionError("required_workflow_blocked: authorizing evidence is no longer present")
+            verify_workflow_artifacts(self.paths, live_workflow, run_started=True)
         legacy_allowed = self._legacy_binding_valid(snapshot.legacy_run, snapshot.legacy_evidence, snapshot.legacy_evidence_digest)
         if "integration-review" in snapshot.nodes and snapshot.workflow is None and not legacy_allowed:
             raise PermissionError("required_workflow_blocked: workflow")
