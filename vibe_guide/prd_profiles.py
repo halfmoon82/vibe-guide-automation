@@ -196,3 +196,25 @@ def select_prd_profiles(selection: Dict[str, str], candidates: Iterable[SkillPro
         else:
             raise ValueError("unsupported Skill profile selection: %s" % action)
     return result
+
+
+def build_prd_guide_draft(request: str, code_evidence=None) -> Dict[str, Any]:
+    """Create a source-labelled PRD draft from natural language and read-only evidence."""
+    if not isinstance(request, str) or not request.strip():
+        raise ValueError("request is required")
+    evidence = list(code_evidence or [])
+    return {
+        "objective": {"value": request.strip(), "source": "user_confirmed"},
+        "user_scenarios": [{"value": "用户希望解决所描述的问题并获得可验证结果", "source": "system_inferred"}],
+        "success_criteria": [{"value": "结果可通过运行时验收证明", "source": "system_inferred"}],
+        "code_evidence": [{"value": item, "source": "unverified"} for item in evidence],
+        "non_goals": [{"value": "未明确的外部或部署动作", "source": "system_inferred"}],
+    }
+
+
+def render_planning_brief(plan_id: str, draft: Dict[str, Any], traceability=None) -> str:
+    rows = traceability or []
+    lines = ["# Planning Brief", "", "## 产品目标", str(draft.get("objective", {})), "", "## 用户场景", str(draft.get("user_scenarios", [])), "", "## 代码现状", str(draft.get("code_evidence", [])), "", "## 方案", "按已确认 PRD 目标生成最小变更方案。", "", "## 非目标", str(draft.get("non_goals", [])), "", "## Spec/Issue 映射与运行时验收", "| Goal | User scenario | Current evidence | Spec | Issue | DAG node | Runtime acceptance |", "|---|---|---|---|---|---|---|"]
+    for row in rows:
+        lines.append("| " + " | ".join(str(row.get(k, "")) for k in ("goal","scenario","current_evidence","spec","issue","dag_node","runtime_acceptance")) + " |")
+    return "\n".join(lines) + "\n"

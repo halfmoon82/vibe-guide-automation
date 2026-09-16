@@ -6,7 +6,22 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 ## 安装
 
-当前发行版本为 `4.2.0`。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
+当前发行版本为 `4.4.0`。版本真相以仓库中匹配的 `v4.4.0` tag、对应提交和 Release 资产为准；`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
+
+### 给 Agent 的安装协议
+
+当用户要求安装或升级时，Agent 必须按以下顺序执行并回报证据：
+
+1. 先查询最新 tag，不根据 README、`dist/` 文件名或历史记忆判断版本：
+   `git ls-remote --tags --sort='-v:refname' https://github.com/halfmoon82/vibe-guide-automation.git 'refs/tags/v*'`
+2. 选择最新稳定 tag（当前应为 `v4.4.0`），核对 tag、提交和可下载 Release 资产版本一致；无法核对时保持 `unknown`，不要猜测。
+3. 在目标环境安装该版本，并验证：
+   `python3 -c "import vibe_guide; print(vibe_guide.__version__)"`
+   `vibe --help`
+4. 安装完成后进入用户指定项目，先运行只读的 `vibe scan --json`；只有用户明确确认初始化时，才运行 `vibe init --confirm --json`。
+5. 初始化后回报 `.vibe/session-contract.json` 和初始化结果；安装成功不等于项目已初始化，也不等于已授权监工、push、merge 或 deploy。
+
+下载包后 Agent 不应假设安装器会自动运行向导或写入项目；初始化必须作为独立、可见、可追溯步骤执行。
 
 升级与回滚必须显式指定已验证的版本：从 V2.0.0 安装后执行 `pip install --upgrade` 到 V3.10.0，确认版本和 CLI，再使用 V2.0.0 构建产物 `--force-reinstall` 回滚并重新确认版本。`.vibe/` 迁移另按 V3.10 安装流程执行；provider、缺失 Python 版本和远端 Release 能力未验证时保持未验证。
 

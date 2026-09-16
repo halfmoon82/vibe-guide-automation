@@ -1,0 +1,61 @@
+{
+  "kind": "v45_workflow_revision",
+  "schema_version": 1,
+  "status": "pending_user_authorization",
+  "revision": 6,
+  "project_root": "/Users/smy/Desktop/CFO/黑客松/开发辅助",
+  "code_head": "53ceb175ef9a51b5e0ea1bcbdcee305c61de2f24",
+  "supersedes": [
+    "docs/superpowers/plans/2026-09-15-v45-prd-guide-workflow-rev5.json",
+    "docs/superpowers/plans/2026-09-15-v45-prd-guide-authorization-card-rev5b.json"
+  ],
+  "artifacts": {
+    "docs/superpowers/specs/2026-09-15-v45-prd-guide-prd.md": "934d09b11ecabb75b60dd98e08e59f4259b2d6ce103204d93e9f467ae0301fb7",
+    "docs/superpowers/specs/2026-09-15-v45-prd-guide-spec-issues-rev6.md": "c829edbfdf36110aeca03f0d8188a2a23833f626a5b6346203f490d43fd9313c",
+    "docs/superpowers/plans/2026-09-15-v45-prd-guide-dag-audit-rev6.md": "603e3184249433d511a11bac3717004e3ee625f283206088a0056e04183ec7d0",
+    "docs/superpowers/plans/2026-09-15-v45-prd-guide-implementation-plan-rev6.md": "bdcec27f4af1ffb99512211f63a829d0f1caf26535e2d1dbb3dbff10d27d7eec"
+  },
+  "execution_authorized": false,
+  "monitor_started": false,
+  "dag": {
+    "depends_on": {
+      "ISSUE-06": [
+        "ISSUE-02"
+      ],
+      "ISSUE-07": [
+        "ISSUE-06"
+      ],
+      "ISSUE-08": [
+        "ISSUE-06"
+      ],
+      "ISSUE-05": [
+        "ISSUE-01",
+        "ISSUE-03",
+        "ISSUE-04",
+        "ISSUE-07",
+        "ISSUE-08"
+      ]
+    },
+    "integration_after": [
+      "integration-review"
+    ],
+    "initial_ready": [
+      "ISSUE-01",
+      "ISSUE-02",
+      "ISSUE-03",
+      "ISSUE-04"
+    ],
+    "parallel_groups": {
+      "initial": [
+        "ISSUE-01",
+        "ISSUE-02",
+        "ISSUE-03",
+        "ISSUE-04"
+      ],
+      "post-06": [
+        "ISSUE-07",
+        "ISSUE-08"
+      ]
+    }
+  }
+}

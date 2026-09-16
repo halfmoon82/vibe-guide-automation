@@ -81,6 +81,7 @@ vibe_guide/__init__.py
 vibe_guide/__main__.py
 vibe_guide/authorization.py
 vibe_guide/baseline_health.py
+vibe_guide/binding_contract.py
 vibe_guide/binding_lifecycle.py
 vibe_guide/brief.py
 vibe_guide/capability_contract.py
@@ -95,6 +96,7 @@ vibe_guide/diagnostics.py
 vibe_guide/doctor.py
 vibe_guide/engine_attestation.py
 vibe_guide/evidence.py
+vibe_guide/history_migration.py
 vibe_guide/initializer.py
 vibe_guide/installation.py
 vibe_guide/lifecycle.py
@@ -103,6 +105,7 @@ vibe_guide/migration.py
 vibe_guide/model_router.py
 vibe_guide/models.py
 vibe_guide/monitor.py
+vibe_guide/native_loop.py
 vibe_guide/path_ownership.py
 vibe_guide/paths.py
 vibe_guide/planner.py
@@ -111,6 +114,7 @@ vibe_guide/preflight.py
 vibe_guide/review.py
 vibe_guide/scanner.py
 vibe_guide/session_bypass.py
+vibe_guide/session_entry.py
 vibe_guide/skills.py
 vibe_guide/state.py
 vibe_guide/supervisor.py

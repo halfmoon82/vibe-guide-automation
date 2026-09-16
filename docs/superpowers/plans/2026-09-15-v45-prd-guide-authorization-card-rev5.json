@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "card_id": "v45-prd-guide-auth-rev5",
+  "plan_id": "v45-prd-guide",
+  "plan_revision": 5,
+  "status": "superseded_by_rev5b",
+  "scope": "ISSUE-01..ISSUE-06 per revision 5",
+  "ready_nodes": [
+    "ISSUE-01",
+    "ISSUE-02",
+    "ISSUE-03",
+    "ISSUE-04"
+  ],
+  "remote_git_actions": null,
+  "remote_git_actions_options": [
+    "allow",
+    "deny"
+  ],
+  "deploy_authorization": false,
+  "execution_authorized": false,
+  "monitor_started": false,
+  "supersedes": "docs/superpowers/plans/2026-09-14-v45-session-s0-s1-entry-authorization-card.json",
+  "evidence_refs": {
+    "docs/superpowers/specs/2026-09-15-v45-prd-guide-prd.md": "8de5ef377fa431d2562a980b55cf638a38907b71e75091b28a060f9e77d886ca",
+    "docs/superpowers/specs/2026-09-15-v45-prd-guide-spec-issues.md": "a1d1f6d2cd916a02815d5d60290341010e6bcb76ba2b84c729baa160e4683695",
+    "docs/superpowers/plans/2026-09-15-v45-prd-guide-dag-audit.md": "f68e3cf56afe00a9b8fe2123ed628fb62cacf27f594eae0a538d653ab35affa3",
+    "docs/superpowers/plans/2026-09-15-v45-prd-guide-implementation-plan.md": "767ad2293bd7f698c9c688eb3d6139371def7775fc745760f28d6c24f65e431b"
+  },
+  "permissions": {
+    "planning_read_only": true,
+    "run_tests": true,
+    "create_workers": false,
+    "start_monitor": false,
+    "commit": false,
+    "push": false,
+    "create_pr": false,
+    "create_mr": false,
+    "merge": false,
+    "deploy": false
+  },
+  "superseded_by": "docs/superpowers/plans/2026-09-15-v45-prd-guide-authorization-card-rev5b.json"
+}

@@ -269,3 +269,17 @@ class PlannerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PRDGuideTests(unittest.TestCase):
+    def test_natural_language_draft_labels_inferred_and_confirmed_fields(self):
+        from vibe_guide.prd_profiles import build_prd_guide_draft
+        draft = build_prd_guide_draft("修复入口", ["vibe_guide/cli.py:main"])
+        self.assertEqual(draft["objective"]["source"], "user_confirmed")
+        self.assertEqual(draft["user_scenarios"][0]["source"], "system_inferred")
+        self.assertEqual(draft["code_evidence"][0]["source"], "unverified")
+
+    def test_planning_brief_contains_traceability_columns(self):
+        from vibe_guide.prd_profiles import render_planning_brief
+        text = render_planning_brief("p", {"objective": {"value":"x"}}, [{"goal":"g","scenario":"s","current_evidence":"vibe_guide/cli.py:main","spec":"spec","issue":"ISSUE-06","dag_node":"n","runtime_acceptance":"test"}])
+        self.assertIn("## 代码现状", text)
+        self.assertIn("| Goal | User scenario | Current evidence | Spec | Issue | DAG node | Runtime acceptance |", text)

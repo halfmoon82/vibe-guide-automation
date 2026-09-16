@@ -9,6 +9,94 @@ from typing import Any, Dict, List, Optional
 import re
 
 
+@dataclass(frozen=True)
+class PRDCheckpoint:
+    kind: str
+    fields: Dict[str, Any]
+    evidence: List[str]
+    status: str
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PRD:
+    title: str
+    objective: str
+    revision: int = 1
+    status: str = "draft"
+
+    def __post_init__(self):
+        if not isinstance(self.title, str) or not self.title.strip():
+            raise ValueError("PRD title is required")
+        if not isinstance(self.objective, str) or not self.objective.strip():
+            raise ValueError("PRD objective is required")
+        if isinstance(self.revision, bool) or not isinstance(self.revision, int) or self.revision < 1:
+            raise ValueError("PRD revision must be a positive integer")
+        if self.status not in {"draft", "blocked_design", "blocked_decision", "review_required", "approved"}:
+            raise ValueError("unsupported PRD status")
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class StageHandoff:
+    from_stage: str
+    from_status: str
+    to_stage: str
+    readiness: str
+    evidence_refs: List[str]
+    open_questions: List[str]
+    required_user_action: str
+    prompt: str
+    forbidden_automatic_actions: List[str]
+    revision: int = 1
+    authorizes: bool = False
+    creates_worker: bool = False
+
+    def __post_init__(self):
+        if not all(isinstance(value, str) and value.strip() for value in (self.from_stage, self.from_status, self.to_stage, self.readiness, self.required_user_action, self.prompt)):
+            raise ValueError("stage handoff text fields are required")
+        for name in ("evidence_refs", "open_questions", "forbidden_automatic_actions"):
+            value = getattr(self, name)
+            if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+                raise TypeError("%s must be a list of strings" % name)
+        if self.authorizes or self.creates_worker:
+            raise ValueError("stage handoff cannot authorize or create workers")
+        if isinstance(self.revision, bool) or not isinstance(self.revision, int) or self.revision < 1:
+            raise ValueError("stage handoff revision must be positive")
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(**data)
+
+    @classmethod
+    def for_blocked_prd(cls, evidence_refs, question, revision=1):
+        return cls("prd", "blocked_design", "spec_issue_dag", "blocked_design", list(evidence_refs), [question], "answer_question", "请先回答产品问题，再继续 Spec/Issue/DAG。", ["create_spec", "create_worker", "authorize", "deploy"], revision)
+
+    def render(self):
+        return "stage={} status={} readiness={} revision={} evidence_refs={} prompt={} open_questions={}".format(self.from_stage, self.from_status, self.readiness, self.revision, self.evidence_refs, self.prompt, self.open_questions)
+
+@dataclass(frozen=True)
+class SkillProfile:
+    name: str
+    source_url: str
+    commit_sha: str
+    license: str
+    selected_paths: List[str]
+    status: str = "candidate"
+    installed_at: str = ""
+    install_time: Any = None
+    verification_status: str = "recheck_before_install"
+
+    def to_dict(self):
+        return asdict(self)
+
 _NODE_STATUSES = frozenset(
     {
         "planned",
@@ -243,6 +331,12 @@ class Plan:
     )
     nodes: List[DAGNode] = field(default_factory=list)
     integration_contract: Dict[str, Any] = field(default_factory=dict)
+    iteration_context: Dict[str, Any] = field(default_factory=dict)
+    compatibility_scope: Dict[str, Any] = field(default_factory=dict)
+    agentsmd_acceptance_refs: List[str] = field(default_factory=list)
+    integration_acceptance_contract: Dict[str, Any] = field(default_factory=dict)
+    unverified_or_excluded: List[str] = field(default_factory=list)
+    planning_goals: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self):
         self.plan_id = _identifier(self.plan_id, "plan id")
