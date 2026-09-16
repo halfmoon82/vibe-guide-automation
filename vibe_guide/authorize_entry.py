@@ -7,8 +7,16 @@ This module closes that gap without weakening the gate:
 * Every one of the ten node records is a projection of an artifact that already
   passed the planning gate, and each carries that artifact's project-relative
   path plus the SHA-256 of the bytes actually read, so a reviewer can re-derive
-  it.  ``verify_workflow_artifacts`` re-hashes them before execution, so a plan
-  edited after authorization does not run on the old evidence.
+  it.  ``verify_workflow_artifacts`` re-hashes them in both ``Monitor.start``
+  and ``Monitor.resume``, so a plan edited after authorization does not run on
+  the old evidence.  The covered set is the gate inputs (``prd.md``,
+  ``plan.json``, ``nodes.json``, ``authorization-card.json``,
+  ``dag-audit.json``, ``plan-confirmation.json``, and every spec/issue file);
+  ``dag.yaml`` and ``plan.md`` are human-readable projections and
+  ``engine-attestation.json`` is validated separately by
+  ``validate_engine_attestation``, so those three are deliberately outside it.
+  Re-running ``authorize`` re-derives the digests from current content, which is
+  intended: that is a fresh user token on the new content, not a bypass.
 * The decision digest is recomputed from the decisions read here and compared
   against the card, rather than copied out of the card, so an edited decision is
   detected instead of attested.
@@ -282,15 +290,20 @@ def verify_workflow_artifacts(paths, workflow: Mapping[str, Any]) -> None:
     for node_id, record in records.items():
         evidence = record.get("evidence") if isinstance(record, Mapping) else None
         if not isinstance(evidence, Mapping):
-            continue
+            raise PermissionError("workflow_evidence_stale: evidence is missing for " + str(node_id))
+        # `authorize` always records an artifact for all ten nodes, so a record
+        # without one is never a legitimate state.  Skipping it silently would
+        # disarm both stale- and forged-evidence detection for that node.
         pending = [evidence.get("artifact")]
         for key in ("spec_artifacts", "issue_artifacts"):
             listed = evidence.get(key)
-            if isinstance(listed, list):
+            if listed is not None:
+                if not isinstance(listed, list):
+                    raise PermissionError("workflow_evidence_stale: malformed {} in {}".format(key, node_id))
                 pending.extend(listed)
         for artifact in pending:
             if not isinstance(artifact, Mapping):
-                continue
+                raise PermissionError("workflow_evidence_stale: missing artifact reference in " + str(node_id))
             reference = artifact.get("ref")
             recorded = artifact.get("sha256")
             if not isinstance(reference, str) or not isinstance(recorded, str):

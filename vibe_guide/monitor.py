@@ -927,6 +927,11 @@ class Monitor:
             result = verify_workflow(snapshot.workflow)
             if result.get("status") != "complete":
                 raise PermissionError("required_workflow_blocked: {}".format(result.get("node", "unknown")))
+            # Symmetric with start(): the lineage check below covers prd.md and
+            # the spec path only, so without this a post-authorization edit to
+            # nodes.json, dag-audit.json, plan-confirmation.json or the card
+            # would go undetected on every tick after the first.
+            verify_workflow_artifacts(self.paths, snapshot.workflow)
         legacy_allowed = self._legacy_binding_valid(snapshot.legacy_run, snapshot.legacy_evidence, snapshot.legacy_evidence_digest)
         if "integration-review" in snapshot.nodes and snapshot.workflow is None and not legacy_allowed:
             raise PermissionError("required_workflow_blocked: workflow")

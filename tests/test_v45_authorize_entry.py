@@ -16,7 +16,8 @@ from vibe_guide.authorize_entry import (
     select_plan_workflow,
     verify_workflow_artifacts,
 )
-from vibe_guide.cli import run_cli
+from vibe_guide.cli import _load_plan, run_cli
+from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.workflow_gate import REQUIRED_COMPLEX_WORKFLOW, require_v42_sdd_first, verify_workflow
 
@@ -127,6 +128,37 @@ class AuthorizeEntryContract(unittest.TestCase):
         result = run_cli(["monitor", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
         self.assertNotEqual(result.payload.get("status"), "ok")
         self.assertIsNone(result.payload.get("run_id"))
+
+    def test_stripping_artifact_keys_does_not_disarm_the_digest_check(self):
+        run_cli(["authorize", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
+        state_path = self.paths.vibe / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        for record in state["task_workflow"]["probe-plan"]["node_records"].values():
+            for key in ("artifact", "spec_artifacts", "issue_artifacts"):
+                record["evidence"].pop(key, None)
+        state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        prd = self.root / ".vibe" / "plans" / "probe-plan" / "prd.md"
+        prd.write_text(prd.read_text(encoding="utf-8") + "\n事后篡改\n", encoding="utf-8")
+        # `authorize` always records an artifact per node, so their absence is
+        # itself evidence of tampering and must not fall through as "nothing to
+        # check".
+        result = run_cli(["monitor", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
+        self.assertIsNone(result.payload.get("run_id"))
+
+    def test_resume_also_rejects_an_artifact_edited_after_the_run_started(self):
+        run_cli(["authorize", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
+        started = run_cli(["monitor", "--json", "--plan", "probe-plan", "--authorize", "AUTHORIZE"], self.root)
+        run_id = started.payload.get("run_id")
+        self.assertIsNotNone(run_id)
+        # dag-audit.json is outside the PRD/spec lineage check, so only the
+        # artifact digests can catch it.
+        audit = self.root / ".vibe" / "plans" / "probe-plan" / "dag-audit.json"
+        data = json.loads(audit.read_text(encoding="utf-8"))
+        data["node_count"] = 999
+        audit.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        directory, plan, nodes, card = _load_plan(self.paths, "probe-plan")
+        with self.assertRaises(PermissionError):
+            Monitor(self.paths, plan, nodes).resume(run_id, runner=None)
 
     def test_reauthorizing_is_idempotent_for_an_unchanged_plan(self):
         first = materialize_workflow_evidence(self.paths, "probe-plan", "AUTHORIZE")
