@@ -44,7 +44,7 @@ from .scanner import scan_project
 from .diagnostics import screen_session, require_session_screened
 from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
 from .workflow_gate import require_capability_contract
-from .authorize_entry import materialize_workflow_evidence
+from .authorize_entry import AuthorizationDenied, materialize_workflow_evidence
 from .state import load_events, load_snapshot
 from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
@@ -1185,24 +1185,27 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             )
         try:
             workflow = materialize_workflow_evidence(paths, args.plan, args.authorize or "")
-        except PermissionError as error:
-            # An OS-level permission fault is an environment problem, not a
-            # policy decision; only the latter is reported as `blocked`.
-            if getattr(error, "errno", None) is not None:
-                return _result(
-                    UNKNOWN,
-                    {
-                        "command": "authorize",
-                        "status": "blocked_unknown",
-                        "reason": "state_unreadable: " + str(error),
-                    },
-                    "授权状态未知：" + str(error),
-                    args.as_json,
-                )
+        except AuthorizationDenied as error:
+            # A policy denial, identified by its type rather than by whether the
+            # exception happens to carry an errno.
             return _result(
                 BLOCKED,
                 {"command": "authorize", "status": "blocked", "reason": str(error)},
                 "授权未记录：" + str(error),
+                args.as_json,
+            )
+        except PermissionError as error:
+            # Every policy path raises AuthorizationDenied, so anything left
+            # here is an OS-level fault: an environment problem, not a design
+            # decision, and reporting it as `blocked` would misattribute it.
+            return _result(
+                UNKNOWN,
+                {
+                    "command": "authorize",
+                    "status": "blocked_unknown",
+                    "reason": "state_unreadable: " + str(error),
+                },
+                "授权状态未知：" + str(error),
                 args.as_json,
             )
         except json.JSONDecodeError as error:

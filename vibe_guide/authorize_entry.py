@@ -11,12 +11,20 @@ This module closes that gap without weakening the gate:
   and ``Monitor.resume``, so a plan edited after authorization does not run on
   the old evidence.  The covered set is the gate inputs (``prd.md``,
   ``plan.json``, ``nodes.json``, ``authorization-card.json``,
-  ``dag-audit.json``, ``plan-confirmation.json``, and every spec/issue file);
-  ``dag.yaml`` and ``plan.md`` are human-readable projections and
-  ``engine-attestation.json`` is validated separately by
-  ``validate_engine_attestation``, so those three are deliberately outside it.
-  Re-running ``authorize`` re-derives the digests from current content, which is
-  intended: that is a fresh user token on the new content, not a bypass.
+  ``dag-audit.json``, ``plan-confirmation.json``, and every spec/issue file).
+  Three published files are outside it, for two different reasons: ``dag.yaml``
+  and ``plan.md`` are written by ``dag.py`` and read by nothing in the package,
+  so no decision rests on them; ``engine-attestation.json`` is checked by
+  ``validate_engine_attestation`` before every dispatch, which recomputes its
+  digest and enforces a freshness window and so is strictly stronger than a
+  digest snapshot.  Re-running ``authorize`` re-derives the digests from current
+  content, which is intended: that is a fresh user token on the new content, not
+  a bypass.
+* Once a run exists, ``plan.json`` and ``plan-confirmation.json`` are rewritten
+  by dispatch itself, so their bytes legitimately change.  They are not skipped
+  on ``resume``: they are checked against the invariant the authorization
+  actually rests on -- the decision digest and the card binding -- via
+  ``LIFECYCLE_REFS``.
 * The decision digest is recomputed from the decisions read here and compared
   against the card, rather than copied out of the card, so an edited decision is
   detected instead of attested.
@@ -38,7 +46,19 @@ from typing import Any, Dict, List, Mapping
 from .authorization import _canonical_digest
 from .diagnostics import assert_planning_gate, require_execution_ready
 from .planner import required_workflow_nodes
+from .state import interprocess_lock
 from .workflow_gate import record_workflow_node, verify_workflow
+
+
+class AuthorizationDenied(PermissionError):
+    """A policy decision, as opposed to an OS-level permission fault.
+
+    The CLI must report a denied policy as ``blocked`` and an environment fault
+    as ``blocked_unknown``.  Discriminating on ``error.errno`` worked only
+    because no policy path happened to set it, so the first ``PermissionError``
+    raised with an errno would silently downgrade a denial into a soft failure.
+    Subclassing keeps every existing ``except PermissionError`` handler intact.
+    """
 
 
 def _sha(path: Path) -> str:
@@ -93,8 +113,13 @@ def build_workflow_evidence(paths, plan_id: str, authorization_token: str) -> Di
     ``ValueError`` when a required artifact is absent or self-inconsistent.
     """
     if not isinstance(authorization_token, str) or authorization_token != "AUTHORIZE":
-        raise PermissionError("authorization required: the exact AUTHORIZE token is required")
-    require_execution_ready(assert_planning_gate(paths, plan_id))
+        raise AuthorizationDenied("authorization required: the exact AUTHORIZE token is required")
+    try:
+        require_execution_ready(assert_planning_gate(paths, plan_id))
+    except PermissionError as error:
+        # `planning_required` is a policy denial too, so it must classify as one
+        # rather than fall through to the environment-fault branch.
+        raise AuthorizationDenied(str(error)) from error
 
     root = paths.resolve_vibe_path(Path("plans") / plan_id)
     plan = _read_json(root / "plan.json")
@@ -246,7 +271,7 @@ def build_workflow_evidence(paths, plan_id: str, authorization_token: str) -> Di
 
     result = verify_workflow(workflow)
     if result.get("status") != "complete":
-        raise PermissionError("required_workflow_blocked: " + str(result.get("node") or result.get("reason") or "unknown"))
+        raise AuthorizationDenied("required_workflow_blocked: " + str(result.get("node") or result.get("reason") or "unknown"))
     return workflow
 
 
@@ -274,23 +299,80 @@ def select_plan_workflow(state_data: Any, plan_id: str) -> Any:
     return None
 
 
-def verify_workflow_artifacts(paths, workflow: Mapping[str, Any]) -> None:
+def load_live_workflow(paths, plan_id: str) -> Any:
+    """Return the unredacted evidence for ``plan_id`` from ``.vibe/state.json``.
+
+    A run snapshot is a poor source for this check: ``evidence`` is one of
+    ``state._PROVIDER_TEXT_KEYS``, so ``save_snapshot`` replaces every ``ref``
+    and ``sha256`` under it with ``[REDACTED_PROVIDER_TEXT]``.  Digests can only
+    be re-derived from the copy ``authorize`` wrote, which is the same source
+    ``Monitor.start`` reads.
+    """
+    state_path = paths.vibe / "state.json"
+    if not state_path.is_file() or state_path.is_symlink():
+        return None
+    try:
+        state_data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise AuthorizationDenied("workflow_evidence_stale: state.json is unreadable: " + str(error)) from error
+    return select_plan_workflow(state_data, plan_id)
+
+
+#: Dispatch rewrites these two gate inputs on purpose: ``cli.py`` sets
+#: ``plan.json``'s ``status`` to ``authorized`` and stamps
+#: ``plan-confirmation.json`` with ``run_id``/``event_sequence``.  Their bytes
+#: therefore legitimately differ after a run starts, so once a run exists they
+#: are checked against the invariant that authorization actually rests on
+#: instead of against the recorded byte digest.  They are never skipped.
+LIFECYCLE_REFS = frozenset({"plan.json", "plan-confirmation.json"})
+
+
+def _verify_lifecycle_invariant(root: Path, reference: str, records: Mapping[str, Any]) -> None:
+    """Check the authorization-relevant content of a dispatch-rewritten file."""
+    if reference == "plan.json":
+        recorded = ((records.get("product_decision") or {}).get("evidence") or {}).get("decision_digest")
+        plan = _read_json(root / "plan.json")
+        if not isinstance(plan, Mapping) or not isinstance(recorded, str):
+            raise AuthorizationDenied("workflow_evidence_stale: plan.json evidence is unusable")
+        live = _canonical_digest(
+            {"decisions": plan.get("decisions") or [], "evidence_priority": plan.get("evidence_priority") or []}
+        )
+        if live != recorded:
+            raise AuthorizationDenied("workflow_evidence_stale: plan.json decisions no longer match the authorized evidence")
+        return
+    recorded = ((records.get("plan_confirmation") or {}).get("output") or {}).get("authorization_digest")
+    confirmation = _read_json(root / "plan-confirmation.json")
+    if not isinstance(confirmation, Mapping) or not isinstance(recorded, str):
+        raise AuthorizationDenied("workflow_evidence_stale: plan-confirmation.json evidence is unusable")
+    if str(confirmation.get("authorization_digest")) != recorded or confirmation.get("status") != "confirmed":
+        raise AuthorizationDenied(
+            "workflow_evidence_stale: plan-confirmation.json is no longer bound to the authorized card digest"
+        )
+
+
+def verify_workflow_artifacts(paths, workflow: Mapping[str, Any], run_started: bool = False) -> None:
     """Re-hash every artifact a record was derived from.
 
     Recorded digests are otherwise never compared again, which would let a plan
-    be edited after authorization and still execute on the old evidence.
+    be edited after authorization and still execute on the old evidence.  With
+    ``run_started`` the two files dispatch itself rewrites are checked against
+    their authorization invariant rather than their byte digest; every other
+    artifact is re-hashed either way.
     """
     plan_id = workflow.get("task_id")
     if not isinstance(plan_id, str) or not plan_id:
-        raise PermissionError("workflow_evidence_stale: workflow identity is missing")
+        raise AuthorizationDenied("workflow_evidence_stale: workflow identity is missing")
     root = paths.resolve_vibe_path(Path("plans") / plan_id)
     records = workflow.get("node_records")
     if not isinstance(records, Mapping):
-        raise PermissionError("workflow_evidence_stale: workflow records are missing")
+        raise AuthorizationDenied("workflow_evidence_stale: workflow records are missing")
+    if run_started:
+        for reference in sorted(LIFECYCLE_REFS):
+            _verify_lifecycle_invariant(root, reference, records)
     for node_id, record in records.items():
         evidence = record.get("evidence") if isinstance(record, Mapping) else None
         if not isinstance(evidence, Mapping):
-            raise PermissionError("workflow_evidence_stale: evidence is missing for " + str(node_id))
+            raise AuthorizationDenied("workflow_evidence_stale: evidence is missing for " + str(node_id))
         # `authorize` always records an artifact for all ten nodes, so a record
         # without one is never a legitimate state.  Skipping it silently would
         # disarm both stale- and forged-evidence detection for that node.
@@ -299,18 +381,20 @@ def verify_workflow_artifacts(paths, workflow: Mapping[str, Any]) -> None:
             listed = evidence.get(key)
             if listed is not None:
                 if not isinstance(listed, list):
-                    raise PermissionError("workflow_evidence_stale: malformed {} in {}".format(key, node_id))
+                    raise AuthorizationDenied("workflow_evidence_stale: malformed {} in {}".format(key, node_id))
                 pending.extend(listed)
         for artifact in pending:
             if not isinstance(artifact, Mapping):
-                raise PermissionError("workflow_evidence_stale: missing artifact reference in " + str(node_id))
+                raise AuthorizationDenied("workflow_evidence_stale: missing artifact reference in " + str(node_id))
             reference = artifact.get("ref")
             recorded = artifact.get("sha256")
             if not isinstance(reference, str) or not isinstance(recorded, str):
-                raise PermissionError("workflow_evidence_stale: malformed artifact reference in " + str(node_id))
+                raise AuthorizationDenied("workflow_evidence_stale: malformed artifact reference in " + str(node_id))
+            if run_started and reference in LIFECYCLE_REFS:
+                continue  # already checked above, against its invariant
             path = root / reference
             if not path.is_file() or path.is_symlink() or _sha(path) != recorded:
-                raise PermissionError(
+                raise AuthorizationDenied(
                     "workflow_evidence_stale: {} no longer matches the evidence recorded for {}".format(reference, node_id)
                 )
 
@@ -326,18 +410,23 @@ def materialize_workflow_evidence(paths, plan_id: str, authorization_token: str)
     state_path = paths.vibe / "state.json"
     if state_path.is_symlink():
         raise ValueError("state.json may not be a symlink")
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    if not isinstance(state, dict):
-        raise ValueError("state.json must contain an object")
-    existing = state.get("task_workflow")
-    if isinstance(existing, Mapping) and "task_id" in existing:
-        # Migrate the single-object layout, preserving whatever it authorized.
-        existing = {str(existing.get("task_id")): dict(existing)}
-    elif not isinstance(existing, Mapping):
-        existing = {}
-    else:
-        existing = dict(existing)
-    existing[plan_id] = workflow
-    state["task_workflow"] = existing
-    _atomic_json(state_path, state)
+    # `state.json` is shared, and this is a read-modify-write: without the lock
+    # two concurrent `authorize` runs would each write back the snapshot they
+    # read, and the loser's plan would silently lose its evidence.  Same lock
+    # idiom the rest of the package uses for shared state.
+    with interprocess_lock(paths.vibe / ".state.authorize.lock"):
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("state.json must contain an object")
+        existing = state.get("task_workflow")
+        if isinstance(existing, Mapping) and "task_id" in existing:
+            # Migrate the single-object layout, preserving whatever it authorized.
+            existing = {str(existing.get("task_id")): dict(existing)}
+        elif not isinstance(existing, Mapping):
+            existing = {}
+        else:
+            existing = dict(existing)
+        existing[plan_id] = workflow
+        state["task_workflow"] = existing
+        _atomic_json(state_path, state)
     return workflow
