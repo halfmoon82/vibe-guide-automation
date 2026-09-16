@@ -44,6 +44,7 @@ from .scanner import scan_project
 from .diagnostics import screen_session, require_session_screened
 from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
 from .workflow_gate import require_capability_contract
+from .authorize_entry import materialize_workflow_evidence
 from .state import load_events, load_snapshot
 from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
@@ -80,7 +81,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "plan", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -785,7 +786,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             screen_session(paths, str(session_id), args.command)
         except (OSError, ValueError, PermissionError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": str(error)}, "会话筛选已阻塞：" + str(error), args.as_json)
-    if args.command in {"monitor", "reconcile", "resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
+    if args.command in {"authorize", "monitor", "reconcile", "resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
         return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": "V2 state.json is missing"}, "会话筛选已阻塞：V2 state.json 缺失", args.as_json)
     if args.command == "scan" and paths.vibe.exists():
         try:
@@ -1172,6 +1173,48 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         }
         return _result(
             SUCCESS, payload, "复杂计划产物已生成，等待一次授权", args.as_json
+        )
+
+    if args.command == "authorize":
+        if not args.plan:
+            return _result(
+                BLOCKED,
+                {"command": "authorize", "status": "blocked", "reason": "plan is required"},
+                "授权未记录：需要计划",
+                args.as_json,
+            )
+        try:
+            workflow = materialize_workflow_evidence(paths, args.plan, args.authorize or "")
+        except PermissionError as error:
+            return _result(
+                BLOCKED,
+                {"command": "authorize", "status": "blocked", "reason": str(error)},
+                "授权未记录：" + str(error),
+                args.as_json,
+            )
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            return _result(
+                BLOCKED,
+                {
+                    "command": "authorize",
+                    "status": "blocked_design",
+                    "reason": str(error),
+                },
+                "授权未记录：" + str(error),
+                args.as_json,
+            )
+        return _result(
+            SUCCESS,
+            {
+                "command": "authorize",
+                "status": "ok",
+                "plan_id": args.plan,
+                "route": workflow.get("route"),
+                "recorded_nodes": list(workflow.get("nodes") or []),
+                "authorization_granted": bool(workflow.get("authorization_granted")),
+            },
+            "十节点门禁证据已记录，可以启动监工",
+            args.as_json,
         )
 
     if args.command == "monitor":
