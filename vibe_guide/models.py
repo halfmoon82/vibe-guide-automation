@@ -181,6 +181,44 @@ class HealingResult:
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA40 = re.compile(r"^[0-9a-fA-F]{40}$")
 
+WORKTREE_PREFIX = ".worktrees/"
+NODE_BRANCH_PREFIX = "node/"
+# Leave room for the digest suffix inside a 255-byte filesystem component.
+_SLUG_MAX = 200
+_SLUG_UNSAFE = re.compile(r"[^A-Za-z0-9_-]+")
+
+
+def node_slug(node_id: Any) -> str:
+    """A filesystem- and git-ref-safe name for a node, one id to one slug.
+
+    Both the publisher (which fills node contracts) and Monitor (which falls
+    back when a contract omits them) name the same directory and branch, so the
+    derivation lives here rather than as two copies of a string expression.
+
+    Every slug carries a digest of the id it came from.  Without it, folding
+    away characters git and the filesystem dislike maps distinct legal ids onto
+    one name -- `_ID` accepts "." and "-" anywhere but the first character, so
+    "a" and "a." are two nodes -- and two writers land in one directory.  The
+    writer lease is keyed per node id, so it reports both as active and never
+    notices.
+    """
+    raw = str(node_id or "")
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    # Dots are legal in a ref but ".." and a ".lock" suffix are not, and a lone
+    # "." is not a usable directory name; drop them rather than special-case.
+    stem = _SLUG_UNSAFE.sub("-", raw.strip()).strip("-")[:_SLUG_MAX].strip("-")
+    return "%s-%s" % (stem, digest) if stem else "node-%s" % digest
+
+
+def node_worktree(node_id: Any) -> str:
+    """The project-relative worktree a node's writer works in."""
+    return WORKTREE_PREFIX + node_slug(node_id)
+
+
+def node_branch(node_id: Any) -> str:
+    """The branch a node's writer commits to."""
+    return NODE_BRANCH_PREFIX + node_slug(node_id)
+
 
 def _identifier(value: Any, field: str) -> str:
     if not isinstance(value, str) or not _ID.fullmatch(value):

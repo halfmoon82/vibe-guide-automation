@@ -7,6 +7,10 @@ build/
 dist/
 *.egg-info/
 
+# Per-node worker trees: the dispatch contract now names .worktrees/<slug> by
+# default, so a run that provisions them would otherwise leave the tree dirty.
+.worktrees/
+
 # Local environments / OS noise
 .venv/
 .DS_Store

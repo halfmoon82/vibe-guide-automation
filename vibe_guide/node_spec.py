@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 from .adapters.base import Environment
 from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
-from .models import IntegrationAcceptanceContract
+from .models import IntegrationAcceptanceContract, node_branch, node_worktree
 from .prd_profiles import render_planning_brief
 
 #: Fields the agent / product manager supplies.  Only business semantics.
@@ -140,23 +140,6 @@ def observe_capabilities(paths: Any) -> ObservedCapabilities:
     )
 
 
-_SLUG_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-def _node_slug(node_id: Any) -> str:
-    """A filesystem- and ref-safe name derived from a node id.
-
-    Node ids come from the product spec, so they may carry spaces or
-    non-ASCII text.  The slug must be stable across dispatches, since the
-    worktree it names is where that node's writer keeps working.
-    """
-    raw = str(node_id or "").strip()
-    slug = _SLUG_SAFE.sub("-", raw).strip("-.")
-    if not slug:
-        slug = "node-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
-    return slug
-
-
 def complete_node_contracts(raw_nodes: List[Dict[str, Any]], adapter_id: str, project_id: Optional[str]) -> None:
     """Fill the engineering defaults every node contract needs (in place, missing only).
 
@@ -184,14 +167,13 @@ def complete_node_contracts(raw_nodes: List[Dict[str, Any]], adapter_id: str, pr
         # parallel developers would share a tree, and nothing cross-checks two
         # nodes for pointing at the same directory.
         #
-        # The names match monitor's own fallbacks (.worktrees/<id>, node/<id>),
-        # which is the convention the rest of the codebase already uses; the
+        # The names come from models.node_worktree/node_branch, the same
+        # derivation Monitor falls back to, so the two sides cannot drift; the
         # spec's literal values used to shadow those safe defaults.  These are
         # identity strings for the dispatch contract, not directories vibe
         # creates: provisioning the tree belongs to whoever runs the node.
-        node_slug = _node_slug(item.get("id"))
-        contract.setdefault("worktree", ".worktrees/" + node_slug)
-        contract.setdefault("branch", "node/" + node_slug)
+        contract.setdefault("worktree", node_worktree(item.get("id")))
+        contract.setdefault("branch", node_branch(item.get("id")))
         contract.setdefault("worker", contract.get("writer", "worker"))
         contract.setdefault("reviewer_worker", contract.get("reviewer", "reviewer"))
         contract.setdefault("worker_profile", {

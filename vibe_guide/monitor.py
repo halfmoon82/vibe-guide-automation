@@ -30,6 +30,8 @@ from .models import (
     LocalModel,
     HealingResult,
     ObservationDisposition,
+    node_branch,
+    node_worktree,
 )
 from .paths import ProjectPaths
 from .planner import resolve_consistency
@@ -1016,8 +1018,8 @@ class Monitor:
             node_state[node_id] = {
                 "status": "delivered" if node.status == "delivered" else "planned",
                 "worker": node.contract.get("worker"),
-                "worktree": node.contract.get("worktree", ".worktrees/" + node_id),
-                "branch": node.contract.get("branch", "node/" + node_id),
+                "worktree": node.contract.get("worktree", node_worktree(node_id)),
+                "branch": node.contract.get("branch", node_branch(node_id)),
                 "status_file": node.contract.get("status_file", ""),
                 "handoff_file": node.contract.get("handoff_file", ""),
                 "evidence": [],
