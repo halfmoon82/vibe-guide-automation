@@ -702,6 +702,11 @@ def _is_capability_contract_unknown(error: BaseException) -> bool:
     return "capability_contract_unknown" in str(error)
 
 
+def _is_draft_block(error: BaseException) -> bool:
+    """A session draft has no product content and never held an authorization."""
+    return str(error).startswith("blocked_design: ")
+
+
 def _require_v38_preflight(paths: ProjectPaths, directory: Path, plan, nodes, card) -> None:
     """Gate V3.8 worker/authorization actions before any provider call."""
     if not ("v3.8" in plan.plan_id.casefold() or any(str(node.id).startswith("V38-") for node in nodes)):
@@ -1680,6 +1685,15 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                         "reason": str(error),
                     },
                     "能力合同状态未知：" + str(error),
+                    args.as_json,
+                )
+            if _is_draft_block(error):
+                # Nothing to invalidate: a draft never held an authorization.
+                # Report the design state and how to finish it.
+                return _result(
+                    BLOCKED,
+                    {"command": args.command, "status": "blocked_design", "reason": str(error)},
+                    "计划仍是草案：" + str(error),
                     args.as_json,
                 )
             _persist_invalidation(

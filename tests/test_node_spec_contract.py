@@ -173,6 +173,22 @@ class DraftAndRoutingTests(_ProjectCase):
         self.assertIn("--from-prd", result.payload.get("reason", ""))
         self.assertNotIn("regular file", result.payload.get("reason", ""))
 
+    def test_status_and_resume_report_a_draft_as_design_state(self):
+        drafted = run_cli(["plan", "--json", "--request", COMPLEX_REQUEST], self.root)
+        plan_id = drafted.payload["plan_id"]
+        for command in ("status", "resume"):
+            result = run_cli([command, "--json", "--plan", plan_id], self.root)
+            self.assertEqual(result.payload.get("status"), "blocked_design", (command, result.payload))
+            self.assertIn("--from-prd", result.payload.get("reason", ""), command)
+            self.assertNotIn("authorization invalidated", result.payload.get("reason", ""), command)
+            self.assertFalse((self.root / ".vibe" / "plans" / plan_id / "authorization-invalidated.json").exists(), command)
+
+    def test_unknown_adapter_in_capabilities_is_reported_not_crashed(self):
+        self.write_capabilities(adapter_id="nonexistent-agent", facts={"nonexistent-agent.shell": True})
+        result = self.plan_from_prd(self.write_spec(_product_spec()))
+        self.assertNotEqual(result.payload.get("status"), "ok")
+        self.assertIn("nonexistent-agent", result.payload.get("reason", ""))
+
     def test_invalid_s1_flag_is_rejected_not_silently_defaulted(self):
         with self.assertRaises(ValueError) as caught:
             build_session_entry(COMPLEX_REQUEST, s1="garbage")

@@ -113,7 +113,12 @@ def observe_capabilities(paths: Any) -> ObservedCapabilities:
         provenance={key: observed["provenance"] for key in facts},
         available_agents=(adapter_id,),
     )
-    detection = AdapterRegistry().get(adapter_id).detect(environment)
+    try:
+        adapter = AdapterRegistry().get(adapter_id)
+    except KeyError as error:
+        # An unknown adapter name is invalid evidence, not a pending probe.
+        raise ValueError("capabilities.json names an unknown adapter: {}".format(adapter_id)) from error
+    detection = adapter.detect(environment)
     caps = detection.capabilities
     project_id = observed.get("project_id")
     if not isinstance(project_id, str) or not project_id.strip():
