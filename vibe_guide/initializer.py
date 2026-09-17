@@ -4,7 +4,6 @@ import os
 import json, tempfile
 
 from .scanner import (
-    AGENTSMD_BLOCKS,
     CAPABILITY_RULES,
     CAPABILITY_RULE_MARKER,
     PRD_GUIDE_MARKER,
@@ -249,21 +248,34 @@ def init_project(paths, confirm):
             offered, damaged = _offered_headings(offered_path)
             if damaged:
                 notes.append(damaged)
-            # Both "already in the proposal" and "already offered" are judged on
-            # the section's own marker.  Matching a whole block verbatim instead
-            # would make a reviewer's edit to one section look like that section
-            # went missing, so it would become pending again and rewrite the
-            # increment -- discarding the section still awaiting review.
+            # Every question here is answered by a section's own heading, and
+            # the proposal is asked about itself.  Matching a whole block
+            # verbatim would read a reviewer's edit as the section going
+            # missing, so it would become pending again and rewrite the
+            # increment, discarding whatever still awaited review; borrowing the
+            # AGENTS.md gate would answer with that file's extra tokens, so a
+            # proposal holding the section would still be offered it -- and a
+            # section sitting in both files is past the reviewer's reach, since
+            # deleting it from the proposal no longer declines it.
             already_proposed = {
-                block.splitlines()[0].strip()
-                for block in AGENTSMD_BLOCKS
-                if block not in missing_agentsmd_blocks(existing_proposal)
+                section.splitlines()[0].strip()
+                for section in _proposal_sections(existing_proposal)
             }
             pending_blocks = [
                 block for block in missing_agentsmd_blocks(report.agentsmd_content)
                 if block.splitlines()[0].strip() not in already_proposed
                 and block.splitlines()[0].strip() not in offered
             ]
+            # Everything the reviewer has now seen, whether it reached them
+            # through the proposal or through the increment.  Recording only what
+            # the increment carried would leave the proposal's own sections
+            # unrecorded, so deleting one would read as "this release added a
+            # section" and offer it straight back.
+            _record_offered(
+                offered_path,
+                offered | already_proposed
+                | {block.splitlines()[0].strip() for block in pending_blocks},
+            )
             if pending_blocks:
                 update_path = proposal_path.with_name(PENDING_UPDATE_NAME)
                 update = (
@@ -281,10 +293,6 @@ def init_project(paths, confirm):
                     if update_path.read_text(encoding='utf-8') != update:
                         _atomic_write_text(update_path, update)
                         created.append(str(update_path.relative_to(root)))
-                _record_offered(
-                    offered_path,
-                    offered | {block.splitlines()[0].strip() for block in pending_blocks},
-                )
     skill_proposal = root / '.vibe/proposals/skills/proposal.md'
     if not skill_proposal.exists() and not any(item.get('valid') and item.get('name') == 'architecture-skill-pack' for item in report.skills):
         _write_new(
