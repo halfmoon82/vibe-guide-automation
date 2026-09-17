@@ -22,7 +22,8 @@ class PackagingAcceptanceTests(unittest.TestCase):
             wheel = list(out.glob("*.whl"))
             self.assertEqual(len(wheel), 1)
             version = re.search(r"-(\d+\.\d+\.\d+)-", wheel[0].name).group(1)
-            self.assertEqual(version, "2.0.0")
+            from vibe_guide import __version__ as current_version
+            self.assertEqual(version, current_version)
             digest = hashlib.sha256(wheel[0].read_bytes()).hexdigest()
             self.assertEqual(len(digest), 64)
 
@@ -36,8 +37,9 @@ class PackagingAcceptanceTests(unittest.TestCase):
                 cwd=str(root), text=True, capture_output=True, check=False,
             )
             self.assertEqual(build.returncode, 0, build.stderr)
-            sdist = out / "vibe-guide-2.0.0.tar.gz"
-            self.assertTrue(sdist.exists())
+            from vibe_guide import __version__ as current_version
+            from tests.support_packaging import find_sdist
+            sdist = find_sdist(out, current_version)
             wheel_build = subprocess.run(
                 [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation", "-w", str(out), str(root)],
                 cwd=str(root), text=True, capture_output=True, check=False,
@@ -53,6 +55,18 @@ class PackagingAcceptanceTests(unittest.TestCase):
                 receiving = Path(directory) / ("receiving-" + artifact.suffix.replace(".", ""))
                 receiving.mkdir()
                 smoke = subprocess.run([str(venv / "bin/python"), "-m", "vibe_guide", "doctor", "--json"], cwd=str(receiving), text=True, capture_output=True, check=False)
-                self.assertEqual(smoke.returncode, 0, smoke.stderr)
+                # An uninitialized directory is legitimately "blocked" for
+                # doctor since V4 (missing AGENTS.md / knowledge / Skills);
+                # the smoke test proves the installed package runs and its
+                # manifests load, not that an empty directory is healthy.
+                # An empty directory has no .vibe, so scanner reports it and
+                # doctor settles on `blocked` (exit 3) every time.  Pin the
+                # exact code and status: accepting 0 as well would let a future
+                # regression that calls an uninitialized directory healthy pass.
+                self.assertEqual(smoke.returncode, 3, smoke.stderr)
+                import json as _json
+                payload = _json.loads(smoke.stdout)
+                self.assertEqual(payload["command"], "doctor", smoke.stdout)
+                self.assertEqual(payload["status"], "blocked", smoke.stdout)
                 console = venv / "bin" / "vibe"
                 self.assertTrue(console.exists(), "console entrypoint was not installed for %s" % artifact.name)
