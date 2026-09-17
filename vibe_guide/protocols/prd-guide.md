@@ -110,7 +110,9 @@ vibe plan --request "<产品经理的原话>" --json
 
 `prd` 的推荐 section：`problem`、`user_scenarios`、`success_criteria`、`non_goals`、`code_evidence`。
 
-**黑名单（写了就被拒）**：顶层 `complexity_band` `route` `route_result` `capabilities` `project_id` `integration_contract` `spec_path` `plan_id`；节点 `status`；`contract` 内 `adapter_id` `project_id` `worker` `reviewer_worker` `worker_profile`。这些全部由 vibe 派生。
+**黑名单（写了就被拒）**：顶层 `complexity_band` `route` `route_result` `capabilities` `project_id` `integration_contract` `spec_path` `plan_id`；节点 `status`；`contract` 内 `adapter_id` `project_id` `worker` `reviewer_worker` `worker_profile` `worktree` `branch` `writer` `reviewer`。这些全部由 vibe 派生。
+
+其中 `worktree` 与 `branch` 由 vibe 按节点 id 派生成互不相同的一对（`.worktrees/<节点>` 与 `node/<节点>`），保证每个节点在自己的目录和分支上开发；agent 写死它们会让两个并行节点撞进同一棵树。
 
 ### 5.2 登记本会话的能力（复杂计划发布前必做一次）
 
