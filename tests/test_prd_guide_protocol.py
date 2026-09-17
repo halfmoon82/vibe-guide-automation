@@ -104,6 +104,24 @@ class PrintProtocolTests(_ProjectCase):
         self.assertEqual(as_json.payload.get("protocol"), load_protocol("prd-guide"))
         self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)
 
+    def test_print_protocol_stays_read_only_on_an_initialized_project(self):
+        """The read-only claim must hold where agents actually run it.
+
+        Session screening fires for any project whose state.json exists, so an
+        initialized project used to get a session-gates.json write from a
+        command that only prints a document.
+        """
+        from vibe_guide.protocols import load_protocol
+        self.init()
+        gates = self.root / ".vibe" / "session-gates.json"
+        gates.unlink(missing_ok=True)
+        before = sorted(str(item) for item in self.root.rglob("*"))
+        result = run_cli(["plan", "--print-protocol"], self.root)
+        self.assertEqual(result.exit_code, 0, result.text)
+        self.assertEqual(result.text, load_protocol("prd-guide"))
+        self.assertFalse(gates.exists(), "--print-protocol must not open a session gate")
+        self.assertEqual(sorted(str(item) for item in self.root.rglob("*")), before)
+
 
 class InitMaterializationTests(_ProjectCase):
     def test_init_materializes_prd_guide_proposal(self):
@@ -121,6 +139,31 @@ class InitMaterializationTests(_ProjectCase):
         self.assertEqual(skill.read_text(encoding="utf-8"), "user edited")
         self.assertNotIn(PRD_GUIDE_PROPOSAL_RELATIVE, second.payload.get("paths", []))
 
+    def test_complex_request_entry_reaches_a_project_that_already_has_capability_rules(self):
+        """A live project already carries the capability section.
+
+        Every gate on the AGENTS.md path used to key on the capability marker
+        alone, so a project that had already applied those rules could never
+        receive the PRD entry section.
+        """
+        from vibe_guide.scanner import CAPABILITY_RULES, PRD_GUIDE_MARKER
+        agentsmd = self.root / "AGENTS.md"
+        agentsmd.write_text(
+            "# Existing project guidance\n\n" + CAPABILITY_RULES, encoding="utf-8"
+        )
+        self.init()
+        proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+        self.assertTrue(proposal.is_file(), "an incomplete AGENTS.md still needs a proposal")
+        self.assertIn(PRD_GUIDE_MARKER, proposal.read_text(encoding="utf-8"))
+        applied = run_cli(["apply-agentsmd", "--confirm", "--json"], self.root)
+        self.assertEqual(applied.exit_code, 0, applied.text)
+        final = agentsmd.read_text(encoding="utf-8")
+        self.assertIn(PRD_GUIDE_MARKER, final)
+        self.assertIn("# Existing project guidance", final)
+        self.assertEqual(final.count(PRD_GUIDE_MARKER), 1, "the section must not be duplicated")
+        again = run_cli(["apply-agentsmd", "--confirm", "--json"], self.root)
+        self.assertEqual(agentsmd.read_text(encoding="utf-8"), final, again.text)
+
 
 class ProtocolEnforcementTests(_ProjectCase):
     def test_needs_confirmation_blocks_publish(self):
@@ -135,6 +178,66 @@ class ProtocolEnforcementTests(_ProjectCase):
         self.assertIn("水印", result.payload.get("question", ""))
         self.assertIn("水印", result.text)
         self.assertFalse((self.root / ".vibe" / "plans" / "pm-plan").exists())
+
+    def test_needs_confirmation_blocks_publish_without_any_other_gate_field(self):
+        """The gate must not depend on unrelated keys being present.
+
+        A spec whose only checkpoint input is the prd itself used to skip the
+        checkpoint evaluation entirely and publish with items still pending.
+        """
+        self.init()
+        self.write_capabilities()
+        spec = _product_spec()
+        for key in ("rationale", "product_question", "skill_profiles"):
+            spec.pop(key, None)
+        spec["prd"]["success_criteria"].append(
+            {"value": "导出是否需要带公司水印尚未确认", "source": "needs_confirmation"}
+        )
+        result = self.plan_from_prd(spec)
+        self.assertEqual(result.payload.get("status"), "blocked_design", result.payload)
+        self.assertIn("水印", result.payload.get("question", ""))
+        self.assertFalse((self.root / ".vibe" / "plans" / "pm-plan").exists())
+
+    def test_a_malformed_prd_is_rejected_rather_than_silently_accepted(self):
+        """A prd of the wrong shape must fail closed, not read as empty.
+
+        The status is `blocked` rather than `blocked_design`: a wrong shape is
+        a defect in what the agent wrote, not a product question waiting on
+        the product manager.  What matters is that nothing publishes and the
+        reason names the offending field.
+        """
+        self.init()
+        self.write_capabilities()
+        malformed_shapes = (
+            ["needs_confirmation"],
+            "needs_confirmation",
+            7,
+            {"success_criteria": 7},
+            {"success_criteria": ["未包装成对象的字符串条目"]},
+            {"success_criteria": [{"value": "缺少 source 标记的条目"}]},
+            {"success_criteria": [{"value": "标记拼错", "source": "confirmed_by_user"}]},
+        )
+        for malformed in malformed_shapes:
+            spec = _product_spec()
+            spec["prd"] = malformed
+            result = self.plan_from_prd(spec, plan_id="pm-malformed")
+            self.assertEqual(result.payload.get("status"), "blocked", (malformed, result.payload))
+            self.assertIn("prd", result.payload.get("reason", ""), (malformed, result.payload))
+            self.assertFalse((self.root / ".vibe" / "plans" / "pm-malformed").exists())
+
+    def test_a_confirmation_marker_with_stray_whitespace_or_case_still_blocks(self):
+        """Marker comparison must not be defeated by a one-character slip."""
+        self.init()
+        self.write_capabilities()
+        for marker in (" needs_confirmation", "needs_confirmation ", "Needs_Confirmation"):
+            spec = _product_spec()
+            spec["prd"]["success_criteria"].append(
+                {"value": "导出是否需要带公司水印尚未确认", "source": marker}
+            )
+            result = self.plan_from_prd(spec, plan_id="pm-marker")
+            self.assertEqual(result.payload.get("status"), "blocked_design", (marker, result.payload))
+            self.assertIn("水印", result.payload.get("question", ""))
+            self.assertFalse((self.root / ".vibe" / "plans" / "pm-marker").exists())
 
     def test_planning_brief_lists_goal_traceability_rows(self):
         self.init()

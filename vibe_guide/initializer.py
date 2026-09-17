@@ -3,7 +3,15 @@ from pathlib import Path
 import os
 import json, tempfile
 
-from .scanner import build_agentsmd_patch, scan_project
+from .scanner import (
+    CAPABILITY_RULES,
+    CAPABILITY_RULE_MARKER,
+    PRD_GUIDE_MARKER,
+    PRD_GUIDE_RULES,
+    build_agentsmd_patch,
+    missing_agentsmd_blocks,
+    scan_project,
+)
 from .protocols import PRD_GUIDE_NAME, PRD_GUIDE_PROPOSAL_RELATIVE, load_protocol
 from .capability_contract import build_contract, contract_path, load_contract, save_contract
 from .migration import migrate_v2_to_v310, migrate_v2_to_v42, _backup, _payload_is_complete
@@ -183,9 +191,26 @@ def init_project(paths, confirm):
         created.append('.vibe/session-contract.json')
     proposal = build_agentsmd_patch(report.agentsmd_content, report)
     proposal_path = root / '.vibe/proposals/agentsmd/proposal.md'
-    if proposal.proposed and not proposal_path.exists():
-        _write_new(proposal_path, proposal.content)
-        created.append(str(proposal_path.relative_to(root)))
+    if proposal.proposed:
+        # A proposal written by an earlier version can predate rule blocks the
+        # current version proposes.  Refresh it when it is missing a block the
+        # project still needs, so the increment is not stranded; leave it alone
+        # otherwise so a reviewed proposal keeps its bytes.
+        existing_proposal = None
+        if proposal_path.is_file() and not proposal_path.is_symlink():
+            try:
+                existing_proposal = proposal_path.read_text(encoding='utf-8')
+            except (OSError, UnicodeDecodeError):
+                existing_proposal = None
+        stale = existing_proposal is not None and any(
+            block.strip() not in existing_proposal for block in missing_agentsmd_blocks(report.agentsmd_content)
+        )
+        if existing_proposal is None:
+            _write_new(proposal_path, proposal.content)
+            created.append(str(proposal_path.relative_to(root)))
+        elif stale:
+            proposal_path.write_text(proposal.content, encoding='utf-8')
+            created.append(str(proposal_path.relative_to(root)))
     skill_proposal = root / '.vibe/proposals/skills/proposal.md'
     if not skill_proposal.exists() and not any(item.get('valid') and item.get('name') == 'architecture-skill-pack' for item in report.skills):
         _write_new(
@@ -205,6 +230,28 @@ def init_project(paths, confirm):
         _write_new(prd_guide, load_protocol(PRD_GUIDE_NAME))
         created.append(PRD_GUIDE_PROPOSAL_RELATIVE)
     return InitResult(bool(created), created)
+
+
+def _proposal_sections(proposal):
+    """Split a reviewed proposal into its `## ` sections, heading included.
+
+    Sections are the unit of application: each one is appended or skipped on
+    its own so a project that already carries an earlier section can still
+    receive a later one.  Any preamble before the first heading is dropped,
+    since it only titles the proposal document.
+    """
+    sections = []
+    current = []
+    for line in proposal.splitlines(keepends=True):
+        if line.startswith("## "):
+            if current:
+                sections.append("".join(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        sections.append("".join(current))
+    return [section for section in (item.strip("\n") for item in sections) if section.strip()]
 
 
 def apply_agentsmd_proposal(paths, confirm):
@@ -230,15 +277,25 @@ def apply_agentsmd_proposal(paths, confirm):
         proposal = proposal_raw.decode("utf-8")
     except UnicodeDecodeError as error:
         raise ValueError("AGENTS.md proposal is not valid UTF-8") from error
-    if not proposal.strip() or "## Capability and Tool Truth" not in proposal:
+    if not proposal.strip() or not (
+        CAPABILITY_RULE_MARKER in proposal or PRD_GUIDE_MARKER in proposal
+    ):
         raise ValueError("AGENTS.md proposal does not contain capability rules")
 
     target = root / "AGENTS.md"
     if target.is_symlink() or (target.exists() and not target.is_file()):
         raise ValueError("AGENTS.md must be a regular file")
     existing = target.read_text(encoding="utf-8") if target.exists() else ""
-    if "## Capability and Tool Truth" in existing:
+    # Append only the sections this AGENTS.md still lacks, judging each by its
+    # own heading.  Keying the whole append on one marker would strand every
+    # later section on any project that already applied an earlier one.
+    pending = [
+        section for section in _proposal_sections(proposal)
+        if section.splitlines()[0].strip() not in existing
+    ]
+    if not pending:
         return InitResult(False, [])
+    proposal = "\n\n".join(pending) + "\n"
 
     if existing:
         separator = "" if existing.endswith("\n") else "\n"

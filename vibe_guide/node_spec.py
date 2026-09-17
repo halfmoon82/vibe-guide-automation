@@ -289,15 +289,54 @@ def normalize_node_spec(spec: Any, entry: Any, paths: Any, route_governs_band: b
     return out
 
 
+NEEDS_CONFIRMATION_SOURCE = "needs_confirmation"
+PRD_SOURCE_MARKERS = ("user_confirmed", "system_inferred", NEEDS_CONFIRMATION_SOURCE, "unverified")
+
+
+def _source_marker(item: Any) -> str:
+    """The normalized source marker of one PRD item.
+
+    Comparison is whitespace- and case-insensitive: a stray space would
+    otherwise read as a confirmed item and let an open question through.
+    """
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("source", "")).strip().lower()
+
+
 def unresolved_confirmations(spec: Dict[str, Any]) -> List[str]:
-    """PRD items the product manager has not confirmed yet, in document order."""
+    """PRD items the product manager has not confirmed yet, in document order.
+
+    A prd of the wrong shape raises instead of reading as empty; treating it
+    as "nothing pending" would turn this gate into a fail-open door for any
+    agent that wrote the section incorrectly.
+    """
     prd = spec.get("prd")
-    if not isinstance(prd, dict):
+    if prd is None:
         return []
+    if not isinstance(prd, dict):
+        raise ValueError("prd 必须是按小节组织的对象；收到 {}".format(type(prd).__name__))
     pending: List[str] = []
-    for items in prd.values():
-        for item in items if isinstance(items, list) else [items]:
-            if isinstance(item, dict) and item.get("source") == "needs_confirmation":
+    for section, items in prd.items():
+        if isinstance(items, (dict, str)):
+            entries: List[Any] = [items]
+        elif isinstance(items, list):
+            entries = list(items)
+        else:
+            raise ValueError("prd.{} 必须是条目列表或单个条目；收到 {}".format(section, type(items).__name__))
+        for item in entries:
+            if not isinstance(item, dict):
+                raise ValueError(
+                    "prd.{} 的每个条目必须是带 value 与 source 的对象；收到 {}".format(section, type(item).__name__)
+                )
+            marker = _source_marker(item)
+            if marker not in PRD_SOURCE_MARKERS:
+                raise ValueError(
+                    "prd.{} 的条目 source 必须是 {} 之一；收到 {!r}".format(
+                        section, "/".join(PRD_SOURCE_MARKERS), item.get("source")
+                    )
+                )
+            if marker == NEEDS_CONFIRMATION_SOURCE:
                 pending.append(str(item.get("value", "")).strip() or "（未填写内容的待确认项）")
     return pending
 

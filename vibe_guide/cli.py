@@ -782,6 +782,13 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             v42_state = isinstance(state_data, dict) and state_data.get("workflow_version") == 4
         except (OSError, ValueError, AttributeError):
             v2_state = False
+    if args.command == "plan" and args.print_protocol:
+        # Read-only, and placed ahead of session screening so it stays that
+        # way: screening opens a session gate on any initialized project, and
+        # printing a document must not touch project state.
+        protocol = load_protocol(PRD_GUIDE_NAME)
+        return _result(SUCCESS, {"command": "plan", "status": "ok", "protocol": protocol}, protocol, args.as_json)
+
     # S0/session screening is an entry-boundary requirement for both legacy
     # V2 and current V4 runs.  Runtime workflow evidence is intentionally
     # separate and must not be used as a substitute for this probe.
@@ -1166,12 +1173,6 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             "可派发可见任务" if summary["visible_automation"] else "未验证可见任务控制面，仅向导/后台模式",
         )
         return _result(SUCCESS, payload, text, args.as_json)
-
-    if args.command == "plan" and args.print_protocol:
-        # Read-only: hand the agent the PRD-guide protocol without needing an
-        # initialized project or a request.
-        protocol = load_protocol(PRD_GUIDE_NAME)
-        return _result(SUCCESS, {"command": "plan", "status": "ok", "protocol": protocol}, protocol, args.as_json)
 
     if args.command == "plan":
         try:
