@@ -45,10 +45,12 @@ class StandaloneInstallTests(unittest.TestCase):
             self.assertEqual(self._run(sys.executable, "-m", "venv", str(venv)).returncode, 0)
             python = venv / "bin" / "python"
             source = root / "source"
-            shutil.copytree(ROOT, source, ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__"))
+            shutil.copytree(ROOT, source, ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__", "build", "dist", "*.egg-info"))
+            from tests.support_packaging import ensure_setuptools
+            ensure_setuptools(self, python)
             built = self._run(str(python), "setup.py", "sdist", "--dist-dir", str(dist), cwd=source)
             self.assertEqual(built.returncode, 0, built.stderr)
-            archive = next(dist.glob("vibe-guide-*.tar.gz"))
+            archive = next(iter(sorted(dist.glob("vibe*guide-*.tar.gz"))))
             installed = self._run(str(python), "-m", "pip", "install", "--no-deps", str(archive))
             self.assertEqual(installed.returncode, 0, installed.stderr)
             result = self._run(str(python), "-m", "vibe_guide", "--help", cwd=root)

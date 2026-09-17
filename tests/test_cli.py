@@ -360,7 +360,8 @@ class CliContractTests(unittest.TestCase):
         ).stdout.strip()
         setup_text = (root / "setup.py").read_text(encoding="utf-8")
 
-        self.assertEqual((name, version), ("vibe-guide", "4.2.2"))
+        from vibe_guide import __version__ as current_version
+        self.assertEqual((name, version), ("vibe-guide", current_version))
         self.assertIn("vibe=vibe_guide.cli:main", setup_text)
         self.assertIn('python_requires=">=3.9"', setup_text)
 
@@ -378,6 +379,8 @@ class CliContractTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
             )
+            from tests.support_packaging import ensure_setuptools
+            ensure_setuptools(self, environment / "bin/python")
             installed = subprocess.run(
                 [str(environment / "bin/python"), "setup.py", "develop"],
                 cwd=str(source),

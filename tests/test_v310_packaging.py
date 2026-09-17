@@ -9,7 +9,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET_VERSION = "4.1.0"
+# The upgrade target is the version the package currently declares; the
+# legacy 2.0.0 side of the scenario is synthesized below and stays fixed.
+from vibe_guide import __version__ as TARGET_VERSION  # noqa: E402
 
 
 def _run(command, *, cwd, env=None):
