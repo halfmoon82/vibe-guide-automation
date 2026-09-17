@@ -11,18 +11,27 @@ from .models import AgentCapabilities, DAGNode, Plan
 
 
 AUTHORIZATION_SCHEMA_VERSION = 2
-_ALLOWED_ACTIONS = ("accept", "commit", "develop", "review", "rework", "test")
+# Baseline scope of every card.  ``commit`` is not here: the confirmed V4.5
+# design makes commit/push/PR/MR/merge one group behind ``remote_git_actions``;
+# ``allow`` adds the whole group (``_REMOTE_GIT_ACTIONS_SCOPE``), ``deny`` none.
+_ALLOWED_ACTIONS = ("accept", "develop", "review", "rework", "test")
 _LOCAL_MERGE_ACTION = "merge_local"
 _EXCLUDED_ACTIONS = ("create_mr", "deploy", "merge", "push")
 _HARD_EXCLUDED_ACTIONS = frozenset(("create_change_request", "deploy", "merge", "push"))
 _REMOTE_GIT_ACTIONS = frozenset(("commit", "push", "pr", "mr", "create_pr", "create_mr", "merge"))
 _REMOTE_GIT_ACTIONS_SCOPE = ("commit", "push", "create_pr", "create_mr", "merge")
+# Legacy spellings that must still be refused under ``deny``; the producer
+# never emits them, so they are not part of what ``allow`` must include.
+_REMOTE_GIT_ACTION_ALIASES = ("pr", "mr")
 _ACTION_KEYS = {"action", "actions", "allowed_actions", "requested_actions"}
 # PR/MR and merge actions are valid only when explicitly present on a
 # confirmed card.  The generic ``create_change_request``/``merge`` forms stay
 # excluded to prevent an ambiguous action from widening the allowlist.
+# Every action a card or executable contract may name: the baseline, the
+# remote Git group (one definition, shared with the validator), and the two
+# merge routes.
 _RUNTIME_ACTIONS = frozenset(
-    _ALLOWED_ACTIONS + ("push", "merge", _LOCAL_MERGE_ACTION, "merge_remote", "create_pr", "create_mr")
+    _ALLOWED_ACTIONS + _REMOTE_GIT_ACTIONS_SCOPE + (_LOCAL_MERGE_ACTION, "merge_remote")
 )
 _SENSITIVE_NAMES = (
     "api_key",
@@ -48,14 +57,20 @@ def remote_git_actions_allowed(authorization, action):
 
 
 def validate_remote_git_permissions(remote_git_actions, allowed_actions):
-    """Fail closed when the remote Git switch and action scope disagree."""
+    """Fail closed when the remote Git switch and action scope disagree.
+
+    The vocabulary is the producer's ``_REMOTE_GIT_ACTIONS_SCOPE`` so a card
+    built with ``allow`` is complete by construction; legacy aliases are only
+    ever grounds for refusal under ``deny``.
+    """
     if remote_git_actions not in {"allow", "deny"}:
         raise ValueError("remote_git_actions must be allow or deny")
     actions = set(allowed_actions or ())
-    remote = {"commit", "push", "create_pr", "create_mr", "merge", "pr", "mr"}
-    if remote_git_actions == "allow" and not remote.issubset(actions):
+    remote_required = set(_REMOTE_GIT_ACTIONS_SCOPE)
+    remote_any = remote_required | set(_REMOTE_GIT_ACTION_ALIASES)
+    if remote_git_actions == "allow" and not remote_required.issubset(actions):
         raise ValueError("remote_git_actions=allow requires all remote Git permissions")
-    if remote_git_actions == "deny" and actions & remote:
+    if remote_git_actions == "deny" and actions & remote_any:
         raise ValueError("remote_git_actions=deny conflicts with remote Git permissions")
     if actions & {"deploy", "production_write", "credentials", "external_communication", "release"}:
         raise ValueError("sensitive actions are always excluded")
@@ -66,7 +81,11 @@ def validate_authorization_card_consistency(card):
     validate_remote_git_permissions(switch, data.get("allowed_actions", ()))
     allowed = set(data.get("allowed_actions", ()))
     excluded = set(data.get("excluded_actions", ()))
-    if excluded & allowed:
+    # ``excluded_actions`` is the worker-side envelope (workers never push or
+    # merge themselves); ``allowed_actions`` is what the user authorized.  The
+    # two overlap by design for the remote Git group under ``allow``, so only
+    # an overlap outside that group is a contradiction.
+    if (excluded & allowed) - set(_REMOTE_GIT_ACTIONS_SCOPE):
         raise ValueError("authorization card has overlapping allowed and excluded actions")
     return True
 
@@ -777,7 +796,11 @@ def build_authorization_card(
     )
     digest = _canonical_digest(canonical)
     canonical["engine_authorization_digest"] = digest
-    return AuthorizationCard(digest=digest, **canonical)
+    card = AuthorizationCard(digest=digest, **canonical)
+    # The issuing path checks its own output: a card the validator would
+    # refuse must not be signed in the first place (ISSUE-08).
+    validate_authorization_card_consistency(card)
+    return card
 
 
 def refresh_authorization_card(
