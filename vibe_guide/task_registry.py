@@ -31,6 +31,7 @@ from .binding_lifecycle import (
     verify_binding as verify_v4_binding,
 )
 from .lifecycle import migrate_task_record, normalize_task_status
+from .providers import CODEX_PROVIDER
 
 
 REGISTRY_SCHEMA_VERSION = 1
@@ -221,7 +222,7 @@ class TaskBinding:
         canonical_id = ids[0] if ids else None
         self.task_id = canonical_id
         self.platform_task_id = canonical_id
-        self.threadId = canonical_id if self.provider == "codex" else self.threadId
+        self.threadId = canonical_id if self.provider == CODEX_PROVIDER else self.threadId
         self.thread_id = self.threadId
 
         hosts = [item for item in (self.host, self.hostId, self.host_id) if item is not None]
@@ -231,7 +232,7 @@ class TaskBinding:
             raise ValueError("platform host identity aliases disagree")
         canonical_host = hosts[0] if hosts else None
         self.host = canonical_host
-        self.hostId = canonical_host if self.provider == "codex" else self.hostId
+        self.hostId = canonical_host if self.provider == CODEX_PROVIDER else self.hostId
         self.host_id = self.hostId
 
         expected_visible = self.mode == "visible"
