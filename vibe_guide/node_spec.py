@@ -17,7 +17,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
-import re
 from typing import Any, Dict, List, Optional
 
 from .adapters.base import Environment
@@ -55,7 +54,13 @@ ENGINEERING_TOP_LEVEL_FIELDS = (
     "integration_contract", "spec_path", "plan_id",
 )
 ENGINEERING_NODE_FIELDS = ("status",)
-ENGINEERING_CONTRACT_FIELDS = ("adapter_id", "project_id", "worker", "reviewer_worker", "worker_profile")
+# `worktree` and `branch` are derived per node so parallel writers cannot share
+# a directory.  The fill below only supplies what is missing, so a product spec
+# naming them would keep its own value and bypass that isolation entirely.
+ENGINEERING_CONTRACT_FIELDS = (
+    "adapter_id", "project_id", "worker", "reviewer_worker", "worker_profile",
+    "worktree", "branch",
+)
 ENGINEERING_FIELDS = {
     "top_level": ENGINEERING_TOP_LEVEL_FIELDS,
     "node": ENGINEERING_NODE_FIELDS,

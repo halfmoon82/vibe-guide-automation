@@ -122,16 +122,41 @@ class NodeIsolationTests(unittest.TestCase):
                 self.assertLessEqual(len(part.encode("utf-8")), 255, tree)
         self.assertEqual(len(set(trees)), 2, trees)
 
-    def test_an_explicit_contract_value_is_preserved(self):
-        """A spec that does say where to work keeps its own answer."""
+    def test_a_hand_written_node_spec_keeps_its_own_answer(self):
+        """The legacy --node-spec path still declares its own placement.
+
+        Those specs carry engineering fields by design, and existing projects
+        depend on the values they name; only the product path forbids them.
+        """
         nodes = [{
             "id": "export-button",
             "title": "export-button",
-            "contract": {"worktree": "../custom-tree", "branch": "feature/custom"},
+            "contract": {"worktree": ".worktrees/custom", "branch": "feature/custom"},
         }]
         complete_node_contracts(nodes, "claude-code", "proj")
-        self.assertEqual(nodes[0]["contract"]["worktree"], "../custom-tree")
+        self.assertEqual(nodes[0]["contract"]["worktree"], ".worktrees/custom")
         self.assertEqual(nodes[0]["contract"]["branch"], "feature/custom")
+
+    def test_a_product_spec_may_not_name_its_own_worktree_or_branch(self):
+        """The last unguarded way back into one tree on the trunk.
+
+        `complete_node_contracts` only fills what is missing, so a product spec
+        that names `worktree: "."` keeps it and every derivation added here is
+        bypassed -- the defect this change fixes, reached through the door the
+        engineering-field guard left open.
+        """
+        from vibe_guide.node_spec import reject_engineering_fields
+        for field, value in (("worktree", "."), ("branch", "main")):
+            spec = {
+                "title": "t", "objective": "o",
+                "nodes": [{
+                    "id": "export-button", "title": "export-button",
+                    "contract": {field: value},
+                }],
+            }
+            with self.assertRaises(ValueError) as caught:
+                reject_engineering_fields(spec)
+            self.assertIn(field, str(caught.exception))
 
     def test_derived_names_are_stable_across_calls(self):
         """The same node must map to the same tree on every dispatch."""
