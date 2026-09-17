@@ -38,6 +38,20 @@ def _product_spec():
 
 
 class ProtocolShippingTests(unittest.TestCase):
+    def test_every_shipped_rule_block_opens_with_its_own_heading(self):
+        """New rule blocks are registered here, and headings identify them.
+
+        A section is tracked by the heading on its first line -- which sections
+        the proposal holds, which the reviewer has been offered.  A block with no
+        first line raises on that lookup, and two blocks sharing a heading
+        collapse into one entry, permanently suppressing the second.
+        """
+        from vibe_guide.scanner import AGENTSMD_BLOCKS
+        headings = [block.splitlines()[0].strip() for block in AGENTSMD_BLOCKS]
+        for heading in headings:
+            self.assertTrue(heading.startswith("## "), heading)
+        self.assertCountEqual(headings, set(headings), "two blocks share a heading")
+
     def test_protocol_schema_example_matches_node_spec_schema(self):
         from vibe_guide.node_spec import PRODUCT_SPEC_FIELDS
         from vibe_guide.protocols import load_protocol, protocol_schema_example
