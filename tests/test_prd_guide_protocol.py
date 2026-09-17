@@ -165,6 +165,25 @@ class InitMaterializationTests(_ProjectCase):
         self.assertEqual(agentsmd.read_text(encoding="utf-8"), final, again.text)
 
 
+class ProposalPreservationTests(_ProjectCase):
+    def test_init_never_overwrites_an_edited_agentsmd_proposal(self):
+        """A proposal is awaiting human review; init must not rewrite it.
+
+        Refreshing a stale proposal in place restored sections the reviewer had
+        deliberately deleted and discarded their notes.  A pending update goes
+        to a side file instead, so the reviewed bytes are never touched.
+        """
+        self.init()
+        proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+        text = proposal.read_text(encoding="utf-8")
+        self.assertIn("## Complex Request Entry", text)
+        head = text.partition("## Complex Request Entry")[0]
+        edited = head.rstrip("\n") + "\n\n<!-- 这一节我们不要，已删除 -->\n"
+        proposal.write_text(edited, encoding="utf-8")
+        self.init()
+        self.assertEqual(proposal.read_text(encoding="utf-8"), edited)
+
+
 class ProtocolEnforcementTests(_ProjectCase):
     def test_needs_confirmation_blocks_publish(self):
         self.init()
@@ -238,6 +257,32 @@ class ProtocolEnforcementTests(_ProjectCase):
             self.assertEqual(result.payload.get("status"), "blocked_design", (marker, result.payload))
             self.assertIn("水印", result.payload.get("question", ""))
             self.assertFalse((self.root / ".vibe" / "plans" / "pm-marker").exists())
+
+    def test_a_falsy_product_question_cannot_mask_a_pending_item(self):
+        """A pending item must win over whatever the spec already put there.
+
+        The injection used setdefault, so a spec that pre-set
+        rationale.product_question to null blocked it: the checkpoint gate then
+        saw no open question and published a plan with the item unconfirmed.
+        """
+        self.init()
+        self.write_capabilities()
+        for masking in (None, "", 0, False, {}):
+            spec = _product_spec()
+            spec["prd"]["success_criteria"].append(
+                {"value": "导出是否需要带公司水印尚未确认", "source": "needs_confirmation"}
+            )
+            spec["rationale"] = {
+                "product_question": masking,
+                "framing": "verified_fact: 已确认问题框定",
+                "tradeoffs": "verified_fact: 已确认取舍",
+                "flow": "verified_fact: 已确认流程",
+                "acceptance": "verified_fact: 已确认验收",
+            }
+            result = self.plan_from_prd(spec, plan_id="pm-mask")
+            self.assertEqual(result.payload.get("status"), "blocked_design", (masking, result.payload))
+            self.assertIn("水印", result.payload.get("question", ""), masking)
+            self.assertFalse((self.root / ".vibe" / "plans" / "pm-mask").exists(), masking)
 
     def test_planning_brief_lists_goal_traceability_rows(self):
         self.init()

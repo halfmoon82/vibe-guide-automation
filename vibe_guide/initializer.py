@@ -192,25 +192,41 @@ def init_project(paths, confirm):
     proposal = build_agentsmd_patch(report.agentsmd_content, report)
     proposal_path = root / '.vibe/proposals/agentsmd/proposal.md'
     if proposal.proposed:
-        # A proposal written by an earlier version can predate rule blocks the
-        # current version proposes.  Refresh it when it is missing a block the
-        # project still needs, so the increment is not stranded; leave it alone
-        # otherwise so a reviewed proposal keeps its bytes.
         existing_proposal = None
         if proposal_path.is_file() and not proposal_path.is_symlink():
             try:
                 existing_proposal = proposal_path.read_text(encoding='utf-8')
             except (OSError, UnicodeDecodeError):
                 existing_proposal = None
-        stale = existing_proposal is not None and any(
-            block.strip() not in existing_proposal for block in missing_agentsmd_blocks(report.agentsmd_content)
-        )
         if existing_proposal is None:
             _write_new(proposal_path, proposal.content)
             created.append(str(proposal_path.relative_to(root)))
-        elif stale:
-            proposal_path.write_text(proposal.content, encoding='utf-8')
-            created.append(str(proposal_path.relative_to(root)))
+        else:
+            # An existing proposal is awaiting human review, and a reviewer may
+            # have deliberately deleted a section they do not want.  Rewriting
+            # it in place would restore that section and discard their notes, so
+            # a proposal that predates a newer rule block goes to a side file
+            # and the reviewed bytes are left alone.
+            pending_blocks = [
+                block for block in missing_agentsmd_blocks(report.agentsmd_content)
+                if block.strip() not in existing_proposal
+            ]
+            if pending_blocks:
+                update_path = proposal_path.with_name('proposal.pending-update.md')
+                update = (
+                    '# 提案增量（本次未合入 proposal.md）\n\n'
+                    '现有 proposal.md 正在等待人工评审，可能已被有意修改，因此不改写它。\n'
+                    '以下小节是当前版本新增、proposal.md 里还没有的内容；确认要采纳时，\n'
+                    '自行复制进 proposal.md 再运行 vibe apply-agentsmd --confirm。\n\n'
+                    + '\n'.join(pending_blocks)
+                )
+                if not update_path.exists():
+                    _write_new(update_path, update)
+                    created.append(str(update_path.relative_to(root)))
+                elif update_path.is_file() and not update_path.is_symlink():
+                    if update_path.read_text(encoding='utf-8') != update:
+                        _atomic_write(update_path, update)
+                        created.append(str(update_path.relative_to(root)))
     skill_proposal = root / '.vibe/proposals/skills/proposal.md'
     if not skill_proposal.exists() and not any(item.get('valid') and item.get('name') == 'architecture-skill-pack' for item in report.skills):
         _write_new(

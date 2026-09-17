@@ -280,11 +280,16 @@ def normalize_node_spec(spec: Any, entry: Any, paths: Any, route_governs_band: b
         rationale = out.get("rationale")
         if not isinstance(rationale, dict):
             rationale = {} if rationale in (None, "") else {"framing": rationale}
-        rationale.setdefault("product_question", {
+        # Assign, do not setdefault: a spec that already carries a falsy
+        # product_question would otherwise block the injection, and the
+        # checkpoint gate would see no open question and publish the plan with
+        # the item still unconfirmed.  A real pending item outranks whatever
+        # the spec put there.
+        rationale["product_question"] = {
             "question": pending[0],
             "options": [],
             "impact": "该项未确认前不能进入规划；共 {} 项待确认".format(len(pending)),
-        })
+        }
         out["rationale"] = rationale
     return out
 
