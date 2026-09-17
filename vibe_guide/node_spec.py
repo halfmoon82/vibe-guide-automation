@@ -109,6 +109,10 @@ def observe_capabilities(paths: Any) -> ObservedCapabilities:
     adapter_id = observed["adapter_id"]
     facts = observed["facts"]
     environment = Environment(
+        # The manifest's agent probe is `command`-kind and is read through
+        # has_command(); hand the session's `<adapter>.agent` statement to
+        # `commands` too, or its recorded evidence is always False.
+        commands={name: value for name, value in facts.items() if name.endswith(".agent")},
         facts=facts,
         provenance={key: observed["provenance"] for key in facts},
         available_agents=(adapter_id,),
