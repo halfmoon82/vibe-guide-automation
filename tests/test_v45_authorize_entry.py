@@ -117,6 +117,30 @@ class AuthorizeEntryContract(unittest.TestCase):
         self.assertEqual(select_plan_workflow(state, "probe-plan")["task_id"], "probe-plan")
         self.assertEqual(select_plan_workflow(state, "plan-b")["task_id"], "plan-b")
 
+    def test_evidence_copied_under_another_plans_key_is_not_accepted(self):
+        # Per-plan keying is the outer guard; the ``task_id`` identity check is
+        # the inner one.  Copying probe-plan's evidence under plan-b's key, or
+        # storing it in the pre-keying single-object layout, must read as absent
+        # for plan-b -- otherwise a mis-keyed or copied record would let one
+        # plan's token start another.
+        publish_second_plan(self.root, "plan-b")
+        materialize_workflow_evidence(self.paths, "probe-plan", "AUTHORIZE")
+        state_path = self.paths.vibe / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        evidence = state["task_workflow"]["probe-plan"]
+        self.assertEqual(evidence["task_id"], "probe-plan")
+        keyed = dict(state)
+        keyed["task_workflow"] = {"plan-b": evidence}
+        self.assertIsNone(select_plan_workflow(keyed, "plan-b"))
+        single = dict(state)
+        single["task_workflow"] = evidence
+        self.assertIsNone(select_plan_workflow(single, "plan-b"))
+        self.assertIsNotNone(select_plan_workflow(single, "probe-plan"))
+        state_path.write_text(json.dumps(keyed, ensure_ascii=False, indent=2), encoding="utf-8")
+        stolen = run_cli(["monitor", "--json", "--plan", "plan-b", "--authorize", "AUTHORIZE"], self.root)
+        self.assertEqual(stolen.payload["status"], "blocked_design")
+        self.assertIn("required_workflow_blocked", stolen.payload["reason"])
+
     def test_editing_an_artifact_after_authorize_invalidates_the_evidence(self):
         workflow = build_workflow_evidence(self.paths, "probe-plan", "AUTHORIZE")
         verify_workflow_artifacts(self.paths, workflow)  # clean before the edit
