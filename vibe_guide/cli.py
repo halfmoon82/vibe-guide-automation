@@ -54,6 +54,7 @@ from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
 from .workflow_gate import require_capability_contract
 from .authorize_entry import AuthorizationDenied, materialize_workflow_evidence
 from .attest import record_session_capabilities
+from .protocols import PRD_GUIDE_NAME, load_protocol
 from .state import load_events, load_snapshot
 from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
@@ -103,6 +104,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--s1")
     parser.add_argument("--node-spec")
     parser.add_argument("--from-prd", dest="from_prd")
+    parser.add_argument("--print-protocol", action="store_true", dest="print_protocol")
     parser.add_argument("--adapter")
     parser.add_argument("--facts")
     parser.add_argument("--provenance")
@@ -780,6 +782,13 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             v42_state = isinstance(state_data, dict) and state_data.get("workflow_version") == 4
         except (OSError, ValueError, AttributeError):
             v2_state = False
+    if args.command == "plan" and args.print_protocol:
+        # Read-only, and placed ahead of session screening so it stays that
+        # way: screening opens a session gate on any initialized project, and
+        # printing a document must not touch project state.
+        protocol = load_protocol(PRD_GUIDE_NAME)
+        return _result(SUCCESS, {"command": "plan", "status": "ok", "protocol": protocol}, protocol, args.as_json)
+
     # S0/session screening is an entry-boundary requirement for both legacy
     # V2 and current V4 runs.  Runtime workflow evidence is intentionally
     # separate and must not be used as a substitute for this probe.
@@ -891,12 +900,11 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             "changed": initialized.changed,
             "paths": initialized.paths,
         }
-        return _result(
-            SUCCESS,
-            payload,
-            "初始化完成" if initialized.changed else "初始化无需变更",
-            args.as_json,
-        )
+        summary = "初始化完成" if initialized.changed else "初始化无需变更"
+        if initialized.notes:
+            payload["notes"] = list(initialized.notes)
+            summary += "；请注意：" + "；".join(initialized.notes)
+        return _result(SUCCESS, payload, summary, args.as_json)
 
     if args.command == "upgrade":
         if not args.confirm:
@@ -1281,7 +1289,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     "handoff_text": handoff.render(),
                     "downstream_artifact": None,
                 }
-                return _result(BLOCKED, payload, "规划已暂停：需要回答产品问题", args.as_json)
+                return _result(BLOCKED, payload, "规划已暂停：需要回答产品问题：" + question, args.as_json)
             review_checkpoints = [item for item in checkpoints if item.status == "review_required"]
             if has_prd_gate_input and review_checkpoints:
                 handoff = build_stage_handoff(

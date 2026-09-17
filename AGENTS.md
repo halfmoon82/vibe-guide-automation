@@ -101,7 +101,7 @@
 ## 7. 配置与外部 Skill
 
 - `architecture-skill-pack` 必装；`akasha-grimoire` 和 `aligning-with-johari-windows` 可选。
-- Skill 只能从已配置 GitHub 地址拉取，记录来源和提交 SHA；不把 Skill 源码复制进本项目。
+- Skill 只能从已配置 GitHub 地址拉取，记录来源和提交 SHA；不把 Skill 源码复制进本项目。vibe 自有的 PRD 引导协议（`vibe_guide/protocols/prd-guide.md`）随包发布、由 `init` 物化为 `.vibe/proposals/skills/prd-guide/SKILL.md`，不属于外部 Skill，不受此条约束。
 - 用户级共享缓存由 `VIBE_HOME` 指定；项目只保存引用和版本，不保存 token、密码或绝对用户路径。
 - `scan` 只读；`init`、Skill 安装和 `.vibe/knowledge/` 初始化必须经确认。
 - 已有 `AGENTS.md` 只生成补丁建议，不直接覆盖、追加或删除。

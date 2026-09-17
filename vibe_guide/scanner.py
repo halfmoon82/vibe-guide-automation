@@ -36,6 +36,15 @@ CAPABILITY_RULES = """## Capability and Tool Truth
 - 只有 runtime/provider 的结构化结果才能进入能力阻断状态。
 """
 
+PRD_GUIDE_MARKER = "Complex Request Entry"
+PRD_GUIDE_RULES = """## Complex Request Entry
+
+- 复杂请求先按 `.vibe/proposals/skills/prd-guide/SKILL.md` 的协议引导：agent 出 PRD 内容与节点拆分，vibe 校验并派生全部工程字段。
+- 产品 spec 只写业务字段；工程字段由 `vibe plan --from-prd` 派生，写了会被拒。
+- `needs_confirmation` 项未闭合不得发布；产品决策只有产品经理选定后才是 approved。
+"""
+
+
 
 @dataclass
 class ScanReport:
@@ -179,20 +188,43 @@ def scan_project(paths):
     )
 
 
-def build_agentsmd_patch(existing, report):
-    if (
-        existing is not None
-        and 'Vibe Guide' in existing
+#: Every rule block this release ships, in document order.
+AGENTSMD_BLOCKS = (CAPABILITY_RULES, PRD_GUIDE_RULES)
+
+
+def missing_agentsmd_blocks(existing):
+    '''Return the rule blocks an AGENTS.md still lacks, in document order.
+
+    Each block is judged on its own marker.  A single combined check would
+    make any later block unreachable for every project that already applied
+    an earlier one.
+    '''
+    if existing is None:
+        return list(AGENTSMD_BLOCKS)
+    blocks = []
+    has_capability_rules = (
+        'Vibe Guide' in existing
         and 'project' in existing.lower()
         and CAPABILITY_RULE_MARKER in existing
         and 'evidence_ref' in existing
         and 'unknown_timeout' in existing
-    ):
+    )
+    if not has_capability_rules:
+        blocks.append(CAPABILITY_RULES)
+    if PRD_GUIDE_MARKER not in existing:
+        blocks.append(PRD_GUIDE_RULES)
+    return blocks
+
+
+def build_agentsmd_patch(existing, report):
+    blocks = missing_agentsmd_blocks(existing)
+    if not blocks:
         return PatchProposal(False, '')
+    body = '\n'.join(blocks)
     if existing is None:
-        content = '# Vibe Guide\n\nProject guidance is maintained through the Vibe Guide.\n\n' + CAPABILITY_RULES
+        content = '# Vibe Guide\n\nProject guidance is maintained through the Vibe Guide.\n\n' + body
     else:
-        content = '# Vibe Guide capability contract proposal\n\n' + CAPABILITY_RULES
+        content = '# Vibe Guide capability contract proposal\n\n' + body
     return PatchProposal(
         True,
         content,

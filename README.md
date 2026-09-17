@@ -49,17 +49,23 @@ python3 -m venv .venv
 python3 -m vibe_guide --help
 ```
 
-## 七个命令
+## 核心命令
 
 ```text
-vibe scan                         只读扫描项目，不创建 .vibe/
-vibe init --confirm               确认后初始化最小项目状态；重复执行不改写
-vibe doctor                       报告可观察的环境、Skill 和 Agent 命令事实
-vibe plan --request <请求>        先走 S0；需要时使用显式 S1 与 node-spec
-vibe monitor --plan <ID>          没有精确授权时拒绝启动
-vibe status --plan <ID>           读取当前快照，不轮询外部 provider
-vibe resume --plan <ID>           从快照、任务登记和事件证据继续
+vibe scan                                    只读扫描项目，不创建 .vibe/
+vibe init --confirm                          确认后初始化最小项目状态；重复执行不改写
+vibe doctor                                  报告可观察的环境、Skill 和 Agent 命令事实
+vibe attest --adapter <id> --facts <json>    登记本会话实测到的能力（复杂计划发布前必做一次）
+vibe plan --request <请求>                   先走 S0/S1 分流；complex 请求生成 draft
+vibe plan --request <请求> --from-prd <spec> 用产品级 spec 发布复杂计划，工程字段自动派生
+vibe plan --print-protocol                   打印 PRD 引导协议（agent 用）
+vibe authorize --plan <ID> --authorize AUTHORIZE   记录一次用户授权（十节点门禁证据）
+vibe monitor --plan <ID> --authorize AUTHORIZE     启动监工；没有精确授权时拒绝
+vibe status --plan <ID>                      读取当前快照，不轮询外部 provider
+vibe resume --plan <ID>                      从快照、任务登记和事件证据继续
 ```
+
+产品经理的完整路径：agent 按 `.vibe/proposals/skills/prd-guide/SKILL.md` 的协议引导写 PRD 与节点拆分（业务字段），`vibe attest` 登记会话能力，`vibe plan --from-prd` 发布，`vibe authorize` 授权，`vibe monitor` 派发。旧的 `--node-spec` 手写路径仍可用。
 
 每个命令都支持 `--json`。默认文本面向产品经理；JSON 适合桌面 App 适配器和自动化调用。退出码为：`0` 命令成功执行，`2` 参数错误，`3` 需要确认或因设计变化阻塞，`4` 外部/运行状态未知。
 
@@ -126,7 +132,7 @@ V4.4 将工程故障限定在节点范围内，并保留同一任务身份。五
 
 该整合流程只适用于 `complex`；`simple` 与 `light_plan` 仍走轻量路径，不生成最终整合 Review。整合通过不等于 merge、push 或 deploy：授权卡的 `remote_git_actions` 仅是远端 Git 总开关，deploy、凭据和系统权限始终需要独立授权与验证。
 
-在 revision 5 运行时，确认授权卡即启动 Monitor；不再需要第二个启动动作。旧版 CLI 兼容路径仍可接受显式 `--authorize`：
+当前版本中，确认授权卡后需要两步：`vibe authorize --plan <ID> --authorize AUTHORIZE` 记录十节点门禁证据，再 `vibe monitor --plan <ID> --authorize AUTHORIZE` 启动 Monitor。旧版 CLI 兼容路径仍可接受显式 `--authorize`：
 
 ```bash
 vibe monitor --plan example-plan --json
