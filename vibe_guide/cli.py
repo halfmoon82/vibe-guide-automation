@@ -53,6 +53,7 @@ from .diagnostics import screen_session, require_session_screened
 from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
 from .workflow_gate import require_capability_contract
 from .authorize_entry import AuthorizationDenied, materialize_workflow_evidence
+from .attest import record_session_capabilities
 from .state import load_events, load_snapshot
 from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
@@ -90,7 +91,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -102,6 +103,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--s1")
     parser.add_argument("--node-spec")
     parser.add_argument("--from-prd", dest="from_prd")
+    parser.add_argument("--adapter")
+    parser.add_argument("--facts")
+    parser.add_argument("--provenance")
+    parser.add_argument("--project-id", dest="project_id")
     parser.add_argument("--authorize")
     parser.add_argument("--authorization-token", dest="legacy_authorization")
     parser.add_argument("--manifest")
@@ -785,7 +790,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             screen_session(paths, str(session_id), args.command)
         except (OSError, ValueError, PermissionError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": str(error)}, "会话筛选已阻塞：" + str(error), args.as_json)
-    if args.command in {"authorize", "monitor", "reconcile", "resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
+    if args.command in {"attest", "authorize", "monitor", "reconcile", "resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
         return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": "V2 state.json is missing"}, "会话筛选已阻塞：V2 state.json 缺失", args.as_json)
     if args.command == "scan" and paths.vibe.exists():
         try:
@@ -1125,6 +1130,40 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             return _result(BLOCKED, {"command": "deploy", "status": "blocked_deploy", "reason": str(error)}, "Deploy 已暂停：" + str(error), args.as_json)
         except (FileNotFoundError, OSError, TypeError, ValueError) as error:
             return _result(UNKNOWN, {"command": "deploy", "status": "blocked_unknown", "reason": str(error)}, "Deploy 状态未知：" + str(error), args.as_json)
+
+    if args.command == "attest":
+        missing = [flag for flag, value in (("--adapter", args.adapter), ("--facts", args.facts), ("--provenance", args.provenance)) if not value]
+        if missing:
+            return _result(
+                BLOCKED,
+                {"command": "attest", "status": "blocked_invalid", "reason": "attest requires " + ", ".join(missing)},
+                "能力登记未完成：缺少 " + ", ".join(missing),
+                args.as_json,
+            )
+        try:
+            facts = _read_json(paths.resolve_relative(args.facts))
+            summary = record_session_capabilities(paths, args.adapter, facts, args.provenance, args.project_id)
+        except PermissionError as error:
+            return _result(
+                BLOCKED,
+                {"command": "attest", "status": "blocked", "reason": str(error)},
+                "能力登记未完成：" + str(error),
+                args.as_json,
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            return _result(
+                BLOCKED,
+                {"command": "attest", "status": "blocked_invalid", "reason": str(error)},
+                "能力登记未完成：" + str(error),
+                args.as_json,
+            )
+        payload = {"command": "attest", "status": "ok"}
+        payload.update(summary)
+        text = "已登记 {} 会话能力：级别 {}，{}".format(
+            summary["adapter_id"], summary["level"],
+            "可派发可见任务" if summary["visible_automation"] else "未验证可见任务控制面，仅向导/后台模式",
+        )
+        return _result(SUCCESS, payload, text, args.as_json)
 
     if args.command == "plan":
         try:
