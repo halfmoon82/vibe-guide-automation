@@ -183,6 +183,69 @@ class ProposalPreservationTests(_ProjectCase):
         self.init()
         self.assertEqual(proposal.read_text(encoding="utf-8"), edited)
 
+    def test_a_pending_increment_still_reaches_agentsmd(self):
+        """Not rewriting the proposal must not mean dropping the increment.
+
+        A project that applied an earlier version already has a proposal on
+        disk, so the new section goes to a side file.  If nothing ever consumes
+        that file the rule never reaches AGENTS.md -- a silent overwrite traded
+        for a silent discard.  This walks the real upgrade: apply the old
+        proposal, re-init, apply again.
+        """
+        from vibe_guide.scanner import PRD_GUIDE_MARKER
+        agentsmd = self.root / "AGENTS.md"
+        proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+
+        self.init()
+        # Stand in for a proposal reviewed under an earlier version: drop the
+        # section this release adds, keep the reviewer's own note.
+        text = proposal.read_text(encoding="utf-8")
+        older = text.partition("## " + PRD_GUIDE_MARKER)[0].rstrip("\n")
+        proposal.write_text(older + "\n\n<!-- 评审备注：保留 -->\n", encoding="utf-8")
+        first = run_cli(["apply-agentsmd", "--confirm", "--json"], self.root)
+        self.assertEqual(first.exit_code, 0, first.text)
+        self.assertNotIn(PRD_GUIDE_MARKER, agentsmd.read_text(encoding="utf-8"))
+
+        self.init()
+        self.assertIn("<!-- 评审备注：保留 -->", proposal.read_text(encoding="utf-8"))
+        applied = run_cli(["apply-agentsmd", "--confirm", "--json"], self.root)
+        self.assertEqual(applied.exit_code, 0, applied.text)
+        final = agentsmd.read_text(encoding="utf-8")
+        self.assertIn(PRD_GUIDE_MARKER, final)
+        self.assertEqual(final.count(PRD_GUIDE_MARKER), 1, final)
+        again = run_cli(["apply-agentsmd", "--confirm", "--json"], self.root)
+        self.assertEqual(agentsmd.read_text(encoding="utf-8"), final, again.text)
+
+    def test_a_fenced_heading_is_not_read_as_a_section_boundary(self):
+        """A `## ` inside ``` is example text, not a new section.
+
+        Splitting on it tears the fence apart: the closing ``` and every line
+        after it ride along with a section whose heading AGENTS.md already has,
+        so they are dropped and the applied markdown has an unclosed fence.
+        """
+        from vibe_guide.initializer import _proposal_sections
+        document = (
+            "# 提案\n\n"
+            "## Already Applied\n\n"
+            "示例写法：\n\n"
+            "```markdown\n"
+            "## Already Applied\n"
+            "这是示例，不是真小节\n"
+            "```\n\n"
+            "这一段必须跟着它自己的小节。\n\n"
+            "## Brand New\n"
+            "真正要合入的内容。\n"
+        )
+        sections = _proposal_sections(document)
+        self.assertEqual(
+            [section.splitlines()[0] for section in sections],
+            ["## Already Applied", "## Brand New"],
+            sections,
+        )
+        for section in sections:
+            self.assertEqual(section.count("```") % 2, 0, section)
+        self.assertIn("这一段必须跟着它自己的小节。", sections[0])
+
 
 class ProtocolEnforcementTests(_ProjectCase):
     def test_needs_confirmation_blocks_publish(self):

@@ -17,6 +17,10 @@ from .capability_contract import build_contract, contract_path, load_contract, s
 from .migration import migrate_v2_to_v310, migrate_v2_to_v42, _backup, _payload_is_complete
 from .workflow_gate import V42_STATE
 
+# Newer rule blocks land here when a reviewed proposal.md already exists; both
+# the writer (init) and the reader (apply-agentsmd) name it from here.
+PENDING_UPDATE_NAME = "proposal.pending-update.md"
+
 
 @dataclass
 class InitResult:
@@ -212,12 +216,13 @@ def init_project(paths, confirm):
                 if block.strip() not in existing_proposal
             ]
             if pending_blocks:
-                update_path = proposal_path.with_name('proposal.pending-update.md')
+                update_path = proposal_path.with_name(PENDING_UPDATE_NAME)
                 update = (
                     '# 提案增量（本次未合入 proposal.md）\n\n'
                     '现有 proposal.md 正在等待人工评审，可能已被有意修改，因此不改写它。\n'
-                    '以下小节是当前版本新增、proposal.md 里还没有的内容；确认要采纳时，\n'
-                    '自行复制进 proposal.md 再运行 vibe apply-agentsmd --confirm。\n\n'
+                    '以下小节是当前版本新增、proposal.md 里还没有的内容。\n'
+                    'vibe apply-agentsmd --confirm 会连同本文件一起合入 AGENTS.md；\n'
+                    '不想采纳某一节就在这里删掉它。\n\n'
                     + '\n'.join(pending_blocks)
                 )
                 if not update_path.exists():
@@ -248,6 +253,24 @@ def init_project(paths, confirm):
     return InitResult(bool(created), created)
 
 
+def _read_proposal(path):
+    """Return a proposal file's text, or None when there is nothing to read.
+
+    Both the reviewed proposal and the increment beside it are files a human
+    may have edited, so each gets the same bounds: a regular file, within the
+    size limit, valid UTF-8.
+    """
+    if path.is_symlink() or not path.is_file():
+        return None
+    raw = path.read_bytes()
+    if len(raw) > 64 * 1024:
+        raise ValueError("%s exceeds the size bound" % path.name)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("%s is not valid UTF-8" % path.name) from error
+
+
 def _proposal_sections(proposal):
     """Split a reviewed proposal into its `## ` sections, heading included.
 
@@ -255,11 +278,19 @@ def _proposal_sections(proposal):
     its own so a project that already carries an earlier section can still
     receive a later one.  Any preamble before the first heading is dropped,
     since it only titles the proposal document.
+
+    A `## ` inside a fenced block is example text, not a boundary.  This
+    protocol's own rules are written with fenced examples, so splitting on one
+    would tear the fence apart and strand its closing line -- and everything
+    after it -- in a section whose heading AGENTS.md may already carry.
     """
     sections = []
     current = []
+    fenced = False
     for line in proposal.splitlines(keepends=True):
-        if line.startswith("## "):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        if line.startswith("## ") and not fenced:
             if current:
                 sections.append("".join(current))
             current = [line]
@@ -284,19 +315,19 @@ def apply_agentsmd_proposal(paths, confirm):
     if not root.is_dir():
         raise ValueError("project root must be a directory")
     proposal_path = root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
-    if proposal_path.is_symlink() or not proposal_path.is_file():
+    proposal = _read_proposal(proposal_path)
+    if proposal is None:
         raise ValueError("AGENTS.md proposal is missing or not a regular file")
-    proposal_raw = proposal_path.read_bytes()
-    if len(proposal_raw) > 64 * 1024:
-        raise ValueError("AGENTS.md proposal exceeds the size bound")
-    try:
-        proposal = proposal_raw.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError("AGENTS.md proposal is not valid UTF-8") from error
     if not proposal.strip() or not (
         CAPABILITY_RULE_MARKER in proposal or PRD_GUIDE_MARKER in proposal
     ):
         raise ValueError("AGENTS.md proposal does not contain capability rules")
+    # A project that reviewed an earlier proposal keeps those bytes, so newer
+    # rule blocks were written beside it rather than into it.  Applying only
+    # proposal.md would leave that increment on disk forever: the rule would
+    # never reach AGENTS.md and nothing would say so.  Section-level dedup
+    # below makes reading both safe.
+    increment = _read_proposal(proposal_path.with_name(PENDING_UPDATE_NAME))
 
     target = root / "AGENTS.md"
     if target.is_symlink() or (target.exists() and not target.is_file()):
@@ -305,8 +336,15 @@ def apply_agentsmd_proposal(paths, confirm):
     # Append only the sections this AGENTS.md still lacks, judging each by its
     # own heading.  Keying the whole append on one marker would strand every
     # later section on any project that already applied an earlier one.
+    sections = _proposal_sections(proposal)
+    if increment:
+        seen = {section.splitlines()[0].strip() for section in sections}
+        sections += [
+            section for section in _proposal_sections(increment)
+            if section.splitlines()[0].strip() not in seen
+        ]
     pending = [
-        section for section in _proposal_sections(proposal)
+        section for section in sections
         if section.splitlines()[0].strip() not in existing
     ]
     if not pending:
