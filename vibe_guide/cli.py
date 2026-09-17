@@ -446,15 +446,15 @@ def _load_plan(paths: ProjectPaths, plan_id: str):
     for item in nodes_data:
         if not isinstance(item, dict):
             raise ValueError("nodes.json entries must be objects")
-        # Revisioned V3.9 plans keep the executable file scope at the node
-        # level; adapt it to the legacy contract container used by the model.
+        # Some revisioned plans keep the executable file scope at the node
+        # level; move it into the contract container the model expects.  Only
+        # the file scope carries over: adapter, worker, and project identity
+        # belong to the project that attested them, so inventing values here
+        # would bind the authorization card to an identity nobody verified.
         if "contract" not in item:
             item = dict(item)
             item["contract"] = {
                 "files": list(item.get("allowlist", [])),
-                "worker": "codex-app-visible-developer",
-                "adapter_id": "codex",
-                "project_id": "dbd30713-4842-4030-90ad-1789a85cbc58",
                 "input": "",
                 "output": "",
                 "error_behavior": "",
