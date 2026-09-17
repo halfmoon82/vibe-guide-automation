@@ -268,6 +268,42 @@ class ProposalPreservationTests(_ProjectCase):
         self.init()
         self.assertFalse(increment.is_file(), "a rejected increment must not come back")
 
+    def test_editing_the_reviewed_proposal_does_not_wipe_the_increment(self):
+        """Reviewing one section must not silently discard another.
+
+        Whether a section is already in `proposal.md` was judged by looking for
+        its whole block verbatim, while whether it had been offered was judged
+        by its heading.  Under those two yardsticks a reviewer who edits a word
+        of the capability section makes its block stop matching, so it becomes
+        pending again and rewrites the increment -- dropping the PRD section
+        along with the reviewer's own notes.  Nothing then re-offers it, because
+        the offered record still lists its heading, and `notes` stays empty.
+        """
+        from vibe_guide.scanner import PRD_GUIDE_MARKER
+        agentsmd = self.root / "AGENTS.md"
+        proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+        increment = proposal.with_name("proposal.pending-update.md")
+
+        self._write_pre_release_proposal(proposal)
+        self.init()
+        self.assertIn(PRD_GUIDE_MARKER, increment.read_text(encoding="utf-8"))
+
+        reviewed = [
+            line for line in proposal.read_text(encoding="utf-8").splitlines(True)
+            if not line.strip().startswith("-")
+        ]
+        proposal.write_text("".join(reviewed), encoding="utf-8")
+
+        self.init()
+        self.assertIn(
+            PRD_GUIDE_MARKER,
+            increment.read_text(encoding="utf-8") if increment.is_file() else "",
+            "editing one section discarded the section still awaiting review",
+        )
+        applied = run_cli(["apply-agentsmd", "--confirm", "--json"], self.root)
+        self.assertEqual(applied.exit_code, 0, applied.text)
+        self.assertIn(PRD_GUIDE_MARKER, agentsmd.read_text(encoding="utf-8"))
+
     def test_rewriting_the_offered_record_keeps_it_readable(self):
         """The rewrite path must not re-encode what is already serialized.
 
