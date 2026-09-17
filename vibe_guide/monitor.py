@@ -58,6 +58,7 @@ from .task_registry import (
     save_task_binding,
 )
 from .workflow_gate import require_capability_contract, require_entry, verify_workflow
+from .authorize_entry import load_live_workflow, select_plan_workflow, verify_workflow_artifacts
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
 from .model_router import ModelRouter
@@ -987,11 +988,18 @@ class Monitor:
                 state_data = json.loads(state.read_text(encoding="utf-8"))
             except (OSError, ValueError, json.JSONDecodeError) as error:
                 raise PermissionError("session_gate_blocked") from error
-            task_workflow = state_data.get("task_workflow") or state_data.get("workflow")
+            # Evidence is selected by plan identity: a token supplied for one
+            # plan must not start a different one, so unrelated evidence reads
+            # as absent and the required-workflow gate below still blocks.
+            task_workflow = select_plan_workflow(state_data, self.plan.plan_id)
             if task_workflow is not None:
                 workflow_result = verify_workflow(task_workflow)
                 if workflow_result.get("status") != "complete":
                     raise PermissionError("required_workflow_blocked: {}".format(workflow_result.get("node", "unknown")))
+                # Recorded digests are otherwise never re-checked, so an
+                # artifact edited after authorization would execute on stale
+                # evidence.
+                verify_workflow_artifacts(self.paths, task_workflow)
         elif self.paths.vibe.exists():
             raise PermissionError("session_gate_blocked: V2 state.json is missing")
         assert record is not None
@@ -1094,6 +1102,18 @@ class Monitor:
             result = verify_workflow(snapshot.workflow)
             if result.get("status") != "complete":
                 raise PermissionError("required_workflow_blocked: {}".format(result.get("node", "unknown")))
+            # Symmetric with start(): the lineage check below covers prd.md and
+            # the spec path only, so without this a post-authorization edit to
+            # nodes.json, dag-audit.json, plan-confirmation.json or the card
+            # would go undetected on every tick after the first.  The digests
+            # must be read from `.vibe/state.json`, not from
+            # `snapshot.workflow`: `evidence` is one of the redacted keys, so
+            # the copy saved with the run has every `ref` and `sha256` replaced
+            # by a placeholder and could never match.
+            live_workflow = load_live_workflow(self.paths, snapshot.plan_id)
+            if live_workflow is None:
+                raise PermissionError("required_workflow_blocked: authorizing evidence is no longer present")
+            verify_workflow_artifacts(self.paths, live_workflow, run_started=True)
         legacy_allowed = self._legacy_binding_valid(snapshot.legacy_run, snapshot.legacy_evidence, snapshot.legacy_evidence_digest)
         if "integration-review" in snapshot.nodes and snapshot.workflow is None and not legacy_allowed:
             raise PermissionError("required_workflow_blocked: workflow")
