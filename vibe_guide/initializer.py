@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import os
 import json, tempfile
@@ -31,6 +31,10 @@ OFFERED_SECTIONS_NAME = "proposal.offered.json"
 class InitResult:
     changed: bool
     paths: list
+    #: Things the user should know but that did not stop initialization, such as
+    #: a state file that could not be read.  Kept out of `paths`, which lists
+    #: what was written.
+    notes: list = field(default_factory=list)
 
 
 def migrate_project(source, destination):
@@ -149,11 +153,23 @@ def _migrate_state(path):
 
 
 def _atomic_write(path, data):
+    """Replace `path` with `data` serialized as JSON."""
+    _atomic_write_text(
+        path, json.dumps(data, ensure_ascii=False, sort_keys=True) + '\n'
+    )
+
+
+def _atomic_write_text(path, text):
+    """Replace `path` with `text` verbatim.
+
+    Prose and already-serialized payloads go through here: handing them to the
+    JSON writer stores a quoted, escaped copy of the text instead of the text,
+    which turns a proposal into an unreadable one-line string.
+    """
     descriptor, temporary_name = tempfile.mkstemp(prefix=f'.{path.name}.', dir=str(path.parent))
     try:
         with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
-            json.dump(data, stream, ensure_ascii=False, sort_keys=True)
-            stream.write('\n'); stream.flush(); os.fsync(stream.fileno())
+            stream.write(text); stream.flush(); os.fsync(stream.fileno())
         os.replace(temporary_name, path)
     finally:
         if os.path.exists(temporary_name):
@@ -168,6 +184,7 @@ def init_project(paths, confirm):
     _migrate_state(root / '.vibe' / 'state.json')
     report = scan_project(paths)
     created = []
+    notes = []
     for relative in (
         '.vibe',
         '.vibe/knowledge',
@@ -228,7 +245,9 @@ def init_project(paths, confirm):
             # a proposal that predates a newer rule block goes to a side file
             # and the reviewed bytes are left alone.
             offered_path = proposal_path.with_name(OFFERED_SECTIONS_NAME)
-            offered = _offered_headings(offered_path)
+            offered, damaged = _offered_headings(offered_path)
+            if damaged:
+                notes.append(damaged)
             pending_blocks = [
                 block for block in missing_agentsmd_blocks(report.agentsmd_content)
                 if block.strip() not in existing_proposal
@@ -249,7 +268,7 @@ def init_project(paths, confirm):
                     created.append(str(update_path.relative_to(root)))
                 elif update_path.is_file() and not update_path.is_symlink():
                     if update_path.read_text(encoding='utf-8') != update:
-                        _atomic_write(update_path, update)
+                        _atomic_write_text(update_path, update)
                         created.append(str(update_path.relative_to(root)))
                 _record_offered(
                     offered_path,
@@ -273,28 +292,32 @@ def init_project(paths, confirm):
         prd_guide.parent.mkdir(parents=True, exist_ok=True)
         _write_new(prd_guide, load_protocol(PRD_GUIDE_NAME))
         created.append(PRD_GUIDE_PROPOSAL_RELATIVE)
-    return InitResult(bool(created), created)
+    return InitResult(bool(created), created, notes)
 
 
 def _offered_headings(path):
     """Return the section headings already put to the reviewer.
 
-    An unreadable or malformed record reads as "nothing offered yet": the cost
-    is re-offering a section, which the reviewer can decline again, whereas
-    treating it as "everything offered" would silently withhold new rules.
+    Returns the headings plus a note when the record could not be read.  An
+    unreadable record reads as "nothing offered yet": the cost is re-offering a
+    section, which the reviewer can decline again, whereas treating it as
+    "everything offered" would silently withhold new rules.  The note is what
+    keeps that fallback from being silent -- otherwise a declined section
+    reappears with nothing on screen to explain why.
     """
     if path.is_symlink() or not path.is_file():
-        return frozenset()
+        return frozenset(), None
+    damaged = '{} 读不出来，本次按“尚未提出过任何小节”处理；已被删除的小节可能会再次出现在增量里。'.format(path.name)
     try:
         recorded = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, UnicodeDecodeError, ValueError):
-        return frozenset()
+        return frozenset(), damaged
     if not isinstance(recorded, dict):
-        return frozenset()
+        return frozenset(), damaged
     headings = recorded.get('offered_headings')
     if not isinstance(headings, list):
-        return frozenset()
-    return frozenset(item for item in headings if isinstance(item, str))
+        return frozenset(), damaged
+    return frozenset(item for item in headings if isinstance(item, str)), None
 
 
 def _record_offered(path, headings):
@@ -304,7 +327,7 @@ def _record_offered(path, headings):
     ) + '\n'
     if path.exists():
         if path.is_file() and not path.is_symlink():
-            _atomic_write(path, payload)
+            _atomic_write_text(path, payload)
     else:
         _write_new(path, payload)
 
@@ -338,15 +361,33 @@ def _proposal_sections(proposal):
     A `## ` inside a fenced block is example text, not a boundary.  This
     protocol's own rules are written with fenced examples, so splitting on one
     would tear the fence apart and strand its closing line -- and everything
-    after it -- in a section whose heading AGENTS.md may already carry.
+    after it -- in a section whose heading AGENTS.md may already carry.  A fence
+    closes only on the same marker that opened it (` ``` ` or `~~~`, at least as
+    long), and one left unclosed is treated as a typo rather than as a reason to
+    swallow every heading after it.
     """
+    lines = proposal.splitlines(keepends=True)
+    boundaries = set()
+    fence = None
+    for index, line in enumerate(lines):
+        marker = _fence_marker(line)
+        if fence is None:
+            if marker:
+                fence = marker
+            elif line.startswith("## "):
+                boundaries.add(index)
+        elif marker and marker[0] == fence[0] and len(marker) >= len(fence):
+            fence = None
+    if fence is not None:
+        # The document ends inside a fence, so the opening line was a typo.
+        # Honouring it would drop every section after it without a word.
+        boundaries = {
+            index for index, line in enumerate(lines) if line.startswith("## ")
+        }
     sections = []
     current = []
-    fenced = False
-    for line in proposal.splitlines(keepends=True):
-        if line.lstrip().startswith("```"):
-            fenced = not fenced
-        if line.startswith("## ") and not fenced:
+    for index, line in enumerate(lines):
+        if index in boundaries:
             if current:
                 sections.append("".join(current))
             current = [line]
@@ -355,6 +396,15 @@ def _proposal_sections(proposal):
     if current:
         sections.append("".join(current))
     return [section for section in (item.strip("\n") for item in sections) if section.strip()]
+
+
+def _fence_marker(line):
+    """Return a code-fence marker (`` ``` `` or `~~~`) opening or closing a block."""
+    stripped = line.lstrip()
+    for char in ("`", "~"):
+        if stripped.startswith(char * 3):
+            return char * (len(stripped) - len(stripped.lstrip(char)))
+    return ""
 
 
 def apply_agentsmd_proposal(paths, confirm):

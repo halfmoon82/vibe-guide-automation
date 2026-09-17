@@ -900,12 +900,11 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             "changed": initialized.changed,
             "paths": initialized.paths,
         }
-        return _result(
-            SUCCESS,
-            payload,
-            "初始化完成" if initialized.changed else "初始化无需变更",
-            args.as_json,
-        )
+        summary = "初始化完成" if initialized.changed else "初始化无需变更"
+        if initialized.notes:
+            payload["notes"] = list(initialized.notes)
+            summary += "；请注意：" + "；".join(initialized.notes)
+        return _result(SUCCESS, payload, summary, args.as_json)
 
     if args.command == "upgrade":
         if not args.confirm:

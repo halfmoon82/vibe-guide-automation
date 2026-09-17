@@ -268,6 +268,107 @@ class ProposalPreservationTests(_ProjectCase):
         self.init()
         self.assertFalse(increment.is_file(), "a rejected increment must not come back")
 
+    def test_rewriting_the_offered_record_keeps_it_readable(self):
+        """The rewrite path must not re-encode what is already serialized.
+
+        `_atomic_write` is the JSON writer, so handing it a finished string
+        stores a JSON string instead of the object.  The record then parses as
+        `str`, reads as "nothing offered yet", and every declined section is
+        offered again -- with nothing on screen to say the file broke.
+        """
+        proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+        offered = proposal.with_name("proposal.offered.json")
+
+        self.init()
+        first = json.loads(offered.read_text(encoding="utf-8"))
+        self.assertIsInstance(first, dict, first)
+
+        # Deleting the proposal sends the next init down the rewrite path.
+        proposal.unlink()
+        self.init()
+        again = json.loads(offered.read_text(encoding="utf-8"))
+        self.assertIsInstance(again, dict, again)
+        self.assertIn("offered_headings", again)
+
+    def test_an_unreadable_offered_record_is_reported_not_swallowed(self):
+        """Reading it as "nothing offered" is right, but must not be silent.
+
+        That fallback is deliberate -- withholding a new rule is worse than
+        asking twice -- yet on its own it hides the damage: declined sections
+        come back and the output gives no reason.  Naming the file is what makes
+        "I was asked again" explainable.
+        """
+        proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+        offered = proposal.with_name("proposal.offered.json")
+
+        self.init()
+        offered.write_text("not json at all", encoding="utf-8")
+        result = self.init()
+        self.assertIn(
+            "proposal.offered.json",
+            json.dumps(result.payload, ensure_ascii=False),
+            result.payload,
+        )
+
+    def test_rewriting_a_pending_increment_keeps_it_markdown(self):
+        """The increment is prose, so the JSON writer must not touch it."""
+        from vibe_guide.scanner import PRD_GUIDE_MARKER
+        proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+        increment = proposal.with_name("proposal.pending-update.md")
+
+        self._write_pre_release_proposal(proposal)
+        self.init()
+        self.assertTrue(increment.is_file())
+        # Reach the rewrite branch through init: clearing the record makes the
+        # section pending again, and the differing file on disk is rewritten.
+        increment.with_name("proposal.offered.json").unlink()
+        increment.write_text("# 旧的增量\n\n<!-- 评审批注 -->\n", encoding="utf-8")
+        self.init()
+        text = increment.read_text(encoding="utf-8")
+        self.assertFalse(text.startswith('"'), text[:80])
+        self.assertIn("## " + PRD_GUIDE_MARKER, text)
+        self.assertIn("vibe apply-agentsmd", text)
+
+    def test_an_unclosed_fence_does_not_swallow_later_sections(self):
+        """A missing closing line must not silently drop the rest.
+
+        Tracking fences fixed the tearing, but an odd number of fence lines
+        left everything after the last one inside a fence, so later headings
+        stopped being boundaries and their sections vanished without a word.
+        """
+        from vibe_guide.initializer import _proposal_sections
+        document = (
+            "## Existing Section\n\n"
+            "```bash\n"
+            "vibe plan --print-protocol\n"
+            "\n"
+            "## New Rule Beta\n"
+            "这一节必须仍然是一个小节。\n"
+        )
+        headings = [section.splitlines()[0] for section in _proposal_sections(document)]
+        self.assertIn("## New Rule Beta", headings, headings)
+
+    def test_a_tilde_fence_is_honoured_like_a_backtick_fence(self):
+        """`~~~` is a fence too; ignoring it reproduces the original tearing."""
+        from vibe_guide.initializer import _proposal_sections
+        document = (
+            "## Already Applied\n\n"
+            "~~~markdown\n"
+            "## Already Applied\n"
+            "示例，不是真小节\n"
+            "~~~\n\n"
+            "这一段必须跟着它自己的小节。\n\n"
+            "## Brand New\n"
+            "真正要合入的内容。\n"
+        )
+        sections = _proposal_sections(document)
+        self.assertEqual(
+            [section.splitlines()[0] for section in sections],
+            ["## Already Applied", "## Brand New"],
+            sections,
+        )
+        self.assertIn("这一段必须跟着它自己的小节。", sections[0])
+
     def test_a_fenced_heading_is_not_read_as_a_section_boundary(self):
         """A `## ` inside ``` is example text, not a new section.
 
