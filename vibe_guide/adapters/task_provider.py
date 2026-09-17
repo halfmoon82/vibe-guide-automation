@@ -20,6 +20,7 @@ from ..workflow_gate import (
 )
 from ..diagnostics import validate_child_session_binding
 from ..models import WorkerProfile
+from ..providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER
 
 
 class ProviderUnavailable(RuntimeError):
@@ -516,11 +517,11 @@ class TaskBinding:
 
     @property
     def thread_id(self):
-        return self.task_id if self.provider == "codex-app-visible" else None
+        return self.task_id if self.provider == CODEX_PROVIDER else None
 
     @property
     def host_id(self):
-        return self.host if self.provider == "codex-app-visible" else None
+        return self.host if self.provider == CODEX_PROVIDER else None
 
     @property
     def pending(self):
@@ -532,7 +533,7 @@ class TaskBinding:
         result["allowlist"] = list(self.allowlist)
         result["capability_contract_digest"] = self.capability_contract_digest
         result["successor_of"] = self.successor_of
-        if self.provider == "codex-app-visible" and self.task_id:
+        if self.provider == CODEX_PROVIDER and self.task_id:
             result["threadId"] = self.task_id
             result["hostId"] = self.host
         return result

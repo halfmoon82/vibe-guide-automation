@@ -33,6 +33,7 @@ from ..task_registry import (
 )
 from ..workflow_gate import session_contract_prompt
 from ..state import read_writer_lease
+from ..providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER
 
 
 #: Native desktop tools per visible provider, one definition for the five
@@ -43,14 +44,14 @@ from ..state import read_writer_lease
 #: cursor).  Binding results for Claude Code use the provider-neutral
 #: ``task_id`` / ``host`` fields; ``threadId`` / ``hostId`` remain Codex-only.
 NATIVE_TOOL_MAP: Dict[str, Dict[str, str]] = {
-    "codex-app-visible": {
+    CODEX_PROVIDER: {
         "create": "codex_app__create_thread",
         "locate": "codex_app__navigate_to_codex_page",
         "visibility": "codex_app__wait_threads",
         "resume": "codex_app__send_message_to_thread",
         "wait": "codex_app__wait_threads",
     },
-    "claude-code-visible": {
+    CLAUDE_CODE_PROVIDER: {
         "create": "ccd_session__spawn_task",
         "locate": "ccd_window__open_session_in",
         "visibility": "ccd_session_mgmt__get_session",
@@ -560,8 +561,8 @@ class ProviderActionRunner(Runner):
             branch=str(contract.get("branch", "")),
             status_file=str(contract.get("status_file", "")),
             handoff_file=str(contract.get("handoff_file", "")),
-            threadId=task_id if self.provider == "codex-app-visible" else None,
-            hostId=host if self.provider == "codex-app-visible" else None,
+            threadId=task_id if self.provider == CODEX_PROVIDER else None,
+            hostId=host if self.provider == CODEX_PROVIDER else None,
             run_id=run_id,
             status=status,
             visible=True,
