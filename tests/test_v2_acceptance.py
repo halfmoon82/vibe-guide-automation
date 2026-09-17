@@ -59,8 +59,14 @@ class PackagingAcceptanceTests(unittest.TestCase):
                 # doctor since V4 (missing AGENTS.md / knowledge / Skills);
                 # the smoke test proves the installed package runs and its
                 # manifests load, not that an empty directory is healthy.
-                self.assertIn(smoke.returncode, (0, 3), smoke.stderr)
+                # An empty directory has no .vibe, so scanner reports it and
+                # doctor settles on `blocked` (exit 3) every time.  Pin the
+                # exact code and status: accepting 0 as well would let a future
+                # regression that calls an uninitialized directory healthy pass.
+                self.assertEqual(smoke.returncode, 3, smoke.stderr)
                 import json as _json
-                self.assertEqual(_json.loads(smoke.stdout)["command"], "doctor", smoke.stdout)
+                payload = _json.loads(smoke.stdout)
+                self.assertEqual(payload["command"], "doctor", smoke.stdout)
+                self.assertEqual(payload["status"], "blocked", smoke.stdout)
                 console = venv / "bin" / "vibe"
                 self.assertTrue(console.exists(), "console entrypoint was not installed for %s" % artifact.name)
