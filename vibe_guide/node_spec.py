@@ -181,10 +181,16 @@ def complete_node_contracts(raw_nodes: List[Dict[str, Any]], adapter_id: str, pr
         # One writer per node means one worktree and one branch per node.  A
         # product spec carries no engineering fields, so without a derived
         # default every node used to land in the project root on the trunk:
-        # parallel developers would share a tree, and the writer lease is keyed
-        # per node so it does not catch that collision.
+        # parallel developers would share a tree, and nothing cross-checks two
+        # nodes for pointing at the same directory.
+        #
+        # The names match monitor's own fallbacks (.worktrees/<id>, node/<id>),
+        # which is the convention the rest of the codebase already uses; the
+        # spec's literal values used to shadow those safe defaults.  These are
+        # identity strings for the dispatch contract, not directories vibe
+        # creates: provisioning the tree belongs to whoever runs the node.
         node_slug = _node_slug(item.get("id"))
-        contract.setdefault("worktree", "../" + node_slug)
+        contract.setdefault("worktree", ".worktrees/" + node_slug)
         contract.setdefault("branch", "node/" + node_slug)
         contract.setdefault("worker", contract.get("writer", "worker"))
         contract.setdefault("reviewer_worker", contract.get("reviewer", "reviewer"))
