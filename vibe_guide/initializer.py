@@ -4,6 +4,7 @@ import os
 import json, tempfile
 
 from .scanner import build_agentsmd_patch, scan_project
+from .protocols import PRD_GUIDE_NAME, PRD_GUIDE_PROPOSAL_RELATIVE, load_protocol
 from .capability_contract import build_contract, contract_path, load_contract, save_contract
 from .migration import migrate_v2_to_v310, migrate_v2_to_v42, _backup, _payload_is_complete
 from .workflow_gate import V42_STATE
@@ -39,6 +40,7 @@ def _validate_initialization_paths(root):
         root / '.vibe' / 'proposals',
         root / '.vibe' / 'proposals' / 'agentsmd',
         root / '.vibe' / 'proposals' / 'skills',
+        root / '.vibe' / 'proposals' / 'skills' / 'prd-guide',
     )
     files = (
         root / '.vibe' / 'config.json',
@@ -46,6 +48,7 @@ def _validate_initialization_paths(root):
         root / '.vibe' / 'session-contract.json',
         root / '.vibe' / 'proposals' / 'agentsmd' / 'proposal.md',
         root / '.vibe' / 'proposals' / 'skills' / 'proposal.md',
+        root / PRD_GUIDE_PROPOSAL_RELATIVE,
     )
     for path in directories:
         if not _is_within(root, path):
@@ -193,6 +196,14 @@ def init_project(paths, confirm):
             '- source_status: remote\n',
         )
         created.append(str(skill_proposal.relative_to(root)))
+    # The PRD-guide protocol is vibe's own, shipped with the package; it is
+    # proposed into the project so the host agent finds it, and never
+    # rewritten once present so user edits survive re-initialization.
+    prd_guide = root / PRD_GUIDE_PROPOSAL_RELATIVE
+    if not prd_guide.exists():
+        prd_guide.parent.mkdir(parents=True, exist_ok=True)
+        _write_new(prd_guide, load_protocol(PRD_GUIDE_NAME))
+        created.append(PRD_GUIDE_PROPOSAL_RELATIVE)
     return InitResult(bool(created), created)
 
 

@@ -56,7 +56,8 @@ class ProtocolShippingTests(unittest.TestCase):
         from vibe_guide import protocols
         self.assertTrue((Path(protocols.__file__).parent / "prd-guide.md").is_file())
         setup_text = (ROOT / "setup.py").read_text(encoding="utf-8")
-        self.assertIn("protocols/*.md", setup_text)
+        self.assertIn("vibe_guide.protocols", setup_text)
+        self.assertRegex(setup_text, r'"vibe_guide\.protocols":\s*\["\*\.md"\]')
 
     def test_protocol_mentions_every_cli_command_it_relies_on(self):
         from vibe_guide.protocols import load_protocol
@@ -91,6 +92,19 @@ class _ProjectCase(unittest.TestCase):
         )
 
 
+class PrintProtocolTests(_ProjectCase):
+    def test_plan_print_protocol_outputs_the_shipped_text_without_touching_the_project(self):
+        from vibe_guide.protocols import load_protocol
+        before = sorted(str(p) for p in self.root.rglob("*"))
+        result = run_cli(["plan", "--print-protocol"], self.root)
+        self.assertEqual(result.exit_code, 0, result.text)
+        self.assertEqual(result.text, load_protocol("prd-guide"))
+        as_json = run_cli(["plan", "--print-protocol", "--json"], self.root)
+        self.assertEqual(as_json.payload.get("status"), "ok")
+        self.assertEqual(as_json.payload.get("protocol"), load_protocol("prd-guide"))
+        self.assertEqual(sorted(str(p) for p in self.root.rglob("*")), before)
+
+
 class InitMaterializationTests(_ProjectCase):
     def test_init_materializes_prd_guide_proposal(self):
         from vibe_guide.protocols import PRD_GUIDE_PROPOSAL_RELATIVE, load_protocol
@@ -98,14 +112,14 @@ class InitMaterializationTests(_ProjectCase):
         skill = self.root / PRD_GUIDE_PROPOSAL_RELATIVE
         self.assertTrue(skill.is_file(), PRD_GUIDE_PROPOSAL_RELATIVE)
         self.assertEqual(skill.read_text(encoding="utf-8"), load_protocol("prd-guide"))
-        self.assertIn(PRD_GUIDE_PROPOSAL_RELATIVE, first.payload.get("created", []))
+        self.assertIn(PRD_GUIDE_PROPOSAL_RELATIVE, first.payload.get("paths", []))
         agentsmd_proposal = (self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md").read_text(encoding="utf-8")
         self.assertIn(PRD_GUIDE_PROPOSAL_RELATIVE, agentsmd_proposal)
         self.assertIn("## Capability and Tool Truth", agentsmd_proposal)
         skill.write_text("user edited", encoding="utf-8")
         second = self.init()
         self.assertEqual(skill.read_text(encoding="utf-8"), "user edited")
-        self.assertNotIn(PRD_GUIDE_PROPOSAL_RELATIVE, second.payload.get("created", []))
+        self.assertNotIn(PRD_GUIDE_PROPOSAL_RELATIVE, second.payload.get("paths", []))
 
 
 class ProtocolEnforcementTests(_ProjectCase):
@@ -119,6 +133,7 @@ class ProtocolEnforcementTests(_ProjectCase):
         result = self.plan_from_prd(spec)
         self.assertEqual(result.payload.get("status"), "blocked_design", result.payload)
         self.assertIn("水印", result.payload.get("question", ""))
+        self.assertIn("水印", result.text)
         self.assertFalse((self.root / ".vibe" / "plans" / "pm-plan").exists())
 
     def test_planning_brief_lists_goal_traceability_rows(self):

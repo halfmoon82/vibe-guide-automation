@@ -36,6 +36,14 @@ CAPABILITY_RULES = """## Capability and Tool Truth
 - 只有 runtime/provider 的结构化结果才能进入能力阻断状态。
 """
 
+PRD_GUIDE_RULES = """## Complex Request Entry
+
+- 复杂请求先按 `.vibe/proposals/skills/prd-guide/SKILL.md` 的协议引导：agent 出 PRD 内容与节点拆分，vibe 校验并派生全部工程字段。
+- 产品 spec 只写业务字段；工程字段由 `vibe plan --from-prd` 派生，写了会被拒。
+- `needs_confirmation` 项未闭合不得发布；产品决策只有产品经理选定后才是 approved。
+"""
+
+
 
 @dataclass
 class ScanReport:
@@ -190,9 +198,9 @@ def build_agentsmd_patch(existing, report):
     ):
         return PatchProposal(False, '')
     if existing is None:
-        content = '# Vibe Guide\n\nProject guidance is maintained through the Vibe Guide.\n\n' + CAPABILITY_RULES
+        content = '# Vibe Guide\n\nProject guidance is maintained through the Vibe Guide.\n\n' + CAPABILITY_RULES + '\n' + PRD_GUIDE_RULES
     else:
-        content = '# Vibe Guide capability contract proposal\n\n' + CAPABILITY_RULES
+        content = '# Vibe Guide capability contract proposal\n\n' + CAPABILITY_RULES + '\n' + PRD_GUIDE_RULES
     return PatchProposal(
         True,
         content,

@@ -272,7 +272,34 @@ def normalize_node_spec(spec: Any, entry: Any, paths: Any, route_governs_band: b
             out["integration_contract"] = derive_integration_contract(out, entry, paths)
         out.setdefault("spec_path", ".vibe/plans/{}/prd.md".format(entry.plan_id))
     out.setdefault("remote_git_actions", "deny")
+    pending = unresolved_confirmations(out)
+    if pending:
+        # Feed the existing PRD checkpoint gate: an unclosed needs_confirmation
+        # item is a product question the user has not answered, and publish
+        # must stop at blocked_design with that question, not proceed.
+        rationale = out.get("rationale")
+        if not isinstance(rationale, dict):
+            rationale = {} if rationale in (None, "") else {"framing": rationale}
+        rationale.setdefault("product_question", {
+            "question": pending[0],
+            "options": [],
+            "impact": "该项未确认前不能进入规划；共 {} 项待确认".format(len(pending)),
+        })
+        out["rationale"] = rationale
     return out
+
+
+def unresolved_confirmations(spec: Dict[str, Any]) -> List[str]:
+    """PRD items the product manager has not confirmed yet, in document order."""
+    prd = spec.get("prd")
+    if not isinstance(prd, dict):
+        return []
+    pending: List[str] = []
+    for items in prd.values():
+        for item in items if isinstance(items, list) else [items]:
+            if isinstance(item, dict) and item.get("source") == "needs_confirmation":
+                pending.append(str(item.get("value", "")).strip() or "（未填写内容的待确认项）")
+    return pending
 
 
 def _source_line(item: Any) -> str:
@@ -319,8 +346,21 @@ def render_planning_brief_markdown(plan_id: str, spec: Dict[str, Any], plan: Any
     }
     goals = spec.get("goals") or []
     if goals and plan is not None:
+        # build_planning_brief validates the seven traceability fields and
+        # requires the five integration-contract sections; they live on the
+        # normalized spec, so hand them over rather than expecting Plan to
+        # carry duplicates.  Its compatibility_scope is a mapping, the
+        # contract's is a list of node ids.
         from .planner import build_planning_brief
-        build_planning_brief(plan, goals)
+        contract = spec.get("integration_contract") or {}
+        build_planning_brief(
+            plan, goals,
+            iteration_context=contract.get("iteration_context") or {"kind": "iteration", "plan_id": plan_id},
+            compatibility_scope={"node_ids": list(contract.get("compatibility_scope") or [])},
+            agentsmd_acceptance_refs=list(contract.get("agentsmd_acceptance_refs") or []),
+            integration_acceptance_contract=contract.get("integration_acceptance_contract") or {},
+            unverified_or_excluded=list(contract.get("unverified_or_excluded") or []),
+        )
     rows = [
         {
             "goal": goal.get("id"), "scenario": goal.get("user_scenario"),

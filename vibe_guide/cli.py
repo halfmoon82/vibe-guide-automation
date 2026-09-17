@@ -54,6 +54,7 @@ from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
 from .workflow_gate import require_capability_contract
 from .authorize_entry import AuthorizationDenied, materialize_workflow_evidence
 from .attest import record_session_capabilities
+from .protocols import PRD_GUIDE_NAME, load_protocol
 from .state import load_events, load_snapshot
 from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
@@ -103,6 +104,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--s1")
     parser.add_argument("--node-spec")
     parser.add_argument("--from-prd", dest="from_prd")
+    parser.add_argument("--print-protocol", action="store_true", dest="print_protocol")
     parser.add_argument("--adapter")
     parser.add_argument("--facts")
     parser.add_argument("--provenance")
@@ -1165,6 +1167,12 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         )
         return _result(SUCCESS, payload, text, args.as_json)
 
+    if args.command == "plan" and args.print_protocol:
+        # Read-only: hand the agent the PRD-guide protocol without needing an
+        # initialized project or a request.
+        protocol = load_protocol(PRD_GUIDE_NAME)
+        return _result(SUCCESS, {"command": "plan", "status": "ok", "protocol": protocol}, protocol, args.as_json)
+
     if args.command == "plan":
         try:
             entry = build_session_entry(args.request or "", args.s1, args.plan_id)
@@ -1281,7 +1289,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     "handoff_text": handoff.render(),
                     "downstream_artifact": None,
                 }
-                return _result(BLOCKED, payload, "规划已暂停：需要回答产品问题", args.as_json)
+                return _result(BLOCKED, payload, "规划已暂停：需要回答产品问题：" + question, args.as_json)
             review_checkpoints = [item for item in checkpoints if item.status == "review_required"]
             if has_prd_gate_input and review_checkpoints:
                 handoff = build_stage_handoff(
