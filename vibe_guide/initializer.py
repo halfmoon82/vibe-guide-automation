@@ -4,10 +4,8 @@ import os
 import json, tempfile
 
 from .scanner import (
-    CAPABILITY_RULES,
     CAPABILITY_RULE_MARKER,
     PRD_GUIDE_MARKER,
-    PRD_GUIDE_RULES,
     build_agentsmd_patch,
     missing_agentsmd_blocks,
     scan_project,
@@ -231,13 +229,15 @@ def init_project(paths, confirm):
             # from it has been declined just as plainly as one deleted from an
             # increment, and only this record can tell that from a proposal
             # written before the section existed.
-            _record_offered(
-                proposal_path.with_name(OFFERED_SECTIONS_NAME),
+            offered_path = proposal_path.with_name(OFFERED_SECTIONS_NAME)
+            if _record_offered(
+                offered_path,
                 {
                     section.splitlines()[0].strip()
                     for section in _proposal_sections(proposal.content)
                 },
-            )
+            ):
+                created.append(str(offered_path.relative_to(root)))
         else:
             # An existing proposal is awaiting human review, and a reviewer may
             # have deliberately deleted a section they do not want.  Rewriting
@@ -271,11 +271,12 @@ def init_project(paths, confirm):
             # the increment carried would leave the proposal's own sections
             # unrecorded, so deleting one would read as "this release added a
             # section" and offer it straight back.
-            _record_offered(
+            if _record_offered(
                 offered_path,
                 offered | already_proposed
                 | {block.splitlines()[0].strip() for block in pending_blocks},
-            )
+            ):
+                created.append(str(offered_path.relative_to(root)))
             if pending_blocks:
                 update_path = proposal_path.with_name(PENDING_UPDATE_NAME)
                 update = (
@@ -340,15 +341,27 @@ def _offered_headings(path):
 
 
 def _record_offered(path, headings):
-    """Persist the headings the reviewer has now seen."""
+    """Persist the headings the reviewer has now seen.
+
+    Returns whether the file changed, so `init` can report the write.  An
+    unchanged record is left alone: this runs on every pass, and rewriting
+    identical bytes would report a change on a run that decided nothing.
+    """
     payload = json.dumps(
         {'offered_headings': sorted(headings)}, ensure_ascii=False, indent=2
     ) + '\n'
-    if path.exists():
-        if path.is_file() and not path.is_symlink():
-            _atomic_write_text(path, payload)
-    else:
+    if not path.exists():
         _write_new(path, payload)
+        return True
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        if path.read_text(encoding='utf-8') == payload:
+            return False
+    except (OSError, UnicodeDecodeError):
+        pass
+    _atomic_write_text(path, payload)
+    return True
 
 
 def _read_proposal(path):

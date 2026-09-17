@@ -282,6 +282,31 @@ class ProposalPreservationTests(_ProjectCase):
         self.init()
         self.assertFalse(increment.is_file(), "a rejected increment must not come back")
 
+    def test_a_written_file_is_always_reported(self):
+        """`changed: false` has to mean nothing on disk moved.
+
+        The offered record is now written on every pass, so a project missing
+        only that file gets a write that `changed` and `paths` both deny.  A
+        caller that trusts the report -- a wrapper deciding whether to commit,
+        or a reviewer reading it -- is told the tree is untouched when it is not.
+        """
+        proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+        offered = proposal.with_name("proposal.offered.json")
+
+        self._write_pre_release_proposal(proposal)
+        self.init()
+        offered.unlink()
+
+        result = run_cli(["init", "--confirm", "--json"], self.root)
+        payload = json.loads(result.text)
+        self.assertTrue(offered.is_file(), "the record should be restored")
+        self.assertIn(
+            ".vibe/proposals/agentsmd/proposal.offered.json",
+            payload.get("paths", []),
+            "a file was written that the report does not mention",
+        )
+        self.assertTrue(payload.get("changed"), payload)
+
     def test_the_increment_never_carries_a_section_the_proposal_already_has(self):
         """A section awaiting review must not also sit outside the proposal.
 
