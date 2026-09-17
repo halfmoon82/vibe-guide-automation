@@ -1,0 +1,65 @@
+{
+  "title": "保单查看页导出 PDF",
+  "objective": "让用户在保单查看页按日期范围导出 PDF，导出结果与页面展示一致",
+  "prd": {
+    "problem": [
+      {"value": "用户需要把保单信息带离系统存档，目前只能截图", "source": "user_confirmed"}
+    ],
+    "user_scenarios": [
+      {"value": "客户经理在保单查看页选择日期范围后点击导出，得到一份 PDF", "source": "user_confirmed"},
+      {"value": "导出的 PDF 与页面展示字段一致，不含未展示的内部字段", "source": "system_inferred"}
+    ],
+    "success_criteria": [
+      {"value": "导出按钮在保单查看页可见且可用", "source": "user_confirmed"},
+      {"value": "PDF 内容与所选日期范围内的页面数据逐字段一致", "source": "user_confirmed"}
+    ],
+    "non_goals": [
+      {"value": "不做批量导出，不做邮件发送", "source": "user_confirmed"}
+    ],
+    "code_evidence": [
+      {"value": "src/pages/policy/view.tsx 是保单查看页入口", "source": "unverified"}
+    ]
+  },
+  "decisions": [
+    {
+      "question": "导出的 PDF 是否带公司水印",
+      "options": ["带水印", "不带水印"],
+      "impact": "带水印需要接印章服务，影响范围和验收",
+      "recommendation": "不带水印",
+      "status": "approved",
+      "selected": "不带水印",
+      "field": "export.watermark"
+    }
+  ],
+  "remote_git_actions": "deny",
+  "nodes": [
+    {
+      "id": "export-button",
+      "title": "保单查看页导出按钮与 PDF 生成",
+      "depends_on": [],
+      "integration_after": [],
+      "parallel_group": "export-ui",
+      "contract": {
+        "input": "保单查看页当前展示的数据与用户选择的日期范围",
+        "output": "一份 PDF 文件，字段与页面一致",
+        "error_behavior": "生成失败时提示用户并保留页面状态，不写入任何数据",
+        "acceptance_example": "选择 2026-01-01 至 2026-03-31 导出，PDF 包含该范围内全部展示字段"
+      },
+      "files": ["src/pages/policy/view.tsx", "src/utils/pdf.ts"]
+    },
+    {
+      "id": "date-range-filter",
+      "title": "日期范围选择器",
+      "depends_on": [],
+      "integration_after": ["export-button"],
+      "parallel_group": "export-ui",
+      "contract": {
+        "input": "用户在页面上选择的起止日期",
+        "output": "一个合法的日期范围，起止顺序正确",
+        "error_behavior": "起始晚于结束时提示并禁用导出按钮",
+        "acceptance_example": "选择 2026-03-31 至 2026-01-01 时导出按钮不可用并显示提示"
+      },
+      "files": ["src/components/DateRange.tsx"]
+    }
+  ]
+}
