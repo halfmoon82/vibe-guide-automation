@@ -146,7 +146,14 @@ class NodeIsolationTests(unittest.TestCase):
         engineering-field guard left open.
         """
         from vibe_guide.node_spec import reject_engineering_fields
-        for field, value in (("worktree", "."), ("branch", "main")):
+        for field, value in (
+            ("worktree", "."),
+            ("branch", "main"),
+            # Aliases the fill reads to set the guarded keys: guarding only the
+            # destination leaves the alias as a way in.
+            ("writer", "codex-app-visible-developer"),
+            ("reviewer", "codex-app-visible-reviewer"),
+        ):
             spec = {
                 "title": "t", "objective": "o",
                 "nodes": [{

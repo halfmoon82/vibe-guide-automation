@@ -57,9 +57,12 @@ ENGINEERING_NODE_FIELDS = ("status",)
 # `worktree` and `branch` are derived per node so parallel writers cannot share
 # a directory.  The fill below only supplies what is missing, so a product spec
 # naming them would keep its own value and bypass that isolation entirely.
+# `writer` and `reviewer` are the aliases the fill reads to set `worker` and
+# `reviewer_worker`, so guarding only the destination leaves the alias as a way
+# to name another machine's worker.
 ENGINEERING_CONTRACT_FIELDS = (
     "adapter_id", "project_id", "worker", "reviewer_worker", "worker_profile",
-    "worktree", "branch",
+    "worktree", "branch", "writer", "reviewer",
 )
 ENGINEERING_FIELDS = {
     "top_level": ENGINEERING_TOP_LEVEL_FIELDS,
