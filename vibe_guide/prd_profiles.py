@@ -212,9 +212,24 @@ def build_prd_guide_draft(request: str, code_evidence=None) -> Dict[str, Any]:
     }
 
 
+def _brief_block(value: Any) -> List[str]:
+    """Render a draft section for a product manager, not as a Python repr."""
+    def _one(item: Any) -> str:
+        if isinstance(item, dict):
+            text = str(item.get("value", "")).strip()
+            source = item.get("source")
+            return "{}（来源：{}）".format(text, source) if source else text
+        return str(item).strip()
+    if isinstance(value, list):
+        items = [_one(item) for item in value if _one(item)]
+        return ["- " + item for item in items] or ["（无）"]
+    text = _one(value) if value not in (None, "", {}, []) else ""
+    return [text or "（无）"]
+
+
 def render_planning_brief(plan_id: str, draft: Dict[str, Any], traceability=None) -> str:
     rows = traceability or []
-    lines = ["# Planning Brief", "", "## 产品目标", str(draft.get("objective", {})), "", "## 用户场景", str(draft.get("user_scenarios", [])), "", "## 代码现状", str(draft.get("code_evidence", [])), "", "## 方案", "按已确认 PRD 目标生成最小变更方案。", "", "## 非目标", str(draft.get("non_goals", [])), "", "## Spec/Issue 映射与运行时验收", "| Goal | User scenario | Current evidence | Spec | Issue | DAG node | Runtime acceptance |", "|---|---|---|---|---|---|---|"]
+    lines = ["# Planning Brief", "", "## 产品目标", *_brief_block(draft.get("objective", {})), "", "## 用户场景", *_brief_block(draft.get("user_scenarios", [])), "", "## 代码现状", *_brief_block(draft.get("code_evidence", [])), "", "## 方案", "按已确认 PRD 目标生成最小变更方案。", "", "## 非目标", *_brief_block(draft.get("non_goals", [])), "", "## Spec/Issue 映射与运行时验收", "| Goal | User scenario | Current evidence | Spec | Issue | DAG node | Runtime acceptance |", "|---|---|---|---|---|---|---|"]
     for row in rows:
         lines.append("| " + " | ".join(str(row.get(k, "")) for k in ("goal","scenario","current_evidence","spec","issue","dag_node","runtime_acceptance")) + " |")
     return "\n".join(lines) + "\n"

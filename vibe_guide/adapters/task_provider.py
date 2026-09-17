@@ -241,6 +241,7 @@ class ProviderActionStore:
         adapter_id: str,
         facts: Mapping[str, Any],
         provenance: str,
+        project_id: Optional[str] = None,
     ) -> None:
         if not isinstance(adapter_id, str) or not adapter_id:
             raise ValueError("adapter id is required")
@@ -257,20 +258,25 @@ class ProviderActionStore:
             raise ValueError("provider capability facts are invalid")
         if not isinstance(provenance, str) or not provenance:
             raise ValueError("provider capability provenance is required")
+        payload = {
+            "schema_version": self.schema_version,
+            "adapter_id": adapter_id,
+            "facts": dict(facts),
+            "provenance": provenance,
+        }
+        # The project id is optional: visible-task routing needs it, other
+        # routes do not, and only the recording session can vouch for it.
+        if project_id is not None:
+            if not isinstance(project_id, str) or not project_id.strip():
+                raise ValueError("provider capability project_id must be a non-empty string")
+            payload["project_id"] = project_id.strip()
         self.root.mkdir(parents=True, exist_ok=True)
-        self._atomic(
-            self.root / "capabilities.json",
-            {
-                "schema_version": self.schema_version,
-                "adapter_id": adapter_id,
-                "facts": dict(facts),
-                "provenance": provenance,
-            },
-        )
+        self._atomic(self.root / "capabilities.json", payload)
 
     def capabilities(self) -> Dict[str, Any]:
         value = self._read(self.root / "capabilities.json")
-        if set(value) != {"schema_version", "adapter_id", "facts", "provenance"}:
+        required = {"schema_version", "adapter_id", "facts", "provenance"}
+        if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - {"project_id"}:
             raise ValueError("provider capability schema is invalid")
         if value["schema_version"] != self.schema_version:
             raise ValueError("provider capability schema is unsupported")

@@ -131,6 +131,11 @@ class SessionEntry:
         }
 
 
+DRAFT_NEXT_STEP = (
+    "计划仍是草案，尚无产品内容；请用 vibe plan --request <原请求> --from-prd <产品 spec 文件> 完成发布"
+)
+
+
 def materialize_session_entry(paths: Any, entry: SessionEntry) -> Path:
     """Persist only deterministic planning inputs for a new session.
 
@@ -163,6 +168,9 @@ def materialize_session_entry(paths: Any, entry: SessionEntry) -> Path:
         "node_ids": [item["id"] for item in entry.node_spec["nodes"]],
         "complexity_band": entry.route.complexity_band,
         "route_result": entry.route.to_dict(),
+        # A draft has no product content yet; tell the agent how to finish it
+        # instead of letting monitor trip over the missing authorization card.
+        "next_step": DRAFT_NEXT_STEP,
     }
     artifacts = {
         "plan.json": plan,
@@ -203,7 +211,13 @@ def build_session_entry(request: str, s1: Any = None, plan_id: Optional[str] = N
     if not normalized:
         raise ValueError("request is required")
     s0 = classify_s0(normalized)
-    context = parse_s1_context(s1) or default_s1_context(normalized)
+    context = parse_s1_context(s1)
+    if context is None and s1 is not None and str(s1).strip():
+        # An explicit override the user typed must not silently fall back to
+        # the heuristic; they would believe it took effect.
+        raise ValueError("--s1 must be five integers between 0 and 5, separated by commas")
+    if context is None:
+        context = default_s1_context(normalized)
     score = score_s1(context)
     route = route_task(context)
     resolved_plan_id = str(plan_id).strip() if isinstance(plan_id, str) and plan_id.strip() else stable_plan_id(normalized)

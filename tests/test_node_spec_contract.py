@@ -211,6 +211,25 @@ class NormalizedSpecModelContractTests(_ProjectCase):
         self.assertEqual(normalized["nodes"][1]["parallel_group"], "export-ui")
 
 
+class BandGovernanceBoundaryTests(_ProjectCase):
+    def test_route_governs_band_only_on_the_product_path(self):
+        # --from-prd: the session route is authoritative (fail-closed).
+        # --node-spec: the hand-written spec keeps declaring its own band, so a
+        # legacy background spec is not silently promoted into the engine
+        # attestation / integration-review gates it never opted into.
+        from vibe_guide.node_spec import normalize_node_spec
+        legacy = json.loads((Path(__file__).parent / "fixtures" / "e2e-project" / "plan-source.json").read_text(encoding="utf-8"))
+        entry = build_session_entry(COMPLEX_REQUEST, s1="4,4,4,4,4", plan_id="legacy")
+        self.assertEqual(entry.route.route, "complex")
+        as_legacy = normalize_node_spec(legacy, entry, self.paths, route_governs_band=False)
+        self.assertNotEqual(as_legacy.get("complexity_band"), "complex")
+        self.assertNotIn("integration_contract", as_legacy)
+        self.write_capabilities()
+        as_product = normalize_node_spec(_product_spec(), entry, self.paths, route_governs_band=True)
+        self.assertEqual(as_product["complexity_band"], "complex")
+        self.assertIn("integration_contract", as_product)
+
+
 class CapabilitiesSchemaTests(_ProjectCase):
     def test_capabilities_schema_accepts_optional_project_id_and_rejects_others(self):
         self.write_capabilities()

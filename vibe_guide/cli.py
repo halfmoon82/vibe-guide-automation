@@ -18,8 +18,6 @@ from .authorization import (
     build_authorization_card,
     refresh_authorization_card,
 )
-from .adapters.base import Environment
-from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
 from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import doctor
@@ -42,6 +40,14 @@ from .planner import (
     build_stage_handoff,
 )
 from .session_entry import build_session_entry, materialize_session_entry
+from .node_spec import (
+    complete_node_contracts,
+    normalize_node_spec,
+    observe_capabilities,
+    reject_engineering_fields,
+    render_planning_brief_markdown,
+    render_prd_markdown,
+)
 from .scanner import scan_project
 from .diagnostics import screen_session, require_session_screened
 from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
@@ -95,6 +101,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence")
     parser.add_argument("--s1")
     parser.add_argument("--node-spec")
+    parser.add_argument("--from-prd", dest="from_prd")
     parser.add_argument("--authorize")
     parser.add_argument("--authorization-token", dest="legacy_authorization")
     parser.add_argument("--manifest")
@@ -239,28 +246,21 @@ def _authorization_card(data: Dict[str, Any]) -> AuthorizationCard:
 
 
 def _observed_adapter(paths: ProjectPaths, adapter_id: str):
-    store = ProviderActionStore(paths)
-    capabilities = None
+    observed = None
     last_error = None
     for attempt in range(3):
         try:
-            capabilities = store.capabilities()
+            observed = observe_capabilities(paths)
             break
-        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        except ProviderPending as error:
             last_error = error
             if attempt < 2:
                 time.sleep(0.05)
-    if capabilities is None:
+    if observed is None:
         raise ProviderPending("provider capability observation pending") from last_error
-    if capabilities["adapter_id"] != adapter_id:
+    if observed.adapter_id != adapter_id:
         raise ValueError("observed provider does not match the selected adapter")
-    facts = capabilities["facts"]
-    environment = Environment(
-        facts=facts,
-        provenance={key: capabilities["provenance"] for key in facts},
-        available_agents=(adapter_id,),
-    )
-    result = AdapterRegistry().get(adapter_id).detect(environment)
+    result = observed.detection
     if (
         not result.detected
         or result.capabilities.mode != "visible"
@@ -286,9 +286,12 @@ def _public_runner(
 
 
 def _publish_plan(
-    paths: ProjectPaths, plan_id: str, source_path: Path
+    paths: ProjectPaths, plan_id: str, source: Any
 ) -> Tuple[Plan, List[DAGNode], AuthorizationCard]:
-    source = _read_json(source_path)
+    # Callers hand over a normalized spec dict; a path is still accepted for
+    # the legacy direct-publish callers.
+    if isinstance(source, (str, Path)):
+        source = _read_json(Path(source))
     if not isinstance(source, dict):
         raise ValueError("node spec must be a JSON object")
     decisions = [DecisionCard(**item) for item in source.get("decisions", [])]
@@ -302,8 +305,9 @@ def _publish_plan(
     if not approval.approved:
         raise PermissionError("product decisions remain unresolved")
     raw_nodes = source.get("nodes", [])
-    source_band = source.get("complexity_band", source.get("route", ""))
-    is_complex_spec = source_band == "complex" or bool(source.get("integration_contract"))
+    # The band is settled by node_spec.normalize_node_spec from the session
+    # route; a spec carrying an integration contract is complex by definition.
+    is_complex_spec = source.get("complexity_band") == "complex" or bool(source.get("integration_contract"))
     source_capabilities = AgentCapabilities.from_dict(source.get("capabilities", {}))
     project_id = source.get("project_id")
     # Visible task routing requires a confirmed project id. Legacy/background
@@ -313,29 +317,7 @@ def _publish_plan(
         raise ValueError("node spec project_id is required for visible task routing")
     if not isinstance(project_id, str) or not project_id.strip():
         project_id = None
-    for item in raw_nodes:
-        contract = item.setdefault("contract", {})
-        contract.setdefault("adapter_id", source_capabilities.agent_id)
-        if project_id:
-            contract.setdefault("project_id", project_id.strip())
-        contract.setdefault("worker", contract.get("writer", "worker"))
-        contract.setdefault("reviewer_worker", contract.get("reviewer", "reviewer"))
-        contract.setdefault("worker_profile", {
-            "worker": contract.get("writer", "worker"),
-            "model": "default",
-            "reasoning": "normal",
-            "fallbacks": [],
-            "selection_basis": {
-                "issue_complexity_ref": item.get("id", "node"),
-                "complexity_band": "standard",
-                "risk_tags": contract.get("risk_tags", []),
-                "availability_evidence": "configured",
-            },
-            "writer": contract.get("writer", "worker"),
-            "worktree": contract.get("worktree", "."),
-            "branch": contract.get("branch", "main"),
-            "allowlist": contract.get("files", []) or ["."],
-        })
+    complete_node_contracts(raw_nodes, source_capabilities.agent_id, project_id.strip() if project_id else None)
     nodes = [DAGNode.from_dict(item) for item in raw_nodes]
     if not nodes:
         raise ValueError("node spec must contain at least one node")
@@ -356,6 +338,7 @@ def _publish_plan(
         complexity_band="complex" if is_complex_spec else "",
         spec_path=str(source.get("spec_path", "spec.md" if is_complex_spec else "")),
         integration_contract=source.get("integration_contract", {}),
+        implementation_plan_path=str(Path(".vibe") / "plans" / plan_id / "planning-brief.md"),
     )
     if is_complex_spec:
         plan = append_integration_review_node(plan)
@@ -406,17 +389,10 @@ def _publish_plan(
         if engine_attestation is not None:
             _atomic_json(staging / "engine-attestation.json", engine_attestation)
         (staging / "prd.md").write_text(
-            "# {}\n\n状态：approved\n审核：reviewed\n\n目标：{}\n\n## 已批准产品决策\n\n{}\n\n"
-            "证据优先级：{}\n".format(
-                prd.title,
-                prd.objective,
-                "\n".join(
-                    "- {} → {}".format(item.question, item.selected)
-                    for item in decisions
-                ),
-                " > ".join(plan.evidence_priority),
-            ),
-            encoding="utf-8",
+            render_prd_markdown(source, decisions, plan.evidence_priority), encoding="utf-8",
+        )
+        (staging / "planning-brief.md").write_text(
+            render_planning_brief_markdown(plan_id, source, plan), encoding="utf-8",
         )
         for node in nodes:
             contract = node.contract
@@ -451,7 +427,13 @@ def _publish_plan(
 
 def _load_plan(paths: ProjectPaths, plan_id: str):
     directory = _plan_root(paths, plan_id)
-    plan = Plan.from_dict(_read_json(directory / "plan.json"))
+    raw_plan = _read_json(directory / "plan.json")
+    if isinstance(raw_plan, dict) and raw_plan.get("status") == "draft":
+        # A session draft has no authorization card yet; say so in the user's
+        # terms instead of failing on the missing file below.
+        raise PermissionError("blocked_design: " + str(raw_plan.get("next_step") or (
+            "计划仍是草案，尚无产品内容；请用 vibe plan --request <原请求> --from-prd <产品 spec 文件> 完成发布")))
+    plan = Plan.from_dict(raw_plan)
     nodes_data = _read_json(directory / "nodes.json")
     if not isinstance(nodes_data, list):
         raise ValueError("nodes.json must contain a list")
@@ -1177,7 +1159,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 return _result(
                     SUCCESS, payload, "任务已进入轻规划", args.as_json
                 )
-            if not args.node_spec:
+            if not args.node_spec and not args.from_prd:
                 materialized = materialize_session_entry(paths, entry)
                 payload = {
                     "command": "plan",
@@ -1192,14 +1174,24 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 return _result(
                     SUCCESS, payload, "复杂请求已生成稳定计划草案，等待授权", args.as_json
                 )
-            source_path = paths.resolve_relative(args.node_spec)
+            if args.from_prd:
+                # Product-level spec from the agent: business fields only;
+                # every engineering field is derived by node_spec.
+                source = _read_json(paths.resolve_relative(args.from_prd))
+                if not isinstance(source, dict):
+                    raise ValueError("product spec must be a JSON object")
+                reject_engineering_fields(source)
+            else:
+                source = _read_json(paths.resolve_relative(args.node_spec))
+                if not isinstance(source, dict):
+                    raise ValueError("node spec must be a JSON object")
+            # The session route settles the band only on the product path;
+            # a hand-written node spec keeps declaring its own band.
+            source = normalize_node_spec(source, entry, paths, route_governs_band=bool(args.from_prd))
             # Evaluate the PRD checkpoints before _publish_plan().  This gate
             # is deliberately side-effect free: unresolved product choices,
             # missing/unverified evidence, and invalid Skill references must
             # not materialize plans or authorization cards.
-            source = _read_json(source_path)
-            if not isinstance(source, dict):
-                raise ValueError("node spec must be a JSON object")
             has_prd_gate_input = any(
                 key in source for key in ("rationale", "product_question", "skill_profiles")
             )
@@ -1263,7 +1255,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     "downstream_artifact": None,
                 }
                 return _result(BLOCKED, payload, "规划已暂停：需要确认 PRD 证据", args.as_json)
-            plan, nodes, card = _publish_plan(paths, entry.plan_id, source_path)
+            plan, nodes, card = _publish_plan(paths, entry.plan_id, source)
         except PermissionError as error:
             if _is_capability_contract_unknown(error):
                 return _result(
