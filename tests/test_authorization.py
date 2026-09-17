@@ -35,10 +35,13 @@ class AuthorizationTests(unittest.TestCase):
     def test_card_lists_actions_scope_and_explicitly_excludes_deploy(self):
         card = build_authorization_card(self.plan, self.nodes, self.capabilities)
 
+        # Default switch is deny: the remote Git group (commit/push/PR/MR/merge)
+        # is not granted, per the confirmed V4.5 session-entry design.
         self.assertEqual(
             card.allowed_actions,
-            ("accept", "commit", "develop", "review", "rework", "test"),
+            ("accept", "develop", "review", "rework", "test"),
         )
+        self.assertEqual(card.remote_git_actions, "deny")
         self.assertEqual(card.excluded_actions, ("create_mr", "deploy", "merge", "push"))
         self.assertEqual(card.node_ids, ("n1", "n2"))
         self.assertEqual(card.file_scope, ("a.py", "b.py", "c.py"))
