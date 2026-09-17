@@ -297,8 +297,7 @@ class ProposalPreservationTests(_ProjectCase):
         self.init()
         offered.unlink()
 
-        result = run_cli(["init", "--confirm", "--json"], self.root)
-        payload = json.loads(result.text)
+        payload = run_cli(["init", "--confirm", "--json"], self.root).payload
         self.assertTrue(offered.is_file(), "the record should be restored")
         self.assertIn(
             ".vibe/proposals/agentsmd/proposal.offered.json",
