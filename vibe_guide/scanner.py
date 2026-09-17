@@ -188,6 +188,10 @@ def scan_project(paths):
     )
 
 
+#: Every rule block this release ships, in document order.
+AGENTSMD_BLOCKS = (CAPABILITY_RULES, PRD_GUIDE_RULES)
+
+
 def missing_agentsmd_blocks(existing):
     '''Return the rule blocks an AGENTS.md still lacks, in document order.
 
@@ -196,7 +200,7 @@ def missing_agentsmd_blocks(existing):
     an earlier one.
     '''
     if existing is None:
-        return [CAPABILITY_RULES, PRD_GUIDE_RULES]
+        return list(AGENTSMD_BLOCKS)
     blocks = []
     has_capability_rules = (
         'Vibe Guide' in existing

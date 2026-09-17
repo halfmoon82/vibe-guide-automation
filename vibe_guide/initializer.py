@@ -4,6 +4,7 @@ import os
 import json, tempfile
 
 from .scanner import (
+    AGENTSMD_BLOCKS,
     CAPABILITY_RULES,
     CAPABILITY_RULE_MARKER,
     PRD_GUIDE_MARKER,
@@ -248,9 +249,19 @@ def init_project(paths, confirm):
             offered, damaged = _offered_headings(offered_path)
             if damaged:
                 notes.append(damaged)
+            # Both "already in the proposal" and "already offered" are judged on
+            # the section's own marker.  Matching a whole block verbatim instead
+            # would make a reviewer's edit to one section look like that section
+            # went missing, so it would become pending again and rewrite the
+            # increment -- discarding the section still awaiting review.
+            already_proposed = {
+                block.splitlines()[0].strip()
+                for block in AGENTSMD_BLOCKS
+                if block not in missing_agentsmd_blocks(existing_proposal)
+            }
             pending_blocks = [
                 block for block in missing_agentsmd_blocks(report.agentsmd_content)
-                if block.strip() not in existing_proposal
+                if block.splitlines()[0].strip() not in already_proposed
                 and block.splitlines()[0].strip() not in offered
             ]
             if pending_blocks:
