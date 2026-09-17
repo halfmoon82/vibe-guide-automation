@@ -150,6 +150,14 @@ class ProductSpecPublishTests(_ProjectCase):
         self.assertIn("project_id", result.payload.get("reason", ""))
         self.assertFalse(self.plan_dir().exists())
 
+    def test_empty_node_list_gives_a_readable_reason(self):
+        self.write_capabilities()
+        spec = _product_spec()
+        spec["nodes"] = []
+        result = self.plan_from_prd(self.write_spec(spec))
+        self.assertNotEqual(result.payload.get("status"), "ok")
+        self.assertIn("at least one node", result.payload.get("reason", ""))
+
     def test_missing_capabilities_blocks_complex_publish_with_existing_message(self):
         result = self.plan_from_prd(self.write_spec(_product_spec()))
         self.assertNotEqual(result.payload.get("status"), "ok")

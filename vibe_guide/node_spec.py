@@ -257,6 +257,10 @@ def normalize_node_spec(spec: Any, entry: Any, paths: Any, route_governs_band: b
     raw_nodes = out.get("nodes")
     if not isinstance(raw_nodes, list):
         raise TypeError("node spec nodes must be a list")
+    if not raw_nodes:
+        # Say it here in plain terms; otherwise the derived integration
+        # contract fails first on an empty compatibility scope.
+        raise ValueError("node spec must contain at least one node")
     complete_node_contracts(raw_nodes, adapter_id, project_id)
 
     if band == "complex":
