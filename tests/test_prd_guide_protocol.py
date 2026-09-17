@@ -268,6 +268,46 @@ class ProposalPreservationTests(_ProjectCase):
         self.init()
         self.assertFalse(increment.is_file(), "a rejected increment must not come back")
 
+    def test_the_increment_never_carries_a_section_the_proposal_already_has(self):
+        """A section awaiting review must not also sit outside the proposal.
+
+        Deciding "already in the proposal" by asking an AGENTS.md-shaped gate
+        borrows its extra tokens -- `Vibe Guide` and `project` come from that
+        file's title, not from a proposal -- so a proposal holding the section
+        verbatim is still read as never having offered it.  The block then joins
+        the increment, and deleting it from `proposal.md` no longer declines it:
+        `apply` reinstates it from the side file.
+        """
+        from vibe_guide.scanner import CAPABILITY_RULE_MARKER, PRD_GUIDE_MARKER
+        agentsmd = self.root / "AGENTS.md"
+        proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+        increment = proposal.with_name("proposal.pending-update.md")
+
+        self._write_pre_release_proposal(proposal)
+        self.init()
+        headings = [
+            line.strip() for line in increment.read_text(encoding="utf-8").splitlines()
+            if line.startswith("## ")
+        ]
+        self.assertNotIn(
+            "## " + CAPABILITY_RULE_MARKER,
+            headings,
+            "the proposal already holds this section; offering it twice puts it "
+            "beyond the reviewer's reach",
+        )
+
+        # Deleting a section from proposal.md is how a reviewer declines it.
+        proposal.write_text(
+            "## " + PRD_GUIDE_MARKER + "\n\n- 只采纳这一节\n", encoding="utf-8"
+        )
+        self.init()
+        run_cli(["apply-agentsmd", "--confirm", "--json"], self.root)
+        self.assertNotIn(
+            CAPABILITY_RULE_MARKER,
+            agentsmd.read_text(encoding="utf-8") if agentsmd.is_file() else "",
+            "the declined section came back through the increment",
+        )
+
     def test_editing_the_reviewed_proposal_does_not_wipe_the_increment(self):
         """Reviewing one section must not silently discard another.
 
