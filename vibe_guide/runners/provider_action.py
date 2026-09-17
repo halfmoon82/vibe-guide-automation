@@ -35,6 +35,31 @@ from ..workflow_gate import session_contract_prompt
 from ..state import read_writer_lease
 
 
+#: Native desktop tools per visible provider, one definition for the five
+#: mailbox operations.  The desktop session that services the mailbox reads
+#: ``native_tool`` from each request and calls that tool.  Claude Code maps to
+#: the desktop app's session tools: spawn a visible session, show it, read its
+#: state, message it, and page its transcript (the page cursor is the wait
+#: cursor).  Binding results for Claude Code use the provider-neutral
+#: ``task_id`` / ``host`` fields; ``threadId`` / ``hostId`` remain Codex-only.
+NATIVE_TOOL_MAP: Dict[str, Dict[str, str]] = {
+    "codex-app-visible": {
+        "create": "codex_app__create_thread",
+        "locate": "codex_app__navigate_to_codex_page",
+        "visibility": "codex_app__wait_threads",
+        "resume": "codex_app__send_message_to_thread",
+        "wait": "codex_app__wait_threads",
+    },
+    "claude-code-visible": {
+        "create": "ccd_session__spawn_task",
+        "locate": "ccd_window__open_session_in",
+        "visibility": "ccd_session_mgmt__get_session",
+        "resume": "ccd_session_mgmt__send_message",
+        "wait": "ccd_session_mgmt__list_events",
+    },
+}
+
+
 class ProviderActionRunner(Runner):
     """Expose a public CLI runner while the App owns native tool execution."""
 
@@ -50,15 +75,14 @@ class ProviderActionRunner(Runner):
         self.store = ProviderActionStore(paths)
 
     def _native_tool(self, operation: str) -> str:
-        if self.provider == "codex-app-visible":
-            return {
-                "create": "codex_app__create_thread",
-                "locate": "codex_app__navigate_to_codex_page",
-                "visibility": "codex_app__wait_threads",
-                "resume": "codex_app__send_message_to_thread",
-                "wait": "codex_app__wait_threads",
-            }[operation]
-        return self.provider + "." + operation
+        tools = NATIVE_TOOL_MAP.get(self.provider)
+        if tools is None:
+            # A placeholder name would sit in the mailbox forever; only
+            # providers with a verified native control plane may dispatch.
+            raise ProviderUnavailable(
+                "no verified native control plane for provider {}".format(self.provider)
+            )
+        return tools[operation]
 
     def _consistency_instruction(self, contract: Dict[str, Any]) -> str:
         try:
