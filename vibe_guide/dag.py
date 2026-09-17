@@ -8,10 +8,13 @@ from pathlib import Path
 import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from .models import DAGNode, Plan
+# INTEGRATION_REVIEW_NODE_ID lives in models so Plan can validate against it.
+# dag imports models, so importing it back from dag would be circular; it is
+# re-exported here to keep every `from .dag import INTEGRATION_REVIEW_NODE_ID`
+# working unchanged.
+from .models import INTEGRATION_REVIEW_NODE_ID, DAGNode, Plan
 
 
-INTEGRATION_REVIEW_NODE_ID = "integration-review"
 INTEGRATION_REVIEWER_ID = "integration-reviewer"
 
 
