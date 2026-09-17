@@ -1,0 +1,12 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Build artifacts (dist/ is a local build cache, not a download entry; see README)
+build/
+dist/
+*.egg-info/
+
+# Local environments / OS noise
+.venv/
+.DS_Store
