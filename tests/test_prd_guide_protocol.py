@@ -84,6 +84,21 @@ class _ProjectCase(unittest.TestCase):
         store.mkdir(parents=True, exist_ok=True)
         (store / "capabilities.json").write_text(json.dumps(CAPABILITIES), encoding="utf-8")
 
+    def _write_pre_release_proposal(self, proposal):
+        """Leave behind what an earlier release's init would have written.
+
+        Only the capability block existed then, and nothing recorded which
+        headings had been shown -- so a later init can tell "this predates the
+        section" from "the reviewer removed it".  Editing a current proposal
+        would not reproduce that: on disk the two look identical.
+        """
+        from vibe_guide.scanner import CAPABILITY_RULES
+        proposal.parent.mkdir(parents=True, exist_ok=True)
+        proposal.write_text(
+            CAPABILITY_RULES.rstrip("\n") + "\n\n<!-- 评审备注：保留 -->\n",
+            encoding="utf-8",
+        )
+
     def plan_from_prd(self, spec, plan_id="pm-plan"):
         (self.root / "product-spec.json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
         return run_cli(
@@ -196,12 +211,10 @@ class ProposalPreservationTests(_ProjectCase):
         agentsmd = self.root / "AGENTS.md"
         proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
 
-        self.init()
-        # Stand in for a proposal reviewed under an earlier version: drop the
-        # section this release adds, keep the reviewer's own note.
-        text = proposal.read_text(encoding="utf-8")
-        older = text.partition("## " + PRD_GUIDE_MARKER)[0].rstrip("\n")
-        proposal.write_text(older + "\n\n<!-- 评审备注：保留 -->\n", encoding="utf-8")
+        # A proposal written before this release: the section did not exist, so
+        # neither it nor any record of offering it is on disk.  That absence is
+        # what distinguishes this from a reviewer who deleted the section.
+        self._write_pre_release_proposal(proposal)
         first = run_cli(["apply-agentsmd", "--confirm", "--json"], self.root)
         self.assertEqual(first.exit_code, 0, first.text)
         self.assertNotIn(PRD_GUIDE_MARKER, agentsmd.read_text(encoding="utf-8"))
@@ -215,6 +228,45 @@ class ProposalPreservationTests(_ProjectCase):
         self.assertEqual(final.count(PRD_GUIDE_MARKER), 1, final)
         again = run_cli(["apply-agentsmd", "--confirm", "--json"], self.root)
         self.assertEqual(agentsmd.read_text(encoding="utf-8"), final, again.text)
+
+    def test_a_section_the_reviewer_deleted_is_not_reoffered(self):
+        """Reachability must not become a way around the reviewer.
+
+        Deleting a section from the proposal is how a reviewer says no.  If
+        `init` cannot tell that from "this proposal predates the section" it
+        re-offers it, `apply` consumes the increment, and the deletion is
+        undone -- the same outcome as rewriting the proposal in place, reached
+        by a longer route.
+        """
+        from vibe_guide.scanner import PRD_GUIDE_MARKER
+        agentsmd = self.root / "AGENTS.md"
+        proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+
+        self.init()
+        text = proposal.read_text(encoding="utf-8")
+        kept = text.partition("## " + PRD_GUIDE_MARKER)[0].rstrip("\n")
+        proposal.write_text(kept + "\n\n<!-- 这一节我们不要 -->\n", encoding="utf-8")
+
+        self.init()
+        applied = run_cli(["apply-agentsmd", "--confirm", "--json"], self.root)
+        self.assertEqual(applied.exit_code, 0, applied.text)
+        final = agentsmd.read_text(encoding="utf-8")
+        self.assertNotIn(PRD_GUIDE_MARKER, final, "the reviewer's deletion was undone")
+        self.assertIn("Capability and Tool Truth", final, "the kept section must still apply")
+
+    def test_a_rejected_increment_is_not_regenerated(self):
+        """Deleting the increment file is the reviewer's answer too."""
+        from vibe_guide.scanner import PRD_GUIDE_MARKER
+        proposal = self.root / ".vibe" / "proposals" / "agentsmd" / "proposal.md"
+        increment = proposal.with_name("proposal.pending-update.md")
+
+        self._write_pre_release_proposal(proposal)
+        self.init()
+        self.assertTrue(increment.is_file(), "the increment should be offered once")
+
+        increment.unlink()
+        self.init()
+        self.assertFalse(increment.is_file(), "a rejected increment must not come back")
 
     def test_a_fenced_heading_is_not_read_as_a_section_boundary(self):
         """A `## ` inside ``` is example text, not a new section.

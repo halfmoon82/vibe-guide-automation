@@ -20,6 +20,11 @@ from .workflow_gate import V42_STATE
 # Newer rule blocks land here when a reviewed proposal.md already exists; both
 # the writer (init) and the reader (apply-agentsmd) name it from here.
 PENDING_UPDATE_NAME = "proposal.pending-update.md"
+# Headings already put to the reviewer, so a section they removed is not
+# offered again.  Without it, "missing from AGENTS.md" is the only signal init
+# has, and it cannot tell a proposal that predates a section from a reviewer
+# who deleted it -- so every re-init re-offers what they already declined.
+OFFERED_SECTIONS_NAME = "proposal.offered.json"
 
 
 @dataclass
@@ -205,15 +210,29 @@ def init_project(paths, confirm):
         if existing_proposal is None:
             _write_new(proposal_path, proposal.content)
             created.append(str(proposal_path.relative_to(root)))
+            # Record the first proposal's own headings too: a section deleted
+            # from it has been declined just as plainly as one deleted from an
+            # increment, and only this record can tell that from a proposal
+            # written before the section existed.
+            _record_offered(
+                proposal_path.with_name(OFFERED_SECTIONS_NAME),
+                {
+                    section.splitlines()[0].strip()
+                    for section in _proposal_sections(proposal.content)
+                },
+            )
         else:
             # An existing proposal is awaiting human review, and a reviewer may
             # have deliberately deleted a section they do not want.  Rewriting
             # it in place would restore that section and discard their notes, so
             # a proposal that predates a newer rule block goes to a side file
             # and the reviewed bytes are left alone.
+            offered_path = proposal_path.with_name(OFFERED_SECTIONS_NAME)
+            offered = _offered_headings(offered_path)
             pending_blocks = [
                 block for block in missing_agentsmd_blocks(report.agentsmd_content)
                 if block.strip() not in existing_proposal
+                and block.splitlines()[0].strip() not in offered
             ]
             if pending_blocks:
                 update_path = proposal_path.with_name(PENDING_UPDATE_NAME)
@@ -232,6 +251,10 @@ def init_project(paths, confirm):
                     if update_path.read_text(encoding='utf-8') != update:
                         _atomic_write(update_path, update)
                         created.append(str(update_path.relative_to(root)))
+                _record_offered(
+                    offered_path,
+                    offered | {block.splitlines()[0].strip() for block in pending_blocks},
+                )
     skill_proposal = root / '.vibe/proposals/skills/proposal.md'
     if not skill_proposal.exists() and not any(item.get('valid') and item.get('name') == 'architecture-skill-pack' for item in report.skills):
         _write_new(
@@ -251,6 +274,39 @@ def init_project(paths, confirm):
         _write_new(prd_guide, load_protocol(PRD_GUIDE_NAME))
         created.append(PRD_GUIDE_PROPOSAL_RELATIVE)
     return InitResult(bool(created), created)
+
+
+def _offered_headings(path):
+    """Return the section headings already put to the reviewer.
+
+    An unreadable or malformed record reads as "nothing offered yet": the cost
+    is re-offering a section, which the reviewer can decline again, whereas
+    treating it as "everything offered" would silently withhold new rules.
+    """
+    if path.is_symlink() or not path.is_file():
+        return frozenset()
+    try:
+        recorded = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return frozenset()
+    if not isinstance(recorded, dict):
+        return frozenset()
+    headings = recorded.get('offered_headings')
+    if not isinstance(headings, list):
+        return frozenset()
+    return frozenset(item for item in headings if isinstance(item, str))
+
+
+def _record_offered(path, headings):
+    """Persist the headings the reviewer has now seen."""
+    payload = json.dumps(
+        {'offered_headings': sorted(headings)}, ensure_ascii=False, indent=2
+    ) + '\n'
+    if path.exists():
+        if path.is_file() and not path.is_symlink():
+            _atomic_write(path, payload)
+    else:
+        _write_new(path, payload)
 
 
 def _read_proposal(path):
