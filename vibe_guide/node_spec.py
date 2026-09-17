@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 from .adapters.base import Environment
@@ -139,6 +140,23 @@ def observe_capabilities(paths: Any) -> ObservedCapabilities:
     )
 
 
+_SLUG_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _node_slug(node_id: Any) -> str:
+    """A filesystem- and ref-safe name derived from a node id.
+
+    Node ids come from the product spec, so they may carry spaces or
+    non-ASCII text.  The slug must be stable across dispatches, since the
+    worktree it names is where that node's writer keeps working.
+    """
+    raw = str(node_id or "").strip()
+    slug = _SLUG_SAFE.sub("-", raw).strip("-.")
+    if not slug:
+        slug = "node-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return slug
+
+
 def complete_node_contracts(raw_nodes: List[Dict[str, Any]], adapter_id: str, project_id: Optional[str]) -> None:
     """Fill the engineering defaults every node contract needs (in place, missing only).
 
@@ -160,6 +178,14 @@ def complete_node_contracts(raw_nodes: List[Dict[str, Any]], adapter_id: str, pr
         contract.setdefault("adapter_id", adapter_id)
         if project_id:
             contract.setdefault("project_id", project_id)
+        # One writer per node means one worktree and one branch per node.  A
+        # product spec carries no engineering fields, so without a derived
+        # default every node used to land in the project root on the trunk:
+        # parallel developers would share a tree, and the writer lease is keyed
+        # per node so it does not catch that collision.
+        node_slug = _node_slug(item.get("id"))
+        contract.setdefault("worktree", "../" + node_slug)
+        contract.setdefault("branch", "node/" + node_slug)
         contract.setdefault("worker", contract.get("writer", "worker"))
         contract.setdefault("reviewer_worker", contract.get("reviewer", "reviewer"))
         contract.setdefault("worker_profile", {
@@ -174,8 +200,8 @@ def complete_node_contracts(raw_nodes: List[Dict[str, Any]], adapter_id: str, pr
                 "availability_evidence": "configured",
             },
             "writer": contract.get("writer", "worker"),
-            "worktree": contract.get("worktree", "."),
-            "branch": contract.get("branch", "main"),
+            "worktree": contract["worktree"],
+            "branch": contract["branch"],
             "allowlist": contract.get("files", []) or ["."],
         })
 
