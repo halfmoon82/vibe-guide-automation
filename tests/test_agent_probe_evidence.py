@@ -45,11 +45,16 @@ class AgentProbeEvidenceTests(unittest.TestCase):
         observed = observe_capabilities(self.paths)
         self.assertFalse(observed.detection.evidence["claude-code.agent"])
 
-    def test_other_facts_and_level_are_unchanged(self):
+    def test_only_the_agent_evidence_changes_with_the_agent_fact(self):
         self.write(FACTS)
-        observed = observe_capabilities(self.paths)
-        self.assertEqual(observed.capabilities["level"], "full")
-        self.assertTrue(observed.detection.detected)
+        with_agent = observe_capabilities(self.paths)
+        self.write({**FACTS, "claude-code.agent": False})
+        without_agent = observe_capabilities(self.paths)
+        strip = lambda evidence: {k: v for k, v in evidence.items() if k != "claude-code.agent"}
+        self.assertEqual(strip(with_agent.detection.evidence), strip(without_agent.detection.evidence))
+        self.assertEqual(with_agent.capabilities, without_agent.capabilities)
+        self.assertEqual(with_agent.detection.detected, without_agent.detection.detected)
+        self.assertEqual(with_agent.capabilities["level"], "full")
         self.write({**FACTS, "claude-code.subprocess": False})
         self.assertEqual(observe_capabilities(self.paths).capabilities["level"], "guide")
 
