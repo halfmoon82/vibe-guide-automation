@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from vibe_guide.authorization import authorize, build_authorization_card
 from vibe_guide.contracts import RunEvent, RunHandle
-from vibe_guide.models import AgentCapabilities, DAGNode, Plan
+from vibe_guide.models import AgentCapabilities, DAGNode, Plan, node_branch
 from vibe_guide.monitor import Monitor
 from vibe_guide.adapters.task_provider import ProviderPending
 from vibe_guide.paths import ProjectPaths
@@ -162,7 +162,7 @@ class MonitorTests(unittest.TestCase):
         developer = load_task_binding(self.paths, "n1", "developer", run_id=snapshot.run_id)
         reviewer = TaskBinding(
             provider="fake", mode="background", issue_id="n1", role="reviewer",
-            task_id="reviewer:n1", worktree=".worktrees/n1", branch="node/n1",
+            task_id="reviewer:n1", worktree=".worktrees/n1", branch=node_branch("n1"),
             status_file="status.txt", handoff_file="handoff.md", run_id=snapshot.run_id,
             status="review", generation=1,
         )
@@ -176,7 +176,7 @@ class MonitorTests(unittest.TestCase):
         subprocess.run(["git", "config", "user.name", "Test"], cwd=worktree, check=True)
         subprocess.run(["git", "add", "."], cwd=worktree, check=True)
         subprocess.run(["git", "commit", "-qm", "evidence"], cwd=worktree, check=True)
-        subprocess.run(["git", "branch", "-M", "node/n1"], cwd=worktree, check=True)
+        subprocess.run(["git", "branch", "-M", node_branch("n1")], cwd=worktree, check=True)
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, capture_output=True, text=True).stdout.strip()
         current = snapshot.nodes["n1"]
         current.update({"status": "blocked_unknown", "active_role": None, "active_task": None,
@@ -628,7 +628,7 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(call["successor"])
         self.assertEqual(call["capability_contract_digest"], fresh.contract_digest)
         self.assertEqual(call["child_binding"]["worktree"], ".worktrees/n1")
-        self.assertEqual(call["branch"], "node/n1")
+        self.assertEqual(call["branch"], node_branch("n1"))
         self.assertEqual(
             call["child_binding"]["capability_contract_digest"],
             fresh.contract_digest,

@@ -89,6 +89,24 @@ class ProductManagerPathTests(unittest.TestCase):
         for forbidden in ("required_workflow_blocked", "session_gate_blocked", "topology evidence", "engine_attestation_unavailable"):
             self.assertNotIn(forbidden, json.dumps(monitored.payload, ensure_ascii=False), forbidden)
 
+        # 5b. The dispatch requests themselves must isolate the parallel nodes.
+        #     Asserting on the pure function is not enough: the value that
+        #     reaches a developer session is the one in child_binding, built
+        #     further down the chain.  Two sessions sharing a directory on the
+        #     trunk is exactly what this used to do.
+        requests = sorted((self.root / ".vibe" / "provider-actions" / "requests").glob("*.json"))
+        self.assertTrue(requests, "monitor dispatched no provider create request")
+        dispatched = []
+        for path in requests:
+            binding = json.loads(path.read_text(encoding="utf-8"))["request"]["child_binding"]
+            dispatched.append((binding["node_id"], binding["worktree"], binding["branch"]))
+        pairs = {(tree, branch) for _, tree, branch in dispatched}
+        self.assertEqual(len(pairs), len(dispatched), dispatched)
+        for node_id, tree, branch in dispatched:
+            self.assertNotIn(branch, {"main", "master"}, node_id)
+            self.assertNotIn(tree, {".", "", "./"}, node_id)
+            self.assertFalse(tree.startswith(".."), (node_id, tree))
+
         # 6. Status and resume read the same run back without a second writer.
         status = self.cli("status", "--plan", "pm-plan")
         self.assertEqual(status.payload.get("run_id"), run_id, status.payload)

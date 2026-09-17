@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 from .adapters.base import Environment
 from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
-from .models import IntegrationAcceptanceContract
+from .models import IntegrationAcceptanceContract, node_branch, node_worktree
 from .prd_profiles import render_planning_brief
 
 #: Fields the agent / product manager supplies.  Only business semantics.
@@ -54,7 +54,16 @@ ENGINEERING_TOP_LEVEL_FIELDS = (
     "integration_contract", "spec_path", "plan_id",
 )
 ENGINEERING_NODE_FIELDS = ("status",)
-ENGINEERING_CONTRACT_FIELDS = ("adapter_id", "project_id", "worker", "reviewer_worker", "worker_profile")
+# `worktree` and `branch` are derived per node so parallel writers cannot share
+# a directory.  The fill below only supplies what is missing, so a product spec
+# naming them would keep its own value and bypass that isolation entirely.
+# `writer` and `reviewer` are the aliases the fill reads to set `worker` and
+# `reviewer_worker`, so guarding only the destination leaves the alias as a way
+# to name another machine's worker.
+ENGINEERING_CONTRACT_FIELDS = (
+    "adapter_id", "project_id", "worker", "reviewer_worker", "worker_profile",
+    "worktree", "branch", "writer", "reviewer",
+)
 ENGINEERING_FIELDS = {
     "top_level": ENGINEERING_TOP_LEVEL_FIELDS,
     "node": ENGINEERING_NODE_FIELDS,
@@ -160,6 +169,19 @@ def complete_node_contracts(raw_nodes: List[Dict[str, Any]], adapter_id: str, pr
         contract.setdefault("adapter_id", adapter_id)
         if project_id:
             contract.setdefault("project_id", project_id)
+        # One writer per node means one worktree and one branch per node.  A
+        # product spec carries no engineering fields, so without a derived
+        # default every node used to land in the project root on the trunk:
+        # parallel developers would share a tree, and nothing cross-checks two
+        # nodes for pointing at the same directory.
+        #
+        # The names come from models.node_worktree/node_branch, the same
+        # derivation Monitor falls back to, so the two sides cannot drift; the
+        # spec's literal values used to shadow those safe defaults.  These are
+        # identity strings for the dispatch contract, not directories vibe
+        # creates: provisioning the tree belongs to whoever runs the node.
+        contract.setdefault("worktree", node_worktree(item.get("id")))
+        contract.setdefault("branch", node_branch(item.get("id")))
         contract.setdefault("worker", contract.get("writer", "worker"))
         contract.setdefault("reviewer_worker", contract.get("reviewer", "reviewer"))
         contract.setdefault("worker_profile", {
@@ -174,8 +196,8 @@ def complete_node_contracts(raw_nodes: List[Dict[str, Any]], adapter_id: str, pr
                 "availability_evidence": "configured",
             },
             "writer": contract.get("writer", "worker"),
-            "worktree": contract.get("worktree", "."),
-            "branch": contract.get("branch", "main"),
+            "worktree": contract["worktree"],
+            "branch": contract["branch"],
             "allowlist": contract.get("files", []) or ["."],
         })
 
