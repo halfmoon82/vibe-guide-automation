@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -12,7 +12,14 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 # dag imports models, so importing it back from dag would be circular; it is
 # re-exported here to keep every `from .dag import INTEGRATION_REVIEW_NODE_ID`
 # working unchanged.
-from .models import INTEGRATION_REVIEW_NODE_ID, DAGNode, Plan
+from .models import (
+    INTEGRATION_REVIEW_NODE_ID,
+    DAGNode,
+    Plan,
+    node_branch,
+    node_worktree,
+)
+from .path_ownership import normalize_project_path
 
 
 INTEGRATION_REVIEWER_ID = "integration-reviewer"
@@ -25,6 +32,77 @@ def is_integration_review_node(node: DAGNode) -> bool:
 
 def _integration_nodes(plan: Plan) -> List[DAGNode]:
     return [node for node in (getattr(plan, "nodes", []) or []) if is_integration_review_node(node)]
+
+
+INTEGRATION_REVIEW_SCOPE_LIMIT = 256
+
+
+def integration_review_scope(business_nodes: Sequence[DAGNode]) -> List[str]:
+    """The files the final reviewer may read: every business node's, deduped.
+
+    The node owns nothing -- it aggregates -- so its `allowlist` stays empty.
+    But dispatch derives a worker profile from `contract["files"]` and
+    `validate_child_session_binding` refuses an empty allowlist, so a node with
+    no files can never be handed to a reviewer session and every complex run
+    stalls on it.  The union is also the honest scope: this reviewer reads the
+    whole delivery.
+
+    Entries go through `normalize_project_path`, the same predicate the rest of
+    the package uses, and unusable ones are dropped rather than passed through:
+    one business node naming `/etc/passwd` must not make this node
+    undispatchable again.  Normalising before deduping matters because the union
+    is a new list that no validator has seen -- `src/x.ts` and `./src/x.ts` each
+    pass on their own node and collide here, and
+    `authorization._normalize_files` rejects that collision by refusing to
+    publish the plan at all.  `allowlist` is an unvalidated channel
+    (`DAGNode.__post_init__` only checks for non-empty strings), so this is the
+    only place those spellings are caught.
+
+    The union also has to stay inside that validator's 256-item bound, which
+    each node's own list respects but their union need not.  Past the bound the
+    scope collapses to the distinct top-level directories: a coarser honest
+    scope, rather than a truncated one that would quietly hide files from the
+    reviewer.
+
+    An empty union returns empty and the caller omits the key, since `"."` is
+    not a legal `files` entry.  `append_integration_review_node` handles that
+    case by giving the node an explicit `worker_profile` instead.
+    """
+    scope: List[str] = []
+    for node in business_nodes:
+        contract = getattr(node, "contract", None) or {}
+        for item in list(contract.get("files") or []) + list(getattr(node, "allowlist", []) or []):
+            if not isinstance(item, str):
+                continue
+            try:
+                normalized = normalize_project_path(item)
+            except ValueError:
+                continue
+            if normalized.startswith("~"):
+                # `normalize_project_path` keeps a leading `~`; a home-relative
+                # path is not project-relative.
+                continue
+            if normalized not in scope:
+                scope.append(normalized)
+    if len(scope) > INTEGRATION_REVIEW_SCOPE_LIMIT:
+        roots: List[str] = []
+        for item in scope:
+            root = PurePosixPath(item).parts[0]
+            if root not in roots:
+                roots.append(root)
+        if len(roots) > INTEGRATION_REVIEW_SCOPE_LIMIT:
+            # Cutting the list here would put back the very hole coarsening
+            # exists to avoid, one level up and losing whole subtrees, while
+            # still producing a well-formed contract.  There is no third level
+            # to collapse to: `"."` is not a legal `files` entry.
+            raise ValueError(
+                "integration review scope spans {} top-level directories, over "
+                "the {} the authorization contract allows; split the plan".format(
+                    len(roots), INTEGRATION_REVIEW_SCOPE_LIMIT
+                )
+            )
+        scope = roots
+    return scope
 
 
 def append_integration_review_node(plan: Plan) -> Plan:
@@ -52,6 +130,50 @@ def append_integration_review_node(plan: Plan) -> Plan:
         "reviewer": INTEGRATION_REVIEWER_ID,
         "allowlist": [],
     })
+    # What this reviewer may read.  `allowlist` above stays empty because it
+    # writes nothing; `files` is what dispatch reads to build the worker
+    # profile, and without it the node is undispatchable (see
+    # `integration_review_scope`).
+    review_scope = integration_review_scope(business_nodes)
+    if review_scope:
+        contract["files"] = review_scope
+    else:
+        # No business node names a file -- a legal spec, since
+        # `complete_node_contracts` only setdefaults `files`.  Supply the same
+        # two things a business node has in that case: an empty `files` and a
+        # `worker_profile` scoped to the whole project.
+        #
+        # Both halves are load-bearing.  `"."` cannot go in `files`
+        # (`_normalize_files` rejects it, so the plan would not publish), and it
+        # cannot be left to the profile alone either: `_start_task` setdefaults
+        # `files` from `worker_profile.allowlist`, so an absent `files` key
+        # becomes `["."]` at dispatch and `validate_runtime_contract` refuses it.
+        # The empty list is what keeps that setdefault from firing -- which is
+        # exactly why business nodes survive this input, their `["."]` allowlist
+        # never reaches that validator.
+        contract["files"] = []
+        contract["worker_profile"] = {
+            "worker": str(contract.get("worker", "worker")),
+            "model": "default",
+            "reasoning": "normal",
+            "fallbacks": [],
+            "selection_basis": {
+                "issue_complexity_ref": INTEGRATION_REVIEW_NODE_ID,
+                "complexity_band": "standard",
+                "risk_tags": ["integration", "read-only"],
+                "availability_evidence": "configured",
+            },
+            "writer": str(contract.get("writer", "worker")),
+            # The node's own tree, from the same derivation
+            # `complete_node_contracts` uses for business nodes.  Not
+            # `contract.get("worktree", ...)`: that key does not exist yet (the
+            # monitor setdefaults it later), so the fallback would always fire
+            # and protocol §6.3 has the platform open the session right there --
+            # in the main working tree, on a branch vibe never generates.
+            "worktree": node_worktree(INTEGRATION_REVIEW_NODE_ID),
+            "branch": node_branch(INTEGRATION_REVIEW_NODE_ID),
+            "allowlist": ["."],
+        }
     # Keep the synthetic integration reviewer on the same verified adapter
     # route as the business nodes so authorization can enforce one binding.
     for node in business_nodes:
@@ -59,6 +181,29 @@ def append_integration_review_node(plan: Plan) -> Plan:
         if adapter_id:
             contract["adapter_id"] = adapter_id
             break
+    # And on the same project.  `task_binding` refuses a visible contract with
+    # no `project_id`, so without this the node is rejected before its session
+    # is created.  Copied from a business node rather than synthesised: the
+    # value only exists when the attested capabilities reported one, and
+    # inventing it would route a session at a project nobody verified.
+    #
+    # Two different values is fail-closed for that same reason.  A spec may
+    # declare its own `project_id` on one node and inherit the attested default
+    # on another (`complete_node_contracts` setdefaults), and picking either one
+    # gives a reviewer that cannot read half the delivery while still being able
+    # to report P0-P2 cleared.
+    project_ids = []
+    for node in business_nodes:
+        project_id = str(node.contract.get("project_id", "")).strip()
+        if project_id and project_id not in project_ids:
+            project_ids.append(project_id)
+    if len(project_ids) > 1:
+        raise ValueError(
+            "business nodes disagree on project_id ({}); the integration "
+            "reviewer cannot span projects".format(", ".join(sorted(project_ids)))
+        )
+    if project_ids:
+        contract["project_id"] = project_ids[0]
     integration = DAGNode(
         INTEGRATION_REVIEW_NODE_ID,
         "Final integration review",
