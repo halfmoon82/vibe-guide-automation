@@ -148,11 +148,26 @@ class MailboxSectionTests(unittest.TestCase):
         docs/superpowers/raw/2026-09-18-claude-code-visible-dispatch-probe.md.
         """
         text = self.protocol()
-        self.assertIn("task_id", text)
-        marker = "无人值守"
-        self.assertIn(marker, text)
-        window = text[text.index("ccd_session__spawn_task"):]
-        self.assertRegex(window[:1200], r"需要.{0,12}(点|确认)")
+        self.assertIn("无人值守", text)
+        # Each fact is asserted on its own.  A window-wide regex passes as long
+        # as any nearby sentence mentions a click, so deleting the one that
+        # states the measured behaviour left it green.
+        claude = text[text.index("`ccd_session__spawn_task` 只是"):]
+        claude = claude[:claude.index("（实测记录见")]
+        # One string, because the three facts only mean anything together:
+        # what the call returns, that a human has to act, and that the caller
+        # is left without a session id.  Asserted separately, `task_id` was
+        # satisfied by the follow-up sentence and stopped guarding this one.
+        self.assertIn(
+            "它返回一个 `task_id` 并在界面上显示一张卡片，"
+            "**需要用户点一下**才真正创建会话；调用方拿不到 `sessionId`。",
+            claude,
+        )
+        self.assertIn("每个节点都有一个人工确认点", claude)
+        for promise in ("全自动", "自动创建会话", "不需要确认"):
+            self.assertNotIn(
+                promise, claude.replace("当成\"全自动\"会一直卡住", ""), promise
+            )
 
 
 class _ProjectCase(unittest.TestCase):

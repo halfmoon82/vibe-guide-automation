@@ -144,6 +144,86 @@ vibe monitor --plan <plan_id> --authorize AUTHORIZE --json
 
 之后用 `vibe status --plan <plan_id>` 看进度，`vibe resume --plan <plan_id>` 从断点续接。
 
-## 6. 什么时候才能打断产品经理
+## 6. 服务监工信箱（复杂计划开工后，每轮都要做）
 
-只有三类：产品设计要变、需要新的外部授权、要部署。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知）由 vibe 的 Monitor 自行分类恢复；恢复不了的会标 `blocked_unknown` 等待，不会伪装成成功。agent 看到 `blocked_unknown` 时先查是不是在等信箱服务，不要立刻报告失败。
+`vibe monitor` 自己不会创建开发会话。它把每个要派发的动作写成一份请求放进信箱，然后停下来等。**请求没人服务，run 就一直停在那里**——`status` 会显示 `retry_pending`，这不是失败，是在等你。
+
+包里没有任何代码能替你做这一步：创建会话需要宿主平台的桌面工具，只有当前这个会话持有它们。所以这是 agent 的职责。
+
+### 6.1 一轮的动作
+
+```python
+from vibe_guide.paths import ProjectPaths
+from vibe_guide.adapters.task_provider import ProviderActionStore
+
+store = ProviderActionStore(ProjectPaths(<项目根>))
+for action in store.pending():          # .vibe/provider-actions/requests/ 里还没有结果的
+    ...                                 # 按 action["native_tool"] 调对应桌面工具
+    store.complete(action["action_id"], <结果 payload>)
+```
+
+也可以直接读 `.vibe/provider-actions/requests/*.json`，但回写必须走 `complete()`——它会把结果和请求的 `request_digest` 绑在一起，手写的结果文件会被判"未绑定到请求"而拒收。
+
+每份请求里你要看的字段：
+
+| 字段 | 用途 |
+|---|---|
+| `action_id` | 回写时的键，原样传给 `complete()` |
+| `operation` | 五个之一：`create` `locate` `visibility` `resume` `wait` |
+| `native_tool` | 这个平台上该调哪个工具，vibe 已经替你查好 |
+| `issue_id` / `role` | 哪个节点的哪个角色（`developer` / `reviewer`） |
+| `request.child_binding` | **合同**：`worktree` `branch` `allowlist`，见 §6.3 |
+| `request.prompt` | 原样交给被派发的会话，里面含它必须回绑的证据 |
+
+### 6.2 回写的形状
+
+`payload` 必须是一个对象，按操作给出 vibe 会读的字段：
+
+| 操作 | payload |
+|---|---|
+| `create` | `{"binding": {"sessionId": "<真实会话 id>", "hostId": "<本机标识>"}}`（Codex 用 `threadId` / `hostId`） |
+| `locate` | `{"located": true}` |
+| `visibility` | `{"visible": true, "direct_enter": true}` |
+| `wait` | 终态事件，或 `{"status": "timeout", "cursor": "<最后一条事件的游标>"}` |
+| `resume` | 与 `create` 同形，沿用同一个会话 id |
+
+三条硬规则：
+
+1. **`create` 的 `binding` 必须含真实的会话 id**。没有身份的绑定会被拒（`provider create result has no task identity`）。只有设置句柄、没有真实会话 id 时，不要回写——留着 pending，下一轮再来。
+2. **`cursor` 不能是空串**。空游标会让同一个结果被重复消费。
+3. **不确定就不回写**。pending 比假成功便宜得多；vibe 会一直等，不会把未知当成功。
+
+回写一个之后 `vibe resume --plan <plan_id>`，剩下的请求下一轮继续。`status` 变回 `retry_pending` 只是说还有没服务完的请求。
+
+### 6.3 派发时必须遵守合同
+
+`request.child_binding` 里的 `worktree` 和 `branch` 是 vibe 按节点 id 派生的、每个节点互不相同的一对。**创建会话时必须把它的工作目录设成合同里的 `worktree`**（Claude Code 传 `cwd`），并让它在合同的 `branch` 上开发。
+
+这不是形式要求：两个并行节点落进同一个目录同一个分支，就是两个 writer 改同一棵树，改动互相覆盖。`allowlist` 同理——被派发的会话只能碰这些文件。
+
+worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），vibe 不会替你建。
+
+### 6.4 平台差异：哪个平台能"授权一次、不用盯屏幕"
+
+五个操作在两个平台都已登记，但**创建会话时要不要人工点一下，两边不一样**。这是平台事实，不是 vibe 的功能差异：
+
+| 操作 | `codex-app-visible` | `claude-code-visible` |
+|---|---|---|
+| `create` | `codex_app__create_thread` | `ccd_session__spawn_task` |
+| `locate` | `codex_app__navigate_to_codex_page` | `ccd_window__open_session_in` |
+| `visibility` | `codex_app__wait_threads` | `ccd_session_mgmt__get_session` |
+| `resume` | `codex_app__send_message_to_thread` | `ccd_session_mgmt__send_message` |
+| `wait` | `codex_app__wait_threads` | `ccd_session_mgmt__list_events` |
+
+- **Codex 本地桌面**：`create_thread` 没有审批门，`create` 直接返回会话身份。这是目前唯一能做到**无人值守**派发的路径——产品经理授权一次之后，agent 可以把整批节点派完，不需要人再看屏幕。
+- **Claude Code 桌面**：`ccd_session__spawn_task` 只是**提议**一个任务。它返回一个 `task_id` 并在界面上显示一张卡片，**需要用户点一下**才真正创建会话；调用方拿不到 `sessionId`。所以每个节点都有一个人工确认点，拿到 `task_id` 之后还要再查一次（`ccd_session_mgmt__list_sessions`）才能取到真实会话 id 去回写 `create`。
+
+在 Claude Code 上把这条流程当成"全自动"会一直卡住：卡片没人点，`create` 永远拿不到身份，run 停在 `retry_pending`。要么守着确认每个节点，要么用 Codex 本地桌面跑派发。
+
+（实测记录见 `docs/superpowers/raw/2026-09-18-claude-code-visible-dispatch-probe.md`。）
+
+## 7. 什么时候才能打断产品经理
+
+只有三类：产品设计要变、需要新的外部授权、要部署。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知）由 vibe 的 Monitor 自行分类恢复；恢复不了的会标 `blocked_unknown` 等待，不会伪装成成功。agent 看到 `blocked_unknown` 或 `retry_pending` 时先按 §6 查信箱里有没有没服务完的请求，不要立刻报告失败。
+
+一个例外要告诉产品经理：在 Claude Code 桌面上派发，每个节点都需要他点一下确认卡片（§6.4）。这属于"需要新的外部授权"那一类，授权卡念完之后就要说清楚，不要让他以为授权一次就不用管了。
