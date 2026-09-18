@@ -220,8 +220,10 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 }
 ```
 
-- 全部清零就是 `findings: []`、`out_of_scope: []`。还有 `status` 为 `open` 的 findings 时不要报 `accepted`——报了会被判
-  `integration review acceptance still reports open P0-P2 findings`，节点落到 `blocked_unknown`。有未清的问题应当报 `review_finding` 事件，让整合审查返工。
+- 全部清零就是 `findings: []`、`out_of_scope: []`。**只有 `resolved` 算清零**：`open`、`accepted`、`waived` 一律计入 `clearance`，报了会被判
+  `integration review acceptance still reports open P0-P2 findings`，节点落到 `blocked_unknown`。审查者不能给自己签豁免——P0–P2 没修完就报 `review_finding` 事件让整合审查返工，要不要放行是人的决定，不是审查者的。
+- 两个判断里的 `evidence` **必须是非空字符串**。给嵌套对象会被拒（`... needs a status and a non-empty evidence string`）：落盘时 `evidence` 整个字段会被打码，对象里"看起来像敏感信息"的键会被丢掉，于是写进去的包回读时不再合法——顶层会先报一次 `complete`，下一次读又退回去。所以这里只收一句话。
+
 - **只能给这四个键，多一个就是 schema 错误**。`run_id`、`plan_id`、`plan_revision`、四个 digest、`aggregated_scope`、`clearance`、`agentsmd_acceptance_refs`、`unverified_or_excluded` 全部由 vibe 从 run 自己和计划的整合合同派生。这不是省事：审查者不能改写它被追责的血缘，也不能缩小它被要求覆盖的范围。
 - 键名错、少键、或者给一个字符串，节点会落到 `blocked_unknown` 并写明
   `integration review evidence cannot be derived (...)`。这是可见的阻塞，不是静默失败——但顶层仍然只是没到 `complete`，所以看到 run 长时间停在 `running` 时先查这个节点的状态和理由。

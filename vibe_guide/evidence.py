@@ -167,6 +167,11 @@ def _open_finding_counts(findings: Any) -> Dict[str, int]:
     Both the validator and the derivation below read the clearance out of the
     findings through this one function, so a package can never be built with a
     clearance the validator would then compute differently.
+
+    Only `resolved` clears a finding.  `waived` and `accepted` are registered
+    spellings because reviewers do report them, but a reviewer waiving its own
+    P0 is not a clearance -- it is an unauthorized exemption, so it counts as
+    open and the run stays short of acceptance until a human decides otherwise.
     """
     open_counts = {"p0": 0, "p1": 0, "p2": 0}
     for finding in findings:
@@ -176,7 +181,7 @@ def _open_finding_counts(findings: Any) -> Dict[str, int]:
         status = str(finding.get("status", finding.get("resolution", ""))).lower()
         if status not in {"open", "resolved", "accepted", "waived"}:
             raise ValueError("integration finding status is invalid")
-        if status in {"open", "unresolved", "pending", "blocked"}:
+        if status != "resolved":
             open_counts[severity] += 1
     return open_counts
 
@@ -262,6 +267,16 @@ def build_integration_review_evidence(
         )
     if not isinstance(claim["findings"], list) or not isinstance(claim["out_of_scope"], list):
         raise ValueError("integration review claim findings and out_of_scope must be lists")
+    for key in ("iteration_compatibility", "test_runtime_delivery"):
+        verdict = claim[key]
+        # The justification has to be text: persistence redacts any value under
+        # an `evidence` key, and for a nested object it drops the keys that look
+        # sensitive -- so `{"secret_scan": "clean"}` was written as `{}` and the
+        # reload-time validator then rejected the whole completed run.
+        if not isinstance(verdict, dict) or not isinstance(verdict.get("evidence"), str) or not verdict["evidence"].strip():
+            raise ValueError(
+                "integration review claim {} needs a status and a non-empty evidence string".format(key)
+            )
     nodes = _snapshot_value(snapshot, "nodes", {})
     package = {
         "schema_version": 1,
