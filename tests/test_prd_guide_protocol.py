@@ -82,6 +82,342 @@ class ProtocolShippingTests(unittest.TestCase):
             self.assertIn(marker, text, marker)
 
 
+class MailboxSectionTests(unittest.TestCase):
+    """The mailbox section must stay true to the code that serves it.
+
+    A monitored run stops at the mailbox and waits: `vibe` writes a request and
+    only advances once a host agent writes the matching result back.  Nothing
+    in the package can perform that step -- it needs the desktop tools the
+    session itself holds -- so the protocol is the only place that step is
+    specified.  Prose alone would rot silently, so each fact below is asserted
+    against the module that produces it rather than merely grepped for.
+    """
+
+    def protocol(self):
+        from vibe_guide.protocols import load_protocol
+        return load_protocol("prd-guide")
+
+    def section(self):
+        """The mailbox section alone.
+
+        Assertions are scoped to the row or block that carries the fact.  A
+        bare `assertIn` over the whole document is satisfied by any other line
+        that happens to contain the same word, so eleven of fifteen deliberate
+        drifts slipped past the first version of these tests.
+        """
+        text = self.protocol()
+        start = text.index("## 6. 服务监工信箱")
+        return text[start:text.index("\n## 7. ", start)]
+
+    def subsection(self, heading):
+        """One `### 6.x` block, so a row is matched in the table that owns it.
+
+        `create` heads a row in both the write-back table and the platform
+        table, so searching the whole section conflates the two.
+        """
+        section = self.section()
+        start = section.index("### " + heading)
+        end = section.find("\n### ", start)
+        return section[start:] if end == -1 else section[start:end]
+
+    def row(self, heading, label):
+        """The table rows in `heading` whose first cell is `label`."""
+        prefix = "| `{}`".format(label)
+        rows = [
+            line for line in self.subsection(heading).splitlines()
+            if line.startswith(prefix)
+        ]
+        self.assertTrue(rows, "no row for {} in {}".format(label, heading))
+        return rows
+
+    def test_protocol_documents_serving_the_provider_mailbox(self):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        section = self.section()
+        # The call block, not the surrounding prose: prose mentioning
+        # `complete()` kept a renamed call site green.
+        block = section[section.index("```python"):section.index("```\n", section.index("```python"))]
+        for name in ("pending", "complete"):
+            self.assertTrue(callable(getattr(ProviderActionStore, name)), name)
+            self.assertIn("{}(".format(name), block, name)
+        # The request directory, spelled as ProviderActionStore spells it, in
+        # the sentence offering the read-the-files-yourself path.  The glob is
+        # part of the fact: the bare directory also appears in the code block's
+        # comment, so asserting that alone survived deleting this sentence.
+        store_source = (ROOT / "vibe_guide" / "adapters" / "task_provider.py").read_text(encoding="utf-8")
+        self.assertIn('"provider-actions"', store_source)
+        self.assertIn(".vibe/provider-actions/requests/*.json", section)
+        # Scoped to the field table: `request.child_binding` also appears in
+        # §6.3, which kept a renamed row here green.  It is spelled with the
+        # path a host agent indexes into, because the field sits under
+        # `request` rather than at the top level.
+        for field in ("action_id", "native_tool", "operation", "request.child_binding"):
+            self.row("6.1 一轮的动作", field)
+
+    def test_protocol_names_every_operation_the_mailbox_can_request(self):
+        """The five operations, in the sentence that enumerates them.
+
+        Scoped to that line: every name also appears in the write-back and
+        platform tables, so a document-wide check could not tell a dropped
+        entry from a mention elsewhere.
+        """
+        from vibe_guide.adapters.task_provider import _PROVIDER_ACTIONS
+        listing = next(
+            line for line in self.subsection("6.1 一轮的动作").splitlines()
+            if line.startswith("| `operation` |")
+        )
+        for operation in _PROVIDER_ACTIONS:
+            self.assertIn("`{}`".format(operation), listing, operation)
+
+    def test_protocol_write_back_shapes_match_the_runner_contract(self):
+        """Each operation's payload keys, checked in that operation's own row.
+
+        The runner reads a different key per operation and silently discards a
+        result that lacks it, so a host agent cannot recover the shape from the
+        request.  `create` is the one that already went wrong once: an earlier
+        draft sent `sessionId`, the desktop tool's own field name, which the
+        runner rejects as "no task identity".
+        """
+        source = (ROOT / "vibe_guide" / "runners" / "provider_action.py").read_text(encoding="utf-8")
+        accepted = re.search(
+            r'task_id = binding_data\.get\("(\w+)"\) or binding_data\.get\("(\w+)"\)\n'
+            r'\s*host = binding_data\.get\("(\w+)"\) or binding_data\.get\("(\w+)"\)',
+            source,
+        )
+        self.assertIsNotNone(accepted, "create binding keys no longer read this way")
+        create = " ".join(self.row("6.2 回写的形状", "create"))
+        # Quoted inside the JSON example or backticked as an accepted alias --
+        # either way a key token, never bare prose.
+        for key in accepted.groups():
+            self.assertRegex(create, r'[`"]{}[`"]'.format(key), key)
+        self.assertNotIn("sessionId", create, create)
+
+        self.assertIn('`{"located": true}`', " ".join(self.row("6.2 回写的形状", "locate")))
+        self.assertIn('"visible": true', " ".join(self.row("6.2 回写的形状", "visibility")))
+        self.assertIn('"direct_enter": true', " ".join(self.row("6.2 回写的形状", "visibility")))
+
+        # `resume` reads `resumed` and never looks at `binding`; a create-shaped
+        # payload has no `resumed`, so the round reports visibility_unknown.
+        self.assertIn('"resumed": true', " ".join(self.row("6.2 回写的形状", "resume")).lower())
+        self.assertRegex(source, r'operation != "resume" or result\.get\("resumed"\) is not True')
+
+        wait_rows = " ".join(self.row("6.2 回写的形状", "wait"))
+        self.assertIn('"status": "timeout"', wait_rows)
+        self.assertIn("cursor", wait_rows)
+        # Terminal wait needs status *and* event, from fixed sets, and the
+        # event name differs by role.  Dropping either stalls the run.
+        for token in ('"status": "completed"', '"event": "complete"', '"event": "accepted"'):
+            self.assertIn(token, wait_rows, token)
+
+    def test_terminal_wait_payload_passes_the_delivery_evidence_gate(self):
+        """The documented terminal payload, run through the gate that reads it.
+
+        A complex plan sets `execution_engine` to `vibeguide_monitor`, which
+        arms `evaluate_delivery_evidence` on every developer `complete`.  The
+        unit fixture in `test_claude_code_dispatch` has no `complexity_band`,
+        so that gate is dormant there and an ablation against it cannot see
+        these fields at all -- which is how an earlier draft came to document
+        `delivery_evidence` as absent and `cursor` as optional.  This asserts
+        the payload the protocol prints, against the gate itself.
+        """
+        import json as _json
+        from vibe_guide.evidence import evaluate_delivery_evidence
+        # Every JSON object in the subsection, wherever it is printed: in a
+        # table cell, a fenced block, indented prose.  Keying on the table row
+        # and on the literal "completed" made a *true* document red whenever it
+        # was reformatted, or when the equally valid `"complete"` was used.
+        subsection = self.subsection("6.2 回写的形状")
+        payloads = []
+        for chunk in re.findall(r"\{.*?\}(?=`|\s|$)", subsection, re.S):
+            try:
+                value = _json.loads(chunk)
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                payloads.append(value)
+        terminal = [p for p in payloads if p.get("event") in {"complete", "accepted"}]
+        self.assertEqual(
+            len(terminal), 2,
+            "expected one terminal payload per role; parsed {} from {} objects".format(
+                len(terminal), len(payloads)
+            ),
+        )
+        binding = {
+            "task_id": "sess_probe", "host": "probe-host",
+            "worktree": ".worktrees/probe", "branch": "node/probe",
+        }
+        def gate(payload):
+            """As the monitor calls it: the evidence comes from one key.
+
+            `monitor.py` passes `event.data.get("delivery_evidence")`, which is
+            why nesting matters -- marks spread across the payload's top level
+            are never looked at, so they fail exactly like omitting them.
+            """
+            return evaluate_delivery_evidence(
+                {"status": "DELIVERED"},
+                {**binding, "cursor": payload.get("cursor")},
+                payload.get("delivery_evidence"),
+            )
+
+        self.assertIn(
+            'event.data.get("delivery_evidence")',
+            (ROOT / "vibe_guide" / "monitor.py").read_text(encoding="utf-8"),
+        )
+        developer = next(p for p in terminal if p.get("event") == "complete")
+        # The cursor reaches the binding only from this payload
+        # (provider_action.py:1153-1160), so omitting it fails the gate.
+        self.assertIn("cursor", developer)
+        self.assertEqual(gate(developer).status, "DELIVERED", gate(developer).reasons)
+        flat = {k: v for k, v in developer.items() if k != "delivery_evidence"}
+        flat.update(developer["delivery_evidence"])
+        self.assertEqual(
+            gate(flat).status, "blocked_unknown",
+            "flattened delivery marks must not read as evidence",
+        )
+        without_cursor = {k: v for k, v in developer.items() if k != "cursor"}
+        self.assertIn("current cursor is missing", gate(without_cursor).reasons)
+        # The reviewer's own requirement is a separate check in the monitor.
+        reviewer = next(p for p in terminal if p.get("event") == "accepted")
+        self.assertIn("evidence", reviewer)
+        monitor = (ROOT / "vibe_guide" / "monitor.py").read_text(encoding="utf-8")
+        self.assertIn("review acceptance has no registered P0-P2 clearance evidence", monitor)
+
+    def test_protocol_prose_states_the_gate_requirements_it_explains(self):
+        """The sentences that explain the gate, not just the payload rows.
+
+        The row assertions pin what a host agent should copy; this pins the
+        prose that tells them *why*, which is where the requirement regressed
+        once already.  Softening "必须是嵌套对象" or restoring reviewer
+        `evidence` to "可以另带" left every payload assertion green while
+        telling the reader the opposite of what the gate enforces.
+        """
+        section = self.section()
+        for claim in (
+            "**developer** 要 `delivery_evidence`，**必须是嵌套对象**",
+            "摊平成顶层三个字段**不算**，门读不到",
+            "- **reviewer** 要 `evidence`：`accepted` 之后没有它",
+        ):
+            self.assertIn(claim, section, claim)
+
+        # The accepted values, taken from the gate rather than restated here.
+        source = (ROOT / "vibe_guide" / "evidence.py").read_text(encoding="utf-8")
+        accepted = re.search(
+            r'thread_status not in \{([^}]*)\}', source,
+        )
+        self.assertIsNotNone(accepted, "thread_status is no longer checked this way")
+        names = re.findall(r'"(\w+)"', accepted.group(1))
+        self.assertTrue(names)
+        for name in names:
+            self.assertIn("`{}`".format(name), section, name)
+        self.assertNotIn("`running` /", section, "running is not a terminal thread_status")
+
+        # The engine value that arms the gate, read from the monitor's own test.
+        self.assertIn(
+            'snapshot.execution_engine == "vibeguide_monitor"',
+            (ROOT / "vibe_guide" / "monitor.py").read_text(encoding="utf-8"),
+        )
+        self.assertIn("`vibeguide_monitor`", section)
+
+        # Rejection is distinguished by the node status, in that direction.
+        self.assertIn("被拒是 `blocked_unknown`，被接受是 `running`", section)
+        # Event names are role-dependent, in that pairing.
+        self.assertIn("developer 报 `complete`、reviewer 报 `accepted`", section)
+        # And vibe does not create the worktree for you.
+        self.assertIn("worktree 需要你先建出来", self.subsection("6.3 派发时必须遵守合同"))
+
+    def test_protocol_states_the_cursor_and_recovery_rules(self):
+        """Two rules whose absence is silent, so nothing else would notice.
+
+        An empty cursor discards the whole result rather than risking a double
+        read, and a rejected write-back is recovered through a freshly emitted
+        request -- rewriting the same action_id does nothing, because a request
+        that already has a result file is never re-read.
+        """
+        section = self.section()
+        source = (ROOT / "vibe_guide" / "runners" / "provider_action.py").read_text(encoding="utf-8")
+        self.assertIn("provider cursor is invalid", source)
+        self.assertIn("provider cursor is invalid", section)
+        self.assertIn("blocked_unknown", section)
+        # One string, because the recovery route only means anything whole:
+        # rewriting the same action_id is inert, and the replacement request is
+        # a *new* one identified by a higher generation.  Asserted as separate
+        # words, `generation` was satisfied by the closing sentence that says
+        # which one to serve, and deleting the route itself stayed green.
+        self.assertIn(
+            "不要重写同一个 `action_id`，已经有结果文件的请求不会被重读，重写没有任何效果。"
+            "`vibe resume` 会为同一个节点发出一个**新的 `create` 请求**（`generation` 加一）",
+            section,
+        )
+        # The empty-cursor consequence, as one string in the rule that owns it.
+        # `blocked_unknown` alone was satisfied by the rejection rule above it,
+        # so both softening it back to "可能重复消费" and downgrading the status
+        # to `retry_pending` stayed green.
+        self.assertIn(
+            "`provider cursor is invalid`，**整个结果被丢掉**，节点停在 `blocked_unknown`",
+            section,
+        )
+        # And that a complex run's developer terminal payload *must* carry one.
+        # The rows print a cursor either way, so softening this claim back to
+        # "可以不给" changed nothing a payload assertion could see.
+        self.assertIn("**`cursor` 在复杂计划的 developer 终态里也是必需的**", section)
+
+    def test_protocol_states_the_per_platform_dispatch_boundary(self):
+        """Unattended dispatch is a platform fact, not a vibe feature.
+
+        Both providers are wired, but only one creates a session without a
+        human click.  An open-source user reading this protocol has to learn
+        that before they plan around "authorize once and walk away".
+        """
+        from vibe_guide.providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER
+        from vibe_guide.runners.provider_action import NATIVE_TOOL_MAP
+        section = self.section()
+        for provider, tools in NATIVE_TOOL_MAP.items():
+            self.assertIn(provider, section, provider)
+            for operation, tool in tools.items():
+                self.assertIn(tool, section, "{}/{}".format(provider, operation))
+        # Which side is unattended is the whole point of the table, and
+        # swapping the two providers left every name still present.  Codex
+        # creates without a click; Claude Code needs one per node.
+        unattended = section[section.index("- **Codex 本地桌面**"):]
+        unattended = unattended[:unattended.index("- **Claude Code 桌面**")]
+        self.assertIn("无人值守", unattended)
+        self.assertNotIn("无人值守", section[section.index("- **Claude Code 桌面**"):])
+        # *Why* Codex is the unattended one, not just that it is labelled so.
+        # Negating this clause to "有审批门" left every other assertion green,
+        # which would have inverted the one fact the table exists to convey.
+        self.assertIn("`create_thread` 没有审批门", unattended)
+        self.assertIn(CODEX_PROVIDER, section)
+        self.assertIn(CLAUDE_CODE_PROVIDER, section)
+
+    def test_protocol_does_not_promise_unattended_claude_code_dispatch(self):
+        """The measured Claude Code behaviour has to survive a doc edit.
+
+        `spawn_task` proposes a task and shows the user a card; it returns a
+        `task_id`, never a session.  Anyone who writes "fully automatic" back
+        into this section has contradicted what was measured on 2026-09-18.
+        """
+        text = self.protocol()
+        self.assertIn("无人值守", text)
+        # Each fact is asserted on its own.  A window-wide regex passes as long
+        # as any nearby sentence mentions a click, so deleting the one that
+        # states the measured behaviour left it green.
+        claude = text[text.index("`ccd_session__spawn_task` 只是"):]
+        claude = claude[:claude.index("（以上两条平台行为")]
+        # One string, because the three facts only mean anything together:
+        # what the call returns, that a human has to act, and that the caller
+        # is left without a session id.  Asserted separately, `task_id` was
+        # satisfied by the follow-up sentence and stopped guarding this one.
+        self.assertIn(
+            "它返回一个 `task_id` 并在界面上显示一张卡片，"
+            "**需要用户点一下**才真正创建会话；调用方拿不到 `sessionId`。",
+            claude,
+        )
+        self.assertIn("每个节点都有一个人工确认点", claude)
+        for promise in ("全自动", "自动创建会话", "不需要确认"):
+            self.assertNotIn(
+                promise, claude.replace("当成\"全自动\"会一直卡住", ""), promise
+            )
+
+
 class _ProjectCase(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="v45-prd-guide-"))

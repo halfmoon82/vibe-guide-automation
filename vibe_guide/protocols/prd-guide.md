@@ -144,6 +144,123 @@ vibe monitor --plan <plan_id> --authorize AUTHORIZE --json
 
 之后用 `vibe status --plan <plan_id>` 看进度，`vibe resume --plan <plan_id>` 从断点续接。
 
-## 6. 什么时候才能打断产品经理
+## 6. 服务监工信箱（复杂计划开工后，每轮都要做）
 
-只有三类：产品设计要变、需要新的外部授权、要部署。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知）由 vibe 的 Monitor 自行分类恢复；恢复不了的会标 `blocked_unknown` 等待，不会伪装成成功。agent 看到 `blocked_unknown` 时先查是不是在等信箱服务，不要立刻报告失败。
+`vibe monitor` 自己不会创建开发会话。它把每个要派发的动作写成一份请求放进信箱，然后停下来等。**请求没人服务，run 就一直停在那里**——`status` 会显示 `retry_pending`，这不是失败，是在等你。
+
+包里没有任何代码能替你做这一步：创建会话需要宿主平台的桌面工具，只有当前这个会话持有它们。所以这是 agent 的职责。
+
+### 6.1 一轮的动作
+
+```python
+from vibe_guide.paths import ProjectPaths
+from vibe_guide.adapters.task_provider import ProviderActionStore
+
+store = ProviderActionStore(ProjectPaths(<项目根>))
+for action in store.pending():          # .vibe/provider-actions/requests/ 里还没有结果的
+    ...                                 # 按 action["native_tool"] 调对应桌面工具
+    store.complete(action["action_id"], <结果 payload>)
+```
+
+也可以直接读 `.vibe/provider-actions/requests/*.json`。回写建议走 `complete()`：结果文件必须恰好含 `schema_version` / `action_id` / `request_digest` / `payload` 四个键，且前三个与请求逐字对应，错一个就会被判"未绑定到请求"而拒收——`complete()` 替你填对。手写也能被接受，但没有理由自己去对 digest。
+
+每份请求里你要看的字段：
+
+| 字段 | 用途 |
+|---|---|
+| `action_id` | 回写时的键，原样传给 `complete()` |
+| `operation` | 五个之一：`create` `locate` `visibility` `resume` `wait` |
+| `native_tool` | 这个平台上该调哪个工具，vibe 已经替你查好 |
+| `issue_id` / `role` | 哪个节点的哪个角色（`developer` / `reviewer`） |
+| `request.child_binding` | **合同**：`worktree` `branch` `allowlist`，见 §6.3 |
+| `request.prompt` | 原样交给被派发的会话，里面含它必须回绑的证据 |
+
+### 6.2 回写的形状
+
+`payload` 必须是一个对象，按操作给出 vibe 会读的字段：
+
+| 操作 | payload |
+|---|---|
+| `create` | `{"binding": {"task_id": "<真实会话 id>", "host": "<本机标识>"}}`（`threadId` / `hostId` 同样接受） |
+| `locate` | `{"located": true}` |
+| `visibility` | `{"visible": true, "direct_enter": true}` |
+| `wait`（还没干完） | `{"status": "timeout", "cursor": "<最后一条事件的游标>"}` |
+| `wait`（干完了，developer） | `{"status": "completed", "cursor": "<游标>", "event": "complete", "delivery_evidence": {"completion_marker": "<完成标记>", "delivery_path": "<交付物路径>", "thread_status": "complete"}}` |
+| `wait`（干完了，reviewer） | `{"status": "completed", "cursor": "<游标>", "event": "accepted", "evidence": "<P0–P2 清零证据>"}` |
+| `resume` | `{"resumed": true}`（会话 id 沿用原来的，**不要**回写绑定） |
+
+`wait` 的终态字段各有各的判定，缺一个就整轮作废：`status` 只认
+`complete` / `completed` / `failed` / `stopped`，`event` 只认
+`complete` / `delivered` / `accepted` / `review_finding` / `failed` / `stopped`，
+且**角色不同事件名不同**——developer 报 `complete`、reviewer 报 `accepted`，
+报错会被判 `provider event is unsupported`。
+
+**复杂计划的终态还要过一道交付证据门，两个角色各要一样东西**（这道门只在
+复杂计划上生效：授权时 `complexity_band == "complex"` 会把引擎设成
+`vibeguide_monitor`，非复杂计划不走这里）：
+
+- **developer** 要 `delivery_evidence`，**必须是嵌套对象**，三个键齐全：
+  `completion_marker`、`delivery_path`、`thread_status`（只认 `complete` /
+  `completed` / `DELIVERED`）。摊平成顶层三个字段**不算**，门读不到。缺任何
+  一个，节点直接 `blocked_unknown`（理由如 `completion marker is missing`），
+  而顶层看起来只是还在等。
+- **reviewer** 要 `evidence`：`accepted` 之后没有它，节点被判
+  `review acceptance has no registered P0-P2 clearance evidence`。
+
+**`cursor` 在复杂计划的 developer 终态里也是必需的**：绑定上的游标只有你回写时
+才会被写进去（`provider_action.py:1153-1160`），不给就等于绑定没有游标，交付证据门
+报 `current cursor is missing`。这道门只挂在 `delivered` / `complete` 上，所以
+reviewer 的 `accepted` 不受它约束——但每轮都回写游标本来就是对的（`wait` 靠它
+接着上一次的位置读），所以上表两行都给了。
+
+`resume` 只看 `resumed`，**完全不读 `binding`**。按 `create` 的形状回写它，
+`resumed` 就是缺的，这一轮会报 `visibility_unknown` 事件，节点落到
+`blocked_unknown` 或重试态，续接推不下去。
+
+三条硬规则：
+
+1. **`create` 的 `binding` 必须用上面那几个键名，并且含真实的会话 id**。vibe 只认 `task_id`/`threadId` 与 `host`/`hostId`；用别的名字（比如桌面工具自己叫的 `sessionId`）会被判"没有任务身份"而丢掉绑定。只有设置句柄、没有真实会话 id 时，不要回写——留着 pending，下一轮再来。
+
+   **顶层状态看不出被拒**：绑定被丢掉和"正在等下一个节点"，顶层 `status` 都是 `retry_pending`，`pending()` 的计数也都会少一个（它只数没有结果文件的请求，不管结果有没有被接受）。要分辨就看 `payload["nodes"]` 里那个节点的状态——被拒是 `blocked_unknown`，被接受是 `running`。顶层之所以掩盖它，是只要还有一个节点在重试，顶层就被改写成 `retry_pending`。
+
+   **发现回写被拒之后**：不要重写同一个 `action_id`，已经有结果文件的请求不会被重读，重写没有任何效果。`vibe resume` 会为同一个节点发出一个**新的 `create` 请求**（`generation` 加一），服务那个新请求才能恢复。所以同一个节点在信箱里可能先后有多份 `create`，认 `generation` 最大的那个。
+2. **给 `cursor` 就必须是非空字符串**（长度 ≤ 4096、不含 NUL）。空串会被判
+   `provider cursor is invalid`，**整个结果被丢掉**，节点停在 `blocked_unknown`——
+   不是"可能重复消费"这种可以容忍的风险。不知道游标就整个字段不给（终态允许省略）。
+3. **不确定就不回写**。pending 比假成功便宜得多；vibe 会一直等，不会把未知当成功。
+
+回写一个之后 `vibe resume --plan <plan_id>`，剩下的请求下一轮继续。`status` 变回 `retry_pending` 只是说还有没服务完的请求。
+
+### 6.3 派发时必须遵守合同
+
+`request.child_binding` 里的 `worktree` 和 `branch` 是 vibe 按节点 id 派生的、每个节点互不相同的一对。**创建会话时必须把它的工作目录设成合同里的 `worktree`**（Claude Code 传 `cwd`），并让它在合同的 `branch` 上开发。
+
+这不是形式要求：两个并行节点落进同一个目录同一个分支，就是两个 writer 改同一棵树，改动互相覆盖。`allowlist` 同理——被派发的会话只能碰这些文件。
+
+worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），vibe 不会替你建。
+
+### 6.4 平台差异：哪个平台能"授权一次、不用盯屏幕"
+
+五个操作在两个平台都已登记，但**创建会话时要不要人工点一下，两边不一样**。这是平台事实，不是 vibe 的功能差异：
+
+| 操作 | `codex-app-visible` | `claude-code-visible` |
+|---|---|---|
+| `create` | `codex_app__create_thread` | `ccd_session__spawn_task` |
+| `locate` | `codex_app__navigate_to_codex_page` | `ccd_window__open_session_in` |
+| `visibility` | `codex_app__wait_threads` | `ccd_session_mgmt__get_session` |
+| `resume` | `codex_app__send_message_to_thread` | `ccd_session_mgmt__send_message` |
+| `wait` | `codex_app__wait_threads` | `ccd_session_mgmt__list_events` |
+
+- **Codex 本地桌面**：`create_thread` 没有审批门，`create` 直接返回会话身份。这是目前唯一能做到**无人值守**派发的路径——产品经理授权一次之后，agent 可以把整批节点派完，不需要人再看屏幕。
+- **Claude Code 桌面**：`ccd_session__spawn_task` 只是**提议**一个任务。它返回一个 `task_id` 并在界面上显示一张卡片，**需要用户点一下**才真正创建会话；调用方拿不到 `sessionId`。所以每个节点都有一个人工确认点，拿到 `task_id` 之后还要再查一次（`ccd_session_mgmt__list_sessions`）才能取到真实会话 id 去回写 `create`。
+
+在 Claude Code 上把这条流程当成"全自动"会一直卡住：卡片没人点，`create` 永远拿不到身份，run 停在 `retry_pending`。要么守着确认每个节点，要么用 Codex 本地桌面跑派发。
+
+（以上两条平台行为为 2026-09-18 本机实测所得，非推断。仓库里另有一份完整实测记录，
+但它不随包发布，所以这里不给路径。）
+
+## 7. 什么时候才能打断产品经理
+
+只有三类：产品设计要变、需要新的外部授权、要部署。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知）由 vibe 的 Monitor 自行分类恢复；恢复不了的会标 `blocked_unknown` 等待，不会伪装成成功。agent 看到 `blocked_unknown` 或 `retry_pending` 时先按 §6 查信箱里有没有没服务完的请求，不要立刻报告失败。
+
+一个例外要告诉产品经理：在 Claude Code 桌面上派发，每个节点都需要他点一下确认卡片（§6.4）。这属于"需要新的外部授权"那一类，授权卡念完之后就要说清楚，不要让他以为授权一次就不用管了。
