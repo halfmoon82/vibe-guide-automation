@@ -162,7 +162,7 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
     store.complete(action["action_id"], <结果 payload>)
 ```
 
-也可以直接读 `.vibe/provider-actions/requests/*.json`，但回写必须走 `complete()`——它会把结果和请求的 `request_digest` 绑在一起，手写的结果文件会被判"未绑定到请求"而拒收。
+也可以直接读 `.vibe/provider-actions/requests/*.json`。回写建议走 `complete()`：结果文件必须恰好含 `schema_version` / `action_id` / `request_digest` / `payload` 四个键，且前三个与请求逐字对应，错一个就会被判"未绑定到请求"而拒收——`complete()` 替你填对。手写也能被接受，但没有理由自己去对 digest。
 
 每份请求里你要看的字段：
 
@@ -184,15 +184,30 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 | `create` | `{"binding": {"task_id": "<真实会话 id>", "host": "<本机标识>"}}`（`threadId` / `hostId` 同样接受） |
 | `locate` | `{"located": true}` |
 | `visibility` | `{"visible": true, "direct_enter": true}` |
-| `wait` | 终态事件，或 `{"status": "timeout", "cursor": "<最后一条事件的游标>"}` |
-| `resume` | 与 `create` 同形，沿用同一个会话 id |
+| `wait`（还没干完） | `{"status": "timeout", "cursor": "<最后一条事件的游标>"}` |
+| `wait`（干完了） | `{"status": "completed", "cursor": "<游标>", "event": "complete"}`，reviewer 角色用 `"event": "accepted"`；可另带 `"evidence": "<验收证据>"` |
+| `resume` | `{"resumed": true}`（会话 id 沿用原来的，**不要**回写绑定） |
+
+`wait` 的终态三个字段各有各的判定，缺一个就整轮作废：`status` 只认
+`complete` / `completed` / `failed` / `stopped`，`event` 只认
+`complete` / `delivered` / `accepted` / `review_finding` / `failed` / `stopped`，
+且**角色不同事件名不同**——developer 报 `complete`、reviewer 报 `accepted`，
+报错会被判 `provider event is unsupported`。`evidence` 与 `cursor` 在终态里可以不给
+（给了就会被记进节点证据）。
+
+`resume` 只看 `resumed`，**完全不读 `binding`**。按 `create` 的形状回写它，
+`resumed` 就是缺的，节点永远停在 `visibility_unknown`。
 
 三条硬规则：
 
 1. **`create` 的 `binding` 必须用上面那几个键名，并且含真实的会话 id**。vibe 只认 `task_id`/`threadId` 与 `host`/`hostId`；用别的名字（比如桌面工具自己叫的 `sessionId`）会被判"没有任务身份"而丢掉绑定。只有设置句柄、没有真实会话 id 时，不要回写——留着 pending，下一轮再来。
 
    **顶层状态看不出被拒**：绑定被丢掉和"正在等下一个节点"，顶层 `status` 都是 `retry_pending`，`pending()` 的计数也都会少一个（它只数没有结果文件的请求，不管结果有没有被接受）。要分辨就看 `payload["nodes"]` 里那个节点的状态——被拒是 `blocked_unknown`，被接受是 `running`。顶层之所以掩盖它，是只要还有一个节点在重试，顶层就被改写成 `retry_pending`。
-2. **`cursor` 不能是空串**。空游标会让同一个结果被重复消费。
+
+   **发现回写被拒之后**：不要重写同一个 `action_id`，已经有结果文件的请求不会被重读，重写没有任何效果。`vibe resume` 会为同一个节点发出一个**新的 `create` 请求**（`generation` 加一），服务那个新请求才能恢复。所以同一个节点在信箱里可能先后有多份 `create`，认 `generation` 最大的那个。
+2. **给 `cursor` 就必须是非空字符串**（长度 ≤ 4096、不含 NUL）。空串会被判
+   `provider cursor is invalid`，**整个结果被丢掉**，节点停在 `blocked_unknown`——
+   不是"可能重复消费"这种可以容忍的风险。不知道游标就整个字段不给（终态允许省略）。
 3. **不确定就不回写**。pending 比假成功便宜得多；vibe 会一直等，不会把未知当成功。
 
 回写一个之后 `vibe resume --plan <plan_id>`，剩下的请求下一轮继续。`status` 变回 `retry_pending` 只是说还有没服务完的请求。
@@ -222,7 +237,8 @@ worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），
 
 在 Claude Code 上把这条流程当成"全自动"会一直卡住：卡片没人点，`create` 永远拿不到身份，run 停在 `retry_pending`。要么守着确认每个节点，要么用 Codex 本地桌面跑派发。
 
-（实测记录见 `docs/superpowers/raw/2026-09-18-claude-code-visible-dispatch-probe.md`。）
+（以上两条平台行为为 2026-09-18 本机实测所得，非推断。仓库里另有一份完整实测记录，
+但它不随包发布，所以这里不给路径。）
 
 ## 7. 什么时候才能打断产品经理
 

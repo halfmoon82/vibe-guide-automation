@@ -97,37 +97,86 @@ class MailboxSectionTests(unittest.TestCase):
         from vibe_guide.protocols import load_protocol
         return load_protocol("prd-guide")
 
-    def test_protocol_documents_serving_the_provider_mailbox(self):
-        text = self.protocol()
-        from vibe_guide.adapters.task_provider import ProviderActionStore
-        for name in ("pending", "complete"):
-            self.assertTrue(callable(getattr(ProviderActionStore, name)), name)
-            self.assertIn("{}(".format(name), text, name)
-        # The directory a host agent has to read, spelled as the store spells it.
-        self.assertIn(".vibe/provider-actions/", text)
-        self.assertIn("action_id", text)
-        self.assertIn("native_tool", text)
+    def section(self):
+        """The mailbox section alone.
 
-    def test_protocol_names_every_operation_the_mailbox_can_request(self):
-        from vibe_guide.adapters.task_provider import _PROVIDER_ACTIONS
-        text = self.protocol()
-        for operation in _PROVIDER_ACTIONS:
-            self.assertIn("`{}`".format(operation), text, operation)
-
-    def test_protocol_write_back_shapes_match_the_runner_contract(self):
-        """The keys `vibe` reads out of a result payload, verbatim.
-
-        `create` is the one that matters: the runner rejects a result whose
-        binding carries no task identity, and a host agent cannot discover
-        that from the request alone.
+        Assertions are scoped to the row or block that carries the fact.  A
+        bare `assertIn` over the whole document is satisfied by any other line
+        that happens to contain the same word, so eleven of fifteen deliberate
+        drifts slipped past the first version of these tests.
         """
         text = self.protocol()
-        for key in ("binding", "located", "visible", "direct_enter", "cursor"):
-            self.assertIn(key, text, key)
-        # The create binding keys are read straight out of the runner, because
-        # naming them by hand is what went wrong: an earlier draft told agents
-        # to send `sessionId` -- the desktop tool's own field name -- which the
-        # runner rejects as "no task identity", silently discarding the binding.
+        start = text.index("## 6. 服务监工信箱")
+        return text[start:text.index("\n## 7. ", start)]
+
+    def subsection(self, heading):
+        """One `### 6.x` block, so a row is matched in the table that owns it.
+
+        `create` heads a row in both the write-back table and the platform
+        table, so searching the whole section conflates the two.
+        """
+        section = self.section()
+        start = section.index("### " + heading)
+        end = section.find("\n### ", start)
+        return section[start:] if end == -1 else section[start:end]
+
+    def row(self, heading, label):
+        """The table rows in `heading` whose first cell is `label`."""
+        prefix = "| `{}`".format(label)
+        rows = [
+            line for line in self.subsection(heading).splitlines()
+            if line.startswith(prefix)
+        ]
+        self.assertTrue(rows, "no row for {} in {}".format(label, heading))
+        return rows
+
+    def test_protocol_documents_serving_the_provider_mailbox(self):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        section = self.section()
+        # The call block, not the surrounding prose: prose mentioning
+        # `complete()` kept a renamed call site green.
+        block = section[section.index("```python"):section.index("```\n", section.index("```python"))]
+        for name in ("pending", "complete"):
+            self.assertTrue(callable(getattr(ProviderActionStore, name)), name)
+            self.assertIn("{}(".format(name), block, name)
+        # The request directory, spelled as ProviderActionStore spells it, in
+        # the sentence offering the read-the-files-yourself path.  The glob is
+        # part of the fact: the bare directory also appears in the code block's
+        # comment, so asserting that alone survived deleting this sentence.
+        store_source = (ROOT / "vibe_guide" / "adapters" / "task_provider.py").read_text(encoding="utf-8")
+        self.assertIn('"provider-actions"', store_source)
+        self.assertIn(".vibe/provider-actions/requests/*.json", section)
+        # Scoped to the field table: `request.child_binding` also appears in
+        # §6.3, which kept a renamed row here green.  It is spelled with the
+        # path a host agent indexes into, because the field sits under
+        # `request` rather than at the top level.
+        for field in ("action_id", "native_tool", "operation", "request.child_binding"):
+            self.row("6.1 一轮的动作", field)
+
+    def test_protocol_names_every_operation_the_mailbox_can_request(self):
+        """The five operations, in the sentence that enumerates them.
+
+        Scoped to that line: every name also appears in the write-back and
+        platform tables, so a document-wide check could not tell a dropped
+        entry from a mention elsewhere.
+        """
+        from vibe_guide.adapters.task_provider import _PROVIDER_ACTIONS
+        listing = next(
+            line for line in self.subsection("6.1 一轮的动作").splitlines()
+            if line.startswith("| `operation` |")
+        )
+        for operation in _PROVIDER_ACTIONS:
+            self.assertIn("`{}`".format(operation), listing, operation)
+
+    def test_protocol_write_back_shapes_match_the_runner_contract(self):
+        """Each operation's payload keys, checked in that operation's own row.
+
+        The runner reads a different key per operation and silently discards a
+        result that lacks it, so a host agent cannot recover the shape from the
+        request.  `create` is the one that already went wrong once: an earlier
+        draft sent `sessionId`, the desktop tool's own field name, which the
+        runner rejects as "no task identity".
+        """
         source = (ROOT / "vibe_guide" / "runners" / "provider_action.py").read_text(encoding="utf-8")
         accepted = re.search(
             r'task_id = binding_data\.get\("(\w+)"\) or binding_data\.get\("(\w+)"\)\n'
@@ -135,14 +184,53 @@ class MailboxSectionTests(unittest.TestCase):
             source,
         )
         self.assertIsNotNone(accepted, "create binding keys no longer read this way")
+        create = " ".join(self.row("6.2 回写的形状", "create"))
+        # Quoted inside the JSON example or backticked as an accepted alias --
+        # either way a key token, never bare prose.
         for key in accepted.groups():
-            self.assertIn("`{}`".format(key), text, key)
-        self.assertNotIn("`sessionId`: ", text)
-        create_row = next(
-            line for line in text.splitlines()
-            if line.startswith("| `create` |") and "binding" in line
+            self.assertRegex(create, r'[`"]{}[`"]'.format(key), key)
+        self.assertNotIn("sessionId", create, create)
+
+        self.assertIn('`{"located": true}`', " ".join(self.row("6.2 回写的形状", "locate")))
+        self.assertIn('"visible": true', " ".join(self.row("6.2 回写的形状", "visibility")))
+        self.assertIn('"direct_enter": true', " ".join(self.row("6.2 回写的形状", "visibility")))
+
+        # `resume` reads `resumed` and never looks at `binding`; sending a
+        # create-shaped payload leaves the node in visibility_unknown forever.
+        self.assertIn('"resumed": true', " ".join(self.row("6.2 回写的形状", "resume")).lower())
+        self.assertRegex(source, r'operation != "resume" or result\.get\("resumed"\) is not True')
+
+        wait_rows = " ".join(self.row("6.2 回写的形状", "wait"))
+        self.assertIn('"status": "timeout"', wait_rows)
+        self.assertIn("cursor", wait_rows)
+        # Terminal wait needs status *and* event, from fixed sets, and the
+        # event name differs by role.  Dropping either stalls the run.
+        for token in ('"status": "completed"', '"event": "complete"', '"event": "accepted"'):
+            self.assertIn(token, wait_rows, token)
+
+    def test_protocol_states_the_cursor_and_recovery_rules(self):
+        """Two rules whose absence is silent, so nothing else would notice.
+
+        An empty cursor discards the whole result rather than risking a double
+        read, and a rejected write-back is recovered through a freshly emitted
+        request -- rewriting the same action_id does nothing, because a request
+        that already has a result file is never re-read.
+        """
+        section = self.section()
+        source = (ROOT / "vibe_guide" / "runners" / "provider_action.py").read_text(encoding="utf-8")
+        self.assertIn("provider cursor is invalid", source)
+        self.assertIn("provider cursor is invalid", section)
+        self.assertIn("blocked_unknown", section)
+        # One string, because the recovery route only means anything whole:
+        # rewriting the same action_id is inert, and the replacement request is
+        # a *new* one identified by a higher generation.  Asserted as separate
+        # words, `generation` was satisfied by the closing sentence that says
+        # which one to serve, and deleting the route itself stayed green.
+        self.assertIn(
+            "不要重写同一个 `action_id`，已经有结果文件的请求不会被重读，重写没有任何效果。"
+            "`vibe resume` 会为同一个节点发出一个**新的 `create` 请求**（`generation` 加一）",
+            section,
         )
-        self.assertNotIn("sessionId", create_row, create_row)
 
     def test_protocol_states_the_per_platform_dispatch_boundary(self):
         """Unattended dispatch is a platform fact, not a vibe feature.
@@ -151,20 +239,29 @@ class MailboxSectionTests(unittest.TestCase):
         human click.  An open-source user reading this protocol has to learn
         that before they plan around "authorize once and walk away".
         """
+        from vibe_guide.providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER
         from vibe_guide.runners.provider_action import NATIVE_TOOL_MAP
-        text = self.protocol()
+        section = self.section()
         for provider, tools in NATIVE_TOOL_MAP.items():
-            self.assertIn(provider, text, provider)
+            self.assertIn(provider, section, provider)
             for operation, tool in tools.items():
-                self.assertIn(tool, text, "{}/{}".format(provider, operation))
+                self.assertIn(tool, section, "{}/{}".format(provider, operation))
+        # Which side is unattended is the whole point of the table, and
+        # swapping the two providers left every name still present.  Codex
+        # creates without a click; Claude Code needs one per node.
+        unattended = section[section.index("- **Codex 本地桌面**"):]
+        unattended = unattended[:unattended.index("- **Claude Code 桌面**")]
+        self.assertIn("无人值守", unattended)
+        self.assertNotIn("无人值守", section[section.index("- **Claude Code 桌面**"):])
+        self.assertIn(CODEX_PROVIDER, section)
+        self.assertIn(CLAUDE_CODE_PROVIDER, section)
 
     def test_protocol_does_not_promise_unattended_claude_code_dispatch(self):
         """The measured Claude Code behaviour has to survive a doc edit.
 
         `spawn_task` proposes a task and shows the user a card; it returns a
         `task_id`, never a session.  Anyone who writes "fully automatic" back
-        into this section has contradicted the probe in
-        docs/superpowers/raw/2026-09-18-claude-code-visible-dispatch-probe.md.
+        into this section has contradicted what was measured on 2026-09-18.
         """
         text = self.protocol()
         self.assertIn("无人值守", text)
@@ -172,7 +269,7 @@ class MailboxSectionTests(unittest.TestCase):
         # as any nearby sentence mentions a click, so deleting the one that
         # states the measured behaviour left it green.
         claude = text[text.index("`ccd_session__spawn_task` 只是"):]
-        claude = claude[:claude.index("（实测记录见")]
+        claude = claude[:claude.index("（以上两条平台行为")]
         # One string, because the three facts only mean anything together:
         # what the call returns, that a human has to act, and that the caller
         # is left without a session id.  Asserted separately, `task_id` was
