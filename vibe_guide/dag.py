@@ -129,6 +129,15 @@ def append_integration_review_node(plan: Plan) -> Plan:
         "read_only": True,
         "reviewer": INTEGRATION_REVIEWER_ID,
         "allowlist": [],
+        # Who runs it, under the three names dispatch reads, all the ones
+        # `complete_node_contracts` gives a business node.  `reviewer_worker` is
+        # the load-bearing one: this node always runs in the reviewer role, and
+        # `_start_task` sets `contract["worker"]` from it for that role, so
+        # without it the monitor's fallback profile reads `None` and the string
+        # `"None"` goes out as the writer identity.
+        "worker": INTEGRATION_REVIEWER_ID,
+        "writer": INTEGRATION_REVIEWER_ID,
+        "reviewer_worker": INTEGRATION_REVIEWER_ID,
     })
     # What this reviewer may read.  `allowlist` above stays empty because it
     # writes nothing; `files` is what dispatch reads to build the worker

@@ -93,6 +93,37 @@ def _dispatch(contract):
     )
 
 
+def _reviewer_profile(contract):
+    """The profile dispatch ends up with, for this node in the reviewer role.
+
+    Includes `_start_task`'s own `contract["worker"]` overwrite
+    (`monitor.py`: `node.contract.get("reviewer_worker") if role == "reviewer"`).
+    Leaving that step out is what hid a `"None"` writer from these tests for a
+    round: the contract looked right and only the dispatched value was wrong.
+    """
+    contract = dict(contract)
+    contract["worker"] = contract.get("reviewer_worker")
+    contract.setdefault(
+        "files", list((contract.get("worker_profile") or {}).get("allowlist", []))
+    )
+    if contract.get("worker_profile"):
+        return dict(contract["worker_profile"])
+    source = Path(monitor.__file__).read_text(encoding="utf-8")
+    match = re.search(
+        r"profile_data = (\{\"worker\": str\(contract\.get.*?\})\n", source, re.S
+    )
+    if match is None:
+        raise AssertionError(
+            "Monitor._start_task no longer builds its fallback worker profile as a "
+            "dict literal; update this helper to match the real derivation"
+        )
+    return eval(  # noqa: S307 - the package's own source
+        match.group(1),
+        {"str": str, "list": list},
+        {"contract": contract, "node_id": INTEGRATION_REVIEW_NODE_ID},
+    )
+
+
 def _validate_runtime(contract):
     """Run the gate `_start_task` applies before it derives the profile.
 
@@ -501,11 +532,18 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
                 n for n in append_integration_review_node(plan).nodes
                 if n.id == INTEGRATION_REVIEW_NODE_ID
             ).contract
+            # `reviewer_worker` is what `_start_task` reads for this role; the
+            # other two only matter if the role ever changes.  Asserting the
+            # contract alone is what let this slip: check the identity the
+            # monitor actually derives.
+            self.assertEqual(
+                contract.get("reviewer_worker"), INTEGRATION_REVIEWER_ID, files
+            )
             self.assertEqual(contract.get("worker"), INTEGRATION_REVIEWER_ID, files)
             self.assertEqual(contract.get("writer"), INTEGRATION_REVIEWER_ID, files)
-            profile = contract.get("worker_profile")
-            if profile is not None:
-                self.assertEqual(profile["writer"], INTEGRATION_REVIEWER_ID, files)
+            self.assertEqual(
+                _reviewer_profile(contract)["writer"], INTEGRATION_REVIEWER_ID, files
+            )
 
     def test_the_scope_limit_tracks_the_validator_that_enforces_it(self):
         """Two spellings of one bound drift silently.
