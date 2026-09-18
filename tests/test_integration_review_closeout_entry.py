@@ -241,6 +241,21 @@ class ProtocolDocumentsTheClaimTests(unittest.TestCase):
         self.assertIn("run_id", section)
         self.assertIn("clearance", section)
 
+    def test_the_protocol_says_which_status_actually_clears_a_finding(self):
+        """The protocol is what made a self-served waiver look legal.
+
+        It listed `waived` among the statuses without saying that only
+        `resolved` clears, so a host agent following it would waive its own P0.
+        The rule is prose, so the assertion has to be on the prose that owns it.
+        """
+        section = self.section()
+        self.assertIn("只有 `resolved` 算清零", section)
+        self.assertIn("integration review acceptance still reports open P0-P2 findings", section)
+
+    def test_the_protocol_says_the_verdict_evidence_must_be_text(self):
+        section = self.section()
+        self.assertIn("必须是非空字符串", section)
+
 
 class MailboxClosesTheRunTests(unittest.TestCase):
     """The real product path: request → mailbox → complete."""

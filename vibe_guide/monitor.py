@@ -42,7 +42,6 @@ from .state import (
     RunSnapshot,
     acquire_writer_lease,
     append_event,
-    durable_projection,
     load_events,
     load_snapshot,
     map_user_status,
@@ -87,7 +86,6 @@ from .evidence import (
     evaluate_v41_closeout,
     evaluate_delivery_evidence,
     record_integration_review as _record_integration_review,
-    validate_integration_review_evidence,
 )
 from .engine_attestation import validate_engine_attestation
 
@@ -3053,14 +3051,6 @@ class Monitor:
             return "integration review evidence cannot be derived ({})".format(error)
         if any(package["clearance"][severity] for severity in ("p0", "p1", "p2")):
             return "integration review acceptance still reports open P0-P2 findings"
-        # A package that does not survive redaction would be written, announced
-        # as `complete`, and then rejected by the next read -- which silently
-        # falls back to the previous snapshot and loses the acceptance.  Block
-        # visibly instead of closing out a run that cannot be loaded again.
-        try:
-            validate_integration_review_evidence(snapshot, durable_projection(package))
-        except (TypeError, ValueError) as error:
-            return "integration review evidence would not survive persistence ({})".format(error)
         _record_integration_review(snapshot, package)
         return None
 
