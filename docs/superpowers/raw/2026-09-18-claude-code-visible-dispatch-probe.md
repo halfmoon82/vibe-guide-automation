@@ -94,8 +94,9 @@ running 的后台会话是否改报别的字段没验）：
   `undefined`。
 - 后台条目同时带一个短 `id`（`4f31def4`）和完整的 `sessionId`，两者不同。
   `attach` / `logs` / `stop` / `rm` 收的是**短 id**。
-- `--resume` 的 `--help` 原文写明：会话**已在运行**时它「starts a copy and says
-  so」。监工靠这条续接、重复调用时会拿到一个副本，不是同一个会话。
+- `--bg` 条目（`claude --help:32-39`，不是 `-r, --resume` 自己那条）写明：配
+  `--resume <id>` 时，会话**已在运行**就「starts a copy and says so」。监工靠
+  这条续接、重复调用时会拿到一个副本，不是同一个会话。
 
 额外好处：`--allowedTools` 与 `--permission-mode` 可以把授权卡的 allowlist
 **翻译成进程级权限约束**，而不是靠被派发会话自觉遵守合同。这比 `spawn_task`
@@ -112,9 +113,10 @@ CLI 里确实存在"只认 API key"的路径：`claude --help` 的 **`--bare`** 
 同机再查了一层：`claude auth status` 回 `{"loggedIn": false, "authMethod": "none"}`，
 `~/.claude/.credentials.json` 不存在，钥匙串里也没有对应条目——**CLI 侧从未单独
 登录过**。所以 `Not logged in` 更可能是这个，而不是"`--bg` 拒绝继承桌面认证"。
-`claude --help` 另列了两条路：`setup-token`（条目自注 requires Claude
-subscription）与 `auth login`，**两条都没实测**（登录会改动本机认证状态，
-超出这次只读探针的范围）。因此这里不下"必须另配 API key、要另计费"的结论——
+另有两条路：`claude --help:293-294` 的 `setup-token`（条目自注 requires Claude
+subscription），以及 `claude auth --help` 里的 `login`（主 `--help` 只写到
+`auth  Manage authentication` 这一层）。**两条都没实测**（登录会改动本机认证
+状态，超出这次只读探针的范围）。因此这里不下"必须另配 API key、要另计费"的结论——
 `setup-token` 那句话本身就说明存在走订阅的路径。
 
 （`spawn_task` 的确认点本身不是设计缺陷：派发会真的创建会话并消耗额度，
