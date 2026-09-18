@@ -140,8 +140,9 @@ def append_integration_review_node(plan: Plan) -> Plan:
         #   `reviewer_worker`  -> the reviewer pass; `_start_task` overwrites
         #                         `contract["worker"]` from it for that role.
         #   `writer`           -> the empty-union branch below, whose injected
-        #                         `worker_profile` is what dispatch then uses
-        #                         verbatim for both passes.
+        #                         `worker_profile` dispatch uses verbatim for
+        #                         both passes; without this key that profile's
+        #                         own default ships the placeholder `"worker"`.
         "worker": INTEGRATION_REVIEWER_ID,
         "writer": INTEGRATION_REVIEWER_ID,
         "reviewer_worker": INTEGRATION_REVIEWER_ID,

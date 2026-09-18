@@ -12,7 +12,7 @@ import re
 import unittest
 from pathlib import Path
 
-from vibe_guide import authorization, monitor
+from vibe_guide import monitor
 from vibe_guide.authorization import _normalize_files, validate_runtime_contract
 from vibe_guide.dag import (
     INTEGRATION_REVIEW_SCOPE_LIMIT,
