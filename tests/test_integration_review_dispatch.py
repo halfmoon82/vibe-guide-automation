@@ -8,8 +8,12 @@ never be handed to a reviewer session -- every complex run stalls with the two
 business nodes `accepted` and this one still `planned`.  That is the last node
 of every complex plan, so no complex run can reach `complete`.
 """
+import re
 import unittest
+from pathlib import Path
 
+from vibe_guide import monitor
+from vibe_guide.authorization import _normalize_files
 from vibe_guide.dag import append_integration_review_node
 from vibe_guide.diagnostics import validate_child_session_binding
 from vibe_guide.models import INTEGRATION_REVIEW_NODE_ID, DAGNode, Plan, WorkerProfile
@@ -36,6 +40,43 @@ def _business_node(node_id, files):
         "planned",
         owned_paths=list(files),
         allowlist=list(files),
+    )
+
+
+def _dispatch(contract):
+    """Hand *contract* to the binding validator the way `_start_task` does.
+
+    The profile literal lives inline in `Monitor._start_task`, so there is
+    nothing to call.  Rather than copy it -- a copy stays green while the real
+    derivation drifts, which is how a previous test in this repo went blind --
+    read it out of the source and evaluate it against this contract.  A rename
+    or a moved fallback breaks this helper loudly instead of silently.
+    """
+    source = (Path(monitor.__file__).read_text(encoding="utf-8"))
+    match = re.search(
+        r"profile_data = (\{\"worker\": str\(contract\.get.*?\})\n", source, re.S
+    )
+    if match is None:
+        raise AssertionError(
+            "Monitor._start_task no longer builds its fallback worker profile as a "
+            "dict literal; update this helper to match the real derivation"
+        )
+    contract = dict(contract)
+    # `_start_task` normalises the contract before deriving the profile.  This
+    # step is what makes an absent `files` key differ from a harmless default:
+    # it becomes `[]`, and the literal's own `[node_id + ".py"]` fallback never
+    # applies because the key now exists.
+    contract.setdefault(
+        "files", list((contract.get("worker_profile") or {}).get("allowlist", []))
+    )
+    profile_data = eval(  # noqa: S307 - evaluating the package's own source
+        match.group(1),
+        {"str": str, "list": list},
+        {"contract": contract, "node_id": INTEGRATION_REVIEW_NODE_ID},
+    )
+    validate_child_session_binding(
+        "run-1", "1", "digest", INTEGRATION_REVIEW_NODE_ID, "reviewer",
+        WorkerProfile(**profile_data),
     )
 
 
@@ -105,26 +146,7 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
         refused with "worker profile is required", leaving the node `planned`
         forever.
         """
-        contract = self.integration_contract()
-        profile = WorkerProfile(
-            worker="worker",
-            model="default",
-            reasoning="normal",
-            fallbacks=[],
-            selection_basis={
-                "issue_complexity_ref": INTEGRATION_REVIEW_NODE_ID,
-                "complexity_band": "standard",
-                "risk_tags": [],
-                "availability_evidence": "runtime",
-            },
-            writer=str(contract.get("worker", "writer")),
-            worktree=str(contract.get("worktree", ".")),
-            branch=str(contract.get("branch", "branch-" + INTEGRATION_REVIEW_NODE_ID)),
-            allowlist=list(contract.get("files", [])),
-        )
-        validate_child_session_binding(
-            "run-1", "1", "digest", INTEGRATION_REVIEW_NODE_ID, "reviewer", profile
-        )
+        _dispatch(self.integration_contract())
 
     def test_the_integration_node_carries_the_project_id(self):
         """Visible dispatch refuses a contract without one.
@@ -189,12 +211,19 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
         ).contract
         self.assertEqual(contract.get("files"), ["src/ok.ts"], contract.get("files"))
 
-    def test_a_plan_whose_nodes_name_no_files_omits_the_key(self):
-        """No files to aggregate means no `files` key, same as a business node.
+    def test_a_plan_whose_nodes_name_no_files_still_dispatches(self):
+        """A spec naming no files is legal, and must not strand the node.
 
-        There is deliberately no whole-project placeholder:
-        `authorization._normalize_files` rejects `"."`, so writing one here
-        blocks publishing the plan instead of making the node dispatchable.
+        `complete_node_contracts` tolerates a node without `files`, and business
+        nodes survive it because their `worker_profile.allowlist` falls back to
+        `["."]`.  The integration node has no `worker_profile`, so an empty
+        union leaves it with the very `worker profile is required` refusal this
+        module exists to prevent.
+
+        Asserting dispatch rather than the shape of the contract: `files` cannot
+        carry `"."` (`authorization._normalize_files` rejects it and the plan
+        would not publish), so the fix has to live somewhere else, and a test
+        pinned to a key name would not notice.
         """
         plan = Plan(
             "plan-3",
@@ -211,7 +240,120 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
             n for n in append_integration_review_node(plan).nodes
             if n.id == INTEGRATION_REVIEW_NODE_ID
         ).contract
-        self.assertNotIn("files", contract)
+        self.assertNotIn("files", contract, "'.' in files would block publishing")
+        _dispatch(contract)
+
+    def test_the_review_scope_stays_publishable(self):
+        """The union must survive the validator that gates publishing.
+
+        Each business node's own `files` passes `_normalize_files`, but the
+        union is a different list: it can exceed the 256-item cap, and it can
+        hold two spellings of one path that the validator rejects as duplicates.
+        Either one turns "the last node stalls" into "the plan never publishes",
+        which is strictly worse and happens where the product path cannot act
+        on it.
+        """
+        many = Plan(
+            "plan-5",
+            1,
+            "prd.md",
+            ["a", "b"],
+            "draft",
+            nodes=[
+                _business_node("a", ["src/a%d.ts" % i for i in range(200)]),
+                _business_node("b", ["src/b%d.ts" % i for i in range(200)]),
+            ],
+            spec_path="spec.md",
+            complexity_band="complex",
+            integration_contract=_integration_contract(["a", "b"]),
+        )
+        shared = Plan(
+            "plan-6",
+            1,
+            "prd.md",
+            ["a", "b"],
+            "draft",
+            nodes=[
+                _business_node("a", ["src/shared.ts"]),
+                _business_node("b", ["./src/shared.ts", "a/./b.ts"]),
+            ],
+            spec_path="spec.md",
+            complexity_band="complex",
+            integration_contract=_integration_contract(["a", "b"]),
+        )
+        for plan in (many, shared):
+            contract = next(
+                n for n in append_integration_review_node(plan).nodes
+                if n.id == INTEGRATION_REVIEW_NODE_ID
+            ).contract
+            # The validator that publishing runs, called the same way.
+            _normalize_files(contract.get("files", []), "contract.files")
+
+    def test_the_review_scope_rejects_what_the_publish_validator_rejects(self):
+        """`allowlist` is an unvalidated channel; the scope must clean it.
+
+        `DAGNode.__post_init__` only checks that `allowlist` holds non-empty
+        strings -- it never looks at the paths.  A backslash, a NUL or padding
+        whitespace therefore reaches the union, and `_normalize_files` refuses
+        the first two, so the plan does not publish.
+        """
+        node = DAGNode(
+            "a", "a", [], [], "group-a",
+            {
+                "input": "a request",
+                "output": "a change",
+                "error_behavior": "a message",
+                "acceptance_example": "click it",
+                "adapter_id": "claude-code",
+                "project_id": "probe-project",
+            },
+            "planned",
+            owned_paths=[],
+            allowlist=["src\\evil.ts", "src/a\x00b.ts", "  src/pad.ts  ", "src/ok.ts"],
+        )
+        plan = Plan(
+            "plan-7", 1, "prd.md", ["a"], "draft", nodes=[node],
+            spec_path="spec.md", complexity_band="complex",
+            integration_contract=_integration_contract(["a"]),
+        )
+        contract = next(
+            n for n in append_integration_review_node(plan).nodes
+            if n.id == INTEGRATION_REVIEW_NODE_ID
+        ).contract
+        self.assertEqual(
+            sorted(contract.get("files") or []),
+            ["src/ok.ts", "src/pad.ts"],
+            contract.get("files"),
+        )
+        _normalize_files(contract["files"], "contract.files")
+
+    def test_conflicting_project_ids_fail_closed(self):
+        """Taking the first of two is worse than refusing.
+
+        `complete_node_contracts` uses `setdefault`, so a spec that declares its
+        own `project_id` on one node keeps it while the other gets the attested
+        default -- divergence is reachable.  Routing the reviewer at one project
+        while half the delivery lives in the other gives a reviewer that reports
+        P0-P2 cleared on a diff it could not read.
+        """
+        plan = Plan(
+            "plan-8",
+            1,
+            "prd.md",
+            ["a", "b"],
+            "draft",
+            nodes=[
+                _business_node("a", ["src/a.ts"]),
+                _business_node("b", ["src/b.ts"]),
+            ],
+            spec_path="spec.md",
+            complexity_band="complex",
+            integration_contract=_integration_contract(["a", "b"]),
+        )
+        plan.nodes[1].contract["project_id"] = "other-project"
+        with self.assertRaises(ValueError) as caught:
+            append_integration_review_node(plan)
+        self.assertIn("project", str(caught.exception))
 
 
 if __name__ == "__main__":
