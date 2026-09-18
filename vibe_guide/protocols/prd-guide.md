@@ -232,12 +232,17 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 `[REDACTED_PROVIDER_TEXT]`——`vibe status --json`、事件日志、隔离记录里都一样，四种
 完全不同的拒收原因长得一模一样。所以别指望"看理由"定位，能读到的是两样东西：
 
-1. 这个节点的 `status` 是 `blocked_unknown`，顶层只是没到 `complete`（看到 run 长时间
-   停在 `running`，先查这个节点）。
-2. 你回写的那份 claim 被记在这个节点的 `evidence` 里，**键名保留、值打码**。照上面三条
-   规则对着它的形状看就能分辨：整条是一个 `[REDACTED_PROVIDER_TEXT]` 说明你给的是字符串；
-   少 `out_of_scope` 就是少一个键；`iteration_compatibility.evidence` 显示成 `{}` 说明你给了
-   对象；`findings` 非空说明有没清零的项。
+1. 这个节点的 `status` 是 `blocked_unknown`，这一轮的顶层 `status` 也是（只要还有别的节点在
+   重试，顶层会被改写成 `retry_pending`，它不告诉你是哪个节点，所以按节点看）。
+2. 你回写的那份 claim 被记在这个节点的 `evidence` 列表里（被拒的那次是最后一条），
+   **键名保留、值打码**。所以**形状读得出来**：整条是一个字符串而不是对象，说明你给的是一句话；
+   对象里少了 `out_of_scope`，就是少一个键；`iteration_compatibility.evidence` 是个对象而不是
+   字符串，说明你给了嵌套对象（键名看起来像敏感信息时还会被整个丢掉，只剩 `{}`）；
+   `out_of_scope` 是个非空列表，就是聚合范围之外有改动。
+   **但值读不出来**：`findings[].status` 也被打码，`resolved` 和 `waived` 长得一样，而且清零的
+   run 本来就可以带 `resolved` 的条目——所以 `findings` 非空**不代表**有没清零的项。形状合法却被
+   拒，就是值的问题：对着你自己发出去的那份 claim 查上面两条规则（只有 `resolved` 算清零、
+   `out_of_scope` 必须是空的），不要指望从盘上的记录看出来。
 
 **`cursor` 在复杂计划的 developer 终态里也是必需的**：绑定上的游标只有你回写时
 才会被写进去（`provider_action.py:1153-1160`），不给就等于绑定没有游标，交付证据门

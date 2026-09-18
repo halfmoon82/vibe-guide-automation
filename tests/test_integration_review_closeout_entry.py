@@ -269,10 +269,13 @@ class ProtocolDocumentsTheClaimTests(unittest.TestCase):
         `vibe status --json` and in every event -- the reason is redacted on
         every persistence path.  What survives is the claim under the node's
         `evidence`, keys intact and values masked, so the shape is what the
-        operator reads.  The marker below appears nowhere else in the protocol.
+        operator reads.  The marker below appears nowhere else in the protocol,
+        and the second assertion pins the load-bearing half: the values are
+        masked too, so a non-empty `findings` diagnoses nothing.
         """
         section = self.section()
         self.assertIn("[REDACTED_PROVIDER_TEXT]", section)
+        self.assertIn("`resolved` 和 `waived` 长得一样", section)
         self.assertNotIn("这是可见的阻塞", section)
 
 
