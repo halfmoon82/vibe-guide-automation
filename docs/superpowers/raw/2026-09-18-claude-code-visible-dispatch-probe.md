@@ -22,7 +22,7 @@ attest --adapter claude-code  →  plan --from-prd（复杂路由）
   →  authorize --authorize AUTHORIZE  →  monitor --authorize AUTHORIZE
   →  信箱出现两个 pending create 请求（两个并行节点各一个）
   →  按合同建 worktree  →  调 ccd_session__spawn_task 创建可见会话
-  →  会话在自己的分支上提交  →  complete() 回写绑定  →  resume 接受
+  →  会话在自己的分支上提交  →  complete() 回写绑定（键名用错，被拒，见下）
 ```
 
 三个操作用真实桌面工具跑过，另两个未单独验证。工具名与 `NATIVE_TOOL_MAP` 登记的一致：
@@ -89,11 +89,15 @@ backgrounded · 4f31def4
 **翻译成进程级权限约束**，而不是靠被派发会话自觉遵守合同。这比 `spawn_task`
 的信任模型强。
 
-**一个真实障碍**：后台会话不继承桌面应用的 OAuth 认证，实测报
-`Not logged in · Please run /login`，所以没干活。`claude --help` 写明后台场景
-「strictly ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and keychain
-are never read)」——**没有任何办法让 `--bg` 复用桌面订阅的 OAuth**。所以这是硬障碍，
-不是取舍：要走这条路必须另配 API key，计费与桌面订阅是两笔。
+**一个真实障碍**：实测 `claude --bg` 起的会话报 `Not logged in · Please run /login`，
+没干活——它没有继承桌面应用的 OAuth。
+
+CLI 里确实存在"只认 API key"的路径：`claude --help` 的 **`--bare`** 一条写明
+「Anthropic auth is strictly ANTHROPIC_API_KEY or apiKeyHelper via --settings
+(OAuth and keychain are never read)」。但那句属于 `--bare`，不是 `--bg`——
+`--bg` 的条目通篇没提认证。所以能确定的只是"`--bg` 这次没继承桌面认证"，
+**能不能配成继承尚未查证**（见"尚未验证"一节）。要跑起来至少得配
+`ANTHROPIC_API_KEY` 或 `apiKeyHelper`，那是与桌面订阅分开的另一笔计费。
 
 （`spawn_task` 的确认点本身不是设计缺陷：派发会真的创建会话并消耗额度，
 有人把关是合理的。它只是不适合"授权后无人值守"这个目标。）
@@ -120,7 +124,7 @@ node=export-button      worktree=.worktrees/export-button-b474cfc3
 被派发的会话实际落点，与合同逐字一致：
 
 ```
-sessionId: local_c3f86730-431e-4745-993c-e6ff65a97cdb
+会话 id:   local_c3f86730-431e-4745-993c-e6ff65a97cdb
 cwd:       /tmp/mbox.acp6/.worktrees/date-range-filter-60466cae
 branch:    node/date-range-filter-60466cae
 commit:    91ca1df feat: date range filter skeleton
@@ -140,7 +144,7 @@ commit:    91ca1df feat: date range filter skeleton
 
 ```python
 store.complete(action_id, {"binding": {"sessionId": "local_c3f86730-…",
-                                       "hostId": "macmini"}})
+                                       "hostId": "<主机名>"}})
 ```
 
 当时看到 pending 从 2 降到 1、`resume` 返回 `retry_pending`，就判成"正确地在等
@@ -156,11 +160,26 @@ task_id   + host     resume=retry_pending   已发出的操作=['create', 'locat
 threadId  + hostId   resume=retry_pending   已发出的操作=['create', 'locate']
 ```
 
-`sessionId` 那次**从未发出 `locate`**——绑定被丢掉了，链路停在 create 没有前进。
-另两种键名下 create 被接受、`locate` 随即发出。`resume` 的状态字在三种情况下
-完全相同，所以状态字本身分不出"在等下一个节点"和"绑定被拒"，要看已发出的操作。
+（上表是"两个请求只服务其中一个"这个配置下的结果，按表复现时要保持这个前提。）
 
-**结论**：本次实测走通的是 create 请求的派发与会话真实落点（下面两节的证据仍然成立），
+`sessionId` 那次**从未发出 `locate`**——绑定被丢掉了，链路停在 create 没有前进。
+另两种键名下 create 被接受、`locate` 随即发出。
+
+**顶层 `status` 三种情况下完全相同，但节点状态分得出来**：
+
+```
+sessionId, 服务 1/2   顶层=retry_pending    节点={date-range-filter: running, export-button: blocked_unknown}
+task_id,   服务 1/2   顶层=retry_pending    节点={date-range-filter: running, export-button: running}
+sessionId, 服务 2/2   顶层=blocked_unknown  节点={两个都 blocked_unknown}
+```
+
+顶层之所以掩盖它，是 `cli.py:618-625`：只要存在任一"有 `retryable_action`、
+状态 `running`、且没有 `active_task`"的节点，顶层就被改写成 `retry_pending`，
+run 级真实状态被盖掉。所以判断回写有没有被接受，**看 `payload["nodes"]` 里的
+节点状态**，比数已发出的操作直接。两个请求都用错键名时顶层也会变
+`blocked_unknown`，不再掩盖。
+
+**结论**：本次实测走通的是 create 请求的派发与会话真实落点（上面"节点隔离在真实派发里的验证"一节的证据仍然成立），
 **没有**走通 create 的绑定回写。回写要用 `task_id` + `host` 或 `threadId` + `hostId`。
 
 用正确键名重跑，逐轮服务信箱（两个节点各一份请求），链路会一路推进：
@@ -173,7 +192,7 @@ round 2: 服务 visibility×2  → resume=running        信箱清空
 
 `retry_pending` 在前两轮出现是对的——它表示还有没服务完的请求；`visibility` 服务完
 （`{"visible": true, "direct_enter": true}`）之后 run 进入 `running`。
-这条序列是用 fake 回写值跑的，证明的是**回写契约与推进逻辑**；真实会话落点由下面两节证明。
+这条序列是用 fake 回写值跑的，证明的是**回写契约与推进逻辑**；真实会话落点由上面"节点隔离在真实派发里的验证"一节证明。
 
 ## 被派发会话报告的两个真实问题
 
@@ -188,8 +207,10 @@ round 2: 服务 visibility×2  → resume=running        信箱清空
 ## 尚未验证
 
 - `locate`（`open_session_in`）与 `resume`（`send_message`）没有单独跑过
-- create 的绑定回写没有走通（键名用错，见"信箱回写"一节）；用正确键名的一轮
-  完整回写仍待实测
-- 多节点并发派发（本次只派了一个节点，第二个留在 pending）
+- create 的绑定回写已用正确键名与 **fake 身份**走通（见"信箱回写"一节）；
+  用**真实会话身份**回写仍待实测
+- `claude --bg` 能否配成继承桌面订阅认证（本次只确认了默认不继承）
+- 多节点并发派发只在 fake 回写值下走通（两个节点各一份请求全程服务完）；
+  两个节点同时接**真实会话**仍待实测——真实那次只派了一个节点，第二个留在 pending
 - reviewer 角色的派发（本次只有 developer）
 - 一个 run 走到 `complete`（本次停在两节点其一）
