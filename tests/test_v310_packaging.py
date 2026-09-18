@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import json
 import os
@@ -58,8 +59,13 @@ class PackagingV310Tests(unittest.TestCase):
                 json.dumps({"version": TARGET_VERSION}), encoding="utf-8"
             )
             report = inspect_compatibility(root)
-        self.assertEqual(report["status"], "compatible", report)
-        self.assertFalse(report["mixed"], report)
+        # The two values this defect put out of step, not the derived verdict:
+        # `status` also folds in `installed_package_version`, which comes from
+        # the environment's install metadata.  A checkout whose editable
+        # install predates the bump reports "mixed" for a reason that has
+        # nothing to do with the literal under test.
+        self.assertEqual(report["versions"]["package_version"], TARGET_VERSION, report)
+        self.assertEqual(report["versions"]["config_version"], TARGET_VERSION, report)
 
     def test_the_migration_namespace_is_not_tied_to_the_release(self):
         """A namespace is a directory on disk, so its name must stay put.
@@ -76,8 +82,15 @@ class PackagingV310Tests(unittest.TestCase):
         # creates this directory and `rollback_state` looks for it.  While the
         # name was built from the version at four separate sites, deriving it
         # made rollback search a directory migration had never written.
-        source = (ROOT / "vibe_guide" / "installation.py").read_text(encoding="utf-8")
-        self.assertEqual(source.count('"v44-'), 1, "namespace name is defined more than once")
+        # Counted as parsed string literals rather than as raw text, so a
+        # docstring mentioning the name does not read as a second definition
+        # and switching to single quotes does not hide one.
+        tree = ast.parse((ROOT / "vibe_guide" / "installation.py").read_text(encoding="utf-8"))
+        literals = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and node.value == MIGRATION_NAMESPACE
+        ]
+        self.assertEqual(len(literals), 1, "namespace name is spelled out more than once")
 
     def test_migrated_state_can_be_rolled_back(self):
         """Writer and reader of the namespace must resolve the same path.
