@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 
 from vibe_guide import monitor
-from vibe_guide.authorization import _normalize_files
+from vibe_guide.authorization import _normalize_files, validate_runtime_contract
 from vibe_guide.dag import append_integration_review_node
 from vibe_guide.diagnostics import validate_child_session_binding
 from vibe_guide.models import INTEGRATION_REVIEW_NODE_ID, DAGNode, Plan, WorkerProfile
@@ -63,13 +63,15 @@ def _dispatch(contract):
         )
     contract = dict(contract)
     # `_start_task` normalises the contract before deriving the profile.  This
-    # step is what makes an absent `files` key differ from a harmless default:
-    # it becomes `[]`, and the literal's own `[node_id + ".py"]` fallback never
-    # applies because the key now exists.
+    # step is why an absent `files` key is not a harmless default: it is filled
+    # from `worker_profile.allowlist`, which is how a `"."` ends up somewhere
+    # `validate_runtime_contract` refuses it.
     contract.setdefault(
         "files", list((contract.get("worker_profile") or {}).get("allowlist", []))
     )
-    profile_data = eval(  # noqa: S307 - evaluating the package's own source
+    # The literal is only the fallback; a contract carrying its own profile uses
+    # that one (`monitor.py`: `if not profile_data`).
+    profile_data = contract.get("worker_profile") or eval(  # noqa: S307 - the package's own source
         match.group(1),
         {"str": str, "list": list},
         {"contract": contract, "node_id": INTEGRATION_REVIEW_NODE_ID},
@@ -78,6 +80,20 @@ def _dispatch(contract):
         "run-1", "1", "digest", INTEGRATION_REVIEW_NODE_ID, "reviewer",
         WorkerProfile(**profile_data),
     )
+
+
+def _validate_runtime(contract):
+    """Run the gate `_start_task` applies before it derives the profile.
+
+    Separate from `_normalize_files` on `contract["files"]`: this one walks the
+    whole contract, so it catches a `"."` that arrived by way of
+    `worker_profile.allowlist`.
+    """
+    normalized = dict(contract)
+    normalized.setdefault(
+        "files", list((normalized.get("worker_profile") or {}).get("allowlist", []))
+    )
+    validate_runtime_contract(normalized, authorized_actions=[], authorized_files=[])
 
 
 def _integration_contract(node_ids):
@@ -220,10 +236,11 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
         union leaves it with the very `worker profile is required` refusal this
         module exists to prevent.
 
-        Asserting dispatch rather than the shape of the contract: `files` cannot
-        carry `"."` (`authorization._normalize_files` rejects it and the plan
-        would not publish), so the fix has to live somewhere else, and a test
-        pinned to a key name would not notice.
+        `files` must be present and empty.  It cannot carry `"."`
+        (`_normalize_files` rejects it, so the plan would not publish), and it
+        cannot be absent either: `_start_task` setdefaults it from
+        `worker_profile.allowlist`, so a missing key becomes `["."]` at dispatch
+        and `validate_runtime_contract` refuses the node.
         """
         plan = Plan(
             "plan-3",
@@ -240,7 +257,9 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
             n for n in append_integration_review_node(plan).nodes
             if n.id == INTEGRATION_REVIEW_NODE_ID
         ).contract
-        self.assertNotIn("files", contract, "'.' in files would block publishing")
+        self.assertEqual(contract.get("files"), [], "'.' in files would block publishing")
+        _normalize_files(contract["files"], "contract.files")
+        _validate_runtime(contract)
         _dispatch(contract)
 
     def test_the_review_scope_stays_publishable(self):
