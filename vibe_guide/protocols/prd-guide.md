@@ -207,9 +207,11 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 - **reviewer** 要 `evidence`：`accepted` 之后没有它，节点被判
   `review acceptance has no registered P0-P2 clearance evidence`。
 
-**`cursor` 在复杂计划的终态里也是必需的**：绑定上的游标只有你回写时才会被
-写进去（`provider_action.py:1153-1160`），不给就等于绑定没有游标，交付证据门
-报 `current cursor is missing`。只有非复杂计划才可以省。
+**`cursor` 在复杂计划的 developer 终态里也是必需的**：绑定上的游标只有你回写时
+才会被写进去（`provider_action.py:1153-1160`），不给就等于绑定没有游标，交付证据门
+报 `current cursor is missing`。这道门只挂在 `delivered` / `complete` 上，所以
+reviewer 的 `accepted` 不受它约束——但每轮都回写游标本来就是对的（`wait` 靠它
+接着上一次的位置读），所以上表两行都给了。
 
 `resume` 只看 `resumed`，**完全不读 `binding`**。按 `create` 的形状回写它，
 `resumed` 就是缺的，这一轮会报 `visibility_unknown` 事件，节点落到

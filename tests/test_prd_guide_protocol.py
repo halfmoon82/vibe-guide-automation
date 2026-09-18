@@ -221,12 +221,26 @@ class MailboxSectionTests(unittest.TestCase):
         """
         import json as _json
         from vibe_guide.evidence import evaluate_delivery_evidence
-        row = " ".join(self.row("6.2 回写的形状", "wait"))
-        terminal = [
-            _json.loads(chunk) for chunk in re.findall(r'`(\{.*?\})`', row)
-            if '"completed"' in chunk
-        ]
-        self.assertTrue(terminal, "no terminal wait payload in the row: " + row)
+        # Every JSON object in the subsection, wherever it is printed: in a
+        # table cell, a fenced block, indented prose.  Keying on the table row
+        # and on the literal "completed" made a *true* document red whenever it
+        # was reformatted, or when the equally valid `"complete"` was used.
+        subsection = self.subsection("6.2 回写的形状")
+        payloads = []
+        for chunk in re.findall(r"\{.*?\}(?=`|\s|$)", subsection, re.S):
+            try:
+                value = _json.loads(chunk)
+            except ValueError:
+                continue
+            if isinstance(value, dict):
+                payloads.append(value)
+        terminal = [p for p in payloads if p.get("event") in {"complete", "accepted"}]
+        self.assertEqual(
+            len(terminal), 2,
+            "expected one terminal payload per role; parsed {} from {} objects".format(
+                len(terminal), len(payloads)
+            ),
+        )
         binding = {
             "task_id": "sess_probe", "host": "probe-host",
             "worktree": ".worktrees/probe", "branch": "node/probe",
@@ -267,6 +281,49 @@ class MailboxSectionTests(unittest.TestCase):
         monitor = (ROOT / "vibe_guide" / "monitor.py").read_text(encoding="utf-8")
         self.assertIn("review acceptance has no registered P0-P2 clearance evidence", monitor)
 
+    def test_protocol_prose_states_the_gate_requirements_it_explains(self):
+        """The sentences that explain the gate, not just the payload rows.
+
+        The row assertions pin what a host agent should copy; this pins the
+        prose that tells them *why*, which is where the requirement regressed
+        once already.  Softening "必须是嵌套对象" or restoring reviewer
+        `evidence` to "可以另带" left every payload assertion green while
+        telling the reader the opposite of what the gate enforces.
+        """
+        section = self.section()
+        for claim in (
+            "**developer** 要 `delivery_evidence`，**必须是嵌套对象**",
+            "摊平成顶层三个字段**不算**，门读不到",
+            "- **reviewer** 要 `evidence`：`accepted` 之后没有它",
+        ):
+            self.assertIn(claim, section, claim)
+
+        # The accepted values, taken from the gate rather than restated here.
+        source = (ROOT / "vibe_guide" / "evidence.py").read_text(encoding="utf-8")
+        accepted = re.search(
+            r'thread_status not in \{([^}]*)\}', source,
+        )
+        self.assertIsNotNone(accepted, "thread_status is no longer checked this way")
+        names = re.findall(r'"(\w+)"', accepted.group(1))
+        self.assertTrue(names)
+        for name in names:
+            self.assertIn("`{}`".format(name), section, name)
+        self.assertNotIn("`running` /", section, "running is not a terminal thread_status")
+
+        # The engine value that arms the gate, read from the monitor's own test.
+        self.assertIn(
+            'snapshot.execution_engine == "vibeguide_monitor"',
+            (ROOT / "vibe_guide" / "monitor.py").read_text(encoding="utf-8"),
+        )
+        self.assertIn("`vibeguide_monitor`", section)
+
+        # Rejection is distinguished by the node status, in that direction.
+        self.assertIn("被拒是 `blocked_unknown`，被接受是 `running`", section)
+        # Event names are role-dependent, in that pairing.
+        self.assertIn("developer 报 `complete`、reviewer 报 `accepted`", section)
+        # And vibe does not create the worktree for you.
+        self.assertIn("worktree 需要你先建出来", self.subsection("6.3 派发时必须遵守合同"))
+
     def test_protocol_states_the_cursor_and_recovery_rules(self):
         """Two rules whose absence is silent, so nothing else would notice.
 
@@ -298,10 +355,10 @@ class MailboxSectionTests(unittest.TestCase):
             "`provider cursor is invalid`，**整个结果被丢掉**，节点停在 `blocked_unknown`",
             section,
         )
-        # And that a complex run's terminal payload *must* carry one.  The rows
-        # print a cursor either way, so softening this claim back to "可以不给"
-        # changed nothing a payload assertion could see.
-        self.assertIn("**`cursor` 在复杂计划的终态里也是必需的**", section)
+        # And that a complex run's developer terminal payload *must* carry one.
+        # The rows print a cursor either way, so softening this claim back to
+        # "可以不给" changed nothing a payload assertion could see.
+        self.assertIn("**`cursor` 在复杂计划的 developer 终态里也是必需的**", section)
 
     def test_protocol_states_the_per_platform_dispatch_boundary(self):
         """Unattended dispatch is a platform fact, not a vibe feature.
