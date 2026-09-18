@@ -225,8 +225,19 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 - 两个判断里的 `evidence` **必须是非空字符串**。给嵌套对象会被拒（`... needs a status and a non-empty evidence string`）：落盘时 `evidence` 整个字段会被打码，对象里"看起来像敏感信息"的键会被丢掉，于是写进去的包回读时不再合法——顶层会先报一次 `complete`，下一次读又退回去。所以这里只收一句话。
 
 - **只能给这四个键，多一个就是 schema 错误**。`run_id`、`plan_id`、`plan_revision`、四个 digest、`aggregated_scope`、`clearance`、`agentsmd_acceptance_refs`、`unverified_or_excluded` 全部由 vibe 从 run 自己和计划的整合合同派生。这不是省事：审查者不能改写它被追责的血缘，也不能缩小它被要求覆盖的范围。
-- 键名错、少键、或者给一个字符串，节点会落到 `blocked_unknown` 并写明
-  `integration review evidence cannot be derived (...)`。这是可见的阻塞，不是静默失败——但顶层仍然只是没到 `complete`，所以看到 run 长时间停在 `running` 时先查这个节点的状态和理由。
+- 键名错、少键、或者给一个字符串，节点会落到 `blocked_unknown`，代码里的判定是
+  `integration review evidence cannot be derived (...)`。
+
+**但这三条的报错原文在盘上读不到。** 节点的 `reason` 落盘时会被打码成
+`[REDACTED_PROVIDER_TEXT]`——`vibe status --json`、事件日志、隔离记录里都一样，四种
+完全不同的拒收原因长得一模一样。所以别指望"看理由"定位，能读到的是两样东西：
+
+1. 这个节点的 `status` 是 `blocked_unknown`，顶层只是没到 `complete`（看到 run 长时间
+   停在 `running`，先查这个节点）。
+2. 你回写的那份 claim 被记在这个节点的 `evidence` 里，**键名保留、值打码**。照上面三条
+   规则对着它的形状看就能分辨：整条是一个 `[REDACTED_PROVIDER_TEXT]` 说明你给的是字符串；
+   少 `out_of_scope` 就是少一个键；`iteration_compatibility.evidence` 显示成 `{}` 说明你给了
+   对象；`findings` 非空说明有没清零的项。
 
 **`cursor` 在复杂计划的 developer 终态里也是必需的**：绑定上的游标只有你回写时
 才会被写进去（`provider_action.py:1153-1160`），不给就等于绑定没有游标，交付证据门

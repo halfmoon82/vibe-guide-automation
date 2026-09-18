@@ -261,6 +261,20 @@ class ProtocolDocumentsTheClaimTests(unittest.TestCase):
         """
         self.assertIn("needs a status and a non-empty evidence string", self.section())
 
+    def test_the_protocol_does_not_promise_a_reason_string_the_disk_erases(self):
+        """The rejection cause is real but unreadable, so the doc must say so.
+
+        Four different rejection causes were served through the real mailbox and
+        all four read `[REDACTED_PROVIDER_TEXT]` in the node reason, in
+        `vibe status --json` and in every event -- the reason is redacted on
+        every persistence path.  What survives is the claim under the node's
+        `evidence`, keys intact and values masked, so the shape is what the
+        operator reads.  The marker below appears nowhere else in the protocol.
+        """
+        section = self.section()
+        self.assertIn("[REDACTED_PROVIDER_TEXT]", section)
+        self.assertNotIn("这是可见的阻塞", section)
+
 
 class MailboxClosesTheRunTests(unittest.TestCase):
     """The real product path: request → mailbox → complete."""
