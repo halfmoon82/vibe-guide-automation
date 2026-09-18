@@ -11,6 +11,14 @@ dist/
 # default, so a run that provisions them would otherwise leave the tree dirty.
 .worktrees/
 
+# Monitor run state: written by each run, changes on every execution.  Tracking
+# it made the tree dirty the moment a probe ran.
+.monitor-v44/
+
+# Local SDD working notes from development sessions; the shipped design docs
+# live under docs/superpowers/ and stay tracked.
+.superpowers/
+
 # Local environments / OS noise
 .venv/
 .DS_Store
