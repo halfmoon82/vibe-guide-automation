@@ -2,8 +2,9 @@
 
 日期：2026-09-18　　执行者：Claude Code 桌面会话（本机）
 
-实测时基底是 main `5a7ccbe`；本文提交在 `3ea0f0e`（#42）之上。两者之间
-`provider_action.py`、`models.py`、`node_spec.py` 逐字节相同，所以下面的证据不受影响。
+实测时基底是 main `5a7ccbe`；本文提交在 `3ea0f0e`（#42）之上。两者之间本文引用的
+五个文件——`provider_action.py`、`models.py`、`node_spec.py`、`cli.py`、
+`adapters/task_provider.py`——逐字节相同，所以下面的证据不受影响。
 
 这份记录写的是**实际发生过的一次派发**，不是设计意图。fake 信箱服务的端到端测试
 （`tests/test_pm_path_end_to_end.py`）已经绿了很久，但它证明不了桌面工具的真实行为，
@@ -81,9 +82,20 @@ backgrounded · 4f31def4
 |---|---|---|
 | `create` | `claude --bg "<prompt>"` | 直接返回 id，无确认点 |
 | `locate` | `claude attach <id>` | 需要时才进前台 |
-| `visibility` | `claude agents --json` | 返回 sessionId/status/cwd |
-| `resume` | `claude --bg --resume <id>` | 同 id 后台续接 |
+| `visibility` | `claude agents --json` | 返回 `sessionId` / `state` / `cwd`，见下 |
+| `resume` | `claude --bg --resume <id>` | 同 id 后台续接；会话已在运行时起副本 |
 | `wait` | `claude logs <id>` | 读输出 |
+
+两处按实测订正（`claude agents --json --all`，本机只有一个**已停止**的后台会话，
+running 的后台会话是否改报别的字段没验）：
+
+- 后台条目的字段是 `state`（这次值为 `stopped`），**不是** `status`；只有
+  `kind: "interactive"` 的条目才有 `status`。监工按 `status` 判可见性会读到
+  `undefined`。
+- 后台条目同时带一个短 `id`（`4f31def4`）和完整的 `sessionId`，两者不同。
+  `attach` / `logs` / `stop` / `rm` 收的是**短 id**。
+- `--resume` 的 `--help` 原文写明：会话**已在运行**时它「starts a copy and says
+  so」。监工靠这条续接、重复调用时会拿到一个副本，不是同一个会话。
 
 额外好处：`--allowedTools` 与 `--permission-mode` 可以把授权卡的 allowlist
 **翻译成进程级权限约束**，而不是靠被派发会话自觉遵守合同。这比 `spawn_task`
@@ -95,9 +107,15 @@ backgrounded · 4f31def4
 CLI 里确实存在"只认 API key"的路径：`claude --help` 的 **`--bare`** 一条写明
 「Anthropic auth is strictly ANTHROPIC_API_KEY or apiKeyHelper via --settings
 (OAuth and keychain are never read)」。但那句属于 `--bare`，不是 `--bg`——
-`--bg` 的条目通篇没提认证。所以能确定的只是"`--bg` 这次没继承桌面认证"，
-**能不能配成继承尚未查证**（见"尚未验证"一节）。要跑起来至少得配
-`ANTHROPIC_API_KEY` 或 `apiKeyHelper`，那是与桌面订阅分开的另一笔计费。
+`--bg` 的条目通篇没提认证。
+
+同机再查了一层：`claude auth status` 回 `{"loggedIn": false, "authMethod": "none"}`，
+`~/.claude/.credentials.json` 不存在，钥匙串里也没有对应条目——**CLI 侧从未单独
+登录过**。所以 `Not logged in` 更可能是这个，而不是"`--bg` 拒绝继承桌面认证"。
+`claude --help` 另列了两条路：`setup-token`（条目自注 requires Claude
+subscription）与 `auth login`，**两条都没实测**（登录会改动本机认证状态，
+超出这次只读探针的范围）。因此这里不下"必须另配 API key、要另计费"的结论——
+`setup-token` 那句话本身就说明存在走订阅的路径。
 
 （`spawn_task` 的确认点本身不是设计缺陷：派发会真的创建会话并消耗额度，
 有人把关是合理的。它只是不适合"授权后无人值守"这个目标。）
@@ -173,14 +191,19 @@ task_id,   服务 1/2   顶层=retry_pending    节点={date-range-filter: runni
 sessionId, 服务 2/2   顶层=blocked_unknown  节点={两个都 blocked_unknown}
 ```
 
-顶层之所以掩盖它，是 `cli.py:618-625`：只要存在任一"有 `retryable_action`、
+顶层之所以掩盖它，是 `cli.py:620-627`：只要存在任一"有 `retryable_action`、
 状态 `running`、且没有 `active_task`"的节点，顶层就被改写成 `retry_pending`，
-run 级真实状态被盖掉。所以判断回写有没有被接受，**看 `payload["nodes"]` 里的
-节点状态**，比数已发出的操作直接。两个请求都用错键名时顶层也会变
-`blocked_unknown`，不再掩盖。
+run 级真实状态被盖掉。所以判断回写有没有被接受，**看 `payload["nodes"]` 里
+你刚服务的那个节点**，比数已发出的操作直接：被拒是 `blocked_unknown`、被接受
+是 `running`。注意**没被服务的节点同样显示 `running`**，与"被接受"同形，不能
+拿它判定——上表里 `export-button` 不是天生被阻的那个，它只是被服务的那个
+（反过来服务 `date-range-filter` 就镜像成它 `blocked_unknown`、另一个
+`running`）。两个请求都用错键名时顶层也会变 `blocked_unknown`，不再掩盖。
 
 **结论**：本次实测走通的是 create 请求的派发与会话真实落点（上面"节点隔离在真实派发里的验证"一节的证据仍然成立），
-**没有**走通 create 的绑定回写。回写要用 `task_id` + `host` 或 `threadId` + `hostId`。
+**没有**走通 create 的绑定回写。回写时任务身份用 `threadId` 或 `task_id`、
+主机用 `hostId` 或 `host`——`509-510` 两行各是一个 `or`，所以四种组合都通
+（实测了其中三种）。
 
 用正确键名重跑，逐轮服务信箱（两个节点各一份请求），链路会一路推进：
 
@@ -209,7 +232,11 @@ round 2: 服务 visibility×2  → resume=running        信箱清空
 - `locate`（`open_session_in`）与 `resume`（`send_message`）没有单独跑过
 - create 的绑定回写已用正确键名与 **fake 身份**走通（见"信箱回写"一节）；
   用**真实会话身份**回写仍待实测
-- `claude --bg` 能否配成继承桌面订阅认证（本次只确认了默认不继承）
+- `claude --bg` 在 CLI 单独登录（`auth login` 或 `setup-token`）之后能否用桌面
+  订阅的额度跑起来。本次只确认了 CLI 侧当前无任何自有凭据、`--bg` 那次报
+  `Not logged in`；两条登录路径都没走（会改动本机认证状态）
+- `claude agents --json` 对**正在运行**的后台会话报什么字段（本机只观察到一个
+  已停止的，它报 `state: "stopped"`）
 - 多节点并发派发只在 fake 回写值下走通（两个节点各一份请求全程服务完）；
   两个节点同时接**真实会话**仍待实测——真实那次只派了一个节点，第二个留在 pending
 - reviewer 角色的派发（本次只有 developer）
