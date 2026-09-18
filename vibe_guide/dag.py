@@ -129,6 +129,23 @@ def append_integration_review_node(plan: Plan) -> Plan:
         "read_only": True,
         "reviewer": INTEGRATION_REVIEWER_ID,
         "allowlist": [],
+        # Who runs it, under the three names dispatch reads, all the ones
+        # `complete_node_contracts` gives a business node.  Like every node this
+        # one is dispatched twice -- developer first, reviewer after delivery --
+        # and each key carries a different path, so dropping any one of them
+        # sends a bogus writer identity out (all three verified by ablation):
+        #   `worker`           -> the developer pass; `monitor.start` seeds the
+        #                         node state's worker from it and `_start_task`
+        #                         reads that back for non-reviewer roles.
+        #   `reviewer_worker`  -> the reviewer pass; `_start_task` overwrites
+        #                         `contract["worker"]` from it for that role.
+        #   `writer`           -> the empty-union branch below, whose injected
+        #                         `worker_profile` dispatch uses verbatim for
+        #                         both passes; without this key that profile's
+        #                         own default ships the placeholder `"worker"`.
+        "worker": INTEGRATION_REVIEWER_ID,
+        "writer": INTEGRATION_REVIEWER_ID,
+        "reviewer_worker": INTEGRATION_REVIEWER_ID,
     })
     # What this reviewer may read.  `allowlist` above stays empty because it
     # writes nothing; `files` is what dispatch reads to build the worker

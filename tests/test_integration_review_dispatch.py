@@ -14,7 +14,11 @@ from pathlib import Path
 
 from vibe_guide import monitor
 from vibe_guide.authorization import _normalize_files, validate_runtime_contract
-from vibe_guide.dag import append_integration_review_node
+from vibe_guide.dag import (
+    INTEGRATION_REVIEW_SCOPE_LIMIT,
+    INTEGRATION_REVIEWER_ID,
+    append_integration_review_node,
+)
 from vibe_guide.diagnostics import validate_child_session_binding
 from vibe_guide.models import (
     INTEGRATION_REVIEW_NODE_ID,
@@ -50,25 +54,29 @@ def _business_node(node_id, files):
     )
 
 
-def _dispatch(contract):
-    """Hand *contract* to the binding validator the way `_start_task` does.
+def _dispatch_profile(contract, role):
+    """The profile dispatch ends up with for this node, in *role*.
 
-    The profile literal lives inline in `Monitor._start_task`, so there is
+    This node is dispatched twice, like every node: `developer` first, then
+    `reviewer` once it delivers.  The two passes read different contract keys,
+    so a helper that only models one of them sees a correct profile while the
+    other path ships `"None"` as the writer identity -- which is exactly what
+    hid a defect from these tests for a round.
+
+    `role == "reviewer"` reproduces `_start_task`'s own overwrite
+    (`monitor.py`: `node.contract.get("reviewer_worker") if role == "reviewer"
+    else current.get("worker")`).  The developer pass reads the node state's
+    worker, which `Monitor.start` seeded from `contract["worker"]`.
+
+    The fallback profile literal lives inline in `_start_task`, so there is
     nothing to call.  Rather than copy it -- a copy stays green while the real
-    derivation drifts, which is how a previous test in this repo went blind --
-    read it out of the source and evaluate it against this contract.  A rename
-    or a moved fallback breaks this helper loudly instead of silently.
+    derivation drifts -- read it out of the source and evaluate it against this
+    contract, so a rename or a moved fallback breaks loudly instead of silently.
     """
-    source = (Path(monitor.__file__).read_text(encoding="utf-8"))
-    match = re.search(
-        r"profile_data = (\{\"worker\": str\(contract\.get.*?\})\n", source, re.S
-    )
-    if match is None:
-        raise AssertionError(
-            "Monitor._start_task no longer builds its fallback worker profile as a "
-            "dict literal; update this helper to match the real derivation"
-        )
     contract = dict(contract)
+    contract["worker"] = (
+        contract.get("reviewer_worker") if role == "reviewer" else contract.get("worker")
+    )
     # `_start_task` normalises the contract before deriving the profile.  This
     # step is why an absent `files` key is not a harmless default: it is filled
     # from `worker_profile.allowlist`, which is how a `"."` ends up somewhere
@@ -78,14 +86,29 @@ def _dispatch(contract):
     )
     # The literal is only the fallback; a contract carrying its own profile uses
     # that one (`monitor.py`: `if not profile_data`).
-    profile_data = contract.get("worker_profile") or eval(  # noqa: S307 - the package's own source
+    if contract.get("worker_profile"):
+        return dict(contract["worker_profile"])
+    source = Path(monitor.__file__).read_text(encoding="utf-8")
+    match = re.search(
+        r"profile_data = (\{\"worker\": str\(contract\.get.*?\})\n", source, re.S
+    )
+    if match is None:
+        raise AssertionError(
+            "Monitor._start_task no longer builds its fallback worker profile as a "
+            "dict literal; update this helper to match the real derivation"
+        )
+    return eval(  # noqa: S307 - the package's own source
         match.group(1),
         {"str": str, "list": list},
         {"contract": contract, "node_id": INTEGRATION_REVIEW_NODE_ID},
     )
+
+
+def _dispatch(contract, role="reviewer"):
+    """Hand the profile *role* would dispatch with to the binding validator."""
     validate_child_session_binding(
-        "run-1", "1", "digest", INTEGRATION_REVIEW_NODE_ID, "reviewer",
-        WorkerProfile(**profile_data),
+        "run-1", "1", "digest", INTEGRATION_REVIEW_NODE_ID, role,
+        WorkerProfile(**_dispatch_profile(contract, role)),
     )
 
 
@@ -469,6 +492,83 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
             if n.id == INTEGRATION_REVIEW_NODE_ID
         ).contract["files"]
         self.assertEqual(scope, ["src/ok.ts"], scope)
+
+    def test_every_dispatch_path_names_the_same_writer(self):
+        """The reviewer identity must not depend on which path built it.
+
+        Four paths reach a dispatched profile for this node: it runs twice (a
+        developer pass, then a reviewer pass once delivered) and each pass takes
+        a different branch depending on whether the file union came out empty.
+        Each of the three identity keys covers exactly one of them, verified by
+        ablation:
+
+        * a non-empty union leaves the profile to the monitor, which reads
+          `contract["worker"]` for the developer pass (seeded into node state by
+          `Monitor.start`) and `contract["reviewer_worker"]` for the reviewer
+          pass -- keys this node never had, so the dispatched contract carried
+          the literal string `"None"` as its writer;
+        * an empty union takes the injected profile, whose `writer` comes from
+          `contract["writer"]` -- without it the fallback literal's
+          `contract.get("worker", "writer")` ships the placeholder `"worker"`.
+
+        Naming all three on the contract, as `complete_node_contracts` does for
+        business nodes, makes every path agree.
+        """
+        for files in ([], ["src/a.ts"]):
+            plan = Plan(
+                "plan-13",
+                1,
+                "prd.md",
+                ["a"],
+                "draft",
+                nodes=[_business_node("a", files)],
+                spec_path="spec.md",
+                complexity_band="complex",
+                integration_contract=_integration_contract(["a"]),
+            )
+            contract = next(
+                n for n in append_integration_review_node(plan).nodes
+                if n.id == INTEGRATION_REVIEW_NODE_ID
+            ).contract
+            for key in ("worker", "reviewer_worker", "writer"):
+                self.assertEqual(
+                    contract.get(key), INTEGRATION_REVIEWER_ID, (key, files)
+                )
+            # Asserting the contract alone is what let this slip once: check the
+            # identity the monitor actually derives, on both passes.
+            for role in ("developer", "reviewer"):
+                self.assertEqual(
+                    _dispatch_profile(contract, role)["writer"],
+                    INTEGRATION_REVIEWER_ID,
+                    (role, files),
+                )
+
+    def test_the_scope_limit_tracks_the_validator_that_enforces_it(self):
+        """Two spellings of one bound drift silently.
+
+        `INTEGRATION_REVIEW_SCOPE_LIMIT` exists only to stay inside
+        `authorization._normalize_files`.  Nothing else ties them together, so
+        lowering that validator's cap leaves every plan with a large union
+        unpublishable while this module keeps building one.
+
+        Probed through the validator itself rather than read off its source:
+        a rewrite that keeps the bound but spells it differently is not a
+        regression, and one that keeps the spelling while changing the
+        comparison is.
+        """
+        at_limit = ["f{}.py".format(index) for index in range(
+            INTEGRATION_REVIEW_SCOPE_LIMIT
+        )]
+        # A scope built right at the limit must publish, or coarsening to
+        # top-level roots would hand the reviewer a list it still refuses.
+        self.assertEqual(
+            len(_normalize_files(at_limit, "contract.files")),
+            INTEGRATION_REVIEW_SCOPE_LIMIT,
+        )
+        # One past it must be refused, or this module coarsens sooner than it
+        # has to and reviews whole directories instead of named files.
+        with self.assertRaises(ValueError):
+            _normalize_files(at_limit + ["over.py"], "contract.files")
 
     def test_conflicting_project_ids_fail_closed(self):
         """Taking the first of two is worse than refusing.
