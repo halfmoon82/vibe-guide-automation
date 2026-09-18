@@ -185,18 +185,35 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 | `locate` | `{"located": true}` |
 | `visibility` | `{"visible": true, "direct_enter": true}` |
 | `wait`（还没干完） | `{"status": "timeout", "cursor": "<最后一条事件的游标>"}` |
-| `wait`（干完了） | `{"status": "completed", "cursor": "<游标>", "event": "complete"}`，reviewer 角色用 `"event": "accepted"`；可另带 `"evidence": "<验收证据>"` |
+| `wait`（干完了，developer） | `{"status": "completed", "cursor": "<游标>", "event": "complete", "delivery_evidence": {"completion_marker": "<完成标记>", "delivery_path": "<交付物路径>", "thread_status": "complete"}}` |
+| `wait`（干完了，reviewer） | `{"status": "completed", "cursor": "<游标>", "event": "accepted", "evidence": "<P0–P2 清零证据>"}` |
 | `resume` | `{"resumed": true}`（会话 id 沿用原来的，**不要**回写绑定） |
 
-`wait` 的终态三个字段各有各的判定，缺一个就整轮作废：`status` 只认
+`wait` 的终态字段各有各的判定，缺一个就整轮作废：`status` 只认
 `complete` / `completed` / `failed` / `stopped`，`event` 只认
 `complete` / `delivered` / `accepted` / `review_finding` / `failed` / `stopped`，
 且**角色不同事件名不同**——developer 报 `complete`、reviewer 报 `accepted`，
-报错会被判 `provider event is unsupported`。`evidence` 与 `cursor` 在终态里可以不给
-（给了就会被记进节点证据）。
+报错会被判 `provider event is unsupported`。
+
+**复杂计划的终态还要过一道交付证据门，两个角色各要一样东西**（这道门只在
+复杂计划上生效：授权时 `complexity_band == "complex"` 会把引擎设成
+`vibeguide_monitor`，非复杂计划不走这里）：
+
+- **developer** 要 `delivery_evidence`，**必须是嵌套对象**，三个键齐全：
+  `completion_marker`、`delivery_path`、`thread_status`（只认 `complete` /
+  `completed` / `DELIVERED`）。摊平成顶层三个字段**不算**，门读不到。缺任何
+  一个，节点直接 `blocked_unknown`（理由如 `completion marker is missing`），
+  而顶层看起来只是还在等。
+- **reviewer** 要 `evidence`：`accepted` 之后没有它，节点被判
+  `review acceptance has no registered P0-P2 clearance evidence`。
+
+**`cursor` 在复杂计划的终态里也是必需的**：绑定上的游标只有你回写时才会被
+写进去（`provider_action.py:1153-1160`），不给就等于绑定没有游标，交付证据门
+报 `current cursor is missing`。只有非复杂计划才可以省。
 
 `resume` 只看 `resumed`，**完全不读 `binding`**。按 `create` 的形状回写它，
-`resumed` 就是缺的，节点永远停在 `visibility_unknown`。
+`resumed` 就是缺的，这一轮会报 `visibility_unknown` 事件，节点落到
+`blocked_unknown` 或重试态，续接推不下去。
 
 三条硬规则：
 

@@ -195,8 +195,8 @@ class MailboxSectionTests(unittest.TestCase):
         self.assertIn('"visible": true', " ".join(self.row("6.2 回写的形状", "visibility")))
         self.assertIn('"direct_enter": true', " ".join(self.row("6.2 回写的形状", "visibility")))
 
-        # `resume` reads `resumed` and never looks at `binding`; sending a
-        # create-shaped payload leaves the node in visibility_unknown forever.
+        # `resume` reads `resumed` and never looks at `binding`; a create-shaped
+        # payload has no `resumed`, so the round reports visibility_unknown.
         self.assertIn('"resumed": true', " ".join(self.row("6.2 回写的形状", "resume")).lower())
         self.assertRegex(source, r'operation != "resume" or result\.get\("resumed"\) is not True')
 
@@ -207,6 +207,65 @@ class MailboxSectionTests(unittest.TestCase):
         # event name differs by role.  Dropping either stalls the run.
         for token in ('"status": "completed"', '"event": "complete"', '"event": "accepted"'):
             self.assertIn(token, wait_rows, token)
+
+    def test_terminal_wait_payload_passes_the_delivery_evidence_gate(self):
+        """The documented terminal payload, run through the gate that reads it.
+
+        A complex plan sets `execution_engine` to `vibeguide_monitor`, which
+        arms `evaluate_delivery_evidence` on every developer `complete`.  The
+        unit fixture in `test_claude_code_dispatch` has no `complexity_band`,
+        so that gate is dormant there and an ablation against it cannot see
+        these fields at all -- which is how an earlier draft came to document
+        `delivery_evidence` as absent and `cursor` as optional.  This asserts
+        the payload the protocol prints, against the gate itself.
+        """
+        import json as _json
+        from vibe_guide.evidence import evaluate_delivery_evidence
+        row = " ".join(self.row("6.2 回写的形状", "wait"))
+        terminal = [
+            _json.loads(chunk) for chunk in re.findall(r'`(\{.*?\})`', row)
+            if '"completed"' in chunk
+        ]
+        self.assertTrue(terminal, "no terminal wait payload in the row: " + row)
+        binding = {
+            "task_id": "sess_probe", "host": "probe-host",
+            "worktree": ".worktrees/probe", "branch": "node/probe",
+        }
+        def gate(payload):
+            """As the monitor calls it: the evidence comes from one key.
+
+            `monitor.py` passes `event.data.get("delivery_evidence")`, which is
+            why nesting matters -- marks spread across the payload's top level
+            are never looked at, so they fail exactly like omitting them.
+            """
+            return evaluate_delivery_evidence(
+                {"status": "DELIVERED"},
+                {**binding, "cursor": payload.get("cursor")},
+                payload.get("delivery_evidence"),
+            )
+
+        self.assertIn(
+            'event.data.get("delivery_evidence")',
+            (ROOT / "vibe_guide" / "monitor.py").read_text(encoding="utf-8"),
+        )
+        developer = next(p for p in terminal if p.get("event") == "complete")
+        # The cursor reaches the binding only from this payload
+        # (provider_action.py:1153-1160), so omitting it fails the gate.
+        self.assertIn("cursor", developer)
+        self.assertEqual(gate(developer).status, "DELIVERED", gate(developer).reasons)
+        flat = {k: v for k, v in developer.items() if k != "delivery_evidence"}
+        flat.update(developer["delivery_evidence"])
+        self.assertEqual(
+            gate(flat).status, "blocked_unknown",
+            "flattened delivery marks must not read as evidence",
+        )
+        without_cursor = {k: v for k, v in developer.items() if k != "cursor"}
+        self.assertIn("current cursor is missing", gate(without_cursor).reasons)
+        # The reviewer's own requirement is a separate check in the monitor.
+        reviewer = next(p for p in terminal if p.get("event") == "accepted")
+        self.assertIn("evidence", reviewer)
+        monitor = (ROOT / "vibe_guide" / "monitor.py").read_text(encoding="utf-8")
+        self.assertIn("review acceptance has no registered P0-P2 clearance evidence", monitor)
 
     def test_protocol_states_the_cursor_and_recovery_rules(self):
         """Two rules whose absence is silent, so nothing else would notice.
@@ -231,6 +290,18 @@ class MailboxSectionTests(unittest.TestCase):
             "`vibe resume` 会为同一个节点发出一个**新的 `create` 请求**（`generation` 加一）",
             section,
         )
+        # The empty-cursor consequence, as one string in the rule that owns it.
+        # `blocked_unknown` alone was satisfied by the rejection rule above it,
+        # so both softening it back to "可能重复消费" and downgrading the status
+        # to `retry_pending` stayed green.
+        self.assertIn(
+            "`provider cursor is invalid`，**整个结果被丢掉**，节点停在 `blocked_unknown`",
+            section,
+        )
+        # And that a complex run's terminal payload *must* carry one.  The rows
+        # print a cursor either way, so softening this claim back to "可以不给"
+        # changed nothing a payload assertion could see.
+        self.assertIn("**`cursor` 在复杂计划的终态里也是必需的**", section)
 
     def test_protocol_states_the_per_platform_dispatch_boundary(self):
         """Unattended dispatch is a platform fact, not a vibe feature.
@@ -253,6 +324,10 @@ class MailboxSectionTests(unittest.TestCase):
         unattended = unattended[:unattended.index("- **Claude Code 桌面**")]
         self.assertIn("无人值守", unattended)
         self.assertNotIn("无人值守", section[section.index("- **Claude Code 桌面**"):])
+        # *Why* Codex is the unattended one, not just that it is labelled so.
+        # Negating this clause to "有审批门" left every other assertion green,
+        # which would have inverted the one fact the table exists to convey.
+        self.assertIn("`create_thread` 没有审批门", unattended)
         self.assertIn(CODEX_PROVIDER, section)
         self.assertIn(CLAUDE_CODE_PROVIDER, section)
 
