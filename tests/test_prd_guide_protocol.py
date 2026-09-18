@@ -122,8 +122,27 @@ class MailboxSectionTests(unittest.TestCase):
         that from the request alone.
         """
         text = self.protocol()
-        for key in ("binding", "sessionId", "hostId", "located", "visible", "direct_enter", "cursor"):
+        for key in ("binding", "located", "visible", "direct_enter", "cursor"):
             self.assertIn(key, text, key)
+        # The create binding keys are read straight out of the runner, because
+        # naming them by hand is what went wrong: an earlier draft told agents
+        # to send `sessionId` -- the desktop tool's own field name -- which the
+        # runner rejects as "no task identity", silently discarding the binding.
+        source = (ROOT / "vibe_guide" / "runners" / "provider_action.py").read_text(encoding="utf-8")
+        accepted = re.search(
+            r'task_id = binding_data\.get\("(\w+)"\) or binding_data\.get\("(\w+)"\)\n'
+            r'\s*host = binding_data\.get\("(\w+)"\) or binding_data\.get\("(\w+)"\)',
+            source,
+        )
+        self.assertIsNotNone(accepted, "create binding keys no longer read this way")
+        for key in accepted.groups():
+            self.assertIn("`{}`".format(key), text, key)
+        self.assertNotIn("`sessionId`: ", text)
+        create_row = next(
+            line for line in text.splitlines()
+            if line.startswith("| `create` |") and "binding" in line
+        )
+        self.assertNotIn("sessionId", create_row, create_row)
 
     def test_protocol_states_the_per_platform_dispatch_boundary(self):
         """Unattended dispatch is a platform fact, not a vibe feature.

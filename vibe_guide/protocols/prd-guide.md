@@ -181,7 +181,7 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 
 | 操作 | payload |
 |---|---|
-| `create` | `{"binding": {"sessionId": "<真实会话 id>", "hostId": "<本机标识>"}}`（Codex 用 `threadId` / `hostId`） |
+| `create` | `{"binding": {"task_id": "<真实会话 id>", "host": "<本机标识>"}}`（`threadId` / `hostId` 同样接受） |
 | `locate` | `{"located": true}` |
 | `visibility` | `{"visible": true, "direct_enter": true}` |
 | `wait` | 终态事件，或 `{"status": "timeout", "cursor": "<最后一条事件的游标>"}` |
@@ -189,7 +189,9 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 
 三条硬规则：
 
-1. **`create` 的 `binding` 必须含真实的会话 id**。没有身份的绑定会被拒（`provider create result has no task identity`）。只有设置句柄、没有真实会话 id 时，不要回写——留着 pending，下一轮再来。
+1. **`create` 的 `binding` 必须用上面那几个键名，并且含真实的会话 id**。vibe 只认 `task_id`/`threadId` 与 `host`/`hostId`；用别的名字（比如桌面工具自己叫的 `sessionId`）会被判"没有任务身份"而丢掉绑定。只有设置句柄、没有真实会话 id 时，不要回写——留着 pending，下一轮再来。
+
+   **被拒和"在等下一个节点"看起来一样**：两种情况下 `status` 都是 `retry_pending`，`pending()` 的计数也都会少一个（它只数没有结果文件的请求，不管结果有没有被接受）。要分辨就看信箱里有没有新发出的 `locate` 请求——create 被接受才会有。
 2. **`cursor` 不能是空串**。空游标会让同一个结果被重复消费。
 3. **不确定就不回写**。pending 比假成功便宜得多；vibe 会一直等，不会把未知当成功。
 
