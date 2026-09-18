@@ -12,7 +12,13 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 # dag imports models, so importing it back from dag would be circular; it is
 # re-exported here to keep every `from .dag import INTEGRATION_REVIEW_NODE_ID`
 # working unchanged.
-from .models import INTEGRATION_REVIEW_NODE_ID, DAGNode, Plan
+from .models import (
+    INTEGRATION_REVIEW_NODE_ID,
+    DAGNode,
+    Plan,
+    node_branch,
+    node_worktree,
+)
 from .path_ownership import normalize_project_path
 
 
@@ -84,7 +90,18 @@ def integration_review_scope(business_nodes: Sequence[DAGNode]) -> List[str]:
             root = PurePosixPath(item).parts[0]
             if root not in roots:
                 roots.append(root)
-        scope = roots[:INTEGRATION_REVIEW_SCOPE_LIMIT]
+        if len(roots) > INTEGRATION_REVIEW_SCOPE_LIMIT:
+            # Cutting the list here would put back the very hole coarsening
+            # exists to avoid, one level up and losing whole subtrees, while
+            # still producing a well-formed contract.  There is no third level
+            # to collapse to: `"."` is not a legal `files` entry.
+            raise ValueError(
+                "integration review scope spans {} top-level directories, over "
+                "the {} the authorization contract allows; split the plan".format(
+                    len(roots), INTEGRATION_REVIEW_SCOPE_LIMIT
+                )
+            )
+        scope = roots
     return scope
 
 
@@ -147,8 +164,14 @@ def append_integration_review_node(plan: Plan) -> Plan:
                 "availability_evidence": "configured",
             },
             "writer": str(contract.get("writer", "worker")),
-            "worktree": str(contract.get("worktree", ".")),
-            "branch": str(contract.get("branch", "branch-" + INTEGRATION_REVIEW_NODE_ID)),
+            # The node's own tree, from the same derivation
+            # `complete_node_contracts` uses for business nodes.  Not
+            # `contract.get("worktree", ...)`: that key does not exist yet (the
+            # monitor setdefaults it later), so the fallback would always fire
+            # and protocol §6.3 has the platform open the session right there --
+            # in the main working tree, on a branch vibe never generates.
+            "worktree": node_worktree(INTEGRATION_REVIEW_NODE_ID),
+            "branch": node_branch(INTEGRATION_REVIEW_NODE_ID),
             "allowlist": ["."],
         }
     # Keep the synthetic integration reviewer on the same verified adapter
