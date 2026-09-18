@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -25,6 +25,39 @@ def is_integration_review_node(node: DAGNode) -> bool:
 
 def _integration_nodes(plan: Plan) -> List[DAGNode]:
     return [node for node in (getattr(plan, "nodes", []) or []) if is_integration_review_node(node)]
+
+
+def integration_review_scope(business_nodes: Sequence[DAGNode]) -> List[str]:
+    """The files the final reviewer may read: every business node's, deduped.
+
+    The node owns nothing -- it aggregates -- so its `allowlist` stays empty.
+    But dispatch derives a worker profile from `contract["files"]` and
+    `validate_child_session_binding` refuses an empty allowlist, so a node with
+    no files can never be handed to a reviewer session and every complex run
+    stalls on it.  The union is also the honest scope: this reviewer reads the
+    whole delivery.
+
+    Paths that the same validator would reject anyway (absolute, or escaping
+    the project) are dropped rather than passed through, so one business node
+    naming `/etc/passwd` cannot make the review node undispatchable again.
+
+    An empty union returns empty and the caller omits the key, exactly as a
+    business node naming no files does.  There is no whole-project spelling to
+    fall back on: `authorization._normalize_files` rejects `"."` outright, so
+    putting it here blocks publishing the plan instead.
+    """
+    scope: List[str] = []
+    for node in business_nodes:
+        contract = getattr(node, "contract", None) or {}
+        for item in list(contract.get("files") or []) + list(getattr(node, "allowlist", []) or []):
+            if not isinstance(item, str) or not item.strip():
+                continue
+            path = PurePosixPath(item)
+            if path.is_absolute() or ".." in path.parts or item.startswith(("/", "~")):
+                continue
+            if item not in scope:
+                scope.append(item)
+    return scope
 
 
 def append_integration_review_node(plan: Plan) -> Plan:
@@ -52,12 +85,31 @@ def append_integration_review_node(plan: Plan) -> Plan:
         "reviewer": INTEGRATION_REVIEWER_ID,
         "allowlist": [],
     })
+    # What this reviewer may read.  `allowlist` above stays empty because it
+    # writes nothing; `files` is what dispatch reads to build the worker
+    # profile, and without it the node is undispatchable (see
+    # `integration_review_scope`).  An empty union omits the key, as a business
+    # node naming no files does -- `authorization._normalize_files` would
+    # reject a `"."` placeholder and block publishing.
+    review_scope = integration_review_scope(business_nodes)
+    if review_scope:
+        contract["files"] = review_scope
     # Keep the synthetic integration reviewer on the same verified adapter
     # route as the business nodes so authorization can enforce one binding.
     for node in business_nodes:
         adapter_id = str(node.contract.get("adapter_id", "")).strip()
         if adapter_id:
             contract["adapter_id"] = adapter_id
+            break
+    # And on the same project.  `task_binding` refuses a visible contract with
+    # no `project_id`, so without this the node is rejected before its session
+    # is created.  Copied from a business node rather than synthesised: the
+    # value only exists when the attested capabilities reported one, and
+    # inventing it would route a session at a project nobody verified.
+    for node in business_nodes:
+        project_id = str(node.contract.get("project_id", "")).strip()
+        if project_id:
+            contract["project_id"] = project_id
             break
     integration = DAGNode(
         INTEGRATION_REVIEW_NODE_ID,

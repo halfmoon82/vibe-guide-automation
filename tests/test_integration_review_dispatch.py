@@ -28,6 +28,7 @@ def _business_node(node_id, files):
             "error_behavior": "a message",
             "acceptance_example": "click it",
             "adapter_id": "claude-code",
+            "project_id": "probe-project",
             "files": list(files),
             "worktree": ".worktrees/" + node_id,
             "branch": "node/" + node_id,
@@ -125,6 +126,45 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
             "run-1", "1", "digest", INTEGRATION_REVIEW_NODE_ID, "reviewer", profile
         )
 
+    def test_the_integration_node_carries_the_project_id(self):
+        """Visible dispatch refuses a contract without one.
+
+        `provider_action.task_binding` raises `visible provider contract
+        requires project_id` before the session is created, so the node is
+        rejected even once its `files` are right.  The business nodes get theirs
+        from `complete_node_contracts`; this node is appended afterwards and
+        never passes through there.
+        """
+        contract = self.integration_contract()
+        self.assertEqual(contract.get("project_id"), "probe-project", contract.get("project_id"))
+
+    def test_the_project_id_is_never_invented(self):
+        """No business node carries one, so neither may this node.
+
+        `node_spec` only fills `project_id` in when the attested capabilities
+        actually reported one, and raises `project_id_unavailable` for visible
+        routes otherwise.  Synthesising a value here would hand a session a
+        project identity nobody verified -- the failure mode PR #41 fixed.
+        """
+        plan = Plan(
+            "plan-4",
+            1,
+            "prd.md",
+            ["a"],
+            "draft",
+            nodes=[_business_node("a", ["src/ok.ts"])],
+            spec_path="spec.md",
+            complexity_band="complex",
+            integration_contract=_integration_contract(["a"]),
+        )
+        for node in plan.nodes:
+            node.contract.pop("project_id", None)
+        contract = next(
+            n for n in append_integration_review_node(plan).nodes
+            if n.id == INTEGRATION_REVIEW_NODE_ID
+        ).contract
+        self.assertNotIn("project_id", contract)
+
     def test_the_review_scope_stays_inside_the_project(self):
         """An aggregated scope must not smuggle in an absolute or parent path.
 
@@ -149,11 +189,12 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
         ).contract
         self.assertEqual(contract.get("files"), ["src/ok.ts"], contract.get("files"))
 
-    def test_a_plan_whose_nodes_name_no_files_still_dispatches(self):
-        """Falling back to the project root keeps the node reviewable.
+    def test_a_plan_whose_nodes_name_no_files_omits_the_key(self):
+        """No files to aggregate means no `files` key, same as a business node.
 
-        `node_spec` already does this for business nodes (`or ["."]`); the
-        integration node is appended afterwards and never passes through there.
+        There is deliberately no whole-project placeholder:
+        `authorization._normalize_files` rejects `"."`, so writing one here
+        blocks publishing the plan instead of making the node dispatchable.
         """
         plan = Plan(
             "plan-3",
@@ -170,7 +211,7 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
             n for n in append_integration_review_node(plan).nodes
             if n.id == INTEGRATION_REVIEW_NODE_ID
         ).contract
-        self.assertEqual(contract.get("files"), ["."])
+        self.assertNotIn("files", contract)
 
 
 if __name__ == "__main__":
