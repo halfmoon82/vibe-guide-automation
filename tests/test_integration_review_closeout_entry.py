@@ -253,8 +253,13 @@ class ProtocolDocumentsTheClaimTests(unittest.TestCase):
         self.assertIn("integration review acceptance still reports open P0-P2 findings", section)
 
     def test_the_protocol_says_the_verdict_evidence_must_be_text(self):
-        section = self.section()
-        self.assertIn("必须是非空字符串", section)
+        """Anchored on the error the code raises, not on prose.
+
+        Asserting "必须是非空字符串" alone passed even with this rule deleted:
+        the `cursor` rule further down §6.2 uses the same words, and the
+        section window reaches it.  The message below exists only here.
+        """
+        self.assertIn("needs a status and a non-empty evidence string", self.section())
 
 
 class MailboxClosesTheRunTests(unittest.TestCase):
