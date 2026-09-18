@@ -13,11 +13,11 @@ dist/
 
 # Monitor run state: written by each run, changes on every execution.  Tracking
 # it made the tree dirty the moment a probe ran.
-.monitor-v44/
+/.monitor-v44/
 
 # Local SDD working notes from development sessions; the shipped design docs
 # live under docs/superpowers/ and stay tracked.
-.superpowers/
+/.superpowers/
 
 # Local environments / OS noise
 .venv/
