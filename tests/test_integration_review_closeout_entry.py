@@ -25,6 +25,7 @@ from vibe_guide.evidence import (
     evaluate_v41_closeout,
     validate_integration_review_evidence,
 )
+from vibe_guide import monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.protocols import load_protocol
 from vibe_guide.adapters.task_provider import ProviderActionStore
@@ -193,7 +194,7 @@ class MailboxClosesTheRunTests(unittest.TestCase):
     def cli(self, *argv):
         return run_cli(list(argv) + ["--json"], self.root)
 
-    def serve(self, reviewer_evidence):
+    def serve(self, reviewer_evidence, crash_once_on_acceptance=False):
         """Publish, authorize and serve every mailbox request to a terminus."""
         self.assertEqual(self.cli("init", "--confirm").payload["status"], "ok")
         (self.root / "facts.json").write_text(json.dumps(FACTS), encoding="utf-8")
@@ -207,12 +208,31 @@ class MailboxClosesTheRunTests(unittest.TestCase):
         run_id = result.payload["run_id"]
         store = ProviderActionStore(self.paths)
         waits = {}
+        crashed = []
+        real_save = monitor.save_snapshot
+
+        def crashing_save(paths, snapshot):
+            """Lose exactly the save that would have persisted the acceptance."""
+            if not crashed and snapshot.nodes.get("integration-review", {}).get("status") == "accepted":
+                crashed.append(True)
+                monitor.save_snapshot = real_save
+                raise OSError("crash after the event landed, before the snapshot did")
+            return real_save(paths, snapshot)
+
+        if crash_once_on_acceptance:
+            monitor.save_snapshot = crashing_save
+            self.addCleanup(setattr, monitor, "save_snapshot", real_save)
         for _ in range(80):
             for action in store.pending():
                 store.complete(action["action_id"], self.reply(action, waits, reviewer_evidence))
-            result = self.cli("resume", "--plan", "closeout")
+            try:
+                result = self.cli("resume", "--plan", "closeout")
+            except OSError:
+                continue
             if result.payload.get("status") == "complete":
                 break
+        if crash_once_on_acceptance:
+            self.assertTrue(crashed, "the crash hook never fired")
         return result, load_snapshot(self.paths, run_id)
 
     @staticmethod
@@ -267,6 +287,24 @@ class MailboxClosesTheRunTests(unittest.TestCase):
         self.assertNotEqual(result.payload["status"], "complete", result.payload)
         self.assertEqual(snapshot.nodes["integration-review"]["status"], "blocked_unknown")
         self.assertEqual(snapshot.integration_review_evidence, {})
+
+    def test_a_crash_before_the_acceptance_is_saved_recovers_by_re_reporting(self):
+        """Recovery cannot rebuild the claim, so it asks for it again.
+
+        The appended event keeps only redacted provider text, so replaying it
+        could never reproduce the reviewer's judgement.  The replay door fails
+        closed instead of inventing a package, which lets the monitor dispatch
+        a second reviewer generation whose acceptance closes the run out for
+        real.  A rebuilt-from-the-event package would leave the generation at 1.
+        """
+        result, snapshot = self.serve(CLEARED_CLAIM, crash_once_on_acceptance=True)
+        integration = snapshot.nodes["integration-review"]
+        self.assertGreater(integration["review_generation"], 1)
+        self.assertEqual(result.payload["status"], "complete", result.payload)
+        package = {key: value for key, value in snapshot.integration_review_evidence.items()
+                   if key != "history"}
+        validate_integration_review_evidence(snapshot, package)
+        self.assertTrue(evaluate_v41_closeout(snapshot).allowed)
 
 
 if __name__ == "__main__":
