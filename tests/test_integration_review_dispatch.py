@@ -346,6 +346,67 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
         )
         _normalize_files(contract["files"], "contract.files")
 
+    def test_an_oversized_scope_coarsens_instead_of_truncating(self):
+        """Past the validator's bound the scope must stay complete.
+
+        Cutting the list at 256 would leave a reviewer whose scope silently
+        excludes real deliverables while still looking well-formed -- it could
+        report P0-P2 cleared on files it was never shown.  Collapsing to the
+        top-level directories is coarser but still covers everything.
+        """
+        plan = Plan(
+            "plan-9",
+            1,
+            "prd.md",
+            ["a", "b"],
+            "draft",
+            nodes=[
+                _business_node("a", ["src/a%d.ts" % i for i in range(200)]),
+                _business_node("b", ["lib/b%d.ts" % i for i in range(200)]),
+            ],
+            spec_path="spec.md",
+            complexity_band="complex",
+            integration_contract=_integration_contract(["a", "b"]),
+        )
+        scope = next(
+            n for n in append_integration_review_node(plan).nodes
+            if n.id == INTEGRATION_REVIEW_NODE_ID
+        ).contract["files"]
+        self.assertEqual(sorted(scope), ["lib", "src"], scope)
+
+    def test_home_relative_paths_are_dropped(self):
+        """`~/x` is not project-relative, and nothing downstream catches it.
+
+        `normalize_project_path` keeps a leading `~` (it only rejects absolute
+        and parent-escaping paths), and so does `_normalize_files`, so a scope
+        carrying one would hand the reviewer a path outside the project.
+        """
+        node = DAGNode(
+            "a", "a", [], [], "group-a",
+            {
+                "input": "a request",
+                "output": "a change",
+                "error_behavior": "a message",
+                "acceptance_example": "click it",
+                "adapter_id": "claude-code",
+                "project_id": "probe-project",
+                "files": ["~/.ssh/id_rsa", "src/ok.ts"],
+            },
+            "planned",
+            owned_paths=[],
+            allowlist=["~/secrets"],
+        )
+        plan = Plan(
+            "plan-10", 1, "prd.md", ["a"], "draft", nodes=[node],
+            spec_path="spec.md", complexity_band="complex",
+            integration_contract=_integration_contract(["a"]),
+        )
+        scope = next(
+            n for n in append_integration_review_node(plan).nodes
+            if n.id == INTEGRATION_REVIEW_NODE_ID
+        ).contract["files"]
+        self.assertEqual(scope, ["src/ok.ts"], scope)
+
     def test_conflicting_project_ids_fail_closed(self):
         """Taking the first of two is worse than refusing.
 
