@@ -82,6 +82,79 @@ class ProtocolShippingTests(unittest.TestCase):
             self.assertIn(marker, text, marker)
 
 
+class MailboxSectionTests(unittest.TestCase):
+    """The mailbox section must stay true to the code that serves it.
+
+    A monitored run stops at the mailbox and waits: `vibe` writes a request and
+    only advances once a host agent writes the matching result back.  Nothing
+    in the package can perform that step -- it needs the desktop tools the
+    session itself holds -- so the protocol is the only place that step is
+    specified.  Prose alone would rot silently, so each fact below is asserted
+    against the module that produces it rather than merely grepped for.
+    """
+
+    def protocol(self):
+        from vibe_guide.protocols import load_protocol
+        return load_protocol("prd-guide")
+
+    def test_protocol_documents_serving_the_provider_mailbox(self):
+        text = self.protocol()
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        for name in ("pending", "complete"):
+            self.assertTrue(callable(getattr(ProviderActionStore, name)), name)
+            self.assertIn("{}(".format(name), text, name)
+        # The directory a host agent has to read, spelled as the store spells it.
+        self.assertIn(".vibe/provider-actions/", text)
+        self.assertIn("action_id", text)
+        self.assertIn("native_tool", text)
+
+    def test_protocol_names_every_operation_the_mailbox_can_request(self):
+        from vibe_guide.adapters.task_provider import _PROVIDER_ACTIONS
+        text = self.protocol()
+        for operation in _PROVIDER_ACTIONS:
+            self.assertIn("`{}`".format(operation), text, operation)
+
+    def test_protocol_write_back_shapes_match_the_runner_contract(self):
+        """The keys `vibe` reads out of a result payload, verbatim.
+
+        `create` is the one that matters: the runner rejects a result whose
+        binding carries no task identity, and a host agent cannot discover
+        that from the request alone.
+        """
+        text = self.protocol()
+        for key in ("binding", "sessionId", "hostId", "located", "visible", "direct_enter", "cursor"):
+            self.assertIn(key, text, key)
+
+    def test_protocol_states_the_per_platform_dispatch_boundary(self):
+        """Unattended dispatch is a platform fact, not a vibe feature.
+
+        Both providers are wired, but only one creates a session without a
+        human click.  An open-source user reading this protocol has to learn
+        that before they plan around "authorize once and walk away".
+        """
+        from vibe_guide.runners.provider_action import NATIVE_TOOL_MAP
+        text = self.protocol()
+        for provider, tools in NATIVE_TOOL_MAP.items():
+            self.assertIn(provider, text, provider)
+            for operation, tool in tools.items():
+                self.assertIn(tool, text, "{}/{}".format(provider, operation))
+
+    def test_protocol_does_not_promise_unattended_claude_code_dispatch(self):
+        """The measured Claude Code behaviour has to survive a doc edit.
+
+        `spawn_task` proposes a task and shows the user a card; it returns a
+        `task_id`, never a session.  Anyone who writes "fully automatic" back
+        into this section has contradicted the probe in
+        docs/superpowers/raw/2026-09-18-claude-code-visible-dispatch-probe.md.
+        """
+        text = self.protocol()
+        self.assertIn("task_id", text)
+        marker = "无人值守"
+        self.assertIn(marker, text)
+        window = text[text.index("ccd_session__spawn_task"):]
+        self.assertRegex(window[:1200], r"需要.{0,12}(点|确认)")
+
+
 class _ProjectCase(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="v45-prd-guide-"))
