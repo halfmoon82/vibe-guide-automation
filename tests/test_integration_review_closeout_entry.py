@@ -20,11 +20,13 @@ from types import SimpleNamespace
 
 from vibe_guide.cli import render_v41_closeout_status, run_cli
 from vibe_guide.evidence import (
+    INTEGRATION_REVIEW_CLAIM_KEYS,
     build_integration_review_evidence,
     evaluate_v41_closeout,
     validate_integration_review_evidence,
 )
 from vibe_guide.paths import ProjectPaths
+from vibe_guide.protocols import load_protocol
 from vibe_guide.adapters.task_provider import ProviderActionStore
 from vibe_guide.state import load_snapshot
 
@@ -150,6 +152,32 @@ class CloseoutTextTests(unittest.TestCase):
         text = render_v41_closeout_status(snapshot)
         self.assertIn("未闭合", text)
         self.assertIn("不可验收", text)
+
+
+class ProtocolDocumentsTheClaimTests(unittest.TestCase):
+    """The host agent can only send the right shape if the protocol says it.
+
+    Anchored to the one subsection that owns the fact, so a key added to
+    `INTEGRATION_REVIEW_CLAIM_KEYS` without a protocol update turns this red
+    instead of silently letting reviewers report an unaccepted shape.
+    """
+
+    SECTION_HEADING = "#### 整合审查节点的 accepted"
+
+    def section(self):
+        text = load_protocol("prd-guide")
+        self.assertIn(self.SECTION_HEADING, text)
+        return text.split(self.SECTION_HEADING, 1)[1].split("\n### ", 1)[0]
+
+    def test_every_claim_key_the_code_requires_is_documented(self):
+        section = self.section()
+        for key in INTEGRATION_REVIEW_CLAIM_KEYS:
+            self.assertIn(key, section)
+
+    def test_the_derived_fields_are_documented_as_not_the_reviewers_to_send(self):
+        section = self.section()
+        self.assertIn("run_id", section)
+        self.assertIn("clearance", section)
 
 
 class MailboxClosesTheRunTests(unittest.TestCase):

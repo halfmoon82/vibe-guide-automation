@@ -186,7 +186,7 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 | `visibility` | `{"visible": true, "direct_enter": true}` |
 | `wait`（还没干完） | `{"status": "timeout", "cursor": "<最后一条事件的游标>"}` |
 | `wait`（干完了，developer） | `{"status": "completed", "cursor": "<游标>", "event": "complete", "delivery_evidence": {"completion_marker": "<完成标记>", "delivery_path": "<交付物路径>", "thread_status": "complete"}}` |
-| `wait`（干完了，reviewer） | `{"status": "completed", "cursor": "<游标>", "event": "accepted", "evidence": "<P0–P2 清零证据>"}` |
+| `wait`（干完了，reviewer） | `{"status": "completed", "cursor": "<游标>", "event": "accepted", "evidence": "<P0–P2 清零证据>"}`；**整合审查节点例外**，`evidence` 必须是结构化判断，见下 |
 | `resume` | `{"resumed": true}`（会话 id 沿用原来的，**不要**回写绑定） |
 
 `wait` 的终态字段各有各的判定，缺一个就整轮作废：`status` 只认
@@ -206,6 +206,25 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
   而顶层看起来只是还在等。
 - **reviewer** 要 `evidence`：`accepted` 之后没有它，节点被判
   `review acceptance has no registered P0-P2 clearance evidence`。
+
+#### 整合审查节点的 accepted：`evidence` 必须是结构化判断
+
+最后那个 `integration-review` 节点的 `accepted` 不只是收下一个节点，它是**整个 run 的验收**：vibe 收到它才写 run 级的整合审查证据包，顶层才从 `running` 走到 `complete`。所以这一个节点的 `evidence` 不能是一句话，必须是一个对象，**恰好四个键**：
+
+```json
+{
+  "findings": [{"severity": "p0|p1|p2", "status": "open|resolved|accepted|waived", "detail": "<一句话>"}],
+  "iteration_compatibility": {"status": "verified|compatible|reviewed", "evidence": "<怎么核实的>"},
+  "test_runtime_delivery": {"status": "verified|reviewed", "evidence": "<怎么核实的>"},
+  "out_of_scope": ["<聚合范围之外被改动的东西>"]
+}
+```
+
+- 全部清零就是 `findings: []`、`out_of_scope: []`。还有 `status` 为 `open` 的 findings 时不要报 `accepted`——报了会被判
+  `integration review acceptance still reports open P0-P2 findings`，节点落到 `blocked_unknown`。有未清的问题应当报 `review_finding` 事件，让整合审查返工。
+- **只能给这四个键，多一个就是 schema 错误**。`run_id`、`plan_id`、`plan_revision`、四个 digest、`aggregated_scope`、`clearance`、`agentsmd_acceptance_refs`、`unverified_or_excluded` 全部由 vibe 从 run 自己和计划的整合合同派生。这不是省事：审查者不能改写它被追责的血缘，也不能缩小它被要求覆盖的范围。
+- 键名错、少键、或者给一个字符串，节点会落到 `blocked_unknown` 并写明
+  `integration review evidence cannot be derived (...)`。这是可见的阻塞，不是静默失败——但顶层仍然只是没到 `complete`，所以看到 run 长时间停在 `running` 时先查这个节点的状态和理由。
 
 **`cursor` 在复杂计划的 developer 终态里也是必需的**：绑定上的游标只有你回写时
 才会被写进去（`provider_action.py:1153-1160`），不给就等于绑定没有游标，交付证据门

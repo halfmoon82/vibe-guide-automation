@@ -82,6 +82,7 @@ from .checkpoint import (
 from .brief import ImplementationBrief, validate_implementation_brief
 from .manifest import RunManifest
 from .evidence import (
+    build_integration_review_evidence,
     evaluate_v41_closeout,
     evaluate_delivery_evidence,
     record_integration_review as _record_integration_review,
@@ -3016,6 +3017,43 @@ class Monitor:
             raise ValueError("event task binding is stale")
         return binding
 
+    def _record_integration_acceptance(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        claim: Any,
+    ) -> Optional[str]:
+        """Write the run-level review package, or say why it cannot be written.
+
+        The integration reviewer's acceptance is the only production entry point
+        for ``integration_review_evidence``: without this write a run whose every
+        node is accepted still reports "integration review evidence is missing"
+        and never leaves ``running``.  The acceptance references and the permanent
+        exclusions come from the plan's integration contract rather than from the
+        reviewer, so a reviewer cannot shrink the scope it is held to.  Returns
+        ``None`` on success and a reason otherwise, so each caller can fail closed
+        in its own idiom.
+        """
+        contract = getattr(self.plan, "integration_contract", None)
+        if not isinstance(contract, dict):
+            contract = {}
+        refs = contract.get("agentsmd_acceptance_refs") or getattr(
+            self.plan, "agentsmd_acceptance_refs", []
+        )
+        excluded = contract.get("unverified_or_excluded") or getattr(
+            self.plan, "unverified_or_excluded", []
+        )
+        try:
+            package = build_integration_review_evidence(
+                snapshot, claim, list(refs or []), list(excluded or [])
+            )
+        except (TypeError, ValueError) as error:
+            return "integration review evidence cannot be derived ({})".format(error)
+        if any(package["clearance"][severity] for severity in ("p0", "p1", "p2")):
+            return "integration review acceptance still reports open P0-P2 findings"
+        _record_integration_review(snapshot, package)
+        return None
+
     def _apply_event(
         self,
         snapshot: RunSnapshot,
@@ -3306,7 +3344,18 @@ class Monitor:
                     "review acceptance has no registered P0-P2 clearance evidence",
                 )
                 return
-            current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
+            if node_id == "integration-review":
+                # The acceptance of this node is the run-level closeout, so the
+                # clearance is whatever the derived package says rather than an
+                # assumed zero; `_record_integration_acceptance` writes both.
+                reason = self._record_integration_acceptance(
+                    snapshot, node_id, evidence
+                )
+                if reason is not None:
+                    self._mark_blocked_unknown(snapshot, node_id, reason)
+                    return
+            else:
+                current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
             self._archive_pair(snapshot, node_id)
             self._release_node_lease(snapshot, node_id)
         elif event.event in {"unknown", "timeout", "state_unknown", "visibility_unknown"}:
@@ -4164,6 +4213,16 @@ class Monitor:
                     current["status"] = "blocked_unknown"
                     current["reason"] = (
                         "review acceptance has no registered P0-P2 clearance evidence"
+                    )
+                elif node_id == "integration-review":
+                    # The appended event keeps only redacted provider text, so the
+                    # reviewer's structured claim cannot be rebuilt here.  Rather
+                    # than close the run out on a package we would have to invent,
+                    # expose the gap and let the reviewer report the acceptance
+                    # again on a live handle.
+                    current["status"] = "blocked_unknown"
+                    current["reason"] = (
+                        "integration review acceptance must be reported again after recovery"
                     )
                 else:
                     current["review_clearance"] = {

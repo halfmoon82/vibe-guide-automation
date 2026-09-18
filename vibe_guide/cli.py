@@ -61,6 +61,7 @@ from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
 from .prd_profiles import evaluate_prd_checkpoints, validate_skill_profile
 from .engine_attestation import create_engine_attestation
+from .evidence import evaluate_v41_closeout
 from .installation import run_install, run_upgrade, migrate_state
 from .models import InstallRequest
 
@@ -667,14 +668,13 @@ def render_v41_closeout_status(snapshot: RunSnapshot) -> str:
         if any(str(item.get("status", "")).casefold() in {"accepted", "delivered"} for key, item in nodes.items() if key != "integration-review"):
             return "局部节点完成：等待整合 Review"
         return "整合 Review 未闭合/不可验收"
-    evidence = getattr(snapshot, "integration_review_evidence", {}) or {}
-    evidence_ok = (
-        isinstance(evidence, dict)
-        and str(evidence.get("status", "")).casefold() in {"accepted", "approved", "passed"}
-        and isinstance(evidence.get("p0_p2", evidence.get("clearance")), dict)
-        and all(evidence.get("p0_p2", evidence.get("clearance", {})).get(k) == 0 for k in ("p0", "p1", "p2"))
-    )
-    if (status == "accepted" and evidence_ok) or (getattr(snapshot, "status", "") == "complete" and integration and evidence_ok):
+    # The acceptance text must agree with the closeout decision, so it reads
+    # the same `clearance` key the validator requires and the same evidence the
+    # snapshot gate checks.  Reading invented names here (`status`, `p0_p2`)
+    # made the text say "未闭合" for runs that had legitimately closed out,
+    # because the validator's exact key set forbids both of them.
+    decision = evaluate_v41_closeout(snapshot)
+    if integration and decision.allowed:
         auth = getattr(snapshot, "authorization", {}) or {}
         remote = auth.get("remote_git_actions") if isinstance(auth, dict) else getattr(auth, "remote_git_actions", "deny")
         if remote != "allow":
