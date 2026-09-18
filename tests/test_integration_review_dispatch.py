@@ -12,9 +12,13 @@ import re
 import unittest
 from pathlib import Path
 
-from vibe_guide import monitor
+from vibe_guide import authorization, monitor
 from vibe_guide.authorization import _normalize_files, validate_runtime_contract
-from vibe_guide.dag import append_integration_review_node
+from vibe_guide.dag import (
+    INTEGRATION_REVIEW_SCOPE_LIMIT,
+    INTEGRATION_REVIEWER_ID,
+    append_integration_review_node,
+)
 from vibe_guide.diagnostics import validate_child_session_binding
 from vibe_guide.models import (
     INTEGRATION_REVIEW_NODE_ID,
@@ -469,6 +473,60 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
             if n.id == INTEGRATION_REVIEW_NODE_ID
         ).contract["files"]
         self.assertEqual(scope, ["src/ok.ts"], scope)
+
+    def test_both_dispatch_paths_name_the_same_writer(self):
+        """The reviewer identity must not depend on which branch built it.
+
+        A non-empty union leaves the profile to the monitor, which reads
+        `contract["worker"]` -- a key this node never had, and one `_start_task`
+        has already set to `None` by then, so the dispatched contract carries the
+        literal string `"None"` as its writer.  An empty union takes the injected
+        profile and gets something else again.  Naming `worker`/`writer` on the
+        contract, as `complete_node_contracts` does for business nodes, makes
+        both paths agree.
+        """
+        for files in ([], ["src/a.ts"]):
+            plan = Plan(
+                "plan-13",
+                1,
+                "prd.md",
+                ["a"],
+                "draft",
+                nodes=[_business_node("a", files)],
+                spec_path="spec.md",
+                complexity_band="complex",
+                integration_contract=_integration_contract(["a"]),
+            )
+            contract = next(
+                n for n in append_integration_review_node(plan).nodes
+                if n.id == INTEGRATION_REVIEW_NODE_ID
+            ).contract
+            self.assertEqual(contract.get("worker"), INTEGRATION_REVIEWER_ID, files)
+            self.assertEqual(contract.get("writer"), INTEGRATION_REVIEWER_ID, files)
+            profile = contract.get("worker_profile")
+            if profile is not None:
+                self.assertEqual(profile["writer"], INTEGRATION_REVIEWER_ID, files)
+
+    def test_the_scope_limit_tracks_the_validator_that_enforces_it(self):
+        """Two spellings of one bound drift silently.
+
+        `INTEGRATION_REVIEW_SCOPE_LIMIT` exists only to stay inside
+        `authorization._normalize_files`.  Nothing else ties them together, so
+        lowering that validator's cap leaves every plan with a large union
+        unpublishable while this module keeps building one.
+        """
+        source = Path(authorization.__file__).read_text(encoding="utf-8")
+        # Scoped to `_normalize_files`: the neighbouring action-list check has a
+        # bound of its own that has nothing to do with file scope.
+        start = source.index("def _normalize_files(")
+        body = source[start:source.index("\ndef ", start + 1)]
+        caps = re.findall(r"len\(value\) > (\d+)", body)
+        self.assertEqual(
+            caps,
+            [str(INTEGRATION_REVIEW_SCOPE_LIMIT)],
+            "_normalize_files caps file lists at {} but this module coarsens at "
+            "{}".format(caps, INTEGRATION_REVIEW_SCOPE_LIMIT),
+        )
 
     def test_conflicting_project_ids_fail_closed(self):
         """Taking the first of two is worse than refusing.
