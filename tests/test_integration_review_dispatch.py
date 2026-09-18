@@ -16,7 +16,14 @@ from vibe_guide import monitor
 from vibe_guide.authorization import _normalize_files, validate_runtime_contract
 from vibe_guide.dag import append_integration_review_node
 from vibe_guide.diagnostics import validate_child_session_binding
-from vibe_guide.models import INTEGRATION_REVIEW_NODE_ID, DAGNode, Plan, WorkerProfile
+from vibe_guide.models import (
+    INTEGRATION_REVIEW_NODE_ID,
+    DAGNode,
+    Plan,
+    WorkerProfile,
+    node_branch,
+    node_worktree,
+)
 
 
 def _business_node(node_id, files):
@@ -373,6 +380,62 @@ class IntegrationReviewDispatchTests(unittest.TestCase):
             if n.id == INTEGRATION_REVIEW_NODE_ID
         ).contract["files"]
         self.assertEqual(sorted(scope), ["lib", "src"], scope)
+
+    def test_too_many_top_level_directories_fail_closed(self):
+        """Coarsening must not truncate either, one level up.
+
+        Cutting the directory list at the same bound reintroduces exactly the
+        hole coarsening exists to avoid, and loses whole subtrees rather than
+        single files while still producing a well-formed contract.  There is no
+        third level to collapse to (`"."` is not a legal `files` entry), so the
+        honest answer is to refuse the plan.
+        """
+        files = ["d%d/f.ts" % i for i in range(300)]
+        plan = Plan(
+            "plan-11",
+            1,
+            "prd.md",
+            ["a", "b"],
+            "draft",
+            nodes=[
+                _business_node("a", files[:150]),
+                _business_node("b", files[150:]),
+            ],
+            spec_path="spec.md",
+            complexity_band="complex",
+            integration_contract=_integration_contract(["a", "b"]),
+        )
+        with self.assertRaises(ValueError) as caught:
+            append_integration_review_node(plan)
+        self.assertIn("scope", str(caught.exception))
+
+    def test_the_review_session_gets_the_derived_worktree_and_branch(self):
+        """The profile must name the node's own tree, not the project root.
+
+        Protocol §6.3 has the platform open the session at
+        `child_binding.worktree`, and vibe derives a distinct one per node
+        (`models.node_worktree`).  `contract` has no `worktree` key yet at this
+        point -- the monitor setdefaults it later -- so a `contract.get(...,
+        ".")` fallback always fires and would send the reviewer into the main
+        working tree on a branch vibe never generates.
+        """
+        plan = Plan(
+            "plan-12",
+            1,
+            "prd.md",
+            ["a"],
+            "draft",
+            nodes=[_business_node("a", [])],
+            spec_path="spec.md",
+            complexity_band="complex",
+            integration_contract=_integration_contract(["a"]),
+        )
+        profile = next(
+            n for n in append_integration_review_node(plan).nodes
+            if n.id == INTEGRATION_REVIEW_NODE_ID
+        ).contract["worker_profile"]
+        self.assertEqual(profile["worktree"], node_worktree(INTEGRATION_REVIEW_NODE_ID))
+        self.assertEqual(profile["branch"], node_branch(INTEGRATION_REVIEW_NODE_ID))
 
     def test_home_relative_paths_are_dropped(self):
         """`~/x` is not project-relative, and nothing downstream catches it.
