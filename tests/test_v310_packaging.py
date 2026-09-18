@@ -35,6 +35,66 @@ class PackagingV310Tests(unittest.TestCase):
         source = (ROOT / "vibe_guide" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn(f'__version__ = "{TARGET_VERSION}"', source)
 
+    def test_the_version_the_installer_reports_is_the_package_version(self):
+        """`vibe install` must not announce a different release than it is.
+
+        This was a second hardcoded literal, three minors behind: a fresh
+        install of 4.5.0 reported 4.2.2, and `inspect_compatibility` compared
+        that stale value against a project's recorded config version, reading
+        the package's own projects as "mixed".
+        """
+        from vibe_guide.installation import PACKAGE_VERSION, inspect_compatibility
+        self.assertEqual(PACKAGE_VERSION, TARGET_VERSION)
+        source = (ROOT / "vibe_guide" / "installation.py").read_text(encoding="utf-8")
+        self.assertNotRegex(
+            source,
+            r'PACKAGE_VERSION\s*=\s*[\'"]',
+            "PACKAGE_VERSION must derive from __version__, not a literal",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".vibe").mkdir()
+            (root / ".vibe" / "config.json").write_text(
+                json.dumps({"version": TARGET_VERSION}), encoding="utf-8"
+            )
+            report = inspect_compatibility(root)
+        self.assertEqual(report["status"], "compatible", report)
+        self.assertFalse(report["mixed"], report)
+
+    def test_the_migration_namespace_is_not_tied_to_the_release(self):
+        """A namespace is a directory on disk, so its name must stay put.
+
+        Deriving it from the version would make every release write a new
+        directory and stop reading the ones earlier releases created.
+        """
+        from vibe_guide.installation import MIGRATION_NAMESPACE, migration_preview
+        with tempfile.TemporaryDirectory() as tmp:
+            preview = migration_preview(Path(tmp))
+        self.assertEqual(preview["target_namespace"], MIGRATION_NAMESPACE)
+        self.assertNotIn(TARGET_VERSION, MIGRATION_NAMESPACE)
+        # One definition, because writer and reader must agree: `migrate_state`
+        # creates this directory and `rollback_state` looks for it.  While the
+        # name was built from the version at four separate sites, deriving it
+        # made rollback search a directory migration had never written.
+        source = (ROOT / "vibe_guide" / "installation.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count('"v44-'), 1, "namespace name is defined more than once")
+
+    def test_migrated_state_can_be_rolled_back(self):
+        """Writer and reader of the namespace must resolve the same path.
+
+        A split definition left this green in isolation and only failed here,
+        because the two halves are in different functions.
+        """
+        from vibe_guide.installation import migrate_state, rollback_state
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".vibe").mkdir()
+            (root / ".vibe" / "state.json").write_text('{"workflow_version": 2}', encoding="utf-8")
+            self.assertEqual(migrate_state(root)["status"], "complete")
+            rolled = rollback_state(root)
+        self.assertEqual(rolled["status"], "complete", rolled)
+        self.assertTrue(rolled["current_namespace_preserved"], rolled)
+
     def _build_artifacts(self, out_dir):
         _run([sys.executable, "setup.py", "bdist_wheel", "--dist-dir", str(out_dir)], cwd=ROOT)
         _run([sys.executable, "setup.py", "sdist", "--dist-dir", str(out_dir)], cwd=ROOT)

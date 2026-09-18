@@ -87,7 +87,11 @@ class InstallationContractTests(unittest.TestCase):
             (root / ".vibe" / "config.json").write_text(json.dumps({"version": "2.0.0"}))
             result = run_upgrade(InstallRequest("layered", True, root), ProjectPaths(root), lambda *_: {"status": "approved"}, lambda *_: {"status": "verified"})
             self.assertEqual(result.version_before, "2.0.0")
-            self.assertEqual(result.migration["target_version"], "4.2.2")
+            # The version upgraded *to* is whatever this package is, so this
+            # reads it rather than restating it; a literal here is what let
+            # the installer report a three-minor-old release.
+            from vibe_guide import __version__
+            self.assertEqual(result.migration["target_version"], __version__)
 
 
 if __name__ == "__main__":

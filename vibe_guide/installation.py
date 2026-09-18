@@ -6,11 +6,22 @@ from pathlib import Path
 import tempfile
 from typing import Any, Callable, Dict, Optional
 
+from . import __version__
 from .models import InstallRequest, InstallResult
 
 PHASES = ("preflight", "probe", "authorize", "backup", "migrate", "finalize")
 _STATUSES = {"complete", "blocked_unknown", "blocked_invalid", "retry_pending", "failed"}
-PACKAGE_VERSION = "4.2.2"
+#: The running package's own version.  `vibe install` reports this to the user
+#: and `inspect_compatibility` compares it with the version recorded in a
+#: project's config, so a second literal here means a fresh install of 4.5.0
+#: announces an older release and reads its own projects as "mixed".
+PACKAGE_VERSION = __version__
+
+#: The migration namespace directory, which is a path on disk.  It is
+#: deliberately not derived from the version: every release writing its own
+#: name would strand the directories earlier releases created, and nothing
+#: reads a namespace other than the current name.
+MIGRATION_NAMESPACE = "v44-4.2.2"
 
 
 def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -237,7 +248,7 @@ def inspect_compatibility(project_root):
 
 def migration_preview(project_root):
     report = inspect_compatibility(project_root); root = Path(project_root).expanduser().resolve(strict=False)
-    return {"status":"preview", "read_only":True, "source":str(root/".vibe"), "target_namespace":f"v44-{PACKAGE_VERSION}", "compatibility":report, "actions":["preserve legacy .vibe artifacts", "create isolated current namespace"]}
+    return {"status":"preview", "read_only":True, "source":str(root/".vibe"), "target_namespace":MIGRATION_NAMESPACE, "compatibility":report, "actions":["preserve legacy .vibe artifacts", "create isolated current namespace"]}
 
 def migrate_state(project_root, *, preview=False):
     result = migration_preview(project_root)
@@ -245,7 +256,7 @@ def migrate_state(project_root, *, preview=False):
     import hashlib, shutil
     root = Path(project_root).expanduser().resolve(strict=False); vibe = root/".vibe"; source = vibe/"state.json"
     if not source.exists(): return {**result, "status":"complete", "migrated":False, "evidence":"no legacy state"}
-    namespace = vibe/"namespaces"/f"v44-{PACKAGE_VERSION}"; namespace.mkdir(parents=True, exist_ok=True)
+    namespace = vibe/"namespaces"/MIGRATION_NAMESPACE; namespace.mkdir(parents=True, exist_ok=True)
     history = namespace/"history"; history.mkdir(exist_ok=True)
     copied=[]
     # Historical artifacts are copied, never moved or overwritten.
@@ -279,7 +290,7 @@ def rollback_state(project_root):
     """Restore legacy history recursively with fail-closed conflict checks."""
     import hashlib, shutil
     root=Path(project_root).expanduser().resolve(strict=False); vibe=root/".vibe"; evidence_path=vibe/"rollback_evidence.json"
-    history=vibe/"namespaces"/f"v44-{PACKAGE_VERSION}"/"history"; current=vibe/"namespaces"/f"v44-{PACKAGE_VERSION}"
+    history=vibe/"namespaces"/MIGRATION_NAMESPACE/"history"; current=vibe/"namespaces"/MIGRATION_NAMESPACE
     source=vibe/"state.json"; before_source=hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else None
     current_before=_tree_hash(current); rollback=vibe/"rollback"; target_before=_tree_hash(rollback); restored=[]; conflicts=[]
     if not history.is_dir():
