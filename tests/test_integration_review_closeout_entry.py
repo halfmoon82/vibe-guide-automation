@@ -29,7 +29,7 @@ from vibe_guide import monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.protocols import load_protocol
 from vibe_guide.adapters.task_provider import ProviderActionStore
-from vibe_guide.state import load_snapshot
+from vibe_guide.state import durable_projection, load_snapshot
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pm-path" / "product-spec.json"
 REQUEST = "设计并实现保单查看页的 PDF 导出，集成日期范围筛选、编写测试并部署"
@@ -106,6 +106,67 @@ class IntegrationReviewPackageDerivationTests(unittest.TestCase):
         ])
         self.assertEqual(self.build(claim)["clearance"], {"p0": 0, "p1": 1, "p2": 0})
 
+    def test_only_a_resolved_finding_clears_so_a_reviewer_cannot_waive_its_own_p0(self):
+        """`waived`/`accepted` are not clearances the reviewer may grant itself.
+
+        Both spellings were registered as legal statuses while only `open` was
+        counted, so `{"severity": "p0", "status": "waived"}` derived an all-zero
+        clearance and closed the run out -- a self-served waiver with no human
+        authorization.  Only `resolved` may clear a finding.
+        """
+        for status in ("waived", "accepted", "open"):
+            claim = dict(CLEARED_CLAIM, findings=[
+                {"severity": "p0", "status": status, "detail": "资金结算路径没验证"},
+            ])
+            self.assertEqual(self.build(claim)["clearance"], {"p0": 1, "p1": 0, "p2": 0}, msg=status)
+
+    def test_an_unregistered_finding_status_or_severity_fails_closed(self):
+        for finding in (
+            {"severity": "p0", "status": "unresolved", "detail": "x"},
+            {"severity": "p0", "status": "pending", "detail": "x"},
+            {"severity": "p0", "detail": "x"},
+            {"severity": "critical", "status": "open", "detail": "x"},
+            {"severity": "p3", "status": "open", "detail": "x"},
+            {"status": "open", "detail": "x"},
+            "p0 open",
+        ):
+            with self.assertRaises(ValueError, msg=finding):
+                self.build(dict(CLEARED_CLAIM, findings=[finding]))
+
+    def test_a_verdict_must_carry_text_the_disk_can_keep(self):
+        """A nested object under `evidence` cannot survive persistence.
+
+        `state.py` redacts any value whose key is `evidence`, and for a dict it
+        drops the keys that look sensitive -- so `{"secret_scan": "clean"}`
+        persisted as `{}`, which the reload-time validator rejects.  The run
+        announced `complete` once and then silently rolled back to the previous
+        snapshot.  Reject the shape instead.
+        """
+        for verdict in (
+            {"status": "verified", "evidence": {"secret_scan": "clean"}},
+            {"status": "verified", "evidence": ["checked"]},
+            {"status": "verified", "evidence": True},
+            {"status": "verified", "evidence": ""},
+            {"status": "verified"},
+        ):
+            with self.assertRaises(ValueError, msg=verdict):
+                self.build(dict(CLEARED_CLAIM, iteration_compatibility=verdict))
+            with self.assertRaises(ValueError, msg=verdict):
+                self.build(dict(CLEARED_CLAIM, test_runtime_delivery=verdict))
+
+    def test_the_derived_package_still_validates_after_persistence_redacts_it(self):
+        """What is written must be what can be read back.
+
+        The durable copy keeps the lineage and the clearance but replaces every
+        provider text with a placeholder, so the package has to stay valid under
+        that projection or the completed run becomes unloadable.
+        """
+        snapshot = _snapshot()
+        package = self.build(dict(CLEARED_CLAIM, findings=[
+            {"severity": "p2", "status": "resolved", "detail": "已修"},
+        ]), snapshot)
+        validate_integration_review_evidence(snapshot, durable_projection(package))
+
     def test_out_of_scope_changes_are_rejected(self):
         with self.assertRaises(ValueError):
             self.build(dict(CLEARED_CLAIM, out_of_scope=["docs/unrelated.md"]))
@@ -168,7 +229,7 @@ class ProtocolDocumentsTheClaimTests(unittest.TestCase):
     def section(self):
         text = load_protocol("prd-guide")
         self.assertIn(self.SECTION_HEADING, text)
-        return text.split(self.SECTION_HEADING, 1)[1].split("\n### ", 1)[0]
+        return text.split(self.SECTION_HEADING, 1)[1].split("\n#", 1)[0]
 
     def test_every_claim_key_the_code_requires_is_documented(self):
         section = self.section()
@@ -287,6 +348,45 @@ class MailboxClosesTheRunTests(unittest.TestCase):
         self.assertNotEqual(result.payload["status"], "complete", result.payload)
         self.assertEqual(snapshot.nodes["integration-review"]["status"], "blocked_unknown")
         self.assertEqual(snapshot.integration_review_evidence, {})
+
+    def test_a_waived_finding_does_not_close_the_run(self):
+        claim = dict(CLEARED_CLAIM, findings=[
+            {"severity": "p0", "status": "waived", "detail": "资金结算路径没验证，本轮先放行"},
+        ])
+        result, snapshot = self.serve(claim)
+        self.assertNotEqual(result.payload["status"], "complete", result.payload)
+        self.assertEqual(snapshot.nodes["integration-review"]["status"], "blocked_unknown")
+        self.assertEqual(snapshot.integration_review_evidence, {})
+
+    def test_a_verdict_the_disk_cannot_keep_never_reports_complete(self):
+        """The CLI must not announce a closeout the next read rolls back.
+
+        With a nested object under `evidence` the first serve reported
+        `complete`, then `load_snapshot` rejected the persisted package and fell
+        back to the previous snapshot -- so the acceptance was lost and the run
+        reverted to `blocked_unknown` for good.
+        """
+        claim = dict(CLEARED_CLAIM,
+                     iteration_compatibility={"status": "verified", "evidence": {"secret_scan": "clean"}})
+        result, snapshot = self.serve(claim)
+        self.assertNotEqual(result.payload["status"], "complete", result.payload)
+        self.assertEqual(snapshot.nodes["integration-review"]["status"], "blocked_unknown")
+        self.assertEqual(snapshot.integration_review_evidence, {})
+
+    def test_the_scope_the_reviewer_is_held_to_comes_from_the_plan(self):
+        """The reviewer never sends these two lists, so the plan must supply them.
+
+        Hardcoding either one in the monitor left every other assertion green,
+        which is the whole claim of this change ("a reviewer cannot shrink the
+        scope it is held to") going untested.
+        """
+        _, snapshot = self.serve(CLEARED_CLAIM)
+        plan = json.loads((self.root / ".vibe" / "plans" / "closeout" / "plan.json").read_text(encoding="utf-8"))
+        contract = plan["integration_contract"]
+        package = snapshot.integration_review_evidence
+        self.assertEqual(package["agentsmd_acceptance_refs"], contract["agentsmd_acceptance_refs"])
+        self.assertEqual(package["unverified_or_excluded"], contract["unverified_or_excluded"])
+        self.assertTrue(contract["unverified_or_excluded"], contract)
 
     def test_a_crash_before_the_acceptance_is_saved_recovers_by_re_reporting(self):
         """Recovery cannot rebuild the claim, so it asks for it again.
