@@ -243,3 +243,81 @@ round 2: 服务 visibility×2  → resume=running        信箱清空
   两个节点同时接**真实会话**仍待实测——真实那次只派了一个节点，第二个留在 pending
 - reviewer 角色的派发（本次只有 developer）
 - 一个 run 走到 `complete`（本次停在两节点其一）
+
+## 2026-09-21 补测：一个 run 走到 `complete`（全 fake 回写，无真实会话）
+
+基底 main `cc8f8d4`（#49）。探针项目是独立 git 仓库 `/tmp/vg-journey-20260921`
+（main `f5a061b`，两个节点 worktree 已按 `child_binding` 建好），run
+`run-8efee9bdae9e4201bc60e1f39bcee64a`，计划 `journey`（complex，两个并行节点
+`export-button`、`date-range-filter` + `integration-review`）。
+
+**先说没做到的**：原定混合方案（前 3 个会话真实、后 3 个 fake）没有执行。桌面端
+`fn__ccd_*` 工具在连续三个会话里都不可用——ToolSearch 能列出名字并显示 "Tool loaded"，
+实际调用一律返回 `No such tool available: <去掉前缀的短名>`（会话 1 六次、会话 2 三次、
+会话 3 一次，涉及 `session_mgmt` 与 `session` 两组）。这是桌面 app 的工具桥没接进会话，
+与 vibe-guide 无关，也与 Codex 适配器无关（ccd 只被 `claude-code` 适配器使用）。
+用户决定改走全 fake。**所以本节证明的只是回写契约与推进逻辑，六个会话全部没有真实落点。**
+
+### 实际发生的序列
+
+30 次信箱回写、27 次 `resume`，每个（节点 × 角色）恰好 5 个操作：
+`create → locate → visibility → wait(timeout) → wait(completed)`。
+
+| 轮 | 服务的请求 | resume 顶层 | 节点状态（被服务的节点） |
+|---|---|---|---|
+| create×2（developer） | 回写 `{"binding": {"task_id","host"}}` | `retry_pending` | `running` |
+| locate×2 | `{"located": true}` | `retry_pending` | `running` |
+| visibility×2 | `{"visible": true, "direct_enter": true}` | `running` | `running`，**信箱清空** |
+| （不服务，再 resume 一次） | — | `blocked_unknown` | `blocked_unknown`，此时才派出 `wait` |
+| wait×2 第一次 | `{"status": "timeout", "cursor"}` | `running` | `retry_pending`，信箱清空 |
+| （再 resume 一次） | — | `blocked_unknown` | `blocked_unknown`，重新派出 `wait` |
+| wait×2 第二次 | `completed` + `event: complete` + `delivery_evidence` | `retry_pending` | `running`，随即派出 reviewer 的 `create` |
+| reviewer 五步同上（visibility 服务完节点是 `review` 而不是 `running`） | wait 第二次回 `event: accepted` + `evidence: "<一句话>"` | `retry_pending` | 两节点 `accepted`，`integration-review` 变 `running` 并派出 create |
+| integration-review developer 五步 | 同 developer | `retry_pending` | `running` |
+| integration-review reviewer 五步 | wait 第二次回 `accepted` + 四键 evidence | **`complete`** | 三个节点全 `accepted` |
+
+落盘核实：`load_snapshot` 的 `status == "complete"`；`integration_review_evidence` 含
+`clearance {"p0":0,"p1":0,"p2":0}`、`aggregated_scope.nodes == ["date-range-filter","export-button"]`、
+`prd_digest/spec_digest/node_contract_digest/authorization_digest` 等 15 个键；
+`evaluate_v41_closeout(snapshot).allowed == True`。
+
+### 观察到的事实（对照 09-18 的判断）
+
+1. **`blocked_unknown` 不只是"被拒"**。09-18 那节写"被拒是 `blocked_unknown`、被接受是 `running`"。
+   本次看到：`visibility` 或 `wait(timeout)` 服务完后信箱为空、顶层 `running`；**再 `resume` 一次**
+   监工才派出 `wait` 请求，并在 `wait` 未被回复期间把节点标成 `blocked_unknown`（fail-closed 等待态）。
+   所以看到节点 `blocked_unknown` 时要再看一眼 `pending()`：该节点有一条 `wait` 在等 → 是等待态；
+   没有任何请求在等 → 才是回写被拒。09-18 的判断在"刚回写完 create"这个时点仍然成立，
+   但不能推广到整条链路。
+2. **`wait` 是被 `resume` 触发才派出的，不是回写完上一步就自动进信箱**。服务信箱的一方要
+   在"信箱空且顶层 `running`"时主动再 `resume`，否则链路停在那里，看起来像"正常运行中"。
+3. **create 请求的 `prompt` 里没有节点标题、合同、文件、分支**。原文只有两句：
+   `请执行 developer 任务，Issue export-button。Capability contract: {...}` 和
+   `一致性纠偏证据必须原样绑定：{...digest×5...}`。节点的 allowlist / branch / worktree
+   在 `request.child_binding` 和 `request.worker_profile` 里，`request.target` 只有
+   `{"type":"project","projectId":...,"environment":{"type":"local"}}`，**没有 cwd**。
+   真实派发时，服务信箱的一方要自己从 `child_binding.worktree` 推出 `spawn_task` 的 cwd，
+   并自己把合同拼进 prompt——协议不替它做。这是一条契约事实，不是 bug 判定。
+4. **回写与回读的字段名不对称**：回写 create 用 `task_id`/`host`（`provider_action.py:509-510`），
+   之后的 `wait`/`locate` 请求里 `targets` 回显为 `[{"threadId": ..., "hostId": ...}]`。
+   两边都是对的，但抄错一侧就会静默被拒（09-18 已踩过）。
+5. **reviewer 的 evidence 两种形态都被接受**：普通节点一句话字符串；`integration-review`
+   必须恰好四键 `findings / iteration_compatibility / test_runtime_delivery / out_of_scope`
+   （协议原文 `prd-guide.md`「整合审查节点的 accepted」）。本次两种都用 fake 值，字符串内容
+   明写"fake：由脚本回写，未经真实会话"，落盘的 evidence 里也是这句。
+6. 本 run 全程**没有派出过 `resume` 操作**（信箱只出现 create/locate/visibility/wait 四种）。
+
+### 尚未验证（逐条对照 09-18 的清单）
+
+- `locate`（`open_session_in`）：本次只回了 fake `{"located": true}`，桌面工具没调。**仍未验证**。
+- `resume`（`send_message`）：本 run 没有派出该操作。**仍未验证**。
+- create 用**真实会话身份**回写：ccd 不可用。**仍未验证**。
+- `claude --bg` 登录路径、`claude agents --json` 运行中字段：本次没碰。**仍未验证**。
+- 两个节点同时接**真实会话**：**仍未验证**；两节点并行在 fake 下全程走完（本次是第二次）。
+- reviewer 角色的派发：**fake 下已走通**（四个 reviewer 会话），真实会话未验。
+- 一个 run 走到 `complete`：**fake 下已走通**，真实会话未验。
+
+fake 值约定：`task_id = "sess_" + action_id[:8]`、`host = "probe"`、
+`cursor = "c_" + action_id[:6] + "_" + n`，与
+`tests/test_integration_review_closeout_entry.py::MailboxClosesTheRunTests.reply` 一致。
+逐轮日志在探针目录 `journal.jsonl`（`/tmp`，不入库）。
