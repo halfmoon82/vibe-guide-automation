@@ -184,6 +184,87 @@ class PackagingV310Tests(unittest.TestCase):
             }
             self.assertEqual(json.loads(json.dumps(evidence))["target_version"], TARGET_VERSION)
 
+    def test_previous_release_to_current_upgrade_per_install_kind(self):
+        """The declared upgrade path is the last tagged release -> this one.
+
+        AGENTS.md's delivery rule wants wheel, sdist and source verified
+        separately and the upgrade verified along a named old->new path.
+        The 2.0.0 scenario above is synthetic; this one builds the previous
+        release from its git tag, so the artifacts on the old side are the
+        ones that were actually shipped, not a stand-in.
+        """
+        previous_version, previous_tag = _previous_release(self)
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            current_dist = temp / "current-dist"
+            current_dist.mkdir()
+            current_wheel, current_sdist = self._build_artifacts(current_dist)
+
+            previous_src = temp / "previous-src"
+            previous_src.mkdir()
+            archive = subprocess.run(
+                ["git", "archive", previous_tag],
+                cwd=ROOT, check=True, stdout=subprocess.PIPE,
+            )
+            subprocess.run(["tar", "-x", "-C", str(previous_src)], input=archive.stdout, check=True)
+            previous_dist = temp / "previous-dist"
+            previous_dist.mkdir()
+            _run([sys.executable, "setup.py", "bdist_wheel", "--dist-dir", str(previous_dist)], cwd=previous_src)
+            _run([sys.executable, "setup.py", "sdist", "--dist-dir", str(previous_dist)], cwd=previous_src)
+            previous_wheel = next(previous_dist.glob("*.whl"))
+            previous_sdist = next(previous_dist.glob("*.tar.gz"))
+            self.assertIn(previous_version, previous_wheel.name)
+            self.assertIn(previous_version, previous_sdist.name)
+
+            kinds = (
+                ("wheel", previous_wheel, current_wheel),
+                ("sdist", previous_sdist, current_sdist),
+                ("source", previous_src, ROOT),
+            )
+            evidence = {}
+            for label, old, new in kinds:
+                with self.subTest(install=label):
+                    python = self._new_venv(temp / label)
+                    _run([str(python), "-m", "pip", "install", "--no-deps", str(old)], cwd=temp / label)
+                    self._assert_installed(python, previous_version)
+                    _run([str(python), "-m", "pip", "install", "--no-deps", "--upgrade", str(new)], cwd=temp / label)
+                    self._assert_installed(python, TARGET_VERSION)
+                    _run([str(python), "-m", "pip", "install", "--no-deps", "--force-reinstall", str(old)], cwd=temp / label)
+                    self._assert_installed(python, previous_version)
+                    evidence[label] = {
+                        "source_version": previous_version,
+                        "target_version": TARGET_VERSION,
+                        "upgrade_verified": True,
+                        "rollback_verified": True,
+                    }
+            self.assertEqual(sorted(evidence), ["sdist", "source", "wheel"])
+
+
+def _previous_release(test):
+    """The highest `v*` tag below the version the package declares.
+
+    A checkout without git cannot name its predecessor, so it skips loudly; a
+    git checkout that has tags but none below the current version is a
+    release-hygiene failure, not a skip.
+    """
+    if not (ROOT / ".git").exists():
+        test.skipTest("not a git checkout: previous release tag unavailable")
+    listing = subprocess.run(
+        ["git", "tag", "--list", "v*"], cwd=ROOT, check=True, text=True, stdout=subprocess.PIPE,
+    ).stdout.split()
+    target = tuple(int(part) for part in TARGET_VERSION.split("."))
+    candidates = []
+    for tag in listing:
+        try:
+            parts = tuple(int(part) for part in tag[1:].split("."))
+        except ValueError:
+            continue
+        if len(parts) == 3 and parts < target:
+            candidates.append((parts, tag))
+    test.assertTrue(candidates, "no tagged release below %s to upgrade from" % TARGET_VERSION)
+    parts, tag = max(candidates)
+    return ".".join(str(part) for part in parts), tag
+
 
 if __name__ == "__main__":
     unittest.main()
