@@ -234,20 +234,24 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 
 1. 这个节点的 `status` 是 `blocked_unknown`，这一轮的顶层 `status` 也是（只要还有别的节点在
    重试，顶层会被改写成 `retry_pending`，它不告诉你是哪个节点，所以按节点看）。
-2. 你回写的那份 claim 被记在这个节点的 `evidence` 列表里（被拒的时候它是最后一条；清零那次
-   vibe 会在它后面再追加派生出来的证据包，所以最后一条是包不是 claim），
-   **键名保留、值打码**。所以**形状读得出来**：整条是一个字符串而不是对象，说明你给的是一句话；
+2. 你回写的那份 claim 被记在这个节点的 `evidence` 列表里，**键名保留、值打码**。
+   **被拒的时候它是最后一条；清零那次最后一条是派生出来的证据包，不是 claim**——清零时
+   vibe 会在 claim 后面再追加那个包。
+   所以**形状读得出来**：整条是一个字符串而不是对象，说明你给的是一句话；
    对象里少了 `out_of_scope`，就是少一个键；`iteration_compatibility.evidence` 是个对象而不是
-   字符串，说明你给了嵌套对象（里面键名看起来像敏感信息的键被逐个丢掉，只有每个键都像时
-   才会只剩 `{}`，混着写就还剩几个键）；
+   字符串，说明你给了嵌套对象
+   （嵌套对象里"看起来像敏感信息"的键被逐个丢掉，**只有每个键都像时才会只剩 `{}`，混着写还剩几个键**）；
    `out_of_scope` 是个非空列表，就是聚合范围之外有改动。
    **但值读不出来**：`findings[].status` 也被打码，`resolved` 和 `waived` 长得一样，而且清零的
    run 本来就可以带 `resolved` 的条目——所以 `findings` 非空**不代表**有没清零的项。
 
-形状合法却被拒，就是值的问题，而且盘上看不出来，只能对着你自己发出去的那份 claim 查这四条：
+形状合法却被拒，就是值的问题，而且盘上看不出来，只能对着你自己发出去的那份 claim 查这五条：
 
-- **只有 `resolved` 算清零**，`open` / `accepted` / `waived` 都计入 `clearance`。
-- **`out_of_scope` 必须是空列表**。
+- **`status` 写 `accepted` 或 `waived` 一样不算清零**，只有 `resolved` 清，其余全部计入 `clearance`。
+- **`out_of_scope` 非空就判 `integration aggregated scope contains out-of-scope changes`**，聚合范围之外改了东西必须先收回去，不能靠在这里列一笔了事。
+- **`evidence` 给空字符串、只有空格或换行、或者干脆不给这个键，和给嵌套对象一样被拒**，报的也是同一句
+  `... needs a status and a non-empty evidence string`。这条在盘上尤其看不出来：真话、`""`、`"   "`
+  打码后落盘完全一样，都是 `[REDACTED_PROVIDER_TEXT]`，所以只能回头查你发出去的原文。
 - **`findings[]` 的 `severity` 只收 `p0` / `p1` / `p2`，`status` 只收 `open` / `resolved` /
   `accepted` / `waived`**。写 `p3` 判 `integration finding schema is invalid`，写 `pending`
   判 `integration finding status is invalid`——都不是"多报一条"，是整包作废。

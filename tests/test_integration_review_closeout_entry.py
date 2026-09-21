@@ -257,9 +257,20 @@ class ProtocolDocumentsTheClaimTests(unittest.TestCase):
 
         Asserting "必须是非空字符串" alone passed even with this rule deleted:
         the `cursor` rule further down §6.2 uses the same words, and the
-        section window reaches it.  The message below exists only here.
+        section window reaches it.
+
+        The raised message is not unique to this row either -- the rejection
+        checklist below quotes the same sentence, so inverting this rule while
+        the checklist copy stands leaves a bare message assertion green.  So
+        the rule is also pinned on the clause only this row states.
         """
-        self.assertIn("needs a status and a non-empty evidence string", self.section())
+        section = self.section()
+        self.assertIn("needs a status and a non-empty evidence string", section)
+        self.assertIn(
+            "两个判断里的 `evidence` **必须是非空字符串**。给嵌套对象会被拒"
+            "（`... needs a status and a non-empty evidence string`）",
+            section,
+        )
 
     def test_the_protocol_does_not_promise_a_reason_string_the_disk_erases(self):
         """The rejection cause is real but unreadable, so the doc must say so.
@@ -295,10 +306,20 @@ class ProtocolDocumentsTheClaimTests(unittest.TestCase):
         `evidence` entry only on rejection: `record_integration_review` appends
         the derived package after it once the run clears.  Asserted here
         because the loose wording of each passed every other test in this class.
+
+        A bare substring on each condition was not enough either: the sentence
+        around `只有每个键都像时` could be inverted to say a mixed object is the
+        one that collapses, and the two cases in the `evidence`-entry rule could
+        be swapped, both while the asserted literal stayed verbatim.  Eight
+        in-memory mutations of this section survived the whole 64-test suite.
+        So each condition is pinned together with the case it belongs to, and
+        the inversion is asserted absent.
         """
         section = self.section()
-        self.assertIn("只有每个键都像时", section)
-        self.assertIn("最后一条是包不是 claim", section)
+        self.assertIn("只有每个键都像时才会只剩 `{}`，混着写还剩几个键", section)
+        self.assertNotIn("混着写才会剩 `{}`", section)
+        self.assertIn("被拒的时候它是最后一条；清零那次最后一条是派生出来的证据包，不是 claim", section)
+        self.assertNotIn("清零的时候它是最后一条", section)
 
     def test_the_protocol_warns_the_top_level_status_can_be_rewritten(self):
         """Reading the top level instead of the node is the wrong instinct.
@@ -323,12 +344,29 @@ class ProtocolDocumentsTheClaimTests(unittest.TestCase):
         `status` -- each of which lands `blocked_unknown` behind a redacted
         reason while the shape on disk stays perfectly legal.  Anchored on the
         raised messages, which appear nowhere else in the protocol.
+
+        The list is five rules now, not four.  An `evidence` of `""`, `"   "`,
+        `"\n\t"` or an absent `evidence` key each raises the same
+        non-empty-string message as a nested object, and all of those values
+        redact to a byte-identical object on disk -- so it is exactly the
+        rejection family this checklist exists to cover, and it was the one
+        missing.  The count word is asserted too: the checklist promises
+        exhaustiveness by number, so the number is part of the claim.
         """
         section = self.section()
+        self.assertIn("查这五条", section)
         self.assertIn("integration finding schema is invalid", section)
         self.assertIn("integration finding status is invalid", section)
         self.assertIn("evidence is incomplete", section)
         self.assertIn("evidence is unknown or expired", section)
+        # Bullets 1-3.  Each needs a literal the rules further up cannot supply:
+        # the `resolved` wording at the top of the section satisfied a bare
+        # substring on bullet 1, so bullet 1 is anchored on `accepted`/`waived`
+        # being named as non-clearing; bullet 2 on the message the code raises;
+        # bullet 3 on the empty-string case being called out by value.
+        self.assertIn("`status` 写 `accepted` 或 `waived` 一样不算清零", section)
+        self.assertIn("integration aggregated scope contains out-of-scope changes", section)
+        self.assertIn("`evidence` 给空字符串、只有空格或换行、或者干脆不给这个键", section)
 
 
 class MailboxClosesTheRunTests(unittest.TestCase):
