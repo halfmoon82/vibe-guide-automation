@@ -169,9 +169,13 @@ def _open_finding_counts(findings: Any) -> Dict[str, int]:
     clearance the validator would then compute differently.
 
     Only `resolved` clears a finding.  `waived` and `accepted` are registered
-    spellings because reviewers do report them, but a reviewer waiving its own
-    P0 is not a clearance -- it is an unauthorized exemption, so it counts as
-    open and the run stays short of acceptance until a human decides otherwise.
+    spellings because reviewers do report them, and counting them as open is a
+    format convention rather than a permission boundary: nothing here
+    cross-checks the `review_finding` events the same reviewer filed earlier, so
+    a reviewer that writes `resolved` over its own unfixed P0 does clear it.
+    What the convention buys is a trace -- a self-served exemption cannot stay
+    spelled `waived`; it has to be restated as a claim that the finding was
+    fixed, in the package a human later reads.
     """
     open_counts = {"p0": 0, "p1": 0, "p2": 0}
     for finding in findings:

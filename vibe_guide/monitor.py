@@ -15,7 +15,9 @@ from .authorization import (
     AuthorizationRecord,
     affected_node_closure,
     canonical_node_contracts,
+    digest_integration_contract,
     executable_contract_digest,
+    integration_contract_projection,
     is_authorization_valid,
     validate_runtime_contract,
 )
@@ -3033,16 +3035,28 @@ class Monitor:
         reviewer, so a reviewer cannot shrink the scope it is held to.  Returns
         ``None`` on success and a reason otherwise, so each caller can fail closed
         in its own idiom.
+
+        The plan is re-read from disk on every resume, and the agents this run
+        dispatches can write to that file, so the contract is only worth reading
+        after it still matches the digest the authorization card froze.  Without
+        the comparison below, editing ``plan.json`` after authorization rewrote
+        the permanent exclusions in the run's own audit package while the run
+        still reported ``complete`` -- the same drift the PRD/Spec lineage check
+        in ``resume`` already refuses, on the same class of material.
         """
-        contract = getattr(self.plan, "integration_contract", None)
-        if not isinstance(contract, dict):
-            contract = {}
-        refs = contract.get("agentsmd_acceptance_refs") or getattr(
-            self.plan, "agentsmd_acceptance_refs", []
-        )
-        excluded = contract.get("unverified_or_excluded") or getattr(
-            self.plan, "unverified_or_excluded", []
-        )
+        contract = integration_contract_projection(self.plan, list(self.nodes.values()))
+        record = self._snapshot_record(snapshot)
+        if digest_integration_contract(contract) != record.integration_contract_digest:
+            return "integration contract no longer matches the authorized digest"
+        if contract:
+            refs = contract.get("agentsmd_acceptance_refs") or []
+            excluded = contract.get("unverified_or_excluded") or []
+        else:
+            # No authorized contract to hold the reviewer to; the plan's own
+            # fields are all there is, and the digest above is empty on both
+            # sides, so nothing here was verified either way.
+            refs = getattr(self.plan, "agentsmd_acceptance_refs", [])
+            excluded = getattr(self.plan, "unverified_or_excluded", [])
         try:
             package = build_integration_review_evidence(
                 snapshot, claim, list(refs or []), list(excluded or [])

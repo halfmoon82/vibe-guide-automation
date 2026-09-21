@@ -107,18 +107,25 @@ class IntegrationReviewPackageDerivationTests(unittest.TestCase):
         self.assertEqual(self.build(claim)["clearance"], {"p0": 0, "p1": 1, "p2": 0})
 
     def test_only_a_resolved_finding_clears_so_a_reviewer_cannot_waive_its_own_p0(self):
-        """`waived`/`accepted` are not clearances the reviewer may grant itself.
+        """`waived`/`accepted` do not clear, and `resolved` still does.
 
         Both spellings were registered as legal statuses while only `open` was
         counted, so `{"severity": "p0", "status": "waived"}` derived an all-zero
-        clearance and closed the run out -- a self-served waiver with no human
-        authorization.  Only `resolved` may clear a finding.
+        clearance and closed the run out.  Rejecting them is a format convention,
+        not a permission boundary: the second half of this test pins the part
+        that stayed open, because the docstring on `_open_finding_counts` and the
+        protocol both now say so and a future edit must not quietly re-promise
+        an authorization gate the code does not implement.
         """
         for status in ("waived", "accepted", "open"):
             claim = dict(CLEARED_CLAIM, findings=[
                 {"severity": "p0", "status": status, "detail": "资金结算路径没验证"},
             ])
             self.assertEqual(self.build(claim)["clearance"], {"p0": 1, "p1": 0, "p2": 0}, msg=status)
+        restated = dict(CLEARED_CLAIM, findings=[
+            {"severity": "p0", "status": "resolved", "detail": "资金结算路径没验证，我说修好了"},
+        ])
+        self.assertEqual(self.build(restated)["clearance"], {"p0": 0, "p1": 0, "p2": 0})
 
     def test_an_unregistered_finding_status_or_severity_fails_closed(self):
         for finding in (
@@ -247,10 +254,16 @@ class ProtocolDocumentsTheClaimTests(unittest.TestCase):
         It listed `waived` among the statuses without saying that only
         `resolved` clears, so a host agent following it would waive its own P0.
         The rule is prose, so the assertion has to be on the prose that owns it.
+
+        The first version of this rule then overshot in the other direction --
+        "审查者不能给自己签豁免" promised an authorization gate the code does not
+        implement, since rewriting the same P0 as `resolved` clears it.  So the
+        limit is pinned too, on the clause only this row states.
         """
         section = self.section()
         self.assertIn("只有 `resolved` 算清零", section)
         self.assertIn("integration review acceptance still reports open P0-P2 findings", section)
+        self.assertIn("格式约定，不是权限边界", section)
 
     def test_the_protocol_says_the_verdict_evidence_must_be_text(self):
         """Anchored on the error the code raises, not on prose.
@@ -382,7 +395,7 @@ class MailboxClosesTheRunTests(unittest.TestCase):
     def cli(self, *argv):
         return run_cli(list(argv) + ["--json"], self.root)
 
-    def serve(self, reviewer_evidence, crash_once_on_acceptance=False):
+    def serve(self, reviewer_evidence, crash_once_on_acceptance=False, tamper_plan=None):
         """Publish, authorize and serve every mailbox request to a terminus."""
         self.assertEqual(self.cli("init", "--confirm").payload["status"], "ok")
         (self.root / "facts.json").write_text(json.dumps(FACTS), encoding="utf-8")
@@ -393,6 +406,15 @@ class MailboxClosesTheRunTests(unittest.TestCase):
         self.cli("plan", "--request", REQUEST, "--plan-id", "closeout", "--from-prd", "product-spec.json")
         self.cli("authorize", "--plan", "closeout", "--authorize", "AUTHORIZE")
         result = self.cli("monitor", "--plan", "closeout", "--authorize", "AUTHORIZE")
+        if tamper_plan is not None:
+            # Whatever a dispatched agent could do to the plan file once the run
+            # is under way, with no privilege this run lacks.  Editing it before
+            # `monitor` starts is already refused at the card check, so the
+            # window this closes is the one that stays open: after start.
+            path = self.root / ".vibe" / "plans" / "closeout" / "plan.json"
+            plan = json.loads(path.read_text(encoding="utf-8"))
+            tamper_plan(plan)
+            path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
         run_id = result.payload["run_id"]
         store = ProviderActionStore(self.paths)
         waits = {}
@@ -514,6 +536,26 @@ class MailboxClosesTheRunTests(unittest.TestCase):
         self.assertEqual(package["agentsmd_acceptance_refs"], contract["agentsmd_acceptance_refs"])
         self.assertEqual(package["unverified_or_excluded"], contract["unverified_or_excluded"])
         self.assertTrue(contract["unverified_or_excluded"], contract)
+
+    def test_the_scope_cannot_be_shrunk_by_editing_the_plan_after_authorization(self):
+        """Reading the live plan is only safe against the frozen digest.
+
+        The plan is re-read on every resume and the agents this run dispatches
+        can write to it, so without comparing the authorization card's
+        `integration_contract_digest` a post-authorization edit rewrote the run's
+        own audit package: the permanent exclusions the product owner was
+        promised turned into whatever the editor wrote, and the run still
+        reported `complete`.  The digest was recorded at authorization and read
+        by nobody.
+        """
+        def shrink(plan):
+            plan["integration_contract"]["unverified_or_excluded"] = ["nothing_at_all"]
+            plan["integration_contract"]["agentsmd_acceptance_refs"] = ["forged.md"]
+
+        result, snapshot = self.serve(CLEARED_CLAIM, tamper_plan=shrink)
+        self.assertNotEqual(result.payload["status"], "complete", result.payload)
+        self.assertEqual(snapshot.nodes["integration-review"]["status"], "blocked_unknown")
+        self.assertEqual(snapshot.integration_review_evidence, {})
 
     def test_a_crash_before_the_acceptance_is_saved_recovers_by_re_reporting(self):
         """Recovery cannot rebuild the claim, so it asks for it again.

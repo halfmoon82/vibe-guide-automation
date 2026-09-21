@@ -221,7 +221,7 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 ```
 
 - 全部清零就是 `findings: []`、`out_of_scope: []`。**只有 `resolved` 算清零**：`open`、`accepted`、`waived` 一律计入 `clearance`，报了会被判
-  `integration review acceptance still reports open P0-P2 findings`，节点落到 `blocked_unknown`。审查者不能给自己签豁免——P0–P2 没修完就报 `review_finding` 事件让整合审查返工，要不要放行是人的决定，不是审查者的。
+  `integration review acceptance still reports open P0-P2 findings`，节点落到 `blocked_unknown`。这一条是**格式约定，不是权限边界**：同一条 P0 写成 `resolved` 照样清零，vibe 不会去核对审查者此前报过的 `review_finding`。约定的作用是让自签豁免在证据包里留下痕迹——`waived` 过不去，想放行只能把它改写成 `resolved`，那就是一条明写在档案里的"我说修好了"。**所以放行仍然是人的决定，只是这道门不替人把关**：P0–P2 没修完就报 `review_finding` 事件让整合审查返工，别改字。
 - 两个判断里的 `evidence` **必须是非空字符串**。给嵌套对象会被拒（`... needs a status and a non-empty evidence string`）：落盘时 `evidence` 整个字段会被打码，对象里"看起来像敏感信息"的键会被丢掉，于是写进去的包回读时不再合法——顶层会先报一次 `complete`，下一次读又退回去。所以这里只收一句话。
 
 - **只能给这四个键，多一个就是 schema 错误**。`run_id`、`plan_id`、`plan_revision`、四个 digest、`aggregated_scope`、`clearance`、`agentsmd_acceptance_refs`、`unverified_or_excluded` 全部由 vibe 从 run 自己和计划的整合合同派生。这不是省事：审查者不能改写它被追责的血缘，也不能缩小它被要求覆盖的范围。
