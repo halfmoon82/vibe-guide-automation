@@ -272,7 +272,7 @@ round 2: 服务 visibility×2  → resume=running        信箱清空
 | wait×2 第一次 | `{"status": "timeout", "cursor"}` | `running` | `retry_pending`，信箱清空 |
 | （再 resume 一次） | — | `blocked_unknown` | `blocked_unknown`，重新派出 `wait` |
 | wait×2 第二次 | `completed` + `event: complete` + `delivery_evidence` | `retry_pending` | `running`，随即派出 reviewer 的 `create` |
-| reviewer 五步同上 | wait 第二次回 `event: accepted` + `evidence: "<一句话>"` | `retry_pending` | 两节点 `accepted`，`integration-review` 变 `running` 并派出 create |
+| reviewer 五步同上（visibility 服务完节点是 `review` 而不是 `running`） | wait 第二次回 `event: accepted` + `evidence: "<一句话>"` | `retry_pending` | 两节点 `accepted`，`integration-review` 变 `running` 并派出 create |
 | integration-review developer 五步 | 同 developer | `retry_pending` | `running` |
 | integration-review reviewer 五步 | wait 第二次回 `accepted` + 四键 evidence | **`complete`** | 三个节点全 `accepted` |
 
