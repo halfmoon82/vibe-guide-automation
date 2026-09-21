@@ -111,6 +111,12 @@ _HEX_DIGEST = lambda value: isinstance(value, str) and len(value) == 64 and all(
     character in "0123456789abcdef" for character in value.lower()
 )
 
+# The only fields an integration reviewer may report.  Everything else in the
+# run-level package is derived; see `build_integration_review_evidence`.
+INTEGRATION_REVIEW_CLAIM_KEYS = frozenset({
+    "findings", "iteration_compatibility", "test_runtime_delivery", "out_of_scope",
+})
+
 
 def _snapshot_value(snapshot: Any, key: str, default: Any = None) -> Any:
     if isinstance(snapshot, dict):
@@ -153,6 +159,35 @@ def _lineage_reasons(snapshot: Any, evidence: Dict[str, Any]) -> List[str]:
         elif evidence.get(key) != expected_value:
             reasons.append("integration evidence {} mismatch".format(key))
     return reasons
+
+
+def _open_finding_counts(findings: Any) -> Dict[str, int]:
+    """Count the still-open P0/P1/P2 findings, rejecting malformed entries.
+
+    Both the validator and the derivation below read the clearance out of the
+    findings through this one function, so a package can never be built with a
+    clearance the validator would then compute differently.
+
+    Only `resolved` clears a finding.  `waived` and `accepted` are registered
+    spellings because reviewers do report them, and counting them as open is a
+    format convention rather than a permission boundary: nothing here
+    cross-checks the `review_finding` events the same reviewer filed earlier, so
+    a reviewer that writes `resolved` over its own unfixed P0 does clear it.
+    What the convention buys is a trace -- a self-served exemption cannot stay
+    spelled `waived`; it has to be restated as a claim that the finding was
+    fixed, in the package a human later reads.
+    """
+    open_counts = {"p0": 0, "p1": 0, "p2": 0}
+    for finding in findings:
+        if not isinstance(finding, dict) or str(finding.get("severity", "")).lower() not in open_counts:
+            raise ValueError("integration finding schema is invalid")
+        severity = str(finding["severity"]).lower()
+        status = str(finding.get("status", finding.get("resolution", ""))).lower()
+        if status not in {"open", "resolved", "accepted", "waived"}:
+            raise ValueError("integration finding status is invalid")
+        if status != "resolved":
+            open_counts[severity] += 1
+    return open_counts
 
 
 def validate_integration_review_evidence(snapshot: Any, evidence: Dict[str, Any]) -> None:
@@ -206,19 +241,72 @@ def validate_integration_review_evidence(snapshot: Any, evidence: Dict[str, Any]
         raise ValueError("integration P0/P1/P2 clearance is invalid")
     if any(type(clearance[key]) is not int or clearance[key] < 0 for key in clearance):
         raise ValueError("integration P0/P1/P2 clearance is invalid")
-    open_counts = {"p0": 0, "p1": 0, "p2": 0}
-    for finding in evidence["findings"]:
-        if not isinstance(finding, dict) or str(finding.get("severity", "")).lower() not in open_counts:
-            raise ValueError("integration finding schema is invalid")
-        severity = str(finding["severity"]).lower()
-        status = str(finding.get("status", finding.get("resolution", ""))).lower()
-        if status not in {"open", "resolved", "accepted", "waived"}:
-            raise ValueError("integration finding status is invalid")
-        if status in {"open", "unresolved", "pending", "blocked"}:
-            open_counts[severity] += 1
+    open_counts = _open_finding_counts(evidence["findings"])
     for key in open_counts:
         if clearance[key] != open_counts[key]:
             raise ValueError("{} clearance does not match finding count".format(key.upper()))
+
+
+def build_integration_review_evidence(
+    snapshot: Any,
+    claim: Any,
+    agentsmd_acceptance_refs: Sequence[Any],
+    unverified_or_excluded: Sequence[Any],
+) -> Dict[str, Any]:
+    """Derive the run-bound review package from the reviewer's judgement.
+
+    The reviewer supplies only what it alone can know -- the findings, the two
+    compatibility/runtime verdicts, and whether it saw changes outside the
+    aggregated scope.  Everything else is lineage the run already owns, so the
+    reviewer can neither forge it nor narrow it; supplying any of it is a
+    schema error rather than an override.  The acceptance references and the
+    permanent exclusions come from the plan's integration contract for the
+    same reason: a reviewer must not be able to shrink the scope it is being
+    held to.
+    """
+    if not isinstance(claim, dict) or set(claim) != INTEGRATION_REVIEW_CLAIM_KEYS:
+        raise ValueError(
+            "integration review claim must be an object with exactly these keys: "
+            + ", ".join(sorted(INTEGRATION_REVIEW_CLAIM_KEYS))
+        )
+    if not isinstance(claim["findings"], list) or not isinstance(claim["out_of_scope"], list):
+        raise ValueError("integration review claim findings and out_of_scope must be lists")
+    for key in ("iteration_compatibility", "test_runtime_delivery"):
+        verdict = claim[key]
+        # The justification has to be text: persistence redacts any value under
+        # an `evidence` key, and for a nested object it drops the keys that look
+        # sensitive -- so `{"secret_scan": "clean"}` was written as `{}` and the
+        # reload-time validator then rejected the whole completed run.
+        if not isinstance(verdict, dict) or not isinstance(verdict.get("evidence"), str) or not verdict["evidence"].strip():
+            raise ValueError(
+                "integration review claim {} needs a status and a non-empty evidence string".format(key)
+            )
+    nodes = _snapshot_value(snapshot, "nodes", {})
+    package = {
+        "schema_version": 1,
+        "run_id": _snapshot_value(snapshot, "run_id"),
+        "plan_id": _snapshot_value(snapshot, "plan_id"),
+        "plan_revision": _snapshot_value(snapshot, "plan_version"),
+        "prd_digest": _snapshot_value(snapshot, "prd_digest"),
+        "spec_digest": _snapshot_value(snapshot, "spec_digest"),
+        "authorization_digest": _snapshot_value(snapshot, "authorization_digest"),
+        "node_contract_digest": _snapshot_value(snapshot, "node_contract_digest"),
+        "aggregated_scope": {
+            "nodes": [
+                node_id for node_id in (nodes if isinstance(nodes, dict) else {})
+                if node_id != "integration-review"
+            ],
+            "out_of_scope": deepcopy(claim["out_of_scope"]),
+        },
+        "iteration_compatibility": deepcopy(claim["iteration_compatibility"]),
+        "agentsmd_acceptance_refs": list(agentsmd_acceptance_refs),
+        "test_runtime_delivery": deepcopy(claim["test_runtime_delivery"]),
+        "unverified_or_excluded": list(unverified_or_excluded),
+        "findings": deepcopy(claim["findings"]),
+        "clearance": _open_finding_counts(claim["findings"]),
+    }
+    validate_integration_review_evidence(snapshot, package)
+    return package
 
 
 def record_integration_review(snapshot: Any, evidence: Dict[str, Any]) -> None:

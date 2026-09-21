@@ -326,6 +326,16 @@ def _sanitize_durable_value(
     return _REDACTED
 
 
+def durable_projection(value: Any) -> Any:
+    """What persistence will keep of ``value``.
+
+    Callers that must agree with what a later read validates -- the run-level
+    integration review package is the one that must -- can only check that by
+    applying the same redaction `save_snapshot` applies.
+    """
+    return _sanitize_durable_value(value)
+
+
 def _sanitize_event_data(data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("event data is invalid")

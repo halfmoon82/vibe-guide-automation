@@ -294,6 +294,23 @@ def executable_contract_digest(nodes: List[DAGNode]) -> str:
     return _canonical_digest({"nodes": canonical_node_contracts(nodes)})
 
 
+def integration_contract_projection(plan: Plan, nodes: List[DAGNode]) -> Dict[str, Any]:
+    """The integration contract the card freezes, from its two sources.
+
+    Monitor re-reads the live plan long after authorization to derive the
+    acceptance references and the permanent exclusions, so it has to project
+    the contract exactly the way the card did or the digest comparison would
+    reject plans nobody touched.  One definition, two callers.
+    """
+    integration = next((node for node in nodes if node.id == "integration-review"), None)
+    contract = getattr(plan, "integration_contract", {}) or (integration.contract if integration else {})
+    return contract if isinstance(contract, dict) else {}
+
+
+def digest_integration_contract(contract: Dict[str, Any]) -> str:
+    return _canonical_digest(contract) if contract else ""
+
+
 def affected_node_closure(
     nodes: List[DAGNode], changed_nodes: List[str]
 ) -> List[str]:
@@ -740,8 +757,8 @@ def build_authorization_card(
     integration = next((node for node in nodes if node.id == "integration-review"), None)
     integration_node_id = integration_node_id or (integration.id if integration else "")
     if integration_contract is None:
-        integration_contract = getattr(plan, "integration_contract", {}) or (integration.contract if integration else {})
-    computed_integration_digest = _canonical_digest(integration_contract) if integration_contract else ""
+        integration_contract = integration_contract_projection(plan, nodes)
+    computed_integration_digest = digest_integration_contract(integration_contract)
     if integration_contract_digest is not None and integration_contract_digest != computed_integration_digest:
         raise ValueError("integration contract digest does not match projection")
     integration_contract_digest = computed_integration_digest

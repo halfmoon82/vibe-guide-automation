@@ -186,7 +186,7 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 | `visibility` | `{"visible": true, "direct_enter": true}` |
 | `wait`（还没干完） | `{"status": "timeout", "cursor": "<最后一条事件的游标>"}` |
 | `wait`（干完了，developer） | `{"status": "completed", "cursor": "<游标>", "event": "complete", "delivery_evidence": {"completion_marker": "<完成标记>", "delivery_path": "<交付物路径>", "thread_status": "complete"}}` |
-| `wait`（干完了，reviewer） | `{"status": "completed", "cursor": "<游标>", "event": "accepted", "evidence": "<P0–P2 清零证据>"}` |
+| `wait`（干完了，reviewer） | `{"status": "completed", "cursor": "<游标>", "event": "accepted", "evidence": "<P0–P2 清零证据>"}`；**整合审查节点例外**，`evidence` 必须是结构化判断，见下 |
 | `resume` | `{"resumed": true}`（会话 id 沿用原来的，**不要**回写绑定） |
 
 `wait` 的终态字段各有各的判定，缺一个就整轮作废：`status` 只认
@@ -207,8 +207,61 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 - **reviewer** 要 `evidence`：`accepted` 之后没有它，节点被判
   `review acceptance has no registered P0-P2 clearance evidence`。
 
+#### 整合审查节点的 accepted：`evidence` 必须是结构化判断
+
+最后那个 `integration-review` 节点的 `accepted` 不只是收下一个节点，它是**整个 run 的验收**：vibe 收到它才写 run 级的整合审查证据包，顶层才从 `running` 走到 `complete`。所以这一个节点的 `evidence` 不能是一句话，必须是一个对象，**恰好四个键**：
+
+```json
+{
+  "findings": [{"severity": "p0|p1|p2", "status": "open|resolved|accepted|waived", "detail": "<一句话>"}],
+  "iteration_compatibility": {"status": "verified|compatible|reviewed", "evidence": "<怎么核实的>"},
+  "test_runtime_delivery": {"status": "verified|reviewed", "evidence": "<怎么核实的>"},
+  "out_of_scope": ["<聚合范围之外被改动的东西>"]
+}
+```
+
+- 全部清零就是 `findings: []`、`out_of_scope: []`。**只有 `resolved` 算清零**：`open`、`accepted`、`waived` 一律计入 `clearance`，报了会被判
+  `integration review acceptance still reports open P0-P2 findings`，节点落到 `blocked_unknown`。这一条是**格式约定，不是权限边界**：同一条 P0 写成 `resolved` 照样清零，vibe 不会去核对审查者此前报过的 `review_finding`。约定的作用是让自签豁免在证据包里留下痕迹——`waived` 过不去，想放行只能把它改写成 `resolved`，那就是一条明写在档案里的"我说修好了"。**所以放行仍然是人的决定，只是这道门不替人把关**：P0–P2 没修完就报 `review_finding` 事件让整合审查返工，别改字。
+- 两个判断里的 `evidence` **必须是非空字符串**。给嵌套对象会被拒（`... needs a status and a non-empty evidence string`）：落盘时 `evidence` 整个字段会被打码，对象里"看起来像敏感信息"的键会被丢掉，于是写进去的包回读时不再合法——顶层会先报一次 `complete`，下一次读又退回去。所以这里只收一句话。
+
+- **只能给这四个键，多一个就是 schema 错误**。`run_id`、`plan_id`、`plan_revision`、四个 digest、`aggregated_scope`、`clearance`、`agentsmd_acceptance_refs`、`unverified_or_excluded` 全部由 vibe 从 run 自己和计划的整合合同派生。这不是省事：审查者不能改写它被追责的血缘，也不能缩小它被要求覆盖的范围。
+- 键名错、少键、或者给一个字符串，节点会落到 `blocked_unknown`，代码里的判定是
+  `integration review evidence cannot be derived (...)`。
+
+**但这三条的报错原文在盘上读不到。** 节点的 `reason` 落盘时会被打码成
+`[REDACTED_PROVIDER_TEXT]`——`vibe status --json`、事件日志、隔离记录里都一样，四种
+完全不同的拒收原因长得一模一样。所以别指望"看理由"定位，能读到的是两样东西：
+
+1. 这个节点的 `status` 是 `blocked_unknown`，这一轮的顶层 `status` 也是（只要还有别的节点在
+   重试，顶层会被改写成 `retry_pending`，它不告诉你是哪个节点，所以按节点看）。
+2. 你回写的那份 claim 被记在这个节点的 `evidence` 列表里，**键名保留、值打码**。
+   **被拒的时候它是最后一条；清零那次最后一条是派生出来的证据包，不是 claim**——清零时
+   vibe 会在 claim 后面再追加那个包。
+   所以**形状读得出来**：整条是一个字符串而不是对象，说明你给的是一句话；
+   对象里少了 `out_of_scope`，就是少一个键；`iteration_compatibility.evidence` 是个对象而不是
+   字符串，说明你给了嵌套对象
+   （嵌套对象里"看起来像敏感信息"的键被逐个丢掉，**只有每个键都像时才会只剩 `{}`，混着写还剩几个键**）；
+   `out_of_scope` 是个非空列表，就是聚合范围之外有改动。
+   **但值读不出来**：`findings[].status` 也被打码，`resolved` 和 `waived` 长得一样，而且清零的
+   run 本来就可以带 `resolved` 的条目——所以 `findings` 非空**不代表**有没清零的项。
+
+形状合法却被拒，就是值的问题，而且盘上看不出来，只能对着你自己发出去的那份 claim 查这五条：
+
+- **`status` 写 `accepted` 或 `waived` 一样不算清零**，只有 `resolved` 清，其余全部计入 `clearance`。
+- **`out_of_scope` 非空就判 `integration aggregated scope contains out-of-scope changes`**，聚合范围之外改了东西必须先收回去，不能靠在这里列一笔了事。
+- **`evidence` 给空字符串、只有空格或换行、或者干脆不给这个键，和给嵌套对象一样被拒**，报的也是同一句
+  `... needs a status and a non-empty evidence string`。这条在盘上尤其看不出来：真话、`""`、`"   "`
+  打码后落盘完全一样，都是 `[REDACTED_PROVIDER_TEXT]`，所以只能回头查你发出去的原文。
+- **`findings[]` 的 `severity` 只收 `p0` / `p1` / `p2`，`status` 只收 `open` / `resolved` /
+  `accepted` / `waived`**。写 `p3` 判 `integration finding schema is invalid`，写 `pending`
+  判 `integration finding status is invalid`——都不是"多报一条"，是整包作废。
+- **两个判断的 `status` 也是封闭取值**：`iteration_compatibility` 只收 `verified` /
+  `compatible` / `reviewed`，`test_runtime_delivery` 只收 `verified` / `reviewed`。写
+  `ok`、`passed` 这类同义词判 `... evidence is incomplete`，写 `unknown` / `expired` /
+  `stale` 判 `... evidence is unknown or expired`。
+
 **`cursor` 在复杂计划的 developer 终态里也是必需的**：绑定上的游标只有你回写时
-才会被写进去（`provider_action.py:1153-1160`），不给就等于绑定没有游标，交付证据门
+才会被写进去（`vibe_guide/runners/provider_action.py:1153-1162`），不给就等于绑定没有游标，交付证据门
 报 `current cursor is missing`。这道门只挂在 `delivered` / `complete` 上，所以
 reviewer 的 `accepted` 不受它约束——但每轮都回写游标本来就是对的（`wait` 靠它
 接着上一次的位置读），所以上表两行都给了。
