@@ -249,6 +249,27 @@ _PROVIDER_TEXT_KEYS = {
 }
 _REDACTED = "[REDACTED]"
 _REDACTED_PROVIDER_TEXT = "[REDACTED_PROVIDER_TEXT]"
+# Keys of these maps are identifiers — node ids, "<node>:<role>" task keys,
+# parallel-group names — not field names, so they are never candidate secret
+# names.  Node ids come straight from the product spec and only have to match
+# models._ID, so `token-refresh` or `secret-rotation` is legal; judging them by
+# substring replaced the whole node object with the string "[REDACTED]" and
+# _validate_snapshot then rejected every later read, leaving the run
+# permanently unloadable from its first save.  The exemption is exactly one
+# level deep: inside an identifier's value, field names are candidate secret
+# names again, so a real `token` field in a node is still redacted.
+_IDENTIFIER_KEYED_FIELDS = frozenset({
+    "authorized_node_contracts",
+    "continuation",
+    "handles",
+    "invalidated_acceptances",
+    "node_contract_digests",
+    "nodes",
+    "parallel_groups",
+    "previous_node_contract_digests",
+    "retained_acceptances",
+    "tasks",
+})
 
 
 def _normalize_data_key(key: str) -> str:
@@ -278,8 +299,10 @@ def redact_provider_text(value: Any) -> Any:
     return _REDACTED_PROVIDER_TEXT
 
 
-def _sanitize_durable_value(value: Any, key: Optional[str] = None) -> Any:
-    if key is not None:
+def _sanitize_durable_value(
+    value: Any, key: Optional[str] = None, key_is_identifier: bool = False
+) -> Any:
+    if key is not None and not key_is_identifier:
         if _is_sensitive_data_key(key):
             return _REDACTED
         if _normalize_data_key(key) in _PROVIDER_TEXT_KEYS:
@@ -289,8 +312,15 @@ def _sanitize_durable_value(value: Any, key: Optional[str] = None) -> Any:
     if isinstance(value, (list, tuple)):
         return [_sanitize_durable_value(item) for item in value]
     if isinstance(value, dict):
+        identifier_keyed = (
+            key is not None
+            and not key_is_identifier
+            and _normalize_data_key(key) in _IDENTIFIER_KEYED_FIELDS
+        )
         return {
-            str(item_key): _sanitize_durable_value(item_value, str(item_key))
+            str(item_key): _sanitize_durable_value(
+                item_value, str(item_key), identifier_keyed
+            )
             for item_key, item_value in value.items()
         }
     return _REDACTED
