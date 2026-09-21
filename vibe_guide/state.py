@@ -260,6 +260,7 @@ _REDACTED_PROVIDER_TEXT = "[REDACTED_PROVIDER_TEXT]"
 # names again, so a real `token` field in a node is still redacted.
 _IDENTIFIER_KEYED_FIELDS = frozenset({
     "authorized_node_contracts",
+    "continuation",
     "handles",
     "invalidated_acceptances",
     "node_contract_digests",

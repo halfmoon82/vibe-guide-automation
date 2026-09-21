@@ -16,15 +16,20 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from vibe_guide.authorization import authorize, build_authorization_card
+from vibe_guide.capability_contract import build_contract, save_contract
 from vibe_guide.cli import run_cli
 from vibe_guide.contracts import RunEvent
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan
+from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
+from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.state import (
     RunSnapshot,
     append_event,
+    load_events,
     load_snapshot,
     save_snapshot,
 )
@@ -44,16 +49,24 @@ SENSITIVE_IDS = (
     "private_key-store",
     "credential-vault",
 )
+# The same defect has a second half.  `_sanitize_durable_value` also rewrites a
+# value whose key names provider text, and those names are bare words that make
+# perfectly ordinary node ids.  On main a node called `reason` had its `status`
+# replaced by "[REDACTED_PROVIDER_TEXT]" — not in _NODE_STATUSES, so the run was
+# just as permanently unloadable, only via a different marker.
+PROVIDER_TEXT_IDS = ("reason", "evidence", "output", "message", "error")
+REDACTION_MARKERS = ("[REDACTED]", "[REDACTED_PROVIDER_TEXT]")
 
 
 def identifier_redactions(payload, identifiers):
-    """Every path where an identifier key maps to the redaction marker.
+    """Every path where an identifier key maps to a redaction marker.
 
     Anchored on the identifier key itself rather than on a bare
     ``"[REDACTED]" not in text`` scan: the durable projection is *supposed* to
     redact genuine fields whose names contain a secret word (`token_required`
     in the workflow record is one), so a whole-file scan would fail for the
-    right behaviour and hide the wrong one.
+    right behaviour and hide the wrong one.  Both markers count — a node whose
+    id names provider text is bricked by the second one.
     """
     found = []
 
@@ -61,7 +74,7 @@ def identifier_redactions(payload, identifiers):
         if isinstance(node, dict):
             for key, item in node.items():
                 child = path + [str(key)]
-                if str(key) in identifiers and item == "[REDACTED]":
+                if str(key) in identifiers and item in REDACTION_MARKERS:
                     found.append("/".join(child))
                 walk(item, child)
         elif isinstance(node, list):
@@ -128,7 +141,7 @@ class SensitiveNodeIdRoundTripTests(unittest.TestCase):
         )
 
     def test_every_sensitive_looking_node_id_survives_save_and_load(self):
-        for node_id in SENSITIVE_IDS:
+        for node_id in SENSITIVE_IDS + PROVIDER_TEXT_IDS:
             with self.subTest(node_id=node_id):
                 self.temporary.cleanup()
                 self.temporary = tempfile.TemporaryDirectory()
@@ -139,6 +152,37 @@ class SensitiveNodeIdRoundTripTests(unittest.TestCase):
                 save_snapshot(self.paths, expected)
 
                 self.assertEqual(load_snapshot(self.paths, "run-1"), expected)
+
+    def test_provider_text_named_node_keeps_its_fields_verbatim(self):
+        """`reason` is a legal node id and also a provider-text field name."""
+        save_snapshot(self.paths, self.snapshot("reason"))
+
+        persisted = json.loads(
+            (self.root / ".vibe" / "runs" / "run-1" / "state.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(persisted["nodes"]["reason"], {"status": "running"})
+        self.assertEqual(persisted["handles"]["reason"], "handle-1")
+        self.assertEqual(
+            identifier_redactions(persisted, {"reason", "reason:developer", "reason-group"}),
+            [],
+        )
+
+    def test_provider_text_inside_a_node_is_still_redacted(self):
+        """The provider-text rule keeps working one level in."""
+        save_snapshot(
+            self.paths,
+            self.snapshot("reason", node_extra={"reason": "provider said something"}),
+        )
+
+        persisted = json.loads(
+            (self.root / ".vibe" / "runs" / "run-1" / "state.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            persisted["nodes"]["reason"]["reason"], "[REDACTED_PROVIDER_TEXT]"
+        )
+        self.assertNotIn("provider said something", json.dumps(persisted, ensure_ascii=False))
 
     def test_identifier_keyed_maps_keep_their_shape_on_disk(self):
         node_id = "token-refresh"
@@ -192,8 +236,183 @@ class SensitiveNodeIdRoundTripTests(unittest.TestCase):
         self.assertNotIn("ghp-real-secret", json.dumps(persisted, ensure_ascii=False))
 
 
+def monitor_node(node_id):
+    return DAGNode(
+        node_id,
+        node_id,
+        [],
+        [],
+        "g1",
+        {
+            "files": [node_id + ".py"],
+            "worker": "worker-" + node_id,
+            "worktree": ".worktrees/" + node_id,
+            "worker_profile": {
+                "worker": "codex", "model": "test", "reasoning": "normal",
+                "fallbacks": [], "writer": "writer",
+                "selection_basis": {
+                    "issue_complexity_ref": node_id, "complexity_band": "standard",
+                    "risk_tags": [], "availability_evidence": "test",
+                },
+                "worktree": ".worktrees/" + node_id,
+                "branch": "branch-" + node_id,
+                "allowlist": [node_id + ".py"],
+            },
+        },
+        "ready",
+    )
+
+
+class SensitiveNodeIdReauthorizationTests(unittest.TestCase):
+    """Recovery path: the reauthorization event carries identifier-keyed maps.
+
+    `continuation`, `node_contract_digests` and the acceptance maps are all
+    keyed by node id (or `<node>:<role>`), are persisted through
+    `_sanitize_event_data`, and are read back field by field when an
+    interrupted reauthorization replays.  Redacting them by key name bricks
+    recovery with an error that names the evidence, never the node id.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.paths = ProjectPaths(Path(self.temporary.name))
+        (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (self.paths.vibe / "state.json").write_text(
+            '{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8"
+        )
+        save_contract(
+            self.paths, build_contract(self.paths.root, provider="fake", host_id="local")
+        )
+        self.capabilities = AgentCapabilities("fake", True, True, True, True, True, "full")
+
+    def replay_interrupted_reauthorization(self, node_id):
+        plan = Plan("plan-1", 1, "docs/prd.md", [node_id], "draft")
+        original = monitor_node(node_id)
+        record = authorize(
+            build_authorization_card(plan, [original], self.capabilities), "AUTHORIZE"
+        )
+        runner = FakeRunner()
+        snapshot = Monitor(self.paths, plan, [original]).start(record, runner)
+
+        corrected = monitor_node(node_id)
+        corrected.contract["acceptance_example"] = "corrected implementation outcome"
+        corrected_record = authorize(
+            build_authorization_card(plan, [corrected], self.capabilities), "AUTHORIZE"
+        )
+        corrected_monitor = Monitor(self.paths, plan, [corrected])
+        # Crash after the event is appended but before the snapshot is saved,
+        # so the next call must replay the persisted event.
+        with patch.object(
+            corrected_monitor,
+            "_schedule_ready",
+            side_effect=RuntimeError("interrupted after reauthorization event"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                corrected_monitor.reauthorize(
+                    snapshot.run_id, corrected_record, runner, "executable_contract_changed"
+                )
+
+        recovered = corrected_monitor.reauthorize(
+            snapshot.run_id, corrected_record, FakeRunner(), "executable_contract_changed"
+        )
+        persisted = [
+            record["data"]
+            for record in load_events(self.paths, snapshot.run_id)
+            if record["event"] == "authorization_reauthorized"
+        ]
+        return recovered, persisted
+
+    def test_sensitive_looking_node_id_replays_an_interrupted_reauthorization(self):
+        recovered, persisted = self.replay_interrupted_reauthorization("token-refresh")
+
+        self.assertEqual(recovered.nodes["token-refresh"]["status"], "rework")
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(
+            persisted[0]["continuation"],
+            {"token-refresh:developer": {"cursor": None, "task_id": "developer:token-refresh"}},
+        )
+        self.assertEqual(
+            sorted(persisted[0]["node_contract_digests"]), ["token-refresh"]
+        )
+        self.assertEqual(
+            sorted(persisted[0]["previous_node_contract_digests"]), ["token-refresh"]
+        )
+        self.assertEqual(sorted(persisted[0]["authorized_node_contracts"]), ["token-refresh"])
+        for name in (
+            "continuation",
+            "node_contract_digests",
+            "previous_node_contract_digests",
+            "authorized_node_contracts",
+        ):
+            self.assertNotIn("[REDACTED]", json.dumps(persisted[0][name]), name)
+
+    def test_plain_node_id_replays_the_same_way(self):
+        """The control: without it, a broken replay reads as an unrelated bug."""
+        recovered, persisted = self.replay_interrupted_reauthorization("plain-node")
+
+        self.assertEqual(recovered.nodes["plain-node"]["status"], "rework")
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(
+            persisted[0]["continuation"],
+            {"plain-node:developer": {"cursor": None, "task_id": "developer:plain-node"}},
+        )
+
+    def test_acceptance_maps_keep_their_sensitive_looking_node_keys(self):
+        """`retained_acceptances` / `invalidated_acceptances` are node-keyed too.
+
+        They only appear once a node has been accepted and a later
+        reauthorization has to decide which acceptances survive the new
+        contract, so reaching them takes a full accept-then-reauthorize run.
+        """
+        changed_id, kept_id = "token-refresh", "secret-rotation"
+        nodes = [monitor_node(changed_id), monitor_node(kept_id)]
+        plan = Plan("plan-1", 1, "docs/prd.md", [changed_id, kept_id], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        runner = FakeRunner(
+            events={
+                (node_id, "developer"): [("complete", {"evidence": "delivery-" + node_id})]
+                for node_id in (changed_id, kept_id)
+            } | {
+                (node_id, "reviewer"): [("accepted", {"evidence": "review-" + node_id})]
+                for node_id in (changed_id, kept_id)
+            }
+        )
+        monitor = Monitor(self.paths, plan, nodes)
+        snapshot = monitor.start(record, runner)
+        for _ in range(3):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes[changed_id]["status"], "accepted")
+        self.assertEqual(snapshot.nodes[kept_id]["status"], "accepted")
+
+        changed = monitor_node(changed_id)
+        changed.contract["acceptance_example"] = "changed contract"
+        changed_nodes = [changed, monitor_node(kept_id)]
+        changed_record = authorize(
+            build_authorization_card(plan, changed_nodes, self.capabilities), "AUTHORIZE"
+        )
+
+        reauthorized = Monitor(self.paths, plan, changed_nodes).reauthorize(
+            snapshot.run_id, changed_record, FakeRunner(), "executable_contract_changed"
+        )
+
+        self.assertEqual(reauthorized.nodes[kept_id]["status"], "accepted")
+        self.assertEqual(reauthorized.nodes[changed_id]["status"], "rework")
+        data = [
+            record["data"]
+            for record in load_events(self.paths, snapshot.run_id)
+            if record["event"] == "authorization_reauthorized"
+        ][-1]
+        self.assertEqual(sorted(data["retained_acceptances"]), [kept_id])
+        self.assertEqual(sorted(data["invalidated_acceptances"]), [changed_id])
+        for name in ("retained_acceptances", "invalidated_acceptances"):
+            for node_id, evidence in data[name].items():
+                self.assertIsInstance(evidence, dict, (name, node_id))
+
+
 class SensitiveNodeIdJourneyTests(unittest.TestCase):
-    """CLI level: the id really does arrive from the product spec."""
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="v45-sensitive-id-"))
