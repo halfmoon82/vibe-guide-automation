@@ -234,18 +234,30 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 
 1. 这个节点的 `status` 是 `blocked_unknown`，这一轮的顶层 `status` 也是（只要还有别的节点在
    重试，顶层会被改写成 `retry_pending`，它不告诉你是哪个节点，所以按节点看）。
-2. 你回写的那份 claim 被记在这个节点的 `evidence` 列表里（被拒的那次是最后一条），
+2. 你回写的那份 claim 被记在这个节点的 `evidence` 列表里（被拒的时候它是最后一条；清零那次
+   vibe 会在它后面再追加派生出来的证据包，所以最后一条是包不是 claim），
    **键名保留、值打码**。所以**形状读得出来**：整条是一个字符串而不是对象，说明你给的是一句话；
    对象里少了 `out_of_scope`，就是少一个键；`iteration_compatibility.evidence` 是个对象而不是
-   字符串，说明你给了嵌套对象（键名看起来像敏感信息时还会被整个丢掉，只剩 `{}`）；
+   字符串，说明你给了嵌套对象（里面键名看起来像敏感信息的键被逐个丢掉，只有每个键都像时
+   才会只剩 `{}`，混着写就还剩几个键）；
    `out_of_scope` 是个非空列表，就是聚合范围之外有改动。
    **但值读不出来**：`findings[].status` 也被打码，`resolved` 和 `waived` 长得一样，而且清零的
-   run 本来就可以带 `resolved` 的条目——所以 `findings` 非空**不代表**有没清零的项。形状合法却被
-   拒，就是值的问题：对着你自己发出去的那份 claim 查上面两条规则（只有 `resolved` 算清零、
-   `out_of_scope` 必须是空的），不要指望从盘上的记录看出来。
+   run 本来就可以带 `resolved` 的条目——所以 `findings` 非空**不代表**有没清零的项。
+
+形状合法却被拒，就是值的问题，而且盘上看不出来，只能对着你自己发出去的那份 claim 查这四条：
+
+- **只有 `resolved` 算清零**，`open` / `accepted` / `waived` 都计入 `clearance`。
+- **`out_of_scope` 必须是空列表**。
+- **`findings[]` 的 `severity` 只收 `p0` / `p1` / `p2`，`status` 只收 `open` / `resolved` /
+  `accepted` / `waived`**。写 `p3` 判 `integration finding schema is invalid`，写 `pending`
+  判 `integration finding status is invalid`——都不是"多报一条"，是整包作废。
+- **两个判断的 `status` 也是封闭取值**：`iteration_compatibility` 只收 `verified` /
+  `compatible` / `reviewed`，`test_runtime_delivery` 只收 `verified` / `reviewed`。写
+  `ok`、`passed` 这类同义词判 `... evidence is incomplete`，写 `unknown` / `expired` /
+  `stale` 判 `... evidence is unknown or expired`。
 
 **`cursor` 在复杂计划的 developer 终态里也是必需的**：绑定上的游标只有你回写时
-才会被写进去（`provider_action.py:1153-1160`），不给就等于绑定没有游标，交付证据门
+才会被写进去（`vibe_guide/runners/provider_action.py:1153-1162`），不给就等于绑定没有游标，交付证据门
 报 `current cursor is missing`。这道门只挂在 `delivered` / `complete` 上，所以
 reviewer 的 `accepted` 不受它约束——但每轮都回写游标本来就是对的（`wait` 靠它
 接着上一次的位置读），所以上表两行都给了。

@@ -270,13 +270,65 @@ class ProtocolDocumentsTheClaimTests(unittest.TestCase):
         every persistence path.  What survives is the claim under the node's
         `evidence`, keys intact and values masked, so the shape is what the
         operator reads.  The marker below appears nowhere else in the protocol,
-        and the second assertion pins the load-bearing half: the values are
-        masked too, so a non-empty `findings` diagnoses nothing.
+        and the assertions pin the conclusions, not the phrasing around them.
+        A substring on `resolved` 和 `waived` 长得一样 alone was not enough:
+        the conclusion beside it could be inverted back to the false claim this
+        test exists to retract while that clause stayed verbatim, and the suite
+        stayed green.  So the conclusion is asserted directly, its inversion is
+        asserted absent, and the shape half gets its own anchor.
         """
         section = self.section()
         self.assertIn("[REDACTED_PROVIDER_TEXT]", section)
+        self.assertIn("**形状读得出来**", section)
         self.assertIn("`resolved` 和 `waived` 长得一样", section)
+        self.assertIn("`findings` 非空**不代表**有没清零的项", section)
+        self.assertNotIn("`findings` 非空**就代表**", section)
         self.assertNotIn("这是可见的阻塞", section)
+
+    def test_the_two_readable_shapes_are_stated_with_their_conditions(self):
+        """Both shape rules hold only conditionally, and the unconditional
+        phrasing of either one sends the operator to the wrong conclusion.
+
+        `redact_provider_text` drops sensitive keys one at a time, so a nested
+        object collapses to `{}` only when every key looks sensitive -- mixed
+        keys survive as a non-empty object.  And the rejected claim is the last
+        `evidence` entry only on rejection: `record_integration_review` appends
+        the derived package after it once the run clears.  Asserted here
+        because the loose wording of each passed every other test in this class.
+        """
+        section = self.section()
+        self.assertIn("只有每个键都像时", section)
+        self.assertIn("最后一条是包不是 claim", section)
+
+    def test_the_protocol_warns_the_top_level_status_can_be_rewritten(self):
+        """Reading the top level instead of the node is the wrong instinct.
+
+        The node is `blocked_unknown`, and so is the top level -- until another
+        node retries, at which point the rendered status becomes `retry_pending`
+        and names no node at all.  An operator told only "top level is
+        blocked_unknown" concludes the run is fine.
+        """
+        section = self.section()
+        self.assertIn("`blocked_unknown`", section)
+        self.assertIn("`retry_pending`", section)
+        self.assertIn("它不告诉你是哪个节点", section)
+
+    def test_the_protocol_lists_every_closed_value_set_a_legal_shape_can_fail(self):
+        """A legal shape can still be rejected on values, so the doc has to
+        enumerate all of them or the operator runs out of places to look.
+
+        Two rules (only `resolved` clears, `out_of_scope` empty) left three
+        further rejections unlisted -- an unregistered `findings[].severity`,
+        an unregistered `findings[].status`, and an unregistered verdict
+        `status` -- each of which lands `blocked_unknown` behind a redacted
+        reason while the shape on disk stays perfectly legal.  Anchored on the
+        raised messages, which appear nowhere else in the protocol.
+        """
+        section = self.section()
+        self.assertIn("integration finding schema is invalid", section)
+        self.assertIn("integration finding status is invalid", section)
+        self.assertIn("evidence is incomplete", section)
+        self.assertIn("evidence is unknown or expired", section)
 
 
 class MailboxClosesTheRunTests(unittest.TestCase):
