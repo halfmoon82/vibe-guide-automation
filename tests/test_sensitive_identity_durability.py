@@ -169,6 +169,28 @@ class SensitiveNodeIdRoundTripTests(unittest.TestCase):
         self.assertNotIn("ghp-real-secret", json.dumps(persisted, ensure_ascii=False))
         self.assertNotIn("sk-real", json.dumps(persisted, ensure_ascii=False))
 
+    def test_exemption_stops_at_the_identifier_even_when_the_id_is_a_field_name(self):
+        """The identifier exemption must be exactly one level deep.
+
+        ``handles`` is a legal node id (models._ID allows it) and is also the
+        name of an identifier-keyed map.  If the exemption were keyed on the
+        name alone instead of on the position, the node's *own* fields would
+        inherit it and a real secret inside that node would be written in the
+        clear.
+        """
+        save_snapshot(
+            self.paths,
+            self.snapshot("handles", node_extra={"token": "ghp-real-secret"}),
+        )
+
+        persisted = json.loads(
+            (self.root / ".vibe" / "runs" / "run-1" / "state.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(persisted["nodes"]["handles"]["status"], "running")
+        self.assertEqual(persisted["nodes"]["handles"]["token"], "[REDACTED]")
+        self.assertNotIn("ghp-real-secret", json.dumps(persisted, ensure_ascii=False))
+
 
 class SensitiveNodeIdJourneyTests(unittest.TestCase):
     """CLI level: the id really does arrive from the product spec."""
