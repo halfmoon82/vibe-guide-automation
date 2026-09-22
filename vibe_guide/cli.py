@@ -51,7 +51,7 @@ from .node_spec import (
 from .scanner import scan_project
 from .diagnostics import screen_session, require_session_screened
 from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
-from .workflow_gate import require_capability_contract
+from .workflow_gate import is_v42_sdd_first_state, require_capability_contract
 from .authorize_entry import AuthorizationDenied, materialize_workflow_evidence
 from .attest import record_session_capabilities
 from .protocols import PRD_GUIDE_NAME, load_protocol
@@ -809,17 +809,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 and state_data.get("workflow_version") == 2
                 and state_data.get("session_gate") == "s0_required"
             )
-            valid_v42 = (
-                isinstance(state_data, dict)
-                and state_data.get("workflow_version") == 4
-                and state_data.get("execution_mode") == "sdd_first"
-                and state_data.get("session_gate") == "s0_required"
-                and state_data.get("capability_contract_required") is True
-                and set(state_data) == {
-                    "workflow_version", "execution_mode", "session_gate",
-                    "capability_contract_required",
-                }
-            )
+            valid_v42 = is_v42_sdd_first_state(state_data)
             if not (valid_v2 or valid_v42):
                 raise ValueError("invalid V2 state")
         except (OSError, ValueError, AttributeError):

@@ -22,6 +22,19 @@ _REMOTE_GIT_ACTIONS = {"commit", "push", "pr", "mr", "create_pr", "create_mr", "
 _V42_EVIDENCE_KEYS = {"task_workflow", "workflow", "legacy_run", "legacy_evidence"}
 
 
+def is_v42_sdd_first_state(value) -> bool:
+    """The one predicate for "this state.json is a V4.2 SDD-first project".
+
+    The session gate, `vibe init` and `vibe scan` all read the same file; a
+    second copy of this check drifted once already, so that a project which
+    had recorded workflow evidence passed the gate but was refused by init
+    and scan as an unknown legacy version.
+    """
+    return (isinstance(value, dict)
+            and not (set(value) - set(V42_STATE) - _V42_EVIDENCE_KEYS)
+            and all(value.get(key) == expected for key, expected in V42_STATE.items()))
+
+
 def create_task_workflow(task_id, context):
     """Create an isolated, task-scoped required workflow projection."""
     from .planner import route_task
@@ -164,9 +177,7 @@ def require_v42_sdd_first(paths) -> dict:
     # omitting it blocked every integration-review plan with
     # `required_workflow_blocked: workflow`.  Allow exactly the evidence keys
     # Monitor reads; anything else is still rejected.
-    if (not isinstance(value, dict)
-            or set(value) - set(V42_STATE) - _V42_EVIDENCE_KEYS
-            or any(value.get(key) != expected for key, expected in V42_STATE.items())):
+    if not is_v42_sdd_first_state(value):
         raise PermissionError("v42_state_required")
     return value
 

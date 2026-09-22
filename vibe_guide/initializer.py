@@ -13,7 +13,7 @@ from .scanner import (
 from .protocols import PRD_GUIDE_NAME, PRD_GUIDE_PROPOSAL_RELATIVE, load_protocol
 from .capability_contract import build_contract, contract_path, load_contract, save_contract
 from .migration import migrate_v2_to_v310, migrate_v2_to_v42, _backup, _payload_is_complete
-from .workflow_gate import V42_STATE
+from .workflow_gate import V42_STATE, is_v42_sdd_first_state
 
 # Newer rule blocks land here when a reviewed proposal.md already exists; both
 # the writer (init) and the reader (apply-agentsmd) name it from here.
@@ -102,7 +102,7 @@ def _migrate_state(path):
     if data == {}:
         _atomic_write(path, {"workflow_version": 2})
         return True
-    if data == V42_STATE:
+    if is_v42_sdd_first_state(data):
         return False
     if data.get('workflow_version') not in (2, 3, 3.1, 3.10):
         raise ValueError('state.json legacy version is unknown')
