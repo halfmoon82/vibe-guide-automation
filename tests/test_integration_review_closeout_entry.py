@@ -465,10 +465,16 @@ class MailboxClosesTheRunTests(unittest.TestCase):
         if action.get("role") == "reviewer":
             return {"status": "completed", "cursor": cursor, "event": "accepted",
                     "evidence": reviewer_evidence}
+        # ISSUE-04: regular nodes are ruled visible-sdd; the single worker
+        # session's delivery must cite its in-session review clearance.
         return {"status": "completed", "cursor": cursor, "event": "complete",
                 "delivery_evidence": {"completion_marker": "done",
                                       "delivery_path": "src/export.ts",
-                                      "thread_status": "complete"}}
+                                      "thread_status": "complete"},
+                "in_session_review": {
+                    "protocol": "vibe_guide/protocols/visible-sdd-worker.md",
+                    "evidence_ref": "closeout-e2e#review-round-1",
+                    "clearance": {"p0": 0, "p1": 0, "p2": 0}}}
 
     def test_a_structured_reviewer_acceptance_closes_the_run(self):
         result, snapshot = self.serve(CLEARED_CLAIM)
