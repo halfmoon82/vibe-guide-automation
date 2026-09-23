@@ -89,6 +89,7 @@
     "ISSUE-03": "PR #56 squash a392f04"
   },
   "deviations": [
-    "ISSUE-02 返工超出原白名单：initializer.py 与 tests/test_cli.py（reviewer P1 实证为唯一正确修法，按 AGENTS.md §6 纠偏条款执行并记录）"
+    "ISSUE-02 返工超出原白名单：initializer.py 与 tests/test_cli.py（reviewer P1 实证为唯一正确修法，按 AGENTS.md §6 纠偏条款执行并记录）",
+    "AGENTS.md 块标题落地为英文 `## New Session Entry`（决策卡草案为中文 `## 新会话入口（Vibe Guide）`），与既有两块英文标题风格一致；已在决策卡 D2 补录"
   ]
 }

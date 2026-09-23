@@ -1,6 +1,6 @@
 # PRD：新会话 S0/S1 入口接线（vibe-entry）
 
-状态：待开发计划确认（2026-09-23）
+状态：已验收完成（2026-09-23；PR #53/#54/#56 已合并，授权卡 vibe-entry-skill-auth-1 status=complete）
 上游合同：[2026-09-23-vibe-entry-skill-decision-card.md](2026-09-23-vibe-entry-skill-decision-card.md)（用户已确认，形态 C + 自包含要求）
 
 ## 背景与问题

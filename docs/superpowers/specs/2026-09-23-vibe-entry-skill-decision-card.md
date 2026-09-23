@@ -11,7 +11,7 @@ C = A+B：随包发布入口 SKILL.md（轻量自评协议，见修订后 D3）�
 
 - 协议源文件随包：`vibe_guide/protocols/vibe-entry.md`（与 prd-guide 同机制、同目录）。
 - init 物化到：`.vibe/proposals/skills/vibe-entry/SKILL.md`；**物化后永不被 init 改写**（用户改动在 re-init 后存活，与 prd-guide 行为一致）。
-- AGENTS.md 块标题：`## 新会话入口（Vibe Guide）`，走现有三态提案机制（proposal / pending-update / offered-sections），由 `vibe apply-agentsmd --confirm` 合入；reviewer 在提案里删掉该块 = 拒绝，与现有语义一致。
+- AGENTS.md 块标题：决策卡草案为 `## 新会话入口（Vibe Guide）`；**落地实现为英文标题 `## New Session Entry`**（marker 同名，与既有两块 `Capability and Tool Truth`/`Complex Request Entry` 的英文标题风格一致，2026-09-23 实现期决定、此处补录留痕），走现有三态提案机制（proposal / pending-update / offered-sections），由 `vibe apply-agentsmd --confirm` 合入；reviewer 在提案里删掉该块 = 拒绝，与现有语义一致。
 
 ## D3 入口协议内容范围（SKILL.md 写什么）——轻量版（2026-09-23 按用户决定修订）
 
