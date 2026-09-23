@@ -626,19 +626,20 @@ class ParallelGroupAuditTests(unittest.TestCase):
         )
         result = audit_dag(self._plan([producer, consumer]))
         self.assertEqual(result.status, "blocked_dag")
-        self.assertTrue(
-            any("produced path docs/spec.md" in reason for reason in result.reasons["consumer"]),
-            result.reasons["consumer"],
-        )
+        for node_id in ("producer", "consumer"):
+            self.assertTrue(
+                any("produced path docs/spec.md" in reason for reason in result.reasons[node_id]),
+                result.reasons[node_id],
+            )
 
     def test_cjk_prose_without_paths_neither_matches_nor_raises(self):
         producer = self._group_node(
             "producer",
-            contract_overrides={"output": "完成中文说明文档的撰写。版本v1.2已发布，见第3.14节"},
+            contract_overrides={"output": "完成中文说明文档的撰写。版本v1.2已发布，见第3.14节与附录/章节说明"},
         )
         consumer = self._group_node(
             "consumer",
-            contract_overrides={"input": "阅读中文说明文档，参考版本v1.2与第3.14节后验证"},
+            contract_overrides={"input": "阅读中文说明文档，参考版本v1.2、第3.14节及正文/背景后验证"},
         )
         result = audit_dag(self._plan([producer, consumer]))
         self.assertEqual(result.status, "ready")
@@ -657,6 +658,41 @@ class ParallelGroupAuditTests(unittest.TestCase):
         result = audit_dag(self._plan([producer, consumer]))
         self.assertEqual(result.status, "ready")
         self.assertEqual(set(result.ready_nodes), {"producer", "consumer"})
+
+    def test_underscore_or_dash_suffixed_output_path_is_not_truncated(self):
+        for suffix in ("_v2", "-v2"):
+            with self.subTest(suffix=suffix):
+                producer = self._group_node(
+                    "producer",
+                    contract_overrides={"output": "产出 docs/spec.md{} 草稿".format(suffix)},
+                )
+                consumer = self._group_node(
+                    "consumer",
+                    contract_overrides={"input": "参照docs/spec.md格式"},
+                )
+                result = audit_dag(self._plan([producer, consumer]))
+                self.assertEqual(result.status, "ready", result.reasons)
+                self.assertEqual(set(result.ready_nodes), {"producer", "consumer"})
+
+    def test_cjk_quoted_output_path_is_detected(self):
+        for quoted in ("《reports/测试输出.json》", "“reports/测试输出.json”", "「reports/测试输出.json」"):
+            with self.subTest(quoted=quoted):
+                producer = self._group_node(
+                    "producer",
+                    contract_overrides={"output": "产出{}供下游校验".format(quoted)},
+                )
+                consumer = self._group_node(
+                    "consumer",
+                    contract_overrides={"input": "读取reports/测试输出.json后做断言"},
+                )
+                result = audit_dag(self._plan([producer, consumer]))
+                self.assertEqual(result.status, "blocked_dag")
+                for node_id in ("producer", "consumer"):
+                    self.assertTrue(
+                        any("produced path reports/测试输出.json" in reason
+                            for reason in result.reasons[node_id]),
+                        result.reasons[node_id],
+                    )
 
 
 if __name__ == "__main__":

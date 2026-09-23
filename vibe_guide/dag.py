@@ -591,15 +591,17 @@ def _cycle_nodes(nodes: List[DAGNode]) -> List[str]:
     return sorted(found)
 
 
-_PATH_TOKEN_PATTERN = re.compile(r"[^\s，。；、：:\"'()（）\[\]<>]+")
+_PATH_TOKEN_PATTERN = re.compile(r"[^\s，。；、：:\"'()（）\[\]<>《》〈〉“”‘’「」『』]+")
 # A file path glued to prose without whitespace (``reports/测试输出.json供下游``)
 # still ends where its extension ends: one or more ``/``-separated segments,
 # then a final segment with an ASCII extension that is not itself continued by
-# alphanumerics, another ``.ext`` (``spec.md.bak``) or ``/``.  Segments may hold
-# non-ASCII characters so CJK file names survive.  The head of the path is only
-# delimited by the token start: gluing prose *before* a path is undecidable and
-# is left unresolved rather than guessed.
-_PATH_SPAN_PATTERN = re.compile(r"^(?:[^/]+/)+[^/]+?\.[A-Za-z0-9]{1,10}(?![A-Za-z0-9/]|\.[A-Za-z0-9])")
+# alphanumerics, ``_``/``-`` (``spec.md_v2``), another ``.ext`` (``spec.md.bak``)
+# or ``/``; the continuation class mirrors ``_references_path`` so both sides
+# agree on where a path ends.  Segments may hold non-ASCII characters so CJK
+# file names survive.  Only the tail is cut: prose glued *before* a path, or
+# after an extension-less directory path (``docs/specs后续``), is undecidable
+# and the token is left whole rather than guessed (it then matches nothing).
+_PATH_SPAN_PATTERN = re.compile(r"^(?:[^/]+/)+[^/]+?\.[A-Za-z0-9]{1,10}(?![A-Za-z0-9_/-]|\.[A-Za-z0-9])")
 
 
 def _write_scope_paths(node: DAGNode) -> Optional[List[str]]:
