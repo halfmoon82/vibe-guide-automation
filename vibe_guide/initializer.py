@@ -19,6 +19,10 @@ from .protocols import (
 from .capability_contract import build_contract, contract_path, load_contract, save_contract
 from .migration import migrate_v2_to_v310, migrate_v2_to_v42, _backup, _payload_is_complete
 from .workflow_gate import V42_STATE, is_v42_sdd_first_state
+from .config import (
+    DEFAULT_MAX_ACTIVE_WORKER_SESSIONS,
+    FIELD_MAX_ACTIVE_WORKER_SESSIONS,
+)
 
 # Newer rule blocks land here when a reviewed proposal.md already exists; both
 # the writer (init) and the reader (apply-agentsmd) name it from here.
@@ -206,10 +210,16 @@ def init_project(paths, confirm):
             path.mkdir()
             if relative in ('.vibe/knowledge', '.vibe/proposals/agentsmd', '.vibe/proposals/skills'):
                 created.append(relative)
+    default_config = json.dumps(
+        {FIELD_MAX_ACTIVE_WORKER_SESSIONS: DEFAULT_MAX_ACTIVE_WORKER_SESSIONS},
+        ensure_ascii=False, sort_keys=True,
+    ) + '\n'
     for relative in ('.vibe/config.json', '.vibe/state.json'):
         path = root / relative
         if not path.exists():
-            _write_new(path, (json.dumps(V42_STATE, ensure_ascii=False, sort_keys=True) + '\n') if relative == '.vibe/state.json' else '{}\n')
+            # Existing files are never rewritten: a config that predates a
+            # newer field keeps its bytes and the reader applies defaults.
+            _write_new(path, (json.dumps(V42_STATE, ensure_ascii=False, sort_keys=True) + '\n') if relative == '.vibe/state.json' else default_config)
             created.append(relative)
     capability_target = contract_path(paths)
     if capability_target.exists():
