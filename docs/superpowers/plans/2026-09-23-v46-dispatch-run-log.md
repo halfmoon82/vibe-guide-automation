@@ -51,3 +51,28 @@
 - 2026-09-23 20:2x ISSUE-04 交付 PR #64（draft）：核心链路改造完成（拓扑派发/上限=min(卡,配置)/监工writer硬拒/successor适配/组审计消费），会话内 review 2 轮无 P0–P2；两处越界阻塞经监工裁定扩白名单（closeout e2e 夹具适配 + provider_action.py 真实桥 topology 传播），worker 继续
 - 2026-09-23 21:0x ISSUE-04 PR #64 squash 合并 f088206；worker 会话归档（活跃 0/5）→ 放行 I08 文档收口（含 PRD/Spec/授权卡/run-log 四文档随 PR 提交）
 - 2026-09-23 21:0x ISSUE-08 派发：threadId 01a0ce5e-8785-7af1-beb8-0792a818d0e3（client c2e9ebca），活跃 1/5
+- 2026-09-23 21:3x ISSUE-08 PR #65 squash 合并 7d845b7（Dirac 终审无 P0–P2）；worker 会话归档，活跃 0/5
+- 2026-09-23 21:3x **run 完成**：8/8 Issue 全部 accepted（PR #58-#65 除编号顺序外全部 squash 进 main 6fdd1dd→7d845b7）；授权卡 status=complete
+
+## 最终验收对照（PRD AC-01～08）
+
+| AC | 结论 | 证据 |
+|---|---|---|
+| AC-01 同轮 ≥2 可见会话 | ✅ 机制交付+本次实战 | PR #64 fixture 测试；本 run 首波 4 会话同轮 create_thread（本文件登记） |
+| AC-02 上限与名额释放 | ✅ | PR #58（配置）+ PR #64（min(卡,配置)、accepted+归档同 tick 释放、未知占名额） |
+| AC-03 会话内 SDD 闭环 | ✅ | PR #61 协议 + 本 run 每 worker 实测 2-5 轮会话内 review |
+| AC-04 review 只读/独立 | ✅ | PR #61 契约测试（含变异体）+ 各 worker 会话实证 |
+| AC-05 监工不作 writer | ✅ | PR #63（卡片拒签）+ PR #64（结构性硬拒 choke point） |
+| AC-06 parallel_group 依赖审查 | ✅ | PR #62（dag.py 门禁+投影）+ PR #64（_schedule_ready 消费，monitor 级回归） |
+| AC-07 降级披露机器校验 | ✅ | PR #63（缺披露 ValueError） |
+| AC-08 visible successor 适配 | ✅ | PR #64（_replay_visible_sdd_acceptance 全链校验、fail-closed） |
+
+## 登记后续（不阻塞，供下一版规划）
+
+1. 跨组/无组写范围冲突无审查；path_ownership.validate_path_ownership 存在但未接线（Feynman P3-1）
+2. in_session_review evidence_ref 未绑 contract digest、accepted 事件 protocol 未比对常量（I04 R2/R4 P3）
+3. dag.py 根 `.` 相交专属单测；CJK 粘连散文产物引用漏检（Russell P3）
+4. 设计基线 §7.3 残留「任务对」旧口径；in_session_sdd 与 visible-sdd 命名双轨（Dirac P3）
+5. lifecycle.py _CANONICAL_FIELDS 未含 topology（I01 交付时登记的证据噪声项）
+6. AGENTS.md §6 补丁建议在 PR #65 body，等用户确认后落地
+7. 知识库沉淀候选：「新增 manifest 探针 = attest 写路径新增必填项，须同步全部 capabilities fixture」（I07 worker 提出，待用户批准入库）
