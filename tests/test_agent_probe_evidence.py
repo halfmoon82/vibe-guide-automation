@@ -58,6 +58,40 @@ class AgentProbeEvidenceTests(unittest.TestCase):
         self.write({**FACTS, "claude-code.subprocess": False})
         self.assertEqual(observe_capabilities(self.paths).capabilities["level"], "guide")
 
+    def test_attested_in_session_sdd_fact_reaches_evidence_provenance_and_topology(self):
+        self.write({**FACTS, "claude-code.in_session_sdd": True})
+        observed = observe_capabilities(self.paths)
+        self.assertTrue(observed.detection.evidence["claude-code.in_session_sdd"])
+        self.assertEqual(
+            observed.detection.capabilities.provenance["claude-code.in_session_sdd"], "test"
+        )
+        from vibe_guide.adapters.base import Environment
+        from vibe_guide.adapters.registry import AdapterRegistry
+        environment = Environment(
+            facts={**FACTS, "claude-code.in_session_sdd": True},
+            provenance={name: "test" for name in {**FACTS, "claude-code.in_session_sdd": True}},
+        )
+        adapter = AdapterRegistry().get("claude-code")
+        decision = adapter.topology_decision(environment)
+        self.assertEqual((decision.topology, decision.probe_status), ("in_session_sdd", "pass"))
+        self.assertEqual(decision.evidence_ref, "test")
+        report = adapter.capability_report(environment)
+        self.assertEqual(report["topology"]["topology"], "in_session_sdd")
+        self.assertEqual(report["topology"]["evidence_ref"], "test")
+
+    def test_missing_in_session_sdd_fact_stays_unknown_and_conservative(self):
+        self.write(FACTS)
+        observed = observe_capabilities(self.paths)
+        self.assertFalse(observed.detection.evidence["claude-code.in_session_sdd"])
+        from vibe_guide.adapters.base import Environment
+        from vibe_guide.adapters.registry import AdapterRegistry
+        adapter = AdapterRegistry().get("claude-code")
+        decision = adapter.topology_decision(Environment(facts=FACTS))
+        self.assertEqual((decision.topology, decision.probe_status), ("dual-visible", "unknown"))
+        report = adapter.capability_report(Environment(facts=FACTS))
+        self.assertEqual(report["topology"]["probe_status"], "unknown")
+        self.assertIsNone(report["topology"]["evidence_ref"])
+
 
 if __name__ == "__main__":
     unittest.main()

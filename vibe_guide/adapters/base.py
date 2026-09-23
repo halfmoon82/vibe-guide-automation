@@ -121,6 +121,32 @@ class DetectionResult:
         }
 
 
+TOPOLOGY_IN_SESSION_SDD = "in_session_sdd"
+TOPOLOGY_DUAL_VISIBLE = "dual-visible"
+
+_TOPOLOGY_VALUES = {TOPOLOGY_IN_SESSION_SDD, TOPOLOGY_DUAL_VISIBLE}
+_CONSERVATIVE_TOPOLOGY_SPEC = {"probe_pass": TOPOLOGY_DUAL_VISIBLE, "probe_unknown": TOPOLOGY_DUAL_VISIBLE}
+
+
+@dataclass(frozen=True)
+class TopologyDecision:
+    """Dispatch-topology ruling derived from the `in_session_sdd` probe evidence.
+
+    UNKNOWN evidence (missing fact, or a pass without provenance) is fail-closed:
+    it never yields ``in_session_sdd``.
+    """
+
+    adapter_id: str
+    probe: str
+    probe_status: str  # "pass" | "unsupported" | "unknown"
+    topology: str
+    evidence_ref: Optional[str]
+    upgraded: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 class ManifestAdapter:
     """Adapter with no platform-specific behavior outside its manifest."""
 
@@ -134,6 +160,9 @@ class ManifestAdapter:
         self.id = self.manifest["id"]
         self.display_name = self.manifest["display_name"]
         self.background_launcher = background_launcher
+        # Injected by AdapterRegistry from DISPATCH_TOPOLOGY_MATRIX; a missing
+        # spec is fail-closed (never `in_session_sdd`).
+        self.topology_spec: Optional[Mapping[str, str]] = None
         self.task_provider = VisibleTaskProvider(
             provider=self.manifest["provider"],
             prompt_factory=lambda role, issue, path: self.session_prompt(
@@ -182,6 +211,14 @@ class ManifestAdapter:
             if name in seen:
                 raise ManifestError("duplicate manifest probe: %s" % name)
             seen.add(name)
+        required_probe_name = manifest["id"] + ".in_session_sdd"
+        if not any(
+            probe.get("kind") == "fact" and probe.get("name") == required_probe_name
+            for probe in manifest["probes"]
+        ):
+            raise ManifestError(
+                "manifest missing required probe: %s" % required_probe_name
+            )
         fields = [item[1] for item in string.Formatter().parse(manifest["session_prompt"]) if item[1]]
         if set(fields) - {"trigger", "plan_id"} or "trigger" not in fields:
             raise ManifestError("session_prompt must use only trigger and plan_id")
@@ -242,6 +279,39 @@ class ManifestAdapter:
     def capabilities(self, environment: Environment) -> AdapterCapabilities:
         return self.detect(environment).capabilities
 
+    def topology_decision(self, environment: Environment) -> TopologyDecision:
+        """Rule the dispatch topology from the `in_session_sdd` probe evidence.
+
+        - fact True with provenance -> probe passes; the registry-injected
+          matrix row decides (SDD platforms upgrade to ``in_session_sdd``).
+        - fact False -> unsupported; conservative topology.
+        - fact missing, or a pass without provenance -> UNKNOWN; UNKNOWN is
+          fail-closed and never yields ``in_session_sdd``.
+        """
+        if not isinstance(environment, Environment):
+            environment = Environment.from_mapping(environment)
+        spec = dict(_CONSERVATIVE_TOPOLOGY_SPEC)
+        if self.topology_spec:
+            for key in ("probe_pass", "probe_unknown"):
+                value = self.topology_spec.get(key)
+                if value not in _TOPOLOGY_VALUES:
+                    raise ManifestError("invalid topology spec for adapter: %s" % self.id)
+                spec[key] = value
+        probe = self.id + ".in_session_sdd"
+        if probe not in environment.facts:
+            return TopologyDecision(self.id, probe, "unknown", spec["probe_unknown"], None)
+        evidence_ref = environment.fact_source(probe)
+        if environment.has_fact(probe, self.id):
+            if not evidence_ref:
+                # A pass without provenance is not admissible evidence.
+                return TopologyDecision(self.id, probe, "unknown", spec["probe_unknown"], None)
+            topology = spec["probe_pass"]
+            return TopologyDecision(
+                self.id, probe, "pass", topology, evidence_ref,
+                upgraded=topology != spec["probe_unknown"],
+            )
+        return TopologyDecision(self.id, probe, "unsupported", spec["probe_unknown"], evidence_ref)
+
     def session_prompt(self, trigger: str, plan_id: Optional[str] = None) -> str:
         try:
             prompt = self.manifest["session_prompt"].format(trigger=str(trigger).strip(), plan_id=str(plan_id or "").strip())
@@ -280,6 +350,7 @@ class ManifestAdapter:
         report["provider"] = result.capabilities.provider
         report["monitor_command"] = self.monitor_command(plan_id, True) if plan_id else None
         report["authorization_card"] = str(authorization_card) if authorization_card else None
+        report["topology"] = self.topology_decision(environment).to_dict()
         return report
 
 
