@@ -26,6 +26,7 @@ from ..model_router import provider_thinking_for
 from ..paths import ProjectPaths
 from ..task_registry import (
     DEFAULT_TOPOLOGY,
+    _TOPOLOGIES,
     TaskBinding,
     binding_contract_enabled,
     load_task_binding,
@@ -452,6 +453,8 @@ class ProviderActionRunner(Runner):
                 }
             )
         topology = str(contract.get("topology") or DEFAULT_TOPOLOGY)
+        if topology not in _TOPOLOGIES:
+            raise ValueError("task binding topology is invalid")
         # Preflight the rulings this visible-only bridge can never satisfy
         # *before* the create side effect: a background ruling would
         # otherwise leak an armed, unregistered visible task on the desktop

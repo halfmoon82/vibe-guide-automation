@@ -1280,6 +1280,20 @@ class VisibleSddTopologyPropagationTests(unittest.TestCase):
                     runner.task_binding(contract, paths.root / "worker", "run-v46", "start_pending")
             provider_call.assert_not_called()
 
+    def test_unknown_topology_string_fails_closed_before_create(self):
+        # R4 P3-1: values outside the closed topology set must be refused
+        # before the create side effect, not by the constructor after it.
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = self._runner(paths)
+            contract = self._contract("bogus")
+            with patch.object(runner, "_require_result") as provider_call:
+                with self.assertRaisesRegex(
+                    ValueError, "task binding topology is invalid"
+                ):
+                    runner.task_binding(contract, paths.root / "worker", "run-v46", "start_pending")
+            provider_call.assert_not_called()
+
     def test_missing_topology_keeps_dual_visible_default(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = ProjectPaths(Path(directory))
