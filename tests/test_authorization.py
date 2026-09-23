@@ -3,6 +3,7 @@ from copy import deepcopy
 import unittest
 
 from vibe_guide.authorization import (
+    BACKGROUND_MODE_DISCLOSURES,
     authorize,
     build_authorization_card,
     is_authorization_valid,
@@ -232,3 +233,237 @@ class AuthorizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuthorizationWorkersSchemaTests(unittest.TestCase):
+    """V4.6 ISSUE-02: structured per-node workers, main-session refusal and
+    machine-checked background downgrade disclosure on authorization cards."""
+
+    def setUp(self):
+        self.plan = Plan("plan-workers", 1, "docs/prd.md", ["n1", "n2"], "draft")
+        self.nodes = [node("n1", ["a.py"]), node("n2", ["b.py"], "worker-2")]
+        self.capabilities = AgentCapabilities(
+            "codex", True, True, True, True, True, "full"
+        )
+
+    @staticmethod
+    def _workers_by_id(card_or_record):
+        return {entry["node_id"]: entry for entry in card_or_record.workers}
+
+    def test_workers_default_to_dual_visible_developer_entries(self):
+        card = build_authorization_card(self.plan, self.nodes, self.capabilities)
+
+        workers = self._workers_by_id(card)
+        self.assertEqual(set(workers), {"n1", "n2"})
+        entry = workers["n1"]
+        self.assertEqual(
+            set(entry),
+            {"node_id", "topology", "mode", "role", "session_source", "limitations"},
+        )
+        self.assertEqual(entry["topology"], "dual-visible")
+        self.assertEqual(entry["mode"], "visible")
+        self.assertEqual(entry["role"], "developer")
+        self.assertEqual(entry["session_source"], "worker-1")
+        self.assertEqual(entry["limitations"], ())
+        summary = card.topology_summary
+        self.assertEqual(summary["total"], 2)
+        self.assertEqual(summary["visible"], 2)
+        self.assertEqual(summary["background"], 0)
+        self.assertEqual(summary["by_topology"]["dual-visible"], 2)
+
+    def test_workers_and_topology_summary_are_bound_into_the_digest(self):
+        base = build_authorization_card(self.plan, self.nodes, self.capabilities)
+        changed = build_authorization_card(
+            self.plan,
+            self.nodes,
+            self.capabilities,
+            workers={"n1": {"topology": "visible-sdd"}},
+        )
+
+        self.assertNotEqual(base.digest, changed.digest)
+        self.assertEqual(
+            changed.topology_summary["by_topology"]["visible-sdd"], 1
+        )
+
+    def test_main_session_developer_variants_are_refused(self):
+        variants = (
+            "main session",
+            "Main Session",
+            "MAIN SESSION",
+            "main-session",
+            "main_session",
+            "codex main session",
+            "Codex Main Session",
+            "  codex   main   session  ",
+            "主会话",
+            "main",
+        )
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises(ValueError):
+                build_authorization_card(
+                    self.plan,
+                    self.nodes,
+                    self.capabilities,
+                    workers={"n1": {"session_source": variant}},
+                )
+
+    def test_main_session_developer_separator_and_compact_variants_are_refused(self):
+        variants = (
+            "MainSession",
+            "mainsession",
+            "main.session",
+            "main/session",
+            "main:session",
+            "main thread",
+            "main-thread",
+            "mainthread",
+            "MainThread",
+            "claude main.thread",
+        )
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises(ValueError):
+                build_authorization_card(
+                    self.plan,
+                    self.nodes,
+                    self.capabilities,
+                    workers={"n1": {"session_source": variant}},
+                )
+
+    def test_non_string_contract_worker_identity_is_refused(self):
+        for bad_worker in (["main session"], {"session": "main"}, 7):
+            with self.subTest(worker=bad_worker):
+                evil = DAGNode(
+                    "n9",
+                    "n9",
+                    [],
+                    [],
+                    None,
+                    {"files": ["x.py"], "worker": bad_worker},
+                    "ready",
+                )
+                plan = Plan("plan-bad-worker", 1, "docs/prd.md", ["n9"], "draft")
+                with self.assertRaises(ValueError):
+                    build_authorization_card(plan, [evil], self.capabilities)
+
+    def test_main_session_identity_from_contract_worker_is_refused(self):
+        evil = node("n9", ["x.py"], worker="Codex Main Session")
+        plan = Plan("plan-main-session", 1, "docs/prd.md", ["n9"], "draft")
+
+        with self.assertRaises(ValueError):
+            build_authorization_card(plan, [evil], self.capabilities)
+
+    def test_developer_rule_does_not_reject_main_session_reviewer(self):
+        card = build_authorization_card(
+            self.plan,
+            self.nodes,
+            self.capabilities,
+            workers={"n1": {"role": "reviewer", "session_source": "codex main session"}},
+        )
+
+        self.assertEqual(self._workers_by_id(card)["n1"]["role"], "reviewer")
+
+    def test_background_worker_without_limitations_is_refused(self):
+        with self.assertRaises(ValueError):
+            build_authorization_card(
+                self.plan,
+                self.nodes,
+                self.capabilities,
+                workers={"n1": {"mode": "background"}},
+            )
+
+    def test_background_worker_with_partial_disclosure_is_refused(self):
+        partial = [
+            "不可见：background 任务不在桌面 App 中可见",
+            "不可直接进入：用户不能直接进入该任务会话",
+        ]
+        with self.assertRaises(ValueError):
+            build_authorization_card(
+                self.plan,
+                self.nodes,
+                self.capabilities,
+                workers={"n1": {"mode": "background", "limitations": partial}},
+            )
+
+    def test_background_worker_with_full_disclosure_is_issued(self):
+        card = build_authorization_card(
+            self.plan,
+            self.nodes,
+            self.capabilities,
+            workers={
+                "n1": {
+                    "mode": "background",
+                    "limitations": list(BACKGROUND_MODE_DISCLOSURES),
+                }
+            },
+        )
+
+        entry = self._workers_by_id(card)["n1"]
+        self.assertEqual(entry["mode"], "background")
+        self.assertEqual(entry["topology"], "background")
+        self.assertEqual(card.topology_summary["background"], 1)
+        self.assertEqual(card.topology_summary["visible"], 1)
+        record = authorize(card, "AUTHORIZE")
+        self.assertEqual(self._workers_by_id(record)["n1"]["mode"], "background")
+        self.assertEqual(record.topology_summary["by_topology"]["background"], 1)
+
+    def test_background_topology_requires_background_mode(self):
+        with self.assertRaises(ValueError):
+            build_authorization_card(
+                self.plan,
+                self.nodes,
+                self.capabilities,
+                workers={
+                    "n1": {
+                        "topology": "background",
+                        "mode": "visible",
+                        "limitations": list(BACKGROUND_MODE_DISCLOSURES),
+                    }
+                },
+            )
+
+    def test_workers_entries_outside_the_dag_are_refused(self):
+        with self.assertRaises(ValueError):
+            build_authorization_card(
+                self.plan,
+                self.nodes,
+                self.capabilities,
+                workers={"n9": {"topology": "dual-visible"}},
+            )
+
+    def test_workers_entries_with_unknown_keys_are_refused(self):
+        with self.assertRaises(ValueError):
+            build_authorization_card(
+                self.plan,
+                self.nodes,
+                self.capabilities,
+                workers={"n1": {"topology": "dual-visible", "surprise": "x"}},
+            )
+
+    def test_active_pair_limit_snapshot_is_carried_from_the_caller(self):
+        card = build_authorization_card(
+            self.plan, self.nodes, self.capabilities, active_pair_limit=2
+        )
+
+        self.assertEqual(card.active_pair_limit, 2)
+        self.assertEqual(authorize(card, "AUTHORIZE").active_pair_limit, 2)
+
+    def test_refresh_preserves_workers_and_disclosures(self):
+        card = build_authorization_card(
+            self.plan,
+            self.nodes,
+            self.capabilities,
+            workers={
+                "n1": {
+                    "mode": "background",
+                    "limitations": list(BACKGROUND_MODE_DISCLOSURES),
+                }
+            },
+        )
+        refreshed = refresh_authorization_card(self.plan, self.nodes, card)
+
+        entry = self._workers_by_id(refreshed)["n1"]
+        self.assertEqual(entry["mode"], "background")
+        self.assertEqual(
+            entry["limitations"],
+            tuple(BACKGROUND_MODE_DISCLOSURES),
+        )
