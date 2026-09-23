@@ -10,7 +10,13 @@ from .scanner import (
     missing_agentsmd_blocks,
     scan_project,
 )
-from .protocols import PRD_GUIDE_NAME, PRD_GUIDE_PROPOSAL_RELATIVE, load_protocol
+from .protocols import (
+    PRD_GUIDE_NAME,
+    PRD_GUIDE_PROPOSAL_RELATIVE,
+    VIBE_ENTRY_NAME,
+    VIBE_ENTRY_PROPOSAL_RELATIVE,
+    load_protocol,
+)
 from .capability_contract import build_contract, contract_path, load_contract, save_contract
 from .migration import migrate_v2_to_v310, migrate_v2_to_v42, _backup, _payload_is_complete
 from .workflow_gate import V42_STATE, is_v42_sdd_first_state
@@ -312,6 +318,13 @@ def init_project(paths, confirm):
         prd_guide.parent.mkdir(parents=True, exist_ok=True)
         _write_new(prd_guide, load_protocol(PRD_GUIDE_NAME))
         created.append(PRD_GUIDE_PROPOSAL_RELATIVE)
+    # The session-entry protocol shares prd-guide's semantics: proposed once,
+    # never rewritten, so user edits survive re-initialization.
+    vibe_entry = root / VIBE_ENTRY_PROPOSAL_RELATIVE
+    if not vibe_entry.exists():
+        vibe_entry.parent.mkdir(parents=True, exist_ok=True)
+        _write_new(vibe_entry, load_protocol(VIBE_ENTRY_NAME))
+        created.append(VIBE_ENTRY_PROPOSAL_RELATIVE)
     return InitResult(bool(created), created, notes)
 
 

@@ -16,6 +16,10 @@ PRD_GUIDE_NAME = "prd-guide"
 #: Where ``vibe init`` places the protocol inside a project.
 PRD_GUIDE_PROPOSAL_RELATIVE = ".vibe/proposals/skills/prd-guide/SKILL.md"
 
+VIBE_ENTRY_NAME = "vibe-entry"
+#: The new-session entry protocol materializes next to prd-guide.
+VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
+
 _HERE = Path(__file__).resolve().parent
 _SCHEMA_HEADING = "### 5.1"
 
