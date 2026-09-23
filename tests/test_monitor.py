@@ -3095,5 +3095,186 @@ class VisibleDispatchTests(unittest.TestCase):
         )
 
 
+class PathOwnershipGateTests(unittest.TestCase):
+    """V4.7 ISSUE-01: validate_path_ownership guards every dispatch round.
+
+    The gate runs over every candidate writer of the round regardless of
+    parallel_group; any owned_paths overlap or unverifiable ownership refuses
+    the whole round, marks the candidates blocked_unknown and writes the
+    run-scoped dag-audit document.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.paths = ProjectPaths(Path(self.temporary.name))
+        (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (self.paths.vibe / "state.json").write_text('{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8")
+        save_contract(
+            self.paths,
+            build_contract(self.paths.root, provider="fake", host_id="local"),
+        )
+        self.capabilities = AgentCapabilities("fake", True, True, True, True, True, "full")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def authorized_monitor(self, nodes):
+        plan = Plan("plan-1", 1, "docs/prd.md", [item.id for item in nodes], "draft")
+        card = build_authorization_card(plan, nodes, self.capabilities)
+        return Monitor(self.paths, plan, nodes), authorize(card, "AUTHORIZE")
+
+    @staticmethod
+    def owned_node(node_id, owned, group="g1"):
+        item = node(node_id)
+        item.parallel_group = group
+        item.owned_paths = list(owned)
+        return item
+
+    def run_audit(self, snapshot):
+        path = self.paths.root / ".vibe" / "runs" / snapshot.run_id / "dag-audit.json"
+        self.assertTrue(path.is_file(), "run-scoped dag-audit.json was not written")
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def assert_round_refused(self, snapshot, runner, node_ids):
+        self.assertEqual(runner.start_calls, [])
+        for node_id in node_ids:
+            self.assertEqual(snapshot.nodes[node_id]["status"], "blocked_unknown", node_id)
+            self.assertIn("path ownership", snapshot.nodes[node_id]["reason"])
+            # Refused before any lease: another run can take the writer slot.
+            self.assertTrue(
+                acquire_writer_lease(self.paths, node_id, ".worktrees/" + node_id, "run-other")
+            )
+        events = [e for e in load_events(self.paths, snapshot.run_id) if e["event"] == "path_ownership_conflict"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(sorted(events[0]["data"]["node_ids"]), sorted(node_ids))
+        audit = self.run_audit(snapshot)
+        self.assertEqual(audit["status"], "blocked_unknown")
+        self.assertEqual(sorted(audit["node_ids"]), sorted(node_ids))
+        self.assertEqual(audit["node_count"], len(node_ids))
+        self.assertFalse(audit["path_ownership"]["valid"])
+        return audit
+
+    def test_intersecting_owned_paths_refuse_the_round_and_write_audit(self):
+        nodes = [self.owned_node("a", ["shared.py"]), self.owned_node("b", ["shared.py"])]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        audit = self.assert_round_refused(snapshot, runner, ["a", "b"])
+        self.assertEqual(
+            audit["path_ownership"]["conflicts"],
+            [{"path": "shared.py", "nodes": ["a", "b"]}],
+        )
+        self.assertIn("shared.py", snapshot.nodes["a"]["reason"])
+        self.assertIn("shared.py", snapshot.nodes["b"]["reason"])
+        # Structural, not advisory: a later tick never dispatches them.
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(runner.start_calls, [])
+        self.assertEqual(snapshot.nodes["a"]["status"], "blocked_unknown")
+        self.assertEqual(snapshot.nodes["b"]["status"], "blocked_unknown")
+
+    def test_disjoint_owned_paths_dispatch_normally(self):
+        nodes = [self.owned_node("a", ["src/a.py"]), self.owned_node("b", ["src/b.py"])]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["a", "b"])
+        self.assertEqual(snapshot.nodes["a"]["status"], "running")
+        self.assertEqual(snapshot.nodes["b"]["status"], "running")
+        self.assertFalse((self.paths.root / ".vibe" / "runs" / snapshot.run_id / "dag-audit.json").exists())
+        self.assertEqual(
+            [e for e in load_events(self.paths, snapshot.run_id) if e["event"] == "path_ownership_conflict"],
+            [],
+        )
+
+    def test_one_conflicting_pair_refuses_all_three_candidates(self):
+        nodes = [
+            self.owned_node("a", ["shared.py"]),
+            self.owned_node("b", ["shared.py"]),
+            self.owned_node("c", ["src/c.py"], group="g2"),
+        ]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        audit = self.assert_round_refused(snapshot, runner, ["a", "b", "c"])
+        self.assertEqual(audit["path_ownership"]["conflicts"], [{"path": "shared.py", "nodes": ["a", "b"]}])
+        self.assertEqual(snapshot.nodes["c"]["status"], "blocked_unknown")
+
+    def test_empty_owned_paths_do_not_block(self):
+        nodes = [self.owned_node("a", ["src/a.py"]), self.owned_node("b", [])]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["a", "b"])
+        self.assertEqual(snapshot.nodes["b"]["status"], "running")
+
+    def test_cross_group_intersection_is_refused(self):
+        nodes = [
+            self.owned_node("a", ["shared.py"], group="g1"),
+            self.owned_node("b", ["shared.py"], group="g2"),
+        ]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        audit = self.assert_round_refused(snapshot, runner, ["a", "b"])
+        self.assertEqual(audit["path_ownership"]["conflicts"], [{"path": "shared.py", "nodes": ["a", "b"]}])
+
+    def test_ungrouped_intersection_is_refused(self):
+        nodes = [
+            self.owned_node("a", ["shared.py"], group=None),
+            self.owned_node("b", ["shared.py"], group=None),
+        ]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        audit = self.assert_round_refused(snapshot, runner, ["a", "b"])
+        self.assertEqual(audit["path_ownership"]["conflicts"], [{"path": "shared.py", "nodes": ["a", "b"]}])
+
+    def test_missing_ownership_metadata_fails_closed(self):
+        # DAGNode itself refuses non-list ownership fields, so the
+        # missing_nodes branch is driven through the validator's own result
+        # shape: the monitor must treat it exactly like a conflict.
+        from vibe_guide import monitor as monitor_module
+        from vibe_guide.path_ownership import PathOwnershipResult
+
+        nodes = [self.owned_node("m", ["src/m.py"], group="g1"), self.owned_node("n", ["src/n.py"], group="g2")]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner()
+
+        with patch.object(
+            monitor_module,
+            "validate_path_ownership",
+            return_value=PathOwnershipResult(False, [], ["m"]),
+        ):
+            snapshot = monitor.start(record, runner)
+
+        audit = self.assert_round_refused(snapshot, runner, ["m", "n"])
+        self.assertEqual(audit["path_ownership"]["conflicts"], [])
+        self.assertEqual(audit["path_ownership"]["missing_nodes"], ["m"])
+
+    def test_invalid_owned_path_fails_closed(self):
+        nodes = [
+            self.owned_node("a", ["../outside.py"], group="g1"),
+            self.owned_node("b", ["src/b.py"], group="g2"),
+        ]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        self.assert_round_refused(snapshot, runner, ["a", "b"])
+
+
 if __name__ == "__main__":
     unittest.main()
