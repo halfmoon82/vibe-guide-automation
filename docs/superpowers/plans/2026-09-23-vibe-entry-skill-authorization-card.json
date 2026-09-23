@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "card_id": "vibe-entry-skill-auth-1",
+  "plan_id": "vibe-entry-skill-20260923",
+  "plan_revision": 1,
+  "status": "complete",
+  "scope": "ISSUE-01..ISSUE-03 as listed in docs/superpowers/specs/2026-09-23-vibe-entry-skill-spec-issues.md (decision card 2026-09-23 confirmed)",
+  "ready_nodes": [
+    "ISSUE-01",
+    "ISSUE-02"
+  ],
+  "deferred_nodes": [
+    "ISSUE-03"
+  ],
+  "parallel_groups": {
+    "entry-wiring": [
+      "ISSUE-01",
+      "ISSUE-02"
+    ]
+  },
+  "active_pair_limit": 2,
+  "allowed_actions": [
+    "develop",
+    "test",
+    "review",
+    "rework",
+    "accept",
+    "archive_task"
+  ],
+  "remote_git_actions": "allow",
+  "remote_git_actions_options": [
+    "allow",
+    "deny"
+  ],
+  "deploy_authorization": false,
+  "permissions": {
+    "run_targeted_tests": true,
+    "run_full_suite": true,
+    "create_visible_tasks": false,
+    "create_worktrees": true,
+    "start_monitor": "manual_document_chain",
+    "commit": "conditional_on_remote_git_actions_allow",
+    "push": "conditional_on_remote_git_actions_allow",
+    "create_pr": "conditional_on_remote_git_actions_allow",
+    "merge": "conditional_on_remote_git_actions_allow_and_independent_review_green",
+    "deploy": false,
+    "release": false,
+    "modify_files_outside_node_whitelist": false
+  },
+  "file_scope": {
+    "ISSUE-01": [
+      "vibe_guide/protocols/vibe-entry.md",
+      "vibe_guide/protocols/__init__.py",
+      "vibe_guide/initializer.py",
+      "tests/test_vibe_entry_protocol.py"
+    ],
+    "ISSUE-02": [
+      "vibe_guide/scanner.py",
+      "tests/test_scanner.py"
+    ],
+    "ISSUE-03": [
+      "README.md",
+      "README.en.md"
+    ]
+  },
+  "workers": {
+    "developer": "codex main session, one isolated worktree per node (branch prefix codex/)",
+    "reviewer": "independent codex subagent per PR, read-only, P0-P3 grading (same as PR #52 practice)"
+  },
+  "merge_rule": "per standing rule 2026-09-15: auto independent review -> rework loop (max 3 rounds) -> squash merge when no P0-P2 and tests green; never direct-push main",
+  "verification": {
+    "targeted": "python3 -m unittest <node test module> -v",
+    "full": "python3 -m unittest discover -s tests -v && python3 -m vibe_guide --help && git diff --check",
+    "real_agent_acceptance": "deferred to post-release rollout (decision card D5); report as unverified if not done"
+  },
+  "excluded": [
+    "deploy",
+    "release/tag",
+    "production writes",
+    "credentials",
+    "vibe init on this repo",
+    "apply-agentsmd on user projects"
+  ],
+  "authorized_at": "2026-09-23",
+  "completed_at": "2026-09-23",
+  "merge_evidence": {
+    "ISSUE-01": "PR #53 squash 2618092",
+    "ISSUE-02": "PR #54 squash be907d8（一轮返工：apply 门禁泛化）",
+    "ISSUE-03": "PR #56 squash a392f04"
+  },
+  "deviations": [
+    "ISSUE-02 返工超出原白名单：initializer.py 与 tests/test_cli.py（reviewer P1 实证为唯一正确修法，按 AGENTS.md §6 纠偏条款执行并记录）",
+    "AGENTS.md 块标题落地为英文 `## New Session Entry`（决策卡草案为中文 `## 新会话入口（Vibe Guide）`），与既有两块英文标题风格一致；已在决策卡 D2 补录"
+  ]
+}
