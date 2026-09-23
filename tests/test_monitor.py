@@ -3275,6 +3275,64 @@ class PathOwnershipGateTests(unittest.TestCase):
 
         self.assert_round_refused(snapshot, runner, ["a", "b"])
 
+    def test_accepted_predecessor_sharing_owned_paths_does_not_block_successor(self):
+        """A hard dependency is the legitimate way to serialize one file.
+
+        Distinct groups keep the V4.6 parallel-group audit out of the way so
+        only the ownership gate decides.
+        """
+        nodes = [self.owned_node("a", ["shared.py"], group="g1"), self.owned_node("b", ["shared.py"], group="g2")]
+        nodes[1].depends_on = ["a"]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner(
+            events={
+                ("a", "developer"): [("delivered", {"evidence": "delivery"})],
+                ("a", "reviewer"): [("accepted", {"evidence": "ok"})],
+            }
+        )
+
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["a"]["status"], "accepted")
+        self.assertEqual(snapshot.nodes["b"]["status"], "running")
+        self.assertEqual(
+            [(call["node_id"], call["role"]) for call in runner.start_calls],
+            [("a", "developer"), ("a", "reviewer"), ("b", "developer")],
+        )
+        self.assertFalse((self.paths.root / ".vibe" / "runs" / snapshot.run_id / "dag-audit.json").exists())
+
+    def test_in_flight_writer_blocks_a_new_candidate_without_retro_blocking_itself(self):
+        nodes = [
+            self.owned_node("a", ["shared.py"], group="g1"),
+            self.owned_node("b", ["shared.py"], group="g2"),
+            self.owned_node("c", ["src/c.py"], group="g3"),
+        ]
+        nodes[1].depends_on = ["c"]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner(
+            events={
+                ("c", "developer"): [("delivered", {"evidence": "delivery"})],
+                ("c", "reviewer"): [("accepted", {"evidence": "ok"})],
+            }
+        )
+
+        snapshot = monitor.start(record, runner)
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["a", "c"])
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["c"]["status"], "accepted")
+        self.assertEqual(snapshot.nodes["a"]["status"], "running")
+        self.assertEqual(snapshot.nodes["b"]["status"], "blocked_unknown")
+        self.assertIn("shared.py", snapshot.nodes["b"]["reason"])
+        self.assertNotIn("b", [call["node_id"] for call in runner.start_calls])
+        audit = self.run_audit(snapshot)
+        self.assertEqual(sorted(audit["node_ids"]), ["a", "b"])
+        self.assertEqual(audit["path_ownership"]["blocked_nodes"], ["b"])
+        self.assertEqual(audit["path_ownership"]["conflicts"], [{"path": "shared.py", "nodes": ["b", "a"]}])
+
 
 if __name__ == "__main__":
     unittest.main()
