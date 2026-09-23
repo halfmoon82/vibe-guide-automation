@@ -27,6 +27,7 @@ CLAUDE_FACTS = {
     "claude-code.visible_task.enter": True,
     "claude-code.visible_task.resume": True,
     "claude-code.visible_task.wait": True,
+    "claude-code.in_session_sdd": False,
 }
 
 

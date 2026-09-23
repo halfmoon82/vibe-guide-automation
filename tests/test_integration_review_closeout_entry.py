@@ -37,6 +37,7 @@ FACTS = {name: True for name in (
     "claude-code.agent", "claude-code.shell", "claude-code.subprocess", "claude-code.worktree",
     "claude-code.visible_task.create", "claude-code.visible_task.enter",
     "claude-code.visible_task.resume", "claude-code.visible_task.wait",
+    "claude-code.in_session_sdd",
 )}
 CLEARED_CLAIM = {
     "findings": [],

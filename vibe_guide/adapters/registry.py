@@ -3,7 +3,13 @@
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Sequence
 
-from .base import Environment, ManifestAdapter, ManifestError
+from .base import (
+    TOPOLOGY_DUAL_VISIBLE,
+    TOPOLOGY_IN_SESSION_SDD,
+    Environment,
+    ManifestAdapter,
+    ManifestError,
+)
 from .task_provider import TaskProviderAdapter
 
 
@@ -11,6 +17,30 @@ SUPPORTED_ADAPTER_IDS = frozenset({
     "codex", "claude-code", "cursor", "grok", "workbuddy", "kimi-code",
     "deepseek-harness",
 })
+
+# Dispatch-topology ruling table (v4.6 ISSUE-07). ``probe_pass`` applies when
+# the platform's `<id>.in_session_sdd` fact probe passes with provenance;
+# ``probe_unknown`` applies when the evidence is UNKNOWN or unsupported.
+# UNKNOWN is fail-closed: it never yields ``in_session_sdd``.
+DISPATCH_TOPOLOGY_MATRIX = {
+    "codex": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+    "claude-code": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+    "cursor": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+    "kimi-code": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+    # DeepSeek Harness dispatches dual-visible until its probe evidence passes.
+    "deepseek-harness": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+    "workbuddy": {"probe_pass": "dual-visible", "probe_unknown": "dual-visible"},
+    "grok": {"probe_pass": "dual-visible", "probe_unknown": "dual-visible"},
+}
+
+_TOPOLOGY_ROW_KEYS = {"probe_pass", "probe_unknown"}
+_TOPOLOGY_ROW_VALUES = {TOPOLOGY_IN_SESSION_SDD, TOPOLOGY_DUAL_VISIBLE}
+if set(DISPATCH_TOPOLOGY_MATRIX) != SUPPORTED_ADAPTER_IDS or any(
+    set(row) != _TOPOLOGY_ROW_KEYS
+    or any(value not in _TOPOLOGY_ROW_VALUES for value in row.values())
+    for row in DISPATCH_TOPOLOGY_MATRIX.values()
+):
+    raise ManifestError("dispatch topology matrix does not match the supported adapter set and topology values")
 
 
 class AdapterRegistry:
@@ -26,6 +56,7 @@ class AdapterRegistry:
             if adapter.id in self._adapters:
                 raise ManifestError("duplicate adapter id: %s" % adapter.id)
             adapter.upgrade_adapter = TaskProviderAdapter(adapter.manifest["provider"], adapter.task_provider, mode="visible")
+            adapter.topology_spec = DISPATCH_TOPOLOGY_MATRIX.get(adapter.id)
             self._adapters[adapter.id] = adapter
         self._require_complete()
 
@@ -49,6 +80,7 @@ class AdapterRegistry:
             if adapter.id in registry._adapters:
                 raise ManifestError("duplicate adapter id: %s" % adapter.id)
             adapter.upgrade_adapter = TaskProviderAdapter(adapter.manifest["provider"], adapter.task_provider, mode="visible")
+            adapter.topology_spec = DISPATCH_TOPOLOGY_MATRIX.get(adapter.id)
             registry._adapters[adapter.id] = adapter
         return registry
 
@@ -74,6 +106,10 @@ class AdapterRegistry:
 
     def detect_all(self, environment: Environment):
         return [adapter.detect(environment) for adapter in self._adapters.values()]
+
+    def topology_decisions(self, environment: Environment):
+        """Per-platform dispatch-topology rulings with evidence references."""
+        return {adapter_id: adapter.topology_decision(environment) for adapter_id, adapter in self._adapters.items()}
 
     def describe_upgrade_entries(self):
         """Return provider-neutral upgrade metadata for all registered adapters."""

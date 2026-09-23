@@ -323,5 +323,127 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(adapter.monitor_command("plan-7", True), ["vibe", "monitor", "--plan", "plan-7", "--json"])
 
 
+EXPECTED_TOPOLOGY_MATRIX = {
+    "codex": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+    "claude-code": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+    "cursor": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+    "kimi-code": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+    "deepseek-harness": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+    "workbuddy": {"probe_pass": "dual-visible", "probe_unknown": "dual-visible"},
+    "grok": {"probe_pass": "dual-visible", "probe_unknown": "dual-visible"},
+}
+
+SDD_PLATFORMS = ("codex", "claude-code", "cursor", "kimi-code", "deepseek-harness")
+DUAL_ONLY_PLATFORMS = ("workbuddy", "grok")
+
+
+def sdd_env(adapter_id, value=True, provenance="session-contract"):
+    facts = {adapter_id + ".in_session_sdd": value}
+    return Environment(facts=facts, provenance={adapter_id + ".in_session_sdd": provenance})
+
+
+class TopologyDecisionTests(unittest.TestCase):
+    def test_every_manifest_declares_the_in_session_sdd_fact_probe(self):
+        registry = AdapterRegistry()
+        for adapter_id in SUPPORTED:
+            manifest = registry.get(adapter_id).manifest
+            probe = {"kind": "fact", "name": adapter_id + ".in_session_sdd"}
+            self.assertIn(probe, [dict(item) for item in manifest["probes"]])
+
+    def test_manifest_without_the_sdd_probe_fails_registration(self):
+        manifest = dict(AdapterRegistry().get("codex").manifest)
+        manifest["probes"] = [
+            dict(item) for item in manifest["probes"]
+            if item["name"] != "codex.in_session_sdd"
+        ]
+        with self.assertRaises(ManifestError):
+            AdapterRegistry.custom_from_manifests([manifest])
+        wrong_kind = dict(AdapterRegistry().get("codex").manifest)
+        wrong_kind["probes"] = [
+            dict(item) if item["name"] != "codex.in_session_sdd"
+            else {"kind": "command", "name": "codex.in_session_sdd"}
+            for item in wrong_kind["probes"]
+        ]
+        with self.assertRaises(ManifestError):
+            AdapterRegistry.custom_from_manifests([wrong_kind])
+
+    def test_dispatch_topology_matrix_matches_the_contract_row_by_row(self):
+        from vibe_guide.adapters.registry import DISPATCH_TOPOLOGY_MATRIX
+        self.assertEqual(DISPATCH_TOPOLOGY_MATRIX, EXPECTED_TOPOLOGY_MATRIX)
+        self.assertEqual(set(DISPATCH_TOPOLOGY_MATRIX), SUPPORTED)
+
+    def test_probe_pass_yields_in_session_sdd_for_sdd_platforms_only(self):
+        registry = AdapterRegistry()
+        for adapter_id in SDD_PLATFORMS:
+            decision = registry.get(adapter_id).topology_decision(sdd_env(adapter_id))
+            self.assertEqual(decision.topology, "in_session_sdd", adapter_id)
+            self.assertEqual(decision.probe_status, "pass", adapter_id)
+            self.assertEqual(decision.probe, adapter_id + ".in_session_sdd")
+            self.assertEqual(decision.evidence_ref, "session-contract")
+        for adapter_id in DUAL_ONLY_PLATFORMS:
+            decision = registry.get(adapter_id).topology_decision(sdd_env(adapter_id))
+            self.assertEqual(decision.topology, "dual-visible", adapter_id)
+            self.assertEqual(decision.probe_status, "pass", adapter_id)
+
+    def test_unknown_probe_never_yields_in_session_sdd(self):
+        registry = AdapterRegistry()
+        for adapter_id in SUPPORTED:
+            decision = registry.get(adapter_id).topology_decision(Environment())
+            self.assertEqual(decision.probe_status, "unknown", adapter_id)
+            self.assertEqual(decision.topology, "dual-visible", adapter_id)
+            self.assertIsNone(decision.evidence_ref, adapter_id)
+
+    def test_false_probe_is_unsupported_and_conservative(self):
+        registry = AdapterRegistry()
+        for adapter_id in SUPPORTED:
+            decision = registry.get(adapter_id).topology_decision(sdd_env(adapter_id, value=False))
+            self.assertEqual(decision.probe_status, "unsupported", adapter_id)
+            self.assertEqual(decision.topology, "dual-visible", adapter_id)
+            self.assertEqual(decision.evidence_ref, "session-contract")
+
+    def test_probe_pass_without_provenance_is_not_admissible(self):
+        registry = AdapterRegistry()
+        env = Environment(facts={"codex.in_session_sdd": True})
+        decision = registry.get("codex").topology_decision(env)
+        self.assertEqual(decision.probe_status, "unknown")
+        self.assertEqual(decision.topology, "dual-visible")
+        self.assertIsNone(decision.evidence_ref)
+
+    def test_deepseek_does_not_upgrade_without_probe_evidence(self):
+        registry = AdapterRegistry()
+        adapter = registry.get("deepseek-harness")
+        unknown = adapter.topology_decision(Environment())
+        self.assertEqual((unknown.topology, unknown.upgraded), ("dual-visible", False))
+        passed = adapter.topology_decision(sdd_env("deepseek-harness"))
+        self.assertEqual((passed.topology, passed.upgraded), ("in_session_sdd", True))
+        for adapter_id in DUAL_ONLY_PLATFORMS:
+            decision = registry.get(adapter_id).topology_decision(sdd_env(adapter_id))
+            self.assertFalse(decision.upgraded, adapter_id)
+
+    def test_capability_report_records_topology_decision_and_evidence_ref(self):
+        adapter = AdapterRegistry().get("codex")
+        report = adapter.capability_report(sdd_env("codex"))
+        self.assertEqual(report["topology"]["topology"], "in_session_sdd")
+        self.assertEqual(report["topology"]["probe_status"], "pass")
+        self.assertEqual(report["topology"]["evidence_ref"], "session-contract")
+        self.assertEqual(report["evidence"]["codex.in_session_sdd"], True)
+        unknown_report = adapter.capability_report(Environment())
+        self.assertEqual(unknown_report["topology"]["topology"], "dual-visible")
+        self.assertEqual(unknown_report["topology"]["probe_status"], "unknown")
+
+    def test_registry_reports_topology_decisions_for_all_platforms(self):
+        registry = AdapterRegistry()
+        env = Environment(
+            facts={"grok.in_session_sdd": True, "kimi-code.in_session_sdd": True},
+            provenance={"grok.in_session_sdd": "session-contract",
+                        "kimi-code.in_session_sdd": "session-contract"},
+        )
+        decisions = registry.topology_decisions(env)
+        self.assertEqual(set(decisions), SUPPORTED)
+        self.assertEqual(decisions["kimi-code"].topology, "in_session_sdd")
+        self.assertEqual(decisions["grok"].topology, "dual-visible")
+        self.assertEqual(decisions["codex"].probe_status, "unknown")
+
+
 if __name__ == "__main__":
     unittest.main()
