@@ -157,3 +157,43 @@ class ScannerTests(unittest.TestCase):
             serialized = json.dumps(result.facts, sort_keys=True).lower()
             for unsupported in ('login', 'approval', 'merge', 'deploy', 'authority'):
                 self.assertNotIn(unsupported, serialized)
+
+
+class VibeEntryRuleBlockTests(unittest.TestCase):
+    """The New Session Entry block joins AGENTSMD_BLOCKS as a third, marker-
+    detected section so the existing tri-state proposal machinery (proposal /
+    pending-update / offered-sections) carries it with zero mechanism change."""
+
+    def test_block_registered_last_with_unique_heading(self):
+        from vibe_guide.scanner import AGENTSMD_BLOCKS, VIBE_ENTRY_RULES
+        self.assertIs(AGENTSMD_BLOCKS[-1], VIBE_ENTRY_RULES)
+        self.assertTrue(VIBE_ENTRY_RULES.startswith("## New Session Entry"))
+        headings = [block.splitlines()[0].strip() for block in AGENTSMD_BLOCKS]
+        self.assertCountEqual(headings, set(headings), "two blocks share a heading")
+
+    def test_missing_detection_is_independent_per_marker(self):
+        from vibe_guide.scanner import (
+            AGENTSMD_BLOCKS, CAPABILITY_RULES, PRD_GUIDE_RULES,
+            VIBE_ENTRY_RULES, missing_agentsmd_blocks,
+        )
+        # An applied document carries the header the capability detection
+        # requires, exactly as build_agentsmd_patch writes it.
+        header = "# Vibe Guide\n\nProject guidance is maintained through the Vibe Guide.\n\n"
+        both_old = header + CAPABILITY_RULES + PRD_GUIDE_RULES
+        self.assertEqual(missing_agentsmd_blocks(both_old), [VIBE_ENTRY_RULES])
+        all_three = both_old + VIBE_ENTRY_RULES
+        self.assertEqual(missing_agentsmd_blocks(all_three), [])
+        # Regression: an AGENTS.md with nothing still gets every block, in
+        # document order, with the entry block last.
+        self.assertEqual(
+            missing_agentsmd_blocks("# Project\n"),
+            [CAPABILITY_RULES, PRD_GUIDE_RULES, VIBE_ENTRY_RULES],
+        )
+        self.assertEqual(len(AGENTSMD_BLOCKS), 3)
+
+    def test_block_points_at_materialized_skill_and_states_gate_discipline(self):
+        from vibe_guide.scanner import VIBE_ENTRY_RULES
+        self.assertIn(".vibe/proposals/skills/vibe-entry/SKILL.md", VIBE_ENTRY_RULES)
+        self.assertIn("vibe scan", VIBE_ENTRY_RULES)
+        self.assertIn("vibe plan --request", VIBE_ENTRY_RULES)
+        self.assertIn("停下报告", VIBE_ENTRY_RULES)

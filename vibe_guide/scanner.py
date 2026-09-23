@@ -188,8 +188,16 @@ def scan_project(paths):
     )
 
 
+VIBE_ENTRY_RULE_MARKER = "New Session Entry"
+VIBE_ENTRY_RULES = """## New Session Entry
+
+- 开发/改动/排查类请求先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1，不逢任务必过 vibe。
+- 自评 >15 或拿不准时才 `vibe scan` 并 `vibe plan --request --s1` 进入正式路由；<=15 直接执行或轻规划。
+- 会话门阻塞必须停下报告，不得伪造或跳过。
+"""
+
 #: Every rule block this release ships, in document order.
-AGENTSMD_BLOCKS = (CAPABILITY_RULES, PRD_GUIDE_RULES)
+AGENTSMD_BLOCKS = (CAPABILITY_RULES, PRD_GUIDE_RULES, VIBE_ENTRY_RULES)
 
 
 def missing_agentsmd_blocks(existing):
@@ -213,6 +221,8 @@ def missing_agentsmd_blocks(existing):
         blocks.append(CAPABILITY_RULES)
     if PRD_GUIDE_MARKER not in existing:
         blocks.append(PRD_GUIDE_RULES)
+    if VIBE_ENTRY_RULE_MARKER not in existing:
+        blocks.append(VIBE_ENTRY_RULES)
     return blocks
 
 
