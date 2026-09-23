@@ -80,9 +80,9 @@
 监工规则：
 
 - 一个 DAG 节点只允许一个有效 writer；
-- developer 与 reviewer 必须是两个不同的可见独立任务，reviewer 只读审查且不得代改业务代码；
+- visible-sdd 拓扑下，reviewer 独立性由会话内独立子代理保证（同一 worker 会话内运行，上下文隔离、只读审查、不得代改业务代码）；dual-visible 拓扑下，developer 与 reviewer 仍必须是两个不同的可见独立任务；
 - 优先启动所有没有硬依赖冲突的 ready 节点；
-- 并发上限按当前未完成、未归档的活跃 developer/reviewer 对计算；已完成并归档的任务不占名额；
+- 并发上限按当前未完成、未归档的活跃 worker 会话数计算（visible-sdd 每节点一个会话；dual-visible 每对 dev/reviewer 各一个）；已完成并归档的任务不占名额；上限值 = min(授权卡快照, 项目 .vibe/config.json max_active_worker_sessions)；
 - Review 缺陷优先退回同一 worker；
 - 返工后复审回到同一 reviewer，保留任务身份、cursor 和证据链；
 - 保留旧证据，新增返工和验收证据；
