@@ -393,13 +393,93 @@ class ParallelGroupAuditTests(unittest.TestCase):
         result = audit_dag(self._plan([good, broken]))
         self.assertEqual(result.status, "blocked_dag")
         self.assertNotIn("broken", result.ready_nodes)
-        self.assertIn("good", result.ready_nodes)
-        self.assertEqual(result.parallel_groups, {"g": ["good"]})
+        # Dispatching the healthy sibling alongside a member whose write scope
+        # cannot be verified is refused too: an unknown scope may overlap.
+        self.assertNotIn("good", result.ready_nodes)
+        self.assertEqual(result.parallel_groups, {})
         self.assertTrue(
             any("parallel_group" in reason and "missing or invalid" in reason
                 for reason in result.reasons["broken"]),
             result.reasons["broken"],
         )
+        self.assertTrue(
+            any("unverifiable member" in reason for reason in result.reasons["good"]),
+            result.reasons["good"],
+        )
+
+    def test_running_group_peer_blocks_conflicting_dispatch(self):
+        running = self._group_node("a", allowlist=["vibe_guide/shared.py"], status="running")
+        candidate = self._group_node("b", allowlist=["vibe_guide/shared.py"])
+        result = audit_dag(self._plan([running, candidate]))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertEqual(result.ready_nodes, [])
+        self.assertEqual(result.parallel_groups, {})
+        # The in-flight writer is not retro-blocked; only the new dispatch is refused.
+        self.assertFalse(result.reasons["a"])
+        self.assertNotIn("a", result.blocked_nodes)
+        self.assertTrue(
+            any("overlapping write scope" in reason for reason in result.reasons["b"]),
+            result.reasons["b"],
+        )
+
+    def test_rework_group_peer_blocks_conflicting_dispatch(self):
+        rework = self._group_node("a", allowlist=["vibe_guide/shared.py"], status="rework")
+        candidate = self._group_node("b", allowlist=["vibe_guide/shared.py"])
+        result = audit_dag(self._plan([rework, candidate]))
+        self.assertNotIn("b", result.ready_nodes)
+        self.assertTrue(
+            any("overlapping write scope" in reason for reason in result.reasons["b"]),
+            result.reasons["b"],
+        )
+
+    def test_delivered_or_accepted_group_members_are_exempt(self):
+        for past in ("delivered", "accepted"):
+            done = self._group_node("a", allowlist=["vibe_guide/shared.py"], status=past)
+            candidate = self._group_node("b", allowlist=["vibe_guide/shared.py"])
+            result = audit_dag(self._plan([done, candidate]))
+            self.assertEqual(result.status, "ready", past)
+            self.assertEqual(result.ready_nodes, ["b"], past)
+            self.assertEqual(result.parallel_groups, {"g": ["b"]}, past)
+
+    def test_missing_allowlist_is_conservatively_refused(self):
+        good = self._group_node("good")
+        bare = DAGNode(
+            "bare", "bare", [], [], "g",
+            {
+                "input": "request",
+                "output": "result",
+                "error_behavior": "return blocked_dag",
+                "acceptance_examples": ["example passes"],
+                "risk_tags": ["scheduling"],
+                "writer": "writer-bare",
+                "worktree": ".vibe/worktrees/bare",
+            },
+            "planned",
+            writer="writer-bare",
+            worktree=".vibe/worktrees/bare",
+        )
+        result = audit_dag(self._plan([good, bare]))
+        self.assertNotIn("bare", result.ready_nodes)
+        self.assertTrue(
+            any("parallel_group" in reason and "missing or invalid" in reason
+                for reason in result.reasons["bare"]),
+            result.reasons["bare"],
+        )
+
+    def test_version_tokens_in_prose_do_not_count_as_produced_paths(self):
+        producer = self._group_node("a", contract_overrides={"output": "发布 v1.2 构建产物"})
+        consumer = self._group_node("b", contract_overrides={"input": "升级到 v1.2 后验证"})
+        result = audit_dag(self._plan([producer, consumer]))
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(set(result.ready_nodes), {"a", "b"})
+        self.assertEqual(result.parallel_groups, {"g": ["a", "b"]})
+
+    def test_path_reference_requires_whole_token_match(self):
+        producer = self._group_node("a", contract_overrides={"output": "产出 docs/spec.md 定稿"})
+        consumer = self._group_node("b", contract_overrides={"input": "参照 docs/spec.md.bak 备份"})
+        result = audit_dag(self._plan([producer, consumer]))
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(set(result.ready_nodes), {"a", "b"})
 
     def test_vibe_entry_regression_fixture_is_refused_from_parallel_group(self):
         fixture_path = Path(__file__).parent / "fixtures" / "v46-parallel-audit-vibe-entry.json"
