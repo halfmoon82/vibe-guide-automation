@@ -36,7 +36,7 @@ _CANONICAL_FIELDS = {
     "provider", "mode", "issue_id", "role", "task_id", "platform_task_id",
     "threadId", "thread_id", "host", "hostId", "host_id", "clientThreadId",
     "client_thread_id", "worktree", "branch", "cursor", "generation", "status",
-    "visible", "run_id", "limitations", "allowlist", "successor_of",
+    "visible", "run_id", "limitations", "allowlist", "successor_of", "topology",
 }
 
 
