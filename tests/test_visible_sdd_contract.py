@@ -14,6 +14,7 @@ The contract elements must not weaken: a missing element keeps the tests red.
 Missing or illegal protocol names reuse load_protocol's existing error paths
 (FileNotFoundError / ValueError); no new branches are added for this protocol.
 """
+import re
 import unittest
 from pathlib import Path
 
@@ -44,11 +45,18 @@ class VisibleSddDualRoleOrderTests(unittest.TestCase):
         self.text = _load()
 
     def test_names_dev_then_review_subagent_order(self):
-        text = self.text
-        dev_pos = text.find("dev")
-        review_pos = text.find("review")
-        self.assertNotEqual(dev_pos, -1, "protocol must name the dev subagent")
-        self.assertNotEqual(review_pos, -1, "protocol must name the review subagent")
+        """Order is pinned inside the fixed-flow code block, not raw text.
+
+        Bare substring positions drift ("preview" contains "review");
+        the fenced flow block is the authoritative statement of order.
+        """
+        match = re.search(r"```text\n(.*?)\n```", self.text, re.S)
+        self.assertIsNotNone(match, "protocol must contain the fixed-flow code block")
+        flow = match.group(1)
+        dev_pos = flow.find("dev")
+        review_pos = flow.find("review")
+        self.assertNotEqual(dev_pos, -1, "flow block must name the dev subagent")
+        self.assertNotEqual(review_pos, -1, "flow block must name the review subagent")
         self.assertLess(dev_pos, review_pos, "dev implements before review reviews")
 
     def test_review_subagent_is_independent_read_only_non_author(self):
@@ -64,6 +72,19 @@ class VisibleSddDualRoleOrderTests(unittest.TestCase):
         self.assertNotEqual(rework_pos, -1, "rework (返工) must be part of the flow")
         self.assertNotEqual(re_review_pos, -1, "re-review (复审) must follow rework")
         self.assertLess(rework_pos, re_review_pos, "复审 follows 返工")
+
+    def test_rework_target_role_is_dev_subagent(self):
+        """Rework must go back to the dev subagent, never to any role.
+
+        Mutant check: replacing "由 dev 子代理修复" with "由任意角色修复"
+        must turn this red -- a reviewer (or anyone else) performing the
+        rework itself is exactly the independence violation element 4 bans.
+        """
+        self.assertRegex(
+            self.text,
+            r"由\s*dev\s*子代理修复",
+            "rework must be pinned to the dev subagent role",
+        )
 
     def test_flow_keeps_single_session_identity(self):
         self.assertIn("同一会话", self.text)
@@ -91,6 +112,12 @@ class VisibleSddGitWriteBanTests(unittest.TestCase):
                 op + " must appear on a ban line, got: " + repr(lines),
             )
 
+    def test_extended_git_write_ban_list_is_named(self):
+        """Beyond the five mandatory ops, the protocol bans all git writes."""
+        for op in ("git add", "git commit", "git push", "git merge",
+                   "git rebase", "git cherry-pick"):
+            self.assertIn(op, self.text, op)
+
     def test_cross_branch_reads_limited_to_show_and_diff(self):
         self.assertIn("git show", self.text)
         self.assertIn("git diff", self.text)
@@ -109,6 +136,11 @@ class VisibleSddEvidenceChainTests(unittest.TestCase):
 
     def test_each_round_writes_conclusion_into_session_delivery(self):
         for token in ("证据", "交付"):
+            self.assertIn(token, self.text, token)
+
+    def test_evidence_granularity_rounds_distinguishable_old_kept_new_appended(self):
+        """Granularity, not just presence: rounds distinguishable, history kept."""
+        for token in ("轮次", "保留", "追加"):
             self.assertIn(token, self.text, token)
 
     def test_supervisor_closes_evidence_into_events_jsonl(self):
