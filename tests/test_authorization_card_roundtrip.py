@@ -9,11 +9,17 @@ action set granted ``commit`` under ``deny`` although the confirmed design
 The validator was also never called on the issuing path, which is why nobody
 noticed.  These tests pin the round trip for every live builder.
 """
+import json
 import unittest
 
 from vibe_guide.authorization import (
+    BACKGROUND_MODE_DISCLOSURES,
     _REMOTE_GIT_ACTIONS_SCOPE,
+    AuthorizationRecord,
+    _canonical_digest,
+    authorize,
     build_authorization_card,
+    is_authorization_integrity_valid,
     refresh_authorization_card,
     validate_authorization_card_consistency,
 )
@@ -74,6 +80,113 @@ class IssuedCardsPassTheirOwnValidatorTests(unittest.TestCase):
         for alias in ("pr", "mr"):
             with self.assertRaises(ValueError):
                 validate_remote_git_permissions("deny", ("develop", alias))
+
+
+class WorkersRoundTripTests(unittest.TestCase):
+    """V4.6 ISSUE-02 round trips: disclosed background cards validate and
+    reload; pre-ISSUE-02 records without workers fields stay readable."""
+
+    def test_background_card_with_full_disclosure_round_trips(self):
+        plan, nodes = _plan()
+        card = build_authorization_card(
+            plan,
+            nodes,
+            CAPS,
+            workers={
+                "n1": {
+                    "mode": "background",
+                    "limitations": list(BACKGROUND_MODE_DISCLOSURES),
+                }
+            },
+        )
+        self.assertTrue(validate_authorization_card_consistency(card))
+
+        record = authorize(card, "AUTHORIZE")
+        restored = AuthorizationRecord.from_dict(
+            json.loads(json.dumps(record.to_dict()))
+        )
+        self.assertTrue(is_authorization_integrity_valid(restored))
+        workers = {entry["node_id"]: entry for entry in restored.workers}
+        self.assertEqual(workers["n1"]["topology"], "background")
+        self.assertEqual(workers["n1"]["mode"], "background")
+
+    def test_validator_refuses_main_session_developer_workers(self):
+        from dataclasses import replace
+
+        plan, nodes = _plan()
+        card = build_authorization_card(plan, nodes, CAPS)
+        forged_workers = [
+            {
+                "node_id": "n1",
+                "topology": "dual-visible",
+                "mode": "visible",
+                "role": "developer",
+                "session_source": "main session",
+                "limitations": (),
+            }
+        ]
+        with self.assertRaises(ValueError):
+            validate_authorization_card_consistency(replace(card, workers=forged_workers))
+
+    def test_from_dict_refuses_main_session_developer_workers(self):
+        plan, nodes = _plan()
+        record = authorize(build_authorization_card(plan, nodes, CAPS), "AUTHORIZE")
+        data = record.to_dict()
+        data["workers"] = [
+            {
+                "node_id": "n1",
+                "topology": "dual-visible",
+                "mode": "visible",
+                "role": "developer",
+                "session_source": "主会话",
+                "limitations": [],
+            }
+        ]
+        with self.assertRaises(ValueError):
+            AuthorizationRecord.from_dict(data)
+
+    def test_from_dict_refuses_background_workers_without_full_disclosure(self):
+        plan, nodes = _plan()
+        record = authorize(build_authorization_card(plan, nodes, CAPS), "AUTHORIZE")
+        data = record.to_dict()
+        data["workers"] = [
+            {
+                "node_id": "n1",
+                "topology": "background",
+                "mode": "background",
+                "role": "developer",
+                "session_source": "subagent-1",
+                "limitations": ["不可见：不显示"],
+            }
+        ]
+        with self.assertRaises(ValueError):
+            AuthorizationRecord.from_dict(data)
+
+    def test_legacy_record_without_workers_fields_still_loads_and_validates(self):
+        plan, nodes = _plan()
+        record = authorize(build_authorization_card(plan, nodes, CAPS), "AUTHORIZE")
+        data = record.to_dict()
+        data.pop("workers", None)
+        data.pop("topology_summary", None)
+        payload = {
+            key: value
+            for key, value in data.items()
+            if key
+            not in {
+                "digest",
+                "remote_git_actions_options",
+                "remote_git_actions_scope",
+                "deploy_authorization",
+            }
+        }
+        # The payload intentionally hashes engine_authorization_digest as ""
+        # (the card digest itself cannot be part of its own hash).
+        payload["engine_authorization_digest"] = ""
+        data["digest"] = _canonical_digest(payload)
+
+        restored = AuthorizationRecord.from_dict(data)
+        self.assertEqual(restored.workers, ())
+        self.assertTrue(is_authorization_integrity_valid(restored))
 
 
 if __name__ == "__main__":

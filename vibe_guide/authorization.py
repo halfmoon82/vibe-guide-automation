@@ -42,6 +42,44 @@ _SENSITIVE_NAMES = (
     "token",
 )
 
+# V4.6 ISSUE-02: structured per-node worker declarations on authorization
+# cards.  Every node records its dispatch topology and the identity source of
+# its worker session; the vocabulary mirrors vibe_guide.task_registry so a
+# card and a task binding can be cross-checked mechanically.
+_WORKER_TOPOLOGIES = ("visible-sdd", "dual-visible", "background")
+DEFAULT_WORKER_TOPOLOGY = "dual-visible"
+_WORKER_MODES = ("visible", "background")
+_WORKER_ROLES = ("developer", "reviewer")
+_WORKER_ENTRY_KEYS = frozenset(
+    ("node_id", "topology", "mode", "role", "session_source", "limitations")
+)
+# Machine-checked downgrade disclosure for ``mode=background`` nodes: each
+# category must be covered by at least one limitation entry, otherwise the
+# card would silently promise full visible automation it cannot deliver.
+BACKGROUND_LIMITATION_REQUIREMENTS = {
+    "not_visible": ("不可见", "not visible", "non-visible", "invisible"),
+    "no_direct_entry": (
+        "不可直接进入",
+        "cannot enter directly",
+        "cannot be entered directly",
+        "no direct entry",
+    ),
+    "rework_continuation_limited": (
+        "返工续接受限",
+        "rework continuation limited",
+        "rework and continuation are limited",
+        "rework/continuation limited",
+        "limited rework",
+    ),
+}
+# Canonical disclosure text producers may reuse verbatim; the validator only
+# requires the category keywords above, so translations stay acceptable.
+BACKGROUND_MODE_DISCLOSURES = (
+    "不可见：background 任务不在桌面 App 中可见",
+    "不可直接进入：用户不能直接进入该任务会话",
+    "返工续接受限：返工与复审无法保证回到原任务会话",
+)
+
 
 def remote_git_actions_allowed(authorization, action):
     """Apply the V4.1 product-facing remote Git switch; deploy stays separate."""
@@ -75,6 +113,178 @@ def validate_remote_git_permissions(remote_git_actions, allowed_actions):
     if actions & {"deploy", "production_write", "credentials", "external_communication", "release"}:
         raise ValueError("sensitive actions are always excluded")
 
+def _is_main_session_identity(value: Any) -> bool:
+    """Whether an identity string names the supervising main session.
+
+    Case, separator (``-``/``_``/whitespace) and language variants are all
+    normalized so "Main Session", "main_session", "codex main session" and
+    "主会话" are recognized as the same forbidden identity.
+    """
+    if not isinstance(value, str):
+        return False
+    normalized = " ".join(
+        value.replace("-", " ").replace("_", " ").split()
+    ).casefold()
+    if not normalized:
+        return False
+    if "主会话" in normalized:
+        return True
+    tokens = normalized.split(" ")
+    if "main" in tokens and "session" in tokens:
+        return True
+    return normalized == "main"
+
+
+def _background_limitation_gaps(limitations: Tuple[str, ...]) -> List[str]:
+    covered = tuple(item.casefold() for item in limitations)
+    missing = []
+    for category, keywords in BACKGROUND_LIMITATION_REQUIREMENTS.items():
+        if not any(
+            keyword in limitation
+            for limitation in covered
+            for keyword in keywords
+        ):
+            missing.append(category)
+    return missing
+
+
+def _normalize_worker_entry(
+    node_id: str, entry: Any, default_session_source: str = ""
+) -> Dict[str, Any]:
+    """Validate and complete one per-node worker declaration (fail closed)."""
+    if entry is None:
+        entry = {}
+    if not isinstance(entry, dict):
+        raise ValueError("worker entry for node " + node_id + " must be an object")
+    unknown = set(entry) - _WORKER_ENTRY_KEYS
+    if unknown:
+        raise ValueError(
+            "worker entry for node " + node_id + " has unknown keys: "
+            + ", ".join(sorted(str(key) for key in unknown))
+        )
+    declared_node_id = entry.get("node_id")
+    if declared_node_id is not None and declared_node_id != node_id:
+        raise ValueError("worker entry node id does not match its declaration")
+    mode = entry.get("mode")
+    topology = entry.get("topology")
+    if topology is None:
+        topology = "background" if mode == "background" else DEFAULT_WORKER_TOPOLOGY
+    if not isinstance(topology, str) or topology not in _WORKER_TOPOLOGIES:
+        raise ValueError("worker topology for node " + node_id + " is invalid")
+    if mode is None:
+        mode = "background" if topology == "background" else "visible"
+    if not isinstance(mode, str) or mode not in _WORKER_MODES:
+        raise ValueError("worker mode for node " + node_id + " is invalid")
+    if topology == "background" and mode != "background":
+        raise ValueError("background topology requires background mode")
+    if mode == "background" and topology != "background":
+        raise ValueError("background mode requires background topology")
+    role = entry.get("role", "developer")
+    if not isinstance(role, str) or role not in _WORKER_ROLES:
+        raise ValueError("worker role for node " + node_id + " is invalid")
+    session_source = entry.get("session_source", default_session_source)
+    if session_source is None:
+        session_source = ""
+    if not isinstance(session_source, str):
+        raise ValueError("worker session source for node " + node_id + " is invalid")
+    limitations = entry.get("limitations") or ()
+    if not isinstance(limitations, (list, tuple)) or not all(
+        isinstance(item, str) for item in limitations
+    ):
+        raise ValueError("worker limitations for node " + node_id + " are invalid")
+    limitations = tuple(limitations)
+    # The supervisor's own session must never be signed as a developer: that
+    # would break the independent visible-task contract this schema exists
+    # to enforce, so any main-session spelling fails closed.
+    if role == "developer" and _is_main_session_identity(session_source):
+        raise ValueError(
+            "the main session cannot be authorized as a developer worker"
+        )
+    if mode == "background":
+        missing = _background_limitation_gaps(limitations)
+        if missing:
+            raise ValueError(
+                "background worker for node "
+                + node_id
+                + " lacks downgrade disclosure: "
+                + ", ".join(missing)
+            )
+    return {
+        "node_id": node_id,
+        "topology": topology,
+        "mode": mode,
+        "role": role,
+        "session_source": session_source,
+        "limitations": limitations,
+    }
+
+
+def _normalize_workers_schema(
+    workers: Any,
+    node_ids: Tuple[str, ...],
+    default_identities: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, Any], ...]:
+    """Validate worker declarations against the DAG and complete defaults.
+
+    Accepts either a mapping ``{node_id: entry}`` or a sequence of entries
+    carrying their own ``node_id``; the canonical form is a tuple of entries
+    ordered by ``node_ids``.  The canonical form is deliberately a sequence
+    keyed by an explicit ``node_id`` field rather than a node-id-keyed
+    mapping: durable persistence redacts sensitive-looking mapping keys, and
+    a legal node id may look exactly like one (``token-refresh``).
+    """
+    if workers is None:
+        workers = {}
+    declared: Dict[str, Any] = {}
+    if isinstance(workers, dict):
+        for key, entry in workers.items():
+            if not isinstance(key, str):
+                raise ValueError("authorization workers schema is invalid")
+            declared[key] = entry
+    elif isinstance(workers, (list, tuple)):
+        for entry in workers:
+            if not isinstance(entry, dict) or not isinstance(
+                entry.get("node_id"), str
+            ):
+                raise ValueError("authorization workers schema is invalid")
+            if entry["node_id"] in declared:
+                raise ValueError(
+                    "duplicate worker entry for node " + entry["node_id"]
+                )
+            declared[entry["node_id"]] = entry
+    else:
+        raise ValueError("authorization workers schema is invalid")
+    unknown_nodes = sorted(key for key in declared if key not in node_ids)
+    if unknown_nodes:
+        raise ValueError(
+            "worker entry outside the authorized DAG: " + ", ".join(unknown_nodes)
+        )
+    identities = default_identities or {}
+    return tuple(
+        _normalize_worker_entry(
+            node_id, declared.get(node_id), identities.get(node_id, "")
+        )
+        for node_id in node_ids
+    )
+
+
+def _topology_summary(workers: Any) -> Dict[str, Any]:
+    entries = workers.values() if isinstance(workers, dict) else workers
+    entries = tuple(entries or ())
+    by_topology = {topology: 0 for topology in _WORKER_TOPOLOGIES}
+    background = 0
+    for entry in entries:
+        by_topology[entry["topology"]] += 1
+        if entry["mode"] == "background":
+            background += 1
+    return {
+        "total": len(entries),
+        "visible": len(entries) - background,
+        "background": background,
+        "by_topology": by_topology,
+    }
+
+
 def validate_authorization_card_consistency(card):
     data = card.to_dict() if hasattr(card, "to_dict") else dict(card)
     switch = data.get("remote_git_actions", "deny")
@@ -87,6 +297,11 @@ def validate_authorization_card_consistency(card):
     # an overlap outside that group is a contradiction.
     if (excluded & allowed) - set(_REMOTE_GIT_ACTIONS_SCOPE):
         raise ValueError("authorization card has overlapping allowed and excluded actions")
+    workers = data.get("workers") or {}
+    if workers:
+        _normalize_workers_schema(
+            workers, tuple(sorted(data.get("node_ids", ()))), {}
+        )
     return True
 
 
@@ -402,8 +617,10 @@ def _authorization_payload(
     dag_revision: int = 0,
     engine_authorization_digest: str = "",
     explicit_execution_mode_override: Optional[Dict[str, Any]] = None,
+    workers: Optional[Any] = None,
+    topology_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
+    payload = {
         "schema_version": AUTHORIZATION_SCHEMA_VERSION,
         "plan_id": plan_id,
         "plan_version": plan_version,
@@ -432,6 +649,17 @@ def _authorization_payload(
         "engine_authorization_digest": "",
         "explicit_execution_mode_override": explicit_execution_mode_override or {},
     }
+    # Workers semantics are bound into the digest whenever present.  Records
+    # pre-dating ISSUE-02 carry no workers at all; keeping the keys absent for
+    # empty declarations preserves their digests bit-for-bit.
+    if workers:
+        payload["workers"] = workers
+        payload["topology_summary"] = (
+            topology_summary
+            if topology_summary is not None
+            else _topology_summary(workers)
+        )
+    return payload
 
 
 @dataclass(frozen=True)
@@ -461,6 +689,8 @@ class AuthorizationCard:
     dag_revision: int = 0
     engine_authorization_digest: str = ""
     explicit_execution_mode_override: Dict[str, Any] = None
+    workers: Tuple[Dict[str, Any], ...] = None
+    topology_summary: Dict[str, Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -501,6 +731,8 @@ class AuthorizationRecord:
     dag_revision: int = 0
     engine_authorization_digest: str = ""
     explicit_execution_mode_override: Dict[str, Any] = None
+    workers: Tuple[Dict[str, Any], ...] = None
+    topology_summary: Dict[str, Any] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -528,7 +760,7 @@ class AuthorizationRecord:
             "digest",
             "agent_id",
         }
-        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"}
+        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"}
         if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
             raise ValueError("authorization record schema is invalid")
         if data["schema_version"] != AUTHORIZATION_SCHEMA_VERSION:
@@ -570,6 +802,25 @@ class AuthorizationRecord:
             or converted["active_pair_limit"] < 1
         ):
             raise ValueError("authorization active pair limit is invalid")
+        # V4.6 ISSUE-02 compatibility: records issued before the workers
+        # schema simply lack the keys and load with empty defaults; any
+        # present declaration is revalidated fail-closed, including the
+        # main-session developer refusal and background disclosure check.
+        workers = converted.get("workers") or ()
+        if workers:
+            converted["workers"] = _normalize_workers_schema(
+                workers, converted["node_ids"], {}
+            )
+            summary = converted.get("topology_summary") or {}
+            derived_summary = _topology_summary(converted["workers"])
+            if summary and summary != derived_summary:
+                raise ValueError(
+                    "authorization topology summary does not match workers"
+                )
+            converted["topology_summary"] = derived_summary
+        else:
+            converted["workers"] = ()
+            converted["topology_summary"] = {}
         return cls(**converted)
 
 
@@ -668,6 +919,7 @@ def build_authorization_card(
     engine_evidence_ref: str = "",
     engine_attestation: Optional[Dict[str, Any]] = None,
     explicit_execution_mode_override: Optional[Dict[str, Any]] = None,
+    workers: Optional[Dict[str, Any]] = None,
 ) -> AuthorizationCard:
     node_ids = tuple(sorted(node.id for node in nodes))
     if node_ids != tuple(sorted(plan.node_ids)):
@@ -695,6 +947,15 @@ def build_authorization_card(
             }
         )
     )
+    worker_identities = {
+        node.id: str(node.contract["worker"])
+        for node in nodes
+        if node.contract.get("worker")
+    }
+    normalized_workers = _normalize_workers_schema(
+        workers, node_ids, worker_identities
+    )
+    topology_summary = _topology_summary(normalized_workers)
     if active_pair_limit is None:
         active_pair_limit = max(1, len(nodes))
     if (
@@ -810,6 +1071,8 @@ def build_authorization_card(
         plan.version,
         "",
         explicit_execution_mode_override,
+        workers=normalized_workers,
+        topology_summary=topology_summary,
     )
     digest = _canonical_digest(canonical)
     canonical["engine_authorization_digest"] = digest
@@ -862,6 +1125,7 @@ def refresh_authorization_card(
         engine_mode=previous.engine_mode,
         engine_evidence_ref=previous.engine_evidence_ref,
         explicit_execution_mode_override=previous.explicit_execution_mode_override,
+        workers=previous.workers,
     )
 
 
@@ -900,6 +1164,8 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         card.dag_revision,
         card.engine_authorization_digest,
         card.explicit_execution_mode_override,
+        workers=card.workers,
+        topology_summary=card.topology_summary,
     )
     if card.schema_version != AUTHORIZATION_SCHEMA_VERSION:
         raise ValueError("unsupported authorization card schema")
@@ -932,6 +1198,8 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         dag_revision=card.dag_revision,
         engine_authorization_digest=card.engine_authorization_digest,
         explicit_execution_mode_override=card.explicit_execution_mode_override,
+        workers=card.workers,
+        topology_summary=card.topology_summary,
     )
 
 
@@ -989,6 +1257,8 @@ def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
         record.execution_engine, record.engine_mode, record.engine_evidence_ref,
         record.dag_revision, record.engine_authorization_digest,
         record.explicit_execution_mode_override,
+        workers=record.workers,
+        topology_summary=record.topology_summary,
     )
     if not secrets.compare_digest(record.digest, _canonical_digest(canonical)):
         # V3/V4 records pre-dating execution-engine binding remain readable
