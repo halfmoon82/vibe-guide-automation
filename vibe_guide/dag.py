@@ -533,14 +533,23 @@ def node_scoped_ready(
 
     Only ``depends_on`` is consulted. Repair/wait states therefore consume
     their existing identity/capacity but do not suppress unrelated ready nodes.
+
+    This is also the runtime hard gate for the parallel-group audit: nodes
+    carrying ``_parallel_group_errors`` violations (overlapping write scope,
+    artifact references, or unverifiable metadata inside their group) are
+    never dispatch-eligible.  ``audit_dag`` reports the same violations with
+    ``blocked_dag`` reasons; the rendered dag.yaml is evidence, not the
+    enforcement point.
     """
-    if _structural_errors(list(nodes)):
+    nodes = list(nodes)
+    if _structural_errors(nodes):
         return []
     by_id = {node.id: node for node in nodes}
     closure = dependency_closure(nodes, blocked_ids or ())
+    group_blocked = set(_parallel_group_errors(nodes))
     ready: List[str] = []
     for node in nodes:
-        if node.id in closure or node.status not in ("planned", "ready"):
+        if node.id in closure or node.id in group_blocked or node.status not in ("planned", "ready"):
             continue
         if _contract_error(node):
             continue

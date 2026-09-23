@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from vibe_guide.dag import DAGAuditResult, audit_dag, ready_nodes, render_plan_artifacts, validate_dag
+from vibe_guide.dag import DAGAuditResult, audit_dag, node_scoped_ready, ready_nodes, render_plan_artifacts, validate_dag
 from vibe_guide.models import DAGNode, Plan
 
 
@@ -495,6 +495,47 @@ class ParallelGroupAuditTests(unittest.TestCase):
             any("produced path docs/specs" in reason for reason in result.reasons["b"]),
             result.reasons["b"],
         )
+
+    def test_node_scoped_ready_hard_gates_conflicting_parallel_group(self):
+        nodes = [
+            self._group_node("a", allowlist=["vibe_guide/shared.py"]),
+            self._group_node("b", allowlist=["vibe_guide/shared.py"]),
+        ]
+        # Runtime dispatch projection applies the same gate as audit_dag:
+        # a conflicting group is not dispatch-eligible even though no code
+        # reads the rendered dag.yaml audit back.
+        self.assertEqual(node_scoped_ready(nodes), [])
+
+    def test_node_scoped_ready_keeps_conflict_free_group_dispatchable(self):
+        nodes = [self._group_node("a"), self._group_node("b")]
+        self.assertEqual(node_scoped_ready(nodes), ["a", "b"])
+
+    def test_node_scoped_ready_conservatively_refuses_unverifiable_group(self):
+        good = self._group_node("good")
+        bare = DAGNode(
+            "bare", "bare", [], [], "g",
+            {
+                "input": "request",
+                "output": "result",
+                "error_behavior": "return blocked_dag",
+                "acceptance_examples": ["example passes"],
+                "risk_tags": ["scheduling"],
+                "writer": "writer-bare",
+                "worktree": ".vibe/worktrees/bare",
+            },
+            "planned",
+            writer="writer-bare",
+            worktree=".vibe/worktrees/bare",
+        )
+        self.assertEqual(node_scoped_ready([good, bare]), [])
+        # Ungrouped nodes are unaffected by the gate.
+        solo = self._group_node("solo", group=None)
+        self.assertEqual(node_scoped_ready([solo]), ["solo"])
+
+    def test_node_scoped_ready_blocks_dispatch_alongside_running_peer(self):
+        running = self._group_node("a", allowlist=["vibe_guide/shared.py"], status="running")
+        candidate = self._group_node("b", allowlist=["vibe_guide/shared.py"], status="ready")
+        self.assertEqual(node_scoped_ready([running, candidate]), [])
 
     def test_vibe_entry_regression_fixture_is_refused_from_parallel_group(self):
         fixture_path = Path(__file__).parent / "fixtures" / "v46-parallel-audit-vibe-entry.json"
