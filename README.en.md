@@ -54,6 +54,8 @@ vibe resume --plan <ID>          Continue from snapshots, task records, and even
 
 Every command supports `--json`. Exit codes are `0` for success, `2` for argument errors, `3` for confirmation or design blocking, and `4` for unknown external or runtime state.
 
+New-session entry: the host agent self-screens S0/S1 in-session following `.vibe/proposals/skills/vibe-entry/SKILL.md` (materialized by `vibe init`, never rewritten). Requests scored <=8 are executed directly and 9-15 get a light plan, neither touching vibe; only requests scored >15 (or uncertain) enter `vibe scan` + `vibe plan --request --s1`. The protocol is fully self-contained and needs no external skill.
+
 ## V4.2 engine evidence
 
 Complex-plan publication records a real provider engine attestation containing the plan, revision, provider, content digest, and freshness checks. Monitor start and resume validate that evidence before dispatch. Missing, altered, mismatched, expired, future-dated, or symlinked plan/evidence files fail closed.
@@ -61,7 +63,7 @@ Complex-plan publication records a real provider engine attestation containing t
 ## Governance boundaries
 
 - `scan` is read-only.
-- Existing `AGENTS.md` files are never overwritten; missing rules produce a proposal only.
+- Existing `AGENTS.md` files are never overwritten; missing rules produce a proposal only (including a `New Session Entry` block pointing at the entry protocol), merged by `vibe apply-agentsmd --confirm` after human review.
 - Provider identity, login, task visibility, permissions, push, merge, and deploy are verified independently.
 - Tests, `PASS`, or `CANMERGE` markers are not approval or release truth.
 - Secrets, tokens, passwords, and private business data must not be stored in `.vibe/`, logs, plans, or chat.

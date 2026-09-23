@@ -65,7 +65,9 @@ vibe status --plan <ID>                      读取当前快照，不轮询外�
 vibe resume --plan <ID>                      从快照、任务登记和事件证据继续
 ```
 
-产品经理的完整路径：agent 按 `.vibe/proposals/skills/prd-guide/SKILL.md` 的协议引导写 PRD 与节点拆分（业务字段），`vibe attest` 登记会话能力，`vibe plan --from-prd` 发布，`vibe authorize` 授权，`vibe monitor` 派发。旧的 `--node-spec` 手写路径仍可用。
+新会话入口：agent 先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1——<=8 直接执行、9-15 轻规划，均不触碰 vibe；>15 或拿不准时才 `vibe scan` + `vibe plan --request --s1` 进入正式路由。该协议完全自包含，不依赖任何外部技能。
+
+产品经理的完整路径（自评确认为复杂之后）：agent 按 `.vibe/proposals/skills/prd-guide/SKILL.md` 的协议引导写 PRD 与节点拆分（业务字段），`vibe attest` 登记会话能力，`vibe plan --from-prd` 发布，`vibe authorize` 授权，`vibe monitor` 派发。旧的 `--node-spec` 手写路径仍可用。
 
 每个命令都支持 `--json`。默认文本面向产品经理；JSON 适合桌面 App 适配器和自动化调用。退出码为：`0` 命令成功执行，`2` 参数错误，`3` 需要确认或因设计变化阻塞，`4` 外部/运行状态未知。
 
@@ -79,7 +81,7 @@ vibe init                 # 退出 3，不写入
 vibe init --confirm       # 创建缺失的最小 .vibe/ 结构
 ```
 
-已有 `AGENTS.md` 不会被覆盖。缺失规则时只在 `.vibe/proposals/agentsmd/` 生成建议。外部 Skill 的安装不由 `init` 隐式触发。
+已有 `AGENTS.md` 不会被覆盖。缺失规则时只在 `.vibe/proposals/agentsmd/` 生成建议（含指向入口协议的 `New Session Entry` 块），由 `vibe apply-agentsmd --confirm` 经人工评审后合入。外部 Skill 的安装不由 `init` 隐式触发。
 
 ### V2 能力合同（监工与 worker 共用）
 
