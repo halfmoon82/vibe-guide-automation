@@ -25,6 +25,8 @@ from ..models import (
 from ..model_router import provider_thinking_for
 from ..paths import ProjectPaths
 from ..task_registry import (
+    DEFAULT_TOPOLOGY,
+    _TOPOLOGIES,
     TaskBinding,
     binding_contract_enabled,
     load_task_binding,
@@ -450,6 +452,27 @@ class ProviderActionRunner(Runner):
                     "worker_profile": profile.to_dict(),
                 }
             )
+        topology = str(contract.get("topology") or DEFAULT_TOPOLOGY)
+        if topology not in _TOPOLOGIES:
+            raise ValueError("task binding topology is invalid")
+        # Preflight the rulings this visible-only bridge can never satisfy
+        # *before* the create side effect: a background ruling would
+        # otherwise leak an armed, unregistered visible task on the desktop
+        # (R3 P1-1), and a visible-sdd ruling without its protocol pointer
+        # would arm a session that does not know the rules it must follow.
+        if topology == "background":
+            raise ValueError("background topology requires background mode")
+        if topology == "visible-sdd":
+            if role != "developer":
+                raise ValueError("visible-sdd topology only binds a developer")
+            sdd_protocol = contract.get("sdd_protocol")
+            if not isinstance(sdd_protocol, str) or not sdd_protocol.strip():
+                raise ValueError("visible-sdd dispatch requires an sdd_protocol pointer")
+            # The desktop session servicing the mailbox must know it is
+            # creating the single visible SDD worker session and which
+            # protocol that session has to follow.
+            create_request["topology"] = topology
+            create_request["sdd_protocol"] = sdd_protocol
         if v39:
             # Keep the provider request bound to the same supervisor target
             # that will later be checked against live binding evidence.  These
@@ -555,6 +578,12 @@ class ProviderActionRunner(Runner):
             mode="visible",
             issue_id=node_id,
             role=role,
+            # Propagate the supervisor-ruled dispatch topology.  The
+            # TaskBinding constructor is fail-closed: a background ruling
+            # cannot be satisfied by this visible-only bridge, and a
+            # visible-sdd ruling only binds a developer session.
+            topology=str(contract.get("topology") or DEFAULT_TOPOLOGY),
+            limitations=list(contract.get("dispatch_limitations", [])),
             task_id=task_id,
             host=host,
             worktree=str(contract.get("worktree") or worktree),
@@ -1190,9 +1219,12 @@ class ProviderActionRunner(Runner):
         metadata["terminal_confirmed"] = True
         self.store._atomic(self._handle_path(handle.run_id), metadata)
         data = dict(claims)
+        # ``in_session_review`` carries the visible-sdd worker session's
+        # review clearance (protocol/evidence_ref/p0-p2) that Monitor needs
+        # to accept a single-session node (ISSUE-04).
         for key in ("evidence", "finding", "in_contract", "consistency",
                     "delivery_evidence", "completion_marker", "delivery_path",
-                    "thread_status"):
+                    "thread_status", "in_session_review"):
             if key in result:
                 data[key] = result[key]
         return [RunEvent(str(event_name), data)]

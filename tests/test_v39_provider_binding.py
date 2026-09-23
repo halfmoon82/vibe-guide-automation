@@ -1159,5 +1159,158 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
                 self.assertEqual(len(runner.store.pending()), 0)
 
 
+
+class VisibleSddTopologyPropagationTests(unittest.TestCase):
+    """ISSUE-04: the visible provider bridge propagates the ruled topology.
+
+    Monitor stamps ``contract["topology"]`` (and, for visible-sdd, the SDD
+    protocol pointer) before dispatch.  The bridge must (1) forward the
+    topology + protocol on the create request so the servicing desktop
+    session knows what it is creating, (2) register the resulting task
+    binding with the same topology so ``Monitor._binding_for`` does not
+    fail closed, and (3) structurally refuse a background ruling this
+    visible-only bridge cannot satisfy.
+    """
+
+    def _runner(self, paths):
+        return ProviderActionRunner(paths, "codex-app-visible", "codex-app-visible")
+
+    def _contract(self, topology=None, **extra):
+        contract = {
+            "run_id": "run-v46",
+            "node_id": "ISSUE-46-001",
+            "role": "developer",
+            "generation": 1,
+            "project_id": "project-1",
+            "branch": "codex/issue-46-001",
+        }
+        if topology is not None:
+            contract["topology"] = topology
+        contract.update(extra)
+        return contract
+
+    def _results(self, c, r, op, req):
+        if op == "create":
+            return {"binding": {"threadId": "task-46", "hostId": "host-46"}}
+        if op == "locate":
+            return {"located": True}
+        if op == "visibility":
+            return {"visible": True, "direct_enter": True}
+        raise AssertionError(op)
+
+    def test_create_request_carries_visible_sdd_topology_and_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = self._runner(paths)
+            contract = self._contract(
+                "visible-sdd",
+                sdd_protocol="vibe_guide/protocols/visible-sdd-worker.md",
+            )
+            captured = []
+
+            def capture_then_pending(c, r, op, req):
+                captured.append((op, req))
+                raise ProviderPending("create pending")
+
+            with patch.object(runner, "_require_result", side_effect=capture_then_pending):
+                with self.assertRaises(ProviderPending):
+                    runner.task_binding(contract, paths.root / "worker", "run-v46", "start_pending")
+            self.assertEqual(captured[0][0], "create")
+            request = captured[0][1]
+            self.assertEqual(request["topology"], "visible-sdd")
+            self.assertEqual(
+                request["sdd_protocol"], "vibe_guide/protocols/visible-sdd-worker.md"
+            )
+
+    def test_task_binding_propagates_visible_sdd_topology(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = self._runner(paths)
+            contract = self._contract(
+                "visible-sdd",
+                sdd_protocol="vibe_guide/protocols/visible-sdd-worker.md",
+            )
+            with patch.object(runner, "_require_result", side_effect=self._results):
+                binding = runner.task_binding(contract, paths.root / "worker", "run-v46", "start_pending")
+            self.assertEqual(binding.topology, "visible-sdd")
+            self.assertEqual(binding.mode, "visible")
+            self.assertEqual(binding.role, "developer")
+
+    def test_background_ruling_is_fail_closed_on_the_visible_bridge(self):
+        # R3 P1-1: the refusal must land *before* the create side effect,
+        # otherwise every dispatch attempt leaks an armed, unregistered
+        # visible task on the desktop.
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = self._runner(paths)
+            contract = self._contract(
+                "background",
+                dispatch_limitations=["background subagent: not directly enterable"],
+            )
+            with patch.object(runner, "_require_result") as provider_call:
+                with self.assertRaisesRegex(
+                    ValueError, "background topology requires background mode"
+                ):
+                    runner.task_binding(contract, paths.root / "worker", "run-v46", "start_pending")
+            provider_call.assert_not_called()
+
+    def test_visible_sdd_without_protocol_pointer_fails_closed_before_create(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = self._runner(paths)
+            contract = self._contract("visible-sdd")
+            with patch.object(runner, "_require_result") as provider_call:
+                with self.assertRaisesRegex(ValueError, "sdd_protocol"):
+                    runner.task_binding(contract, paths.root / "worker", "run-v46", "start_pending")
+            provider_call.assert_not_called()
+
+    def test_visible_sdd_reviewer_ruling_fails_closed_before_create(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = self._runner(paths)
+            contract = self._contract(
+                "visible-sdd",
+                role="reviewer",
+                sdd_protocol="vibe_guide/protocols/visible-sdd-worker.md",
+            )
+            with patch.object(runner, "_require_result") as provider_call:
+                with self.assertRaisesRegex(
+                    ValueError, "visible-sdd topology only binds a developer"
+                ):
+                    runner.task_binding(contract, paths.root / "worker", "run-v46", "start_pending")
+            provider_call.assert_not_called()
+
+    def test_unknown_topology_string_fails_closed_before_create(self):
+        # R4 P3-1: values outside the closed topology set must be refused
+        # before the create side effect, not by the constructor after it.
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = self._runner(paths)
+            contract = self._contract("bogus")
+            with patch.object(runner, "_require_result") as provider_call:
+                with self.assertRaisesRegex(
+                    ValueError, "task binding topology is invalid"
+                ):
+                    runner.task_binding(contract, paths.root / "worker", "run-v46", "start_pending")
+            provider_call.assert_not_called()
+
+    def test_missing_topology_keeps_dual_visible_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = self._runner(paths)
+            contract = self._contract()
+            captured = []
+
+            def capture_results(c, r, op, req):
+                captured.append((op, req))
+                return self._results(c, r, op, req)
+
+            with patch.object(runner, "_require_result", side_effect=capture_results):
+                binding = runner.task_binding(contract, paths.root / "worker", "run-v46", "start_pending")
+            self.assertEqual(binding.topology, "dual-visible")
+            create_request = next(req for op, req in captured if op == "create")
+            self.assertNotIn("sdd_protocol", create_request)
+
+
 if __name__ == "__main__":
     unittest.main()
