@@ -452,12 +452,24 @@ class ProviderActionRunner(Runner):
                 }
             )
         topology = str(contract.get("topology") or DEFAULT_TOPOLOGY)
+        # Preflight the rulings this visible-only bridge can never satisfy
+        # *before* the create side effect: a background ruling would
+        # otherwise leak an armed, unregistered visible task on the desktop
+        # (R3 P1-1), and a visible-sdd ruling without its protocol pointer
+        # would arm a session that does not know the rules it must follow.
+        if topology == "background":
+            raise ValueError("background topology requires background mode")
         if topology == "visible-sdd":
+            if role != "developer":
+                raise ValueError("visible-sdd topology only binds a developer")
+            sdd_protocol = contract.get("sdd_protocol")
+            if not isinstance(sdd_protocol, str) or not sdd_protocol.strip():
+                raise ValueError("visible-sdd dispatch requires an sdd_protocol pointer")
             # The desktop session servicing the mailbox must know it is
             # creating the single visible SDD worker session and which
             # protocol that session has to follow.
             create_request["topology"] = topology
-            create_request["sdd_protocol"] = contract.get("sdd_protocol")
+            create_request["sdd_protocol"] = sdd_protocol
         if v39:
             # Keep the provider request bound to the same supervisor target
             # that will later be checked against live binding evidence.  These
