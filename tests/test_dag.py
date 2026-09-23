@@ -645,6 +645,19 @@ class ParallelGroupAuditTests(unittest.TestCase):
         self.assertEqual(set(result.ready_nodes), {"producer", "consumer"})
         self.assertEqual(result.parallel_groups, {"g": ["producer", "consumer"]})
 
+    def test_multi_extension_output_path_is_not_truncated_to_shorter_path(self):
+        producer = self._group_node(
+            "producer",
+            contract_overrides={"output": "归档 docs/spec.md.bak 备份"},
+        )
+        consumer = self._group_node(
+            "consumer",
+            contract_overrides={"input": "参照docs/spec.md格式"},
+        )
+        result = audit_dag(self._plan([producer, consumer]))
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(set(result.ready_nodes), {"producer", "consumer"})
+
 
 if __name__ == "__main__":
     unittest.main()
