@@ -36,6 +36,7 @@ from .models import (
     node_worktree,
 )
 from .paths import ProjectPaths
+from .path_ownership import validate_path_ownership
 from .planner import resolve_consistency
 from . import dag as _dag_module
 from .dag import audit_dag, node_scoped_ready, ready_nodes
@@ -43,6 +44,7 @@ from .adapters.task_provider import ProviderActionStore, ProviderPending, Provid
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
     RunSnapshot,
+    _atomic_bytes,
     acquire_writer_lease,
     append_event,
     load_events,
@@ -52,6 +54,7 @@ from .state import (
     read_writer_lease,
     redact_provider_text,
     release_writer_lease,
+    run_dir,
     save_snapshot,
     validate_run_id,
 )
@@ -750,6 +753,82 @@ class Monitor:
             # Unverifiable audit metadata is fail-closed inside the audit
             # itself; a broken projection must not silently widen dispatch.
             return set(self.nodes)
+
+    _OWNERSHIP_IN_FLIGHT = ("running", "rework", "review", "brief_pending")
+
+    def _refuse_path_ownership_conflicts(self, snapshot: RunSnapshot) -> None:
+        """Refuse the whole dispatch round when candidate writers collide.
+
+        ``validate_path_ownership`` (V3.8) is the existing owned_paths check;
+        until V4.7 nothing on the dispatch path called it.  The candidates
+        are the planned nodes eligible for a first write this round plus the
+        in-flight writers they would run beside, regardless of
+        parallel_group.  Any overlap, missing ownership metadata or invalid
+        path fails closed: every planned candidate becomes blocked_unknown,
+        the conflict is recorded as an event and written to the run-scoped
+        ``.vibe/runs/<run-id>/dag-audit.json`` (the plan-level dag-audit.json
+        is digest-locked after authorization and must never be rewritten).
+        """
+        planned = []
+        in_flight = []
+        for node_id, node in self.nodes.items():
+            current = snapshot.nodes[node_id]
+            status = current.get("status")
+            if status == "planned" and all(
+                snapshot.nodes[dependency].get("status") == "accepted"
+                for dependency in node.depends_on
+            ):
+                planned.append(node_id)
+            elif status in self._OWNERSHIP_IN_FLIGHT:
+                in_flight.append(node_id)
+        if not planned:
+            return
+        candidates = planned + in_flight
+        try:
+            result = validate_path_ownership([self.nodes[node_id] for node_id in candidates])
+        except (TypeError, ValueError) as error:
+            conflicts, missing = [], []
+            reason = "path ownership unverifiable: {}".format(error)
+        else:
+            if result.valid:
+                return
+            conflicts = [{"path": item.path, "nodes": list(item.nodes)} for item in result.conflicts]
+            missing = list(result.missing_nodes)
+            details = ["{} owned by {}".format(item["path"], ", ".join(item["nodes"])) for item in conflicts]
+            if missing:
+                details.append("ownership metadata missing on " + ", ".join(missing))
+            reason = "path ownership conflict: " + "; ".join(details)
+        affected = sorted({node_id for item in conflicts for node_id in item["nodes"]} | set(missing))
+        for node_id in planned:
+            self._mark_blocked_unknown(snapshot, node_id, reason, quarantine_lease=False)
+        self._record(
+            snapshot,
+            "path_ownership_conflict",
+            {
+                "run_id": snapshot.run_id,
+                "node_ids": list(candidates),
+                "affected_nodes": affected,
+                "reason": reason,
+            },
+        )
+        audit = {
+            "status": "blocked_unknown",
+            "run_id": snapshot.run_id,
+            "plan_revision": str(snapshot.plan_version),
+            "node_count": len(candidates),
+            "node_ids": list(candidates),
+            "path_ownership": {
+                "valid": False,
+                "conflicts": conflicts,
+                "missing_nodes": missing,
+                "blocked_nodes": list(planned),
+                "reason": reason,
+            },
+        }
+        _atomic_bytes(
+            run_dir(self.paths, snapshot.run_id, create=True) / "dag-audit.json",
+            (json.dumps(audit, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+        )
 
     def _projection_nodes(self, snapshot: RunSnapshot) -> List[DAGNode]:
         """The status-projected node list used for readiness decisions."""
@@ -2278,6 +2357,12 @@ class Monitor:
         # acquired; on a dag.py without the gate the audit set is empty and
         # dispatch behavior is unchanged.
         group_blocked = self._parallel_group_blocked(snapshot)
+        # V4.7 ISSUE-01: explicit writer ownership is checked over every
+        # candidate of this round (same group, cross group or ungrouped)
+        # before any writer lease is acquired.  A refused round leaves its
+        # candidates blocked_unknown, so the planned branch below never sees
+        # them.
+        self._refuse_path_ownership_conflicts(snapshot)
         active_sessions = sum(
             1
             for node_id, current in snapshot.nodes.items()
