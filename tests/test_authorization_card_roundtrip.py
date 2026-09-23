@@ -162,6 +162,14 @@ class WorkersRoundTripTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             AuthorizationRecord.from_dict(data)
 
+    def test_from_dict_refuses_topology_summary_without_workers(self):
+        plan, nodes = _plan()
+        record = authorize(build_authorization_card(plan, nodes, CAPS), "AUTHORIZE")
+        data = record.to_dict()
+        data["workers"] = []
+        with self.assertRaises(ValueError):
+            AuthorizationRecord.from_dict(data)
+
     def test_legacy_record_without_workers_fields_still_loads_and_validates(self):
         plan, nodes = _plan()
         record = authorize(build_authorization_card(plan, nodes, CAPS), "AUTHORIZE")

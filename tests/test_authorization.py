@@ -307,6 +307,44 @@ class AuthorizationWorkersSchemaTests(unittest.TestCase):
                     workers={"n1": {"session_source": variant}},
                 )
 
+    def test_main_session_developer_separator_and_compact_variants_are_refused(self):
+        variants = (
+            "MainSession",
+            "mainsession",
+            "main.session",
+            "main/session",
+            "main:session",
+            "main thread",
+            "main-thread",
+            "mainthread",
+            "MainThread",
+            "claude main.thread",
+        )
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises(ValueError):
+                build_authorization_card(
+                    self.plan,
+                    self.nodes,
+                    self.capabilities,
+                    workers={"n1": {"session_source": variant}},
+                )
+
+    def test_non_string_contract_worker_identity_is_refused(self):
+        for bad_worker in (["main session"], {"session": "main"}, 7):
+            with self.subTest(worker=bad_worker):
+                evil = DAGNode(
+                    "n9",
+                    "n9",
+                    [],
+                    [],
+                    None,
+                    {"files": ["x.py"], "worker": bad_worker},
+                    "ready",
+                )
+                plan = Plan("plan-bad-worker", 1, "docs/prd.md", ["n9"], "draft")
+                with self.assertRaises(ValueError):
+                    build_authorization_card(plan, [evil], self.capabilities)
+
     def test_main_session_identity_from_contract_worker_is_refused(self):
         evil = node("n9", ["x.py"], worker="Codex Main Session")
         plan = Plan("plan-main-session", 1, "docs/prd.md", ["n9"], "draft")

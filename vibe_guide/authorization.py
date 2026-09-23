@@ -3,6 +3,7 @@
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import re
 from pathlib import PurePosixPath
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
@@ -122,17 +123,20 @@ def _is_main_session_identity(value: Any) -> bool:
     """
     if not isinstance(value, str):
         return False
-    normalized = " ".join(
-        value.replace("-", " ").replace("_", " ").split()
-    ).casefold()
+    # Fold every non-alphanumeric/non-CJK character into a separator so
+    # "main.session", "main/session" and "main:session" tokenize the same as
+    # "main session"; compact forms catch camelCase ("MainSession") and
+    # fused spellings ("mainthread").
+    normalized = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", " ", value).strip().casefold()
     if not normalized:
         return False
-    if "主会话" in normalized:
+    compact = normalized.replace(" ", "")
+    if "主会话" in compact:
         return True
     tokens = normalized.split(" ")
-    if "main" in tokens and "session" in tokens:
+    if "main" in tokens and ("session" in tokens or "thread" in tokens):
         return True
-    return normalized == "main"
+    return compact in {"main", "mainsession", "mainthread"}
 
 
 def _background_limitation_gaps(limitations: Tuple[str, ...]) -> List[str]:
@@ -274,6 +278,12 @@ def _topology_summary(workers: Any) -> Dict[str, Any]:
     by_topology = {topology: 0 for topology in _WORKER_TOPOLOGIES}
     background = 0
     for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or entry.get("topology") not in _WORKER_TOPOLOGIES
+            or entry.get("mode") not in _WORKER_MODES
+        ):
+            raise ValueError("worker entry is invalid")
         by_topology[entry["topology"]] += 1
         if entry["mode"] == "background":
             background += 1
@@ -297,11 +307,16 @@ def validate_authorization_card_consistency(card):
     # an overlap outside that group is a contradiction.
     if (excluded & allowed) - set(_REMOTE_GIT_ACTIONS_SCOPE):
         raise ValueError("authorization card has overlapping allowed and excluded actions")
-    workers = data.get("workers") or {}
+    workers = data.get("workers") or ()
     if workers:
-        _normalize_workers_schema(
+        normalized_workers = _normalize_workers_schema(
             workers, tuple(sorted(data.get("node_ids", ()))), {}
         )
+        summary = data.get("topology_summary") or {}
+        if summary and summary != _topology_summary(normalized_workers):
+            raise ValueError(
+                "authorization topology summary does not match workers"
+            )
     return True
 
 
@@ -819,6 +834,10 @@ class AuthorizationRecord:
                 )
             converted["topology_summary"] = derived_summary
         else:
+            if converted.get("topology_summary"):
+                raise ValueError(
+                    "authorization topology summary requires workers"
+                )
             converted["workers"] = ()
             converted["topology_summary"] = {}
         return cls(**converted)
@@ -947,11 +966,17 @@ def build_authorization_card(
             }
         )
     )
-    worker_identities = {
-        node.id: str(node.contract["worker"])
-        for node in nodes
-        if node.contract.get("worker")
-    }
+    worker_identities = {}
+    for node in nodes:
+        raw_worker = node.contract.get("worker")
+        if raw_worker is None:
+            continue
+        if not isinstance(raw_worker, str):
+            # Fail closed: coercing a non-string identity with str() would
+            # let a structured value smuggle a main-session spelling past
+            # the worker identity refusal.
+            raise ValueError("contract worker identity must be a string")
+        worker_identities[node.id] = raw_worker
     normalized_workers = _normalize_workers_schema(
         workers, node_ids, worker_identities
     )
@@ -1171,6 +1196,8 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         raise ValueError("unsupported authorization card schema")
     if not _valid_action_scope(card.allowed_actions) or card.excluded_actions != _EXCLUDED_ACTIONS:
         raise ValueError("authorization action scope is invalid")
+    if card.workers:
+        _normalize_workers_schema(card.workers, card.node_ids, {})
     if not secrets.compare_digest(card.digest, _canonical_digest(canonical)):
         raise ValueError("authorization card digest is invalid")
     return AuthorizationRecord(
