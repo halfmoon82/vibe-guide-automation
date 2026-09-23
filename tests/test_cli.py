@@ -173,6 +173,44 @@ class CliContractTests(unittest.TestCase):
             self.assertFalse(repeated.payload["changed"])
             self.assertEqual(agents.read_text(encoding="utf-8"), content)
 
+    def test_apply_agentsmd_accepts_a_proposal_with_only_the_entry_block(self):
+        """Regression: the apply gate recognized only the two legacy markers.
+
+        A project that already applied the older blocks gets a proposal whose
+        only section is New Session Entry; the gate must accept any shipped
+        block, or the upgrade path is unreachable.
+        """
+        from vibe_guide.cli import run_cli
+        from vibe_guide.scanner import CAPABILITY_RULES, PRD_GUIDE_RULES
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".project-root").write_text("fixture\n", encoding="utf-8")
+            agents = root / "AGENTS.md"
+            original = (
+                "# Vibe Guide\n\n"
+                "Project guidance is maintained through the Vibe Guide.\n\n"
+                + CAPABILITY_RULES + PRD_GUIDE_RULES
+            )
+            agents.write_text(original, encoding="utf-8")
+
+            initialized = run_cli(["init", "--confirm", "--json"], root)
+            self.assertEqual(initialized.exit_code, 0, initialized.payload)
+            proposal = (root / ".vibe" / "proposals" / "agentsmd" / "proposal.md").read_text(encoding="utf-8")
+            self.assertIn("New Session Entry", proposal)
+            self.assertNotIn("Capability and Tool Truth", proposal)
+
+            applied = run_cli(["apply-agentsmd", "--confirm", "--json"], root)
+            self.assertEqual(applied.exit_code, 0, applied.payload)
+            self.assertTrue(applied.payload["changed"])
+            content = agents.read_text(encoding="utf-8")
+            self.assertTrue(content.startswith(original))
+            self.assertIn("New Session Entry", content)
+
+            repeated = run_cli(["apply-agentsmd", "--confirm", "--json"], root)
+            self.assertEqual(repeated.exit_code, 0)
+            self.assertFalse(repeated.payload["changed"])
+
     def test_monitor_missing_capability_contract_is_unknown_not_unavailable(self):
         try:
             from vibe_guide.cli import run_cli

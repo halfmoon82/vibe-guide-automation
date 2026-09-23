@@ -4,8 +4,7 @@ import os
 import json, tempfile
 
 from .scanner import (
-    CAPABILITY_RULE_MARKER,
-    PRD_GUIDE_MARKER,
+    AGENTSMD_BLOCKS,
     build_agentsmd_patch,
     missing_agentsmd_blocks,
     scan_project,
@@ -23,6 +22,12 @@ PENDING_UPDATE_NAME = "proposal.pending-update.md"
 # has, and it cannot tell a proposal that predates a section from a reviewer
 # who deleted it -- so every re-init re-offers what they already declined.
 OFFERED_SECTIONS_NAME = "proposal.offered.json"
+
+#: Heading text of every shipped rule block; the apply gate accepts any of
+#: them so a new block can never be stranded by a gate written before it.
+_KNOWN_RULE_MARKERS = tuple(
+    block.splitlines()[0].strip().lstrip("#").strip() for block in AGENTSMD_BLOCKS
+)
 
 
 @dataclass
@@ -456,8 +461,15 @@ def apply_agentsmd_proposal(paths, confirm):
     proposal = _read_proposal(proposal_path)
     if proposal is None:
         raise ValueError("AGENTS.md proposal is missing or not a regular file")
-    if not proposal.strip() or not (
-        CAPABILITY_RULE_MARKER in proposal or PRD_GUIDE_MARKER in proposal
+    increment = _read_proposal(proposal_path.with_name(PENDING_UPDATE_NAME))
+    # Accept every shipped block, from proposal and increment alike: a project
+    # that applied (or declined) the older blocks gets a proposal whose only
+    # section is the newest one, and a gate keyed to legacy markers would
+    # strand it.  Deriving from AGENTSMD_BLOCKS keeps the gate in step with
+    # whatever this release ships.
+    offered = "\n".join(part for part in (proposal, increment) if part)
+    if not offered.strip() or not any(
+        marker in offered for marker in _KNOWN_RULE_MARKERS
     ):
         raise ValueError("AGENTS.md proposal does not contain capability rules")
     # A project that reviewed an earlier proposal keeps those bytes, so newer
@@ -465,8 +477,6 @@ def apply_agentsmd_proposal(paths, confirm):
     # proposal.md would leave that increment on disk forever: the rule would
     # never reach AGENTS.md and nothing would say so.  Section-level dedup
     # below makes reading both safe.
-    increment = _read_proposal(proposal_path.with_name(PENDING_UPDATE_NAME))
-
     target = root / "AGENTS.md"
     if target.is_symlink() or (target.exists() and not target.is_file()):
         raise ValueError("AGENTS.md must be a regular file")
