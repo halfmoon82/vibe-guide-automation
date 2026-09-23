@@ -592,6 +592,14 @@ def _cycle_nodes(nodes: List[DAGNode]) -> List[str]:
 
 
 _PATH_TOKEN_PATTERN = re.compile(r"[^\s，。；、：:\"'()（）\[\]<>]+")
+# A file path glued to prose without whitespace (``reports/测试输出.json供下游``)
+# still ends where its extension ends: one or more ``/``-separated segments,
+# then a final segment with an ASCII extension that is not itself continued by
+# alphanumerics, another ``.ext`` (``spec.md.bak``) or ``/``.  Segments may hold
+# non-ASCII characters so CJK file names survive.  The head of the path is only
+# delimited by the token start: gluing prose *before* a path is undecidable and
+# is left unresolved rather than guessed.
+_PATH_SPAN_PATTERN = re.compile(r"^(?:[^/]+/)+[^/]+?\.[A-Za-z0-9]{1,10}(?![A-Za-z0-9/]|\.[A-Za-z0-9])")
 
 
 def _write_scope_paths(node: DAGNode) -> Optional[List[str]]:
@@ -650,7 +658,13 @@ def _contract_texts(value: Any) -> List[str]:
 
 
 def _path_like_token(token: str) -> Optional[str]:
-    """Normalize a whitespace-delimited token that names a project path."""
+    """Normalize a whitespace-delimited token that names a project path.
+
+    CJK prose carries no whitespace, so the token may continue past the path
+    (``reports/测试输出.json供下游校验``); ``_PATH_SPAN_PATTERN`` cuts the
+    token at the file extension when one is present.  Tokens without an
+    extension (``docs/specs``) are taken whole as before.
+    """
     # Trailing sentence punctuation only: a leading dot (`.vibe/...`) is part
     # of the path and must survive normalization.
     candidate = token.strip().rstrip(",;.")
@@ -662,6 +676,9 @@ def _path_like_token(token: str) -> Optional[str]:
     # identity belongs to the declared write scope.
     if "/" not in candidate:
         return None
+    span = _PATH_SPAN_PATTERN.match(candidate)
+    if span:
+        candidate = span.group(0)
     try:
         return normalize_project_path(candidate)
     except ValueError:

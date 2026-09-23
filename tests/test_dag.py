@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from vibe_guide.dag import DAGAuditResult, audit_dag, node_scoped_ready, ready_nodes, render_plan_artifacts, validate_dag
 from vibe_guide.models import DAGNode, Plan
+from vibe_guide.path_ownership import normalize_project_path
 
 
 def node(node_id, depends=None, integration=None, group=None, status="planned", contract=None):
@@ -565,6 +566,84 @@ class ParallelGroupAuditTests(unittest.TestCase):
                     for reason in result.reasons[node_id]),
                 result.reasons[node_id],
             )
+
+    # --- V4.7 ISSUE-03: root/prefix overlap and CJK glued path references ---
+
+    def test_normalize_project_path_rejects_project_root_dot(self):
+        with self.assertRaises(ValueError):
+            normalize_project_path(".")
+
+    def test_parent_directory_owned_path_overlaps_child_file(self):
+        nodes = [
+            self._group_node("a", owned=["src"]),
+            self._group_node("b", owned=["src/utils.py"]),
+        ]
+        result = audit_dag(self._plan(nodes))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertEqual(result.ready_nodes, [])
+        for node_id in ("a", "b"):
+            self.assertTrue(
+                any("overlapping write scope (src)" in reason for reason in result.reasons[node_id]),
+                result.reasons[node_id],
+            )
+
+    def test_shared_string_prefix_is_not_directory_overlap(self):
+        nodes = [
+            self._group_node("a", owned=["src"]),
+            self._group_node("b", owned=["srcfoo/x.py"]),
+        ]
+        result = audit_dag(self._plan(nodes))
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(set(result.ready_nodes), {"a", "b"})
+        self.assertEqual(result.parallel_groups, {"g": ["a", "b"]})
+
+    def test_cjk_glued_artifact_reference_is_detected(self):
+        producer = self._group_node(
+            "producer",
+            contract_overrides={"output": "产出：reports/测试输出.json供下游校验"},
+        )
+        consumer = self._group_node(
+            "consumer",
+            contract_overrides={"input": "读取reports/测试输出.json后做断言"},
+        )
+        result = audit_dag(self._plan([producer, consumer]))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertEqual(result.ready_nodes, [])
+        for node_id in ("producer", "consumer"):
+            self.assertTrue(
+                any("produced path reports/测试输出.json" in reason for reason in result.reasons[node_id]),
+                result.reasons[node_id],
+            )
+
+    def test_ascii_path_glued_inside_cjk_prose_is_detected(self):
+        producer = self._group_node(
+            "producer",
+            contract_overrides={"output": "产出：docs/spec.md定稿"},
+        )
+        consumer = self._group_node(
+            "consumer",
+            contract_overrides={"input": "参照docs/spec.md格式"},
+        )
+        result = audit_dag(self._plan([producer, consumer]))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertTrue(
+            any("produced path docs/spec.md" in reason for reason in result.reasons["consumer"]),
+            result.reasons["consumer"],
+        )
+
+    def test_cjk_prose_without_paths_neither_matches_nor_raises(self):
+        producer = self._group_node(
+            "producer",
+            contract_overrides={"output": "完成中文说明文档的撰写。版本v1.2已发布，见第3.14节"},
+        )
+        consumer = self._group_node(
+            "consumer",
+            contract_overrides={"input": "阅读中文说明文档，参考版本v1.2与第3.14节后验证"},
+        )
+        result = audit_dag(self._plan([producer, consumer]))
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(set(result.ready_nodes), {"producer", "consumer"})
+        self.assertEqual(result.parallel_groups, {"g": ["producer", "consumer"]})
 
 
 if __name__ == "__main__":
