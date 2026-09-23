@@ -1,0 +1,55 @@
+{
+  "description": "V4.6 ISSUE-06 回归夹具：vibe-entry 案例中 ISSUE-01 物化 .vibe/proposals/skills/vibe-entry/SKILL.md，ISSUE-02 的 AGENTS.md 块内容指向该协议文件路径；两节点存在产物级软依赖，parallel_group 派发前依赖审查必须判为不可同组。",
+  "plan": {
+    "plan_id": "v46-parallel-audit-vibe-entry",
+    "version": 1,
+    "prd_path": "prd.md",
+    "status": "authorized"
+  },
+  "nodes": [
+    {
+      "id": "ISSUE-01",
+      "title": "vibe-entry 协议随包发布与物化",
+      "depends_on": [],
+      "integration_after": [],
+      "parallel_group": "vibe-entry",
+      "status": "planned",
+      "writer": "writer-issue-01",
+      "worktree": ".vibe/worktrees/ISSUE-01",
+      "allowlist": [
+        "vibe_guide/protocols/vibe-entry.md",
+        "vibe_guide/protocols/__init__.py",
+        "vibe_guide/initializer.py",
+        "tests/test_vibe_entry_protocol.py"
+      ],
+      "contract": {
+        "input": "已确认决策卡与 PRD",
+        "output": "vibe-entry 协议随包发布，init 物化 .vibe/proposals/skills/vibe-entry/SKILL.md",
+        "error_behavior": "协议文件缺失或非法名走 load_protocol 现有 FileNotFoundError/ValueError 路径",
+        "acceptance_example": "物化幂等与用户改动存活测试通过",
+        "risk_tags": ["packaging"]
+      }
+    },
+    {
+      "id": "ISSUE-02",
+      "title": "AGENTS.md 新会话入口提案块",
+      "depends_on": [],
+      "integration_after": [],
+      "parallel_group": "vibe-entry",
+      "status": "planned",
+      "writer": "writer-issue-02",
+      "worktree": ".vibe/worktrees/ISSUE-02",
+      "allowlist": [
+        "vibe_guide/scanner.py",
+        "tests/test_scanner.py"
+      ],
+      "contract": {
+        "input": "AGENTS.md 块内容指向 .vibe/proposals/skills/vibe-entry/SKILL.md 协议文件路径",
+        "output": "VIBE_ENTRY_RULES 块进入 AGENTSMD_BLOCKS 提案",
+        "error_behavior": "缺失检测走现有三态提案机制",
+        "acceptance_example": "缺失检测与合入幂等测试通过",
+        "risk_tags": ["scanner"]
+      }
+    }
+  ]
+}

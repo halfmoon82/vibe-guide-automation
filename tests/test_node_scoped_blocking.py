@@ -5,7 +5,11 @@ from vibe_guide.models import DAGNode
 
 
 def node(node_id, deps=(), status="planned", integration_after=()):
-    contract = {"input":"i","output":"o","error_behavior":"e","acceptance_example":"a","risk_tags":["test"],"writer":node_id+"-w","worktree":"/tmp/"+node_id,"allowlist":[]}
+    # Per-node disjoint write scope: the v4.6 parallel-group audit refuses
+    # group members whose write scope is missing or unverifiable, so the
+    # shared empty allowlist would now (correctly) block every node here.
+    # These tests cover dependency closure and integration_after, not groups.
+    contract = {"input":"i","output":"o","error_behavior":"e","acceptance_example":"a","risk_tags":["test"],"writer":node_id+"-w","worktree":"/tmp/"+node_id,"allowlist":[node_id + ".py"]}
     return DAGNode(node_id, node_id, list(deps), list(integration_after), "g", contract, status)
 
 class NodeScopedBlockingTests(unittest.TestCase):
