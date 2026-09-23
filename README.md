@@ -128,6 +128,18 @@ V4.4 将工程故障限定在节点范围内，并保留同一任务身份。五
 
 每个 Agent Task 都是某个 Issue 的运行时实例；任务线程、Provider 返回值或 worker 自报不会替代 Issue/DAG 合同。节点完成独立验收后，Monitor 立即依据最新的 `depends_on` 状态重算 `ready_set`，已解锁的节点可以继续调度，不等待整批任务形成 barrier。
 
+### V4.6 派发拓扑与并发上限
+
+V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 为 `create_thread` 创建的 user-owned thread）；监工只派发、等待、收口，不作任何节点的 writer。任务登记 `tasks.json` 用 `topology` 字段记录每个节点的派发拓扑：
+
+- `visible-sdd`：每节点一个可见会话，会话内走 SDD 双角色——dev 子代理实现，review 子代理以独立上下文、只读审查（协议见 `vibe_guide/protocols/visible-sdd-worker.md`），返工与复审在同一会话身份内闭环；
+- `dual-visible`：保守默认，developer 与 reviewer 是两个不同的可见独立任务；平台能力 UNKNOWN 时 fail-closed 到本拓扑，不会升级为 `visible-sdd`；
+- `background`：平台无可见桥接时的显式降级，必须在能力报告、授权卡和交付三处披露降级及限制（不可见、不可直接进入、返工续接受限）；`mode=background` 缺少披露时授权卡机器校验直接失败。
+
+平台拓扑由适配器注册表的 `DISPATCH_TOPOLOGY_MATRIX` 按各平台 `in_session_sdd` 探针证据裁定。
+
+并发上限：`.vibe/config.json` 的 `max_active_worker_sessions` 控制同时活跃的 worker 会话数，默认 5（合法范围 1–64），与授权卡快照取较小者生效；显式但非法的值是配置错误，不会静默回落默认值。节点验收、P0–P2 清零且证据登记后归档会话，名额释放给后续 ready 节点。
+
 ### V4.1 复杂任务最终整合
 
 复杂任务在授权前必须完成 PRD 阶段的范围与边界确认，并把需求、PRD、Spec/Issue、DAG 审计、计划确认、授权卡和用户授权纳入十节点强制链；节点只能通过结构化记录完成，显式跳过会记录用户指令、原因和后继策略：允许后继时继续，跳过授权节点则不能推导执行授权。所有业务节点完成后，独立 reviewer 执行只读的最终整合 Review，核验 PRD/Spec 合同、全量 diff 与 P0–P2 门禁。CLI 会区分“局部节点完成”“整合 Review 进行中”“整合 Review 返工”和“整合通过但外部动作未授权”。

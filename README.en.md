@@ -60,6 +60,18 @@ New-session entry: the host agent self-screens S0/S1 in-session following `.vibe
 
 Complex-plan publication records a real provider engine attestation containing the plan, revision, provider, content digest, and freshness checks. Monitor start and resume validate that evidence before dispatch. Missing, altered, mismatched, expired, future-dated, or symlinked plan/evidence files fail closed.
 
+## V4.6 dispatch topology
+
+Since V4.6, true DAG parallelism is carried by one visible worker session per node (Codex: `create_thread`, user-owned); the supervisor only dispatches, waits, and closes out, and is never the writer of any node. The task registry records each node's dispatch topology in its `topology` field:
+
+- `visible-sdd`: one visible session per node running in-session SDD — a dev subagent implements while an independent-context, read-only review subagent audits (protocol: `vibe_guide/protocols/visible-sdd-worker.md`); rework and re-review close the loop inside the same session identity;
+- `dual-visible`: the conservative default, with two distinct visible tasks for developer and reviewer; UNKNOWN platform evidence fails closed to this topology and never upgrades to `visible-sdd`;
+- `background`: the explicit downgrade when a platform has no visible bridge. The downgrade and its limitations (not visible, not directly enterable, limited rework continuation) must be disclosed in the capability report, the authorization card, and the delivery; a `mode=background` worker without disclosure fails authorization-card validation.
+
+Platform topology is ruled by the adapter registry's `DISPATCH_TOPOLOGY_MATRIX` from each platform's `in_session_sdd` probe evidence.
+
+Concurrency cap: `max_active_worker_sessions` in `.vibe/config.json` caps simultaneously active worker sessions (default 5, valid range 1–64) and takes effect as the minimum with the authorization-card snapshot; an explicit but invalid value is a configuration error, never silently replaced. Accepted and archived sessions release capacity for later ready nodes.
+
 ## Governance boundaries
 
 - `scan` is read-only.

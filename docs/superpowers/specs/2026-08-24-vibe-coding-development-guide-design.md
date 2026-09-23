@@ -99,6 +99,29 @@ S1 使用五个维度评分：
 
 共享文件或潜在冲突不是天然的串行理由，优先使用隔离 worktree。只有契约变化或占位无法满足真实约束，才需要回到设计变更确认。
 
+### 4.2 任务拓扑（V4.6 两级拓扑）
+
+V4.6 起，DAG 真并行采用两级拓扑：
+
+```text
+监工（主会话）
+  └─ 按 DAG ready 集并行派发可见 worker 会话（Codex：create_thread，user-owned）
+       └─ 会话内 SDD 双角色：dev 子代理实现 + review 子代理独立只读审查
+            └─ 返工/复审循环在同一会话身份内闭环
+```
+
+每个节点的派发拓扑记录在任务登记（`.vibe/runs/<run-id>/tasks.json`）的 `topology` 字段，取值三种：
+
+- **`visible-sdd`**：每节点绑定一个可见 worker 会话；会话内按 `vibe_guide/protocols/visible-sdd-worker.md` 协议走 SDD 双角色——dev 子代理实现，review 子代理以独立上下文、只读、非作者视角审查，返工与复审在同一会话身份内闭环。reviewer 独立性由会话内独立子代理保证，不再独占第二个可见任务。
+- **`dual-visible`**：保守默认拓扑；developer 与 reviewer 仍是两个不同的可见独立任务。平台能力 UNKNOWN 时 fail-closed 到本拓扑，UNKNOWN 永远不会升级为 `visible-sdd`。
+- **`background`**：平台无可见任务桥时的显式降级。必须在能力报告、授权卡和交付三处披露降级及限制（不可见、不可直接进入、返工续接受限）；`mode=background` 缺少披露时授权卡机器校验直接失败，不是事后补记。
+
+平台拓扑由 `vibe_guide/adapters/registry.py` 的 `DISPATCH_TOPOLOGY_MATRIX` 逐平台裁定：Codex、Claude Code、Cursor、Kimi Code、DeepSeek Harness 在 `in_session_sdd` 探针通过时升级为会话内 SDD；WorkBuddy 与 Grok 恒为 `dual-visible`（探针通过也不升级）；UNKNOWN 一律按 `dual-visible` 处理，永远不会升级为 `visible-sdd`。
+
+并发上限：同时活跃的 worker 会话数由项目配置 `.vibe/config.json` 的 `max_active_worker_sessions` 控制，默认 5（合法范围 1–64），与授权卡快照取较小者生效。节点验收、P0–P2 清零且证据登记后归档会话，名额释放给后续 ready 节点。
+
+监工职责收窄为派发、等待、收口与纠偏：监工自身不得作为任何节点的 writer，该约束是结构性拒绝，不依赖授权卡文本。
+
 ## 5. 项目产物
 
 建议的项目运行目录：
@@ -141,7 +164,7 @@ vibe resume     # 从快照恢复
 
 桌面 App 会话负责需求讨论、展示决策卡和授权卡、接收短触发词、展示进度；CLI 负责真实状态、调度和证据写入。
 
-桌面 App 适配器优先通过 `VisibleTaskProvider` 为每个 developer 和 reviewer 创建独立任务。创建成功后任务必须出现在该 App 的任务/会话列表，用户可以进入查看过程。监工通过精确平台任务 ID 和 host 下发后续输入并用逐任务 cursor/token 等待；不得用全局任务列表轮询代替精确登记。Codex App 的具体映射为 `create_thread`、`threadId`、`hostId` 和 cursor。若 provider 明确返回“不支持”，才可在授权卡中声明 `background` 降级并使用 subagent。
+桌面 App 适配器优先通过 `VisibleTaskProvider` 按 §4.2 任务拓扑创建可见任务：`visible-sdd` 每节点只创建一个可见 worker 会话（审查在会话内完成），`dual-visible` 为 developer 和 reviewer 各创建一个独立任务。创建成功后任务必须出现在该 App 的任务/会话列表，用户可以进入查看过程。监工通过精确平台任务 ID 和 host 下发后续输入并用逐任务 cursor/token 等待；不得用全局任务列表轮询代替精确登记。Codex App 的具体映射为 `create_thread`、`threadId`、`hostId` 和 cursor。若 provider 明确返回“不支持”，才可在授权卡中声明 `background` 降级并使用 subagent。
 
 配置中的任务对上限表示同时活跃并发量，不表示整个 DAG 期间累计只能创建这么多任务。一个 Issue 的 developer/reviewer 已完成、独立 Review 的 P0–P2 清零且证据已登记后，监工关闭或归档对应会话，释放并发名额；任务 ID、host、worktree、branch、状态/交付路径和最终 cursor 继续作为历史证据保留。仍可能返工或复审的原任务不得提前归档，也不得通过删除登记绕过唯一 writer 或续接要求。新解锁的 Issue 使用释放后的名额创建新的独立 developer/reviewer。
 
@@ -188,14 +211,14 @@ planned → ready → running → delivered → review → accepted
 1. 找出所有硬依赖已完成且契约满足的 `ready` 节点；
 2. 按并行组为没有 writer 冲突的 Issue 创建用户可见 developer 任务，同时登记 `threadId`、`hostId`、worktree、branch、`status_file`、`handoff_file` 和 cursor；
 3. worker 自主计划、写 Red 测试、实现、测试并交付；
-4. developer 交付后创建另一个用户可见 reviewer 任务，独立检查累计 diff、测试和交付证据；
+4. developer 交付后由独立 reviewer 检查累计 diff、测试和交付证据：`dual-visible` 下创建另一个用户可见 reviewer 任务，`visible-sdd` 下由会话内独立 review 子代理按协议出具审查证据；
 5. 实现缺陷退回原 developer 任务，修复后复审回到原 reviewer 任务；
 6. 节点通过 Review 后锁定成果，解锁后续节点；
 7. 全部节点完成后执行最终 DAG 验收。
 
 调度容量按活跃任务对计算：已完成且归档的任务不阻塞后续 ready 节点；同一时刻不得超过授权卡列明的活跃 developer/reviewer 对数。
 
-一个节点只允许一个有效 writer。reviewer 只读审查，不能代改业务代码。developer 与 reviewer 必须是两个不同的显式独立任务；不得因不确定的线程索引、短暂超时或状态延迟创建第二 writer，也不得用内部 subagent 替代已登记的可见任务。
+一个节点只允许一个有效 writer。reviewer 只读审查，不能代改业务代码。reviewer 独立性按 §4.2 任务拓扑保证：`visible-sdd` 下由会话内独立上下文、只读的 review 子代理承担（不再创建第二个可见任务），`dual-visible` 下 developer 与 reviewer 必须是两个不同的显式独立任务；不得因不确定的线程索引、短暂超时或状态延迟创建第二 writer，也不得用内部 subagent 替代已登记的可见任务。
 
 ### 7.4 异常处理
 

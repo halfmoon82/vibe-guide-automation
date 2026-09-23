@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "card_id": "v46-visible-parallel-dispatch-auth-1",
+  "plan_id": "v46-visible-parallel-dispatch-20260923",
+  "plan_revision": 1,
+  "status": "authorized",
+  "scope": "ISSUE-01..ISSUE-08 as listed in docs/superpowers/specs/2026-09-23-v46-visible-parallel-dispatch-spec-issues.md (PRD 2026-09-23 三项用户决策定稿; Spec 2026-09-23 用户确认)",
+  "topology": "visible-sdd (dogfood): one visible user-owned Codex thread per node via create_thread; in-session dev subagent + independent read-only review subagent; rework loop closes in-session; supervisor never writes node code",
+  "ready_nodes": [
+    "ISSUE-01",
+    "ISSUE-03",
+    "ISSUE-06",
+    "ISSUE-07"
+  ],
+  "deferred_nodes": [
+    "ISSUE-02 (depends_on ISSUE-01)",
+    "ISSUE-04 (depends_on ISSUE-01+03+07)",
+    "ISSUE-05 (depends_on ISSUE-01)",
+    "ISSUE-08 (integration closeout, depends_on all)"
+  ],
+  "parallel_groups": {
+    "v46-first-wave": [
+      "ISSUE-01",
+      "ISSUE-03",
+      "ISSUE-06",
+      "ISSUE-07"
+    ]
+  },
+  "active_worker_session_limit": 5,
+  "active_this_round": 4,
+  "allowed_actions": [
+    "develop",
+    "test",
+    "review",
+    "rework",
+    "accept",
+    "archive_task"
+  ],
+  "remote_git_actions": "allow",
+  "remote_git_actions_options": [
+    "allow",
+    "deny"
+  ],
+  "deploy_authorization": false,
+  "permissions": {
+    "run_targeted_tests": true,
+    "run_full_suite": true,
+    "create_visible_tasks": true,
+    "create_worktrees": true,
+    "start_monitor": "manual_document_chain (this repo has no .vibe; supervisor = main session, dispatch/wait/collect only)",
+    "commit": "conditional_on_remote_git_actions_allow",
+    "push": "conditional_on_remote_git_actions_allow",
+    "create_pr": "conditional_on_remote_git_actions_allow",
+    "merge": "conditional_on_remote_git_actions_allow_and_independent_review_green",
+    "deploy": false,
+    "release": false,
+    "modify_files_outside_node_whitelist": false,
+    "rewrite_AGENTS_md": "false (ISSUE-08 produces patch proposal only; user confirms separately)"
+  },
+  "file_scope": {
+    "ISSUE-01": [
+      "vibe_guide/task_registry.py",
+      "tests/test_task_registry.py"
+    ],
+    "ISSUE-03": [
+      "vibe_guide/config.py (new)",
+      "vibe_guide/initializer.py",
+      "tests/test_config.py (new)"
+    ],
+    "ISSUE-06": [
+      "vibe_guide/dag.py",
+      "vibe_guide/planner.py",
+      "tests/test_dag.py",
+      "tests/fixtures/v46-parallel-audit-* (new)"
+    ],
+    "ISSUE-07": [
+      "vibe_guide/adapters/manifests/*.yaml (7)",
+      "vibe_guide/adapters/base.py",
+      "vibe_guide/adapters/registry.py",
+      "vibe_guide/adapters/task_provider.py",
+      "tests/test_adapters.py",
+      "tests/test_agent_probe_evidence.py"
+    ]
+  },
+  "workers": {
+    "developer": "one visible user-owned Codex thread per node (create_thread, worktree from main 6fdd1dd, branch codex/v46-issue-NN); issue contract delivered inline in prompt because PRD/Spec docs are not yet committed on main",
+    "reviewer": "in-session independent read-only review subagent per worker thread (visible-sdd dogfood) with explicit git-write ban (checkout/switch/reset/clean prohibited; cross-branch reads via git show/git diff only); plus supervisor-side independent PR reviewer per standing rule 2026-09-15"
+  },
+  "merge_rule": "per standing rule 2026-09-15: auto independent review -> rework loop (max 3 rounds) -> squash merge when no P0-P2 and tests green; never direct-push main",
+  "verification": {
+    "targeted": "python3 -m unittest <node test module> -v",
+    "full": "python3 -m unittest discover -s tests -v && python3 -m vibe_guide --help && git diff --check",
+    "real_agent_acceptance": "this run itself is the first live visible-parallel dispatch; platform probes for non-Codex adapters remain probe-evidence based, UNKNOWN treated as unsupported"
+  },
+  "spec_docs_commit": "PRD + Spec/Issues (currently untracked) ride along with ISSUE-08 closeout PR; worker prompts carry issue contracts inline meanwhile",
+  "invalidation": "any change to plan scope, topology semantics, file whitelists, or concurrency limit invalidates this card; deploy/release always require separate authorization",
+  "excluded": [
+    "deploy",
+    "release/tag (V4.6 release held until this PRD is implemented and accepted)",
+    "production writes",
+    "credentials",
+    "vibe init on this repo",
+    "apply-agentsmd on user projects",
+    "AGENTS.md rewrite (patch proposal only)"
+  ],
+  "authorized_at": "2026-09-23",
+  "merge_evidence": {
+    "ISSUE-03": "PR #58 squash c97d75e（独立 reviewer Herschel 无 P0–P2，870/870 复跑绿；2×P3 遗留不阻断）",
+    "ISSUE-01": "PR #59 squash e1c799c（独立 reviewer Goodall 无 P0–P2，872/872 复跑绿+7 项对抗探针；3×P3 遗留不阻断；会话内 review 2 轮修 P1-1/P2-1/P2-2）",
+    "ISSUE-07": "PR #60 squash 9657cca（独立 reviewer Kierkegaard 无 P0–P2，872/872 复跑绿，白名单+授权夹具各一行无夹带；3×P3 遗留）",
+    "ISSUE-02": "PR #63 squash 83c191b（降级披露：独立 reviewer 子代理因 Kimi 配额 403 不可用，由监工会话亲自做非作者复审——合同五条逐项核对+对抗探针 22 变体全拒零误伤+全量 903/903 复跑绿；残余缺口西里尔а/主线程为作者已披露 P3，确认属实）",
+    "ISSUE-05": "PR #61 squash 9ac7dfa（一轮返工：Beauvoir P2 契约测试钉「返工回 dev 子代理」+3xP3 加固；监工复核变异体转红、17/17 定向、899/899 全量复跑绿）",
+    "ISSUE-06": "PR #62 squash cadd480（会话内 Erdos 5 轮+独立 Feynman 1 轮 P2-1+监工裁定转 I04+独立 Russell 终审 APPROVE；878/878 复跑绿；P3×2 登记后续：根`.`相交专属单测、CJK 粘连散文产物引用漏检）",
+    "ISSUE-04": "PR #64 squash f088206（会话内 Plato 4 轮含 R3 P1-1 真实修复；独立 Ohm 终审 9 条合同全过、972/972 复跑绿、白名单含两处授权扩大无夹带；P3×3 登记后续）"
+  },
+  "deviations": [
+    "ISSUE-07 白名单经监工纠偏扩大：tests/test_attest.py、test_integration_review_closeout_entry.py、test_pm_path_end_to_end.py、test_sensitive_identity_durability.py 四处 facts 夹具各补一行 claude-code.in_session_sdd=false（ attest 完整性校验为合同意图既有延伸，唯一连贯解；仅限测试夹具）。reviewer P2-1（attest 写路径强制布尔）确认为既有设计延伸不改代码，PR body 补设计说明闭合。",
+    "ISSUE-06 白名单经监工裁定扩大：tests/test_node_scoped_blocking.py 夹具按方案 A 改逐节点互斥 allowlist（硬门禁语义下空 allowlist 夹具必被拒，唯一连贯解；不改动被测语义）",
+    "ISSUE-06 Erdos 第4轮 P1-1（_schedule_ready 不消费 node_scoped_ready，硬门禁仅在投影层）经监工裁定转移至 ISSUE-04 合同增补：monitor.py 派发分支消费 node_scoped_ready + monitor 级回归测试；PR #62 交付边界= dag.py 侧门禁+投影层消费，窗口期披露入 PR body。证据：I06 worker 动态探针复现（gated projection [] 但 DISPATCHED [n1,n2]）",
+    "ISSUE-04 白名单经监工裁定扩大两处：①tests/test_integration_review_closeout_entry.py 夹具适配（visible-sdd 裁定下补 in_session_review 清零证据，8 个 e2e 恢复绿，不改被测语义）；②vibe_guide/runners/provider_action.py 真实桥传播 topology + sdd_protocol 指针（AC-01 真实路径必选项，fail-closed 语义保持）"
+  ]
+}
