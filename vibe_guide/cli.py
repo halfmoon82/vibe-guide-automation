@@ -18,7 +18,10 @@ from .authorization import (
     build_authorization_card,
     refresh_authorization_card,
 )
+from .adapters.base import Environment as AdapterEnvironment
+from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
+from .config import load_project_config
 from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import doctor
 from .initializer import apply_agentsmd_proposal, init_project
@@ -253,6 +256,38 @@ def _authorization_card(data: Dict[str, Any]) -> AuthorizationCard:
     return AuthorizationCard(**converted)
 
 
+def _observed_topology_rulings(paths: ProjectPaths) -> dict:
+    """Return ``{adapter_id: dispatch ruling}`` from the recorded bridge.
+
+    The ruling re-derives the ISSUE-07 topology decision from the capability
+    facts and provenance the desktop session published.  Any missing or
+    invalid evidence yields an empty mapping, and the monitor then keeps its
+    conservative dual-visible default: UNKNOWN never upgrades to visible-sdd.
+    """
+    try:
+        observed = observe_capabilities(paths)
+    except (ProviderPending, OSError, TypeError, ValueError):
+        return {}
+    probe = observed.adapter_id + ".in_session_sdd"
+    evidence = observed.detection.evidence
+    provenance = observed.detection.capabilities.provenance
+    facts = {}
+    provenance_map = {}
+    if probe in evidence:
+        facts[probe] = bool(evidence[probe])
+        source = provenance.get(probe)
+        if isinstance(source, str) and source:
+            provenance_map[probe] = source
+    try:
+        adapter = AdapterRegistry().get(observed.adapter_id)
+        decision = adapter.topology_decision(
+            AdapterEnvironment(facts=facts, provenance=provenance_map)
+        )
+    except (KeyError, TypeError, ValueError):
+        return {}
+    return {observed.adapter_id: decision.topology}
+
+
 def _observed_adapter(paths: ProjectPaths, adapter_id: str):
     observed = None
     last_error = None
@@ -482,7 +517,12 @@ def _load_plan(paths: ProjectPaths, plan_id: str):
             "codex",
             True, True, True, False, True, "full",
         )
-        card = build_authorization_card(plan, nodes, capabilities, active_pair_limit=5)
+        card = build_authorization_card(
+            plan,
+            nodes,
+            capabilities,
+            active_pair_limit=load_project_config(paths.root).max_active_worker_sessions,
+        )
     if plan.plan_id != plan_id or card.plan_id != plan_id:
         raise ValueError("plan identity does not match its directory")
     return directory, plan, nodes, card
@@ -1485,7 +1525,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 record = authorize(card, args.authorize)
                 if runner is None:
                     runner = _public_runner(paths, card, nodes)
-                snapshot = Monitor(paths, plan, nodes).reauthorize(
+                snapshot = Monitor(
+                    paths, plan, nodes,
+                    topology_rulings=_observed_topology_rulings(paths),
+                ).reauthorize(
                     _run_id(directory, None),
                     record,
                     runner,
@@ -1514,7 +1557,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 record = authorize(card, args.authorize)
                 if runner is None:
                     runner = _public_runner(paths, card, nodes)
-                snapshot = Monitor(paths, plan, nodes).reauthorize(
+                snapshot = Monitor(
+                    paths, plan, nodes,
+                    topology_rulings=_observed_topology_rulings(paths),
+                ).reauthorize(
                     _run_id(directory, None),
                     record,
                     runner,
@@ -1524,7 +1570,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 record = authorize(card, args.authorize)
                 if runner is None:
                     runner = _public_runner(paths, card, nodes)
-                snapshot = Monitor(paths, plan, nodes).start(record, runner)
+                snapshot = Monitor(
+                    paths, plan, nodes,
+                    topology_rulings=_observed_topology_rulings(paths),
+                ).start(record, runner)
             # Publishing a plan records confirmation, not execution
             # authorization.  Once the user supplies the exact authorization
             # token, persist the lifecycle transition so the public execution
@@ -1617,7 +1666,12 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 args.as_json,
             )
         if args.watch:
-            supervisor = Supervisor(paths, Monitor(paths, plan, nodes), runner, snapshot.run_id)
+            supervisor = Supervisor(
+                paths,
+                Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths)),
+                runner,
+                snapshot.run_id,
+            )
             lease_result = supervisor.recover_or_start()
             if not lease_result.get("active_supervisors"):
                 return _result(
@@ -1637,7 +1691,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             directory, plan, nodes, _card = _load_plan(paths, args.plan)
             evidence_path = paths.resolve_relative(args.evidence)
             package = _read_json(evidence_path)
-            snapshot = Monitor(paths, plan, nodes).reconcile_evidence(args.run_id, package)
+            snapshot = Monitor(
+                paths, plan, nodes,
+                topology_rulings=_observed_topology_rulings(paths),
+            ).reconcile_evidence(args.run_id, package)
             return _snapshot_result("reconcile", snapshot, args.as_json)
         except (FileNotFoundError, OSError, TypeError, ValueError, PermissionError) as error:
             return _result(
@@ -1707,7 +1764,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 AuthorizationRecord.from_dict(
                     _read_json(directory / "authorization.json")
                 )
-                monitor = Monitor(paths, plan, nodes)
+                monitor = Monitor(
+                    paths, plan, nodes,
+                    topology_rulings=_observed_topology_rulings(paths),
+                )
                 # The CLI performs the normal resume tick immediately after
                 # reattachment; let that tick own the single provider poll.
                 snapshot = monitor.resume(run_id, runner, poll_handles=False)

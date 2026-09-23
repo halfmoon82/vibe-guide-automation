@@ -1,0 +1,63 @@
+{
+  "schema": "v46-dispatch-fixture/1",
+  "description": "V4.6 ISSUE-04 proof fixture: two DAG nodes with no hard dependency; the codex platform ruling is in_session_sdd, so the monitor must create one visible-sdd worker session per node inside the same tick.",
+  "topology_rulings": {"codex": "in_session_sdd"},
+  "nodes": [
+    {
+      "id": "sdd-a",
+      "depends_on": [],
+      "parallel_group": "g1",
+      "contract": {
+        "files": ["sdd-a.py"],
+        "worker": "codex",
+        "adapter_id": "codex",
+        "worktree": ".worktrees/sdd-a",
+        "branch": "branch-sdd-a",
+        "worker_profile": {
+          "worker": "codex",
+          "model": "test",
+          "reasoning": "normal",
+          "fallbacks": [],
+          "selection_basis": {
+            "issue_complexity_ref": "sdd-a",
+            "complexity_band": "standard",
+            "risk_tags": [],
+            "availability_evidence": "test"
+          },
+          "writer": "writer-a",
+          "worktree": ".worktrees/sdd-a",
+          "branch": "branch-sdd-a",
+          "allowlist": ["sdd-a.py"]
+        }
+      }
+    },
+    {
+      "id": "sdd-b",
+      "depends_on": [],
+      "parallel_group": "g1",
+      "contract": {
+        "files": ["sdd-b.py"],
+        "worker": "codex",
+        "adapter_id": "codex",
+        "worktree": ".worktrees/sdd-b",
+        "branch": "branch-sdd-b",
+        "worker_profile": {
+          "worker": "codex",
+          "model": "test",
+          "reasoning": "normal",
+          "fallbacks": [],
+          "selection_basis": {
+            "issue_complexity_ref": "sdd-b",
+            "complexity_band": "standard",
+            "risk_tags": [],
+            "availability_evidence": "test"
+          },
+          "writer": "writer-b",
+          "worktree": ".worktrees/sdd-b",
+          "branch": "branch-sdd-b",
+          "allowlist": ["sdd-b.py"]
+        }
+      }
+    }
+  ]
+}

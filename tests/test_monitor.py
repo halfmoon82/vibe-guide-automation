@@ -3,6 +3,7 @@ import hashlib
 import json
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,7 +11,7 @@ from unittest.mock import patch
 from vibe_guide.authorization import authorize, build_authorization_card
 from vibe_guide.contracts import RunEvent, RunHandle
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan, node_branch
-from vibe_guide.monitor import Monitor
+from vibe_guide.monitor import Monitor, VISIBLE_SDD_PROTOCOL_REF
 from vibe_guide.adapters.task_provider import ProviderPending
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
@@ -2666,6 +2667,431 @@ class MonitorTests(unittest.TestCase):
             monitor.resume(snapshot.run_id, runner)
         self.assertFalse(
             acquire_writer_lease(self.paths, "n1", ".worktrees/n1", "run-second")
+        )
+
+
+class VisibleSddRunner(FakeRunner):
+    """Provider bridge fixture: one visible worker session per node.
+
+    The binding observed by the bridge carries the topology the monitor
+    requested, mirroring a platform that honored the dispatch ruling.
+    """
+
+    def __init__(self, events=None, binding_topology="visible-sdd", binding_mode="visible"):
+        super().__init__(events)
+        self.binding_topology = binding_topology
+        self.binding_mode = binding_mode
+        self.started_at = []
+
+    def start(self, contract, worktree):
+        self.started_at.append(time.monotonic())
+        return super().start(contract, worktree)
+
+    def task_binding(self, contract, worktree, run_id, status):
+        return TaskBinding(
+            provider="fake-visible",
+            mode=self.binding_mode,
+            topology=self.binding_topology,
+            host="fake-host",
+            issue_id=contract["node_id"],
+            role=contract["role"],
+            task_id=contract["task_id"],
+            worktree=str(worktree),
+            branch=contract.get("branch", "branch-" + contract["node_id"]),
+            run_id=run_id,
+            status=status,
+            generation=contract["generation"],
+            limitations=list(contract.get("dispatch_limitations", [])),
+        )
+
+
+V46_DISPATCH_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "v46-dispatch-two-node.json"
+)
+
+
+def load_v46_dispatch_fixture():
+    payload = json.loads(V46_DISPATCH_FIXTURE.read_text(encoding="utf-8"))
+    nodes = [
+        DAGNode(
+            item["id"],
+            item["id"],
+            list(item["depends_on"]),
+            [],
+            item["parallel_group"],
+            dict(item["contract"]),
+            "ready",
+        )
+        for item in payload["nodes"]
+    ]
+    return payload, nodes
+
+
+class VisibleDispatchTests(unittest.TestCase):
+    """V4.6 ISSUE-04: topology-aware parallel dispatch of visible sessions."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.paths = ProjectPaths(Path(self.temporary.name))
+        (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (self.paths.vibe / "state.json").write_text('{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8")
+        save_contract(
+            self.paths,
+            build_contract(self.paths.root, provider="fake", host_id="local"),
+        )
+        self.capabilities = AgentCapabilities("fake", True, True, True, True, True, "full")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def authorized_monitor(self, nodes, active_pair_limit=None, topology_rulings=None):
+        plan = Plan("plan-1", 1, "docs/prd.md", [item.id for item in nodes], "draft")
+        card = build_authorization_card(
+            plan,
+            nodes,
+            self.capabilities,
+            active_pair_limit=active_pair_limit,
+        )
+        return (
+            Monitor(self.paths, plan, nodes, topology_rulings=topology_rulings),
+            authorize(card, "AUTHORIZE"),
+        )
+
+    def test_visible_sdd_dispatch_creates_parallel_visible_sessions_in_one_tick(self):
+        payload, nodes = load_v46_dispatch_fixture()
+        self.assertTrue(all(not item["depends_on"] for item in payload["nodes"]))
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner()
+
+        before = time.monotonic()
+        snapshot = monitor.start(record, runner)
+        after = time.monotonic()
+
+        self.assertEqual(
+            [call["node_id"] for call in runner.start_calls], ["sdd-a", "sdd-b"]
+        )
+        # Both sessions were created inside the same scheduling tick: their
+        # creation timestamps fall into one overlapping window.
+        self.assertEqual(len(runner.started_at), 2)
+        self.assertTrue(
+            all(before <= stamp <= after for stamp in runner.started_at)
+        )
+        for call in runner.start_calls:
+            node_id = call["node_id"]
+            self.assertEqual(call["role"], "developer")
+            self.assertEqual(call["topology"], "visible-sdd")
+            self.assertEqual(call["sdd_protocol"], VISIBLE_SDD_PROTOCOL_REF)
+            self.assertEqual(call["files"], [node_id + ".py"])
+            self.assertTrue(call["worktree"].endswith(".worktrees/" + node_id))
+            self.assertEqual(call["branch"], "branch-" + node_id)
+        for node_id in ("sdd-a", "sdd-b"):
+            binding = load_task_binding(
+                self.paths, node_id, "developer", run_id=snapshot.run_id
+            )
+            self.assertEqual(binding.mode, "visible")
+            self.assertEqual(binding.topology, "visible-sdd")
+            self.assertEqual(snapshot.nodes[node_id]["status"], "running")
+
+    def test_session_limit_prefers_tighter_project_config_and_releases_on_archive(self):
+        payload, nodes = load_v46_dispatch_fixture()
+        (self.paths.vibe / "config.json").write_text(
+            json.dumps({"max_active_worker_sessions": 1}), encoding="utf-8"
+        )
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": {
+                                "protocol": VISIBLE_SDD_PROTOCOL_REF,
+                                "evidence_ref": "session-delivery#review-round-1",
+                                "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                            },
+                        },
+                    )
+                ]
+            }
+        )
+
+        snapshot = monitor.start(record, runner)
+        # Card default would allow both nodes; the tighter project config
+        # limits the tick to one active worker session.
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["sdd-a"])
+        self.assertEqual(snapshot.nodes["sdd-b"]["status"], "planned")
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+        self.assertTrue(snapshot.nodes["sdd-a"]["pair_archived"])
+        self.assertEqual(
+            load_task_binding(
+                self.paths, "sdd-a", "developer", run_id=snapshot.run_id
+            ).status,
+            "archived",
+        )
+        # The archived session released its slot in the same tick, so the
+        # next ready node was dispatched without waiting for another pass.
+        self.assertEqual(
+            [call["node_id"] for call in runner.start_calls], ["sdd-a", "sdd-b"]
+        )
+        self.assertEqual(snapshot.nodes["sdd-b"]["status"], "running")
+
+    def test_session_limit_prefers_tighter_authorization_card(self):
+        payload, nodes = load_v46_dispatch_fixture()
+        (self.paths.vibe / "config.json").write_text(
+            json.dumps({"max_active_worker_sessions": 5}), encoding="utf-8"
+        )
+        monitor, record = self.authorized_monitor(
+            nodes, active_pair_limit=1, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["sdd-a"])
+        self.assertEqual(snapshot.nodes["sdd-b"]["status"], "planned")
+
+    def test_supervisor_identity_is_structurally_rejected_as_node_writer(self):
+        payload, nodes = load_v46_dispatch_fixture()
+        rogue = nodes[0]
+        rogue.contract["worker"] = "vibeguide_monitor"
+        rogue.contract["worker_profile"]["worker"] = "vibeguide_monitor"
+        rogue.contract["worker_profile"]["writer"] = "vibeguide_monitor"
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        self.assertEqual(len(runner.start_calls), 1)
+        self.assertEqual(runner.start_calls[0]["node_id"], "sdd-b")
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+        self.assertIn("supervisor", snapshot.nodes["sdd-a"]["reason"])
+
+        # Structural, not advisory: a later tick never retries the dispatch.
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(len(runner.start_calls), 1)
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+
+    def test_visible_sdd_delivery_without_in_session_review_is_blocked_unknown(self):
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner(
+            events={("sdd-a", "developer"): [("complete", {"evidence": "delivery"})]}
+        )
+        snapshot = monitor.start(record, runner)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+        self.assertIn("in-session review", snapshot.nodes["sdd-a"]["reason"])
+        binding = load_task_binding(
+            self.paths, "sdd-a", "developer", run_id=snapshot.run_id
+        )
+        self.assertNotEqual(binding.status, "archived")
+        # Fail closed: no reviewer task is ever started for visible-sdd.
+        self.assertTrue(all(call["role"] == "developer" for call in runner.start_calls))
+
+    def test_binding_topology_mismatch_fails_closed(self):
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner(binding_topology="dual-visible")
+
+        snapshot = monitor.start(record, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+        self.assertEqual(snapshot.nodes["sdd-b"]["status"], "blocked_unknown")
+        self.assertEqual(runner.start_calls, [])
+
+    def test_visible_sdd_delivered_node_is_blocked_not_stranded(self):
+        """A delivered visible-sdd node at schedule time means lost evidence.
+
+        The in-session review is consumed at delivery; a delivered state that
+        reaches the scheduler can only come from an interrupted recovery.
+        The node must fail closed (blocked_unknown, slot still accounted),
+        never strand in delivered and never dispatch a reviewer task.
+        """
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner()
+        snapshot = monitor.start(record, runner)
+        current = snapshot.nodes["sdd-a"]
+        current["status"] = "delivered"
+        current["active_role"] = None
+        current["active_task"] = None
+        snapshot.handles.pop("sdd-a", None)
+        save_snapshot(self.paths, snapshot)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+        self.assertIn("in-session review", snapshot.nodes["sdd-a"]["reason"])
+        self.assertFalse(snapshot.nodes["sdd-a"]["pair_archived"])
+        self.assertTrue(all(call["role"] == "developer" for call in runner.start_calls))
+
+    def test_visible_sdd_acceptance_recovers_from_event_replay(self):
+        """Crash after the accepted event landed but before the snapshot did.
+
+        Restoring the pre-tick snapshot forces the monitor to replay the
+        durable delivered+accepted events; the visible-sdd variant must
+        rebuild the accepted, archived node without a reviewer binding.
+        """
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": {
+                                "protocol": VISIBLE_SDD_PROTOCOL_REF,
+                                "evidence_ref": "session-delivery#review-round-1",
+                                "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                            },
+                        },
+                    )
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        preserved = deepcopy(snapshot)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+
+        # Lose every snapshot write the tick performed.
+        save_snapshot(self.paths, preserved)
+
+        recovered = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(recovered.nodes["sdd-a"]["status"], "accepted")
+        self.assertTrue(recovered.nodes["sdd-a"]["pair_archived"])
+        self.assertEqual(
+            recovered.nodes["sdd-a"]["review_clearance"], {"p0": 0, "p1": 0, "p2": 0}
+        )
+        self.assertEqual(
+            load_task_binding(
+                self.paths, "sdd-a", "developer", run_id=snapshot.run_id
+            ).status,
+            "archived",
+        )
+
+    def test_visible_sdd_delivered_replay_without_evidence_is_blocked_unknown(self):
+        """Only the delivered event survived: evidence is unverifiable.
+
+        Replay applies the delivery, and the scheduler must then fail closed
+        to blocked_unknown instead of stranding the node in delivered.
+        """
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner()
+        snapshot = monitor.start(record, runner)
+        active = snapshot.nodes["sdd-a"]["active_task"]
+        append_event(
+            self.paths,
+            RunEvent(
+                "delivered",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": "sdd-a",
+                    "evidence": "delivery",
+                },
+            ),
+            {
+                "role": "developer",
+                "task_id": active["task_id"],
+                "handle_id": active["handle_id"],
+                "generation": active["generation"],
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+            },
+        )
+
+        replayed = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(replayed.nodes["sdd-a"]["status"], "blocked_unknown")
+        self.assertIn("in-session review", replayed.nodes["sdd-a"]["reason"])
+        self.assertFalse(replayed.nodes["sdd-a"]["pair_archived"])
+        self.assertTrue(all(call["role"] == "developer" for call in runner.start_calls))
+
+    def test_background_topology_dispatch_carries_disclosure(self):
+        """A contract-stamped background ruling degrades with disclosure."""
+        background_node = node("bg")
+        background_node.contract["dispatch_topology"] = "background"
+        monitor, record = self.authorized_monitor([background_node])
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        self.assertEqual(runner.start_calls[0]["topology"], "background")
+        limitations = runner.start_calls[0]["dispatch_limitations"]
+        self.assertTrue(any("background" in item for item in limitations))
+        binding = load_task_binding(
+            self.paths, "bg", "developer", run_id=snapshot.run_id
+        )
+        self.assertEqual(binding.topology, "background")
+        self.assertEqual(binding.mode, "background")
+        self.assertEqual(binding.limitations, limitations)
+        self.assertEqual(snapshot.nodes["bg"]["status"], "running")
+    def test_parallel_group_audit_refused_nodes_are_never_dispatched(self):
+        """ISSUE-04 + ISSUE-06 gate: conflicting group members get no lease.
+
+        Two nodes share parallel_group g1 with intersecting write scopes;
+        the parallel-group audit refuses both, so Monitor.start must not
+        dispatch either, while an unrelated node in its own group starts.
+        """
+        from vibe_guide import dag as dag_module
+
+        if not callable(getattr(dag_module, "_parallel_group_errors", None)):
+            self.skipTest("parallel-group audit gate lands with ISSUE-06 (PR #62)")
+        conflicted_a = node("ga")
+        conflicted_b = node("gb")
+        for item in (conflicted_a, conflicted_b):
+            item.parallel_group = "g1"
+            item.allowlist = ["shared.py"]
+            item.contract["allowlist"] = ["shared.py"]
+            item.contract["worker_profile"]["allowlist"] = ["shared.py"]
+        independent = node("gc")
+        independent.parallel_group = "g2"
+        monitor, record = self.authorized_monitor(
+            [conflicted_a, conflicted_b, independent],
+            topology_rulings={"codex": "dual-visible"},
+        )
+        runner = VisibleSddRunner(binding_topology="dual-visible", binding_mode="background")
+
+        snapshot = monitor.start(record, runner)
+
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["gc"])
+        self.assertEqual(snapshot.nodes["ga"]["status"], "planned")
+        self.assertEqual(snapshot.nodes["gb"]["status"], "planned")
+        self.assertEqual(snapshot.nodes["gc"]["status"], "running")
+        # Never dispatched means no writer lease was ever acquired: another
+        # run can take both leases immediately.
+        self.assertTrue(
+            acquire_writer_lease(self.paths, "ga", ".worktrees/ga", "run-other")
+        )
+        self.assertTrue(
+            acquire_writer_lease(self.paths, "gb", ".worktrees/gb", "run-other")
         )
 
 

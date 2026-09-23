@@ -37,6 +37,7 @@ from .models import (
 )
 from .paths import ProjectPaths
 from .planner import resolve_consistency
+from . import dag as _dag_module
 from .dag import audit_dag, node_scoped_ready, ready_nodes
 from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
 from .state import (
@@ -61,6 +62,7 @@ from .task_registry import (
     runtime_binding_gate,
     save_task_binding,
 )
+from .config import load_project_config
 from .workflow_gate import require_capability_contract, require_entry, verify_workflow
 from .authorize_entry import load_live_workflow, select_plan_workflow, verify_workflow_artifacts
 from .diagnostics import validate_child_session_binding
@@ -90,6 +92,38 @@ from .evidence import (
     record_integration_review as _record_integration_review,
 )
 from .engine_attestation import validate_engine_attestation
+
+
+# --- V4.6 ISSUE-04: topology-aware dispatch of visible worker sessions ---
+
+#: Dispatch topologies a node can be ruled into.  ``visible-sdd`` binds one
+#: visible worker session per node (review is in-session evidence, never a
+#: second task); ``dual-visible`` keeps the developer/reviewer pair;
+#: ``background`` is the disclosed downgrade when no visible bridge exists.
+TOPOLOGY_VISIBLE_SDD = "visible-sdd"
+TOPOLOGY_DUAL_VISIBLE = "dual-visible"
+TOPOLOGY_BACKGROUND = "background"
+_DISPATCH_TOPOLOGIES = {TOPOLOGY_VISIBLE_SDD, TOPOLOGY_DUAL_VISIBLE, TOPOLOGY_BACKGROUND}
+
+#: Platform ruling (from the ISSUE-07 probe matrix) that upgrades a node to
+#: the single visible SDD session topology.
+_RULING_IN_SESSION_SDD = "in_session_sdd"
+
+#: Protocol pointer carried by every visible-sdd create request so the worker
+#: session can resolve the in-session SDD protocol from the installed package.
+VISIBLE_SDD_PROTOCOL_REF = "vibe_guide/protocols/visible-sdd-worker.md"
+
+#: Disclosure recorded when a node is dispatched without a visible bridge.
+BACKGROUND_TOPOLOGY_DISCLOSURE = (
+    "平台无可见任务桥：降级为 background subagent，不可见、不可直接进入、返工续接受限"
+)
+
+#: Identities reserved for the supervisor itself.  A node whose writer
+#: resolves to one of these is structurally rejected: the monitor must never
+#: become the writer of any node, regardless of authorization-card text.
+_SUPERVISOR_WRITER_IDENTITIES = frozenset(
+    {"monitor", "vibeguide_monitor", "vibe_guide_monitor", "supervisor", "vibe_supervisor"}
+)
 
 
 def reconcile_pending_binding(snapshot: Any, node_id: str, runner: Any) -> bool:
@@ -579,7 +613,9 @@ class Monitor:
         snapshot.topology_digest = digest
         snapshot.started_nodes = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
         snapshot.active_concurrency = len(snapshot.started_nodes)
-        snapshot.capacity = int(getattr(self._snapshot_record(snapshot), "active_pair_limit", 0) or 0)
+        snapshot.capacity = self._effective_worker_session_limit(
+            self._snapshot_record(snapshot)
+        )
         snapshot.monitor_entry_evidence = entry
         snapshot.parallel_groups = {n: ([self.nodes[n].parallel_group] if self.nodes[n].parallel_group else []) for n in snapshot.started_nodes}
 
@@ -631,10 +667,20 @@ class Monitor:
         plan: Plan,
         nodes: List[DAGNode],
         context_policy: Optional[ContextBudgetPolicy] = None,
+        topology_rulings: Optional[Any] = None,
     ):
         self.paths = paths
         self.plan = plan
         self.nodes = {node.id: node for node in nodes}
+        # Platform dispatch-topology rulings (adapter_id -> ruling), normally
+        # derived from the ISSUE-07 probe matrix.  Anything missing or
+        # unrecognized is fail-closed to the conservative dual-visible
+        # topology; UNKNOWN never upgrades a node to visible-sdd.
+        self._topology_rulings: Dict[str, str] = {}
+        if isinstance(topology_rulings, dict):
+            for adapter_id, ruling in topology_rulings.items():
+                if isinstance(adapter_id, str) and isinstance(ruling, str):
+                    self._topology_rulings[adapter_id] = ruling
         # Binding reads are scoped to one public monitor operation.  The
         # registry is still the durable source of truth; clearing this cache
         # at each operation boundary prevents stale cross-tick identities.
@@ -643,6 +689,125 @@ class Monitor:
 
     def _reset_binding_cache(self) -> None:
         self._binding_cache.clear()
+
+    def _node_adapter_id(self, node: DAGNode) -> str:
+        """Return the platform adapter id a node is ruled under, or ""."""
+        contract = node.contract if isinstance(node.contract, dict) else {}
+        adapter_id = contract.get("adapter_id")
+        if isinstance(adapter_id, str) and adapter_id.strip():
+            return adapter_id.strip()
+        profile = contract.get("worker_profile")
+        if isinstance(profile, dict):
+            worker = profile.get("worker")
+            if isinstance(worker, str) and worker.strip():
+                return worker.strip()
+        return ""
+
+    def _node_dispatch_topology(self, node: DAGNode) -> str:
+        """Rule the dispatch topology for one node.
+
+        Resolution order, all fail-closed:
+
+        1. an authorization-bound ``dispatch_topology`` persisted in the node
+           contract (stamped when the plan was materialized);
+        2. the live platform ruling injected at monitor construction
+           (``in_session_sdd`` upgrades to a single visible SDD session);
+        3. the conservative ``dual-visible`` default.  UNKNOWN evidence never
+           yields ``visible-sdd``.
+        """
+        contract = node.contract if isinstance(node.contract, dict) else {}
+        persisted = contract.get("dispatch_topology")
+        if isinstance(persisted, str) and persisted in _DISPATCH_TOPOLOGIES:
+            return persisted
+        if getattr(node, "id", "") == "integration-review":
+            # The integration-review node is a reviewer-role closeout node by
+            # construction; the single-session developer topology can never
+            # apply to it.
+            return TOPOLOGY_DUAL_VISIBLE
+        rulings = getattr(self, "_topology_rulings", None) or {}
+        ruling = rulings.get(self._node_adapter_id(node))
+        if ruling == _RULING_IN_SESSION_SDD:
+            return TOPOLOGY_VISIBLE_SDD
+        if ruling == TOPOLOGY_BACKGROUND:
+            return TOPOLOGY_BACKGROUND
+        return TOPOLOGY_DUAL_VISIBLE
+
+    def _parallel_group_blocked(self, snapshot: RunSnapshot) -> set:
+        """Node ids refused by the V4.6 parallel-group audit.
+
+        The audit runs on the same status projection the scheduler uses for
+        readiness, so ``running`` siblings hold their write scope against new
+        dispatches.  ``_parallel_group_errors`` arrives with ISSUE-06; before
+        that dag.py lands, the blocked set is empty (no behavior change).
+        """
+        audit = getattr(_dag_module, "_parallel_group_errors", None)
+        if not callable(audit):
+            return set()
+        projected = self._projection_nodes(snapshot)
+        try:
+            return set(audit(projected))
+        except (TypeError, ValueError):
+            # Unverifiable audit metadata is fail-closed inside the audit
+            # itself; a broken projection must not silently widen dispatch.
+            return set(self.nodes)
+
+    def _projection_nodes(self, snapshot: RunSnapshot) -> List[DAGNode]:
+        """The status-projected node list used for readiness decisions."""
+        projected = []
+        for node in self.nodes.values():
+            current = snapshot.nodes.get(node.id, {})
+            runtime_status = current.get(
+                "status", getattr(node, "status", "planned")
+            )
+            if runtime_status not in {"planned", "ready", "running", "delivered", "review", "accepted", "rework", "blocked_design", "blocked_deploy", "blocked_unknown", "brief_pending"}:
+                runtime_status = "running"
+            projected.append(replace(node, status=runtime_status))
+        return projected
+
+    def _effective_worker_session_limit(self, record: AuthorizationRecord) -> int:
+        """Concurrency cap = min(authorization card snapshot, project config).
+
+        The project config (``.vibe/config.json``,
+        ``max_active_worker_sessions``) is validated by ``load_project_config``;
+        an explicit but illegal value is a configuration error and propagates
+        instead of being silently replaced.
+        """
+        card_limit = int(getattr(record, "active_pair_limit", 0) or 0)
+        config_limit = load_project_config(self.paths.root).max_active_worker_sessions
+        if card_limit < 1:
+            return config_limit
+        return min(card_limit, config_limit)
+
+    def _supervisor_writer_rejection(
+        self, node: DAGNode, current: Dict[str, Any]
+    ) -> Optional[str]:
+        """Return a reason when the node's writer is the supervisor itself.
+
+        Structural guard: the monitor/supervisor identity must never be the
+        writer of any node.  This does not rely on authorization-card text;
+        every dispatch path passes through it.
+        """
+        contract = node.contract if isinstance(node.contract, dict) else {}
+        candidates = [
+            contract.get("worker"),
+            contract.get("reviewer_worker"),
+            current.get("worker"),
+            getattr(node, "writer", ""),
+            getattr(node, "reviewer", ""),
+        ]
+        profile = contract.get("worker_profile")
+        if isinstance(profile, dict):
+            candidates.extend([profile.get("worker"), profile.get("writer")])
+        for value in candidates:
+            if (
+                isinstance(value, str)
+                and value.strip().casefold() in _SUPERVISOR_WRITER_IDENTITIES
+            ):
+                return (
+                    "supervisor identity cannot be a node writer: "
+                    + value.strip()
+                )
+        return None
 
     def _current_plan_digests(self) -> Tuple[str, str]:
         values = []
@@ -1882,6 +2047,11 @@ class Monitor:
         it is not evidence for creating a successor or another writer.
         """
         current = snapshot.nodes[node_id]
+        if self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
+            # A delivered visible-sdd binding only reaches blocked_unknown
+            # when its in-session review evidence was rejected.  That is a
+            # fail-closed terminal doubt, not a recoverable continuation.
+            return False
         if (
             current.get("status") != "blocked_unknown"
             or not isinstance(current.get("quarantine"), dict)
@@ -1998,6 +2168,81 @@ class Monitor:
             return binding.task_id or ""
         return None
 
+    def _replay_visible_sdd_acceptance(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        data: Dict[str, Any],
+        provenance: Dict[str, Any],
+    ) -> None:
+        """Apply a durable visible-sdd acceptance lost with the snapshot.
+
+        The single-session acceptance binds the developer session identity
+        (the in-session reviewer role shares it); there is no reviewer
+        binding to load.  Stale identity, lineage or digest evidence raises,
+        exactly like the dual-visible replay; missing clearance evidence
+        fails closed to ``blocked_unknown`` without archiving.
+        """
+        current = snapshot.nodes[node_id]
+        if provenance["role"] != "reviewer":
+            raise ValueError("unapplied acceptance lacks reviewer provenance")
+        generation = int(current.get("developer_generation", 0))
+        if (
+            provenance["task_id"] != current.get("developer_identity")
+            or provenance["generation"] != generation
+            or generation <= 0
+        ):
+            raise ValueError(
+                "unapplied visible-sdd acceptance identity or generation is stale"
+            )
+        try:
+            registered = self._load_task_binding(snapshot, node_id, "developer")
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            raise ValueError(
+                "unapplied visible-sdd acceptance developer binding is unavailable"
+            ) from error
+        if (
+            registered.task_id != provenance["task_id"]
+            or registered.generation != generation
+        ):
+            raise ValueError(
+                "unapplied visible-sdd acceptance registry generation is stale"
+            )
+        contract_digest = data.get("contract_digest")
+        authorization_epoch = data.get("authorization_epoch")
+        if (
+            not isinstance(contract_digest, str)
+            or len(contract_digest) != 64
+            or any(
+                character not in "0123456789abcdef" for character in contract_digest
+            )
+            or contract_digest != current.get("contract_digest")
+            or authorization_epoch != snapshot.authorization_digest
+        ):
+            raise ValueError("unapplied acceptance contract epoch is stale")
+        self._set_binding_status(snapshot, node_id, "developer", "accepted")
+        current["status"] = "accepted"
+        current["acceptance"] = {
+            "contract_digest": contract_digest,
+            "authorization_epoch": authorization_epoch,
+        }
+        current["reviewer_identity"] = provenance["task_id"]
+        current["review_generation"] = generation
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = None
+        snapshot.handles.pop(node_id, None)
+        if not data.get("evidence"):
+            current["status"] = "blocked_unknown"
+            current["reason"] = (
+                "visible-sdd acceptance has no registered in-session review evidence"
+            )
+        else:
+            current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
+            self._set_binding_status(snapshot, node_id, "developer", "archived")
+            current["pair_archived"] = True
+        self._release_node_lease(snapshot, node_id)
+
     def _reject_replayed_old_task_reconciliation(
         self, snapshot: RunSnapshot, node_id: str, data: Dict[str, Any]
     ) -> None:
@@ -2021,7 +2266,19 @@ class Monitor:
     ) -> None:
         record = self._require_snapshot_authorization(snapshot)
         self._validate_execution_topology(snapshot)
-        active_pairs = sum(
+        # V4.6: capacity counts active *worker sessions* (one visible-sdd
+        # session or one dev/reviewer pair slot per occupied node), not
+        # logical pairs.  Unknown states keep occupying their slot: when the
+        # evidence is ambiguous the monitor dispatches less, never more.
+        session_limit = self._effective_worker_session_limit(record)
+        # The V4.6 parallel-group audit (ISSUE-06, wired into
+        # ``node_scoped_ready`` in dag.py) refuses nodes whose group
+        # membership is conflicting or unverifiable.  Consume the same audit
+        # signal on the same readiness projection before any writer lease is
+        # acquired; on a dag.py without the gate the audit set is empty and
+        # dispatch behavior is unchanged.
+        group_blocked = self._parallel_group_blocked(snapshot)
+        active_sessions = sum(
             1
             for node_id, current in snapshot.nodes.items()
             if current.get("status") not in {"stopped", "failed"}
@@ -2035,13 +2292,13 @@ class Monitor:
         )
         for node_id, node in self.nodes.items():
             current = snapshot.nodes[node_id]
-            was_active_pair = not current.get("pair_archived") and (
+            was_active_session = not current.get("pair_archived") and (
                 int(current.get("developer_generation", 0)) > 0
                 or current.get("retryable_action") is not None
             )
             if self._recover_quarantined_delivered_developer(snapshot, node_id):
-                if was_active_pair:
-                    active_pairs -= 1
+                if was_active_session:
+                    active_sessions -= 1
             if recover_missing_reviewer:
                 self._recover_missing_reviewer_successor(snapshot, node_id)
             retry = current.get("retryable_action")
@@ -2152,7 +2409,7 @@ class Monitor:
                     current["retryable_action"] = retry
                     continue
                 if pending_schedule and (
-                    active_pairs >= record.active_pair_limit
+                    active_sessions >= session_limit
                     or not all(
                         snapshot.nodes[dependency].get("status") == "accepted"
                         for dependency in node.depends_on
@@ -2171,7 +2428,7 @@ class Monitor:
                     continue
                 if pending_schedule:
                     current["pair_archived"] = False
-                    active_pairs += 1
+                    active_sessions += 1
                 if self._start_task(
                     snapshot,
                     node_id,
@@ -2185,6 +2442,20 @@ class Monitor:
                         current["retryable_action"] = None
                 continue
             if current.get("status") == "delivered" and not current.get("reviewer_started"):
+                if self._node_dispatch_topology(node) == TOPOLOGY_VISIBLE_SDD:
+                    # visible-sdd review is in-session evidence consumed at
+                    # delivery time; no reviewer task is ever dispatched.  A
+                    # delivered state reaching the scheduler means the
+                    # evidence was lost (interrupted recovery), never that it
+                    # was accepted: fail closed instead of stranding the node
+                    # with its session slot held forever.
+                    self._mark_blocked_unknown(
+                        snapshot,
+                        node_id,
+                        "visible-sdd delivery has no consumable in-session review evidence after recovery",
+                        quarantine_lease=False,
+                    )
+                    continue
                 retry_role = "reviewer"
                 retry_generation = int(current.get("review_generation", 0)) + 1
                 retry_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, retry_role, retry_generation, current))
@@ -2199,9 +2470,27 @@ class Monitor:
                 continue
             if current.get("status") != "planned":
                 continue
+            if node_id in group_blocked:
+                # Refused by the parallel-group audit: never acquire a
+                # writer lease for a conflicting or unverifiable group
+                # member.
+                continue
+            supervisor_rejection = self._supervisor_writer_rejection(node, current)
+            if supervisor_rejection is not None:
+                self._mark_blocked_unknown(snapshot, node_id, supervisor_rejection)
+                self._record(
+                    snapshot,
+                    "supervisor_writer_rejected",
+                    {
+                        "run_id": snapshot.run_id,
+                        "node_id": node_id,
+                        "reason": supervisor_rejection,
+                    },
+                )
+                continue
             if not self._brief_allows_first_write(snapshot, node_id, node):
                 continue
-            if active_pairs >= record.active_pair_limit:
+            if active_sessions >= session_limit:
                 continue
             if not all(
                 snapshot.nodes[dependency].get("status") == "accepted"
@@ -2220,7 +2509,7 @@ class Monitor:
             if self._start_task(
                 snapshot, node_id, "developer", "develop", runner, False
             ):
-                active_pairs += 1
+                active_sessions += 1
 
     def _brief_allows_first_write(
         self, snapshot: RunSnapshot, node_id: str, node: DAGNode
@@ -2283,6 +2572,10 @@ class Monitor:
         task/handle/start intent could represent an unresolved side effect.
         """
         current = snapshot.nodes[node_id]
+        if self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
+            # visible-sdd binds a single worker session; there is never a
+            # reviewer binding to recover.
+            return
         if current.get("status") != "blocked_unknown":
             return
         if current.get("reviewer_started") is not True:
@@ -2432,6 +2725,31 @@ class Monitor:
         record = self._require_snapshot_authorization(snapshot)
         node = self.nodes[node_id]
         current = snapshot.nodes[node_id]
+        topology = self._node_dispatch_topology(node)
+        supervisor_rejection = self._supervisor_writer_rejection(node, current)
+        if supervisor_rejection is not None:
+            self._mark_blocked_unknown(snapshot, node_id, supervisor_rejection)
+            self._record(
+                snapshot,
+                "supervisor_writer_rejected",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "role": role,
+                    "reason": supervisor_rejection,
+                },
+            )
+            return False
+        if topology == TOPOLOGY_VISIBLE_SDD and role == "reviewer":
+            # Structural rule (not authorization-card text): a visible-sdd
+            # node binds exactly one worker session; review is in-session
+            # evidence and is never dispatched as a reviewer task.
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "visible-sdd topology never dispatches a reviewer task",
+            )
+            return False
         identity_key = role + "_identity"
         predecessor_identity = current.get(identity_key) or "{}:{}".format(
             role, node_id
@@ -2484,6 +2802,20 @@ class Monitor:
                 "consistency_binding": self._consistency_binding(record, node),
             }
         )
+        # The create request carries the dispatch topology with the node
+        # contract, file allowlist and worktree/branch; visible-sdd sessions
+        # additionally receive the SDD protocol pointer they must follow.
+        contract["topology"] = topology
+        if topology == TOPOLOGY_VISIBLE_SDD:
+            contract["sdd_protocol"] = VISIBLE_SDD_PROTOCOL_REF
+        elif topology == TOPOLOGY_BACKGROUND:
+            limitations = contract.get("dispatch_limitations")
+            if not (
+                isinstance(limitations, list)
+                and any(isinstance(item, str) and item.strip() for item in limitations)
+            ):
+                limitations = [BACKGROUND_TOPOLOGY_DISCLOSURE]
+            contract["dispatch_limitations"] = list(limitations)
         retry = current.get("retryable_action")
         if successor:
             predecessor_task_id = None
@@ -2918,6 +3250,16 @@ class Monitor:
                 allowlist=list(contract.get("files", [])),
                 capability_contract_digest=contract.get("capability_contract_digest"),
                 successor_of=contract.get("predecessor_task_id") if successor else None,
+                topology=str(contract.get("topology") or TOPOLOGY_DUAL_VISIBLE),
+                limitations=list(contract.get("dispatch_limitations", [])),
+            )
+        # The registered binding must match the dispatch ruling.  A bridge
+        # that cannot honor the ruled topology (e.g. no visible session for a
+        # visible-sdd node) is fail-closed, never silently downgraded.
+        expected_topology = str(contract.get("topology") or TOPOLOGY_DUAL_VISIBLE)
+        if binding.topology != expected_topology:
+            raise ValueError(
+                "task binding topology does not match the dispatch ruling"
             )
         if successor:
             predecessor = contract.get("predecessor_task_id")
@@ -3145,6 +3487,9 @@ class Monitor:
             current["active_role"] = None
             current["active_task"] = None
             snapshot.handles.pop(node_id, None)
+            if self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
+                self._accept_visible_sdd_delivery(snapshot, node_id, event, current)
+                return
             reviewer_continuation = False
             reviewer_successor = False
             if current.get("reviewer_started"):
@@ -3470,9 +3815,104 @@ class Monitor:
         snapshot.nodes[node_id]["active_task"] = None
         return True
 
+    def _accept_visible_sdd_delivery(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        event: RunEvent,
+        current: Dict[str, Any],
+    ) -> None:
+        """Accept a visible-sdd node from its in-session review evidence.
+
+        The single worker session carries the whole SDD loop (implement,
+        independent read-only review, rework, re-review); the delivery event
+        must therefore cite the in-session review clearance.  Missing or
+        malformed evidence is fail-closed: the node goes ``blocked_unknown``
+        and keeps occupying its session slot instead of faking acceptance.
+        """
+        review = event.data.get("in_session_review")
+        clearance = review.get("clearance") if isinstance(review, dict) else None
+        evidence_ref = review.get("evidence_ref") if isinstance(review, dict) else None
+        valid = (
+            isinstance(review, dict)
+            and isinstance(clearance, dict)
+            and all(
+                isinstance(clearance.get(severity), int)
+                and not isinstance(clearance.get(severity), bool)
+                and clearance.get(severity) == 0
+                for severity in ("p0", "p1", "p2")
+            )
+            and isinstance(evidence_ref, str)
+            and bool(evidence_ref.strip())
+        )
+        if not valid:
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "visible-sdd delivery lacks verifiable in-session review evidence",
+            )
+            return
+        # The in-session reviewer acts under the same single session
+        # identity (ISSUE-01/05 semantics): the acceptance provenance names
+        # the reviewer role of that session, and the review proof travels in
+        # the event payload (evidence keeps the durable, replay-checked
+        # clearance reference; topology/protocol/clearance annotate it).
+        review_identity = current.get("developer_identity")
+        review_generation = int(current.get("developer_generation", 0))
+        try:
+            # The binding transition lands before the durable accepted event:
+            # a failure here must not leave an acceptance the registry never
+            # confirmed.
+            self._set_binding_status(snapshot, node_id, "developer", "accepted")
+        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "task binding cannot record acceptance ({})".format(
+                    type(error).__name__
+                ),
+            )
+            return
+        current["reviewer_identity"] = review_identity
+        current["review_generation"] = review_generation
+        self._record(
+            snapshot,
+            "accepted",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "evidence": evidence_ref.strip(),
+                "topology": TOPOLOGY_VISIBLE_SDD,
+                "protocol": review.get("protocol"),
+                "evidence_ref": evidence_ref.strip(),
+                "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                "contract_digest": current["contract_digest"],
+                "authorization_epoch": snapshot.authorization_digest,
+            },
+            {
+                "role": "reviewer",
+                "task_id": review_identity,
+                "handle_id": None,
+                "generation": review_generation,
+            },
+        )
+        current["status"] = "accepted"
+        current["acceptance"] = {
+            "contract_digest": current["contract_digest"],
+            "authorization_epoch": snapshot.authorization_digest,
+        }
+        current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
+        current["quarantine"] = None
+        self._archive_pair(snapshot, node_id)
+        self._release_node_lease(snapshot, node_id)
+
     def _archive_pair(self, snapshot: RunSnapshot, node_id: str) -> None:
         current = snapshot.nodes[node_id]
-        for role in ("developer", "reviewer"):
+        roles = ("developer", "reviewer")
+        if self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
+            # A visible-sdd node holds exactly one worker-session binding.
+            roles = ("developer",)
+        for role in roles:
             self._set_binding_status(snapshot, node_id, role, "archived")
         current["pair_archived"] = True
         self._record(
@@ -4179,6 +4619,12 @@ class Monitor:
                     retry["predecessor_task_id"] = predecessor
                     current["retryable_action"] = retry
             elif record["event"] == "accepted":
+                if self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
+                    self._replay_visible_sdd_acceptance(
+                        snapshot, node_id, data, provenance
+                    )
+                    snapshot.event_sequence = record["sequence"]
+                    continue
                 if provenance["role"] != "reviewer":
                     raise ValueError("unapplied acceptance lacks reviewer provenance")
                 self._registered_active_binding(snapshot, node_id, provenance)
