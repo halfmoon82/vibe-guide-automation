@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
+import re
 from pathlib import Path, PurePosixPath
 import tempfile
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -581,6 +582,166 @@ def _cycle_nodes(nodes: List[DAGNode]) -> List[str]:
     return sorted(found)
 
 
+_PATH_TOKEN_PATTERN = re.compile(r"[^\s，。；、：:\"'()（）\[\]<>]+")
+
+
+def _write_scope_paths(node: DAGNode) -> Optional[List[str]]:
+    """Return the node's normalized write scope, or None when it is unverifiable.
+
+    The scope is the union of the write allowlist and owned paths; ``"."``
+    (project root) is kept as a root marker that overlaps everything.  Missing
+    or malformed metadata returns None so the parallel-group audit can fail
+    closed instead of guessing whether two writers collide.
+    """
+    allowlist = _node_metadata(node, "allowlist")
+    if allowlist is None:
+        return None
+    if not isinstance(allowlist, (list, tuple)) or not all(
+        isinstance(item, str) and item.strip() for item in allowlist
+    ):
+        return None
+    raw = [str(item).strip() for item in allowlist]
+    contract = node.contract if isinstance(node.contract, Mapping) else {}
+    for source in (getattr(node, "owned_paths", None), contract.get("owned_paths")):
+        if source is None:
+            continue
+        if not isinstance(source, list) or not all(
+            isinstance(item, str) and item.strip() for item in source
+        ):
+            return None
+        raw.extend(str(item).strip() for item in source)
+    normalized: List[str] = []
+    for item in raw:
+        if item == ".":
+            candidate = item
+        else:
+            try:
+                candidate = normalize_project_path(item)
+            except ValueError:
+                return None
+        if candidate not in normalized:
+            normalized.append(candidate)
+    return normalized
+
+
+def _write_paths_overlap(left: str, right: str) -> bool:
+    if left == "." or right == ".":
+        return True
+    return left == right or left.startswith(right + "/") or right.startswith(left + "/")
+
+
+def _contract_texts(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return [text for item in value.values() for text in _contract_texts(item)]
+    if isinstance(value, (list, tuple)):
+        return [text for item in value for text in _contract_texts(item)]
+    return []
+
+
+def _path_like_token(token: str) -> Optional[str]:
+    """Normalize a whitespace-delimited token that names a project path."""
+    # Trailing sentence punctuation only: a leading dot (`.vibe/...`) is part
+    # of the path and must survive normalization.
+    candidate = token.strip().rstrip(",;.")
+    if not candidate or candidate == ".":
+        return None
+    if "/" not in candidate and "." not in PurePosixPath(candidate).name:
+        return None
+    try:
+        return normalize_project_path(candidate)
+    except ValueError:
+        return None
+
+
+def _produced_paths(node: DAGNode, scope: Sequence[str]) -> List[str]:
+    """Paths a node may produce: its write scope plus paths named in outputs."""
+    produced = list(scope)
+    contract = node.contract if isinstance(node.contract, Mapping) else {}
+    for key in ("output", "outputs"):
+        for text in _contract_texts(contract.get(key)):
+            for token in _PATH_TOKEN_PATTERN.findall(text):
+                normalized = _path_like_token(token)
+                if normalized and normalized not in produced:
+                    produced.append(normalized)
+    return produced
+
+
+def _parallel_group_errors(nodes: List[DAGNode]) -> Dict[str, List[str]]:
+    """Audit intra-group soft dependencies for dispatch-eligible nodes.
+
+    Two nodes may share a parallel group only when their write scopes are
+    verifiably disjoint and neither contract consumes a path the other
+    produces.  Overlap, artifact references, or unverifiable metadata refuse
+    the grouping: the nodes stay blocked until the plan relabels the relation
+    as ``integration_after`` or splits the group.  Nodes already past dispatch
+    (accepted/delivered/...) no longer run concurrently, so only
+    planned/ready members are judged.
+    """
+    groups: Dict[str, List[DAGNode]] = {}
+    for node in nodes:
+        if node.status not in ("planned", "ready"):
+            continue
+        group = _node_metadata(node, "parallel_group")
+        if group is not None and str(group).strip():
+            groups.setdefault(str(group), []).append(node)
+    errors: Dict[str, List[str]] = {}
+    for group, members in groups.items():
+        if len(members) < 2:
+            continue
+        scopes: Dict[str, Optional[List[str]]] = {}
+        for member in members:
+            scope = _write_scope_paths(member)
+            scopes[member.id] = scope
+            if scope is None:
+                errors.setdefault(member.id, []).append(
+                    "parallel_group '{}': write scope of node {} is missing or invalid; "
+                    "refusing unverifiable group membership".format(group, member.id)
+                )
+        for index, left in enumerate(members):
+            for right in members[index + 1:]:
+                left_scope = scopes[left.id]
+                right_scope = scopes[right.id]
+                if left_scope is None or right_scope is None:
+                    continue
+                overlaps = sorted({
+                    path for path in left_scope for other in right_scope
+                    if _write_paths_overlap(path, other)
+                })
+                if overlaps:
+                    message = (
+                        "parallel_group '{}': nodes {} and {} have overlapping write scope "
+                        "({}); relabel integration_after or split the group".format(
+                            group, left.id, right.id, ", ".join(overlaps[:3])
+                        )
+                    )
+                    errors.setdefault(left.id, []).append(message)
+                    errors.setdefault(right.id, []).append(message)
+                produced_left = _produced_paths(left, left_scope)
+                produced_right = _produced_paths(right, right_scope)
+                for consumer, producer, produced in (
+                    (right, left, produced_left),
+                    (left, right, produced_right),
+                ):
+                    contract = consumer.contract if isinstance(consumer.contract, Mapping) else {}
+                    inputs = _contract_texts(contract.get("input")) + _contract_texts(contract.get("inputs"))
+                    referenced = sorted({
+                        path for path in produced
+                        if path != "." and any(path in text for text in inputs)
+                    })
+                    for path in referenced[:3]:
+                        message = (
+                            "parallel_group '{}': node {} contract references {}'s produced "
+                            "path {}; relabel integration_after or split the group".format(
+                                group, consumer.id, producer.id, path
+                            )
+                        )
+                        errors.setdefault(consumer.id, []).append(message)
+                        errors.setdefault(producer.id, []).append(message)
+    return errors
+
+
 def audit_dag(plan: Plan) -> DAGAuditResult:
     """Audit executable readiness; only hard dependencies block startup."""
     nodes = list(getattr(plan, "nodes", []) or [])
@@ -647,6 +808,9 @@ def audit_dag(plan: Plan) -> DAGAuditResult:
             )
             for node_id in node_ids:
                 reasons[node_id].append(reason)
+
+    for node_id, group_reasons in _parallel_group_errors(nodes).items():
+        reasons.setdefault(node_id, []).extend(group_reasons)
 
     ready: List[str] = []
     for node in nodes:

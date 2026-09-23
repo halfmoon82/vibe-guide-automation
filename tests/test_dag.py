@@ -49,7 +49,10 @@ class DAGTests(unittest.TestCase):
                 "risk_tags": ["scheduling"],
                 "worker_profile": {
                     "writer": "codex-app-visible-developer",
-                    "allowlist": ["vibe_guide/dag.py", "tests/test_dag.py"],
+                    "allowlist": [
+                        "vibe_guide/{}.py".format(node_id.lower()),
+                        "tests/test_{}.py".format(node_id.lower()),
+                    ],
                 },
             }
             return DAGNode(
@@ -267,6 +270,165 @@ class DAGTests(unittest.TestCase):
 
             self.assertFalse((output_dir / "dag.yaml").exists())
             self.assertFalse((output_dir / "plan.md").exists())
+class ParallelGroupAuditTests(unittest.TestCase):
+    """V4.6 ISSUE-06: parallel_group dispatch-time dependency audit."""
+
+    def _group_node(self, node_id, group="g", allowlist=None, owned=None,
+                    contract_overrides=None, status="planned"):
+        contract = {
+            "input": "request",
+            "output": "result",
+            "error_behavior": "return blocked_dag",
+            "acceptance_examples": ["example passes"],
+            "risk_tags": ["scheduling"],
+            "writer": "writer-" + node_id,
+            "worktree": ".vibe/worktrees/" + node_id,
+            "allowlist": list(allowlist if allowlist is not None else ["vibe_guide/{}.py".format(node_id)]),
+        }
+        contract.update(contract_overrides or {})
+        return DAGNode(
+            node_id, node_id, [], [], group, contract, status,
+            writer=contract.get("writer", ""),
+            worktree=contract.get("worktree", ""),
+            allowlist=list(allowlist if allowlist is not None else ["vibe_guide/{}.py".format(node_id)]),
+            owned_paths=list(owned or []),
+        )
+
+    def _plan(self, nodes):
+        return Plan("pg", 1, "prd.md", [n.id for n in nodes], "authorized", nodes=nodes)
+
+    def test_overlapping_allowlists_are_refused_from_parallel_group(self):
+        nodes = [
+            self._group_node("a", allowlist=["vibe_guide/shared.py", "vibe_guide/a.py"]),
+            self._group_node("b", allowlist=["vibe_guide/shared.py"]),
+        ]
+        result = audit_dag(self._plan(nodes))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertEqual(result.ready_nodes, [])
+        self.assertEqual(result.parallel_groups, {})
+        self.assertEqual(set(result.blocked_nodes), {"a", "b"})
+        for node_id in ("a", "b"):
+            self.assertTrue(
+                any("parallel_group" in reason and "overlapping write scope" in reason
+                    and "vibe_guide/shared.py" in reason for reason in result.reasons[node_id]),
+                result.reasons[node_id],
+            )
+            self.assertTrue(
+                any("integration_after" in reason for reason in result.reasons[node_id]),
+                result.reasons[node_id],
+            )
+
+    def test_overlapping_owned_paths_are_refused_from_parallel_group(self):
+        nodes = [
+            self._group_node("a", owned=["docs/owned/shared.md"]),
+            self._group_node("b", owned=["docs/owned/shared.md"]),
+        ]
+        result = audit_dag(self._plan(nodes))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertEqual(result.ready_nodes, [])
+        for node_id in ("a", "b"):
+            self.assertTrue(
+                any("overlapping write scope" in reason and "docs/owned/shared.md" in reason
+                    for reason in result.reasons[node_id]),
+                result.reasons[node_id],
+            )
+
+    def test_directory_prefix_overlap_is_refused_from_parallel_group(self):
+        nodes = [
+            self._group_node("a", allowlist=["tests/fixtures"]),
+            self._group_node("b", allowlist=["tests/fixtures/v46.json"]),
+        ]
+        result = audit_dag(self._plan(nodes))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertTrue(
+            any("overlapping write scope" in reason for reason in result.reasons["a"]),
+            result.reasons["a"],
+        )
+
+    def test_artifact_reference_is_refused_from_parallel_group(self):
+        producer = self._group_node(
+            "producer",
+            contract_overrides={"output": "init 物化 docs/specs/shared-protocol.md"},
+        )
+        consumer = self._group_node(
+            "consumer",
+            contract_overrides={"input": "块内容指向 docs/specs/shared-protocol.md 协议文件"},
+        )
+        result = audit_dag(self._plan([producer, consumer]))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertEqual(result.ready_nodes, [])
+        self.assertEqual(result.parallel_groups, {})
+        for node_id in ("producer", "consumer"):
+            self.assertTrue(
+                any("produced path docs/specs/shared-protocol.md" in reason
+                    and "integration_after" in reason for reason in result.reasons[node_id]),
+                result.reasons[node_id],
+            )
+
+    def test_disjoint_nodes_remain_in_parallel_group(self):
+        nodes = [self._group_node("a"), self._group_node("b")]
+        result = audit_dag(self._plan(nodes))
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(set(result.ready_nodes), {"a", "b"})
+        self.assertEqual(result.parallel_groups, {"g": ["a", "b"]})
+
+    def test_unverifiable_write_scope_is_conservatively_refused(self):
+        good = self._group_node("good")
+        broken = DAGNode(
+            "broken", "broken", [], [], "g",
+            {
+                "input": "request",
+                "output": "result",
+                "error_behavior": "return blocked_dag",
+                "acceptance_examples": ["example passes"],
+                "risk_tags": ["scheduling"],
+                "writer": "writer-broken",
+                "worktree": ".vibe/worktrees/broken",
+                "allowlist": "not-a-list",
+            },
+            "planned",
+            writer="writer-broken",
+            worktree=".vibe/worktrees/broken",
+        )
+        result = audit_dag(self._plan([good, broken]))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertNotIn("broken", result.ready_nodes)
+        self.assertIn("good", result.ready_nodes)
+        self.assertEqual(result.parallel_groups, {"g": ["good"]})
+        self.assertTrue(
+            any("parallel_group" in reason and "missing or invalid" in reason
+                for reason in result.reasons["broken"]),
+            result.reasons["broken"],
+        )
+
+    def test_vibe_entry_regression_fixture_is_refused_from_parallel_group(self):
+        fixture_path = Path(__file__).parent / "fixtures" / "v46-parallel-audit-vibe-entry.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        nodes = [
+            DAGNode(
+                item["id"], item["title"],
+                item.get("depends_on", []), item.get("integration_after", []),
+                item.get("parallel_group"), item["contract"], item.get("status", "planned"),
+                writer=item.get("writer", ""),
+                worktree=item.get("worktree", ""),
+                allowlist=item.get("allowlist", []),
+                owned_paths=item.get("owned_paths", []),
+            )
+            for item in fixture["nodes"]
+        ]
+        info = fixture["plan"]
+        plan = Plan(info["plan_id"], info["version"], info["prd_path"],
+                    [node.id for node in nodes], info["status"], nodes=nodes)
+        result = audit_dag(plan)
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertEqual(result.ready_nodes, [])
+        self.assertEqual(result.parallel_groups, {})
+        for node_id in ("ISSUE-01", "ISSUE-02"):
+            self.assertTrue(
+                any("produced path .vibe/proposals/skills/vibe-entry/SKILL.md" in reason
+                    for reason in result.reasons[node_id]),
+                result.reasons[node_id],
+            )
 
 
 if __name__ == "__main__":
