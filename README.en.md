@@ -68,7 +68,7 @@ Since V4.6, true DAG parallelism is carried by one visible worker session per no
 - `dual-visible`: the conservative default, with two distinct visible tasks for developer and reviewer; UNKNOWN platform evidence fails closed to this topology and never upgrades to `visible-sdd`;
 - `background`: the explicit downgrade when a platform has no visible bridge. The downgrade and its limitations (not visible, not directly enterable, limited rework continuation) must be disclosed in the capability report, the authorization card, and the delivery; a `mode=background` worker without disclosure fails authorization-card validation.
 
-Platform topology is ruled by the adapter registry's `DISPATCH_TOPOLOGY_MATRIX` from each platform's `in_session_sdd` probe evidence.
+Platform topology is ruled by the adapter registry's `DISPATCH_TOPOLOGY_MATRIX` from each platform's `in_session_sdd` probe evidence. `in_session_sdd` and `visible-sdd` live on different layers and are not interchangeable: the former is an adapter-layer name — both the manifest capability-probe field name and the ruling value in `DISPATCH_TOPOLOGY_MATRIX`; the latter is an enum value of the `topology` field (dispatch layer), translated from that ruling by the supervisor and describing how the node is actually dispatched; a passing probe does not by itself mean the node's topology is `visible-sdd` (the matrix ruling decides).
 
 Concurrency cap: `max_active_worker_sessions` in `.vibe/config.json` caps simultaneously active worker sessions (default 5, valid range 1–64) and takes effect as the minimum with the authorization-card snapshot; an explicit but invalid value is a configuration error, never silently replaced. Accepted and archived sessions release capacity for later ready nodes.
 

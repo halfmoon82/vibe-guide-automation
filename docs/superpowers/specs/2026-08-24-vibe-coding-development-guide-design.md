@@ -118,6 +118,8 @@ V4.6 起，DAG 真并行采用两级拓扑：
 
 平台拓扑由 `vibe_guide/adapters/registry.py` 的 `DISPATCH_TOPOLOGY_MATRIX` 逐平台裁定：Codex、Claude Code、Cursor、Kimi Code、DeepSeek Harness 在 `in_session_sdd` 探针通过时升级为会话内 SDD；WorkBuddy 与 Grok 恒为 `dual-visible`（探针通过也不升级）；UNKNOWN 一律按 `dual-visible` 处理，永远不会升级为 `visible-sdd`。
 
+`in_session_sdd` 与 `visible-sdd` 是两个不同层的名字，语义不同，不互换：`in_session_sdd` 是适配层的名字——既是 manifest 能力探针字段名（`<id>.in_session_sdd`，描述平台是否具备会话内 SDD 能力），也是 `DISPATCH_TOPOLOGY_MATRIX` 的裁定值；`visible-sdd` 是任务登记 `topology` 字段的枚举值，属于派发层，由监工把裁定值翻译而来，描述节点实际以何种拓扑派发。探针通过只是升级的前提之一，不等于该节点的 topology 已是 `visible-sdd`（以矩阵裁定为准）。
+
 并发上限：同时活跃的 worker 会话数由项目配置 `.vibe/config.json` 的 `max_active_worker_sessions` 控制，默认 5（合法范围 1–64），与授权卡快照取较小者生效。节点验收、P0–P2 清零且证据登记后归档会话，名额释放给后续 ready 节点。
 
 监工职责收窄为派发、等待、收口与纠偏：监工自身不得作为任何节点的 writer，该约束是结构性拒绝，不依赖授权卡文本。
@@ -166,7 +168,7 @@ vibe resume     # 从快照恢复
 
 桌面 App 适配器优先通过 `VisibleTaskProvider` 按 §4.2 任务拓扑创建可见任务：`visible-sdd` 每节点只创建一个可见 worker 会话（审查在会话内完成），`dual-visible` 为 developer 和 reviewer 各创建一个独立任务。创建成功后任务必须出现在该 App 的任务/会话列表，用户可以进入查看过程。监工通过精确平台任务 ID 和 host 下发后续输入并用逐任务 cursor/token 等待；不得用全局任务列表轮询代替精确登记。Codex App 的具体映射为 `create_thread`、`threadId`、`hostId` 和 cursor。若 provider 明确返回“不支持”，才可在授权卡中声明 `background` 降级并使用 subagent。
 
-配置中的任务对上限表示同时活跃并发量，不表示整个 DAG 期间累计只能创建这么多任务。一个 Issue 的 developer/reviewer 已完成、独立 Review 的 P0–P2 清零且证据已登记后，监工关闭或归档对应会话，释放并发名额；任务 ID、host、worktree、branch、状态/交付路径和最终 cursor 继续作为历史证据保留。仍可能返工或复审的原任务不得提前归档，也不得通过删除登记绕过唯一 writer 或续接要求。新解锁的 Issue 使用释放后的名额创建新的独立 developer/reviewer。
+配置中的 worker 会话上限（`max_active_worker_sessions`）表示同时活跃的并发量，不表示整个 DAG 期间累计只能创建这么多会话。名额按当前未完成、未归档的活跃 worker 会话数计算：`visible-sdd` 每节点占一个会话，`dual-visible` 下 developer 与 reviewer 各占一个会话。一个 Issue 的开发与独立 Review 均已完成、P0–P2 清零且证据已登记后，监工关闭或归档对应会话，释放并发名额；任务 ID、host、worktree、branch、状态/交付路径和最终 cursor 继续作为历史证据保留。仍可能返工或复审的原会话不得提前归档，也不得通过删除登记绕过唯一 writer 或续接要求。新解锁的 Issue 使用释放后的名额创建新的 worker 会话。
 
 三组同义触发词，均不超过 10 个字：
 
@@ -216,7 +218,7 @@ planned → ready → running → delivered → review → accepted
 6. 节点通过 Review 后锁定成果，解锁后续节点；
 7. 全部节点完成后执行最终 DAG 验收。
 
-调度容量按活跃任务对计算：已完成且归档的任务不阻塞后续 ready 节点；同一时刻不得超过授权卡列明的活跃 developer/reviewer 对数。
+调度容量按当前未完成、未归档的活跃 worker 会话数计算（`visible-sdd` 每节点一个会话；`dual-visible` 下 developer 与 reviewer 各占一个会话）：已完成且归档的会话不阻塞后续 ready 节点；同一时刻不得超过生效上限，上限值 = min(授权卡快照, `.vibe/config.json` 的 `max_active_worker_sessions`)。
 
 一个节点只允许一个有效 writer。reviewer 只读审查，不能代改业务代码。reviewer 独立性按 §4.2 任务拓扑保证：`visible-sdd` 下由会话内独立上下文、只读的 review 子代理承担（不再创建第二个可见任务），`dual-visible` 下 developer 与 reviewer 必须是两个不同的显式独立任务；不得因不确定的线程索引、短暂超时或状态延迟创建第二 writer，也不得用内部 subagent 替代已登记的可见任务。
 

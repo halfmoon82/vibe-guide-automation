@@ -136,7 +136,7 @@ V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 
 - `dual-visible`：保守默认，developer 与 reviewer 是两个不同的可见独立任务；平台能力 UNKNOWN 时 fail-closed 到本拓扑，不会升级为 `visible-sdd`；
 - `background`：平台无可见桥接时的显式降级，必须在能力报告、授权卡和交付三处披露降级及限制（不可见、不可直接进入、返工续接受限）；`mode=background` 缺少披露时授权卡机器校验直接失败。
 
-平台拓扑由适配器注册表的 `DISPATCH_TOPOLOGY_MATRIX` 按各平台 `in_session_sdd` 探针证据裁定。
+平台拓扑由适配器注册表的 `DISPATCH_TOPOLOGY_MATRIX` 按各平台 `in_session_sdd` 探针证据裁定。`in_session_sdd` 与 `visible-sdd` 分属两层、不互换：前者是适配层的名字——既是 manifest 能力探针字段名，也是 `DISPATCH_TOPOLOGY_MATRIX` 的裁定值；后者是 `topology` 字段的枚举值（派发层），由监工把裁定值翻译而来，描述节点实际派发拓扑；探针通过不等于 topology 已是 `visible-sdd`（以矩阵裁定为准）。
 
 并发上限：`.vibe/config.json` 的 `max_active_worker_sessions` 控制同时活跃的 worker 会话数，默认 5（合法范围 1–64），与授权卡快照取较小者生效；显式但非法的值是配置错误，不会静默回落默认值。节点验收、P0–P2 清零且证据登记后归档会话，名额释放给后续 ready 节点。
 
