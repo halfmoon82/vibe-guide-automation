@@ -481,6 +481,21 @@ class ParallelGroupAuditTests(unittest.TestCase):
         self.assertEqual(result.status, "ready")
         self.assertEqual(set(result.ready_nodes), {"a", "b"})
 
+    def test_directory_scope_covers_references_to_files_inside_it(self):
+        producer = self._group_node("a", allowlist=["docs/specs"])
+        consumer = self._group_node(
+            "b",
+            allowlist=["vibe_guide/b.py"],
+            contract_overrides={"input": "参照 docs/specs/v2.md 的格式"},
+        )
+        result = audit_dag(self._plan([producer, consumer]))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertEqual(result.ready_nodes, [])
+        self.assertTrue(
+            any("produced path docs/specs" in reason for reason in result.reasons["b"]),
+            result.reasons["b"],
+        )
+
     def test_vibe_entry_regression_fixture_is_refused_from_parallel_group(self):
         fixture_path = Path(__file__).parent / "fixtures" / "v46-parallel-audit-vibe-entry.json"
         fixture = json.loads(fixture_path.read_text(encoding="utf-8"))

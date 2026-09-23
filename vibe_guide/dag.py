@@ -663,10 +663,14 @@ def _references_path(text: str, path: str) -> bool:
     """Return whether *text* references *path* as a whole path token.
 
     A bare substring check would let ``docs/spec.md`` match
-    ``docs/spec.md.bak``; require the path to be delimited by characters that
-    cannot belong to a longer path spelling.
+    ``docs/spec.md.bak``, so the path must be delimited by characters that
+    cannot extend its spelling.  ``/`` stays legal *after* the match: a
+    directory in the write scope covers references to files inside it
+    (``docs/specs`` must match a reference to ``docs/specs/v2.md``), while
+    ``.``/alphanumerics still reject ``docs/spec.md.bak``.  ``/`` before the
+    match stays rejected so ``xdocs/spec.md`` prefix attacks fail.
     """
-    pattern = r"(?<![A-Za-z0-9._/-])" + re.escape(path) + r"(?![A-Za-z0-9._/-])"
+    pattern = r"(?<![A-Za-z0-9._/-])" + re.escape(path) + r"(?![A-Za-z0-9._-])"
     return re.search(pattern, text) is not None
 
 
