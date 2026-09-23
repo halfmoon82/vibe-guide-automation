@@ -38,6 +38,8 @@ REGISTRY_SCHEMA_VERSION = 1
 BINDING_SCHEMA_VERSION = 1
 _ROLES = {"developer", "reviewer"}
 _MODES = {"visible", "background"}
+_TOPOLOGIES = {"visible-sdd", "dual-visible", "background"}
+DEFAULT_TOPOLOGY = "dual-visible"
 _STATUSES = {
     "created",
     "start_pending",
@@ -86,6 +88,7 @@ class TaskBinding:
     status: str = "created"
     visible: Optional[bool] = None
     limitations: List[str] = field(default_factory=list)
+    topology: str = DEFAULT_TOPOLOGY
     thread_id: Optional[str] = None
     host_id: Optional[str] = None
     continuation_digest: Optional[str] = None
@@ -112,6 +115,23 @@ class TaskBinding:
             raise ValueError("mode must be visible or background")
         if self.role not in _ROLES:
             raise ValueError("role must be developer or reviewer")
+        if not isinstance(self.topology, str) or self.topology not in _TOPOLOGIES:
+            raise ValueError("task binding topology is invalid")
+        if self.topology == "visible-sdd":
+            # A visible-sdd issue binds exactly one visible developer session;
+            # review stays as in-session evidence and is never registered as
+            # a task binding of its own.
+            if self.role != "developer":
+                raise ValueError("visible-sdd topology only binds a developer")
+            if self.mode != "visible":
+                raise ValueError("visible-sdd topology requires visible mode")
+        if self.topology == "background":
+            if self.mode != "background":
+                raise ValueError("background topology requires background mode")
+            if not any(
+                isinstance(item, str) and item.strip() for item in self.limitations
+            ):
+                raise ValueError("background task binding requires limitations")
         if not isinstance(self.issue_id, str) or not self.issue_id:
             raise ValueError("issue_id is required")
         if self.status not in _STATUSES:
@@ -301,6 +321,7 @@ class TaskBinding:
             "status": self.status,
             "visible": self.visible,
             "limitations": list(self.limitations),
+            "topology": self.topology,
             "generation": self.generation,
             "allowlist": list(self.allowlist),
             "capability_contract_digest": self.capability_contract_digest,
@@ -352,7 +373,7 @@ class TaskBinding:
             "limitations",
             "generation",
         }
-        optional = {"binding_intent", "binding_observation", "binding_state", "business_write_allowed", "legacy"}
+        optional = {"binding_intent", "binding_observation", "binding_state", "business_write_allowed", "legacy", "topology"}
         allowed = expected | {"allowlist", "capability_contract_digest", "successor_of", "route_digest", "model", "reasoning"} | optional
         if not isinstance(data, dict) or not set(data).issubset(allowed) or not expected.issubset(data):
             raise ValueError("task binding record schema is invalid")
@@ -368,6 +389,7 @@ class TaskBinding:
         normalized.setdefault("binding_state", "blocked_unknown")
         normalized.setdefault("business_write_allowed", False)
         normalized.setdefault("legacy", {})
+        normalized.setdefault("topology", DEFAULT_TOPOLOGY)
         if normalized["binding_state"] == "binding_verified":
             normalized["binding_state"] = "blocked_unknown"
             normalized["business_write_allowed"] = False
@@ -512,7 +534,20 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding) -> None:
         for current in existing:
             if current.issue_id != persistent.issue_id:
                 continue
+            if "visible-sdd" in (current.topology, persistent.topology):
+                # A visible-sdd issue binds exactly one visible developer
+                # session; review stays as in-session evidence and is never
+                # registered as a second task binding.
+                if persistent.role == "reviewer" or current.role == "reviewer":
+                    raise ValueError(
+                        "visible-sdd topology registers a single developer binding"
+                    )
             if current.role == persistent.role:
+                if current.topology != persistent.topology and (
+                    current.run_id == persistent.run_id
+                    or current.status not in _TERMINAL_STATUSES
+                ):
+                    raise ValueError("immutable task binding topology drift")
                 if (
                     current.composite_identity != persistent.composite_identity
                     and (
