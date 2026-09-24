@@ -2,11 +2,13 @@
 
 [English README](README.en.md)
 
+> 如果这个项目对你有帮助，欢迎点一下右上角的 ⭐ Star，让更多人发现它。
+
 Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次精确授权启动可恢复的开发、独立 Review 与返工流程。它把技术交付、Review 接受、push、MR、merge 和 deploy 分开记录；默认授权永远不包含 deploy。
 
 ## 安装
 
-当前发行版本为 `4.5.0`。版本真相以仓库中匹配的 `v4.5.0` tag、对应提交和 Release 资产为准；`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
+当前发行版本为 `4.8.0`。版本真相以仓库中匹配的 `v4.8` tag、对应提交和 Release 资产为准；`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
 
 ### 给 Agent 的安装协议
 
