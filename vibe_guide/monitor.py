@@ -831,9 +831,23 @@ class Monitor:
                 "reason": reason,
             },
         }
+        audit_path = run_dir(self.paths, snapshot.run_id, create=True) / "dag-audit.json"
+        # Append rather than overwrite: multiple conflict rounds in the same run
+        # each contribute a record so the full ownership history survives.
+        existing: list = []
+        if audit_path.is_file():
+            try:
+                raw = json.loads(audit_path.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    existing = raw
+                elif isinstance(raw, dict):
+                    existing = [raw]
+            except (OSError, ValueError):
+                existing = []
+        existing.append(audit)
         _atomic_bytes(
-            run_dir(self.paths, snapshot.run_id, create=True) / "dag-audit.json",
-            (json.dumps(audit, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
+            audit_path,
+            (json.dumps(existing, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
         )
 
     def _projection_nodes(self, snapshot: RunSnapshot) -> List[DAGNode]:

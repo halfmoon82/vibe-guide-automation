@@ -3133,7 +3133,13 @@ class PathOwnershipGateTests(unittest.TestCase):
     def run_audit(self, snapshot):
         path = self.paths.root / ".vibe" / "runs" / snapshot.run_id / "dag-audit.json"
         self.assertTrue(path.is_file(), "run-scoped dag-audit.json was not written")
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # dag-audit.json is now a list of conflict records (append-on-conflict);
+        # return the most recent record so per-round assertions stay unchanged.
+        if isinstance(data, list):
+            self.assertGreater(len(data), 0, "dag-audit.json list is empty")
+            return data[-1]
+        return data
 
     def assert_round_refused(self, snapshot, runner, node_ids):
         self.assertEqual(runner.start_calls, [])
