@@ -15,10 +15,16 @@ Missing or illegal protocol names reuse load_protocol's existing error paths
 (FileNotFoundError / ValueError); no new branches are added for this protocol.
 """
 import re
+import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
+
+from vibe_guide.monitor import VISIBLE_SDD_PROTOCOL_REF
 
 PROTOCOL_NAME = "visible-sdd-worker"
+EVIDENCE_REF = "session-delivery#review-round-1"
 
 
 def _load() -> str:
@@ -161,6 +167,398 @@ class VisibleSddReviewerViolationTests(unittest.TestCase):
     def test_violation_blocks_node_and_is_recorded(self):
         self.assertIn("blocked", self.text)
         self.assertIn("记录", self.text)
+
+
+class VisibleSddAcceptanceStructureTests(unittest.TestCase):
+    """V4.7 ISSUE-02: the acceptance evidence structure is fail-closed.
+
+    ``contract_digest`` reuses the node-level digest the monitor stamps at
+    dispatch (``executable_contract_digest([node])``, full SHA-256 hex) --
+    supervisor ruling 2026-09-24: no second digest algorithm.  Construction
+    rejects a missing, blank, placeholder or wrong-length digest, so no
+    writer can persist a partial acceptance.
+    """
+
+    DIGEST = "0123456789abcdef" * 4
+    PROTOCOL_REF = "vibe_guide/protocols/visible-sdd-worker.md"
+    EVIDENCE_REF = EVIDENCE_REF
+
+    def _acceptance(self, **overrides):
+        from vibe_guide.binding_lifecycle import VisibleSddAcceptance
+
+        values = dict(
+            contract_digest=self.DIGEST,
+            protocol_ref=self.PROTOCOL_REF,
+            evidence_ref=self.EVIDENCE_REF,
+        )
+        values.update(overrides)
+        return VisibleSddAcceptance(**values)
+
+    def test_complete_acceptance_constructs(self):
+        acceptance = self._acceptance()
+        self.assertEqual(acceptance.contract_digest, self.DIGEST)
+        self.assertEqual(acceptance.protocol_ref, self.PROTOCOL_REF)
+        self.assertEqual(acceptance.evidence_ref, self.EVIDENCE_REF)
+
+    def test_missing_or_placeholder_contract_digest_fails_construction(self):
+        for bad in (None, "", "   ", "placeholder", "0" * 32, "0" * 63, "0" * 65, "g" * 64, self.DIGEST.upper()):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self._acceptance(contract_digest=bad)
+
+    def test_missing_protocol_ref_or_evidence_ref_fails_construction(self):
+        for bad in (None, "", "  ", "a\x00b"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self._acceptance(protocol_ref=bad)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self._acceptance(evidence_ref=bad)
+
+    def test_round_trip_through_dict_keeps_every_field(self):
+        from vibe_guide.binding_lifecycle import VisibleSddAcceptance
+
+        acceptance = self._acceptance()
+        payload = acceptance.to_dict()
+        self.assertEqual(
+            payload,
+            {
+                "contract_digest": self.DIGEST,
+                "protocol_ref": self.PROTOCOL_REF,
+                "evidence_ref": self.EVIDENCE_REF,
+            },
+        )
+        self.assertEqual(VisibleSddAcceptance.from_dict(payload), acceptance)
+
+    def test_from_dict_rejects_missing_digest_or_foreign_shape(self):
+        from vibe_guide.binding_lifecycle import VisibleSddAcceptance
+
+        complete = self._acceptance().to_dict()
+        without_digest = dict(complete)
+        del without_digest["contract_digest"]
+        extra_key = dict(complete, clearance={"p0": 0})
+        for bad in (None, "", [], {}, without_digest, extra_key, dict(complete, contract_digest="")):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                VisibleSddAcceptance.from_dict(bad)
+
+
+class VisibleSddAcceptanceMonitorTests(unittest.TestCase):
+    """AC-02 on both visible-sdd acceptance paths: live delivery and replay.
+
+    The accepted event carries the dispatch-time node ``contract_digest``;
+    every path that turns it into an accepted node recomputes
+    ``executable_contract_digest([node])`` from the live contract and
+    compares.  A tampered or unreadable contract, or a foreign protocol
+    pointer, never yields an accepted node.
+    """
+
+    def setUp(self):
+        from vibe_guide.capability_contract import build_contract, save_contract
+        from vibe_guide.models import AgentCapabilities
+        from vibe_guide.paths import ProjectPaths
+
+        self.temporary = tempfile.TemporaryDirectory()
+        self.paths = ProjectPaths(Path(self.temporary.name))
+        (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (self.paths.vibe / "state.json").write_text(
+            '{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8"
+        )
+        save_contract(
+            self.paths, build_contract(self.paths.root, provider="fake", host_id="local")
+        )
+        self.capabilities = AgentCapabilities("fake", True, True, True, True, True, "full")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _monitor(self):
+        from tests.test_monitor import load_v46_dispatch_fixture
+        from vibe_guide.authorization import authorize, build_authorization_card
+        from vibe_guide.models import Plan
+        from vibe_guide.monitor import Monitor
+
+        payload, nodes = load_v46_dispatch_fixture()
+        plan = Plan("plan-1", 1, "docs/prd.md", [item.id for item in nodes], "draft")
+        card = build_authorization_card(plan, nodes, self.capabilities)
+        monitor = Monitor(
+            self.paths, plan, nodes, topology_rulings=payload["topology_rulings"]
+        )
+        return monitor, authorize(card, "AUTHORIZE")
+
+    @staticmethod
+    def _runner(protocol=VISIBLE_SDD_PROTOCOL_REF):
+        from tests.test_monitor import VisibleSddRunner
+
+        return VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": {
+                                "protocol": protocol,
+                                "evidence_ref": EVIDENCE_REF,
+                                "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                            },
+                        },
+                    )
+                ]
+            }
+        )
+
+    def _accepted_events(self, run_id):
+        from vibe_guide.state import load_events
+
+        return [
+            record
+            for record in load_events(self.paths, run_id)
+            if record["event"] == "accepted" and record["data"].get("node_id") == "sdd-a"
+        ]
+
+    def _binding_status(self, run_id):
+        from vibe_guide.task_registry import load_task_binding
+
+        return load_task_binding(self.paths, "sdd-a", "developer", run_id=run_id).status
+
+    def test_accepted_event_reuses_dispatch_time_executable_contract_digest(self):
+        """Ruling pin: the acceptance reuses the node digest, it does not mint one."""
+        from vibe_guide.authorization import executable_contract_digest
+
+        monitor, record = self._monitor()
+        runner = self._runner()
+        snapshot = monitor.start(record, runner)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+        events = self._accepted_events(snapshot.run_id)
+        self.assertEqual(len(events), 1)
+        digest = events[0]["data"]["contract_digest"]
+        self.assertEqual(digest, executable_contract_digest([monitor.nodes["sdd-a"]]))
+        self.assertEqual(digest, snapshot.nodes["sdd-a"]["contract_digest"])
+        self.assertEqual(len(digest), 64)
+
+    def test_accepted_event_protocol_ref_matches_shipped_constant(self):
+        """Element 3 of the spec: the accepted event names the shipped protocol.
+
+        The pointer is asserted on the event the monitor emits (captured at
+        ``_record``) because ``state._EVENT_DATA_KEYS`` does not yet persist
+        ``protocol_ref``; the constant is also pinned to the packaged file so
+        a moved protocol cannot leave acceptances pointing at the old path.
+        """
+        from vibe_guide import protocols
+        from vibe_guide.authorization import executable_contract_digest
+
+        shipped = Path(protocols.__file__).parent / Path(VISIBLE_SDD_PROTOCOL_REF).name
+        self.assertTrue(shipped.is_file(), VISIBLE_SDD_PROTOCOL_REF)
+        self.assertTrue(VISIBLE_SDD_PROTOCOL_REF.startswith("vibe_guide/protocols/"))
+
+        monitor, record = self._monitor()
+        runner = self._runner()
+        with patch.object(monitor, "_record", wraps=monitor._record) as recorded:
+            snapshot = monitor.start(record, runner)
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+        accepted = [call.args[2] for call in recorded.call_args_list if call.args[1] == "accepted"]
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(accepted[0]["protocol_ref"], VISIBLE_SDD_PROTOCOL_REF)
+        self.assertEqual(accepted[0]["evidence_ref"], EVIDENCE_REF)
+        self.assertEqual(
+            accepted[0]["contract_digest"], executable_contract_digest([monitor.nodes["sdd-a"]])
+        )
+
+    def test_delivery_citing_foreign_protocol_is_blocked_unknown(self):
+        monitor, record = self._monitor()
+        runner = self._runner(protocol="vibe_guide/protocols/dual-visible-worker.md")
+        snapshot = monitor.start(record, runner)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+        self.assertIn("protocol", snapshot.nodes["sdd-a"]["reason"])
+        self.assertEqual(self._accepted_events(snapshot.run_id), [])
+        self.assertNotEqual(self._binding_status(snapshot.run_id), "archived")
+
+    def test_replay_accepts_when_recomputed_digest_matches(self):
+        from vibe_guide.state import save_snapshot
+
+        monitor, record = self._monitor()
+        runner = self._runner()
+        snapshot = monitor.start(record, runner)
+        preserved = deepcopy(snapshot)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+        save_snapshot(self.paths, preserved)
+
+        recovered = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(recovered.nodes["sdd-a"]["status"], "accepted")
+        self.assertTrue(recovered.nodes["sdd-a"]["pair_archived"])
+        self.assertEqual(self._binding_status(snapshot.run_id), "archived")
+
+    def test_replay_rejects_accepted_event_when_contract_was_tampered(self):
+        """Digest mismatch (64-hex, different content): the event is invalid.
+
+        Editing the node contract itself trips the authorization gate first
+        (PermissionError, node never accepted).  The case only the ISSUE-02
+        recomputation catches is a smuggled acceptance: snapshot digest and
+        accepted event agree with each other but not with the live contract.
+        """
+        import hashlib
+        from vibe_guide.contracts import RunEvent
+        from vibe_guide.state import append_event, load_snapshot, save_snapshot
+
+        monitor, record = self._monitor()
+        runner = self._runner()
+        snapshot = monitor.start(record, runner)
+        active = snapshot.nodes["sdd-a"]["active_task"]
+        original_files = list(monitor.nodes["sdd-a"].contract["files"])
+
+        monitor.nodes["sdd-a"].contract["files"] = original_files + ["smuggled.py"]
+        with self.assertRaises(PermissionError):
+            monitor.tick(snapshot.run_id, runner)
+        monitor.nodes["sdd-a"].contract["files"] = original_files
+
+        forged = hashlib.sha256(b"smuggled contract").hexdigest()
+        snapshot.nodes["sdd-a"]["contract_digest"] = forged
+        save_snapshot(self.paths, snapshot)
+        append_event(
+            self.paths,
+            RunEvent(
+                "accepted",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": "sdd-a",
+                    "evidence": EVIDENCE_REF,
+                    "contract_digest": forged,
+                    "authorization_epoch": snapshot.authorization_digest,
+                },
+            ),
+            {
+                "role": "reviewer",
+                "task_id": active["task_id"],
+                "handle_id": None,
+                "generation": active["generation"],
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+            },
+        )
+
+        with self.assertRaises(ValueError) as refused:
+            monitor.tick(snapshot.run_id, runner)
+
+        self.assertIn("stale", str(refused.exception))
+        on_disk = load_snapshot(self.paths, snapshot.run_id)
+        self.assertNotEqual(on_disk.nodes["sdd-a"]["status"], "accepted")
+        self.assertFalse(on_disk.nodes["sdd-a"]["pair_archived"])
+
+    def test_replay_rejects_forged_accepted_event_without_digest(self):
+        from vibe_guide.contracts import RunEvent
+        from vibe_guide.state import append_event, load_snapshot
+
+        monitor, record = self._monitor()
+        runner = self._runner()
+        snapshot = monitor.start(record, runner)
+        active = snapshot.nodes["sdd-a"]["active_task"]
+        append_event(
+            self.paths,
+            RunEvent(
+                "accepted",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": "sdd-a",
+                    "evidence": EVIDENCE_REF,
+                    "authorization_epoch": snapshot.authorization_digest,
+                },
+            ),
+            {
+                "role": "reviewer",
+                "task_id": active["task_id"],
+                "handle_id": None,
+                "generation": active["generation"],
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+            },
+        )
+
+        with self.assertRaises(ValueError):
+            monitor.tick(snapshot.run_id, runner)
+
+        self.assertNotEqual(
+            load_snapshot(self.paths, snapshot.run_id).nodes["sdd-a"]["status"], "accepted"
+        )
+
+    def test_live_acceptance_refuses_digest_that_does_not_match_live_contract(self):
+        """Live path: a snapshot digest that no longer matches the contract.
+
+        The delivered session review is otherwise valid; only the recomputed
+        ``executable_contract_digest([node])`` exposes the mismatch, and the
+        node must go blocked_unknown instead of accepting with that digest.
+        """
+        import hashlib
+        from vibe_guide.state import save_snapshot
+
+        monitor, record = self._monitor()
+        runner = self._runner()
+        snapshot = monitor.start(record, runner)
+        snapshot.nodes["sdd-a"]["contract_digest"] = hashlib.sha256(b"smuggled contract").hexdigest()
+        save_snapshot(self.paths, snapshot)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+        self.assertIn("does not match the live node contract", snapshot.nodes["sdd-a"]["reason"])
+        self.assertEqual(self._accepted_events(snapshot.run_id), [])
+        self.assertNotEqual(self._binding_status(snapshot.run_id), "archived")
+
+    def _refuse_unreadable_contract(self, unreadable):
+        """Acceptance boundary with an unreadable contract: refused, blocked_unknown.
+
+        Inside ``tick`` an emptied contract already trips the authorization
+        gate (whole-DAG digest, PermissionError) and the ISSUE-01 ownership
+        gate blocks it at dispatch, so the acceptance boundary is exercised
+        directly: it is the last refusal before an accepted event is written.
+        """
+        from vibe_guide.contracts import RunEvent
+
+        monitor, record = self._monitor()
+        runner = self._runner()
+        snapshot = monitor.start(record, runner)
+        monitor.nodes["sdd-a"].contract = unreadable
+        delivery = RunEvent(
+            "complete",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": "sdd-a",
+                "evidence": "delivery",
+                "in_session_review": {
+                    "protocol": VISIBLE_SDD_PROTOCOL_REF,
+                    "evidence_ref": EVIDENCE_REF,
+                    "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                },
+            },
+        )
+
+        monitor._accept_visible_sdd_delivery(
+            snapshot, "sdd-a", delivery, snapshot.nodes["sdd-a"]
+        )
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+        self.assertIn("unreadable", snapshot.nodes["sdd-a"]["reason"])
+        self.assertIsNone(snapshot.nodes["sdd-a"]["acceptance"])
+        self.assertEqual(self._accepted_events(snapshot.run_id), [])
+        self.assertNotIn(self._binding_status(snapshot.run_id), {"accepted", "archived"})
+
+    def test_delivery_with_empty_contract_is_refused_blocked_unknown(self):
+        self._refuse_unreadable_contract({})
+
+    def test_delivery_with_none_contract_is_refused_blocked_unknown(self):
+        self._refuse_unreadable_contract(None)
+
+    def test_unreadable_contract_never_yields_a_digest(self):
+        monitor, _ = self._monitor()
+        for unreadable in (None, {}, "", [], "not-a-dict"):
+            monitor.nodes["sdd-a"].contract = unreadable
+            with self.assertRaises(ValueError, msg=repr(unreadable)):
+                monitor._live_node_contract_digest("sdd-a")
 
 
 class VisibleSddErrorPathTests(unittest.TestCase):

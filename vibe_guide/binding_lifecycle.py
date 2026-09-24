@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 import re
 
 
@@ -16,6 +16,11 @@ LIFECYCLE_STATES = (
     "blocked_unknown",
 )
 _SHA40 = re.compile(r"^[0-9a-fA-F]{40}$")
+#: V4.7 ISSUE-02 acceptance digest: the node-level ``contract_digest`` the
+#: monitor already stamps at dispatch (``executable_contract_digest([node])``,
+#: full SHA-256 as lowercase hex).  The acceptance reuses that digest rather
+#: than minting a second one; any other length or alphabet is not a digest.
+_CONTRACT_DIGEST64 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _text(value: str, name: str) -> str:
@@ -189,10 +194,52 @@ def verify_binding(
     return BindingVerificationResult("binding_verified", True)
 
 
+@dataclass(frozen=True)
+class VisibleSddAcceptance:
+    """Evidence a visible-sdd accepted event must carry (fail-closed).
+
+    ``contract_digest`` binds the in-session review evidence to the exact
+    node contract it reviewed (the node's existing dispatch-time
+    ``contract_digest``); ``protocol_ref`` names the shipped protocol
+    the session followed; ``evidence_ref`` points at the session delivery
+    round that cleared P0-P2.  Construction rejects any missing, blank or
+    malformed field, so no writer can persist a partial acceptance.
+    """
+
+    contract_digest: str
+    protocol_ref: str
+    evidence_ref: str
+
+    def __post_init__(self):
+        digest = _text(self.contract_digest, "contract_digest")
+        if not _CONTRACT_DIGEST64.fullmatch(digest):
+            raise ValueError("contract_digest must be 64 lowercase hex characters")
+        for name in ("protocol_ref", "evidence_ref"):
+            object.__setattr__(self, name, _text(getattr(self, name), name))
+
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "contract_digest": self.contract_digest,
+            "protocol_ref": self.protocol_ref,
+            "evidence_ref": self.evidence_ref,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Any) -> "VisibleSddAcceptance":
+        if not isinstance(payload, dict) or set(payload) != {
+            "contract_digest",
+            "protocol_ref",
+            "evidence_ref",
+        }:
+            raise ValueError("visible-sdd acceptance payload shape is invalid")
+        return cls(**payload)
+
+
 __all__ = [
     "LIFECYCLE_STATES",
     "RequestedBindingPolicy",
     "ProviderRuntimeBinding",
     "BindingVerificationResult",
+    "VisibleSddAcceptance",
     "verify_binding",
 ]

@@ -37,6 +37,7 @@ from .models import (
 )
 from .paths import ProjectPaths
 from .path_ownership import validate_path_ownership
+from .binding_lifecycle import VisibleSddAcceptance
 from .planner import resolve_consistency
 from . import dag as _dag_module
 from .dag import audit_dag, node_scoped_ready, ready_nodes
@@ -108,8 +109,10 @@ TOPOLOGY_DUAL_VISIBLE = "dual-visible"
 TOPOLOGY_BACKGROUND = "background"
 _DISPATCH_TOPOLOGIES = {TOPOLOGY_VISIBLE_SDD, TOPOLOGY_DUAL_VISIBLE, TOPOLOGY_BACKGROUND}
 
-#: Platform ruling (from the ISSUE-07 probe matrix) that upgrades a node to
-#: the single visible SDD session topology.
+#: Manifest capability-probe field name / ``DISPATCH_TOPOLOGY_MATRIX`` ruling
+#: value (adapter layer, from the ISSUE-07 probe matrix).  The supervisor
+#: translates it into the topology enum value ``visible-sdd`` (dispatch
+#: layer); the adapter-layer name itself is never a topology value.
 _RULING_IN_SESSION_SDD = "in_session_sdd"
 
 #: Protocol pointer carried by every visible-sdd create request so the worker
@@ -714,7 +717,10 @@ class Monitor:
         1. an authorization-bound ``dispatch_topology`` persisted in the node
            contract (stamped when the plan was materialized);
         2. the live platform ruling injected at monitor construction
-           (``in_session_sdd`` upgrades to a single visible SDD session);
+           (``in_session_sdd`` is the manifest capability-probe field name /
+           ``DISPATCH_TOPOLOGY_MATRIX`` ruling value at the adapter layer; the
+           supervisor translates it into the ``visible-sdd`` topology enum
+           value at the dispatch layer);
         3. the conservative ``dual-visible`` default.  UNKNOWN evidence never
            yields ``visible-sdd``.
         """
@@ -2247,6 +2253,22 @@ class Monitor:
             return binding.task_id or ""
         return None
 
+    def _live_node_contract_digest(self, node_id: str) -> str:
+        """Recompute the node contract digest from the live node contract.
+
+        V4.7 ISSUE-02: every path that turns a visible-sdd accepted event
+        into an accepted node compares the digest the event carries against
+        this recomputation, not merely against the snapshot copy stamped at
+        dispatch.  An empty or non-dict contract is unreadable and raises;
+        ``executable_contract_digest`` itself would happily digest ``None``,
+        so the refusal has to happen here.
+        """
+        node = self.nodes[node_id]
+        contract = getattr(node, "contract", None)
+        if not isinstance(contract, dict) or not contract:
+            raise ValueError("node contract content is unreadable")
+        return executable_contract_digest([node])
+
     def _replay_visible_sdd_acceptance(
         self,
         snapshot: RunSnapshot,
@@ -2260,7 +2282,10 @@ class Monitor:
         (the in-session reviewer role shares it); there is no reviewer
         binding to load.  Stale identity, lineage or digest evidence raises,
         exactly like the dual-visible replay; missing clearance evidence
-        fails closed to ``blocked_unknown`` without archiving.
+        fails closed to ``blocked_unknown`` without archiving.  The carried
+        ``contract_digest`` must also equal the digest recomputed from the
+        live node contract (ISSUE-02): a tampered contract invalidates the
+        event and the node never turns accepted.
         """
         current = snapshot.nodes[node_id]
         if provenance["role"] != "reviewer":
@@ -2289,6 +2314,12 @@ class Monitor:
             )
         contract_digest = data.get("contract_digest")
         authorization_epoch = data.get("authorization_epoch")
+        try:
+            live_digest = self._live_node_contract_digest(node_id)
+        except ValueError as error:
+            raise ValueError(
+                "unapplied visible-sdd acceptance node contract is unreadable"
+            ) from error
         if (
             not isinstance(contract_digest, str)
             or len(contract_digest) != 64
@@ -2296,6 +2327,7 @@ class Monitor:
                 character not in "0123456789abcdef" for character in contract_digest
             )
             or contract_digest != current.get("contract_digest")
+            or contract_digest != live_digest
             or authorization_epoch != snapshot.authorization_digest
         ):
             raise ValueError("unapplied acceptance contract epoch is stale")
@@ -3937,6 +3969,42 @@ class Monitor:
                 "visible-sdd delivery lacks verifiable in-session review evidence",
             )
             return
+        if review.get("protocol") != VISIBLE_SDD_PROTOCOL_REF:
+            # The session must have followed the protocol shipped with this
+            # package; a different or missing pointer is not the visible-sdd
+            # review this acceptance certifies.
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "visible-sdd delivery cites an unknown in-session review protocol",
+            )
+            return
+        # ISSUE-02: the acceptance evidence is bound to the node contract it
+        # reviewed.  The carried digest is the dispatch-time node digest and
+        # must still equal the digest recomputed from the live contract; an
+        # unreadable contract or a drifted one refuses the acceptance instead
+        # of writing an empty, placeholder or stale digest.
+        try:
+            live_digest = self._live_node_contract_digest(node_id)
+            acceptance = VisibleSddAcceptance(
+                contract_digest=current.get("contract_digest"),
+                protocol_ref=VISIBLE_SDD_PROTOCOL_REF,
+                evidence_ref=evidence_ref.strip(),
+            )
+        except ValueError as error:
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "visible-sdd acceptance refused: {}".format(error),
+            )
+            return
+        if acceptance.contract_digest != live_digest:
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "visible-sdd acceptance refused: contract digest does not match the live node contract",
+            )
+            return
         # The in-session reviewer acts under the same single session
         # identity (ISSUE-01/05 semantics): the acceptance provenance names
         # the reviewer role of that session, and the review proof travels in
@@ -3968,10 +4036,8 @@ class Monitor:
                 "node_id": node_id,
                 "evidence": evidence_ref.strip(),
                 "topology": TOPOLOGY_VISIBLE_SDD,
-                "protocol": review.get("protocol"),
-                "evidence_ref": evidence_ref.strip(),
                 "clearance": {"p0": 0, "p1": 0, "p2": 0},
-                "contract_digest": current["contract_digest"],
+                **acceptance.to_dict(),
                 "authorization_epoch": snapshot.authorization_digest,
             },
             {
