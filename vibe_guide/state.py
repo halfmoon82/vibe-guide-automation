@@ -225,6 +225,13 @@ _EVENT_DATA_KEYS = {
     "capacity",
     "parallel_groups",
     "monitor_entry_evidence",
+    # visible-sdd accepted event fields emitted by _accept_visible_sdd_delivery.
+    # Absent from this set they are silently dropped by _sanitize_event_data,
+    # leaving the persisted event incomplete for audit replay and future
+    # VisibleSddAcceptance.from_dict verification.
+    "protocol_ref",
+    "evidence_ref",
+    "clearance",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",

@@ -3784,6 +3784,28 @@ class Monitor:
                     snapshot, node_id, "reviewer identity or generation is stale"
                 )
                 return
+            # ISSUE-02 (dual-visible): recompute the live contract digest before
+            # recording the acceptance, matching the guard already in
+            # _accept_visible_sdd_delivery.  A drifted or unreadable contract
+            # must not silently bind a stale snapshot digest.
+            try:
+                live_digest = self._live_node_contract_digest(node_id)
+            except ValueError as error:
+                self._mark_blocked_unknown(
+                    snapshot,
+                    node_id,
+                    "dual-visible acceptance refused: node contract is unreadable ({})".format(
+                        error
+                    ),
+                )
+                return
+            if current.get("contract_digest") != live_digest:
+                self._mark_blocked_unknown(
+                    snapshot,
+                    node_id,
+                    "dual-visible acceptance refused: contract digest does not match the live node contract",
+                )
+                return
             acceptance_event = RunEvent(
                 event.event,
                 {
@@ -4804,11 +4826,22 @@ class Monitor:
                 current["status"] = "accepted"
                 contract_digest = data.get("contract_digest")
                 authorization_epoch = data.get("authorization_epoch")
+                # ISSUE-02 (dual-visible replay): recompute the live contract
+                # digest and require it to match, identical to the visible-sdd
+                # replay path at _replay_visible_sdd_acceptance.  A snapshot
+                # copy alone cannot detect a drifted contract.
+                try:
+                    live_digest = self._live_node_contract_digest(node_id)
+                except ValueError as error:
+                    raise ValueError(
+                        "unapplied dual-visible acceptance node contract is unreadable"
+                    ) from error
                 if (
                     not isinstance(contract_digest, str)
                     or len(contract_digest) != 64
                     or any(character not in "0123456789abcdef" for character in contract_digest)
                     or contract_digest != current.get("contract_digest")
+                    or contract_digest != live_digest
                     or authorization_epoch != snapshot.authorization_digest
                 ):
                     raise ValueError("unapplied acceptance contract epoch is stale")
