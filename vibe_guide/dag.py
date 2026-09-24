@@ -591,7 +591,8 @@ def _cycle_nodes(nodes: List[DAGNode]) -> List[str]:
     return sorted(found)
 
 
-_PATH_TOKEN_PATTERN = re.compile(r"[^\s，。；、：:\"'()（）\[\]<>《》〈〉“”‘’「」『』]+")
+# V4.8: CJK connectives 和/或/与/及 added as token delimiters.
+_PATH_TOKEN_PATTERN = re.compile(r"[^\s，。；、：:\"'()（）\[\]<>《》〈〉“”‘’「」『』和或与及]+")
 # A file path glued to prose without whitespace (``reports/测试输出.json供下游``)
 # still ends where its extension ends: one or more ``/``-separated segments,
 # then a final segment with an ASCII extension that is not itself continued by
