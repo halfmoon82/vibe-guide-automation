@@ -135,7 +135,7 @@ git diff --check
 ## 10. Git、worktree 与交付
 
 - 开发节点优先使用独立 worktree 或等价隔离目录；一个节点一个有效 writer。
-- **本项目 worktree 路径约定（唯一来源）**：所有 worker worktree 必须建在仓库内 `.worktrees/<slug>`，不得使用桌面兄弟目录（`../<slug>`）。兄弟目录会话找不到本项目 `.claude/settings.json`，`gh` 等需权限配置的命令会被全部拦截。`git worktree add` 示例：`git worktree add .worktrees/<slug> -b fix/<slug> origin/main`。
+- **本项目 worktree 路径约定**：所有 worker worktree 必须建在仓库内 `.worktrees/<slug>`（代码级来源：`vibe_guide/models.py` 的 `WORKTREE_PREFIX` / `node_worktree()`，自动派发的节点分支由 `node_branch()` 派生为 `node/<slug>`），不得使用桌面兄弟目录（`../<slug>`）。Claude Code 按会话 cwd 归属项目，仓库外目录拿不到本项目的权限/信任配置，`gh pr create` 等命令会被拦截（V4.7 实录见 run log 2026-09-23 §降级与偏差汇总第 2 条）。已验证的做法：worker 会话 cwd 保持主目录，所有命令以 `cd .worktrees/<slug> &&` 开头。监工手工建树示例：`git worktree add .worktrees/<slug> -b fix/<slug> origin/main`。
 - 创建任一桌面 App 独立任务前先确认 provider、目标项目、起始分支和 worktree；Codex App 使用 `create_thread`。同一 Issue 不得同时存在内部 subagent 与可见任务两个 writer。
 - 提交前只暂存当前任务白名单；禁止 `git add .` 和 `git add -A`。
 - `commit`、`push`、创建 MR、`merge` 作为一个 Git 远端动作授权组；deploy 仍是独立动作，不得把 Git 组描述成发布。
