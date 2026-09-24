@@ -228,7 +228,10 @@ _EVENT_DATA_KEYS = {
     # visible-sdd accepted event fields emitted by _accept_visible_sdd_delivery.
     # Absent from this set they are silently dropped by _sanitize_event_data,
     # leaving the persisted event incomplete for audit replay and future
-    # VisibleSddAcceptance.from_dict verification.
+    # VisibleSddAcceptance.from_dict verification.  All three are structural
+    # identifiers or integer severity counters; none carries provider text or
+    # secrets (protocol_ref and evidence_ref are exempted by _is_sensitive_data_key
+    # already; clearance is {"p0": 0, "p1": 0, "p2": 0}).
     "protocol_ref",
     "evidence_ref",
     "clearance",
