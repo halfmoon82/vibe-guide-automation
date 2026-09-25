@@ -27,12 +27,29 @@ def _run(command, *, cwd, env=None):
     )
 
 
+def _setup_py_version_literal():
+    """The `version=` literal setuptools<61 builds from, read without executing."""
+    tree = ast.parse((ROOT / "setup.py").read_text(encoding="utf-8"))
+    return next(
+        keyword.value.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "setup"
+        for keyword in node.keywords
+        if keyword.arg == "version"
+    )
+
+
 class PackagingV310Tests(unittest.TestCase):
     def test_metadata_and_source_version_are_consistent(self):
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertRegex(pyproject, rf"(?ms)^\[project\].*?^version\s*=\s*['\"]{TARGET_VERSION}['\"]")
         setup_version = _run([sys.executable, "setup.py", "--version"], cwd=ROOT).stdout.strip()
         self.assertEqual(setup_version, TARGET_VERSION)
+        # `setup.py --version` answers from pyproject on setuptools>=61, so it
+        # stays green while setup.py's own literal rots. On the setuptools 58
+        # path the README documents for Python 3.9, that literal is what ships:
+        # it sat at 4.5.0 through the 4.8.0 bump. Assert the literal itself.
+        self.assertEqual(_setup_py_version_literal(), TARGET_VERSION)
         source = (ROOT / "vibe_guide" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn(f'__version__ = "{TARGET_VERSION}"', source)
 
