@@ -1,0 +1,128 @@
+name: release-tag-gate
+
+# 只在 push tag 和手动触发时跑，不挂 PR。
+# 起因：v4.8 打在了 bump 提交 9024381 之前，tag 上三处版本声明全是 4.5.0，
+# 而 Release 一个资产都没有——用户照 README 安装装出了 4.5.0。
+# 本门禁把「tag 版本 == 包版本」和「Release 必须有资产」变成机器检查。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的 tag（手动补跑用，例如 v4.8）"
+        required: true
+
+concurrency:
+  group: release-tag-gate-${{ github.event.inputs.tag || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    # ubuntu 专用：本门禁的断言与平台无关，macOS runner 计费 ×10。
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: echo "name=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.name }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tag version must equal package version
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          python - <<'PY'
+          import ast, os, re, sys
+
+          tag = os.environ["TAG"]
+
+          def norm(raw):
+              """v4.8 和 v4.8.0 是同一个版本：补齐到三段再比。"""
+              parts = raw.lstrip("v").split(".")
+              if not all(p.isdigit() for p in parts) or not 1 <= len(parts) <= 3:
+                  sys.exit(f"tag {raw!r} 不是 vX[.Y[.Z]] 形式，无法校验")
+              return tuple(int(p) for p in parts + ["0"] * (3 - len(parts)))
+
+          init = open("vibe_guide/__init__.py", encoding="utf-8").read()
+          package = re.search(r'__version__ = "([^"]+)"', init).group(1)
+
+          pyproject = open("pyproject.toml", encoding="utf-8").read()
+          declared = re.search(
+              r'(?ms)^\[project\].*?^version\s*=\s*"([^"]+)"', pyproject
+          ).group(1)
+
+          # setuptools<61 不读 PEP 621，构建时取的是 setup.py 的字面量。
+          # 只有它也对，README 记载的 Python 3.9 legacy 路径才装得出正确版本。
+          tree = ast.parse(open("setup.py", encoding="utf-8").read())
+          literal = next(
+              kw.value.value
+              for node in ast.walk(tree)
+              if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "setup"
+              for kw in node.keywords
+              if kw.arg == "version"
+          )
+
+          carriers = {
+              "vibe_guide/__init__.py": package,
+              "pyproject.toml": declared,
+              "setup.py": literal,
+          }
+          for path, value in carriers.items():
+              print(f"{path}: {value}")
+          print(f"tag: {tag}")
+
+          bad = [f"{p} = {v}" for p, v in carriers.items() if v != package]
+          if bad:
+              sys.exit("包内版本声明不一致：" + "；".join(bad))
+          if norm(tag) != norm(package):
+              sys.exit(f"tag {tag} 与包版本 {package} 不一致——tag 很可能打在 bump 之前")
+          print(f"OK: tag {tag} 与三处版本声明一致")
+          PY
+
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade build
+          python -m build --outdir dist
+          ls -l dist
+
+      - name: Built artifacts must carry the tag version
+        run: |
+          python - <<'PY'
+          import os, re
+
+          version = re.search(
+              r'__version__ = "([^"]+)"',
+              open("vibe_guide/__init__.py", encoding="utf-8").read(),
+          ).group(1)
+          built = sorted(os.listdir("dist"))
+          expected = {
+              f"vibe_guide-{version}-py3-none-any.whl",
+              f"vibe_guide-{version}.tar.gz",
+          }
+          missing = expected - set(built)
+          if missing:
+              raise SystemExit(f"构建产物缺失或版本不符：缺 {sorted(missing)}，实际 {built}")
+          print(f"OK: {built}")
+          PY
+
+      - name: Attach artifacts to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --notes "Release $TAG"
+          gh release upload "$TAG" dist/* --clobber
+          gh release view "$TAG" --json assets -q '.assets[].name'
