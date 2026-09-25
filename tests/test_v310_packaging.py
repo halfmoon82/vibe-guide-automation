@@ -276,7 +276,13 @@ def _previous_release(test):
             parts = tuple(int(part) for part in tag[1:].split("."))
         except ValueError:
             continue
-        if len(parts) == 3 and parts < target:
+        # Tags are a mix of three-part (v4.5.0) and two-part (v4.8); pad so the
+        # short ones stay in the running. Requiring three parts silently dropped
+        # v4.8, and would have hard-failed here once the padded tags aged out.
+        if not 1 <= len(parts) <= 3:
+            continue
+        parts += (0,) * (3 - len(parts))
+        if parts < target:
             candidates.append((parts, tag))
     test.assertTrue(candidates, "no tagged release below %s to upgrade from" % TARGET_VERSION)
     parts, tag = max(candidates)

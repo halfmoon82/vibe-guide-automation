@@ -43,7 +43,13 @@ jobs:
           # $() 和反引号，dispatch 的 input 更是完全自由文本。
           RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         id: tag
-        run: printf 'name=%s\n' "$RAW_TAG" >> "$GITHUB_OUTPUT"
+        run: |
+          # dispatch 的 input 可以含换行，直接 printf 会往 $GITHUB_OUTPUT 里
+          # 多写几行，污染后续 step 的输入。tag 名不可能长这样，直接拒。
+          case "$RAW_TAG" in
+            *[!A-Za-z0-9._/-]*|"") echo "tag '$RAW_TAG' 含非法字符"; exit 1 ;;
+          esac
+          printf 'name=%s\n' "$RAW_TAG" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
@@ -54,6 +60,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Bootstrap build tooling
+        # setup-python 的工具缓存只装 pip——3.12 起 ensurepip 不再捆绑
+        # setuptools/wheel。而打包验收要跑 setup.py --version / bdist_wheel /
+        # sdist，第一行 import setuptools 就会炸。本机 python3 预装了才看着是绿的。
+        run: python -m pip install --upgrade setuptools wheel
 
       - name: Tag version must equal package version
         env:
@@ -73,7 +85,7 @@ jobs:
                   sys.exit(f"没找到{what}，无法校验版本")
               return found.group(1)
 
-          def norm(raw):
+          def norm(raw, what):
               """v4.8 和 v4.8.0 是同一个版本：补齐到三段再比。
 
               历史 tag 是 v4.4.0/v4.5.0 三段式，v4.8 是两段式（为保持
@@ -83,7 +95,7 @@ jobs:
               # 但只允许一个，vv4.8 这类畸形要拒。
               shape = re.fullmatch(r"v?([0-9]+)(?:\.([0-9]+))?(?:\.([0-9]+))?", raw)
               if not shape:
-                  sys.exit(f"{raw!r} 不是 [v]X[.Y[.Z]] 形式，无法校验")
+                  sys.exit(f"{what} {raw!r} 不是 [v]X[.Y[.Z]] 形式，无法校验")
               return tuple(int(p or 0) for p in shape.groups())
 
           package = must(r'__version__ = "([^"]+)"', read("vibe_guide/__init__.py"), "__init__.py 的 __version__")
@@ -91,7 +103,7 @@ jobs:
           # 先切出 [project] 段再找 version：`.*?` 会跨 section 边界，
           # 若 [project] 改成 dynamic 而后面某个 tool 段恰好有 version，会误绿。
           section = must(r"(?ms)^\[project\]\n(.*?)(?=^\[|\Z)", read("pyproject.toml"), "pyproject.toml 的 [project] 段")
-          declared = must(r'^version\s*=\s*"([^"]+)"', section, "[project] 段内的 version", re.M)
+          declared = must(r"""^version\s*=\s*['"]([^'"]+)['"]""", section, "[project] 段内的 version", re.M)
 
           # setuptools<61 不读 PEP 621，构建时取的是 setup.py 的字面量。
           # 只有它也对，README 记载的 Python 3.9 legacy 路径才装得出正确版本。
@@ -121,13 +133,25 @@ jobs:
           if bad:
               sys.exit(f"以 __init__.py={package} 为准，以下版本声明不一致：" + "；".join(bad))
 
-          # README 是用户实际照着装的那份，且 README.en.md 写死了 wheel 文件名。
-          # 它在 4.8 这一轮整篇停在 4.5.0，是下一次同类漂移最可能的载体。
-          for doc in ("README.md", "README.en.md"):
-              if package not in read(doc):
-                  sys.exit(f"{doc} 里没有出现当前版本 {package}，安装说明已过期")
+          # README 是用户实际照着装的那份。整篇 substring 不够：只要文中任何
+          # 一处（哪怕是「历史」小节）提到新版本就绿，而 README.en.md 那条
+          # 写死 wheel 文件名的安装命令照样停在旧版本——正是要堵的那类漂移。
+          # 所以锚到承载事实的那一行。
+          v = re.escape(package)
+          anchors = {
+              "README.md": [rf"当前发行版本为 `{v}`"],
+              "README.en.md": [
+                  rf"The current release is \*\*{v}\*\*",
+                  rf"vibe_guide-{v}-py3-none-any\.whl",
+              ],
+          }
+          for doc, patterns in anchors.items():
+              text = read(doc)
+              for pattern in patterns:
+                  if not re.search(pattern, text):
+                      sys.exit(f"{doc} 里找不到 {pattern!r}：安装说明停在旧版本")
 
-          if norm(tag) != norm(package):
+          if norm(tag, "tag") != norm(package, "包版本"):
               sys.exit(f"tag {tag} 与包版本 {package} 不一致——tag 很可能打在 bump 之前")
           print(f"OK: tag {tag}、三处版本声明、两份 README 全部一致")
           PY
@@ -140,6 +164,9 @@ jobs:
 
       - name: Build wheel and sdist
         run: |
+          # 上一步的验收会在树里留下 build/lib 和 egg-info，setuptools 会复用，
+          # 先清掉，避免把上一次的残留打进这次的产物。
+          rm -rf build dist ./*.egg-info
           python -m pip install --upgrade build
           python -m build --outdir dist
           ls -l dist
@@ -173,4 +200,8 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 \
             || gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
           gh release upload "$TAG" dist/* --clobber
+          # draft Release 的资产不可公开下载。view/upload 全都成功、资产名也打得出来，
+          # 但用户点链接下不到东西——绿灯掩盖空手而归，必须显式断言。
+          test "$(gh release view "$TAG" --json isDraft -q .isDraft)" = "false" \
+            || { echo "Release $TAG 仍是 draft，资产不可下载"; exit 1; }
           gh release view "$TAG" --json assets -q '.assets[].name'
