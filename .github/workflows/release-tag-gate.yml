@@ -138,10 +138,12 @@ jobs:
           # 写死 wheel 文件名的安装命令照样停在旧版本——正是要堵的那类漂移。
           # 所以锚到承载事实的那一行。
           v = re.escape(package)
+          t = re.escape(tag)
           anchors = {
-              "README.md": [rf"当前发行版本为 `{v}`"],
+              "README.md": [rf"当前发行版本为 `{v}`", rf"`{t}`"],
               "README.en.md": [
                   rf"The current release is \*\*{v}\*\*",
+                  rf"`{t}`",
                   rf"vibe_guide-{v}-py3-none-any\.whl",
               ],
           }
@@ -150,6 +152,13 @@ jobs:
               for pattern in patterns:
                   if not re.search(pattern, text):
                       sys.exit(f"{doc} 里找不到 {pattern!r}：安装说明停在旧版本")
+              # 版本号锚定管不到 tag 引用：README.md 那句「版本真相以 `v4.8` tag
+              # ⋯为准」正是告诉用户去哪儿下载的，改版本号时漏改它，门禁照样绿。
+              # 反引号 v-token 在两份 README 里只用于指代当前 tag（历史版本写作
+              # V2.0.0、V4.4，大写且无反引号），所以要求它们全部等于本次 tag。
+              stale = {m for m in re.findall(r"`v[0-9][0-9.]*`", text) if m != f"`{tag}`"}
+              if stale:
+                  sys.exit(f"{doc} 里还留着旧 tag 引用 {sorted(stale)}，应为 `{tag}`")
 
           if norm(tag, "tag") != norm(package, "包版本"):
               sys.exit(f"tag {tag} 与包版本 {package} 不一致——tag 很可能打在 bump 之前")
@@ -204,4 +213,16 @@ jobs:
           # 但用户点链接下不到东西——绿灯掩盖空手而归，必须显式断言。
           test "$(gh release view "$TAG" --json isDraft -q .isDraft)" = "false" \
             || { echo "Release $TAG 仍是 draft，资产不可下载"; exit 1; }
-          gh release view "$TAG" --json assets -q '.assets[].name'
+          # --clobber 只覆盖**同名**资产（gh 原话：Overwrite existing assets of the
+          # same name）。同一 tag 上一次半截运行或人工传过的旧版本产物会安静活下来，
+          # 用户点链接可能下到错的版本——正是本门禁起因那个失败模式的另一条路径。
+          # isDraft 堵的是「下不到」，这里堵的是「下到错的」。
+          expected=$(cd dist && printf '%s\n' * | LC_ALL=C sort)
+          actual=$(gh release view "$TAG" --json assets -q '.assets[].name' | LC_ALL=C sort)
+          if [ "$expected" != "$actual" ]; then
+            echo "Release $TAG 的资产与本次产物不一致："
+            diff <(echo "$expected") <(echo "$actual") || true
+            exit 1
+          fi
+          echo "OK: Release 资产集合与本次产物完全一致"
+          echo "$actual"

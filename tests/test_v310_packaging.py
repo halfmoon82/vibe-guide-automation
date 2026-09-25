@@ -2,6 +2,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -294,8 +295,20 @@ def _previous_release(test):
         if parts < target:
             candidates.append((parts, tag))
     test.assertTrue(candidates, "no tagged release below %s to upgrade from" % TARGET_VERSION)
-    parts, tag = max(candidates)
-    return ".".join(str(part) for part in parts), tag
+    _, tag = max(candidates)
+    # The version a tag *ships* is the one declared inside it, which is not
+    # always the one its name implies: v4.8 was cut before the 4.8.0 bump and
+    # declared 4.5.0 until the tag was moved. The release gate stops that for
+    # tags cut from a commit that carries the workflow, but a tag cut from an
+    # older commit never triggers it -- exactly how this happened. So read the
+    # version out of the tag rather than inferring it from the tag name.
+    source = subprocess.run(
+        ["git", "show", "%s:vibe_guide/__init__.py" % tag],
+        cwd=ROOT, check=True, text=True, stdout=subprocess.PIPE,
+    ).stdout
+    found = re.search(r'__version__ = "([^"]+)"', source)
+    test.assertIsNotNone(found, "tag %s declares no __version__" % tag)
+    return found.group(1), tag
 
 
 if __name__ == "__main__":
