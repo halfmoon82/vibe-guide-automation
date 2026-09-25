@@ -400,6 +400,9 @@ class CliContractTests(unittest.TestCase):
 
         from vibe_guide import __version__ as current_version
         self.assertEqual((name, version), ("vibe-guide", current_version))
+        # `--version` above answers from pyproject on setuptools>=61; the legacy
+        # path this test is named for reads the literal, so assert it directly.
+        self.assertIn(f'version="{current_version}"', setup_text)
         self.assertIn("vibe=vibe_guide.cli:main", setup_text)
         self.assertIn('python_requires=">=3.9"', setup_text)
 
