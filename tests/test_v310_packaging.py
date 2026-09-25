@@ -302,13 +302,25 @@ def _previous_release(test):
     # tags cut from a commit that carries the workflow, but a tag cut from an
     # older commit never triggers it -- exactly how this happened. So read the
     # version out of the tag rather than inferring it from the tag name.
-    source = subprocess.run(
+    show = subprocess.run(
         ["git", "show", "%s:vibe_guide/__init__.py" % tag],
-        cwd=ROOT, check=True, text=True, stdout=subprocess.PIPE,
-    ).stdout
-    found = re.search(r'__version__ = "([^"]+)"', source)
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    test.assertEqual(show.returncode, 0, "cannot read %s: %s" % (tag, show.stderr.strip()))
+    found = re.search(r'__version__ = "([^"]+)"', show.stdout)
     test.assertIsNotNone(found, "tag %s declares no __version__" % tag)
-    return found.group(1), tag
+    version = found.group(1)
+    # Reading the version out of the tag means the tag *name* no longer bounds
+    # it. A tag cut after the bump declares TARGET_VERSION itself, and the
+    # upgrade test silently degenerates into new -> new: every assertion still
+    # passes while nothing is being verified. Bound it here instead.
+    shipped = tuple(int(part) for part in version.split("."))
+    test.assertLess(
+        shipped + (0,) * (3 - len(shipped)), target,
+        "tag %s declares %s, not below %s: no upgrade path to verify"
+        % (tag, version, TARGET_VERSION),
+    )
+    return version, tag
 
 
 if __name__ == "__main__":

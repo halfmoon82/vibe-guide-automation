@@ -72,7 +72,7 @@ jobs:
           TAG: ${{ steps.tag.outputs.name }}
         run: |
           python - <<'PY'
-          import ast, os, re, sys
+          import ast, os, re, subprocess, sys
 
           tag = os.environ["TAG"]
 
@@ -154,9 +154,16 @@ jobs:
                       sys.exit(f"{doc} 里找不到 {pattern!r}：安装说明停在旧版本")
               # 版本号锚定管不到 tag 引用：README.md 那句「版本真相以 `v4.8` tag
               # ⋯为准」正是告诉用户去哪儿下载的，改版本号时漏改它，门禁照样绿。
-              # 反引号 v-token 在两份 README 里只用于指代当前 tag（历史版本写作
-              # V2.0.0、V4.4，大写且无反引号），所以要求它们全部等于本次 tag。
-              stale = {m for m in re.findall(r"`v[0-9][0-9.]*`", text) if m != f"`{tag}`"}
+              # 只认**真实存在的 tag**：反引号 v-token 也被用来写 Node `v20`、
+              # API `v1` 这类无关版本，全匹配会把它们判成过期 tag，还会建议把
+              # Node 版本改成本次 release 号。代价是「`v4.5.0` 升级说明」这类
+              # 刻意的历史引用也会红——历史版本按现有写法写成 V4.5.0 即可。
+              known = set(subprocess.run(
+                  ["git", "tag", "--list", "v*"], text=True, check=True,
+                  stdout=subprocess.PIPE,
+              ).stdout.split())
+              stale = {m for m in re.findall(r"`(v[0-9][0-9.]*)`", text)
+                       if m != tag and m in known}
               if stale:
                   sys.exit(f"{doc} 里还留着旧 tag 引用 {sorted(stale)}，应为 `{tag}`")
 
@@ -201,6 +208,10 @@ jobs:
           PY
 
       - name: Attach artifacts to the release
+        # 默认是 `bash -e`，管道只看最后一节：gh 挂了 actual 变成空串，
+        # 下面会报成「资产不一致」而不是「查不到 Release」，把人指向错方向。
+        # `shell: bash` 换成 `bash -eo pipefail`。
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
