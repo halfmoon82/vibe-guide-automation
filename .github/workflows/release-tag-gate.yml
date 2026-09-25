@@ -1,0 +1,207 @@
+name: release-tag-gate
+
+# 只在 push tag 和手动触发时跑，不挂 PR。
+# 起因：v4.8 打在 bump 提交 9024381 之前，tag 上三处版本声明全是 4.5.0，
+# 而 Release 一个资产都没有——用户照 README 安装装出了 4.5.0。
+# 本门禁把「tag 版本 == 包版本」「产物可安装」「Release 必须有资产」变成机器检查。
+#
+# 重要前提：push 事件用的是**被推送那个 tag 所指提交里的** workflow 定义。
+# 所以 tag 必须打在含有本文件的提交上，否则本门禁不触发且不会有任何提示。
+# 手动补跑（workflow_dispatch）时 ref 要选 main，选 tag 会找不到本文件。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的 tag（例如 v4.8）。注意上方 ref 必须选 main，不要选 tag。"
+        required: true
+
+concurrency:
+  # 两种触发都归一到 ref_name，否则 push 落在 refs/tags/v4.8、
+  # dispatch 落在 v4.8，同一个 tag 分到两个组，会在上传资产时对撞。
+  group: release-tag-gate-${{ github.event.inputs.tag || github.ref_name }}
+  # 本 job 会改动 Release。发版一年个位数次，排队成本可忽略，
+  # 但中途被取消会留下「只传了 wheel 没传 sdist」的半截状态，且显示为
+  # cancelled 而非 failed，极易被当成无害。故不取消，排队。
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    # ubuntu 专用：本门禁的断言与平台无关，macOS runner 计费 ×10。
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.repository == 'halfmoon82/vibe-guide-automation'
+    steps:
+      - name: Resolve tag
+        env:
+          # 经 env 传入，不把 ${{ }} 直接插进 shell 字符串：tag 名可以合法包含
+          # $() 和反引号，dispatch 的 input 更是完全自由文本。
+          RAW_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        id: tag
+        run: |
+          # dispatch 的 input 可以含换行，直接 printf 会往 $GITHUB_OUTPUT 里
+          # 多写几行，污染后续 step 的输入。tag 名不可能长这样，直接拒。
+          case "$RAW_TAG" in
+            *[!A-Za-z0-9._/-]*|"") echo "tag '$RAW_TAG' 含非法字符"; exit 1 ;;
+          esac
+          printf 'name=%s\n' "$RAW_TAG" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.name }}
+          # 打包验收测试要 `git tag --list` 找上一个 release 做升级/回滚。
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bootstrap build tooling
+        # setup-python 的工具缓存只装 pip——3.12 起 ensurepip 不再捆绑
+        # setuptools/wheel。而打包验收要跑 setup.py --version / bdist_wheel /
+        # sdist，第一行 import setuptools 就会炸。本机 python3 预装了才看着是绿的。
+        run: python -m pip install --upgrade setuptools wheel
+
+      - name: Tag version must equal package version
+        env:
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          python - <<'PY'
+          import ast, os, re, sys
+
+          tag = os.environ["TAG"]
+
+          def read(path):
+              return open(path, encoding="utf-8").read()
+
+          def must(pattern, text, what, flags=0):
+              found = re.search(pattern, text, flags)
+              if not found:
+                  sys.exit(f"没找到{what}，无法校验版本")
+              return found.group(1)
+
+          def norm(raw, what):
+              """v4.8 和 v4.8.0 是同一个版本：补齐到三段再比。
+
+              历史 tag 是 v4.4.0/v4.5.0 三段式，v4.8 是两段式（为保持
+              Release 链接不变而保留），两种都要能过。
+              """
+              # 本函数同时用于 tag（带 v）和包版本（不带 v），故 v 可选；
+              # 但只允许一个，vv4.8 这类畸形要拒。
+              shape = re.fullmatch(r"v?([0-9]+)(?:\.([0-9]+))?(?:\.([0-9]+))?", raw)
+              if not shape:
+                  sys.exit(f"{what} {raw!r} 不是 [v]X[.Y[.Z]] 形式，无法校验")
+              return tuple(int(p or 0) for p in shape.groups())
+
+          package = must(r'__version__ = "([^"]+)"', read("vibe_guide/__init__.py"), "__init__.py 的 __version__")
+
+          # 先切出 [project] 段再找 version：`.*?` 会跨 section 边界，
+          # 若 [project] 改成 dynamic 而后面某个 tool 段恰好有 version，会误绿。
+          section = must(r"(?ms)^\[project\]\n(.*?)(?=^\[|\Z)", read("pyproject.toml"), "pyproject.toml 的 [project] 段")
+          declared = must(r"""^version\s*=\s*['"]([^'"]+)['"]""", section, "[project] 段内的 version", re.M)
+
+          # setuptools<61 不读 PEP 621，构建时取的是 setup.py 的字面量。
+          # 只有它也对，README 记载的 Python 3.9 legacy 路径才装得出正确版本。
+          # 注意本 workflow 用 `python -m build`（PEP 517），构建本身不走这条路，
+          # 所以这是纯静态校验，不会被构建顺带验证。
+          tree = ast.parse(read("setup.py"))
+          literal = next(
+              (
+                  kw.value.value
+                  for node in ast.walk(tree)
+                  if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "setup"
+                  for kw in node.keywords
+                  if kw.arg == "version" and isinstance(kw.value, ast.Constant)
+              ),
+              None,
+          )
+          if literal is None:
+              sys.exit("setup.py 的 setup(version=...) 不是字符串字面量，无法校验")
+
+          carriers = {"pyproject.toml": declared, "setup.py": literal}
+          print(f"vibe_guide/__init__.py: {package}  (参照)")
+          for path, value in carriers.items():
+              print(f"{path}: {value}")
+          print(f"tag: {tag}")
+
+          bad = [f"{p}={v}" for p, v in carriers.items() if v != package]
+          if bad:
+              sys.exit(f"以 __init__.py={package} 为准，以下版本声明不一致：" + "；".join(bad))
+
+          # README 是用户实际照着装的那份。整篇 substring 不够：只要文中任何
+          # 一处（哪怕是「历史」小节）提到新版本就绿，而 README.en.md 那条
+          # 写死 wheel 文件名的安装命令照样停在旧版本——正是要堵的那类漂移。
+          # 所以锚到承载事实的那一行。
+          v = re.escape(package)
+          anchors = {
+              "README.md": [rf"当前发行版本为 `{v}`"],
+              "README.en.md": [
+                  rf"The current release is \*\*{v}\*\*",
+                  rf"vibe_guide-{v}-py3-none-any\.whl",
+              ],
+          }
+          for doc, patterns in anchors.items():
+              text = read(doc)
+              for pattern in patterns:
+                  if not re.search(pattern, text):
+                      sys.exit(f"{doc} 里找不到 {pattern!r}：安装说明停在旧版本")
+
+          if norm(tag, "tag") != norm(package, "包版本"):
+              sys.exit(f"tag {tag} 与包版本 {package} 不一致——tag 很可能打在 bump 之前")
+          print(f"OK: tag {tag}、三处版本声明、两份 README 全部一致")
+          PY
+
+      - name: Packaging acceptance (wheel / sdist / source install + upgrade path)
+        # AGENTS.md:148 要求 wheel、sdist、源码安装分别验证，且验证明确的
+        # 旧版本到新版本路径。只比对产物文件名不够：一个文件名正确但
+        # import 就炸、或漏了 protocols/*.md 的包，光看文件名会照样放行。
+        run: python -m unittest tests.test_v310_packaging -v
+
+      - name: Build wheel and sdist
+        run: |
+          # 上一步的验收会在树里留下 build/lib 和 egg-info，setuptools 会复用，
+          # 先清掉，避免把上一次的残留打进这次的产物。
+          rm -rf build dist ./*.egg-info
+          python -m pip install --upgrade build
+          python -m build --outdir dist
+          ls -l dist
+
+      - name: Built artifacts must carry the tag version
+        run: |
+          python - <<'PY'
+          import os, re, sys
+
+          version = re.search(
+              r'__version__ = "([^"]+)"',
+              open("vibe_guide/__init__.py", encoding="utf-8").read(),
+          ).group(1)
+          built = sorted(os.listdir("dist"))
+
+          # sdist 命名随 setuptools 世代在 vibe-guide- 和 vibe_guide- 之间变过，
+          # 两种都接受，避免解析到旧版本时误红挡住发版。
+          wheels = [f for f in built if f == f"vibe_guide-{version}-py3-none-any.whl"]
+          sdists = [f for f in built if f in (f"vibe_guide-{version}.tar.gz", f"vibe-guide-{version}.tar.gz")]
+          if len(wheels) != 1 or len(sdists) != 1 or len(built) != 2:
+              sys.exit(f"产物不符：期望 {version} 的一个 wheel + 一个 sdist，实际 {built}")
+          print(f"OK: {built}")
+          PY
+
+      - name: Attach artifacts to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/* --clobber
+          # draft Release 的资产不可公开下载。view/upload 全都成功、资产名也打得出来，
+          # 但用户点链接下不到东西——绿灯掩盖空手而归，必须显式断言。
+          test "$(gh release view "$TAG" --json isDraft -q .isDraft)" = "false" \
+            || { echo "Release $TAG 仍是 draft，资产不可下载"; exit 1; }
+          gh release view "$TAG" --json assets -q '.assets[].name'
