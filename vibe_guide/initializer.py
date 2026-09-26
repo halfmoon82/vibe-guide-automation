@@ -373,7 +373,8 @@ def init_project(paths, confirm):
         notes.append(
             'AGENTS.md 的「' + VIBE_ENTRY_RULE_MARKER + '」块与当前版本不一致：'
             '可能是旧版块，也可能是本地改写；init 不会重复提案同名小节，'
-            '请人工对照 .vibe/proposals/agentsmd/ 的最新提案内容手动更新。'
+            '.vibe/proposals/agentsmd/ 的既有提案也可能同样是旧版。'
+            '请人工对照包内最新块（python -c "from vibe_guide.scanner import VIBE_ENTRY_RULES; print(VIBE_ENTRY_RULES)"）手动更新。'
         )
     return InitResult(bool(created), created, notes)
 
