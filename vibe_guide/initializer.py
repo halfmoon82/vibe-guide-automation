@@ -5,6 +5,8 @@ import json, tempfile
 
 from .scanner import (
     AGENTSMD_BLOCKS,
+    VIBE_ENTRY_CURRENT_SENTINEL,
+    VIBE_ENTRY_RULE_MARKER,
     build_agentsmd_patch,
     missing_agentsmd_blocks,
     scan_project,
@@ -340,15 +342,38 @@ def init_project(paths, confirm):
         vibe_entry.parent.mkdir(parents=True, exist_ok=True)
         _write_new(vibe_entry, load_protocol(VIBE_ENTRY_NAME))
         created.append(VIBE_ENTRY_PROPOSAL_RELATIVE)
-    elif vibe_entry.is_file() and not vibe_entry.is_symlink() and vibe_entry.read_text(encoding='utf-8') != load_protocol(VIBE_ENTRY_NAME):
-        # The copy is never rewritten, so a difference stays silent forever
-        # unless surfaced here.  The cause is ambiguous -- a local edit or a
-        # shipped-protocol update -- so the note says both and leaves the
-        # merge to a human.
+    elif vibe_entry.is_file() and not vibe_entry.is_symlink():
+        try:
+            current_entry = vibe_entry.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError):
+            current_entry = None
+        if current_entry is None:
+            notes.append(
+                VIBE_ENTRY_PROPOSAL_RELATIVE
+                + ' 读不出来，本次跳过一致性比对；vibe 永不改写该文件，请人工核对。'
+            )
+        elif current_entry != load_protocol(VIBE_ENTRY_NAME):
+            # The copy is never rewritten, so a difference stays silent
+            # forever unless surfaced here.  The cause is ambiguous -- a
+            # local edit or a shipped-protocol update -- so the note says
+            # both and leaves the merge to a human.
+            notes.append(
+                VIBE_ENTRY_PROPOSAL_RELATIVE
+                + ' 与随包协议不一致：可能是本地修改，也可能是随包协议已更新；'
+                + 'vibe 永不改写该文件，请人工 diff 后手动合并。'
+            )
+    # The AGENTS.md entry block has the same silent-staleness gap: marker
+    # detection only answers "a block is present", never "it is current",
+    # and the heading-level dedup never re-proposes a same-named section.
+    if (
+        report.agentsmd_content
+        and VIBE_ENTRY_RULE_MARKER in report.agentsmd_content
+        and VIBE_ENTRY_CURRENT_SENTINEL not in report.agentsmd_content
+    ):
         notes.append(
-            VIBE_ENTRY_PROPOSAL_RELATIVE
-            + ' 与随包协议不一致：可能是本地修改，也可能是随包协议已更新；'
-            + 'vibe 永不改写该文件，请人工 diff 后手动合并。'
+            'AGENTS.md 的「' + VIBE_ENTRY_RULE_MARKER + '」块与当前版本不一致：'
+            '可能是旧版块，也可能是本地改写；init 不会重复提案同名小节，'
+            '请人工对照 .vibe/proposals/agentsmd/ 的最新提案内容手动更新。'
         )
     return InitResult(bool(created), created, notes)
 

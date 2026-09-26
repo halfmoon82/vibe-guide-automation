@@ -196,6 +196,10 @@ VIBE_ENTRY_RULES = """## New Session Entry
 - 会话门阻塞必须停下报告，不得伪造或跳过。
 """
 
+#: Substring unique to the current entry-block wording.  The marker only
+#: answers "a block is present"; this answers "it is the current block".
+VIBE_ENTRY_CURRENT_SENTINEL = "凡经 S1 评分的请求"
+
 #: Every rule block this release ships, in document order.
 AGENTSMD_BLOCKS = (CAPABILITY_RULES, PRD_GUIDE_RULES, VIBE_ENTRY_RULES)
 

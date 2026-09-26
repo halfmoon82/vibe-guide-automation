@@ -130,6 +130,37 @@ class VibeEntryMaterializationTests(unittest.TestCase):
             quiet = self._init(root)
             self.assertFalse(any("不一致" in note for note in quiet.notes), quiet.notes)
 
+    def test_reinit_notes_stale_agentsmd_entry_block(self):
+        """An AGENTS.md carrying the old entry block passes marker detection
+        forever (heading dedup never re-proposes it), so init must surface a
+        note instead of leaving the stale block silent."""
+        from vibe_guide.scanner import VIBE_ENTRY_RULES
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._init(root)
+            stale_block = (
+                "## New Session Entry\n\n"
+                "- 开发/改动/排查类请求先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1，不逢任务必过 vibe。\n"
+                "- 会话门阻塞必须停下报告，不得伪造或跳过。\n"
+            )
+            (root / "AGENTS.md").write_text("# P\n\n" + stale_block, encoding="utf-8")
+            result = self._init(root)
+            self.assertTrue(any("New Session Entry" in note for note in result.notes), result.notes)
+            # A current block stays quiet.
+            (root / "AGENTS.md").write_text("# P\n\n" + VIBE_ENTRY_RULES, encoding="utf-8")
+            quiet = self._init(root)
+            self.assertFalse(any("New Session Entry" in note for note in quiet.notes), quiet.notes)
+
+    def test_reinit_unreadable_skill_notes_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._init(root)
+            skill = root / ".vibe" / "proposals" / "skills" / "vibe-entry" / "SKILL.md"
+            skill.write_bytes(b"\xff\xfe\x00not-utf8")
+            result = self._init(root)
+            self.assertEqual(skill.read_bytes(), b"\xff\xfe\x00not-utf8")
+            self.assertTrue(any("读不出来" in note for note in result.notes), result.notes)
+
     def test_reinit_preserves_user_edited_skill(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
