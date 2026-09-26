@@ -191,10 +191,14 @@ def scan_project(paths):
 VIBE_ENTRY_RULE_MARKER = "New Session Entry"
 VIBE_ENTRY_RULES = """## New Session Entry
 
-- 开发/改动/排查类请求先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1，不逢任务必过 vibe。
-- 自评 >15 或拿不准时才 `vibe scan` 并 `vibe plan --request --s1` 进入正式路由；<=15 直接执行或轻规划。
+- 开发/改动/排查类请求（「排查」含只读日志/生产数据分析）先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1，不逢任务必过 vibe。
+- 凡经 S1 评分的请求，评分后输出一行评分与档位（形如 `S1：11→轻规划（不触碰 vibe）`）；>15 或拿不准时才 `vibe scan` 并 `vibe plan --request --s1` 进入正式路由；<=15 直接执行或轻规划。
 - 会话门阻塞必须停下报告，不得伪造或跳过。
 """
+
+#: Substring unique to the current entry-block wording.  The marker only
+#: answers "a block is present"; this answers "it is the current block".
+VIBE_ENTRY_CURRENT_SENTINEL = "凡经 S1 评分的请求"
 
 #: Every rule block this release ships, in document order.
 AGENTSMD_BLOCKS = (CAPABILITY_RULES, PRD_GUIDE_RULES, VIBE_ENTRY_RULES)

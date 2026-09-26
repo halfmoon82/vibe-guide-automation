@@ -65,6 +65,28 @@ class VibeEntryProtocolShippingTests(unittest.TestCase):
                 self.assertIn("可选", line, line)
                 self.assertNotIn("必须", line, line)
 
+    def test_protocol_requires_observable_s1_output_line(self):
+        """Every scored request must leave an observable S1 trace.
+
+        D5 (2026-09-26): the 9-15 band's "think through the steps silently"
+        wording left zero observable evidence, making protocol compliance
+        indistinguishable from never running the entry protocol at all.
+        """
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("vibe-entry")
+        self.assertIn("输出一行", text)
+        self.assertIn("S1：", text)
+        self.assertNotIn("心里列步骤", text)
+
+    def test_protocol_clarifies_triage_scope_and_uncertainty_fallback(self):
+        """Triage covers read-only log/production-data analysis; the
+        uncertain-scores fallback must survive wording edits."""
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("vibe-entry")
+        self.assertIn("排查", text)
+        self.assertIn("只读", text)
+        self.assertIn("拿不准一律按 >15 处理", text)
+
     def test_protocol_states_gate_discipline(self):
         from vibe_guide.protocols import load_protocol
         text = load_protocol("vibe-entry")
@@ -88,6 +110,56 @@ class VibeEntryMaterializationTests(unittest.TestCase):
             self.assertIn(".vibe/proposals/skills/vibe-entry/SKILL.md", result.paths)
             # prd-guide regression: same init still ships it.
             self.assertTrue((root / ".vibe" / "proposals" / "skills" / "prd-guide" / "SKILL.md").is_file())
+
+    def test_reinit_notes_drift_without_rewriting(self):
+        """A materialized copy differing from the shipped protocol is never
+        rewritten, but the difference must not stay silent: init reports a
+        note so a stale copy (or a local edit) gets a human diff."""
+        from vibe_guide.protocols import load_protocol
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._init(root)
+            skill = root / ".vibe" / "proposals" / "skills" / "vibe-entry" / "SKILL.md"
+            stale = "# stale or locally edited copy\n"
+            skill.write_text(stale, encoding="utf-8")
+            result = self._init(root)
+            self.assertEqual(skill.read_text(encoding="utf-8"), stale)
+            self.assertTrue(any("不一致" in note for note in result.notes), result.notes)
+            # No drift, no note: an untouched copy stays quiet.
+            skill.write_text(load_protocol("vibe-entry"), encoding="utf-8")
+            quiet = self._init(root)
+            self.assertFalse(any("不一致" in note for note in quiet.notes), quiet.notes)
+
+    def test_reinit_notes_stale_agentsmd_entry_block(self):
+        """An AGENTS.md carrying the old entry block passes marker detection
+        forever (heading dedup never re-proposes it), so init must surface a
+        note instead of leaving the stale block silent."""
+        from vibe_guide.scanner import VIBE_ENTRY_RULES
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._init(root)
+            stale_block = (
+                "## New Session Entry\n\n"
+                "- 开发/改动/排查类请求先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1，不逢任务必过 vibe。\n"
+                "- 会话门阻塞必须停下报告，不得伪造或跳过。\n"
+            )
+            (root / "AGENTS.md").write_text("# P\n\n" + stale_block, encoding="utf-8")
+            result = self._init(root)
+            self.assertTrue(any("New Session Entry" in note for note in result.notes), result.notes)
+            # A current block stays quiet.
+            (root / "AGENTS.md").write_text("# P\n\n" + VIBE_ENTRY_RULES, encoding="utf-8")
+            quiet = self._init(root)
+            self.assertFalse(any("New Session Entry" in note for note in quiet.notes), quiet.notes)
+
+    def test_reinit_unreadable_skill_notes_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._init(root)
+            skill = root / ".vibe" / "proposals" / "skills" / "vibe-entry" / "SKILL.md"
+            skill.write_bytes(b"\xff\xfe\x00not-utf8")
+            result = self._init(root)
+            self.assertEqual(skill.read_bytes(), b"\xff\xfe\x00not-utf8")
+            self.assertTrue(any("读不出来" in note for note in result.notes), result.notes)
 
     def test_reinit_preserves_user_edited_skill(self):
         with tempfile.TemporaryDirectory() as directory:

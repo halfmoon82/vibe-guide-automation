@@ -197,3 +197,9 @@ class VibeEntryRuleBlockTests(unittest.TestCase):
         self.assertIn("vibe scan", VIBE_ENTRY_RULES)
         self.assertIn("vibe plan --request", VIBE_ENTRY_RULES)
         self.assertIn("停下报告", VIBE_ENTRY_RULES)
+        from vibe_guide.scanner import VIBE_ENTRY_CURRENT_SENTINEL
+        self.assertIn(VIBE_ENTRY_CURRENT_SENTINEL, VIBE_ENTRY_RULES)
+        self.assertIn("输出一行", VIBE_ENTRY_RULES)
+        self.assertIn("S1：", VIBE_ENTRY_RULES)
+        self.assertIn("排查", VIBE_ENTRY_RULES)
+        self.assertIn("只读日志/生产数据分析", VIBE_ENTRY_RULES)
