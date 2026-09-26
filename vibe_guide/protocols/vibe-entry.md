@@ -34,6 +34,8 @@
 | `failure_cost` 失败代价 | 可随时回退 | 中等影响 | 不可逆/影响生产 |
 | `toolchain` 工具链复杂度 | 现有工具即可 | 需新装/新配 | 多工具编排 |
 
+每维取 0-5 整数，表中为 1/3/5 锚点：0 表示该维度可忽略，2/4 为相邻锚点之间的中间档。
+
 阈值（与 vibe planner 路由一致）：
 
 - **<=8**：直接执行，不触碰 vibe。
@@ -51,7 +53,7 @@
 
 ```bash
 vibe scan --json                                        # 只读：确认项目态与会话门
-vibe plan --request "<用户原话>" --s1 s,d,u,f,t --json    # 正式路由；s,d,u,f,t 为 §2 五维分数
+vibe plan --request "<用户原话>" --s1 5,3,5,3,1 --json    # 正式路由；示例为 17 分（五维顺序见下）
 ```
 
 - `--s1` 五个数字的顺序即 `steps,domains,uncertainty,failure_cost,toolchain`，各取 0-5 整数。

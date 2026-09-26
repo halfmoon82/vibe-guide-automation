@@ -40,9 +40,16 @@ class VibeEntryProtocolShippingTests(unittest.TestCase):
             self.assertIn(field, text, field)
 
     def test_protocol_states_thresholds(self):
+        # Tokens derive from the planner's routing constants so a threshold
+        # change forces the document (and this test) to move with it.
+        from vibe_guide.planner import ROUTE_LIGHT_PLAN_MAX_SCORE, ROUTE_SIMPLE_MAX_SCORE
         from vibe_guide.protocols import load_protocol
         text = load_protocol("vibe-entry")
-        for token in ("<=8", "9-15", ">15"):
+        for token in (
+            f"<={ROUTE_SIMPLE_MAX_SCORE}",
+            f"{ROUTE_SIMPLE_MAX_SCORE + 1}-{ROUTE_LIGHT_PLAN_MAX_SCORE}",
+            f">{ROUTE_LIGHT_PLAN_MAX_SCORE}",
+        ):
             self.assertIn(token, text, token)
 
     def test_protocol_complex_path_names_scan_and_plan_with_s1(self):

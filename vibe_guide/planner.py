@@ -10,6 +10,13 @@ from typing import Any, Dict, List, Optional
 from .models import EVIDENCE_PRIORITY, IssueComplexity, TargetContract, IntegrationAcceptanceContract, PRD, StageHandoff
 
 
+#: S1 total-score routing thresholds.  The vibe-entry protocol's threshold
+#: table is pinned to these constants by tests so the document cannot drift
+#: from the route logic.
+ROUTE_SIMPLE_MAX_SCORE = 8
+ROUTE_LIGHT_PLAN_MAX_SCORE = 15
+
+
 @dataclass(frozen=True)
 class S0Result:
     simple: bool
@@ -70,7 +77,7 @@ class RouteResult:
         if self.score is not None and (isinstance(self.score, bool) or not isinstance(self.score, int) or self.score < 0):
             raise ValueError("route score must be a non-negative integer")
         if self.score is not None and not self.force_upgrade_flags:
-            expected = "simple" if self.score <= 8 else "light_plan" if self.score <= 15 else "complex"
+            expected = "simple" if self.score <= ROUTE_SIMPLE_MAX_SCORE else "light_plan" if self.score <= ROUTE_LIGHT_PLAN_MAX_SCORE else "complex"
             if self.route != expected:
                 raise ValueError("route score does not match route")
         if self.force_upgrade_flags and self.route != "complex":
@@ -451,7 +458,7 @@ def _route_result_from_score(score: S1Score, force_upgrade_flags: Optional[List[
     if score.total < 0:
         raise ValueError("S1 total cannot be negative")
     flags = list(dict.fromkeys(force_upgrade_flags or []))
-    route = "complex" if flags else ("simple" if score.total <= 8 else "light_plan" if score.total <= 15 else "complex")
+    route = "complex" if flags else ("simple" if score.total <= ROUTE_SIMPLE_MAX_SCORE else "light_plan" if score.total <= ROUTE_LIGHT_PLAN_MAX_SCORE else "complex")
     return RouteResult(
         route=route,
         complexity_band=route,
@@ -483,7 +490,7 @@ def classify_v310_task(s0: Any, s1: Optional[S1Score], force_upgrade_flags: Opti
         raise TypeError("s1 must be S1Score or TaskContext")
     band = _route_result_from_score(score, flags).route
     issue_band = "light" if band == "light_plan" else band
-    if isinstance(s0, str) and s0 == "simple" and not flags and score.total <= 8:
+    if isinstance(s0, str) and s0 == "simple" and not flags and score.total <= ROUTE_SIMPLE_MAX_SCORE:
         band = "simple"
     return IssueComplexity(
         issue_id="task",

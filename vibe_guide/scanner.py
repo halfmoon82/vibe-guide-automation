@@ -188,6 +188,10 @@ def scan_project(paths):
     )
 
 
+# The threshold prose inside this block (<=15 / >15) must stay in step with
+# planner.ROUTE_SIMPLE_MAX_SCORE / ROUTE_LIGHT_PLAN_MAX_SCORE; the protocol
+# threshold test derives its tokens from those constants and turns red on
+# drift, forcing a sync here.
 VIBE_ENTRY_RULE_MARKER = "New Session Entry"
 VIBE_ENTRY_RULES = """## New Session Entry
 
