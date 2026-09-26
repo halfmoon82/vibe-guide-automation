@@ -65,6 +65,28 @@ class VibeEntryProtocolShippingTests(unittest.TestCase):
                 self.assertIn("可选", line, line)
                 self.assertNotIn("必须", line, line)
 
+    def test_protocol_requires_observable_s1_output_line(self):
+        """Every scored request must leave an observable S1 trace.
+
+        D5 (2026-09-26): the 9-15 band's "think through the steps silently"
+        wording left zero observable evidence, making protocol compliance
+        indistinguishable from never running the entry protocol at all.
+        """
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("vibe-entry")
+        self.assertIn("输出一行", text)
+        self.assertIn("S1：", text)
+        self.assertNotIn("心里列步骤", text)
+
+    def test_protocol_clarifies_triage_scope_and_uncertainty_fallback(self):
+        """"排查" covers read-only log/production-data analysis; the
+        uncertain-scores-fallback must survive wording edits."""
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("vibe-entry")
+        self.assertIn("排查", text)
+        self.assertIn("只读", text)
+        self.assertIn("拿不准一律按 >15 处理", text)
+
     def test_protocol_states_gate_discipline(self):
         from vibe_guide.protocols import load_protocol
         text = load_protocol("vibe-entry")

@@ -67,7 +67,7 @@ vibe status --plan <ID>                      读取当前快照，不轮询外�
 vibe resume --plan <ID>                      从快照、任务登记和事件证据继续
 ```
 
-新会话入口：agent 先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1——<=8 直接执行、9-15 轻规划，均不触碰 vibe；>15 或拿不准时才 `vibe scan` + `vibe plan --request --s1` 进入正式路由。该协议完全自包含，不依赖任何外部技能。
+新会话入口：agent 先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1——<=8 直接执行、9-15 轻规划，均不触碰 vibe，评分后输出一行 S1 评分与档位；>15 或拿不准时才 `vibe scan` + `vibe plan --request --s1` 进入正式路由。该协议完全自包含，不依赖任何外部技能。
 
 产品经理的完整路径（自评确认为复杂之后）：agent 按 `.vibe/proposals/skills/prd-guide/SKILL.md` 的协议引导写 PRD 与节点拆分（业务字段），`vibe attest` 登记会话能力，`vibe plan --from-prd` 发布，`vibe authorize` 授权，`vibe monitor` 派发。旧的 `--node-spec` 手写路径仍可用。
 
