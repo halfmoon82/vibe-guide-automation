@@ -340,6 +340,16 @@ def init_project(paths, confirm):
         vibe_entry.parent.mkdir(parents=True, exist_ok=True)
         _write_new(vibe_entry, load_protocol(VIBE_ENTRY_NAME))
         created.append(VIBE_ENTRY_PROPOSAL_RELATIVE)
+    elif vibe_entry.is_file() and not vibe_entry.is_symlink() and vibe_entry.read_text(encoding='utf-8') != load_protocol(VIBE_ENTRY_NAME):
+        # The copy is never rewritten, so a difference stays silent forever
+        # unless surfaced here.  The cause is ambiguous -- a local edit or a
+        # shipped-protocol update -- so the note says both and leaves the
+        # merge to a human.
+        notes.append(
+            VIBE_ENTRY_PROPOSAL_RELATIVE
+            + ' 与随包协议不一致：可能是本地修改，也可能是随包协议已更新；'
+            + 'vibe 永不改写该文件，请人工 diff 后手动合并。'
+        )
     return InitResult(bool(created), created, notes)
 
 

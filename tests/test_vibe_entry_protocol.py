@@ -79,8 +79,8 @@ class VibeEntryProtocolShippingTests(unittest.TestCase):
         self.assertNotIn("心里列步骤", text)
 
     def test_protocol_clarifies_triage_scope_and_uncertainty_fallback(self):
-        """"排查" covers read-only log/production-data analysis; the
-        uncertain-scores-fallback must survive wording edits."""
+        """Triage covers read-only log/production-data analysis; the
+        uncertain-scores fallback must survive wording edits."""
         from vibe_guide.protocols import load_protocol
         text = load_protocol("vibe-entry")
         self.assertIn("排查", text)
@@ -110,6 +110,25 @@ class VibeEntryMaterializationTests(unittest.TestCase):
             self.assertIn(".vibe/proposals/skills/vibe-entry/SKILL.md", result.paths)
             # prd-guide regression: same init still ships it.
             self.assertTrue((root / ".vibe" / "proposals" / "skills" / "prd-guide" / "SKILL.md").is_file())
+
+    def test_reinit_notes_drift_without_rewriting(self):
+        """A materialized copy differing from the shipped protocol is never
+        rewritten, but the difference must not stay silent: init reports a
+        note so a stale copy (or a local edit) gets a human diff."""
+        from vibe_guide.protocols import load_protocol
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._init(root)
+            skill = root / ".vibe" / "proposals" / "skills" / "vibe-entry" / "SKILL.md"
+            stale = "# stale or locally edited copy\n"
+            skill.write_text(stale, encoding="utf-8")
+            result = self._init(root)
+            self.assertEqual(skill.read_text(encoding="utf-8"), stale)
+            self.assertTrue(any("不一致" in note for note in result.notes), result.notes)
+            # No drift, no note: an untouched copy stays quiet.
+            skill.write_text(load_protocol("vibe-entry"), encoding="utf-8")
+            quiet = self._init(root)
+            self.assertFalse(any("不一致" in note for note in quiet.notes), quiet.notes)
 
     def test_reinit_preserves_user_edited_skill(self):
         with tempfile.TemporaryDirectory() as directory:
