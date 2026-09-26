@@ -210,7 +210,7 @@ jobs:
       - name: Attach artifacts to the release
         # 默认是 `bash -e`，管道只看最后一节：gh 挂了 actual 变成空串，
         # 下面会报成「资产不一致」而不是「查不到 Release」，把人指向错方向。
-        # `shell: bash` 换成 `bash -eo pipefail`。
+        # 显式 `shell: bash` 即启用 pipefail（内置关键字默认含 `-eo pipefail`，省略时只有 `-e`）。
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
