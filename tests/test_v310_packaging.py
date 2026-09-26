@@ -151,6 +151,15 @@ class PackagingV310Tests(unittest.TestCase):
             env=env,
         )
         self.assertEqual(result.stdout.strip(), expected_version)
+        if expected_version == TARGET_VERSION:
+            # The vibe-entry protocol ships only with the current version;
+            # upgrade/rollback checks against older packages must skip it.
+            protocol = _run(
+                [str(python), "-c", "from vibe_guide.protocols import load_protocol; assert load_protocol('vibe-entry').strip(), 'empty vibe-entry protocol'; print('vibe-entry ok')"],
+                cwd=Path(tempfile.gettempdir()),
+                env=env,
+            )
+            self.assertEqual(protocol.stdout.strip(), "vibe-entry ok")
 
     def test_wheel_sdist_and_source_install_in_clean_environments(self):
         with tempfile.TemporaryDirectory() as directory:
