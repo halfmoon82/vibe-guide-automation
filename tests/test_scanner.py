@@ -203,3 +203,12 @@ class VibeEntryRuleBlockTests(unittest.TestCase):
         self.assertIn("S1：", VIBE_ENTRY_RULES)
         self.assertIn("排查", VIBE_ENTRY_RULES)
         self.assertIn("只读日志/生产数据分析", VIBE_ENTRY_RULES)
+
+    def test_block_states_host_statusline_merge_rule(self):
+        # Hosts with their own mandatory gate (e.g. a Johari-style alignment
+        # card) must merge S1 into that status line: the D5 failure's root
+        # cause was two mandatory entry protocols with no defined ordering.
+        from vibe_guide.scanner import VIBE_ENTRY_RULES
+        self.assertIn("并入", VIBE_ENTRY_RULES)
+        self.assertIn("首个强制状态行", VIBE_ENTRY_RULES)
+        self.assertIn("不另起一轮评分或第二个门", VIBE_ENTRY_RULES)

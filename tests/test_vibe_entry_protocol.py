@@ -87,6 +87,15 @@ class VibeEntryProtocolShippingTests(unittest.TestCase):
         self.assertIn("只读", text)
         self.assertIn("拿不准一律按 >15 处理", text)
 
+    def test_protocol_states_host_statusline_merge_rule(self):
+        # Same merge rule as the AGENTS.md block: hosts with their own
+        # mandatory gate merge S1 into its first status line, never
+        # double-gating.
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("vibe-entry")
+        self.assertIn("首个强制状态行", text)
+        self.assertIn("第二个门", text)
+
     def test_protocol_states_gate_discipline(self):
         from vibe_guide.protocols import load_protocol
         text = load_protocol("vibe-entry")
