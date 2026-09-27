@@ -2351,6 +2351,9 @@ class Monitor:
             "contract_digest": contract_digest,
             "authorization_epoch": authorization_epoch,
         }
+        # Match the live path: a replayed acceptance must not resurrect the
+        # rejection text the lost snapshot still carried.
+        current["reason"] = None
         current["reviewer_identity"] = provenance["task_id"]
         current["review_generation"] = generation
         current["active_role"] = None
@@ -4956,6 +4959,9 @@ class Monitor:
                     "contract_digest": contract_digest,
                     "authorization_epoch": authorization_epoch,
                 }
+                # Match the live path: a replayed acceptance must not
+                # resurrect the rejection text the lost snapshot carried.
+                current["reason"] = None
                 current["active_role"] = None
                 current["active_task"] = None
                 current["quarantine"] = None

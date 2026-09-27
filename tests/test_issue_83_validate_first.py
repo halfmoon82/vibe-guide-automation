@@ -229,6 +229,39 @@ class VisibleSddValidateFirstTests(unittest.TestCase):
             len(self._node_events(snapshot.run_id, "acceptance_rejected")), 1
         )
 
+    def test_rejection_reason_never_trips_the_user_decision_mapping(self):
+        """The raw validator text names claim keys like ``out_of_scope`` --
+        a user-decision marker.  The node must carry the fixed marker-free
+        text; the raw reason lives only in the redacted audit event."""
+        from vibe_guide.evidence import build_integration_review_evidence
+        from vibe_guide.state import map_user_status
+
+        monitor, record = self._monitor()
+        runner = self._runner([("complete", {"evidence": "delivery"})])
+        snapshot = monitor.start(record, runner)
+        active = snapshot.nodes["sdd-a"]["active_task"]
+        self.assertIsInstance(active, dict)
+
+        # The real raw reason the integration claim validator produces for a
+        # free-form acceptance; it contains a user-decision marker ("scope"),
+        # so the pre-fix code did surface "需要你决定" for it.
+        with self.assertRaises(ValueError) as raised:
+            build_integration_review_evidence(snapshot, "P0-P2 cleared", [], [])
+        raw_reason = str(raised.exception)
+        self.assertIn("out_of_scope", raw_reason)
+        self.assertEqual(
+            map_user_status({"status": "running", "reason": raw_reason}),
+            "需要你决定",
+        )
+
+        monitor._reject_acceptance_format(snapshot, "sdd-a", active, raw_reason)
+
+        node = snapshot.nodes["sdd-a"]
+        self.assertNotIn("out_of_scope", node["reason"])
+        self.assertNotEqual(map_user_status(node), "需要你决定")
+        rejection = self._node_events(snapshot.run_id, "acceptance_rejected")[-1]
+        self.assertTrue(rejection["data"].get("recoverable"))
+
 
 class FindingSeverityWhitelistTests(unittest.TestCase):
     """p3/p4 observations register without loosening the fail-closed net."""
