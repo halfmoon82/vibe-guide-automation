@@ -120,10 +120,18 @@ class VisibleSddValidateFirstTests(unittest.TestCase):
         rejections = self._node_events(snapshot.run_id, "acceptance_rejected")
         self.assertEqual(len(rejections), 1, self._events(snapshot.run_id))
         self.assertTrue(rejections[0]["data"].get("recoverable"))
+        # A recoverable format error is automatic recovery, not a user
+        # decision: the node reason must not carry decision markers even
+        # when the raw validator text mentions names like "out_of_scope".
+        from vibe_guide.state import map_user_status
+
+        self.assertNotEqual(map_user_status(current), "需要你决定")
 
         snapshot = monitor.tick(snapshot.run_id, runner)
 
         self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+        # The corrected re-report clears the rejection text.
+        self.assertIsNone(snapshot.nodes["sdd-a"].get("reason"))
         self.assertEqual(len(self._node_events(snapshot.run_id, "accepted")), 1)
         # The audit trail keeps the rejection next to the later acceptance.
         self.assertEqual(len(self._node_events(snapshot.run_id, "acceptance_rejected")), 1)
@@ -203,11 +211,23 @@ class VisibleSddValidateFirstTests(unittest.TestCase):
         self.assertEqual(len(self._node_events(snapshot.run_id, "acceptance_rejected")), 1)
 
         status_before = snapshot.nodes["sdd-a"]["status"]
-        snapshot.event_sequence -= 1  # rewind over exactly the rejection record
+        reason_before = snapshot.nodes["sdd-a"].get("reason")
+        # Rewind to the rejection event itself: tick() appends further
+        # topology observations after it, so rewinding by one would only
+        # replay those and never exercise the no-op branch.
+        rejection_sequence = self._node_events(
+            snapshot.run_id, "acceptance_rejected"
+        )[0]["sequence"]
+        snapshot.event_sequence = rejection_sequence - 1
         monitor._reconcile_unapplied_events(snapshot)
 
         self.assertEqual(snapshot.nodes["sdd-a"]["status"], status_before)
+        self.assertEqual(snapshot.nodes["sdd-a"].get("reason"), reason_before)
         self.assertNotEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+        # Replaying the audit event must not duplicate it either.
+        self.assertEqual(
+            len(self._node_events(snapshot.run_id, "acceptance_rejected")), 1
+        )
 
 
 class FindingSeverityWhitelistTests(unittest.TestCase):

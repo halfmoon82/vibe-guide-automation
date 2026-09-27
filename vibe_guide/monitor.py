@@ -3492,52 +3492,6 @@ class Monitor:
             raise ValueError("event task binding is stale")
         return binding
 
-    def _record_integration_acceptance(
-        self,
-        snapshot: RunSnapshot,
-        node_id: str,
-        claim: Any,
-    ) -> Optional[str]:
-        """Write the run-level review package, or say why it cannot be written.
-
-        The integration reviewer's acceptance is the only production entry point
-        for ``integration_review_evidence``: without this write a run whose every
-        node is accepted still reports "integration review evidence is missing"
-        and never leaves ``running``.  The acceptance references and the permanent
-        exclusions come from the plan's integration contract rather than from the
-        reviewer, so a reviewer cannot shrink the scope it is held to.  Returns
-        ``None`` on success and a reason otherwise, so each caller can fail closed
-        in its own idiom.
-
-        The plan is re-read from disk on every resume, and the agents this run
-        dispatches can write to that file, so the contract is only worth reading
-        after it still matches the digest the authorization card froze.  Without
-        the comparison below, editing ``plan.json`` after authorization rewrote
-        the permanent exclusions in the run's own audit package while the run
-        still reported ``complete`` -- the same drift the PRD/Spec lineage check
-        in ``resume`` already refuses, on the same class of material.
-        """
-        contract = integration_contract_projection(self.plan, list(self.nodes.values()))
-        record = self._snapshot_record(snapshot)
-        if digest_integration_contract(contract) != record.integration_contract_digest:
-            return "integration contract no longer matches the authorized digest"
-        if contract:
-            refs = contract.get("agentsmd_acceptance_refs") or []
-            excluded = contract.get("unverified_or_excluded") or []
-        else:
-            # No authorized contract to hold the reviewer to; the plan's own
-            # fields are all there is, and the digest above is empty on both
-            # sides, so nothing here was verified either way.
-            refs = getattr(self.plan, "agentsmd_acceptance_refs", [])
-            excluded = getattr(self.plan, "unverified_or_excluded", [])
-        package, reason, _recoverable = self._derive_integration_acceptance(
-            snapshot, claim, contract=contract, refs=refs, excluded=excluded
-        )
-        if reason is not None:
-            return reason
-        _record_integration_review(snapshot, package)
-        return None
-
     def _derive_integration_acceptance(
         self,
         snapshot: RunSnapshot,
@@ -3594,9 +3548,21 @@ class Monitor:
         wait on the same session -- the reviewer/worker can correct the
         payload and report again.  Replay treats ``acceptance_rejected`` as a
         no-op for the same reason: nothing here mutated lifecycle state.
+
+        The node ``reason`` is a fixed, decision-marker-free text: the raw
+        validator reason stays only in the redacted audit event, because
+        free-form reasons (e.g. key names like ``out_of_scope``) otherwise
+        trip the user-facing "needs your decision" mapping for an error the
+        same session recovers from on its own.  Crash-window trade-off: if
+        the process dies after this event is appended but before the
+        snapshot is saved, the replayed no-op restores neither the evidence
+        entry nor this reason -- the durable trail is the audit event alone.
         """
         current = snapshot.nodes[node_id]
-        current["reason"] = reason
+        current["reason"] = (
+            "acceptance report format error; "
+            "the same session can correct and re-report"
+        )
         self._record(
             snapshot,
             "acceptance_rejected",
@@ -3954,6 +3920,8 @@ class Monitor:
                 "contract_digest": current["contract_digest"],
                 "authorization_epoch": snapshot.authorization_digest,
             }
+            # A corrected re-report must not keep the rejection text.
+            current["reason"] = None
             current["active_role"] = None
             current["active_task"] = None
             current["quarantine"] = None
@@ -4211,6 +4179,8 @@ class Monitor:
             "contract_digest": current["contract_digest"],
             "authorization_epoch": snapshot.authorization_digest,
         }
+        # A corrected re-report must not keep the rejection text.
+        current["reason"] = None
         current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
         current["quarantine"] = None
         self._archive_pair(snapshot, node_id)
