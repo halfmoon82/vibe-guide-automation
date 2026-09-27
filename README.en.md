@@ -13,8 +13,8 @@ The current release is **4.8.0**. Treat the matching `v4.8` tag, commit, and Rel
 - **Runtime**: Python >= 3.9, zero third-party dependencies (standard library only); install with pip or pipx from wheel, sdist, or source (all three are pinned by tests to ship the protocol files).
 - **Post-install verification**: `python3 -c "import vibe_guide; print(vibe_guide.__version__)"` and `vibe --help`.
 - **Initialization order**: in a project, run read-only `vibe scan --json` first; run `vibe init --confirm` only when initialization is confirmed; AGENTS.md rule blocks are merged by `vibe apply-agentsmd --confirm` after human review.
-- **No host-framework requirement**: the entry protocol is fully self-contained. When the host runs its own mandatory gate/status-line protocol (e.g. an alignment card), the S1 score merges into its first mandatory status line as an `S1:` field -- no second scoring pass and no second gate; otherwise the agent emits one standalone S1 line.
-- **Upgrading existing projects**: materialized files (`.vibe/proposals/skills/*/SKILL.md` and already-merged AGENTS.md blocks) are never rewritten; a newer init prints a drift note when they differ from the shipped content, and a human merges manually.
+- **No host-framework requirement**: the entry protocol is fully self-contained. When the host runs its own mandatory gate/status-line protocol (e.g. an alignment card), the S1 score merges into its first mandatory status line as an `S1：` field -- no second scoring pass and no second gate; otherwise the agent emits one standalone S1 line.
+- **Upgrading existing projects**: materialized files (`.vibe/proposals/skills/*/SKILL.md` and already-merged AGENTS.md blocks) are never rewritten; a newer init prints a drift note when they differ from the shipped content, and a human merges manually after a manual diff.
 
 ### Installation protocol for Agents
 
