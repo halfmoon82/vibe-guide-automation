@@ -25,7 +25,7 @@
     "codex.visible_task.resume": true, "codex.visible_task.wait": true, "codex.in_session_sdd": true}
    ```
 
-   facts 文件需放在项目内、用相对路径传入；**必须带 `--project-id`**（Codex 的 project id），否则发布会报 `project_id_unavailable`：
+   上面只是键名模板，**值必须按本会话实际看到的工具逐个改**，不要原样照抄。facts 文件需放在项目内、用相对于项目根的路径传入（建议 `.vibe/codex-facts.json`，`.vibe/` 已被 gitignore）；**必须带 `--project-id`**（Codex 的 project id），否则发布会报 `project_id_unavailable`：
 
    ```bash
    vibe attest --adapter codex --facts <codex-facts.json> --provenance "<依据>" --project-id <codex project id>
