@@ -38,7 +38,7 @@ vibeguide **唯一一块结构性空白：reviewer 知道按什么分级，但�
 | 已有分发通道 1：`AGENTSMD_BLOCKS` 四个规则块 → `vibe apply-agentsmd --confirm` 合入项目 AGENTS.md | `scanner.py:227-232`、`missing_agentsmd_blocks` :235-262 |
 | 通道 1 的 sentinel 覆盖率：4 块里**只有 2 块**有版本化 sentinel（`VIBE_ENTRY` :206、`ENGINEERING_PRINCIPLES` :224）；`CAPABILITY` 与 `PRD_GUIDE` 没有。且 sentinel 的**唯一读取点在 `initializer.py:370-391`**，`missing_agentsmd_blocks` 只读 MARKER、从不读 sentinel | `grep -rn "CURRENT_SENTINEL" vibe_guide/` |
 | 已有分发通道 2：vibe **自有**协议物化到 `.vibe/proposals/skills/<name>/SKILL.md`，写一次永不改写——**只覆盖 prd-guide 与 vibe-entry 两个随包协议**，与外部 skill 安装是两条互不相连的路径 | `initializer.py:335-346` |
-| 分发通道 3 **只完成了一半**：`install_skill()`（`skills.py:316-391`）功能完整——clone、校验 SHA、物化、算 `installed_tree_sha256`、原子替换——但①**全仓无生产调用点**（只有 `tests/test_skills.py` 的 9 处）；②`vibe install` 是 **vibe 自身的安装/升级状态机**（`cli.py:99` choices → `cli.py:867-885` → `run_install_or_upgrade`），与 skill 无关，且 parser 只有一个位置参数、多传一个子路径会被 argparse 拒；③记录写的是 `$VIBE_HOME/skills/<name>.json`，键为 `source/sha/tree/installed_tree_sha256/timestamp/validation`，**既没有 `name` 也没有 `commit`**，也**不写 `.vibe/config.json`** | `grep -rn "install_skill" vibe_guide/ tests/`；`skills.py:333-368` |
+| 分发通道 3 **只完成了一半**：`install_skill()`（`skills.py:316-391`）功能完整——clone、校验 SHA、物化、算 `installed_tree_sha256`、原子替换——但①**全仓无生产调用点**（只有 `tests/test_skills.py` 的 8 处调用，另 1 处 import）；②`vibe install` 是 **vibe 自身的安装/升级状态机**（`cli.py:99` choices → `cli.py:867-885` → `run_install_or_upgrade`），与 skill 无关，且 parser 只有一个位置参数、多传一个子路径会被 argparse 拒；③记录写的是 `$VIBE_HOME/skills/<name>.json`，键为 `source/sha/tree/installed_tree_sha256/timestamp/validation`，**既没有 `name` 也没有 `commit`**，也**不写 `.vibe/config.json`** | `grep -rn "install_skill" vibe_guide/ tests/`；`skills.py:333-368` |
 | `.vibe/config.json` 的 `skills[]`（形状确为 `{name, source, commit}`）是 **scanner 的只读输入**，由用户/外部写入，没有任何代码产出它 | `scanner.py:87-148` |
 | 已有分发通道 4：visible-sdd 节点合同携带 `sdd_protocol` 指针 | `monitor.py:2944` |
 
@@ -178,7 +178,7 @@ intent 重锚到节点合同 + 空合同兜底、fan-out 硬上限、静态/实�
 |---|---|---|
 | A. CLI 面 | 新增 skill 安装子命令 + 参数解析（`name` 与 `subdir` 必须是两个参数——`skills.py:17` 的 `_NAME` 正则不允许 `/`） | **不存在**。`vibe install` 已被 vibe 自身的安装/升级占用，不可复用 |
 | B. 子路径能力 | `SkillSpec.subdir`；`_materialize_commit` 的归档 spec 由 `commit` 改为 `f'{commit}:{subdir}'`；subdir 入口校验（拒绝绝对路径、`..`、首尾 `/`，只允许 `[A-Za-z0-9_.-]` 与 `/`） | 不存在，但**已实测归档语义可行**，manifest 检查与 `_safe_archive_members` 不用改 |
-| C. 记录落地 | 把安装结果写进 `.vibe/config.json` 的 `skills[]`（`{name, source, commit}` + 新增 `subdir`），让 `vibe scan` 能看见 | **不存在**。今天 `install_skill` 只写 `$VIBE_HOME/skills/<name>.json`，两套记录互不相连 |
+| C. 记录落地 | 把安装结果写进 `.vibe/config.json` 的 `skills[]`（`{name, source, commit}` + 新增 `subdir`），让 `vibe scan` 能看见。**写入必须是 append / 按 `name` 幂等合并，不得整体重写 `skills[]`**——该数组今天是纯用户输入，代码首次写入时必须保留已有条目 | **不存在**。今天 `install_skill` 只写 `$VIBE_HOME/skills/<name>.json`，两套记录互不相连 |
 
 **附带需要定的一件事**：记录里的 `tree` 字段（`skills.py:350,360`）来自 `_verify_vendor`，是**仓库根 tree**；
 subdir 模式下它不再对应实际物化内容（对应的是 `installed_tree_sha256`）。保持原样还是改记子树，需明确。
@@ -241,10 +241,12 @@ r1 里 `vibe install pm-ai-shipping/skills/code-review` 这种把子路径当唯
 | Unresolved | 落 `blocked_unknown`，既不计入 clearance 也不算通过 |
 | Coverage | 写进 §3 证据链；"零发现"必须表述为"在已审范围内无成立发现"，不得表述为"无缺陷" |
 
-**这一步收益的准确表述**（r1 此处过度承诺，已修正）：本方案**不改** `monitor.py:4066-4077`，
-所以交付门改动前后**同样只校验"clearance 三个键是整数 0"**。「未反驳不得计 P0–P2」是加给 agent 的
-**协议文本约束，vibe 侧没有任何机器判据可验证它**。按 AGENTS.md §11「不把 marker / 文件存在当成
-业务批准」，这条收益只能记为"提高 reviewer 自律的文本约束"，不能记为"门变严了"。已进 §6 未验证项。
+**这一步收益的准确表述**（r1 此处过度承诺，已修正）：本方案**不改** `monitor.py:4066-4080`，
+交付门改动前后**完全不变**，仍只校验三项：clearance 三键为非 bool 整数 0、`evidence_ref` 为非空字符串、
+`protocol` 与 `VISIBLE_SDD_PROTOCOL_REF` 逐字相等——**这三项都不反映反驳是否完成**。
+「未反驳不得计 P0–P2」是加给 agent 的**协议文本约束，vibe 侧没有任何机器判据可验证它**。
+按 AGENTS.md §11「不把 marker / 文件存在当成业务批准」，这条收益只能记为"提高 reviewer 自律的
+文本约束"，不能记为"门变严了"。已进 §6 未验证项。
 
 **2c. 新增第 5 个 AGENTS.md 分发块 `## Review Methodology`**（`scanner.py` `AGENTSMD_BLOCKS`）
 
@@ -252,13 +254,24 @@ r1 里 `vibe install pm-ai-shipping/skills/code-review` 这种把子路径当唯
 唯一可靠送达消费项目的通道是 AGENTS.md 分发块。
 
 **指针写什么**（r1 写的 `.vibe/proposals/skills/code-review/SKILL.md` **是悬空路径**——没有任何代码会
-创建它：`.vibe/proposals/skills/` 只由 `initializer.py:335-346` 为 vibe 自有的两个随包协议而写，
+创建它：`.vibe/proposals/skills/` 目录下只有 vibe **自有随包协议**（prd-guide/vibe-entry）与一个
+`proposal.md`（architecture-skill-pack 提案），由 `initializer.py:322`、`:335-346` 写入；
 外部安装的 skill 落在 `$VIBE_HOME/skills/<name>`，两条路径互不相连）。两个可选落点：
 
 | 方案 | 代价 | 评价 |
 |---|---|---|
-| **推荐**：指针写 `$VIBE_HOME/skills/code-review/SKILL.md`（**变量形式**，不写死 `/Users/...`） | 零新增代码 | 与 AGENTS.md §7「用户级共享缓存由 `VIBE_HOME` 指定；项目只保存引用和版本」完全一致，是这条规则本来就设计好的用法 |
+| **推荐**：指针写 `${VIBE_HOME:-$HOME/.vibe-guide}/skills/code-review/SKILL.md`（**带默认值的变量形式**，不写死 `/Users/...`） | 零新增代码 | 与 AGENTS.md §7「用户级共享缓存由 `VIBE_HOME` 指定；项目只保存引用和版本」一致。**但必须带默认值**，理由见下方 ⚠️ |
 | 备选：阶段 0 增加"把已安装 skill 物化到消费项目 `.vibe/proposals/skills/`"的能力 | 阶段 0 再加一段新工作量 | 与现有 prd-guide/vibe-entry 形态统一、项目自包含；但把外部 skill 内容复制进每个项目，与 §7 精神有张力 |
+
+**⚠️ 裸 `$VIBE_HOME` 会复现 §1.4 的同一种失效**：`VIBE_HOME` 在 vibe 的 Python 里**有默认值**
+（`paths.py:73`：`os.environ.get("VIBE_HOME") or str(Path.home() / ".vibe-guide")`），但那个默认值
+**只存在于 vibe 进程内，不会传给读 AGENTS.md 的 agent**——`grep -rn "vibe_home" vibe_guide/` 在
+`paths.py`/`skills.py` 之外零命中，`vibe scan --json`（`cli.py:178-187`）与 `vibe doctor` 的 facts
+（`doctor.py:65-80`）都不输出解析后的 `vibe_home`。环境变量未导出时 shell 把 `$VIBE_HOME/skills/...`
+展开成 `/skills/code-review/SKILL.md`（文件系统根下的必然不存在路径），而**未导出正是 vibe 支持的默认形态**
+（本机实测：`VIBE_HOME` 未设置，默认解析为 `~/.vibe-guide`，该目录不存在）。
+所以指针必须写成带默认值的 `${VIBE_HOME:-$HOME/.vibe-guide}` 形式；若改为让 `vibe scan --json` 输出
+`vibe_home` 字段，则属阶段 0 的新增代码，此落点就不再是"零新增代码"。
 
 块内容 4–5 行，只写指针与三条硬规则：节点合同即 intent（为空按 Unresolved）；未反驳不计 P0–P2；
 未知落 `blocked_unknown`。
@@ -328,8 +341,11 @@ r1 里 `vibe install pm-ai-shipping/skills/code-review` 这种把子路径当唯
 - 上游 commit `8607e3b` 之后的变化未跟踪（本次审阅为只读，未做网络动作）。
 - 本方案**未在任何真实 DAG run 上验证过收益**；阶段 2 完成后需要至少 1 个真实节点跑通才能给出效果结论。
 - `intended-vs-implemented` 重锚到节点合同的实际效果**为设计推断，未实测**。
-- **阶段 2b 的「未反驳不得计 P0–P2」是纯文本约束，vibe 侧无机器判据**；改动前后交付门同样只校验
-  clearance 三个键是整数 0。它是否真能改变 reviewer 行为，未验证。
+- **阶段 2b 的「未反驳不得计 P0–P2」是纯文本约束，vibe 侧无机器判据**；改动前后交付门完全不变，
+  仍只校验 clearance 三键为 0、`evidence_ref` 非空、`protocol` 逐字相等。它是否真能改变 reviewer 行为，未验证。
+- **`${VIBE_HOME:-$HOME/.vibe-guide}` 指针未在真实消费项目里验证过**：本机 `VIBE_HOME` 未设置、
+  默认目录 `~/.vibe-guide` 不存在（因为今天没有任何 CLI 走过安装通道）。阶段 0 落地后需实际验证
+  该指针在消费项目的 agent 会话里可解析。
 - **空节点合同的发生率未测**：`cli.py:493-500` 的空串回填只影响没有 `contract` 的旧计划，
   实际有多少存量计划落在这一支，未统计。
 - 3 个 skill 的审查质量**未在 vibeguide 真实 diff 上盲测**，§2 的评估来自读文本。
