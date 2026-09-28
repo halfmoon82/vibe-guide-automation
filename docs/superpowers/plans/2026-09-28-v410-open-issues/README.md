@@ -16,20 +16,36 @@
 
 ## 在 Codex 机器上开工
 
-1. 拉取本仓库最新 main，按需 `vibe init --confirm`。
-2. 按 `vibe_guide/adapters/manifests/codex.yaml` 的 probes 登记 Codex 会话能力，**必须带 `--project-id`**（Codex 的 project id），否则发布会报 `project_id_unavailable`：
+1. 拉取本仓库最新 main，按需 `vibe init --confirm`。**不要**先跑不带 `--from-prd` 的 `vibe plan` 生成草案——草案会占用编号，再发布时撞上 `plan already exists`。
+2. 登记 Codex 会话能力。facts 文件必须写满 `vibe_guide/adapters/manifests/codex.yaml` 的全部 9 个 probe（含 command 类的 `codex.agent`，漏了报 `missing: codex.agent`），值只能是 `true`/`false`，只有本会话确实看到对应工具才写 `true`：
+
+   ```json
+   {"codex.agent": true, "codex.shell": true, "codex.subprocess": true, "codex.worktree": true,
+    "codex.visible_task.create": true, "codex.visible_task.enter": true,
+    "codex.visible_task.resume": true, "codex.visible_task.wait": true, "codex.in_session_sdd": true}
+   ```
+
+   facts 文件需放在项目内、用相对路径传入；**必须带 `--project-id`**（Codex 的 project id），否则发布会报 `project_id_unavailable`：
 
    ```bash
    vibe attest --adapter codex --facts <codex-facts.json> --provenance "<依据>" --project-id <codex project id>
    ```
 
-3. 从本目录的产品 spec 重新发布（**必须带 `--s1`**，且 `--plan-id` 用新机器上尚不存在的编号）：
+3. **先定远端 Git 动作**（提交/推送/开 PR/合并）允许还是禁止。这个开关在发布时由 `product-spec.json` 顶层字段 `remote_git_actions` 决定，`vibe authorize` 改不了它；当前 spec 未写此字段，默认 `deny`。产品经理选“允许”时，先在 spec 顶层加 `"remote_git_actions": "allow"` 再发布。
+4. 从本目录的产品 spec 发布（**必须带 `--s1`**，`--plan-id` 用新机器上尚不存在的编号）：
 
    ```bash
-   vibe plan --request "从GitHub上获取所有开放issue（#80 #88 #91 #92 #93 #94），用vibeguide一次性解决他们；从讨论迭代PRD开始" --s1 5,4,4,3,3 --plan-id v410-open-issues --from-prd docs/superpowers/plans/2026-09-28-v410-open-issues/product-spec.json --json
+   vibe plan --request "从GitHub上获取所有开放issue（#80 #88 #91 #92 #93 #94），用vibeguide一次性解决他们；从讨论迭代PRD开始" --s1 5,4,4,3,3 --plan-id v410-open-issues-codex --from-prd docs/superpowers/plans/2026-09-28-v410-open-issues/product-spec.json --json
    ```
 
-4. 把新生成的授权卡念给产品经理，由其选择远端 Git 动作（提交/推送/开 PR/合并）允许或禁止，然后 `vibe authorize` → `vibe monitor`，按 prd-guide §6 服务信箱。
+5. 把新生成的授权卡念给产品经理确认后：
+
+   ```bash
+   vibe authorize --plan v410-open-issues-codex --authorize AUTHORIZE --json
+   vibe monitor --plan v410-open-issues-codex --authorize AUTHORIZE --json
+   ```
+
+   然后按 prd-guide §6 服务信箱。
 
 ## 发布时踩到的两个坑（不在本轮 issue 范围）
 
