@@ -344,7 +344,11 @@ def _replace_draft(destination: Path, staging: Path) -> None:
     """
     holding = Path(tempfile.mkdtemp(prefix="." + destination.name + ".draft.", dir=str(destination.parent)))
     parked = holding / "draft"
-    os.rename(str(destination), str(parked))
+    try:
+        os.rename(str(destination), str(parked))
+    except BaseException:
+        shutil.rmtree(str(holding), ignore_errors=True)
+        raise
     try:
         extras = replaceable_draft_extras(parked)
         if extras is None:
