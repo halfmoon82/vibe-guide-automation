@@ -321,22 +321,45 @@ class DraftReplacementBoundaryTests(_Project):
         published = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
         self.assertEqual(published.payload.get("status"), "ok", published.payload)
 
-    def test_an_interrupt_after_the_swap_leaves_a_landed_publication(self):
-        """§5.3 branch ③: the destination holds this publish's card; it succeeded."""
-        plan_id = self.draft()
+    def test_a_parked_draft_behind_another_publication_republishes_under_a_new_id(self):
+        """§5.3 branch ③, followed literally.
+
+        Another publisher can take the id while the draft is moved aside, so
+        the card at the destination is not this publish's; the spec is taken
+        back and published under a new id with the parked draft's own S1.
+        """
+        plan_id = self.cli("plan", "--request", SHORT_REQUEST, "--s1", SESSION_S1).payload["plan_id"]
+        self.prepare_session()
+        spec = self.write_spec(".vibe/plans/{}/product-spec.json".format(plan_id), "allow")
         import vibe_guide.cli as cli_module
-        real_replace = os.replace
+        real_rename = os.rename
+        state = {"parked": False}
 
-        def interrupted_swap(source, target):
-            real_replace(source, target)
-            if str(target).endswith(plan_id):
-                raise KeyboardInterrupt
+        def other_publisher(source, target):
+            real_rename(source, target)
+            if not state["parked"] and str(source).endswith(plan_id) and "draft" in str(target):
+                state["parked"] = True
+                self.plan_dir(plan_id).mkdir()
+                (self.plan_dir(plan_id) / "authorization-card.json").write_text('{"by": "other"}', encoding="utf-8")
 
-        with mock.patch.object(cli_module.os, "replace", side_effect=interrupted_swap):
-            result = self.publish(plan_id)
+        with mock.patch.object(cli_module.os, "rename", side_effect=other_publisher):
+            result = self.cli("plan", "--request", SHORT_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
         self.assertIn("draft could not be restored", result.payload.get("reason", ""))
-        self.assertTrue((self.plan_dir(plan_id) / "authorization-card.json").is_file())
-        self.assertEqual(len(list((self.root / ".vibe" / "plans").glob(".{}.draft.*/draft".format(plan_id)))), 1)
+        self.assertEqual(self.card(plan_id), {"by": "other"})
+        parked = list((self.root / ".vibe" / "plans").glob(".{}.draft.*/draft".format(plan_id)))
+        self.assertEqual(len(parked), 1, parked)
+        # Take the spec back; --s1 from the parked plan.json, in the named order.
+        taken = self.root / "product-spec.json"
+        shutil.copy2(str(parked[0] / "product-spec.json"), str(taken))
+        dimensions = json.loads((parked[0] / "plan.json").read_text(encoding="utf-8"))["route_result"]["dimensions"]
+        s1 = ",".join(str(dimensions[name]) for name in ("steps", "domains", "uncertainty", "failure_cost", "toolchain"))
+        again = self.cli(
+            "plan", "--request", SHORT_REQUEST, "--plan-id", plan_id + "-r2", "--s1", s1,
+            "--from-prd", "product-spec.json",
+        )
+        self.assertEqual(again.payload.get("status"), "ok", again.payload)
+        self.assertEqual(again.payload.get("score"), 19, again.payload)
+        self.assertEqual(self.card(plan_id + "-r2")["remote_git_actions"], "allow")
 
     def test_a_publication_landing_mid_swap_is_not_overwritten(self):
         """Re-check what was actually moved aside, not what was seen before."""
