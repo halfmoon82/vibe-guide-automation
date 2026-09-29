@@ -267,6 +267,23 @@ class DraftReplacementBoundaryTests(_Project):
         leftovers = [p.name for p in self.plan_dir(plan_id).parent.iterdir() if p.name.startswith(".")]
         self.assertEqual(leftovers, [])
 
+    def test_an_interrupt_after_parking_never_deletes_the_draft(self):
+        """The park cleanup may only remove an empty holding directory."""
+        plan_id = self.draft()
+        import vibe_guide.cli as cli_module
+        real_rename = os.rename
+
+        def interrupted_park(source, target):
+            real_rename(source, target)
+            if str(source).endswith(plan_id) and "draft" in str(target):
+                raise KeyboardInterrupt
+
+        with mock.patch.object(cli_module.os, "rename", side_effect=interrupted_park):
+            with self.assertRaises(KeyboardInterrupt):
+                self.publish(plan_id)
+        parked = [p / "draft" / "plan.json" for p in self.plan_dir(plan_id).parent.iterdir() if p.name.startswith(".")]
+        self.assertTrue(any(path.is_file() for path in parked), "the parked draft was deleted")
+
     def test_a_publication_landing_mid_swap_is_not_overwritten(self):
         """Re-check what was actually moved aside, not what was seen before."""
         plan_id = self.draft()

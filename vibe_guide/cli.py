@@ -347,7 +347,12 @@ def _replace_draft(destination: Path, staging: Path) -> None:
     try:
         os.rename(str(destination), str(parked))
     except BaseException:
-        shutil.rmtree(str(holding), ignore_errors=True)
+        # rmdir, not rmtree: an interrupt landing after the rename succeeded
+        # leaves the draft in here, and it must stay recoverable.
+        try:
+            os.rmdir(str(holding))
+        except OSError:
+            pass
         raise
     try:
         extras = replaceable_draft_extras(parked)
