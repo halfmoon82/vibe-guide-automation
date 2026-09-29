@@ -137,8 +137,8 @@ vibe plan --request "<产品经理的原话>" --plan-id <plan_id> --from-prd <pr
 用 §1 草案的同一个 `plan_id` 发布，vibe 会替换这份草案（草案从未持有授权）；已发布或已授权的计划不会被覆盖，仍报 `plan already exists`。发布同样不必传 `--s1`，vibe 沿用草案记下的评分，只升不降。
 
 - `status: ok`：vibe 已生成 PRD、Spec、Issue、DAG 审计、授权卡、planning-brief。把 `authorization_card` 用产品语言念给产品经理：要做哪几件事、哪些同时开工、每件事一个开发任务加一个独立审查任务、发布前选定的远端 Git 开关（卡上的 `remote_git_actions`）、永远不含部署/发布/生产写入/凭据/对外通信。
-- 念卡时分开说两件事，别让 `allow` 听起来像"允许了又排除了"：`excluded_actions` 里的推送/合并是说开发任务自己永远不推送；`allowed_actions` 里的推送/合并是说产品经理允许后，监工可以在独立终审通过后执行这些动作。选 `deny` 时 `allowed_actions` 不含任何远端 Git 动作，`excluded_actions` 照样列着推送/合并。
-- 产品经理此时想改远端 Git 开关：`vibe authorize` 改不了它。改产品 spec 的 `remote_git_actions`，用一个新的 `plan_id` 重新发布，再念新卡。
+- 念卡时分开说两件事，别让 `allow` 听起来像"允许了又排除了"：`excluded_actions` 里的推送/合并是说开发任务自己永远不推送；`allowed_actions` 里的推送/合并是说产品经理允许后，这些动作进入授权范围；vibe 只在独立终审通过后校验并记录，不代为执行。选 `deny` 时 `allowed_actions` 不含任何远端 Git 动作，`excluded_actions` 照样列着推送/合并。
+- 产品经理此时想改远端 Git 开关：`vibe authorize` 改不了它。改产品 spec 的 `remote_git_actions`，用一个新的 `plan_id` 重新发布（`--plan-id <新编号> --s1 <s1>`，`<s1>` 照抄首次发布结果里的 `s1`：草案已被替换，新编号没有评分可沿用），再念新卡。
 - `status: blocked` 且 reason 以 `product_spec_requires_complex_route` 开头：请求被评成了非复杂路径，vibe 拒绝丢掉产品 spec。用 §1 草案的 `plan_id` 发布，或按 §1 用 `--s1` 显式升级。
 - `status: blocked` 且 reason 含 `product decisions remain unresolved`：回到 §2 把决策问清楚。
 - `status: blocked` 且 reason 含 `engine_attestation_unavailable`：先做 §5.2。

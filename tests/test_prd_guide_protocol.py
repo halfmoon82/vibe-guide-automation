@@ -467,6 +467,10 @@ class PublishSectionTests(unittest.TestCase):
         self.assertIn("缺省 `deny`", rule)
         change = self.line(section, "`vibe authorize` 改不了")
         self.assertIn("新的 `plan_id` 重新发布", change)
+        # The draft is gone after the first publish, so the new id has
+        # nothing to inherit; the first publish hands its S1 back instead.
+        self.assertIn("首次发布结果里的 `s1`", change)
+        self.assertIn("--s1 <s1>", change)
         for stale in ("唯一要选的是允许还是禁止远端 Git 动作", "选定远端 Git 动作后"):
             self.assertNotIn(stale, self.protocol(), stale)
 
@@ -475,11 +479,21 @@ class PublishSectionTests(unittest.TestCase):
         rule = self.line(section, "`excluded_actions`")
         self.assertIn("`allowed_actions`", rule)
         self.assertIn("开发任务自己永远不推送", rule)
-        self.assertIn("监工可以在独立终审通过后执行", rule)
+        self.assertIn("进入授权范围", rule)
+        self.assertIn("vibe 只在独立终审通过后校验并记录，不代为执行", rule)
+        self.assertNotIn("监工可以在独立终审通过后执行", self.protocol())
+        # The code facts behind "records, never executes": the monitor stamps
+        # remote Git actions as not performed, and the only merge gate needs
+        # merge_local/merge_remote, which the published card never carries.
+        import inspect
+        from vibe_guide import authorization, monitor
+        self.assertIn('"external_execution": "not_performed"', inspect.getsource(monitor))
+        self.assertIn('{"merge_local", "merge_remote"}', inspect.getsource(authorization.can_auto_merge))
         # The worker envelope is fixed, so it lists push/merge under deny too.
         from vibe_guide.authorization import _EXCLUDED_ACTIONS, _REMOTE_GIT_ACTIONS_SCOPE
         self.assertTrue({"push", "merge"} <= set(_EXCLUDED_ACTIONS))
         self.assertIn("`excluded_actions` 照样列着推送/合并", rule)
+        self.assertFalse({"merge_local", "merge_remote"} & set(_REMOTE_GIT_ACTIONS_SCOPE))
         for action in _REMOTE_GIT_ACTIONS_SCOPE:
             from vibe_guide.authorization import _ALLOWED_ACTIONS
             self.assertNotIn(action, _ALLOWED_ACTIONS, action)

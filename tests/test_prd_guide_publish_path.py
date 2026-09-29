@@ -15,10 +15,12 @@ exercised:
 3. the remote Git switch is fixed at publish time, not at authorization.
 """
 import json
+import os
 import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vibe_guide.cli import run_cli
 from vibe_guide.session_entry import stable_plan_id
@@ -118,6 +120,28 @@ class ProtocolPathTests(_Project):
         self.assert_complex_publish(published, plan_id, "deny")
         self.assertEqual(published.payload.get("score"), 19, published.payload)
 
+    def test_changing_the_switch_republishes_under_a_new_id_with_the_returned_s1(self):
+        """§5.3: the switch cannot change after publishing; republish instead.
+
+        The draft is gone by then, so the S1 comes from the first publish's
+        own result -- otherwise a short request falls back to its text score.
+        """
+        plan_id = self.cli("plan", "--request", SHORT_REQUEST, "--s1", SESSION_S1).payload["plan_id"]
+        self.prepare_session()
+        first = self.cli(
+            "plan", "--request", SHORT_REQUEST, "--plan-id", plan_id,
+            "--from-prd", self.write_spec("product-spec.json", "deny"),
+        )
+        self.assertEqual(first.payload.get("s1"), SESSION_S1, first.payload)
+        again = self.cli(
+            "plan", "--request", SHORT_REQUEST, "--plan-id", plan_id + "-r2", "--s1", first.payload["s1"],
+            "--from-prd", self.write_spec("product-spec-r2.json", "allow"),
+        )
+        self.assertEqual(again.payload.get("status"), "ok", again.payload)
+        self.assertEqual(again.payload.get("score"), 19, again.payload)
+        self.assertEqual(self.card(plan_id + "-r2")["remote_git_actions"], "allow")
+        self.assertEqual(self.card(plan_id)["remote_git_actions"], "deny")
+
     def test_a_product_spec_is_never_dropped_behind_status_ok(self):
         """No draft to inherit from and a low-scoring text: refuse, loudly."""
         self.prepare_session()
@@ -195,6 +219,56 @@ class DraftReplacementBoundaryTests(_Project):
         result = self.publish(plan_id)
         self.assertEqual(result.payload.get("status"), "blocked", result.payload)
         self.assertTrue((self.plan_dir(plan_id) / "specs").is_dir())
+
+    def test_a_symlinked_plan_id_never_replaces_the_draft_it_points_to(self):
+        plan_id = self.draft()
+        os.symlink(plan_id, str(self.plan_dir("alias")))
+        result = self.publish("alias")
+        self.assertEqual(result.payload.get("status"), "blocked", result.payload)
+        self.assertIn("plan already exists", result.payload.get("reason", ""))
+        plan = json.loads((self.plan_dir(plan_id) / "plan.json").read_text(encoding="utf-8"))
+        self.assertEqual((plan["plan_id"], plan["status"]), (plan_id, "draft"))
+
+    def test_a_failed_swap_restores_the_draft_and_its_spec(self):
+        plan_id = self.draft()
+        spec = self.write_spec(".vibe/plans/{}/product-spec.json".format(plan_id))
+        before = sorted(p.name for p in self.plan_dir(plan_id).iterdir())
+        real_replace = os.replace
+
+        def failing_replace(source, target):
+            if str(target) == str(self.plan_dir(plan_id).resolve()) or str(target) == str(self.plan_dir(plan_id)):
+                raise OSError("injected swap failure")
+            return real_replace(source, target)
+
+        with mock.patch("vibe_guide.cli.os.replace", side_effect=failing_replace):
+            result = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+        self.assertNotEqual(result.payload.get("status"), "ok", result.payload)
+        self.assertEqual(sorted(p.name for p in self.plan_dir(plan_id).iterdir()), before)
+        leftovers = [p.name for p in self.plan_dir(plan_id).parent.iterdir() if p.name.startswith(".")]
+        self.assertEqual(leftovers, [])
+
+    def test_a_publication_landing_mid_swap_is_not_overwritten(self):
+        """Re-check what was actually moved aside, not what was seen before."""
+        plan_id = self.draft()
+        import vibe_guide.cli as cli_module
+        real_rename = os.rename
+        state = {"raced": False}
+
+        def racing_rename(source, target):
+            if not state["raced"] and str(source).endswith(plan_id) and "draft" in str(target):
+                state["raced"] = True
+                # Another publisher finished in the window: the directory
+                # is no longer a draft by the time it is moved aside.
+                (Path(source) / "authorization-card.json").write_text("{}", encoding="utf-8")
+            return real_rename(source, target)
+
+        with mock.patch.object(cli_module.os, "rename", side_effect=racing_rename):
+            result = self.publish(plan_id)
+        self.assertTrue(state["raced"], "the swap never moved the draft aside")
+        self.assertEqual(result.payload.get("status"), "blocked", result.payload)
+        self.assertTrue((self.plan_dir(plan_id) / "authorization-card.json").is_file())
+        leftovers = [p.name for p in self.plan_dir(plan_id).parent.iterdir() if p.name.startswith(".")]
+        self.assertEqual(leftovers, [])
 
     def test_a_rejected_publish_leaves_the_draft_intact(self):
         """A publish that fails its gates must not consume the draft."""
