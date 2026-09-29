@@ -284,6 +284,31 @@ class DraftReplacementBoundaryTests(_Project):
         parked = [p / "draft" / "plan.json" for p in self.plan_dir(plan_id).parent.iterdir() if p.name.startswith(".")]
         self.assertTrue(any(path.is_file() for path in parked), "the parked draft was deleted")
 
+    def test_the_protocol_recovery_step_brings_a_parked_draft_back(self):
+        """§5.3's recovery, followed literally, lets the same publish succeed."""
+        plan_id = self.draft()
+        spec = self.write_spec(".vibe/plans/{}/product-spec.json".format(plan_id))
+        import vibe_guide.cli as cli_module
+        real_rename = os.rename
+
+        def interrupted_park(source, target):
+            real_rename(source, target)
+            if str(source).endswith(plan_id) and "draft" in str(target):
+                raise KeyboardInterrupt
+
+        with mock.patch.object(cli_module.os, "rename", side_effect=interrupted_park):
+            with self.assertRaises(KeyboardInterrupt):
+                self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+        self.assertFalse(self.plan_dir(plan_id).exists())
+        # The protocol: .vibe/plans/.<plan_id>.draft.*/draft goes back to
+        # .vibe/plans/<plan_id> when that does not exist.
+        parked = list((self.root / ".vibe" / "plans").glob(".{}.draft.*/draft".format(plan_id)))
+        self.assertEqual(len(parked), 1, parked)
+        shutil.move(str(parked[0]), str(self.plan_dir(plan_id)))
+        published = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+        self.assertEqual(published.payload.get("status"), "ok", published.payload)
+        self.assertTrue((self.root / spec).is_file())
+
     def test_a_publication_landing_mid_swap_is_not_overwritten(self):
         """Re-check what was actually moved aside, not what was seen before."""
         plan_id = self.draft()

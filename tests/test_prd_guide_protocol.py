@@ -453,6 +453,19 @@ class PublishSectionTests(unittest.TestCase):
         self.assertIn("替换这份草案", rule)
         self.assertIn("已发布或已授权的计划不会被覆盖", rule)
 
+    def test_publish_step_tells_how_to_recover_a_parked_draft(self):
+        """Where a draft is left when a swap is interrupted comes from the code."""
+        import inspect
+        from vibe_guide import cli
+        source = inspect.getsource(cli._replace_draft)
+        self.assertIn('prefix="." + destination.name + ".draft."', source)
+        self.assertIn('parked = holding / "draft"', source)
+        self.assertIn("draft could not be restored", source)
+        rule = self.line(self.section("### 5.3 ", "\n## 6. "), "draft could not be restored")
+        self.assertIn("`.vibe/plans/.<plan_id>.draft.*/draft`", rule)
+        self.assertIn("`.vibe/plans/<plan_id>` 不存在", rule)
+        self.assertIn("已存在就不要覆盖", rule)
+
     def test_remote_git_switch_is_chosen_before_publishing(self):
         from vibe_guide.cli import _parser
         from vibe_guide.node_spec import PRODUCT_SPEC_FIELDS
