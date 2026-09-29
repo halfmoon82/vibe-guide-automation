@@ -136,11 +136,13 @@ class ProtocolPathTests(_Project):
         plan_id = routed.payload["plan_id"]
         self.prepare_session()
         published = self.cli(
-            "plan", "--request", SHORT_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5",
+            "plan", "--request", SHORT_REQUEST, "--plan-id", plan_id, "--s1", "4,4,4,2,2",
             "--from-prd", self.write_spec("product-spec.json"),
         )
+        # Lower than the draft's 19 on purpose: a higher explicit score would
+        # pass whether or not the draft is consulted.
         self.assertEqual(published.payload.get("status"), "ok", published.payload)
-        self.assertEqual(published.payload.get("score"), 25, published.payload)
+        self.assertEqual(published.payload.get("score"), 16, published.payload)
 
 
 class DraftReplacementBoundaryTests(_Project):
