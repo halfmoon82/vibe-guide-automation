@@ -80,7 +80,9 @@ class _Project(unittest.TestCase):
         self.assertEqual(len(lines), 1, "§5.1 names no spec location for a new plan_id: {}".format(lines))
         locations = re.findall(r"`([^`]*product-spec\.json)`", lines[0])
         self.assertEqual(len(locations), 1, lines[0])
-        return locations[0].replace("<plan_id>", plan_id)
+        location = locations[0].replace("<plan_id>", plan_id)
+        self.assertNotRegex(location, "[<>]", "unresolved placeholder in §5.1's location")
+        return location
 
     def card(self, plan_id):
         return json.loads((self.plan_dir(plan_id) / "authorization-card.json").read_text(encoding="utf-8"))
