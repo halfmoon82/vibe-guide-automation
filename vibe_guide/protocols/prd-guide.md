@@ -136,7 +136,7 @@ vibe plan --request "<产品经理的原话>" --plan-id <plan_id> --from-prd <pr
 
 用 §1 草案的同一个 `plan_id` 发布，vibe 会替换这份草案（草案从未持有授权）；已发布或已授权的计划不会被覆盖，仍报 `plan already exists`。发布同样不必传 `--s1`，vibe 沿用草案记下的评分，只升不降。
 
-替换中途被打断（如 Ctrl-C）或 reason 含 `draft could not be restored` 时，草案不会丢，它在 `.vibe/plans/.<plan_id>.draft.*/draft`：`.vibe/plans/<plan_id>` 不存在就把它整个挪回这个位置，再按原命令重新发布；`.vibe/plans/<plan_id>` 已存在就不要覆盖，只从挪开的草案里取回产品 spec。挪完剩下的空隐藏目录可以删掉。
+替换中途被打断（如 Ctrl-C）或 reason 含 `draft could not be restored` 时，先确认草案有没有被挪开：位置以 reason 里给出的路径为准，没给路径就找 `.vibe/plans/.<plan_id>.draft.*/draft`（命中多个时别猜，问产品经理）。①找不到：草案没被挪动，直接按原命令重新发布；②找到了且 `.vibe/plans/<plan_id>` 不存在：把它整个挪回这个位置，再按原命令重新发布；③找到了且 `.vibe/plans/<plan_id>` 已存在就不要覆盖：里面有 `authorization-card.json` 说明本次发布其实已落盘，照 `status: ok` 往下走，否则只从挪开的草案里取回产品 spec。挪完剩下的空隐藏目录可以删掉。
 
 - `status: ok`：vibe 已生成 PRD、Spec、Issue、DAG 审计、授权卡、planning-brief。把 `authorization_card` 用产品语言念给产品经理：要做哪几件事、哪些同时开工、每件事一个开发任务加一个独立审查任务、发布前选定的远端 Git 开关（卡上的 `remote_git_actions`）、永远不含部署/发布/生产写入/凭据/对外通信。
 - 念卡时分开说两件事，别让 `allow` 听起来像"允许了又排除了"：`excluded_actions` 里的推送/合并是说开发任务自己永远不推送；`allowed_actions` 里的推送/合并是说产品经理允许后，这些动作进入授权范围；vibe 只在独立终审通过后校验并记录，不代为执行。选 `deny` 时 `allowed_actions` 不含任何远端 Git 动作，`excluded_actions` 照样列着推送/合并。

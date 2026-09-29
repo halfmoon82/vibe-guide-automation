@@ -309,6 +309,35 @@ class DraftReplacementBoundaryTests(_Project):
         self.assertEqual(published.payload.get("status"), "ok", published.payload)
         self.assertTrue((self.root / spec).is_file())
 
+    def test_an_interrupt_before_the_swap_leaves_the_draft_in_place(self):
+        """§5.3 branch ①: no parked draft, rerun the same command."""
+        plan_id = self.draft()
+        spec = self.write_spec(".vibe/plans/{}/product-spec.json".format(plan_id))
+        import vibe_guide.cli as cli_module
+        with mock.patch.object(cli_module, "render_plan_artifacts", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+        self.assertEqual(list((self.root / ".vibe" / "plans").glob(".{}.draft.*/draft".format(plan_id))), [])
+        published = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+        self.assertEqual(published.payload.get("status"), "ok", published.payload)
+
+    def test_an_interrupt_after_the_swap_leaves_a_landed_publication(self):
+        """§5.3 branch ③: the destination holds this publish's card; it succeeded."""
+        plan_id = self.draft()
+        import vibe_guide.cli as cli_module
+        real_replace = os.replace
+
+        def interrupted_swap(source, target):
+            real_replace(source, target)
+            if str(target).endswith(plan_id):
+                raise KeyboardInterrupt
+
+        with mock.patch.object(cli_module.os, "replace", side_effect=interrupted_swap):
+            result = self.publish(plan_id)
+        self.assertIn("draft could not be restored", result.payload.get("reason", ""))
+        self.assertTrue((self.plan_dir(plan_id) / "authorization-card.json").is_file())
+        self.assertEqual(len(list((self.root / ".vibe" / "plans").glob(".{}.draft.*/draft".format(plan_id)))), 1)
+
     def test_a_publication_landing_mid_swap_is_not_overwritten(self):
         """Re-check what was actually moved aside, not what was seen before."""
         plan_id = self.draft()

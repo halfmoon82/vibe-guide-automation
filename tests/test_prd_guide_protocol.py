@@ -462,9 +462,16 @@ class PublishSectionTests(unittest.TestCase):
         self.assertIn('parked = holding / "draft"', source)
         self.assertIn("draft could not be restored", source)
         rule = self.line(self.section("### 5.3 ", "\n## 6. "), "draft could not be restored")
+        self.assertIn("替换中途被打断（如 Ctrl-C）", rule)
+        self.assertIn("以 reason 里给出的路径为准", rule)
         self.assertIn("`.vibe/plans/.<plan_id>.draft.*/draft`", rule)
-        self.assertIn("`.vibe/plans/<plan_id>` 不存在", rule)
-        self.assertIn("已存在就不要覆盖", rule)
+        # Most interrupts land before the draft is moved; that branch first.
+        self.assertIn("①找不到：草案没被挪动，直接按原命令重新发布", rule)
+        self.assertIn("②找到了且 `.vibe/plans/<plan_id>` 不存在：把它整个挪回这个位置，再按原命令重新发布", rule)
+        self.assertIn("③找到了且 `.vibe/plans/<plan_id>` 已存在就不要覆盖", rule)
+        self.assertIn("有 `authorization-card.json` 说明本次发布其实已落盘", rule)
+        self.assertIn("否则只从挪开的草案里取回产品 spec", rule)
+        self.assertIn("空隐藏目录可以删掉", rule)
 
     def test_remote_git_switch_is_chosen_before_publishing(self):
         from vibe_guide.cli import _parser
