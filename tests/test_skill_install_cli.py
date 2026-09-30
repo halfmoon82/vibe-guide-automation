@@ -133,6 +133,23 @@ class ProjectInstallTests(unittest.TestCase):
         self.assertEqual(result.status, 'pending')
         self.assertFalse((self.project / '.vibe').exists())
 
+    def test_symlinked_proposal_dirs_are_pending_without_outside_writes(self):
+        for linked in ('proposals', 'proposals/skills'):
+            with self.subTest(linked=linked):
+                project = self.base / ('p-' + linked.replace('/', '-'))
+                outside = self.base / ('out-' + linked.replace('/', '-'))
+                outside.mkdir()
+                link = project / '.vibe' / linked
+                link.parent.mkdir(parents=True)
+                link.symlink_to(outside, target_is_directory=True)
+                result = install_project_skill(
+                    SkillSpec('alpha', SOURCE, self.sha, 'skills/alpha'),
+                    project, self.vibe_home,
+                )
+                self.assertEqual(result.status, 'pending')
+                self.assertEqual(list(outside.rglob('*')), [])
+                self.assertFalse((project / '.vibe' / 'config.json').exists())
+
     def test_scanner_marks_invalid_subdir_record_invalid(self):
         install_project_skill(
             SkillSpec('alpha', SOURCE, self.sha, 'skills/alpha'),
@@ -222,6 +239,7 @@ class SkillInstallCliTests(unittest.TestCase):
             '--name', 'evil', '--subdir', '../x', '--confirm',
         ])
         self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.payload['status'], 'pending')
         self.assertFalse((self.project / '.vibe').exists())
 
 

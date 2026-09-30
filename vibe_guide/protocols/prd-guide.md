@@ -65,7 +65,7 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
 | prioritize-features | 非目标与排序 | `pm-product-discovery/skills/prioritize-features` |
 | prioritization-frameworks | 非目标与排序 | `pm-execution/skills/prioritization-frameworks` |
 | job-stories | 用户场景 | `pm-execution/skills/job-stories` |
-| customer-journey-map（可选） | 用户场景 | `pm-market-research/skills/customer-journey-map` |
+| customer-journey-map | 用户场景（可选） | `pm-market-research/skills/customer-journey-map` |
 | strategy-red-team | 风险与反例 | `pm-execution/skills/strategy-red-team` |
 | pre-mortem | 风险与反例 | `pm-execution/skills/pre-mortem` |
 

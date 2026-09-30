@@ -3636,6 +3636,7 @@ class Monitor:
                                 "reason": "; ".join(gate.reasons),
                                 "disposition": gate.classification,
                                 "finding": list(gate.reasons),
+                                "recoverable": True,
                             },
                             active,
                         )

@@ -503,6 +503,9 @@ def install_project_skill(spec, project_root, vibe_home, fetch=True):
         if vibe_dir.exists() and (vibe_dir.is_symlink() or not vibe_dir.is_dir()):
             raise _InstallError()
         proposals_dir = vibe_dir / 'proposals' / 'skills'
+        for directory in (vibe_dir / 'proposals', proposals_dir):
+            if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+                raise _InstallError()
         target = proposals_dir / spec.name
         config_path = vibe_dir / 'config.json'
 

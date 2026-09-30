@@ -220,6 +220,7 @@ class DeliveryGateRereportTests(unittest.TestCase):
         self.assertEqual(
             rejected["data"]["disposition"], "acceptance_rejected"
         )
+        self.assertIs(rejected["data"].get("recoverable"), True)
         self.assertNotIn("delivered", names)
 
         snapshot = monitor.tick(snapshot.run_id, runner)

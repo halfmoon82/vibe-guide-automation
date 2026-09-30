@@ -70,7 +70,7 @@ from .prd_profiles import evaluate_prd_checkpoints, validate_skill_profile
 from .engine_attestation import create_engine_attestation
 from .evidence import evaluate_v41_closeout
 from .installation import run_install, run_upgrade, migrate_state
-from .skills import SkillSpec, install_project_skill, normalize_skill_subdir
+from .skills import SkillSpec, install_project_skill
 from .models import InstallRequest
 
 
@@ -982,7 +982,6 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         try:
             if not (args.skill_source and args.skill_sha and args.skill_name):
                 raise ValueError("skill-install requires --source, --sha and --name")
-            normalize_skill_subdir(args.skill_subdir)
             spec = SkillSpec(
                 args.skill_name, args.skill_source, args.skill_sha, args.skill_subdir,
             )
