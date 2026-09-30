@@ -115,6 +115,66 @@ class WorkBuddyHostBoundaryTests(unittest.TestCase):
         (self.root / "AGENTS.md").symlink_to("real.md")
         self.assertEqual(self._integration_ref(), ["AGENTS.md"])
 
+    def test_a_symlinked_agents_md_beside_codebuddy_md_writes_where_it_cites(self):
+        # Citing AGENTS.md while appending to CODEBUDDY.md would split the
+        # rules from the reference; main refused the symlink, so keep that.
+        self._write("real.md", "rules\n")
+        (self.root / "AGENTS.md").symlink_to("real.md")
+        self._write("CODEBUDDY.md", "rules\n")
+        self.assertEqual(self._integration_ref(), ["AGENTS.md"])
+        self.assertEqual(_rules_target(self.root).name, "AGENTS.md")
+
+    def test_an_agents_md_that_is_not_a_file_leaves_codebuddy_md_as_the_target(self):
+        # A dangling link or a directory is cited as CODEBUDDY.md, so the
+        # rules must be written there too -- the pairing main already had.
+        self._write("CODEBUDDY.md", "rules\n")
+        (self.root / "AGENTS.md").symlink_to("nope.md")
+        self.assertEqual(self._integration_ref(), ["CODEBUDDY.md"])
+        self.assertEqual(_rules_target(self.root).name, "CODEBUDDY.md")
+        (self.root / "AGENTS.md").unlink()
+        (self.root / "AGENTS.md").mkdir()
+        self.assertEqual(self._integration_ref(), ["CODEBUDDY.md"])
+        self.assertEqual(_rules_target(self.root).name, "CODEBUDDY.md")
+
+    def test_an_agents_md_linked_to_codebuddy_md_still_receives_the_rules(self):
+        # Writing CODEBUDDY.md is writing the file AGENTS.md cites here.
+        from vibe_guide.cli import run_cli
+
+        self._write("CODEBUDDY.md", "# codebuddy rules\n")
+        (self.root / "AGENTS.md").symlink_to("CODEBUDDY.md")
+        self.assertEqual(_rules_target(self.root).name, "CODEBUDDY.md")
+        run_cli(["init", "--confirm", "--json"], self.root)
+        applied = run_cli(["apply-agentsmd", "--confirm", "--json"], self.root)
+        self.assertEqual(applied.exit_code, 0, applied.text)
+        self.assertTrue((self.root / "AGENTS.md").is_symlink())
+        self.assertIn("## ", (self.root / "CODEBUDDY.md").read_text(encoding="utf-8"))
+
+    def test_a_link_spelling_codebuddy_md_in_another_case_is_the_same_file(self):
+        self._write("codebuddy.md", "rules\n")
+        if not (self.root / "CODEBUDDY.md").is_file():
+            self.skipTest("case-sensitive filesystem")
+        (self.root / "AGENTS.md").symlink_to("codebuddy.md")
+        self.assertEqual(_rules_target(self.root).name, "CODEBUDDY.md")
+
+    def test_apply_agentsmd_without_confirm_names_the_rules_file(self):
+        from vibe_guide.cli import run_cli
+
+        self._write("CODEBUDDY.md", "# codebuddy rules\n")
+        paused = run_cli(["apply-agentsmd"], self.root)
+        self.assertIn("CODEBUDDY.md", paused.text)
+        self.assertNotIn("AGENTS.md", paused.text)
+
+    def test_apply_agentsmd_names_the_file_it_actually_wrote(self):
+        from vibe_guide.cli import run_cli
+
+        self._write("CODEBUDDY.md", "# codebuddy rules\n")
+        run_cli(["init", "--confirm", "--json"], self.root)
+        applied = run_cli(["apply-agentsmd", "--confirm"], self.root)
+        self.assertEqual(applied.exit_code, 0, applied.text)
+        self.assertIn("CODEBUDDY.md", applied.text)
+        self.assertNotIn("AGENTS.md", applied.text)
+        self.assertFalse((self.root / "AGENTS.md").exists())
+
     def test_a_pinned_host_record_outside_every_host_root_is_invalid(self):
         outside = Path(self._tmp.name) / "elsewhere" / "stray-skill"
         outside.mkdir(parents=True)

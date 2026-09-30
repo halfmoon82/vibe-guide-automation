@@ -24,7 +24,7 @@ from .adapters.task_provider import ProviderActionStore, ProviderPending
 from .config import load_project_config
 from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import doctor
-from .initializer import apply_agentsmd_proposal, init_project
+from .initializer import _rules_target, apply_agentsmd_proposal, init_project
 from .upgrade import upgrade_project
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import Monitor
@@ -1027,6 +1027,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         )
 
     if args.command == "apply-agentsmd":
+        rules_name = _rules_target(Path(paths.root).resolve()).name
         if not args.confirm:
             return _result(
                 BLOCKED,
@@ -1035,7 +1036,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     "status": "blocked",
                     "reason": "confirmation required",
                 },
-                "AGENTS.md 规则应用已暂停：需要明确确认",
+                rules_name + " 规则应用已暂停：需要明确确认",
                 args.as_json,
             )
         try:
@@ -1048,7 +1049,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     "status": "blocked",
                     "reason": str(error),
                 },
-                "AGENTS.md 规则应用已阻塞：" + str(error),
+                rules_name + " 规则应用已阻塞：" + str(error),
                 args.as_json,
             )
         payload = {
@@ -1060,9 +1061,9 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         return _result(
             SUCCESS,
             payload,
-            "AGENTS.md 能力规则已生效"
+            rules_name + " 能力规则已生效"
             if applied.changed
-            else "AGENTS.md 能力规则无需变更",
+            else rules_name + " 能力规则无需变更",
             args.as_json,
         )
 

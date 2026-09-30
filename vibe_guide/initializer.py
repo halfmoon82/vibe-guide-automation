@@ -331,38 +331,37 @@ def init_project(paths, confirm):
             '- source_status: remote\n',
         )
         created.append(str(skill_proposal.relative_to(root)))
-    # The PRD-guide protocol is vibe's own, shipped with the package; it is
+    # Both protocols are vibe's own, shipped with the package; each is
     # proposed into the project so the host agent finds it, and never
     # rewritten once present so user edits survive re-initialization.
-    prd_guide = root / PRD_GUIDE_PROPOSAL_RELATIVE
-    if not prd_guide.exists():
-        prd_guide.parent.mkdir(parents=True, exist_ok=True)
-        _write_new(prd_guide, load_protocol(PRD_GUIDE_NAME))
-        created.append(PRD_GUIDE_PROPOSAL_RELATIVE)
-    # The session-entry protocol shares prd-guide's semantics: proposed once,
-    # never rewritten, so user edits survive re-initialization.
-    vibe_entry = root / VIBE_ENTRY_PROPOSAL_RELATIVE
-    if not vibe_entry.exists():
-        vibe_entry.parent.mkdir(parents=True, exist_ok=True)
-        _write_new(vibe_entry, load_protocol(VIBE_ENTRY_NAME))
-        created.append(VIBE_ENTRY_PROPOSAL_RELATIVE)
-    elif vibe_entry.is_file() and not vibe_entry.is_symlink():
+    for relative, name in (
+        (PRD_GUIDE_PROPOSAL_RELATIVE, PRD_GUIDE_NAME),
+        (VIBE_ENTRY_PROPOSAL_RELATIVE, VIBE_ENTRY_NAME),
+    ):
+        copy = root / relative
+        if not copy.exists():
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            _write_new(copy, load_protocol(name))
+            created.append(relative)
+            continue
+        if not copy.is_file() or copy.is_symlink():
+            continue
         try:
-            current_entry = vibe_entry.read_text(encoding='utf-8')
+            current = copy.read_text(encoding='utf-8')
         except (OSError, UnicodeDecodeError):
-            current_entry = None
-        if current_entry is None:
+            current = None
+        if current is None:
             notes.append(
-                VIBE_ENTRY_PROPOSAL_RELATIVE
+                relative
                 + ' 读不出来，本次跳过一致性比对；vibe 永不改写该文件，请人工核对。'
             )
-        elif current_entry != load_protocol(VIBE_ENTRY_NAME):
+        elif current != load_protocol(name):
             # The copy is never rewritten, so a difference stays silent
             # forever unless surfaced here.  The cause is ambiguous -- a
             # local edit or a shipped-protocol update -- so the note says
             # both and leaves the merge to a human.
             notes.append(
-                VIBE_ENTRY_PROPOSAL_RELATIVE
+                relative
                 + ' 与随包协议不一致：可能是本地修改，也可能是随包协议已更新；'
                 + 'vibe 永不改写该文件，请人工 diff 后手动合并。'
             )
@@ -525,8 +524,22 @@ def _rules_target(root):
     so a WorkBuddy project's CODEBUDDY.md -- the only file its host reads --
     actually receives them.  A project with none still gets AGENTS.md, which
     is what every host loads and what older releases always wrote.
+
+    The target must be the file the integration contract cites, which is
+    AGENTS.md whenever it reads as a file (a symlink followed).  A symlink
+    resolving to the chosen rule file is that same file, so it is written
+    through; any other symlink stays the target and is refused below rather
+    than the rules quietly landing in a file nobody cites.
     """
-    return root / (resolve_rules_file(root) or "AGENTS.md")
+    agents = root / "AGENTS.md"
+    chosen = resolve_rules_file(root)
+    if agents.is_file():
+        # samefile, not a path compare: on a case-insensitive disk the
+        # link may spell the name differently from the candidate.
+        if chosen and os.path.samefile(str(agents), str(root / chosen)):
+            return root / chosen
+        return agents
+    return root / (chosen or "AGENTS.md")
 
 
 def apply_agentsmd_proposal(paths, confirm):
