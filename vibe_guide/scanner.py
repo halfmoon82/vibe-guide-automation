@@ -199,12 +199,12 @@ VIBE_ENTRY_RULES = """## New Session Entry
 - 凡经 S1 评分的请求，评分后输出一行评分与档位（形如 `S1：11→轻规划（不触碰 vibe）`）；>15 或拿不准时才 `vibe scan` 并 `vibe plan --request --s1` 进入正式路由；<=15 直接执行或轻规划。
 - 宿主另有强制入口/状态行协议时，S1 评分并入其首个强制状态行作为 `S1：` 字段输出，不另起一轮评分或第二个门。
 - 会话门阻塞必须停下报告，不得伪造或跳过。
-- 涉及图形界面的新增或改动，不论 S1 多少分，先按入口协议 §4 给出每个页面可打开查看的设计稿，产品经理明确确认前不动手写代码。
+- 涉及图形界面的新增或改动，不论 S1 多少分，先按入口协议的「界面设计稿门」给出每个页面可打开查看的设计稿，产品经理明确确认前不动手写代码。
 """
 
 #: Substring unique to the current entry-block wording.  The marker only
 #: answers "a block is present"; this answers "it is the current block".
-VIBE_ENTRY_CURRENT_SENTINEL = "不论 S1 多少分，先按入口协议 §4"
+VIBE_ENTRY_CURRENT_SENTINEL = "先按入口协议的「界面设计稿门」"
 
 ENGINEERING_PRINCIPLES_MARKER = "Engineering Principles"
 ENGINEERING_PRINCIPLES = """## Engineering Principles

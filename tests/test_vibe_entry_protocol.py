@@ -151,6 +151,9 @@ class VibeEntryProtocolShippingTests(unittest.TestCase):
         self.assertIn("不论 S1", line)
         self.assertIn("设计稿", line)
         self.assertIn(VIBE_ENTRY_CURRENT_SENTINEL, line)
+        # Old projects keep their materialized SKILL.md, whose numbering may
+        # differ; name the section instead of pointing at a number.
+        self.assertNotIn("§", line)
 
     def test_protocol_states_gate_discipline(self):
         from vibe_guide.protocols import load_protocol
