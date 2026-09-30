@@ -9,6 +9,7 @@ from .scanner import (
     ENGINEERING_PRINCIPLES_MARKER,
     VIBE_ENTRY_CURRENT_SENTINEL,
     VIBE_ENTRY_RULE_MARKER,
+    WORKBUDDY_ORIGIN,
     build_agentsmd_patch,
     missing_agentsmd_blocks,
     resolve_rules_file,
@@ -321,7 +322,7 @@ def init_project(paths, confirm):
                         _atomic_write_text(update_path, update)
                         created.append(str(update_path.relative_to(root)))
     skill_proposal = root / '.vibe/proposals/skills/proposal.md'
-    if not skill_proposal.exists() and not any(item.get('valid') and item.get('name') == 'architecture-skill-pack' for item in report.skills):
+    if not skill_proposal.exists() and not any(item.get('valid') and item.get('name') == 'architecture-skill-pack' and item.get('origin') != WORKBUDDY_ORIGIN for item in report.skills):
         _write_new(
             skill_proposal,
             '# Skill proposal\n\n'

@@ -1,9 +1,9 @@
 # vibe-guide → WorkBuddy 适配：改动总清单
 
 版本：vibe-guide **4.9.1** ｜ WorkBuddy / CodeBuddy Code CLI **2.137.1** ｜ Windows 11
-Python 环境：`C:\Users\sunnywong\.workbuddy\binaries\python\envs\default`
+Python 环境：`%USERPROFILE%\.workbuddy\binaries\python\envs\default`
 包目录：`...\envs\default\Lib\site-packages\vibe_guide\`
-验证项目：`E:\PycharmProjects\future\vibe-complex-test`（新建，未污染 trading_core4 / books_obsidian）
+验证项目：`<测试项目目录>`（新建，未污染已有项目）
 
 ---
 
@@ -116,10 +116,10 @@ WorkBuddy 读的是 `CODEBUDDY.md`，根本不看 `AGENTS.md`。原来只认 `AG
 
 | 项 | 位置 | 说明 |
 |---|---|---|
-| 命令 shim | `C:\Users\sunnywong\.workbuddy\bin\workbuddy.cmd` | 必须 `.cmd` 后缀；win32 `shutil.which` 按 PATHEXT 拼后缀，裸名 `workbuddy` 永远匹配不到 |
+| 命令 shim | `%USERPROFILE%\.workbuddy\bin\workbuddy.cmd` | 必须 `.cmd` 后缀；win32 `shutil.which` 按 PATHEXT 拼后缀，裸名 `workbuddy` 永远匹配不到 |
 | 用户 PATH | `HKCU\Environment\Path` | **本次才真正写入**（之前记录失真，见第五节） |
-| skill 收编 | `C:\Users\sunnywong\.workbuddy\skills\` | 9 个 `architecture-*`，从 `D:\books_obsidian\.workbuddy\skills\` 复制，**D 盘原件保留** |
-| 测试项目 | `E:\PycharmProjects\future\vibe-complex-test` | `CODEBUDDY.md` + `core/{ledger,engine,report}.py` + git 仓库 + `.vibe/` |
+| skill 收编 | `%USERPROFILE%\.workbuddy\skills\` | 9 个 `architecture-*`，从 `<另一个本地项目>\.workbuddy\skills\` 复制，**D 盘原件保留** |
+| 测试项目 | `<测试项目目录>` | `CODEBUDDY.md` + `core/{ledger,engine,report}.py` + git 仓库 + `.vibe/` |
 
 收编的 9 个 skill（均含 `SKILL.md`）：
 `architecture-agents-md-contract` / `git-worktree-contract` / `module-contract` /
@@ -242,9 +242,9 @@ bridge 为 null。**它只影响派发，不阻塞规划/发布/授权。**
 | 读事件流 | `GET /api/v1/jobs/:id/stream`（SSE）/ `/transcript` |
 | 恢复 / 重启 | `POST /api/v1/jobs/resume`、`POST /api/v1/jobs/:id/respawn` |
 
-**本机实测闭环全 200**：起 daemon（PID 31276，`http://127.0.0.1:8099`）→
+**本机实测闭环全 200**：起 daemon（PID <pid>，`http://127.0.0.1:8099`）→
 `health`/`info`/`jobs`/`workers`/`dispatch-context` 全通 → `POST /api/v1/jobs` 派发返回
-`id=26c26e32`、`state=done`、`settled=true` → 查详情 / 读 transcript / 删除全通 → `daemon stop`。
+`id=<job-id>`、`state=done`、`settled=true` → 查详情 / 读 transcript / 删除全通 → `daemon stop`。
 
 **Windows 硬约束**：官方文档明确「只有通过 `daemon start` 启动的 daemon 独立于发起进程存活，
 `--bg` 会随 CLI 退出被回收」。真要接，必须先拉 daemon 再打 HTTP。
@@ -258,7 +258,7 @@ bridge 为 null。**它只影响派发，不阻塞规划/发布/授权。**
 `attention` + `no candidate Agent command found`，追查发现：
 
 - `_AGENT_COMMANDS`（scanner.py:14-22）**本来就包含 `workbuddy`** —— 不是漏了候选命令
-- 读注册表 `HKCU\Environment\Path` → **不含** `C:\Users\sunnywong\.workbuddy\bin`
+- 读注册表 `HKCU\Environment\Path` → **不含** `%USERPROFILE%\.workbuddy\bin`
 - 但 `shutil.which('workbuddy', path=<shim 目录>)` → 命中 `...\workbuddy.CMD` —— shim 本身没问题
 - 之前 V2 PASS 是因为在测试进程里临时改过 PATH，**没有持久化**
 
@@ -284,9 +284,9 @@ pip install --force-reinstall vibe-guide==4.9.1
 ```
 
 - D 组单独回滚：删掉 `adapters/manifests/workbuddy.yaml` 里的 `native_control_plane` 键
-- shim：删除 `C:\Users\sunnywong\.workbuddy\bin\workbuddy.cmd`，并从用户 PATH 移除该目录
-- 收编的 skill：删除 `C:\Users\sunnywong\.workbuddy\skills\architecture-*`（D 盘原件未动）
-- 测试项目：整个删掉 `E:\PycharmProjects\future\vibe-complex-test`
+- shim：删除 `%USERPROFILE%\.workbuddy\bin\workbuddy.cmd`，并从用户 PATH 移除该目录
+- 收编的 skill：删除 `%USERPROFILE%\.workbuddy\skills\architecture-*`（D 盘原件未动）
+- 测试项目：整个删掉 `<测试项目目录>`
 
 ---
 

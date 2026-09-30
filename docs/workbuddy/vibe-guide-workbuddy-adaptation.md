@@ -1,7 +1,7 @@
 # vibe-guide → WorkBuddy 深度适配报告
 
 目标：让 vibe-guide v4.9.1 在本机 **跑复杂任务**（complex 路由 10 节点）。
-验证项目：`E:\PycharmProjects\future\vibe-complex-test`（新建，未污染 trading_core4 / books_obsidian）。
+验证项目：`<测试项目目录>`（新建，未污染已有项目）。
 
 ---
 
@@ -25,7 +25,7 @@
 
 ## 二、改动清单（4 个可独立回滚的 commit）
 
-目录：`C:\Users\sunnywong\.workbuddy\binaries\python\envs\default\Lib\site-packages\vibe_guide\`
+目录：`%USERPROFILE%\.workbuddy\binaries\python\envs\default\Lib\site-packages\vibe_guide\`
 
 ### A. 规则文件解析（AGENTS.md → CODEBUDDY.md）
 - `scanner.py`：新增 `RULES_FILE_CANDIDATES = ('AGENTS.md','CODEBUDDY.md','CLAUDE.md')` 与
@@ -59,9 +59,9 @@
 
 ## 三、配套落地
 
-- **收编 skill**：9 个 `architecture-*` 由 `D:\books_obsidian\.workbuddy\skills\` 复制到
-  `C:\Users\sunnywong\.workbuddy\skills\`（**保留 D 盘原件**）
-- **命令 shim**：`C:\Users\sunnywong\.workbuddy\bin\workbuddy.cmd`。
+- **收编 skill**：9 个 `architecture-*` 由 `<另一个本地项目>\.workbuddy\skills\` 复制到
+  `%USERPROFILE%\.workbuddy\skills\`（**保留 D 盘原件**）
+- **命令 shim**：`%USERPROFILE%\.workbuddy\bin\workbuddy.cmd`。
   必须是 `.cmd` 后缀——win32 `shutil.which` 按 PATHEXT 拼后缀，裸名 `workbuddy` 永远匹配不到。
   实测 `workbuddy --version` → `2.137.1`
 
@@ -233,7 +233,7 @@ WorkBuddy Jobs API **逐条都有对应**，且是官方公开 REST：
 
 ```
 daemon start --port 8099 --auth none
-  → Daemon started (PID: 31276, endpoint: http://127.0.0.1:8099)
+  → Daemon started (PID: <pid>, endpoint: http://127.0.0.1:8099)
 
 GET  /api/v1/health  → 200 {"status":"ok","platforms":["generic","wecom","wechat-kf"]}
 GET  /api/v1/info    → 200 {"version":"5.5.6","os":"win32","gatewayMode":"local"}
@@ -242,11 +242,11 @@ GET  /api/v1/jobs    → 200 {"jobs":[]}
 GET  /api/v1/workers → 200 本机全部 worker（含 kind=interactive/bg/daemon）
 
 POST /api/v1/jobs {"prompt":"echo VIBE-PROBE-PONG","bash":true,"cwd":"...vibe-complex-test"}
-  → 200 {"id":"26c26e32","state":"done","settled":true,
-         "sessionId":"26c26e32-735c-4059-90fe-d0d9e824af7a", ...}
-GET  /api/v1/jobs/26c26e32            → 200 state=done
-GET  /api/v1/jobs/26c26e32/transcript → 200
-DELETE /api/v1/jobs/26c26e32          → 200 {"deleted":true}
+  → 200 {"id":"<job-id>","state":"done","settled":true,
+         "sessionId":"<session-id>", ...}
+GET  /api/v1/jobs/<job-id>            → 200 state=done
+GET  /api/v1/jobs/<job-id>/transcript → 200
+DELETE /api/v1/jobs/<job-id>          → 200 {"deleted":true}
 
 daemon stop → Daemon stopped.
 ```
@@ -291,7 +291,7 @@ daemon stop → Daemon stopped.
 1. **`_AGENT_COMMANDS`（scanner.py:14-22）本来就包含 `workbuddy`**，不是漏了这个候选命令。
 2. 真正原因是 **shim 目录没有持久化进用户 PATH**——进程里
    `shutil.which('workbuddy')` 恒为 `None`：
-   - 读注册表 `HKCU\Environment\Path`：不含 `C:\Users\sunnywong\.workbuddy\bin`（**False**）
+   - 读注册表 `HKCU\Environment\Path`：不含 `%USERPROFILE%\.workbuddy\bin`（**False**）
    - 但 `shutil.which('workbuddy', path=<shim 目录>)` → 命中 `...\workbuddy.CMD`（**shim 本身没问题**）
 
    之前 V2 之所以 PASS，是在测试进程里临时改过 PATH，**没有落盘**。属于记录失真，已更正。

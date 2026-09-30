@@ -30,7 +30,7 @@ _SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 #: WorkBuddy host loads CODEBUDDY.md and never looks at AGENTS.md, so without
 #: this a WorkBuddy project is reported as "missing AGENTS.md" and the rules
 #: vibe writes land in a file no host ever reads.
-RULES_FILE_CANDIDATES = ('AGENTS.md', 'CODEBUDDY.md', 'CLAUDE.md')
+RULES_FILE_CANDIDATES = ('AGENTS.md', 'CODEBUDDY.md')
 
 
 def resolve_rules_file(root):
@@ -384,24 +384,11 @@ def _configured_skills(vibe, paths=None):
         origin = (
             record.get('origin') if isinstance(record.get('origin'), str) else ''
         )
-        if origin:
-            # An explicit origin is a claim about where the skill comes from.
-            # Anything other than the one origin this build understands fails
-            # closed: guessing would let a pinned record masquerade as a
-            # github source it never claimed to be.
-            if origin != WORKBUDDY_ORIGIN:
-                result.append(
-                    {
-                        'name': name[:128],
-                        'source': '<invalid-source>',
-                        'commit': '',
-                        'origin': origin[:64],
-                        'valid': False,
-                    }
-                )
-                continue
+        if origin == WORKBUDDY_ORIGIN:
             result.append(_configured_host_skill(record, paths))
             continue
+        # Any other origin is validated exactly as before this key existed:
+        # a github source pinned to a commit, or invalid.
         try:
             canonical_source = normalize_github_source(source)
             source_valid = True

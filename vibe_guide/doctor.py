@@ -36,7 +36,13 @@ def doctor(report):
     configured_names = sorted(
         skill.get('name', '') for skill in valid_skills if skill.get('name')
     )
-    required_skill = _REQUIRED_SKILL in configured_names
+    # The required skill must be pinned to a github source and commit
+    # (AGENTS.md §7); an unpinned host copy is reported, never counted.
+    required_skill = any(
+        skill.get('name') == _REQUIRED_SKILL
+        and skill.get('origin') != WORKBUDDY_ORIGIN
+        for skill in valid_skills
+    )
     host_provided = sorted(
         skill.get('name', '')
         for skill in report.skills
