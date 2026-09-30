@@ -1188,3 +1188,62 @@ class ProtocolEnforcementTests(_ProjectCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MethodologyReferenceTests(unittest.TestCase):
+    """ISSUE-94: prd-guide §2 methodology reference table.
+
+    Anchors the north-star-metric row and the rule that source marks and
+    the needs_confirmation gate do not change.
+    """
+
+    def _section2(self):
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("prd-guide")
+        start = text.index("## 2. PRD")
+        end = text.find("\n## 3.", start)
+        return text[start:end]
+
+    def setUp(self):
+        self.section = self._section2()
+
+    def test_lists_all_nine_skills(self):
+        for name in (
+            "opportunity-solution-tree",
+            "north-star-metric",
+            "metrics-dashboard",
+            "prioritize-features",
+            "prioritization-frameworks",
+            "job-stories",
+            "customer-journey-map",
+            "strategy-red-team",
+            "pre-mortem",
+        ):
+            self.assertIn(name, self.section, name)
+
+    def test_north_star_metric_row_exists_in_table(self):
+        rows = [l for l in self.section.splitlines() if "north-star-metric" in l]
+        self.assertTrue(
+            any(l.strip().startswith("|") for l in rows),
+            "north-star-metric must appear as a table row",
+        )
+
+    def test_customer_journey_map_marked_optional(self):
+        rows = [l for l in self.section.splitlines() if "customer-journey-map" in l]
+        self.assertTrue(any("可选" in l for l in rows))
+
+    def test_project_skill_path_shape(self):
+        self.assertIn(".vibe/proposals/skills/", self.section)
+
+    def test_source_marks_and_gate_unchanged(self):
+        self.assertIn("不得改变来源标记与停等门", self.section)
+        for mark in (
+            "user_confirmed",
+            "system_inferred",
+            "needs_confirmation",
+            "unverified",
+        ):
+            self.assertIn(mark, self.section, mark)
+
+    def test_no_markdown_side_effects(self):
+        self.assertIn("另存", self.section)

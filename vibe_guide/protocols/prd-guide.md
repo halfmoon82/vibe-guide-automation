@@ -47,6 +47,29 @@ vibe plan --request "<产品经理的原话>" --json
 
 **涉及图形界面时，PRD 必须带设计稿**（vibe-entry §4 的界面设计稿门在这里落地）：本次新增和改动的每一个页面，都在 `prd.design_mockups` 小节写一条，`value` 形如 `订单列表页（改动）：<稿件路径或链接>`。稿件必须打开就能看到页面长什么样（图片、HTML 原型、Figma 等链接），纯文字描述不算。产品经理确认前这条的 `source` 写 `needs_confirmation`——vibe 会因此拒绝发布，这是正确行为；他明确确认后改成 `user_confirmed`；稿件改过，把这条改回 `needs_confirmation` 重新确认。**设计稿没确认，不得进入 §4，更不得动手写代码。**
 
+### 2.1 方法论引用（可参考，不强制）
+
+讨论到对应话题时，可参考下列方法论 skill；它们位于项目 `.vibe/proposals/skills/<名>/SKILL.md`：
+
+| 方法论 | 适用话题 | 安装命令 |
+|---|---|---|
+| opportunity-solution-tree | 问题/场景拆分 | `vibe skill-install --name opportunity-solution-tree --confirm` |
+| north-star-metric | 成功标准 | `vibe skill-install --name north-star-metric --confirm` |
+| metrics-dashboard | 成功标准度量 | `vibe skill-install --name metrics-dashboard --confirm` |
+| prioritize-features | 非目标与排序 | `vibe skill-install --name prioritize-features --confirm` |
+| prioritization-frameworks | 非目标与排序 | `vibe skill-install --name prioritization-frameworks --confirm` |
+| job-stories | 用户场景 | `vibe skill-install --name job-stories --confirm` |
+| customer-journey-map（可选） | 用户场景 | `vibe skill-install --name customer-journey-map --confirm` |
+| strategy-red-team | 风险与反例 | `vibe skill-install --name strategy-red-team --confirm` |
+| pre-mortem | 风险与反例 | `vibe skill-install --name pre-mortem --confirm` |
+
+使用规则：
+
+- 仅作参考、不强制逐字引用；对应 skill 未安装时提示安装命令后继续按本节规则推进，不得阻塞对话。
+- `$ARGUMENTS` 与主题从当前对话读取，不为方法论单独要求参数。
+- 输出仍为中文；不得把方法论产出另存为额外 markdown 文件。
+- 不得改变来源标记与停等门：`user_confirmed`/`system_inferred`/`needs_confirmation`/`unverified` 的语义与 `needs_confirmation` 停等规则保持不变。
+
 会改变产品方向、授权边界或验收标准的取舍，同时要写成 `decisions[]` 条目：`question` / `options`（至少两个、互不相同）/ `impact` / `recommendation`（必须是 options 之一）/ `field`（这个决定落在哪个契约字段上，如 `export.watermark`）。产品经理选定后，`selected` 逐字等于所选 option，`status` 写 `approved`。**没选定的决策保持 `unresolved`，vibe 会拒绝发布，这是正确行为。**
 
 ## 3. 只读代码分析
