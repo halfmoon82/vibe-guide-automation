@@ -257,6 +257,30 @@ class DAGTests(unittest.TestCase):
         self.assertEqual(result.status, "ready")
         self.assertEqual(result.ready_nodes, ["b"])
 
+    def test_audit_allows_overlap_when_transitive_dependency_serializes_nodes(self):
+        # a -> b -> c: a and c overlap but the depends_on chain still orders them.
+        nodes = [
+            audited_node("a", allowlist=["shared/output.md"]),
+            audited_node("b", depends=["a"], allowlist=["docs/b.md"]),
+            audited_node("c", depends=["b"], allowlist=["shared/output.md"]),
+        ]
+        result = audit_dag(Plan("p1", 1, "prd.md", ["a", "b", "c"], "authorized", nodes=nodes))
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(result.ready_nodes, ["a"])
+        self.assertFalse(any("overlapping write scope" in reason for reason in result.reasons["a"]))
+        self.assertFalse(any("overlapping write scope" in reason for reason in result.reasons["c"]))
+
+    def test_audit_still_blocks_overlap_when_only_sibling_without_chain(self):
+        nodes = [
+            audited_node("a", group="first", allowlist=["README.md"]),
+            audited_node("b", depends=["a"], allowlist=["vibe_guide/b.py"]),
+            audited_node("c", group="second", allowlist=["README.md"]),
+        ]
+        result = audit_dag(Plan("p1", 1, "prd.md", ["a", "b", "c"], "authorized", nodes=nodes))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertTrue(any("overlapping write scope" in reason for reason in result.reasons["a"]))
+        self.assertTrue(any("overlapping write scope" in reason for reason in result.reasons["c"]))
+
     def test_audit_reports_conflicting_nodes_paths_and_split_direction(self):
         nodes = [
             audited_node("a", group="first", allowlist=["README.md", "docs/a.md"]),

@@ -1122,8 +1122,15 @@ def refresh_authorization_card(
     nodes: List[DAGNode],
     previous: AuthorizationCard,
     workflow: Optional[Dict[str, Any]] = None,
+    engine_attestation: Optional[Dict[str, Any]] = None,
 ) -> AuthorizationCard:
-    """Rebuild a same-plan card while retaining its approved agent/capacity scope."""
+    """Rebuild a same-plan card while retaining its approved agent/capacity scope.
+
+    ``engine_attestation`` lets a same-run reauthorization rebind the card to
+    fresh Monitor engine evidence (for example after the original attestation
+    aged out).  It never widens scope: the attestation is validated against
+    this exact plan revision before its reference enters the digest.
+    """
 
     authorize(previous, "AUTHORIZE")
     if (
@@ -1157,7 +1164,8 @@ def refresh_authorization_card(
         workflow=workflow,
         execution_engine=previous.execution_engine,
         engine_mode=previous.engine_mode,
-        engine_evidence_ref=previous.engine_evidence_ref,
+        engine_evidence_ref=None if engine_attestation is not None else previous.engine_evidence_ref,
+        engine_attestation=engine_attestation,
         explicit_execution_mode_override=previous.explicit_execution_mode_override,
         workers=previous.workers,
     )

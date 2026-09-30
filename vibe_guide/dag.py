@@ -877,7 +877,8 @@ def _write_scope_conflict_errors(nodes: List[DAGNode]) -> Dict[str, List[str]]:
     ``_parallel_group_errors`` covers members of one explicit
     ``parallel_group``.  This complementary plan/authorization gate covers
     every unordered node pair: overlapping write scope is legal only when a
-    ``depends_on`` edge serializes the pair.  Otherwise both may be
+    ``depends_on`` path serializes the pair - direct or transitive, since a
+    chain ``a -> b -> c`` still orders ``a`` before ``c``.  Otherwise both may be
     dispatched independently while editing the same paths.  Pairs already
     inside one parallel group are skipped because the group audit emits the
     more specific message.
@@ -900,13 +901,25 @@ def _write_scope_conflict_errors(nodes: List[DAGNode]) -> Dict[str, List[str]]:
         if member.status in _DISPATCH_ELIGIBLE:
             errors.setdefault(member.id, []).append(message)
 
+    ancestors: Dict[str, set] = {}
+    for node in by_id.values():
+        found: set = set()
+        stack = [dep for dep in node.depends_on if dep in by_id]
+        while stack:
+            dep = stack.pop()
+            if dep in found:
+                continue
+            found.add(dep)
+            stack.extend(dep_id for dep_id in by_id[dep].depends_on if dep_id in by_id)
+        ancestors[node.id] = found
+
     for index, left in enumerate(by_id.values()):
         if left.id not in scopes:
             continue
         for right in list(by_id.values())[index + 1:]:
             if right.id not in scopes:
                 continue
-            if left.id in right.depends_on or right.id in left.depends_on:
+            if left.id in ancestors[right.id] or right.id in ancestors[left.id]:
                 continue
             left_scope = scopes[left.id]
             right_scope = scopes[right.id]

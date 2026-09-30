@@ -97,6 +97,90 @@ class EngineAttestationTests(unittest.TestCase):
             with self.assertRaisesRegex(PermissionError, "execution_engine_unverified"):
                 monitor._execution_engine_binding(record)
 
+    def test_refresh_rebinds_card_to_fresh_attestation_and_rejects_mismatch(self):
+        from datetime import datetime, timezone
+
+        from vibe_guide.authorization import (
+            authorize,
+            build_authorization_card,
+            refresh_authorization_card,
+        )
+        from vibe_guide.models import AgentCapabilities, DAGNode, Plan
+        from vibe_guide.workflow_gate import REQUIRED_COMPLEX_WORKFLOW
+
+        nodes = [
+            DAGNode(id="issue", title="Issue", status="planned",
+                    depends_on=[], integration_after=[],
+                    parallel_group="g",
+                    contract={"worker": "w", "files": ["a.py"]}),
+            DAGNode(id="integration-review", title="Integration Review",
+                    status="planned", depends_on=["issue"],
+                    integration_after=[], parallel_group="integration",
+                    contract={"worker": "w2", "reviewer": "reviewer",
+                              "files": ["a.py"], "read_only": True}),
+        ]
+        plan = Plan(
+            "p", 1, "prd.md", [n.id for n in nodes], "draft",
+            complexity_band="complex",
+            integration_contract={
+                "prd_ref": "prd.md", "spec_ref": "spec.md",
+                "plan_revision": 1, "scope": ["issue"],
+                "acceptance": ["P0-P2=0"], "reviewer": "reviewer",
+            },
+            nodes=nodes,
+        )
+
+        def fresh_attestation(**overrides):
+            overrides.setdefault("now", datetime.now(timezone.utc).isoformat())
+            return self._create(**overrides)
+
+        def completed_workflow():
+            sequence = list(REQUIRED_COMPLEX_WORKFLOW)
+            return {
+                "task_id": "t", "route": "complex", "nodes": sequence,
+                "authorization_granted": True,
+                "node_records": {
+                    node_id: {
+                        "task_id": "t", "node_id": node_id,
+                        "status": "completed", "input": {"v": 1},
+                        "output": {"v": 1}, "evidence": {"v": 1},
+                        "sequence": index,
+                    }
+                    for index, node_id in enumerate(sequence, 1)
+                },
+            }
+
+        capabilities = AgentCapabilities("codex", True, True, True, True, True, "full")
+        first_attestation = fresh_attestation()
+        card = build_authorization_card(
+            plan, nodes, capabilities, engine_attestation=first_attestation,
+        )
+        card = authorize(card, "AUTHORIZE")
+        self.assertEqual(card.engine_evidence_ref, first_attestation["evidence_ref"])
+
+        fresh = fresh_attestation(provenance="live:refresh")
+        refreshed = refresh_authorization_card(
+            plan, nodes, card,
+            workflow=completed_workflow(),
+            engine_attestation=fresh,
+        )
+        self.assertEqual(refreshed.engine_evidence_ref, fresh["evidence_ref"])
+        self.assertEqual(refreshed.allowed_actions, card.allowed_actions)
+        self.assertEqual(refreshed.file_scope, card.file_scope)
+        self.assertEqual(refreshed.worker_scope, card.worker_scope)
+
+        unchanged = refresh_authorization_card(
+            plan, nodes, card, workflow=completed_workflow(),
+        )
+        self.assertEqual(unchanged.engine_evidence_ref, card.engine_evidence_ref)
+
+        with self.assertRaisesRegex(ValueError, "plan"):
+            refresh_authorization_card(
+                plan, nodes, card,
+                workflow=completed_workflow(),
+                engine_attestation=fresh_attestation(plan_id="other"),
+            )
+
     def test_monitor_rejects_attestation_from_another_plan(self):
         from vibe_guide.monitor import Monitor
         from vibe_guide.paths import ProjectPaths
