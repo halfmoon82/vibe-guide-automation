@@ -1245,5 +1245,19 @@ class MethodologyReferenceTests(unittest.TestCase):
         ):
             self.assertIn(mark, self.section, mark)
 
+    def test_install_command_carries_every_argument_skill_install_requires(self):
+        # cli.py rejects skill-install without --source/--sha/--name; a
+        # template missing any of them fails for whoever copies it.
+        commands = [l for l in self.section.splitlines() if l.startswith("vibe skill-install")]
+        self.assertEqual(len(commands), 1)
+        for flag in ("--source https://github.com/phuryn/pm-skills",
+                     "--sha 8607e3b077817f89bf4a9b623246219734ac3be0",
+                     "--subdir", "--name", "--confirm"):
+            self.assertIn(flag, commands[0], flag)
+
+    def test_decision_rules_stay_outside_methodology_subsection(self):
+        head, _, _ = self.section.partition("### 2.1")
+        self.assertIn("decisions[]", head)
+
     def test_no_markdown_side_effects(self):
         self.assertIn("另存", self.section)
