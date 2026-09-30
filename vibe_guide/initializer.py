@@ -534,7 +534,9 @@ def _rules_target(root):
     agents = root / "AGENTS.md"
     chosen = resolve_rules_file(root)
     if agents.is_file():
-        if chosen and agents.resolve() == (root / chosen).resolve():
+        # samefile, not a path compare: on a case-insensitive disk the
+        # link may spell the name differently from the candidate.
+        if chosen and os.path.samefile(str(agents), str(root / chosen)):
             return root / chosen
         return agents
     return root / (chosen or "AGENTS.md")

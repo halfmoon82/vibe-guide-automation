@@ -149,6 +149,13 @@ class WorkBuddyHostBoundaryTests(unittest.TestCase):
         self.assertTrue((self.root / "AGENTS.md").is_symlink())
         self.assertIn("## ", (self.root / "CODEBUDDY.md").read_text(encoding="utf-8"))
 
+    def test_a_link_spelling_codebuddy_md_in_another_case_is_the_same_file(self):
+        self._write("codebuddy.md", "rules\n")
+        if not (self.root / "CODEBUDDY.md").is_file():
+            self.skipTest("case-sensitive filesystem")
+        (self.root / "AGENTS.md").symlink_to("codebuddy.md")
+        self.assertEqual(_rules_target(self.root).name, "CODEBUDDY.md")
+
     def test_apply_agentsmd_without_confirm_names_the_rules_file(self):
         from vibe_guide.cli import run_cli
 
