@@ -6,9 +6,11 @@ same-session retriable) from missing binding evidence such as task
 identity, worktree, branch or cursor (fail-closed blocked_unknown).
 """
 
+import hashlib
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from vibe_guide.authorization import authorize, build_authorization_card
@@ -109,10 +111,20 @@ class DeliveryGateRereportTests(unittest.TestCase):
         (self.paths.root / "docs" / "prd.md").write_text("prd\n", encoding="utf-8")
         (self.paths.root / "docs" / "spec.md").write_text("spec\n", encoding="utf-8")
         workflow = create_task_workflow("plan-88", TaskContext(5, 5, 5, 5, 5))
+        # Monitor.start re-hashes every node's artifact (authorize_entry.
+        # verify_workflow_artifacts), so each record must point at a real file.
+        plan_dir = self.paths.vibe / "plans" / "plan-88"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        evidence_file = plan_dir / "workflow-evidence.md"
+        evidence_file.write_text("evidence\n", encoding="utf-8")
+        artifact = {
+            "ref": evidence_file.name,
+            "sha256": hashlib.sha256(evidence_file.read_bytes()).hexdigest(),
+        }
         for node_id in REQUIRED_COMPLEX_WORKFLOW:
             record_workflow_node(
                 workflow, node_id, {"ref": node_id}, {"ref": node_id},
-                {"ref": node_id},
+                {"ref": node_id, "artifact": artifact},
             )
         (self.paths.vibe / "state.json").write_text(
             json.dumps(
@@ -151,7 +163,7 @@ class DeliveryGateRereportTests(unittest.TestCase):
             provider="fake",
             capability_facts={"fake.worktree": True},
             provenance="live:test",
-            now="2026-09-29T00:00:00Z",
+            now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         )
         target = self.paths.vibe / "plans" / plan.plan_id
         target.mkdir(parents=True, exist_ok=True)
