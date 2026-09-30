@@ -3031,6 +3031,24 @@ class Monitor:
                     delivery,
                 )
                 if not gate.complete:
+                    if gate.classification == "acceptance_rejected":
+                        # Pure artifact-format gap: audit the rejection, keep
+                        # the handle and binding so the same task can
+                        # re-report a corrected delivery in this session.
+                        self._record(
+                            snapshot,
+                            "acceptance_rejected",
+                            {
+                                "run_id": snapshot.run_id,
+                                "node_id": node_id,
+                                "reason": "; ".join(gate.reasons),
+                                "disposition": gate.classification,
+                                "finding": list(gate.reasons),
+                            },
+                            active,
+                        )
+                        save_snapshot(self.paths, snapshot)
+                        return
                     self._mark_blocked_unknown(snapshot, node_id, "; ".join(gate.reasons))
                     return
             self._record_runner_event(snapshot, node_id, event, active)

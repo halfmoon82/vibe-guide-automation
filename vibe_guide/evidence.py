@@ -16,13 +16,21 @@ from .state import _atomic_bytes, run_dir
 class DeliveryEvidence:
     status: str
     reasons: List[str]
+    classification: str = "blocked_unknown"
 
     @property
     def complete(self) -> bool:
         return self.status == "DELIVERED"
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"status": self.status, "reasons": list(self.reasons)}
+        return {"status": self.status, "reasons": list(self.reasons), "classification": self.classification}
+
+
+_DELIVERY_FORMAT_REASONS = (
+    "completion marker is missing",
+    "delivery path is missing",
+    "terminal thread status is missing",
+)
 
 
 def evaluate_delivery_evidence(node: Any, binding: Any, artifacts: Any) -> DeliveryEvidence:
@@ -46,7 +54,20 @@ def evaluate_delivery_evidence(node: Any, binding: Any, artifacts: Any) -> Deliv
     thread_status = get(artifacts, "thread_status")
     if thread_status not in {"complete", "completed", "DELIVERED"}:
         reasons.append("terminal thread status is missing")
-    return DeliveryEvidence("DELIVERED" if not reasons else "blocked_unknown", reasons)
+    if not reasons:
+        return DeliveryEvidence("DELIVERED", [], "complete")
+    if artifacts is not None and not isinstance(artifacts, dict):
+        # A non-mapping payload cannot be classified safely; fail closed.
+        return DeliveryEvidence("blocked_unknown", reasons, "blocked_unknown")
+    # A worker report that lacks only delivery-artifact fields is a pure
+    # format gap: the developer can re-report within the same session.  Any
+    # missing identity/worktree/cursor evidence stays fail-closed.
+    classification = (
+        "acceptance_rejected"
+        if all(reason in _DELIVERY_FORMAT_REASONS for reason in reasons)
+        else "blocked_unknown"
+    )
+    return DeliveryEvidence("blocked_unknown", reasons, classification)
 
 
 @dataclass(frozen=True)
