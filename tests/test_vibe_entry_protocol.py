@@ -103,6 +103,24 @@ class VibeEntryProtocolShippingTests(unittest.TestCase):
         self.assertIn("首个强制状态行", text)
         self.assertIn("第二个门", text)
 
+    def test_protocol_states_ui_design_gate_regardless_of_score(self):
+        """UI changes need confirmed, openable mockups before any code.
+
+        Anchored to §4 itself: the same words elsewhere (e.g. §7's summary
+        line) must not keep this green if the section is dropped.
+        """
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("vibe-entry")
+        section = text[text.index("## 4. 界面设计稿门"):text.index("## 5.")]
+        self.assertIn("不管 S1 多少分", section)
+        self.assertIn("新增和改动的每一个页面", section)
+        self.assertIn("纯文字描述不算设计稿", section)
+        self.assertIn("产品经理明确确认之前，严禁动手写实现代码", section)
+        self.assertIn("<=15 按原档位执行，但动手前先出稿、等确认", section)
+        self.assertIn("`design_mockups`", section)
+        self.assertIn("按改界面处理", section)
+        self.assertIn("设计稿门：待确认", section)
+
     def test_protocol_states_gate_discipline(self):
         from vibe_guide.protocols import load_protocol
         text = load_protocol("vibe-entry")

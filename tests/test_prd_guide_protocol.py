@@ -1024,6 +1024,33 @@ class ProtocolEnforcementTests(_ProjectCase):
         self.assertIn("水印", result.text)
         self.assertFalse((self.root / ".vibe" / "plans" / "pm-plan").exists())
 
+    def test_unconfirmed_design_mockup_blocks_publish_and_confirmed_one_does_not(self):
+        """§2's design-mockup gate rides on needs_confirmation, not new code.
+
+        The protocol promises an unconfirmed mockup stops publish; that is
+        only true while a free-form ``design_mockups`` section goes through
+        the same checkpoint as the recommended ones.
+        """
+        from vibe_guide.protocols import load_protocol
+        section = load_protocol("prd-guide")
+        section = section[section.index("## 2."):section.index("## 3.")]
+        self.assertIn("`prd.design_mockups`", section)
+        self.assertIn("纯文字描述不算", section)
+        self.assertIn("设计稿没确认，不得进入 §4，更不得动手写代码", section)
+        self.init()
+        self.write_capabilities()
+        spec = _product_spec()
+        spec["prd"]["design_mockups"] = [
+            {"value": "订单列表页（改动）：design/orders.png", "source": "needs_confirmation"}
+        ]
+        result = self.plan_from_prd(spec)
+        self.assertEqual(result.payload.get("status"), "blocked_design", result.payload)
+        self.assertIn("订单列表页", result.payload.get("question", ""))
+        self.assertFalse((self.root / ".vibe" / "plans" / "pm-plan").exists())
+        spec["prd"]["design_mockups"][0]["source"] = "user_confirmed"
+        result = self.plan_from_prd(spec)
+        self.assertNotEqual(result.payload.get("status"), "blocked_design", result.payload)
+
     def test_needs_confirmation_blocks_publish_without_any_other_gate_field(self):
         """The gate must not depend on unrelated keys being present.
 
