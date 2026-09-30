@@ -5,12 +5,13 @@ Python 环境：`%USERPROFILE%\.workbuddy\binaries\python\envs\default`
 包目录：`...\envs\default\Lib\site-packages\vibe_guide\`
 验证项目：`<测试项目目录>`（新建，未污染已有项目）
 
-> **合入说明（PR #115）**：本文是 #109 原作者在 Windows 本机做适配时的记录，保留作为实测过程存档。合入时有三项被撤回，**以代码为准**：
-> 1. manifest 不写 `native_control_plane: true`。WorkBuddy 的 Jobs API 还没在真实会话里跑通，所以仍判为"未验证原生桌面控制面"，拿不到完整可见自动化（`level=full`）。
+> **合入说明（PR #115）**：本文是 #109 原作者在 Windows 本机做适配时的记录，保留作为实测过程存档。合入时有四项被撤回，**以代码为准**：
+> 1. manifest 不写 `native_control_plane: true`。WorkBuddy 的 Jobs API 还没在真实会话里跑通，所以仍判为"未验证原生桌面控制面"，拿不到完整可见自动化（`level=full`）。因此当前代码也不会为 WorkBuddy 生成派发请求，下文"写请求已通""信箱级实测"都不成立。
 > 2. 宿主目录里的 skill 只列在 doctor 的 `host_provided`，不算"已配置"。必装 skill 仍要有 GitHub 来源和提交 SHA，`required_configured` 不会因为宿主 skill 变成 true。
 > 3. 规则文件候选只认 `AGENTS.md`、`CODEBUDDY.md`，不认 `CLAUDE.md`。
+> 4. 带 `workbuddy` 以外 `origin` 的 skill 记录不再 fail-closed，而是按原有 GitHub 规则（来源 + 提交 SHA）校验。
 >
-> 下文凡是和这三项矛盾的描述（"已解""PASS""level=full" 等），都只代表原方案。
+> 下文凡是和这四项矛盾的描述（"已解""PASS""level=full" 等），都只代表原方案。
 
 ---
 
