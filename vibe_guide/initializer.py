@@ -523,15 +523,21 @@ def _rules_target(root):
     A project already carrying a host-loaded rule file gets the rules there,
     so a WorkBuddy project's CODEBUDDY.md -- the only file its host reads --
     actually receives them.  A project with none still gets AGENTS.md, which
-    is what every host loads and what older releases always wrote.  Any
-    AGENTS.md -- a symlink included -- keeps the target, matching the file
-    the integration contract cites; a symlink is then refused as on main
-    rather than the rules quietly landing in CODEBUDDY.md.
+    is what every host loads and what older releases always wrote.
+
+    The target must be the file the integration contract cites, which is
+    AGENTS.md whenever it reads as a file (a symlink followed).  A symlink
+    resolving to the chosen rule file is that same file, so it is written
+    through; any other symlink stays the target and is refused below rather
+    than the rules quietly landing in a file nobody cites.
     """
     agents = root / "AGENTS.md"
-    if agents.is_symlink() or agents.exists():
+    chosen = resolve_rules_file(root)
+    if agents.is_file():
+        if chosen and agents.resolve() == (root / chosen).resolve():
+            return root / chosen
         return agents
-    return root / (resolve_rules_file(root) or "AGENTS.md")
+    return root / (chosen or "AGENTS.md")
 
 
 def apply_agentsmd_proposal(paths, confirm):

@@ -1027,6 +1027,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         )
 
     if args.command == "apply-agentsmd":
+        rules_name = _rules_target(Path(paths.root).resolve()).name
         if not args.confirm:
             return _result(
                 BLOCKED,
@@ -1035,10 +1036,9 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     "status": "blocked",
                     "reason": "confirmation required",
                 },
-                "AGENTS.md 规则应用已暂停：需要明确确认",
+                rules_name + " 规则应用已暂停：需要明确确认",
                 args.as_json,
             )
-        rules_name = _rules_target(Path(paths.root).resolve()).name
         try:
             applied = apply_agentsmd_proposal(paths, True)
         except (OSError, TypeError, ValueError) as error:
