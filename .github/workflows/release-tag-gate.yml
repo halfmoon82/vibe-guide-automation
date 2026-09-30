@@ -57,6 +57,12 @@ jobs:
           # 打包验收测试要 `git tag --list` 找上一个 release 做升级/回滚。
           fetch-depth: 0
 
+      # 先装 3.9 再装 3.12：后装的成为默认 python，3.9 只给下面的旧打包路径用。
+      - uses: actions/setup-python@v5
+        id: legacy-python
+        with:
+          python-version: "3.9"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -177,6 +183,61 @@ jobs:
         # 旧版本到新版本路径。只比对产物文件名不够：一个文件名正确但
         # import 就炸、或漏了 protocols/*.md 的包，光看文件名会照样放行。
         run: python -m unittest tests.test_v310_packaging -v
+
+      - name: Legacy sdist (Python 3.9 + setuptools<61) must carry every data file
+        # setuptools<61 只按 MANIFEST.in 收 sdist，不看 package_data。上面的验收和
+        # 下面的正式构建都走新 setuptools，漏写 MANIFEST.in 时照样全绿——v4.9.1 的
+        # 协议 .md 和适配器 .yaml 就是这样漏掉的（#111）。README 记载的 Python 3.9
+        # 安装路径走的正是这条旧路，所以在这里真打一次包核对内容。
+        # 对照基准是 git 跟踪的 vibe_guide/ 下全部非 .py 文件：新增数据文件却忘了
+        # 写 package_data/MANIFEST.in 也会在这里红。
+        shell: bash
+        env:
+          LEGACY_PY: ${{ steps.legacy-python.outputs.python-path }}
+        run: |
+          work=$(mktemp -d)
+          mkdir "$work/src" && git archive HEAD | tar -x -C "$work/src"
+          "$LEGACY_PY" -m venv "$work/build-env"
+          "$work/build-env/bin/pip" install -q "setuptools<61" wheel
+          (cd "$work/src" && "$work/build-env/bin/python" setup.py -q sdist --dist-dir "$work/dist")
+          sdist=$(ls "$work"/dist/*.tar.gz)
+          # 过滤用 awk 不用 grep：结果为空时 grep 退出 1，在 pipefail 下整步静默中止，
+          # 恰好是「一个数据文件都没收进去」这种最该把差异打出来的情况。
+          expected=$(git ls-files vibe_guide | awk '!/\.py$/' | LC_ALL=C sort)
+          actual=$(tar -tzf "$sdist" | sed 's|^[^/]*/||' | awk '/^vibe_guide\// && !/\/$/ && !/\.py$/' | LC_ALL=C sort)
+          if [ "$expected" != "$actual" ]; then
+            echo "旧 setuptools 打出的 sdist 数据文件与 git 跟踪的不一致（< 缺失，> 多出）："
+            diff <(echo "$expected") <(echo "$actual") || true
+            exit 1
+          fi
+          # 文件在包里还不够，装出来要能按包内路径读到。
+          "$LEGACY_PY" -m venv "$work/install-env"
+          "$work/install-env/bin/pip" install -q "setuptools<61" "$sdist"
+          (cd "$work" && "$work/install-env/bin/python" - <<'PY'
+          import os
+          import subprocess
+          from importlib import resources
+          import vibe_guide
+
+          root = resources.files(vibe_guide)
+          expected = subprocess.run(
+              ["git", "-C", os.environ["GITHUB_WORKSPACE"], "ls-files", "vibe_guide"],
+              text=True, check=True, stdout=subprocess.PIPE,
+          ).stdout.split()
+          missing = []
+          for path in expected:
+              if path.endswith(".py"):
+                  continue
+              node = root.joinpath(*path.split("/")[1:])
+              if not node.is_file() or not node.read_bytes():
+                  missing.append(path)
+          if missing:
+              raise SystemExit(f"从旧 sdist 安装后读不到：{missing}")
+          print("OK: 旧 sdist 安装后全部数据文件可读")
+          PY
+          )
+          echo "OK: 旧 setuptools sdist 数据文件齐全"
+          echo "$actual"
 
       - name: Build wheel and sdist
         run: |
