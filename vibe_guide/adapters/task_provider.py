@@ -400,6 +400,64 @@ class ProviderActionStore:
                 result.append(self._read(path))
         return result
 
+    def record_worker_delivery(self, run_id, issue_id, role, payload):
+        """Worker self-reported delivery, idempotent and format-gated.
+
+        The payload is validated against the delivery gate *here*, so the
+        worker hears the error immediately.  A legal report completes the
+        pending ``wait`` request for this node/role (the supervisor consumes
+        it on the next ``resume``) and is also archived under
+        ``deliveries/`` for pull-based fallback.  Re-reporting an identical
+        payload is a no-op and never produces a second result.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError('worker delivery payload must be an object')
+        marker = payload.get('completion_marker')
+        delivery = payload.get('delivery_evidence')
+        if not isinstance(delivery, dict):
+            delivery = payload
+        missing = [
+            key for key in ('completion_marker', 'delivery_path', 'thread_status')
+            if not (isinstance(delivery.get(key), str) and delivery[key].strip())
+        ]
+        if missing:
+            raise ValueError(
+                'worker delivery is missing: {}'.format(', '.join(missing))
+            )
+        if delivery.get('thread_status') not in {'complete', 'completed', 'DELIVERED'}:
+            raise ValueError('worker delivery thread_status is not terminal')
+
+        report = {
+            'run_id': run_id,
+            'issue_id': issue_id,
+            'role': role,
+            'payload': payload,
+            'reported_at': __import__('time').time(),
+        }
+        # Idempotence is keyed on the reported payload, not the timestamp.
+        deliveries = self.root / 'deliveries'
+        deliveries.mkdir(parents=True, exist_ok=True)
+        digest = _canonical_digest(report)
+        path = deliveries / (
+            '{}-{}-{}.json'.format(run_id, issue_id, role)
+        )
+        existing = self._read(path) if path.exists() else None
+        consumed = False
+        if isinstance(existing, dict) and existing.get('payload') == payload:
+            return {'recorded': True, 'consumed': False, 'duplicate': True}
+        self._atomic(path, report)
+
+        for action in self.pending():
+            if (
+                action.get('run_id') == run_id
+                and action.get('issue_id') == issue_id
+                and action.get('role') == role
+                and action.get('operation') == 'wait'
+            ):
+                self.complete(action['action_id'], dict(payload, idempotent_key=digest))
+                consumed = True
+        return {'recorded': True, 'consumed': consumed, 'duplicate': False}
+
     def has_request(
         self,
         run_id: str,

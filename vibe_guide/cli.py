@@ -101,7 +101,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy", "skill-install", "supervisor-preflight", "supervisor-register", "supervisor-address"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy", "skill-install", "supervisor-preflight", "supervisor-register", "supervisor-address", "worker-deliver"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -134,6 +134,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--session-id", dest="session_id")
     parser.add_argument("--host", dest="supervisor_host")
     parser.add_argument("--token-threshold", dest="token_threshold", type=int, default=None)
+    parser.add_argument("--node", dest="node_id")
+    parser.add_argument("--role", dest="role", default="developer")
+    parser.add_argument("--payload", dest="worker_payload")
     return parser
 
 
@@ -1033,6 +1036,22 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         payload = current_supervisor_address(paths, args.run_id)
         code = SUCCESS if payload["status"] == "ok" else UNKNOWN
         return _result(code, {"command": args.command, **payload}, "监工地址查询：{}".format(payload["status"]), args.as_json)
+
+    if args.command == "worker-deliver":
+        # Worker self-report: validate against the delivery gate shape, then
+        # persist.  Malformed reports exit nonzero without touching disk.
+        if not (args.run_id and args.node_id and args.worker_payload):
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "worker-deliver requires --run-id, --node and --payload"}, "缺少参数", args.as_json)
+        try:
+            raw = args.worker_payload
+            if raw.startswith("@"):
+                raw = Path(raw[1:]).read_text(encoding="utf-8")
+            payload = json.loads(raw)
+            store = ProviderActionStore(paths)
+            outcome = store.record_worker_delivery(args.run_id, args.node_id, args.role, payload)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "自报格式错误：" + str(error), args.as_json)
+        return _result(SUCCESS, {"command": args.command, "status": "recorded", **outcome}, "交付已登记", args.as_json)
 
     if args.command == "scan":
         payload = {
