@@ -332,6 +332,21 @@ worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），
 （以上两条平台行为为 2026-09-18 本机实测所得，非推断。仓库里另有一份完整实测记录，
 但它不随包发布，所以这里不给路径。）
 
+### 6.5 监工心跳纪律（预检 → idle/work/rotate）
+
+每次心跳的第一步只跑本地预检，只读磁盘：
+
+```bash
+vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路径>
+```
+
+- 输出 `idle`：worker 在干活且无新请求。只回一字结束本轮，不做任何写。
+- 输出 `work`：有待服务请求或 worker 已完工。按 §6.1 原流程服务信箱，状态一律只从磁盘读，不凭记忆。
+- 输出 `rotate`：本会话上下文超过阈值（默认约 6 万 token，可配 `--token-threshold`）。执行换班：新开会话→新会话写一条简短交接（进度在磁盘上，交接只指方向）→新会话用 `vibe supervisor-register` 登记自身地址、自建心跳、置顶、改标题；删除旧心跳，旧会话把自己归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。
+- 输出 `unknown`：会话记录读不到或解析失败。**不得当成 idle**，按 `work` 处理。
+
+监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run>` 查询；未登记返回 `unknown` 而非空成功。登记内容只允许 provider/会话 id/host，不得含凭据。
+
 ## 7. 什么时候才能打断产品经理
 
 只有三类：产品设计要变、需要新的外部授权、要部署。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知）由 vibe 的 Monitor 自行分类恢复；恢复不了的会标 `blocked_unknown` 等待，不会伪装成成功。agent 看到 `blocked_unknown` 或 `retry_pending` 时先按 §6 查信箱里有没有没服务完的请求，不要立刻报告失败。

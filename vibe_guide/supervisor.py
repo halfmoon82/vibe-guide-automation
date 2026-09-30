@@ -167,3 +167,161 @@ class Supervisor:
         continue polling/recovery rather than letting the parent exit.
         """
         return self.run_until_terminal(interval=interval, max_cycles=max_cycles)
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-91: local supervisor preflight, address registry, and rotation.
+
+DEFAULT_ROTATE_TOKEN_THRESHOLD = 60000
+
+
+def _read_json_file(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, UnicodeDecodeError):
+        return None
+
+
+def _session_tokens(record):
+    """Best-effort token usage extraction; None when unreadable/unknown."""
+    if not isinstance(record, dict):
+        return None
+    for key in ("token_count", "tokens", "context_tokens", "context_used"):
+        value = record.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and value >= 0:
+            return int(value)
+    usage = record.get("usage")
+    if isinstance(usage, dict):
+        return _session_tokens(usage)
+    return None
+
+
+def supervisor_preflight(
+    paths,
+    run_id,
+    session_record=None,
+    *,
+    token_threshold=DEFAULT_ROTATE_TOKEN_THRESHOLD,
+):
+    """Read-only disk check; returns exactly one of idle/work/rotate/unknown.
+
+    - ``unknown``: the session record could not be read or parsed (never
+      collapsed into idle).
+    - ``rotate``: the session's own context/token usage exceeds the
+      threshold (default ~60k tokens).
+    - ``work``: pending provider requests exist, or a bound worker has
+      delivered/finished something not yet consumed.
+    - ``idle``: workers are active and nothing new needs servicing.
+    """
+    if session_record is None:
+        return {"state": "unknown", "reason": "session record path is missing"}
+    record = _read_json_file(session_record)
+    if record is None:
+        return {"state": "unknown", "reason": "session record unreadable"}
+    tokens = _session_tokens(record)
+    if tokens is None:
+        return {"state": "unknown", "reason": "token usage unknown"}
+    if tokens > token_threshold:
+        return {"state": "rotate", "reason": "context over threshold", "tokens": tokens}
+
+    try:
+        from .adapters.task_provider import ProviderActionStore
+
+        pending = ProviderActionStore(paths).pending()
+    except Exception:
+        pending = None
+    if pending is None:
+        return {"state": "unknown", "reason": "provider mailbox unreadable"}
+    if pending:
+        return {"state": "work", "reason": "pending provider requests", "pending": len(pending)}
+
+    try:
+        snapshot = load_snapshot(paths, run_id)
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        snapshot = None
+    if snapshot is None:
+        return {"state": "unknown", "reason": "run snapshot unavailable"}
+    delivered = [
+        node for node, data in (snapshot.nodes or {}).items()
+        if isinstance(data, dict) and data.get("status") in ("delivered", "review")
+    ]
+    if delivered:
+        return {"state": "work", "reason": "worker delivery pending", "nodes": delivered}
+    running = [
+        node for node, data in (snapshot.nodes or {}).items()
+        if isinstance(data, dict) and data.get("status") == "running"
+    ]
+    if running:
+        return {"state": "idle", "reason": "workers active", "nodes": running}
+    return {"state": "idle", "reason": "nothing pending"}
+
+
+_REGISTRY_NAME = "supervisor-registry.json"
+
+
+def _registry_path(paths, run_id):
+    return run_dir(paths, run_id, create=True) / _REGISTRY_NAME
+
+
+def register_supervisor_address(paths, run_id, address):
+    """Atomically record the current supervisor address; keeps history."""
+    if not isinstance(address, dict):
+        raise TypeError("address must be a mapping")
+    provider = address.get("provider")
+    session_id = address.get("session_id") or address.get("task_id")
+    host = address.get("host") or address.get("hostId")
+    if not (
+        isinstance(provider, str) and provider
+        and isinstance(session_id, str) and session_id
+        and isinstance(host, str) and host
+    ):
+        raise ValueError("supervisor address requires provider, session_id and host")
+    for forbidden in ("token", "password", "secret", "credential"):
+        for key in address:
+            if forbidden in str(key).lower():
+                raise ValueError("supervisor address must not carry credentials")
+    path = _registry_path(paths, run_id)
+    registry = _read_json_file(path)
+    if not isinstance(registry, dict):
+        registry = {}
+    history = registry.get("history")
+    if not isinstance(history, list):
+        history = []
+    current = registry.get("current")
+    if isinstance(current, dict):
+        history.append(current)
+    entry = {
+        "provider": provider,
+        "session_id": session_id,
+        "host": host,
+        "registered_at": time.time(),
+    }
+    registry = {"current": entry, "history": history}
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".supervisor-registry-", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(registry, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, str(path))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return entry
+
+
+def current_supervisor_address(paths, run_id):
+    """Return the registered supervisor address or an explicit unknown."""
+    registry = _read_json_file(_registry_path(paths, run_id))
+    if not isinstance(registry, dict) or not isinstance(registry.get("current"), dict):
+        return {"status": "unknown", "reason": "no supervisor registered"}
+    return {
+        "status": "ok",
+        "current": registry["current"],
+        "history": registry.get("history", []),
+    }

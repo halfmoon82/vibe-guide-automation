@@ -28,7 +28,12 @@ from .initializer import apply_agentsmd_proposal, init_project
 from .upgrade import upgrade_project
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import Monitor
-from .supervisor import Supervisor
+from .supervisor import (
+    Supervisor,
+    current_supervisor_address,
+    register_supervisor_address,
+    supervisor_preflight,
+)
 from .change_requests import ChangeRequest, classify_merge_capability
 from .deploy import authorize_deploy, plan_deploy, verify_deploy, start_deploy
 from .paths import ProjectPaths
@@ -96,7 +101,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy", "supervisor-preflight", "supervisor-register", "supervisor-address"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -120,6 +125,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--observations")
     parser.add_argument("--watch", action="store_true", dest="watch")
     parser.add_argument("--mode", choices=("layered", "bundled"), default="layered")
+    parser.add_argument("--session-record", dest="session_record")
+    parser.add_argument("--provider", dest="supervisor_provider")
+    parser.add_argument("--session-id", dest="session_id")
+    parser.add_argument("--host", dest="supervisor_host")
+    parser.add_argument("--token-threshold", dest="token_threshold", type=int, default=None)
     return parser
 
 
@@ -952,6 +962,36 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         status = payload.get("status")
         code = SUCCESS if status == "complete" else UNKNOWN if status in {"blocked_unknown", "retry_pending", "failed"} else BLOCKED
         return _result(code, {"command": args.command, **payload}, payload.get("message", "需要你决定"), args.as_json)
+
+    if args.command == "supervisor-preflight":
+        if not args.run_id:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        kwargs = {}
+        if args.token_threshold is not None:
+            kwargs["token_threshold"] = args.token_threshold
+        payload = supervisor_preflight(paths, args.run_id, args.session_record, **kwargs)
+        code = SUCCESS if payload["state"] in {"idle", "work", "rotate"} else UNKNOWN
+        return _result(code, {"command": args.command, **payload}, "监工预检：{}".format(payload["state"]), args.as_json)
+
+    if args.command == "supervisor-register":
+        if not args.run_id:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        try:
+            entry = register_supervisor_address(paths, args.run_id, {
+                "provider": args.supervisor_provider,
+                "session_id": args.session_id,
+                "host": args.supervisor_host,
+            })
+        except (TypeError, ValueError, OSError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "登记失败：" + str(error), args.as_json)
+        return _result(SUCCESS, {"command": args.command, "status": "ok", "current": entry}, "监工地址已登记", args.as_json)
+
+    if args.command == "supervisor-address":
+        if not args.run_id:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        payload = current_supervisor_address(paths, args.run_id)
+        code = SUCCESS if payload["status"] == "ok" else UNKNOWN
+        return _result(code, {"command": args.command, **payload}, "监工地址查询：{}".format(payload["status"]), args.as_json)
 
     if args.command == "scan":
         payload = {
