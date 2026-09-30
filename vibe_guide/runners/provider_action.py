@@ -24,6 +24,7 @@ from ..models import (
 )
 from ..model_router import provider_thinking_for
 from ..paths import ProjectPaths
+from ..protocols import load_protocol
 from ..task_registry import (
     DEFAULT_TOPOLOGY,
     _TOPOLOGIES,
@@ -484,9 +485,20 @@ class ProviderActionRunner(Runner):
                 raise ValueError("visible-sdd dispatch requires an sdd_protocol pointer")
             # The desktop session servicing the mailbox must know it is
             # creating the single visible SDD worker session and which
-            # protocol that session has to follow.
+            # protocol that session has to follow.  The pointer stays a
+            # verbatim version reference; the protocol body is inlined
+            # into the worker prompt so the session does not need the
+            # repository to obey it.  A missing packaged protocol fails
+            # closed here, before the create request leaves the mailbox.
+            protocol_text = load_protocol(Path(sdd_protocol).stem)
             create_request["topology"] = topology
             create_request["sdd_protocol"] = sdd_protocol
+            create_request["prompt"] = (
+                prompt
+                + "\n\n"
+                + "## 会话必须遵循的协议（随包全文，逐字执行）\n\n"
+                + protocol_text
+            )
         if v39:
             # Keep the provider request bound to the same supervisor target
             # that will later be checked against live binding evidence.  These

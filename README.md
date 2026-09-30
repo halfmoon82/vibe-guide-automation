@@ -142,7 +142,7 @@ V4.4 将工程故障限定在节点范围内，并保留同一任务身份。五
 
 V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 为 `create_thread` 创建的 user-owned thread）；监工只派发、等待、收口，不作任何节点的 writer。任务登记 `tasks.json` 用 `topology` 字段记录每个节点的派发拓扑：
 
-- `visible-sdd`：每节点一个可见会话，会话内走 SDD 双角色——dev 子代理实现，review 子代理以独立上下文、只读审查（协议见 `vibe_guide/protocols/visible-sdd-worker.md`），返工与复审在同一会话身份内闭环；
+- `visible-sdd`：每节点一个可见会话，会话内走 SDD 双角色——dev 子代理实现，review 子代理以独立上下文、只读审查（协议见 `vibe_guide/protocols/visible-sdd-worker.md`），返工与复审在同一会话身份内闭环；派发时 create 请求的 prompt 会内联随包协议全文（`VISIBLE_SDD_PROTOCOL_REF` 仅作版本指针），随包协议缺失时在派发前 fail-closed、不创建会话；
 - `dual-visible`：保守默认，developer 与 reviewer 是两个不同的可见独立任务；平台能力 UNKNOWN 时 fail-closed 到本拓扑，不会升级为 `visible-sdd`；
 - `background`：平台无可见桥接时的显式降级，必须在能力报告、授权卡和交付三处披露降级及限制（不可见、不可直接进入、返工续接受限）；`mode=background` 缺少披露时授权卡机器校验直接失败。
 
