@@ -24,7 +24,6 @@ from .adapters.task_provider import ProviderActionStore, ProviderPending
 from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import doctor
 from .initializer import apply_agentsmd_proposal, init_project
-from .upgrade import upgrade_project
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import Monitor
 from .supervisor import Supervisor
@@ -902,37 +901,6 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             SUCCESS,
             payload,
             "初始化完成" if initialized.changed else "初始化无需变更",
-            args.as_json,
-        )
-
-    if args.command == "upgrade":
-        if not args.confirm:
-            return _result(
-                BLOCKED,
-                {"command": "upgrade", "status": "blocked", "reason": "confirmation required"},
-                "升级已暂停：需要明确确认",
-                args.as_json,
-            )
-        try:
-            upgraded = upgrade_project(paths, True)
-        except (OSError, TypeError, ValueError) as error:
-            return _result(
-                BLOCKED,
-                {"command": "upgrade", "status": "blocked", "reason": str(error)},
-                "升级已阻塞：" + str(error),
-                args.as_json,
-            )
-        payload = {
-            "command": "upgrade",
-            "status": "ok",
-            "changed": upgraded.changed,
-            "paths": upgraded.paths,
-            "deploy": False,
-        }
-        return _result(
-            SUCCESS,
-            payload,
-            "升级完成" if upgraded.changed else "升级无需变更",
             args.as_json,
         )
 
