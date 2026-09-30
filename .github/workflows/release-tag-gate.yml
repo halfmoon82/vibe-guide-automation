@@ -187,8 +187,8 @@ jobs:
       - name: Legacy sdist (Python 3.9 + setuptools<61) must carry every data file
         # setuptools<61 只按 MANIFEST.in 收 sdist，不看 package_data。上面的验收和
         # 下面的正式构建都走新 setuptools，漏写 MANIFEST.in 时照样全绿——v4.9.1 的
-        # 协议 .md 和适配器 .yaml 就是这样漏掉的（#111）。README 记载的 Python 3.9
-        # 安装路径走的正是这条旧路，所以在这里真打一次包核对内容。
+        # 协议 .md 和适配器 .yaml 就是这样漏掉的（#111）。谁用旧 setuptools 打 sdist，
+        # 谁就会发出缺文件的包，所以在这里真打一次包核对内容。
         # 对照基准是 git 跟踪的 vibe_guide/ 下全部非 .py 文件：新增数据文件却忘了
         # 写 package_data/MANIFEST.in 也会在这里红。
         shell: bash
@@ -212,7 +212,9 @@ jobs:
           fi
           # 文件在包里还不够，装出来要能按包内路径读到。
           "$LEGACY_PY" -m venv "$work/install-env"
-          "$work/install-env/bin/pip" install -q "setuptools<61" "$sdist"
+          # 安装时 pip 按 pyproject 另起隔离环境、用新 setuptools 构建；这无妨：
+          # sdist 里没有的文件，新 setuptools 也补不回来，这里验的是包本身。
+          "$work/install-env/bin/pip" install -q "$sdist"
           (cd "$work" && "$work/install-env/bin/python" - <<'PY'
           import os
           import subprocess
@@ -221,12 +223,12 @@ jobs:
 
           root = resources.files(vibe_guide)
           expected = subprocess.run(
-              ["git", "-C", os.environ["GITHUB_WORKSPACE"], "ls-files", "vibe_guide"],
+              ["git", "-C", os.environ["GITHUB_WORKSPACE"], "ls-files", "-z", "vibe_guide"],
               text=True, check=True, stdout=subprocess.PIPE,
-          ).stdout.split()
+          ).stdout.split("\0")
           missing = []
           for path in expected:
-              if path.endswith(".py"):
+              if not path or path.endswith(".py"):
                   continue
               node = root.joinpath(*path.split("/")[1:])
               if not node.is_file() or not node.read_bytes():
