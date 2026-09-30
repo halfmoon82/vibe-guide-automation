@@ -877,7 +877,7 @@ def _write_scope_conflict_errors(nodes: List[DAGNode]) -> Dict[str, List[str]]:
     ``_parallel_group_errors`` covers members of one explicit
     ``parallel_group``.  This complementary plan/authorization gate covers
     every unordered node pair: overlapping write scope is legal only when a
-    ``depends_on`` edge serializes the pair.  Otherwise both may be
+    direct or transitive ``depends_on`` chain serializes the pair.  Otherwise both may be
     dispatched independently while editing the same paths.  Pairs already
     inside one parallel group are skipped because the group audit emits the
     more specific message.
@@ -894,6 +894,22 @@ def _write_scope_conflict_errors(nodes: List[DAGNode]) -> Dict[str, List[str]]:
         groups[node.id] = str(group) if group is not None else ""
         scopes[node.id] = _conflict_write_scope(node)
 
+    ancestors: Dict[str, set] = {}
+
+    def upstream(node_id: str) -> set:
+        # Transitive depends_on closure: a->b->c serializes a and c too.
+        if node_id not in ancestors:
+            seen: set = set()
+            stack = list(getattr(by_id.get(node_id), "depends_on", None) or [])
+            while stack:
+                current = stack.pop()
+                if current in seen:
+                    continue
+                seen.add(current)
+                stack.extend(getattr(by_id.get(current), "depends_on", None) or [])
+            ancestors[node_id] = seen
+        return ancestors[node_id]
+
     errors: Dict[str, List[str]] = {}
 
     def attach(member: DAGNode, message: str) -> None:
@@ -906,7 +922,7 @@ def _write_scope_conflict_errors(nodes: List[DAGNode]) -> Dict[str, List[str]]:
         for right in list(by_id.values())[index + 1:]:
             if right.id not in scopes:
                 continue
-            if left.id in right.depends_on or right.id in left.depends_on:
+            if left.id in upstream(right.id) or right.id in upstream(left.id):
                 continue
             left_scope = scopes[left.id]
             right_scope = scopes[right.id]
