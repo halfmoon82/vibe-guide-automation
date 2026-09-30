@@ -115,6 +115,26 @@ class WorkBuddyHostBoundaryTests(unittest.TestCase):
         (self.root / "AGENTS.md").symlink_to("real.md")
         self.assertEqual(self._integration_ref(), ["AGENTS.md"])
 
+    def test_a_symlinked_agents_md_beside_codebuddy_md_writes_where_it_cites(self):
+        # Citing AGENTS.md while appending to CODEBUDDY.md would split the
+        # rules from the reference; main refused the symlink, so keep that.
+        self._write("real.md", "rules\n")
+        (self.root / "AGENTS.md").symlink_to("real.md")
+        self._write("CODEBUDDY.md", "rules\n")
+        self.assertEqual(self._integration_ref(), ["AGENTS.md"])
+        self.assertEqual(_rules_target(self.root).name, "AGENTS.md")
+
+    def test_apply_agentsmd_names_the_file_it_actually_wrote(self):
+        from vibe_guide.cli import run_cli
+
+        self._write("CODEBUDDY.md", "# codebuddy rules\n")
+        run_cli(["init", "--confirm", "--json"], self.root)
+        applied = run_cli(["apply-agentsmd", "--confirm"], self.root)
+        self.assertEqual(applied.exit_code, 0, applied.text)
+        self.assertIn("CODEBUDDY.md", applied.text)
+        self.assertNotIn("AGENTS.md", applied.text)
+        self.assertFalse((self.root / "AGENTS.md").exists())
+
     def test_a_pinned_host_record_outside_every_host_root_is_invalid(self):
         outside = Path(self._tmp.name) / "elsewhere" / "stray-skill"
         outside.mkdir(parents=True)

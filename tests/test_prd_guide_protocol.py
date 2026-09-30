@@ -664,6 +664,24 @@ class InitMaterializationTests(_ProjectCase):
         self.assertEqual(skill.read_text(encoding="utf-8"), "user edited")
         self.assertNotIn(PRD_GUIDE_PROPOSAL_RELATIVE, second.payload.get("paths", []))
 
+    def test_reinit_notes_a_stale_prd_guide_copy_without_rewriting_it(self):
+        """The copy is never rewritten, so an old project keeps an old guide
+        silently unless init says so -- the same note vibe-entry gets."""
+        from vibe_guide.protocols import PRD_GUIDE_PROPOSAL_RELATIVE, load_protocol
+        self.init()
+        skill = self.root / PRD_GUIDE_PROPOSAL_RELATIVE
+        stale = "# stale or locally edited copy\n"
+        skill.write_text(stale, encoding="utf-8")
+        notes = self.init().payload.get("notes", [])
+        self.assertEqual(skill.read_text(encoding="utf-8"), stale)
+        self.assertTrue(
+            any(PRD_GUIDE_PROPOSAL_RELATIVE in note and "不一致" in note for note in notes),
+            notes,
+        )
+        skill.write_text(load_protocol("prd-guide"), encoding="utf-8")
+        quiet = self.init().payload.get("notes", [])
+        self.assertFalse(any(PRD_GUIDE_PROPOSAL_RELATIVE in note for note in quiet), quiet)
+
     def test_complex_request_entry_reaches_a_project_that_already_has_capability_rules(self):
         """A live project already carries the capability section.
 
