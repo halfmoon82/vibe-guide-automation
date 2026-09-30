@@ -25,7 +25,6 @@ from .config import load_project_config
 from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import doctor
 from .initializer import _rules_target, apply_agentsmd_proposal, init_project
-from .upgrade import upgrade_project
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import Monitor
 from .supervisor import Supervisor
@@ -994,37 +993,6 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             payload["notes"] = list(initialized.notes)
             summary += "；请注意：" + "；".join(initialized.notes)
         return _result(SUCCESS, payload, summary, args.as_json)
-
-    if args.command == "upgrade":
-        if not args.confirm:
-            return _result(
-                BLOCKED,
-                {"command": "upgrade", "status": "blocked", "reason": "confirmation required"},
-                "升级已暂停：需要明确确认",
-                args.as_json,
-            )
-        try:
-            upgraded = upgrade_project(paths, True)
-        except (OSError, TypeError, ValueError) as error:
-            return _result(
-                BLOCKED,
-                {"command": "upgrade", "status": "blocked", "reason": str(error)},
-                "升级已阻塞：" + str(error),
-                args.as_json,
-            )
-        payload = {
-            "command": "upgrade",
-            "status": "ok",
-            "changed": upgraded.changed,
-            "paths": upgraded.paths,
-            "deploy": False,
-        }
-        return _result(
-            SUCCESS,
-            payload,
-            "升级完成" if upgraded.changed else "升级无需变更",
-            args.as_json,
-        )
 
     if args.command == "apply-agentsmd":
         rules_name = _rules_target(Path(paths.root).resolve()).name
