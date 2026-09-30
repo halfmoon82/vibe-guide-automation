@@ -320,20 +320,22 @@ worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），
 
 ### 6.4 平台差异：哪个平台能"授权一次、不用盯屏幕"
 
-五个操作在两个平台都已登记，但**创建会话时要不要人工点一下，两边不一样**。这是平台事实，不是 vibe 的功能差异：
+五个操作在三个平台都已登记，但**创建会话时要不要人工点一下，各平台不一样**。这是平台事实，不是 vibe 的功能差异：
 
-| 操作 | `codex-app-visible` | `claude-code-visible` |
-|---|---|---|
-| `create` | `codex_app__create_thread` | `ccd_session__spawn_task` |
-| `locate` | `codex_app__navigate_to_codex_page` | `ccd_window__open_session_in` |
-| `visibility` | `codex_app__wait_threads` | `ccd_session_mgmt__get_session` |
-| `resume` | `codex_app__send_message_to_thread` | `ccd_session_mgmt__send_message` |
-| `wait` | `codex_app__wait_threads` | `ccd_session_mgmt__list_events` |
+| 操作 | `codex-app-visible` | `claude-code-visible` | `workbuddy-visible` |
+|---|---|---|---|
+| `create` | `codex_app__create_thread` | `ccd_session__spawn_task` | `workbuddy_job__create` |
+| `locate` | `codex_app__navigate_to_codex_page` | `ccd_window__open_session_in` | `workbuddy_job__get` |
+| `visibility` | `codex_app__wait_threads` | `ccd_session_mgmt__get_session` | `workbuddy_job__list` |
+| `resume` | `codex_app__send_message_to_thread` | `ccd_session_mgmt__send_message` | `workbuddy_job__reply` |
+| `wait` | `codex_app__wait_threads` | `ccd_session_mgmt__list_events` | `workbuddy_job__wait` |
 
 - **Codex 本地桌面**：`create_thread` 没有审批门，`create` 直接返回会话身份。这是目前唯一能做到**无人值守**派发的路径——产品经理授权一次之后，agent 可以把整批节点派完，不需要人再看屏幕。
 - **Claude Code 桌面**：`ccd_session__spawn_task` 只是**提议**一个任务。它返回一个 `task_id` 并在界面上显示一张卡片，**需要用户点一下**才真正创建会话；调用方拿不到 `sessionId`。所以每个节点都有一个人工确认点，拿到 `task_id` 之后还要再查一次（`ccd_session_mgmt__list_sessions`）才能取到真实会话 id 去回写 `create`。
 
 在 Claude Code 上把这条流程当成"全自动"会一直卡住：卡片没人点，`create` 永远拿不到身份，run 停在 `retry_pending`。要么守着确认每个节点，要么用 Codex 本地桌面跑派发。
+
+- **WorkBuddy**：`workbuddy_job__*` 五个工具名已登记，对应 WorkBuddy 官方 Jobs API，但**还没有在真实会话里跑通过**。在本机实测之前，不要把它当成已验证的派发路径，也不要据此承诺授权后不用人看。
 
 （以上两条平台行为为 2026-09-18 本机实测所得，非推断。仓库里另有一份完整实测记录，
 但它不随包发布，所以这里不给路径。）
