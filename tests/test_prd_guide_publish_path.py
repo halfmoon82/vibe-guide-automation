@@ -474,7 +474,6 @@ class DraftReplacementBoundaryTests(_Project):
         # Starting work goes to the new id only: a run records its plan in its
         # own state.json and points back from the plan's current-run.json.
         monitored = self.cli("monitor", "--plan", plan_id + "-r2", "--authorize", "AUTHORIZE")
-        self.assertIn(monitored.payload.get("status"), {"retry_pending", "running"}, monitored.payload)
         runs = list((self.root / ".vibe" / "runs").glob("*/state.json"))
         self.assertTrue(runs, "monitor started no run")
         for run_state in runs:
@@ -483,6 +482,7 @@ class DraftReplacementBoundaryTests(_Project):
         # Nothing under the old id was touched by publishing, authorizing or
         # starting the new one: no authorization.json, no current-run.json.
         self.assertEqual(snapshot(self.plan_dir(plan_id)), old_files)
+        self.assertIn(monitored.payload.get("status"), {"retry_pending", "running"}, monitored.payload)
 
     def test_a_publication_landing_mid_swap_is_not_overwritten(self):
         """Re-check what was actually moved aside, not what was seen before."""
