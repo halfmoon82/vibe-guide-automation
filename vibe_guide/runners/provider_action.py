@@ -64,6 +64,9 @@ NATIVE_TOOL_MAP: Dict[str, Dict[str, str]] = {
         "resume": "ccd_session_mgmt__send_message",
         "wait": "ccd_session_mgmt__list_events",
     },
+    # Registered, not yet reachable: the workbuddy manifest has no native
+    # control plane until a real session has run these, so detect() never
+    # hands out this provider.
     WORKBUDDY_VISIBLE_PROVIDER: {
         "create": "workbuddy_job__create",
         "locate": "workbuddy_job__get",

@@ -11,12 +11,14 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from vibe_guide.adapters.base import Environment
 from vibe_guide.adapters.registry import AdapterRegistry
 from vibe_guide.doctor import doctor
 from vibe_guide.initializer import _rules_target
+from vibe_guide.node_spec import derive_integration_contract
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.scanner import scan_project
 
@@ -30,13 +32,17 @@ _PINNED = {
 
 class WorkBuddyHostBoundaryTests(unittest.TestCase):
     def setUp(self):
-        env = {k: v for k, v in os.environ.items() if k != "WORKBUDDY_CONFIG_DIR"}
-        patcher = mock.patch.dict(os.environ, env, clear=True)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name)
+        # Unset would fall back to ~/.workbuddy, so pin an empty host dir.
+        patcher = mock.patch.dict(os.environ, {
+            "WORKBUDDY_CONFIG_DIR": str(Path(self._tmp.name) / "no-host"),
+            "CODEBUDDY_CONFIG_DIR": "",
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.root = Path(self._tmp.name) / "project"
+        self.root.mkdir()
         (self.root / ".vibe").mkdir()
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
 
@@ -54,9 +60,12 @@ class WorkBuddyHostBoundaryTests(unittest.TestCase):
             ".workbuddy/skills/architecture-skill-pack/SKILL.md",
             "---\nname: architecture-skill-pack\n---\n",
         )
-        skills = doctor(self._scan()).facts["skills"]
+        report = doctor(self._scan())
+        skills = report.facts["skills"]
         self.assertIn("architecture-skill-pack", skills["host_provided"])
         self.assertIs(skills["required_configured"], False, skills)
+        self.assertNotIn("architecture-skill-pack", skills["configured"], skills)
+        self.assertIn(".vibe/proposals/skills/proposal.md", report.proposals)
 
     def test_init_still_proposes_the_required_skill_when_only_the_host_has_it(self):
         from vibe_guide.initializer import init_project
@@ -84,6 +93,38 @@ class WorkBuddyHostBoundaryTests(unittest.TestCase):
         report = self._scan()
         self.assertTrue(report.agentsmd_exists)
         self.assertEqual(report.rules_file, "CODEBUDDY.md")
+
+    def test_agents_md_wins_when_both_rules_files_exist(self):
+        self._write("AGENTS.md", "rules\n")
+        self._write("CODEBUDDY.md", "rules\n")
+        self.assertEqual(self._scan().rules_file, "AGENTS.md")
+        self.assertEqual(_rules_target(self.root).name, "AGENTS.md")
+
+    def _integration_ref(self):
+        entry = SimpleNamespace(plan_id="p", request="r")
+        contract = derive_integration_contract({"nodes": [{"id": "a"}]}, entry, ProjectPaths(self.root))
+        return contract["agentsmd_acceptance_refs"]
+
+    def test_a_codebuddy_only_project_writes_and_cites_codebuddy_md(self):
+        self._write("CODEBUDDY.md", "rules\n")
+        self.assertEqual(_rules_target(self.root).name, "CODEBUDDY.md")
+        self.assertEqual(self._integration_ref(), ["CODEBUDDY.md"])
+
+    def test_a_symlinked_agents_md_is_still_cited_as_on_main(self):
+        self._write("real.md", "rules\n")
+        (self.root / "AGENTS.md").symlink_to("real.md")
+        self.assertEqual(self._integration_ref(), ["AGENTS.md"])
+
+    def test_a_pinned_host_record_outside_every_host_root_is_invalid(self):
+        outside = Path(self._tmp.name) / "elsewhere" / "stray-skill"
+        outside.mkdir(parents=True)
+        (outside / "SKILL.md").write_text("---\nname: stray-skill\n---\n", encoding="utf-8")
+        self._write("AGENTS.md", "rules\n")
+        self._write(".vibe/config.json", json.dumps({"skills": [
+            {"name": "stray-skill", "origin": "workbuddy", "path": str(outside)},
+        ]}))
+        skills = self._scan().skills
+        self.assertEqual([s["valid"] for s in skills if s["name"] == "stray-skill"], [False], skills)
 
     def test_a_pinned_record_with_a_non_workbuddy_origin_is_validated_as_before(self):
         self._write("AGENTS.md", "rules\n")

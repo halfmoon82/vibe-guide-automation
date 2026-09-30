@@ -5,6 +5,13 @@ Python 环境：`%USERPROFILE%\.workbuddy\binaries\python\envs\default`
 包目录：`...\envs\default\Lib\site-packages\vibe_guide\`
 验证项目：`<测试项目目录>`（新建，未污染已有项目）
 
+> **合入说明（PR #115）**：本文是 #109 原作者在 Windows 本机做适配时的记录，保留作为实测过程存档。合入时有三项被撤回，**以代码为准**：
+> 1. manifest 不写 `native_control_plane: true`。WorkBuddy 的 Jobs API 还没在真实会话里跑通，所以仍判为"未验证原生桌面控制面"，拿不到完整可见自动化（`level=full`）。
+> 2. 宿主目录里的 skill 只列在 doctor 的 `host_provided`，不算"已配置"。必装 skill 仍要有 GitHub 来源和提交 SHA，`required_configured` 不会因为宿主 skill 变成 true。
+> 3. 规则文件候选只认 `AGENTS.md`、`CODEBUDDY.md`，不认 `CLAUDE.md`。
+>
+> 下文凡是和这三项矛盾的描述（"已解""PASS""level=full" 等），都只代表原方案。
+
 ---
 
 ## 零、一句话结论
@@ -118,7 +125,7 @@ WorkBuddy 读的是 `CODEBUDDY.md`，根本不看 `AGENTS.md`。原来只认 `AG
 |---|---|---|
 | 命令 shim | `%USERPROFILE%\.workbuddy\bin\workbuddy.cmd` | 必须 `.cmd` 后缀；win32 `shutil.which` 按 PATHEXT 拼后缀，裸名 `workbuddy` 永远匹配不到 |
 | 用户 PATH | `HKCU\Environment\Path` | **本次才真正写入**（之前记录失真，见第五节） |
-| skill 收编 | `%USERPROFILE%\.workbuddy\skills\` | 9 个 `architecture-*`，从 `<另一个本地项目>\.workbuddy\skills\` 复制，**D 盘原件保留** |
+| skill 收编 | `%USERPROFILE%\.workbuddy\skills\` | 9 个 `architecture-*`，从 `<另一个本地项目>\.workbuddy\skills\` 复制，**原件保留** |
 | 测试项目 | `<测试项目目录>` | `CODEBUDDY.md` + `core/{ledger,engine,report}.py` + git 仓库 + `.vibe/` |
 
 收编的 9 个 skill（均含 `SKILL.md`）：
@@ -285,7 +292,7 @@ pip install --force-reinstall vibe-guide==4.9.1
 
 - D 组单独回滚：删掉 `adapters/manifests/workbuddy.yaml` 里的 `native_control_plane` 键
 - shim：删除 `%USERPROFILE%\.workbuddy\bin\workbuddy.cmd`，并从用户 PATH 移除该目录
-- 收编的 skill：删除 `%USERPROFILE%\.workbuddy\skills\architecture-*`（D 盘原件未动）
+- 收编的 skill：删除 `%USERPROFILE%\.workbuddy\skills\architecture-*`（原件未动）
 - 测试项目：整个删掉 `<测试项目目录>`
 
 ---

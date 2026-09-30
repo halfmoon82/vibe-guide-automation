@@ -33,16 +33,14 @@ def doctor(report):
     # the historical name rather than raising AttributeError.
     rules_file = getattr(report, 'rules_file', None)
     valid_skills = [skill for skill in report.skills if skill.get('valid')]
+    # Configured means pinned to a github source and commit (AGENTS.md §7);
+    # an unpinned host copy is listed under host_provided, never counted.
     configured_names = sorted(
-        skill.get('name', '') for skill in valid_skills if skill.get('name')
-    )
-    # The required skill must be pinned to a github source and commit
-    # (AGENTS.md §7); an unpinned host copy is reported, never counted.
-    required_skill = any(
-        skill.get('name') == _REQUIRED_SKILL
-        and skill.get('origin') != WORKBUDDY_ORIGIN
+        skill.get('name', '')
         for skill in valid_skills
+        if skill.get('name') and skill.get('origin') != WORKBUDDY_ORIGIN
     )
+    required_skill = _REQUIRED_SKILL in configured_names
     host_provided = sorted(
         skill.get('name', '')
         for skill in report.skills

@@ -3,6 +3,13 @@
 目标：让 vibe-guide v4.9.1 在本机 **跑复杂任务**（complex 路由 10 节点）。
 验证项目：`<测试项目目录>`（新建，未污染已有项目）。
 
+> **合入说明（PR #115）**：本文是 #109 原作者在 Windows 本机做适配时的记录，保留作为实测过程存档。合入时有三项被撤回，**以代码为准**：
+> 1. manifest 不写 `native_control_plane: true`。WorkBuddy 的 Jobs API 还没在真实会话里跑通，所以仍判为"未验证原生桌面控制面"，拿不到完整可见自动化（`level=full`）。
+> 2. 宿主目录里的 skill 只列在 doctor 的 `host_provided`，不算"已配置"。必装 skill 仍要有 GitHub 来源和提交 SHA，`required_configured` 不会因为宿主 skill 变成 true。
+> 3. 规则文件候选只认 `AGENTS.md`、`CODEBUDDY.md`，不认 `CLAUDE.md`。
+>
+> 下文凡是和这三项矛盾的描述（"已解""PASS""level=full" 等），都只代表原方案。
+
 ---
 
 ## 一、结论
@@ -60,7 +67,7 @@
 ## 三、配套落地
 
 - **收编 skill**：9 个 `architecture-*` 由 `<另一个本地项目>\.workbuddy\skills\` 复制到
-  `%USERPROFILE%\.workbuddy\skills\`（**保留 D 盘原件**）
+  `%USERPROFILE%\.workbuddy\skills\`（**保留原件**）
 - **命令 shim**：`%USERPROFILE%\.workbuddy\bin\workbuddy.cmd`。
   必须是 `.cmd` 后缀——win32 `shutil.which` 按 PATHEXT 拼后缀，裸名 `workbuddy` 永远匹配不到。
   实测 `workbuddy --version` → `2.137.1`
@@ -241,7 +248,7 @@ GET  /api/v1/jobs/dispatch-context → 200 cwd + agents[cli/ptc/minimal/create] 
 GET  /api/v1/jobs    → 200 {"jobs":[]}
 GET  /api/v1/workers → 200 本机全部 worker（含 kind=interactive/bg/daemon）
 
-POST /api/v1/jobs {"prompt":"echo VIBE-PROBE-PONG","bash":true,"cwd":"...vibe-complex-test"}
+POST /api/v1/jobs {"prompt":"echo VIBE-PROBE-PONG","bash":true,"cwd":"<测试项目目录>"}
   → 200 {"id":"<job-id>","state":"done","settled":true,
          "sessionId":"<session-id>", ...}
 GET  /api/v1/jobs/<job-id>            → 200 state=done
