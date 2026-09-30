@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from .models import WorkerProfile
+from .scanner import WORKBUDDY_ORIGIN
 
 
 @dataclass(frozen=True)
@@ -144,7 +145,11 @@ def _valid_plan_confirmation_binding(
 def diagnose_skill(name: str, report, config: dict) -> SkillDiagnostic:
     if not isinstance(name, str) or not name.strip():
         raise ValueError("skill name is required")
-    project = {item.get("name") for item in getattr(report, "skills", []) if item.get("valid")}
+    # A host-provided copy has no pinned source, so it is not a project reference.
+    project = {
+        item.get("name") for item in getattr(report, "skills", [])
+        if item.get("valid") and item.get("origin") != WORKBUDDY_ORIGIN
+    }
     global_skills = config.get("global_skills", []) if isinstance(config, dict) else []
     present_global = False
     if isinstance(config, dict):
