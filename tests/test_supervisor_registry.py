@@ -89,6 +89,62 @@ class PreflightTests(unittest.TestCase):
             result = supervisor_preflight(self.paths, "run-1", rec)
         self.assertEqual(result["state"], "work")
 
+    def test_nodes_needing_service_are_work_not_idle(self):
+        rec = _record(self.tmp.name, 30000)
+        for status in ("retry_pending", "blocked_unknown", "start_pending",
+                       "ready", "rework", "something_new"):
+            with self.subTest(status=status):
+                with _patch_snapshot({"n1": "running", "n2": status}):
+                    result = supervisor_preflight(self.paths, "run-1", rec)
+                self.assertEqual(result["state"], "work")
+
+    def test_unconsumed_self_report_is_work(self):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+
+        ProviderActionStore(self.paths).record_worker_delivery(
+            "run-1", "n1", "developer",
+            {"delivery_evidence": {
+                "completion_marker": "M", "delivery_path": "x",
+                "thread_status": "completed",
+            }},
+        )
+        rec = _record(self.tmp.name, 30000)
+        with _patch_snapshot({"n1": "running"}):
+            result = supervisor_preflight(self.paths, "run-1", rec)
+        self.assertEqual(result["state"], "work")
+
+    def test_other_runs_pending_request_does_not_wake_this_run(self):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+
+        ProviderActionStore(self.paths).request(
+            operation="wait", provider="codex", run_id="run-other",
+            issue_id="n1", role="developer", generation=1,
+            native_tool="codex_app__wait_threads", request={"t": 1},
+        )
+        rec = _record(self.tmp.name, 30000)
+        with _patch_snapshot({"n1": "running"}):
+            result = supervisor_preflight(self.paths, "run-1", rec)
+        self.assertEqual(result["state"], "idle")
+
+    def test_claude_code_jsonl_record_reads_latest_usage(self):
+        path = Path(self.tmp.name) / "session.jsonl"
+        lines = [
+            {"type": "user", "message": {"content": "hi"}},
+            {"type": "assistant", "message": {"usage": {
+                "input_tokens": 10, "cache_read_input_tokens": 20000,
+                "cache_creation_input_tokens": 500}}},
+            {"type": "assistant", "message": {"usage": {
+                "input_tokens": 5, "cache_read_input_tokens": 70000,
+                "cache_creation_input_tokens": 100}}},
+        ]
+        path.write_text(
+            "\n".join(json.dumps(line) for line in lines) + '\n{"partial',
+            encoding="utf-8",
+        )
+        result = supervisor_preflight(self.paths, "run-1", str(path))
+        self.assertEqual(result["state"], "rotate")
+        self.assertEqual(result["tokens"], 70105)
+
     def test_missing_record_is_unknown_not_idle(self):
         result = supervisor_preflight(self.paths, "run-1", "/nonexistent.json")
         self.assertEqual(result["state"], "unknown")
@@ -164,6 +220,11 @@ class SupervisorCliTests(unittest.TestCase):
         result = self.cli(["supervisor-address", "--run-id", "run-1"])
         self.assertNotEqual(result.exit_code, 0)
         self.assertEqual(result.payload["status"], "unknown")
+
+    def test_address_query_with_escaping_run_id_is_blocked(self):
+        result = self.cli(["supervisor-address", "--run-id", "../x"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.payload["status"], "blocked_invalid")
 
     def test_preflight_cli_rotate(self):
         rec = Path(self.tmp.name) / "s.json"

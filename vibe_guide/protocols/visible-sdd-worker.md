@@ -107,7 +107,9 @@ fail-closed，不可重报。
 记录保留在事件日志里作为审计痕迹，不阻塞后续 acceptance。
 
 被拒后如何重报之外还有一条主动通道：`vibe worker-deliver` 可以把合法交付当场落盘并完成
-对应 pending 的 `wait` 请求，监工下一次 resume 即消费；同一 payload 重复自报幂等，不产生
+对应 pending 的 `wait` 请求，监工下一次 resume 即消费；`--payload` 的形状与上面的交付事件相同
+（嵌套 `delivery_evidence`，visible-sdd 另带 `in_session_review`）。自报时监工还没发出 `wait`
+也不会丢：交付先存档，监工下一次发出 `wait` 时自动领取。同一 payload 重复自报幂等，不产生
 第二个事件。监工侧校验门位置不变，也不信任唤醒信号的内容。
 
 ## 6. 与本协议无关的事项

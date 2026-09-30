@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
@@ -32,6 +33,8 @@ class ProviderPending(RuntimeError):
 
 
 _PROVIDER_ACTIONS = {"create", "locate", "visibility", "resume", "wait"}
+_SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_WORKER_DELIVERY_EVENTS = {"delivered", "complete", "accepted", "review_finding"}
 
 
 def _is_complex_contract(value: Any) -> bool:
@@ -354,6 +357,8 @@ class ProviderActionStore:
                 raise ValueError("provider action request identity drift")
         else:
             self._atomic(path, payload)
+        if operation == "wait":
+            self._consume_archived_delivery(run_id, issue_id, role)
         return payload
 
     def result(self, action_id: str) -> Optional[Dict[str, Any]]:
@@ -391,31 +396,44 @@ class ProviderActionStore:
             },
         )
 
-    def pending(self) -> List[Dict[str, Any]]:
+    def pending(self, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
         request_dir = self._directory("requests")
         result_dir = self._directory("results")
         result = []
         for path in sorted(request_dir.glob("action-*.json")):
             if not (result_dir / path.name).exists():
-                result.append(self._read(path))
+                action = self._read(path)
+                if run_id is None or action.get("run_id") == run_id:
+                    result.append(action)
         return result
 
     def record_worker_delivery(self, run_id, issue_id, role, payload):
         """Worker self-reported delivery, idempotent and format-gated.
 
-        The payload is validated against the delivery gate *here*, so the
-        worker hears the error immediately.  A legal report completes the
-        pending ``wait`` request for this node/role (the supervisor consumes
-        it on the next ``resume``) and is also archived under
-        ``deliveries/`` for pull-based fallback.  Re-reporting an identical
-        payload is a no-op and never produces a second result.
+        The payload carries the same shape as a delivery event (protocol
+        section 5): a nested ``delivery_evidence`` object, plus
+        ``in_session_review`` for visible-sdd.  It is validated here so the
+        worker hears a format error immediately, archived under
+        ``deliveries/``, and handed to the pending ``wait`` request for this
+        node/role as a terminal ``delivered`` result the monitor's existing
+        gates then judge.  With no pending wait yet, the archive stays
+        unconsumed and the next ``wait`` request picks it up.  Re-reporting an
+        identical payload never produces a second result.
         """
+        from ..state import validate_run_id
+
+        validate_run_id(run_id)
+        if not isinstance(issue_id, str) or not _SAFE_ID.fullmatch(issue_id):
+            raise ValueError('worker delivery node id must be a simple identifier')
+        if role not in {'developer', 'reviewer'}:
+            raise ValueError('worker delivery role must be developer or reviewer')
         if not isinstance(payload, dict):
             raise ValueError('worker delivery payload must be an object')
-        marker = payload.get('completion_marker')
         delivery = payload.get('delivery_evidence')
         if not isinstance(delivery, dict):
-            delivery = payload
+            raise ValueError(
+                'worker delivery requires a nested delivery_evidence object'
+            )
         missing = [
             key for key in ('completion_marker', 'delivery_path', 'thread_status')
             if not (isinstance(delivery.get(key), str) and delivery[key].strip())
@@ -426,37 +444,73 @@ class ProviderActionStore:
             )
         if delivery.get('thread_status') not in {'complete', 'completed', 'DELIVERED'}:
             raise ValueError('worker delivery thread_status is not terminal')
+        event = payload.get('event', 'delivered')
+        if event not in _WORKER_DELIVERY_EVENTS:
+            raise ValueError('worker delivery event is unsupported')
 
-        report = {
+        deliveries = self.root / 'deliveries'
+        path = deliveries / '{}-{}-{}.json'.format(run_id, issue_id, role)
+        existing = self._read(path) if path.exists() else None
+        if isinstance(existing, dict) and existing.get('payload') == payload:
+            if existing.get('consumed_by'):
+                return {'recorded': True, 'consumed': False, 'duplicate': True}
+            consumed = self._consume_archived_delivery(run_id, issue_id, role)
+            return {'recorded': True, 'consumed': consumed, 'duplicate': True}
+        deliveries.mkdir(parents=True, exist_ok=True)
+        self._atomic(path, {
             'run_id': run_id,
             'issue_id': issue_id,
             'role': role,
             'payload': payload,
             'reported_at': __import__('time').time(),
-        }
-        # Idempotence is keyed on the reported payload, not the timestamp.
-        deliveries = self.root / 'deliveries'
-        deliveries.mkdir(parents=True, exist_ok=True)
-        digest = _canonical_digest(report)
-        path = deliveries / (
-            '{}-{}-{}.json'.format(run_id, issue_id, role)
-        )
-        existing = self._read(path) if path.exists() else None
-        consumed = False
-        if isinstance(existing, dict) and existing.get('payload') == payload:
-            return {'recorded': True, 'consumed': False, 'duplicate': True}
-        self._atomic(path, report)
+            'consumed_by': None,
+        })
+        consumed = self._consume_archived_delivery(run_id, issue_id, role)
+        return {'recorded': True, 'consumed': consumed, 'duplicate': False}
 
-        for action in self.pending():
+    def _consume_archived_delivery(self, run_id, issue_id, role):
+        """Hand an unconsumed archived delivery to this node's pending wait."""
+        if not isinstance(issue_id, str) or not _SAFE_ID.fullmatch(issue_id):
+            return False
+        path = self.root / 'deliveries' / '{}-{}-{}.json'.format(run_id, issue_id, role)
+        if not path.is_file():
+            return False
+        report = self._read(path)
+        if not isinstance(report, dict) or report.get('consumed_by'):
+            return False
+        payload = report.get('payload')
+        if not isinstance(payload, dict):
+            return False
+        for action in self.pending(run_id):
             if (
-                action.get('run_id') == run_id
-                and action.get('issue_id') == issue_id
+                action.get('issue_id') == issue_id
                 and action.get('role') == role
                 and action.get('operation') == 'wait'
             ):
-                self.complete(action['action_id'], dict(payload, idempotent_key=digest))
-                consumed = True
-        return {'recorded': True, 'consumed': consumed, 'duplicate': False}
+                result = dict(payload)
+                result['event'] = payload.get('event', 'delivered')
+                result['status'] = 'completed'
+                result['idempotent_key'] = _canonical_digest(payload)
+                self.complete(action['action_id'], result)
+                self._atomic(path, dict(report, consumed_by=action['action_id']))
+                return True
+        return False
+
+    def unconsumed_deliveries(self, run_id):
+        """Read-only list of archived self-reports no wait has taken yet."""
+        deliveries = self.root / 'deliveries'
+        if not deliveries.is_dir():
+            return []
+        found = []
+        for path in sorted(deliveries.glob('*.json')):
+            report = self._read(path)
+            if (
+                isinstance(report, dict)
+                and report.get('run_id') == run_id
+                and not report.get('consumed_by')
+            ):
+                found.append(report.get('issue_id'))
+        return found
 
     def has_request(
         self,

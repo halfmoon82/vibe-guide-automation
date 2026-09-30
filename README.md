@@ -77,6 +77,7 @@ vibe skill-install --source <GitHub> --sha <40hex> --name <名> [--subdir <子�
 vibe supervisor-preflight --run-id <run> --session-record <file>   监工心跳预检，只读磁盘，输出 idle/work/rotate/unknown
 vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h>   原子登记当前监工地址（保留历史，不含凭据）
 vibe supervisor-address --run-id <run>             查询当前监工地址；未登记返回 unknown
+vibe worker-deliver --run-id <run> --node <id> --payload '<json>'   worker 自报交付（嵌套 delivery_evidence），格式错误当场返回
 ```
 
 新会话入口：agent 先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1——<=8 直接执行、9-15 轻规划，均不触碰 vibe，评分后输出一行 S1 评分与档位；>15 或拿不准时才 `vibe scan` + `vibe plan --request --s1` 进入正式路由。该协议完全自包含，不依赖任何外部技能。

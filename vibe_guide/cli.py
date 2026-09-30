@@ -1032,7 +1032,10 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if args.command == "supervisor-address":
         if not args.run_id:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
-        payload = current_supervisor_address(paths, args.run_id)
+        try:
+            payload = current_supervisor_address(paths, args.run_id)
+        except (OSError, TypeError, ValueError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "查询失败：" + str(error), args.as_json)
         code = SUCCESS if payload["status"] == "ok" else UNKNOWN
         return _result(code, {"command": args.command, **payload}, "监工地址查询：{}".format(payload["status"]), args.as_json)
 

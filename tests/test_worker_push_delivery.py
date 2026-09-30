@@ -30,9 +30,11 @@ def _wait_request(store, run_id="run-1", node="n1"):
     )
 
 GOOD = {
-    "completion_marker": "DELIVERY_COMPLETE",
-    "delivery_path": ".vibe/runs/run-1/n1/delivery.md",
-    "thread_status": "completed",
+    "delivery_evidence": {
+        "completion_marker": "DELIVERY_COMPLETE",
+        "delivery_path": ".vibe/runs/run-1/n1/delivery.md",
+        "thread_status": "completed",
+    },
 }
 
 
@@ -56,7 +58,9 @@ class WorkerDeliveryTests(unittest.TestCase):
             self.assertTrue(outcome["consumed"])
             self.assertEqual(store.pending(), [])
             result = store.result(action["action_id"])
-            self.assertEqual(result["completion_marker"], "DELIVERY_COMPLETE")
+            self.assertEqual(
+                result["delivery_evidence"]["completion_marker"], "DELIVERY_COMPLETE"
+            )
 
     def test_duplicate_report_is_idempotent(self):
         with tempfile.TemporaryDirectory() as d:
@@ -84,6 +88,89 @@ class WorkerDeliveryTests(unittest.TestCase):
             self.assertFalse(outcome["consumed"])
             records = list((Path(d) / ".vibe" / "provider-actions" / "deliveries").glob("*.json"))
             self.assertEqual(len(records), 1)
+
+
+    def test_flattened_evidence_is_rejected_without_writing(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = _store(d)
+            with self.assertRaises(ValueError):
+                store.record_worker_delivery(
+                    "run-1", "n1", "developer", dict(GOOD["delivery_evidence"])
+                )
+            self.assertFalse(
+                (Path(d) / ".vibe" / "provider-actions" / "deliveries").exists()
+            )
+
+    def test_path_components_cannot_escape_the_mailbox(self):
+        with tempfile.TemporaryDirectory() as d:
+            project = Path(d) / "project"
+            project.mkdir()
+            store = _store(project)
+            for run_id, node, role in (
+                ("../../../../escaped", "n1", "developer"),
+                ("x/../..", "n1", "developer"),
+                ("run-1", "../n1", "developer"),
+                ("run-1", "n1", "../.."),
+            ):
+                with self.subTest(run_id=run_id, node=node, role=role):
+                    with self.assertRaises(ValueError):
+                        store.record_worker_delivery(run_id, node, role, dict(GOOD))
+            written = [p for p in Path(d).rglob("*.json")]
+            self.assertEqual(written, [])
+
+    def test_consumed_report_reaches_monitor_as_delivered_event(self):
+        from vibe_guide.runners.provider_action import ProviderActionRunner
+
+        with tempfile.TemporaryDirectory() as d:
+            runner = ProviderActionRunner(
+                ProjectPaths(Path(d)), "codex", "codex-app-visible"
+            )
+            action = _wait_request(runner.store)
+            review = {
+                "protocol": "vibe_guide/protocols/visible-sdd-worker.md",
+                "evidence_ref": "session#1",
+                "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            }
+            runner.store.record_worker_delivery(
+                "run-1", "n1", "developer", dict(GOOD, in_session_review=review)
+            )
+            result = runner.store.result(action["action_id"])
+            handle = type("Handle", (), {"run_id": "h1"})()
+            metadata = {"node_id": "n1", "role": "developer", "run_id": "run-1"}
+            runner.store._atomic(runner._handle_path(handle.run_id), metadata)
+            events = runner._wait_result(handle, metadata, {"node_id": "n1"}, result)
+            self.assertEqual([event.event for event in events], ["delivered"])
+            self.assertEqual(
+                events[0].data["delivery_evidence"], GOOD["delivery_evidence"]
+            )
+            self.assertEqual(events[0].data["in_session_review"], review)
+
+    def test_report_before_wait_is_picked_up_by_the_next_wait(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as d, patch(
+            "vibe_guide.adapters.task_provider.require_entry"
+        ):
+            # A live run always has state.json; the entry gate itself is
+            # covered elsewhere, so it is stubbed to let the wait through.
+            (Path(d) / ".vibe").mkdir()
+            (Path(d) / ".vibe" / "state.json").write_text("{}", encoding="utf-8")
+            store = _store(d)
+            early = store.record_worker_delivery(
+                "run-1", "n1", "developer", dict(GOOD)
+            )
+            self.assertFalse(early["consumed"])
+            self.assertEqual(store.unconsumed_deliveries("run-1"), ["n1"])
+            action = _wait_request(store)
+            result = store.result(action["action_id"])
+            self.assertIsNotNone(result, "archived delivery must fill the new wait")
+            self.assertEqual(result["event"], "delivered")
+            self.assertEqual(store.unconsumed_deliveries("run-1"), [])
+            again = store.record_worker_delivery(
+                "run-1", "n1", "developer", dict(GOOD)
+            )
+            self.assertTrue(again["duplicate"])
+            self.assertFalse(again["consumed"])
 
 
 class WorkerDeliverCliTests(unittest.TestCase):
@@ -115,6 +202,16 @@ class WorkerDeliverCliTests(unittest.TestCase):
         ])
         self.assertEqual(result.exit_code, 0, result.payload)
         self.assertTrue(result.payload["consumed"])
+
+
+    def test_escaping_run_id_is_blocked(self):
+        result = self.cli([
+            "worker-deliver", "--run-id", "../../escaped", "--node", "n1",
+            "--payload", json.dumps(GOOD),
+        ])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.payload["status"], "blocked_invalid")
+        self.assertFalse((self.root.parent / "escaped-n1-developer.json").exists())
 
 
 class DispatchPromptTests(unittest.TestCase):

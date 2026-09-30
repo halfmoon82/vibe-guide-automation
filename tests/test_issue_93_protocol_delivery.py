@@ -70,6 +70,17 @@ class VisibleSddPromptCarriesProtocolTests(unittest.TestCase):
             self.assertEqual(request["sdd_protocol"], VISIBLE_SDD_PROTOCOL_REF)
             self.assertEqual(request["topology"], "visible-sdd")
 
+    def test_consistency_block_stays_last_after_inlined_protocol(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            runner.task_binding(dict(CONTRACT), Path(directory), "run-93", "running")
+            prompt = [req for op, req in runner.requests if op == "create"][0]["prompt"]
+            tail = prompt.split("一致性纠偏证据必须原样绑定：", 1)[1]
+            json.loads(tail)
+            self.assertIn("--run-id run-93", prompt)
+
     def test_missing_protocol_fails_closed_before_create(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = self._runner(directory)

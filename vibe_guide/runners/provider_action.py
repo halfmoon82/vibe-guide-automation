@@ -447,18 +447,16 @@ class ProviderActionRunner(Runner):
             # self-reporting.  The signal content is never trusted -- the
             # monitor's existing gates still decide; without a push
             # capability this degrades to plain pull on the next resume.
-            # The block sits before the consistency evidence: consumers split
-            # the prompt on the consistency marker and parse what follows it
-            # as a single JSON document, so nothing may trail that marker.
-            prompt = "请执行 {} 任务，Issue {}。完工步骤（固定顺序）：1) 先执行 `vibe worker-deliver --run-id <run> --node {} --payload '<交付 JSON>'` 自报落盘（格式错误会当场返回）；2) `vibe supervisor-address --run-id <run>` 查询监工地址；3) 若平台有推送能力，向监工发固定格式唤醒信号；没有就到此为止，监工心跳兜底拉取。信号内容不影响验收。{}".format(
-                role, node_id, node_id, self._consistency_instruction(contract),
+            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序）：1) 先执行 `vibe worker-deliver --run-id {} --node {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；格式错误会当场返回）；2) `vibe supervisor-address --run-id {}` 查询监工地址；3) 若平台有推送能力，向监工发固定格式唤醒信号；没有就到此为止，监工心跳兜底拉取。信号内容不影响验收。".format(
+                role, node_id, run_id, node_id, run_id,
             )
         else:
-            prompt = "请执行 {} 任务，Issue {}。{}".format(
-                role,
-                node_id,
-                self._consistency_instruction(contract),
-            )
+            head = "请执行 {} 任务，Issue {}。".format(role, node_id)
+        # Consumers split the prompt on the consistency marker and parse what
+        # follows as one JSON document, so the consistency block always goes
+        # last -- after any inlined protocol text.
+        consistency = self._consistency_instruction(contract)
+        prompt = head + consistency
         create_request = {
             "prompt": prompt,
             "target": {
@@ -506,10 +504,12 @@ class ProviderActionRunner(Runner):
             create_request["topology"] = topology
             create_request["sdd_protocol"] = sdd_protocol
             create_request["prompt"] = (
-                prompt
+                head
                 + "\n\n"
                 + "## 会话必须遵循的协议（随包全文，逐字执行）\n\n"
                 + protocol_text
+                + "\n\n"
+                + consistency
             )
         if v39:
             # Keep the provider request bound to the same supervisor target

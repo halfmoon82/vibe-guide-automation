@@ -176,10 +176,31 @@ DEFAULT_ROTATE_TOKEN_THRESHOLD = 60000
 
 
 def _read_json_file(path):
+    """Read a JSON record, or the newest usage-bearing line of a JSONL log.
+
+    Claude Code keeps its session record as JSONL; the last line that
+    reports ``usage`` holds the session's current context size.
+    """
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError, UnicodeDecodeError):
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, TypeError, UnicodeDecodeError):
         return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    latest = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # a line still being written
+        if _session_tokens(entry) is not None:
+            latest = entry
+    return latest
 
 
 def _session_tokens(record):
@@ -195,7 +216,31 @@ def _session_tokens(record):
     usage = record.get("usage")
     if isinstance(usage, dict):
         return _session_tokens(usage)
+    message = record.get("message")
+    if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+        usage = message["usage"]
+    if isinstance(usage, dict):
+        # Anthropic usage: the context in play is the prompt side of the turn.
+        parts = [
+            usage.get(key)
+            for key in (
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            )
+        ]
+        numbers = [
+            value for value in parts
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        ]
+        if numbers:
+            return sum(numbers)
     return None
+
+
+_IDLE_SAFE_STATUSES = frozenset(
+    {"running", "planned", "accepted", "complete", "blocked_design"}
+)
 
 
 def supervisor_preflight(
@@ -229,13 +274,17 @@ def supervisor_preflight(
     try:
         from .adapters.task_provider import ProviderActionStore
 
-        pending = ProviderActionStore(paths).pending()
+        store = ProviderActionStore(paths)
+        pending = store.pending(run_id)
+        unconsumed = store.unconsumed_deliveries(run_id)
     except Exception:
         pending = None
     if pending is None:
         return {"state": "unknown", "reason": "provider mailbox unreadable"}
     if pending:
         return {"state": "work", "reason": "pending provider requests", "pending": len(pending)}
+    if unconsumed:
+        return {"state": "work", "reason": "worker delivery pending", "nodes": unconsumed}
 
     try:
         snapshot = load_snapshot(paths, run_id)
@@ -243,18 +292,23 @@ def supervisor_preflight(
         snapshot = None
     if snapshot is None:
         return {"state": "unknown", "reason": "run snapshot unavailable"}
-    delivered = [
-        node for node, data in (snapshot.nodes or {}).items()
-        if isinstance(data, dict) and data.get("status") in ("delivered", "review")
-    ]
-    if delivered:
-        return {"state": "work", "reason": "worker delivery pending", "nodes": delivered}
-    running = [
-        node for node, data in (snapshot.nodes or {}).items()
-        if isinstance(data, dict) and data.get("status") == "running"
-    ]
+    # Idle is only safe when every node is either being worked on, finished,
+    # or waiting on a human.  Anything else -- a delivery, a retry, a ready
+    # node, an unknown state -- needs the supervisor's next resume.
+    statuses = {
+        node: (data.get("status") if isinstance(data, dict) else None)
+        for node, data in (snapshot.nodes or {}).items()
+    }
+    needs_service = sorted(
+        node for node, status in statuses.items() if status not in _IDLE_SAFE_STATUSES
+    )
+    if needs_service:
+        return {"state": "work", "reason": "nodes need servicing", "nodes": needs_service}
+    running = sorted(node for node, status in statuses.items() if status == "running")
     if running:
         return {"state": "idle", "reason": "workers active", "nodes": running}
+    if any(status == "planned" for status in statuses.values()):
+        return {"state": "work", "reason": "planned nodes with nothing running"}
     return {"state": "idle", "reason": "nothing pending"}
 
 
