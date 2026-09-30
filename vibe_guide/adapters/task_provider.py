@@ -357,8 +357,9 @@ class ProviderActionStore:
                 raise ValueError("provider action request identity drift")
         else:
             self._atomic(path, payload)
-        if operation == "wait":
-            self._consume_archived_delivery(run_id, issue_id, role)
+        probe = isinstance(request, dict) and request.get("purpose") == "binding_probe"
+        if operation == "wait" and not probe:
+            self._consume_archived_delivery(run_id, issue_id, role, generation)
         return payload
 
     def result(self, action_id: str) -> Optional[Dict[str, Any]]:
@@ -407,7 +408,7 @@ class ProviderActionStore:
                     result.append(action)
         return result
 
-    def record_worker_delivery(self, run_id, issue_id, role, payload):
+    def record_worker_delivery(self, run_id, issue_id, role, payload, generation):
         """Worker self-reported delivery, idempotent and format-gated.
 
         The payload carries the same shape as a delivery event (protocol
@@ -415,10 +416,12 @@ class ProviderActionStore:
         ``in_session_review`` for visible-sdd.  It is validated here so the
         worker hears a format error immediately, archived under
         ``deliveries/``, and handed to the pending ``wait`` request for this
-        node/role as a terminal ``delivered`` result the monitor's existing
-        gates then judge.  With no pending wait yet, the archive stays
-        unconsumed and the next ``wait`` request picks it up.  Re-reporting an
-        identical payload never produces a second result.
+        node/role/generation as a terminal ``delivered`` result the
+        monitor's existing gates then judge.  With no pending wait yet, the
+        archive stays unconsumed and the next ``wait`` of the same generation
+        picks it up; a later generation (rework) never takes an older report.
+        Re-reporting an identical payload in one generation never produces a
+        second result.
         """
         from ..state import validate_run_id
 
@@ -427,6 +430,8 @@ class ProviderActionStore:
             raise ValueError('worker delivery node id must be a simple identifier')
         if role not in {'developer', 'reviewer'}:
             raise ValueError('worker delivery role must be developer or reviewer')
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            raise ValueError('worker delivery generation must be a positive integer')
         if not isinstance(payload, dict):
             raise ValueError('worker delivery payload must be an object')
         delivery = payload.get('delivery_evidence')
@@ -448,31 +453,61 @@ class ProviderActionStore:
         if event not in _WORKER_DELIVERY_EVENTS:
             raise ValueError('worker delivery event is unsupported')
 
-        deliveries = self.root / 'deliveries'
-        path = deliveries / '{}-{}-{}.json'.format(run_id, issue_id, role)
+        path = self._delivery_path(run_id, issue_id, role, generation)
         existing = self._read(path) if path.exists() else None
         if isinstance(existing, dict) and existing.get('payload') == payload:
             if existing.get('consumed_by'):
                 return {'recorded': True, 'consumed': False, 'duplicate': True}
-            consumed = self._consume_archived_delivery(run_id, issue_id, role)
+            consumed = self._consume_archived_delivery(
+                run_id, issue_id, role, generation
+            )
             return {'recorded': True, 'consumed': consumed, 'duplicate': True}
-        deliveries.mkdir(parents=True, exist_ok=True)
+        self._directory('deliveries')
         self._atomic(path, {
             'run_id': run_id,
             'issue_id': issue_id,
             'role': role,
+            'generation': generation,
             'payload': payload,
             'reported_at': __import__('time').time(),
             'consumed_by': None,
         })
-        consumed = self._consume_archived_delivery(run_id, issue_id, role)
+        consumed = self._consume_archived_delivery(run_id, issue_id, role, generation)
         return {'recorded': True, 'consumed': consumed, 'duplicate': False}
 
-    def _consume_archived_delivery(self, run_id, issue_id, role):
-        """Hand an unconsumed archived delivery to this node's pending wait."""
+    def _delivery_path(self, run_id, issue_id, role, generation):
+        return self.root / 'deliveries' / '{}-{}-{}-g{}.json'.format(
+            run_id, issue_id, role, generation
+        )
+
+    def _consume_archived_delivery(self, run_id, issue_id, role, generation):
+        """Hand this generation's archived delivery to its pending wait.
+
+        Reports from earlier generations of the same node/role are marked
+        superseded so a rework never inherits them and the preflight stops
+        counting them as pending work.
+        """
         if not isinstance(issue_id, str) or not _SAFE_ID.fullmatch(issue_id):
             return False
-        path = self.root / 'deliveries' / '{}-{}-{}.json'.format(run_id, issue_id, role)
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            return False
+        deliveries = self.root / 'deliveries'
+        if not deliveries.is_dir():
+            return False
+        prefix = '{}-{}-{}-g'.format(run_id, issue_id, role)
+        for older in deliveries.glob(prefix + '*.json'):
+            report = self._read(older)
+            if (
+                isinstance(report, dict)
+                and report.get('run_id') == run_id
+                and report.get('issue_id') == issue_id
+                and report.get('role') == role
+                and isinstance(report.get('generation'), int)
+                and report['generation'] < generation
+                and not report.get('consumed_by')
+            ):
+                self._atomic(older, dict(report, consumed_by='superseded'))
+        path = self._delivery_path(run_id, issue_id, role, generation)
         if not path.is_file():
             return False
         report = self._read(path)
@@ -482,10 +517,16 @@ class ProviderActionStore:
         if not isinstance(payload, dict):
             return False
         for action in self.pending(run_id):
+            request = action.get('request')
             if (
                 action.get('issue_id') == issue_id
                 and action.get('role') == role
                 and action.get('operation') == 'wait'
+                and action.get('generation') == generation
+                and not (
+                    isinstance(request, dict)
+                    and request.get('purpose') == 'binding_probe'
+                )
             ):
                 result = dict(payload)
                 result['event'] = payload.get('event', 'delivered')

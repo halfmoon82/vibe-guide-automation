@@ -92,11 +92,21 @@ class PreflightTests(unittest.TestCase):
     def test_nodes_needing_service_are_work_not_idle(self):
         rec = _record(self.tmp.name, 30000)
         for status in ("retry_pending", "blocked_unknown", "start_pending",
-                       "ready", "rework", "something_new"):
+                       "delivered", "brief_pending", "something_new"):
             with self.subTest(status=status):
                 with _patch_snapshot({"n1": "running", "n2": status}):
                     result = supervisor_preflight(self.paths, "run-1", rec)
                 self.assertEqual(result["state"], "work")
+
+    def test_active_and_settled_nodes_stay_idle(self):
+        rec = _record(self.tmp.name, 30000)
+        for status in ("review", "rework", "accepted", "failed", "stopped",
+                       "skipped_by_user", "blocked_design",
+                       "blocked_by_required_node"):
+            with self.subTest(status=status):
+                with _patch_snapshot({"n1": "running", "n2": status}):
+                    result = supervisor_preflight(self.paths, "run-1", rec)
+                self.assertEqual(result["state"], "idle")
 
     def test_unconsumed_self_report_is_work(self):
         from vibe_guide.adapters.task_provider import ProviderActionStore
@@ -107,6 +117,7 @@ class PreflightTests(unittest.TestCase):
                 "completion_marker": "M", "delivery_path": "x",
                 "thread_status": "completed",
             }},
+            1,
         )
         rec = _record(self.tmp.name, 30000)
         with _patch_snapshot({"n1": "running"}):

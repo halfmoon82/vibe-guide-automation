@@ -215,10 +215,12 @@ def _session_tokens(record):
             return int(value)
     usage = record.get("usage")
     if isinstance(usage, dict):
-        return _session_tokens(usage)
+        nested = _session_tokens(usage)
+        if nested is not None:
+            return nested
     message = record.get("message")
-    if isinstance(message, dict) and isinstance(message.get("usage"), dict):
-        usage = message["usage"]
+    if not isinstance(usage, dict) and isinstance(message, dict):
+        usage = message.get("usage")
     if isinstance(usage, dict):
         # Anthropic usage: the context in play is the prompt side of the turn.
         parts = [
@@ -238,8 +240,13 @@ def _session_tokens(record):
     return None
 
 
+# Nodes a worker is actively on (running/review/rework), finished nodes and
+# nodes waiting on a human or an upstream node need no supervisor resume.
 _IDLE_SAFE_STATUSES = frozenset(
-    {"running", "planned", "accepted", "complete", "blocked_design"}
+    {
+        "running", "review", "rework", "planned", "accepted", "failed",
+        "stopped", "skipped_by_user", "blocked_design", "blocked_by_required_node",
+    }
 )
 
 
@@ -304,7 +311,10 @@ def supervisor_preflight(
     )
     if needs_service:
         return {"state": "work", "reason": "nodes need servicing", "nodes": needs_service}
-    running = sorted(node for node, status in statuses.items() if status == "running")
+    running = sorted(
+        node for node, status in statuses.items()
+        if status in ("running", "review", "rework")
+    )
     if running:
         return {"state": "idle", "reason": "workers active", "nodes": running}
     if any(status == "planned" for status in statuses.values()):

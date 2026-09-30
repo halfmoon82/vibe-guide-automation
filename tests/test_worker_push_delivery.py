@@ -45,7 +45,7 @@ class WorkerDeliveryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.record_worker_delivery(
                     "run-1", "n1", "developer", {"delivery_path": "x"}
-                )
+                , 1)
             self.assertFalse((Path(d) / "deliveries").exists())
 
     def test_legal_report_completes_pending_wait(self):
@@ -54,7 +54,7 @@ class WorkerDeliveryTests(unittest.TestCase):
             action = _wait_request(store)
             outcome = store.record_worker_delivery(
                 "run-1", "n1", "developer", dict(GOOD)
-            )
+            , 1)
             self.assertTrue(outcome["consumed"])
             self.assertEqual(store.pending(), [])
             result = store.result(action["action_id"])
@@ -68,10 +68,10 @@ class WorkerDeliveryTests(unittest.TestCase):
             _wait_request(store)
             first = store.record_worker_delivery(
                 "run-1", "n1", "developer", dict(GOOD)
-            )
+            , 1)
             second = store.record_worker_delivery(
                 "run-1", "n1", "developer", dict(GOOD)
-            )
+            , 1)
             self.assertFalse(first["duplicate"])
             self.assertTrue(second["duplicate"])
             results = list(
@@ -84,7 +84,7 @@ class WorkerDeliveryTests(unittest.TestCase):
             store = _store(d)
             outcome = store.record_worker_delivery(
                 "run-1", "n1", "developer", dict(GOOD)
-            )
+            , 1)
             self.assertFalse(outcome["consumed"])
             records = list((Path(d) / ".vibe" / "provider-actions" / "deliveries").glob("*.json"))
             self.assertEqual(len(records), 1)
@@ -96,7 +96,7 @@ class WorkerDeliveryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.record_worker_delivery(
                     "run-1", "n1", "developer", dict(GOOD["delivery_evidence"])
-                )
+                , 1)
             self.assertFalse(
                 (Path(d) / ".vibe" / "provider-actions" / "deliveries").exists()
             )
@@ -114,7 +114,7 @@ class WorkerDeliveryTests(unittest.TestCase):
             ):
                 with self.subTest(run_id=run_id, node=node, role=role):
                     with self.assertRaises(ValueError):
-                        store.record_worker_delivery(run_id, node, role, dict(GOOD))
+                        store.record_worker_delivery(run_id, node, role, dict(GOOD), 1)
             written = [p for p in Path(d).rglob("*.json")]
             self.assertEqual(written, [])
 
@@ -133,7 +133,7 @@ class WorkerDeliveryTests(unittest.TestCase):
             }
             runner.store.record_worker_delivery(
                 "run-1", "n1", "developer", dict(GOOD, in_session_review=review)
-            )
+            , 1)
             result = runner.store.result(action["action_id"])
             handle = type("Handle", (), {"run_id": "h1"})()
             metadata = {"node_id": "n1", "role": "developer", "run_id": "run-1"}
@@ -158,7 +158,7 @@ class WorkerDeliveryTests(unittest.TestCase):
             store = _store(d)
             early = store.record_worker_delivery(
                 "run-1", "n1", "developer", dict(GOOD)
-            )
+            , 1)
             self.assertFalse(early["consumed"])
             self.assertEqual(store.unconsumed_deliveries("run-1"), ["n1"])
             action = _wait_request(store)
@@ -168,9 +168,74 @@ class WorkerDeliveryTests(unittest.TestCase):
             self.assertEqual(store.unconsumed_deliveries("run-1"), [])
             again = store.record_worker_delivery(
                 "run-1", "n1", "developer", dict(GOOD)
-            )
+            , 1)
             self.assertTrue(again["duplicate"])
             self.assertFalse(again["consumed"])
+
+
+class GenerationBindingTests(unittest.TestCase):
+    """Archived self-reports are bound to one node generation."""
+
+    def setUp(self):
+        from unittest.mock import patch
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        # A live run always has state.json; the entry gate itself is covered
+        # elsewhere, so it is stubbed to let several waits through.
+        (self.root / ".vibe").mkdir()
+        (self.root / ".vibe" / "state.json").write_text("{}", encoding="utf-8")
+        gate = patch("vibe_guide.adapters.task_provider.require_entry")
+        gate.start()
+        self.addCleanup(gate.stop)
+        self.store = _store(self.root)
+
+    def _wait(self, generation, sequence=1, purpose=None):
+        request = {"threadId": "t-1", "timeoutMs": 0}
+        if purpose:
+            request["purpose"] = purpose
+        return self.store.request(
+            operation="wait", provider="codex", run_id="run-1", issue_id="n1",
+            role="developer", generation=generation,
+            native_tool="codex_app__wait_threads", request=request,
+            sequence=sequence,
+        )
+
+    def test_binding_probe_wait_never_takes_the_delivery(self):
+        self.store.record_worker_delivery("run-1", "n1", "developer", dict(GOOD), 1)
+        probe = self._wait(1, sequence=0, purpose="binding_probe")
+        self.assertIsNone(self.store.result(probe["action_id"]))
+        real = self._wait(1, sequence=1)
+        self.assertEqual(self.store.result(real["action_id"])["event"], "delivered")
+
+    def test_rework_generation_never_takes_an_older_report(self):
+        self.store.record_worker_delivery("run-1", "n1", "developer", dict(GOOD), 1)
+        rework = self._wait(2)
+        self.assertIsNone(self.store.result(rework["action_id"]))
+        self.assertEqual(self.store.unconsumed_deliveries("run-1"), [])
+
+    def test_same_payload_in_a_new_generation_is_not_a_duplicate(self):
+        first = self._wait(1)
+        self.store.record_worker_delivery("run-1", "n1", "developer", dict(GOOD), 1)
+        self.assertIsNotNone(self.store.result(first["action_id"]))
+        second = self._wait(2)
+        outcome = self.store.record_worker_delivery(
+            "run-1", "n1", "developer", dict(GOOD), 2
+        )
+        self.assertFalse(outcome["duplicate"])
+        self.assertTrue(outcome["consumed"])
+        self.assertEqual(self.store.result(second["action_id"])["event"], "delivered")
+
+    def test_symlinked_deliveries_dir_is_refused(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        actions = self.root / ".vibe" / "provider-actions"
+        actions.mkdir(parents=True)
+        (actions / "deliveries").symlink_to(outside, target_is_directory=True)
+        with self.assertRaises((OSError, ValueError)):
+            self.store.record_worker_delivery("run-1", "n1", "developer", dict(GOOD), 1)
+        self.assertEqual(list(outside.iterdir()), [])
 
 
 class WorkerDeliverCliTests(unittest.TestCase):
@@ -185,7 +250,7 @@ class WorkerDeliverCliTests(unittest.TestCase):
 
     def test_missing_marker_exits_nonzero_and_writes_nothing(self):
         result = self.cli([
-            "worker-deliver", "--run-id", "run-1", "--node", "n1",
+            "worker-deliver", "--generation", "1", "--run-id", "run-1", "--node", "n1",
             "--payload", json.dumps({"delivery_path": "x"}),
         ])
         self.assertNotEqual(result.exit_code, 0)
@@ -197,7 +262,7 @@ class WorkerDeliverCliTests(unittest.TestCase):
         store = _store(self.root)
         _wait_request(store)
         result = self.cli([
-            "worker-deliver", "--run-id", "run-1", "--node", "n1",
+            "worker-deliver", "--generation", "1", "--run-id", "run-1", "--node", "n1",
             "--payload", json.dumps(GOOD),
         ])
         self.assertEqual(result.exit_code, 0, result.payload)
@@ -206,7 +271,7 @@ class WorkerDeliverCliTests(unittest.TestCase):
 
     def test_escaping_run_id_is_blocked(self):
         result = self.cli([
-            "worker-deliver", "--run-id", "../../escaped", "--node", "n1",
+            "worker-deliver", "--generation", "1", "--run-id", "../../escaped", "--node", "n1",
             "--payload", json.dumps(GOOD),
         ])
         self.assertNotEqual(result.exit_code, 0)
@@ -240,6 +305,10 @@ class DispatchPromptTests(unittest.TestCase):
             }
             runner.task_binding(contract, Path(d), "run-1", "running")
             prompt = dict(seen)["create"]["prompt"]
+            self.assertIn(
+                "cd {} && vibe worker-deliver".format(ProjectPaths(Path(d)).root), prompt
+            )
+            self.assertIn("--generation 1", prompt)
             for token in (
                 "worker-deliver",
                 "supervisor-address",
