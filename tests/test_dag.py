@@ -257,6 +257,18 @@ class DAGTests(unittest.TestCase):
         self.assertEqual(result.status, "ready")
         self.assertEqual(result.ready_nodes, ["b"])
 
+    def test_audit_allows_overlapping_write_scope_serialized_through_transitive_chain(self):
+        nodes = [
+            audited_node("a", group="first", allowlist=["README.md"]),
+            audited_node("b", depends=["a"], group="second", allowlist=["docs/b.md"]),
+            audited_node("c", depends=["b"], group="third", allowlist=["README.md"]),
+        ]
+        result = audit_dag(Plan("p1", 1, "prd.md", ["a", "b", "c"], "authorized", nodes=nodes))
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(result.ready_nodes, ["a"])
+        for node_id in ("a", "c"):
+            self.assertFalse(any("overlapping write scope" in reason for reason in result.reasons.get(node_id, [])))
+
     def test_audit_reports_conflicting_nodes_paths_and_split_direction(self):
         nodes = [
             audited_node("a", group="first", allowlist=["README.md", "docs/a.md"]),
