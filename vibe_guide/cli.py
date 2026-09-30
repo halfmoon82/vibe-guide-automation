@@ -66,6 +66,7 @@ from .prd_profiles import evaluate_prd_checkpoints, validate_skill_profile
 from .engine_attestation import create_engine_attestation
 from .evidence import evaluate_v41_closeout
 from .installation import run_install, run_upgrade, migrate_state
+from .adapters.task_provider import ProviderActionStore
 from .models import InstallRequest
 
 
@@ -96,7 +97,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy", "worker-deliver"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -120,6 +121,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--observations")
     parser.add_argument("--watch", action="store_true", dest="watch")
     parser.add_argument("--mode", choices=("layered", "bundled"), default="layered")
+    parser.add_argument("--node", dest="node_id")
+    parser.add_argument("--role", dest="role", default="developer")
+    parser.add_argument("--payload", dest="worker_payload")
     return parser
 
 
@@ -952,6 +956,22 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         status = payload.get("status")
         code = SUCCESS if status == "complete" else UNKNOWN if status in {"blocked_unknown", "retry_pending", "failed"} else BLOCKED
         return _result(code, {"command": args.command, **payload}, payload.get("message", "需要你决定"), args.as_json)
+
+    if args.command == "worker-deliver":
+        # Worker self-report: validate against the delivery gate shape, then
+        # persist.  Malformed reports exit nonzero without touching disk.
+        if not (args.run_id and args.node_id and args.worker_payload):
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "worker-deliver requires --run-id, --node and --payload"}, "缺少参数", args.as_json)
+        try:
+            raw = args.worker_payload
+            if raw.startswith("@"):
+                raw = Path(raw[1:]).read_text(encoding="utf-8")
+            payload = json.loads(raw)
+            store = ProviderActionStore(paths)
+            outcome = store.record_worker_delivery(args.run_id, args.node_id, args.role, payload)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "自报格式错误：" + str(error), args.as_json)
+        return _result(SUCCESS, {"command": args.command, "status": "recorded", **outcome}, "交付已登记", args.as_json)
 
     if args.command == "scan":
         payload = {

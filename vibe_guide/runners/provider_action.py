@@ -427,11 +427,23 @@ class ProviderActionRunner(Runner):
         project_id = contract.get("project_id")
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("visible provider contract requires project_id")
-        prompt = "请执行 {} 任务，Issue {}。{}".format(
-            role,
-            node_id,
-            self._consistency_instruction(contract),
-        )
+        if role == "developer":
+            # ISSUE-91 worker-push-delivery: the worker session ends by
+            # self-reporting.  The signal content is never trusted -- the
+            # monitor's existing gates still decide; without a push
+            # capability this degrades to plain pull on the next resume.
+            # The block sits before the consistency evidence: consumers split
+            # the prompt on the consistency marker and parse what follows it
+            # as a single JSON document, so nothing may trail that marker.
+            prompt = "请执行 {} 任务，Issue {}。完工步骤（固定顺序）：1) 先执行 `vibe worker-deliver --run-id <run> --node {} --payload '<交付 JSON>'` 自报落盘（格式错误会当场返回）；2) `vibe supervisor-address --run-id <run>` 查询监工地址；3) 若平台有推送能力，向监工发固定格式唤醒信号；没有就到此为止，监工心跳兜底拉取。信号内容不影响验收。{}".format(
+                role, node_id, node_id, self._consistency_instruction(contract),
+            )
+        else:
+            prompt = "请执行 {} 任务，Issue {}。{}".format(
+                role,
+                node_id,
+                self._consistency_instruction(contract),
+            )
         create_request = {
             "prompt": prompt,
             "target": {
