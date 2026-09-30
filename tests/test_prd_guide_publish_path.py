@@ -443,6 +443,11 @@ class DraftReplacementBoundaryTests(_Project):
         self.assertEqual(len(parked), 1, parked)
         self.assertTrue(self.plan_dir(plan_id).is_dir())
         old_plan = (self.plan_dir(plan_id) / "plan.json").read_bytes()
+
+        def snapshot(directory):
+            return {str(f.relative_to(directory)): f.read_bytes() for f in sorted(directory.rglob("*")) if f.is_file()}
+
+        old_files = snapshot(self.plan_dir(plan_id))
         self.assertNotEqual(json.loads(old_plan).get("status"), "draft")
         self.assertIn("remote_git_actions", self.card(plan_id))
         # Followed literally: new id, parked S1, old plan untouched.
@@ -466,6 +471,18 @@ class DraftReplacementBoundaryTests(_Project):
         workflow = json.loads((self.root / ".vibe" / "state.json").read_text(encoding="utf-8"))["task_workflow"]
         self.assertIn(plan_id + "-r2", workflow)
         self.assertNotIn(plan_id, workflow)
+        # Starting work goes to the new id only: a run records its plan in its
+        # own state.json and points back from the plan's current-run.json.
+        monitored = self.cli("monitor", "--plan", plan_id + "-r2", "--authorize", "AUTHORIZE")
+        runs = list((self.root / ".vibe" / "runs").glob("*/state.json"))
+        self.assertTrue(runs, "monitor started no run")
+        for run_state in runs:
+            self.assertEqual(json.loads(run_state.read_text(encoding="utf-8"))["plan_id"], plan_id + "-r2", run_state)
+        self.assertTrue((self.plan_dir(plan_id + "-r2") / "current-run.json").is_file())
+        # Nothing under the old id was touched by publishing, authorizing or
+        # starting the new one: no authorization.json, no current-run.json.
+        self.assertEqual(snapshot(self.plan_dir(plan_id)), old_files)
+        self.assertIn(monitored.payload.get("status"), {"retry_pending", "running"}, monitored.payload)
 
     def test_a_publication_landing_mid_swap_is_not_overwritten(self):
         """Re-check what was actually moved aside, not what was seen before."""
