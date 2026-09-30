@@ -58,6 +58,7 @@ vibe plan --request <request>     Run S0 and, when needed, explicit S1 and node-
 vibe monitor --plan <ID>         Start only with exact authorization and valid evidence
 vibe status --plan <ID>          Read the current snapshot without polling providers
 vibe resume --plan <ID>          Continue from snapshots, task records, and event evidence
+vibe skill-install --source <GitHub> --sha <40hex> --name <name> [--subdir <dir>] --confirm   Fetch a GitHub skill at an exact SHA, validate an optional repo subdir, materialize into .vibe/proposals/skills/<name>/ and register it in .vibe/config.json; traversal, absolute, or edge-slash subdirs are rejected without writes
 ```
 
 Every command supports `--json`. Exit codes are `0` for success, `2` for argument errors, `3` for confirmation or design blocking, and `4` for unknown external or runtime state.

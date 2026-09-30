@@ -66,6 +66,7 @@ from .prd_profiles import evaluate_prd_checkpoints, validate_skill_profile
 from .engine_attestation import create_engine_attestation
 from .evidence import evaluate_v41_closeout
 from .installation import run_install, run_upgrade, migrate_state
+from .skills import SkillSpec, install_project_skill, normalize_skill_subdir
 from .models import InstallRequest
 
 
@@ -96,7 +97,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy", "skill-install"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -120,6 +121,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--observations")
     parser.add_argument("--watch", action="store_true", dest="watch")
     parser.add_argument("--mode", choices=("layered", "bundled"), default="layered")
+    parser.add_argument("--source", dest="skill_source")
+    parser.add_argument("--sha", dest="skill_sha")
+    parser.add_argument("--name", dest="skill_name")
+    parser.add_argument("--subdir", dest="skill_subdir", default="")
     return parser
 
 
@@ -952,6 +957,42 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         status = payload.get("status")
         code = SUCCESS if status == "complete" else UNKNOWN if status in {"blocked_unknown", "retry_pending", "failed"} else BLOCKED
         return _result(code, {"command": args.command, **payload}, payload.get("message", "需要你决定"), args.as_json)
+
+    if args.command == "skill-install":
+        if not args.confirm:
+            return _result(
+                BLOCKED,
+                {"command": "skill-install", "status": "blocked", "reason": "confirmation required"},
+                "Skill 安装已暂停：需要明确确认",
+                args.as_json,
+            )
+        try:
+            if not (args.skill_source and args.skill_sha and args.skill_name):
+                raise ValueError("skill-install requires --source, --sha and --name")
+            normalize_skill_subdir(args.skill_subdir)
+            spec = SkillSpec(
+                args.skill_name, args.skill_source, args.skill_sha, args.skill_subdir,
+            )
+            result = install_project_skill(
+                spec, paths.root, paths.vibe_home, fetch=True,
+            )
+            payload = {
+                "command": "skill-install",
+                "status": result.status,
+                "installed": result.installed,
+                "source": result.source,
+                "commit": result.commit,
+                "source_status": result.source_status,
+            }
+            code = SUCCESS if result.installed else UNKNOWN
+            return _result(code, payload, "Skill 安装：{}".format(result.status), args.as_json)
+        except (OSError, TypeError, ValueError) as error:
+            return _result(
+                BLOCKED,
+                {"command": "skill-install", "status": "blocked_invalid", "reason": str(error)},
+                "Skill 安装已阻塞：" + str(error),
+                args.as_json,
+            )
 
     if args.command == "scan":
         payload = {

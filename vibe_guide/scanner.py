@@ -7,7 +7,11 @@ import subprocess
 from typing import Dict, List, Optional
 
 from .paths import ProjectPaths
-from .skills import normalize_github_source, sanitize_git_url_for_display
+from .skills import (
+    normalize_github_source,
+    normalize_skill_subdir,
+    sanitize_git_url_for_display,
+)
 
 
 _AGENT_COMMANDS = (
@@ -126,22 +130,31 @@ def _configured_skills(vibe):
         commit = (
             record.get('commit') if isinstance(record.get('commit'), str) else ''
         )
+        subdir = record.get('subdir', '')
         try:
             canonical_source = normalize_github_source(source)
             source_valid = True
         except ValueError:
             canonical_source = sanitize_git_url_for_display(source)
             source_valid = False
+        try:
+            canonical_subdir = normalize_skill_subdir(subdir)
+            subdir_valid = True
+        except ValueError:
+            canonical_subdir = ''
+            subdir_valid = False
         valid = bool(
             _SKILL_NAME.fullmatch(name)
             and _FULL_SHA.fullmatch(commit)
             and source_valid
+            and subdir_valid
         )
         result.append(
             {
                 'name': name[:128],
                 'source': canonical_source,
                 'commit': commit.lower() if _FULL_SHA.fullmatch(commit) else '',
+                'subdir': canonical_subdir,
                 'valid': valid,
             }
         )
