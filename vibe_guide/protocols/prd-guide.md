@@ -20,7 +20,7 @@
 vibe plan --request "<产品经理的原话>" --json
 ```
 
-- `route` 为 `simple` 或 `light_plan`：直接开始做，不进入本协议。
+- `route` 为 `simple` 或 `light_plan`：直接开始做，不进入本协议；但涉及图形界面时，动手前仍要先过 vibe-entry §4 的界面设计稿门（出稿、等产品经理明确确认）。
 - `route` 为 `complex`：vibe 会生成一个 draft（`status: planned`，`execution: deferred_until_authorize`），记下 `plan_id`，进入 §2。
 - 不要自己算 `--s1`：分数由 vibe 从文本推导并记进草案，发布时沿用草案的评分（§5.3 不必再传）；如果产品经理明确要求按复杂流程走，用 `--s1 5,5,5,5,5` 显式升级，绝不反向降级。
 
@@ -44,6 +44,8 @@ vibe plan --request "<产品经理的原话>" --json
 - `unverified`：证据不足、暂时无法核实的（多见于代码现状）。
 
 只在 `needs_confirmation` 时提问。每次只问一个问题，说清楚不同答案会怎样改变结果。普通的信息缺口记为 `system_inferred` 继续。
+
+**涉及图形界面时，PRD 必须带设计稿**（vibe-entry §4 的界面设计稿门在这里落地）：本次新增和改动的每一个页面，都在 `prd.design_mockups` 小节写一条，`value` 形如 `订单列表页（改动）：<稿件路径或链接>`。稿件必须打开就能看到页面长什么样（图片、HTML 原型、Figma 等链接），纯文字描述不算。产品经理确认前这条的 `source` 写 `needs_confirmation`——vibe 会因此拒绝发布，这是正确行为；他明确确认后改成 `user_confirmed`；稿件改过，把这条改回 `needs_confirmation` 重新确认。**设计稿没确认，不得进入 §4，更不得动手写代码。**
 
 会改变产品方向、授权边界或验收标准的取舍，同时要写成 `decisions[]` 条目：`question` / `options`（至少两个、互不相同）/ `impact` / `recommendation`（必须是 options 之一）/ `field`（这个决定落在哪个契约字段上，如 `export.watermark`）。产品经理选定后，`selected` 逐字等于所选 option，`status` 写 `approved`。**没选定的决策保持 `unresolved`，vibe 会拒绝发布，这是正确行为。**
 
@@ -116,7 +118,7 @@ vibe plan --request "<产品经理的原话>" --json
 }
 ```
 
-`prd` 的推荐 section：`problem`、`user_scenarios`、`success_criteria`、`non_goals`、`code_evidence`。
+`prd` 的推荐 section：`problem`、`user_scenarios`、`success_criteria`、`non_goals`、`code_evidence`；涉及图形界面时必须有 `design_mockups`（见 §2）。
 
 **黑名单（写了就被拒）**：顶层 `complexity_band` `route` `route_result` `capabilities` `project_id` `integration_contract` `spec_path` `plan_id`；节点 `status`；`contract` 内 `adapter_id` `project_id` `worker` `reviewer_worker` `worker_profile` `worktree` `branch` `writer` `reviewer`。这些全部由 vibe 派生。
 
