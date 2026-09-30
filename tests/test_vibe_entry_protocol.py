@@ -120,6 +120,37 @@ class VibeEntryProtocolShippingTests(unittest.TestCase):
         self.assertIn("`design_mockups`", section)
         self.assertIn("按改界面处理", section)
         self.assertIn("设计稿门：待确认", section)
+        # The gate persists across turns: a bare S0 reply is not a sign-off.
+        self.assertIn("跨轮次保持", section)
+        self.assertIn("不算对设计稿的确认", section)
+
+    def test_every_direct_execution_exit_defers_to_the_design_gate(self):
+        """Each place that says "just do it" must point back at §4.
+
+        Otherwise an agent that follows the route result, a bare "继续", or
+        §7's summary line walks straight past the gate.
+        """
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("vibe-entry")
+        s0 = text[text.index("## 1."):text.index("## 2.")]
+        self.assertIn("不解除 §4", s0)
+        routes = text[text.index("## 3."):text.index("## 4.")]
+        simple = next(line for line in routes.splitlines() if "`simple`/`light_plan`" in line)
+        self.assertIn("§4", simple)
+        dont = text[text.index("## 7."):]
+        self.assertIn("不在设计稿确认前动手改界面", dont)
+        guide = load_protocol("prd-guide")
+        entry = guide[guide.index("## 1."):guide.index("## 2.")]
+        simple = next(line for line in entry.splitlines() if "`simple` 或 `light_plan`" in line)
+        self.assertIn("vibe-entry §4", simple)
+
+    def test_agentsmd_entry_block_carries_the_design_gate(self):
+        """The block every session loads must not read as "<=15: just do it"."""
+        from vibe_guide.scanner import VIBE_ENTRY_CURRENT_SENTINEL, VIBE_ENTRY_RULES
+        line = next(line for line in VIBE_ENTRY_RULES.splitlines() if "图形界面" in line)
+        self.assertIn("不论 S1", line)
+        self.assertIn("设计稿", line)
+        self.assertIn(VIBE_ENTRY_CURRENT_SENTINEL, line)
 
     def test_protocol_states_gate_discipline(self):
         from vibe_guide.protocols import load_protocol

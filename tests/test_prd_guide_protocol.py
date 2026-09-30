@@ -1037,6 +1037,7 @@ class ProtocolEnforcementTests(_ProjectCase):
         self.assertIn("`prd.design_mockups`", section)
         self.assertIn("纯文字描述不算", section)
         self.assertIn("设计稿没确认，不得进入 §4，更不得动手写代码", section)
+        self.assertIn("稿件改过，把这条改回 `needs_confirmation`", section)
         self.init()
         self.write_capabilities()
         spec = _product_spec()
