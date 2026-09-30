@@ -54,6 +54,29 @@ class PackagingV310Tests(unittest.TestCase):
         source = (ROOT / "vibe_guide" / "__init__.py").read_text(encoding="utf-8")
         self.assertIn(f'__version__ = "{TARGET_VERSION}"', source)
 
+    def test_every_package_data_pattern_is_in_manifest(self):
+        # setuptools<61 builds the sdist from MANIFEST.in only; package_data
+        # alone leaves protocols/*.md and manifests/*.yaml out, and an install
+        # from that sdist cannot load them. The release gate runs setuptools>=61
+        # and never sees it, so pin the pairing here.
+        tree = ast.parse((ROOT / "setup.py").read_text(encoding="utf-8"))
+        package_data = next(
+            ast.literal_eval(keyword.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "setup"
+            for keyword in node.keywords
+            if keyword.arg == "package_data"
+        )
+        manifest = {
+            tuple(line.split())
+            for line in (ROOT / "MANIFEST.in").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        for package, patterns in package_data.items():
+            for pattern in patterns:
+                directory, _, glob = ("/".join([*package.split("."), pattern])).rpartition("/")
+                self.assertIn(("recursive-include", directory, glob), manifest, pattern)
+
     def test_the_version_the_installer_reports_is_the_package_version(self):
         """`vibe install` must not announce a different release than it is.
 
