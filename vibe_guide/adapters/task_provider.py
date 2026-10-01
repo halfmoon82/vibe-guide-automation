@@ -453,6 +453,13 @@ class ProviderActionStore:
         if event not in _WORKER_DELIVERY_EVENTS:
             raise ValueError('worker delivery event is unsupported')
 
+        latest = self._latest_generation(run_id, issue_id, role)
+        if latest is not None and generation < latest:
+            raise ValueError(
+                'worker delivery generation {} is stale; current generation is {}'.format(
+                    generation, latest
+                )
+            )
         path = self._delivery_path(run_id, issue_id, role, generation)
         existing = self._read(path) if path.exists() else None
         if isinstance(existing, dict) and existing.get('payload') == payload:
@@ -474,6 +481,25 @@ class ProviderActionStore:
         })
         consumed = self._consume_archived_delivery(run_id, issue_id, role, generation)
         return {'recorded': True, 'consumed': consumed, 'duplicate': False}
+
+    def _latest_generation(self, run_id, issue_id, role):
+        """Highest generation the monitor has dispatched for this node/role."""
+        latest = None
+        for path in self._directory('requests').glob('action-*.json'):
+            action = self._read(path)
+            if not isinstance(action, dict):
+                continue
+            generation = action.get('generation')
+            if (
+                action.get('run_id') == run_id
+                and action.get('issue_id') == issue_id
+                and action.get('role') == role
+                and isinstance(generation, int)
+                and not isinstance(generation, bool)
+                and (latest is None or generation > latest)
+            ):
+                latest = generation
+        return latest
 
     def _delivery_path(self, run_id, issue_id, role, generation):
         return self.root / 'deliveries' / '{}-{}-{}-g{}.json'.format(
@@ -536,6 +562,25 @@ class ProviderActionStore:
                 self._atomic(path, dict(report, consumed_by=action['action_id']))
                 return True
         return False
+
+    def unpolled_results(self, run_id):
+        """Read-only list of nodes whose pending action already has a result.
+
+        A self-report can complete a wait the monitor has not polled yet;
+        until it does, the run still needs the supervisor's next resume.
+        """
+        handles = self.root / 'handles'
+        if not handles.is_dir():
+            return []
+        found = []
+        for path in sorted(handles.glob('*.json')):
+            metadata = self._read(path)
+            if not isinstance(metadata, dict) or metadata.get('run_id') != run_id:
+                continue
+            action_id = metadata.get('pending_action')
+            if isinstance(action_id, str) and action_id and self.result(action_id) is not None:
+                found.append(metadata.get('node_id'))
+        return found
 
     def unconsumed_deliveries(self, run_id):
         """Read-only list of archived self-reports no wait has taken yet."""

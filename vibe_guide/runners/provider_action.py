@@ -1105,8 +1105,15 @@ class ProviderActionRunner(Runner):
             request = {
                 "threadId": binding.task_id,
                 "hostId": binding.host,
-                "prompt": "请继续处理 Issue {}。{}".format(
-                    contract["node_id"], self._consistency_instruction(contract)
+                "prompt": "请继续处理 Issue {}。{}{}".format(
+                    contract["node_id"],
+                    # Every dispatch bumps the generation; a resumed developer
+                    # must self-report under the new one or the report is
+                    # refused as stale.
+                    "本轮完工自报改用 `--generation {}`（替换此前派发指令里的值，其余步骤不变）。".format(
+                        int(contract["generation"])
+                    ) if contract.get("role") == "developer" else "",
+                    self._consistency_instruction(contract),
                 ),
             }
             action = self._action(contract, run_id, "resume", request)

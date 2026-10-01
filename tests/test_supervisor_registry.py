@@ -92,7 +92,8 @@ class PreflightTests(unittest.TestCase):
     def test_nodes_needing_service_are_work_not_idle(self):
         rec = _record(self.tmp.name, 30000)
         for status in ("retry_pending", "blocked_unknown", "start_pending",
-                       "delivered", "brief_pending", "something_new"):
+                       "delivered", "brief_pending", "something_new",
+                       "review", "rework"):
             with self.subTest(status=status):
                 with _patch_snapshot({"n1": "running", "n2": status}):
                     result = supervisor_preflight(self.paths, "run-1", rec)
@@ -100,7 +101,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_active_and_settled_nodes_stay_idle(self):
         rec = _record(self.tmp.name, 30000)
-        for status in ("review", "rework", "accepted", "failed", "stopped",
+        for status in ("accepted", "failed", "stopped",
                        "skipped_by_user", "blocked_design",
                        "blocked_by_required_node"):
             with self.subTest(status=status):
@@ -123,6 +124,24 @@ class PreflightTests(unittest.TestCase):
         with _patch_snapshot({"n1": "running"}):
             result = supervisor_preflight(self.paths, "run-1", rec)
         self.assertEqual(result["state"], "work")
+
+    def test_self_completed_wait_not_yet_polled_is_work(self):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+
+        store = ProviderActionStore(self.paths)
+        handles = store._directory("handles")
+        (handles / "h1.json").write_text(json.dumps({
+            "run_id": "run-1", "node_id": "n1", "pending_action": "action-w",
+        }), encoding="utf-8")
+        rec = _record(self.tmp.name, 30000)
+        with _patch_snapshot({"n1": "running"}), \
+                patch.object(ProviderActionStore, "result", return_value={"event": "delivered"}):
+            result = supervisor_preflight(self.paths, "run-1", rec)
+        self.assertEqual(result["state"], "work")
+        with _patch_snapshot({"n1": "running"}), \
+                patch.object(ProviderActionStore, "result", return_value=None):
+            result = supervisor_preflight(self.paths, "run-1", rec)
+        self.assertEqual(result["state"], "idle")
 
     def test_other_runs_pending_request_does_not_wake_this_run(self):
         from vibe_guide.adapters.task_provider import ProviderActionStore

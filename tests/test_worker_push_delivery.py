@@ -227,6 +227,21 @@ class GenerationBindingTests(unittest.TestCase):
         self.assertTrue(outcome["consumed"])
         self.assertEqual(self.store.result(second["action_id"])["event"], "delivered")
 
+    def test_stale_generation_report_is_refused_not_recorded(self):
+        first = self._wait(1)
+        self.store.record_worker_delivery("run-1", "n1", "developer", dict(GOOD), 1)
+        self.assertIsNotNone(self.store.result(first["action_id"]))
+        rework = self._wait(2)
+        newer = {"delivery_evidence": dict(GOOD["delivery_evidence"], delivery_path="v2")}
+        with self.assertRaises(ValueError):
+            self.store.record_worker_delivery("run-1", "n1", "developer", newer, 1)
+        self.assertIsNone(self.store.result(rework["action_id"]))
+        self.assertFalse(
+            self.store._delivery_path("run-1", "n1", "developer", 1).read_text(
+                encoding="utf-8"
+            ).count("v2")
+        )
+
     def test_symlinked_deliveries_dir_is_refused(self):
         outside = self.root / "outside"
         outside.mkdir()
@@ -316,6 +331,41 @@ class DispatchPromptTests(unittest.TestCase):
                 "心跳兜底",
             ):
                 self.assertIn(token, prompt, token)
+
+    def test_rework_resume_prompt_carries_the_new_generation(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from vibe_guide.runners import provider_action
+        from vibe_guide.runners.provider_action import ProviderActionRunner
+
+        with tempfile.TemporaryDirectory() as d:
+            runner = ProviderActionRunner(
+                ProjectPaths(Path(d)), "codex", "codex-app-visible"
+            )
+            seen = []
+
+            def fake_action(contract, run_id, operation, request):
+                seen.append((operation, request))
+                return {"action_id": "action-r"}
+
+            runner._action = fake_action
+            runner.binding_gate = lambda contract, binding: SimpleNamespace(verified=True)
+            binding = SimpleNamespace(
+                task_id="t", host="mac", cursor=None, capability_contract_digest=None,
+            )
+            contract = {
+                "run_id": "run-1", "node_id": "n1", "role": "developer",
+                "generation": 3, "continuation": True,
+            }
+            with patch.object(provider_action, "require_complex_monitor_dispatch"), \
+                    patch.object(provider_action, "load_task_binding", return_value=binding), \
+                    patch.object(provider_action, "binding_contract_enabled", return_value=False):
+                runner.start(contract, Path(d))
+            prompt = dict(seen)["resume"]["prompt"]
+            self.assertIn("--generation 3", prompt)
+            tail = prompt.split("一致性纠偏证据必须原样绑定：", 1)[1]
+            json.loads(tail)
 
 
 if __name__ == "__main__":

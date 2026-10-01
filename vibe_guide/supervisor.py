@@ -240,11 +240,14 @@ def _session_tokens(record):
     return None
 
 
-# Nodes a worker is actively on (running/review/rework), finished nodes and
-# nodes waiting on a human or an upstream node need no supervisor resume.
+# Nodes a developer is actively on, finished nodes and nodes waiting on a
+# human or an upstream node need no supervisor resume.  ``review`` and
+# ``rework`` are deliberately excluded: reviewers have no self-report channel
+# and an integration-review rework only advances on the next resume, so both
+# must keep the heartbeat pulling.
 _IDLE_SAFE_STATUSES = frozenset(
     {
-        "running", "review", "rework", "planned", "accepted", "failed",
+        "running", "planned", "accepted", "failed",
         "stopped", "skipped_by_user", "blocked_design", "blocked_by_required_node",
     }
 )
@@ -284,6 +287,7 @@ def supervisor_preflight(
         store = ProviderActionStore(paths)
         pending = store.pending(run_id)
         unconsumed = store.unconsumed_deliveries(run_id)
+        unpolled = store.unpolled_results(run_id)
     except Exception:
         pending = None
     if pending is None:
@@ -292,6 +296,8 @@ def supervisor_preflight(
         return {"state": "work", "reason": "pending provider requests", "pending": len(pending)}
     if unconsumed:
         return {"state": "work", "reason": "worker delivery pending", "nodes": unconsumed}
+    if unpolled:
+        return {"state": "work", "reason": "provider results not yet polled", "nodes": unpolled}
 
     try:
         snapshot = load_snapshot(paths, run_id)
@@ -313,7 +319,7 @@ def supervisor_preflight(
         return {"state": "work", "reason": "nodes need servicing", "nodes": needs_service}
     running = sorted(
         node for node, status in statuses.items()
-        if status in ("running", "review", "rework")
+        if status == "running"
     )
     if running:
         return {"state": "idle", "reason": "workers active", "nodes": running}
