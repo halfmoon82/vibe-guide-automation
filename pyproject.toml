@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vibe-guide"
-version = "5.0.0"
+version = "5.0.1"
 requires-python = ">=3.9"
 
 [project.scripts]
