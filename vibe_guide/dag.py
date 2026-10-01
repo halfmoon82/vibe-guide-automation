@@ -878,20 +878,18 @@ def _write_scope_conflict_errors(nodes: List[DAGNode]) -> Dict[str, List[str]]:
     ``parallel_group``.  This complementary plan/authorization gate covers
     every unordered node pair: overlapping write scope is legal only when a
     direct or transitive ``depends_on`` chain serializes the pair.  Otherwise both may be
-    dispatched independently while editing the same paths.  Pairs already
-    inside one parallel group are skipped because the group audit emits the
-    more specific message.
+    dispatched independently while editing the same paths.  Pairs inside one
+    parallel group are audited here too: the group audit reads a narrower
+    scope (no contract ``files``) and authorization runs only this gate, so a
+    same-group overlap carries both the group message and this one.
     """
     _WRITER_HOLDING = ("planned", "ready", "running", "rework", "review", "brief_pending")
     _DISPATCH_ELIGIBLE = ("planned", "ready")
     by_id = {node.id: node for node in nodes}
     scopes: Dict[str, Optional[List[str]]] = {}
-    groups: Dict[str, str] = {}
     for node in nodes:
         if node.status not in _WRITER_HOLDING or is_integration_review_node(node):
             continue
-        group = _node_metadata(node, "parallel_group")
-        groups[node.id] = str(group) if group is not None else ""
         scopes[node.id] = _conflict_write_scope(node)
 
     ancestors: Dict[str, set] = {}
