@@ -29,6 +29,18 @@ def _wait_request(store, run_id="run-1", node="n1"):
         request={"threadId": "t-1", "timeoutMs": 0},
     )
 
+def _dispatched(store, generation=1, run_id="run-1", node="n1"):
+    """Record the create the monitor sends before any worker can report."""
+    action_id = "action-create-{}-{}-g{}".format(run_id, node, generation)
+    (store._directory("requests") / (action_id + ".json")).write_text(json.dumps({
+        "schema_version": 1, "action_id": action_id, "operation": "create",
+        "provider": "codex", "run_id": run_id, "issue_id": node,
+        "role": "developer", "generation": generation, "sequence": 0,
+        "native_tool": "codex_app__create_thread", "request": {"prompt": "x"},
+        "request_digest": "0" * 64,
+    }), encoding="utf-8")
+
+
 GOOD = {
     "delivery_evidence": {
         "completion_marker": "DELIVERY_COMPLETE",
@@ -82,6 +94,7 @@ class WorkerDeliveryTests(unittest.TestCase):
     def test_report_without_pending_wait_still_lands_on_disk(self):
         with tempfile.TemporaryDirectory() as d:
             store = _store(d)
+            _dispatched(store)
             outcome = store.record_worker_delivery(
                 "run-1", "n1", "developer", dict(GOOD)
             , 1)
@@ -156,6 +169,7 @@ class WorkerDeliveryTests(unittest.TestCase):
             (Path(d) / ".vibe").mkdir()
             (Path(d) / ".vibe" / "state.json").write_text("{}", encoding="utf-8")
             store = _store(d)
+            _dispatched(store)
             early = store.record_worker_delivery(
                 "run-1", "n1", "developer", dict(GOOD)
             , 1)
@@ -203,6 +217,7 @@ class GenerationBindingTests(unittest.TestCase):
         )
 
     def test_binding_probe_wait_never_takes_the_delivery(self):
+        _dispatched(self.store)
         self.store.record_worker_delivery("run-1", "n1", "developer", dict(GOOD), 1)
         probe = self._wait(1, sequence=0, purpose="binding_probe")
         self.assertIsNone(self.store.result(probe["action_id"]))
@@ -210,6 +225,7 @@ class GenerationBindingTests(unittest.TestCase):
         self.assertEqual(self.store.result(real["action_id"])["event"], "delivered")
 
     def test_rework_generation_never_takes_an_older_report(self):
+        _dispatched(self.store)
         self.store.record_worker_delivery("run-1", "n1", "developer", dict(GOOD), 1)
         rework = self._wait(2)
         self.assertIsNone(self.store.result(rework["action_id"]))
@@ -251,6 +267,17 @@ class GenerationBindingTests(unittest.TestCase):
         )
         self.assertEqual(self.store.unconsumed_deliveries("run-1"), [])
         self.assertIsNone(self.store.result(current["action_id"]))
+
+    def test_undispatched_node_report_is_refused_not_archived(self):
+        _dispatched(self.store)
+        with self.assertRaises(ValueError):
+            self.store.record_worker_delivery("run-1", "n1x", "developer", dict(GOOD), 1)
+        with self.assertRaises(ValueError):
+            self.store.record_worker_delivery("run-1", "n1", "reviewer", dict(GOOD), 1)
+        with self.assertRaises(ValueError):
+            self.store.record_worker_delivery("run-2", "n1", "developer", dict(GOOD), 1)
+        self.assertEqual(self.store.unconsumed_deliveries("run-1"), [])
+        self.assertEqual(self.store.unconsumed_deliveries("run-2"), [])
 
     def test_symlinked_deliveries_dir_is_refused(self):
         outside = self.root / "outside"

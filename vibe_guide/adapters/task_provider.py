@@ -454,7 +454,14 @@ class ProviderActionStore:
             raise ValueError('worker delivery event is unsupported')
 
         latest = self._latest_generation(run_id, issue_id, role)
-        if latest is not None and generation != latest:
+        if latest is None:
+            # No dispatch for this run/node/role: a mistyped node or role
+            # would be archived forever and keep the heartbeat busy.
+            raise ValueError(
+                'worker delivery has no dispatched task for this run/node/role; '
+                'run it from the main project directory and check --run-id/--node'
+            )
+        if generation != latest:
             # Older: a rework superseded it.  Newer: never dispatched, so no
             # wait would ever take it and it would keep the heartbeat busy.
             raise ValueError(
