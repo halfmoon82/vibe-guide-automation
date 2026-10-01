@@ -58,6 +58,7 @@ vibe plan --request <request>     Run S0 and, when needed, explicit S1 and node-
 vibe monitor --plan <ID>         Start only with exact authorization and valid evidence
 vibe status --plan <ID>          Read the current snapshot without polling providers
 vibe resume --plan <ID>          Continue from snapshots, task records, and event evidence
+vibe skill-install --source <GitHub> --sha <40hex> --name <name> [--subdir <dir>] --confirm   Fetch a GitHub skill at an exact SHA, validate an optional repo subdir, materialize into .vibe/proposals/skills/<name>/ and register it in .vibe/config.json; traversal, absolute, or edge-slash subdirs are rejected without writes
 ```
 
 Every command supports `--json`. Exit codes are `0` for success, `2` for argument errors, `3` for confirmation or design blocking, and `4` for unknown external or runtime state.
@@ -72,7 +73,7 @@ Complex-plan publication records a real provider engine attestation containing t
 
 Since V4.6, true DAG parallelism is carried by one visible worker session per node (Codex: `create_thread`, user-owned); the supervisor only dispatches, waits, and closes out, and is never the writer of any node. The task registry records each node's dispatch topology in its `topology` field:
 
-- `visible-sdd`: one visible session per node running in-session SDD — a dev subagent implements while an independent-context, read-only review subagent audits (protocol: `vibe_guide/protocols/visible-sdd-worker.md`); rework and re-review close the loop inside the same session identity;
+- `visible-sdd`: one visible session per node running in-session SDD — a dev subagent implements while an independent-context, read-only review subagent audits (protocol: `vibe_guide/protocols/visible-sdd-worker.md`); rework and re-review close the loop inside the same session identity; dispatch inlines the full shipped protocol text into the create prompt (`VISIBLE_SDD_PROTOCOL_REF` stays a verbatim version pointer), and a missing packaged protocol fails closed before any session is created;
 - `dual-visible`: the conservative default, with two distinct visible tasks for developer and reviewer; UNKNOWN platform evidence fails closed to this topology and never upgrades to `visible-sdd`;
 - `background`: the explicit downgrade when a platform has no visible bridge. The downgrade and its limitations (not visible, not directly enterable, limited rework continuation) must be disclosed in the capability report, the authorization card, and the delivery; a `mode=background` worker without disclosure fails authorization-card validation.
 

@@ -49,6 +49,33 @@ vibe plan --request "<产品经理的原话>" --json
 
 会改变产品方向、授权边界或验收标准的取舍，同时要写成 `decisions[]` 条目：`question` / `options`（至少两个、互不相同）/ `impact` / `recommendation`（必须是 options 之一）/ `field`（这个决定落在哪个契约字段上，如 `export.watermark`）。产品经理选定后，`selected` 逐字等于所选 option，`status` 写 `approved`。**没选定的决策保持 `unresolved`，vibe 会拒绝发布，这是正确行为。**
 
+### 2.1 方法论引用（可参考，不强制）
+
+讨论到对应话题时，可参考下列方法论 skill；它们位于项目 `.vibe/proposals/skills/<名>/SKILL.md`。未安装时用下面的命令按锁定版本装进项目（`<名>` 和 `<子目录>` 取自表格对应行）：
+
+```bash
+vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077817f89bf4a9b623246219734ac3be0 --subdir <子目录> --name <名> --confirm
+```
+
+| 方法论 | 适用话题 | 仓库子目录（`--subdir`） |
+|---|---|---|
+| opportunity-solution-tree | 问题/场景拆分 | `pm-product-discovery/skills/opportunity-solution-tree` |
+| north-star-metric | 成功标准 | `pm-marketing-growth/skills/north-star-metric` |
+| metrics-dashboard | 成功标准度量 | `pm-product-discovery/skills/metrics-dashboard` |
+| prioritize-features | 非目标与排序 | `pm-product-discovery/skills/prioritize-features` |
+| prioritization-frameworks | 非目标与排序 | `pm-execution/skills/prioritization-frameworks` |
+| job-stories | 用户场景 | `pm-execution/skills/job-stories` |
+| customer-journey-map | 用户场景（可选） | `pm-market-research/skills/customer-journey-map` |
+| strategy-red-team | 风险与反例 | `pm-execution/skills/strategy-red-team` |
+| pre-mortem | 风险与反例 | `pm-execution/skills/pre-mortem` |
+
+使用规则：
+
+- 仅作参考、不强制逐字引用；对应 skill 未安装时提示安装命令后继续按本节规则推进，不得阻塞对话。
+- `$ARGUMENTS` 与主题从当前对话读取，不为方法论单独要求参数。
+- 输出仍为中文；不得把方法论产出另存为额外 markdown 文件。
+- 不得改变来源标记与停等门：`user_confirmed`/`system_inferred`/`needs_confirmation`/`unverified` 的语义与 `needs_confirmation` 停等规则保持不变。
+
 ## 3. 只读代码分析
 
 对话结束后、拆节点之前，只读地看代码。禁止改任何文件。找出：
@@ -341,6 +368,21 @@ worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），
 但它不随包发布，所以这里不给路径。）
 
 - **WorkBuddy**：`workbuddy_job__*` 五个工具名已登记，对应 WorkBuddy 官方 Jobs API，但**还没有在真实会话里跑通过**。在本机实测之前，不要把它当成已验证的派发路径，也不要据此承诺授权后不用人看。
+
+### 6.5 监工心跳纪律（预检 → idle/work/rotate）
+
+每次心跳的第一步只跑本地预检，只读磁盘：
+
+```bash
+vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路径>
+```
+
+- 输出 `idle`：所有节点都在运行、已完成或等人拍板，且无新请求。只回一字结束本轮，不做任何写。
+- 输出 `work`：有待服务请求、worker 已完工（含已自报但监工还没领取的交付），或有节点处在就绪/重试/未知等需要推进的状态。按 §6.1 原流程服务信箱，状态一律只从磁盘读，不凭记忆。
+- 输出 `rotate`：本会话上下文超过阈值（默认约 6 万 token，可配 `--token-threshold`）。执行换班：新开会话→新会话写一条简短交接（进度在磁盘上，交接只指方向）→新会话用 `vibe supervisor-register` 登记自身地址、自建心跳、置顶、改标题；删除旧心跳，旧会话把自己归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。
+- 输出 `unknown`：会话记录读不到或解析失败。**不得当成 idle**，按 `work` 处理。
+
+监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run>` 查询；未登记返回 `unknown` 而非空成功。登记内容只允许 provider/会话 id/host，不得含凭据。
 
 ## 7. 什么时候才能打断产品经理
 

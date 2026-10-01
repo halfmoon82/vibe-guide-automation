@@ -167,3 +167,231 @@ class Supervisor:
         continue polling/recovery rather than letting the parent exit.
         """
         return self.run_until_terminal(interval=interval, max_cycles=max_cycles)
+
+
+# ---------------------------------------------------------------------------
+# ISSUE-91: local supervisor preflight, address registry, and rotation.
+
+DEFAULT_ROTATE_TOKEN_THRESHOLD = 60000
+
+
+def _read_json_file(path):
+    """Read a JSON record, or the newest usage-bearing line of a JSONL log.
+
+    Claude Code keeps its session record as JSONL; the last line that
+    reports ``usage`` holds the session's current context size.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, TypeError, UnicodeDecodeError):
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    latest = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # a line still being written
+        if _session_tokens(entry) is not None:
+            latest = entry
+    return latest
+
+
+def _session_tokens(record):
+    """Best-effort token usage extraction; None when unreadable/unknown."""
+    if not isinstance(record, dict):
+        return None
+    for key in ("token_count", "tokens", "context_tokens", "context_used"):
+        value = record.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and value >= 0:
+            return int(value)
+    usage = record.get("usage")
+    if isinstance(usage, dict):
+        nested = _session_tokens(usage)
+        if nested is not None:
+            return nested
+    message = record.get("message")
+    if not isinstance(usage, dict) and isinstance(message, dict):
+        usage = message.get("usage")
+    if isinstance(usage, dict):
+        # Anthropic usage: the context in play is the prompt side of the turn.
+        parts = [
+            usage.get(key)
+            for key in (
+                "input_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+            )
+        ]
+        numbers = [
+            value for value in parts
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        ]
+        if numbers:
+            return sum(numbers)
+    return None
+
+
+# Nodes a developer is actively on, finished nodes and nodes waiting on a
+# human or an upstream node need no supervisor resume.  ``review`` and
+# ``rework`` are deliberately excluded: reviewers have no self-report channel
+# and an integration-review rework only advances on the next resume, so both
+# must keep the heartbeat pulling.
+_IDLE_SAFE_STATUSES = frozenset(
+    {
+        "running", "planned", "accepted", "failed",
+        "stopped", "skipped_by_user", "blocked_design", "blocked_by_required_node",
+    }
+)
+
+
+def supervisor_preflight(
+    paths,
+    run_id,
+    session_record=None,
+    *,
+    token_threshold=DEFAULT_ROTATE_TOKEN_THRESHOLD,
+):
+    """Read-only disk check; returns exactly one of idle/work/rotate/unknown.
+
+    - ``unknown``: the session record could not be read or parsed (never
+      collapsed into idle).
+    - ``rotate``: the session's own context/token usage exceeds the
+      threshold (default ~60k tokens).
+    - ``work``: pending provider requests exist, or a bound worker has
+      delivered/finished something not yet consumed.
+    - ``idle``: workers are active and nothing new needs servicing.
+    """
+    if session_record is None:
+        return {"state": "unknown", "reason": "session record path is missing"}
+    record = _read_json_file(session_record)
+    if record is None:
+        return {"state": "unknown", "reason": "session record unreadable"}
+    tokens = _session_tokens(record)
+    if tokens is None:
+        return {"state": "unknown", "reason": "token usage unknown"}
+    if tokens > token_threshold:
+        return {"state": "rotate", "reason": "context over threshold", "tokens": tokens}
+
+    try:
+        from .adapters.task_provider import ProviderActionStore
+
+        store = ProviderActionStore(paths)
+        pending = store.pending(run_id)
+        unconsumed = store.unconsumed_deliveries(run_id)
+        unpolled = store.unpolled_results(run_id)
+    except Exception:
+        pending = None
+    if pending is None:
+        return {"state": "unknown", "reason": "provider mailbox unreadable"}
+    if pending:
+        return {"state": "work", "reason": "pending provider requests", "pending": len(pending)}
+    if unconsumed:
+        return {"state": "work", "reason": "worker delivery pending", "nodes": unconsumed}
+    if unpolled:
+        return {"state": "work", "reason": "provider results not yet polled", "nodes": unpolled}
+
+    try:
+        snapshot = load_snapshot(paths, run_id)
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        snapshot = None
+    if snapshot is None:
+        return {"state": "unknown", "reason": "run snapshot unavailable"}
+    # Idle is only safe when every node is either being worked on, finished,
+    # or waiting on a human.  Anything else -- a delivery, a retry, a ready
+    # node, an unknown state -- needs the supervisor's next resume.
+    statuses = {
+        node: (data.get("status") if isinstance(data, dict) else None)
+        for node, data in (snapshot.nodes or {}).items()
+    }
+    needs_service = sorted(
+        node for node, status in statuses.items() if status not in _IDLE_SAFE_STATUSES
+    )
+    if needs_service:
+        return {"state": "work", "reason": "nodes need servicing", "nodes": needs_service}
+    running = sorted(
+        node for node, status in statuses.items()
+        if status == "running"
+    )
+    if running:
+        return {"state": "idle", "reason": "workers active", "nodes": running}
+    if any(status == "planned" for status in statuses.values()):
+        return {"state": "work", "reason": "planned nodes with nothing running"}
+    return {"state": "idle", "reason": "nothing pending"}
+
+
+_REGISTRY_NAME = "supervisor-registry.json"
+
+
+def _registry_path(paths, run_id):
+    return run_dir(paths, run_id, create=True) / _REGISTRY_NAME
+
+
+def register_supervisor_address(paths, run_id, address):
+    """Atomically record the current supervisor address; keeps history."""
+    if not isinstance(address, dict):
+        raise TypeError("address must be a mapping")
+    provider = address.get("provider")
+    session_id = address.get("session_id") or address.get("task_id")
+    host = address.get("host") or address.get("hostId")
+    if not (
+        isinstance(provider, str) and provider
+        and isinstance(session_id, str) and session_id
+        and isinstance(host, str) and host
+    ):
+        raise ValueError("supervisor address requires provider, session_id and host")
+    for forbidden in ("token", "password", "secret", "credential"):
+        for key in address:
+            if forbidden in str(key).lower():
+                raise ValueError("supervisor address must not carry credentials")
+    path = _registry_path(paths, run_id)
+    registry = _read_json_file(path)
+    if not isinstance(registry, dict):
+        registry = {}
+    history = registry.get("history")
+    if not isinstance(history, list):
+        history = []
+    current = registry.get("current")
+    if isinstance(current, dict):
+        history.append(current)
+    entry = {
+        "provider": provider,
+        "session_id": session_id,
+        "host": host,
+        "registered_at": time.time(),
+    }
+    registry = {"current": entry, "history": history}
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".supervisor-registry-", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(registry, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, str(path))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return entry
+
+
+def current_supervisor_address(paths, run_id):
+    """Return the registered supervisor address or an explicit unknown."""
+    registry = _read_json_file(_registry_path(paths, run_id))
+    if not isinstance(registry, dict) or not isinstance(registry.get("current"), dict):
+        return {"status": "unknown", "reason": "no supervisor registered"}
+    return {
+        "status": "ok",
+        "current": registry["current"],
+        "history": registry.get("history", []),
+    }

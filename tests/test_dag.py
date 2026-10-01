@@ -5,7 +5,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from vibe_guide.dag import DAGAuditResult, audit_dag, node_scoped_ready, ready_nodes, render_plan_artifacts, validate_dag
+from vibe_guide.dag import (
+    DAGAuditResult,
+    _parallel_group_errors,
+    _write_scope_conflict_errors,
+    audit_dag,
+    node_scoped_ready,
+    ready_nodes,
+    render_plan_artifacts,
+    validate_dag,
+)
 from vibe_guide.models import DAGNode, Plan
 from vibe_guide.path_ownership import normalize_project_path
 
@@ -269,6 +278,18 @@ class DAGTests(unittest.TestCase):
         for node_id in ("a", "c"):
             self.assertFalse(any("overlapping write scope" in reason for reason in result.reasons.get(node_id, [])))
 
+    def test_audit_still_blocks_overlap_when_only_sibling_without_chain(self):
+        # a -> b is a chain, but c has no path to a: their overlap stays illegal.
+        nodes = [
+            audited_node("a", group="first", allowlist=["README.md"]),
+            audited_node("b", depends=["a"], allowlist=["vibe_guide/b.py"]),
+            audited_node("c", group="second", allowlist=["README.md"]),
+        ]
+        result = audit_dag(Plan("p1", 1, "prd.md", ["a", "b", "c"], "authorized", nodes=nodes))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertTrue(any("overlapping write scope" in reason for reason in result.reasons["a"]))
+        self.assertTrue(any("overlapping write scope" in reason for reason in result.reasons["c"]))
+
     def test_audit_reports_conflicting_nodes_paths_and_split_direction(self):
         nodes = [
             audited_node("a", group="first", allowlist=["README.md", "docs/a.md"]),
@@ -387,6 +408,38 @@ class ParallelGroupAuditTests(unittest.TestCase):
             any("overlapping write scope" in reason for reason in result.reasons["a"]),
             result.reasons["a"],
         )
+
+    def test_same_group_overlap_carries_group_and_write_scope_gate_reasons(self):
+        nodes = [
+            self._group_node("a", allowlist=["vibe_guide/shared.py"]),
+            self._group_node("b", allowlist=["vibe_guide/shared.py"]),
+        ]
+        result = audit_dag(self._plan(nodes))
+        for node_id in ("a", "b"):
+            self.assertEqual(
+                result.reasons[node_id],
+                [
+                    "parallel_group 'g': nodes a and b have overlapping write scope "
+                    "(vibe_guide/shared.py); relabel integration_after or split the group",
+                    "nodes a and b have overlapping write scope (vibe_guide/shared.py); "
+                    "add depends_on, relabel integration_after, or split the paths",
+                ],
+            )
+
+    def test_write_scope_gate_does_not_skip_same_group_pairs(self):
+        # The group audit reads only allowlist/owned_paths; an overlap declared
+        # through contract ``files`` is visible to the write-scope gate alone,
+        # which is also the only conflict check authorization runs.
+        nodes = [
+            self._group_node("a", contract_overrides={"files": ["vibe_guide/shared.py"]}),
+            self._group_node("b", contract_overrides={"files": ["vibe_guide/shared.py"]}),
+        ]
+        self.assertEqual(_parallel_group_errors(nodes), {})
+        conflicts = _write_scope_conflict_errors(nodes)
+        self.assertEqual(set(conflicts), {"a", "b"})
+        result = audit_dag(self._plan(nodes))
+        self.assertEqual(result.status, "blocked_dag")
+        self.assertEqual(result.ready_nodes, [])
 
     def test_artifact_reference_is_refused_from_parallel_group(self):
         producer = self._group_node(

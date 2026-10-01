@@ -65,4 +65,5 @@ vibe 会自动追加最终的 `integration-review` 节点。
 ## 未验证
 
 - Codex 侧的监工换班、心跳预检、worker 主动叫醒监工，均待在 Codex 机器上实证。
+- Claude Code 上的 worker→监工唤醒：**未验证**（2026-10-01 合入 main 时登记）。已验证的只到磁盘层：worker 自报能完成监工的 `wait` 并以 `delivered` 事件交给监工的交付门，自报早于 `wait` 时下一次 `wait` 会自动领取，预检在有未领取交付或待推进节点时回 `work`。真实桌面会话之间的推送唤醒还没有跑过。
 - `skill-subdir-install` 合并后，实际安装 pm-ai-shipping 的 3 个 skill（锁定 commit `8607e3b077817f89bf4a9b623246219734ac3be0`）是运行时步骤，尚未执行。

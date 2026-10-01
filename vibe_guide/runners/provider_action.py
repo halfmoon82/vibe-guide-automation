@@ -3,6 +3,7 @@
 from dataclasses import replace
 import hashlib
 import json
+import shlex
 from pathlib import Path
 import subprocess
 from typing import Any, Dict, Optional
@@ -24,6 +25,7 @@ from ..models import (
 )
 from ..model_router import provider_thinking_for
 from ..paths import ProjectPaths
+from ..protocols import load_protocol
 from ..task_registry import (
     DEFAULT_TOPOLOGY,
     _TOPOLOGIES,
@@ -441,11 +443,25 @@ class ProviderActionRunner(Runner):
         project_id = contract.get("project_id")
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("visible provider contract requires project_id")
-        prompt = "请执行 {} 任务，Issue {}。{}".format(
-            role,
-            node_id,
-            self._consistency_instruction(contract),
-        )
+        if role == "developer":
+            # ISSUE-91 worker-push-delivery: the worker session ends by
+            # self-reporting.  The signal content is never trusted -- the
+            # monitor's existing gates still decide; without a push
+            # capability this degrades to plain pull on the next resume.
+            # Both commands run from the supervisor's project root: inside a
+            # worktree the CLI would resolve that worktree's own .vibe and
+            # the report would never reach the supervisor.
+            root = shlex.quote(str(self.paths.root))
+            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须在主项目目录执行，不要在 worktree 里执行）：1) 先执行 `cd {} && vibe worker-deliver --run-id {} --node {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；格式错误会当场返回）；2) `cd {} && vibe supervisor-address --run-id {}` 查询监工地址；3) 若平台有推送能力，向监工发固定格式唤醒信号；没有就到此为止，监工心跳兜底拉取。信号内容不影响验收。".format(
+                role, node_id, root, run_id, node_id, generation, root, run_id,
+            )
+        else:
+            head = "请执行 {} 任务，Issue {}。".format(role, node_id)
+        # Consumers split the prompt on the consistency marker and parse what
+        # follows as one JSON document, so the consistency block always goes
+        # last -- after any inlined protocol text.
+        consistency = self._consistency_instruction(contract)
+        prompt = head + consistency
         create_request = {
             "prompt": prompt,
             "target": {
@@ -484,9 +500,22 @@ class ProviderActionRunner(Runner):
                 raise ValueError("visible-sdd dispatch requires an sdd_protocol pointer")
             # The desktop session servicing the mailbox must know it is
             # creating the single visible SDD worker session and which
-            # protocol that session has to follow.
+            # protocol that session has to follow.  The pointer stays a
+            # verbatim version reference; the protocol body is inlined
+            # into the worker prompt so the session does not need the
+            # repository to obey it.  A missing packaged protocol fails
+            # closed here, before the create request leaves the mailbox.
+            protocol_text = load_protocol(Path(sdd_protocol).stem)
             create_request["topology"] = topology
             create_request["sdd_protocol"] = sdd_protocol
+            create_request["prompt"] = (
+                head
+                + "\n\n"
+                + "## 会话必须遵循的协议（随包全文，逐字执行）\n\n"
+                + protocol_text
+                + "\n\n"
+                + consistency
+            )
         if v39:
             # Keep the provider request bound to the same supervisor target
             # that will later be checked against live binding evidence.  These
@@ -1076,8 +1105,15 @@ class ProviderActionRunner(Runner):
             request = {
                 "threadId": binding.task_id,
                 "hostId": binding.host,
-                "prompt": "请继续处理 Issue {}。{}".format(
-                    contract["node_id"], self._consistency_instruction(contract)
+                "prompt": "请继续处理 Issue {}。{}{}".format(
+                    contract["node_id"],
+                    # Every dispatch bumps the generation; a resumed developer
+                    # must self-report under the new one or the report is
+                    # refused as stale.
+                    "本轮完工自报改用 `--generation {}`（替换此前派发指令里的值，其余步骤不变）。".format(
+                        int(contract["generation"])
+                    ) if contract.get("role") == "developer" else "",
+                    self._consistency_instruction(contract),
                 ),
             }
             action = self._action(contract, run_id, "resume", request)
