@@ -30,6 +30,10 @@ class SkillSpec:
     name: str
     source: str
     commit: str
+    # Optional repository subdirectory that holds the skill root.  ``None``
+    # and ``""`` both mean the repository root; only normalized values may
+    # reach the archive/materialize stage.
+    subdir: str = ''
 
 
 @dataclass
@@ -107,6 +111,52 @@ def normalize_github_source(source, reject_credentials=True):
             raise ValueError('credential-bearing Git URL')
     owner, repository = _github_path(parsed.path)
     return 'https://github.com/{}/{}'.format(owner, repository)
+
+
+_SUBDIR_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def normalize_skill_subdir(subdir):
+    """Validate and normalize the optional in-repository skill subdir.
+
+    Rejects ``..`` segments, absolute paths, leading/trailing slashes,
+    empty segments (``//``) and characters outside the GitHub-safe set.
+    ``None`` and ``""`` normalize to ``""`` meaning the repository root.
+    """
+    if subdir is None:
+        return ''
+    if not isinstance(subdir, str):
+        raise ValueError('skill subdir must be a string')
+    value = subdir
+    if value == '':
+        return ''
+    if value != value.strip() or '//' in value:
+        raise ValueError('skill subdir is invalid')
+    if value.startswith('/') or value.endswith('/'):
+        raise ValueError('skill subdir must not have leading or trailing slash')
+    segments = value.split('/')
+    if any(part in ('', '.', '..') for part in segments):
+        raise ValueError('skill subdir escapes the repository')
+    path = PurePosixPath(value)
+    if path.is_absolute():
+        raise ValueError('skill subdir escapes the repository')
+    if any(not _SUBDIR_SEGMENT.fullmatch(part) or part in ('.', '..') for part in path.parts):
+        raise ValueError('skill subdir contains an invalid segment')
+    return path.as_posix()
+
+
+def repository_vendor_dir(vibe_home, source):
+    """Vendor cache directory keyed by repository identity, not skill name.
+
+    One repository can host several skills under different subdirs; the
+    clone is therefore shared under a content digest of the normalized
+    GitHub URL so two installs from the same repo reuse one vendor copy.
+    """
+    canonical = normalize_github_source(source)
+    digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:16]
+    parts = canonical.rsplit('/', 2)
+    slug = '{}-{}'.format(parts[-2], parts[-1])
+    return Path(vibe_home).resolve() / 'vendor' / '{}-{}'.format(slug, digest)
 
 
 def sanitize_git_url_for_display(source):
@@ -222,7 +272,7 @@ def _safe_archive_members(archive):
     return members
 
 
-def _materialize_commit(vendor, commit, stage):
+def _materialize_commit(vendor, commit, stage, subdir=''):
     environment = os.environ.copy()
     environment['GIT_TERMINAL_PROMPT'] = '0'
     try:
@@ -237,11 +287,21 @@ def _materialize_commit(vendor, commit, stage):
         raise _InstallError()
     if completed.returncode != 0:
         raise _InstallError()
+    prefix = tuple(PurePosixPath(subdir).parts) if subdir else ()
     try:
         with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode='r:') as archive:
             members = _safe_archive_members(archive)
+            materialized = 0
             for member in members:
-                destination = stage.joinpath(*PurePosixPath(member.name).parts)
+                member_parts = PurePosixPath(member.name).parts
+                if prefix:
+                    if member_parts[:len(prefix)] != prefix:
+                        continue
+                    member_parts = member_parts[len(prefix):]
+                    if not member_parts:
+                        continue
+                materialized += 1
+                destination = stage.joinpath(*member_parts)
                 if member.isdir():
                     destination.mkdir(parents=True, exist_ok=True)
                     continue
@@ -252,6 +312,10 @@ def _materialize_commit(vendor, commit, stage):
                 with source_file, destination.open('xb') as output:
                     shutil.copyfileobj(source_file, output)
                 destination.chmod(0o755 if member.mode & 0o111 else 0o644)
+            if prefix and materialized == 0:
+                # The subdir does not exist at this commit: nothing may be
+                # staged, recorded or reported as installed.
+                raise _InstallError()
     except (OSError, tarfile.TarError):
         raise _InstallError()
     manifest = stage / 'SKILL.md'
@@ -352,12 +416,15 @@ def install_skill(spec, vibe_home, fetch=False):
         stage = Path(
             tempfile.mkdtemp(prefix='.' + spec.name + '-', dir=str(skills_root))
         )
-        _materialize_commit(vendor, actual, stage)
+        _materialize_commit(
+            vendor, actual, stage, normalize_skill_subdir(spec.subdir)
+        )
         installed_tree = _materialized_tree_sha256(stage)
         record = {
             'source': source,
             'sha': actual,
             'tree': tree,
+            'subdir': normalize_skill_subdir(spec.subdir),
             'installed_tree_sha256': installed_tree,
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'validation': 'verified',
@@ -383,6 +450,114 @@ def install_skill(spec, vibe_home, fetch=False):
         if record_created and record_path is not None:
             try:
                 record_path.unlink()
+            except OSError:
+                pass
+        return SkillInstallResult('pending', False, safe_source, safe_commit, source_status)
+    finally:
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+def _config_skill_records(config_path):
+    """Read .vibe/config.json as a dict; errors are install errors."""
+    if not config_path.exists():
+        return {}
+    if config_path.is_symlink() or not config_path.is_file():
+        raise _InstallError()
+    try:
+        document = json.loads(config_path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise _InstallError()
+    if not isinstance(document, dict):
+        raise _InstallError()
+    skills = document.get('skills')
+    if skills is not None and not isinstance(skills, list):
+        raise _InstallError()
+    return document
+
+
+def install_project_skill(spec, project_root, vibe_home, fetch=True):
+    """Install a skill into ``.vibe/proposals/skills/<name>/`` and register it.
+
+    Writes only happen after the source clone is verified and the subtree
+    (repository root or ``spec.subdir``) is staged outside the project.
+    Every failure returns ``pending`` without landing files or records.
+    """
+    safe_source = sanitize_git_url_for_display(spec.source)
+    safe_commit = spec.commit.lower() if _FULL_SHA.fullmatch(spec.commit or '') else ''
+    source_status = classify_skill_source(spec.source)
+    stage = None
+    target = None
+    published = False
+    try:
+        if not _NAME.fullmatch(spec.name or '') or spec.name in ('.', '..'):
+            raise _InstallError()
+        source = normalize_github_source(spec.source)
+        if not _FULL_SHA.fullmatch(spec.commit or ''):
+            raise _InstallError()
+        subdir = normalize_skill_subdir(spec.subdir)
+        requested_sha = spec.commit.lower()
+
+        root = Path(project_root).resolve()
+        vibe_dir = root / '.vibe'
+        if vibe_dir.exists() and (vibe_dir.is_symlink() or not vibe_dir.is_dir()):
+            raise _InstallError()
+        proposals_dir = vibe_dir / 'proposals' / 'skills'
+        for directory in (vibe_dir / 'proposals', proposals_dir):
+            if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+                raise _InstallError()
+        target = proposals_dir / spec.name
+        config_path = vibe_dir / 'config.json'
+
+        document = _config_skill_records(config_path)
+        records = document.setdefault('skills', [])
+        if any(
+            isinstance(record, dict) and record.get('name') == spec.name
+            for record in records
+        ):
+            raise _InstallError()
+        if _lexists(target):
+            raise _InstallError()
+
+        vendor = repository_vendor_dir(vibe_home, source)
+        if not _lexists(vendor):
+            if not fetch:
+                raise _InstallError()
+            _clone_vendor(source, vendor, requested_sha)
+        actual, tree = _verify_vendor(vendor, source, requested_sha, fetch)
+
+        stage = Path(tempfile.mkdtemp(
+            prefix='.vibe-skill-' + spec.name + '-'
+        ))
+        _materialize_commit(vendor, actual, stage, subdir)
+        installed_tree = _materialized_tree_sha256(stage)
+
+        records.append({
+            'name': spec.name,
+            'source': source,
+            'commit': actual,
+            'subdir': subdir,
+            'tree': tree,
+            'installed_tree_sha256': installed_tree,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'validation': 'verified',
+        })
+        proposals_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(stage), str(target))
+        stage = None
+        published = True
+        _write_record_atomic(config_path, document)
+        return SkillInstallResult('installed', True, source, actual, source_status)
+    except (
+        _InstallError,
+        OSError,
+        ValueError,
+        subprocess.SubprocessError,
+        tarfile.TarError,
+    ):
+        if published and target is not None:
+            try:
+                _remove_published_path(target)
             except OSError:
                 pass
         return SkillInstallResult('pending', False, safe_source, safe_commit, source_status)

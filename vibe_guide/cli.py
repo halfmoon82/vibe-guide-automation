@@ -25,10 +25,14 @@ from .config import load_project_config
 from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import doctor
 from .initializer import _rules_target, apply_agentsmd_proposal, init_project
-from .upgrade import upgrade_project
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import Monitor
-from .supervisor import Supervisor
+from .supervisor import (
+    Supervisor,
+    current_supervisor_address,
+    register_supervisor_address,
+    supervisor_preflight,
+)
 from .change_requests import ChangeRequest, classify_merge_capability
 from .deploy import authorize_deploy, plan_deploy, verify_deploy, start_deploy
 from .paths import ProjectPaths
@@ -66,6 +70,7 @@ from .prd_profiles import evaluate_prd_checkpoints, validate_skill_profile
 from .engine_attestation import create_engine_attestation
 from .evidence import evaluate_v41_closeout
 from .installation import run_install, run_upgrade, migrate_state
+from .skills import SkillSpec, install_project_skill
 from .models import InstallRequest
 
 
@@ -96,7 +101,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy", "skill-install", "supervisor-preflight", "supervisor-register", "supervisor-address", "worker-deliver"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -120,6 +125,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--observations")
     parser.add_argument("--watch", action="store_true", dest="watch")
     parser.add_argument("--mode", choices=("layered", "bundled"), default="layered")
+    parser.add_argument("--source", dest="skill_source")
+    parser.add_argument("--sha", dest="skill_sha")
+    parser.add_argument("--name", dest="skill_name")
+    parser.add_argument("--subdir", dest="skill_subdir", default="")
+    parser.add_argument("--session-record", dest="session_record")
+    parser.add_argument("--provider", dest="supervisor_provider")
+    parser.add_argument("--session-id", dest="session_id")
+    parser.add_argument("--host", dest="supervisor_host")
+    parser.add_argument("--token-threshold", dest="token_threshold", type=int, default=None)
+    parser.add_argument("--node", dest="node_id")
+    parser.add_argument("--role", dest="role", default="developer")
+    parser.add_argument("--payload", dest="worker_payload")
+    parser.add_argument("--generation", dest="worker_generation", type=int, default=None)
     return parser
 
 
@@ -954,6 +972,92 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         code = SUCCESS if status == "complete" else UNKNOWN if status in {"blocked_unknown", "retry_pending", "failed"} else BLOCKED
         return _result(code, {"command": args.command, **payload}, payload.get("message", "需要你决定"), args.as_json)
 
+    if args.command == "skill-install":
+        if not args.confirm:
+            return _result(
+                BLOCKED,
+                {"command": "skill-install", "status": "blocked", "reason": "confirmation required"},
+                "Skill 安装已暂停：需要明确确认",
+                args.as_json,
+            )
+        try:
+            if not (args.skill_source and args.skill_sha and args.skill_name):
+                raise ValueError("skill-install requires --source, --sha and --name")
+            spec = SkillSpec(
+                args.skill_name, args.skill_source, args.skill_sha, args.skill_subdir,
+            )
+            result = install_project_skill(
+                spec, paths.root, paths.vibe_home, fetch=True,
+            )
+            payload = {
+                "command": "skill-install",
+                "status": result.status,
+                "installed": result.installed,
+                "source": result.source,
+                "commit": result.commit,
+                "source_status": result.source_status,
+            }
+            code = SUCCESS if result.installed else UNKNOWN
+            return _result(code, payload, "Skill 安装：{}".format(result.status), args.as_json)
+        except (OSError, TypeError, ValueError) as error:
+            return _result(
+                BLOCKED,
+                {"command": "skill-install", "status": "blocked_invalid", "reason": str(error)},
+                "Skill 安装已阻塞：" + str(error),
+                args.as_json,
+            )
+
+    if args.command == "supervisor-preflight":
+        if not args.run_id:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        kwargs = {}
+        if args.token_threshold is not None:
+            kwargs["token_threshold"] = args.token_threshold
+        payload = supervisor_preflight(paths, args.run_id, args.session_record, **kwargs)
+        code = SUCCESS if payload["state"] in {"idle", "work", "rotate"} else UNKNOWN
+        return _result(code, {"command": args.command, **payload}, "监工预检：{}".format(payload["state"]), args.as_json)
+
+    if args.command == "supervisor-register":
+        if not args.run_id:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        try:
+            entry = register_supervisor_address(paths, args.run_id, {
+                "provider": args.supervisor_provider,
+                "session_id": args.session_id,
+                "host": args.supervisor_host,
+            })
+        except (TypeError, ValueError, OSError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "登记失败：" + str(error), args.as_json)
+        return _result(SUCCESS, {"command": args.command, "status": "ok", "current": entry}, "监工地址已登记", args.as_json)
+
+    if args.command == "supervisor-address":
+        if not args.run_id:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        try:
+            payload = current_supervisor_address(paths, args.run_id)
+        except (OSError, TypeError, ValueError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "查询失败：" + str(error), args.as_json)
+        code = SUCCESS if payload["status"] == "ok" else UNKNOWN
+        return _result(code, {"command": args.command, **payload}, "监工地址查询：{}".format(payload["status"]), args.as_json)
+
+    if args.command == "worker-deliver":
+        # Worker self-report: validate against the delivery gate shape, then
+        # persist.  Malformed reports exit nonzero without touching disk.
+        if not (args.run_id and args.node_id and args.worker_payload and args.worker_generation):
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "worker-deliver requires --run-id, --node, --generation and --payload"}, "缺少参数", args.as_json)
+        try:
+            raw = args.worker_payload
+            if raw.startswith("@"):
+                raw = Path(raw[1:]).read_text(encoding="utf-8")
+            payload = json.loads(raw)
+            store = ProviderActionStore(paths)
+            outcome = store.record_worker_delivery(
+                args.run_id, args.node_id, args.role, payload, args.worker_generation
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "自报格式错误：" + str(error), args.as_json)
+        return _result(SUCCESS, {"command": args.command, "status": "recorded", **outcome}, "交付已登记", args.as_json)
+
     if args.command == "scan":
         payload = {
             "command": "scan",
@@ -994,37 +1098,6 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             payload["notes"] = list(initialized.notes)
             summary += "；请注意：" + "；".join(initialized.notes)
         return _result(SUCCESS, payload, summary, args.as_json)
-
-    if args.command == "upgrade":
-        if not args.confirm:
-            return _result(
-                BLOCKED,
-                {"command": "upgrade", "status": "blocked", "reason": "confirmation required"},
-                "升级已暂停：需要明确确认",
-                args.as_json,
-            )
-        try:
-            upgraded = upgrade_project(paths, True)
-        except (OSError, TypeError, ValueError) as error:
-            return _result(
-                BLOCKED,
-                {"command": "upgrade", "status": "blocked", "reason": str(error)},
-                "升级已阻塞：" + str(error),
-                args.as_json,
-            )
-        payload = {
-            "command": "upgrade",
-            "status": "ok",
-            "changed": upgraded.changed,
-            "paths": upgraded.paths,
-            "deploy": False,
-        }
-        return _result(
-            SUCCESS,
-            payload,
-            "升级完成" if upgraded.changed else "升级无需变更",
-            args.as_json,
-        )
 
     if args.command == "apply-agentsmd":
         rules_name = _rules_target(Path(paths.root).resolve()).name
