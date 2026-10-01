@@ -112,7 +112,13 @@ class PreflightTests(unittest.TestCase):
     def test_unconsumed_self_report_is_work(self):
         from vibe_guide.adapters.task_provider import ProviderActionStore
 
-        ProviderActionStore(self.paths).record_worker_delivery(
+        store = ProviderActionStore(self.paths)
+        (store._directory("requests") / "action-c.json").write_text(json.dumps({
+            "action_id": "action-c", "operation": "create", "run_id": "run-1",
+            "issue_id": "n1", "role": "developer", "generation": 1,
+        }), encoding="utf-8")
+        (store._directory("results") / "action-c.json").write_text("{}", encoding="utf-8")
+        store.record_worker_delivery(
             "run-1", "n1", "developer",
             {"delivery_evidence": {
                 "completion_marker": "M", "delivery_path": "x",
