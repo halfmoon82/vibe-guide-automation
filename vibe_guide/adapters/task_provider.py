@@ -454,10 +454,12 @@ class ProviderActionStore:
             raise ValueError('worker delivery event is unsupported')
 
         latest = self._latest_generation(run_id, issue_id, role)
-        if latest is not None and generation < latest:
+        if latest is not None and generation != latest:
+            # Older: a rework superseded it.  Newer: never dispatched, so no
+            # wait would ever take it and it would keep the heartbeat busy.
             raise ValueError(
-                'worker delivery generation {} is stale; current generation is {}'.format(
-                    generation, latest
+                'worker delivery generation {} is {}; current generation is {}'.format(
+                    generation, 'stale' if generation < latest else 'unknown', latest
                 )
             )
         path = self._delivery_path(run_id, issue_id, role, generation)
