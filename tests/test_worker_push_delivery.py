@@ -242,6 +242,16 @@ class GenerationBindingTests(unittest.TestCase):
             ).count("v2")
         )
 
+    def test_future_generation_report_is_refused_not_archived(self):
+        current = self._wait(1)
+        with self.assertRaises(ValueError):
+            self.store.record_worker_delivery("run-1", "n1", "developer", dict(GOOD), 4)
+        self.assertFalse(
+            self.store._delivery_path("run-1", "n1", "developer", 4).exists()
+        )
+        self.assertEqual(self.store.unconsumed_deliveries("run-1"), [])
+        self.assertIsNone(self.store.result(current["action_id"]))
+
     def test_symlinked_deliveries_dir_is_refused(self):
         outside = self.root / "outside"
         outside.mkdir()
