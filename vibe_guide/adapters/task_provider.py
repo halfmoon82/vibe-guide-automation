@@ -458,7 +458,8 @@ class ProviderActionStore:
             # No dispatch for this run/node/role: a mistyped node or role
             # would be archived forever and keep the heartbeat busy.
             raise ValueError(
-                'worker delivery has no dispatched task for this run/node/role'
+                'worker delivery has no dispatched task for this run/node/role; '
+                'run it from the main project directory and check --run-id/--node'
             )
         if generation != latest:
             # Older: a rework superseded it.  Newer: never dispatched, so no
