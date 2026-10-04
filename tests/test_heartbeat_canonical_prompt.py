@@ -58,6 +58,18 @@ class ProtocolCarriesTheSameTextTests(unittest.TestCase):
         self.assertIn("同一段心跳指令", rotate[0])
 
 
+class EntryProtocolPointsAtTheGeneratedPromptTests(unittest.TestCase):
+    """Review P2: the entry protocol is read first; it must not invite a self-written heartbeat."""
+
+    def test_first_shift_line_requires_the_generated_prompt(self):
+        text = load_protocol("vibe-entry")
+        path = text[text.index("## 3."):text.index("## 4.")]
+        lines = [line for line in path.splitlines() if "首班监工开工两件事" in line]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("逐字使用 vibe 生成的那一段", lines[0])
+        self.assertIn("不得自己另写", lines[0])
+
+
 class CliPrintsThePromptTests(unittest.TestCase):
     def start(self):
         root = publish_complex_probe(self)

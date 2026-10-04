@@ -208,7 +208,7 @@ vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本
 
 登记内容只允许 provider / 会话 id / host，不得含凭据。worker 完工后的唤醒信号按这个地址发；没登记时 `vibe supervisor-address` 返回 `unknown`，唤醒信号无处可发，交付只能等监工被动 resume 才领取。
 
-**自建心跳**：vibe 是 CLI，没有常驻进程，心跳只能由宿主 agent 会话承载。用宿主平台原语建一个周期任务（Codex 桌面用 heartbeat automation，可以全自动），心跳指令**逐字使用 vibe 生成的这一段**——`vibe monitor` 首次启动和未登记时的每次 `vibe resume` 都会把填好计划与运行编号的版本打印出来，照抄那份，只替换 `<本会话记录路径>`：
+**自建心跳**：vibe 是 CLI，没有常驻进程，心跳只能由宿主 agent 会话承载。用宿主平台原语建一个周期任务（Codex 桌面用 heartbeat automation，可以全自动），心跳指令**逐字使用 vibe 生成的这一段**——未登记时 `vibe monitor` 和 `vibe resume` 都会把填好计划与运行编号的版本打印出来，照抄那份，只替换 `<本会话记录路径>`：
 
 ```text
 vibe 监工心跳 · 计划 <plan_id> · 运行 <run-id>
