@@ -134,6 +134,13 @@ class CommandRefreshTests(_Case):
         text = run_cli(["resume"], self.root).text
         self.assertIn(VIBE_ENTRY_PROPOSAL_RELATIVE, text)
 
+    def test_refresh_keeps_file_permissions(self):
+        copy = self.age(PRD_GUIDE_PROPOSAL_RELATIVE)
+        copy.chmod(0o644)
+        run_cli(["resume"], self.root)
+        self.assertEqual(copy.read_text(encoding="utf-8"), load_protocol("prd-guide"))
+        self.assertEqual(copy.stat().st_mode & 0o777, 0o644)
+
     def test_local_edit_is_not_touched(self):
         edited = OLD_TEXT + "本地补充\n"
         copy = self.age(PRD_GUIDE_PROPOSAL_RELATIVE, edited)

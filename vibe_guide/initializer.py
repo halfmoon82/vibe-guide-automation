@@ -228,7 +228,9 @@ def refresh_protocol_copy(root, relative, name):
         return 'current'
     if not is_shipped_protocol(name, text):
         return 'edited'
+    mode = copy.stat().st_mode & 0o777
     _atomic_write_text(copy, shipped)
+    os.chmod(copy, mode)
     return 'refreshed'
 
 
