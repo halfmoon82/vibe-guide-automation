@@ -208,11 +208,21 @@ vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本
 
 登记内容只允许 provider / 会话 id / host，不得含凭据。worker 完工后的唤醒信号按这个地址发；没登记时 `vibe supervisor-address` 返回 `unknown`，唤醒信号无处可发，交付只能等监工被动 resume 才领取。
 
-**自建心跳**：vibe 是 CLI，没有常驻进程，心跳只能由宿主 agent 会话承载。用宿主平台原语建一个周期任务（Codex 桌面用 heartbeat automation，可以全自动），把下面这条固定作为**每次心跳的第一步**：
+**自建心跳**：vibe 是 CLI，没有常驻进程，心跳只能由宿主 agent 会话承载。用宿主平台原语建一个周期任务（Codex 桌面用 heartbeat automation，可以全自动），心跳指令**逐字使用 vibe 生成的这一段**——`vibe monitor` 首次启动和未登记时的每次 `vibe resume` 都会把填好计划与运行编号的版本打印出来，照抄那份，只替换 `<本会话记录路径>`：
 
-```bash
-vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路径>
+```text
+vibe 监工心跳 · 计划 <plan_id> · 运行 <run-id>
+（本指令由 vibe 生成。建心跳时逐字照抄，只替换 <本会话记录路径>；不得另写、增删或合并步骤。）
+第 1 步，只跑这一条：
+  vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路径>
+第 2 步，按输出的 state 走一个分支：
+  - idle：只回一个字，结束本轮，不再跑任何命令。
+  - work 或 unknown：按 prd-guide §6.1 服务信箱一轮，推进用 vibe resume --plan <plan_id> --run-id <run-id>；状态只从磁盘读。
+  - rotate：按 prd-guide §6.5 换班，新会话用同一段心跳指令自建心跳。
+例行轮询不向用户汇报。
 ```
+
+不要自己另写心跳指令，也不要把信箱服务直接写进心跳：自写的心跳每次都跑一整轮 `vibe resume`，跳过预检、不登记、不换班，空闲心跳的成本是设计值的 5–15 倍（2026-10-03 实测）。
 
 心跳不建，`rotate` 的阈值检测就不会发生：token 涨过阈值也不会换班，一直涨到溢出。换班后的新会话同样要做这两件事（§6.5）。
 
@@ -401,7 +411,7 @@ vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路
 
 - 输出 `idle`：所有节点都在运行、已完成或等人拍板，且无新请求。只回一字结束本轮，不做任何写。
 - 输出 `work`：有待服务请求、worker 已完工（含已自报但监工还没领取的交付），或有节点处在就绪/重试/未知等需要推进的状态。按 §6.1 原流程服务信箱，状态一律只从磁盘读，不凭记忆。
-- 输出 `rotate`：本会话上下文超过阈值（默认约 6 万 token，可配 `--token-threshold`）。执行换班：新开会话→新会话写一条简短交接（进度在磁盘上，交接只指方向）→新会话用 `vibe supervisor-register` 登记自身地址、自建心跳、置顶、改标题；删除旧心跳，旧会话把自己归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。
+- 输出 `rotate`：本会话上下文超过阈值（默认约 6 万 token，可配 `--token-threshold`）。执行换班：新开会话→新会话写一条简短交接（进度在磁盘上，交接只指方向）→新会话用 `vibe supervisor-register` 登记自身地址、用 §6.0 同一段心跳指令自建心跳、置顶、改标题；删除旧心跳，旧会话把自己归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。
 - 输出 `unknown`：会话记录读不到或解析失败。**不得当成 idle**，按 `work` 处理。
 
 监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run>` 查询；未登记返回 `unknown` 而非空成功。登记内容只允许 provider/会话 id/host，不得含凭据。

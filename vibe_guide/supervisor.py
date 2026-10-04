@@ -395,3 +395,27 @@ def current_supervisor_address(paths, run_id):
         "current": registry["current"],
         "history": registry.get("history", []),
     }
+
+
+def heartbeat_prompt(plan_id, run_id):
+    """The one heartbeat instruction a supervisor shift may install.
+
+    ISSUE-127 told the shift to make the preflight the first step of a
+    heartbeat it wrote itself.  On socialmore (5.0.1, Codex) the shift wrote a
+    prompt that ran a full `vibe resume` every beat instead, so the preflight,
+    the registration and the rotation never happened and an idle beat cost
+    5-15x the design.  vibe now owns the wording; prd-guide §6.0 embeds this
+    exact text and a test keeps the two identical.
+    """
+    return (
+        "vibe 监工心跳 · 计划 {plan} · 运行 {run}\n"
+        "（本指令由 vibe 生成。建心跳时逐字照抄，只替换 <本会话记录路径>；不得另写、增删或合并步骤。）\n"
+        "第 1 步，只跑这一条：\n"
+        "  vibe supervisor-preflight --run-id {run} --session-record <本会话记录路径>\n"
+        "第 2 步，按输出的 state 走一个分支：\n"
+        "  - idle：只回一个字，结束本轮，不再跑任何命令。\n"
+        "  - work 或 unknown：按 prd-guide §6.1 服务信箱一轮，"
+        "推进用 vibe resume --plan {plan} --run-id {run}；状态只从磁盘读。\n"
+        "  - rotate：按 prd-guide §6.5 换班，新会话用同一段心跳指令自建心跳。\n"
+        "例行轮询不向用户汇报。"
+    ).format(plan=plan_id, run=run_id)
