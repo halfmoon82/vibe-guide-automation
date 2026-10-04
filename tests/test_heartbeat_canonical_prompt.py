@@ -10,10 +10,12 @@ make `resume` (what a drifting heartbeat actually calls) keep asking for the
 start-of-shift duties until the shift registers.
 """
 import unittest
+from unittest import mock
 
 from vibe_guide.cli import run_cli
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.protocols import load_protocol
+from vibe_guide.monitor import Monitor
 from vibe_guide.supervisor import heartbeat_prompt, register_supervisor_address
 
 from tests.support_v45_authorize import publish_complex_probe
@@ -96,6 +98,29 @@ class CliPrintsThePromptTests(unittest.TestCase):
         self.assertIsNotNone(again.payload.get("run_id"), again.text)
         self.assertNotIn("vibe supervisor-register", again.text)
         self.assertNotIn("handoff", again.payload)
+
+    def test_resume_on_a_complete_run_stays_quiet(self):
+        """socialmore 2026-10-04: resume on a finished run still printed both
+        duties, inviting a heartbeat that could only ever wake to idle."""
+        root, run_id, _started = self.start()
+        args = ["resume", "--plan", "probe-plan", "--run-id", run_id]
+        original = Monitor.tick
+
+        def finished(monitor, *a, **k):
+            snapshot = original(monitor, *a, **k)
+            snapshot.status = "complete"
+            return snapshot
+
+        with mock.patch.object(Monitor, "tick", finished):
+            done = run_cli(args + ["--json"], root)
+            text = run_cli(args, root).text
+        self.assertEqual(done.payload.get("status"), "complete", done.payload)
+        self.assertNotIn("handoff", done.payload)
+        self.assertNotIn("vibe supervisor-register", text)
+        self.assertNotIn(heartbeat_prompt("probe-plan", run_id), text)
+        # The same unregistered run, not finished, still asks.
+        still = run_cli(args, root).text
+        self.assertIn("vibe supervisor-register", still)
 
     def test_status_stays_quiet(self):
         root, run_id, _started = self.start()

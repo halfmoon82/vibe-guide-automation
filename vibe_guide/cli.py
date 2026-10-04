@@ -782,7 +782,9 @@ def _snapshot_result(
     )
 
 
-def _first_shift_handoff(paths: ProjectPaths, plan_id: str, run_id: str) -> str:
+def _first_shift_handoff(
+    paths: ProjectPaths, plan_id: str, run_id: str, run_status: Optional[str] = None
+) -> str:
     """The two duties a first supervisor shift owes before serving the mailbox.
 
     ISSUE-127: the address registry and the preflight shipped in 5.0.1, but the
@@ -791,7 +793,13 @@ def _first_shift_handoff(paths: ProjectPaths, plan_id: str, run_id: str) -> str:
     and nothing called the threshold check periodically.  Printing the step
     where the shift starts is what closes that gap; a shift that already
     registered stays quiet.
+
+    A complete run has nothing left to supervise, so it stays quiet too: a
+    heartbeat built from the hint would only wake to find no work.  failed and
+    blocked_design runs can still move on, so they keep asking.
     """
+    if run_status == "complete":
+        return ""
     try:
         address = current_supervisor_address(paths, run_id)
     except Exception:
@@ -1903,7 +1911,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工状态未知：" + str(error),
                 args.as_json,
             )
-        handoff = _first_shift_handoff(paths, args.plan, snapshot.run_id)
+        handoff = _first_shift_handoff(paths, args.plan, snapshot.run_id, snapshot.status)
         if args.watch:
             supervisor = Supervisor(
                 paths,
@@ -2089,7 +2097,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         # A heartbeat that drifted from the generated prompt still calls
         # resume, so resume keeps asking until the shift registers.
         handoff = (
-            _first_shift_handoff(paths, args.plan, snapshot.run_id)
+            _first_shift_handoff(paths, args.plan, snapshot.run_id, snapshot.status)
             if args.command == "resume"
             else ""
         )
