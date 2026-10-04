@@ -101,6 +101,33 @@ def find_cli(explicit: Optional[str] = None) -> Optional[str]:
     return None
 
 
+def _stop(process: subprocess.Popen) -> None:
+    """Terminate a gateway we started, escalating to SIGKILL if it resists."""
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
+def _banner_shape(log: Path) -> str:
+    """Describe a failed banner read without reproducing its contents.
+
+    The startup banner carries the gateway password.  Echoing the raw text as a
+    diagnostic would leak that password exactly when it matters most -- when the
+    banner format drifted and ``_PASSWORD_RE`` no longer matches, so the
+    credential would sit unredacted in the tail.  Report the shape instead.
+    """
+    text = _plain(log.read_text(encoding="utf-8", errors="replace"))
+    return "captured %d bytes, endpoint line %s, password line %s" % (
+        len(text),
+        "seen" if _ENDPOINT_RE.search(text) else "absent",
+        "seen" if _PASSWORD_RE.search(text) else "absent",
+    )
+
+
 class Gateway:
     """One HTTP gateway, either supplied by env or started on first use.
 
@@ -169,7 +196,7 @@ class Gateway:
         os.close(handle)
         log = Path(log_name)
         try:
-            last_banner = ""
+            last_diagnostic = "no banner captured"
             for attempt in range(2):
                 port = _free_port()
                 with log.open("w", encoding="utf-8") as sink:
@@ -179,34 +206,37 @@ class Gateway:
                         stderr=subprocess.STDOUT,
                     )
                 banner = {"endpoint": "", "password": ""}
-                deadline = time.monotonic() + self._startup_timeout
-                while time.monotonic() < deadline:
-                    text = _plain(log.read_text(encoding="utf-8", errors="replace"))
-                    if not banner["endpoint"]:
-                        found = _ENDPOINT_RE.search(text)
-                        if found:
-                            banner["endpoint"] = found.group(1)
-                    if not banner["password"]:
-                        found = _PASSWORD_RE.search(text)
-                        if found:
-                            banner["password"] = found.group(1)
-                    if banner["endpoint"] and banner["password"]:
-                        break
-                    if process.poll() is not None:
-                        break
-                    time.sleep(0.05)
+                try:
+                    deadline = time.monotonic() + self._startup_timeout
+                    while time.monotonic() < deadline:
+                        text = _plain(log.read_text(encoding="utf-8", errors="replace"))
+                        if not banner["endpoint"]:
+                            found = _ENDPOINT_RE.search(text)
+                            if found:
+                                banner["endpoint"] = found.group(1)
+                        if not banner["password"]:
+                            found = _PASSWORD_RE.search(text)
+                            if found:
+                                banner["password"] = found.group(1)
+                        if banner["endpoint"] and banner["password"]:
+                            break
+                        if process.poll() is not None:
+                            break
+                        time.sleep(0.05)
+                except BaseException:
+                    # Whatever went wrong while reading the banner, the gateway
+                    # we started must not be left running.
+                    _stop(process)
+                    raise
                 if banner["endpoint"] and banner["password"]:
                     break
-                last_banner = _plain(log.read_text(encoding="utf-8", errors="replace"))[-400:].strip()
-                process.terminate()
-                if process.poll() is None:
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
+                last_diagnostic = _banner_shape(log)
+                _stop(process)
             else:
                 raise GatewayError(
-                    "gateway did not report an endpoint and password: %s" % last_banner
+                    "gateway did not report an endpoint and password (%s); "
+                    "the banner itself is withheld because it can carry the "
+                    "gateway password" % last_diagnostic
                 )
         finally:
             try:
@@ -450,9 +480,53 @@ _ARGUMENTS: Dict[str, Tuple[str, ...]] = {
     "wait": ("job_id", "timeout_seconds", "poll_seconds"),
 }
 
+#: The published schemas, keyed by tool name, so the runtime check and the
+#: schema we advertise cannot drift apart.
+_SCHEMAS: Dict[str, Mapping[str, Any]] = {
+    tool["name"]: tool["inputSchema"] for tool in TOOL_DEFINITIONS
+}
+
+#: JSON Schema type name -> the Python types that satisfy it.
+_JSON_TYPES: Dict[str, Tuple[type, ...]] = {
+    "string": (str,),
+    "boolean": (bool,),
+    "number": (int, float),
+    "integer": (int,),
+}
+
+#: Protocol revisions this server actually implements.  `initialize` echoes the
+#: client's version only when it is one of these; anything else falls back to
+#: our own rather than claiming support we do not have.
+_SUPPORTED_PROTOCOL_VERSIONS: Tuple[str, ...] = (PROTOCOL_VERSION,)
+
 
 class ToolError(ValueError):
     """A tool call was rejected before it reached the control plane."""
+
+
+def _validate_arguments(name: str, supplied: Mapping[str, Any]) -> None:
+    """Reject a call whose arguments do not fit the tool's own schema.
+
+    Without this a wrong type reaches the operation and surfaces as a generic
+    internal error, which tells the caller nothing about what it got wrong.
+    """
+    schema = _SCHEMAS[name]
+    properties = schema.get("properties", {})
+    for required in schema.get("required", ()):
+        if required not in supplied:
+            raise ToolError("missing required argument for %s: %s" % (name, required))
+    for key, value in supplied.items():
+        declared = properties.get(key, {}).get("type")
+        expected = _JSON_TYPES.get(declared or "")
+        if expected is None:
+            continue
+        if declared in ("number", "integer"):
+            # bool subclasses int but is not a JSON number.
+            valid = isinstance(value, expected) and not isinstance(value, bool)
+        else:
+            valid = isinstance(value, expected)
+        if not valid:
+            raise ToolError("%s must be %s" % (key, declared))
 
 
 def call_tool(jobs: WorkBuddyJobs, name: str, arguments: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -463,6 +537,7 @@ def call_tool(jobs: WorkBuddyJobs, name: str, arguments: Optional[Mapping[str, A
     unexpected = set(supplied) - set(_ARGUMENTS[name])
     if unexpected:
         raise ToolError("unexpected arguments for %s: %s" % (name, ", ".join(sorted(unexpected))))
+    _validate_arguments(name, supplied)
     operation = getattr(jobs, name)
     return operation(**supplied)
 
@@ -490,7 +565,13 @@ def handle_message(jobs: WorkBuddyJobs, message: Mapping[str, Any]) -> Optional[
         return _result(
             message_id,
             {
-                "protocolVersion": requested if isinstance(requested, str) and requested else PROTOCOL_VERSION,
+                # Echo the client's revision only when we implement it; never
+                # claim a version we do not speak.
+                "protocolVersion": (
+                    requested
+                    if requested in _SUPPORTED_PROTOCOL_VERSIONS
+                    else PROTOCOL_VERSION
+                ),
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             },

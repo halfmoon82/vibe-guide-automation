@@ -12,6 +12,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -111,6 +112,51 @@ class JsonRpcSurfaceTests(unittest.TestCase):
         )
         self.assertEqual(response["error"]["code"], -32602)
         self.assertEqual(gateway.calls, [])
+
+    def test_a_wrong_argument_type_is_rejected_before_any_call(self):
+        # `wait` takes numbers; a string would otherwise reach the operation and
+        # surface as an opaque internal error.
+        gateway = FakeGateway()
+        jobs = WorkBuddyJobs(gateway=gateway)
+        response = handle_message(
+            jobs,
+            {"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+             "params": {"name": "wait", "arguments": {"job_id": "j1", "timeout_seconds": "abc"}}},
+        )
+        self.assertEqual(response["error"]["code"], -32602)
+        self.assertIn("timeout_seconds", response["error"]["message"])
+        self.assertEqual(gateway.calls, [])
+
+    def test_a_missing_required_argument_is_rejected_before_any_call(self):
+        gateway = FakeGateway()
+        jobs = WorkBuddyJobs(gateway=gateway)
+        response = handle_message(
+            jobs,
+            {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+             "params": {"name": "create", "arguments": {}}},
+        )
+        self.assertEqual(response["error"]["code"], -32602)
+        self.assertEqual(gateway.calls, [])
+
+    def test_a_boolean_is_not_accepted_where_a_number_is_declared(self):
+        # bool subclasses int in Python, but it is not a JSON number.
+        gateway = FakeGateway()
+        jobs = WorkBuddyJobs(gateway=gateway)
+        response = handle_message(
+            jobs,
+            {"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+             "params": {"name": "wait", "arguments": {"job_id": "j1", "poll_seconds": True}}},
+        )
+        self.assertEqual(response["error"]["code"], -32602)
+        self.assertEqual(gateway.calls, [])
+
+    def test_initialize_never_claims_a_version_we_do_not_implement(self):
+        response = handle_message(
+            self.jobs,
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "9999-01-01"}},
+        )
+        self.assertEqual(response["result"]["protocolVersion"], module.PROTOCOL_VERSION)
 
     def test_parse_errors_and_non_objects_are_reported(self):
         stdout = io.StringIO()
@@ -259,6 +305,65 @@ class GatewayTransportTests(unittest.TestCase):
             with self.assertRaises(GatewayError):
                 gateway.ensure()
             gateway.close()
+
+    def test_a_failed_banner_is_reported_without_echoing_it(self):
+        # The banner carries the gateway password.  When its format drifts the
+        # password pattern stops matching, so echoing the raw text would leak
+        # the credential precisely in the failure case.
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "drifted-cli"
+            script.write_text(
+                "#!/bin/sh\n"
+                "echo 'Endpoint: http://127.0.0.1:45678'\n"
+                "echo 'Password: hunter2-not-real'\n"
+                "sleep 5\n",
+                encoding="utf-8",
+            )
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+            gateway = Gateway(cli=str(script), startup_timeout=1.0)
+            with self.assertRaises(GatewayError) as raised:
+                gateway.ensure()
+            gateway.close()
+        self.assertNotIn("hunter2-not-real", str(raised.exception))
+        # The shape is still useful for diagnosis.
+        self.assertIn("captured", str(raised.exception))
+
+    def test_a_failure_while_reading_the_banner_stops_the_gateway(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "terminated"
+            ready = Path(tmp) / "ready"
+            script = Path(tmp) / "slow-cli"
+            # The script announces that its TERM trap is installed, so the test
+            # can fail the banner read at a point where a clean shutdown is
+            # observable rather than racing the shell's own start-up.
+            script.write_text(
+                "#!/bin/sh\n"
+                'trap \'echo term > "%s"; exit 0\' TERM\n'
+                'echo ready > "%s"\n'
+                "echo 'nothing useful here'\n"
+                "sleep 30 &\n"
+                "wait\n" % (marker, ready),
+                encoding="utf-8",
+            )
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+            def fail_once_the_gateway_is_up(*_args, **_kwargs):
+                for _ in range(250):
+                    if ready.exists():
+                        break
+                    time.sleep(0.02)
+                raise RuntimeError("boom")
+
+            gateway = Gateway(cli=str(script), startup_timeout=15.0)
+            with mock.patch.object(module, "_plain", side_effect=fail_once_the_gateway_is_up):
+                with self.assertRaises(RuntimeError):
+                    gateway.ensure()
+            for _ in range(150):
+                if marker.exists():
+                    break
+                time.sleep(0.02)
+            self.assertTrue(marker.exists(), "the started gateway was left running")
+            self.assertFalse(gateway.started)
 
     def test_http_errors_carry_the_status_and_body(self):
         import urllib.error
