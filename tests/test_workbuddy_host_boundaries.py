@@ -197,18 +197,30 @@ class WorkBuddyHostBoundaryTests(unittest.TestCase):
         self.assertIs(skills[0]["valid"], True, skills)
         self.assertEqual(skills[0]["source"], _PINNED["source"], skills)
 
-    def test_workbuddy_is_not_full_visible_until_a_real_session_ran_it(self):
+    def test_workbuddy_declaration_alone_does_not_promote_it(self):
+        """The manifest declares the control plane; only observed facts promote it.
+
+        The manifest carrying ``native_control_plane: true`` is a statement of
+        what the platform offers, not evidence that this session can use it:
+        with the create/enter/resume/wait lifecycle only partly observed,
+        WorkBuddy stays `guide`.  Host discovery may only *add* information.
+        """
         adapter = AdapterRegistry().get("workbuddy")
-        facts = {p["name"]: True for p in adapter.manifest["probes"] if p["kind"] == "fact"}
+        self.assertIs(adapter.manifest["native_control_plane"], True)
+        partial = {
+            "workbuddy.agent": True, "workbuddy.shell": True,
+            "workbuddy.subprocess": True, "workbuddy.worktree": True,
+            "workbuddy.visible_task.create": True,
+        }
         env = Environment(
             commands={"workbuddy.agent": True},
-            facts=facts,
-            provenance={name: "self-attest" for name in facts},
+            facts=partial,
+            provenance={name: "self-attest" for name in partial},
         )
         capabilities = adapter.detect(env).capabilities
-        self.assertIs(adapter.manifest["native_control_plane"], False)
         self.assertIs(capabilities.visible_automation, False)
         self.assertNotEqual(capabilities.level, "full")
+        self.assertEqual(capabilities.mode, "guide")
 
 
 if __name__ == "__main__":

@@ -223,7 +223,11 @@ class ManifestAdapter:
         if set(fields) - {"trigger", "plan_id"} or "trigger" not in fields:
             raise ManifestError("session_prompt must use only trigger and plan_id")
         result = dict(manifest)
-        result.setdefault("native_control_plane", result["id"] == "codex")
+        # Whether a platform has a native desktop control plane is declared by
+        # that platform's own manifest -- no adapter id is privileged here.  An
+        # undeclared platform is fail-closed: it stays `guide` until its
+        # manifest declares the plane (see `codex.yaml`, `claude-code.yaml`).
+        result.setdefault("native_control_plane", False)
         return result
 
     def _probe(self, environment: Environment, probe: Mapping[str, Any]) -> bool:

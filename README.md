@@ -8,7 +8,7 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 ## 安装
 
-当前发行版本为 `5.0.1`。版本真相以仓库中匹配的 `v5.0.1` tag、对应提交和 Release 资产为准；版本引用的写法约定：反引号 v 形式（如本句的 tag）只用于当前 release tag，历史版本写作 V4.5.0 这样大写、无反引号的形式，否则 release-tag-gate 会判为旧 tag 残留。`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
+当前发行版本为 `5.0.2`。版本真相以仓库中匹配的 `v5.0.2` tag、对应提交和 Release 资产为准；版本引用的写法约定：反引号 v 形式（如本句的 tag）只用于当前 release tag，历史版本写作 V4.5.0 这样大写、无反引号的形式，否则 release-tag-gate 会判为旧 tag 残留。`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
 
 ### 安装与初始化前提
 
@@ -24,7 +24,7 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 1. 先查询最新 tag，不根据 README、`dist/` 文件名或历史记忆判断版本：
    `git ls-remote --tags --sort='-v:refname' https://github.com/halfmoon82/vibe-guide-automation.git 'refs/tags/v*'`
-2. 选择最新稳定 tag（当前应为 `v5.0.1`），核对 tag、提交和可下载 Release 资产版本一致；无法核对时保持 `unknown`，不要猜测。
+2. 选择最新稳定 tag（当前应为 `v5.0.2`），核对 tag、提交和可下载 Release 资产版本一致；无法核对时保持 `unknown`，不要猜测。
 3. 在目标环境安装该版本，并验证：
    `python3 -c "import vibe_guide; print(vibe_guide.__version__)"`
    `vibe --help`
@@ -154,6 +154,17 @@ V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 
 平台拓扑由适配器注册表的 `DISPATCH_TOPOLOGY_MATRIX` 按各平台 `in_session_sdd` 探针证据裁定。`in_session_sdd` 与 `visible-sdd` 分属两层、不互换：前者是适配层的名字——既是 manifest 能力探针字段名，也是 `DISPATCH_TOPOLOGY_MATRIX` 的裁定值；后者是 `topology` 字段的枚举值（派发层），由监工把裁定值翻译而来，描述节点实际派发拓扑；探针通过不等于 topology 已是 `visible-sdd`（以矩阵裁定为准）。
 
 并发上限：`.vibe/config.json` 的 `max_active_worker_sessions` 控制同时活跃的 worker 会话数，默认 5（合法范围 1–64），与授权卡快照取较小者生效；显式但非法的值是配置错误，不会静默回落默认值。节点验收、P0–P2 清零且证据登记后归档会话，名额释放给后续 ready 节点。
+
+### WorkBuddy 派发桥（`workbuddy_job` MCP server）
+
+监工自己不执行桌面动作：它把请求写进 `.vibe/provider-actions/requests/`，写明要调的**原生工具名**，由桌面会话真正去调。WorkBuddy 的五个名字是 `workbuddy_job__create` / `__get` / `__list` / `__reply` / `__wait`——本包随附一个纯标准库的 stdio MCP server 提供它们：
+
+```bash
+python3 -m vibe_guide.mcp_servers.workbuddy_jobs --print-tools   # 看五个工具定义
+python3 -m vibe_guide.mcp_servers.workbuddy_jobs --selfcheck     # 探测控制面是否可达
+```
+
+注册到宿主 `~/.workbuddy-ai/mcp.json`（server 名必须是 `workbuddy_job`），写完后需在连接器管理页对自定义连接器点"信任"才生效。默认在首次调用时自动拉起 `codebuddy --serve` 本地网关并随进程退出而停止；也可用 `WORKBUDDY_JOB_ENDPOINT` / `WORKBUDDY_JOB_TOKEN` 复用已有网关，或 `WORKBUDDY_JOB_AUTOSTART=0` 禁止自动拉起（拿不到凭据即报错，不猜）。控制面不可达、鉴权失败、宿主守卫拦截都返回 `isError`，不会伪装成功。实测端点差异、环境变量与已知阻断见 `docs/workbuddy/workbuddy-job-mcp-server.md`。
 
 ### V4.1 复杂任务最终整合
 

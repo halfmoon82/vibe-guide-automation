@@ -235,6 +235,54 @@ class EngineAttestationTests(unittest.TestCase):
             attestation = json.loads((root / ".vibe" / "plans" / "claude-attestation" / "engine-attestation.json").read_text())
             self.assertEqual(attestation["provider"], "claude-code")
 
+    def test_complex_plan_publication_works_for_workbuddy(self):
+        """Regression: WorkBuddy sessions were pinned to `guide` by the id default.
+
+        `base.py` defaulted `native_control_plane` to `id == "codex"`, so a
+        WorkBuddy session that had observed its whole native task lifecycle
+        still reported `guide` and every complex plan died on
+        `engine_attestation_unavailable`.  The declaration now lives in
+        `workbuddy.yaml`.
+        """
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        from vibe_guide.cli import run_cli
+        from vibe_guide.paths import ProjectPaths
+
+        fixture = Path(__file__).parent / "fixtures" / "e2e-project"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            shutil.copytree(fixture, root)
+            self.assertEqual(run_cli(["init", "--confirm", "--json"], root).exit_code, 0)
+            ProviderActionStore(ProjectPaths(root)).publish_capabilities(
+                "workbuddy",
+                {"workbuddy.shell": True, "workbuddy.subprocess": True,
+                 "workbuddy.worktree": True, "workbuddy.visible_task.create": True,
+                 "workbuddy.visible_task.enter": True,
+                 "workbuddy.visible_task.resume": True,
+                 "workbuddy.visible_task.wait": True},
+                "workbuddy-desktop-session-bridge",
+            )
+            source = json.loads((root / "plan-source.json").read_text())
+            source["capabilities"] = {"agent_id": "workbuddy", "shell": True, "subprocess": True,
+                                       "worktree": True, "background": True, "session_resume": True,
+                                       "level": "full"}
+            source["project_id"] = "project-fixture"
+            source["complexity_band"] = "complex"
+            source["integration_contract"] = {
+                "iteration_context": {"kind": "iteration", "based_on": "V4"},
+                "compatibility_scope": ["V4 API"],
+                "agentsmd_acceptance_refs": ["AGENTS.md#8"],
+                "integration_acceptance_contract": {"checks": ["all"]},
+                "unverified_or_excluded": ["provider"],
+            }
+            source_path = root / "workbuddy-source.json"
+            source_path.write_text(json.dumps(source))
+            result = run_cli(["plan", "--request", "设计并实现两个契约兼容的并行节点并完成独立审查", "--plan-id", "workbuddy-attestation",
+                              "--s1", "4,4,4,4,4", "--node-spec", source_path.name, "--json"], root)
+            self.assertEqual(result.exit_code, 0, result.text)
+            attestation = json.loads((root / ".vibe" / "plans" / "workbuddy-attestation" / "engine-attestation.json").read_text())
+            self.assertEqual(attestation["provider"], "workbuddy")
+
 
 if __name__ == "__main__":
     unittest.main()
