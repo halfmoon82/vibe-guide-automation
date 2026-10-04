@@ -525,11 +525,6 @@ def _validate_arguments(name: str, supplied: Mapping[str, Any]) -> None:
         if required not in supplied:
             raise ToolError("missing required argument for %s: %s" % (name, required))
     for key, value in supplied.items():
-        # An explicit null means "not provided" for an optional argument; the
-        # operations already treat it that way, and some clients send it rather
-        # than omitting the key.
-        if value is None:
-            continue
         declared = properties.get(key, {}).get("type")
         expected = _JSON_TYPES.get(declared or "")
         if expected is None:
@@ -547,10 +542,16 @@ def call_tool(jobs: WorkBuddyJobs, name: str, arguments: Optional[Mapping[str, A
     """Run one tool call and always return a JSON-serialisable object."""
     if name not in TOOL_NAMES:
         raise ToolError("unknown tool: %s" % name)
-    supplied = dict(arguments or {})
-    unexpected = set(supplied) - set(_ARGUMENTS[name])
+    raw = dict(arguments or {})
+    unexpected = set(raw) - set(_ARGUMENTS[name])
     if unexpected:
         raise ToolError("unexpected arguments for %s: %s" % (name, ", ".join(sorted(unexpected))))
+    # An explicit null means "not provided" -- some clients send it instead of
+    # omitting the key, and the operations treat an absent optional argument as
+    # the default.  Dropping it here keeps that meaning for every tool: a null
+    # optional value falls back to the default, while a null *required* value
+    # is reported as missing rather than reaching the operation as None.
+    supplied = {key: value for key, value in raw.items() if value is not None}
     _validate_arguments(name, supplied)
     operation = getattr(jobs, name)
     return operation(**supplied)

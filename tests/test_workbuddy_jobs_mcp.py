@@ -196,6 +196,44 @@ class JsonRpcSurfaceTests(unittest.TestCase):
         self.assertFalse(response["result"]["isError"])
         self.assertEqual(gateway.calls[-1]["path"], "/api/v1/jobs")
 
+    def test_an_explicit_null_numeric_argument_falls_back_to_the_default(self):
+        # `wait` compares its bounds, so a null that reached the operation would
+        # surface as an opaque internal error instead of the documented default.
+        gateway = FakeGateway({("GET", "/api/v1/jobs/j1"): {"state": "done", "settled": True}})
+        jobs = WorkBuddyJobs(gateway=gateway)
+        response = handle_message(
+            jobs,
+            {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+             "params": {"name": "wait",
+                        "arguments": {"job_id": "j1", "timeout_seconds": None, "poll_seconds": None}}},
+        )
+        self.assertFalse(response["result"]["isError"])
+        self.assertNotIn("internal error", response["result"]["content"][0]["text"])
+
+    def test_a_required_argument_sent_as_null_is_reported_as_missing(self):
+        gateway = FakeGateway()
+        jobs = WorkBuddyJobs(gateway=gateway)
+        response = handle_message(
+            jobs,
+            {"jsonrpc": "2.0", "id": 13, "method": "tools/call",
+             "params": {"name": "get", "arguments": {"job_id": None}}},
+        )
+        self.assertEqual(response["error"]["code"], -32602)
+        self.assertEqual(gateway.calls, [])
+
+    def test_an_unexpected_null_argument_is_still_rejected(self):
+        # Dropping nulls must not become a way to smuggle an unknown key past
+        # the argument whitelist.
+        gateway = FakeGateway()
+        jobs = WorkBuddyJobs(gateway=gateway)
+        response = handle_message(
+            jobs,
+            {"jsonrpc": "2.0", "id": 14, "method": "tools/call",
+             "params": {"name": "get", "arguments": {"job_id": "a", "shell": None}}},
+        )
+        self.assertEqual(response["error"]["code"], -32602)
+        self.assertEqual(gateway.calls, [])
+
     def test_parse_errors_and_non_objects_are_reported(self):
         stdout = io.StringIO()
         serve(io.StringIO("not json\n[]\n"), stdout, jobs=WorkBuddyJobs(gateway=FakeGateway()))
