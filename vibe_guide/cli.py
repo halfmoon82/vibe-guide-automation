@@ -735,7 +735,13 @@ def _require_public_execution_gate(
     raise PermissionError("planning_required: " + ", ".join(gate.missing))
 
 
-def _snapshot_result(command: str, snapshot: Any, as_json: bool, continuation: str = "manual") -> CLIResult:
+def _snapshot_result(
+    command: str,
+    snapshot: Any,
+    as_json: bool,
+    continuation: str = "manual",
+    handoff: str = "",
+) -> CLIResult:
     retry_pending = any(
         isinstance(node.get("retryable_action"), dict)
         and node.get("status") == "running"
@@ -752,6 +758,8 @@ def _snapshot_result(command: str, snapshot: Any, as_json: bool, continuation: s
         "closeout_status": render_v41_closeout_status(snapshot),
         "continuation": continuation,
     }
+    if handoff:
+        payload["handoff"] = handoff
     if retry_pending or snapshot.status == "blocked_unknown":
         code = UNKNOWN
     elif snapshot.status == "blocked_design":
@@ -760,16 +768,43 @@ def _snapshot_result(command: str, snapshot: Any, as_json: bool, continuation: s
         code = UNKNOWN
     else:
         code = SUCCESS
+    text = (
+        "监工已启动并自动推进中：运行 {}".format(snapshot.run_id)
+        if retry_pending
+        else render_v41_closeout_status(snapshot)
+    )
     return _result(
         code,
         payload,
-        (
-            "监工已启动并自动推进中：运行 {}".format(snapshot.run_id)
-            if retry_pending
-            else render_v41_closeout_status(snapshot),
-        ),
+        text + ("\n" + handoff if handoff else ""),
         as_json,
     )
+
+
+def _first_shift_handoff(paths: ProjectPaths, run_id: str) -> str:
+    """The two duties a first supervisor shift owes before serving the mailbox.
+
+    ISSUE-127: the address registry and the preflight shipped in 5.0.1, but the
+    protocol only named them inside the rotate branch, so a first shift never
+    announced itself -- a worker's completion wake-up had no address to target
+    and nothing called the threshold check periodically.  Printing the step
+    where the shift starts is what closes that gap; a shift that already
+    registered stays quiet.
+    """
+    try:
+        address = current_supervisor_address(paths, run_id)
+    except (OSError, ValueError, TypeError):
+        address = None
+    if isinstance(address, dict) and address.get("status") == "ok":
+        return ""
+    return (
+        "首班监工还有两件事没做，做完才算开工：\n"
+        "  1) 登记地址：vibe supervisor-register --run-id {} "
+        "--provider <平台> --session-id <本会话 id> --host <本机标识>\n"
+        "  2) 自建心跳：用宿主平台原语建周期任务，心跳第一步固定跑 "
+        "vibe supervisor-preflight --run-id {} --session-record <本会话记录路径>\n"
+        "没登记地址，worker 的完工唤醒信号无处可发；没心跳，rotate 的阈值检测不会发生。"
+    ).format(run_id, run_id)
 
 
 def render_v41_closeout_status(snapshot: RunSnapshot) -> str:
@@ -1824,6 +1859,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工状态未知：" + str(error),
                 args.as_json,
             )
+        handoff = _first_shift_handoff(paths, snapshot.run_id)
         if args.watch:
             supervisor = Supervisor(
                 paths,
@@ -1840,8 +1876,8 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     args.as_json,
                 )
             snapshot = supervisor.watch()
-            return _snapshot_result("monitor", snapshot, args.as_json, "supervisor")
-        return _snapshot_result("monitor", snapshot, args.as_json, "manual")
+            return _snapshot_result("monitor", snapshot, args.as_json, "supervisor", handoff)
+        return _snapshot_result("monitor", snapshot, args.as_json, "manual", handoff)
 
     if args.command == "reconcile":
         try:
