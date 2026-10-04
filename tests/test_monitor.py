@@ -3058,6 +3058,413 @@ class VisibleDispatchTests(unittest.TestCase):
         self.assertFalse(replayed.nodes["sdd-a"]["pair_archived"])
         self.assertTrue(all(call["role"] == "developer" for call in runner.start_calls))
 
+    @staticmethod
+    def _blocked_unknown_review(item):
+        return {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-1",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "blocked_unknowns": [item],
+        }
+
+    def test_visible_sdd_blocked_unknown_pauses_acceptance_until_disposed(self):
+        """Design 3.6 acceptance example: pause, dispose, then accept.
+
+        A delivery carrying a blocked_unknown item ("cannot confirm the
+        2.3.7 props") must not be accepted and must not fake a clean
+        clearance: the node waits in blocked_unknown with the delivery
+        unrecorded and the worker-session handle live.  After a clearing
+        disposition is recorded, the same session's re-report is accepted.
+        """
+        from vibe_guide.state import load_events
+
+        item = "\u65e0\u6cd5\u786e\u8ba4 2.3.7 \u7684 props"
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertIn("disposition", current["reason"])
+        self.assertEqual(current["blocked_unknowns_pending"], [item])
+        self.assertFalse(current.get("pair_archived", False))
+        # The delivery stayed unrecorded and the handle stayed live, so the
+        # same worker session re-reports after dispositions land.
+        self.assertIn("sdd-a", snapshot.handles)
+        self.assertIsInstance(current.get("active_task"), dict)
+        events = load_events(self.paths, snapshot.run_id)
+        pauses = [
+            record_
+            for record_ in events
+            if record_["event"] == "blocked_unknown_disposition_required"
+            and record_["data"].get("node_id") == "sdd-a"
+        ]
+        self.assertEqual(len(pauses), 1)
+        self.assertEqual(pauses[0]["data"]["proof"]["blocked_unknowns"], [item])
+        self.assertEqual(pauses[0]["data"]["proof"]["undisposed"], [item])
+        self.assertFalse(
+            any(
+                record_["event"] == "accepted"
+                and record_["data"].get("node_id") == "sdd-a"
+                for record_ in events
+            )
+        )
+        self.assertFalse(
+            any(
+                record_["event"] == "delivered"
+                and record_["data"].get("node_id") == "sdd-a"
+                for record_ in events
+            )
+        )
+        binding = load_task_binding(
+            self.paths, "sdd-a", "developer", run_id=snapshot.run_id
+        )
+        self.assertNotEqual(binding.status, "archived")
+
+        snapshot = monitor.record_blocked_unknown_disposition(
+            snapshot.run_id,
+            "sdd-a",
+            item,
+            "resolved_with_facts",
+            note="\u5df2\u8865\u73af\u5883\u4e8b\u5b9e\u5e76\u590d\u5ba1\u901a\u8fc7",
+        )
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [])
+        dispositions = [
+            record_
+            for record_ in load_events(self.paths, snapshot.run_id)
+            if record_["event"] == "blocked_unknown_disposition"
+            and record_["data"].get("node_id") == "sdd-a"
+        ]
+        self.assertEqual(len(dispositions), 1)
+        self.assertEqual(dispositions[0]["data"]["proof"]["item"], item)
+        self.assertEqual(dispositions[0]["data"]["disposition"], "resolved_with_facts")
+        # A disposition alone never accepts the delivery.
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertEqual(current["status"], "accepted")
+        self.assertTrue(current["pair_archived"])
+        self.assertEqual(current["blocked_unknowns_pending"], [])
+        # The audit chain keeps the disposition after acceptance.
+        self.assertEqual(
+            current["blocked_unknown_dispositions"],
+            [
+                {
+                    "item": item,
+                    "disposition": "resolved_with_facts",
+                    "note": "\u5df2\u8865\u73af\u5883\u4e8b\u5b9e\u5e76\u590d\u5ba1\u901a\u8fc7",
+                }
+            ],
+        )
+        self.assertEqual(
+            load_task_binding(
+                self.paths, "sdd-a", "developer", run_id=snapshot.run_id
+            ).status,
+            "archived",
+        )
+
+    def test_visible_sdd_blocked_unknown_malformed_shape_is_rejected_for_re_report(self):
+        """Shape errors stay on the recoverable acceptance_rejected channel."""
+        from vibe_guide.state import load_events
+
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        malformed = {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-1",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "blocked_unknowns": ["", 42],
+        }
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    ("complete", {"evidence": "delivery", "in_session_review": malformed}),
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": {
+                                "protocol": VISIBLE_SDD_PROTOCOL_REF,
+                                "evidence_ref": "session-delivery#review-round-2",
+                                "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                            },
+                        },
+                    ),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertNotEqual(current["status"], "blocked_unknown", current.get("reason"))
+        self.assertNotEqual(current["status"], "accepted")
+        self.assertIn("sdd-a", snapshot.handles)
+        rejections = [
+            record_
+            for record_ in load_events(self.paths, snapshot.run_id)
+            if record_["event"] == "acceptance_rejected"
+            and record_["data"].get("node_id") == "sdd-a"
+        ]
+        self.assertEqual(len(rejections), 1)
+        self.assertTrue(rejections[0]["data"].get("recoverable"))
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+
+    def test_visible_sdd_blocked_unknown_silent_drop_on_rereport_stays_paused(self):
+        """P1 regression: dropping a paused item from the payload is not closure.
+
+        Once a delivery paused on item X, re-reporting with X removed (or the
+        key omitted) must still refuse acceptance: only a recorded disposition
+        answers a paused item.  Without this, the escape hatch this node
+        closes would survive as "just don't mention it again".
+        """
+        from vibe_guide.state import load_events
+
+        item = "\u65e0\u6cd5\u786e\u8ba4 2.3.7 \u7684 props"
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        clean_review = {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-2",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+        }
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                    # Silent drop: the re-report no longer mentions the item.
+                    ("complete", {"evidence": "delivery", "in_session_review": clean_review}),
+                    # After the disposition, the same clean re-report passes.
+                    ("complete", {"evidence": "delivery", "in_session_review": clean_review}),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [item])
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertEqual(current["blocked_unknowns_pending"], [item])
+        self.assertFalse(current.get("pair_archived", False))
+        self.assertFalse(
+            any(
+                record_["event"] == "accepted"
+                and record_["data"].get("node_id") == "sdd-a"
+                for record_ in load_events(self.paths, snapshot.run_id)
+            )
+        )
+
+        snapshot = monitor.record_blocked_unknown_disposition(
+            snapshot.run_id, "sdd-a", item, "resolved_with_facts"
+        )
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+        self.assertTrue(snapshot.nodes["sdd-a"]["pair_archived"])
+
+    def test_visible_sdd_blocked_unknown_escalation_answers_pending_not_payload(self):
+        """Escalation answers the paused item but never clears a live report.
+
+        After ``escalated_to_findings`` the pending item is answered (the
+        authorized rework may drop it), yet a re-delivery still carrying the
+        same item pauses again: acceptance never proceeds while the reviewer
+        still reports it unknown.  A reworked re-delivery without the item
+        is then accepted.
+        """
+        from vibe_guide.state import load_events
+
+        item = "\u65e0\u6cd5\u786e\u8ba4\u8be5\u7ec4\u4ef6\u7684\u4e8b\u4ef6\u7b7e\u540d"
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        clean_review = {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-3",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+        }
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                    # Unchanged re-delivery: still carries the item.
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                    # Reworked re-delivery: the escalated item is gone.
+                    ("complete", {"evidence": "delivery", "in_session_review": clean_review}),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [item])
+
+        snapshot = monitor.record_blocked_unknown_disposition(
+            snapshot.run_id, "sdd-a", item, "escalated_to_findings", note="\u8f6c P1 \u8fd4\u5de5"
+        )
+        # The escalation answers the paused item.
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [])
+        # A duplicate registration of the same kind is audit noise: rejected.
+        with self.assertRaises(ValueError):
+            monitor.record_blocked_unknown_disposition(
+                snapshot.run_id, "sdd-a", item, "escalated_to_findings"
+            )
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertEqual(current["blocked_unknowns_pending"], [item])
+        self.assertFalse(current.get("pair_archived", False))
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertEqual(current["status"], "accepted")
+        self.assertTrue(current["pair_archived"])
+        dispositions = [
+            record_
+            for record_ in load_events(self.paths, snapshot.run_id)
+            if record_["event"] == "blocked_unknown_disposition"
+            and record_["data"].get("node_id") == "sdd-a"
+        ]
+        self.assertEqual(len(dispositions), 1)
+        self.assertEqual(dispositions[0]["data"]["disposition"], "escalated_to_findings")
+
+    def test_blocked_unknown_disposition_requires_pending_item(self):
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner()
+        snapshot = monitor.start(record, runner)
+
+        with self.assertRaises(ValueError):
+            monitor.record_blocked_unknown_disposition(
+                snapshot.run_id, "sdd-a", "never reported", "confirmed_benign"
+            )
+        with self.assertRaises(ValueError):
+            monitor.record_blocked_unknown_disposition(
+                snapshot.run_id, "sdd-a", "", "confirmed_benign"
+            )
+        with self.assertRaises(ValueError):
+            monitor.record_blocked_unknown_disposition(
+                snapshot.run_id, "sdd-a", "item", "not-a-kind"
+            )
+        with self.assertRaises(ValueError):
+            monitor.record_blocked_unknown_disposition(
+                snapshot.run_id, "no-such-node", "item", "confirmed_benign"
+            )
+
+    def test_visible_sdd_blocked_unknown_pause_survives_event_replay(self):
+        """Crash after the pause and disposition landed but before the snapshot.
+
+        Replay must rebuild the pending/disposition state from the durable
+        events; the re-report consumed afterwards is then accepted.
+        """
+        item = "\u65e0\u6cd5\u786e\u8ba4 2.3.7 \u7684 props"
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        preserved = deepcopy(snapshot)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [item])
+        snapshot = monitor.record_blocked_unknown_disposition(
+            snapshot.run_id, "sdd-a", item, "resolved_with_facts"
+        )
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [])
+
+        # Lose every snapshot write the pause and disposition performed.
+        save_snapshot(self.paths, preserved)
+
+        recovered = monitor.tick(snapshot.run_id, runner)
+
+        current = recovered.nodes["sdd-a"]
+        self.assertEqual(current["status"], "accepted")
+        self.assertTrue(current["pair_archived"])
+        self.assertEqual(current["blocked_unknowns_pending"], [])
+        self.assertEqual(
+            current["blocked_unknown_dispositions"],
+            [{"item": item, "disposition": "resolved_with_facts", "note": ""}],
+        )
+
     def test_background_topology_dispatch_carries_disclosure(self):
         """A contract-stamped background ruling degrades with disclosure."""
         background_node = node("bg")

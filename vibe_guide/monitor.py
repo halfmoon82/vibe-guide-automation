@@ -119,6 +119,25 @@ _RULING_IN_SESSION_SDD = "in_session_sdd"
 #: session can resolve the in-session SDD protocol from the installed package.
 VISIBLE_SDD_PROTOCOL_REF = "vibe_guide/protocols/visible-sdd-worker.md"
 
+#: Disposition kinds that close one ``blocked_unknowns`` item reported by an
+#: in-session review (issue #140 design draft section 3.6).  A non-empty
+#: ``blocked_unknowns`` array never counts into the P0-P2 clearance numbers;
+#: every item must instead be closed by an explicit disposition event before
+#: acceptance may continue, so "cannot confirm" stops being a silent escape
+#: hatch for real defects.
+BLOCKED_UNKNOWN_DISPOSITION_KINDS = (
+    "confirmed_benign",
+    "escalated_to_findings",
+    "resolved_with_facts",
+)
+
+#: Dispositions that release an item for acceptance.  ``escalated_to_findings``
+#: documents that the unknown is a real defect the worker session must rework;
+#: it is recorded for the audit chain but never clears the gate.
+BLOCKED_UNKNOWN_CLEARING_DISPOSITIONS = frozenset(
+    {"confirmed_benign", "resolved_with_facts"}
+)
+
 #: Disclosure recorded when a node is dispatched without a visible bridge.
 BACKGROUND_TOPOLOGY_DISCLOSURE = (
     "平台无可见任务桥：降级为 background subagent，不可见、不可直接进入、返工续接受限"
@@ -1640,6 +1659,79 @@ class Monitor:
         save_snapshot(self.paths, snapshot)
         return snapshot
 
+    def record_blocked_unknown_disposition(
+        self,
+        run_id: str,
+        node_id: str,
+        item: str,
+        disposition: str,
+        note: str = "",
+    ) -> RunSnapshot:
+        """Record one per-item disposition for a paused blocked_unknown delivery.
+
+        Dispositions are the audit chain that closes the escape hatch: each
+        pending item from the latest paused delivery must be explicitly
+        confirmed benign, resolved after supplementing environment facts, or
+        escalated to P0-P2 rework before acceptance may continue.  Every
+        disposition answers the item (it leaves pending) and is appended to
+        the event log, but only clearing dispositions
+        (``confirmed_benign`` / ``resolved_with_facts``) release the
+        acceptance gate; after ``escalated_to_findings`` the reworked
+        re-delivery must no longer carry the item, otherwise the delivery
+        pauses again.  Nothing here accepts the delivery itself.
+        """
+        self._reset_binding_cache()
+        snapshot = load_snapshot(self.paths, run_id)
+        self._require_snapshot_authorization(snapshot)
+        if node_id not in snapshot.nodes:
+            raise ValueError("blocked_unknown disposition targets an unknown node")
+        current = snapshot.nodes[node_id]
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("blocked_unknown disposition item must be a non-empty string")
+        if disposition not in BLOCKED_UNKNOWN_DISPOSITION_KINDS:
+            raise ValueError(
+                "blocked_unknown disposition must be one of: {}".format(
+                    ", ".join(BLOCKED_UNKNOWN_DISPOSITION_KINDS)
+                )
+            )
+        if not isinstance(note, str):
+            raise ValueError("blocked_unknown disposition note must be a string")
+        pending = current.get("blocked_unknowns_pending") or []
+        if item not in pending:
+            raise ValueError(
+                "blocked_unknown disposition item is not pending on this node"
+            )
+        dispositions = current.setdefault("blocked_unknown_dispositions", [])
+        if any(
+            entry.get("item") == item and entry.get("disposition") == disposition
+            for entry in dispositions
+        ):
+            raise ValueError(
+                "blocked_unknown disposition already recorded for this item and kind"
+            )
+        dispositions.append({"item": item, "disposition": disposition, "note": note})
+        # Any disposition answers the paused item, so it leaves pending; the
+        # acceptance gate separately requires a *clearing* disposition before
+        # a re-delivery carrying the same item may pass.
+        current["blocked_unknowns_pending"] = [
+            pending_item for pending_item in pending if pending_item != item
+        ]
+        self._record(
+            snapshot,
+            "blocked_unknown_disposition",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "disposition": disposition,
+                # ``proof`` is the durable pass-through key for the structured
+                # item/note payload (see _record_contract_test_execution).
+                "proof": {"item": item, "note": note},
+            },
+        )
+        self._refresh_run_status(snapshot)
+        save_snapshot(self.paths, snapshot)
+        return snapshot
+
     def reconcile_evidence(self, run_id: str, package: Dict[str, Any]) -> RunSnapshot:
         """Promote a verified, same-run evidence package through normal events.
 
@@ -2358,6 +2450,7 @@ class Monitor:
         current["review_generation"] = generation
         current["active_role"] = None
         current["active_task"] = None
+        current["blocked_unknowns_pending"] = []
         current["quarantine"] = None
         snapshot.handles.pop(node_id, None)
         if not data.get("evidence"):
@@ -3667,6 +3760,14 @@ class Monitor:
                         return
                     self._mark_blocked_unknown(snapshot, node_id, reason)
                     return
+                undisposed = self._undisposed_blocked_unknowns(
+                    current, event.data.get("in_session_review")
+                )
+                if undisposed:
+                    self._pause_delivery_for_blocked_unknowns(
+                        snapshot, node_id, event, current, undisposed
+                    )
+                    return
             self._record_runner_event(snapshot, node_id, event, active)
             if role != "developer":
                 try:
@@ -4063,6 +4164,92 @@ class Monitor:
         snapshot.nodes[node_id]["active_task"] = None
         return True
 
+    @staticmethod
+    def _undisposed_blocked_unknowns(
+        current: Dict[str, Any], review: Any
+    ) -> List[str]:
+        """Blocked_unknown items still blocking acceptance.
+
+        Two closure rules keep the escape hatch shut in both directions:
+
+        * An item that already paused a delivery (``blocked_unknowns_pending``)
+          stays blocking until ANY disposition answers it -- silently dropping
+          it from a later payload is not closure.  ``escalated_to_findings``
+          answers it too: the unknown became a tracked finding, so the
+          reworked re-delivery may legitimately stop carrying the item.
+        * An item the CURRENT payload still carries needs a clearing
+          disposition (``confirmed_benign`` / ``resolved_with_facts``):
+          acceptance never proceeds while the reviewer still reports the
+          item as unknown, even if it was escalated before.
+        """
+        pending = [
+            item
+            for item in current.get("blocked_unknowns_pending") or []
+            if isinstance(item, str)
+        ]
+        payload_items: List[str] = []
+        if isinstance(review, dict):
+            payload_items = [
+                item
+                for item in review.get("blocked_unknowns") or []
+                if isinstance(item, str)
+            ]
+        answered = set()
+        cleared = set()
+        for entry in current.get("blocked_unknown_dispositions") or []:
+            if not isinstance(entry, dict):
+                continue
+            answered.add(entry.get("item"))
+            if entry.get("disposition") in BLOCKED_UNKNOWN_CLEARING_DISPOSITIONS:
+                cleared.add(entry.get("item"))
+        undisposed = [item for item in pending if item not in answered]
+        for item in payload_items:
+            if item not in cleared and item not in undisposed:
+                undisposed.append(item)
+        return undisposed
+
+    def _pause_delivery_for_blocked_unknowns(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        event: RunEvent,
+        current: Dict[str, Any],
+        undisposed: List[str],
+    ) -> None:
+        """Pause acceptance until every blocked_unknown item is disposed.
+
+        A non-empty ``blocked_unknowns`` array is not a format error and is
+        never folded into the P0-P2 clearance counts -- that would turn
+        "cannot confirm" into a silent escape hatch.  The delivery stays
+        unrecorded and the worker-session handle, binding and lease stay
+        untouched, so the same session re-reports once dispositions close
+        every item; the node waits in ``blocked_unknown`` until then.
+        """
+        review = event.data.get("in_session_review")
+        items = review.get("blocked_unknowns") if isinstance(review, dict) else []
+        current["status"] = "blocked_unknown"
+        current["reason"] = (
+            "acceptance paused: blocked_unknown items await disposition"
+        )
+        current["blocked_unknowns_pending"] = list(undisposed)
+        active = current.get("active_task")
+        self._record(
+            snapshot,
+            "blocked_unknown_disposition_required",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                # The durable event schema only preserves structured values
+                # under pass-through keys (see _record_contract_test_execution);
+                # the item lists ride under ``proof``.
+                "proof": {
+                    "blocked_unknowns": list(items or []),
+                    "undisposed": list(undisposed),
+                },
+            },
+            active if isinstance(active, dict) else None,
+        )
+
     def _validate_visible_sdd_review(
         self,
         snapshot: RunSnapshot,
@@ -4096,6 +4283,17 @@ class Monitor:
         )
         if not valid:
             return "visible-sdd delivery lacks verifiable in-session review evidence", True
+        blocked_unknowns = review.get("blocked_unknowns", [])
+        if not isinstance(blocked_unknowns, list) or any(
+            not isinstance(item, str) or not item.strip() for item in blocked_unknowns
+        ):
+            # Shape errors stay on the recoverable acceptance_rejected
+            # channel; only a well-formed non-empty list reaches the
+            # disposition gate in _apply_event.
+            return (
+                "visible-sdd in-session review blocked_unknowns must be a list of non-empty strings",
+                True,
+            )
         if review.get("protocol") != VISIBLE_SDD_PROTOCOL_REF:
             # The session must have followed the protocol shipped with this
             # package; a different or missing pointer is not the visible-sdd
@@ -4140,6 +4338,18 @@ class Monitor:
         if failure is not None:
             reason, _recoverable = failure
             self._mark_blocked_unknown(snapshot, node_id, reason)
+            return
+        if self._undisposed_blocked_unknowns(
+            current, event.data.get("in_session_review")
+        ):
+            # Fail-closed twin of the _apply_event pause: a direct or
+            # replay-adjacent caller never writes an acceptance over
+            # undisposed blocked_unknown items either.
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "visible-sdd acceptance refused: blocked_unknown items await disposition",
+            )
             return
         try:
             acceptance = VisibleSddAcceptance(
@@ -4204,6 +4414,7 @@ class Monitor:
         # A corrected re-report must not keep the rejection text.
         current["reason"] = None
         current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
+        current["blocked_unknowns_pending"] = []
         current["quarantine"] = None
         self._archive_pair(snapshot, node_id)
         self._release_node_lease(snapshot, node_id)
@@ -5126,6 +5337,50 @@ class Monitor:
                 # and node status were all left for the same task's corrected
                 # re-report -- so replay must mutate nothing either.
                 pass
+            elif record["event"] == "blocked_unknown_disposition_required":
+                # The live pause recorded no delivery and left the handle,
+                # binding and lease untouched, so replay restores only the
+                # pause marker and the still-pending items.
+                current["status"] = "blocked_unknown"
+                current["reason"] = (
+                    "acceptance paused: blocked_unknown items await disposition"
+                )
+                proof = data.get("proof")
+                undisposed = proof.get("undisposed") if isinstance(proof, dict) else None
+                current["blocked_unknowns_pending"] = (
+                    [item for item in undisposed if isinstance(item, str)]
+                    if isinstance(undisposed, list)
+                    else []
+                )
+            elif record["event"] == "blocked_unknown_disposition":
+                if provenance["role"] != "system":
+                    raise ValueError(
+                        "blocked_unknown disposition lacks system provenance"
+                    )
+                proof = data.get("proof")
+                item = proof.get("item") if isinstance(proof, dict) else None
+                disposition = data.get("disposition")
+                if (
+                    not isinstance(item, str)
+                    or not item.strip()
+                    or disposition not in BLOCKED_UNKNOWN_DISPOSITION_KINDS
+                ):
+                    raise ValueError("replayed blocked_unknown disposition is invalid")
+                current.setdefault("blocked_unknown_dispositions", []).append(
+                    {
+                        "item": item,
+                        "disposition": disposition,
+                        "note": proof.get("note", "") if isinstance(proof.get("note", ""), str) else "",
+                    }
+                )
+                # Mirror the live path: any disposition answers the pending
+                # item; only clearing kinds release the acceptance gate.
+                pending = current.get("blocked_unknowns_pending") or []
+                current["blocked_unknowns_pending"] = [
+                    pending_item
+                    for pending_item in pending
+                    if pending_item != item
+                ]
             else:
                 current["status"] = "blocked_unknown"
                 current["reason"] = "unapplied event needs manual reconciliation"
