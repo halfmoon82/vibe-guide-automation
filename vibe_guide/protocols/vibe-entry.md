@@ -61,6 +61,7 @@ vibe plan --request "<用户原话>" --s1 5,3,5,3,1 --json    # 正式路由；�
 - `--s1` 五个数字的顺序即 `steps,domains,uncertainty,failure_cost,toolchain`，各取 0-5 整数。
 - `route` 为 `simple`/`light_plan`：按 vibe 的路由结果直接执行（vibe 的正式路由优先于你的自评）；涉及图形界面时，动手前仍先过 §4 设计稿门。
 - `route` 为 `complex`：记下 `plan_id`，按 prd-guide 协议进入 PRD/Spec/DAG/授权卡流程。
+- **首班监工开工两件事**：`route` 为 `complex`、监工（`vibe monitor`）真正启动之后，本会话作为首班监工必须先做这两件事，做完才算开工——`vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识>` 登记自身地址；再用宿主平台原语自建心跳，心跳第一步固定跑 `vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路径>`。不登记，worker 的完工唤醒信号无处可发；不建心跳，`rotate` 的换班检测不会发生。两条指令的完整说明见 prd-guide §6.0。
 - **会话门阻塞（`session_gate_blocked`）时必须停下报告**，不得伪造状态、不得跳过门禁、不得手写 plan 工程字段。
 - scan 报告未知/超时保持 `unknown`，不得当成成功或永久不可用。
 
