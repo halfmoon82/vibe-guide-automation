@@ -556,15 +556,18 @@ _VIBE_ENTRY_COMMAND = re.compile(r'\bvibe\s+(?:doctor|plan|scan)\b')
 # also matches ordinary prose ("派发前必须核对…然后重跑 vibe doctor").  The
 # quantifier must govern a task word, or "每次升级后" / "所有字段" would count.
 _EVERY_TASK = re.compile(
-    r'(?:任何|每个|每次|每条|所有)[^，。；,;]{0,8}?(?:任务|需求|请求|改动)|新任务|新需求'
-    r'|\b(?:every|each|any|all)\s+(?:new\s+)?(?:tasks?|requests?|changes?)\b',
+    r'(?:任何|每个|每次|每条|所有)[^，。；,;]{0,15}?(?:任务|需求|请求|改动|工作|开发)'
+    r'|新任务|新需求|一律|都要|总是|始终'
+    r'|\b(?:every|each|any|all)\b(?:\s+\w+){0,3}?\s+(?:tasks?|requests?|changes?)\b',
     re.IGNORECASE,
 )
 _BEFORE_START = re.compile(
-    r'先跑|先运行|先执行|必须先|开始前|动手前|开工前|\bbefore\b',
+    r'先跑|先运行|先执行|必须先|开始前|动手前|开工前|\bbefore\b|\bfirst\s+(?:for|on|before)\b',
     re.IGNORECASE,
 )
-# A rule scoped to complex / S1>15 work says what New Session Entry says.
+# A rule scoped to complex / S1>15 work says what New Session Entry says --
+# but only when the scope comes before the command; "每个任务先跑 vibe plan
+# 判断是否复杂任务" still gates every task.
 _SCOPED_TO_COMPLEX = re.compile(
     r'S1\s*[>＞]|>\s*15|复杂(?:任务|需求|请求)|\bcomplex\s+(?:tasks?|requests?)',
     re.IGNORECASE,
@@ -606,11 +609,14 @@ def legacy_entry_rule_lines(content):
             continue
         if in_shipped:
             continue
+        command = _VIBE_ENTRY_COMMAND.search(stripped)
+        if not command:
+            continue
+        scope = _SCOPED_TO_COMPLEX.search(stripped)
         if (
-            _VIBE_ENTRY_COMMAND.search(stripped)
-            and _EVERY_TASK.search(stripped)
+            _EVERY_TASK.search(stripped)
             and _BEFORE_START.search(stripped)
-            and not _SCOPED_TO_COMPLEX.search(stripped)
+            and not (scope and scope.start() < command.start())
         ):
             lines.append(number)
     return lines

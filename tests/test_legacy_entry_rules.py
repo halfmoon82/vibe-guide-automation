@@ -103,6 +103,31 @@ class LegacyEntryRuleLinesTests(unittest.TestCase):
         content = _agents('# Rules', legacy, '', VIBE_ENTRY_RULES)
         self.assertEqual(legacy_entry_rule_lines(content), [2])
 
+    def test_rewordings_of_a_per_task_gate_are_flagged(self):
+        rules = (
+            '- 任何开发任务开始前必须先跑 `vibe doctor`，S1>15 再 `vibe plan`。',
+            '- 每个任务开始前必须先跑 `vibe plan` 判断是否复杂任务。',
+            '- 每个涉及代码修改的开发任务开始前必须先跑 `vibe doctor`。',
+            '- 所有开发工作开始前必须先跑 `vibe doctor`。',
+            '- 开工前一律先跑 `vibe doctor --json`。',
+            '- Before any of the tasks, run vibe doctor.',
+            '- Run vibe plan first for each new task.',
+        )
+        for rule in rules:
+            with self.subTest(rule=rule):
+                content = _agents('# Rules', rule, '', VIBE_ENTRY_RULES)
+                self.assertEqual(legacy_entry_rule_lines(content), [2])
+
+    def test_fence_closes_only_on_its_own_character(self):
+        content = _agents('```', '~~~', PII_LEGACY, '```', SXM_LEGACY, '', VIBE_ENTRY_RULES)
+        self.assertEqual(legacy_entry_rule_lines(content), [5])
+
+    def test_heading_merely_mentioning_a_marker_is_not_a_vibe_section(self):
+        content = _agents(
+            '## Notes on New Session Entry migration', PII_LEGACY, '', VIBE_ENTRY_RULES
+        )
+        self.assertEqual(legacy_entry_rule_lines(content), [2])
+
     def test_english_per_task_rule_is_flagged(self):
         legacy = '- Before every task, run `vibe doctor --json` first.'
         content = _agents('# Rules', legacy, '', VIBE_ENTRY_RULES)
