@@ -1,8 +1,10 @@
 """Implementation Brief validation before a developer's first write."""
 
+import re
+
 from dataclasses import MISSING, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Tuple
 
 from .manifest import RunManifest
 from .models import DAGNode
@@ -56,6 +58,44 @@ class ImplementationBrief:
             else:
                 values.setdefault(name, field_info.default)
         return cls(**values)
+
+
+
+_TS_SYMBOL_PATTERN = (
+    r"\bexport\s+(?:default\s+)?(?:async\s+)?"
+    r"(?:const|function|class|interface|type)\s+%s\b"
+)
+_VUE_SCRIPT_BLOCK = re.compile(r"<script\b[^>]*>(.*?)</script>", re.IGNORECASE | re.DOTALL)
+_FRONTEND_SUFFIXES = frozenset({".ts", ".tsx", ".js", ".jsx"})
+# Fallback marker recorded in evidence when a suffix has no strict checker:
+# the check degrades to a plain word match and must stay visible there.
+WORD_MATCH_FALLBACK = "word_match_fallback"
+
+
+def _word_match(source: str, name: str) -> bool:
+    return re.search(r"\b%s\b" % re.escape(name), source) is not None
+
+
+def check_entrypoint_symbol(source: str, suffix: str, symbol: str) -> Tuple[bool, str]:
+    """Extension-dispatched entrypoint symbol check.
+
+    Returns ``(present, mode)``; ``mode`` records how the symbol was
+    validated so a degraded fallback stays explicit in evidence instead of
+    silently reducing the check to file existence.
+    """
+    name = symbol.split(".", 1)[0]
+    if not name:
+        return False, "missing_symbol"
+    if suffix == ".py":
+        present = ("def " + name) in source or ("class " + name) in source
+        return present, "python_definition"
+    if suffix in _FRONTEND_SUFFIXES:
+        pattern = _TS_SYMBOL_PATTERN % re.escape(name)
+        return re.search(pattern, source) is not None, "ts_export"
+    if suffix == ".vue":
+        blocks = _VUE_SCRIPT_BLOCK.findall(source)
+        return _word_match("\n".join(blocks), name), "vue_script_block"
+    return _word_match(source, name), WORD_MATCH_FALLBACK
 
 
 @dataclass(frozen=True)
@@ -129,7 +169,16 @@ def validate_implementation_brief(brief: ImplementationBrief, manifest: RunManif
                     source = path.read_text(encoding="utf-8")
                 except OSError:
                     source = ""
-                if ("def " + symbol.split(".", 1)[0]) not in source:
+                present, mode = check_entrypoint_symbol(
+                    source, path.suffix.lower(), symbol
+                )
+                checks["invariants[%d].entrypoint.symbol" % index] = {
+                    "symbol": symbol,
+                    "mode": mode,
+                    "present": present,
+                    "degraded": mode == WORD_MATCH_FALLBACK,
+                }
+                if not present:
                     missing.append("invariants[%d].entrypoint" % index)
     status = "implementing" if not missing else "brief_pending"
     evidence = {
