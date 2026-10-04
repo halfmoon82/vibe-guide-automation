@@ -196,6 +196,28 @@ vibe monitor --plan <plan_id> --authorize AUTHORIZE --json
 
 包里没有任何代码能替你做这一步：创建会话需要宿主平台的桌面工具，只有当前这个会话持有它们。所以这是 agent 的职责。
 
+### 6.0 开工准备（首班监工必做，做完才算开工）
+
+首班监工在服务信箱之前先把自己接上电。两件事，各一条命令：
+
+**登记监工地址**：
+
+```bash
+vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识>
+```
+
+登记内容只允许 provider / 会话 id / host，不得含凭据。worker 完工后的唤醒信号按这个地址发；没登记时 `vibe supervisor-address` 返回 `unknown`，唤醒信号无处可发，交付只能等监工被动 resume 才领取。
+
+**自建心跳**：vibe 是 CLI，没有常驻进程，心跳只能由宿主 agent 会话承载。用宿主平台原语建一个周期任务（Codex 桌面用 heartbeat automation，可以全自动），把下面这条固定作为**每次心跳的第一步**：
+
+```bash
+vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路径>
+```
+
+心跳不建，`rotate` 的阈值检测就不会发生：token 涨过阈值也不会换班，一直涨到溢出。换班后的新会话同样要做这两件事（§6.5）。
+
+宿主差异：Codex 桌面两条都能自动建；Claude Code 没有换班原语，心跳降级为兜底机制，换班时是移交给新会话（§6.5）。两件事做完再进 §6.1。
+
 ### 6.1 一轮的动作
 
 ```python
