@@ -31,6 +31,7 @@ from .supervisor import (
     Supervisor,
     current_supervisor_address,
     register_supervisor_address,
+    heartbeat_prompt,
     supervisor_preflight,
 )
 from .change_requests import ChangeRequest, classify_merge_capability
@@ -781,7 +782,7 @@ def _snapshot_result(
     )
 
 
-def _first_shift_handoff(paths: ProjectPaths, run_id: str) -> str:
+def _first_shift_handoff(paths: ProjectPaths, plan_id: str, run_id: str) -> str:
     """The two duties a first supervisor shift owes before serving the mailbox.
 
     ISSUE-127: the address registry and the preflight shipped in 5.0.1, but the
@@ -805,11 +806,11 @@ def _first_shift_handoff(paths: ProjectPaths, run_id: str) -> str:
         "首班监工还有两件事没做，做完才算开工：\n"
         "  1) 登记地址：vibe supervisor-register --run-id {} "
         "--provider <平台> --session-id <本会话 id> --host <本机标识>\n"
-        "  2) 自建心跳：用宿主平台原语建周期任务，心跳第一步固定跑 "
-        "vibe supervisor-preflight --run-id {} --session-record <本会话记录路径>\n"
+        "  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n"
+        "{}\n"
         "没登记地址，worker 的完工唤醒信号无处可发；没心跳，rotate 的阈值检测不会发生。\n"
         "宿主差异：Codex 桌面两条都能自动建；Claude Code 没有换班原语，心跳降级为兜底机制。"
-    ).format(run_id, run_id)
+    ).format(run_id, heartbeat_prompt(plan_id, run_id))
 
 
 def render_v41_closeout_status(snapshot: RunSnapshot) -> str:
@@ -1864,7 +1865,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工状态未知：" + str(error),
                 args.as_json,
             )
-        handoff = _first_shift_handoff(paths, snapshot.run_id)
+        handoff = _first_shift_handoff(paths, args.plan, snapshot.run_id)
         if args.watch:
             supervisor = Supervisor(
                 paths,
@@ -2047,7 +2048,14 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "状态未知：" + message,
                 args.as_json,
             )
-        return _snapshot_result(args.command, snapshot, args.as_json)
+        # A heartbeat that drifted from the generated prompt still calls
+        # resume, so resume keeps asking until the shift registers.
+        handoff = (
+            _first_shift_handoff(paths, args.plan, snapshot.run_id)
+            if args.command == "resume"
+            else ""
+        )
+        return _snapshot_result(args.command, snapshot, args.as_json, handoff=handoff)
 
     return _result(
         USAGE_ERROR, {"status": "usage_error"}, "参数错误", args.as_json
