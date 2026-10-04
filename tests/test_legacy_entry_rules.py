@@ -44,6 +44,14 @@ LEGIT_LINES = (
     '- 每次升级 vibe-guide 后先跑 `vibe doctor` 确认 issues 为空。',
     '- `vibe plan` 会先运行校验，所有字段必须齐全。',
     '- First run `vibe scan` to list all tasks in the repo.',
+    # A named occasion ("发版前") is not every task, however emphatic.
+    '- 发版前都要先跑 `vibe doctor --json` 确认环境。',
+    '- 派发前总是先跑 `vibe doctor` 核对活跃桥。',
+    '- 升级后始终先跑 `vibe scan` 再看 diff。',
+    '- 合并 PR 前一律先跑 `vibe doctor`。',
+    '- 改动 AGENTS.md 后都要先运行测试，再跑 vibe doctor 复核。',
+    '- 所有开发者在提交前先跑 `vibe doctor`。',
+    '- 任何改动 AGENTS.md 的提交前先跑 `vibe doctor`。',
 )
 
 
@@ -110,6 +118,8 @@ class LegacyEntryRuleLinesTests(unittest.TestCase):
             '- 每个涉及代码修改的开发任务开始前必须先跑 `vibe doctor`。',
             '- 所有开发工作开始前必须先跑 `vibe doctor`。',
             '- 开工前一律先跑 `vibe doctor --json`。',
+            '- 每个涉及代码与配置文件修改的任务开始前必须先跑 `vibe doctor`。',
+            '- S1>15 用 `vibe plan`；每个任务开始前都要先跑 `vibe doctor`。',
             '- Before any of the tasks, run vibe doctor.',
             '- Run vibe plan first for each new task.',
         )

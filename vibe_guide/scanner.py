@@ -556,8 +556,8 @@ _VIBE_ENTRY_COMMAND = re.compile(r'\bvibe\s+(?:doctor|plan|scan)\b')
 # also matches ordinary prose ("派发前必须核对…然后重跑 vibe doctor").  The
 # quantifier must govern a task word, or "每次升级后" / "所有字段" would count.
 _EVERY_TASK = re.compile(
-    r'(?:任何|每个|每次|每条|所有)[^，。；,;]{0,15}?(?:任务|需求|请求|改动|工作|开发)'
-    r'|新任务|新需求|一律|都要|总是|始终'
+    r'(?:任何|每个|每次|每条|所有)[^，。；,;]{0,15}?(?:任务|需求|请求|改动|工作|开发(?!者))'
+    r'|新任务|新需求|^[-*\s]*(?:开工|动手)前'
     r'|\b(?:every|each|any|all)\b(?:\s+\w+){0,3}?\s+(?:tasks?|requests?|changes?)\b',
     re.IGNORECASE,
 )
@@ -572,6 +572,9 @@ _SCOPED_TO_COMPLEX = re.compile(
     r'S1\s*[>＞]|>\s*15|复杂(?:任务|需求|请求)|\bcomplex\s+(?:tasks?|requests?)',
     re.IGNORECASE,
 )
+# "发版前都要先跑 vibe doctor" names one occasion, not every task.
+_NAMED_OCCASION = re.compile(r'(?:发版|派发|合并|提交|升级|上线|部署|PR)\s*[前后]')
+_CLAUSE_BREAK = re.compile(r'[；;。]')
 _FENCE = re.compile(r'(`{3,}|~{3,})')
 _HEADING = re.compile(r'#{1,6}\s+(.*)')
 
@@ -609,17 +612,25 @@ def legacy_entry_rule_lines(content):
             continue
         if in_shipped:
             continue
-        command = _VIBE_ENTRY_COMMAND.search(stripped)
-        if not command:
-            continue
-        scope = _SCOPED_TO_COMPLEX.search(stripped)
-        if (
-            _EVERY_TASK.search(stripped)
-            and _BEFORE_START.search(stripped)
-            and not (scope and scope.start() < command.start())
-        ):
+        if any(_is_legacy_entry_clause(clause) for clause in _CLAUSE_BREAK.split(stripped)):
             lines.append(number)
     return lines
+
+
+def _is_legacy_entry_clause(clause):
+    command = _VIBE_ENTRY_COMMAND.search(clause)
+    if not command:
+        return False
+    # A complex/S1>15 scope or a named occasion qualifies the command only
+    # when it comes first: "每个任务先跑 vibe plan 判断是否复杂任务" still
+    # gates every task.
+    head = clause[:command.start()]
+    return bool(
+        _EVERY_TASK.search(clause)
+        and _BEFORE_START.search(clause)
+        and not _SCOPED_TO_COMPLEX.search(head)
+        and not _NAMED_OCCASION.search(head)
+    )
 
 
 def build_agentsmd_patch(existing, report):
