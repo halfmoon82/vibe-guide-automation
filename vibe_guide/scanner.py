@@ -552,16 +552,25 @@ _SHIPPED_RULE_MARKERS = (
 )
 _VIBE_ENTRY_COMMAND = re.compile(r'\bvibe\s+(?:doctor|plan|scan)\b')
 # A legacy entry rule makes a vibe command the gate for every task: it needs
-# both a "whatever the task" word and a "before starting" word.  Either alone
-# also matches ordinary prose ("派发前必须核对…然后重跑 vibe doctor").
+# both a "whatever the task" phrase and a "before starting" word.  Either alone
+# also matches ordinary prose ("派发前必须核对…然后重跑 vibe doctor").  The
+# quantifier must govern a task word, or "每次升级后" / "所有字段" would count.
 _EVERY_TASK = re.compile(
-    r'任何|每个|每次|每条|所有|新任务|\b(?:every|each|any|all)\b[^.;]*\btasks?\b',
+    r'(?:任何|每个|每次|每条|所有)[^，。；,;]{0,8}?(?:任务|需求|请求|改动)|新任务|新需求'
+    r'|\b(?:every|each|any|all)\s+(?:new\s+)?(?:tasks?|requests?|changes?)\b',
     re.IGNORECASE,
 )
 _BEFORE_START = re.compile(
-    r'先跑|先运行|先执行|必须先|开始前|动手前|开工前|\bbefore\b|\bfirst\b',
+    r'先跑|先运行|先执行|必须先|开始前|动手前|开工前|\bbefore\b',
     re.IGNORECASE,
 )
+# A rule scoped to complex / S1>15 work says what New Session Entry says.
+_SCOPED_TO_COMPLEX = re.compile(
+    r'S1\s*[>＞]|>\s*15|复杂(?:任务|需求|请求)|\bcomplex\s+(?:tasks?|requests?)',
+    re.IGNORECASE,
+)
+_FENCE = re.compile(r'(`{3,}|~{3,})')
+_HEADING = re.compile(r'#{1,6}\s+(.*)')
 
 
 def legacy_entry_rule_lines(content):
@@ -571,24 +580,29 @@ def legacy_entry_rule_lines(content):
     hand-written "every task runs vibe doctor / vibe plan first" rule.  Once
     the New Session Entry block ("<=15 does not touch vibe") is present the
     host gets two opposite entry rules.  vibe never shipped that older text,
-    so it is found by wording, not fingerprint.  Code fences and vibe's own
-    rule sections are skipped; without a New Session Entry block there is no
-    conflict to report.
+    so it is found by wording, not fingerprint, one line at a time.  Code
+    fences and vibe's own rule sections are skipped; without a New Session
+    Entry block there is no conflict to report.
     '''
     if not content or VIBE_ENTRY_RULE_MARKER not in content:
         return []
     lines = []
-    in_fence = False
+    fence = None
     in_shipped = False
     for number, line in enumerate(content.splitlines(), start=1):
         stripped = line.strip()
-        if stripped.startswith('```'):
-            in_fence = not in_fence
+        opening = _FENCE.match(stripped)
+        if fence is None and opening:
+            fence = opening.group(1)
             continue
-        if in_fence:
+        if fence is not None:
+            # A fence closes only on the same character, at least as long.
+            if set(stripped) == {fence[0]} and len(stripped) >= len(fence):
+                fence = None
             continue
-        if stripped.startswith('#'):
-            in_shipped = any(marker in stripped for marker in _SHIPPED_RULE_MARKERS)
+        heading = _HEADING.match(stripped)
+        if heading:
+            in_shipped = heading.group(1).startswith(_SHIPPED_RULE_MARKERS)
             continue
         if in_shipped:
             continue
@@ -596,6 +610,7 @@ def legacy_entry_rule_lines(content):
             _VIBE_ENTRY_COMMAND.search(stripped)
             and _EVERY_TASK.search(stripped)
             and _BEFORE_START.search(stripped)
+            and not _SCOPED_TO_COMPLEX.search(stripped)
         ):
             lines.append(number)
     return lines

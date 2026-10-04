@@ -38,6 +38,12 @@ LEGIT_LINES = (
     '- 发版前先跑 `vibe doctor --json` 确认环境。',
     # An every-task gate that is not a vibe command.
     '- 任何任务开始前先读 README 和 docs/。',
+    # Rules that agree with New Session Entry or are not about tasks.
+    '- 任何 S1>15 的任务开始前先跑 `vibe plan --request`。',
+    '- 复杂任务开始前先跑 `vibe scan`，再 `vibe plan --request --s1`。',
+    '- 每次升级 vibe-guide 后先跑 `vibe doctor` 确认 issues 为空。',
+    '- `vibe plan` 会先运行校验，所有字段必须齐全。',
+    '- First run `vibe scan` to list all tasks in the repo.',
 )
 
 
@@ -71,6 +77,31 @@ class LegacyEntryRuleLinesTests(unittest.TestCase):
             legacy_entry_rule_lines(content),
             [_line_of(content, PII_LEGACY), _line_of(content, SXM_LEGACY)],
         )
+
+    def test_tilde_and_longer_backtick_fences_are_skipped(self):
+        content = _agents(
+            '~~~',
+            SXM_LEGACY,
+            '~~~',
+            '````markdown',
+            '```',
+            PII_LEGACY,
+            '```',
+            '````',
+            PII_LEGACY,
+            '',
+            VIBE_ENTRY_RULES,
+        )
+        self.assertEqual(legacy_entry_rule_lines(content), [9])
+
+    def test_hash_prefixed_prose_is_not_a_heading(self):
+        # "#134 ..." is prose; only "## Heading" opens a section, so it can
+        # neither hide a rule nor end a skipped vibe section.
+        legacy = '#134 每个任务先跑 `vibe doctor --json`。'
+        content = _agents(VIBE_ENTRY_RULES, legacy)
+        self.assertEqual(legacy_entry_rule_lines(content), [])
+        content = _agents('# Rules', legacy, '', VIBE_ENTRY_RULES)
+        self.assertEqual(legacy_entry_rule_lines(content), [2])
 
     def test_english_per_task_rule_is_flagged(self):
         legacy = '- Before every task, run `vibe doctor --json` first.'
@@ -167,6 +198,22 @@ class ApplyAgentsmdLegacyEntryRuleTests(unittest.TestCase):
         self.assertEqual(len(result.notes), 1)
         self.assertIn('AGENTS.md 第 3 行', result.notes[0])
         self.assertIn('New Session Entry', result.notes[0])
+
+    def test_rerun_with_nothing_to_append_still_notes_the_conflict(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'AGENTS.md').write_text(_agents('# Rules', '', SXM_LEGACY), encoding='utf-8')
+            proposal = root / '.vibe' / 'proposals' / 'agentsmd' / 'proposal.md'
+            proposal.parent.mkdir(parents=True)
+            proposal.write_text(
+                '# Vibe Guide capability contract proposal\n\n' + VIBE_ENTRY_RULES,
+                encoding='utf-8',
+            )
+            apply_agentsmd_proposal(ProjectPaths.from_cwd(root), True)
+            rerun = apply_agentsmd_proposal(ProjectPaths.from_cwd(root), True)
+        self.assertFalse(rerun.changed)
+        self.assertEqual(len(rerun.notes), 1)
+        self.assertIn('AGENTS.md 第 3 行', rerun.notes[0])
 
     def test_apply_without_conflict_has_no_note(self):
         with tempfile.TemporaryDirectory() as d:
