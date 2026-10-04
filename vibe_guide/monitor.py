@@ -15,6 +15,7 @@ from .authorization import (
     AuthorizationRecord,
     affected_node_closure,
     canonical_node_contracts,
+    contract_invariant_entries,
     digest_integration_contract,
     executable_contract_digest,
     integration_contract_projection,
@@ -96,6 +97,47 @@ from .evidence import (
     record_integration_review as _record_integration_review,
 )
 from .engine_attestation import validate_engine_attestation
+
+
+# ISSUE-140 (design section 3.3): contract-declared invariant test commands
+# are executed by the monitor inside the node writer worktree.  Commands come
+# from the already-authorized node contract and execution never leaves the
+# contract writer worktree, so this introduces no new authorization surface.
+DEFAULT_CONTRACT_TEST_TIMEOUT_SECONDS = 120
+
+#: Compile/build command prefixes that can never prove a *behavioral*
+#: invariant (they only prove the code compiles).  Built-in and not reducible
+#: through configuration; projects may append entries via
+#: ``.vibe/config.json`` ``behavioral_command_blacklist_extra``.
+BEHAVIORAL_COMPILE_COMMAND_BLACKLIST = frozenset({
+    "tsc",
+    "vue-tsc",
+    "vite build",
+    "webpack",
+    "rollup",
+    "esbuild",
+    "npm run build",
+    "pnpm build",
+    "yarn build",
+    "next build",
+    "ng build",
+})
+
+
+def _command_matches_blacklist(command: str, blacklist) -> bool:
+    """Prefix match on whitespace-split tokens.
+
+    A command hits a blacklist entry when its first ``len(entry_tokens)``
+    tokens equal the entry's tokens exactly.
+    """
+    tokens = str(command).split()
+    for entry in blacklist:
+        entry_tokens = str(entry).split()
+        if entry_tokens and tokens[: len(entry_tokens)] == entry_tokens:
+            return True
+    return False
+
+
 
 
 # --- V4.6 ISSUE-04: topology-aware dispatch of visible worker sessions ---
@@ -3156,6 +3198,35 @@ class Monitor:
         )
         # The intent and lease are durable before the external side effect.
         save_snapshot(self.paths, snapshot)
+        # ISSUE-140 (expected_red): a TDD node must observe its invariant
+        # commands failing before the first developer dispatch.  The flag is
+        # node state, so rework/continuation never re-runs the observation.
+        if (
+            role == "developer"
+            and isinstance(node.contract, dict)
+            and isinstance(node.contract.get("expected_red"), str)
+            and node.contract["expected_red"].strip()
+            and not current.get("expected_red_observed")
+        ):
+            expected_red_failure = self._execute_contract_test_commands(
+                snapshot, node_id, "expected_red", current.get("active_task")
+            )
+            if expected_red_failure is not None:
+                # Same cleanup as the other pre-dispatch failure branches:
+                # reset the active/intent fields and do not fabricate a
+                # retryable action for what is a contract violation.
+                current["active_task"] = None
+                current["active_role"] = None
+                current["start_intent"] = None
+                self._mark_blocked_unknown(
+                    snapshot,
+                    node_id,
+                    "contract test execution failed: {}".format(expected_red_failure),
+                )
+                save_snapshot(self.paths, snapshot)
+                return False
+            current["expected_red_observed"] = True
+            save_snapshot(self.paths, snapshot)
         self._require_snapshot_authorization(snapshot)
         try:
             # All starts pass through the intent transaction.  V4.4 providers
@@ -3917,6 +3988,19 @@ class Monitor:
                         return
                     self._mark_blocked_unknown(snapshot, node_id, rejection)
                     return
+            # ISSUE-140: contract-declared invariant test commands gate the
+            # acceptance.  Nodes without invariants return None immediately
+            # and follow the legacy path unchanged.
+            contract_test_failure = self._execute_contract_test_commands(
+                snapshot, node_id, "acceptance", active
+            )
+            if contract_test_failure is not None:
+                self._mark_blocked_unknown(
+                    snapshot,
+                    node_id,
+                    "contract test execution failed: {}".format(contract_test_failure),
+                )
+                return
             acceptance_event = RunEvent(
                 event.event,
                 {
@@ -4152,6 +4236,18 @@ class Monitor:
                 snapshot,
                 node_id,
                 "visible-sdd acceptance refused: {}".format(error),
+            )
+            return
+        # ISSUE-140: invariant test commands gate the acceptance here too,
+        # before the binding transition and the durable accepted event.
+        contract_test_failure = self._execute_contract_test_commands(
+            snapshot, node_id, "acceptance"
+        )
+        if contract_test_failure is not None:
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "contract test execution failed: {}".format(contract_test_failure),
             )
             return
         # The in-session reviewer acts under the same single session
@@ -5139,6 +5235,185 @@ class Monitor:
             str(current.get("worktree", "")),
             snapshot.run_id,
         )
+
+    def _contract_test_entries(self, node_id: str):
+        """Collect executable invariant entries from the node contract.
+
+        Missing/non-list/empty ``invariants`` yields an empty list, which is
+        what keeps contracts without invariants completely behavior-neutral.
+        An invalid ``timeout_seconds`` is a contract error and is reported
+        through the returned error string instead of being guessed at.
+        """
+        node = self.nodes[node_id]
+        contract = node.contract if isinstance(node.contract, dict) else {}
+        entries = []
+        for index, item in contract_invariant_entries(contract):
+            invariant_id = item.get("id")
+            if not isinstance(invariant_id, str) or not invariant_id.strip():
+                invariant_id = "invariants[{}]".format(index)
+            kind = item.get("kind")
+            kind = kind.strip() if isinstance(kind, str) and kind.strip() else None
+            timeout_seconds = item.get(
+                "timeout_seconds", DEFAULT_CONTRACT_TEST_TIMEOUT_SECONDS
+            )
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, int)
+                or timeout_seconds < 1
+            ):
+                return None, (
+                    "invariant {} has an invalid timeout_seconds value "
+                    "(contract error)".format(invariant_id.strip())
+                )
+            entries.append(
+                {
+                    "invariant_id": invariant_id.strip(),
+                    "command": item["test_command"],
+                    "kind": kind,
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+        return entries, None
+
+    def _record_contract_test_execution(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        phase: str,
+        entry: Dict[str, Any],
+        exit_code: Optional[int],
+        output_tail: str,
+        worktree: Path,
+        active: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        # The execution detail rides under ``proof``: it is a structured
+        # result (identifiers, exit code, bounded output tail), and the
+        # durable event schema only preserves structured values under
+        # pass-through keys.  run_id/node_id/phase stay top-level.
+        self._record(
+            snapshot,
+            "contract_test_execution",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "phase": phase,
+                "proof": {
+                    "invariant_id": entry["invariant_id"],
+                    "command": entry["command"],
+                    "exit_code": exit_code,
+                    "output_tail": output_tail,
+                    "executed_at": datetime.now(timezone.utc).isoformat(),
+                    "worktree": str(worktree),
+                },
+            },
+            active,
+        )
+
+    def _execute_contract_test_commands(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        phase: str,
+        active: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Run contract-declared invariant test commands for one node.
+
+        No new authorization surface: every command comes from the
+        already-authorized node contract and execution is confined to the
+        contract writer worktree.  ``phase`` is ``"acceptance"`` (commands
+        must pass) or ``"expected_red"`` (commands must fail before the
+        implementation exists).  Returns ``None`` on success, otherwise a
+        failure reason; every executed (or refused) command is recorded as a
+        ``contract_test_execution`` event first, so a rejection can never be
+        forged into a pass.
+        """
+        entries, contract_error = self._contract_test_entries(node_id)
+        if contract_error is not None:
+            return contract_error
+        if not entries:
+            return None
+        current = snapshot.nodes[node_id]
+        worktree = self._worktree_path(current)
+        if not worktree.is_dir():
+            return (
+                "writer worktree {} does not exist; contract test execution "
+                "is confined to it".format(worktree)
+            )
+        blacklist = frozenset()
+        if any(entry["kind"] == "behavioral" for entry in entries):
+            # Fail closed: an unreadable project config means the effective
+            # blacklist is unknown, so behavioral invariants cannot run.
+            try:
+                project_config = load_project_config(self.paths.root)
+            except ValueError as error:
+                return (
+                    "behavioral command blacklist cannot be resolved from "
+                    "the project config: {}".format(error)
+                )
+            blacklist = BEHAVIORAL_COMPILE_COMMAND_BLACKLIST | set(
+                project_config.behavioral_command_blacklist_extra
+            )
+        for entry in entries:
+            if entry["kind"] == "behavioral" and _command_matches_blacklist(
+                entry["command"], blacklist
+            ):
+                note = (
+                    "behavioral invariant test_command matches the compile "
+                    "command blacklist"
+                )
+                self._record_contract_test_execution(
+                    snapshot, node_id, phase, entry, None,
+                    "not executed: " + note, worktree, active,
+                )
+                return "invariant {}: {} ({!r})".format(
+                    entry["invariant_id"], note, entry["command"]
+                )
+            try:
+                completed = subprocess.run(
+                    entry["command"],
+                    shell=True,
+                    cwd=str(worktree),
+                    capture_output=True,
+                    text=True,
+                    timeout=entry["timeout_seconds"],
+                )
+                exit_code: Optional[int] = completed.returncode
+                output_tail = (
+                    (completed.stdout or "") + "\n" + (completed.stderr or "")
+                )[-2000:]
+            except subprocess.TimeoutExpired as error:
+                exit_code = None
+                partial = error.stdout or ""
+                if isinstance(partial, bytes):
+                    partial = partial.decode("utf-8", "replace")
+                output_tail = (
+                    "timeout after {}s\n".format(entry["timeout_seconds"])
+                    + str(partial)
+                )[-2000:]
+            self._record_contract_test_execution(
+                snapshot, node_id, phase, entry, exit_code, output_tail,
+                worktree, active,
+            )
+            if phase == "expected_red":
+                # Red means any non-zero outcome (failure, timeout, missing
+                # command); only a clean pass violates the TDD contract.
+                if exit_code == 0:
+                    return (
+                        "invariant {} expected red before implementation, "
+                        "command passed ({!r})".format(
+                            entry["invariant_id"], entry["command"]
+                        )
+                    )
+                continue
+            if exit_code is None:
+                return "invariant {} command {!r} timed out after {}s".format(
+                    entry["invariant_id"], entry["command"], entry["timeout_seconds"]
+                )
+            if exit_code != 0:
+                return "invariant {} command {!r} exited with code {}".format(
+                    entry["invariant_id"], entry["command"], exit_code
+                )
+        return None
 
     def _worktree_path(self, current: Dict[str, Any]) -> Path:
         worktree_path = Path(str(current.get("worktree", ".")))
