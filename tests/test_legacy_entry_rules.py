@@ -32,6 +32,12 @@ LEGIT_LINES = (
     '`vibe resume/status` 轮询回收。',
     '- 派发前必须核对活跃桥 `adapter_id` 与当前宿主一致；不一致时切换后重跑 '
     '`vibe doctor --json` 确认 `provider_bridge.detected == true`。',
+    # "every" without "before starting" is a routine, not an entry gate.
+    '- 每次发版后用 `vibe doctor --json` 复核环境。',
+    # "before" scoped to one occasion, not to every task.
+    '- 发版前先跑 `vibe doctor --json` 确认环境。',
+    # An every-task gate that is not a vibe command.
+    '- 任何任务开始前先读 README 和 docs/。',
 )
 
 
