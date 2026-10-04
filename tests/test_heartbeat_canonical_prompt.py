@@ -146,6 +146,28 @@ class CliPrintsThePromptTests(unittest.TestCase):
             running = run_cli(args + ["--json"], root)
         self.assertIn("handoff", running.payload, "an unfinished watch still asks")
 
+    def test_monitor_watch_drops_a_hint_made_stale_by_registering(self):
+        """The shift can register while the watch runs; the hint computed
+        when it started must not ask again once it is done."""
+        root, run_id, _started = self.start()
+        paths = ProjectPaths(root)
+
+        def registered_then_failed(_supervisor):
+            register_supervisor_address(
+                paths, run_id,
+                {"provider": "codex", "session_id": "s-1", "host": "mac"},
+            )
+            snapshot = load_snapshot(paths, run_id)
+            snapshot.status = "failed"
+            return snapshot
+
+        args = ["monitor", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--watch", "--json"]
+        with mock.patch.object(Supervisor, "recover_or_start", return_value={"active_supervisors": ["me"]}), \
+                mock.patch.object(Supervisor, "watch", registered_then_failed):
+            done = run_cli(args, root)
+        self.assertEqual(done.payload.get("status"), "failed", done.payload)
+        self.assertNotIn("handoff", done.payload)
+
     def test_status_stays_quiet(self):
         root, run_id, _started = self.start()
         shown = run_cli(["status", "--plan", "probe-plan", "--run-id", run_id], root)
