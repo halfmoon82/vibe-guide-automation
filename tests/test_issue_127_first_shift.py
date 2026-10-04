@@ -111,6 +111,23 @@ class MonitorFirstShiftTests(unittest.TestCase):
         self.assertIsNotNone(again.payload.get("run_id"), again.text)
         self.assertNotIn("vibe supervisor-register", again.text)
 
+    def test_handoff_text_carries_the_host_difference(self):
+        """issue #127 建议 1 明确要求「含宿主差异说明」，不能只给两条命令。"""
+        _root, started = self._start()
+        self.assertIn("Codex", started.text)
+        self.assertIn("Claude Code", started.text)
+
+    def test_snapshot_text_is_a_plain_string_not_a_tuple(self):
+        """Review P2: the append touched this expression, so pin its shape.
+
+        It used to be a one-element tuple, and `main()` printed its repr --
+        users saw `('整合 Review 未闭合/不可验收',)`.  Pinned because a silent
+        revert to the tuple would otherwise leave the suite green.
+        """
+        _root, started = self._start()
+        self.assertIsInstance(started.text, str)
+        self.assertNotIn("('", started.text)
+
 
 if __name__ == "__main__":
     unittest.main()

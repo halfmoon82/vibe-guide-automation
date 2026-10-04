@@ -793,7 +793,11 @@ def _first_shift_handoff(paths: ProjectPaths, run_id: str) -> str:
     """
     try:
         address = current_supervisor_address(paths, run_id)
-    except (OSError, ValueError, TypeError):
+    except Exception:
+        # ISSUE-127 review (P3): a start-of-shift hint must never take the
+        # shift down.  Any failure to read the registry only means "we cannot
+        # prove it is registered", and re-printing the two duties is the safe
+        # direction -- never a silent pass.
         address = None
     if isinstance(address, dict) and address.get("status") == "ok":
         return ""
@@ -803,7 +807,8 @@ def _first_shift_handoff(paths: ProjectPaths, run_id: str) -> str:
         "--provider <平台> --session-id <本会话 id> --host <本机标识>\n"
         "  2) 自建心跳：用宿主平台原语建周期任务，心跳第一步固定跑 "
         "vibe supervisor-preflight --run-id {} --session-record <本会话记录路径>\n"
-        "没登记地址，worker 的完工唤醒信号无处可发；没心跳，rotate 的阈值检测不会发生。"
+        "没登记地址，worker 的完工唤醒信号无处可发；没心跳，rotate 的阈值检测不会发生。\n"
+        "宿主差异：Codex 桌面两条都能自动建；Claude Code 没有换班原语，心跳降级为兜底机制。"
     ).format(run_id, run_id)
 
 
