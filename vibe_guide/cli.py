@@ -1209,14 +1209,15 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             "changed": applied.changed,
             "paths": applied.paths,
         }
-        return _result(
-            SUCCESS,
-            payload,
+        summary = (
             rules_name + " 能力规则已生效"
             if applied.changed
-            else rules_name + " 能力规则无需变更",
-            args.as_json,
+            else rules_name + " 能力规则无需变更"
         )
+        if applied.notes:
+            payload["notes"] = list(applied.notes)
+            summary += "；请注意：" + "；".join(applied.notes)
+        return _result(SUCCESS, payload, summary, args.as_json)
 
     if args.command == "doctor":
         report = doctor(scan_project(paths))

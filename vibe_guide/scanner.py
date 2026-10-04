@@ -544,6 +544,95 @@ def missing_agentsmd_blocks(existing):
     return blocks
 
 
+_SHIPPED_RULE_MARKERS = (
+    CAPABILITY_RULE_MARKER,
+    PRD_GUIDE_MARKER,
+    VIBE_ENTRY_RULE_MARKER,
+    ENGINEERING_PRINCIPLES_MARKER,
+)
+_VIBE_ENTRY_COMMAND = re.compile(r'\bvibe\s+(?:doctor|plan|scan)\b')
+# A legacy entry rule makes a vibe command the gate for every task: it needs
+# both a "whatever the task" phrase and a "before starting" word.  Either alone
+# also matches ordinary prose ("派发前必须核对…然后重跑 vibe doctor").  The
+# quantifier must govern a task word, or "每次升级后" / "所有字段" would count.
+_EVERY_TASK = re.compile(
+    r'(?:任何|每个|每次|每条|所有)[^，。；,;]{0,15}?(?:任务|需求|请求|改动|工作|开发)'
+    r'|新任务|新需求|^[-*\s]*(?:开工|动手)前'
+    r'|\b(?:every|each|any|all)\b(?:\s+\w+){0,3}?\s+(?:tasks?|requests?|changes?)\b',
+    re.IGNORECASE,
+)
+_BEFORE_START = re.compile(
+    r'先跑|先运行|先执行|必须先|开始前|动手前|开工前|\bbefore\b|\bfirst\s+(?:for|on|before)\b',
+    re.IGNORECASE,
+)
+# A rule scoped to complex / S1>15 work says what New Session Entry says --
+# but only when the scope comes before the command; "每个任务先跑 vibe plan
+# 判断是否复杂任务" still gates every task.
+_SCOPED_TO_COMPLEX = re.compile(
+    r'S1\s*[>＞]|>\s*15|复杂(?:任务|需求|请求)|\bcomplex\s+(?:tasks?|requests?)',
+    re.IGNORECASE,
+)
+# "发版前都要先跑 vibe doctor" names one occasion, not every task.
+_NAMED_OCCASION = re.compile(r'(?:发版|派发|合并|提交|升级|上线|部署|PR)\s*[前后]')
+_CLAUSE_BREAK = re.compile(r'[；;。]')
+_FENCE = re.compile(r'(`{3,}|~{3,})')
+_HEADING = re.compile(r'#{1,6}\s+(.*)')
+
+
+def legacy_entry_rule_lines(content):
+    '''Return 1-based line numbers of entry rules that contradict New Session Entry.
+
+    Projects that used vibe before the entry block existed often carry a
+    hand-written "every task runs vibe doctor / vibe plan first" rule.  Once
+    the New Session Entry block ("<=15 does not touch vibe") is present the
+    host gets two opposite entry rules.  vibe never shipped that older text,
+    so it is found by wording, not fingerprint, one line at a time.  Code
+    fences and vibe's own rule sections are skipped; without a New Session
+    Entry block there is no conflict to report.
+    '''
+    if not content or VIBE_ENTRY_RULE_MARKER not in content:
+        return []
+    lines = []
+    fence = None
+    in_shipped = False
+    for number, line in enumerate(content.splitlines(), start=1):
+        stripped = line.strip()
+        opening = _FENCE.match(stripped)
+        if fence is None and opening:
+            fence = opening.group(1)
+            continue
+        if fence is not None:
+            # A fence closes only on the same character, at least as long.
+            if set(stripped) == {fence[0]} and len(stripped) >= len(fence):
+                fence = None
+            continue
+        heading = _HEADING.match(stripped)
+        if heading:
+            in_shipped = heading.group(1).startswith(_SHIPPED_RULE_MARKERS)
+            continue
+        if in_shipped:
+            continue
+        if any(_is_legacy_entry_clause(clause) for clause in _CLAUSE_BREAK.split(stripped)):
+            lines.append(number)
+    return lines
+
+
+def _is_legacy_entry_clause(clause):
+    command = _VIBE_ENTRY_COMMAND.search(clause)
+    if not command:
+        return False
+    # A complex/S1>15 scope or a named occasion qualifies the command only
+    # when it comes first: "每个任务先跑 vibe plan 判断是否复杂任务" still
+    # gates every task.
+    head = clause[:command.start()]
+    return bool(
+        _EVERY_TASK.search(clause)
+        and _BEFORE_START.search(clause)
+        and not _SCOPED_TO_COMPLEX.search(head)
+        and not _NAMED_OCCASION.search(head)
+    )
+
+
 def build_agentsmd_patch(existing, report):
     blocks = missing_agentsmd_blocks(existing)
     if not blocks:

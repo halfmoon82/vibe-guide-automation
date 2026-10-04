@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import re
 from .diagnostics import diagnose_skill, build_skill_reference_proposal, build_agentsmd_proposal, check_agents_contract
-from .scanner import WORKBUDDY_ORIGIN
+from .scanner import WORKBUDDY_ORIGIN, legacy_entry_rule_lines
 
 
 _PYTHON_VERSION = re.compile(r"Python\s+(\d+)\.(\d+)")
@@ -63,6 +63,15 @@ def doctor(report):
         issues.append('git unavailable')
     if not report.agentsmd_exists:
         issues.append('missing ' + (rules_file or 'AGENTS.md'))
+    # Outside its own marker blocks doctor read nothing, so an older
+    # "every task runs vibe first" rule sat beside New Session Entry and the
+    # check stayed green (#134).
+    legacy_entry_lines = legacy_entry_rule_lines(report.agentsmd_content)
+    for number in legacy_entry_lines:
+        issues.append(
+            (rules_file or 'AGENTS.md') + ' line ' + str(number)
+            + ': legacy entry rule conflicts with New Session Entry'
+        )
     if not report.knowledge_exists:
         issues.append('missing .vibe/knowledge')
     if report.skill_records_error:
@@ -81,7 +90,11 @@ def doctor(report):
             'version': report.python_version,
         },
         'git': {'available': git_available, 'version': report.git_version},
-        'rules': {'present': report.agentsmd_exists, 'file': rules_file},
+        'rules': {
+            'present': report.agentsmd_exists,
+            'file': rules_file,
+            'legacy_entry_lines': legacy_entry_lines,
+        },
         'knowledge': {'present': report.knowledge_exists},
         'skills': {
             'configured': configured_names,
