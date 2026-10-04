@@ -1929,9 +1929,11 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 )
             snapshot = supervisor.watch()
             # The watch runs to a terminal outcome, so the hint computed at
-            # the start can be stale by the time it is printed.
-            if getattr(snapshot, "status", None) == "complete":
-                handoff = ""
+            # the start can be stale by the time it is printed: the run may
+            # have completed, or the shift may have registered meanwhile.
+            handoff = _first_shift_handoff(
+                paths, args.plan, snapshot.run_id, getattr(snapshot, "status", None)
+            )
             return _snapshot_result("monitor", snapshot, args.as_json, "supervisor", handoff)
         return _snapshot_result("monitor", snapshot, args.as_json, "manual", handoff)
 
