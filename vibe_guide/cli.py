@@ -1928,6 +1928,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     args.as_json,
                 )
             snapshot = supervisor.watch()
+            # The watch runs to a terminal outcome, so the hint computed at
+            # the start can be stale by the time it is printed.
+            if getattr(snapshot, "status", None) == "complete":
+                handoff = ""
             return _snapshot_result("monitor", snapshot, args.as_json, "supervisor", handoff)
         return _snapshot_result("monitor", snapshot, args.as_json, "manual", handoff)
 

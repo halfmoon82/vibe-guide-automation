@@ -16,6 +16,8 @@ from vibe_guide.cli import run_cli
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.protocols import load_protocol
 from vibe_guide.monitor import Monitor
+from vibe_guide.state import load_snapshot
+from vibe_guide.supervisor import Supervisor
 from vibe_guide.supervisor import heartbeat_prompt, register_supervisor_address
 
 from tests.support_v45_authorize import publish_complex_probe
@@ -121,6 +123,28 @@ class CliPrintsThePromptTests(unittest.TestCase):
         # The same unregistered run, not finished, still asks.
         still = run_cli(args, root).text
         self.assertIn("vibe supervisor-register", still)
+
+    def test_monitor_watch_ending_complete_stays_quiet(self):
+        """The watch runs to a terminal outcome; a hint computed when it
+        started must not be printed once the run has finished."""
+        root, run_id, _started = self.start()
+        paths = ProjectPaths(root)
+
+        def finished(_supervisor):
+            snapshot = load_snapshot(paths, run_id)
+            snapshot.status = "complete"
+            return snapshot
+
+        args = ["monitor", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--watch"]
+        with mock.patch.object(Supervisor, "recover_or_start", return_value={"active_supervisors": ["me"]}), \
+                mock.patch.object(Supervisor, "watch", finished):
+            done = run_cli(args + ["--json"], root)
+        self.assertEqual(done.payload.get("status"), "complete", done.payload)
+        self.assertNotIn("handoff", done.payload)
+        with mock.patch.object(Supervisor, "recover_or_start", return_value={"active_supervisors": ["me"]}), \
+                mock.patch.object(Supervisor, "watch", lambda _s: load_snapshot(paths, run_id)):
+            running = run_cli(args + ["--json"], root)
+        self.assertIn("handoff", running.payload, "an unfinished watch still asks")
 
     def test_status_stays_quiet(self):
         root, run_id, _started = self.start()
