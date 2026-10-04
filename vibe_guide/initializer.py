@@ -11,6 +11,7 @@ from .scanner import (
     VIBE_ENTRY_RULE_MARKER,
     WORKBUDDY_ORIGIN,
     build_agentsmd_patch,
+    legacy_entry_rule_lines,
     missing_agentsmd_blocks,
     resolve_rules_file,
     scan_project,
@@ -594,7 +595,7 @@ def apply_agentsmd_proposal(paths, confirm):
         if section.splitlines()[0].strip() not in existing
     ]
     if not pending:
-        return InitResult(False, [])
+        return InitResult(False, [], _legacy_entry_notes(target.name, existing))
     proposal = "\n\n".join(pending) + "\n"
 
     if existing:
@@ -615,4 +616,20 @@ def apply_agentsmd_proposal(paths, confirm):
     finally:
         if temporary.exists():
             temporary.unlink()
-    return InitResult(True, [target.name])
+    return InitResult(True, [target.name], _legacy_entry_notes(target.name, content))
+
+
+def _legacy_entry_notes(name, content):
+    """Point at older entry rules that now contradict New Session Entry.
+
+    Appending the entry block is what creates the conflict, yet the user's
+    own text is theirs to change (AGENTS.md §7), so this only names the lines.
+    """
+    lines = legacy_entry_rule_lines(content)
+    if not lines:
+        return []
+    return [
+        name + ' 第 ' + '、'.join(str(number) for number in lines) + ' 行'
+        '仍要求每个任务先跑 vibe，与 New Session Entry（<=15 不触碰 vibe）冲突；'
+        'vibe 不改写已有内容，请人工删除或改写这些旧入口规则。'
+    ]
