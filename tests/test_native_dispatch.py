@@ -47,6 +47,38 @@ class NativeDispatchTests(unittest.TestCase):
         manifest = AdapterRegistry().get("claude-code").manifest
         self.assertIs(manifest["native_control_plane"], True)
 
+    def test_workbuddy_visible_after_observed_native_lifecycle_facts(self):
+        """Observed lifecycle facts, not the adapter id, decide visibility."""
+        env = Environment(commands={"workbuddy.agent": True}, facts={
+            "workbuddy.shell": True, "workbuddy.subprocess": True,
+            "workbuddy.worktree": True, "workbuddy.visible_task.create": True,
+            "workbuddy.visible_task.enter": True,
+            "workbuddy.visible_task.resume": True,
+            "workbuddy.visible_task.wait": True,
+        })
+        caps = AdapterRegistry().get("workbuddy").detect(env).capabilities
+        self.assertEqual(caps.mode, "visible")
+        self.assertEqual(caps.provider, "workbuddy-visible")
+        self.assertTrue(caps.create_task and caps.enter_task and caps.resume_task and caps.wait_task)
+
+    def test_workbuddy_manifest_declares_native_control_plane(self):
+        """WorkBuddy declares its own control plane; the flag was simply missing."""
+        manifest = AdapterRegistry().get("workbuddy").manifest
+        self.assertIs(manifest["native_control_plane"], True)
+
+    def test_codex_manifest_declares_native_control_plane(self):
+        """Removing the `id == 'codex'` default must not silently drop Codex."""
+        manifest = AdapterRegistry().get("codex").manifest
+        self.assertIs(manifest["native_control_plane"], True)
+
+    def test_the_adapter_id_no_longer_grants_a_native_control_plane(self):
+        """Regression: `id == 'codex'` used to be the only way to be visible."""
+        from vibe_guide.adapters.base import ManifestAdapter
+
+        manifest = dict(AdapterRegistry().get("codex").manifest)
+        manifest.pop("native_control_plane")
+        self.assertIs(ManifestAdapter(manifest).manifest["native_control_plane"], False)
+
 
 class DispatchTopologyRulingWiringTests(unittest.TestCase):
     """ISSUE-04: the CLI hands the observed platform ruling to the monitor."""

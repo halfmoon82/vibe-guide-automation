@@ -66,9 +66,10 @@ NATIVE_TOOL_MAP: Dict[str, Dict[str, str]] = {
         "resume": "ccd_session_mgmt__send_message",
         "wait": "ccd_session_mgmt__list_events",
     },
-    # Registered, not yet reachable: the workbuddy manifest has no native
-    # control plane until a real session has run these, so detect() never
-    # hands out this provider.
+    # Reachable once a WorkBuddy session attests its full visible lifecycle:
+    # `workbuddy.yaml` declares the native control plane since 5.0.2.  The
+    # mailbox request is emitted either way; actually running these tool names
+    # still needs the session-side bridge that exposes them.
     WORKBUDDY_VISIBLE_PROVIDER: {
         "create": "workbuddy_job__create",
         "locate": "workbuddy_job__get",

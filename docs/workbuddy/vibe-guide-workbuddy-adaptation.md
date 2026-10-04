@@ -10,6 +10,17 @@
 > 4. 带 `workbuddy` 以外 `origin` 的 skill 记录不再 fail-closed，而是按原有 GitHub 规则（来源 + 提交 SHA）校验。
 >
 > 下文凡是和这四项矛盾的描述（"已解""PASS""level=full" 等），都只代表原方案。
+>
+> **2026-10-03 更正（v5.0.2，本条推翻上表第 1 项）**：D 组现已落地——`workbuddy.yaml`
+> 声明 `native_control_plane: true`，且 `base.py` 的 `id == "codex"` 硬编码默认值已改为
+> fail-closed 的 `False`（`codex.yaml` 显式补声明，行为不变）。撤回理由针对的是**派发**
+> 未验证，但发布门禁共用同一标志，副作用是复杂计划在 WorkBuddy 上结构性无法发布；
+> 同一处遗漏此前已为 claude-code 修过一次（`8317729`）。
+>
+> 第六节末尾「补 flag 解不了派发门禁」仍然成立（那是另一道门，见 changes-summary E 组），
+> 但「发布门禁未解」的结论已失效。声明 ≠ 可用性：四项 `visible_task.*` 事实缺一项仍是
+> `guide`。最后一环（会话侧暴露 `workbuddy_job__*`）**已由 v5.0.2 随包提供的 MCP server
+> 补上**（`vibe_guide/mcp_servers/workbuddy_jobs.py`），不再是缺口，见第八节。
 
 ---
 
@@ -287,6 +298,19 @@ daemon stop → Daemon stopped.
 这是**纯新增、不改现有行为**，且全部基于官方公开接口，不构成伪造能力。
 需要确认：是否要让 vibe 自动拉起/停掉 daemon（涉及常驻进程与认证凭据）。
 
+> **2026-10-03 更新（v5.0.2，macOS 实测）**：上述映射表已由 E 组落地；
+> "谁来调这些工具"这一环也已补上——随包发布 `vibe_guide/mcp_servers/workbuddy_jobs.py`
+> （stdio MCP server，server 名 `workbuddy_job`，暴露 create/get/list/reply/wait 五个工具，
+> 打 `codebuddy --serve` 的 `/api/v1/*`）。注册、实测端点差异与当前阻断见
+> [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md)。
+> 结论修订：**执行体已存在**，剩下的不是"要不要写"，而是宿主侧两件事——
+> ① 在连接器管理页对 `workbuddy_job` 点"信任"；② `POST /api/v1/jobs` 被宿主
+> **safe-delete 批量守卫**拦下的 500。注意 ② 的机制已更正：**不是**沙箱 `delete: ask`
+> 规则（实测该 settings 里没有任何一条匹配 `~/.workbuddy-ai/jobs/`），而是宿主 shim
+> `safe-delete-bulk-guard.cjs` 按**回合**计的删除额度（本机阈值 50）被打满——跑全量测试
+> 是主要消耗方，换回合即归零。完整机制见
+> [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md) §5。
+
 ---
 
 ## 九、收尾复验：PATH 真写入后 doctor 全绿
@@ -334,4 +358,4 @@ bridge 为 null。**这不阻塞规划/发布/授权**，只影响自动派发�
 |---|---|
 | 引擎 / doctor / 规则文件 / skill 供给 | **全绿**（`issues: []`，exit 0） |
 | 复杂任务规划 → 发布 → 授权 | **可用**（十节点门禁实测通过） |
-| 自动派发并行会话 | **不可用**（vibe 未接入；WorkBuddy 侧能力已确认存在） |
+| 自动派发并行会话 | **执行体已补**（v5.0.2 随包 `workbuddy_job` MCP server；2026-10-03 macOS 实测五工具可用）。待宿主信任 + 解决 safe-delete 500，见 [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md) |
