@@ -556,7 +556,7 @@ _VIBE_ENTRY_COMMAND = re.compile(r'\bvibe\s+(?:doctor|plan|scan)\b')
 # also matches ordinary prose ("派发前必须核对…然后重跑 vibe doctor").  The
 # quantifier must govern a task word, or "每次升级后" / "所有字段" would count.
 _EVERY_TASK = re.compile(
-    r'(?:任何|每个|每次|每条|所有)[^，。；,;]{0,15}?(?:任务|需求|请求|改动|工作|开发(?!者))'
+    r'(?:任何|每个|每次|每条|所有)[^，。；,;]{0,15}?(?:任务|需求|请求|改动|工作|开发)'
     r'|新任务|新需求|^[-*\s]*(?:开工|动手)前'
     r'|\b(?:every|each|any|all)\b(?:\s+\w+){0,3}?\s+(?:tasks?|requests?|changes?)\b',
     re.IGNORECASE,
