@@ -12,6 +12,26 @@ Python 环境：`%USERPROFILE%\.workbuddy\binaries\python\envs\default`
 > 4. 带 `workbuddy` 以外 `origin` 的 skill 记录不再 fail-closed，而是按原有 GitHub 规则（来源 + 提交 SHA）校验。
 >
 > 下文凡是和这四项矛盾的描述（"已解""PASS""level=full" 等），都只代表原方案。
+>
+> **2026-10-03 更正（v5.0.2，本条推翻上表第 1 项）**：`workbuddy.yaml` 现已声明
+> `native_control_plane: true`，同时把 `base.py` 里 `id == "codex"` 的硬编码默认值
+> 改成 fail-closed 的 `False`（`codex.yaml` 显式补声明）。撤回理由（"Jobs API 还没在
+> 真实会话里跑通"）针对的是**派发**，而发布门禁用的是同一个标志，导致 WorkBuddy 上
+> 复杂计划**结构性无法发布**——这是漏改，不是设计。同一处遗漏此前已为 claude-code
+> 修过一次（`8317729`）。
+>
+> 分层结论（与 E 组、第八节一致）：**发布 / 授权 / 信箱写请求已可用**。
+>
+> **2026-10-03 二次更正（同属 v5.0.2）**：上面这句原本接的是"最后一环仍需会话侧暴露
+> `workbuddy_job__*` 的 MCP server"——**该 server 已随包提供**：
+> `vibe_guide/mcp_servers/workbuddy_jobs.py`（纯标准库 stdio server，server 名
+> `workbuddy_job`，暴露 `create`/`get`/`list`/`reply`/`wait` 五个工具，与
+> `provider_action.py` 的 `NATIVE_TOOL_MAP` 由测试钉死一致）。注册方法与实测差异见
+> `workbuddy-job-mcp-server.md`。因此"需要一个 MCP server"不再是缺口。
+>
+> 仍然成立的是"**声明 ≠ 可用性**"：四项 `visible_task.*` 事实缺一项仍是 `guide`，
+> fail-closed 未放松；且宿主要先对 `workbuddy_job` 连接器点"信任"，工具才会出现在会话里。
+> 本文 §0"一句话结论"与第八节的"还没有叫这些名字的工具"是 5.0.2 之前的存档描述。
 
 ---
 
@@ -225,7 +245,7 @@ Codex（`codex_app__create_thread` / `navigate_to_codex_page` / `wait_threads` /
 |---|---|---|---|
 | 发布门禁 | `cli.py:308-313` → `base.py:252-255` | `native_control_plane` | **已解**（D 组） |
 | 派发门禁 | `provider_action.py:48` `NATIVE_TOOL_MAP` | provider 是否在表内 | **已解**（E 组） |
-| 执行门禁 | 桌面会话里有没有这个工具 | MCP server 是否装并信任 | **未解**（下一步） |
+| 执行门禁 | 桌面会话里有没有这个工具 | MCP server 是否装并信任 | **已提供**（v5.0.2 随包 `vibe_guide/mcp_servers/workbuddy_jobs.py`，见 [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md)）；待宿主"信任"+解决 safe-delete 阻断 |
 
 失败模式是干净的：明确报错 + 隔离节点，不会伪装成功、不会傻等。
 E 组之后变成"请求已入信箱、等待被取走"，同样不会伪装成功。
