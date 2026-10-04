@@ -21,6 +21,7 @@ from .protocols import (
     PRD_GUIDE_PROPOSAL_RELATIVE,
     VIBE_ENTRY_NAME,
     VIBE_ENTRY_PROPOSAL_RELATIVE,
+    is_shipped_protocol,
     load_protocol,
 )
 from .capability_contract import build_contract, contract_path, load_contract, save_contract
@@ -196,6 +197,53 @@ def _atomic_write_text(path, text):
             os.unlink(temporary_name)
 
 
+PROTOCOL_COPIES = (
+    (PRD_GUIDE_PROPOSAL_RELATIVE, PRD_GUIDE_NAME),
+    (VIBE_ENTRY_PROPOSAL_RELATIVE, VIBE_ENTRY_NAME),
+)
+
+
+def refresh_protocol_copy(root, relative, name):
+    """Replace a project's protocol copy when it is an unedited old release.
+
+    Returns ``refreshed``, ``current``, ``edited``, ``unreadable`` or
+    ``skipped`` (missing, or reached through a symlink).  Only a byte-exact
+    match against a shipped digest is replaced: such a copy cannot hold a
+    local edit, while anything else might.
+    """
+    root = Path(root)
+    copy = root / relative
+    step = root
+    for part in Path(relative).parts:
+        step = step / part
+        if step.is_symlink():
+            return 'skipped'
+    if not copy.is_file():
+        return 'skipped'
+    try:
+        text = copy.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError):
+        return 'unreadable'
+    shipped = load_protocol(name)
+    if text == shipped:
+        return 'current'
+    if not is_shipped_protocol(name, text):
+        return 'edited'
+    mode = copy.stat().st_mode & 0o777
+    _atomic_write_text(copy, shipped)
+    os.chmod(copy, mode)
+    return 'refreshed'
+
+
+def refresh_protocol_copies(root):
+    """Refresh every unedited old protocol copy; return the replaced paths."""
+    return [
+        relative
+        for relative, name in PROTOCOL_COPIES
+        if refresh_protocol_copy(root, relative, name) == 'refreshed'
+    ]
+
+
 def init_project(paths, confirm):
     if not confirm:
         return InitResult(False, [])
@@ -333,38 +381,31 @@ def init_project(paths, confirm):
         )
         created.append(str(skill_proposal.relative_to(root)))
     # Both protocols are vibe's own, shipped with the package; each is
-    # proposed into the project so the host agent finds it, and never
-    # rewritten once present so user edits survive re-initialization.
-    for relative, name in (
-        (PRD_GUIDE_PROPOSAL_RELATIVE, PRD_GUIDE_NAME),
-        (VIBE_ENTRY_PROPOSAL_RELATIVE, VIBE_ENTRY_NAME),
-    ):
+    # proposed into the project so the host agent finds it.  Once present a
+    # copy is only replaced when it is an unedited earlier release, so user
+    # edits survive re-initialization.
+    for relative, name in PROTOCOL_COPIES:
         copy = root / relative
         if not copy.exists():
             copy.parent.mkdir(parents=True, exist_ok=True)
             _write_new(copy, load_protocol(name))
             created.append(relative)
             continue
-        if not copy.is_file() or copy.is_symlink():
-            continue
-        try:
-            current = copy.read_text(encoding='utf-8')
-        except (OSError, UnicodeDecodeError):
-            current = None
-        if current is None:
+        outcome = refresh_protocol_copy(root, relative, name)
+        if outcome == 'refreshed':
+            created.append(relative)
+        elif outcome == 'unreadable':
             notes.append(
                 relative
-                + ' 读不出来，本次跳过一致性比对；vibe 永不改写该文件，请人工核对。'
+                + ' 读不出来，本次跳过一致性比对；vibe 不改写该文件，请人工核对。'
             )
-        elif current != load_protocol(name):
-            # The copy is never rewritten, so a difference stays silent
-            # forever unless surfaced here.  The cause is ambiguous -- a
-            # local edit or a shipped-protocol update -- so the note says
-            # both and leaves the merge to a human.
+        elif outcome == 'edited':
+            # Not any version vibe shipped, so it carries a local edit; the
+            # difference stays silent forever unless surfaced here.
             notes.append(
                 relative
-                + ' 与随包协议不一致：可能是本地修改，也可能是随包协议已更新；'
-                + 'vibe 永不改写该文件，请人工 diff 后手动合并。'
+                + ' 与随包协议不一致，且不是任何已发布版本的原样（多半是本地修改）；'
+                + 'vibe 不改写该文件，请人工 diff 后手动合并。'
             )
     # The AGENTS.md entry block has the same silent-staleness gap: marker
     # detection only answers "a block is present", never "it is current",

@@ -24,7 +24,7 @@ from .adapters.task_provider import ProviderActionStore, ProviderPending
 from .config import load_project_config
 from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import doctor
-from .initializer import _rules_target, apply_agentsmd_proposal, init_project
+from .initializer import _rules_target, apply_agentsmd_proposal, init_project, refresh_protocol_copies
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import Monitor
 from .supervisor import (
@@ -909,7 +909,44 @@ def _run_id(directory: Path, requested: Optional[str]) -> str:
     return value
 
 
+#: Commands that start or continue work and may already write under .vibe.
+#: scan, status and --print-protocol stay read-only; init refreshes itself.
+_PROTOCOL_REFRESH_COMMANDS = {"plan", "monitor", "resume"}
+
+
 def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
+    # A package upgrade runs no project code, so an unedited protocol copy
+    # left by an earlier release is brought current on the next working
+    # command instead.
+    refreshed: List[str] = []
+    try:
+        args = _parser().parse_args(list(argv))
+    except SystemExit:
+        args = None
+    if (
+        args is not None
+        and not args.show_help
+        and args.command in _PROTOCOL_REFRESH_COMMANDS
+        and not (args.command == "plan" and args.print_protocol)
+    ):
+        try:
+            refreshed = refresh_protocol_copies(ProjectPaths.from_cwd(Path(cwd)).root)
+        except (OSError, ValueError):
+            refreshed = []
+    result = _run_cli(argv, cwd, runner)
+    if refreshed:
+        result = CLIResult(
+            result.exit_code,
+            {**result.payload, "protocol_refreshed": refreshed},
+            result.text
+            + "\n已把旧版协议副本刷新为当前版本（未发现本地修改）："
+            + "、".join(refreshed),
+            result.as_json,
+        )
+    return result
+
+
+def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     parser = _parser()
     try:
         args = parser.parse_args(list(argv))
