@@ -132,7 +132,10 @@ class Gateway:
     """One HTTP gateway, either supplied by env or started on first use.
 
     A started gateway is owned by this object and stopped by :meth:`close`.
-    The password it prints is held in memory only and never logged.
+    The password it prints is read out of the CLI's own startup log, held in
+    memory only, and never echoed back to a caller: the temporary log is
+    removed on every exit path, and a failed banner read reports its shape
+    rather than its text.
     """
 
     def __init__(
@@ -230,8 +233,14 @@ class Gateway:
                     raise
                 if banner["endpoint"] and banner["password"]:
                     break
-                last_diagnostic = _banner_shape(log)
-                _stop(process)
+                # Reading the diagnostic can fail too, and it must not become a
+                # second way to leave the gateway we started running.
+                try:
+                    last_diagnostic = _banner_shape(log)
+                except Exception:
+                    last_diagnostic = "banner unreadable"
+                finally:
+                    _stop(process)
             else:
                 raise GatewayError(
                     "gateway did not report an endpoint and password (%s); "
@@ -516,6 +525,11 @@ def _validate_arguments(name: str, supplied: Mapping[str, Any]) -> None:
         if required not in supplied:
             raise ToolError("missing required argument for %s: %s" % (name, required))
     for key, value in supplied.items():
+        # An explicit null means "not provided" for an optional argument; the
+        # operations already treat it that way, and some clients send it rather
+        # than omitting the key.
+        if value is None:
+            continue
         declared = properties.get(key, {}).get("type")
         expected = _JSON_TYPES.get(declared or "")
         if expected is None:

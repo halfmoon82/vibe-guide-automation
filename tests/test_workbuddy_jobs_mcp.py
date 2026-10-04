@@ -31,6 +31,31 @@ from vibe_guide.providers import WORKBUDDY_VISIBLE_PROVIDER
 from vibe_guide.runners.provider_action import NATIVE_TOOL_MAP
 
 
+#: A fake gateway whose TERM trap is observable.  It reaps its own background
+#: sleep, records that it was asked to stop, and only then announces readiness
+#: -- so a test can fail the banner read at a point where a clean shutdown is
+#: genuinely observable instead of racing the shell's own start-up.
+_SLOW_CLI = (
+    "#!/bin/sh\n"
+    "sleep 30 &\n"
+    "SLEEP_PID=$!\n"
+    "trap 'kill \"$SLEEP_PID\" 2>/dev/null; echo term > \"%s\"; exit 0' TERM\n"
+    "echo ready > \"%s\"\n"
+    "echo 'nothing useful here'\n"
+    "wait\n"
+)
+
+
+def _await_ready(path, timeout=5.0):
+    """Wait for a marker file, returning whether it showed up in time."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.02)
+    return path.exists()
+
+
 class FakeGateway:
     """Records calls and replays canned payloads; never touches the network."""
 
@@ -157,6 +182,19 @@ class JsonRpcSurfaceTests(unittest.TestCase):
              "params": {"protocolVersion": "9999-01-01"}},
         )
         self.assertEqual(response["result"]["protocolVersion"], module.PROTOCOL_VERSION)
+
+    def test_an_explicit_null_optional_argument_counts_as_absent(self):
+        # Some clients send null rather than omitting an optional key; that is
+        # not the same as passing the wrong type.
+        gateway = FakeGateway({("GET", "/api/v1/jobs"): {"jobs": []}})
+        jobs = WorkBuddyJobs(gateway=gateway)
+        response = handle_message(
+            jobs,
+            {"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+             "params": {"name": "list", "arguments": {"cwd": None, "include_all": None}}},
+        )
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(gateway.calls[-1]["path"], "/api/v1/jobs")
 
     def test_parse_errors_and_non_objects_are_reported(self):
         stdout = io.StringIO()
@@ -333,36 +371,39 @@ class GatewayTransportTests(unittest.TestCase):
             marker = Path(tmp) / "terminated"
             ready = Path(tmp) / "ready"
             script = Path(tmp) / "slow-cli"
-            # The script announces that its TERM trap is installed, so the test
-            # can fail the banner read at a point where a clean shutdown is
-            # observable rather than racing the shell's own start-up.
-            script.write_text(
-                "#!/bin/sh\n"
-                'trap \'echo term > "%s"; exit 0\' TERM\n'
-                'echo ready > "%s"\n'
-                "echo 'nothing useful here'\n"
-                "sleep 30 &\n"
-                "wait\n" % (marker, ready),
-                encoding="utf-8",
-            )
+            script.write_text(_SLOW_CLI % (marker, ready), encoding="utf-8")
             script.chmod(script.stat().st_mode | stat.S_IEXEC)
 
             def fail_once_the_gateway_is_up(*_args, **_kwargs):
-                for _ in range(250):
-                    if ready.exists():
-                        break
-                    time.sleep(0.02)
+                _await_ready(ready)
                 raise RuntimeError("boom")
 
             gateway = Gateway(cli=str(script), startup_timeout=15.0)
             with mock.patch.object(module, "_plain", side_effect=fail_once_the_gateway_is_up):
                 with self.assertRaises(RuntimeError):
                     gateway.ensure()
-            for _ in range(150):
-                if marker.exists():
-                    break
-                time.sleep(0.02)
-            self.assertTrue(marker.exists(), "the started gateway was left running")
+            self.assertTrue(_await_ready(marker), "the started gateway was left running")
+            self.assertFalse(gateway.started)
+
+    def test_a_failure_while_shaping_the_banner_also_stops_the_gateway(self):
+        # Reading the diagnostic happens outside the polling loop; if it can
+        # throw, it becomes a second way to orphan the gateway.
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "terminated"
+            ready = Path(tmp) / "ready"
+            script = Path(tmp) / "slow-cli"
+            script.write_text(_SLOW_CLI % (marker, ready), encoding="utf-8")
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+
+            def fail_once_the_gateway_is_up(*_args, **_kwargs):
+                _await_ready(ready)
+                raise OSError("banner unreadable")
+
+            gateway = Gateway(cli=str(script), startup_timeout=1.0)
+            with mock.patch.object(module, "_banner_shape", side_effect=fail_once_the_gateway_is_up):
+                with self.assertRaises(GatewayError):
+                    gateway.ensure()
+            self.assertTrue(_await_ready(marker), "the started gateway was left running")
             self.assertFalse(gateway.started)
 
     def test_http_errors_carry_the_status_and_body(self):
