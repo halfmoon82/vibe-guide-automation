@@ -31,6 +31,10 @@ from .supervisor import (
     Supervisor,
     current_supervisor_address,
     register_supervisor_address,
+    release_supervisor_hold,
+    set_supervisor_hold,
+    supervisor_handoff,
+    supervisor_holds,
     heartbeat_prompt,
     supervisor_preflight,
 )
@@ -102,7 +106,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy", "skill-install", "supervisor-preflight", "supervisor-register", "supervisor-address", "worker-deliver"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy", "skill-install", "supervisor-preflight", "supervisor-register", "supervisor-address", "supervisor-hold", "supervisor-handoff", "worker-deliver"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -135,6 +139,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--session-id", dest="session_id")
     parser.add_argument("--host", dest="supervisor_host")
     parser.add_argument("--token-threshold", dest="token_threshold", type=int, default=None)
+    parser.add_argument("--reason", dest="hold_reason")
+    parser.add_argument("--release", action="store_true", dest="hold_release")
     parser.add_argument("--node", dest="node_id")
     parser.add_argument("--role", dest="role", default="developer")
     parser.add_argument("--payload", dest="worker_payload")
@@ -813,7 +819,10 @@ def _first_shift_handoff(
     return (
         "首班监工还有两件事没做，做完才算开工：\n"
         "  1) 登记地址：vibe supervisor-register --run-id {} "
-        "--provider <平台> --session-id <本会话 id> --host <本机标识>\n"
+        "--provider <平台> --session-id <本会话 id> --host <本机标识> "
+        "--session-record <本会话记录路径>\n"
+        "     <本会话记录路径> 是本会话自己的日志文件（Codex 为 ~/.codex/sessions/…/rollout-…-<本会话 id>.jsonl，"
+        "Claude Code 为 ~/.claude/projects/<项目>/<本会话 id>.jsonl），不要另写记录文件。\n"
         "  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n"
         "{}\n"
         "没登记地址，worker 的完工唤醒信号无处可发；没心跳，rotate 的阈值检测不会发生。\n"
@@ -1111,10 +1120,40 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "provider": args.supervisor_provider,
                 "session_id": args.session_id,
                 "host": args.supervisor_host,
-            })
+            }, session_record=args.session_record)
         except (TypeError, ValueError, OSError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "登记失败：" + str(error), args.as_json)
-        return _result(SUCCESS, {"command": args.command, "status": "ok", "current": entry}, "监工地址已登记", args.as_json)
+        text = "监工地址已登记"
+        if "baseline_context" in entry:
+            text += "；接班起点 {} token，换班按此后增长计算".format(entry["baseline_context"])
+        else:
+            text += "；未记下接班起点（{}），换班按绝对阈值计算".format(
+                "会话记录读不到" if args.session_record else "没给 --session-record")
+        return _result(SUCCESS, {"command": args.command, "status": "ok", "current": entry}, text, args.as_json)
+
+    if args.command == "supervisor-hold":
+        if not (args.run_id and args.node_id):
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id and --node required"}, "缺少 --run-id 或 --node", args.as_json)
+        try:
+            if args.hold_release:
+                released = release_supervisor_hold(paths, args.run_id, args.node_id)
+                holds = supervisor_holds(paths, args.run_id)
+                text = ("已解除挂起：" if released else "该节点没有挂起：") + args.node_id
+            else:
+                holds = set_supervisor_hold(paths, args.run_id, args.node_id, args.hold_reason)
+                text = "已挂起 {} 等人拍板：{}".format(args.node_id, holds[args.node_id]["reason"])
+        except (FileNotFoundError, TypeError, ValueError, OSError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "挂起失败：" + str(error), args.as_json)
+        return _result(SUCCESS, {"command": args.command, "status": "ok", "holds": holds}, text, args.as_json)
+
+    if args.command == "supervisor-handoff":
+        if not args.run_id:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        try:
+            payload, text = supervisor_handoff(paths, args.run_id)
+        except (FileNotFoundError, TypeError, ValueError, OSError) as error:
+            return _result(UNKNOWN, {"command": args.command, "status": "unknown", "reason": str(error)}, "交接信息读不到：" + str(error), args.as_json)
+        return _result(SUCCESS, {"command": args.command, **payload}, text, args.as_json)
 
     if args.command == "supervisor-address":
         if not args.run_id:

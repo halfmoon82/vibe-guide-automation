@@ -74,8 +74,10 @@ vibe monitor --plan <ID> --authorize AUTHORIZE     启动监工；没有精确�
 vibe status --plan <ID>                      读取当前快照，不轮询外部 provider
 vibe resume --plan <ID>                      从快照、任务登记和事件证据继续
 vibe skill-install --source <GitHub> --sha <40hex> --name <名> [--subdir <子目录>] --confirm   按完整 SHA 拉取 GitHub skill，校验 subdir 合法性后物化到 .vibe/proposals/skills/<名>/ 并在 .vibe/config.json 登记；subdir 含 ..、绝对路径、首尾 / 或非法字符时拒绝且不落盘
-vibe supervisor-preflight --run-id <run> --session-record <file>   监工心跳预检，只读磁盘，输出 idle/work/rotate/unknown
-vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h>   原子登记当前监工地址（保留历史，不含凭据）
+vibe supervisor-preflight --run-id <run> --session-record <file>   监工心跳预检，只读磁盘，输出 idle/work/rotate/unknown；<file> 直接用本会话日志（Codex rollout / Claude Code jsonl）
+vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> [--session-record <file>]   原子登记当前监工地址（保留历史，不含凭据）；给了日志就记下接班起点，换班按此后增长计算
+vibe supervisor-hold --run-id <run> --node <id> --reason <原因> [--release]   登记/解除"节点等人拍板"，预检据此判为空闲
+vibe supervisor-handoff --run-id <run>             打印接班所需的全部内容（进度、等人事项、心跳指令、步骤），换班时新会话只跑这一条
 vibe supervisor-address --run-id <run>             查询当前监工地址；未登记返回 unknown
 vibe worker-deliver --run-id <run> --node <id> --generation <n> --payload '<json>'   worker 在主项目目录自报交付（嵌套 delivery_evidence），格式错误当场返回
 ```
