@@ -75,6 +75,44 @@ TOKEN_ENV = "WORKBUDDY_JOB_TOKEN"
 CLI_ENV = "WORKBUDDY_CLI"
 AUTOSTART_ENV = "WORKBUDDY_JOB_AUTOSTART"
 
+#: The host's safe-delete broker wiring.  WorkBuddy injects these into every
+#: process it starts, and the shim they activate routes each delete through an
+#: IPC broker that only honours deletions approved for an *agent tool call*.
+#: A gateway started from here is not such a call, so the broker answers
+#: ``denied`` and the shim fails closed: ``POST /api/v1/jobs`` returns HTTP 500
+#: while cleaning up the lock directory it just made for the new job, and leaves
+#: an empty ``<job>.state.lock.guard`` behind.  Withdrawing the wiring makes
+#: ``hasBrokerDeleteEnv()`` false, so the shim takes its trash fallback instead
+#: of refusing.
+#:
+#: Measured 2026-10-05 on WorkBuddy AI (macOS, CLI 2.147.0): with the host env
+#: intact, an ``fs.rmdirSync`` under ``~/.workbuddy-ai/jobs/.locks`` raises
+#: ``[safe-delete] broker denied delete`` and leaves the directory behind; with
+#: these five variables removed the same call succeeds.
+BROKER_ENV_VARS: Tuple[str, ...] = (
+    "CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS",
+    "CODEBUDDY_SANDBOX_BROKER_SESSION_ID",
+    "CODEBUDDY_SANDBOX_HOST_FILE_OPERATION_COMMAND",
+    "CODEBUDDY_SANDBOX_BROKER_TOOL_CALL_ID",
+    "CODEBUDDY_SANDBOX_BROKER_TRACE_ID",
+)
+
+
+def _gateway_env() -> Dict[str, str]:
+    """The environment a gateway we start should see.
+
+    Keeps everything the CLI needs to run, minus the host's safe-delete broker
+    wiring.  That broker authorises deletes per *agent tool call*, and a
+    gateway started here has no such call to point at, so every cleanup it
+    performs on the job directory is refused and the create fails after the
+    job was already written.  Without the broker the shim falls back to its
+    trash path, which succeeds.
+    """
+    env = dict(os.environ)
+    for name in BROKER_ENV_VARS:
+        env.pop(name, None)
+    return env
+
 
 class GatewayError(RuntimeError):
     """The WorkBuddy control plane is unreachable or refused the request."""
@@ -207,6 +245,11 @@ class Gateway:
                         [cli, "--serve", "--host", "127.0.0.1", "--port", str(port)],
                         stdout=sink,
                         stderr=subprocess.STDOUT,
+                        # The gateway cleans up its own job-directory locks as
+                        # part of `create`; the host's delete broker would
+                        # refuse that and turn a successful create into an
+                        # HTTP 500.  See BROKER_ENV_VARS.
+                        env=_gateway_env(),
                     )
                 banner = {"endpoint": "", "password": ""}
                 try:

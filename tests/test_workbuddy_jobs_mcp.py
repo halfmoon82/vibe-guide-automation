@@ -473,5 +473,72 @@ class GatewayTransportTests(unittest.TestCase):
         self.assertEqual(gateway.call("GET", "/api/v1/jobs"), {"jobs": []})
 
 
+class GatewayEnvironmentTests(unittest.TestCase):
+    """A gateway we start must not inherit the host's safe-delete broker.
+
+    WorkBuddy injects that broker wiring into every process it starts, and the
+    shim it activates only honours a delete approved for an *agent tool call*.
+    A gateway started from this module is not such a call, so with the wiring
+    intact its own lock cleanup is refused and `POST /api/v1/jobs` answers
+    HTTP 500 after the job has already been written -- leaving an empty
+    `<job>.state.lock.guard` behind.  Measured 2026-10-05 on WorkBuddy AI
+    (macOS, CLI 2.147.0).
+    """
+
+    def test_broker_wiring_is_stripped(self):
+        planted = {name: "planted-" + name for name in module.BROKER_ENV_VARS}
+        with mock.patch.dict(os.environ, planted, clear=False):
+            env = module._gateway_env()
+        for name in module.BROKER_ENV_VARS:
+            self.assertNotIn(name, env)
+
+    def test_every_variable_the_broker_gate_needs_is_covered(self):
+        # `hasBrokerDeleteEnv()` in the host shim needs the socket address, the
+        # session id and the command.  Dropping only some of them would leave
+        # the gate open, so pin the trio explicitly rather than trusting the
+        # tuple to stay complete.
+        self.assertIn("CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS", module.BROKER_ENV_VARS)
+        self.assertIn("CODEBUDDY_SANDBOX_BROKER_SESSION_ID", module.BROKER_ENV_VARS)
+        self.assertIn("CODEBUDDY_SANDBOX_HOST_FILE_OPERATION_COMMAND", module.BROKER_ENV_VARS)
+
+    def test_unrelated_variables_survive(self):
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=False):
+            env = module._gateway_env()
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+
+    def test_the_started_gateway_really_cannot_see_the_broker(self):
+        # End-to-end: plant the wiring, start a gateway, then read the
+        # environment the child actually received.
+        with tempfile.TemporaryDirectory() as tmp:
+            dump = Path(tmp) / "child-env.txt"
+            script = Path(tmp) / "env-cli"
+            script.write_text(
+                "#!/bin/sh\n"
+                'env > "%s"\n'
+                "printf '  Endpoint    http://127.0.0.1:45678\\n'\n"
+                "printf '  Password    hunter2-not-real\\n'\n"
+                "sleep 30\n" % dump,
+                encoding="utf-8",
+            )
+            script.chmod(script.stat().st_mode | stat.S_IEXEC)
+            planted = {name: "planted" for name in module.BROKER_ENV_VARS}
+            planted["VIBE_GATEWAY_ENV_PROBE"] = "kept"
+            gateway = Gateway(cli=str(script), startup_timeout=15.0)
+            try:
+                with mock.patch.dict(os.environ, planted, clear=False):
+                    gateway.ensure()
+                self.assertTrue(_await_ready(dump), "the fake CLI never dumped its environment")
+                child = dict(
+                    line.split("=", 1)
+                    for line in dump.read_text(encoding="utf-8").splitlines()
+                    if "=" in line
+                )
+            finally:
+                gateway.close()
+        for name in module.BROKER_ENV_VARS:
+            self.assertNotIn(name, child, "the gateway inherited %s" % name)
+        self.assertEqual(child.get("VIBE_GATEWAY_ENV_PROBE"), "kept")
+
+
 if __name__ == "__main__":
     unittest.main()
