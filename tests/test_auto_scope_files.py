@@ -106,6 +106,32 @@ class ResolveConsistencyAutoScopeTests(unittest.TestCase):
             )
         )
 
+    def test_card_scope_of_a_finished_node_stays_in_scope(self):
+        """Files the card already authorized keep working as before this change."""
+        result = resolve_consistency(
+            _inconsistency(["n1.py", "n2.py"]),
+            decisions=[dict(DECISION)],
+            issue_contract={"naming": "approved-name"},
+            authorized_actions=["rework"],
+            authorized_files=["n1.py", "n2.py"],
+            expected_binding=BINDING,
+            node_files=["n1.py"],
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.scope_expanded_files, [])
+
+    def test_card_file_another_active_node_writes_is_refused(self):
+        self.assertIsNone(resolve_consistency(
+            _inconsistency(["n1.py", "n2.py"]),
+            decisions=[dict(DECISION)],
+            issue_contract={"naming": "approved-name"},
+            authorized_actions=["rework"],
+            authorized_files=["n1.py", "n2.py"],
+            expected_binding=BINDING,
+            node_files=["n1.py"],
+            occupied_files=["n2.py"],
+        ))
+
     def test_path_traversal_and_absolute_paths_are_refused(self):
         for path in (
             "tests/../vibe_guide/monitor.py",

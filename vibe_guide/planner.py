@@ -283,10 +283,11 @@ def resolve_consistency(
 ) -> Optional[ConsistencyResolution]:
     """Resolve only one evidence-determined, authorized non-deploy correction.
 
-    A file outside the node's scope (``node_files``; the authorized scope when
-    not given) is accepted only under `auto_scope_rule` and only when no other
-    active node holds it (``occupied_files``); it is then reported in
-    ``scope_expanded_files``.  Any other out-of-scope file rejects the
+    The scope is the authorized card scope plus ``node_files`` (the node's
+    own scope including earlier expansions), minus files another active node
+    holds (``occupied_files``).  A file outside it is accepted only under
+    `auto_scope_rule` and only when no other active node holds it; it is then
+    reported in ``scope_expanded_files``.  Any other out-of-scope file rejects the
     correction so the user is asked.
     """
 
@@ -307,8 +308,11 @@ def resolve_consistency(
         or not candidates
     ):
         return None
-    in_scope = set(authorized_files if node_files is None else node_files)
+    # The authorization card's scope stays in scope as before; the node's own
+    # earlier expansions join it, and files another active node is writing
+    # leave it (one writer per file).
     occupied = set(occupied_files or ())
+    in_scope = (set(authorized_files) | set(node_files or ())) - occupied
     scope_expanded_files: List[str] = []
     for item in files:
         if item in in_scope:
