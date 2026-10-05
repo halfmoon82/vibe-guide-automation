@@ -2817,6 +2817,7 @@ class VisibleDispatchTests(unittest.TestCase):
                                 "protocol": VISIBLE_SDD_PROTOCOL_REF,
                                 "evidence_ref": "session-delivery#review-round-1",
                                 "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                                "environment_facts_ref": "none",
                             },
                         },
                     )
@@ -2989,6 +2990,7 @@ class VisibleDispatchTests(unittest.TestCase):
                                 "protocol": VISIBLE_SDD_PROTOCOL_REF,
                                 "evidence_ref": "session-delivery#review-round-1",
                                 "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                                "environment_facts_ref": "none",
                             },
                         },
                     )
@@ -3064,6 +3066,7 @@ class VisibleDispatchTests(unittest.TestCase):
             "protocol": VISIBLE_SDD_PROTOCOL_REF,
             "evidence_ref": "session-delivery#review-round-1",
             "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "environment_facts_ref": "none",
             "blocked_unknowns": [item],
         }
 
@@ -3215,6 +3218,7 @@ class VisibleDispatchTests(unittest.TestCase):
                                 "protocol": VISIBLE_SDD_PROTOCOL_REF,
                                 "evidence_ref": "session-delivery#review-round-2",
                                 "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                                "environment_facts_ref": "none",
                             },
                         },
                     ),
@@ -3242,6 +3246,61 @@ class VisibleDispatchTests(unittest.TestCase):
 
         self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
 
+    def test_visible_sdd_review_missing_environment_facts_ref_is_rejected_and_correctable(self):
+        """ISSUE-140 (integration P2-1): the payload field is gate-enforced.
+
+        The shipped protocol makes ``environment_facts_ref`` mandatory in
+        the in_session_review payload ("none" when the contract declares no
+        environment_facts).  A delivery omitting it is a recoverable format
+        rejection, and the same session's corrected re-report is accepted.
+        """
+        from vibe_guide.state import load_events
+
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        missing = {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-1",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+        }
+        corrected = dict(
+            missing,
+            evidence_ref="session-delivery#review-round-2",
+            environment_facts_ref="none",
+        )
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    ("complete", {"evidence": "delivery", "in_session_review": missing}),
+                    ("complete", {"evidence": "delivery", "in_session_review": corrected}),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertNotEqual(current["status"], "blocked_unknown", current.get("reason"))
+        self.assertNotEqual(current["status"], "accepted")
+        self.assertIn("sdd-a", snapshot.handles)
+        rejections = [
+            record_
+            for record_ in load_events(self.paths, snapshot.run_id)
+            if record_["event"] == "acceptance_rejected"
+            and record_["data"].get("node_id") == "sdd-a"
+        ]
+        self.assertEqual(len(rejections), 1)
+        self.assertTrue(rejections[0]["data"].get("recoverable"))
+        # Durable events redact provider text, so the causal link is
+        # structural: the only difference between the rejected payload and
+        # the accepted re-report is the added environment_facts_ref field.
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+
     def test_visible_sdd_blocked_unknown_silent_drop_on_rereport_stays_paused(self):
         """P1 regression: dropping a paused item from the payload is not closure.
 
@@ -3261,6 +3320,7 @@ class VisibleDispatchTests(unittest.TestCase):
             "protocol": VISIBLE_SDD_PROTOCOL_REF,
             "evidence_ref": "session-delivery#review-round-2",
             "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "environment_facts_ref": "none",
         }
         runner = VisibleSddRunner(
             events={
@@ -3325,6 +3385,7 @@ class VisibleDispatchTests(unittest.TestCase):
             "protocol": VISIBLE_SDD_PROTOCOL_REF,
             "evidence_ref": "session-delivery#review-round-3",
             "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "environment_facts_ref": "none",
         }
         runner = VisibleSddRunner(
             events={
@@ -4099,6 +4160,52 @@ class ContractTestExecutionTests(unittest.TestCase):
         data["contract_test_commands"] = {"n1": "not-a-list"}
         with self.assertRaises(ValueError):
             AuthorizationRecord.from_dict(data)
+
+    def test_contract_test_execution_event_replay_mutates_nothing(self):
+        """ISSUE-140 (integration P2-2): pure-audit events never brick replay.
+
+        A crash between the durable ``contract_test_execution`` record and
+        the durable acceptance leaves the audit event unapplied.  Replay
+        must mutate nothing (same rule as ``acceptance_rejected``): the
+        node stays in its last durable lifecycle state instead of being
+        bricked into blocked_unknown manual reconciliation.
+        """
+        import glob
+        import json
+
+        from vibe_guide.state import load_events, load_snapshot
+
+        current = self.invariant_node(
+            "n1", [{"id": "I1", "test_command": "python3 -c \"print('ok')\""}]
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+
+        events = load_events(self.paths, snapshot.run_id)
+        index = next(
+            i for i, event in enumerate(events)
+            if event["event"] == "contract_test_execution"
+        )
+        # Crash window: the last durable snapshot predates the audit event
+        # and the acceptance was never recorded.
+        replay = load_snapshot(self.paths, snapshot.run_id)
+        replay.event_sequence = index
+        replay.nodes["n1"]["status"] = "delivered"
+        replay.nodes["n1"]["reason"] = None
+        events_file = glob.glob(
+            str(self.paths.root / ".vibe" / "runs" / snapshot.run_id / "events.jsonl")
+        )[0]
+        with open(events_file, "w") as handle:
+            for event in events[: index + 1]:
+                handle.write(json.dumps(event) + "\n")
+
+        monitor._reconcile_unapplied_events(replay)
+
+        self.assertEqual(replay.nodes["n1"]["status"], "delivered")
+        self.assertIsNone(replay.nodes["n1"].get("reason"))
 
 
 if __name__ == "__main__":

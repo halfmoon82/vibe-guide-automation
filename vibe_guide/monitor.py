@@ -4383,6 +4383,18 @@ class Monitor:
             # package; a different or missing pointer is not the visible-sdd
             # review this acceptance certifies.
             return "visible-sdd delivery cites an unknown in-session review protocol", True
+        environment_facts_ref = review.get("environment_facts_ref")
+        if not isinstance(environment_facts_ref, str) or not environment_facts_ref.strip():
+            # The shipped protocol (visible-sdd-worker.md section 3) makes
+            # this field mandatory so the acceptance stays traceable to the
+            # environment facts the in-session review was dispatched with
+            # ("none" when the contract declares no environment_facts).  A
+            # missing or blank value is a format error the same session can
+            # correct and re-report on its live handle.
+            return (
+                "visible-sdd in-session review environment_facts_ref must be a non-empty string",
+                True,
+            )
         # ISSUE-02: the acceptance evidence is bound to the node contract it
         # reviewed.  The carried digest is the dispatch-time node digest and
         # must still equal the digest recomputed from the live contract; an
@@ -5432,6 +5444,14 @@ class Monitor:
                 # live pass mutated no lifecycle state -- the handle, binding
                 # and node status were all left for the same task's corrected
                 # re-report -- so replay must mutate nothing either.
+                pass
+            elif record["event"] == "contract_test_execution":
+                # Pure audit like acceptance_rejected: the live pass only
+                # gates acceptance (or the expected_red observation) and
+                # mutates no lifecycle state, so replay must mutate nothing
+                # either -- otherwise a crash between the execution record
+                # and the durable acceptance would brick the node into
+                # manual reconciliation for no real inconsistency.
                 pass
             elif record["event"] == "blocked_unknown_disposition_required":
                 # The live pause recorded no delivery and left the handle,
