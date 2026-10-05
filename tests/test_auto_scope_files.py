@@ -544,6 +544,26 @@ class MonitorAutoScopeTests(unittest.TestCase):
         self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
         self.assertEqual(snapshot.nodes["n1"]["scope_expansions"], ["tests/test_n1.py"])
 
+    def test_integration_review_scope_is_never_counted_as_held(self):
+        # P1-1: once n2 is accepted, nothing else writes its files; the
+        # planned integration reviewer still lists them but must not hold
+        # them (otherwise n1 could not pick up n2's finished test file).
+        plan, (monitor, _runner, snapshot) = self._run_complex_finding(
+            [_node("n1"), _node("n2", ["tests/test_shared.py"])],
+            ["n1.py"],
+        )
+        integration = [n for n in plan.nodes if n.id == INTEGRATION_REVIEW_NODE_ID][0]
+        self.assertIn("tests/test_shared.py", integration.contract["files"])
+        self.assertEqual(
+            snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["status"], "planned"
+        )
+        self.assertIn(
+            "tests/test_shared.py",
+            monitor._files_held_by_other_active_nodes(snapshot, "n1"),
+        )
+        snapshot.nodes["n2"]["status"] = "accepted"
+        self.assertEqual(monitor._files_held_by_other_active_nodes(snapshot, "n1"), [])
+
     def test_scope_rules_survive_persistence_with_sensitive_words_in_paths(self):
         # P2-3: read back the persisted events.jsonl shape.
         files = ["n1.py", "tests/test_token_x.py", "tests/test_secret_y.py"]
