@@ -338,6 +338,7 @@ def _valid_holds(holds, statuses, now):
             entry.get("statuses") != statuses
             or not isinstance(held_at, (int, float))
             or now - held_at > HOLD_RECHECK_SECONDS
+            or held_at > now + 60  # clock moved back: recheck rather than trust it
         ):
             stale.append(node)
         else:
@@ -386,9 +387,17 @@ def _mailbox_state(paths, run_id, holds):
     )
     if needs_service:
         return {"state": "work", "reason": "nodes need servicing", "nodes": needs_service}
+    # A node the DAG already marks dispatchable is not waiting behind the
+    # held decision, even if it was already dispatchable at hold time.
+    dispatchable = sorted(
+        node for node in (getattr(snapshot, "ready_set", None) or [])
+        if node not in holds and statuses.get(node) != "running"
+    )
+    if dispatchable:
+        return {"state": "work", "reason": "dispatchable nodes", "nodes": dispatchable}
     if holds:
-        # The whole run is exactly as it was when the supervisor parked it,
-        # so planned nodes are the ones waiting behind the held decision.
+        # The whole run is exactly as it was when the supervisor parked it and
+        # nothing is dispatchable, so planned nodes wait behind the decision.
         return {"state": "idle", "reason": "waiting on a human decision", "held": sorted(holds)}
     running = sorted(
         node for node, status in statuses.items()
@@ -514,11 +523,9 @@ def set_supervisor_hold(paths, run_id, node, reason):
     holds = supervisor_holds(paths, run_id)
     statuses = _node_statuses(snapshot)
     now = time.time()
+    # Only this hold is refreshed; another hold voided by a change stays void
+    # until the supervisor rechecks and re-holds that node too.
     holds[node] = {"reason": reason, "held_at": now, "statuses": statuses}
-    for entry in holds.values():
-        # One supervisor looked at the whole run just now: every hold it keeps
-        # describes this state.
-        entry["statuses"] = statuses
     _write_holds(paths, run_id, holds)
     return holds
 

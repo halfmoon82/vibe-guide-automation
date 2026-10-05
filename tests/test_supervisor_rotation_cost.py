@@ -64,14 +64,15 @@ def _codex_rollout(directory, contexts, name="rollout.jsonl"):
 
 
 class _FakeSnapshot:
-    def __init__(self, statuses):
+    def __init__(self, statuses, ready_set=()):
         self.nodes = {node: {"status": status} for node, status in statuses.items()}
+        self.ready_set = list(ready_set)
 
 
-def _patch_snapshot(statuses):
+def _patch_snapshot(statuses, ready_set=()):
     return patch(
         "vibe_guide.supervisor.load_snapshot",
-        return_value=_FakeSnapshot(statuses),
+        return_value=_FakeSnapshot(statuses, ready_set),
     )
 
 
@@ -279,6 +280,36 @@ class HoldTests(_Case):
             result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
         self.assertEqual(result["state"], "idle", result)
         self.assertEqual(result["held"], ["x"])
+
+    def test_hold_does_not_hide_an_independent_dispatchable_node(self):
+        """Review round 2 P2: Z depends only on accepted A, so it can start now."""
+        statuses = {"a": "accepted", "z": "planned", "x": "ready"}
+        with _patch_snapshot(statuses, ready_set=["x", "z"]):
+            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
+        self.assertEqual(result["state"], "work", result)
+        self.assertEqual(result["nodes"], ["z"])
+
+    def test_hold_from_the_future_is_rechecked(self):
+        """Review round 2 P3: a clock moved back must not extend a hold."""
+        with _patch_snapshot({"x": "ready"}):
+            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            earlier = __import__("time").time() - 3600
+            with patch("vibe_guide.supervisor.time.time", return_value=earlier):
+                result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
+        self.assertEqual(result["reason"], "hold needs recheck")
+
+    def test_re_holding_one_node_does_not_revive_another(self):
+        """Review round 2 P3: each voided hold needs its own recheck."""
+        with _patch_snapshot({"x": "ready", "y": "ready"}):
+            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板 x")
+            set_supervisor_hold(self.paths, "run-1", "y", "等用户拍板 y")
+        changed = {"x": "blocked_unknown", "y": "ready"}
+        with _patch_snapshot(changed):
+            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板 x")
+            result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
+        self.assertEqual(result["state"], "work", result)
+        self.assertEqual(result["nodes"], ["y"])
 
     def test_any_status_change_since_the_hold_voids_it(self):
         """Review P2: a hold must not hide what happened after it."""

@@ -27,6 +27,7 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        "06e6c3cc275851e32127d378d6dcf3cec40dceafa3f8fe3c84058d528932ba93",
         "08591263683208c510570d6af2f3733bb0596ecd1c00bdb2dc8fc7206fabaa13",
         "0e6c7401ff1c6c6565da6a28202cc0312e7c3f5bbc3ba139a536cfaf3b11dfd0",
         "15c531ea1b21a28f8178e9c90fa7d80a4a8afec04a4de0ff624817b2d288a6ab",
