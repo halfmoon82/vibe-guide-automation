@@ -638,7 +638,7 @@ class VisibleSddEnvironmentFactsDispatchTests(unittest.TestCase):
 
     def test_proxy_metrics_banned_as_acceptance_criteria(self):
         """Ban semantics, not mere mention: each proxy metric line says 不得."""
-        for proxy in ("页面能打开", "路由可解析"):
+        for proxy in ("页面能打开", "组件在产物里", "路由可解析"):
             lines = [line for line in self.text.splitlines() if proxy in line]
             self.assertTrue(lines, proxy + " must be named by the ban rule")
             self.assertTrue(
