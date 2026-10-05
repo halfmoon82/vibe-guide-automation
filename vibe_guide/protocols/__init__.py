@@ -45,8 +45,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "c2c11e2c6db35977be5df3c8ad6ea272cbba58acf0ca873794a5172ab74c08ea",
         "d31adcdf3fb33d3b6e2fd557f7324cbdbd07a80acc0a8d18f5ce186c23971ac7",
         "d93d32ba556b02d8e132bb78829e8b8eaf354e5420553908873c576597c7634e",
+        "e93c430fa34d2db44ba7dd6383cc61c6bd013a2a536642f13f6c976850e26b26",
         "f2f90466346715fcf1b65a8f8cc3f5be6aa5244c676fe4fb38fc725c89610c38",
-        "dc17c0c7d7071f68e62bbb1dd7454a8acb33437eba3b8aa44b59f8bb0dbf7974",
     }),
     "vibe-entry": frozenset({
         "08140f273188868532d5724d4fb199d1ee48ac46c80cbc2786f46fce91e4ddff",
