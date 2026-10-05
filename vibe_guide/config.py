@@ -14,6 +14,9 @@ through configuration.
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import unicodedata
+
+from .path_ownership import normalize_project_path
 
 #: Field name in ``.vibe/config.json`` capping simultaneously active
 #: developer/reviewer session pairs.
@@ -29,6 +32,12 @@ DEFAULT_MAX_ACTIVE_WORKER_SESSIONS = 5
 
 MIN_MAX_ACTIVE_WORKER_SESSIONS = 1
 MAX_MAX_ACTIVE_WORKER_SESSIONS = 64
+
+#: Field name listing mechanical companion files (repository-relative paths)
+#: the supervisor may pull into a node's file scope without asking the user,
+#: in addition to files under ``tests/``.  The product default is empty: vibe
+#: is a general tool and must not presume any project's layout.
+FIELD_AUTO_SCOPE_PATHS = 'auto_scope_paths'
 
 #: `ProjectConfig.source` value when the default was applied.
 SOURCE_DEFAULT = 'default'
@@ -47,6 +56,41 @@ class ProjectConfig:
     #: Append-only: these extend the built-in blacklist, never shrink it.
     #: Defaults to an empty tuple so two-argument construction keeps working.
     behavioral_command_blacklist_extra: tuple = ()
+    auto_scope_paths: tuple = ()
+
+
+def is_repo_relative_path(value):
+    """True for a normalized POSIX path that stays inside the repository.
+
+    Accepts exactly what `normalize_project_path` accepts, and only in its
+    already-normalized spelling (no ``./``, ``//``, trailing ``/`` or
+    surrounding blanks), so the string compared against scopes is the file
+    that will be written.  Control characters are refused outright: a path
+    carrying one would be persisted and then rejected at dispatch, leaving the
+    node stuck.
+    """
+    if not isinstance(value, str) or any(
+        unicodedata.category(char) == 'Cc' for char in value
+    ):
+        return False
+    try:
+        return normalize_project_path(value) == value
+    except ValueError:
+        return False
+
+
+def _auto_scope_paths(data):
+    if FIELD_AUTO_SCOPE_PATHS not in data:
+        return ()
+    value = data[FIELD_AUTO_SCOPE_PATHS]
+    if not isinstance(value, list) or not all(
+        is_repo_relative_path(item) for item in value
+    ):
+        raise ValueError(
+            f'{FIELD_AUTO_SCOPE_PATHS} must be a list of repository-relative '
+            'paths without "." or ".." segments'
+        )
+    return tuple(dict.fromkeys(value))
 
 
 def _config_path(root):
@@ -90,9 +134,11 @@ def load_project_config(root):
     if not isinstance(data, dict):
         raise ValueError('.vibe/config.json must contain a JSON object')
     blacklist_extra = _load_blacklist_extra(data)
+    auto_scope_paths = _auto_scope_paths(data)
     if FIELD_MAX_ACTIVE_WORKER_SESSIONS not in data:
         return ProjectConfig(
-            DEFAULT_MAX_ACTIVE_WORKER_SESSIONS, SOURCE_DEFAULT, blacklist_extra
+            DEFAULT_MAX_ACTIVE_WORKER_SESSIONS, SOURCE_DEFAULT, blacklist_extra,
+            auto_scope_paths=auto_scope_paths,
         )
     value = data[FIELD_MAX_ACTIVE_WORKER_SESSIONS]
     # bool is a subclass of int; True/False are never a valid worker cap.
@@ -103,4 +149,6 @@ def load_project_config(root):
             f'{FIELD_MAX_ACTIVE_WORKER_SESSIONS} must be an integer between '
             f'{MIN_MAX_ACTIVE_WORKER_SESSIONS} and {MAX_MAX_ACTIVE_WORKER_SESSIONS}'
         )
-    return ProjectConfig(value, SOURCE_CONFIG, blacklist_extra)
+    return ProjectConfig(
+        value, SOURCE_CONFIG, blacklist_extra, auto_scope_paths=auto_scope_paths
+    )

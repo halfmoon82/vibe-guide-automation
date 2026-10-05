@@ -236,6 +236,10 @@ _EVENT_DATA_KEYS = {
     "protocol_ref",
     "evidence_ref",
     "clearance",
+    # scope_auto_expanded: [{"path", "rule"}] for each file the supervisor
+    # pulled into a node's scope on its own ("tests_dir" / "auto_scope_paths").
+    # Repository-relative paths and fixed rule names only.
+    "scope_rules",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",

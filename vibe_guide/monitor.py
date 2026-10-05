@@ -21,6 +21,7 @@ from .authorization import (
     integration_contract_projection,
     is_authorization_valid,
     validate_runtime_contract,
+    _scoped_values,
 )
 from .contracts import RunEvent, RunHandle, Runner
 from .models import (
@@ -39,9 +40,15 @@ from .models import (
 from .paths import ProjectPaths
 from .path_ownership import validate_path_ownership
 from .binding_lifecycle import VisibleSddAcceptance
-from .planner import resolve_consistency
+from .planner import auto_scope_rule, resolve_consistency
 from . import dag as _dag_module
-from .dag import audit_dag, node_scoped_ready, ready_nodes
+from .dag import (
+    _write_scope_paths,
+    audit_dag,
+    is_integration_review_node,
+    node_scoped_ready,
+    ready_nodes,
+)
 from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
@@ -2009,6 +2016,48 @@ class Monitor:
         except (TypeError, ValueError) as error:
             raise PermissionError("snapshot authorization record is invalid") from error
 
+    def _node_scope_files(self, node_id: str, current: Dict[str, Any]) -> List[str]:
+        """The node's authorized files plus files auto-added to its scope."""
+        files = list(_scoped_values(self.nodes[node_id].contract, "files"))
+        for item in current.get("scope_expansions", []):
+            if item not in files:
+                files.append(item)
+        return files
+
+    def _files_held_by_other_active_nodes(
+        self, snapshot: RunSnapshot, node_id: str
+    ) -> List[str]:
+        """Write scope of every other node that is not yet accepted.
+
+        The write scope is what the node may actually write -- its allowlist
+        and owned paths (`dag._write_scope_paths`) -- not just the `files` it
+        listed: a node without `files` gets the whole-repository allowlist
+        ``["."]`` from `node_spec`.  An unverifiable scope counts as ``"."``.
+        Earlier auto-expansions of that node are added on top.
+        """
+        held: List[str] = []
+        for other_id, other in snapshot.nodes.items():
+            if other_id == node_id or other_id not in self.nodes:
+                continue
+            # The integration reviewer lists every business file but is
+            # read-only: it never writes, so it holds nothing.
+            if is_integration_review_node(self.nodes[other_id]):
+                continue
+            if other.get("status") == "accepted":
+                continue
+            write_scope = _write_scope_paths(self.nodes[other_id])
+            held.extend(["."] if write_scope is None else write_scope)
+            held.extend(self._node_scope_files(other_id, other))
+        return held
+
+    def _auto_scope_paths(self) -> Tuple[str, ...]:
+        # An unreadable or invalid config never widens scope: fall back to
+        # the empty list so the correction stops for the user instead.
+        try:
+            return load_project_config(self.paths.root).auto_scope_paths
+        except ValueError:
+            return ()
+
     def _consistency_binding(
         self, record: AuthorizationRecord, node: DAGNode
     ) -> Dict[str, Any]:
@@ -3039,6 +3088,9 @@ class Monitor:
 
         contract = dict(node.contract)
         contract.update(current.get("contract_overrides", {}))
+        scope_expansions = list(current.get("scope_expansions", []))
+        if scope_expansions:
+            contract["files"] = self._node_scope_files(node_id, current)
         contract.update(
             {
                 "node_id": node_id,
@@ -3132,6 +3184,13 @@ class Monitor:
                 v2 = True
             if v2:
                 profile_data = contract.get("worker_profile") or {}
+                if profile_data and scope_expansions:
+                    allowlist = list(profile_data.get("allowlist", []))
+                    profile_data = dict(
+                        profile_data,
+                        allowlist=allowlist
+                        + [item for item in scope_expansions if item not in allowlist],
+                    )
                 if not profile_data:
                     profile_data = {"worker": str(contract.get("worker", "worker")), "model": "default", "reasoning": "normal", "fallbacks": [], "selection_basis": {"issue_complexity_ref": node_id, "complexity_band": "standard", "risk_tags": [], "availability_evidence": "runtime"}, "writer": str(contract.get("worker", "writer")), "worktree": str(contract.get("worktree", ".")), "branch": str(contract.get("branch", "branch-" + node_id)), "allowlist": list(contract.get("files", [node_id + ".py"]))}
                 profile = WorkerProfile(**profile_data)
@@ -3142,7 +3201,7 @@ class Monitor:
             contract = validate_runtime_contract(
                 contract,
                 authorized_actions=record.allowed_actions,
-                authorized_files=record.file_scope,
+                authorized_files=tuple(record.file_scope) + tuple(scope_expansions),
             )
             if self._binding_recovery_requested(contract):
                 self._preflight_binding_recovery(
@@ -3942,6 +4001,7 @@ class Monitor:
                 return
             if not event.data.get("in_contract", False):
                 record = self._snapshot_record(snapshot)
+                auto_paths = self._auto_scope_paths()
                 resolution = resolve_consistency(
                     event.data.get("consistency"),
                     self.plan.decisions,
@@ -3949,12 +4009,41 @@ class Monitor:
                     list(record.allowed_actions),
                     list(record.file_scope),
                     self._consistency_binding(record, self.nodes[node_id]),
+                    node_files=self._node_scope_files(node_id, current),
+                    auto_scope_paths=auto_paths,
+                    occupied_files=self._files_held_by_other_active_nodes(
+                        snapshot, node_id
+                    ),
                 )
                 if resolution is not None:
                     if not self._stop_active_for_transition(
                         snapshot, node_id, role, handle_id, runner, "stopped"
                     ):
                         return
+                    if resolution.scope_expanded_files:
+                        expansions = current.setdefault("scope_expansions", [])
+                        for item in resolution.scope_expanded_files:
+                            if item not in expansions:
+                                expansions.append(item)
+                        self._record(
+                            snapshot,
+                            "scope_auto_expanded",
+                            {
+                                "run_id": snapshot.run_id,
+                                "node_id": node_id,
+                                "files": list(resolution.scope_expanded_files),
+                                # A list, not a path-keyed dict: persistence
+                                # redacts by key name, so a path containing
+                                # e.g. "token" would be wiped.
+                                "scope_rules": [
+                                    {
+                                        "path": item,
+                                        "rule": auto_scope_rule(item, auto_paths),
+                                    }
+                                    for item in resolution.scope_expanded_files
+                                ],
+                            },
+                        )
                     current.setdefault("contract_overrides", {})[
                         resolution.field
                     ] = resolution.value
@@ -5408,6 +5497,11 @@ class Monitor:
                     current["isolated"] = True
                     current["retryable_action"] = None
                     current["quarantine"] = {"run_id": snapshot.run_id, "handle_id": snapshot.handles.get(node_id), "reason": current["reason"]}
+            elif record["event"] == "scope_auto_expanded":
+                expansions = current.setdefault("scope_expansions", [])
+                for item in data.get("files", []):
+                    if item not in expansions:
+                        expansions.append(item)
             elif record["event"] == "consistency_corrected":
                 correction = {
                     key: data[key]
