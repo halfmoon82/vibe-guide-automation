@@ -258,9 +258,16 @@ def auto_scope_rule(path: Any, auto_scope_paths: Any = ()) -> Optional[str]:
     Only two kinds qualify: a file under the repository's ``tests/`` directory
     or a path the project listed in ``.vibe/config.json`` ``auto_scope_paths``.
     Paths that escape the repository or look like credential files never
-    qualify, whichever list they come from.
+    qualify, whichever list they come from.  Neither do paths carrying a
+    colon (Windows drive-relative ``C:foo`` or an NTFS alternate data stream
+    ``a:b``), an invisible format character (Unicode Cf: zero-width and
+    bidi controls), or a ``.git`` segment.
     """
     if not is_repo_relative_path(path):
+        return None
+    if ":" in path or any(unicodedata.category(char) == "Cf" for char in path):
+        return None
+    if any(part.casefold() == ".git" for part in path.split("/")):
         return None
     name = path.rsplit("/", 1)[-1].casefold()
     if (
@@ -284,8 +291,12 @@ def _scope_compare_key(path: Any) -> str:
     Normalized like every other project path, then NFC + casefold because the
     default macOS filesystem treats those variants as one file.  An entry that
     cannot be normalized becomes the root marker ``"."``, which overlaps
-    everything: an unverifiable claim must fail closed, not be ignored.
+    everything: an unverifiable claim must fail closed, not be ignored.  A
+    glob (``*``, ``?``, ``[``) cannot be matched safely and is treated the
+    same way.
     """
+    if not isinstance(path, str) or any(char in path for char in "*?["):
+        return "."
     try:
         normalized = normalize_project_path(path)
     except ValueError:

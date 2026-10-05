@@ -257,6 +257,32 @@ class ReviewRoundOneUnitTests(unittest.TestCase):
             with self.subTest(path=repr(path)):
                 self.assertIsNone(_resolve(["n1.py", path]))
 
+    def test_colon_paths_are_refused(self):
+        # P2-A: `C:foo` is drive-relative on Windows; `a:b.py` is an NTFS
+        # alternate data stream.
+        for path in ("tests/C:foo.py", "tests/a:b.py"):
+            with self.subTest(path=path):
+                self.assertIsNone(_resolve(["n1.py", path]))
+        self.assertIsNone(_resolve(["n1.py", "C:foo"], auto_scope_paths=["C:foo"]))
+
+    def test_format_characters_and_git_segments_are_refused(self):
+        # P3: zero-width / bidi controls (Unicode Cf) and `.git` segments.
+        for path in (
+            "tests/test_\u200bn1.py", "tests/test_\u202en1.py",
+            "tests/\ufefftest_n1.py", "tests/.git/config", "tests/x/.git/hooks/pre-commit",
+        ):
+            with self.subTest(path=repr(path)):
+                self.assertIsNone(_resolve(["n1.py", path]))
+        self.assertIsNone(_resolve(["n1.py", ".git/config"], auto_scope_paths=[".git/config"]))
+
+    def test_glob_occupancy_entries_hold_everything(self):
+        # P3: a glob cannot be matched safely, so it fails closed.
+        for held in (["tests/*.py"], ["tests/test_?.py"], ["tests/[ab].py"]):
+            with self.subTest(held=held):
+                self.assertIsNone(_resolve(["n1.py", "vibe_guide/protocols/__init__.py"],
+                                           auto_scope_paths=["vibe_guide/protocols/__init__.py"],
+                                           occupied_files=held))
+
     def test_more_credential_names_are_refused(self):
         # P3-1
         for path in (
@@ -563,6 +589,46 @@ class MonitorAutoScopeTests(unittest.TestCase):
         )
         snapshot.nodes["n2"]["status"] = "accepted"
         self.assertEqual(monitor._files_held_by_other_active_nodes(snapshot, "n1"), [])
+
+    def test_sibling_with_root_allowlist_holds_every_file(self):
+        # P1-A ①: no files -> node_spec defaults the allowlist to ["."]
+        # (the whole repository is writable), so it holds tests/ too.
+        # The card's write-scope gate only admits a whole-repo writer that is
+        # serialized behind the others, so n2 waits on n1 (status planned).
+        n2 = _node("n2")
+        n2.depends_on = ["n1"]
+        n2.parallel_group = "g2"
+        n2.contract["files"] = []
+        n2.contract["worker_profile"]["allowlist"] = ["."]
+        _monitor, _runner, snapshot = self._run_finding(
+            [_node("n1"), n2], ["n1.py", "tests/test_n1.py"]
+        )
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
+        self.assertEqual(self._scope_events(snapshot.run_id), [])
+
+    def test_sibling_allowlist_directory_holds_files_beneath_it(self):
+        # P1-A ②: the write allowlist names `tests`; files does not.
+        n2 = _node("n2")
+        n2.contract["worker_profile"]["allowlist"] = ["n2.py", "tests"]
+        _monitor, _runner, snapshot = self._run_finding(
+            [_node("n1"), n2], ["n1.py", "tests/test_n1.py"]
+        )
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
+        self.assertEqual(self._scope_events(snapshot.run_id), [])
+
+    def test_sibling_owned_paths_hold_files_beneath_them(self):
+        n2 = _node("n2")
+        n2.contract["owned_paths"] = ["tests/fixtures"]
+        _monitor, _runner, snapshot = self._run_finding(
+            [_node("n1"), n2], ["n1.py", "tests/fixtures/data.py"]
+        )
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
+
+    def test_sibling_with_disjoint_allowlist_does_not_block(self):
+        _monitor, _runner, snapshot = self._run_finding(
+            [_node("n1"), _node("n2")], ["n1.py", "tests/test_n1.py"]
+        )
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
 
     def test_scope_rules_survive_persistence_with_sensitive_words_in_paths(self):
         # P2-3: read back the persisted events.jsonl shape.

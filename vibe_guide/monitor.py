@@ -42,7 +42,13 @@ from .path_ownership import validate_path_ownership
 from .binding_lifecycle import VisibleSddAcceptance
 from .planner import auto_scope_rule, resolve_consistency
 from . import dag as _dag_module
-from .dag import audit_dag, is_integration_review_node, node_scoped_ready, ready_nodes
+from .dag import (
+    _write_scope_paths,
+    audit_dag,
+    is_integration_review_node,
+    node_scoped_ready,
+    ready_nodes,
+)
 from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
@@ -2021,7 +2027,14 @@ class Monitor:
     def _files_held_by_other_active_nodes(
         self, snapshot: RunSnapshot, node_id: str
     ) -> List[str]:
-        """Files in the scope of every other node that is not yet accepted."""
+        """Write scope of every other node that is not yet accepted.
+
+        The write scope is what the node may actually write -- its allowlist
+        and owned paths (`dag._write_scope_paths`) -- not just the `files` it
+        listed: a node without `files` gets the whole-repository allowlist
+        ``["."]`` from `node_spec`.  An unverifiable scope counts as ``"."``.
+        Earlier auto-expansions of that node are added on top.
+        """
         held: List[str] = []
         for other_id, other in snapshot.nodes.items():
             if other_id == node_id or other_id not in self.nodes:
@@ -2032,6 +2045,8 @@ class Monitor:
                 continue
             if other.get("status") == "accepted":
                 continue
+            write_scope = _write_scope_paths(self.nodes[other_id])
+            held.extend(["."] if write_scope is None else write_scope)
             held.extend(self._node_scope_files(other_id, other))
         return held
 
