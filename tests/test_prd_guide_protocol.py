@@ -73,6 +73,26 @@ class ProtocolShippingTests(unittest.TestCase):
         self.assertIn("vibe_guide.protocols", setup_text)
         self.assertRegex(setup_text, r'"vibe_guide\.protocols":\s*\["\*\.md"\]')
 
+    def test_protocol_documents_environment_facts_rule(self):
+        """The closure rule for environment_facts stays true to the code.
+
+        The protocol is the only place a host agent learns when the facts are
+        mandatory and how `source` is read, so the trigger list and the
+        discrimination tokens are asserted against the module that enforces
+        them rather than merely grepped for.
+        """
+        from vibe_guide.contracts import THIRD_PARTY_UI_LIBRARY_MARKERS, _REPO_PATH_SUFFIXES
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("prd-guide")
+        self.assertIn("environment_facts", text)
+        self.assertIn("THIRD_PARTY_UI_LIBRARY_MARKERS", text)
+        for marker in THIRD_PARTY_UI_LIBRARY_MARKERS:
+            self.assertIn("`{}`".format(marker), text, marker)
+        for suffix in _REPO_PATH_SUFFIXES:
+            self.assertIn("`{}`".format(suffix), text, suffix)
+        for token in ("://", "verified_at", "fact", "source"):
+            self.assertIn(token, text, token)
+
     def test_protocol_mentions_every_cli_command_it_relies_on(self):
         from vibe_guide.protocols import load_protocol
         text = load_protocol("prd-guide")

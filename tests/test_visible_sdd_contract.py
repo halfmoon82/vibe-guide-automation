@@ -297,6 +297,7 @@ class VisibleSddAcceptanceMonitorTests(unittest.TestCase):
                                 "protocol": protocol,
                                 "evidence_ref": EVIDENCE_REF,
                                 "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                                "environment_facts_ref": "none",
                             },
                         },
                     )
@@ -552,6 +553,7 @@ class VisibleSddAcceptanceMonitorTests(unittest.TestCase):
                     "protocol": VISIBLE_SDD_PROTOCOL_REF,
                     "evidence_ref": EVIDENCE_REF,
                     "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                    "environment_facts_ref": "none",
                 },
             },
         )
@@ -578,6 +580,105 @@ class VisibleSddAcceptanceMonitorTests(unittest.TestCase):
             monitor.nodes["sdd-a"].contract = unreadable
             with self.assertRaises(ValueError, msg=repr(unreadable)):
                 monitor._live_node_contract_digest("sdd-a")
+
+
+
+class VisibleSddEnvironmentFactsDispatchTests(unittest.TestCase):
+    """ISSUE-140 suggestions 5/6: environment facts ride the review dispatch.
+
+    Pinned protocol elements (text drift must turn these red):
+    (1) section 2.5 step 1's convention source is "contract + the contract's
+        declared environment_facts + AGENTS.md + neighboring conventions";
+    (2) a mandatory dispatch-prompt section "环境事实与已知缺陷" whose absence
+        voids the review round as clearance evidence;
+    (3) the proxy-metric ban: "page opens / component shipped / route
+        resolves" must never stand in for an acceptance criterion;
+    (4) the in_session_review payload gains environment_facts_ref (string,
+        "none" allowed) and blocked_unknowns (nullable array, default empty,
+        non-empty blocks direct acceptance).
+    """
+
+    def setUp(self):
+        self.text = _load()
+
+    def _section(self, start_marker, end_marker):
+        start = self.text.index(start_marker)
+        end = self.text.index(end_marker, start)
+        return self.text[start:end]
+
+    def test_step1_convention_source_includes_environment_facts(self):
+        """Mutant: dropping environment_facts from step 1 must go red."""
+        section = self._section("## 2.5", "## 2.6")
+        step1_lines = [line for line in section.splitlines() if line.startswith("1. ")]
+        self.assertEqual(len(step1_lines), 1, "section 2.5 must keep exactly one step-1 line")
+        step1 = step1_lines[0]
+        for token in ("再参考合同声明的 `environment_facts`", "AGENTS.md", "邻近约定"):
+            self.assertIn(token, step1, "step 1 convention source must name " + token)
+        self.assertIn(
+            "约定来源 = 合同 + 合同声明的 `environment_facts` + AGENTS.md + 邻近约定",
+            step1,
+            "the verbatim source formula from the design draft must be pinned",
+        )
+        env_pos = step1.find("environment_facts")
+        agents_pos = step1.find("AGENTS.md")
+        self.assertLess(env_pos, agents_pos,
+                        "environment_facts is declared by the contract, before external conventions")
+
+    def test_mandatory_dispatch_section_voids_clearance_when_missing(self):
+        """The mandatory section exists and carries the clearance-evidence ban."""
+        section = self._section("## 2.6", "## 3.")
+        self.assertIn("环境事实与已知缺陷", section)
+        self.assertIn("逐项原文", section,
+                      "environment_facts must be copied verbatim into the dispatch prompt")
+        self.assertIn("本节点无环境事实声明", section,
+                      "empty environment_facts must be stated explicitly")
+        self.assertRegex(
+            section,
+            r"缺失本节.{0,40}不得作为\s*clearance\s*证据",
+            "a dispatch missing this section must void the round as clearance evidence",
+        )
+
+    def test_proxy_metrics_banned_as_acceptance_criteria(self):
+        """Ban semantics, not mere mention: each proxy metric line says 不得."""
+        for proxy in ("页面能打开", "组件在产物里", "路由可解析"):
+            lines = [line for line in self.text.splitlines() if proxy in line]
+            self.assertTrue(lines, proxy + " must be named by the ban rule")
+            self.assertTrue(
+                any(re.search(re.escape(proxy) + r".{0,30}不得作为验收", line) for line in lines),
+                proxy + " must be banned as an acceptance item in immediate context",
+            )
+        self.assertIn("目标交互动作跑通", self.text,
+                      "acceptance must be phrased as the target interaction working")
+        self.assertIn("不构成行为证据", self.text,
+                      "green compile/build must be declared non-evidence of behavior")
+
+    def test_payload_environment_facts_ref_shape_and_default(self):
+        section = self._section("## 5.", "## 6.")
+        self.assertIn('"environment_facts_ref": "none"', section,
+                      "the JSON example must show environment_facts_ref with the none default")
+        bullet_lines = [line for line in section.splitlines()
+                        if "environment_facts_ref" in line and line.strip().startswith("-")]
+        self.assertTrue(bullet_lines, "a field bullet must define environment_facts_ref")
+        bullet = bullet_lines[0]
+        self.assertIn("字符串", bullet)
+        self.assertIn('"none"', bullet, "the none default semantics must be written out")
+        self.assertIn("监工门校验其存在", bullet,
+                      "the supervisor gate checking its presence must be pinned")
+
+    def test_payload_blocked_unknowns_shape_and_gate(self):
+        section = self._section("## 5.", "## 6.")
+        self.assertIn('"blocked_unknowns": []', section,
+                      "the JSON example must show blocked_unknowns as an array")
+        bullet_lines = [line for line in section.splitlines()
+                        if "blocked_unknowns" in line and line.strip().startswith("-")]
+        self.assertTrue(bullet_lines, "a field bullet must define blocked_unknowns")
+        bullet = bullet_lines[0]
+        self.assertIn("缺省视为空", bullet, "default-empty semantics must be written out")
+        self.assertRegex(bullet, r"非空时监工不得直接\s*acceptance",
+                         "non-empty blocked_unknowns must block direct acceptance")
+        self.assertIn("逐项", bullet, "each item requires an individual disposition")
+        for disposition in ("已确认无虞", "已补环境事实后复审"):
+            self.assertIn(disposition, bullet, disposition)
 
 
 class VisibleSddErrorPathTests(unittest.TestCase):

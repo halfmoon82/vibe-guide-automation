@@ -15,6 +15,7 @@ from .authorization import (
     AuthorizationRecord,
     affected_node_closure,
     canonical_node_contracts,
+    contract_invariant_entries,
     digest_integration_contract,
     executable_contract_digest,
     integration_contract_projection,
@@ -98,6 +99,47 @@ from .evidence import (
 from .engine_attestation import validate_engine_attestation
 
 
+# ISSUE-140 (design section 3.3): contract-declared invariant test commands
+# are executed by the monitor inside the node writer worktree.  Commands come
+# from the already-authorized node contract and execution never leaves the
+# contract writer worktree, so this introduces no new authorization surface.
+DEFAULT_CONTRACT_TEST_TIMEOUT_SECONDS = 120
+
+#: Compile/build command prefixes that can never prove a *behavioral*
+#: invariant (they only prove the code compiles).  Built-in and not reducible
+#: through configuration; projects may append entries via
+#: ``.vibe/config.json`` ``behavioral_command_blacklist_extra``.
+BEHAVIORAL_COMPILE_COMMAND_BLACKLIST = frozenset({
+    "tsc",
+    "vue-tsc",
+    "vite build",
+    "webpack",
+    "rollup",
+    "esbuild",
+    "npm run build",
+    "pnpm build",
+    "yarn build",
+    "next build",
+    "ng build",
+})
+
+
+def _command_matches_blacklist(command: str, blacklist) -> bool:
+    """Prefix match on whitespace-split tokens.
+
+    A command hits a blacklist entry when its first ``len(entry_tokens)``
+    tokens equal the entry's tokens exactly.
+    """
+    tokens = str(command).split()
+    for entry in blacklist:
+        entry_tokens = str(entry).split()
+        if entry_tokens and tokens[: len(entry_tokens)] == entry_tokens:
+            return True
+    return False
+
+
+
+
 # --- V4.6 ISSUE-04: topology-aware dispatch of visible worker sessions ---
 
 #: Dispatch topologies a node can be ruled into.  ``visible-sdd`` binds one
@@ -118,6 +160,25 @@ _RULING_IN_SESSION_SDD = "in_session_sdd"
 #: Protocol pointer carried by every visible-sdd create request so the worker
 #: session can resolve the in-session SDD protocol from the installed package.
 VISIBLE_SDD_PROTOCOL_REF = "vibe_guide/protocols/visible-sdd-worker.md"
+
+#: Disposition kinds that close one ``blocked_unknowns`` item reported by an
+#: in-session review (issue #140 design draft section 3.6).  A non-empty
+#: ``blocked_unknowns`` array never counts into the P0-P2 clearance numbers;
+#: every item must instead be closed by an explicit disposition event before
+#: acceptance may continue, so "cannot confirm" stops being a silent escape
+#: hatch for real defects.
+BLOCKED_UNKNOWN_DISPOSITION_KINDS = (
+    "confirmed_benign",
+    "escalated_to_findings",
+    "resolved_with_facts",
+)
+
+#: Dispositions that release an item for acceptance.  ``escalated_to_findings``
+#: documents that the unknown is a real defect the worker session must rework;
+#: it is recorded for the audit chain but never clears the gate.
+BLOCKED_UNKNOWN_CLEARING_DISPOSITIONS = frozenset(
+    {"confirmed_benign", "resolved_with_facts"}
+)
 
 #: Disclosure recorded when a node is dispatched without a visible bridge.
 BACKGROUND_TOPOLOGY_DISCLOSURE = (
@@ -1640,6 +1701,79 @@ class Monitor:
         save_snapshot(self.paths, snapshot)
         return snapshot
 
+    def record_blocked_unknown_disposition(
+        self,
+        run_id: str,
+        node_id: str,
+        item: str,
+        disposition: str,
+        note: str = "",
+    ) -> RunSnapshot:
+        """Record one per-item disposition for a paused blocked_unknown delivery.
+
+        Dispositions are the audit chain that closes the escape hatch: each
+        pending item from the latest paused delivery must be explicitly
+        confirmed benign, resolved after supplementing environment facts, or
+        escalated to P0-P2 rework before acceptance may continue.  Every
+        disposition answers the item (it leaves pending) and is appended to
+        the event log, but only clearing dispositions
+        (``confirmed_benign`` / ``resolved_with_facts``) release the
+        acceptance gate; after ``escalated_to_findings`` the reworked
+        re-delivery must no longer carry the item, otherwise the delivery
+        pauses again.  Nothing here accepts the delivery itself.
+        """
+        self._reset_binding_cache()
+        snapshot = load_snapshot(self.paths, run_id)
+        self._require_snapshot_authorization(snapshot)
+        if node_id not in snapshot.nodes:
+            raise ValueError("blocked_unknown disposition targets an unknown node")
+        current = snapshot.nodes[node_id]
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("blocked_unknown disposition item must be a non-empty string")
+        if disposition not in BLOCKED_UNKNOWN_DISPOSITION_KINDS:
+            raise ValueError(
+                "blocked_unknown disposition must be one of: {}".format(
+                    ", ".join(BLOCKED_UNKNOWN_DISPOSITION_KINDS)
+                )
+            )
+        if not isinstance(note, str):
+            raise ValueError("blocked_unknown disposition note must be a string")
+        pending = current.get("blocked_unknowns_pending") or []
+        if item not in pending:
+            raise ValueError(
+                "blocked_unknown disposition item is not pending on this node"
+            )
+        dispositions = current.setdefault("blocked_unknown_dispositions", [])
+        if any(
+            entry.get("item") == item and entry.get("disposition") == disposition
+            for entry in dispositions
+        ):
+            raise ValueError(
+                "blocked_unknown disposition already recorded for this item and kind"
+            )
+        dispositions.append({"item": item, "disposition": disposition, "note": note})
+        # Any disposition answers the paused item, so it leaves pending; the
+        # acceptance gate separately requires a *clearing* disposition before
+        # a re-delivery carrying the same item may pass.
+        current["blocked_unknowns_pending"] = [
+            pending_item for pending_item in pending if pending_item != item
+        ]
+        self._record(
+            snapshot,
+            "blocked_unknown_disposition",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "disposition": disposition,
+                # ``proof`` is the durable pass-through key for the structured
+                # item/note payload (see _record_contract_test_execution).
+                "proof": {"item": item, "note": note},
+            },
+        )
+        self._refresh_run_status(snapshot)
+        save_snapshot(self.paths, snapshot)
+        return snapshot
+
     def reconcile_evidence(self, run_id: str, package: Dict[str, Any]) -> RunSnapshot:
         """Promote a verified, same-run evidence package through normal events.
 
@@ -2358,6 +2492,7 @@ class Monitor:
         current["review_generation"] = generation
         current["active_role"] = None
         current["active_task"] = None
+        current["blocked_unknowns_pending"] = []
         current["quarantine"] = None
         snapshot.handles.pop(node_id, None)
         if not data.get("evidence"):
@@ -3156,6 +3291,35 @@ class Monitor:
         )
         # The intent and lease are durable before the external side effect.
         save_snapshot(self.paths, snapshot)
+        # ISSUE-140 (expected_red): a TDD node must observe its invariant
+        # commands failing before the first developer dispatch.  The flag is
+        # node state, so rework/continuation never re-runs the observation.
+        if (
+            role == "developer"
+            and isinstance(node.contract, dict)
+            and isinstance(node.contract.get("expected_red"), str)
+            and node.contract["expected_red"].strip()
+            and not current.get("expected_red_observed")
+        ):
+            expected_red_failure = self._execute_contract_test_commands(
+                snapshot, node_id, "expected_red", current.get("active_task")
+            )
+            if expected_red_failure is not None:
+                # Same cleanup as the other pre-dispatch failure branches:
+                # reset the active/intent fields and do not fabricate a
+                # retryable action for what is a contract violation.
+                current["active_task"] = None
+                current["active_role"] = None
+                current["start_intent"] = None
+                self._mark_blocked_unknown(
+                    snapshot,
+                    node_id,
+                    "contract test execution failed: {}".format(expected_red_failure),
+                )
+                save_snapshot(self.paths, snapshot)
+                return False
+            current["expected_red_observed"] = True
+            save_snapshot(self.paths, snapshot)
         self._require_snapshot_authorization(snapshot)
         try:
             # All starts pass through the intent transaction.  V4.4 providers
@@ -3667,6 +3831,14 @@ class Monitor:
                         return
                     self._mark_blocked_unknown(snapshot, node_id, reason)
                     return
+                undisposed = self._undisposed_blocked_unknowns(
+                    current, event.data.get("in_session_review")
+                )
+                if undisposed:
+                    self._pause_delivery_for_blocked_unknowns(
+                        snapshot, node_id, event, current, undisposed
+                    )
+                    return
             self._record_runner_event(snapshot, node_id, event, active)
             if role != "developer":
                 try:
@@ -3917,6 +4089,19 @@ class Monitor:
                         return
                     self._mark_blocked_unknown(snapshot, node_id, rejection)
                     return
+            # ISSUE-140: contract-declared invariant test commands gate the
+            # acceptance.  Nodes without invariants return None immediately
+            # and follow the legacy path unchanged.
+            contract_test_failure = self._execute_contract_test_commands(
+                snapshot, node_id, "acceptance", active
+            )
+            if contract_test_failure is not None:
+                self._mark_blocked_unknown(
+                    snapshot,
+                    node_id,
+                    "contract test execution failed: {}".format(contract_test_failure),
+                )
+                return
             acceptance_event = RunEvent(
                 event.event,
                 {
@@ -4063,6 +4248,92 @@ class Monitor:
         snapshot.nodes[node_id]["active_task"] = None
         return True
 
+    @staticmethod
+    def _undisposed_blocked_unknowns(
+        current: Dict[str, Any], review: Any
+    ) -> List[str]:
+        """Blocked_unknown items still blocking acceptance.
+
+        Two closure rules keep the escape hatch shut in both directions:
+
+        * An item that already paused a delivery (``blocked_unknowns_pending``)
+          stays blocking until ANY disposition answers it -- silently dropping
+          it from a later payload is not closure.  ``escalated_to_findings``
+          answers it too: the unknown became a tracked finding, so the
+          reworked re-delivery may legitimately stop carrying the item.
+        * An item the CURRENT payload still carries needs a clearing
+          disposition (``confirmed_benign`` / ``resolved_with_facts``):
+          acceptance never proceeds while the reviewer still reports the
+          item as unknown, even if it was escalated before.
+        """
+        pending = [
+            item
+            for item in current.get("blocked_unknowns_pending") or []
+            if isinstance(item, str)
+        ]
+        payload_items: List[str] = []
+        if isinstance(review, dict):
+            payload_items = [
+                item
+                for item in review.get("blocked_unknowns") or []
+                if isinstance(item, str)
+            ]
+        answered = set()
+        cleared = set()
+        for entry in current.get("blocked_unknown_dispositions") or []:
+            if not isinstance(entry, dict):
+                continue
+            answered.add(entry.get("item"))
+            if entry.get("disposition") in BLOCKED_UNKNOWN_CLEARING_DISPOSITIONS:
+                cleared.add(entry.get("item"))
+        undisposed = [item for item in pending if item not in answered]
+        for item in payload_items:
+            if item not in cleared and item not in undisposed:
+                undisposed.append(item)
+        return undisposed
+
+    def _pause_delivery_for_blocked_unknowns(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        event: RunEvent,
+        current: Dict[str, Any],
+        undisposed: List[str],
+    ) -> None:
+        """Pause acceptance until every blocked_unknown item is disposed.
+
+        A non-empty ``blocked_unknowns`` array is not a format error and is
+        never folded into the P0-P2 clearance counts -- that would turn
+        "cannot confirm" into a silent escape hatch.  The delivery stays
+        unrecorded and the worker-session handle, binding and lease stay
+        untouched, so the same session re-reports once dispositions close
+        every item; the node waits in ``blocked_unknown`` until then.
+        """
+        review = event.data.get("in_session_review")
+        items = review.get("blocked_unknowns") if isinstance(review, dict) else []
+        current["status"] = "blocked_unknown"
+        current["reason"] = (
+            "acceptance paused: blocked_unknown items await disposition"
+        )
+        current["blocked_unknowns_pending"] = list(undisposed)
+        active = current.get("active_task")
+        self._record(
+            snapshot,
+            "blocked_unknown_disposition_required",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                # The durable event schema only preserves structured values
+                # under pass-through keys (see _record_contract_test_execution);
+                # the item lists ride under ``proof``.
+                "proof": {
+                    "blocked_unknowns": list(items or []),
+                    "undisposed": list(undisposed),
+                },
+            },
+            active if isinstance(active, dict) else None,
+        )
+
     def _validate_visible_sdd_review(
         self,
         snapshot: RunSnapshot,
@@ -4096,11 +4367,34 @@ class Monitor:
         )
         if not valid:
             return "visible-sdd delivery lacks verifiable in-session review evidence", True
+        blocked_unknowns = review.get("blocked_unknowns", [])
+        if not isinstance(blocked_unknowns, list) or any(
+            not isinstance(item, str) or not item.strip() for item in blocked_unknowns
+        ):
+            # Shape errors stay on the recoverable acceptance_rejected
+            # channel; only a well-formed non-empty list reaches the
+            # disposition gate in _apply_event.
+            return (
+                "visible-sdd in-session review blocked_unknowns must be a list of non-empty strings",
+                True,
+            )
         if review.get("protocol") != VISIBLE_SDD_PROTOCOL_REF:
             # The session must have followed the protocol shipped with this
             # package; a different or missing pointer is not the visible-sdd
             # review this acceptance certifies.
             return "visible-sdd delivery cites an unknown in-session review protocol", True
+        environment_facts_ref = review.get("environment_facts_ref")
+        if not isinstance(environment_facts_ref, str) or not environment_facts_ref.strip():
+            # The shipped protocol (visible-sdd-worker.md section 3) makes
+            # this field mandatory so the acceptance stays traceable to the
+            # environment facts the in-session review was dispatched with
+            # ("none" when the contract declares no environment_facts).  A
+            # missing or blank value is a format error the same session can
+            # correct and re-report on its live handle.
+            return (
+                "visible-sdd in-session review environment_facts_ref must be a non-empty string",
+                True,
+            )
         # ISSUE-02: the acceptance evidence is bound to the node contract it
         # reviewed.  The carried digest is the dispatch-time node digest and
         # must still equal the digest recomputed from the live contract; an
@@ -4141,6 +4435,18 @@ class Monitor:
             reason, _recoverable = failure
             self._mark_blocked_unknown(snapshot, node_id, reason)
             return
+        if self._undisposed_blocked_unknowns(
+            current, event.data.get("in_session_review")
+        ):
+            # Fail-closed twin of the _apply_event pause: a direct or
+            # replay-adjacent caller never writes an acceptance over
+            # undisposed blocked_unknown items either.
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "visible-sdd acceptance refused: blocked_unknown items await disposition",
+            )
+            return
         try:
             acceptance = VisibleSddAcceptance(
                 contract_digest=current.get("contract_digest"),
@@ -4152,6 +4458,18 @@ class Monitor:
                 snapshot,
                 node_id,
                 "visible-sdd acceptance refused: {}".format(error),
+            )
+            return
+        # ISSUE-140: invariant test commands gate the acceptance here too,
+        # before the binding transition and the durable accepted event.
+        contract_test_failure = self._execute_contract_test_commands(
+            snapshot, node_id, "acceptance"
+        )
+        if contract_test_failure is not None:
+            self._mark_blocked_unknown(
+                snapshot,
+                node_id,
+                "contract test execution failed: {}".format(contract_test_failure),
             )
             return
         # The in-session reviewer acts under the same single session
@@ -4204,6 +4522,7 @@ class Monitor:
         # A corrected re-report must not keep the rejection text.
         current["reason"] = None
         current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
+        current["blocked_unknowns_pending"] = []
         current["quarantine"] = None
         self._archive_pair(snapshot, node_id)
         self._release_node_lease(snapshot, node_id)
@@ -5126,6 +5445,58 @@ class Monitor:
                 # and node status were all left for the same task's corrected
                 # re-report -- so replay must mutate nothing either.
                 pass
+            elif record["event"] == "contract_test_execution":
+                # Pure audit like acceptance_rejected: the live pass only
+                # gates acceptance (or the expected_red observation) and
+                # mutates no lifecycle state, so replay must mutate nothing
+                # either -- otherwise a crash between the execution record
+                # and the durable acceptance would brick the node into
+                # manual reconciliation for no real inconsistency.
+                pass
+            elif record["event"] == "blocked_unknown_disposition_required":
+                # The live pause recorded no delivery and left the handle,
+                # binding and lease untouched, so replay restores only the
+                # pause marker and the still-pending items.
+                current["status"] = "blocked_unknown"
+                current["reason"] = (
+                    "acceptance paused: blocked_unknown items await disposition"
+                )
+                proof = data.get("proof")
+                undisposed = proof.get("undisposed") if isinstance(proof, dict) else None
+                current["blocked_unknowns_pending"] = (
+                    [item for item in undisposed if isinstance(item, str)]
+                    if isinstance(undisposed, list)
+                    else []
+                )
+            elif record["event"] == "blocked_unknown_disposition":
+                if provenance["role"] != "system":
+                    raise ValueError(
+                        "blocked_unknown disposition lacks system provenance"
+                    )
+                proof = data.get("proof")
+                item = proof.get("item") if isinstance(proof, dict) else None
+                disposition = data.get("disposition")
+                if (
+                    not isinstance(item, str)
+                    or not item.strip()
+                    or disposition not in BLOCKED_UNKNOWN_DISPOSITION_KINDS
+                ):
+                    raise ValueError("replayed blocked_unknown disposition is invalid")
+                current.setdefault("blocked_unknown_dispositions", []).append(
+                    {
+                        "item": item,
+                        "disposition": disposition,
+                        "note": proof.get("note", "") if isinstance(proof.get("note", ""), str) else "",
+                    }
+                )
+                # Mirror the live path: any disposition answers the pending
+                # item; only clearing kinds release the acceptance gate.
+                pending = current.get("blocked_unknowns_pending") or []
+                current["blocked_unknowns_pending"] = [
+                    pending_item
+                    for pending_item in pending
+                    if pending_item != item
+                ]
             else:
                 current["status"] = "blocked_unknown"
                 current["reason"] = "unapplied event needs manual reconciliation"
@@ -5139,6 +5510,185 @@ class Monitor:
             str(current.get("worktree", "")),
             snapshot.run_id,
         )
+
+    def _contract_test_entries(self, node_id: str):
+        """Collect executable invariant entries from the node contract.
+
+        Missing/non-list/empty ``invariants`` yields an empty list, which is
+        what keeps contracts without invariants completely behavior-neutral.
+        An invalid ``timeout_seconds`` is a contract error and is reported
+        through the returned error string instead of being guessed at.
+        """
+        node = self.nodes[node_id]
+        contract = node.contract if isinstance(node.contract, dict) else {}
+        entries = []
+        for index, item in contract_invariant_entries(contract):
+            invariant_id = item.get("id")
+            if not isinstance(invariant_id, str) or not invariant_id.strip():
+                invariant_id = "invariants[{}]".format(index)
+            kind = item.get("kind")
+            kind = kind.strip() if isinstance(kind, str) and kind.strip() else None
+            timeout_seconds = item.get(
+                "timeout_seconds", DEFAULT_CONTRACT_TEST_TIMEOUT_SECONDS
+            )
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, int)
+                or timeout_seconds < 1
+            ):
+                return None, (
+                    "invariant {} has an invalid timeout_seconds value "
+                    "(contract error)".format(invariant_id.strip())
+                )
+            entries.append(
+                {
+                    "invariant_id": invariant_id.strip(),
+                    "command": item["test_command"],
+                    "kind": kind,
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+        return entries, None
+
+    def _record_contract_test_execution(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        phase: str,
+        entry: Dict[str, Any],
+        exit_code: Optional[int],
+        output_tail: str,
+        worktree: Path,
+        active: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        # The execution detail rides under ``proof``: it is a structured
+        # result (identifiers, exit code, bounded output tail), and the
+        # durable event schema only preserves structured values under
+        # pass-through keys.  run_id/node_id/phase stay top-level.
+        self._record(
+            snapshot,
+            "contract_test_execution",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "phase": phase,
+                "proof": {
+                    "invariant_id": entry["invariant_id"],
+                    "command": entry["command"],
+                    "exit_code": exit_code,
+                    "output_tail": output_tail,
+                    "executed_at": datetime.now(timezone.utc).isoformat(),
+                    "worktree": str(worktree),
+                },
+            },
+            active,
+        )
+
+    def _execute_contract_test_commands(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        phase: str,
+        active: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Run contract-declared invariant test commands for one node.
+
+        No new authorization surface: every command comes from the
+        already-authorized node contract and execution is confined to the
+        contract writer worktree.  ``phase`` is ``"acceptance"`` (commands
+        must pass) or ``"expected_red"`` (commands must fail before the
+        implementation exists).  Returns ``None`` on success, otherwise a
+        failure reason; every executed (or refused) command is recorded as a
+        ``contract_test_execution`` event first, so a rejection can never be
+        forged into a pass.
+        """
+        entries, contract_error = self._contract_test_entries(node_id)
+        if contract_error is not None:
+            return contract_error
+        if not entries:
+            return None
+        current = snapshot.nodes[node_id]
+        worktree = self._worktree_path(current)
+        if not worktree.is_dir():
+            return (
+                "writer worktree {} does not exist; contract test execution "
+                "is confined to it".format(worktree)
+            )
+        blacklist = frozenset()
+        if any(entry["kind"] == "behavioral" for entry in entries):
+            # Fail closed: an unreadable project config means the effective
+            # blacklist is unknown, so behavioral invariants cannot run.
+            try:
+                project_config = load_project_config(self.paths.root)
+            except ValueError as error:
+                return (
+                    "behavioral command blacklist cannot be resolved from "
+                    "the project config: {}".format(error)
+                )
+            blacklist = BEHAVIORAL_COMPILE_COMMAND_BLACKLIST | set(
+                project_config.behavioral_command_blacklist_extra
+            )
+        for entry in entries:
+            if entry["kind"] == "behavioral" and _command_matches_blacklist(
+                entry["command"], blacklist
+            ):
+                note = (
+                    "behavioral invariant test_command matches the compile "
+                    "command blacklist"
+                )
+                self._record_contract_test_execution(
+                    snapshot, node_id, phase, entry, None,
+                    "not executed: " + note, worktree, active,
+                )
+                return "invariant {}: {} ({!r})".format(
+                    entry["invariant_id"], note, entry["command"]
+                )
+            try:
+                completed = subprocess.run(
+                    entry["command"],
+                    shell=True,
+                    cwd=str(worktree),
+                    capture_output=True,
+                    text=True,
+                    timeout=entry["timeout_seconds"],
+                )
+                exit_code: Optional[int] = completed.returncode
+                output_tail = (
+                    (completed.stdout or "") + "\n" + (completed.stderr or "")
+                )[-2000:]
+            except subprocess.TimeoutExpired as error:
+                exit_code = None
+                partial = error.stdout or ""
+                if isinstance(partial, bytes):
+                    partial = partial.decode("utf-8", "replace")
+                output_tail = (
+                    "timeout after {}s\n".format(entry["timeout_seconds"])
+                    + str(partial)
+                )[-2000:]
+            self._record_contract_test_execution(
+                snapshot, node_id, phase, entry, exit_code, output_tail,
+                worktree, active,
+            )
+            if phase == "expected_red":
+                # Red means any non-zero outcome (failure, timeout, missing
+                # command); only a clean pass violates the TDD contract.
+                if exit_code == 0:
+                    return (
+                        "invariant {} expected red before implementation, "
+                        "command passed ({!r})".format(
+                            entry["invariant_id"], entry["command"]
+                        )
+                    )
+                continue
+            if exit_code is None:
+                return "invariant {} command {!r} timed out after {}s".format(
+                    entry["invariant_id"], entry["command"], entry["timeout_seconds"]
+                )
+            if exit_code != 0:
+                return "invariant {} command {!r} exited with code {}".format(
+                    entry["invariant_id"], entry["command"], exit_code
+                )
+        return None
 
     def _worktree_path(self, current: Dict[str, Any]) -> Path:
         worktree_path = Path(str(current.get("worktree", ".")))

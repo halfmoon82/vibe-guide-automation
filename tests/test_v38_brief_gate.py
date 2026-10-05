@@ -95,5 +95,92 @@ class V38BriefGateTests(unittest.TestCase):
         self.assertEqual(validation.evidence["invariants"][0]["id"], "I1")
 
 
+
+    def _brief_with_entrypoint(self, entrypoint):
+        return self._valid_brief(invariants=[{
+            "id": "I1", "entrypoint": entrypoint,
+            "positive_case": "ok", "negative_case": "bad",
+            "test_command": "python -m unittest",
+            "evidence_ref": "evidence/I1.json",
+        }])
+
+    def _validate_with_file(self, rel_path, content, entrypoint):
+        with tempfile.TemporaryDirectory() as root:
+            entry = Path(root) / rel_path
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            entry.write_text(content, encoding="utf-8")
+            return validate_implementation_brief(
+                self._brief_with_entrypoint(entrypoint), self.manifest, self.node,
+                project_root=Path(root),
+            )
+
+    def _symbol_check(self, validation):
+        return validation.evidence["checks"]["invariants[0].entrypoint.symbol"]
+
+    def test_ts_entrypoint_export_symbol_accepted(self):
+        validation = self._validate_with_file(
+            "src/a.ts", "export const someConst = 1;\n", "src/a.ts:someConst")
+        self.assertTrue(validation.valid, validation.missing)
+        self.assertEqual(self._symbol_check(validation)["mode"], "ts_export")
+
+    def test_ts_entrypoint_missing_symbol_fails(self):
+        validation = self._validate_with_file(
+            "src/a.ts", "const other = 1;\n", "src/a.ts:someConst")
+        self.assertFalse(validation.valid)
+        self.assertIn("invariants[0].entrypoint", validation.missing)
+
+    def test_ts_entrypoint_export_type_accepted(self):
+        validation = self._validate_with_file(
+            "src/a.tsx", "export type SomeConst = string;\n", "src/a.tsx:SomeConst")
+        self.assertTrue(validation.valid, validation.missing)
+
+    def test_jsx_entrypoint_export_function_accepted(self):
+        validation = self._validate_with_file(
+            "src/a.jsx", "export function renderApp() {}\n", "src/a.jsx:renderApp")
+        self.assertTrue(validation.valid, validation.missing)
+
+    def test_vue_entrypoint_symbol_in_script_block_accepted(self):
+        content = ("<template><div /></template>\n"
+                   "<script setup>\nconst someConst = 1;\n</script>\n")
+        validation = self._validate_with_file(
+            "src/views/a/index.vue", content, "src/views/a/index.vue:someConst")
+        self.assertTrue(validation.valid, validation.missing)
+        self.assertEqual(self._symbol_check(validation)["mode"], "vue_script_block")
+
+    def test_vue_entrypoint_symbol_outside_script_fails(self):
+        content = ("<template><div>{{ someConst }}</div></template>\n"
+                   "<script setup>\nconst other = 1;\n</script>\n")
+        validation = self._validate_with_file(
+            "src/views/a/index.vue", content, "src/views/a/index.vue:someConst")
+        self.assertFalse(validation.valid)
+        self.assertIn("invariants[0].entrypoint", validation.missing)
+
+    def test_unknown_extension_word_match_records_degradation(self):
+        validation = self._validate_with_file(
+            "docs/a.md", "This mentions someConst in prose.\n", "docs/a.md:someConst")
+        self.assertTrue(validation.valid, validation.missing)
+        check = self._symbol_check(validation)
+        self.assertEqual(check["mode"], "word_match_fallback")
+        self.assertTrue(check["degraded"])
+
+    def test_unknown_extension_without_symbol_fails(self):
+        validation = self._validate_with_file(
+            "docs/a.md", "No such name here.\n", "docs/a.md:someConst")
+        self.assertFalse(validation.valid)
+        self.assertIn("invariants[0].entrypoint", validation.missing)
+
+    def test_py_entrypoint_strictness_kept_for_plain_mentions(self):
+        validation = self._validate_with_file(
+            "vibe_guide/a.py", "# entry is mentioned here\nVALUE = 'entry'\n",
+            "vibe_guide/a.py:entry")
+        self.assertFalse(validation.valid)
+        self.assertIn("invariants[0].entrypoint", validation.missing)
+
+    def test_py_entrypoint_class_definition_accepted(self):
+        validation = self._validate_with_file(
+            "vibe_guide/a.py", "class entry:\n    pass\n", "vibe_guide/a.py:entry")
+        self.assertTrue(validation.valid, validation.missing)
+
+
 if __name__ == "__main__":
     unittest.main()

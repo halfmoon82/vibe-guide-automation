@@ -486,7 +486,8 @@ class MailboxClosesTheRunTests(unittest.TestCase):
                 "in_session_review": {
                     "protocol": "vibe_guide/protocols/visible-sdd-worker.md",
                     "evidence_ref": "closeout-e2e#review-round-1",
-                    "clearance": {"p0": 0, "p1": 0, "p2": 0}}}
+                    "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                    "environment_facts_ref": "none"}}
 
     def test_a_structured_reviewer_acceptance_closes_the_run(self):
         result, snapshot = self.serve(CLEARED_CLAIM)

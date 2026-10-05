@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from vibe_guide.authorization import authorize, build_authorization_card
+from vibe_guide.authorization import AuthorizationRecord, authorize, build_authorization_card
 from vibe_guide.contracts import RunEvent, RunHandle
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan, node_branch
 from vibe_guide.monitor import Monitor, VISIBLE_SDD_PROTOCOL_REF
@@ -2817,6 +2817,7 @@ class VisibleDispatchTests(unittest.TestCase):
                                 "protocol": VISIBLE_SDD_PROTOCOL_REF,
                                 "evidence_ref": "session-delivery#review-round-1",
                                 "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                                "environment_facts_ref": "none",
                             },
                         },
                     )
@@ -2989,6 +2990,7 @@ class VisibleDispatchTests(unittest.TestCase):
                                 "protocol": VISIBLE_SDD_PROTOCOL_REF,
                                 "evidence_ref": "session-delivery#review-round-1",
                                 "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                                "environment_facts_ref": "none",
                             },
                         },
                     )
@@ -3057,6 +3059,472 @@ class VisibleDispatchTests(unittest.TestCase):
         self.assertIn("in-session review", replayed.nodes["sdd-a"]["reason"])
         self.assertFalse(replayed.nodes["sdd-a"]["pair_archived"])
         self.assertTrue(all(call["role"] == "developer" for call in runner.start_calls))
+
+    @staticmethod
+    def _blocked_unknown_review(item):
+        return {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-1",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "environment_facts_ref": "none",
+            "blocked_unknowns": [item],
+        }
+
+    def test_visible_sdd_blocked_unknown_pauses_acceptance_until_disposed(self):
+        """Design 3.6 acceptance example: pause, dispose, then accept.
+
+        A delivery carrying a blocked_unknown item ("cannot confirm the
+        2.3.7 props") must not be accepted and must not fake a clean
+        clearance: the node waits in blocked_unknown with the delivery
+        unrecorded and the worker-session handle live.  After a clearing
+        disposition is recorded, the same session's re-report is accepted.
+        """
+        from vibe_guide.state import load_events
+
+        item = "\u65e0\u6cd5\u786e\u8ba4 2.3.7 \u7684 props"
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertIn("disposition", current["reason"])
+        self.assertEqual(current["blocked_unknowns_pending"], [item])
+        self.assertFalse(current.get("pair_archived", False))
+        # The delivery stayed unrecorded and the handle stayed live, so the
+        # same worker session re-reports after dispositions land.
+        self.assertIn("sdd-a", snapshot.handles)
+        self.assertIsInstance(current.get("active_task"), dict)
+        events = load_events(self.paths, snapshot.run_id)
+        pauses = [
+            record_
+            for record_ in events
+            if record_["event"] == "blocked_unknown_disposition_required"
+            and record_["data"].get("node_id") == "sdd-a"
+        ]
+        self.assertEqual(len(pauses), 1)
+        self.assertEqual(pauses[0]["data"]["proof"]["blocked_unknowns"], [item])
+        self.assertEqual(pauses[0]["data"]["proof"]["undisposed"], [item])
+        self.assertFalse(
+            any(
+                record_["event"] == "accepted"
+                and record_["data"].get("node_id") == "sdd-a"
+                for record_ in events
+            )
+        )
+        self.assertFalse(
+            any(
+                record_["event"] == "delivered"
+                and record_["data"].get("node_id") == "sdd-a"
+                for record_ in events
+            )
+        )
+        binding = load_task_binding(
+            self.paths, "sdd-a", "developer", run_id=snapshot.run_id
+        )
+        self.assertNotEqual(binding.status, "archived")
+
+        snapshot = monitor.record_blocked_unknown_disposition(
+            snapshot.run_id,
+            "sdd-a",
+            item,
+            "resolved_with_facts",
+            note="\u5df2\u8865\u73af\u5883\u4e8b\u5b9e\u5e76\u590d\u5ba1\u901a\u8fc7",
+        )
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [])
+        dispositions = [
+            record_
+            for record_ in load_events(self.paths, snapshot.run_id)
+            if record_["event"] == "blocked_unknown_disposition"
+            and record_["data"].get("node_id") == "sdd-a"
+        ]
+        self.assertEqual(len(dispositions), 1)
+        self.assertEqual(dispositions[0]["data"]["proof"]["item"], item)
+        self.assertEqual(dispositions[0]["data"]["disposition"], "resolved_with_facts")
+        # A disposition alone never accepts the delivery.
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertEqual(current["status"], "accepted")
+        self.assertTrue(current["pair_archived"])
+        self.assertEqual(current["blocked_unknowns_pending"], [])
+        # The audit chain keeps the disposition after acceptance.
+        self.assertEqual(
+            current["blocked_unknown_dispositions"],
+            [
+                {
+                    "item": item,
+                    "disposition": "resolved_with_facts",
+                    "note": "\u5df2\u8865\u73af\u5883\u4e8b\u5b9e\u5e76\u590d\u5ba1\u901a\u8fc7",
+                }
+            ],
+        )
+        self.assertEqual(
+            load_task_binding(
+                self.paths, "sdd-a", "developer", run_id=snapshot.run_id
+            ).status,
+            "archived",
+        )
+
+    def test_visible_sdd_blocked_unknown_malformed_shape_is_rejected_for_re_report(self):
+        """Shape errors stay on the recoverable acceptance_rejected channel."""
+        from vibe_guide.state import load_events
+
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        malformed = {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-1",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "blocked_unknowns": ["", 42],
+        }
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    ("complete", {"evidence": "delivery", "in_session_review": malformed}),
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": {
+                                "protocol": VISIBLE_SDD_PROTOCOL_REF,
+                                "evidence_ref": "session-delivery#review-round-2",
+                                "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                                "environment_facts_ref": "none",
+                            },
+                        },
+                    ),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertNotEqual(current["status"], "blocked_unknown", current.get("reason"))
+        self.assertNotEqual(current["status"], "accepted")
+        self.assertIn("sdd-a", snapshot.handles)
+        rejections = [
+            record_
+            for record_ in load_events(self.paths, snapshot.run_id)
+            if record_["event"] == "acceptance_rejected"
+            and record_["data"].get("node_id") == "sdd-a"
+        ]
+        self.assertEqual(len(rejections), 1)
+        self.assertTrue(rejections[0]["data"].get("recoverable"))
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+
+    def test_visible_sdd_review_missing_environment_facts_ref_is_rejected_and_correctable(self):
+        """ISSUE-140 (integration P2-1): the payload field is gate-enforced.
+
+        The shipped protocol makes ``environment_facts_ref`` mandatory in
+        the in_session_review payload ("none" when the contract declares no
+        environment_facts).  A delivery omitting it is a recoverable format
+        rejection, and the same session's corrected re-report is accepted.
+        """
+        from vibe_guide.state import load_events
+
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        missing = {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-1",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+        }
+        corrected = dict(
+            missing,
+            evidence_ref="session-delivery#review-round-2",
+            environment_facts_ref="none",
+        )
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    ("complete", {"evidence": "delivery", "in_session_review": missing}),
+                    ("complete", {"evidence": "delivery", "in_session_review": corrected}),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertNotEqual(current["status"], "blocked_unknown", current.get("reason"))
+        self.assertNotEqual(current["status"], "accepted")
+        self.assertIn("sdd-a", snapshot.handles)
+        rejections = [
+            record_
+            for record_ in load_events(self.paths, snapshot.run_id)
+            if record_["event"] == "acceptance_rejected"
+            and record_["data"].get("node_id") == "sdd-a"
+        ]
+        self.assertEqual(len(rejections), 1)
+        self.assertTrue(rejections[0]["data"].get("recoverable"))
+        # Durable events redact provider text, so the causal link is
+        # structural: the only difference between the rejected payload and
+        # the accepted re-report is the added environment_facts_ref field.
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+
+    def test_visible_sdd_blocked_unknown_silent_drop_on_rereport_stays_paused(self):
+        """P1 regression: dropping a paused item from the payload is not closure.
+
+        Once a delivery paused on item X, re-reporting with X removed (or the
+        key omitted) must still refuse acceptance: only a recorded disposition
+        answers a paused item.  Without this, the escape hatch this node
+        closes would survive as "just don't mention it again".
+        """
+        from vibe_guide.state import load_events
+
+        item = "\u65e0\u6cd5\u786e\u8ba4 2.3.7 \u7684 props"
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        clean_review = {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-2",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "environment_facts_ref": "none",
+        }
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                    # Silent drop: the re-report no longer mentions the item.
+                    ("complete", {"evidence": "delivery", "in_session_review": clean_review}),
+                    # After the disposition, the same clean re-report passes.
+                    ("complete", {"evidence": "delivery", "in_session_review": clean_review}),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [item])
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertEqual(current["blocked_unknowns_pending"], [item])
+        self.assertFalse(current.get("pair_archived", False))
+        self.assertFalse(
+            any(
+                record_["event"] == "accepted"
+                and record_["data"].get("node_id") == "sdd-a"
+                for record_ in load_events(self.paths, snapshot.run_id)
+            )
+        )
+
+        snapshot = monitor.record_blocked_unknown_disposition(
+            snapshot.run_id, "sdd-a", item, "resolved_with_facts"
+        )
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+        self.assertTrue(snapshot.nodes["sdd-a"]["pair_archived"])
+
+    def test_visible_sdd_blocked_unknown_escalation_answers_pending_not_payload(self):
+        """Escalation answers the paused item but never clears a live report.
+
+        After ``escalated_to_findings`` the pending item is answered (the
+        authorized rework may drop it), yet a re-delivery still carrying the
+        same item pauses again: acceptance never proceeds while the reviewer
+        still reports it unknown.  A reworked re-delivery without the item
+        is then accepted.
+        """
+        from vibe_guide.state import load_events
+
+        item = "\u65e0\u6cd5\u786e\u8ba4\u8be5\u7ec4\u4ef6\u7684\u4e8b\u4ef6\u7b7e\u540d"
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        clean_review = {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-3",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "environment_facts_ref": "none",
+        }
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                    # Unchanged re-delivery: still carries the item.
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                    # Reworked re-delivery: the escalated item is gone.
+                    ("complete", {"evidence": "delivery", "in_session_review": clean_review}),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [item])
+
+        snapshot = monitor.record_blocked_unknown_disposition(
+            snapshot.run_id, "sdd-a", item, "escalated_to_findings", note="\u8f6c P1 \u8fd4\u5de5"
+        )
+        # The escalation answers the paused item.
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [])
+        # A duplicate registration of the same kind is audit noise: rejected.
+        with self.assertRaises(ValueError):
+            monitor.record_blocked_unknown_disposition(
+                snapshot.run_id, "sdd-a", item, "escalated_to_findings"
+            )
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertEqual(current["blocked_unknowns_pending"], [item])
+        self.assertFalse(current.get("pair_archived", False))
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertEqual(current["status"], "accepted")
+        self.assertTrue(current["pair_archived"])
+        dispositions = [
+            record_
+            for record_ in load_events(self.paths, snapshot.run_id)
+            if record_["event"] == "blocked_unknown_disposition"
+            and record_["data"].get("node_id") == "sdd-a"
+        ]
+        self.assertEqual(len(dispositions), 1)
+        self.assertEqual(dispositions[0]["data"]["disposition"], "escalated_to_findings")
+
+    def test_blocked_unknown_disposition_requires_pending_item(self):
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner()
+        snapshot = monitor.start(record, runner)
+
+        with self.assertRaises(ValueError):
+            monitor.record_blocked_unknown_disposition(
+                snapshot.run_id, "sdd-a", "never reported", "confirmed_benign"
+            )
+        with self.assertRaises(ValueError):
+            monitor.record_blocked_unknown_disposition(
+                snapshot.run_id, "sdd-a", "", "confirmed_benign"
+            )
+        with self.assertRaises(ValueError):
+            monitor.record_blocked_unknown_disposition(
+                snapshot.run_id, "sdd-a", "item", "not-a-kind"
+            )
+        with self.assertRaises(ValueError):
+            monitor.record_blocked_unknown_disposition(
+                snapshot.run_id, "no-such-node", "item", "confirmed_benign"
+            )
+
+    def test_visible_sdd_blocked_unknown_pause_survives_event_replay(self):
+        """Crash after the pause and disposition landed but before the snapshot.
+
+        Replay must rebuild the pending/disposition state from the durable
+        events; the re-report consumed afterwards is then accepted.
+        """
+        item = "\u65e0\u6cd5\u786e\u8ba4 2.3.7 \u7684 props"
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                    (
+                        "complete",
+                        {
+                            "evidence": "delivery",
+                            "in_session_review": self._blocked_unknown_review(item),
+                        },
+                    ),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        preserved = deepcopy(snapshot)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [item])
+        snapshot = monitor.record_blocked_unknown_disposition(
+            snapshot.run_id, "sdd-a", item, "resolved_with_facts"
+        )
+        self.assertEqual(snapshot.nodes["sdd-a"]["blocked_unknowns_pending"], [])
+
+        # Lose every snapshot write the pause and disposition performed.
+        save_snapshot(self.paths, preserved)
+
+        recovered = monitor.tick(snapshot.run_id, runner)
+
+        current = recovered.nodes["sdd-a"]
+        self.assertEqual(current["status"], "accepted")
+        self.assertTrue(current["pair_archived"])
+        self.assertEqual(current["blocked_unknowns_pending"], [])
+        self.assertEqual(
+            current["blocked_unknown_dispositions"],
+            [{"item": item, "disposition": "resolved_with_facts", "note": ""}],
+        )
 
     def test_background_topology_dispatch_carries_disclosure(self):
         """A contract-stamped background ruling degrades with disclosure."""
@@ -3366,6 +3834,378 @@ class PathOwnershipGateTests(unittest.TestCase):
         self.assertEqual(sorted(audit["node_ids"]), ["a", "b"])
         self.assertEqual(audit["path_ownership"]["blocked_nodes"], ["b"])
         self.assertEqual(audit["path_ownership"]["conflicts"], [{"path": "shared.py", "nodes": ["b", "a"]}])
+
+
+class ContractTestExecutionTests(unittest.TestCase):
+    """ISSUE-140 (design section 3.3): invariant test_command execution gates.
+
+    Acceptance executes every contract-declared invariant ``test_command``
+    inside the node writer worktree; ``expected_red`` nodes must observe red
+    before the first developer dispatch.  Nodes without invariants keep the
+    legacy behavior (covered by the pre-existing monitor tests).
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.paths = ProjectPaths(Path(self.temporary.name))
+        (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (self.paths.vibe / "state.json").write_text('{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8")
+        save_contract(
+            self.paths,
+            build_contract(self.paths.root, provider="fake", host_id="local"),
+        )
+        self.capabilities = AgentCapabilities("fake", True, True, True, True, True, "full")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def authorized_monitor(self, nodes):
+        plan = Plan("plan-1", 1, "docs/prd.md", [item.id for item in nodes], "draft")
+        card = build_authorization_card(plan, nodes, self.capabilities)
+        return Monitor(self.paths, plan, nodes), authorize(card, "AUTHORIZE")
+
+    def make_worktree(self, node_id):
+        worktree = self.paths.root / ".worktrees" / node_id
+        worktree.mkdir(parents=True, exist_ok=True)
+        return worktree
+
+    @staticmethod
+    def invariant_node(node_id, invariants, expected_red=None):
+        current = node(node_id)
+        current.contract["invariants"] = invariants
+        if expected_red is not None:
+            current.contract["expected_red"] = expected_red
+        return current
+
+    def acceptance_runner(self):
+        return FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+                ("n1", "reviewer"): [("accepted", {"evidence": "P0-P2 clear"})],
+            }
+        )
+
+    def run_to_acceptance_attempt(self, monitor, record, runner):
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        return snapshot
+
+    def contract_test_events(self, run_id):
+        return [
+            event
+            for event in load_events(self.paths, run_id)
+            if event["event"] == "contract_test_execution"
+        ]
+
+    def test_acceptance_rejects_failing_invariant_command(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "test_command": "python3 -c \"import sys; sys.exit(3)\""}],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("contract test execution failed", snapshot.nodes["n1"]["reason"])
+        self.assertIn("exited with code 3", snapshot.nodes["n1"]["reason"])
+        events = load_events(self.paths, snapshot.run_id)
+        self.assertFalse(any(event["event"] == "accepted" for event in events))
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        self.assertEqual(executions[0]["data"]["phase"], "acceptance")
+        self.assertEqual(executions[0]["data"]["proof"]["exit_code"], 3)
+
+    def test_acceptance_passes_and_records_execution_evidence(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "test_command": "python3 -c \"print('ok')\""}],
+        )
+        worktree = self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        data = executions[0]["data"]
+        self.assertEqual(data["node_id"], "n1")
+        self.assertEqual(data["phase"], "acceptance")
+        proof = data["proof"]
+        self.assertEqual(proof["invariant_id"], "I1")
+        self.assertEqual(proof["command"], "python3 -c \"print('ok')\"")
+        self.assertEqual(proof["exit_code"], 0)
+        self.assertIn("ok", proof["output_tail"])
+        self.assertTrue(proof["executed_at"])
+        self.assertEqual(proof["worktree"], str(worktree))
+
+    def test_acceptance_rejects_timeout(self):
+        current = self.invariant_node(
+            "n1",
+            [{
+                "id": "I1",
+                "test_command": "python3 -c \"import time; time.sleep(5)\"",
+                "timeout_seconds": 1,
+            }],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("timed out", snapshot.nodes["n1"]["reason"])
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        proof = executions[0]["data"]["proof"]
+        self.assertIsNone(proof["exit_code"])
+        self.assertIn("timeout", proof["output_tail"])
+        self.assertFalse(
+            any(event["event"] == "accepted" for event in load_events(self.paths, snapshot.run_id))
+        )
+
+    def test_acceptance_rejects_when_writer_worktree_missing(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "test_command": "python3 -c \"print('ok')\""}],
+        )
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("worktree", snapshot.nodes["n1"]["reason"])
+        self.assertFalse(
+            any(event["event"] == "accepted" for event in load_events(self.paths, snapshot.run_id))
+        )
+
+    def test_invalid_timeout_seconds_is_a_contract_error(self):
+        current = self.invariant_node(
+            "n1",
+            [{
+                "id": "I1",
+                "test_command": "python3 -c \"print('ok')\"",
+                "timeout_seconds": 0,
+            }],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("timeout_seconds", snapshot.nodes["n1"]["reason"])
+
+    def test_behavioral_invariant_blacklisted_command_is_not_executed(self):
+        sentinel = self.paths.root / "sentinel-n1"
+        command = "vue-tsc --noEmit || touch {}".format(sentinel)
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "kind": "behavioral", "test_command": command}],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("blacklist", snapshot.nodes["n1"]["reason"])
+        # Proof the command never ran: executing it would create the sentinel.
+        self.assertFalse(sentinel.exists())
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        self.assertIsNone(executions[0]["data"]["proof"]["exit_code"])
+
+    def test_project_config_appends_behavioral_blacklist(self):
+        (self.paths.vibe / "config.json").write_text(
+            json.dumps({"behavioral_command_blacklist_extra": ["make build"]}),
+            encoding="utf-8",
+        )
+        sentinel = self.paths.root / "sentinel-n1"
+        command = "make build || touch {}".format(sentinel)
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "kind": "behavioral", "test_command": command}],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("blacklist", snapshot.nodes["n1"]["reason"])
+        self.assertFalse(sentinel.exists())
+
+    def test_config_rejects_invalid_blacklist_extra(self):
+        from vibe_guide.config import load_project_config
+
+        (self.paths.vibe / "config.json").write_text(
+            json.dumps({"behavioral_command_blacklist_extra": "tsc"}),
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValueError):
+            load_project_config(self.paths.root)
+
+    def test_behavioral_blacklist_config_error_fails_closed(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "kind": "behavioral", "test_command": "python3 -c \"print('ok')\""}],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        (self.paths.vibe / "config.json").write_text(
+            json.dumps({"behavioral_command_blacklist_extra": "tsc"}),
+            encoding="utf-8",
+        )
+
+        reason = monitor._execute_contract_test_commands(snapshot, "n1", "acceptance")
+
+        self.assertIsNotNone(reason)
+        self.assertIn("config", reason)
+
+    def test_expected_red_failing_command_allows_first_dispatch(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "test_command": "python3 -c \"import sys; sys.exit(1)\""}],
+            expected_red="I1 must fail before the implementation exists",
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1"])
+        self.assertEqual(snapshot.nodes["n1"]["status"], "running")
+        self.assertTrue(snapshot.nodes["n1"]["expected_red_observed"])
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        self.assertEqual(executions[0]["data"]["phase"], "expected_red")
+        self.assertEqual(executions[0]["data"]["proof"]["exit_code"], 1)
+
+    def test_expected_red_passing_command_blocks_first_dispatch(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "test_command": "python3 -c \"print('ok')\""}],
+            expected_red="I1 must fail before the implementation exists",
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        self.assertEqual(runner.start_calls, [])
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("expected red", snapshot.nodes["n1"]["reason"])
+        self.assertIsNone(snapshot.nodes["n1"]["active_task"])
+        self.assertIsNone(snapshot.nodes["n1"]["active_role"])
+        self.assertIsNone(snapshot.nodes["n1"]["start_intent"])
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        self.assertEqual(executions[0]["data"]["phase"], "expected_red")
+        self.assertEqual(executions[0]["data"]["proof"]["exit_code"], 0)
+
+    def test_authorization_card_lists_contract_test_commands(self):
+        current = self.invariant_node(
+            "n1",
+            [
+                {"id": "I2", "test_command": "python3 -c \"print('b')\""},
+                {"id": "I1", "test_command": "python3 -c \"print('a')\""},
+            ],
+        )
+        plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+
+        card = build_authorization_card(plan, [current], self.capabilities)
+
+        self.assertEqual(
+            card.contract_test_commands,
+            {"n1": ("python3 -c \"print('a')\"", "python3 -c \"print('b')\"")},
+        )
+        record = authorize(card, "AUTHORIZE")
+        self.assertEqual(record.contract_test_commands, card.contract_test_commands)
+        restored = AuthorizationRecord.from_dict(record.to_dict())
+        self.assertEqual(restored.contract_test_commands, card.contract_test_commands)
+
+    def test_authorization_card_without_invariants_omits_contract_test_commands(self):
+        plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+
+        card = build_authorization_card(plan, [node("n1")], self.capabilities)
+
+        self.assertIsNone(card.contract_test_commands)
+        # authorize() re-derives the canonical payload and compares digests,
+        # so a passing authorize proves the legacy payload is byte-identical.
+        record = authorize(card, "AUTHORIZE")
+        self.assertIsNone(record.contract_test_commands)
+        restored = AuthorizationRecord.from_dict(record.to_dict())
+        self.assertIsNone(restored.contract_test_commands)
+
+    def test_authorization_record_rejects_invalid_contract_test_commands(self):
+        plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+        card = build_authorization_card(plan, [node("n1")], self.capabilities)
+        record = authorize(card, "AUTHORIZE")
+        data = record.to_dict()
+        data["contract_test_commands"] = {"n1": "not-a-list"}
+        with self.assertRaises(ValueError):
+            AuthorizationRecord.from_dict(data)
+
+    def test_contract_test_execution_event_replay_mutates_nothing(self):
+        """ISSUE-140 (integration P2-2): pure-audit events never brick replay.
+
+        A crash between the durable ``contract_test_execution`` record and
+        the durable acceptance leaves the audit event unapplied.  Replay
+        must mutate nothing (same rule as ``acceptance_rejected``): the
+        node stays in its last durable lifecycle state instead of being
+        bricked into blocked_unknown manual reconciliation.
+        """
+        import glob
+        import json
+
+        from vibe_guide.state import load_events, load_snapshot
+
+        current = self.invariant_node(
+            "n1", [{"id": "I1", "test_command": "python3 -c \"print('ok')\""}]
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+
+        events = load_events(self.paths, snapshot.run_id)
+        index = next(
+            i for i, event in enumerate(events)
+            if event["event"] == "contract_test_execution"
+        )
+        # Crash window: the last durable snapshot predates the audit event
+        # and the acceptance was never recorded.
+        replay = load_snapshot(self.paths, snapshot.run_id)
+        replay.event_sequence = index
+        replay.nodes["n1"]["status"] = "delivered"
+        replay.nodes["n1"]["reason"] = None
+        events_file = glob.glob(
+            str(self.paths.root / ".vibe" / "runs" / snapshot.run_id / "events.jsonl")
+        )[0]
+        with open(events_file, "w") as handle:
+            for event in events[: index + 1]:
+                handle.write(json.dumps(event) + "\n")
+
+        monitor._reconcile_unapplied_events(replay)
+
+        self.assertEqual(replay.nodes["n1"]["status"], "delivered")
+        self.assertIsNone(replay.nodes["n1"].get("reason"))
 
 
 if __name__ == "__main__":

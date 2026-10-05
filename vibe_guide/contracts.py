@@ -67,6 +67,46 @@ class Runner:
         raise NotImplementedError
 
 
+#: Markers of common third-party UI component libraries.  A contract whose
+#: goal or declared paths mention one of these (case-insensitive substring) is
+#: treated as changing third-party UI component usage and must then carry
+#: ``environment_facts``.  Extend this tuple (with a test) when a project
+#: adopts another library.
+THIRD_PARTY_UI_LIBRARY_MARKERS = (
+    "element-plus", "element-ui", "antd", "ant-design", "vuetify", "quasar",
+    "naive-ui", "arco", "material-ui", "mui", "primereact", "chakra",
+)
+
+#: File suffixes that make an ``environment_facts[].source`` value read as an
+#: in-repo path even without a ``/`` (e.g. ``package.json``).
+_REPO_PATH_SUFFIXES = (
+    ".json", ".md", ".py", ".js", ".jsx", ".ts", ".tsx", ".vue",
+    ".yaml", ".yml", ".toml", ".lock", ".txt", ".html", ".css",
+)
+
+
+def _touches_third_party_ui(issue: "IssueContract") -> bool:
+    haystack = " ".join([issue.goal] + list(issue.owned_paths) + list(issue.read_paths)).lower()
+    return any(marker in haystack for marker in THIRD_PARTY_UI_LIBRARY_MARKERS)
+
+
+def _looks_like_repo_path(source: str) -> bool:
+    """Decide whether an ``environment_facts[].source`` names an in-repo file.
+
+    Discrimination rule (kept deliberately simple and deterministic):
+    a value containing ``://`` is an external reference (URL); a value without
+    ``/`` and without a common file suffix is descriptive prose (e.g.
+    "official docs"); anything else is treated as a project-relative path and
+    must exist under the project root.
+    """
+    text = source.strip()
+    if "://" in text:
+        return False
+    if "/" in text:
+        return True
+    return PurePosixPath(text).suffix.lower() in _REPO_PATH_SUFFIXES
+
+
 @dataclass(frozen=True)
 class IssueContract:
     issue_id: str
@@ -84,18 +124,20 @@ class IssueContract:
     evidence_ref: str
     allowlist: List[str] = field(default_factory=list)
     ownership: Mapping[str, Any] = field(default_factory=dict)
+    environment_facts: List[Dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "IssueContract":
         required = {"issue_id", "goal", "non_goals", "owned_paths", "read_paths",
                     "call_chain", "invariants", "expected_red", "risk_notes", "base_sha",
                     "plan_revision", "execution_epoch", "evidence_ref"}
-        optional = {"allowlist", "ownership"}
+        optional = {"allowlist", "ownership", "environment_facts"}
         if not isinstance(data, Mapping) or not required.issubset(set(data)) or set(data) - required - optional:
             raise ValueError("issue contract schema is invalid")
         values = dict(data)
         values.setdefault("allowlist", [])
         values.setdefault("ownership", {})
+        values.setdefault("environment_facts", [])
         return cls(**values)
 
 
@@ -164,4 +206,22 @@ def check_contract_closure(issue: IssueContract, project_root: Path) -> Contract
             else:
                 if not candidate.is_file():
                     missing.append("entrypoint missing: " + relative)
+    facts = list(issue.environment_facts or [])
+    if _touches_third_party_ui(issue) and not facts:
+        missing.append("environment_facts")
+    for index, item in enumerate(facts):
+        if not isinstance(item, Mapping):
+            missing.append("environment_facts[%d]" % index)
+            continue
+        for key in ("fact", "source"):
+            value = item.get(key)
+            if not isinstance(value, str) or not value.strip():
+                missing.append("environment_facts[%d].%s" % (index, key))
+        source = item.get("source")
+        if isinstance(source, str) and source.strip() and _looks_like_repo_path(source):
+            relative = PurePosixPath(source.strip())
+            if relative.is_absolute() or ".." in relative.parts:
+                missing.append("environment_facts[%d].source outside project: %s" % (index, source))
+            elif not (project_root / relative).is_file():
+                missing.append("environment_facts[%d].source missing: %s" % (index, source))
     return ContractClosureResult(not missing, missing, issue.evidence_ref)
