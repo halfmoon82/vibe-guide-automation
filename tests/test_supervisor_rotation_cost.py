@@ -196,7 +196,12 @@ class RelativeThresholdTests(_Case):
 
     def test_relative_log_path_records_no_baseline(self):
         """Review P3: a relative path resolves differently per working directory."""
+        import os
+
         _codex_rollout(self.tmp.name, [45000])
+        cwd = os.getcwd()
+        os.chdir(self.tmp.name)  # the relative path really is readable here
+        self.addCleanup(os.chdir, cwd)
         entry = self.register(session_record="rollout.jsonl")
         self.assertNotIn("baseline_context", entry)
 
