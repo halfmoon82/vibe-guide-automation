@@ -223,7 +223,7 @@ A 臂失败后**目录残留**，与 §7 记的失败期空 `.guard` 残留**完
 5. `create` 在写完 job 目录后要清理自己的 `.guard` 锁目录 → 被拒 → 整个 create 返回
    HTTP 500，**尽管 job 已经建成**（`state.json` 已是 `state:"working"`）。
 
-#### 7.1.3 修复（已实施，三版；**只有第三版可用**）
+#### 7.1.3 修复（已实施，四版；**只有第四版可用**）
 
 **第一版（复审推翻，见 §7.1.6）**：只剥 5 个 broker 变量。它确实让 `create` 不再 500，
 但把故障搬到了网关的 shell 里（rc=13），更隐蔽。**不要采用这一版。**
@@ -231,17 +231,28 @@ A 臂失败后**目录残留**，与 §7 记的失败期空 `.guard` 残留**完
 **第二版（复审推翻，见 §7.1.7）**：剥**整个注入面**。rc=13 消失了，但宿主的 safe-delete
 护栏被一起关掉 —— 网关与它派发的每个作业都变成无监管的原生删除。**不要采用这一版。**
 
-**第三版（当前）**：注入面里装的是**两件互相独立的东西**，而只有一件在这里是坏的。
+**第三版（复审推翻，见 §7.1.8）**：只剥 broker 绑定、保留护栏。rc=13 与「原生直删」都消失了，
+但 `create` 变成**状态依赖** —— 网关每次派活都把删除记到**宿主当前回合**的账上，账一满就
+500。**不要采用这一版。**
+
+**第四版（当前）**：注入面里装的是**三件互相独立的东西**，坏在这里的是前两件。
 
 | 装的是什么 | 含哪些 | 在这里能用吗 | 处置 |
 |---|---|---|---|
-| **broker 绑定** | `CODEBUDDY_SANDBOX_*`（IPC 地址 / session / tool-call / trace / program policy / file token / zsh bin）、`CODEBUDDY_BROKERED_*`、`CODEBUDDY_TOYBOX_*`、`SANDBOX_CENTER_*`、`TOYBOX_SANDBOX_SOCK`、`PATH` 里的 `brokered-bin` | **不能**：broker 只批准「agent 工具调用」的删除，网关不是 | 剥离 |
-| **safe-delete 护栏** | `BASH_ENV` + `safe-bin` 包装（把 `rm`/`unlink`/`rmdir` 定义成函数）、`CODEBUDDY_SAFE_DELETE_*`、`NODE_OPTIONS`、`PYTHONPATH` | **能**：broker 不可达时它降级为「移进回收站」，正是应有的行为 | 保留 |
+| **broker 绑定** | `CODEBUDDY_SANDBOX_*`（IPC 地址 / session / tool-call / trace / program policy / file token / zsh bin）、`CODEBUDDY_BROKERED_*`、`CODEBUDDY_TOYBOX_*`、`SANDBOX_CENTER_*`、`TOYBOX_SANDBOX_SOCK`、`CODEBUDDY_BROKER_IPC_CLIENT`、`PATH` 里的 `brokered-bin` | **不能**：broker 只批准「agent 工具调用」的删除，网关不是 | 剥离 |
+| **回合身份** | `CODEBUDDY_CONVERSATION_REQUEST_ID`、`CODEBUDDY_TOOL_CALL_ID` | **不能**：这是「一次删除算在哪个回合头上」的记账键，常驻守护进程没有回合 | 剥离 |
+| **safe-delete 护栏** | `BASH_ENV` + `safe-bin` 包装（把 `rm`/`unlink`/`rmdir` 定义成函数）、`CODEBUDDY_SAFE_DELETE_*`、`NODE_OPTIONS`、`PYTHONPATH`、`CODEBUDDY_SESSION_ID` | **能**：broker 与回合都撤掉后它降级为「移进回收站」，正是应有的行为 | 保留 |
 
-`_gateway_env()` 因此只做两件事：按前缀删 broker 绑定（`CODEBUDDY_SANDBOX_` /
+`_gateway_env()` 因此做三件事：按前缀删 broker 绑定（`CODEBUDDY_SANDBOX_` /
 `CODEBUDDY_BROKERED_` / `CODEBUDDY_TOYBOX_` / `SANDBOX_CENTER_`）、按名单删
-`TOYBOX_SANDBOX_SOCK` 与 `CODEBUDDY_BROKER_IPC_CLIENT`，再从 `PATH` 摘掉 `brokered-bin`
-一项。`safe-bin` 留在 `PATH` 上 —— 它只含 `rm`/`unlink`/`rmdir`，留在裸系统工具之前是净收益。
+`TOYBOX_SANDBOX_SOCK` / `CODEBUDDY_BROKER_IPC_CLIENT` / 两个回合身份键，再从 `PATH`
+摘掉 `brokered-bin` 一项。`safe-bin` 留在 `PATH` 上 —— 它只含 `rm`/`unlink`/`rmdir`，
+留在裸系统工具之前是净收益。
+
+**保留但不写进上表的还有**：`CODEBUDDY_SESSION_ID`（护栏自己的门控，见 §7.1.4）、
+`CODEBUDDY_NODE_BIN`（守卫 helper 的解释器）、`CODEBUDDY_SAFE_DELETE_SANDBOX`（见 §7.1.4）、
+`CODEBUDDY_SAFE_DELETE_REPORT_PATH`（删除去向的报告落点）。它们既不是 broker 绑定也不是
+回合身份，保留理由是各自独立的，逐条写在 §7.1.4。
 
 机制上为什么**必须**同时摘 `CODEBUDDY_BROKERED_BIN_DIR`：`BASH_ENV` →
 `shell-runtime-bash-env.sh` 依次 source 两个脚本 —— `safe-bin/safe-delete-bash-env.sh`
@@ -249,6 +260,35 @@ A 臂失败后**目录残留**，与 §7 记的失败期空 `.guard` 残留**完
 `CODEBUDDY_BROKERED_BIN_DIR` 双非空门控**，门内 `unset -f rm` 并
 `export PATH="${CODEBUDDY_BROKERED_BIN_DIR}:$PATH"`）。**这个顺序决定了一切**：只要那两个变量
 还在，brokered 块就会把刚定义的护栏函数掀掉、并把 `brokered-bin` 塞回 `PATH` 首位。
+
+**为什么必须连回合身份一起摘（第四版的关键，2026-10-05 深夜实测）**：网关每次 `create` 都要
+清理 `~/.workbuddy-ai/jobs/.locks/*.candidate`，这些删除**不在 OS 临时目录下**，于是 bulk
+守卫把它们记到 `CODEBUDDY_CONVERSATION_REQUEST_ID` 所指的那个回合头上 —— 也就是**宿主当前
+回合**。实测每次 `create` 记**约 6 笔**（6327→6334→6340→6346），阈值 50，所以一个普通回合派
+几次活就把账用穿；账一穿，守卫回 `confirmRequired`，网关自己的清理 fail-closed，`create`
+返回 HTTP 500：
+
+```text
+[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]
+{"count":6358,"threshold":50,"scope":"turn",
+ "targets":["~/.workbuddy-ai/jobs/.locks/547a46cb.state.lock.4119.<uuid>.candidate"]}
+```
+
+更麻烦的是**它时好时坏**：能否过还取决于网关启动时继承的 `CODEBUDDY_TOOL_CALL_ID` 是否恰好
+落在守卫的 `toolApprovals` 里。同一条探针的对照 —— 用未批准的 id 跑 6 次 `create`，
+**6 次全 500**；用已批准的 id 跑 6 次，**6 次全成功**（同时继续给宿主回合加账）。第四版把两个
+键都摘掉后，**同一条未批准 id 的探针 6 次全成功**，且宿主回合计数 **delta +0**。
+
+摘掉是安全的，因为三个载体在缺 `CODEBUDDY_TOOL_CALL_ID` 时**一律放行**、不是 fail-closed：
+`safe-bin/safe-delete-common.sh:48` 的 `|| return 0`、`node-safe-delete-shim.cjs:220` 的
+`return`、`sitecustomize.py:853` 的 `return`。**回收站改道因此完全保留**；丢掉的只是「单回合
+删满 50 个要弹窗确认」这道闸门，而它在后台作业里本来就弹不出来（没有人在那儿点），只会让作业
+直接失败 —— 这一点由用户拍板确认（选项 1）。
+
+**代价（显式登记）**：网关派发树内不再有 ≥50 的交互式批量确认，删除仍进回收站。已实测受影响
+的是 `bash=true` 作业（它继承网关的环境，宿主不重新注入回合键）；agent 作业自身的工具调用由
+宿主按次注入新键，推断不受影响 —— **这一条是推断，未实测**（作业探针跑满 3 分钟仍 `working`，
+`get` 取不到输出，`~/.workbuddy-ai/logs/job-<id>.log` 为空）。
 
 实测（2026-10-05，CLI 2.147.0）。判据必须落在**删除的去向**上：`safe_delete_rm` 对位于 OS
 临时目录下的目标直接走 `$REAL_RM`（不进回收站），所以探针目标必须放在临时目录之外 ——
@@ -259,38 +299,75 @@ A 臂失败后**目录残留**，与 §7 记的失败期空 `.guard` 残留**完
 | 完整宿主环境 | `…/shim/brokered-bin/rm` | 0 | broker 批准 | 护栏由 broker 兜住 |
 | 第一版（只剥 5 个变量） | `…/shim/brokered-bin/rm` | **13** | — | §7.1.6 |
 | 第二版（整类剥离） | `/bin/rm` | 0 | **原生直删** | §7.1.7 |
-| **第三版（当前）** | `rm`（**函数** → `safe-bin`） | 0 | **回收站** | 本版 |
+| 第三版（只剥 broker，已推翻） | `rm`（**函数** → `safe-bin`） | 0 | **回收站** | 删除去向正确，但 create 状态依赖，§7.1.8 |
+| **第四版（当前）** | `rm`（**函数** → `safe-bin`） | 0 | **回收站** | 本版；去向与第三版同形，差别只在回合预算 |
 | 负控：无 shim | `/bin/rm` | 0 | 原生直删 | 证明「进回收站」由 shim 造成 |
-| 负控：第三版但去掉 `CODEBUDDY_SESSION_ID` | `rm`（函数） | 0 | 原生直删 | 确定性负控，不依赖时序 |
+| 负控：第四版但去掉 `CODEBUDDY_SESSION_ID` | `rm`（函数） | 0 | 原生直删 | 确定性负控，不依赖时序 |
 
 表里「完整宿主环境」一臂的 `ls` rc **取决于宿主此刻有没有把 broker 环境注入本进程**：作为
 脱离活跃工具调用的常驻进程时，这一臂会得到 rc=13。它**不是**稳定可复现的臂，所以判据不建立在
 它上面 —— 可复现的 rc=13 是「只剥 broker 变量、`brokered-bin` 仍在 `PATH` 上」那一行。
 
 同一三分对照在 node（`fs.rmSync`）与 python（`os.remove`）上形状一致：第二版两侧护栏全丢，
-第三版两侧都恢复、与宿主基线一致。写路径（`writeFileSync` / `open(w)` / `>`）在三版下都正常，
-没有 fail-closed。
+第三版两侧都恢复、与宿主基线一致。读 / 写 / 删三类操作在三版下都实测过，**没有 fail-closed**：
+`CODEBUDDY_SAFE_DELETE_SANDBOX=1` 保留下来会让 node shim 与 `sitecustomize.py` 仍去加载
+brokered-fs 钩子，但该钩子拿不到 socket 时保持惰性（读 `readFileSync`/`readdirSync`、
+写 `writeFileSync`/`open(w)`、删 `rmSync`/`os.remove` 全部 rc=0，与宿主基线同形）。
 
 `create` 本身不 shell out，所以三臂的 `create` 都返回 200 —— **这正是第一、二版能蒙过
 `create` 验收的原因**。真正的判据是 job 日志（`~/.workbuddy-ai/logs/exec-<job>.log`）与
 删除去向，不是 `create` 的 HTTP 码。
 
 验证：
-- `tests/test_workbuddy_jobs_mcp.py::GatewayEnvironmentTests`（9 个用例）：
+- `tests/test_workbuddy_jobs_mcp.py::GatewayEnvironmentTests`（12 个用例）：
   - `test_the_fixture_shim_reproduces_the_real_wiring`：**不跳过**。用夹具复刻宿主的注入顺序，
-    断言三种环境给出三种不同印记 —— 宿主 → `brokered`、第三版 → `safe-delete`、整类剥离 →
+    断言三种环境给出三种不同印记 —— 宿主 → `brokered`、第四版 → `safe-delete`、整类剥离 →
     空。夹具先自证能复现 broker 抢占，否则后面的断言没有意义；
-  - `test_a_delete_still_routes_to_the_trash`：**不跳过**。跑宿主的真
-    `safe-delete-common.sh`，但把 `GENIE_TRASH_DIR` 指向替身，因此判据是 shim 自己的报告文件，
-    不会往用户废纸篓里丢东西；同时跑整类剥离臂作负控，断言它**不**进回收站；
+  - `test_a_delete_still_routes_to_the_trash`：**不跳过，且夹具驱动**（2026-10-05 深夜改）。
+    早先它跑宿主的真 `safe-delete-common.sh` 并读真实 `os.environ`，结果是**两个假绿叠在一起**：
+    在宿主没注入的进程里 `_gateway_env()` 是恒等函数，没有 `BASH_ENV` 与 `safe-bin`，`rm` 就是
+    `/bin/rm`，回收站断言悬空；而在宿主注入的进程里它又随回合内的 bulk 计数漂移，回合账一满就
+    `SAFE_DELETE_BULK_CONFIRM_REQUIRED`、文件没删掉、用例失败。现在的夹具 `safe-bin/rm` 复刻
+    真契约可观测的那一半（把目标交给回收站替身 + 写 `{"operation":"trash"}` 报告行），因此判据
+    落在**删除走了哪条路**上，既不碰宿主也不碰回合账。**宿主环境与 `env -i` 干净环境实测同形**
+    （49 用例全绿；干净环境 2 条依赖宿主接线的按设计跳过，本条不在其中）；
+  - `test_the_turn_identity_is_not_inherited`：钉住第四版新增的那一条 —— 两个回合键不得出现在
+    网关环境里，且先断言夹具里确实带有它们（守门的门）；
+  - `test_the_session_id_survives_so_the_guardrail_stays_armed`：`CODEBUDDY_SESSION_ID` 必须留下。
+    它和回合键同前缀，极易被顺手摘掉，而 `safe-bin/rm` 在没有 session id 时直接透传真删；
   - `test_a_shell_under_the_gateway_environment_really_works`：真实宿主环境下跑
     `bash -c 'command -v ls; ls /tmp; echo rc=$?'` 与 `command -v rm; type -t rm`，
     断言 rc=0、`ls` 不经 `brokered-bin`、`rm` 仍落在护栏上（函数或 `safe-bin`）；
   - `test_the_probe_sees_the_half_fix`：用第一版的环境跑同一个探针，断言它**失败** ——
     没有这条，探针只是个永远绿的空壳。宿主沙箱未激活时跳过（拿不到 program policy 变量）；
-  - 其余为环境形状断言：broker 绑定全删、护栏载体全留、`PATH` 只摘 `brokered-bin`。
+  - `test_the_sandbox_flag_is_kept_and_is_not_the_guardrail`：`CODEBUDDY_SAFE_DELETE_SANDBOX`
+    名字像护栏、实际只喂 brokered-fs 钩子（§7.1.4）。本条钉住「它保留」并写明它真正拨动的是
+    哪个开关 —— 顺带把早先那条站不住的保留理由换成实测理由；
+  - 其余为环境形状断言：broker 绑定全删、护栏载体全留、`PATH` 只摘 `brokered-bin`、
+    `test_the_started_gateway_really_cannot_see_the_broker` 端到端复核同一套规则。
+- **作业内删除去向（端到端，第四版实测）**：派一个 bash 作业，在它自己的 shell 里打印环境并
+  删一个**临时目录之外**的文件：
+
+  | 观测 | 值 |
+  |---|---|
+  | `CODEBUDDY_TOOL_CALL_ID` | `unset`（回合身份已摘） |
+  | `CODEBUDDY_CONVERSATION_REQUEST_ID` | `unset` |
+  | `CODEBUDDY_SESSION_ID` | `e3b2bc3d-…`（保留，护栏因此保持武装） |
+  | `command -v rm` | `…/shim/safe-bin/rm` |
+  | `rm` 返回码 / 目标文件 | `0` / 已删除 |
+  | 报告文件里的 `trash` 记录 | **10 条** —— 删除确实进了回收站，不是原生直删 |
+  | 宿主回合计数 delta | **+0**（第三版是每次 `create` +约 6） |
 - 真实 CLI 端到端：`create` 0.24 秒返回、无 500、`.guard` 残留 47 → 47 不增加；
   job `b593da65` 的日志三行：`shell-ok` / `/bin/ls` / `inner-rc=0`。
+- **匹配对端到端**（同一个作业、同一个网关二进制，只换网关启动时的环境）—— 最强的一条：
+
+  | 臂 | job | `rm` 解析 | `inner-rc` |
+  |---|---|---|---|
+  | 第三版（收窄） | `137592ac` | `…/shim/safe-bin/rm` | 0 |
+  | 第二版（整类剥离） | `ddac4103` | **`/bin/rm`** | 0 |
+
+  两版都修好了 rc=13，但只有第三版把删除留在护栏上。反事实因此落在**原 bug 被测量的
+  那个层级**，而不是助手函数的层级。
 
 #### 7.1.4 仍未解释 / 未覆盖（诚实边界）
 
@@ -298,15 +375,39 @@ A 臂失败后**目录残留**，与 §7 记的失败期空 `.guard` 残留**完
   **不是每次都注入**（端到端复跑时父进程就没有这些变量；本仓库的 `Bash` 工具也会在「沙箱被
   绕过」时不注入）。为什么状态在 19:49→19:50 之间翻转，**未查明**。修复不依赖解释这一点 ——
   它让 create 在**两种**状态下都能成功。
-- **§5 的额度撞线（`SAFE_DELETE_BULK_CONFIRM_REQUIRED`）未处理**：那是另一条路径，
-  报文带 `count`/`threshold`，换回合可绕过。本修复不覆盖它。
+- **§5 的额度撞线（`SAFE_DELETE_BULK_CONFIRM_REQUIRED`）已由第四版处理**：它**不是**另一条
+  路径，而是同一条 —— 网关继承的回合身份让它的清理记在**宿主回合**头上（见 §7.1.3）。「换回合
+  绕过」只能绕过一次，因为下一个回合派几次活同样会把账用穿。第四版摘掉回合身份后：未批准 id
+  的探针 6 次 `create` 全成功、宿主回合计数 delta +0。
 - **brokered-fs 钩子不再生效，这是不可避免的降级**：`CODEBUDDY_BROKERED_FS_HOOK_ENABLED`
   被剥掉、broker socket 也没了，所以网关与它派发的作业**不再经 broker 审批文件写入**。
   这正是被修掉的那条通道，无法两全；但它不同于「关掉护栏」—— 删除仍走回收站。写路径实测
   在三版下都正常，没有 fail-closed。
-- **`CODEBUDDY_SAFE_DELETE_SANDBOX=1` 保留**：它只喂 node shim（`node-language-shim.cjs:24`）
-  与 `sitecustomize.py:34,38` 的 brokered-fs 开关，而在无 socket 时那两个钩子实测惰性。
-  保留是因为剥掉它等于替宿主断言「不在沙箱里」，而我们无法核实这一点。
+- **`CODEBUDDY_SAFE_DELETE_SANDBOX=1` 保留（理由已按实测改写）**：全 shim 树里这个名字只出现
+  两次 —— `node-language-shim.cjs:24` 与 `sitecustomize.py:34` —— 且两处都只喂
+  `_BROKERED_FS_HOOK_ENABLED`，**不**参与 safe-delete（护栏由 `CODEBUDDY_SAFE_DELETE_ENABLED`
+  门控）。socket 已随 broker 绑定一起撤掉，所以它在这里是惰性的，留与不留实测无差别。保留是
+  「不按名字做推断」的默认选择；早先那条「剥掉它等于替宿主断言不在沙箱里」的理由实测站不住，
+  已作废，不再作为依据。
+- **测试负控 `_whole_class_strip` 只适用于 shell 臂**：它剥 `BASH_ENV` 与 shim 的 PATH 项，
+  但**不动** `NODE_OPTIONS` / `PYTHONPATH`。拿它当 node / python 的负控会得到「仍进回收站」的
+  误导结果 —— 语言 shim 还在，删除照样走护栏。node / python 臂若要负控，必须连这两个一起剥。
+- **护栏本身由 `CODEBUDDY_SESSION_ID` 门控，本修复不改变这一点**：`safe-bin/rm` 的开头是
+  `[ -z "$CODEBUDDY_SESSION_ID" ] && [ -z "$CLAUDE_SESSION_ID" ] && exec "$REAL_RM" "$@"`，
+  即**没有 session id 就直接透传真删**。宿主注入它、本修复保留它，所以网关里护栏生效；
+  但宿主不注入时（本仓库的 `Bash` 工具在「沙箱被绕过」时就不注入）网关也拿不到护栏。
+  这是宿主既有语义，不是本修复引入的缺口 —— 负控臂「第三版去掉 `CODEBUDDY_SESSION_ID`」
+  正是为了把这条边界钉成可复现的事实，而不是留成推断。
+- **P3 残留边界（不阻塞合并，逐条登记）**：
+  1. 护栏由 `CODEBUDDY_SESSION_ID` **单点门控**：宿主不注入它时（本仓库的 `Bash` 工具在
+     「沙箱被绕过」时就不注入）网关也拿不到护栏。宿主既有语义，非本修复引入。
+  2. 网关会继承 `CODEBUDDY_GATEWAY_PASSWORD` 与 `CODEBUDDY_MCP_CONFIG`（内含 Bearer 与 JWT）。
+     本修复不处理凭据面，另立跟踪。
+  3. **zsh 作业壳未覆盖**：`BASH_ENV` 只对 bash 生效，而宿主给的会话壳是
+     `cli/vendor/zsh-macos/bin/zsh`，其删除走 `brokered-bin` 的 PATH 项而不是护栏函数。
+     本表所有 shell 判据都是 `bash -c` 下测的。
+  4. 「作业内删除是否进回收站」目前是**手工探针**证据（见 §7.1.3 末表），不是自动化测试 ——
+     它需要真 CLI 与网络，做不成 hermetic 用例。
 - **本次只修网关的环境继承**：宿主「必须能自动化操控可见任务窗口」的发布门禁口径不在本条范围，
   另见 `product-spec.json` 的 `in-session-sdd-topology` 节点。
 
@@ -381,6 +482,47 @@ brokered-fs 钩子、批量删除守卫全没了。结果是：网关**与它派
   会把关掉护栏的版本判成绿的。
 - **负控必须是确定性的**：靠「宿主此刻恰好注入/不注入」的对照会随环境漂移。可靠的负控是
   「同一环境只改一个开关」（如去掉 `CODEBUDDY_SESSION_ID`），它必须稳定地给出相反结果。
+
+#### 7.1.8 复审三次推翻：第三版把「create 不再 500」建在了状态依赖上（2026-10-05 深夜，PR #158）
+
+第三轮独立复审的总判是**不能 squash merge**。与前一版不同，**生产代码 `_gateway_env()` 本身
+被认可**（剥离规则、保留规则、`PATH` 处理都没问题），两个 P0 分别落在**测试的 hermetic 性**与
+**验收口径的完整性**上。开发者逐条独立复现，结论全部成立。
+
+**P0-1 —— `test_a_delete_still_routes_to_the_trash` 是假绿。** 它读真实 `os.environ`：
+
+- 在宿主**没有**注入的进程里，`_gateway_env()` 是恒等函数 —— 没有 `BASH_ENV`、没有 `safe-bin`，
+  `rm` 就是 `/bin/rm`，于是「进回收站」的断言悬空，而在干净环境跑是 **FAIL 而不是 skip**；
+  skip 守卫只检查 `_HOST_SHIM/safe-bin/rm` 这个文件在不在，本机装了 WorkBuddy 就在，
+  **没有**检查宿主是否真的把接线注入了这个进程。
+- 在宿主**有**注入的进程里，它又随回合内的 bulk 计数漂移：回合账一满，删除被
+  `SAFE_DELETE_BULK_CONFIRM_REQUIRED` 拦下，文件没删掉，用例 **FAIL**。全量套件实测正是这一条。
+
+两条加起来的意思是：**同一个用例，在两台机器上、或同一台机器的两个时刻，会因为与被测代码
+无关的原因改变结论。**
+
+**P0-2 —— `create` 的状态依赖。** 见 §7.1.3 的实测：网关每次 `create` 给宿主回合账加约 6 笔，
+账一满就 500；能否过还取决于继承的 `CODEBUDDY_TOOL_CALL_ID` 是否落在 `toolApprovals` 里。
+所以 PR 那句「create 不再 500」**不成立**。
+
+**返工（第四版）**：摘掉回合身份（`CODEBUDDY_CONVERSATION_REQUEST_ID` /
+`CODEBUDDY_TOOL_CALL_ID`）；测试改夹具驱动。两项都已验证，见 §7.1.3。
+
+由此修正出的判据（已写进 skill）：
+
+- **「成功」与「去向」必须分开观测，且两者都要有确定性负控**：`rm` 返回 0 只能证明删除发生了，
+  证明不了它去了哪。第三版的判据只到「成功」这一层，于是把「关掉护栏」也判成绿。
+- **依赖宿主环境事实的用例，要么夹具化，要么显式自证前置**：`skipTest` 检查「文件在不在」不是
+  自证 —— 它检查的是**安装**，不是**注入**。判据是「宿主接线是否真的在这个进程的 `os.environ`
+  里」。拿不到就做夹具，不要用 skip 掩盖。
+- **验收口径要对齐最坏可复现状态，不要对齐幸运状态**：`create` 在「继承的 call id 恰好被批准」
+  时全绿，这不是修好了，是躲过了。派复审时要把这类**环境事实**写进材料 ——
+  review 门只校验形状与自报，查不出「这个结论依赖哪个未写明的环境前提」。
+
+> 后两条与知识库里两条 Global 条目同型：
+> `desensitization/degradation-path-false-green.md`（只断言产物形态分不清「主路径成功」与
+> 「兜底顶上」）与 `vibe-guide/review-gates-structural-blindspot.md`（review 门不校验环境事实，
+> review 上限由派发者的事实储备决定）。它们不是本次新发现的规律，但这次是第二个独立实例。
 
 
 

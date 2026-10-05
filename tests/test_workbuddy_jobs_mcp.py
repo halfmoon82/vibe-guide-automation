@@ -558,8 +558,34 @@ def _build_fake_shim(root):
 
     for directory, marker in ((brokered, "brokered"), (safe, "safe-delete")):
         wrapper = directory / "rm"
+        if marker == "safe-delete":
+            # Reproduce the two observable halves of the real
+            # `safe-delete-common.sh` contract -- hand the target to a trash
+            # stand-in, and record the operation -- so a test can assert the
+            # *route* a delete took and not merely that it happened.  Guarded,
+            # so the mark-only tests need not set these up.  `/bin/rm`, not
+            # `rm`: see the note on the stand-in genie-trash further down.
+            body = (
+                'if [ -n "$target" ] && [ -n "${GENIE_TRASH_LOG:-}" ]; then '
+                'printf \'%s\\n\' "$target" >> "$GENIE_TRASH_LOG"; fi\n'
+                'if [ -n "$target" ] && [ -n "${CODEBUDDY_SAFE_DELETE_REPORT_PATH:-}" ]; then '
+                'printf \'{"operation":"trash","path":"%s"}\\n\' "$target" >> '
+                '"$CODEBUDDY_SAFE_DELETE_REPORT_PATH"; fi\n'
+            )
+        else:
+            body = ""
         wrapper.write_text(
-            '#!/bin/sh\nprintf \'%s\\n\' "$*" > "%s/%s"\n' % ("%s", marks, marker),
+            '#!/bin/sh\n'
+            'printf \'%s\\n\' "$*" > "%s/%s"\n' % ("%s", marks, marker)
+            # `rm -f <path>` puts the flag in `$1`, so pick the operand out
+            # rather than assuming position one.  `/bin/rm`, not `rm`: on macOS
+            # `/bin/sh` is bash, so a bare `rm` here would pick the guardrail
+            # function back up from `BASH_ENV` and call itself -- a fork bomb
+            # that looks like a hang.
+            + 'target=\n'
+            + 'for arg in "$@"; do case "$arg" in --|-*) ;; *) target="$arg" ;; esac; done\n'
+            + body
+            + '/bin/rm -f -- "$target"\n',
             encoding="utf-8",
         )
         wrapper.chmod(0o755)
@@ -598,7 +624,7 @@ def _fake_shim_env(root):
     }
 
 
-def _whole_class_strip(env):
+def _whole_class_strip(env, shim_markers=("/cli/vendor/shim",)):
     """The rule this branch shipped first, kept as a control.
 
     It withdraws the guardrail along with the broker -- variables, `BASH_ENV`
@@ -608,6 +634,16 @@ def _whole_class_strip(env):
     as a control.  Reproduced here so "the guardrail survives" has a
     counterpart showing what losing it looks like; without one, that test would
     pass even if nothing were wired at all.
+
+    `shim_markers` names the PATH entries that count as shims.  It defaults to
+    the host's; a fixture-driven test passes its own temporary root instead,
+    because the host's marker matches nothing there.
+
+    This control withdraws the *shell* carriers only -- `BASH_ENV` and the shim
+    PATH entries.  It leaves `NODE_OPTIONS` and `PYTHONPATH` alone, so it is a
+    control for the shell arm and nothing else: a node or python negative
+    control that reused it would still reach the trash through the language
+    shim and would therefore prove the wrong thing.
     """
     stripped = {
         name: value for name, value in env.items()
@@ -618,7 +654,7 @@ def _whole_class_strip(env):
     if path:
         kept = [
             part for part in path.split(os.pathsep)
-            if part and "/cli/vendor/shim" not in part
+            if part and not any(marker in part for marker in shim_markers)
         ]
         if kept:
             stripped["PATH"] = os.pathsep.join(kept)
@@ -727,6 +763,13 @@ class GatewayEnvironmentTests(unittest.TestCase):
                 "/usr/bin",
                 "/bin",
             ]),
+            # The turn identity: whose agent turn a delete is charged to, plus
+            # the session the guardrail gates itself on.  The first two go --
+            # see TURN_IDENTITY_ENV_VARS -- and the third stays, because
+            # `safe-bin/rm` falls through to `$REAL_RM` without it.
+            "CODEBUDDY_CONVERSATION_REQUEST_ID": "turn-planted",
+            "CODEBUDDY_TOOL_CALL_ID": "call_00_planted",
+            "CODEBUDDY_SESSION_ID": "planted-session",
             # Things the gateway legitimately needs must survive.
             "VIBE_GATEWAY_ENV_PROBE": "kept",
             "CODEBUDDY_PROJECT_DIR": "/tmp/planted-project",
@@ -773,6 +816,64 @@ class GatewayEnvironmentTests(unittest.TestCase):
         env = self._gateway_env_with(self._planted())
         self.assertEqual(env.get("VIBE_GATEWAY_ENV_PROBE"), "kept")
         self.assertEqual(env.get("CODEBUDDY_PROJECT_DIR"), "/tmp/planted-project")
+
+    def test_the_turn_identity_is_not_inherited(self):
+        """The third thing on the surface: *whose turn* a delete counts as.
+
+        The host charges every non-temp delete to the turn named by these two
+        variables, and the guard trips at 50 of them.  A gateway outlives the
+        turn that started it, so inheriting them charges the gateway's own
+        lock-directory bookkeeping to a turn that may long since have ended --
+        at roughly 6 counts per ``create``, an ordinary turn runs out of budget
+        after a handful of dispatches, and then ``create`` answers HTTP 500
+        with ``SAFE_DELETE_BULK_CONFIRM_REQUIRED``.  Whether it trips depends
+        on whether the tool-call id inherited at startup happens to sit in the
+        guard's approvals, so the very same call succeeds in one session and
+        500s in the next.
+        """
+        planted = self._planted()
+        env = self._gateway_env_with(planted)
+        for name in module.TURN_IDENTITY_ENV_VARS:
+            self.assertIn(name, planted,
+                          "the planted env lost %s, so this rule is exercised by nothing" % name)
+            self.assertNotIn(
+                name, env,
+                "the gateway inherited the host's turn identity %s" % name,
+            )
+
+    def test_the_session_id_survives_so_the_guardrail_stays_armed(self):
+        """`safe-bin/rm` falls through to `$REAL_RM` when no session id is set.
+
+        Pinned separately because it is easy to lose by accident: it shares the
+        `CODEBUDDY_` prefix with the turn identity above and reads like one
+        more binding to withdraw.  Withdraw it and every gateway delete stops
+        being a move to the trash and becomes a native unlink -- so the reason
+        it stays is written down here rather than left to be inferred from the
+        name.
+        """
+        env = self._gateway_env_with(self._planted())
+        self.assertEqual(env.get("CODEBUDDY_SESSION_ID"), "planted-session")
+
+    def test_the_sandbox_flag_is_kept_and_is_not_the_guardrail(self):
+        """`CODEBUDDY_SAFE_DELETE_SANDBOX` reads like the guardrail.  It is not.
+
+        Measured across the host's shim tree, the name occurs exactly twice --
+        `node-language-shim.cjs:24` and `sitecustomize.py:34` -- and both uses
+        feed the *brokered fs hook* switch rather than the safe-delete one.  The
+        safe-delete shim is gated by `CODEBUDDY_SAFE_DELETE_ENABLED`, which
+        this rule leaves alone.  So the flag is inert here either way: the
+        broker binding it switches on has already been withdrawn.
+
+        It is kept and pinned rather than stripped on the strength of its name.
+        An earlier note justified keeping it by saying stripping it would
+        assert, on the host's behalf, that we are not inside a sandbox; that
+        claim does not survive measurement -- dropping the flag changes nothing
+        observable -- so it is not repeated here as the reason.  What is pinned
+        is that the flag stays, and which switch it actually throws.
+        """
+        env = self._gateway_env_with(self._planted())
+        self.assertEqual(env.get("CODEBUDDY_SAFE_DELETE_SANDBOX"), "1")
+        self.assertEqual(env.get("CODEBUDDY_SAFE_DELETE_ENABLED"), "1")
 
     # -- the rule, measured against a fixture (never skipped) --------------
 
@@ -853,64 +954,59 @@ class GatewayEnvironmentTests(unittest.TestCase):
     def test_a_delete_still_routes_to_the_trash(self):
         """The property the first fix broke: deletes must not go native.
 
-        Runs the host's real `safe-delete-common.sh` against a stand-in
-        genie-trash, so the evidence is the shim's own report file and nothing
-        lands in the user's Trash.  The target must sit outside the shim's
-        temp-dir list, because `safe_delete_rm` sends those straight to
-        `$REAL_RM`; the child's `TMPDIR` is pointed at `/var/tmp` so the list
-        no longer covers this test's own temporary directory.
-        """
-        if not Path(_HOST_SHIM, "safe-bin", "rm").exists():
-            self.skipTest("the host's safe-delete shim is not installed here")
-        if not Path("/var/tmp").is_dir():
-            self.skipTest("/var/tmp is unavailable, so the temp-dir list cannot be steered")
+        Driven by the fixture shim rather than the host's real one, on purpose.
+        Against the real shim this test was two false greens at once:
 
+        * it read the real ``os.environ``.  In a process the host never
+          injected, ``_gateway_env()`` is the identity function -- no
+          ``BASH_ENV``, no ``safe-bin`` -- so ``rm`` was ``/bin/rm`` and the
+          trash assertions rested on nothing.  The skip guard only checked that
+          the shim's files existed, which is true on any machine that has
+          WorkBuddy, whether or not this process was wired up.
+        * it depended on the host's turn-scoped bulk-delete counter.  Once the
+          surrounding turn had deleted past the threshold, the arm stopped with
+          ``SAFE_DELETE_BULK_CONFIRM_REQUIRED`` and the victim survived -- so
+          the same code passed or failed on unrelated global state.
+
+        The fixture's ``safe-bin/rm`` reproduces the observable half of the
+        real contract -- the target is handed to a trash stand-in, and a
+        ``{"operation":"trash"}`` line lands in the report file -- so this
+        asserts the *route* a delete took, not merely that it happened, and
+        does it without touching the host or the turn counter.
+        """
         with tempfile.TemporaryDirectory() as tmp:
-            tmpdir = Path(tmp)
-            trash_dir = tmpdir / "genie-trash"
-            trash_dir.mkdir()
-            fake = trash_dir / "darwin-arm64"
-            # `/bin/rm`, not `rm`: on macOS `/bin/sh` is bash, so a bare `rm`
-            # here would pick up the guardrail function from `BASH_ENV` and
-            # call this stand-in again -- a fork bomb that looks like a hang.
-            fake.write_text(
-                "#!/bin/sh\n"
-                'printf \'%s\\n\' "$1" >> "$GENIE_TRASH_LOG"\n'
-                '/bin/rm -f -- "$1"\n',
-                encoding="utf-8",
+            root = Path(tmp)
+            _build_fake_shim(root)
+            log = root / "trashed.txt"
+            report = root / "report.jsonl"
+            victim = root / "victim.txt"
+            planted = dict(
+                _fake_shim_env(root),
+                GENIE_TRASH_LOG=str(log),
+                CODEBUDDY_SAFE_DELETE_REPORT_PATH=str(report),
             )
-            fake.chmod(0o755)
-            log = tmpdir / "trashed.txt"
-            report = tmpdir / "report.jsonl"
-            victim = tmpdir / "victim.txt"
 
             def delete_under(env):
                 victim.write_text("probe\n", encoding="utf-8")
                 for stale in (log, report):
                     if stale.exists():
                         stale.unlink()
-                child = dict(env)
-                child.update({
-                    "TMPDIR": "/var/tmp",
-                    "GENIE_TRASH_DIR": str(trash_dir),
-                    "GENIE_TRASH_LOG": str(log),
-                    "CODEBUDDY_SAFE_DELETE_REPORT_PATH": str(report),
-                    "VICTIM": str(victim),
-                })
                 return subprocess.run(
-                    ["/bin/bash", "-c", 'rm -f "$VICTIM"'],
-                    env=child, capture_output=True, text=True, timeout=60,
+                    ["/bin/bash", "-c", 'rm -f "%s"' % victim],
+                    env=env, capture_output=True, text=True, timeout=60,
                 )
 
-            narrowed = delete_under(module._gateway_env())
-            self.assertFalse(victim.exists(), "the delete did not happen: %s" % narrowed.stderr)
+            narrowed = delete_under(self._gateway_env_with(planted))
+            self.assertFalse(victim.exists(),
+                             "the delete did not happen: %s" % narrowed.stderr)
             self.assertTrue(log.exists(),
                             "the delete bypassed the trash: %s" % narrowed.stderr)
             self.assertIn("victim.txt", log.read_text(encoding="utf-8"))
             self.assertIn('"operation":"trash"', report.read_text(encoding="utf-8"))
 
-            stripped = delete_under(_whole_class_strip(os.environ))
-            self.assertFalse(victim.exists(), "the control did not delete anything")
+            control = delete_under(_whole_class_strip(planted, shim_markers=(str(root),)))
+            self.assertFalse(victim.exists(),
+                             "the control did not delete anything: %s" % control.stderr)
             self.assertFalse(log.exists(),
                              "the control reached the trash, so the narrowed "
                              "reading above proves nothing")
@@ -946,8 +1042,14 @@ class GatewayEnvironmentTests(unittest.TestCase):
         for name in self.BROKER_BOUND:
             self.assertNotIn(name, child, "the gateway inherited %s" % name)
         self.assertNotIn("/cli/vendor/shim/brokered-bin", child.get("PATH", ""))
+        for name in module.TURN_IDENTITY_ENV_VARS:
+            self.assertNotIn(
+                name, child,
+                "the gateway inherited the host's turn identity %s" % name,
+            )
         for name in _GUARDRAIL_CARRIERS:
             self.assertIn(name, child, "the gateway lost the guardrail carrier %s" % name)
+        self.assertEqual(child.get("CODEBUDDY_SESSION_ID"), "planted-session")
         self.assertEqual(child.get("VIBE_GATEWAY_ENV_PROBE"), "kept")
 
 
