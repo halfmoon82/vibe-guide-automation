@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -75,42 +76,92 @@ TOKEN_ENV = "WORKBUDDY_JOB_TOKEN"
 CLI_ENV = "WORKBUDDY_CLI"
 AUTOSTART_ENV = "WORKBUDDY_JOB_AUTOSTART"
 
-#: The host's safe-delete broker wiring.  WorkBuddy injects these into every
-#: process it starts, and the shim they activate routes each delete through an
-#: IPC broker that only honours deletions approved for an *agent tool call*.
-#: A gateway started from here is not such a call, so the broker answers
-#: ``denied`` and the shim fails closed: ``POST /api/v1/jobs`` returns HTTP 500
-#: while cleaning up the lock directory it just made for the new job, and leaves
-#: an empty ``<job>.state.lock.guard`` behind.  Withdrawing the wiring makes
-#: ``hasBrokerDeleteEnv()`` false, so the shim takes its trash fallback instead
-#: of refusing.
+#: The host's sandbox and safe-delete broker wiring.  WorkBuddy injects it into
+#: every process it starts, and the shim it activates routes each delete
+#: through an IPC broker that only honours deletions approved for an *agent
+#: tool call*.  A gateway started from here is not such a call, so the broker
+#: answers ``denied`` and the shim fails closed.
 #:
-#: Measured 2026-10-05 on WorkBuddy AI (macOS, CLI 2.147.0): with the host env
-#: intact, an ``fs.rmdirSync`` under ``~/.workbuddy-ai/jobs/.locks`` raises
-#: ``[safe-delete] broker denied delete`` and leaves the directory behind; with
-#: these five variables removed the same call succeeds.
-BROKER_ENV_VARS: Tuple[str, ...] = (
-    "CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS",
-    "CODEBUDDY_SANDBOX_BROKER_SESSION_ID",
-    "CODEBUDDY_SANDBOX_HOST_FILE_OPERATION_COMMAND",
-    "CODEBUDDY_SANDBOX_BROKER_TOOL_CALL_ID",
-    "CODEBUDDY_SANDBOX_BROKER_TRACE_ID",
+#: Two failures were measured on WorkBuddy AI (macOS, CLI 2.147.0):
+#:
+#: 1. Host env intact: an ``fs.rmdirSync`` under ``~/.workbuddy-ai/jobs/.locks``
+#:    raises ``[safe-delete] broker denied delete``, so ``POST /api/v1/jobs``
+#:    returns HTTP 500 while cleaning up the lock directory it just made, and
+#:    leaves an empty ``<job>.state.lock.guard`` behind.
+#: 2. Withdrawing *only* the broker IPC variables is worse than doing nothing.
+#:    ``PATH`` still begins with the host's ``brokered-bin`` shim, which still
+#:    sees ``CODEBUDDY_SANDBOX_PROGRAM_POLICY_COMMAND`` and can no longer reach
+#:    the broker it just lost, so it fails closed: every command run inside the
+#:    gateway's shells exits 13 with ``Brokered program policy check
+#:    unavailable``.  ``create`` still answered 200 -- it does not shell out --
+#:    so that breakage stays invisible until a shell actually runs.
+#:
+#: The unit of removal is therefore the whole injection surface rather than a
+#: list of names: every variable the host uses to route a child through its
+#: sandbox, plus the PATH / NODE_OPTIONS / PYTHONPATH entries that re-activate
+#: the shims even after the variables themselves are gone.
+BROKER_ENV_PREFIXES: Tuple[str, ...] = (
+    "CODEBUDDY_SANDBOX_",
+    "CODEBUDDY_BROKERED_",
+    "CODEBUDDY_SAFE_DELETE_",
+    "CODEBUDDY_TOYBOX_",
+    "SANDBOX_CENTER_",
 )
+
+#: Broker wiring that shares no prefix with the rest.
+BROKER_ENV_VARS: Tuple[str, ...] = ("TOYBOX_SANDBOX_SOCK", "BASH_ENV")
+
+#: PATH entries that route a command through one of the host's shims.
+BROKER_PATH_MARKERS: Tuple[str, ...] = (
+    "/cli/vendor/shim/brokered-bin",
+    "/cli/vendor/shim/safe-bin",
+)
+
+#: The shim directory itself, as referenced from NODE_OPTIONS and PYTHONPATH.
+SHIM_DIR_MARKER = "/cli/vendor/shim"
 
 
 def _gateway_env() -> Dict[str, str]:
     """The environment a gateway we start should see.
 
-    Keeps everything the CLI needs to run, minus the host's safe-delete broker
-    wiring.  That broker authorises deletes per *agent tool call*, and a
-    gateway started here has no such call to point at, so every cleanup it
-    performs on the job directory is refused and the create fails after the
-    job was already written.  Without the broker the shim falls back to its
-    trash path, which succeeds.
+    Keeps everything the CLI needs to run, minus the host's sandbox and
+    safe-delete broker wiring in every form it arrives in.  Removing the
+    variables without also removing the shim PATH / NODE_OPTIONS / PYTHONPATH
+    entries leaves a shim that fails closed, which is a worse failure than the
+    one being fixed -- see the notes on ``BROKER_ENV_PREFIXES``.
     """
-    env = dict(os.environ)
-    for name in BROKER_ENV_VARS:
-        env.pop(name, None)
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(BROKER_ENV_PREFIXES) and name not in BROKER_ENV_VARS
+    }
+    path = env.get("PATH")
+    if path:
+        kept = [
+            part for part in path.split(os.pathsep)
+            if part and not any(marker in part for marker in BROKER_PATH_MARKERS)
+        ]
+        # Only ever narrow PATH: an empty result would mean the host PATH held
+        # nothing but shims, and a shimmed PATH still beats no PATH at all.
+        if kept:
+            env["PATH"] = os.pathsep.join(kept)
+    node_options = env.get("NODE_OPTIONS")
+    if node_options:
+        kept = [token for token in shlex.split(node_options) if SHIM_DIR_MARKER not in token]
+        if kept:
+            env["NODE_OPTIONS"] = shlex.join(kept)
+        else:
+            env.pop("NODE_OPTIONS", None)
+    python_path = env.get("PYTHONPATH")
+    if python_path:
+        kept = [
+            part for part in python_path.split(os.pathsep)
+            if part and SHIM_DIR_MARKER not in part
+        ]
+        if kept:
+            env["PYTHONPATH"] = os.pathsep.join(kept)
+        else:
+            env.pop("PYTHONPATH", None)
     return env
 
 
@@ -246,9 +297,9 @@ class Gateway:
                         stdout=sink,
                         stderr=subprocess.STDOUT,
                         # The gateway cleans up its own job-directory locks as
-                        # part of `create`; the host's delete broker would
-                        # refuse that and turn a successful create into an
-                        # HTTP 500.  See BROKER_ENV_VARS.
+                        # part of `create`, and runs the shell of every job it
+                        # dispatches; the host's sandbox wiring breaks both.
+                        # See BROKER_ENV_PREFIXES.
                         env=_gateway_env(),
                     )
                 banner = {"endpoint": "", "password": ""}

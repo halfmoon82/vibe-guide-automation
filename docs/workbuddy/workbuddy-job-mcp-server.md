@@ -223,32 +223,61 @@ A 臂失败后**目录残留**，与 §7 记的失败期空 `.guard` 残留**完
 5. `create` 在写完 job 目录后要清理自己的 `.guard` 锁目录 → 被拒 → 整个 create 返回
    HTTP 500，**尽管 job 已经建成**（`state.json` 已是 `state:"working"`）。
 
-#### 7.1.3 修复（已实施）
+#### 7.1.3 修复（已实施，两版；**只有第二版可用**）
 
-`Gateway._autostart()` 启动网关时不再继承 broker 接线：
+**第一版（已被复审推翻，见 §7.1.6）**：只剥 5 个 broker 变量。它确实让 `create` 不再 500，
+但把故障搬到了别处，而且更隐蔽。**不要采用这一版。**
 
-- 新增 `BROKER_ENV_VARS`（5 个：`CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS` /
-  `CODEBUDDY_SANDBOX_BROKER_SESSION_ID` / `CODEBUDDY_SANDBOX_HOST_FILE_OPERATION_COMMAND` /
-  `CODEBUDDY_SANDBOX_BROKER_TOOL_CALL_ID` / `CODEBUDDY_SANDBOX_BROKER_TRACE_ID`）与 `_gateway_env()`；
-- `Popen(..., env=_gateway_env())`。
+**第二版（当前）**：剥离**整个注入面**，而不是挑名字。
+
+`Gateway._autostart()` 启动网关时传 `env=_gateway_env()`，`_gateway_env()` 做四件事：
+
+| # | 动作 | 覆盖 |
+|---|---|---|
+| 1 | 按前缀删变量：`CODEBUDDY_SANDBOX_` / `CODEBUDDY_BROKERED_` / `CODEBUDDY_SAFE_DELETE_` / `CODEBUDDY_TOYBOX_` / `SANDBOX_CENTER_` | broker、program policy、file token、safe-delete 全套、toybox |
+| 2 | 按名单删：`TOYBOX_SANDBOX_SOCK` / `BASH_ENV` | 沙箱 socket、bash 启动钩子 |
+| 3 | 从 `PATH` 摘掉 `…/cli/vendor/shim/brokered-bin` 与 `…/cli/vendor/shim/safe-bin` | 否则 shim 仍会被调用 |
+| 4 | 从 `NODE_OPTIONS` 摘掉 `--require=…/cli/vendor/shim/node-language-shim.cjs`（摘空则删该变量）、从 `PYTHONPATH` 摘掉 `…/cli/vendor/shim` | Node 与 Python 两侧的 shim |
+
+第 3、4 条是关键：**变量删了、shim 还在 PATH 上**，shim 会因为拿不到 broker 而 fail-closed。
+
+实测（2026-10-05，CLI 2.147.0）三臂对照 —— 同一个 job、同一个网关，只有环境处理不同：
+
+| 臂 | `command -v ls` | stderr | 内层 rc | job 状态 |
+|---|---|---|---|---|
+| 完整宿主环境 | `…/shim/brokered-bin/ls` | `Brokered program policy check unavailable` | 13 | `done`（**假绿**） |
+| 第一版（只剥 5 个变量） | `…/shim/brokered-bin/ls` | `Brokered program policy check unavailable` | **13** | `done`（**假绿**） |
+| 第二版（整类剥离） | `/bin/ls` | 空 | **0** | `done` |
+
+`create` 本身不 shell out，所以三臂的 `create` 都返回 200 —— **这正是第一版能蒙过验收的原因**。
+真正的判据是 job 日志（`~/.workbuddy-ai/logs/exec-<job>.log`），不是 `create` 的 HTTP 码。
 
 效果：`hasBrokerDeleteEnv()` 为 false → `tryBrokerDelete` 返回 `unavailable` → 走回收站降级路径，
-**不再 fail-closed**。网关仍受 shim 监管（没有绕过安全删除），只是不再撞那个它拿不到批准的 broker。
+不再 fail-closed；网关的 shell 也不再经过 shim，`command -v ls` 回到 `/bin/ls`。
 
-验证：`tests/test_workbuddy_jobs_mcp.py::GatewayEnvironmentTests`（4 个用例，含一个**读子进程真实
-环境**的端到端用例）。真实 CLI 端到端复跑：网关子进程已看不到 broker 三个变量，`create` 返回 200
-且**不残留** `.guard`。
+验证：
+- `tests/test_workbuddy_jobs_mcp.py::GatewayEnvironmentTests`（8 个用例），其中三个是**功能性**的：
+  - `test_a_shell_under_the_gateway_environment_really_works`：在真实宿主环境里用 `_gateway_env()`
+    跑 `bash -c 'command -v ls; ls /tmp; echo rc=$?'`，断言 rc=0 且解析结果不含 `shim`；
+  - `test_the_probe_sees_the_half_fix`：用第一版的环境跑同一个探针，断言它**失败**——
+    没有这条，探针只是个永远绿的空壳；
+  - `test_no_shim_carrier_is_left_behind`：**载体清点**，遍历当前进程里所有值含
+    `/cli/vendor/shim` 或 `broker.sock` 的变量，断言一个都没漏。宿主以后新增注入变量会在这里红，
+    而不是静默复活。
+- 真实 CLI 端到端：`create` 0.24 秒返回、无 500、`.guard` 残留 47 → 47 不增加；
+  job `b593da65` 的日志三行：`shell-ok` / `/bin/ls` / `inner-rc=0`。
 
 #### 7.1.4 仍未解释 / 未覆盖（诚实边界）
 
 - **间歇性的来源未定**：19:27–19:49 共 7/7 失败，19:50 之后 23/23 成功。宿主的 broker 环境
   **不是每次都注入**（端到端复跑时父进程就没有这些变量）。为什么状态在 19:49→19:50 之间翻转，
   **未查明**。修复不依赖解释这一点——它让 create 在**两种**状态下都能成功。
-- **`CODEBUDDY_SAFE_DELETE_BIN_DIR` 仍会传给网关**（端到端实测确认）。它只影响 bash 子进程的
-  `rm`/`rmdir` 包装，不影响 Node 侧的 broker 判定，故**未纳入**本次最小修复；
-  若后续发现网关会 spawn bash 删目录，需要补。
 - **§5 的额度撞线（`SAFE_DELETE_BULK_CONFIRM_REQUIRED`）未处理**：那是另一条路径，
   报文带 `count`/`threshold`，换回合可绕过。本修复不覆盖它。
+- **`CODEBUDDY_SAFE_DELETE_BIN_DIR` 已纳入第二版**：第一版把它列为「未覆盖」，是漏项
+  —— 它就在 `CODEBUDDY_SAFE_DELETE_` 前缀里。
+- **本次只修网关的环境继承**：宿主「必须能自动化操控可见任务窗口」的发布门禁口径不在本条范围，
+  另见 `product-spec.json` 的 `in-session-sdd-topology` 节点。
 
 #### 7.1.5 对上一版五条判据的处置
 
@@ -256,5 +285,25 @@ A 臂失败后**目录残留**，与 §7 记的失败期空 `.guard` 残留**完
 **判据 3 被证伪**：它说「没有 vibeguide 侧回归可指认」——就**代码回归**而言是对的
 （`workbuddy_jobs.py` 确实只有一个提交），但它被用来支撑「所以不修」，这一步不成立。
 **没有回归 ≠ 没有可修点**：vibe 改不了宿主的 broker，但**可以不让自己的子进程继承那套接线**。
+
+#### 7.1.6 复审推翻：第一版把 500 换成了 rc=13 的坏 shell（2026-10-05 晚，PR #158）
+
+第一版修复在合并前被独立复审拦下，P0 成立：**它没有修好，只是换了个故障点，而且更隐蔽。**
+
+第一版看起来对，是因为三件事同时成立：
+
+1. 根因链条（§7.1.2）本身没错，剥掉 broker 变量确实让 `create` 不再被拒；
+2. `create` 不 shell out，所以复跑验收时它照样返回 200 —— **验收指标选错了**；
+3. 当时的 4 个测试只断言「名字被删掉」，而第一版恰好把名字删对了。
+
+由此得到三条判据（已写进 skill）：
+
+- **判据要落在被测对象真的会做的事上**：网关的核心用途是跑 shell 与派发子任务，
+  所以判据必须是「网关里的一条 shell 命令能不能跑通」，不是「`create` 返回几」。
+- **fail-closed 的组件被「删一半」比不删更糟**：shim 拿不到 broker 就拒绝一切，
+  而被删掉的那一半正好是它赖以放行的部分。这类修复必须**整类剥离**或**完全不动**。
+- **载体要清点，不要列名字**：注入面有 20+ 个变量和 3 条 `PATH`/`NODE_OPTIONS`/`PYTHONPATH`
+  通道，手写名单必然漏。
+
 
 

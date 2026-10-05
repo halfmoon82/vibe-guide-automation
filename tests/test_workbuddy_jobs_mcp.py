@@ -10,6 +10,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -473,40 +474,196 @@ class GatewayTransportTests(unittest.TestCase):
         self.assertEqual(gateway.call("GET", "/api/v1/jobs"), {"jobs": []})
 
 
-class GatewayEnvironmentTests(unittest.TestCase):
-    """A gateway we start must not inherit the host's safe-delete broker.
+#: The host's shim directory, as it appears in PATH / NODE_OPTIONS / PYTHONPATH.
+_HOST_SHIM = (
+    "/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked"
+    "/cli/vendor/shim"
+)
 
-    WorkBuddy injects that broker wiring into every process it starts, and the
-    shim it activates only honours a delete approved for an *agent tool call*.
-    A gateway started from this module is not such a call, so with the wiring
-    intact its own lock cleanup is refused and `POST /api/v1/jobs` answers
-    HTTP 500 after the job has already been written -- leaving an empty
-    `<job>.state.lock.guard` behind.  Measured 2026-10-05 on WorkBuddy AI
-    (macOS, CLI 2.147.0).
+#: What a job's shell does.  `command -v` resolves through PATH, so a shimmed
+#: PATH shows up here; the trailing `echo` reports the *inner* exit code,
+#: because the outer bash always exits 0 on a successful echo.
+_SHELL_PROBE = "command -v ls; ls /tmp >/dev/null; echo rc=$?"
+
+#: The first fix on this branch withdrew exactly these and nothing else.
+_HALF_FIX_VARS = (
+    "CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS",
+    "CODEBUDDY_SANDBOX_BROKER_SESSION_ID",
+    "CODEBUDDY_SANDBOX_HOST_FILE_OPERATION_COMMAND",
+    "CODEBUDDY_SANDBOX_BROKER_TOOL_CALL_ID",
+    "CODEBUDDY_SANDBOX_BROKER_TRACE_ID",
+)
+
+
+def _run_shell_probe(env):
+    return subprocess.run(
+        ["/bin/bash", "-c", _SHELL_PROBE], env=env,
+        capture_output=True, text=True, timeout=60,
+    )
+
+
+def _probe_rc(result):
+    for line in result.stdout.splitlines():
+        if line.startswith("rc="):
+            return int(line[3:])
+    raise AssertionError("the shell probe reported no exit code: %r" % (result.stdout,))
+
+
+class GatewayEnvironmentTests(unittest.TestCase):
+    """A gateway we start must not inherit the host's sandbox wiring.
+
+    WorkBuddy injects that wiring into every process it starts, in four forms:
+    broker variables, a PATH whose first entries are the host's shims, a
+    NODE_OPTIONS `--require` for the language shim, and a PYTHONPATH pointing
+    at the `sitecustomize` shim.  The shims only honour operations approved for
+    an *agent tool call*, and a gateway started from this module is not such a
+    call.  Measured 2026-10-05 on WorkBuddy AI (macOS, CLI 2.147.0):
+
+    * host env intact -> an `fs.rmdirSync` under `~/.workbuddy-ai/jobs/.locks`
+      raises `[safe-delete] broker denied delete`, so `POST /api/v1/jobs`
+      answers HTTP 500 while cleaning up the lock directory it just made, and
+      leaves an empty `<job>.state.lock.guard` behind;
+    * broker variables *alone* withdrawn -> worse.  The surviving `brokered-bin`
+      PATH entry still sees `CODEBUDDY_SANDBOX_PROGRAM_POLICY_COMMAND` and can
+      no longer reach the broker it just lost, so it fails closed: every
+      command run inside the gateway's shells exits 13 with `Brokered program
+      policy check unavailable`.
+
+    The second failure is why the tests below run a real shell instead of only
+    inspecting names: a name-by-name fix satisfies every list-shaped assertion
+    while still shipping a gateway whose shells cannot run anything.
     """
 
-    def test_broker_wiring_is_stripped(self):
-        planted = {name: "planted-" + name for name in module.BROKER_ENV_VARS}
-        with mock.patch.dict(os.environ, planted, clear=False):
-            env = module._gateway_env()
-        for name in module.BROKER_ENV_VARS:
-            self.assertNotIn(name, env)
+    def _planted(self):
+        """The whole injection surface, planted with the host's real paths."""
+        return {
+            # Broker variables -- both failures start here.
+            "CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS": "/tmp/cbb-planted/broker.sock",
+            "CODEBUDDY_SANDBOX_BROKER_SESSION_ID": "planted-session",
+            "CODEBUDDY_SANDBOX_BROKER_TOOL_CALL_ID": "call_00_planted",
+            "CODEBUDDY_SANDBOX_BROKER_TRACE_ID": "broker-planted",
+            "CODEBUDDY_SANDBOX_BROKER_READ_TIMEOUT_MS": "125000",
+            "CODEBUDDY_SANDBOX_HOST_FILE_OPERATION_COMMAND": "HostFileOperation",
+            "CODEBUDDY_SANDBOX_FILE_TOKEN_OPERATION_COMMAND": "FileTokenRequest",
+            "CODEBUDDY_SANDBOX_PROGRAM_POLICY_COMMAND": "CheckProgramPolicy",
+            "CODEBUDDY_SANDBOX_ZSH_BIN": "/planted/zsh",
+            "CODEBUDDY_BROKERED_BIN_DIR": _HOST_SHIM + "/brokered-bin",
+            "CODEBUDDY_BROKERED_SHELL_ENV": _HOST_SHIM + "/broker-env.sh",
+            "CODEBUDDY_BROKERED_FS_HOOK_ENABLED": "1",
+            "CODEBUDDY_SAFE_DELETE_ENABLED": "1",
+            "CODEBUDDY_SAFE_DELETE_BIN_DIR": _HOST_SHIM + "/safe-bin",
+            "CODEBUDDY_SAFE_DELETE_SANDBOX": "1",
+            "CODEBUDDY_TOYBOX_BIN": "/planted/toybox",
+            "CODEBUDDY_TOYBOX_SANDBOX_PROFILE": "/planted/toybox.sb",
+            "TOYBOX_SANDBOX_SOCK": "/tmp/cbb-planted/broker.sock",
+            "SANDBOX_CENTER_IPC_ADDRESS": "/tmp/sandbox-center.sock",
+            "SANDBOX_CENTER_UID": "planted-uid",
+            "BASH_ENV": _HOST_SHIM + "/shell-runtime-bash-env.sh",
+            # The shims re-activate through these three even with no variables.
+            "PATH": os.pathsep.join([
+                _HOST_SHIM + "/brokered-bin",
+                _HOST_SHIM + "/safe-bin",
+                "/usr/bin",
+                "/bin",
+            ]),
+            "NODE_OPTIONS": '--require="%s/node-language-shim.cjs"' % _HOST_SHIM,
+            "PYTHONPATH": os.pathsep.join([_HOST_SHIM, "/usr/lib/python3"]),
+            # Things the gateway legitimately needs must survive.
+            "VIBE_GATEWAY_ENV_PROBE": "kept",
+            "CODEBUDDY_PROJECT_DIR": "/tmp/planted-project",
+        }
 
-    def test_every_variable_the_broker_gate_needs_is_covered(self):
-        # `hasBrokerDeleteEnv()` in the host shim needs the socket address, the
-        # session id and the command.  Dropping only some of them would leave
-        # the gate open, so pin the trio explicitly rather than trusting the
-        # tuple to stay complete.
-        self.assertIn("CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS", module.BROKER_ENV_VARS)
-        self.assertIn("CODEBUDDY_SANDBOX_BROKER_SESSION_ID", module.BROKER_ENV_VARS)
-        self.assertIn("CODEBUDDY_SANDBOX_HOST_FILE_OPERATION_COMMAND", module.BROKER_ENV_VARS)
+    def _gateway_env_with(self, planted):
+        with mock.patch.dict(os.environ, planted, clear=False):
+            return module._gateway_env()
+
+    def test_every_injected_variable_is_stripped(self):
+        planted = self._planted()
+        env = self._gateway_env_with(planted)
+        injected = [
+            name for name in planted
+            if name.startswith(module.BROKER_ENV_PREFIXES) or name in module.BROKER_ENV_VARS
+        ]
+        # Guard the guard: the planted set must actually exercise both halves
+        # of the removal rule, or this test proves nothing.
+        self.assertIn("CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS", injected)
+        self.assertIn("CODEBUDDY_SAFE_DELETE_ENABLED", injected)
+        self.assertIn("TOYBOX_SANDBOX_SOCK", injected)
+        self.assertIn("BASH_ENV", injected)
+        for name in injected:
+            self.assertNotIn(name, env, "the gateway inherited %s" % name)
+
+    def test_the_shim_path_entries_are_gone(self):
+        env = self._gateway_env_with(self._planted())
+        self.assertEqual(env["PATH"], os.pathsep.join(["/usr/bin", "/bin"]))
+
+    def test_the_node_and_python_shims_are_gone(self):
+        env = self._gateway_env_with(self._planted())
+        # NODE_OPTIONS held nothing but the shim require, so the variable goes.
+        self.assertNotIn("NODE_OPTIONS", env)
+        # PYTHONPATH keeps its legitimate entry.
+        self.assertEqual(env["PYTHONPATH"], "/usr/lib/python3")
 
     def test_unrelated_variables_survive(self):
-        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=False):
-            env = module._gateway_env()
-        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+        env = self._gateway_env_with(self._planted())
+        self.assertEqual(env.get("VIBE_GATEWAY_ENV_PROBE"), "kept")
+        self.assertEqual(env.get("CODEBUDDY_PROJECT_DIR"), "/tmp/planted-project")
 
-    def test_the_started_gateway_really_cannot_see_the_broker(self):
+    def test_a_shell_under_the_gateway_environment_really_works(self):
+        """The measurement that matters, run against the real host env.
+
+        Skipped when this process is not itself a host-injected child, because
+        then there is nothing to reproduce.
+        """
+        if not any(name.startswith(module.BROKER_ENV_PREFIXES) for name in os.environ):
+            self.skipTest("not running inside a host-injected environment")
+        result = _run_shell_probe(module._gateway_env())
+        self.assertEqual(_probe_rc(result), 0, result.stdout + result.stderr)
+        resolved = result.stdout.splitlines()[0]
+        self.assertNotIn("shim", resolved,
+                         "a gateway shell still resolves through the host shim")
+        self.assertNotIn("policy check unavailable", result.stderr)
+
+    def test_the_probe_sees_the_half_fix(self):
+        """Prove the probe above can see the bug it exists to catch.
+
+        Without this, a fix that only withdraws the broker variables would pass
+        every name-shaped assertion while shipping the exit-13 shell.
+        """
+        if not os.environ.get("CODEBUDDY_SANDBOX_PROGRAM_POLICY_COMMAND"):
+            self.skipTest("host did not inject the brokered program-policy variable")
+        if not os.environ.get("CODEBUDDY_SANDBOX_BROKER_IPC_ADDRESS"):
+            self.skipTest("host did not inject the broker wiring")
+        half = {name: value for name, value in os.environ.items() if name not in _HALF_FIX_VARS}
+        result = _run_shell_probe(half)
+        self.assertNotEqual(
+            _probe_rc(result), 0,
+            "the half-fix arm unexpectedly worked, so the probe proves nothing: %r"
+            % (result.stdout,),
+        )
+
+    def test_no_shim_carrier_is_left_behind(self):
+        """Carrier inventory: nothing that points at the host shim survives.
+
+        A name list goes stale the moment the host adds a variable.  This walks
+        what the host actually injected, so a new carrier fails here instead of
+        silently reintroducing a fail-closed shim.
+        """
+        carriers = {
+            name: value for name, value in os.environ.items()
+            if "/cli/vendor/shim" in value or "broker.sock" in value
+        }
+        if not carriers:
+            self.skipTest("not running inside a host-injected environment")
+        env = module._gateway_env()
+        left = sorted(
+            name for name, value in carriers.items()
+            if env.get(name) == value and name != "PATH"
+        )
+        self.assertEqual(left, [], "the gateway inherited shim carriers: %s" % left)
+        self.assertNotIn("/cli/vendor/shim", env.get("PATH", ""))
+
+    def test_the_started_gateway_really_cannot_see_the_shim(self):
         # End-to-end: plant the wiring, start a gateway, then read the
         # environment the child actually received.
         with tempfile.TemporaryDirectory() as tmp:
@@ -521,8 +678,7 @@ class GatewayEnvironmentTests(unittest.TestCase):
                 encoding="utf-8",
             )
             script.chmod(script.stat().st_mode | stat.S_IEXEC)
-            planted = {name: "planted" for name in module.BROKER_ENV_VARS}
-            planted["VIBE_GATEWAY_ENV_PROBE"] = "kept"
+            planted = self._planted()
             gateway = Gateway(cli=str(script), startup_timeout=15.0)
             try:
                 with mock.patch.dict(os.environ, planted, clear=False):
@@ -535,8 +691,12 @@ class GatewayEnvironmentTests(unittest.TestCase):
                 )
             finally:
                 gateway.close()
-        for name in module.BROKER_ENV_VARS:
-            self.assertNotIn(name, child, "the gateway inherited %s" % name)
+        for name in planted:
+            if name.startswith(module.BROKER_ENV_PREFIXES) or name in module.BROKER_ENV_VARS:
+                self.assertNotIn(name, child, "the gateway inherited %s" % name)
+        self.assertNotIn("/cli/vendor/shim", child.get("PATH", ""))
+        self.assertNotIn("/cli/vendor/shim", child.get("NODE_OPTIONS", ""))
+        self.assertNotIn("/cli/vendor/shim", child.get("PYTHONPATH", ""))
         self.assertEqual(child.get("VIBE_GATEWAY_ENV_PROBE"), "kept")
 
 
