@@ -290,6 +290,22 @@ class HoldTests(_Case):
         self.assertEqual(result["state"], "work", result)
         self.assertEqual(result["nodes"], ["z"])
 
+    def test_queued_nodes_behind_full_capacity_stay_idle_without_holds(self):
+        """Review round 3 P1: ready_set ignores capacity; a full run is still idle."""
+        statuses = {"n1": "running", "n2": "planned", "n3": "planned"}
+        with _patch_snapshot(statuses, ready_set=["n2", "n3"]):
+            result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
+        self.assertEqual(result["state"], "idle", result)
+        self.assertEqual(result["reason"], "workers active")
+
+    def test_queued_nodes_behind_full_capacity_stay_idle_with_a_hold(self):
+        statuses = {"x": "ready", "n1": "running", "n2": "planned"}
+        with _patch_snapshot(statuses, ready_set=["x", "n2"]):
+            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
+        self.assertEqual(result["state"], "idle", result)
+        self.assertEqual(result["held"], ["x"])
+
     def test_hold_from_the_future_is_rechecked(self):
         """Review round 2 P3: a clock moved back must not extend a hold."""
         with _patch_snapshot({"x": "ready"}):

@@ -387,15 +387,21 @@ def _mailbox_state(paths, run_id, holds):
     )
     if needs_service:
         return {"state": "work", "reason": "nodes need servicing", "nodes": needs_service}
-    # A node the DAG already marks dispatchable is not waiting behind the
-    # held decision, even if it was already dispatchable at hold time.
-    dispatchable = sorted(
-        node for node in (getattr(snapshot, "ready_set", None) or [])
-        if node not in holds and statuses.get(node) != "running"
-    )
-    if dispatchable:
-        return {"state": "work", "reason": "dispatchable nodes", "nodes": dispatchable}
     if holds:
+        running = sorted(node for node, status in statuses.items() if status == "running")
+        if running:
+            # A delivery from a running worker wakes the supervisor anyway,
+            # and that resume dispatches whatever capacity frees up.
+            return {"state": "idle", "reason": "workers active", "nodes": running,
+                    "held": sorted(holds)}
+        # Nothing runs: a node the DAG marks dispatchable is not waiting behind
+        # the held decision, even if it was already dispatchable at hold time.
+        dispatchable = sorted(
+            node for node in (getattr(snapshot, "ready_set", None) or [])
+            if node not in holds
+        )
+        if dispatchable:
+            return {"state": "work", "reason": "dispatchable nodes", "nodes": dispatchable}
         # The whole run is exactly as it was when the supervisor parked it and
         # nothing is dispatchable, so planned nodes wait behind the decision.
         return {"state": "idle", "reason": "waiting on a human decision", "held": sorted(holds)}
