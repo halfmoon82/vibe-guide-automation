@@ -67,7 +67,7 @@ from .workflow_gate import is_v42_sdd_first_state, require_capability_contract
 from .authorize_entry import AuthorizationDenied, materialize_workflow_evidence
 from .attest import record_session_capabilities
 from .protocols import PRD_GUIDE_NAME, load_protocol
-from .state import load_events, load_snapshot
+from .state import load_events, load_snapshot, validate_run_id
 from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
@@ -1127,8 +1127,15 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         if "baseline_context" in entry:
             text += "；接班起点 {} token，换班按此后增长计算".format(entry["baseline_context"])
         else:
-            text += "；未记下接班起点（{}），换班按绝对阈值计算".format(
-                "会话记录读不到" if args.session_record else "没给 --session-record")
+            if not args.session_record:
+                why = "没给 --session-record"
+            elif not Path(args.session_record).expanduser().is_absolute():
+                why = "--session-record 要用绝对路径"
+            elif not Path(args.session_record).expanduser().is_file():
+                why = "会话记录读不到"
+            else:
+                why = "记录里还没有上下文用量"
+            text += "；未记下接班起点（{}），换班按绝对阈值计算".format(why)
         return _result(SUCCESS, {"command": args.command, "status": "ok", "current": entry}, text, args.as_json)
 
     if args.command == "supervisor-hold":
@@ -1149,6 +1156,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     if args.command == "supervisor-handoff":
         if not args.run_id:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        try:
+            validate_run_id(args.run_id)
+        except ValueError as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "运行编号不合法：" + str(error), args.as_json)
         try:
             payload, text = supervisor_handoff(paths, args.run_id)
         except (FileNotFoundError, TypeError, ValueError, OSError) as error:

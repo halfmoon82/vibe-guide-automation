@@ -219,7 +219,8 @@ def _session_tokens(record):
     payload = record.get("payload")
     if isinstance(payload, dict) and payload.get("type") == "token_count":
         # Codex Desktop rollout: ``last_token_usage`` is the latest call, whose
-        # input (cached included) is the context; ``total_token_usage`` is a
+        # input (cached included) is the context, short only by that call's
+        # own output; ``total_token_usage`` is a
         # running sum and must never be read as the context.
         info = payload.get("info")
         last = info.get("last_token_usage") if isinstance(info, dict) else None
@@ -318,9 +319,30 @@ def supervisor_preflight(
     result = _mailbox_state(paths, run_id, holds)
     result.setdefault("tokens", tokens)
     result.setdefault("baseline", baseline)
-    if holds and result["state"] == "idle":
-        result["held"] = sorted(holds)
     return result
+
+
+def _valid_holds(holds, statuses, now):
+    """Holds still describing the run the supervisor looked at when parking.
+
+    A hold carries every node's status at hold time.  Any change since --
+    a downstream node, a review, a quarantine -- or a hold older than
+    ``HOLD_RECHECK_SECONDS`` voids it, so the supervisor looks again and
+    re-holds if the run still waits on the human.
+    """
+    stale = []
+    valid = {}
+    for node, entry in holds.items():
+        held_at = entry.get("held_at")
+        if (
+            entry.get("statuses") != statuses
+            or not isinstance(held_at, (int, float))
+            or now - held_at > HOLD_RECHECK_SECONDS
+        ):
+            stale.append(node)
+        else:
+            valid[node] = entry
+    return valid, sorted(stale)
 
 
 def _mailbox_state(paths, run_id, holds):
@@ -335,11 +357,6 @@ def _mailbox_state(paths, run_id, holds):
         pending = None
     if pending is None:
         return {"state": "unknown", "reason": "provider mailbox unreadable"}
-    # A request the supervisor parked for a human decision is not new work;
-    # a delivery or result on that node still is (handled below).
-    pending = [action for action in pending if action.get("issue_id") not in holds]
-    if pending:
-        return {"state": "work", "reason": "pending provider requests", "pending": len(pending)}
     if unconsumed:
         return {"state": "work", "reason": "worker delivery pending", "nodes": unconsumed}
     if unpolled:
@@ -351,19 +368,28 @@ def _mailbox_state(paths, run_id, holds):
         snapshot = None
     if snapshot is None:
         return {"state": "unknown", "reason": "run snapshot unavailable"}
+    statuses = _node_statuses(snapshot)
+    holds, stale = _valid_holds(holds, statuses, time.time())
+    if stale:
+        return {"state": "work", "reason": "hold needs recheck", "nodes": stale}
+    # A request the supervisor parked for a human decision is not new work;
+    # a delivery or result on that node still is (checked above).
+    pending = [action for action in pending if action.get("issue_id") not in holds]
+    if pending:
+        return {"state": "work", "reason": "pending provider requests", "pending": len(pending)}
     # Idle is only safe when every node is either being worked on, finished,
     # or waiting on a human.  Anything else -- a delivery, a retry, a ready
     # node, an unknown state -- needs the supervisor's next resume.
-    statuses = {
-        node: (data.get("status") if isinstance(data, dict) else None)
-        for node, data in (snapshot.nodes or {}).items()
-    }
     needs_service = sorted(
         node for node, status in statuses.items()
         if status not in _IDLE_SAFE_STATUSES and node not in holds
     )
     if needs_service:
         return {"state": "work", "reason": "nodes need servicing", "nodes": needs_service}
+    if holds:
+        # The whole run is exactly as it was when the supervisor parked it,
+        # so planned nodes are the ones waiting behind the held decision.
+        return {"state": "idle", "reason": "waiting on a human decision", "held": sorted(holds)}
     running = sorted(
         node for node, status in statuses.items()
         if status == "running"
@@ -372,9 +398,14 @@ def _mailbox_state(paths, run_id, holds):
         return {"state": "idle", "reason": "workers active", "nodes": running}
     if any(status == "planned" for status in statuses.values()):
         return {"state": "work", "reason": "planned nodes with nothing running"}
-    if any(node in holds for node in statuses):
-        return {"state": "idle", "reason": "waiting on a human decision"}
     return {"state": "idle", "reason": "nothing pending"}
+
+
+def _node_statuses(snapshot):
+    return {
+        node: (data.get("status") if isinstance(data, dict) else None)
+        for node, data in (snapshot.nodes or {}).items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +422,7 @@ def _record_digest(session_record):
 
 def _takeover_baseline(paths, run_id, session_record):
     try:
-        registry = _read_json_file(_registry_path(paths, run_id))
+        registry = _read_json_file(run_dir(paths, run_id) / _REGISTRY_NAME)
     except (OSError, ValueError):
         return None
     current = registry.get("current") if isinstance(registry, dict) else None
@@ -414,16 +445,22 @@ def _takeover_baseline(paths, run_id, session_record):
 # 46 of 60 preflights said work while the run waited on one A/B answer).
 
 _HOLDS_NAME = "supervisor-holds.json"
+#: A hold older than this wakes the supervisor once to recheck it, so a hold
+#: nobody released after the human answered cannot stall a run silently.
+HOLD_RECHECK_SECONDS = 6 * 3600
 _HOLD_REASON_LIMIT = 200
+#: Reviewers have no self-report channel and reworks advance only on resume
+#: (see ``_IDLE_SAFE_STATUSES``); parking them would hide their completion.
+_UNHOLDABLE_STATUSES = frozenset({"review", "rework"})
 _NODE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
-def _holds_path(paths, run_id):
-    return run_dir(paths, run_id, create=True) / _HOLDS_NAME
+def _holds_path(paths, run_id, create=False):
+    return run_dir(paths, run_id, create=create) / _HOLDS_NAME
 
 
 def supervisor_holds(paths, run_id):
-    """Return ``{node: {"reason", "held_at"}}``; raises ValueError if unreadable."""
+    """Return ``{node: {"reason", "held_at", "statuses"}}``; ValueError if unreadable."""
     path = _holds_path(paths, run_id)
     if not path.exists():
         return {}
@@ -440,7 +477,7 @@ def supervisor_holds(paths, run_id):
 
 
 def _write_holds(paths, run_id, holds):
-    path = _holds_path(paths, run_id)
+    path = _holds_path(paths, run_id, create=True)
     descriptor, temporary = tempfile.mkstemp(prefix=".supervisor-holds-", dir=str(path.parent))
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -455,7 +492,10 @@ def _write_holds(paths, run_id, holds):
 
 
 def set_supervisor_hold(paths, run_id, node, reason):
-    """Park ``node`` for a human decision; the node must exist in the run."""
+    """Park ``node`` for a human decision; the node must exist in the run.
+
+    Holding again refreshes the hold to the run's current state.
+    """
     if not isinstance(node, str) or not _NODE_ID.fullmatch(node):
         raise ValueError("hold node must be a simple node id")
     if not isinstance(reason, str) or not reason.strip():
@@ -466,8 +506,19 @@ def set_supervisor_hold(paths, run_id, node, reason):
     snapshot = load_snapshot(paths, run_id)
     if node not in (snapshot.nodes or {}):
         raise ValueError("node {} is not in this run".format(node))
+    status = _node_statuses(snapshot)[node]
+    if status in _UNHOLDABLE_STATUSES:
+        raise ValueError(
+            "node {} is in {}; it advances only on the supervisor's resume".format(node, status)
+        )
     holds = supervisor_holds(paths, run_id)
-    holds[node] = {"reason": reason, "held_at": time.time()}
+    statuses = _node_statuses(snapshot)
+    now = time.time()
+    holds[node] = {"reason": reason, "held_at": now, "statuses": statuses}
+    for entry in holds.values():
+        # One supervisor looked at the whole run just now: every hold it keeps
+        # describes this state.
+        entry["statuses"] = statuses
     _write_holds(paths, run_id, holds)
     return holds
 
@@ -529,10 +580,18 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None):
         "host": host,
         "registered_at": time.time(),
     }
-    if session_record is not None:
+    if session_record is not None and Path(str(session_record)).expanduser().is_absolute():
         record = _read_json_file(session_record)
         baseline = _session_tokens(record) if record is not None else None
         digest = _record_digest(session_record)
+        if (
+            isinstance(current, dict)
+            and current.get("session_id") == session_id
+            and current.get("session_record_digest") == digest
+            and isinstance(current.get("baseline_context"), int)
+        ):
+            # Registering the same shift again must not push its rotation out.
+            baseline = current["baseline_context"]
         if baseline is not None and digest is not None:
             entry["baseline_context"] = baseline
             entry["session_record_digest"] = digest
@@ -638,7 +697,11 @@ def supervisor_handoff(paths, run_id):
                      "用户回复后先 vibe supervisor-hold --run-id {} --node <节点> --release，再推进。".format(
                          len(holds), run_id))
         for node, entry in sorted(holds.items()):
-            lines.append("  - {}：{}".format(node, entry.get("reason")))
+            held_at = entry.get("held_at")
+            hours = (time.time() - held_at) / 3600 if isinstance(held_at, (int, float)) else None
+            lines.append("  - {}：{}（已挂起 {}）".format(
+                node, entry.get("reason"),
+                "{:.1f} 小时".format(hours) if hours is not None else "时长未知"))
     lines.append("信箱：待服务请求 {} 项（不含等人拍板的节点）".format(
         "未知" if pending is None else len(pending)))
     lines += [
@@ -652,8 +715,9 @@ def supervisor_handoff(paths, run_id):
         heartbeat_prompt(plan_id, run_id),
         "  3) 置顶、改标题；删掉上一班的心跳，归档上一班会话"
         "（Claude Code 没有换班原语：上一班结束会话即可）。",
-        "  4) 跑一次第 1 步的预检，按输出走。",
+        "  4) 跑一次心跳指令第 1 步的预检，按输出走。",
         "监工挂起某个节点等用户拍板时，先登记：vibe supervisor-hold --run-id {} "
-        "--node <节点> --reason <一句话原因>，否则每次心跳都会被当成有事做。".format(run_id),
+        "--node <节点> --reason <一句话原因>，否则每次心跳都会被当成有事做。"
+        "运行状态一变或挂起满 6 小时，预检会报 work（hold needs recheck）：复核后仍在等人就再跑一次同一条命令刷新。".format(run_id),
     ]
     return payload, "\n".join(lines)

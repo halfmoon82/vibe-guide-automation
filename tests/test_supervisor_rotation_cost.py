@@ -187,6 +187,19 @@ class RelativeThresholdTests(_Case):
         result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 70000))
         self.assertEqual(result["state"], "rotate")
 
+    def test_registering_the_same_shift_again_keeps_its_baseline(self):
+        path = _codex_rollout(self.tmp.name, [45000])
+        self.register(session_record=path)
+        _codex_rollout(self.tmp.name, [45000, 90000])
+        entry = self.register(session_record=path)
+        self.assertEqual(entry["baseline_context"], 45000)
+
+    def test_relative_log_path_records_no_baseline(self):
+        """Review P3: a relative path resolves differently per working directory."""
+        _codex_rollout(self.tmp.name, [45000])
+        entry = self.register(session_record="rollout.jsonl")
+        self.assertNotIn("baseline_context", entry)
+
     def test_registry_keeps_no_path_to_the_log(self):
         path = _codex_rollout(self.tmp.name, [40000])
         self.register(session_record=path)
@@ -252,6 +265,58 @@ class HoldTests(_Case):
         with _patch_snapshot({"n1": "running"}):
             result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
         self.assertEqual(result["state"], "unknown")
+
+    def test_held_middle_node_with_planned_downstream_is_idle(self):
+        """Review P1: the held node is often not the DAG's last node."""
+        statuses = {"a": "accepted", "x": "ready", "y": "planned"}
+        with _patch_snapshot(statuses):
+            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
+        self.assertEqual(result["state"], "idle", result)
+        self.assertEqual(result["held"], ["x"])
+
+    def test_any_status_change_since_the_hold_voids_it(self):
+        """Review P2: a hold must not hide what happened after it."""
+        with _patch_snapshot({"x": "ready", "y": "planned"}):
+            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+        for changed in ({"x": "blocked_unknown", "y": "planned"},
+                        {"x": "ready", "y": "ready"},
+                        {"x": "ready", "y": "planned", "z": "planned"}):
+            with self.subTest(changed=changed), _patch_snapshot(changed):
+                result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
+                self.assertEqual(result["state"], "work", result)
+                self.assertEqual(result["reason"], "hold needs recheck")
+
+    def test_holding_again_refreshes_to_the_current_state(self):
+        with _patch_snapshot({"x": "ready", "y": "planned"}):
+            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+        with _patch_snapshot({"x": "blocked_unknown", "y": "planned"}):
+            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
+        self.assertEqual(result["state"], "idle", result)
+
+    def test_old_hold_wakes_the_supervisor_to_recheck(self):
+        """Review P2: a hold nobody released must not stall the run silently."""
+        from vibe_guide.supervisor import HOLD_RECHECK_SECONDS
+
+        with _patch_snapshot({"x": "ready"}):
+            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            later = __import__("time").time() + HOLD_RECHECK_SECONDS + 1
+            with patch("vibe_guide.supervisor.time.time", return_value=later):
+                result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
+        self.assertEqual(result["state"], "work")
+        self.assertEqual(result["reason"], "hold needs recheck")
+
+    def test_review_and_rework_cannot_be_held(self):
+        for status in ("review", "rework"):
+            with self.subTest(status=status), _patch_snapshot({"x": status}):
+                with self.assertRaises(ValueError):
+                    set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+
+    def test_preflight_on_an_unknown_run_creates_nothing(self):
+        """Review P3: the preflight promises a read-only disk check."""
+        supervisor_preflight(self.paths, "run-typo", _record(self.tmp.name, 30000))
+        self.assertFalse((self.paths.vibe / "runs" / "run-typo").exists())
 
     def test_hold_needs_a_known_node_and_a_reason(self):
         with _patch_snapshot({"n1": "ready"}):
@@ -330,6 +395,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(as_json.payload["plan_id"], "probe-plan")
         self.assertEqual(list(as_json.payload["holds"]), [node])
         self.assertIn(node, as_json.payload["nodes"])
+
+    def test_hold_on_a_real_run_turns_the_preflight_idle(self):
+        """Review P3: the hold-to-idle chain on a real snapshot, no mocks."""
+        root, run_id, _node = self.start()
+        log = _codex_rollout(root, [30000])
+        before = run_cli([
+            "supervisor-preflight", "--json", "--run-id", run_id, "--session-record", log,
+        ], root)
+        self.assertEqual(before.payload["state"], "work", before.payload)
+        node = before.payload["nodes"][0]
+        run_cli([
+            "supervisor-hold", "--run-id", run_id, "--node", node, "--reason", "等用户拍板",
+        ], root)
+        after = run_cli([
+            "supervisor-preflight", "--json", "--run-id", run_id, "--session-record", log,
+        ], root)
+        self.assertEqual(after.payload["state"], "idle", after.payload)
+        self.assertEqual(after.payload["held"], [node])
+
+    def test_handoff_with_invalid_run_id_is_blocked(self):
+        root, _run_id, _node = self.start()
+        result = run_cli(["supervisor-handoff", "--json", "--run-id", "../x"], root)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.payload["status"], "blocked_invalid")
 
     def test_handoff_for_unknown_run_is_unknown(self):
         root, _run_id, _node = self.start()
