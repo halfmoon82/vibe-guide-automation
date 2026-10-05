@@ -608,6 +608,57 @@ def validate_runtime_contract(
     return normalized
 
 
+def contract_invariant_entries(contract: Any) -> List[Tuple[int, Dict[str, Any]]]:
+    """Return ``(index, invariant)`` pairs with a usable ``test_command``.
+
+    Shared by authorization-card building (which lists the commands a run
+    will execute) and the monitor's contract-test executor, so both always
+    agree on what counts as an executable invariant: the contract's
+    ``invariants`` must be a list, each entry a mapping whose
+    ``test_command`` is a non-empty string.  Anything else is ignored,
+    which keeps contracts without invariants completely behavior-neutral.
+    """
+    if not isinstance(contract, dict):
+        return []
+    invariants = contract.get("invariants")
+    if not isinstance(invariants, list):
+        return []
+    entries = []
+    for index, item in enumerate(invariants):
+        if not isinstance(item, dict):
+            continue
+        command = item.get("test_command")
+        if not isinstance(command, str) or not command.strip():
+            continue
+        entries.append((index, item))
+    return entries
+
+
+def _normalize_contract_test_commands(value: Any) -> Optional[Dict[str, Tuple[str, ...]]]:
+    """Validate the ``contract_test_commands`` card/record field shape.
+
+    ``None`` (absent legacy records) stays ``None``; anything present must
+    be a dict of non-empty node id strings to non-empty string command
+    sequences.  Invalid shapes are a schema error, never silently dropped.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not all(
+        isinstance(node_id, str) and node_id for node_id in value
+    ):
+        raise ValueError("authorization contract test commands are invalid")
+    normalized: Dict[str, Tuple[str, ...]] = {}
+    for node_id, commands in value.items():
+        if (
+            not isinstance(commands, (list, tuple))
+            or not commands
+            or not all(isinstance(command, str) and command.strip() for command in commands)
+        ):
+            raise ValueError("authorization contract test commands are invalid")
+        normalized[node_id] = tuple(commands)
+    return normalized
+
+
 def _authorization_payload(
     plan_id: str,
     plan_version: int,
@@ -634,6 +685,7 @@ def _authorization_payload(
     explicit_execution_mode_override: Optional[Dict[str, Any]] = None,
     workers: Optional[Any] = None,
     topology_summary: Optional[Dict[str, Any]] = None,
+    contract_test_commands: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     payload = {
         "schema_version": AUTHORIZATION_SCHEMA_VERSION,
@@ -674,6 +726,14 @@ def _authorization_payload(
             if topology_summary is not None
             else _topology_summary(workers)
         )
+    # Same digest-preservation rule as workers: the commands a run will
+    # execute are bound into the digest when present, and the key stays
+    # absent for invariant-free plans so pre-existing digests are unchanged.
+    if contract_test_commands:
+        payload["contract_test_commands"] = {
+            str(node_id): tuple(sorted(commands))
+            for node_id, commands in sorted(contract_test_commands.items())
+        }
     return payload
 
 
@@ -706,9 +766,15 @@ class AuthorizationCard:
     explicit_execution_mode_override: Dict[str, Any] = None
     workers: Tuple[Dict[str, Any], ...] = None
     topology_summary: Dict[str, Any] = None
+    contract_test_commands: Dict[str, Tuple[str, ...]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
+        # Absent-when-empty, mirroring the payload rule: invariant-free cards
+        # serialize exactly like pre-ISSUE-140 cards so digests and stored
+        # records stay byte-identical.
+        if result.get("contract_test_commands") is None:
+            result.pop("contract_test_commands", None)
         # Keep the signed contract unchanged while making the user-facing
         # remote-action choice explicit in plan artifacts and authorization UI.
         result.update({
@@ -748,9 +814,12 @@ class AuthorizationRecord:
     explicit_execution_mode_override: Dict[str, Any] = None
     workers: Tuple[Dict[str, Any], ...] = None
     topology_summary: Dict[str, Any] = None
+    contract_test_commands: Dict[str, Tuple[str, ...]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
+        if result.get("contract_test_commands") is None:
+            result.pop("contract_test_commands", None)
         result.update({
             "remote_git_actions_options": ["allow", "deny"],
             "remote_git_actions_scope": list(_REMOTE_GIT_ACTIONS_SCOPE),
@@ -775,7 +844,7 @@ class AuthorizationRecord:
             "digest",
             "agent_id",
         }
-        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"}
+        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"}
         if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
             raise ValueError("authorization record schema is invalid")
         if data["schema_version"] != AUTHORIZATION_SCHEMA_VERSION:
@@ -821,6 +890,9 @@ class AuthorizationRecord:
         # schema simply lack the keys and load with empty defaults; any
         # present declaration is revalidated fail-closed, including the
         # main-session developer refusal and background disclosure check.
+        converted["contract_test_commands"] = _normalize_contract_test_commands(
+            converted.get("contract_test_commands")
+        )
         workers = converted.get("workers") or ()
         if workers:
             converted["workers"] = _normalize_workers_schema(
@@ -1081,6 +1153,17 @@ def build_authorization_card(
             "evidence_priority": plan.evidence_priority,
         }
     )
+    # The card summary lists every invariant test_command the monitor will
+    # execute for each node, so the authorization review sees the exact
+    # command set being approved (ISSUE-140).  Invariant-free plans omit the
+    # key entirely and keep their legacy digest.
+    contract_test_commands: Dict[str, List[str]] = {}
+    for node in nodes:
+        entries = contract_invariant_entries(node.contract)
+        if entries:
+            contract_test_commands[node.id] = [
+                item["test_command"] for _index, item in entries
+            ]
     canonical = _authorization_payload(
         plan.plan_id,
         plan.version,
@@ -1107,6 +1190,7 @@ def build_authorization_card(
         explicit_execution_mode_override,
         workers=normalized_workers,
         topology_summary=topology_summary,
+        contract_test_commands=contract_test_commands,
     )
     digest = _canonical_digest(canonical)
     canonical["engine_authorization_digest"] = digest
@@ -1200,6 +1284,7 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         card.explicit_execution_mode_override,
         workers=card.workers,
         topology_summary=card.topology_summary,
+        contract_test_commands=card.contract_test_commands,
     )
     if card.schema_version != AUTHORIZATION_SCHEMA_VERSION:
         raise ValueError("unsupported authorization card schema")
@@ -1236,6 +1321,7 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         explicit_execution_mode_override=card.explicit_execution_mode_override,
         workers=card.workers,
         topology_summary=card.topology_summary,
+        contract_test_commands=card.contract_test_commands,
     )
 
 
@@ -1295,6 +1381,7 @@ def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
         record.explicit_execution_mode_override,
         workers=record.workers,
         topology_summary=record.topology_summary,
+        contract_test_commands=record.contract_test_commands,
     )
     if not secrets.compare_digest(record.digest, _canonical_digest(canonical)):
         # V3/V4 records pre-dating execution-engine binding remain readable

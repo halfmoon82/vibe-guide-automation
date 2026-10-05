@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from vibe_guide.authorization import authorize, build_authorization_card
+from vibe_guide.authorization import AuthorizationRecord, authorize, build_authorization_card
 from vibe_guide.contracts import RunEvent, RunHandle
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan, node_branch
 from vibe_guide.monitor import Monitor, VISIBLE_SDD_PROTOCOL_REF
@@ -3773,6 +3773,332 @@ class PathOwnershipGateTests(unittest.TestCase):
         self.assertEqual(sorted(audit["node_ids"]), ["a", "b"])
         self.assertEqual(audit["path_ownership"]["blocked_nodes"], ["b"])
         self.assertEqual(audit["path_ownership"]["conflicts"], [{"path": "shared.py", "nodes": ["b", "a"]}])
+
+
+class ContractTestExecutionTests(unittest.TestCase):
+    """ISSUE-140 (design section 3.3): invariant test_command execution gates.
+
+    Acceptance executes every contract-declared invariant ``test_command``
+    inside the node writer worktree; ``expected_red`` nodes must observe red
+    before the first developer dispatch.  Nodes without invariants keep the
+    legacy behavior (covered by the pre-existing monitor tests).
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.paths = ProjectPaths(Path(self.temporary.name))
+        (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (self.paths.vibe / "state.json").write_text('{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8")
+        save_contract(
+            self.paths,
+            build_contract(self.paths.root, provider="fake", host_id="local"),
+        )
+        self.capabilities = AgentCapabilities("fake", True, True, True, True, True, "full")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def authorized_monitor(self, nodes):
+        plan = Plan("plan-1", 1, "docs/prd.md", [item.id for item in nodes], "draft")
+        card = build_authorization_card(plan, nodes, self.capabilities)
+        return Monitor(self.paths, plan, nodes), authorize(card, "AUTHORIZE")
+
+    def make_worktree(self, node_id):
+        worktree = self.paths.root / ".worktrees" / node_id
+        worktree.mkdir(parents=True, exist_ok=True)
+        return worktree
+
+    @staticmethod
+    def invariant_node(node_id, invariants, expected_red=None):
+        current = node(node_id)
+        current.contract["invariants"] = invariants
+        if expected_red is not None:
+            current.contract["expected_red"] = expected_red
+        return current
+
+    def acceptance_runner(self):
+        return FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+                ("n1", "reviewer"): [("accepted", {"evidence": "P0-P2 clear"})],
+            }
+        )
+
+    def run_to_acceptance_attempt(self, monitor, record, runner):
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        return snapshot
+
+    def contract_test_events(self, run_id):
+        return [
+            event
+            for event in load_events(self.paths, run_id)
+            if event["event"] == "contract_test_execution"
+        ]
+
+    def test_acceptance_rejects_failing_invariant_command(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "test_command": "python3 -c \"import sys; sys.exit(3)\""}],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("contract test execution failed", snapshot.nodes["n1"]["reason"])
+        self.assertIn("exited with code 3", snapshot.nodes["n1"]["reason"])
+        events = load_events(self.paths, snapshot.run_id)
+        self.assertFalse(any(event["event"] == "accepted" for event in events))
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        self.assertEqual(executions[0]["data"]["phase"], "acceptance")
+        self.assertEqual(executions[0]["data"]["proof"]["exit_code"], 3)
+
+    def test_acceptance_passes_and_records_execution_evidence(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "test_command": "python3 -c \"print('ok')\""}],
+        )
+        worktree = self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        data = executions[0]["data"]
+        self.assertEqual(data["node_id"], "n1")
+        self.assertEqual(data["phase"], "acceptance")
+        proof = data["proof"]
+        self.assertEqual(proof["invariant_id"], "I1")
+        self.assertEqual(proof["command"], "python3 -c \"print('ok')\"")
+        self.assertEqual(proof["exit_code"], 0)
+        self.assertIn("ok", proof["output_tail"])
+        self.assertTrue(proof["executed_at"])
+        self.assertEqual(proof["worktree"], str(worktree))
+
+    def test_acceptance_rejects_timeout(self):
+        current = self.invariant_node(
+            "n1",
+            [{
+                "id": "I1",
+                "test_command": "python3 -c \"import time; time.sleep(5)\"",
+                "timeout_seconds": 1,
+            }],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("timed out", snapshot.nodes["n1"]["reason"])
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        proof = executions[0]["data"]["proof"]
+        self.assertIsNone(proof["exit_code"])
+        self.assertIn("timeout", proof["output_tail"])
+        self.assertFalse(
+            any(event["event"] == "accepted" for event in load_events(self.paths, snapshot.run_id))
+        )
+
+    def test_acceptance_rejects_when_writer_worktree_missing(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "test_command": "python3 -c \"print('ok')\""}],
+        )
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("worktree", snapshot.nodes["n1"]["reason"])
+        self.assertFalse(
+            any(event["event"] == "accepted" for event in load_events(self.paths, snapshot.run_id))
+        )
+
+    def test_invalid_timeout_seconds_is_a_contract_error(self):
+        current = self.invariant_node(
+            "n1",
+            [{
+                "id": "I1",
+                "test_command": "python3 -c \"print('ok')\"",
+                "timeout_seconds": 0,
+            }],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("timeout_seconds", snapshot.nodes["n1"]["reason"])
+
+    def test_behavioral_invariant_blacklisted_command_is_not_executed(self):
+        sentinel = self.paths.root / "sentinel-n1"
+        command = "vue-tsc --noEmit || touch {}".format(sentinel)
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "kind": "behavioral", "test_command": command}],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("blacklist", snapshot.nodes["n1"]["reason"])
+        # Proof the command never ran: executing it would create the sentinel.
+        self.assertFalse(sentinel.exists())
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        self.assertIsNone(executions[0]["data"]["proof"]["exit_code"])
+
+    def test_project_config_appends_behavioral_blacklist(self):
+        (self.paths.vibe / "config.json").write_text(
+            json.dumps({"behavioral_command_blacklist_extra": ["make build"]}),
+            encoding="utf-8",
+        )
+        sentinel = self.paths.root / "sentinel-n1"
+        command = "make build || touch {}".format(sentinel)
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "kind": "behavioral", "test_command": command}],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = self.acceptance_runner()
+
+        snapshot = self.run_to_acceptance_attempt(monitor, record, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("blacklist", snapshot.nodes["n1"]["reason"])
+        self.assertFalse(sentinel.exists())
+
+    def test_config_rejects_invalid_blacklist_extra(self):
+        from vibe_guide.config import load_project_config
+
+        (self.paths.vibe / "config.json").write_text(
+            json.dumps({"behavioral_command_blacklist_extra": "tsc"}),
+            encoding="utf-8",
+        )
+        with self.assertRaises(ValueError):
+            load_project_config(self.paths.root)
+
+    def test_behavioral_blacklist_config_error_fails_closed(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "kind": "behavioral", "test_command": "python3 -c \"print('ok')\""}],
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        (self.paths.vibe / "config.json").write_text(
+            json.dumps({"behavioral_command_blacklist_extra": "tsc"}),
+            encoding="utf-8",
+        )
+
+        reason = monitor._execute_contract_test_commands(snapshot, "n1", "acceptance")
+
+        self.assertIsNotNone(reason)
+        self.assertIn("config", reason)
+
+    def test_expected_red_failing_command_allows_first_dispatch(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "test_command": "python3 -c \"import sys; sys.exit(1)\""}],
+            expected_red="I1 must fail before the implementation exists",
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        self.assertEqual([call["node_id"] for call in runner.start_calls], ["n1"])
+        self.assertEqual(snapshot.nodes["n1"]["status"], "running")
+        self.assertTrue(snapshot.nodes["n1"]["expected_red_observed"])
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        self.assertEqual(executions[0]["data"]["phase"], "expected_red")
+        self.assertEqual(executions[0]["data"]["proof"]["exit_code"], 1)
+
+    def test_expected_red_passing_command_blocks_first_dispatch(self):
+        current = self.invariant_node(
+            "n1",
+            [{"id": "I1", "test_command": "python3 -c \"print('ok')\""}],
+            expected_red="I1 must fail before the implementation exists",
+        )
+        self.make_worktree("n1")
+        monitor, record = self.authorized_monitor([current])
+        runner = FakeRunner()
+
+        snapshot = monitor.start(record, runner)
+
+        self.assertEqual(runner.start_calls, [])
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertIn("expected red", snapshot.nodes["n1"]["reason"])
+        self.assertIsNone(snapshot.nodes["n1"]["active_task"])
+        self.assertIsNone(snapshot.nodes["n1"]["active_role"])
+        self.assertIsNone(snapshot.nodes["n1"]["start_intent"])
+        executions = self.contract_test_events(snapshot.run_id)
+        self.assertEqual(len(executions), 1)
+        self.assertEqual(executions[0]["data"]["phase"], "expected_red")
+        self.assertEqual(executions[0]["data"]["proof"]["exit_code"], 0)
+
+    def test_authorization_card_lists_contract_test_commands(self):
+        current = self.invariant_node(
+            "n1",
+            [
+                {"id": "I2", "test_command": "python3 -c \"print('b')\""},
+                {"id": "I1", "test_command": "python3 -c \"print('a')\""},
+            ],
+        )
+        plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+
+        card = build_authorization_card(plan, [current], self.capabilities)
+
+        self.assertEqual(
+            card.contract_test_commands,
+            {"n1": ("python3 -c \"print('a')\"", "python3 -c \"print('b')\"")},
+        )
+        record = authorize(card, "AUTHORIZE")
+        self.assertEqual(record.contract_test_commands, card.contract_test_commands)
+        restored = AuthorizationRecord.from_dict(record.to_dict())
+        self.assertEqual(restored.contract_test_commands, card.contract_test_commands)
+
+    def test_authorization_card_without_invariants_omits_contract_test_commands(self):
+        plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+
+        card = build_authorization_card(plan, [node("n1")], self.capabilities)
+
+        self.assertIsNone(card.contract_test_commands)
+        # authorize() re-derives the canonical payload and compares digests,
+        # so a passing authorize proves the legacy payload is byte-identical.
+        record = authorize(card, "AUTHORIZE")
+        self.assertIsNone(record.contract_test_commands)
+        restored = AuthorizationRecord.from_dict(record.to_dict())
+        self.assertIsNone(restored.contract_test_commands)
+
+    def test_authorization_record_rejects_invalid_contract_test_commands(self):
+        plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+        card = build_authorization_card(plan, [node("n1")], self.capabilities)
+        record = authorize(card, "AUTHORIZE")
+        data = record.to_dict()
+        data["contract_test_commands"] = {"n1": "not-a-list"}
+        with self.assertRaises(ValueError):
+            AuthorizationRecord.from_dict(data)
 
 
 if __name__ == "__main__":
