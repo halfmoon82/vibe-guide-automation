@@ -379,6 +379,23 @@ reviewer 的 `accepted` 不受它约束——但每轮都回写游标本来就�
 
 worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），vibe 不会替你建。
 
+#### 节点合同的环境事实（environment_facts）
+
+改动第三方 UI 组件用法的节点，IssueContract 必须携带 `environment_facts`，否则合同不闭环、不能开工——这是拦停，不是警告过渡。字段形状：
+
+```json
+"environment_facts": [
+  {"fact": "str", "source": "str", "verified_at": "str"}
+]
+```
+
+- **fact**：一句实测得到的环境事实（如"element-plus 实装 2.3.7 无 value prop"）；**source**：事实的出处；**verified_at**：核实日期。`fact` 与 `source` 必须是非空字符串，缺任一项闭环失败并列出 `environment_facts[i].fact` / `environment_facts[i].source` 缺口。
+- **何时必须声明**：节点的 goal、owned_paths 或 read_paths 文本命中内置第三方 UI 库清单（大小写不敏感匹配）而 `environment_facts` 缺失或为 `[]` 时，闭环直接失败并指出 `environment_facts`。清单是 `vibe_guide.contracts.THIRD_PARTY_UI_LIBRARY_MARKERS`，当前含 `element-plus` `element-ui` `antd` `ant-design` `vuetify` `quasar` `naive-ui` `arco` `material-ui` `mui` `primereact` `chakra`；项目用到清单外的库时，改该常量并补测试，不要绕过闭环。
+- **source 的路径判别**：含 `://` 的视为外部引用（URL），不要求文件存在；不含 `/` 且不以常见文件扩展名（`.json` `.md` `.py` `.js` `.jsx` `.ts` `.tsx` `.vue` `.yaml` `.yml` `.toml` `.lock` `.txt` `.html` `.css`）结尾的视为描述性文字（如"官方文档"），也不要求文件存在；其余一律按仓内相对路径处理，该文件必须存在于项目根下，绝对路径或含 `..` 判为越界缺口。
+- **向后兼容**：旧合同没有 `environment_facts` 字段照常通过 schema 校验与闭环；只有命中第三方 UI 库清单时缺失才被拦停。
+
+拆节点（§4）时如果需求涉及第三方 UI 组件用法，就在合同评审前把实测事实核好，避免派发时被闭环门拦下返工。
+
 ### 6.4 平台差异：哪个平台能"授权一次、不用盯屏幕"
 
 五个操作在三个平台都已登记，但**创建会话时要不要人工点一下，各平台不一样**。这是平台事实，不是 vibe 的功能差异：
