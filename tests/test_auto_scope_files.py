@@ -624,6 +624,20 @@ class MonitorAutoScopeTests(unittest.TestCase):
         )
         self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
 
+    def test_sibling_with_unverifiable_write_scope_holds_every_file(self):
+        # P1-A: no allowlist anywhere -> dag._write_scope_paths is None
+        # (unverifiable), which must count as the whole repository.
+        n2 = _node("n2")
+        n2.depends_on = ["n1"]
+        n2.parallel_group = "g2"
+        n2.contract["worker_profile"]["allowlist"] = []
+        _monitor, _runner, snapshot = self._run_finding(
+            [_node("n1"), n2], ["n1.py", "tests/test_n1.py"]
+        )
+        self.assertEqual(snapshot.nodes["n2"]["status"], "planned")
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
+        self.assertEqual(self._scope_events(snapshot.run_id), [])
+
     def test_sibling_with_disjoint_allowlist_does_not_block(self):
         _monitor, _runner, snapshot = self._run_finding(
             [_node("n1"), _node("n2")], ["n1.py", "tests/test_n1.py"]
