@@ -7,8 +7,10 @@ must not be a deploy/credential file and must not be held by another active
 (not yet accepted) node.  Every such widening is recorded.  Anything else
 still stops for the user.
 """
+import hashlib
 import json
 import tempfile
+from datetime import datetime, timezone
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -21,7 +23,14 @@ from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.planner import resolve_consistency
 from vibe_guide.runners.fake import FakeRunner
-from vibe_guide.state import load_events
+from vibe_guide.cli import _snapshot_result
+from vibe_guide.models import INTEGRATION_REVIEW_NODE_ID
+from vibe_guide.dag import append_integration_review_node
+from vibe_guide.engine_attestation import create_engine_attestation
+from vibe_guide.planner import REQUIRED_COMPLEX_WORKFLOW, TaskContext
+from vibe_guide.task_registry import TaskBinding
+from vibe_guide.workflow_gate import create_task_workflow, record_workflow_node
+from vibe_guide.state import load_events, load_snapshot
 
 
 BINDING = {
@@ -192,6 +201,71 @@ class AutoScopeConfigTests(unittest.TestCase):
                 self._write({"auto_scope_paths": value})
                 with self.assertRaisesRegex(ValueError, "auto_scope_paths"):
                     load_project_config(self.root)
+    def test_control_characters_in_config_are_errors(self):
+        for value in (["a\nb.py"], ["a\x00.py"], ["./a.py"], ["a//b.py"], [" a.py"]):
+            with self.subTest(value=repr(value)):
+                self._write({"auto_scope_paths": value})
+                with self.assertRaisesRegex(ValueError, "auto_scope_paths"):
+                    load_project_config(self.root)
+
+
+
+class ReviewRoundOneUnitTests(unittest.TestCase):
+    """PR #144 round-one review findings, at the resolve_consistency level."""
+
+    def test_own_files_are_never_removed_by_occupancy(self):
+        # P1-1: another node's scope (e.g. the integration reviewer's union)
+        # listing this node's own file must not push it out of scope.
+        result = _resolve(["n1.py", "tests/test_n1.py"], occupied_files=["n1.py"])
+        self.assertIsNotNone(result)
+        self.assertEqual(result.scope_expanded_files, ["tests/test_n1.py"])
+
+    def test_occupancy_uses_normalized_prefix_overlap(self):
+        # P1-2: directory scopes and ./ spellings still count as held.
+        for held in (["tests"], ["./tests/test_shared.py"], ["tests/"]):
+            with self.subTest(held=held):
+                self.assertIsNone(
+                    _resolve(["n1.py", "tests/test_shared.py"], occupied_files=held)
+                )
+        self.assertIsNone(resolve_consistency(
+            _inconsistency(["n1.py", "n2.py"]),
+            decisions=[dict(DECISION)],
+            issue_contract={"naming": "approved-name"},
+            authorized_actions=["rework"],
+            authorized_files=["n1.py", "n2.py"],
+            expected_binding=BINDING,
+            node_files=["n1.py"],
+            occupied_files=["./n2.py"],
+        ))
+
+    def test_occupancy_ignores_case_and_unicode_form(self):
+        # P2-1: macOS treats these as the same file.
+        self.assertIsNone(
+            _resolve(["n1.py", "tests/test_shared.py"],
+                     occupied_files=["tests/Test_Shared.py"])
+        )
+        nfd = "tests/cafe\u0301.py"
+        nfc = "tests/caf\u00e9.py"
+        self.assertIsNone(_resolve(["n1.py", nfc], occupied_files=[nfd]))
+        # Comparison only: the stored spelling stays as written.
+        result = _resolve(["n1.py", "tests/Test_N1.py"], occupied_files=["tests/other.py"])
+        self.assertEqual(result.scope_expanded_files, ["tests/Test_N1.py"])
+
+    def test_control_characters_are_refused(self):
+        # P2-2
+        for path in ("tests/a\x00.py", "tests/a\nb.py", "tests/a\tb.py", "tests/a\x7f.py"):
+            with self.subTest(path=repr(path)):
+                self.assertIsNone(_resolve(["n1.py", path]))
+
+    def test_more_credential_names_are_refused(self):
+        # P3-1
+        for path in (
+            "tests/fixtures/id_rsa", "tests/fixtures/id_ed25519",
+            "tests/fixtures/id_ecdsa", "tests/fixtures/server.crt",
+            "tests/fixtures/secrets.yaml", "tests/fixtures/service-account-ci.json",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(_resolve(["n1.py", path]))
 
 
 def _node(node_id, extra_files=()):
@@ -220,6 +294,21 @@ def _node(node_id, extra_files=()):
         },
         "ready",
     )
+
+
+class _BoundBindingRunner(FakeRunner):
+    """Visible binding with host/cursor evidence (as in the issue-88 tests)."""
+
+    def task_binding(self, contract, worktree, run_id, status):
+        return TaskBinding(
+            provider="fake", mode="visible", issue_id=contract["node_id"],
+            role=contract["role"],
+            task_id="task-{}-{}".format(contract["node_id"], contract["role"]),
+            host="host-1", worktree=str(worktree),
+            branch=str(contract.get("branch", "")), run_id=run_id,
+            status=status, cursor="cursor-1", hostId="host-1",
+            generation=contract["generation"],
+        )
 
 
 _REAL_START_TASK = Monitor._start_task
@@ -258,11 +347,16 @@ class MonitorAutoScopeTests(unittest.TestCase):
         )
         card = build_authorization_card(plan, nodes, self.capabilities)
         monitor = Monitor(self.paths, plan, nodes)
+        return self._drive(monitor, card, nodes, files)
+
+    def _drive(self, monitor, card, nodes, files, runner_class=FakeRunner,
+               delivery=("complete", {"evidence": "delivery"})):
         self._monitor = monitor
-        runner = FakeRunner(
+        runner = runner_class(
             events={
-                (item.id, "developer"): [("complete", {"evidence": "delivery"})]
+                (item.id, "developer"): [delivery]
                 for item in nodes
+                if item.id != INTEGRATION_REVIEW_NODE_ID
             }
         )
         snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
@@ -283,6 +377,78 @@ class MonitorAutoScopeTests(unittest.TestCase):
         ]
         snapshot = monitor.tick(snapshot.run_id, runner)
         return monitor, runner, snapshot
+
+    def _run_complex_finding(self, business, files):
+        """Complex plan: vibe appends the read-only integration reviewer.
+
+        Fixture mirrors tests/test_issue_88_delivery_gate.py (workflow
+        evidence, PRD/Spec files, engine attestation)."""
+        (self.paths.root / "docs").mkdir(parents=True, exist_ok=True)
+        (self.paths.root / "docs" / "prd.md").write_text("prd\n", encoding="utf-8")
+        (self.paths.root / "docs" / "spec.md").write_text("spec\n", encoding="utf-8")
+        workflow = create_task_workflow("plan-1", TaskContext(5, 5, 5, 5, 5))
+        plan_dir = self.paths.vibe / "plans" / "plan-1"
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        evidence_file = plan_dir / "workflow-evidence.md"
+        evidence_file.write_text("evidence\n", encoding="utf-8")
+        artifact = {
+            "ref": evidence_file.name,
+            "sha256": hashlib.sha256(evidence_file.read_bytes()).hexdigest(),
+        }
+        for node_id in REQUIRED_COMPLEX_WORKFLOW:
+            record_workflow_node(
+                workflow, node_id, {"ref": node_id}, {"ref": node_id},
+                {"ref": node_id, "artifact": artifact},
+            )
+        (self.paths.vibe / "state.json").write_text(
+            json.dumps({"workflow_version": 2, "session_gate": "s0_required",
+                        "task_workflow": workflow}),
+            encoding="utf-8",
+        )
+        plan = append_integration_review_node(Plan(
+            "plan-1", 1, "docs/prd.md", [item.id for item in business], "draft",
+            decisions=[dict(DECISION, question="canonical name")],
+            spec_path="docs/spec.md",
+            complexity_band="complex",
+            nodes=list(business),
+            integration_contract={
+                "iteration_context": {"kind": "iteration", "based_on": "V5"},
+                "compatibility_scope": ["V5 API"],
+                "agentsmd_acceptance_refs": ["AGENTS.md#8"],
+                "integration_acceptance_contract": {"checks": ["all"]},
+                "unverified_or_excluded": ["provider"],
+            },
+        ))
+        nodes = list(plan.nodes)
+        attestation = create_engine_attestation(
+            plan_id=plan.plan_id, plan_revision=plan.version,
+            execution_engine="vibeguide_monitor", engine_mode="dag",
+            provider="fake", capability_facts={"fake.worktree": True},
+            provenance="live:test",
+            now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+        (plan_dir / "engine-attestation.json").write_text(
+            json.dumps(attestation), encoding="utf-8"
+        )
+        card = build_authorization_card(
+            plan, nodes, self.capabilities,
+            execution_engine="vibeguide_monitor", engine_mode="dag",
+            engine_evidence_ref=attestation["evidence_ref"],
+        )
+        monitor = Monitor(self.paths, plan, nodes)
+        # Topology projection evidence is a separate gate (same isolation as
+        # the issue-88 fixture).
+        monitor._validate_execution_topology = lambda snapshot: None
+        delivered = ("delivered", {
+            "evidence": "delivery",
+            "delivery_evidence": {
+                "completion_marker": "DONE", "delivery_path": "/out",
+                "thread_status": "complete",
+            },
+        })
+        return plan, self._drive(
+            monitor, card, nodes, files, _BoundBindingRunner, delivered
+        )
 
     def _scope_events(self, run_id):
         return [
@@ -308,7 +474,7 @@ class MonitorAutoScopeTests(unittest.TestCase):
                 "run_id": snapshot.run_id,
                 "node_id": "n1",
                 "files": ["tests/test_n1.py"],
-                "scope_rules": {"tests/test_n1.py": "tests_dir"},
+                "scope_rules": [{"path": "tests/test_n1.py", "rule": "tests_dir"}],
             },
         )
 
@@ -324,7 +490,7 @@ class MonitorAutoScopeTests(unittest.TestCase):
         events = self._scope_events(snapshot.run_id)
         self.assertEqual(
             events[0]["scope_rules"],
-            {"vibe_guide/protocols/__init__.py": "auto_scope_paths"},
+            [{"path": "vibe_guide/protocols/__init__.py", "rule": "auto_scope_paths"}],
         )
 
     def test_unlisted_file_still_stops_for_the_user(self):
@@ -363,6 +529,51 @@ class MonitorAutoScopeTests(unittest.TestCase):
         self.assertEqual(recovered.nodes["n1"]["status"], "rework")
         self.assertIn("tests/test_n1.py", recovery.start_calls[-1]["files"])
 
+
+    def test_integration_review_node_does_not_count_as_a_writer(self):
+        # P1-1 end to end: the planned integration reviewer lists every
+        # business file; it is read-only and must not block corrections.
+        plan, (_monitor, _runner, snapshot) = self._run_complex_finding(
+            [_node("n1"), _node("n2")], ["n1.py", "tests/test_n1.py"]
+        )
+        integration = [n for n in plan.nodes if n.id == INTEGRATION_REVIEW_NODE_ID][0]
+        self.assertIn("n1.py", integration.contract["files"])
+        self.assertEqual(
+            snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["status"], "planned"
+        )
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+        self.assertEqual(snapshot.nodes["n1"]["scope_expansions"], ["tests/test_n1.py"])
+
+    def test_scope_rules_survive_persistence_with_sensitive_words_in_paths(self):
+        # P2-3: read back the persisted events.jsonl shape.
+        files = ["n1.py", "tests/test_token_x.py", "tests/test_secret_y.py"]
+        _monitor, _runner, snapshot = self._run_finding([_node("n1")], files)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+        lines = [
+            json.loads(line)
+            for line in (
+                self.paths.vibe / "runs" / snapshot.run_id / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+        ]
+        data = [r["data"] for r in lines if r["event"] == "scope_auto_expanded"][0]
+        self.assertEqual(data["files"], files[1:])
+        self.assertEqual(
+            data["scope_rules"],
+            [
+                {"path": "tests/test_token_x.py", "rule": "tests_dir"},
+                {"path": "tests/test_secret_y.py", "rule": "tests_dir"},
+            ],
+        )
+
+    def test_status_json_lists_scope_expansions(self):
+        # P2-4: the supervisor reads `vibe status --json` to report delivery.
+        _monitor, _runner, snapshot = self._run_finding(
+            [_node("n1")], ["n1.py", "tests/test_n1.py"]
+        )
+        result = _snapshot_result("status", load_snapshot(self.paths, snapshot.run_id), True)
+        self.assertEqual(
+            result.payload["nodes"]["n1"]["scope_expansions"], ["tests/test_n1.py"]
+        )
 
 
 if __name__ == "__main__":

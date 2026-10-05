@@ -4,10 +4,13 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import re
+import unicodedata
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional
 
 from .config import is_repo_relative_path
+from .dag import _write_paths_overlap
+from .path_ownership import normalize_project_path
 from .models import EVIDENCE_PRIORITY, IssueComplexity, TargetContract, IntegrationAcceptanceContract, PRD, StageHandoff
 
 
@@ -241,8 +244,12 @@ def _decision_reference(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 AUTO_SCOPE_RULE_TESTS = "tests_dir"
 AUTO_SCOPE_RULE_CONFIG = "auto_scope_paths"
-_CREDENTIAL_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore")
-_CREDENTIAL_NAMES = {".netrc", ".npmrc", ".pypirc", "credentials", "credentials.json"}
+_CREDENTIAL_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore", ".crt")
+_CREDENTIAL_NAMES = {
+    ".netrc", ".npmrc", ".pypirc", "credentials", "credentials.json",
+    "id_rsa", "id_ed25519", "id_ecdsa",
+}
+_CREDENTIAL_PREFIXES = (".env.", "secrets.")
 
 
 def auto_scope_rule(path: Any, auto_scope_paths: Any = ()) -> Optional[str]:
@@ -258,9 +265,10 @@ def auto_scope_rule(path: Any, auto_scope_paths: Any = ()) -> Optional[str]:
     name = path.rsplit("/", 1)[-1].casefold()
     if (
         name == ".env"
-        or name.startswith(".env.")
+        or name.startswith(_CREDENTIAL_PREFIXES)
         or name in _CREDENTIAL_NAMES
         or name.endswith(_CREDENTIAL_SUFFIXES)
+        or (name.startswith("service-account") and name.endswith(".json"))
     ):
         return None
     if path.startswith("tests/"):
@@ -268,6 +276,21 @@ def auto_scope_rule(path: Any, auto_scope_paths: Any = ()) -> Optional[str]:
     if path in set(auto_scope_paths or ()):
         return AUTO_SCOPE_RULE_CONFIG
     return None
+
+
+def _scope_compare_key(path: Any) -> str:
+    """Comparison-only spelling of a scope entry (stored spelling is kept).
+
+    Normalized like every other project path, then NFC + casefold because the
+    default macOS filesystem treats those variants as one file.  An entry that
+    cannot be normalized becomes the root marker ``"."``, which overlaps
+    everything: an unverifiable claim must fail closed, not be ignored.
+    """
+    try:
+        normalized = normalize_project_path(path)
+    except ValueError:
+        return "."
+    return unicodedata.normalize("NFC", normalized).casefold()
 
 
 def resolve_consistency(
@@ -308,18 +331,25 @@ def resolve_consistency(
         or not candidates
     ):
         return None
-    # The authorization card's scope stays in scope as before; the node's own
-    # earlier expansions join it, and files another active node is writing
-    # leave it (one writer per file).
-    occupied = set(occupied_files or ())
-    in_scope = (set(authorized_files) | set(node_files or ())) - occupied
+    # Scope = (card scope minus what another active node is writing) plus the
+    # node's own files, which occupancy never removes.  "Held" uses the DAG's
+    # write-overlap semantics on normalized keys, so a directory scope
+    # (``tests``) or a ``./`` spelling still counts.
+    occupied_keys = [_scope_compare_key(item) for item in occupied_files or ()]
+
+    def held(path: str) -> bool:
+        key = _scope_compare_key(path)
+        return any(_write_paths_overlap(key, other) for other in occupied_keys)
+
+    own_files = set(node_files or ())
+    card_files = set(authorized_files)
     scope_expanded_files: List[str] = []
     for item in files:
-        if item in in_scope:
+        if item in own_files or (item in card_files and not held(item)):
             continue
         if (
             "deploy" in action.casefold()
-            or item in occupied
+            or held(item)
             or auto_scope_rule(item, auto_scope_paths) is None
         ):
             return None

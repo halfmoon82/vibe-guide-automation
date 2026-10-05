@@ -14,6 +14,9 @@ through configuration.
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import unicodedata
+
+from .path_ownership import normalize_project_path
 
 #: Field name in ``.vibe/config.json`` capping simultaneously active
 #: developer/reviewer session pairs.
@@ -59,15 +62,21 @@ class ProjectConfig:
 def is_repo_relative_path(value):
     """True for a normalized POSIX path that stays inside the repository.
 
-    Rejects absolute paths, backslashes, drive prefixes and any empty, ``.``
-    or ``..`` segment, so the string compared against scopes is exactly the
-    file that will be written.
+    Accepts exactly what `normalize_project_path` accepts, and only in its
+    already-normalized spelling (no ``./``, ``//``, trailing ``/`` or
+    surrounding blanks), so the string compared against scopes is the file
+    that will be written.  Control characters are refused outright: a path
+    carrying one would be persisted and then rejected at dispatch, leaving the
+    node stuck.
     """
-    if not isinstance(value, str) or not value or value != value.strip():
+    if not isinstance(value, str) or any(
+        unicodedata.category(char) == 'Cc' for char in value
+    ):
         return False
-    if value.startswith('/') or '\\' in value or ':' in value:
+    try:
+        return normalize_project_path(value) == value
+    except ValueError:
         return False
-    return all(part not in ('', '.', '..') for part in value.split('/'))
 
 
 def _auto_scope_paths(data):

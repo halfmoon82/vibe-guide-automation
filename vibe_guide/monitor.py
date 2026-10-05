@@ -42,7 +42,7 @@ from .path_ownership import validate_path_ownership
 from .binding_lifecycle import VisibleSddAcceptance
 from .planner import auto_scope_rule, resolve_consistency
 from . import dag as _dag_module
-from .dag import audit_dag, node_scoped_ready, ready_nodes
+from .dag import audit_dag, is_integration_review_node, node_scoped_ready, ready_nodes
 from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
@@ -2026,6 +2026,10 @@ class Monitor:
         for other_id, other in snapshot.nodes.items():
             if other_id == node_id or other_id not in self.nodes:
                 continue
+            # The integration reviewer lists every business file but is
+            # read-only: it never writes, so it holds nothing.
+            if is_integration_review_node(self.nodes[other_id]):
+                continue
             if other.get("status") == "accepted":
                 continue
             held.extend(self._node_scope_files(other_id, other))
@@ -3982,6 +3986,7 @@ class Monitor:
                 return
             if not event.data.get("in_contract", False):
                 record = self._snapshot_record(snapshot)
+                auto_paths = self._auto_scope_paths()
                 resolution = resolve_consistency(
                     event.data.get("consistency"),
                     self.plan.decisions,
@@ -3990,7 +3995,7 @@ class Monitor:
                     list(record.file_scope),
                     self._consistency_binding(record, self.nodes[node_id]),
                     node_files=self._node_scope_files(node_id, current),
-                    auto_scope_paths=self._auto_scope_paths(),
+                    auto_scope_paths=auto_paths,
                     occupied_files=self._files_held_by_other_active_nodes(
                         snapshot, node_id
                     ),
@@ -4001,7 +4006,6 @@ class Monitor:
                     ):
                         return
                     if resolution.scope_expanded_files:
-                        auto_paths = self._auto_scope_paths()
                         expansions = current.setdefault("scope_expansions", [])
                         for item in resolution.scope_expanded_files:
                             if item not in expansions:
@@ -4013,10 +4017,16 @@ class Monitor:
                                 "run_id": snapshot.run_id,
                                 "node_id": node_id,
                                 "files": list(resolution.scope_expanded_files),
-                                "scope_rules": {
-                                    item: auto_scope_rule(item, auto_paths)
+                                # A list, not a path-keyed dict: persistence
+                                # redacts by key name, so a path containing
+                                # e.g. "token" would be wiped.
+                                "scope_rules": [
+                                    {
+                                        "path": item,
+                                        "rule": auto_scope_rule(item, auto_paths),
+                                    }
                                     for item in resolution.scope_expanded_files
-                                },
+                                ],
                             },
                         )
                     current.setdefault("contract_overrides", {})[
