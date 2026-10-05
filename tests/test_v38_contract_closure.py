@@ -99,3 +99,103 @@ class V38ContractClosureTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _closure_payload(**overrides):
+    payload = {
+        "issue_id": "V38-9", "goal": "改造设置页交互", "non_goals": [],
+        "owned_paths": ["src/settings.vue"], "read_paths": [],
+        "call_chain": ["src/settings.vue:render"],
+        "invariants": [{"id": "I1", "entrypoint": "src/settings.vue:render",
+                        "positive_case": "ok", "negative_case": "bad",
+                        "test_command": "python -m unittest"}],
+        "expected_red": "fails", "risk_notes": [], "base_sha": "a" * 40,
+        "plan_revision": 1, "execution_epoch": 0, "evidence_ref": "ref",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _closure_root(directory):
+    root = Path(directory)
+    (root / "src").mkdir()
+    (root / "src" / "settings.vue").write_text("<template/>\n", encoding="utf-8")
+    (root / "package.json").write_text('{"dependencies": {"element-plus": "2.3.7"}}\n', encoding="utf-8")
+    return root
+
+
+class EnvironmentFactsClosureTests(unittest.TestCase):
+    def test_third_party_ui_change_without_environment_facts_is_not_closed(self):
+        issue = IssueContract.from_mapping(_closure_payload(
+            goal="把设置页表格换成 element-plus 的 el-table 用法",
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            result = check_contract_closure(issue, _closure_root(directory))
+        self.assertFalse(result.closed)
+        self.assertTrue(any("environment_facts" in item for item in result.missing))
+
+    def test_third_party_ui_marker_matching_is_case_insensitive(self):
+        issue = IssueContract.from_mapping(_closure_payload(
+            goal="升级 Element-Plus 组件用法", environment_facts=[],
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            result = check_contract_closure(issue, _closure_root(directory))
+        self.assertFalse(result.closed)
+        self.assertTrue(any("environment_facts" in item for item in result.missing))
+
+    def test_third_party_ui_change_with_verified_fact_is_closed(self):
+        issue = IssueContract.from_mapping(_closure_payload(
+            goal="把设置页表格换成 element-plus 的 el-table 用法",
+            environment_facts=[{
+                "fact": "element-plus 实装 2.3.7 无 value prop",
+                "source": "package.json",
+                "verified_at": "2026-10-04",
+            }],
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            result = check_contract_closure(issue, _closure_root(directory))
+        self.assertTrue(result.closed, result.missing)
+
+    def test_environment_fact_missing_fact_or_source_is_not_closed(self):
+        for facts in (
+            [{"fact": "", "source": "package.json", "verified_at": "2026-10-04"}],
+            [{"fact": "element-plus 实装 2.3.7 无 value prop", "source": "", "verified_at": "2026-10-04"}],
+            [{"source": "package.json", "verified_at": "2026-10-04"}],
+            [{"fact": "element-plus 实装 2.3.7 无 value prop", "verified_at": "2026-10-04"}],
+        ):
+            issue = IssueContract.from_mapping(_closure_payload(environment_facts=facts))
+            with tempfile.TemporaryDirectory() as directory:
+                result = check_contract_closure(issue, _closure_root(directory))
+            self.assertFalse(result.closed, facts)
+            self.assertTrue(any("environment_facts[0]." in item for item in result.missing), result.missing)
+
+    def test_environment_fact_source_repo_path_must_exist(self):
+        issue = IssueContract.from_mapping(_closure_payload(
+            environment_facts=[{
+                "fact": "element-plus 实装 2.3.7 无 value prop",
+                "source": "frontend/package-lock.json",
+                "verified_at": "2026-10-04",
+            }],
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            result = check_contract_closure(issue, _closure_root(directory))
+        self.assertFalse(result.closed)
+        self.assertTrue(any("environment_facts[0].source" in item for item in result.missing))
+
+    def test_environment_fact_source_url_or_prose_needs_no_file(self):
+        issue = IssueContract.from_mapping(_closure_payload(
+            goal="把设置页表格换成 element-plus 的 el-table 用法",
+            environment_facts=[
+                {"fact": "el-table 无 value prop", "source": "https://element-plus.org/zh-CN/component/table.html", "verified_at": "2026-10-04"},
+                {"fact": "官方文档未列 value", "source": "官方文档", "verified_at": "2026-10-04"},
+            ],
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            result = check_contract_closure(issue, _closure_root(directory))
+        self.assertTrue(result.closed, result.missing)
+
+    def test_legacy_contract_without_environment_facts_still_closes(self):
+        issue = IssueContract.from_mapping(_closure_payload())
+        with tempfile.TemporaryDirectory() as directory:
+            result = check_contract_closure(issue, _closure_root(directory))
+        self.assertTrue(result.closed, result.missing)
