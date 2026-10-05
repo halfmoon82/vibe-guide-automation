@@ -203,10 +203,10 @@ vibe monitor --plan <plan_id> --authorize AUTHORIZE --json
 **登记监工地址**：
 
 ```bash
-vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识>
+vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>
 ```
 
-登记内容只允许 provider / 会话 id / host，不得含凭据。worker 完工后的唤醒信号按这个地址发；没登记时 `vibe supervisor-address` 返回 `unknown`，唤醒信号无处可发，交付只能等监工被动 resume 才领取。
+登记内容只允许 provider / 会话 id / host，不得含凭据。`<本会话记录路径>` 是本会话自己的日志文件（Codex 为 `~/.codex/sessions/<年>/<月>/<日>/rollout-…-<本会话 id>.jsonl`，Claude Code 为 `~/.claude/projects/<项目>/<本会话 id>.jsonl`），预检直接从里面读上下文大小，不要另写记录文件；登记时 vibe 顺带记下此刻的上下文作为接班起点，换班按此后的增长计算。worker 完工后的唤醒信号按这个地址发；没登记时 `vibe supervisor-address` 返回 `unknown`，唤醒信号无处可发，交付只能等监工被动 resume 才领取。
 
 **自建心跳**：vibe 是 CLI，没有常驻进程，心跳只能由宿主 agent 会话承载。用宿主平台原语建一个周期任务（Codex 桌面用 heartbeat automation，可以全自动），心跳指令**逐字使用 vibe 生成的这一段**——未登记时 `vibe monitor` 和 `vibe resume` 都会把填好计划与运行编号的版本打印出来，照抄那份，只替换 `<本会话记录路径>`：
 
@@ -218,7 +218,7 @@ vibe 监工心跳 · 计划 <plan_id> · 运行 <run-id>
 第 2 步，按输出的 state 走一个分支：
   - idle：只回一个字，结束本轮，不再跑任何命令。
   - work 或 unknown：按 prd-guide §6.1 服务信箱一轮，推进用 vibe resume --plan <plan_id> --run-id <run-id>；状态只从磁盘读。
-  - rotate：按 prd-guide §6.5 换班，新会话用同一段心跳指令自建心跳。
+  - rotate：新开一个会话，让它跑 vibe supervisor-handoff --run-id <run-id> 并照输出接班；本会话不再做别的。
 例行轮询不向用户汇报。
 ```
 
@@ -427,11 +427,12 @@ vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路
 ```
 
 - 输出 `idle`：所有节点都在运行、已完成或等人拍板，且无新请求。只回一字结束本轮，不做任何写。
+- **等人拍板必须登记**：监工决定把某个节点挂起等用户回答时，先跑 `vibe supervisor-hold --run-id <run-id> --node <节点> --reason <一句话原因>`；用户回复后先 `vibe supervisor-hold --run-id <run-id> --node <节点> --release` 再推进。不登记，挂起的请求每次心跳都被当成 `work`，空闲心跳的成本是设计值的数倍（2026-10-05 run 140 实测：60 次预检 46 次误判）。挂起的节点上有 worker 交付或结果时仍然是 `work`。挂起会记下当时全盘节点状态：此后任何节点状态变化，或挂起满 6 小时，预检报 `work`（`hold needs recheck`），复核后仍在等人就对每个挂起节点再跑一次同一条挂起命令刷新。挂起节点的待服务请求在用户答复并解除挂起之前不执行，换班后的新班次同样遵守。`review`/`rework` 状态的节点不能挂起（它们只靠监工推进）。
 - 输出 `work`：有待服务请求、worker 已完工（含已自报但监工还没领取的交付），或有节点处在就绪/重试/未知等需要推进的状态。按 §6.1 原流程服务信箱，状态一律只从磁盘读，不凭记忆。
-- 输出 `rotate`：本会话上下文超过阈值（默认约 6 万 token，可配 `--token-threshold`）。执行换班：新开会话→新会话写一条简短交接（进度在磁盘上，交接只指方向）→新会话用 `vibe supervisor-register` 登记自身地址、用 §6.0 同一段心跳指令自建心跳、置顶、改标题；删除旧心跳，旧会话把自己归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。
+- 输出 `rotate`：本会话上下文自接班以来增长超过阈值（默认 6 万 token，可配 `--token-threshold`），或超过 15 万的绝对上限；登记时没给 `--session-record` 的班次没有接班起点，按绝对值计算。执行换班：新开会话，让它跑 `vibe supervisor-handoff --run-id <run-id>`——这一条打印接班需要的全部内容（进度、等人拍板事项、填好的同一段心跳指令、接班步骤），新会话照做即可，不必再翻本协议、授权卡或完整状态：用 `vibe supervisor-register --session-record` 登记、自建心跳、置顶、改标题；删除旧心跳，旧会话归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。
 - 输出 `unknown`：会话记录读不到或解析失败。**不得当成 idle**，按 `work` 处理。
 
-监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run>` 查询；未登记返回 `unknown` 而非空成功。登记内容只允许 provider/会话 id/host，不得含凭据。
+监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> --session-record <日志>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run>` 查询；未登记返回 `unknown` 而非空成功。登记内容只允许 provider/会话 id/host，不得含凭据。
 
 ## 7. 什么时候才能打断产品经理
 
