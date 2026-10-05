@@ -223,59 +223,90 @@ A 臂失败后**目录残留**，与 §7 记的失败期空 `.guard` 残留**完
 5. `create` 在写完 job 目录后要清理自己的 `.guard` 锁目录 → 被拒 → 整个 create 返回
    HTTP 500，**尽管 job 已经建成**（`state.json` 已是 `state:"working"`）。
 
-#### 7.1.3 修复（已实施，两版；**只有第二版可用**）
+#### 7.1.3 修复（已实施，三版；**只有第三版可用**）
 
-**第一版（已被复审推翻，见 §7.1.6）**：只剥 5 个 broker 变量。它确实让 `create` 不再 500，
-但把故障搬到了别处，而且更隐蔽。**不要采用这一版。**
+**第一版（复审推翻，见 §7.1.6）**：只剥 5 个 broker 变量。它确实让 `create` 不再 500，
+但把故障搬到了网关的 shell 里（rc=13），更隐蔽。**不要采用这一版。**
 
-**第二版（当前）**：剥离**整个注入面**，而不是挑名字。
+**第二版（复审推翻，见 §7.1.7）**：剥**整个注入面**。rc=13 消失了，但宿主的 safe-delete
+护栏被一起关掉 —— 网关与它派发的每个作业都变成无监管的原生删除。**不要采用这一版。**
 
-`Gateway._autostart()` 启动网关时传 `env=_gateway_env()`，`_gateway_env()` 做四件事：
+**第三版（当前）**：注入面里装的是**两件互相独立的东西**，而只有一件在这里是坏的。
 
-| # | 动作 | 覆盖 |
-|---|---|---|
-| 1 | 按前缀删变量：`CODEBUDDY_SANDBOX_` / `CODEBUDDY_BROKERED_` / `CODEBUDDY_SAFE_DELETE_` / `CODEBUDDY_TOYBOX_` / `SANDBOX_CENTER_` | broker、program policy、file token、safe-delete 全套、toybox |
-| 2 | 按名单删：`TOYBOX_SANDBOX_SOCK` / `BASH_ENV` | 沙箱 socket、bash 启动钩子 |
-| 3 | 从 `PATH` 摘掉 `…/cli/vendor/shim/brokered-bin` 与 `…/cli/vendor/shim/safe-bin` | 否则 shim 仍会被调用 |
-| 4 | 从 `NODE_OPTIONS` 摘掉 `--require=…/cli/vendor/shim/node-language-shim.cjs`（摘空则删该变量）、从 `PYTHONPATH` 摘掉 `…/cli/vendor/shim` | Node 与 Python 两侧的 shim |
+| 装的是什么 | 含哪些 | 在这里能用吗 | 处置 |
+|---|---|---|---|
+| **broker 绑定** | `CODEBUDDY_SANDBOX_*`（IPC 地址 / session / tool-call / trace / program policy / file token / zsh bin）、`CODEBUDDY_BROKERED_*`、`CODEBUDDY_TOYBOX_*`、`SANDBOX_CENTER_*`、`TOYBOX_SANDBOX_SOCK`、`PATH` 里的 `brokered-bin` | **不能**：broker 只批准「agent 工具调用」的删除，网关不是 | 剥离 |
+| **safe-delete 护栏** | `BASH_ENV` + `safe-bin` 包装（把 `rm`/`unlink`/`rmdir` 定义成函数）、`CODEBUDDY_SAFE_DELETE_*`、`NODE_OPTIONS`、`PYTHONPATH` | **能**：broker 不可达时它降级为「移进回收站」，正是应有的行为 | 保留 |
 
-第 3、4 条是关键：**变量删了、shim 还在 PATH 上**，shim 会因为拿不到 broker 而 fail-closed。
+`_gateway_env()` 因此只做两件事：按前缀删 broker 绑定（`CODEBUDDY_SANDBOX_` /
+`CODEBUDDY_BROKERED_` / `CODEBUDDY_TOYBOX_` / `SANDBOX_CENTER_`）、按名单删
+`TOYBOX_SANDBOX_SOCK` 与 `CODEBUDDY_BROKER_IPC_CLIENT`，再从 `PATH` 摘掉 `brokered-bin`
+一项。`safe-bin` 留在 `PATH` 上 —— 它只含 `rm`/`unlink`/`rmdir`，留在裸系统工具之前是净收益。
 
-实测（2026-10-05，CLI 2.147.0）三臂对照 —— 同一个 job、同一个网关，只有环境处理不同：
+机制上为什么**必须**同时摘 `CODEBUDDY_BROKERED_BIN_DIR`：`BASH_ENV` →
+`shell-runtime-bash-env.sh` 依次 source 两个脚本 —— `safe-bin/safe-delete-bash-env.sh`
+（定义 `rm` 函数）与 `brokered-sandbox-bash-env.sh`（**整段被 `CODEBUDDY_TOYBOX_BIN` 与
+`CODEBUDDY_BROKERED_BIN_DIR` 双非空门控**，门内 `unset -f rm` 并
+`export PATH="${CODEBUDDY_BROKERED_BIN_DIR}:$PATH"`）。**这个顺序决定了一切**：只要那两个变量
+还在，brokered 块就会把刚定义的护栏函数掀掉、并把 `brokered-bin` 塞回 `PATH` 首位。
 
-| 臂 | `command -v ls` | stderr | 内层 rc | job 状态 |
+实测（2026-10-05，CLI 2.147.0）。判据必须落在**删除的去向**上：`safe_delete_rm` 对位于 OS
+临时目录下的目标直接走 `$REAL_RM`（不进回收站），所以探针目标必须放在临时目录之外 ——
+早先一次探针把目标放在 `/tmp`，于是每臂都得「无记录」，判据实际失效。
+
+| 臂 | `rm` 解析 | `ls` rc | 删除去向 | 说明 |
 |---|---|---|---|---|
-| 完整宿主环境 | `…/shim/brokered-bin/ls` | `Brokered program policy check unavailable` | 13 | `done`（**假绿**） |
-| 第一版（只剥 5 个变量） | `…/shim/brokered-bin/ls` | `Brokered program policy check unavailable` | **13** | `done`（**假绿**） |
-| 第二版（整类剥离） | `/bin/ls` | 空 | **0** | `done` |
+| 完整宿主环境 | `…/shim/brokered-bin/rm` | 0 | broker 批准 | 护栏由 broker 兜住 |
+| 第一版（只剥 5 个变量） | `…/shim/brokered-bin/rm` | **13** | — | §7.1.6 |
+| 第二版（整类剥离） | `/bin/rm` | 0 | **原生直删** | §7.1.7 |
+| **第三版（当前）** | `rm`（**函数** → `safe-bin`） | 0 | **回收站** | 本版 |
+| 负控：无 shim | `/bin/rm` | 0 | 原生直删 | 证明「进回收站」由 shim 造成 |
+| 负控：第三版但去掉 `CODEBUDDY_SESSION_ID` | `rm`（函数） | 0 | 原生直删 | 确定性负控，不依赖时序 |
 
-`create` 本身不 shell out，所以三臂的 `create` 都返回 200 —— **这正是第一版能蒙过验收的原因**。
-真正的判据是 job 日志（`~/.workbuddy-ai/logs/exec-<job>.log`），不是 `create` 的 HTTP 码。
+表里「完整宿主环境」一臂的 `ls` rc **取决于宿主此刻有没有把 broker 环境注入本进程**：作为
+脱离活跃工具调用的常驻进程时，这一臂会得到 rc=13。它**不是**稳定可复现的臂，所以判据不建立在
+它上面 —— 可复现的 rc=13 是「只剥 broker 变量、`brokered-bin` 仍在 `PATH` 上」那一行。
 
-效果：`hasBrokerDeleteEnv()` 为 false → `tryBrokerDelete` 返回 `unavailable` → 走回收站降级路径，
-不再 fail-closed；网关的 shell 也不再经过 shim，`command -v ls` 回到 `/bin/ls`。
+同一三分对照在 node（`fs.rmSync`）与 python（`os.remove`）上形状一致：第二版两侧护栏全丢，
+第三版两侧都恢复、与宿主基线一致。写路径（`writeFileSync` / `open(w)` / `>`）在三版下都正常，
+没有 fail-closed。
+
+`create` 本身不 shell out，所以三臂的 `create` 都返回 200 —— **这正是第一、二版能蒙过
+`create` 验收的原因**。真正的判据是 job 日志（`~/.workbuddy-ai/logs/exec-<job>.log`）与
+删除去向，不是 `create` 的 HTTP 码。
 
 验证：
-- `tests/test_workbuddy_jobs_mcp.py::GatewayEnvironmentTests`（8 个用例），其中三个是**功能性**的：
-  - `test_a_shell_under_the_gateway_environment_really_works`：在真实宿主环境里用 `_gateway_env()`
-    跑 `bash -c 'command -v ls; ls /tmp; echo rc=$?'`，断言 rc=0 且解析结果不含 `shim`；
-  - `test_the_probe_sees_the_half_fix`：用第一版的环境跑同一个探针，断言它**失败**——
-    没有这条，探针只是个永远绿的空壳；
-  - `test_no_shim_carrier_is_left_behind`：**载体清点**，遍历当前进程里所有值含
-    `/cli/vendor/shim` 或 `broker.sock` 的变量，断言一个都没漏。宿主以后新增注入变量会在这里红，
-    而不是静默复活。
+- `tests/test_workbuddy_jobs_mcp.py::GatewayEnvironmentTests`（9 个用例）：
+  - `test_the_fixture_shim_reproduces_the_real_wiring`：**不跳过**。用夹具复刻宿主的注入顺序，
+    断言三种环境给出三种不同印记 —— 宿主 → `brokered`、第三版 → `safe-delete`、整类剥离 →
+    空。夹具先自证能复现 broker 抢占，否则后面的断言没有意义；
+  - `test_a_delete_still_routes_to_the_trash`：**不跳过**。跑宿主的真
+    `safe-delete-common.sh`，但把 `GENIE_TRASH_DIR` 指向替身，因此判据是 shim 自己的报告文件，
+    不会往用户废纸篓里丢东西；同时跑整类剥离臂作负控，断言它**不**进回收站；
+  - `test_a_shell_under_the_gateway_environment_really_works`：真实宿主环境下跑
+    `bash -c 'command -v ls; ls /tmp; echo rc=$?'` 与 `command -v rm; type -t rm`，
+    断言 rc=0、`ls` 不经 `brokered-bin`、`rm` 仍落在护栏上（函数或 `safe-bin`）；
+  - `test_the_probe_sees_the_half_fix`：用第一版的环境跑同一个探针，断言它**失败** ——
+    没有这条，探针只是个永远绿的空壳。宿主沙箱未激活时跳过（拿不到 program policy 变量）；
+  - 其余为环境形状断言：broker 绑定全删、护栏载体全留、`PATH` 只摘 `brokered-bin`。
 - 真实 CLI 端到端：`create` 0.24 秒返回、无 500、`.guard` 残留 47 → 47 不增加；
   job `b593da65` 的日志三行：`shell-ok` / `/bin/ls` / `inner-rc=0`。
 
 #### 7.1.4 仍未解释 / 未覆盖（诚实边界）
 
 - **间歇性的来源未定**：19:27–19:49 共 7/7 失败，19:50 之后 23/23 成功。宿主的 broker 环境
-  **不是每次都注入**（端到端复跑时父进程就没有这些变量）。为什么状态在 19:49→19:50 之间翻转，
-  **未查明**。修复不依赖解释这一点——它让 create 在**两种**状态下都能成功。
+  **不是每次都注入**（端到端复跑时父进程就没有这些变量；本仓库的 `Bash` 工具也会在「沙箱被
+  绕过」时不注入）。为什么状态在 19:49→19:50 之间翻转，**未查明**。修复不依赖解释这一点 ——
+  它让 create 在**两种**状态下都能成功。
 - **§5 的额度撞线（`SAFE_DELETE_BULK_CONFIRM_REQUIRED`）未处理**：那是另一条路径，
   报文带 `count`/`threshold`，换回合可绕过。本修复不覆盖它。
-- **`CODEBUDDY_SAFE_DELETE_BIN_DIR` 已纳入第二版**：第一版把它列为「未覆盖」，是漏项
-  —— 它就在 `CODEBUDDY_SAFE_DELETE_` 前缀里。
+- **brokered-fs 钩子不再生效，这是不可避免的降级**：`CODEBUDDY_BROKERED_FS_HOOK_ENABLED`
+  被剥掉、broker socket 也没了，所以网关与它派发的作业**不再经 broker 审批文件写入**。
+  这正是被修掉的那条通道，无法两全；但它不同于「关掉护栏」—— 删除仍走回收站。写路径实测
+  在三版下都正常，没有 fail-closed。
+- **`CODEBUDDY_SAFE_DELETE_SANDBOX=1` 保留**：它只喂 node shim（`node-language-shim.cjs:24`）
+  与 `sitecustomize.py:34,38` 的 brokered-fs 开关，而在无 socket 时那两个钩子实测惰性。
+  保留是因为剥掉它等于替宿主断言「不在沙箱里」，而我们无法核实这一点。
 - **本次只修网关的环境继承**：宿主「必须能自动化操控可见任务窗口」的发布门禁口径不在本条范围，
   另见 `product-spec.json` 的 `in-session-sdd-topology` 节点。
 
@@ -301,9 +332,55 @@ A 臂失败后**目录残留**，与 §7 记的失败期空 `.guard` 残留**完
 - **判据要落在被测对象真的会做的事上**：网关的核心用途是跑 shell 与派发子任务，
   所以判据必须是「网关里的一条 shell 命令能不能跑通」，不是「`create` 返回几」。
 - **fail-closed 的组件被「删一半」比不删更糟**：shim 拿不到 broker 就拒绝一切，
-  而被删掉的那一半正好是它赖以放行的部分。这类修复必须**整类剥离**或**完全不动**。
+  而被删掉的那一半正好是它赖以放行的部分。
 - **载体要清点，不要列名字**：注入面有 20+ 个变量和 3 条 `PATH`/`NODE_OPTIONS`/`PYTHONPATH`
   通道，手写名单必然漏。
+
+以及一条**当时推出、随后被 §7.1.7 证伪**的：
+
+- ~~**这类修复必须整类剥离或完全不动**~~。它从上一轮的错误里推得太远：真正要剥的是
+  **那一半依赖 broker 的接线**，不是整张注入面。把判据写成「整类剥离」恰好制造了
+  下一个更严重的错误。
+
+#### 7.1.6.1 由 §7.1.6 得到的判据，逐条复核
+
+| 判据 | 现状 |
+|---|---|
+| 判据要落在被测对象真会做的事上 | **成立**。第三版的两条功能判据都落在「删除的去向」与「shell 能否跑通」上 |
+| fail-closed 组件不能删一半 | **成立但表述不准**：应为「不能只删它赖以**放行**的那一半」。broker 变量正是放行通道，只删它才更糟 |
+| 载体要清点，不要列名字 | **成立**。第三版的两条夹具判据都不依赖手写名单，夹具自证能复现宿主接线 |
+| 必须整类剥离或完全不动 | **已证伪**，见 §7.1.7 |
+
+#### 7.1.7 复审二次推翻：第二版把宿主的 safe-delete 护栏一起关掉了（2026-10-05 深夜，PR #158）
+
+第二版（整类剥离）在合并前被第二轮独立复审拦下，P0 成立，但**性质与第一版相反**：
+不是「没修好」，是**修过头了**。
+
+`_gateway_env()` 不只摘掉 broker 变量，而是把**整套护栏**一起摘掉 —— 回收站路由、程序黑名单、
+brokered-fs 钩子、批量删除守卫全没了。结果是：网关**与它派发出去的自主作业**都变成
+「无监管的原生删除」。第一版至少还留着护栏，第二版连护栏都没了，而这个网关的用途正是
+派发自主作业。
+
+独立复现（同一探针，目标放在临时目录之外，三臂对照）：
+
+| 臂 | `PATH` 首位 | `rm` 解析 | `rm` 类型 | `ls` rc |
+|---|---|---|---|---|
+| 完整宿主环境 | `…/shim/brokered-bin` | `…/shim/brokered-bin/rm` | file | 0 |
+| 第二版（整类剥离） | node bin | **`/bin/rm`** | file | 0 |
+| 第三版（收窄） | `…/shim/safe-bin` | `rm` | **function** | 0 |
+
+关键：**第三版同样拿到 `ls` rc=0** —— 也就是说收窄版与整类剥离一样解决了原来的 rc=13，
+但多了回收站路由。可见「必须整类剥离」这条判据是多余的代价。
+
+由此修正出的判据（已写进 skill）：
+
+- **先分清注入面里哪一半坏了**：一张注入面常常同时装着「坏掉的传输」与「独立的护栏」。
+  修复的单位是**坏掉的那一半**，不是整张面。判据是「拿掉之后护栏还在不在」，不是「名字删干净没有」。
+- **护栏的可观测性要单独设计**：删除的「去向」不会写在退出码里 —— 原生直删与移进回收站
+  都返回 0。判据必须落到**去向**（回收站报告 / 替身二进制是否被调用），否则「rc=0 即通过」
+  会把关掉护栏的版本判成绿的。
+- **负控必须是确定性的**：靠「宿主此刻恰好注入/不注入」的对照会随环境漂移。可靠的负控是
+  「同一环境只改一个开关」（如去掉 `CODEBUDDY_SESSION_ID`），它必须稳定地给出相反结果。
 
 
 

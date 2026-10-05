@@ -35,7 +35,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import shutil
 import socket
 import subprocess
@@ -96,39 +95,59 @@ AUTOSTART_ENV = "WORKBUDDY_JOB_AUTOSTART"
 #:    unavailable``.  ``create`` still answered 200 -- it does not shell out --
 #:    so that breakage stays invisible until a shell actually runs.
 #:
-#: The unit of removal is therefore the whole injection surface rather than a
-#: list of names: every variable the host uses to route a child through its
-#: sandbox, plus the PATH / NODE_OPTIONS / PYTHONPATH entries that re-activate
-#: the shims even after the variables themselves are gone.
+#: What has to go is the *broker binding*, and nothing else.  The injection
+#: surface carries two independent things and only one of them is broken here:
+#:
+#: * the **broker binding** -- the variables naming one live session's socket,
+#:   plus the shims that consult it.  Unusable from a detached gateway, so it
+#:   goes.
+#: * the **safe-delete guardrail** -- ``BASH_ENV`` and the safe-bin wrappers,
+#:   ``CODEBUDDY_SAFE_DELETE_*``, ``NODE_OPTIONS``, ``PYTHONPATH``.  It needs
+#:   no broker: with the broker unreachable it degrades to moving the target
+#:   to the trash, which is what should happen.  Removing it as well would
+#:   leave the gateway and every job it dispatches doing unmediated native
+#:   deletes -- worse than the bug being fixed.  That was the first attempt at
+#:   this fix, and review rejected it.
+#:
+#: Measured per arm, deleting a file outside any OS temp dir (``safe_delete_rm``
+#: sends those straight to ``$REAL_RM``):
+#:
+#: * host env -- ``rm`` is ``brokered-bin/rm``, broker approves, ``ls`` rc=0
+#: * broker binding dropped only -- ``rm`` is ``/bin/rm``, **no** trash, rc=0
+#: * this function (narrowed) -- ``rm`` is a safe-bin function, **trash**, rc=0
+#: * no shim at all -- ``rm`` is ``/bin/rm``, **no** trash, rc=0
+#:
+#: The last row is a control: the "trash" reading comes from the shim and not
+#: from something else on the machine.  A second control drops only
+#: ``CODEBUDDY_SESSION_ID`` from the narrowed env -- same wrappers, no session
+#: -- and reports "no trash" again.  The same three-way comparison over node
+#: (``fs.rmSync``) and python (``os.remove``) gives the same shape.
 BROKER_ENV_PREFIXES: Tuple[str, ...] = (
     "CODEBUDDY_SANDBOX_",
     "CODEBUDDY_BROKERED_",
-    "CODEBUDDY_SAFE_DELETE_",
     "CODEBUDDY_TOYBOX_",
     "SANDBOX_CENTER_",
 )
 
 #: Broker wiring that shares no prefix with the rest.
-BROKER_ENV_VARS: Tuple[str, ...] = ("TOYBOX_SANDBOX_SOCK", "BASH_ENV")
-
-#: PATH entries that route a command through one of the host's shims.
-BROKER_PATH_MARKERS: Tuple[str, ...] = (
-    "/cli/vendor/shim/brokered-bin",
-    "/cli/vendor/shim/safe-bin",
+BROKER_ENV_VARS: Tuple[str, ...] = (
+    "TOYBOX_SANDBOX_SOCK",
+    "CODEBUDDY_BROKER_IPC_CLIENT",
 )
 
-#: The shim directory itself, as referenced from NODE_OPTIONS and PYTHONPATH.
-SHIM_DIR_MARKER = "/cli/vendor/shim"
+#: PATH entries that route a command through the host's brokered shim.  Just
+#: this one: the ``safe-bin`` entry stays, because the guardrail behind it
+#: still works and is worth keeping in front of the bare system tools.
+BROKER_PATH_MARKERS: Tuple[str, ...] = ("/cli/vendor/shim/brokered-bin",)
 
 
 def _gateway_env() -> Dict[str, str]:
     """The environment a gateway we start should see.
 
-    Keeps everything the CLI needs to run, minus the host's sandbox and
-    safe-delete broker wiring in every form it arrives in.  Removing the
-    variables without also removing the shim PATH / NODE_OPTIONS / PYTHONPATH
-    entries leaves a shim that fails closed, which is a worse failure than the
-    one being fixed -- see the notes on ``BROKER_ENV_PREFIXES``.
+    Drops the host's broker binding -- the variables and the PATH entry that
+    tie a process to one live agent tool call -- and keeps everything else,
+    including the safe-delete guardrail that degrades cleanly without a broker.
+    See the notes on ``BROKER_ENV_PREFIXES`` for why both halves matter.
     """
     env = {
         name: value
@@ -145,23 +164,6 @@ def _gateway_env() -> Dict[str, str]:
         # nothing but shims, and a shimmed PATH still beats no PATH at all.
         if kept:
             env["PATH"] = os.pathsep.join(kept)
-    node_options = env.get("NODE_OPTIONS")
-    if node_options:
-        kept = [token for token in shlex.split(node_options) if SHIM_DIR_MARKER not in token]
-        if kept:
-            env["NODE_OPTIONS"] = shlex.join(kept)
-        else:
-            env.pop("NODE_OPTIONS", None)
-    python_path = env.get("PYTHONPATH")
-    if python_path:
-        kept = [
-            part for part in python_path.split(os.pathsep)
-            if part and SHIM_DIR_MARKER not in part
-        ]
-        if kept:
-            env["PYTHONPATH"] = os.pathsep.join(kept)
-        else:
-            env.pop("PYTHONPATH", None)
     return env
 
 
@@ -298,7 +300,7 @@ class Gateway:
                         stderr=subprocess.STDOUT,
                         # The gateway cleans up its own job-directory locks as
                         # part of `create`, and runs the shell of every job it
-                        # dispatches; the host's sandbox wiring breaks both.
+                        # dispatches; the host's broker binding breaks both.
                         # See BROKER_ENV_PREFIXES.
                         env=_gateway_env(),
                     )
