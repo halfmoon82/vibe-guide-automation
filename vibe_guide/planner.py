@@ -7,6 +7,7 @@ import re
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional
 
+from .config import is_repo_relative_path
 from .models import EVIDENCE_PRIORITY, IssueComplexity, TargetContract, IntegrationAcceptanceContract, PRD, StageHandoff
 
 
@@ -205,6 +206,10 @@ class ConsistencyResolution:
     files: List[str]
     consistency_binding: Dict[str, Any]
     decision: Optional[Dict[str, Any]] = None
+    #: Files outside the node's scope that the correction pulls in under the
+    #: mechanical-file rule (see `auto_scope_rule`).  Empty when the
+    #: correction stays inside the existing scope.
+    scope_expanded_files: List[str] = field(default_factory=list)
 
 
 def _decision_reference(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -234,6 +239,37 @@ def _decision_reference(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+AUTO_SCOPE_RULE_TESTS = "tests_dir"
+AUTO_SCOPE_RULE_CONFIG = "auto_scope_paths"
+_CREDENTIAL_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore")
+_CREDENTIAL_NAMES = {".netrc", ".npmrc", ".pypirc", "credentials", "credentials.json"}
+
+
+def auto_scope_rule(path: Any, auto_scope_paths: Any = ()) -> Optional[str]:
+    """Return why `path` may join a node's scope without the user, else None.
+
+    Only two kinds qualify: a file under the repository's ``tests/`` directory
+    or a path the project listed in ``.vibe/config.json`` ``auto_scope_paths``.
+    Paths that escape the repository or look like credential files never
+    qualify, whichever list they come from.
+    """
+    if not is_repo_relative_path(path):
+        return None
+    name = path.rsplit("/", 1)[-1].casefold()
+    if (
+        name == ".env"
+        or name.startswith(".env.")
+        or name in _CREDENTIAL_NAMES
+        or name.endswith(_CREDENTIAL_SUFFIXES)
+    ):
+        return None
+    if path.startswith("tests/"):
+        return AUTO_SCOPE_RULE_TESTS
+    if path in set(auto_scope_paths or ()):
+        return AUTO_SCOPE_RULE_CONFIG
+    return None
+
+
 def resolve_consistency(
     inconsistency: Any,
     decisions: List[Dict[str, Any]],
@@ -241,8 +277,18 @@ def resolve_consistency(
     authorized_actions: List[str],
     authorized_files: List[str],
     expected_binding: Dict[str, Any],
+    node_files: Optional[List[str]] = None,
+    auto_scope_paths: Any = (),
+    occupied_files: Any = (),
 ) -> Optional[ConsistencyResolution]:
-    """Resolve only one evidence-determined, authorized non-deploy correction."""
+    """Resolve only one evidence-determined, authorized non-deploy correction.
+
+    A file outside the node's scope (``node_files``; the authorized scope when
+    not given) is accepted only under `auto_scope_rule` and only when no other
+    active node holds it (``occupied_files``); it is then reported in
+    ``scope_expanded_files``.  Any other out-of-scope file rejects the
+    correction so the user is asked.
+    """
 
     if not isinstance(inconsistency, dict):
         return None
@@ -256,11 +302,25 @@ def resolve_consistency(
         or action not in set(authorized_actions)
         or not isinstance(files, list)
         or not files
-        or any(item not in set(authorized_files) for item in files)
+        or not all(isinstance(item, str) for item in files)
         or not isinstance(candidates, list)
         or not candidates
     ):
         return None
+    in_scope = set(authorized_files if node_files is None else node_files)
+    occupied = set(occupied_files or ())
+    scope_expanded_files: List[str] = []
+    for item in files:
+        if item in in_scope:
+            continue
+        if (
+            "deploy" in action.casefold()
+            or item in occupied
+            or auto_scope_rule(item, auto_scope_paths) is None
+        ):
+            return None
+        if item not in scope_expanded_files:
+            scope_expanded_files.append(item)
     normalized = []
     for candidate in candidates:
         if not isinstance(candidate, dict) or candidate.get("source") not in EVIDENCE_PRIORITY:
@@ -343,6 +403,7 @@ def resolve_consistency(
         list(files),
         dict(expected_binding),
         decision_reference,
+        scope_expanded_files,
     )
 
 
