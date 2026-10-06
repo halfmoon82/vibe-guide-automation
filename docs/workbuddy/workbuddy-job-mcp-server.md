@@ -421,8 +421,9 @@ brokered-fs 钩子，但该钩子拿不到 socket 时保持惰性（读 `readFil
      有 `scrubRequestContextFromEnv`，它擦掉 `TRACEPARENT` / `TRACESTATE` / `BAGGAGE` /
      `CODEBUDDY_CONVERSATION_REQUEST_ID` / `CODEBUDDY_CONVERSATION_MESSAGE_ID` /
      `CODEBUDDY_TOOL_CALL_ID` / `CODEBUDDY_SANDBOX_BROKER_TOOL_CALL_ID` /
-     `CODEBUDDY_SANDBOX_BROKER_TRACE_ID`。本修复与它的交集是我们要摘的两个回合键；另外三个
-     `CODEBUDDY_SANDBOX_BROKER_*` 已被前缀规则顺带摘掉。**未摘的是**
+     `CODEBUDDY_SANDBOX_BROKER_TRACE_ID`。本修复与它的交集是我们要摘的两个回合键；另外两个
+     `CODEBUDDY_SANDBOX_BROKER_*`（`_TOOL_CALL_ID`、`_TRACE_ID`）已被前缀规则顺带摘掉。
+     **未摘的是**
      `CODEBUDDY_CONVERSATION_MESSAGE_ID` 与三个 trace 变量 —— 经查它们在 shim 树里**零消费者**
      （`CODEBUDDY_CONVERSATION_MESSAGE_ID`、`TRACEPARENT` 在 `cli/vendor/shim` 下 grep 无命中），
      不参与删除守卫，因此不影响本修复的结论；但「本修复的集合等于宿主的规范集合」**不成立**，
