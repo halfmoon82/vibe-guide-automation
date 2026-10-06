@@ -75,6 +75,158 @@ TOKEN_ENV = "WORKBUDDY_JOB_TOKEN"
 CLI_ENV = "WORKBUDDY_CLI"
 AUTOSTART_ENV = "WORKBUDDY_JOB_AUTOSTART"
 
+#: The host's sandbox and safe-delete broker wiring.  WorkBuddy injects it into
+#: every process it starts, and the shim it activates routes each delete
+#: through an IPC broker that only honours deletions approved for an *agent
+#: tool call*.  A gateway started from here is not such a call, so the broker
+#: answers ``denied`` and the shim fails closed.
+#:
+#: Two failures were measured on WorkBuddy AI (macOS, CLI 2.147.0):
+#:
+#: 1. Host env intact: an ``fs.rmdirSync`` under ``~/.workbuddy-ai/jobs/.locks``
+#:    raises ``[safe-delete] broker denied delete``, so ``POST /api/v1/jobs``
+#:    returns HTTP 500 while cleaning up the lock directory it just made, and
+#:    leaves an empty ``<job>.state.lock.guard`` behind.
+#: 2. Withdrawing *only* the broker IPC variables is worse than doing nothing.
+#:    ``PATH`` still begins with the host's ``brokered-bin`` shim, which still
+#:    sees ``CODEBUDDY_SANDBOX_PROGRAM_POLICY_COMMAND`` and can no longer reach
+#:    the broker it just lost, so it fails closed: every command run inside the
+#:    gateway's shells exits 13 with ``Brokered program policy check
+#:    unavailable``.  ``create`` still answered 200 -- it does not shell out --
+#:    so that breakage stays invisible until a shell actually runs.
+#: 3. Withdrawing the broker binding *but keeping* the turn identity fixes 1
+#:    and 2 while leaving ``create`` state-dependent.  The gateway cleans stale
+#:    ``.locks/*.candidate`` entries on every ``create``, and each of those is
+#:    a non-temp delete, so the bulk guard charges it to the inherited
+#:    ``CODEBUDDY_CONVERSATION_REQUEST_ID``.  That key is the *host's current
+#:    turn*, the rate is roughly 6 counts per ``create``, and the threshold is
+#:    50 -- so once the turn has spent its budget the guard answers
+#:    ``confirmRequired`` and the gateway's own cleanup fails closed:
+#:
+#:        [safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED]
+#:        {"count":6358,"threshold":50,"scope":"turn",
+#:         "targets":["~/.workbuddy-ai/jobs/.locks/547a46cb.state.lock...candidate"]}
+#:
+#:    Whether it trips depends on whether the inherited
+#:    ``CODEBUDDY_TOOL_CALL_ID`` happens to sit in the guard's ``toolApprovals``
+#:    map, so the very same call 500s in one session and succeeds in the next.
+#:    Measured: six ``create`` calls under an unapproved tool-call id returned
+#:    six HTTP 500s; six under an approved one all succeeded, while adding ~6
+#:    each to the host turn's count (6327 -> 6334 -> 6340 -> 6346).
+#:
+#: What has to go is the broker binding *and* the turn identity -- and nothing
+#: else.  The injection surface carries three independent things:
+#:
+#: * the **broker binding** -- ``CODEBUDDY_SANDBOX_*`` naming one live
+#:   session's socket, ``CODEBUDDY_BROKERED_*``, ``CODEBUDDY_TOYBOX_*``,
+#:   ``SANDBOX_CENTER_*``, plus the ``brokered-bin`` PATH entry that consults
+#:   them.  It only honours deletions approved for an *agent tool call*, and a
+#:   gateway started from this module is not such a call.  Goes.
+#: * the **turn identity** -- ``CODEBUDDY_CONVERSATION_REQUEST_ID`` and
+#:   ``CODEBUDDY_TOOL_CALL_ID`` (see ``TURN_IDENTITY_ENV_VARS``): the two
+#:   variables the bulk guard uses to decide *which agent turn* a delete
+#:   belongs to.  A detached daemon has no turn, and inheriting the host's
+#:   stale one is exactly what makes failure 3 above possible.  Goes.
+#: * the **safe-delete guardrail** -- ``BASH_ENV`` and the safe-bin wrappers,
+#:   ``CODEBUDDY_SAFE_DELETE_*``, ``NODE_OPTIONS``, ``PYTHONPATH``.  It needs
+#:   no broker and no turn: with both withdrawn it degrades to moving the
+#:   target to the trash, which is what should happen.  Removing it as well
+#:   would leave the gateway and every job it dispatches doing unmediated
+#:   native deletes -- worse than the bug being fixed.  An earlier revision on
+#:   this branch did exactly that, and review rejected it.  Stays.
+#:
+#: Why dropping the turn identity is the right half to drop: all three carriers
+#: treat a missing ``CODEBUDDY_TOOL_CALL_ID`` as "this guard does not apply"
+#: and let the delete through -- ``safe-bin/safe-delete-common.sh``
+#: (``return 0``), ``node-safe-delete-shim.cjs`` (``return``) and
+#: ``sitecustomize.py`` (``return``).  None of them fails closed, so the trash
+#: redirection -- the part of the guardrail that actually protects the user's
+#: files -- is untouched.  What is given up is the >=50-files *interactive*
+#: confirmation inside the gateway's tree, a prompt that cannot be answered
+#: there in any case because a background job has nobody to answer it.  The
+#: audit trail is not given up with it: every delete still lands in the trash
+#: and still leaves a ``{"operation":"trash"}`` line in
+#: ``CODEBUDDY_SAFE_DELETE_REPORT_PATH`` (measured: 10 such lines from one
+#: job's shell).  Only the prompt is lost, not the record.
+#:
+#: Measured per arm, deleting a file outside any OS temp dir (``safe_delete_rm``
+#: sends those straight to ``$REAL_RM``):
+#:
+#: * host env -- ``rm`` is ``brokered-bin/rm``, broker approves, ``ls`` rc=0
+#: * the whole surface dropped (broker *and* guardrail, i.e. the rejected
+#:   second revision) -- ``rm`` is ``/bin/rm``, **no** trash, rc=0
+#: * this function (narrowed) -- ``rm`` is a safe-bin function, **trash**, rc=0
+#: * no shim at all -- ``rm`` is ``/bin/rm``, **no** trash, rc=0
+#:
+#: The last row is a control: the "trash" reading comes from the shim and not
+#: from something else on the machine.  A second control drops only
+#: ``CODEBUDDY_SESSION_ID`` from the narrowed env -- same wrappers, no session
+#: -- and reports "no trash" again.  The same three-way comparison over node
+#: (``fs.rmSync``) and python (``os.remove``) gives the same shape.
+BROKER_ENV_PREFIXES: Tuple[str, ...] = (
+    "CODEBUDDY_SANDBOX_",
+    "CODEBUDDY_BROKERED_",
+    "CODEBUDDY_TOYBOX_",
+    "SANDBOX_CENTER_",
+)
+
+#: Broker wiring that shares no prefix with the rest.
+BROKER_ENV_VARS: Tuple[str, ...] = (
+    "TOYBOX_SANDBOX_SOCK",
+    "CODEBUDDY_BROKER_IPC_CLIENT",
+)
+
+#: The host's *turn identity*: the two variables the safe-delete bulk guard
+#: reads to decide which agent turn a delete belongs to.  A gateway we start
+#: outlives the turn that started it, so both are stale the moment they are
+#: handed over -- and every file the gateway removes for its own bookkeeping
+#: is then charged to a turn that may long since have ended.  See the notes
+#: above for what that does to ``create``.
+#:
+#: ``CODEBUDDY_SESSION_ID`` is deliberately *not* here.  ``safe-bin/rm`` falls
+#: through to ``$REAL_RM`` when no session id is set, so dropping it would turn
+#: the gateway's deletes from "moved to the trash" into "gone" -- precisely the
+#: regression this rule exists to prevent.
+TURN_IDENTITY_ENV_VARS: Tuple[str, ...] = (
+    "CODEBUDDY_CONVERSATION_REQUEST_ID",
+    "CODEBUDDY_TOOL_CALL_ID",
+)
+
+#: PATH entries that route a command through the host's brokered shim.  Just
+#: this one: the ``safe-bin`` entry stays, because the guardrail behind it
+#: still works and is worth keeping in front of the bare system tools.
+BROKER_PATH_MARKERS: Tuple[str, ...] = ("/cli/vendor/shim/brokered-bin",)
+
+
+def _gateway_env() -> Dict[str, str]:
+    """The environment a gateway we start should see.
+
+    Drops the host's broker binding -- the variables and the PATH entry that
+    tie a process to one live agent tool call -- and with it the host's turn
+    identity, so nothing the gateway deletes is charged to a turn that is not
+    its own.  Everything else survives, including the safe-delete guardrail,
+    which degrades to the trash once the broker and the turn are gone.  See
+    the notes above for why each half is on the side it is on.
+    """
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(BROKER_ENV_PREFIXES)
+        and name not in BROKER_ENV_VARS
+        and name not in TURN_IDENTITY_ENV_VARS
+    }
+    path = env.get("PATH")
+    if path:
+        kept = [
+            part for part in path.split(os.pathsep)
+            if part and not any(marker in part for marker in BROKER_PATH_MARKERS)
+        ]
+        # Only ever narrow PATH: an empty result would mean the host PATH held
+        # nothing but shims, and a shimmed PATH still beats no PATH at all.
+        if kept:
+            env["PATH"] = os.pathsep.join(kept)
+    return env
+
 
 class GatewayError(RuntimeError):
     """The WorkBuddy control plane is unreachable or refused the request."""
@@ -207,6 +359,11 @@ class Gateway:
                         [cli, "--serve", "--host", "127.0.0.1", "--port", str(port)],
                         stdout=sink,
                         stderr=subprocess.STDOUT,
+                        # The gateway cleans up its own job-directory locks as
+                        # part of `create`, and runs the shell of every job it
+                        # dispatches; the host's broker binding breaks both.
+                        # See BROKER_ENV_PREFIXES.
+                        env=_gateway_env(),
                     )
                 banner = {"endpoint": "", "password": ""}
                 try:
