@@ -330,9 +330,12 @@ brokered-fs 钩子，但该钩子拿不到 socket 时保持惰性（读 `readFil
     `SAFE_DELETE_BULK_CONFIRM_REQUIRED`、文件没删掉、用例失败。现在的夹具 `safe-bin/rm` 复刻
     真契约可观测的那一半（把目标交给回收站替身 + 写 `{"operation":"trash"}` 报告行），因此判据
     落在**删除走了哪条路**上，既不碰宿主也不碰回合账。**宿主环境与 `env -i` 干净环境实测同形**
-    （49 用例全绿；干净环境 2 条依赖宿主接线的按设计跳过，本条不在其中）；
+    （宿主 50 run / 0 skipped 全绿；`env -i` 干净环境 50 run、2 条依赖宿主接线的按设计跳过，
+    本条不在其中）；
   - `test_the_turn_identity_is_not_inherited`：钉住第四版新增的那一条 —— 两个回合键不得出现在
-    网关环境里，且先断言夹具里确实带有它们（守门的门）；
+    网关环境里，且先断言夹具里确实带有它们（守门的门）。**期望集钉死在测试里，不从
+    `TURN_IDENTITY_ENV_VARS` 取**：遍历生产常量自己的循环，在常量被置空时循环体一次都不跑，
+    会空转变绿（实测：把常量置成空元组，50 个用例一个不红）。同端到端用例亦钉同一期望集；
   - `test_the_session_id_survives_so_the_guardrail_stays_armed`：`CODEBUDDY_SESSION_ID` 必须留下。
     它和回合键同前缀，极易被顺手摘掉，而 `safe-bin/rm` 在没有 session id 时直接透传真删；
   - `test_a_shell_under_the_gateway_environment_really_works`：真实宿主环境下跑
@@ -383,8 +386,9 @@ brokered-fs 钩子，但该钩子拿不到 socket 时保持惰性（读 `readFil
   被剥掉、broker socket 也没了，所以网关与它派发的作业**不再经 broker 审批文件写入**。
   这正是被修掉的那条通道，无法两全；但它不同于「关掉护栏」—— 删除仍走回收站。写路径实测
   在三版下都正常，没有 fail-closed。
-- **`CODEBUDDY_SAFE_DELETE_SANDBOX=1` 保留（理由已按实测改写）**：全 shim 树里这个名字只出现
-  两次 —— `node-language-shim.cjs:24` 与 `sitecustomize.py:34` —— 且两处都只喂
+- **`CODEBUDDY_SAFE_DELETE_SANDBOX=1` 保留（理由已按实测改写）**：全 shim 树里这个名字出现在
+  三处 —— `node-brokered-fs-shim.cjs:22`、`node-language-shim.cjs:24` 与 `sitecustomize.py:34`
+  —— 且三处都只喂
   `_BROKERED_FS_HOOK_ENABLED`，**不**参与 safe-delete（护栏由 `CODEBUDDY_SAFE_DELETE_ENABLED`
   门控）。socket 已随 broker 绑定一起撤掉，所以它在这里是惰性的，留与不留实测无差别。保留是
   「不按名字做推断」的默认选择；早先那条「剥掉它等于替宿主断言不在沙箱里」的理由实测站不住，
@@ -408,6 +412,23 @@ brokered-fs 钩子，但该钩子拿不到 socket 时保持惰性（读 `readFil
      本表所有 shell 判据都是 `bash -c` 下测的。
   4. 「作业内删除是否进回收站」目前是**手工探针**证据（见 §7.1.3 末表），不是自动化测试 ——
      它需要真 CLI 与网络，做不成 hermetic 用例。
+  5. **CLI bundle 里的引用未逐处核对**：本节的「三处」「一处消费者」等计数都是对
+     `cli/vendor/shim` 树做的；`cli/dist/*.js` / `*.mjs` 打包产物里同名变量另有若干处引用
+     （`CODEBUDDY_SAFE_DELETE_SANDBOX` 在 bundle 里就不止三处，见下第 6 条），**未逐处核对**。
+     判据只覆盖 shim 树，bundle 里的读取者可能改变结论。
+  6. **宿主自己有一套更大的「请求上下文」擦除集合，本修复只覆盖其中一部分**：CLI bundle 里
+     有 `scrubRequestContextFromEnv`，它擦掉 `TRACEPARENT` / `TRACESTATE` / `BAGGAGE` /
+     `CODEBUDDY_CONVERSATION_REQUEST_ID` / `CODEBUDDY_CONVERSATION_MESSAGE_ID` /
+     `CODEBUDDY_TOOL_CALL_ID` / `CODEBUDDY_SANDBOX_BROKER_TOOL_CALL_ID` /
+     `CODEBUDDY_SANDBOX_BROKER_TRACE_ID`。本修复与它的交集是我们要摘的两个回合键；另外三个
+     `CODEBUDDY_SANDBOX_BROKER_*` 已被前缀规则顺带摘掉。**未摘的是**
+     `CODEBUDDY_CONVERSATION_MESSAGE_ID` 与三个 trace 变量 —— 经查它们在 shim 树里**零消费者**
+     （`CODEBUDDY_CONVERSATION_MESSAGE_ID`、`TRACEPARENT` 在 `cli/vendor/shim` 下 grep 无命中），
+     不参与删除守卫，因此不影响本修复的结论；但「本修复的集合等于宿主的规范集合」**不成立**，
+     这是登记在案的差异而非已验证的等价。
+- **§7.1.3 补一条独立佐证**：上面第 6 条那个宿主自带的擦除函数，是**不依赖本仓库任何推理**的
+  旁证 —— 宿主在派生长驻 / 嵌套进程时，自己也要擦掉 `CODEBUDDY_CONVERSATION_REQUEST_ID` 与
+  `CODEBUDDY_TOOL_CALL_ID`。本修复摘的正是这两个，方向与宿主既有语义一致。
 - **本次只修网关的环境继承**：宿主「必须能自动化操控可见任务窗口」的发布门禁口径不在本条范围，
   另见 `product-spec.json` 的 `in-session-sdd-topology` 节点。
 

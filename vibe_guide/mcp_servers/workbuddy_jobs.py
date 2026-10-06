@@ -143,13 +143,18 @@ AUTOSTART_ENV = "WORKBUDDY_JOB_AUTOSTART"
 #: redirection -- the part of the guardrail that actually protects the user's
 #: files -- is untouched.  What is given up is the >=50-files *interactive*
 #: confirmation inside the gateway's tree, a prompt that cannot be answered
-#: there in any case because a background job has nobody to answer it.
+#: there in any case because a background job has nobody to answer it.  The
+#: audit trail is not given up with it: every delete still lands in the trash
+#: and still leaves a ``{"operation":"trash"}`` line in
+#: ``CODEBUDDY_SAFE_DELETE_REPORT_PATH`` (measured: 10 such lines from one
+#: job's shell).  Only the prompt is lost, not the record.
 #:
 #: Measured per arm, deleting a file outside any OS temp dir (``safe_delete_rm``
 #: sends those straight to ``$REAL_RM``):
 #:
 #: * host env -- ``rm`` is ``brokered-bin/rm``, broker approves, ``ls`` rc=0
-#: * broker binding dropped only -- ``rm`` is ``/bin/rm``, **no** trash, rc=0
+#: * the whole surface dropped (broker *and* guardrail, i.e. the rejected
+#:   second revision) -- ``rm`` is ``/bin/rm``, **no** trash, rc=0
 #: * this function (narrowed) -- ``rm`` is a safe-bin function, **trash**, rc=0
 #: * no shim at all -- ``rm`` is ``/bin/rm``, **no** trash, rc=0
 #:

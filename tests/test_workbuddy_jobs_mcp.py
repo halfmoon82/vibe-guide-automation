@@ -833,6 +833,16 @@ class GatewayEnvironmentTests(unittest.TestCase):
         """
         planted = self._planted()
         env = self._gateway_env_with(planted)
+        # The set is pinned here, never taken from the constant under test: a
+        # loop over `TURN_IDENTITY_ENV_VARS` with the constant emptied out runs
+        # its body zero times and reports green while the gateway passes the
+        # turn identity straight through.  (Measured: emptying the constant
+        # leaves all 50 cases green.)
+        self.assertEqual(
+            set(module.TURN_IDENTITY_ENV_VARS),
+            {"CODEBUDDY_CONVERSATION_REQUEST_ID", "CODEBUDDY_TOOL_CALL_ID"},
+            "TURN_IDENTITY_ENV_VARS changed; this test has to be re-pointed by hand",
+        )
         for name in module.TURN_IDENTITY_ENV_VARS:
             self.assertIn(name, planted,
                           "the planted env lost %s, so this rule is exercised by nothing" % name)
@@ -857,9 +867,10 @@ class GatewayEnvironmentTests(unittest.TestCase):
     def test_the_sandbox_flag_is_kept_and_is_not_the_guardrail(self):
         """`CODEBUDDY_SAFE_DELETE_SANDBOX` reads like the guardrail.  It is not.
 
-        Measured across the host's shim tree, the name occurs exactly twice --
-        `node-language-shim.cjs:24` and `sitecustomize.py:34` -- and both uses
-        feed the *brokered fs hook* switch rather than the safe-delete one.  The
+        Measured across the host's shim tree, the name occurs in three places --
+        `node-brokered-fs-shim.cjs:22`, `node-language-shim.cjs:24` and
+        `sitecustomize.py:34` -- and all three feed the *brokered fs hook*
+        switch rather than the safe-delete one.  The
         safe-delete shim is gated by `CODEBUDDY_SAFE_DELETE_ENABLED`, which
         this rule leaves alone.  So the flag is inert here either way: the
         broker binding it switches on has already been withdrawn.
@@ -1042,6 +1053,11 @@ class GatewayEnvironmentTests(unittest.TestCase):
         for name in self.BROKER_BOUND:
             self.assertNotIn(name, child, "the gateway inherited %s" % name)
         self.assertNotIn("/cli/vendor/shim/brokered-bin", child.get("PATH", ""))
+        self.assertEqual(
+            set(module.TURN_IDENTITY_ENV_VARS),
+            {"CODEBUDDY_CONVERSATION_REQUEST_ID", "CODEBUDDY_TOOL_CALL_ID"},
+            "TURN_IDENTITY_ENV_VARS changed; this test has to be re-pointed by hand",
+        )
         for name in module.TURN_IDENTITY_ENV_VARS:
             self.assertNotIn(
                 name, child,
