@@ -728,7 +728,30 @@ class GatewayEnvironmentTests(unittest.TestCase):
         "TOYBOX_SANDBOX_SOCK",
         "SANDBOX_CENTER_IPC_ADDRESS",
         "SANDBOX_CENTER_UID",
+        # Not covered by any prefix above (`CODEBUDDY_BROKER_` is not
+        # `CODEBUDDY_BROKERED_`), so it is named one by one in
+        # `_BROKER_BOUND_VARS`.  It was carried by the rule but planted by no
+        # test, which left the withdrawal unexercised.
+        "CODEBUDDY_BROKER_IPC_CLIENT",
     )
+
+    #: The guardrail carriers, pinned.  `_GUARDRAIL_CARRIERS` is a test-side
+    #: literal, but a loop over it still reports green when it is emptied or
+    #: slimmed down -- the same false green this whole round of review has been
+    #: about -- so both call sites assert the set before looping.
+    _GUARDRAIL_CARRIERS_PIN = frozenset((
+        "BASH_ENV",
+        "CODEBUDDY_SAFE_DELETE_BIN_DIR",
+        "CODEBUDDY_SAFE_DELETE_ENABLED",
+        "NODE_OPTIONS",
+        "PYTHONPATH",
+    ))
+
+    def _pin_guardrail_carriers(self):
+        self.assertEqual(
+            set(_GUARDRAIL_CARRIERS), set(self._GUARDRAIL_CARRIERS_PIN),
+            "_GUARDRAIL_CARRIERS changed; these tests have to be re-pointed by hand",
+        )
 
     def _planted(self):
         """The whole injection surface, planted with the host's real paths."""
@@ -748,6 +771,7 @@ class GatewayEnvironmentTests(unittest.TestCase):
             "CODEBUDDY_TOYBOX_BIN": "/planted/toybox",
             "CODEBUDDY_TOYBOX_SANDBOX_PROFILE": "/planted/toybox.sb",
             "TOYBOX_SANDBOX_SOCK": "/tmp/cbb-planted/broker.sock",
+            "CODEBUDDY_BROKER_IPC_CLIENT": "/tmp/cbb-planted/ipc-client",
             "SANDBOX_CENTER_IPC_ADDRESS": "/tmp/sandbox-center.sock",
             "SANDBOX_CENTER_UID": "planted-uid",
             # The guardrail: no broker needed, so all of it stays.
@@ -800,6 +824,9 @@ class GatewayEnvironmentTests(unittest.TestCase):
     def test_the_safe_delete_guardrail_survives(self):
         planted = self._planted()
         env = self._gateway_env_with(planted)
+        # Guard the guard: the tuple is a literal, so an emptied or slimmed one
+        # would make the loop below silent and green.
+        self._pin_guardrail_carriers()
         for name in _GUARDRAIL_CARRIERS:
             self.assertIn(name, env, "the gateway lost the guardrail carrier %s" % name)
             self.assertEqual(env[name], planted[name])
@@ -1063,6 +1090,7 @@ class GatewayEnvironmentTests(unittest.TestCase):
                 name, child,
                 "the gateway inherited the host's turn identity %s" % name,
             )
+        self._pin_guardrail_carriers()
         for name in _GUARDRAIL_CARRIERS:
             self.assertIn(name, child, "the gateway lost the guardrail carrier %s" % name)
         self.assertEqual(child.get("CODEBUDDY_SESSION_ID"), "planted-session")

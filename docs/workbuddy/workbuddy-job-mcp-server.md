@@ -413,9 +413,10 @@ brokered-fs 钩子，但该钩子拿不到 socket 时保持惰性（读 `readFil
   4. 「作业内删除是否进回收站」目前是**手工探针**证据（见 §7.1.3 末表），不是自动化测试 ——
      它需要真 CLI 与网络，做不成 hermetic 用例。
   5. **CLI bundle 里的引用未逐处核对**：本节的「三处」「一处消费者」等计数都是对
-     `cli/vendor/shim` 树做的；`cli/dist/*.js` / `*.mjs` 打包产物里同名变量另有若干处引用
-     （`CODEBUDDY_SAFE_DELETE_SANDBOX` 在 bundle 里就不止三处，见下第 6 条），**未逐处核对**。
-     判据只覆盖 shim 树，bundle 里的读取者可能改变结论。
+     `cli/vendor/shim` 树做的；`cli/dist/*.js` / `*.mjs` 打包产物里同名变量另有若干处引用，
+     **未逐处核对**。bundle 是单行压缩代码，按行计数只报 1 行、无意义，所以 bundle 侧的
+     出现次数**没有数字**（既不写「三处」也不写「不止三处」）。判据只覆盖 shim 树，
+     bundle 里的读取者可能改变结论。
   6. **宿主自己有一套更大的「请求上下文」擦除集合，本修复只覆盖其中一部分**：CLI bundle 里
      有 `scrubRequestContextFromEnv`，它擦掉 `TRACEPARENT` / `TRACESTATE` / `BAGGAGE` /
      `CODEBUDDY_CONVERSATION_REQUEST_ID` / `CODEBUDDY_CONVERSATION_MESSAGE_ID` /
