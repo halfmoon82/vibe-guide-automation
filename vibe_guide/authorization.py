@@ -1409,7 +1409,9 @@ def refresh_authorization_card(
         # ``build_authorization_card`` refuses a reference that disagrees with
         # the attestation it was handed, so the carried-forward reference is
         # only passed when there is no fresh attestation to name instead.
-        engine_evidence_ref="" if engine_attestation is not None else previous.engine_evidence_ref,
+        engine_evidence_ref=(
+            "" if engine_attestation is not None else previous.engine_evidence_ref
+        ),
         engine_attestation=engine_attestation,
         explicit_execution_mode_override=previous.explicit_execution_mode_override,
         workers=workers,
