@@ -329,17 +329,29 @@ EXPECTED_TOPOLOGY_MATRIX = {
     "cursor": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
     "kimi-code": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
     "deepseek-harness": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
-    "workbuddy": {"probe_pass": "dual-visible", "probe_unknown": "dual-visible"},
+    "workbuddy": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
     "grok": {"probe_pass": "dual-visible", "probe_unknown": "dual-visible"},
 }
 
-SDD_PLATFORMS = ("codex", "claude-code", "cursor", "kimi-code", "deepseek-harness")
-DUAL_ONLY_PLATFORMS = ("workbuddy", "grok")
+SDD_PLATFORMS = ("codex", "claude-code", "cursor", "kimi-code", "deepseek-harness", "workbuddy")
+DUAL_ONLY_PLATFORMS = ("grok",)
 
 
 def sdd_env(adapter_id, value=True, provenance="session-contract"):
     facts = {adapter_id + ".in_session_sdd": value}
     return Environment(facts=facts, provenance={adapter_id + ".in_session_sdd": provenance})
+
+
+def sdd_capability_env(adapter_id, value=True, provenance="session-contract"):
+    """An environment where ``detect()`` can reach the in-session SDD branch.
+
+    ``detect()`` rules ``guide`` whenever ``subprocess`` is unproven, so the
+    capability-side assertions need that fact as well as the SDD probe.
+    """
+    facts = {adapter_id + ".subprocess": True, adapter_id + ".in_session_sdd": value}
+    return Environment(
+        facts=facts, provenance={adapter_id + ".in_session_sdd": provenance}
+    )
 
 
 class TopologyDecisionTests(unittest.TestCase):
@@ -392,6 +404,38 @@ class TopologyDecisionTests(unittest.TestCase):
             self.assertEqual(decision.probe_status, "unknown", adapter_id)
             self.assertEqual(decision.topology, "dual-visible", adapter_id)
             self.assertIsNone(decision.evidence_ref, adapter_id)
+
+    def test_capability_report_never_upgrades_past_the_platform_ruling(self):
+        """``detect()`` must honour the matrix row, not just the probe fact.
+
+        A row may keep ``probe_pass`` at the conservative topology even when
+        the probe passes (``grok``).  If the capability report upgraded anyway,
+        the publish/dispatch gate would admit a shape the supervisor never
+        dispatches -- the card/dispatch split this ruling exists to remove.
+        """
+        registry = AdapterRegistry()
+        for adapter_id in SDD_PLATFORMS:
+            capabilities = registry.get(adapter_id).detect(
+                sdd_capability_env(adapter_id)
+            ).capabilities
+            self.assertTrue(capabilities.in_session_sdd, adapter_id)
+            self.assertEqual(capabilities.mode, "in_session_sdd", adapter_id)
+        for adapter_id in DUAL_ONLY_PLATFORMS:
+            capabilities = registry.get(adapter_id).detect(
+                sdd_capability_env(adapter_id)
+            ).capabilities
+            self.assertFalse(capabilities.in_session_sdd, adapter_id)
+            self.assertEqual(capabilities.mode, "guide", adapter_id)
+
+    def test_a_pass_without_provenance_never_upgrades_the_capability(self):
+        registry = AdapterRegistry()
+        environment = Environment(
+            facts={"workbuddy.subprocess": True, "workbuddy.in_session_sdd": True},
+            provenance={},
+        )
+        capabilities = registry.get("workbuddy").detect(environment).capabilities
+        self.assertFalse(capabilities.in_session_sdd)
+        self.assertEqual(capabilities.mode, "guide")
 
     def test_false_probe_is_unsupported_and_conservative(self):
         registry = AdapterRegistry()

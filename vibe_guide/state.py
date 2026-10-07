@@ -186,6 +186,13 @@ _EVENT_DATA_KEYS = {
     "previous_capability_contract_digest",
     "previous_node_contract_digest",
     "previous_node_contract_digests",
+    # Same-run reauthorization is where an edited PRD/Spec is re-bound, so the
+    # old -> new source digests have to survive event sanitization: replaying
+    # the transition without them would silently drop the re-pin.
+    "previous_prd_digest",
+    "previous_spec_digest",
+    "prd_digest",
+    "spec_digest",
     "reason",
     "retained_acceptances",
     "invalidated_acceptances",

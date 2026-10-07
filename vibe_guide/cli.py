@@ -18,7 +18,10 @@ from .authorization import (
     build_authorization_card,
     refresh_authorization_card,
 )
-from .adapters.base import Environment as AdapterEnvironment
+from .adapters.base import (
+    Environment as AdapterEnvironment,
+    TOPOLOGY_IN_SESSION_SDD,
+)
 from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
 from .config import load_project_config
@@ -330,12 +333,16 @@ def _observed_adapter(paths: ProjectPaths, adapter_id: str):
     if observed.adapter_id != adapter_id:
         raise ValueError("observed provider does not match the selected adapter")
     result = observed.detection
-    if (
-        not result.detected
-        or result.capabilities.mode != "visible"
-        or not result.capabilities.visible_automation
-    ):
-        raise ValueError("selected provider has no verified visible lifecycle")
+    capabilities = result.capabilities
+    # Two admissible dispatch shapes: a verified visible lifecycle, or the
+    # in-session SDD topology (no visible task window, concurrent in-session
+    # subagents instead).  Anything else stays refused.
+    dispatchable = (
+        capabilities.mode == TOPOLOGY_IN_SESSION_SDD
+        or (capabilities.mode == "visible" and capabilities.visible_automation)
+    )
+    if not result.detected or not dispatchable:
+        raise ValueError("selected provider has no verified dispatch lifecycle")
     return result
 
 
@@ -488,6 +495,7 @@ def _publish_plan(
         allowed_actions=source.get("allowed_actions"),
         remote_git_actions=source.get("remote_git_actions", "deny"),
         engine_attestation=engine_attestation,
+        topology_rulings=_observed_topology_rulings(paths),
     )
 
     plans_root = destination.parent
@@ -732,6 +740,7 @@ def _require_public_execution_gate(
             refreshed = refresh_authorization_card(
                 plan, nodes, card,
                 workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
+                topology_rulings=_observed_topology_rulings(paths),
             )
             if _verified_same_run_reauthorization(
                 paths, directory, plan, nodes, refreshed
@@ -1467,9 +1476,18 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             )
         payload = {"command": "attest", "status": "ok"}
         payload.update(summary)
+        # Three dispatch shapes, not two: a verified visible lifecycle, the
+        # in-session SDD topology (concurrent in-session subagents instead of
+        # a visible task window), or guide-only.  ``.get`` keeps summaries
+        # written before the key existed readable.
+        if summary["visible_automation"]:
+            dispatch_note = "可派发可见任务"
+        elif summary.get("in_session_sdd"):
+            dispatch_note = "可派发会话内 SDD 子代理（无可见任务窗口自动化）"
+        else:
+            dispatch_note = "未验证可见任务控制面，仅向导/后台模式"
         text = "已登记 {} 会话能力：级别 {}，{}".format(
-            summary["adapter_id"], summary["level"],
-            "可派发可见任务" if summary["visible_automation"] else "未验证可见任务控制面，仅向导/后台模式",
+            summary["adapter_id"], summary["level"], dispatch_note,
         )
         return _result(SUCCESS, payload, text, args.as_json)
 
@@ -1817,6 +1835,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 card = refresh_authorization_card(
                     plan, nodes, card,
                     workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
+                    topology_rulings=_observed_topology_rulings(paths),
                 )
                 record = authorize(card, args.authorize)
                 if runner is None:
@@ -1848,8 +1867,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 card = refresh_authorization_card(
                     plan, nodes, card,
                     workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
+                    topology_rulings=_observed_topology_rulings(paths),
                 )
-                _atomic_json(directory / "authorization-card.json", card.to_dict())
                 record = authorize(card, args.authorize)
                 if runner is None:
                     runner = _public_runner(paths, card, nodes)
@@ -1862,6 +1881,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                     runner,
                     "capability_contract_changed",
                 )
+                # Publish the refreshed card only after the reauthorization
+                # actually succeeded.  Writing it first left the card, the
+                # authorization record and plan-confirmation.json disagreeing
+                # whenever reauthorize raised, and the next public authorize
+                # then failed closed with `plan-confirmation.invalid`.
+                _atomic_json(directory / "authorization-card.json", card.to_dict())
             else:
                 record = authorize(card, args.authorize)
                 if runner is None:

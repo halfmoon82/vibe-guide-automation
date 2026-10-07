@@ -8,7 +8,12 @@ from pathlib import PurePosixPath
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
-from .models import AgentCapabilities, DAGNode, Plan
+from .models import (
+    INTEGRATION_REVIEW_NODE_ID,
+    AgentCapabilities,
+    DAGNode,
+    Plan,
+)
 
 
 AUTHORIZATION_SCHEMA_VERSION = 2
@@ -47,8 +52,20 @@ _SENSITIVE_NAMES = (
 # cards.  Every node records its dispatch topology and the identity source of
 # its worker session; the vocabulary mirrors vibe_guide.task_registry so a
 # card and a task binding can be cross-checked mechanically.
-_WORKER_TOPOLOGIES = ("visible-sdd", "dual-visible", "background")
-DEFAULT_WORKER_TOPOLOGY = "dual-visible"
+WORKER_TOPOLOGY_VISIBLE_SDD = "visible-sdd"
+WORKER_TOPOLOGY_DUAL_VISIBLE = "dual-visible"
+WORKER_TOPOLOGY_BACKGROUND = "background"
+_WORKER_TOPOLOGIES = (
+    WORKER_TOPOLOGY_VISIBLE_SDD,
+    WORKER_TOPOLOGY_DUAL_VISIBLE,
+    WORKER_TOPOLOGY_BACKGROUND,
+)
+DEFAULT_WORKER_TOPOLOGY = WORKER_TOPOLOGY_DUAL_VISIBLE
+#: Capability-probe ruling value as the adapter layer spells it
+#: (``DISPATCH_TOPOLOGY_MATRIX`` / the manifest probe field name).  The
+#: supervisor translates it into the ``visible-sdd`` topology enum value; the
+#: adapter-layer name itself is never a topology value.
+RULING_IN_SESSION_SDD = "in_session_sdd"
 _WORKER_MODES = ("visible", "background")
 _WORKER_ROLES = ("developer", "reviewer")
 _WORKER_ENTRY_KEYS = frozenset(
@@ -293,6 +310,116 @@ def _topology_summary(workers: Any) -> Dict[str, Any]:
         "background": background,
         "by_topology": by_topology,
     }
+
+
+def node_adapter_id(node: DAGNode) -> str:
+    """Return the platform adapter id a node is ruled under, or "".
+
+    A contract may name its platform either explicitly through ``adapter_id``
+    or through the ``worker_profile`` block.  Both spellings are read here so
+    the dispatch ruling has exactly one resolution order shared by the
+    authorization card and the live dispatcher.
+    """
+    contract = node.contract if isinstance(node.contract, dict) else {}
+    adapter_id = contract.get("adapter_id")
+    if isinstance(adapter_id, str) and adapter_id.strip():
+        return adapter_id.strip()
+    profile = contract.get("worker_profile")
+    if isinstance(profile, dict):
+        worker = profile.get("worker")
+        if isinstance(worker, str) and worker.strip():
+            return worker.strip()
+    return ""
+
+
+def dispatch_topology_for_node(
+    node: DAGNode,
+    topology_rulings: Optional[Dict[str, str]] = None,
+) -> str:
+    """Single source of truth for one node's dispatch topology.
+
+    The authorization card and the live dispatcher both rule a node through
+    this function, so a card can never advertise a topology the supervisor
+    would not actually dispatch.  Resolution order, all fail-closed:
+
+    1. an authorization-bound ``dispatch_topology`` persisted in the node
+       contract (stamped when the plan was materialized);
+    2. ``integration-review`` is a reviewer-role closeout node by
+       construction, so the single-session developer topology can never
+       apply to it;
+    3. the live platform ruling (``in_session_sdd`` is the manifest
+       capability-probe field name / ``DISPATCH_TOPOLOGY_MATRIX`` ruling
+       value at the adapter layer; this function translates it into the
+       ``visible-sdd`` topology enum value at the dispatch layer);
+    4. the conservative ``dual-visible`` default.  UNKNOWN evidence never
+       yields ``visible-sdd``.
+    """
+    contract = node.contract if isinstance(node.contract, dict) else {}
+    persisted = contract.get("dispatch_topology")
+    if isinstance(persisted, str) and persisted in _WORKER_TOPOLOGIES:
+        return persisted
+    if getattr(node, "id", "") == INTEGRATION_REVIEW_NODE_ID:
+        return WORKER_TOPOLOGY_DUAL_VISIBLE
+    ruling = (topology_rulings or {}).get(node_adapter_id(node))
+    if ruling == RULING_IN_SESSION_SDD:
+        return WORKER_TOPOLOGY_VISIBLE_SDD
+    if ruling == WORKER_TOPOLOGY_BACKGROUND:
+        return WORKER_TOPOLOGY_BACKGROUND
+    return DEFAULT_WORKER_TOPOLOGY
+
+
+def _rerule_workers(
+    previous_workers: Any,
+    nodes: List[DAGNode],
+    topology_rulings: Optional[Dict[str, str]],
+) -> Tuple[Dict[str, Any], ...]:
+    """Re-derive every worker entry's topology from the live ruling.
+
+    A same-run reauthorization used to carry ``previous.workers`` through
+    verbatim, so the refreshed card kept advertising whatever topology the
+    first card happened to record even after the platform ruling changed —
+    the card then described a dispatch the supervisor would never perform.
+
+    ``role`` and ``mode`` are re-derived together with the topology so an
+    entry stays internally consistent: a ``visible-sdd`` node is one visible
+    session that owns both the developer role and its in-session review, and
+    ``background`` is the only topology that pairs with background mode.
+    """
+    by_id = {node.id: node for node in nodes}
+    if isinstance(previous_workers, dict):
+        entries: Any = tuple(previous_workers.values())
+    else:
+        entries = tuple(previous_workers or ())
+    reruled: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("node_id"), str):
+            raise ValueError("authorization workers schema is invalid")
+        node = by_id.get(entry["node_id"])
+        if node is None:
+            raise ValueError(
+                "worker entry outside the authorized DAG: " + entry["node_id"]
+            )
+        if (
+            entry.get("mode") == "background"
+            or entry.get("topology") == WORKER_TOPOLOGY_BACKGROUND
+        ):
+            # A disclosed background downgrade is part of what the user
+            # approved, so it is sticky: a refresh must never silently upgrade
+            # it to a visible topology the platform may not actually support.
+            # The visible topologies below only *describe* dispatch, which is
+            # why they are the ones re-derived from the live ruling.
+            reruled.append(dict(entry))
+            continue
+        topology = dispatch_topology_for_node(node, topology_rulings)
+        updated = dict(entry)
+        updated["topology"] = topology
+        updated["mode"] = (
+            "background" if topology == WORKER_TOPOLOGY_BACKGROUND else "visible"
+        )
+        if topology == WORKER_TOPOLOGY_VISIBLE_SDD:
+            updated["role"] = "developer"
+        reruled.append(updated)
+    return tuple(reruled)
 
 
 def validate_authorization_card_consistency(card):
@@ -1011,6 +1138,7 @@ def build_authorization_card(
     engine_attestation: Optional[Dict[str, Any]] = None,
     explicit_execution_mode_override: Optional[Dict[str, Any]] = None,
     workers: Optional[Dict[str, Any]] = None,
+    topology_rulings: Optional[Dict[str, str]] = None,
 ) -> AuthorizationCard:
     node_ids = tuple(sorted(node.id for node in nodes))
     if node_ids != tuple(sorted(plan.node_ids)):
@@ -1061,6 +1189,17 @@ def build_authorization_card(
     normalized_workers = _normalize_workers_schema(
         workers, node_ids, worker_identities
     )
+    if topology_rulings is not None:
+        # The card has to describe the dispatch the supervisor will actually
+        # perform from the *first* publication on, not only after a refresh.
+        # ``_normalize_workers_schema`` defaults every undeclared entry to the
+        # conservative topology, so a fresh card would advertise
+        # ``dual-visible`` for a node the live ruling dispatches as
+        # ``visible-sdd`` -- the same card/dispatch split, one publication
+        # earlier.
+        normalized_workers = _rerule_workers(
+            normalized_workers, nodes, topology_rulings
+        )
     topology_summary = _topology_summary(normalized_workers)
     if active_pair_limit is None:
         active_pair_limit = max(1, len(nodes))
@@ -1206,8 +1345,16 @@ def refresh_authorization_card(
     nodes: List[DAGNode],
     previous: AuthorizationCard,
     workflow: Optional[Dict[str, Any]] = None,
+    topology_rulings: Optional[Dict[str, str]] = None,
 ) -> AuthorizationCard:
-    """Rebuild a same-plan card while retaining its approved agent/capacity scope."""
+    """Rebuild a same-plan card while retaining its approved agent/capacity scope.
+
+    The agent/capacity envelope is retained from ``previous`` because it was
+    already approved; the per-node worker topology is *not*.  It is re-derived
+    from the live platform ruling through :func:`dispatch_topology_for_node`,
+    so the refreshed card describes the dispatch the supervisor will actually
+    perform rather than echoing the topology the first card recorded.
+    """
 
     authorize(previous, "AUTHORIZE")
     if (
@@ -1227,6 +1374,7 @@ def refresh_authorization_card(
     )
     if getattr(plan, "complexity_band", "") == "complex" and workflow is None:
         raise ValueError("complex reauthorization requires preserved workflow evidence")
+    workers = _rerule_workers(previous.workers, nodes, topology_rulings)
     return build_authorization_card(
         plan,
         nodes,
@@ -1243,7 +1391,7 @@ def refresh_authorization_card(
         engine_mode=previous.engine_mode,
         engine_evidence_ref=previous.engine_evidence_ref,
         explicit_execution_mode_override=previous.explicit_execution_mode_override,
-        workers=previous.workers,
+        workers=workers,
     )
 
 

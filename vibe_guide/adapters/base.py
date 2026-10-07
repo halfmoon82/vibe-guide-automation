@@ -80,6 +80,7 @@ class AdapterCapabilities(SharedAgentCapabilities):
     enter_task: bool = False
     resume_task: bool = False
     wait_task: bool = False
+    in_session_sdd: bool = False
     limitations: Tuple[str, ...] = ()
     evidence: Mapping[str, bool] = field(default_factory=dict)
     provenance: Mapping[str, Optional[str]] = field(default_factory=dict)
@@ -102,6 +103,10 @@ class DetectionResult:
     @property
     def level(self):
         return self.capabilities.level
+
+    @property
+    def in_session_sdd(self):
+        return self.capabilities.in_session_sdd
 
     @property
     def mode(self):
@@ -257,12 +262,36 @@ class ManifestAdapter:
             self.manifest["native_control_plane"]
             and shell and subprocess and worktree and create and enter and resume and wait
         )
+        # The in-session SDD escape hatch (v4.6 ISSUE-07): a host that cannot
+        # drive a visible task window but *can* run concurrent in-session
+        # subagents is still dispatchable -- ``visible-sdd`` is exactly the
+        # in-session dev/review-subagent protocol.  Fail-closed: the fact must
+        # be True AND carry provenance; a pass without provenance stays
+        # UNKNOWN and never upgrades.
+        sdd_fact = fact("in_session_sdd")
+        sdd_provenance = provenance.get(self.id + ".in_session_sdd")
+        # The platform ruling must admit the upgrade too.  A matrix row may
+        # keep ``probe_pass`` at the conservative topology even when the probe
+        # passes (``grok``), and that row is what the dispatcher rules through.
+        # Reading the probe fact alone would let the capability report upgrade
+        # past the ruling, so the gate would admit a shape the supervisor never
+        # dispatches -- the very card/dispatch split this ruling is meant to
+        # remove.  Missing or unrecognized specs stay conservative.
+        sdd_ruling = (self.topology_spec or _CONSERVATIVE_TOPOLOGY_SPEC).get(
+            "probe_pass"
+        )
+        in_session_sdd = bool(
+            sdd_fact and sdd_provenance and sdd_ruling == TOPOLOGY_IN_SESSION_SDD
+        )
         if not subprocess:
             level, mode, provider = "guide", "guide", ""
             limitations = ("无法启动 subprocess；仅保留向导能力",)
         elif visible:
             level, mode, provider = "full", "visible", self.manifest["provider"]
             limitations = ()
+        elif in_session_sdd:
+            level, mode, provider = "full", TOPOLOGY_IN_SESSION_SDD, self.manifest["provider"]
+            limitations = ("可派发会话内 SDD 子代理（无可见任务窗口自动化）",)
         else:
             level, mode, provider = "guide", "guide", ""
             limitations = (
@@ -274,7 +303,8 @@ class ManifestAdapter:
             provider=provider, mode=mode, visible_automation=visible,
             direct_enter=enter and visible, create_task=create and visible,
             enter_task=enter and visible, resume_task=resume and visible,
-            wait_task=wait and visible, limitations=limitations,
+            wait_task=wait and visible, in_session_sdd=in_session_sdd,
+            limitations=limitations,
             evidence=evidence, provenance=provenance,
         )
         return DetectionResult(self.id, detected, capabilities, evidence,

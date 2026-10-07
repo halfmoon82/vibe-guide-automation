@@ -66,6 +66,7 @@ def record_session_capabilities(paths: Any, adapter_id: str, facts: Any, provena
         "level": caps.level,
         "mode": caps.mode,
         "visible_automation": bool(caps.visible_automation),
+        "in_session_sdd": bool(caps.in_session_sdd),
         "project_id": observed.project_id,
         "facts": validated,
         "capabilities_path": CAPABILITIES_RELATIVE_PATH,
