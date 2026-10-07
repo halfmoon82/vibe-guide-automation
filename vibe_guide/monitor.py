@@ -12,14 +12,19 @@ import uuid
 import copy
 
 from .authorization import (
+    WORKER_TOPOLOGY_BACKGROUND,
+    WORKER_TOPOLOGY_DUAL_VISIBLE,
+    WORKER_TOPOLOGY_VISIBLE_SDD,
     AuthorizationRecord,
     affected_node_closure,
     canonical_node_contracts,
     contract_invariant_entries,
     digest_integration_contract,
+    dispatch_topology_for_node,
     executable_contract_digest,
     integration_contract_projection,
     is_authorization_valid,
+    node_adapter_id,
     validate_runtime_contract,
     _scoped_values,
 )
@@ -153,16 +158,13 @@ def _command_matches_blacklist(command: str, blacklist) -> bool:
 #: visible worker session per node (review is in-session evidence, never a
 #: second task); ``dual-visible`` keeps the developer/reviewer pair;
 #: ``background`` is the disclosed downgrade when no visible bridge exists.
-TOPOLOGY_VISIBLE_SDD = "visible-sdd"
-TOPOLOGY_DUAL_VISIBLE = "dual-visible"
-TOPOLOGY_BACKGROUND = "background"
-_DISPATCH_TOPOLOGIES = {TOPOLOGY_VISIBLE_SDD, TOPOLOGY_DUAL_VISIBLE, TOPOLOGY_BACKGROUND}
-
-#: Manifest capability-probe field name / ``DISPATCH_TOPOLOGY_MATRIX`` ruling
-#: value (adapter layer, from the ISSUE-07 probe matrix).  The supervisor
-#: translates it into the topology enum value ``visible-sdd`` (dispatch
-#: layer); the adapter-layer name itself is never a topology value.
-_RULING_IN_SESSION_SDD = "in_session_sdd"
+#: The ruling itself lives in
+#: :func:`vibe_guide.authorization.dispatch_topology_for_node` so the
+#: authorization card and the dispatcher can never disagree; these names are
+#: re-exported for the supervisor's own reads.
+TOPOLOGY_VISIBLE_SDD = WORKER_TOPOLOGY_VISIBLE_SDD
+TOPOLOGY_DUAL_VISIBLE = WORKER_TOPOLOGY_DUAL_VISIBLE
+TOPOLOGY_BACKGROUND = WORKER_TOPOLOGY_BACKGROUND
 
 #: Protocol pointer carried by every visible-sdd create request so the worker
 #: session can resolve the in-session SDD protocol from the installed package.
@@ -449,6 +451,17 @@ def isolate_affected_action(snapshot: Any, node_id: str, reason: str) -> None:
 
 
 class Monitor:
+    # Platform dispatch-topology rulings (adapter_id -> ruling), normally
+    # filled by ``__init__`` from the ISSUE-07 probe matrix.  Declared at
+    # class level as well because partially constructed instances are a
+    # supported shape in this codebase -- the tests build a Monitor with
+    # ``Monitor.__new__(Monitor)`` and assign only the attributes the case
+    # needs.  A missing ruling map must stay fail-closed (conservative
+    # ``dual-visible``) rather than raise, so the default is the empty map.
+    # ``__init__`` rebinds it to a fresh per-instance dict, so instances built
+    # the normal way never share this object.
+    _topology_rulings: Dict[str, str] = {}
+
     @staticmethod
     def _prospective_intent_digest(snapshot: RunSnapshot, node_id: str, role: str, generation: int, current: Dict[str, Any]) -> str:
         payload = {"run_id": snapshot.run_id, "node_id": node_id, "role": role, "generation": generation, "task_id": current.get(role + "_identity") or f"{role}:{node_id}", "writer": current.get("writer") or current.get("worker") or role, "worktree": current.get("worktree", ""), "branch": current.get("branch", ""), "authorization_digest": snapshot.authorization_digest, "node_contract_digest": current.get("contract_digest") or snapshot.node_contract_digest}
@@ -766,48 +779,20 @@ class Monitor:
 
     def _node_adapter_id(self, node: DAGNode) -> str:
         """Return the platform adapter id a node is ruled under, or ""."""
-        contract = node.contract if isinstance(node.contract, dict) else {}
-        adapter_id = contract.get("adapter_id")
-        if isinstance(adapter_id, str) and adapter_id.strip():
-            return adapter_id.strip()
-        profile = contract.get("worker_profile")
-        if isinstance(profile, dict):
-            worker = profile.get("worker")
-            if isinstance(worker, str) and worker.strip():
-                return worker.strip()
-        return ""
+        return node_adapter_id(node)
 
     def _node_dispatch_topology(self, node: DAGNode) -> str:
         """Rule the dispatch topology for one node.
 
-        Resolution order, all fail-closed:
-
-        1. an authorization-bound ``dispatch_topology`` persisted in the node
-           contract (stamped when the plan was materialized);
-        2. the live platform ruling injected at monitor construction
-           (``in_session_sdd`` is the manifest capability-probe field name /
-           ``DISPATCH_TOPOLOGY_MATRIX`` ruling value at the adapter layer; the
-           supervisor translates it into the ``visible-sdd`` topology enum
-           value at the dispatch layer);
-        3. the conservative ``dual-visible`` default.  UNKNOWN evidence never
-           yields ``visible-sdd``.
+        Delegates to
+        :func:`vibe_guide.authorization.dispatch_topology_for_node`, which is
+        also what ``refresh_authorization_card`` rules the card's workers
+        through.  Keeping one implementation is the point: the card must
+        describe the dispatch the supervisor will actually perform, and a
+        second copy of this resolution order is exactly how the two drifted
+        apart before.
         """
-        contract = node.contract if isinstance(node.contract, dict) else {}
-        persisted = contract.get("dispatch_topology")
-        if isinstance(persisted, str) and persisted in _DISPATCH_TOPOLOGIES:
-            return persisted
-        if getattr(node, "id", "") == "integration-review":
-            # The integration-review node is a reviewer-role closeout node by
-            # construction; the single-session developer topology can never
-            # apply to it.
-            return TOPOLOGY_DUAL_VISIBLE
-        rulings = getattr(self, "_topology_rulings", None) or {}
-        ruling = rulings.get(self._node_adapter_id(node))
-        if ruling == _RULING_IN_SESSION_SDD:
-            return TOPOLOGY_VISIBLE_SDD
-        if ruling == TOPOLOGY_BACKGROUND:
-            return TOPOLOGY_BACKGROUND
-        return TOPOLOGY_DUAL_VISIBLE
+        return dispatch_topology_for_node(node, self._topology_rulings)
 
     def _parallel_group_blocked(self, snapshot: RunSnapshot) -> set:
         """Node ids refused by the V4.6 parallel-group audit.
@@ -1556,8 +1541,14 @@ class Monitor:
             raise PermissionError("reauthorization must remain on the same plan revision")
         if snapshot.authorization_digest == record.digest and not capability_contract_changed:
             self._require_snapshot_authorization(snapshot)
+            # A replay of an interrupted reauthorization lands here with the
+            # transition already applied but its projection never recorded,
+            # so refresh the projection before dispatching for the same
+            # reason as the full path below.
+            self._record_topology_projection(snapshot, "monitor.reauthorize")
             self._schedule_ready(snapshot, runner)
             self._refresh_run_status(snapshot)
+            self._record_topology_projection(snapshot, "monitor.reauthorize")
             save_snapshot(self.paths, snapshot)
             return snapshot
 
@@ -1646,16 +1637,30 @@ class Monitor:
                     "cursor": binding.cursor,
                 }
 
+        # A same-run reauthorization is the user re-confirming the contract, so
+        # it is also where an edited PRD/Spec is re-bound.  ``resume`` keeps
+        # its strict lineage check: only an explicit reauthorization may move
+        # the pinned source digests, and the move is recorded old -> new in
+        # the transition so the audit chain shows what was re-bound.
+        current_prd_digest, current_spec_digest = self._current_plan_digests()
+        if not current_prd_digest:
+            current_prd_digest = snapshot.prd_digest
+        if not current_spec_digest:
+            current_spec_digest = snapshot.spec_digest
         transition = {
             "run_id": snapshot.run_id,
             "previous_authorization": previous.to_dict(),
             "previous_authorization_digest": previous.digest,
             "previous_node_contract_digest": previous.node_contract_digest,
             "previous_capability_contract_digest": snapshot.capability_contract_digest,
+            "previous_prd_digest": snapshot.prd_digest,
+            "previous_spec_digest": snapshot.spec_digest,
             "new_authorization": record.to_dict(),
             "authorization_digest": record.digest,
             "node_contract_digest": record.node_contract_digest,
             "capability_contract_digest": current_capability_contract_digest,
+            "prd_digest": current_prd_digest,
+            "spec_digest": current_spec_digest,
             "previous_node_contract_digests": previous_node_contract_digests,
             "node_contract_digests": new_node_contract_digests,
             "authorized_node_contracts": authorized_node_contracts,
@@ -1669,9 +1674,17 @@ class Monitor:
         }
         self._record(snapshot, "authorization_reauthorized", transition)
         self._apply_reauthorization_transition(snapshot, transition)
+        # The transition resets every never-started node back to ``planned``,
+        # so the readiness projection the snapshot carries is stale by
+        # construction.  Refresh and record it *before* dispatching:
+        # ``_schedule_ready`` opens with ``_validate_execution_topology`` and
+        # would otherwise compare the new ready set against the stale one and
+        # fail closed with ``ready-set drift`` — the same double-record
+        # ordering ``tick`` already uses.
+        self._record_topology_projection(snapshot, "monitor.reauthorize")
         self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
-        self._refresh_execution_projection(snapshot, "monitor.reauthorize")
+        self._record_topology_projection(snapshot, "monitor.reauthorize")
         save_snapshot(self.paths, snapshot)
         return snapshot
 
@@ -2123,6 +2136,28 @@ class Monitor:
         continuation = data.get("continuation")
         if not isinstance(continuation, dict):
             raise ValueError("reauthorization continuation evidence is invalid")
+        # Events recorded before the lineage re-pin existed carry none of the
+        # four keys; defaulting each to the snapshot's own value keeps those
+        # replays a no-op instead of turning a legacy log into a hard failure.
+        previous_prd_digest = data.get("previous_prd_digest", snapshot.prd_digest)
+        previous_spec_digest = data.get("previous_spec_digest", snapshot.spec_digest)
+        replacement_prd_digest = data.get("prd_digest", snapshot.prd_digest)
+        replacement_spec_digest = data.get("spec_digest", snapshot.spec_digest)
+        if not all(
+            isinstance(value, str)
+            for value in (
+                previous_prd_digest,
+                previous_spec_digest,
+                replacement_prd_digest,
+                replacement_spec_digest,
+            )
+        ):
+            raise ValueError("reauthorization plan lineage is invalid")
+        if (
+            previous_prd_digest != snapshot.prd_digest
+            or previous_spec_digest != snapshot.spec_digest
+        ):
+            raise ValueError("reauthorization plan lineage is inconsistent")
         for key, evidence in continuation.items():
             if not isinstance(key, str) or ":" not in key or not isinstance(evidence, dict):
                 raise ValueError("reauthorization continuation evidence is invalid")
@@ -2242,6 +2277,8 @@ class Monitor:
         snapshot.authorization_digest = replacement.digest
         snapshot.node_contract_digest = replacement.node_contract_digest
         snapshot.capability_contract_digest = replacement_capability_digest or ""
+        snapshot.prd_digest = replacement_prd_digest
+        snapshot.spec_digest = replacement_spec_digest
         snapshot.status = "running"
         snapshot.handles.clear()
         for node_id, current in snapshot.nodes.items():

@@ -329,12 +329,12 @@ EXPECTED_TOPOLOGY_MATRIX = {
     "cursor": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
     "kimi-code": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
     "deepseek-harness": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
-    "workbuddy": {"probe_pass": "dual-visible", "probe_unknown": "dual-visible"},
+    "workbuddy": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
     "grok": {"probe_pass": "dual-visible", "probe_unknown": "dual-visible"},
 }
 
-SDD_PLATFORMS = ("codex", "claude-code", "cursor", "kimi-code", "deepseek-harness")
-DUAL_ONLY_PLATFORMS = ("workbuddy", "grok")
+SDD_PLATFORMS = ("codex", "claude-code", "cursor", "kimi-code", "deepseek-harness", "workbuddy")
+DUAL_ONLY_PLATFORMS = ("grok",)
 
 
 def sdd_env(adapter_id, value=True, provenance="session-contract"):
