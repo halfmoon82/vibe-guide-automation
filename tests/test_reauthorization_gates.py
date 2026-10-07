@@ -25,9 +25,12 @@ import json
 import shutil
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from vibe_guide import cli as cli_module
+from vibe_guide import monitor as monitor_module
 from vibe_guide.authorize_entry import load_live_workflow
 from vibe_guide.authorization import (
     BACKGROUND_MODE_DISCLOSURES,
@@ -36,7 +39,19 @@ from vibe_guide.authorization import (
     dispatch_topology_for_node,
     refresh_authorization_card,
 )
-from vibe_guide.cli import _load_plan, _observed_adapter, run_cli
+from vibe_guide.cli import (
+    _VOLATILE_CARD_FIELDS,
+    _card_field_diff,
+    _load_plan,
+    _normalize_card_value,
+    _observed_adapter,
+    _staged_engine_attestation,
+    run_cli,
+)
+from vibe_guide.engine_attestation import (
+    create_engine_attestation,
+    validate_engine_attestation,
+)
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan
 from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
@@ -160,11 +175,29 @@ class DispatchTopologyRulingTests(unittest.TestCase):
         self.assertEqual(entry["mode"], "background")
         self.assertEqual(entry["limitations"], tuple(BACKGROUND_MODE_DISCLOSURES))
 
-    def test_integration_review_is_never_ruled_into_the_single_session_topology(self):
+    def test_integration_review_follows_its_platform_ruling(self):
+        """The closeout node is ruled by its platform, like every other node.
+
+        It used to be pinned to ``dual-visible`` ahead of the live ruling.  That
+        pin contradicted the card: a platform with no visible-task lifecycle
+        cannot serve ``dual-visible`` at all, so the card advertised a dispatch
+        the supervisor would never perform -- the very card/dispatch split this
+        module exists to remove.  A plan that genuinely needs the
+        two-visible-session shape states it in the node contract, which still
+        wins over the ruling.
+        """
         node = _business_node("integration-review")
 
         self.assertEqual(
             dispatch_topology_for_node(node, {"workbuddy": "in_session_sdd"}),
+            "visible-sdd",
+        )
+        self.assertEqual(dispatch_topology_for_node(node, {}), "dual-visible")
+        self.assertEqual(
+            dispatch_topology_for_node(
+                _business_node("integration-review", dispatch_topology="dual-visible"),
+                {"workbuddy": "in_session_sdd"},
+            ),
             "dual-visible",
         )
 
@@ -466,6 +499,499 @@ class FailedReauthorizationCardPublicationTests(unittest.TestCase):
 
         self.assertNotEqual(result.payload.get("status"), "ok")
         self.assertEqual(self.card_path.read_bytes(), before)
+
+
+class EngineEvidenceStagingTests(unittest.TestCase):
+    """The evidence a reauthorization names must be on disk before it runs.
+
+    ``Monitor._require_record`` re-reads ``engine-attestation.json``, while the
+    refreshed card is deliberately published only after ``reauthorize``
+    succeeds.  Those two orderings cannot both be "after", so the evidence is
+    staged for the duration of the call and put back when it raises.  A
+    reauthorization that fails must leave the plan exactly as it found it.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="vg-staged-attestation-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.path = self.root / "engine-attestation.json"
+
+    def test_a_raise_restores_the_previous_bytes(self):
+        original = b'{"previous": true}'
+        self.path.write_bytes(original)
+
+        with self.assertRaises(RuntimeError):
+            with _staged_engine_attestation(self.path, {"fresh": True}):
+                self.assertEqual(
+                    json.loads(self.path.read_text(encoding="utf-8")), {"fresh": True}
+                )
+                raise RuntimeError("reauthorize refused by test")
+
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_a_raise_removes_a_file_that_did_not_exist_before(self):
+        with self.assertRaises(RuntimeError):
+            with _staged_engine_attestation(self.path, {"fresh": True}):
+                raise RuntimeError("reauthorize refused by test")
+
+        self.assertFalse(self.path.exists())
+
+    def test_a_success_leaves_the_staged_evidence_in_place(self):
+        self.path.write_bytes(b'{"previous": true}')
+
+        with _staged_engine_attestation(self.path, {"fresh": True}) as staged:
+            self.assertEqual(staged, {"fresh": True})
+
+        self.assertEqual(
+            json.loads(self.path.read_text(encoding="utf-8")), {"fresh": True}
+        )
+
+
+class _StubCard:
+    """Stand-in carrying only the serialization shape ``_card_field_diff`` reads."""
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def to_dict(self):
+        return self._payload
+
+
+class CardDiffRepresentationTests(unittest.TestCase):
+    """A diff between a loaded card and a derived one must be a real diff.
+
+    ``AuthorizationCard.to_dict()`` hands back tuples; the same card read from
+    ``authorization-card.json`` carries lists.  Comparing them raw reported
+    ``integration_review_scope``, ``required_workflow`` and ``skipped_nodes``
+    as changed on every preview and buried the fields a reviewer has to read.
+    """
+
+    def setUp(self):
+        self.capabilities = AgentCapabilities("fake", True, True, True, True, True, "full")
+
+    def _card(self):
+        nodes = [_business_node("alpha")]
+        plan = Plan("plan-1", 1, "docs/prd.md", ["alpha"], "draft")
+        return build_authorization_card(plan, nodes, self.capabilities)
+
+    def test_a_list_and_a_tuple_representation_of_one_card_are_not_a_diff(self):
+        derived = self._card().to_dict()
+        reloaded = json.loads(json.dumps(derived, ensure_ascii=False))
+
+        self.assertEqual(
+            _card_field_diff(_StubCard(reloaded), _StubCard(derived)), {}
+        )
+
+    def test_a_real_change_is_still_reported(self):
+        card = self._card()
+        other = build_authorization_card(
+            Plan("plan-1", 2, "docs/prd.md", ["alpha"], "draft"),
+            [_business_node("alpha")],
+            self.capabilities,
+        )
+
+        changed = _card_field_diff(card, other)
+
+        self.assertIn("plan_version", changed)
+        self.assertNotIn("required_workflow", changed)
+
+
+class RefreshNamesFreshEngineEvidenceTests(unittest.TestCase):
+    """``refresh_authorization_card`` must be able to re-sign new evidence.
+
+    Run on the published probe plan rather than a hand-built card: a complex
+    plan refuses a card that does not carry the complete required workflow and
+    the plan's own integration contract, so a hand-built stand-in would test
+    the stand-in.
+    """
+
+    def setUp(self):
+        self.root = publish_complex_probe(self)
+        self.paths = ProjectPaths(self.root)
+        authorized = run_cli(
+            ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
+            self.root,
+        )
+        assert authorized.payload.get("status") == "ok", authorized.payload
+        _directory, self.plan, self.nodes, self.card = _load_plan(self.paths, "probe-plan")
+        # A refresh that names no new evidence is only reachable once the plan
+        # is past publication confirmation; before that the card build refuses
+        # a complex plan without a verified attestation.
+        self.plan.status = "authorized"
+
+    def _attestation(self, now):
+        return create_engine_attestation(
+            self.plan.plan_id, self.plan.version, "vibeguide_monitor", "dag",
+            self.card.agent_id, {self.card.agent_id + ".subprocess": True}, "test", now,
+        )
+
+    def _refresh(self, **kwargs):
+        # A complex plan refuses a refresh without the workflow evidence the
+        # published card preserved.
+        return refresh_authorization_card(
+            self.plan,
+            self.nodes,
+            self.card,
+            workflow=load_live_workflow(self.paths, self.plan.plan_id),
+            **kwargs
+        )
+
+    def test_without_new_evidence_the_previous_reference_is_carried(self):
+        refreshed = self._refresh()
+
+        self.assertEqual(
+            refreshed.engine_evidence_ref, self.card.engine_evidence_ref
+        )
+
+    def test_new_evidence_replaces_the_carried_reference(self):
+        fresh = self._attestation("2026-10-07T00:00:00Z")
+        self.assertNotEqual(fresh["evidence_ref"], self.card.engine_evidence_ref)
+
+        refreshed = self._refresh(engine_attestation=fresh)
+
+        self.assertEqual(refreshed.engine_evidence_ref, fresh["evidence_ref"])
+        self.assertEqual(refreshed.engine_authorization_digest, refreshed.digest)
+
+    def test_the_carried_reference_is_not_re_passed_beside_new_evidence(self):
+        """Both at once is a contradiction, and must not be silently resolved.
+
+        ``build_authorization_card`` refuses a reference that disagrees with
+        the attestation it was handed, so the refresh clears the carried
+        reference whenever it has fresh evidence to name instead.  Passing
+        both is what the refresh must not do.
+        """
+        fresh = self._attestation("2026-10-07T00:00:00Z")
+
+        with self.assertRaisesRegex(ValueError, "does not match attestation"):
+            build_authorization_card(
+                self.plan, self.nodes, self._capabilities(),
+                engine_evidence_ref=self.card.engine_evidence_ref,
+                engine_attestation=fresh,
+                required_workflow=self.card.required_workflow,
+                integration_node_id=self.card.integration_node_id,
+                integration_review_scope=self.card.integration_review_scope,
+                workflow=load_live_workflow(self.paths, self.plan.plan_id),
+                execution_engine=self.card.execution_engine,
+                engine_mode=self.card.engine_mode,
+                active_pair_limit=self.card.active_pair_limit,
+                allowed_actions=self.card.allowed_actions,
+                remote_git_actions=self.card.remote_git_actions,
+            )
+
+    def _capabilities(self):
+        return AgentCapabilities(
+            self.card.agent_id, False, False, False, False, False, "guide"
+        )
+
+
+class ExpiredEngineEvidenceReauthorizationTests(unittest.TestCase):
+    """A plan older than the evidence window must still be reauthorizable.
+
+    ``validate_engine_attestation`` refuses evidence older than a day, and the
+    only writer of ``engine-attestation.json`` is publication, which refuses to
+    run for a plan that already exists.  A plan published yesterday therefore
+    had no supported way back: the refreshed card kept naming the expired
+    reference and ``Monitor._require_record`` blocked before any dispatch was
+    considered.
+
+    Time is what ages the evidence, so time is what the test moves:
+    ``_aged_evidence`` makes the validator see the already-published
+    attestation as a day past its window, and nothing else.
+    """
+
+    def setUp(self):
+        self.root = publish_complex_probe(self)
+        self.paths = ProjectPaths(self.root)
+        authorized = run_cli(
+            ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
+            self.root,
+        )
+        assert authorized.payload.get("status") == "ok", authorized.payload
+        self.directory, self.plan, nodes, card = _load_plan(self.paths, "probe-plan")
+        self.attestation_path = self.directory / "engine-attestation.json"
+        self.published = json.loads(self.attestation_path.read_text(encoding="utf-8"))
+        self.card_path = self.directory / "authorization-card.json"
+        self.card_before = json.loads(self.card_path.read_text(encoding="utf-8"))
+        self.snapshot = Monitor(self.paths, self.plan, nodes).start(
+            authorize(card, "AUTHORIZE"), FakeRunner()
+        )
+        # A delivered contract correction, so the refreshed card really is a
+        # different card and the assertions below are not vacuous.  It has to
+        # land after ``start``: the run verifies the published workflow
+        # evidence against ``nodes.json`` and would refuse a node set that no
+        # longer matches what was recorded.
+        self._edit_a_node_contract()
+        # Mirror the state a successful monitor run leaves behind, so the
+        # `elif _current_run_path(directory).exists()` branch is selected.
+        published = json.loads((self.directory / "plan.json").read_text(encoding="utf-8"))
+        published["status"] = "authorized"
+        (self.directory / "plan.json").write_text(json.dumps(published), encoding="utf-8")
+        (self.directory / "current-run.json").write_text(
+            json.dumps({"run_id": self.snapshot.run_id}), encoding="utf-8"
+        )
+
+    def _edit_a_node_contract(self):
+        nodes_path = self.directory / "nodes.json"
+        payload = json.loads(nodes_path.read_text(encoding="utf-8"))
+        target = payload["nodes"][0] if isinstance(payload, dict) else payload[0]
+        target["contract"]["acceptance_example"] = "verified_fact: README 含两行文本"
+        nodes_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def _aged_evidence(self):
+        real = monitor_module.validate_engine_attestation
+        beyond = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat().replace(
+            "+00:00", "Z"
+        )
+
+        def validate(candidate, plan_id, plan_revision, **kwargs):
+            if candidate.get("digest") == self.published["digest"]:
+                kwargs["now"] = beyond
+            return real(candidate, plan_id, plan_revision, **kwargs)
+
+        return patch.object(monitor_module, "validate_engine_attestation", validate)
+
+    def _reauthorize(self):
+        return run_cli(
+            ["monitor", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
+            self.root,
+        )
+
+    def test_the_published_evidence_is_what_expires(self):
+        """Non-vacuousness: the fixture really is past the window."""
+        with self._aged_evidence():
+            with self.assertRaisesRegex(ValueError, "expired"):
+                monitor_module.validate_engine_attestation(
+                    self.published, "probe-plan", self.plan.version
+                )
+
+    def test_reauthorization_replaces_the_expired_evidence(self):
+        with self._aged_evidence():
+            self._reauthorize()
+
+        # The run's own event log is the signal: a refused reauthorization
+        # leaves no transition behind, whatever status the snapshot reports.
+        names = [event["event"] for event in load_events(self.paths, self.snapshot.run_id)]
+        self.assertIn("authorization_reauthorized", names)
+        refreshed = json.loads(self.attestation_path.read_text(encoding="utf-8"))
+        self.assertNotEqual(refreshed["digest"], self.published["digest"])
+        # The replacement is real evidence, not a re-typed copy: it validates
+        # against the plan binding with the clock left alone.
+        validate_engine_attestation(refreshed, "probe-plan", self.plan.version)
+        # The card names the evidence that is actually on disk.
+        card = json.loads(self.card_path.read_text(encoding="utf-8"))
+        self.assertEqual(card["engine_evidence_ref"], refreshed["evidence_ref"])
+        self.assertNotEqual(card["digest"], self.card_before["digest"])
+
+    def test_carrying_the_expired_reference_forward_still_fails_closed(self):
+        """Negative control: the pre-fix behaviour is still a refusal.
+
+        Returning the already-published attestation is exactly what the old
+        path did by carrying ``previous.engine_evidence_ref`` through, so this
+        is the block the fix removes -- not a block it merely renames.
+        """
+        before = self.card_path.read_bytes()
+        with self._aged_evidence():
+            with patch.object(
+                cli_module,
+                "_observed_engine_attestation",
+                lambda _paths, _plan: dict(self.published),
+            ):
+                result = self._reauthorize()
+
+        self.assertIn("execution_engine_unverified", result.payload.get("reason", ""))
+        self.assertEqual(self.card_path.read_bytes(), before)
+        names = [event["event"] for event in load_events(self.paths, self.snapshot.run_id)]
+        self.assertNotIn("authorization_reauthorized", names)
+
+    def test_a_refused_reauthorization_leaves_the_published_card_alone(self):
+        before = self.card_path.read_bytes()
+
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("reauthorize refused by test")
+
+        with self._aged_evidence():
+            with patch.object(Monitor, "reauthorize", explode):
+                result = self._reauthorize()
+
+        self.assertNotEqual(result.payload.get("status"), "ok")
+        self.assertEqual(self.card_path.read_bytes(), before)
+
+
+class CardPreviewTests(unittest.TestCase):
+    """``monitor --preview-card`` is the read-only half of the approval loop.
+
+    Publishing the refreshed card on its own is not a representable state: the
+    execution gate binds the on-disk card to the run snapshot's authorized
+    digest, so a refreshed card with the previous authorization beside it fails
+    closed with ``plan-confirmation.invalid``.  The preview derives the same
+    card in memory instead, which is the only way to show a reviewer what a
+    reauthorization would sign before it is signed.
+    """
+
+    def setUp(self):
+        self.root = publish_complex_probe(self)
+        self.paths = ProjectPaths(self.root)
+        authorized = run_cli(
+            ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
+            self.root,
+        )
+        assert authorized.payload.get("status") == "ok", authorized.payload
+        self.directory, plan, nodes, card = _load_plan(self.paths, "probe-plan")
+        self.snapshot = Monitor(self.paths, plan, nodes).start(
+            authorize(card, "AUTHORIZE"), FakeRunner()
+        )
+        (self.directory / "current-run.json").write_text(
+            json.dumps({"run_id": self.snapshot.run_id}), encoding="utf-8"
+        )
+        # A delivered contract correction, so the preview has something real to
+        # report rather than an empty diff.  It has to land after ``start``:
+        # the run verifies the published workflow evidence against
+        # ``nodes.json`` and would refuse a node set that no longer matches.
+        nodes_path = self.directory / "nodes.json"
+        payload = json.loads(nodes_path.read_text(encoding="utf-8"))
+        target = payload["nodes"][0] if isinstance(payload, dict) else payload[0]
+        target["contract"]["acceptance_example"] = "verified_fact: README 含两行文本"
+        nodes_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        # The CLI flips plan.json to `authorized` after a successful monitor
+        # run; a refresh is only reachable on such a plan.
+        published = json.loads((self.directory / "plan.json").read_text(encoding="utf-8"))
+        published["status"] = "authorized"
+        (self.directory / "plan.json").write_text(json.dumps(published), encoding="utf-8")
+
+    def _fingerprint(self):
+        return {
+            path.relative_to(self.root).as_posix(): hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+            for path in sorted(self.root.rglob("*"))
+            if path.is_file()
+        }
+
+    def _preview(self, extra=()):
+        return run_cli(
+            ["monitor", "--plan", "probe-plan", "--preview-card", "--json", *extra],
+            self.root,
+        )
+
+    def test_the_preview_writes_nothing(self):
+        before = self._fingerprint()
+
+        result = self._preview()
+
+        self.assertEqual(result.payload.get("status"), "ok", result.payload)
+        self.assertEqual(self._fingerprint(), before)
+
+    def test_the_preview_needs_no_authorize_token(self):
+        """Reading a card must not require the token that signs it."""
+        result = self._preview()
+
+        self.assertEqual(result.payload.get("status"), "ok", result.payload)
+        self.assertEqual(result.payload["publication"], "same_run_reauthorization")
+
+    def test_the_preview_reports_the_fields_the_reauthorization_will_change(self):
+        result = self._preview()
+
+        changed = result.payload["changed_fields"]
+        # The reviewer-facing diff is against the card that was approved, so
+        # the contract correction shows up rather than only the engine fields.
+        self.assertIn("node_contract_digest", changed)
+        self.assertIn("digest", changed)
+        self.assertEqual(
+            changed["engine_evidence_ref"]["previous"],
+            json.loads(
+                (self.directory / "authorization-card.json").read_text(encoding="utf-8")
+            )["engine_evidence_ref"],
+        )
+        # Representation-only fields must not appear: a tuple on one side and a
+        # list on the other is not a change a reviewer has to consider.
+        for noisy in ("required_workflow", "skipped_nodes", "integration_review_scope"):
+            self.assertNotIn(noisy, changed)
+        # The narrower self-check -- a refresh with old evidence against a
+        # refresh with new evidence -- must stay clean.
+        self.assertEqual(result.payload["engine_refresh_drift"], [])
+
+    def test_the_preview_reports_a_topology_move(self):
+        """The fixture rules ``dual-visible``; a passing probe must move it.
+
+        This is the card-level half of the closeout-node change: once the
+        platform is ruled into the single-session topology, ``integration-review``
+        is dispatched that way too, and the preview says so before the card is
+        signed rather than after.
+        """
+        self._probe_in_session_sdd()
+
+        changed = self._preview().payload["changed_fields"]
+
+        self.assertIn("workers", changed)
+        self.assertIn("topology_summary", changed)
+        workers = changed["workers"]["next"]
+        self.assertEqual(
+            {entry["node_id"]: entry["topology"] for entry in workers},
+            {"probe-node-a": "visible-sdd", "integration-review": "visible-sdd"},
+        )
+
+    def _probe_in_session_sdd(self):
+        store = self.root / ".vibe" / "provider-actions" / "capabilities.json"
+        payload = json.loads(store.read_text(encoding="utf-8"))
+        payload["facts"]["claude-code.in_session_sdd"] = True
+        store.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def test_an_underivable_self_check_is_unknown_rather_than_clean(self):
+        """``unknown`` must never be reported as "no drift found".
+
+        A plan whose lifecycle never advanced past
+        ``confirmed_pending_authorization`` has a run but no refresh that names
+        the old evidence, so the drift comparison has nothing to compare
+        against.  The card is still shown -- that is the point of a read-only
+        preview -- and the missing check is disclosed.
+        """
+        plan_path = self.directory / "plan.json"
+        payload = json.loads(plan_path.read_text(encoding="utf-8"))
+        payload["status"] = "confirmed_pending_authorization"
+        plan_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        result = self._preview()
+
+        self.assertEqual(result.payload.get("status"), "ok", result.payload)
+        self.assertIsNone(result.payload["engine_refresh_drift"])
+        self.assertTrue(result.payload["engine_refresh_carry_error"])
+        self.assertTrue(
+            result.payload["card"]["engine_evidence_ref"].startswith(
+                "engine-attestation:"
+            )
+        )
+
+    def test_the_preview_card_is_the_card_a_reauthorization_publishes(self):
+        preview = self._preview().payload["card"]
+        before = self._fingerprint()
+
+        run_cli(
+            ["monitor", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
+            self.root,
+        )
+
+        self.assertNotEqual(self._fingerprint(), before)
+        names = [event["event"] for event in load_events(self.paths, self.snapshot.run_id)]
+        self.assertIn("authorization_reauthorized", names)
+        published = json.loads(
+            (self.directory / "authorization-card.json").read_text(encoding="utf-8")
+        )
+        # Everything a reviewer can act on is identical; only the fields that
+        # carry the re-observed attestation's timestamp may differ.  Both sides
+        # go through the JSON shape so a tuple on one side and a list on the
+        # other is not mistaken for a difference.
+        self.assertEqual(
+            {
+                key: _normalize_card_value(value)
+                for key, value in preview.items()
+                if key not in _VOLATILE_CARD_FIELDS
+            },
+            {
+                key: _normalize_card_value(value)
+                for key, value in published.items()
+                if key not in _VOLATILE_CARD_FIELDS
+            },
+        )
 
 
 class ObservedAdapterAdmissionTests(unittest.TestCase):

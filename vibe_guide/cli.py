@@ -1,6 +1,7 @@
 """Thin CLI wiring over the scanner, planner, authorization and monitor APIs."""
 
 import argparse
+import contextlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
@@ -70,7 +71,7 @@ from .workflow_gate import is_v42_sdd_first_state, require_capability_contract
 from .authorize_entry import AuthorizationDenied, materialize_workflow_evidence
 from .attest import record_session_capabilities
 from .protocols import PRD_GUIDE_NAME, load_protocol
-from .state import load_events, load_snapshot, validate_run_id
+from .state import _atomic_bytes, load_events, load_snapshot, validate_run_id
 from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
@@ -132,6 +133,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--acceptance-state")
     parser.add_argument("--observations")
     parser.add_argument("--watch", action="store_true", dest="watch")
+    parser.add_argument("--preview-card", action="store_true", dest="preview_card")
     parser.add_argument("--mode", choices=("layered", "bundled"), default="layered")
     parser.add_argument("--source", dest="skill_source")
     parser.add_argument("--sha", dest="skill_sha")
@@ -315,6 +317,66 @@ def _observed_topology_rulings(paths: ProjectPaths) -> dict:
     except (KeyError, TypeError, ValueError):
         return {}
     return {observed.adapter_id: decision.topology}
+
+
+def _observed_engine_attestation(paths: ProjectPaths, plan: Plan) -> Dict[str, Any]:
+    """Re-observe the engine evidence a same-plan reauthorization has to name.
+
+    Publication stamps the plan's ``engine-attestation.json`` once, and
+    ``validate_engine_attestation`` refuses evidence older than a day.  A plan
+    published more than a day ago therefore could not be reauthorized at all:
+    the refreshed card would keep naming the expired reference, and
+    ``Monitor._require_record`` reads the file, finds the recorded reference
+    intact but the evidence stale, and blocks before any provider dispatch is
+    considered.  There is no other supported way back -- the only writer is the
+    publication path, which refuses to run for a plan that already exists.
+
+    The observation is taken the way publication takes it, from the live
+    ``ProviderActionStore``, so the re-signed card rests on freshly observed
+    facts rather than on a re-typed copy of the old ones.  Raising is the
+    correct outcome when the store cannot be read: an unverifiable engine
+    binding must not be re-signed.
+    """
+    observed = ProviderActionStore(paths).capabilities()
+    return create_engine_attestation(
+        plan.plan_id,
+        plan.version,
+        "vibeguide_monitor",
+        "dag",
+        observed["adapter_id"],
+        observed["facts"],
+        observed["provenance"],
+        datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    )
+
+
+@contextlib.contextmanager
+def _staged_engine_attestation(path: Path, attestation: Dict[str, Any]):
+    """Publish ``attestation`` for the duration of one reauthorization call.
+
+    ``Monitor._require_record`` re-reads the file, so the refreshed evidence
+    has to be on disk *before* ``reauthorize`` runs -- while the card that
+    names it is deliberately published only after it succeeds.  Those two
+    orderings cannot both be "after", so the evidence is staged and put back
+    on failure: a reauthorization that raises leaves the plan exactly as it
+    found it, instead of pairing fresh evidence with a card that still names
+    the old reference.  If the process dies inside the window the leftover
+    state is detectable rather than silently wrong -- the card names evidence
+    the file no longer matches -- and the next reauthorization restages it.
+    """
+    previous = (
+        path.read_bytes() if path.is_file() and not path.is_symlink() else None
+    )
+    _atomic_json(path, attestation)
+    try:
+        yield attestation
+    except BaseException:
+        if previous is None:
+            if path.exists():
+                path.unlink()
+        else:
+            _atomic_bytes(path, previous)
+        raise
 
 
 def _observed_adapter(paths: ProjectPaths, adapter_id: str):
@@ -749,6 +811,256 @@ def _require_public_execution_gate(
         except (OSError, TypeError, ValueError):
             pass
     raise PermissionError("planning_required: " + ", ".join(gate.missing))
+
+
+#: Fields a same-plan reauthorization legitimately re-signs.  The engine
+#: evidence reference is stamped when its attestation is generated, so it
+#: cannot be stable across two observations; the card digest covers every
+#: field, and ``engine_authorization_digest`` mirrors the card digest.
+_VOLATILE_CARD_FIELDS = frozenset(
+    {"digest", "engine_evidence_ref", "engine_authorization_digest"}
+)
+
+
+def _normalize_card_value(value: Any) -> Any:
+    """Return ``value`` in the shape a JSON round-trip would give it.
+
+    ``AuthorizationCard.to_dict()`` hands back tuples, while a card read back
+    from ``authorization-card.json`` carries lists.  Comparing the two
+    representations directly reports ``integration_review_scope``,
+    ``required_workflow`` and ``skipped_nodes`` as changed on every preview,
+    burying the changes a reviewer actually has to look at.
+    """
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
+    except (TypeError, ValueError):
+        return value
+
+
+def _card_field_diff(before: Any, after: Any) -> Dict[str, Any]:
+    """Return ``{field: {previous, next}}`` for every field that changed."""
+    left = before.to_dict()
+    right = after.to_dict()
+    return {
+        key: {"previous": left.get(key), "next": right.get(key)}
+        for key in sorted(set(left) | set(right))
+        if _normalize_card_value(left.get(key)) != _normalize_card_value(right.get(key))
+    }
+
+
+def _short_card_value(value: Any, limit: int = 40) -> str:
+    """Render one card field for a human line without flooding it."""
+    if isinstance(value, (list, tuple, dict)):
+        rendered = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    else:
+        rendered = str(value)
+    if len(rendered) > limit:
+        return rendered[:limit] + "…"
+    return rendered or "（空）"
+
+
+def _preview_authorization_card(
+    paths: ProjectPaths, plan_id: str, as_json: bool
+) -> CLIResult:
+    """Render the card a reauthorization would publish, writing nothing.
+
+    Refreshing the card is the only way to see the topology a same-plan
+    reauthorization will dispatch, and it is also the one step that cannot be
+    published early: the execution gate binds the on-disk card to the run
+    snapshot's authorized digest, so a refreshed card with the previous
+    authorization still beside it fails closed until ``Monitor.reauthorize``
+    runs and re-records the binding.  Publishing the card on its own is
+    therefore not a representable state, and the preview derives the same card
+    in memory instead, leaving every file untouched.
+
+    The reported change set is the one a reviewer actually needs: the on-disk
+    card -- the card that was approved -- against the card about to be signed.
+    A second, narrower comparison is kept beside it as an invariant check: the
+    same card refreshed with the previous engine reference versus the same card
+    refreshed with a freshly observed one.  That pair must differ in nothing
+    but the engine-evidence fields; anything else there is a defect in the
+    refresh itself, and is reported as ``engine_refresh_drift`` rather than
+    being folded into the reviewer-facing diff.
+    """
+    try:
+        directory, plan, nodes, card = _load_plan(paths, plan_id)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        return _result(
+            BLOCKED,
+            {
+                "command": "monitor",
+                "status": "blocked_design",
+                "reason": str(error),
+            },
+            "授权卡预览失败：" + str(error),
+            as_json,
+        )
+    if not _current_run_path(directory).exists():
+        # Nothing has been authorized yet, so the published card already is
+        # the card the next authorization signs -- no refresh is involved and
+        # the digest below is the one that will be recorded.
+        payload = {
+            "command": "monitor",
+            "status": "ok",
+            "publication": "first",
+            "plan_id": plan.plan_id,
+            "preview_card_digest": card.digest,
+            "topology_summary": card.topology_summary,
+            "changed_fields": {},
+            "engine_refresh_drift": [],
+            "engine_refresh_carry_error": "",
+            "card": card.to_dict(),
+        }
+        return _result(
+            SUCCESS, payload, _render_card_preview(payload, card), as_json
+        )
+    run_id = _run_id(directory, None)
+    workflow = load_snapshot(paths, run_id).workflow
+    topology_rulings = _observed_topology_rulings(paths)
+    carry_error = ""
+    try:
+        carried = refresh_authorization_card(
+            plan, nodes, card, workflow=workflow, topology_rulings=topology_rulings
+        )
+    except (OSError, TypeError, ValueError) as error:
+        # The drift check needs a refresh that names no new evidence.  A plan
+        # that cannot produce one -- a run whose lifecycle never advanced past
+        # ``confirmed_pending_authorization``, say -- still has a card worth
+        # showing, so the check is reported as UNKNOWN rather than as clean.
+        carried = None
+        carry_error = str(error)
+    engine_evidence_error = ""
+    try:
+        attestation = _observed_engine_attestation(paths, plan)
+    except (ProviderPending, OSError, TypeError, ValueError) as error:
+        # The substantive card is still derivable without a live observation;
+        # only the digest that publication will sign is not.  Reporting the
+        # card plus the reason beats reporting nothing.
+        attestation = None
+        engine_evidence_error = str(error)
+    if attestation is None:
+        published = carried
+    else:
+        try:
+            published = refresh_authorization_card(
+                plan,
+                nodes,
+                card,
+                workflow=workflow,
+                topology_rulings=topology_rulings,
+                engine_attestation=attestation,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            return _result(
+                BLOCKED,
+                {
+                    "command": "monitor",
+                    "status": "blocked_design",
+                    "reason": str(error),
+                },
+                "授权卡预览失败：" + str(error),
+                as_json,
+            )
+    if published is None:
+        reason = carry_error or "the refreshed card could not be derived"
+        return _result(
+            BLOCKED,
+            {"command": "monitor", "status": "blocked_design", "reason": reason},
+            "授权卡预览失败：" + reason,
+            as_json,
+        )
+    changed = _card_field_diff(card, published)
+    drift = (
+        None
+        if carried is None
+        else sorted(set(_card_field_diff(carried, published)) - _VOLATILE_CARD_FIELDS)
+    )
+    payload = {
+        "command": "monitor",
+        "status": "ok",
+        "publication": "same_run_reauthorization",
+        "plan_id": plan.plan_id,
+        "run_id": run_id,
+        "current_card_digest": card.digest,
+        "preview_card_digest": published.digest,
+        "engine_evidence_observed": attestation is not None,
+        "engine_evidence_error": engine_evidence_error,
+        "topology_summary": published.topology_summary,
+        "changed_fields": changed,
+        "engine_refresh_drift": drift,
+        "engine_refresh_carry_error": carry_error,
+        "card": published.to_dict(),
+    }
+    return _result(SUCCESS, payload, _render_card_preview(payload, published), as_json)
+
+
+def _render_card_preview(payload: Dict[str, Any], card: AuthorizationCard) -> str:
+    """Render the human-readable half of a card preview."""
+    summary = card.topology_summary or {}
+    by_topology = summary.get("by_topology") or {}
+    lines = [
+        "授权卡预览（只读：未写盘、未重新授权、未派发）",
+        "计划 {}｜发布形态 {}".format(payload["plan_id"], payload["publication"]),
+        "预览卡 digest {}".format(payload["preview_card_digest"]),
+    ]
+    if payload.get("current_card_digest"):
+        lines.append("当前在盘卡 digest {}".format(payload["current_card_digest"]))
+    lines.append(
+        "拓扑：visible-sdd {}｜dual-visible {}｜background {}".format(
+            by_topology.get("visible-sdd", 0),
+            by_topology.get("dual-visible", 0),
+            by_topology.get("background", 0),
+        )
+    )
+    for entry in card.workers or ():
+        lines.append(
+            "  {}：{}（{}）".format(
+                entry.get("node_id"), entry.get("topology"), entry.get("role")
+            )
+        )
+    changed = payload.get("changed_fields") or {}
+    if isinstance(changed, dict) and changed:
+        lines.append("相对当前在盘卡，本次重新授权将改动 " + str(len(changed)) + " 个字段：")
+        for key in sorted(changed):
+            entry = changed[key] or {}
+            lines.append(
+                "  {}：{} → {}".format(
+                    key,
+                    _short_card_value(entry.get("previous")),
+                    _short_card_value(entry.get("next")),
+                )
+            )
+    elif isinstance(changed, (list, tuple)) and changed:
+        lines.append("本次重新授权将改动的字段：" + ", ".join(changed))
+    if payload.get("publication") == "same_run_reauthorization":
+        # The engine attestation is re-observed at publication time, and its
+        # timestamp is inside its own digest, so the signed card digest cannot
+        # be stable across two observations.  Saying so is the difference
+        # between "I approved this card" and "I approved a digest that was
+        # never published".
+        lines.append(
+            "注：引擎凭证在发布时重新观测，其时间戳进入凭证与卡的摘要，"
+            "因此发布时的卡 digest 与上面的预览 digest 不同；"
+            "可核验的是拓扑、授权范围、节点与文件清单，"
+            "以及「除 " + ", ".join(sorted(_VOLATILE_CARD_FIELDS)) + " 外无其它字段变化」。"
+        )
+    if payload.get("engine_refresh_drift"):
+        lines.append(
+            "注意：刷新引擎凭证时还改动了引擎凭证以外的字段，"
+            "说明刷新本身不干净、预览可能不等于发布结果："
+            + ", ".join(payload["engine_refresh_drift"])
+        )
+    elif payload.get("engine_refresh_drift") is None:
+        lines.append(
+            "未能完成刷新自检（未知，不等于无漂移）："
+            + (payload.get("engine_refresh_carry_error") or "无法在不引入新凭证的前提下重导卡片")
+        )
+    if payload.get("engine_evidence_error"):
+        lines.append(
+            "未能重新观测引擎凭证，发布时的卡 digest 会与本次预览不同："
+            + payload["engine_evidence_error"]
+        )
+    return "\n".join(lines)
 
 
 def _snapshot_result(
@@ -1783,6 +2095,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 "监工未启动：需要计划和精确授权",
                 args.as_json,
             )
+        # A read-only preview sits ahead of the token check on purpose: it
+        # neither authorizes nor dispatches, so demanding the exact token would
+        # only stop the user from looking at the card they are being asked to
+        # confirm.
+        if args.preview_card:
+            return _preview_authorization_card(paths, args.plan, args.as_json)
         # Plan-bound confirmations may use an explicit revision token.
         if args.authorize != "AUTHORIZE" and not (
             args.authorize == "AUTHORIZE_V39_REV3_SELF_HEAL_NON_DEPLOY_SCOPE"
@@ -1832,27 +2150,32 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 invalidation = _read_json(invalidation_path)
                 if not isinstance(invalidation, dict):
                     raise ValueError("authorization invalidation record is invalid")
-                card = refresh_authorization_card(
-                    plan, nodes, card,
-                    workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
-                    topology_rulings=_observed_topology_rulings(paths),
-                )
-                record = authorize(card, args.authorize)
-                if runner is None:
-                    runner = _public_runner(paths, card, nodes)
-                snapshot = Monitor(
-                    paths, plan, nodes,
-                    topology_rulings=_observed_topology_rulings(paths),
-                ).reauthorize(
-                    _run_id(directory, None),
-                    record,
-                    runner,
-                    str(
-                        invalidation.get(
-                            "change_reason", "executable_contract_changed"
-                        )
-                    ),
-                )
+                with _staged_engine_attestation(
+                    directory / "engine-attestation.json",
+                    _observed_engine_attestation(paths, plan),
+                ) as engine_attestation:
+                    card = refresh_authorization_card(
+                        plan, nodes, card,
+                        workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
+                        topology_rulings=_observed_topology_rulings(paths),
+                        engine_attestation=engine_attestation,
+                    )
+                    record = authorize(card, args.authorize)
+                    if runner is None:
+                        runner = _public_runner(paths, card, nodes)
+                    snapshot = Monitor(
+                        paths, plan, nodes,
+                        topology_rulings=_observed_topology_rulings(paths),
+                    ).reauthorize(
+                        _run_id(directory, None),
+                        record,
+                        runner,
+                        str(
+                            invalidation.get(
+                                "change_reason", "executable_contract_changed"
+                            )
+                        ),
+                    )
                 _atomic_json(directory / "authorization-card.json", card.to_dict())
                 invalidation_to_clear = invalidation_path
             elif _current_run_path(directory).exists():
@@ -1864,23 +2187,28 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 # Refresh the card as well: a delivered contract correction
                 # may have changed the executable node digest without writing
                 # an invalidation marker yet.
-                card = refresh_authorization_card(
-                    plan, nodes, card,
-                    workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
-                    topology_rulings=_observed_topology_rulings(paths),
-                )
-                record = authorize(card, args.authorize)
-                if runner is None:
-                    runner = _public_runner(paths, card, nodes)
-                snapshot = Monitor(
-                    paths, plan, nodes,
-                    topology_rulings=_observed_topology_rulings(paths),
-                ).reauthorize(
-                    _run_id(directory, None),
-                    record,
-                    runner,
-                    "capability_contract_changed",
-                )
+                with _staged_engine_attestation(
+                    directory / "engine-attestation.json",
+                    _observed_engine_attestation(paths, plan),
+                ) as engine_attestation:
+                    card = refresh_authorization_card(
+                        plan, nodes, card,
+                        workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
+                        topology_rulings=_observed_topology_rulings(paths),
+                        engine_attestation=engine_attestation,
+                    )
+                    record = authorize(card, args.authorize)
+                    if runner is None:
+                        runner = _public_runner(paths, card, nodes)
+                    snapshot = Monitor(
+                        paths, plan, nodes,
+                        topology_rulings=_observed_topology_rulings(paths),
+                    ).reauthorize(
+                        _run_id(directory, None),
+                        record,
+                        runner,
+                        "capability_contract_changed",
+                    )
                 # Publish the refreshed card only after the reauthorization
                 # actually succeeded.  Writing it first left the card, the
                 # authorization record and plan-confirmation.json disagreeing
