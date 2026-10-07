@@ -71,6 +71,7 @@ vibe plan --request <请求> --from-prd <spec> 用产品级 spec 发布复杂计
 vibe plan --print-protocol                   打印 PRD 引导协议（agent 用）
 vibe authorize --plan <ID> --authorize AUTHORIZE   记录一次用户授权（十节点门禁证据）
 vibe monitor --plan <ID> --authorize AUTHORIZE     启动监工；没有精确授权时拒绝
+vibe monitor --plan <ID> --preview-card            只读预览重新授权将要发布的授权卡；不写盘、不授权、不派发，不需要 token
 vibe status --plan <ID>                      读取当前快照，不轮询外部 provider
 vibe resume --plan <ID>                      从快照、任务登记和事件证据继续
 vibe skill-install --source <GitHub> --sha <40hex> --name <名> [--subdir <子目录>] --confirm   按完整 SHA 拉取 GitHub skill，校验 subdir 合法性后物化到 .vibe/proposals/skills/<名>/ 并在 .vibe/config.json 登记；subdir 含 ..、绝对路径、首尾 / 或非法字符时拒绝且不落盘
@@ -193,6 +194,10 @@ vibe resume --plan example-plan --json
 恢复以 `.vibe/runs/<run-id>/state.json`、`tasks.json` 和 `events.jsonl` 为准。已登记的活动 handle 不会因重复 `resume` 创建第二 writer。计划或节点合同变化会持久化为 `blocked_design` 并使旧授权失效；provider unknown/timeout 会保持 `blocked_unknown`，不会转成成功或无事项。
 
 已确认规则能够唯一判断、且仍处于当前项目、plan revision、授权文件/action 和非 deploy 边界内的实现纠偏，由监工自动执行并记录，不会再次作为产品取舍询问。纠偏证据必须绑定已批准决定、授权和 Issue 合同；未绑定文本不能冒充用户决定。合同变化后的 `monitor --plan <ID> --authorize AUTHORIZE` 会在同一 run 上审计旧授权与变更原因，保留原任务身份和 cursor，登记新授权后续接修正 DAG；旧任务终止或 continuation 无法证明时仍会 fail closed。
+
+授权卡是「发布时才签」的：执行门把在盘卡绑到 run 快照的 authorized digest 上，所以「卡已重出、尚未授权」在本产品里不可表示——只重出卡会让公开执行门以 `plan-confirmation.invalid` 关门。合同或 PRD 变化后要重新授权时，先用 `vibe monitor --plan <ID> --preview-card` 只读地看一遍将要签的卡：它报的是「相对当前在盘卡会改动哪些字段」（这才是要审的东西），并单独自检「刷新本身是否只动了引擎凭证字段」。确认后再跑带 `--authorize` 的那条，一次原子完成重新授权与派发。预览里的卡 digest 只是预览态——引擎凭证的时间戳进入凭证与卡的摘要，发布时会重新观测，所以别拿预览 digest 当审批凭据。
+
+计划发布超过 24 小时后，`engine-attestation.json` 会过期，`monitor --authorize` 会以 `execution_engine_unverified` 拒绝，而重新发布计划不是一条可用出路。同一 plan revision 上的重新授权会按发布路径同样的方式**重新观测**引擎凭证并重签，凭证先落盘、卡后发布，重新授权失败则逐字节还原，不需要重新发布计划。
 
 桌面 App 原生能力不能由 Python 直接调用时，public CLI 使用 `.vibe/provider-actions/` 的 provider-neutral request/result bridge。`monitor/resume` 会写入有界、digest 绑定的 `create/locate/visibility/resume/wait` 请求；App 会话按 `native_tool` 调用公开能力并回写绑定结果。Codex 映射到 `create_thread`、`navigate_to_codex_page`、`send_message_to_thread` 和 `wait_threads`；其他 provider 必须先接入并验证自己的等价桌面控制面。未完成原生探针时不允许 background fallback；在真实 task ID、host、定位和可见性全部核验前，状态保持 `blocked_unknown`；node-spec 中的 provider/mode/thread/host 自声明不会成为证据。
 
