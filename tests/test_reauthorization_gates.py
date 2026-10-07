@@ -22,7 +22,10 @@ succeeds) and is covered by ``tests/test_cli.py``.
 """
 import hashlib
 import json
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from vibe_guide.authorize_entry import load_live_workflow
@@ -33,7 +36,7 @@ from vibe_guide.authorization import (
     dispatch_topology_for_node,
     refresh_authorization_card,
 )
-from vibe_guide.cli import _load_plan, run_cli
+from vibe_guide.cli import _load_plan, _observed_adapter, run_cli
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan
 from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
@@ -92,6 +95,46 @@ class DispatchTopologyRulingTests(unittest.TestCase):
         refreshed = refresh_authorization_card(plan, nodes, card, topology_rulings={})
 
         self.assertEqual(self._by_id(refreshed)["alpha"]["topology"], "dual-visible")
+
+    def test_first_publication_rules_workers_from_the_live_ruling(self):
+        """The first card, not only a refresh, must describe the real dispatch.
+
+        ``_normalize_workers_schema`` defaults every undeclared entry to the
+        conservative topology, so without a ruling the published card would
+        advertise ``dual-visible`` for a node the supervisor dispatches as
+        ``visible-sdd`` -- the same split, one publication earlier.
+        """
+        nodes = [_business_node("alpha"), _business_node("beta")]
+        plan = Plan("plan-1", 1, "docs/prd.md", ["alpha", "beta"], "draft")
+
+        without_ruling = build_authorization_card(plan, nodes, self.capabilities)
+        self.assertEqual(
+            without_ruling.topology_summary["by_topology"]["visible-sdd"], 0
+        )
+
+        ruled = build_authorization_card(
+            plan,
+            nodes,
+            self.capabilities,
+            topology_rulings={"workbuddy": "in_session_sdd"},
+        )
+
+        entries = self._by_id(ruled)
+        for node_id in ("alpha", "beta"):
+            self.assertEqual(entries[node_id]["topology"], "visible-sdd")
+            self.assertEqual(entries[node_id]["mode"], "visible")
+            self.assertEqual(entries[node_id]["role"], "developer")
+        self.assertEqual(ruled.topology_summary["by_topology"]["visible-sdd"], 2)
+
+    def test_first_publication_stays_conservative_without_a_ruling(self):
+        nodes = [_business_node("alpha")]
+        plan = Plan("plan-1", 1, "docs/prd.md", ["alpha"], "draft")
+
+        card = build_authorization_card(
+            plan, nodes, self.capabilities, topology_rulings={}
+        )
+
+        self.assertEqual(self._by_id(card)["alpha"]["topology"], "dual-visible")
 
     def test_refresh_never_silently_upgrades_a_disclosed_background_worker(self):
         nodes = [_business_node("alpha")]
@@ -423,6 +466,82 @@ class FailedReauthorizationCardPublicationTests(unittest.TestCase):
 
         self.assertNotEqual(result.payload.get("status"), "ok")
         self.assertEqual(self.card_path.read_bytes(), before)
+
+
+class ObservedAdapterAdmissionTests(unittest.TestCase):
+    """The publish/dispatch gate must admit exactly what the ruling admits.
+
+    ``_observed_adapter`` decides "is this platform dispatchable?" from the
+    capability report.  It used to require a verified visible lifecycle
+    outright, which refused the in-session SDD shape entirely; now it admits
+    that shape -- but only for platforms whose matrix row actually rules it,
+    so the gate can never be looser than the dispatcher.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="vg-observed-adapter-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.paths = ProjectPaths(self.root)
+        self.assertEqual(
+            run_cli(["init", "--confirm", "--json"], self.root).payload["status"], "ok"
+        )
+
+    def write(self, adapter_id, **facts):
+        store = self.root / ".vibe" / "provider-actions"
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "capabilities.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "adapter_id": adapter_id,
+                    "facts": facts,
+                    "provenance": "test",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_admits_the_in_session_sdd_shape(self):
+        self.write("workbuddy", **{"workbuddy.subprocess": True, "workbuddy.in_session_sdd": True})
+
+        result = _observed_adapter(self.paths, "workbuddy")
+
+        self.assertEqual(result.capabilities.mode, "in_session_sdd")
+        self.assertTrue(result.capabilities.in_session_sdd)
+        self.assertFalse(result.capabilities.visible_automation)
+
+    def test_refuses_a_row_that_never_upgrades(self):
+        # Byte-for-byte the same fact shape that workbuddy is admitted on;
+        # only grok's matrix row differs (``probe_pass`` stays conservative).
+        self.write("grok", **{"grok.subprocess": True, "grok.in_session_sdd": True})
+
+        with self.assertRaises(ValueError) as caught:
+            _observed_adapter(self.paths, "grok")
+
+        self.assertIn("dispatch lifecycle", str(caught.exception))
+
+    def test_refuses_a_pass_without_provenance(self):
+        store = self.root / ".vibe" / "provider-actions"
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "capabilities.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "adapter_id": "workbuddy",
+                    "facts": {
+                        "workbuddy.subprocess": True,
+                        "workbuddy.in_session_sdd": True,
+                    },
+                    "provenance": "",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            _observed_adapter(self.paths, "workbuddy")
+
+        self.assertIn("dispatch lifecycle", str(caught.exception))
 
 
 if __name__ == "__main__":

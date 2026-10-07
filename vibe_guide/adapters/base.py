@@ -270,7 +270,19 @@ class ManifestAdapter:
         # UNKNOWN and never upgrades.
         sdd_fact = fact("in_session_sdd")
         sdd_provenance = provenance.get(self.id + ".in_session_sdd")
-        in_session_sdd = bool(sdd_fact and sdd_provenance)
+        # The platform ruling must admit the upgrade too.  A matrix row may
+        # keep ``probe_pass`` at the conservative topology even when the probe
+        # passes (``grok``), and that row is what the dispatcher rules through.
+        # Reading the probe fact alone would let the capability report upgrade
+        # past the ruling, so the gate would admit a shape the supervisor never
+        # dispatches -- the very card/dispatch split this ruling is meant to
+        # remove.  Missing or unrecognized specs stay conservative.
+        sdd_ruling = (self.topology_spec or _CONSERVATIVE_TOPOLOGY_SPEC).get(
+            "probe_pass"
+        )
+        in_session_sdd = bool(
+            sdd_fact and sdd_provenance and sdd_ruling == TOPOLOGY_IN_SESSION_SDD
+        )
         if not subprocess:
             level, mode, provider = "guide", "guide", ""
             limitations = ("无法启动 subprocess；仅保留向导能力",)

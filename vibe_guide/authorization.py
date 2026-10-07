@@ -1138,6 +1138,7 @@ def build_authorization_card(
     engine_attestation: Optional[Dict[str, Any]] = None,
     explicit_execution_mode_override: Optional[Dict[str, Any]] = None,
     workers: Optional[Dict[str, Any]] = None,
+    topology_rulings: Optional[Dict[str, str]] = None,
 ) -> AuthorizationCard:
     node_ids = tuple(sorted(node.id for node in nodes))
     if node_ids != tuple(sorted(plan.node_ids)):
@@ -1188,6 +1189,17 @@ def build_authorization_card(
     normalized_workers = _normalize_workers_schema(
         workers, node_ids, worker_identities
     )
+    if topology_rulings is not None:
+        # The card has to describe the dispatch the supervisor will actually
+        # perform from the *first* publication on, not only after a refresh.
+        # ``_normalize_workers_schema`` defaults every undeclared entry to the
+        # conservative topology, so a fresh card would advertise
+        # ``dual-visible`` for a node the live ruling dispatches as
+        # ``visible-sdd`` -- the same card/dispatch split, one publication
+        # earlier.
+        normalized_workers = _rerule_workers(
+            normalized_workers, nodes, topology_rulings
+        )
     topology_summary = _topology_summary(normalized_workers)
     if active_pair_limit is None:
         active_pair_limit = max(1, len(nodes))

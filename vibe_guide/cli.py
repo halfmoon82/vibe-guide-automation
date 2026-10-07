@@ -495,6 +495,7 @@ def _publish_plan(
         allowed_actions=source.get("allowed_actions"),
         remote_git_actions=source.get("remote_git_actions", "deny"),
         engine_attestation=engine_attestation,
+        topology_rulings=_observed_topology_rulings(paths),
     )
 
     plans_root = destination.parent
