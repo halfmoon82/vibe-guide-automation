@@ -42,6 +42,7 @@ from vibe_guide.authorization import (
 from vibe_guide.cli import (
     _VOLATILE_CARD_FIELDS,
     _card_field_diff,
+    _engine_evidence_required,
     _load_plan,
     _normalize_card_value,
     _observed_adapter,
@@ -803,6 +804,45 @@ class ExpiredEngineEvidenceReauthorizationTests(unittest.TestCase):
         names = [event["event"] for event in load_events(self.paths, self.snapshot.run_id)]
         self.assertNotIn("authorization_reauthorized", names)
 
+    def test_a_plan_without_an_engine_binding_stages_nothing(self):
+        """Non-complex plans must not acquire evidence they cannot carry.
+
+        The predicate is stubbed so the real call site runs with
+        ``engine_attestation=None``; the predicate itself is covered for every
+        band in ``EngineEvidenceScopeTests``.
+        """
+        before = self.attestation_path.read_bytes()
+
+        with patch.object(cli_module, "_engine_evidence_required", lambda _plan: False):
+            self._reauthorize()
+
+        names = [event["event"] for event in load_events(self.paths, self.snapshot.run_id)]
+        self.assertIn("authorization_reauthorized", names)
+        self.assertEqual(self.attestation_path.read_bytes(), before)
+
+    def test_a_failed_card_publication_restores_the_evidence(self):
+        """The staged window must cover the card write, not stop before it.
+
+        With the card published after the window closed, a failing write left
+        freshly observed evidence on disk beside a card still naming the old
+        reference -- the exact pairing the staging exists to prevent.
+        """
+        before_evidence = self.attestation_path.read_bytes()
+        before_card = self.card_path.read_bytes()
+        real = cli_module._atomic_json
+
+        def explode_on_the_card(path, payload):
+            if Path(path).name == "authorization-card.json":
+                raise OSError("card publication refused by test")
+            return real(path, payload)
+
+        with patch.object(cli_module, "_atomic_json", explode_on_the_card):
+            result = self._reauthorize()
+
+        self.assertNotEqual(result.payload.get("status"), "ok")
+        self.assertEqual(self.attestation_path.read_bytes(), before_evidence)
+        self.assertEqual(self.card_path.read_bytes(), before_card)
+
     def test_a_refused_reauthorization_leaves_the_published_card_alone(self):
         before = self.card_path.read_bytes()
 
@@ -815,6 +855,49 @@ class ExpiredEngineEvidenceReauthorizationTests(unittest.TestCase):
 
         self.assertNotEqual(result.payload.get("status"), "ok")
         self.assertEqual(self.card_path.read_bytes(), before)
+        names = [event["event"] for event in load_events(self.paths, self.snapshot.run_id)]
+        self.assertNotIn("authorization_reauthorized", names)
+
+
+class EngineEvidenceScopeTests(unittest.TestCase):
+    """Only a complex plan carries an engine binding, so only it may be staged.
+
+    Observing evidence for a simple or light plan would hard-require a
+    capability store that non-complex publication never reads -- turning a
+    reauthorization that used to work into ``retry_pending`` -- and would leave
+    behind an ``engine-attestation.json`` the plan is not allowed to carry.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="vg-engine-scope-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.path = self.root / "engine-attestation.json"
+
+    @staticmethod
+    def _plan(band):
+        return Plan("p", 1, "prd.md", [], "draft", complexity_band=band)
+
+    def test_only_a_complex_plan_requires_engine_evidence(self):
+        for band in ("simple", "light_plan", ""):
+            with self.subTest(band=band):
+                self.assertFalse(_engine_evidence_required(self._plan(band)))
+        self.assertTrue(_engine_evidence_required(self._plan("complex")))
+
+    def test_staging_none_creates_nothing(self):
+        with _staged_engine_attestation(self.path, None) as staged:
+            self.assertIsNone(staged)
+            self.assertFalse(self.path.exists())
+
+        self.assertFalse(self.path.exists())
+
+    def test_staging_none_leaves_an_existing_file_untouched(self):
+        original = b'{"previous": true}'
+        self.path.write_bytes(original)
+
+        with _staged_engine_attestation(self.path, None) as staged:
+            self.assertIsNone(staged)
+
+        self.assertEqual(self.path.read_bytes(), original)
 
 
 class CardPreviewTests(unittest.TestCase):
@@ -887,6 +970,36 @@ class CardPreviewTests(unittest.TestCase):
 
         self.assertEqual(result.payload.get("status"), "ok", result.payload)
         self.assertEqual(result.payload["publication"], "same_run_reauthorization")
+
+    def test_the_preview_reports_a_missing_run_instead_of_raising(self):
+        """The preview sits outside the monitor command's own handler.
+
+        A dangling ``current-run.json`` used to raise straight out of the CLI:
+        the call is made before the ``monitor`` try block, so nothing catches
+        it.  Reading a card must never be the thing that crashes the process.
+        """
+        (self.directory / "current-run.json").write_text(
+            json.dumps({"run_id": "run-that-does-not-exist"}), encoding="utf-8"
+        )
+        before = self._fingerprint()
+
+        result = self._preview()
+
+        self.assertEqual(result.payload.get("status"), "blocked_design", result.payload)
+        self.assertTrue(result.payload.get("reason"))
+        self.assertEqual(self._fingerprint(), before)
+
+    def test_the_preview_discloses_that_its_digest_will_change(self):
+        """A ``--json`` consumer must not read the preview digest as a credential."""
+        result = self._preview()
+
+        self.assertFalse(result.payload["preview_card_digest_matches_publication"])
+        self.assertNotEqual(
+            result.payload["preview_card_digest"],
+            json.loads(
+                (self.directory / "authorization-card.json").read_text(encoding="utf-8")
+            )["digest"],
+        )
 
     def test_the_preview_reports_the_fields_the_reauthorization_will_change(self):
         result = self._preview()
@@ -992,6 +1105,38 @@ class CardPreviewTests(unittest.TestCase):
                 if key not in _VOLATILE_CARD_FIELDS
             },
         )
+
+
+class FirstPublicationPreviewTests(unittest.TestCase):
+    """Before a run exists, the preview digest *is* the digest that gets signed.
+
+    That is the one case where the preview is a literal approval credential, so
+    the flag that says so has to be right in both directions.
+    """
+
+    def setUp(self):
+        self.root = publish_complex_probe(self)
+        self.paths = ProjectPaths(self.root)
+        authorized = run_cli(
+            ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
+            self.root,
+        )
+        assert authorized.payload.get("status") == "ok", authorized.payload
+
+    def test_the_first_publication_digest_is_the_one_that_gets_signed(self):
+        result = run_cli(
+            ["monitor", "--plan", "probe-plan", "--preview-card", "--json"], self.root
+        )
+
+        self.assertEqual(result.payload.get("status"), "ok", result.payload)
+        self.assertEqual(result.payload["publication"], "first")
+        self.assertTrue(result.payload["preview_card_digest_matches_publication"])
+        on_disk = json.loads(
+            (
+                self.paths.vibe / "plans" / "probe-plan" / "authorization-card.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(result.payload["preview_card_digest"], on_disk["digest"])
 
 
 class ObservedAdapterAdmissionTests(unittest.TestCase):
