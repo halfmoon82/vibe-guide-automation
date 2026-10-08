@@ -2817,6 +2817,7 @@ class VisibleDispatchTests(unittest.TestCase):
                                 "protocol": VISIBLE_SDD_PROTOCOL_REF,
                                 "evidence_ref": "session-delivery#review-round-1",
                                 "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                                "coverage": {"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": []},
                                 "environment_facts_ref": "none",
                             },
                         },
@@ -2990,6 +2991,7 @@ class VisibleDispatchTests(unittest.TestCase):
                                 "protocol": VISIBLE_SDD_PROTOCOL_REF,
                                 "evidence_ref": "session-delivery#review-round-1",
                                 "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                                "coverage": {"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": []},
                                 "environment_facts_ref": "none",
                             },
                         },
@@ -3066,6 +3068,7 @@ class VisibleDispatchTests(unittest.TestCase):
             "protocol": VISIBLE_SDD_PROTOCOL_REF,
             "evidence_ref": "session-delivery#review-round-1",
             "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "coverage": {"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": []},
             "environment_facts_ref": "none",
             "blocked_unknowns": [item],
         }
@@ -3218,6 +3221,7 @@ class VisibleDispatchTests(unittest.TestCase):
                                 "protocol": VISIBLE_SDD_PROTOCOL_REF,
                                 "evidence_ref": "session-delivery#review-round-2",
                                 "clearance": {"p0": 0, "p1": 0, "p2": 0},
+                                "coverage": {"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": []},
                                 "environment_facts_ref": "none",
                             },
                         },
@@ -3269,6 +3273,7 @@ class VisibleDispatchTests(unittest.TestCase):
             missing,
             evidence_ref="session-delivery#review-round-2",
             environment_facts_ref="none",
+            coverage={"mode": "ocr", "listed": 2, "reviewed": 2, "skipped": []},
         )
         runner = VisibleSddRunner(
             events={
@@ -3295,8 +3300,96 @@ class VisibleDispatchTests(unittest.TestCase):
         self.assertTrue(rejections[0]["data"].get("recoverable"))
         # Durable events redact provider text, so the causal link is
         # structural: the only difference between the rejected payload and
-        # the accepted re-report is the added environment_facts_ref field.
+        # the accepted re-report is the added environment_facts_ref and
+        # coverage fields.
 
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+
+    def test_visible_sdd_delivery_without_coverage_denominator_is_rejected(self):
+        """The coverage denominator is mandatory (protocol section 2.5 step 0).
+
+        Clearance counts findings, never coverage: a delivery that does not
+        state how many reviewable files it covered cannot be told apart from
+        one that silently skipped files.  Omitting ``coverage`` is a
+        recoverable format rejection, and the same session's corrected
+        re-report is accepted.
+        """
+        from vibe_guide.state import load_events
+
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        missing = {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-1",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "environment_facts_ref": "none",
+        }
+        corrected = dict(
+            missing,
+            evidence_ref="session-delivery#review-round-2",
+            coverage={"mode": "ocr", "listed": 2, "reviewed": 2, "skipped": []},
+        )
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    ("complete", {"evidence": "delivery", "in_session_review": missing}),
+                    ("complete", {"evidence": "delivery", "in_session_review": corrected}),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        current = snapshot.nodes["sdd-a"]
+        self.assertNotEqual(current["status"], "blocked_unknown", current.get("reason"))
+        self.assertNotEqual(current["status"], "accepted")
+        self.assertIn("sdd-a", snapshot.handles)
+        rejections = [
+            record_
+            for record_ in load_events(self.paths, snapshot.run_id)
+            if record_["event"] == "acceptance_rejected"
+            and record_["data"].get("node_id") == "sdd-a"
+        ]
+        self.assertEqual(len(rejections), 1)
+        self.assertTrue(rejections[0]["data"].get("recoverable"))
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+
+    def test_visible_sdd_coverage_waiver_is_accepted_with_a_reason(self):
+        """``mode: "none"`` is an explicit waiver, not a missing key.
+
+        The waiver covers the tool (no deterministic file list available),
+        never the obligation to account for scope -- so a reasoned waiver
+        passes the gate and the node is accepted.
+        """
+        payload, nodes = load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(
+            nodes, topology_rulings=payload["topology_rulings"]
+        )
+        waived = {
+            "protocol": VISIBLE_SDD_PROTOCOL_REF,
+            "evidence_ref": "session-delivery#review-round-1",
+            "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "environment_facts_ref": "none",
+            "coverage": {
+                "mode": "none",
+                "reason": "ocr delegate unavailable: changeset is not a git diff",
+            },
+        }
+        runner = VisibleSddRunner(
+            events={
+                ("sdd-a", "developer"): [
+                    ("complete", {"evidence": "delivery", "in_session_review": waived}),
+                ]
+            }
+        )
+        snapshot = monitor.start(record, runner)
         snapshot = monitor.tick(snapshot.run_id, runner)
 
         self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
@@ -3320,6 +3413,7 @@ class VisibleDispatchTests(unittest.TestCase):
             "protocol": VISIBLE_SDD_PROTOCOL_REF,
             "evidence_ref": "session-delivery#review-round-2",
             "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "coverage": {"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": []},
             "environment_facts_ref": "none",
         }
         runner = VisibleSddRunner(
@@ -3385,6 +3479,7 @@ class VisibleDispatchTests(unittest.TestCase):
             "protocol": VISIBLE_SDD_PROTOCOL_REF,
             "evidence_ref": "session-delivery#review-round-3",
             "clearance": {"p0": 0, "p1": 0, "p2": 0},
+            "coverage": {"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": []},
             "environment_facts_ref": "none",
         }
         runner = VisibleSddRunner(
@@ -4206,6 +4301,155 @@ class ContractTestExecutionTests(unittest.TestCase):
 
         self.assertEqual(replay.nodes["n1"]["status"], "delivered")
         self.assertIsNone(replay.nodes["n1"].get("reason"))
+
+
+class CoverageDenominatorTests(unittest.TestCase):
+    """Branch coverage for the coverage-denominator gate.
+
+    The gate exists because clearance counts findings, never coverage.  Every
+    rejection branch must be a *recoverable* format error (the same worker
+    session corrects and re-reports), and the arithmetic check must make
+    ``listed = reviewed + skipped`` machine-verifiable rather than trusted
+    from prose.  These tests call the validator directly; the end-to-end
+    accept/reject behaviour is pinned by VisibleDispatchTests.
+    """
+
+    validate = staticmethod(Monitor._validate_visible_sdd_coverage)
+
+    def test_consistent_ocr_coverage_passes(self):
+        self.assertIsNone(
+            self.validate(
+                {
+                    "mode": "ocr",
+                    "listed": 14,
+                    "reviewed": 13,
+                    "skipped": [{"file": "a.xml", "reason": "generated"}],
+                }
+            )
+        )
+
+    def test_ocr_coverage_with_no_skips_passes(self):
+        self.assertIsNone(
+            self.validate({"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": []})
+        )
+
+    def test_missing_coverage_is_rejected(self):
+        reason = self.validate(None)
+        self.assertIsNotNone(reason)
+        self.assertIn("coverage must be an object", reason)
+
+    def test_reasoned_waiver_passes(self):
+        self.assertIsNone(
+            self.validate({"mode": "none", "reason": "not a git changeset"})
+        )
+
+    def test_waiver_without_reason_is_rejected(self):
+        self.assertIn("non-empty reason", self.validate({"mode": "none"}) or "")
+        self.assertIn(
+            "non-empty reason", self.validate({"mode": "none", "reason": "   "}) or ""
+        )
+
+    def test_unknown_mode_is_rejected(self):
+        self.assertIn(
+            'must be "ocr" or "none"', self.validate({"mode": "partial"}) or ""
+        )
+
+    def test_negative_counts_are_rejected(self):
+        self.assertIn(
+            "listed must be a non-negative integer",
+            self.validate(
+                {"mode": "ocr", "listed": -1, "reviewed": 0, "skipped": []}
+            )
+            or "",
+        )
+
+    def test_boolean_counts_are_rejected(self):
+        # bool is a subclass of int; a True listed count would otherwise pass
+        # an isinstance check and silently mean "1 file".
+        self.assertIn(
+            "listed must be a non-negative integer",
+            self.validate(
+                {"mode": "ocr", "listed": True, "reviewed": 1, "skipped": []}
+            )
+            or "",
+        )
+
+    def test_skipped_must_be_a_list(self):
+        self.assertIn(
+            "skipped must be a list",
+            self.validate(
+                {"mode": "ocr", "listed": 1, "reviewed": 1, "skipped": "none"}
+            )
+            or "",
+        )
+
+    def test_skipped_entries_need_file_and_reason(self):
+        self.assertIn(
+            'non-empty "file" and "reason"',
+            self.validate(
+                {"mode": "ocr", "listed": 1, "reviewed": 0, "skipped": [{"file": "a"}]}
+            )
+            or "",
+        )
+        self.assertIn(
+            'non-empty "file" and "reason"',
+            self.validate(
+                {
+                    "mode": "ocr",
+                    "listed": 1,
+                    "reviewed": 0,
+                    "skipped": [{"file": "a", "reason": "  "}],
+                }
+            )
+            or "",
+        )
+
+    def test_arithmetic_must_add_up(self):
+        reason = self.validate(
+            {"mode": "ocr", "listed": 5, "reviewed": 3, "skipped": []}
+        )
+        self.assertIn("does not add up", reason or "")
+
+    def test_understated_listed_is_caught(self):
+        # Lowering `listed` while still declaring the skips is the sloppy way to
+        # make the gate pass; the arithmetic check turns that into a visible
+        # mismatch instead of a clean clearance.
+        reason = self.validate(
+            {"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": [{"file": "a", "reason": "r"}]}
+        )
+        self.assertIn("does not add up", reason or "")
+
+    def test_understated_changeset_is_accepted_by_design(self):
+        # The known ceiling, pinned as an executable fact: a reviewer that
+        # really looked at 3 of 14 files passes by declaring `listed: 3` and
+        # dropping the skips.  The arithmetic is self-consistent and nothing at
+        # this layer can disprove it without a ground truth.  The gate raises
+        # *silent* omission to *explicit* fabrication; it does not eliminate the
+        # fabrication.
+        #
+        # This test fails the day someone adds a cross-check against the real
+        # changeset -- which is the point: that change has to be conscious, and
+        # the protocol section 5 wording has to move with it.
+        self.assertIsNone(
+            self.validate({"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": []})
+        )
+
+    def test_duplicate_skipped_file_is_rejected(self):
+        # `len(skipped)` is an addend of the denominator, so a duplicate entry
+        # inflates the count for free.  The protocol promises a *per-file*
+        # disposition; the same file counted twice is not one.
+        reason = self.validate(
+            {
+                "mode": "ocr",
+                "listed": 2,
+                "reviewed": 0,
+                "skipped": [
+                    {"file": "a.xml", "reason": "generated"},
+                    {"file": " a.xml ", "reason": "generated"},
+                ],
+            }
+        )
+        self.assertIn("more than once", reason or "")
 
 
 if __name__ == "__main__":

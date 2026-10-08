@@ -67,6 +67,7 @@ class DeliveryContractUntouchedTests(unittest.TestCase):
             'delivery_evidence',
             "vibe_guide/protocols/visible-sdd-worker.md",
             'clearance',
+            'coverage',
             'evidence_ref',
         ):
             self.assertIn(token, text)
