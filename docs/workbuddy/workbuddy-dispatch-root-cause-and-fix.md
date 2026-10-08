@@ -670,3 +670,37 @@ workbuddy/session 相关 5 模块 **135 项全绿**。
 
 三条新护栏的变异（resume 谎报成功、create 去掉 accepted 守卫、reply 去掉 accepted 守卫）
 各自被对应用例抓到。
+
+---
+
+## 14. 第八轮复审：可合并
+
+§13 的返工经**独立复审**：**P0 = 0，P1 = 0，P2 = 0 → 可合并。**
+
+复审逐出口核对了标记生命周期（全仓 6 处 `_unlink(marker)`，每处都能证明「未入队」或
+「已记账」），并跑了 16 处变异，13 处变红。前两轮报出的覆盖缺口（`_deliver` 两条护栏、
+`_answer_resume` 护栏、jobs 两条 accepted 守卫）确认已堵上。
+
+### 14.1 复审报出的 3 个 P3 及处置
+
+| # | 项 | 处置 |
+|---|---|---|
+| 1 | `workbuddy_jobs.py` 的 `_window_state` 里 `known`（baseline 为 `None`）护栏无用例 | **已补**：`test_a_window_without_a_baseline_never_reports_a_settled_reply`。这条守的是**串轮**——无 baseline 的窗口里任何回复都属于别人的回合，报成本任务输出就是把上一轮的答案当成新的。变异（把未知 baseline 当 0 处理）已确认被抓到 |
+| 2 | `workbuddy_sessions.py` 的 `_answer_locate` 里 `and alive` 无用例 | 记录在案。`sessions()` 只返回活窗口，该条件现实不可达，补测也只是测桩 |
+| 3 | `_answer_resume` 的终态负结果经 `provider_action.py:1154` 只落 `visibility_unknown`、`pending_action` 不清 | 记录在案（见 §12.2）。非假绿、非重投，属协议侧已知限制 |
+
+### 14.2 合并前状态
+
+- 分支 `fix/workbuddy-window-dispatch-rework`，共 8 个提交（`b13b05a` → 合并前 HEAD）。
+- PR #163，squash 合并进 `main`。
+- workbuddy/session 相关 5 模块 **143 项全绿**；全量 1529 项中仅 5 个既有环境性失败
+  （`test_v310_packaging` / `test_v2_acceptance` / `test_skill_install_cli`，与本改动零引用）。
+- 合并前最后一个提交**仅改测试**，未触碰生产代码（`git diff --stat` 只有
+  `tests/test_workbuddy_jobs_mcp.py`）。
+
+### 14.3 仍未做的事（用户侧配合，非代码）
+
+派发桥本身可用，但它要求：项目目录里开着 WorkBuddy 窗口；编排者自身窗口通过
+`serve(exclude=…)` 或 `WORKBUDDY_DISPATCH_EXCLUDE_SIDS` 排除（现已默认按
+`CODEBUDDY_SESSION_ID` 自动排除）。**尚未在真实窗口上做过端到端派发验证**——
+所有验证都在桩上完成，这是本改动最大的未验证面。

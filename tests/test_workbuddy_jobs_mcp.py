@@ -79,10 +79,14 @@ class FakeGateway:
 class WindowStub:
     """The slice of ``SessionDispatch`` the jobs server reaches for."""
 
-    def __init__(self, sessions, handles=None, deliver_state="accepted"):
+    def __init__(
+        self, sessions, handles=None, deliver_state="accepted", count=0, reply=None
+    ):
         self._sessions = sessions
         self._handles = handles or {}
         self._deliver_state = deliver_state
+        self._count = count
+        self._reply = reply
         self.delivered = []
         self.saved = []
 
@@ -93,7 +97,14 @@ class WindowStub:
         return self._handles.get(handle_id)
 
     def history(self, session_id):
-        return {"session_id": session_id, "count": 0, "requests": []}
+        return {
+            "session_id": session_id,
+            "count": self._count,
+            "requests": [{}] * self._count,
+        }
+
+    def reply_after(self, session_id, start_index):
+        return self._reply
 
     def deliver(self, session_id, text):
         self.delivered.append((session_id, text))
@@ -398,6 +409,24 @@ class OperationMappingTests(unittest.TestCase):
             jobs.reply("h1", "continue")
         self.assertIn("did not accept the turn", str(caught.exception))
         self.assertEqual(dispatch.saved, [])
+
+    def test_a_window_without_a_baseline_never_reports_a_settled_reply(self):
+        # A handle synthesised from a bare session id has no baseline: this
+        # session never dispatched a turn into it, so any reply in the history
+        # belongs to somebody else's turn.  Reporting it as this job's output
+        # would hand the monitor the previous turn's answer as if it were the
+        # new one -- the cross-turn read this module exists to prevent.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = WindowStub(
+            [_live_window(session)], count=3, reply="SOMEONE ELSE'S TURN"
+        )
+        jobs = WorkBuddyJobs(
+            gateway=FakeGateway(), sleeper=lambda _seconds: None, dispatch=dispatch
+        )
+        state = jobs.get(session)
+        self.assertEqual(state["state"], "working")
+        self.assertFalse(state["settled"])
+        self.assertIsNone(state["output"])
 
     def test_list_asks_for_completed_jobs_only_when_requested(self):
         jobs, gateway = self._jobs({("GET", "/api/v1/jobs"): {"jobs": [{"id": "a", "cwd": "/x"}]},
