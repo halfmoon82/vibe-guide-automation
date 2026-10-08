@@ -41,6 +41,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "71c5130222474d5852c8233978e72f927c499d785f56948d78728acbd609a190",
         "94d652883bf2bf187793f41f1b000c097664674ec9a7de8355fe8c179e7bee65",
         "96d1c163c59b73e86a7967bc11ddf5dc6730d033ddf1b299efc0804eb3bf7e8b",
+        # 2026-10-08: §6.0 host differences now name WorkBuddy too.
+        "9afc9c94643cec8c79f097a7278abd902700aa4c51230afff9cc087e5f2a63a8",
         "bba7d6c7c6976b5713d170f48062e18a81ea02a43071cc36850023b379e2b40c",
         "c2c11e2c6db35977be5df3c8ad6ea272cbba58acf0ca873794a5172ab74c08ea",
         "d31adcdf3fb33d3b6e2fd557f7324cbdbd07a80acc0a8d18f5ce186c23971ac7",

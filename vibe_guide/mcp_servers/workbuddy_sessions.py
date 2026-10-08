@@ -56,6 +56,11 @@ try:  # POSIX only; on other platforms the lock degrades to a no-op.
 except ImportError:  # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore[assignment]
 
+# One definition of the topology name, shared with the authorization card and
+# the task registry.  Imported rather than respelled here: a second literal is
+# exactly how a rename silently stops matching.
+from ..authorization import WORKER_TOPOLOGY_VISIBLE_SDD
+
 #: Shared with ``workbuddy_jobs`` on purpose: one override name for the
 #: gateway password, so a session that already knows it does not need two.
 TOKEN_ENV = "WORKBUDDY_JOB_TOKEN"
@@ -128,9 +133,13 @@ def _may_have_reached(error: BaseException) -> bool:
 
 #: The host's own session id.  The supervisor normally runs *inside* the very
 #: conversation it dispatches for, and that window is a live window on disk, so
-#: auto-pick will happily choose it.  A task delivered back into the supervisor's
-#: own thread collapses the two roles into one conversation, so the host session
-#: is excluded by default rather than left to an operator to remember.
+#: auto-pick will happily choose it.  Whether that is a collapse or the whole
+#: point depends on the topology, so the decision lives in ``_answer_create``:
+#: excluded for two-window work, allowed for the in-session protocol -- which is
+#: defined as dev and review subagents inside one session identity and is the
+#: only shape a host without a second credentialed window can serve at all
+#: (``adapters/registry.py``: ``visible-sdd`` "is exactly the in-session
+#: dev/review-subagent protocol, which is what WorkBuddy can actually serve").
 HOST_SESSION_ENV = "CODEBUDDY_SESSION_ID"
 
 
@@ -233,32 +242,64 @@ def save_handle(record: Mapping[str, Any], root: Optional[Path] = None) -> None:
 # ---------------------------------------------------------------------------
 # credential discovery
 # ---------------------------------------------------------------------------
-def gateway_token(scanner: Optional[Callable[[], str]] = None) -> str:
-    """The App-level gateway password, shared by every session.
+def gateway_tokens(
+    scanner: Optional[Callable[[], str]] = None, allow_scan: bool = True
+) -> List[str]:
+    """Gateway credentials, most-trusted first.
 
-    It is not written to disk anywhere.  The host injects it into the
-    processes it spawns, so when we are one of them it is simply in our
-    environment; otherwise we read it back out of a running ``codebuddy``
-    process, which is what a human would do with ``ps eww``.
+    A host can run several app instances at once, each with its own gateway
+    password, and the environment we inherit is not necessarily the one that
+    opens the gateway we need.  Measured on macOS 2026-10-08: the agent's own
+    ``CODEBUDDY_GATEWAY_PASSWORD`` belonged to another instance's prewarm pool
+    and every request answered ``401 AUTH_REQUIRED``, while the password of the
+    conversation process opened the same endpoint.  Nothing on disk says which
+    is which, so do not guess -- hand every candidate to the transport and let
+    it keep the one that is accepted.  A 401 is decided before the gateway
+    looks at the request, so trying the next candidate can never deliver a turn
+    twice.
 
-    ``ps -axeww`` is *not* usable for this: on macOS it prints the command
-    column but not the environment block, so a scan of its output matches
-    only processes whose command line happens to contain the variable name —
-    including the scanner itself.  ``ps eww -p <pid>`` does print the
-    environment, so the scan is two steps: list candidate pids, then read
-    each one's environment.
+    The environment comes first and the process scan runs only when the
+    environment offers nothing, or when ``allow_scan`` says it may: an operator
+    who sets ``WORKBUDDY_JOB_TOKEN`` is entitled to have that be the end of it.
+    ``SessionDispatch`` re-scans lazily, and only after a 401, so the happy path
+    never pays for a stale-password hunt.
     """
+    ordered: List[str] = []
     for name in (TOKEN_ENV, "CODEBUDDY_GATEWAY_PASSWORD"):
         value = os.environ.get(name)
-        if value:
-            return value
+        if value and value not in ordered:
+            ordered.append(value)
+    if ordered or not allow_scan:
+        return ordered
+    return _scanned_tokens(scanner)
+
+
+def _scanned_tokens(scanner: Optional[Callable[[], str]] = None) -> List[str]:
+    """Every distinct password visible in a running ``codebuddy`` process.
+
+    ``ps -axeww`` is *not* usable for this: on macOS it prints the command
+    column but not the environment block, so a scan of its output matches only
+    processes whose command line happens to contain the variable name --
+    including the scanner itself.  ``ps eww -p <pid>`` does print the
+    environment, so the scan is two steps: list candidate pids, then read each
+    one's environment.
+    """
     text = scanner() if scanner is not None else _scan_process_env()
-    match = _PASSWORD_RE.search(text or "")
-    if not match:
+    ordered: List[str] = []
+    for match in _PASSWORD_RE.finditer(text or ""):
+        if match.group(1) not in ordered:
+            ordered.append(match.group(1))
+    return ordered
+
+
+def gateway_token(scanner: Optional[Callable[[], str]] = None) -> str:
+    """The credential to start with; see :func:`gateway_tokens`."""
+    ordered = gateway_tokens(scanner)
+    if not ordered:
         raise SessionError(
             "gateway password not found; set %s or start a WorkBuddy session" % TOKEN_ENV
         )
-    return match.group(1)
+    return ordered[0]
 
 
 def _scan_process_env() -> str:
@@ -325,15 +366,30 @@ def discover_sessions(
 ) -> List[Dict[str, Any]]:
     """Every live window session that can be dispatched into.
 
-    Only ``kind == "interactive"`` sessions carry an ``endpoint``; prewarm and
+    Only ``kind == "interactive"`` sessions are considered; prewarm and
     background sessions have nothing to talk to.  A dead pid means the file is
     stale, so it is dropped rather than offered as a target that will 404.
+
+    The endpoint is not always in the same file as the session id.  Measured on
+    macOS 2026-10-08: the conversation registers a real UUID with **no**
+    endpoint, while the ``codebuddy --serve`` process registers an endpoint
+    under a placeholder id (``interactive-<pid>``) that the gateway itself
+    answers SESSION_NOT_FOUND for.  Requiring both in one file therefore
+    returned *zero* targets and left every dispatch with nowhere to go, so a
+    session with no endpoint of its own inherits the gateway's.  An endpoint
+    that does not actually serve the session answers SESSION_NOT_FOUND, which
+    callers already treat as an unreachable window, so a wrong join cannot turn
+    into a fabricated success.
     """
     directory = Path(root) if root is not None else sessions_root()
     if not directory.is_dir():
         return []
     skip = set(exclude) if exclude else set(excluded_session_ids())
     found: List[Dict[str, Any]] = []
+    #: Endpoints published by a ``--serve`` process.  It is never a dispatch
+    #: target itself -- its own id is a placeholder -- but it is where the real
+    #: sessions are served from.
+    gateways: List[str] = []
     for path in sorted(directory.glob("*.json")):
         payload = _load_json(path)
         if payload is None:
@@ -342,9 +398,15 @@ def discover_sessions(
             continue
         session_id = payload.get("sessionId")
         endpoint = payload.get("endpoint") or payload.get("url")
-        if not isinstance(session_id, str) or not _SESSION_ID_RE.match(session_id):
+        if not isinstance(session_id, str):
             continue
-        if not isinstance(endpoint, str) or not endpoint:
+        if not _SESSION_ID_RE.match(session_id):
+            if (
+                isinstance(endpoint, str)
+                and endpoint
+                and _pid_alive(payload.get("pid"))
+            ):
+                gateways.append(endpoint.rstrip("/"))
             continue
         if session_id in skip:
             continue
@@ -357,13 +419,37 @@ def discover_sessions(
             {
                 "pid": pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
                 "session_id": session_id,
-                "endpoint": endpoint.rstrip("/"),
+                "endpoint": (
+                    endpoint.rstrip("/")
+                    if isinstance(endpoint, str) and endpoint
+                    else None
+                ),
                 "cwd": payload.get("cwd"),
-                "alive": _pid_alive(pid),
+                "alive": True,
             }
         )
-    found.sort(key=lambda item: (item["pid"] is None, item["pid"] or 0))
-    return found
+    # One session can be registered more than once -- the conversation and its
+    # prewarmed pool both claim the same id -- and the duplicates are not
+    # equivalent: whichever file carries an endpoint is the better description
+    # of the same window.  Collapse them first, so the join below can only fill
+    # in what is genuinely missing instead of shadowing a real endpoint.
+    unique: Dict[str, Dict[str, Any]] = {}
+    for item in found:
+        key = str(item["session_id"])
+        existing = unique.get(key)
+        if existing is None:
+            unique[key] = item
+        elif not existing.get("endpoint") and item.get("endpoint"):
+            unique[key] = item
+    if gateways:
+        for item in unique.values():
+            if not item.get("endpoint"):
+                item["endpoint"] = gateways[0]
+    # A session still without an endpoint has nothing to talk to; offering it
+    # would turn a dispatch into a 404.
+    ordered = [item for item in unique.values() if item.get("endpoint")]
+    ordered.sort(key=lambda item: (item["pid"] is None, item["pid"] or 0))
+    return ordered
 
 
 def candidate_sessions(
@@ -383,10 +469,13 @@ def candidate_sessions(
     busy (``delivered: false``) and try the next, instead of collapsing a
     multi-node sweep onto the first window that happens to be occupied.
 
-    ``exclude`` is how the orchestrator keeps itself out of the pool: a task
-    delivered into the window that is running the monitor lands as a user turn
-    in that same conversation, which collapses the roles the whole dispatch
-    topology exists to keep apart.
+    ``exclude`` is how the caller keeps the supervisor's own window out of the
+    pool.  A task delivered into the window that is running the monitor lands
+    as a user turn in that same conversation, which is exactly wrong when the
+    topology wants two windows -- and exactly right for the in-session
+    protocol, where dev and review subagents are defined to share one session
+    identity.  So this function does not decide it: the caller passes the host
+    session id in ``exclude`` or does not, per ``_answer_create``.
     """
     skip = set(exclude) if exclude else set()
     live = [
@@ -431,7 +520,23 @@ class SessionDispatch:
         handle_root: Optional[Path] = None,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
-        self._token = token if token is not None else gateway_token()
+        if token is not None:
+            # An explicit credential is the whole list: the caller knows which
+            # one it wants, and scanning would second-guess it.
+            self._tokens = [token]
+            self._scan_exhausted = True
+        else:
+            self._tokens = gateway_tokens(allow_scan=False)
+            self._scan_exhausted = False
+            if not self._tokens:
+                self._tokens = _scanned_tokens()
+                self._scan_exhausted = True
+            if not self._tokens:
+                raise SessionError(
+                    "gateway password not found; set %s or start a WorkBuddy "
+                    "session" % TOKEN_ENV
+                )
+        self._token = self._tokens[0]
         self._sessions = [dict(item) for item in sessions] if sessions is not None else None
         # Honour the override env var: the module-level ``handle_root()`` does,
         # and a writer/reader that disagree on the directory lose every handle.
@@ -443,6 +548,27 @@ class SessionDispatch:
         self._sleep = sleeper
 
     # -- transport ---------------------------------------------------------
+    def _rotate_token(self) -> bool:
+        """Advance to the next candidate credential, or report there is none.
+
+        ``False`` is what turns a 401 back into the failure it is, instead of a
+        loop over credentials that all fail.  The process scan happens here and
+        nowhere else: it is the expensive step, and the only thing that can
+        rescue an inherited password belonging to a different app instance --
+        which is a case we cannot detect before the gateway rejects us.
+        """
+        if len(self._tokens) <= 1:
+            if self._scan_exhausted:
+                return False
+            self._scan_exhausted = True
+            extra = [item for item in _scanned_tokens() if item not in self._tokens]
+            if not extra:
+                return False
+            self._tokens = self._tokens + extra
+        self._tokens = self._tokens[1:]
+        self._token = self._tokens[0]
+        return True
+
     def _call(
         self,
         endpoint: str,
@@ -452,30 +578,38 @@ class SessionDispatch:
         timeout: float = 30.0,
     ) -> Any:
         data = None if body is None else json.dumps(body).encode("utf-8")
-        request = urllib.request.Request(endpoint + path, method=method, data=data)
-        for name, value in _REQUEST_HEADERS.items():
-            request.add_header(name, value)
-        request.add_header("Authorization", "Bearer " + self._token)
-        if data is not None:
-            request.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read(_MAX_BODY)
-        except urllib.error.HTTPError as error:
-            detail = ""
+        while True:
+            request = urllib.request.Request(endpoint + path, method=method, data=data)
+            for name, value in _REQUEST_HEADERS.items():
+                request.add_header(name, value)
+            request.add_header("Authorization", "Bearer " + self._token)
+            if data is not None:
+                request.add_header("Content-Type", "application/json")
             try:
-                detail = error.read(400).decode("utf-8", "replace").strip()
-            except Exception:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    raw = response.read(_MAX_BODY)
+                break
+            except urllib.error.HTTPError as error:
+                # 401 is decided before the gateway looks at the request, so
+                # nothing was queued and another credential may still be the
+                # right one -- see ``gateway_tokens``.  Every other status may
+                # have been served already, so it is never retried.
+                if error.code == 401 and self._rotate_token():
+                    continue
                 detail = ""
-            raise SessionError(
-                "%s %s failed: HTTP %s%s"
-                % (method, path, error.code, (" " + detail) if detail else "")
-            ) from error
-        except (urllib.error.URLError, OSError, ValueError) as error:
-            raise TransportError(
-                "%s %s failed: %s" % (method, path, error),
-                reached=_may_have_reached(error),
-            ) from error
+                try:
+                    detail = error.read(400).decode("utf-8", "replace").strip()
+                except Exception:
+                    detail = ""
+                raise SessionError(
+                    "%s %s failed: HTTP %s%s"
+                    % (method, path, error.code, (" " + detail) if detail else "")
+                ) from error
+            except (urllib.error.URLError, OSError, ValueError) as error:
+                raise TransportError(
+                    "%s %s failed: %s" % (method, path, error),
+                    reached=_may_have_reached(error),
+                ) from error
         if not raw:
             return {}
         try:
@@ -932,12 +1066,18 @@ class MailboxServicer:
         # window already claimed in this sweep, so a multi-node run fans out
         # across windows instead of piling every node onto the first one.
         skip = set(excluded_session_ids())
-        # The host's own conversation is a live window too, and it is the one
-        # target that must never be chosen: a task delivered back into the
-        # supervisor's thread collapses the two roles into one conversation.
-        # Excluded by default rather than left to an operator to remember.
+        # The host's own conversation is a live window too, so auto-pick would
+        # happily choose it -- but whether that is a collapse or the whole point
+        # depends on the topology.  ``dual-visible`` keeps the two roles in two
+        # windows, so the supervisor's thread must never be one of them.
+        # ``visible-sdd`` is defined as dev and review subagents *inside one
+        # session identity* (protocols/visible-sdd-worker.md §1), and on a host
+        # whose Jobs API spawns credential-less processes there is no second
+        # window to be had: the host conversation is the only target that
+        # exists.  So it stays excluded unless the request asks for in-session
+        # work.
         own = host_session_id()
-        if own:
+        if own and request.get("topology") != WORKER_TOPOLOGY_VISIBLE_SDD:
             skip.add(own)
         if self._skip is not None:
             skip.update(self._skip)
@@ -1037,27 +1177,52 @@ class MailboxServicer:
             "binding": {"task_id": handle_id, "host": endpoint},
         }
 
+    def _reachable(self, session_id: str) -> bool:
+        """Whether the gateway that owns this window actually serves it.
+
+        ``discover_sessions`` can only vouch for the *process* being alive.  A
+        session whose registration carries no endpoint inherits the ``--serve``
+        gateway's, and that gateway serves exactly one conversation (measured),
+        so a borrowed endpoint may well belong to somebody else.  Answering
+        ``located`` or ``visible`` off liveness alone would then confirm a
+        binding that nothing can be delivered into -- a false green on the very
+        gate whose job is to keep undeliverable bindings out.  One cheap read
+        settles it for real, and every failure mode lands on the fail-closed
+        side of the answer.
+        """
+        try:
+            self.dispatch.history(session_id)
+        except SessionError:
+            return False
+        return True
+
     def _answer_locate(self, request: Mapping[str, Any]) -> Dict[str, Any]:
         thread_id = request.get("threadId") or request.get("task_id")
         if not isinstance(thread_id, str) or not thread_id:
             raise SessionError("locate request carries no thread identity")
         session_id = self._resolve_session(thread_id)
-        # Fail closed: a window that is gone cannot be located, and claiming
-        # otherwise would let a dead binding through the supervisor's gate.
-        located = any(
+        # Fail closed, and fail *honestly*, on two separate questions.  Listed:
+        # the registry still knows this window.  Reachable: the gateway that
+        # owns it actually serves it -- see ``_reachable``.  A borrowed
+        # endpoint answers the first without the second, and answering
+        # ``located`` off either alone would let an undeliverable binding
+        # through the supervisor's gate.
+        listed = any(
             item.get("session_id") == session_id and item.get("alive")
             for item in self.dispatch.sessions(refresh=True)
         )
-        return {"located": located, "threadId": thread_id}
+        return {
+            "located": listed and self._reachable(session_id),
+            "threadId": thread_id,
+        }
 
     def _answer_visibility(self, request: Mapping[str, Any]) -> Dict[str, Any]:
         targets = request.get("targets")
         if not isinstance(targets, list) or not targets:
             raise SessionError("visibility request carries no targets")
-        sessions = self.dispatch.sessions(refresh=True)
-        alive = {
+        listed = {
             str(item.get("session_id"))
-            for item in sessions
+            for item in self.dispatch.sessions(refresh=True)
             if item.get("alive")
         }
         results = []
@@ -1067,7 +1232,12 @@ class MailboxServicer:
                 continue
             thread_id = str(target.get("threadId") or target.get("task_id") or "")
             session_id = self._resolve_session(thread_id) if thread_id else ""
-            present = session_id in alive
+            # Being listed is only half of it -- see ``_reachable``.
+            present = (
+                bool(session_id)
+                and session_id in listed
+                and self._reachable(session_id)
+            )
             results.append({"visible": present, "direct_enter": present})
         # `provider_action.visibility` reads the top level, not the list.
         visible = all(item["visible"] for item in results)

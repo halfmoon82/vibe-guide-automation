@@ -640,6 +640,28 @@ def current_supervisor_address(paths, run_id):
     }
 
 
+#: Where each host writes the session log a shift hands over.  One definition,
+#: printed by both the first-shift hint and the handoff steps: two copies of
+#: this list is how a host silently goes missing from one of them, which is
+#: exactly what had happened to WorkBuddy.
+SESSION_RECORD_HINT = (
+    "<本会话记录路径> 是本会话自己的日志文件，不要另写记录文件："
+    "Codex 为 ~/.codex/sessions/<年>/<月>/<日>/rollout-…-<本会话 id>.jsonl，"
+    "Claude Code 为 ~/.claude/projects/<项目>/<本会话 id>.jsonl，"
+    "WorkBuddy 为 ~/.workbuddy-ai/projects/<项目路径把 / 换成 ->/<本会话 id>.jsonl"
+    "（<本会话 id> 就是 $CODEBUDDY_SESSION_ID）；用 ls 确认。"
+)
+
+#: What each host automates about a shift and what it cannot.  Issue #127 asks
+#: the first-shift hint to explain the difference instead of only listing two
+#: commands, and both texts that print it now read this one string.
+HOST_SHIFT_DIFFERENCES = (
+    "宿主差异：Codex 桌面两条都能自动建；"
+    "Claude Code 没有换班原语，心跳降级为兜底机制；"
+    "WorkBuddy 两条都得在本会话里手动做（登记地址、建心跳），不会自己发生。"
+)
+
+
 def heartbeat_prompt(plan_id, run_id, *, command_prefix="vibe"):
     """The one heartbeat instruction a supervisor shift may install.
 
@@ -730,14 +752,13 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "接班步骤：",
         "  1) 登记：vibe supervisor-register --run-id {} --provider <平台> "
         "--session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>".format(run_id),
-        "     <本会话记录路径> 是本会话自己的日志文件，不要另写记录文件："
-        "Codex 为 ~/.codex/sessions/<年>/<月>/<日>/rollout-…-<本会话 id>.jsonl，"
-        "Claude Code 为 ~/.claude/projects/<项目>/<本会话 id>.jsonl（用 ls 确认）。",
+        "     " + SESSION_RECORD_HINT,
         "  2) 自建心跳，指令逐字用下面这段，只替换 <本会话记录路径>：",
         heartbeat_prompt(plan_id, run_id, command_prefix=command_prefix),
         "  3) 置顶、改标题；删掉上一班的心跳，归档上一班会话"
         "（Claude Code 没有换班原语：上一班结束会话即可）。",
         "  4) 跑一次心跳指令第 1 步的预检，按输出走。",
+        HOST_SHIFT_DIFFERENCES,
         "监工挂起某个节点等用户拍板时，先登记：vibe supervisor-hold --run-id {} "
         "--node <节点> --reason <一句话原因>，否则每次心跳都会被当成有事做。"
         "运行状态一变或挂起满 6 小时，预检会报 work（hold needs recheck）：复核后仍在等人就再跑一次同一条命令刷新。".format(run_id),
