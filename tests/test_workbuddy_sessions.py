@@ -839,6 +839,32 @@ class MailboxTests(unittest.TestCase):
         # Nothing was queued on the window that went away, so no marker is left.
         self.assertFalse((self.mailbox / "delivering" / "action-30.json").exists())
 
+    def test_a_resume_with_an_unreadable_answer_is_answered_terminally(self):
+        # `provider_action.poll` clears `pending_action` the moment it sees
+        # `resumed: true`, and the monitor then treats the node as resumed.  If
+        # the answer was unreadable the turn may never have been queued, so
+        # claiming success here is the exact false green this module exists to
+        # prevent.  It must be a terminal failure instead -- and no retry.
+        session = "99999999-9999-4999-8999-999999999999"
+        dispatch = FakeDispatch(
+            [{"pid": 5, "session_id": session, "cwd": str(self.project),
+              "endpoint": "http://127.0.0.1:1", "alive": True}],
+            unknown={session},
+        )
+        dispatch.save_handle({"id": "action-31", "session_id": session, "baseline": 0})
+        self._request("action-31", "resume", {"threadId": "action-31", "prompt": "again"})
+        servicer = module.MailboxServicer(dispatch)
+        outcome = servicer.serve(project_dir=str(self.project))
+        self.assertEqual(outcome["served"], [])
+        self.assertEqual([item["action_id"] for item in outcome["failed"]], ["action-31"])
+        payload = self._result("action-31")["payload"]
+        self.assertTrue(payload["failed"])
+        self.assertNotIn("resumed", payload)
+        # The handle baseline was not advanced, and nothing is sent again.
+        self.assertEqual(dispatch.handles["action-31"]["baseline"], 0)
+        self.assertEqual(servicer.serve(project_dir=str(self.project))["failed"], [])
+        self.assertEqual(dispatch.delivered, [(session, "again")])
+
     def test_a_window_that_dies_mid_sweep_does_not_abandon_the_action(self):
         # ``history`` failing on one candidate is a reason to try the next one,
         # not to leave the whole action unanswered.

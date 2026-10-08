@@ -579,11 +579,11 @@ workbuddy/session 相关 5 模块 **135 项全绿**。
 ### 12.1 P2：`_deliver` 的两条标记护栏没有用例（护红线）
 
 第 11 轮把「谁有权放下标记」收拢到 `_deliver` 一处，但那一处有三种行为，其中两种
-**没有任何用例**。实测确认（我复现了复审给出的变异）：
+**没有任何用例**。复审报出后我逐条复现：
 
 - 把 `except DeliveryUnknown: raise` 并进 `except SessionError`（即让 `DeliveryUnknown`
-  也放下标记）→ **102 项全绿**。
-- 删掉「显式拒绝放下标记」那一行 → **全绿**。
+  也放下标记）→ 当时 **100 项全绿**。
+- 删掉「显式拒绝放下标记」那一行 → 全绿。
 
 为什么上一轮没覆盖到：`test_a_terminal_answer_that_cannot_be_written_keeps_the_marker`
 里 `FakeDispatch` 是**返回** `state="unknown"`，而 `_deliver` 的 `except DeliveryUnknown`
@@ -618,9 +618,55 @@ workbuddy/session 相关 5 模块 **135 项全绿**。
 
 ### 12.3 测试
 
-`tests/test_workbuddy_sessions.py` 47 → **51 项**。workbuddy/session 相关 5 模块
+`tests/test_workbuddy_sessions.py` 47 → **50 项**。workbuddy/session 相关 5 模块
 **139 项全绿**。
 
 > 六轮下来，每轮返工都引入了**新的同类问题**（第 3→4→5→6 轮全部围绕「重复投递」这条
 > 红线打转）。第 11 轮的「收拢成一条规则」是第一次让规则本身收敛而不是再加一个补丁；
 > 第 12 轮补上护栏用例后，这条不变式才第一次有了完整的回归保护。
+
+---
+
+## 13. 第七轮复审返工（2026-10-08）
+
+§12 的返工经**独立复审**：**P0 = 0，P1 = 0**。剩下的仍是**覆盖缺口**，不是代码缺陷——
+连续两轮都是这个形态，说明代码本身已经稳定，短板在回归保护上。
+
+### 13.1 P2：`_answer_resume` 的护栏没有用例（护假绿红线）
+
+- **位置**：`workbuddy_sessions.py` 的 `_answer_resume`，`state != "accepted"` 时抛
+  `DeliveryUnknown`。
+- **变异实测**：把它改成 `return {"resumed": True, ...}`（谎报恢复成功）→ sessions + jobs
+  **103 项全绿**。我复现确认。
+- **后果**：`provider_action.poll:1154` 见到 `resumed: true` 就清 `pending_action`，监工
+  随即把节点当成「已恢复、有 worker 在跑」。而该回合可能**从未入队** → 永远等一个不会
+  到来的自报。这是不折不扣的假绿。
+- **为什么漏**：resume 路径已有「窗口已死」「落到所属窗口」「回写 baseline」三个用例，
+  但没有一个覆盖「窗口在、答复不可读」这一态——三态里只测了两态。
+- **修法**：新增 `test_a_resume_with_an_unreadable_answer_is_answered_terminally`，
+  断言结果是终态失败、payload 里**没有** `resumed`、handle baseline **没有**被推进、
+  且第二轮 sweep 不再投递。
+
+### 13.2 P3（同类未覆盖，一并补上）
+
+复审指出 `jobs.reply` 与 `_create_in_window` 的 accepted 守卫删掉后 jobs 53 项仍绿。
+虽是 P3，但与前一条同形，一并补测，避免下一轮再以同一形态回来：
+
+- `test_create_into_a_window_that_refuses_is_not_reported_as_dispatched`
+- `test_reply_into_a_window_that_refuses_is_not_reported_as_resumed`
+
+两条都断言：窗口答 `delivered: false` 时抛错，且**不写 handle**（写了就等于告诉监工
+有 worker 在跑）。为此把测试里的 `WindowStub` 补成可配 `deliver_state` 的完整桩。
+
+### 13.3 文档更正
+
+§12.3 与对应 commit 写的「sessions 47 → 51 项」是**错的**，实测 50 项（第 12 轮只加了
+3 条用例）。此处已更正。这类数字属于可测量事实，不该凭印象写——复审抓出来是对的。
+
+### 13.4 测试
+
+`tests/test_workbuddy_sessions.py` 50 → **51 项**，`tests/test_workbuddy_jobs_mcp.py`
+53 → **55 项**。workbuddy/session 相关 5 模块 **142 项全绿**。
+
+三条新护栏的变异（resume 谎报成功、create 去掉 accepted 守卫、reply 去掉 accepted 守卫）
+各自被对应用例抓到。

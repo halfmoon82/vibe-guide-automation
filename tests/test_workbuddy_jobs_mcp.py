@@ -79,15 +79,38 @@ class FakeGateway:
 class WindowStub:
     """The slice of ``SessionDispatch`` the jobs server reaches for."""
 
-    def __init__(self, sessions, handles=None):
+    def __init__(self, sessions, handles=None, deliver_state="accepted"):
         self._sessions = sessions
         self._handles = handles or {}
+        self._deliver_state = deliver_state
+        self.delivered = []
+        self.saved = []
 
     def sessions(self, refresh=False):
         return [dict(item) for item in self._sessions]
 
     def load_handle(self, handle_id):
         return self._handles.get(handle_id)
+
+    def history(self, session_id):
+        return {"session_id": session_id, "count": 0, "requests": []}
+
+    def deliver(self, session_id, text):
+        self.delivered.append((session_id, text))
+        return {"session_id": session_id, "state": self._deliver_state}
+
+    def save_handle(self, record):
+        self.saved.append(dict(record))
+
+
+def _live_window(session):
+    return {
+        "pid": os.getpid(),
+        "session_id": session,
+        "cwd": "/repo",
+        "endpoint": "http://127.0.0.1:1",
+        "alive": True,
+    }
 
 
 class DispatchContractTests(unittest.TestCase):
@@ -345,6 +368,36 @@ class OperationMappingTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             jobs.wait(session, timeout_seconds=0.1)
         self.assertIn("has no dispatch handle", str(caught.exception))
+
+    def test_create_into_a_window_that_refuses_is_not_reported_as_dispatched(self):
+        # A busy window answers `delivered: false`.  Reporting a handle for it
+        # would tell the monitor a worker is running when none is.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = WindowStub([_live_window(session)], deliver_state="refused")
+        jobs = WorkBuddyJobs(
+            gateway=FakeGateway(), sleeper=lambda _seconds: None, dispatch=dispatch
+        )
+        with self.assertRaises(ValueError) as caught:
+            jobs.create(prompt="work", session_id=session)
+        self.assertIn("did not accept the turn", str(caught.exception))
+        self.assertEqual(dispatch.saved, [])
+
+    def test_reply_into_a_window_that_refuses_is_not_reported_as_resumed(self):
+        # Same guard on the resume path: `resumed: true` would make the provider
+        # clear its pending action and treat the node as running again.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = WindowStub(
+            [_live_window(session)],
+            handles={"h1": {"id": "h1", "session_id": session, "baseline": 0}},
+            deliver_state="refused",
+        )
+        jobs = WorkBuddyJobs(
+            gateway=FakeGateway(), sleeper=lambda _seconds: None, dispatch=dispatch
+        )
+        with self.assertRaises(ValueError) as caught:
+            jobs.reply("h1", "continue")
+        self.assertIn("did not accept the turn", str(caught.exception))
+        self.assertEqual(dispatch.saved, [])
 
     def test_list_asks_for_completed_jobs_only_when_requested(self):
         jobs, gateway = self._jobs({("GET", "/api/v1/jobs"): {"jobs": [{"id": "a", "cwd": "/x"}]},
