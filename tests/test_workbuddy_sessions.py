@@ -211,7 +211,7 @@ class GatewayTokenTests(unittest.TestCase):
 class FakeDispatch:
     """Enough of SessionDispatch for the servicer; no network, no processes."""
 
-    def __init__(self, sessions, replies=None, accept=True, refuse=None):
+    def __init__(self, sessions, replies=None, accept=True, refuse=None, unknown=None):
         self._sessions = sessions
         self._replies = replies or {}
         #: Whether a window accepts a delivered turn.  A busy window answers
@@ -220,6 +220,9 @@ class FakeDispatch:
         #: Session ids that individually refuse (a busy window), so a sweep can
         #: be tested falling through to the next one.
         self.refuse = set(refuse or ())
+        #: Session ids whose reply is unreadable (neither accepted nor refused);
+        #: a sweep must fail closed rather than retry those on another window.
+        self.unknown = set(unknown or ())
         self.delivered = []
         self.handles = {}
 
@@ -238,8 +241,17 @@ class FakeDispatch:
 
     def deliver(self, session_id, text):
         self.delivered.append((session_id, text))
-        ok = self.accept and session_id not in self.refuse
-        return {"delivered": ok, "session_id": session_id}
+        if not self.accept or session_id in self.refuse:
+            state = "refused"
+        elif session_id in self.unknown:
+            state = "unknown"
+        else:
+            state = "accepted"
+        return {
+            "delivered": state == "accepted",
+            "state": state,
+            "session_id": session_id,
+        }
 
     def save_handle(self, record):
         self.handles[record["id"]] = dict(record)
@@ -476,6 +488,27 @@ class MailboxTests(unittest.TestCase):
         # The occupied window was tried first, then the free one accepted it.
         self.assertEqual(dispatch.delivered, [(busy, "work"), (idle, "work")])
         self.assertEqual(self._result("action-17")["payload"]["sessionId"], idle)
+
+    def test_an_unknown_delivery_outcome_does_not_rotate(self):
+        # An unreadable gateway reply must not be treated as a refusal: the
+        # turn may already be queued, so rotating would deliver it twice.
+        first = "77777777-7777-4777-8777-777777777777"
+        second = "88888888-8888-4888-8888-888888888888"
+        dispatch = FakeDispatch(
+            [
+                {"pid": 5, "session_id": first, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:1", "alive": True},
+                {"pid": 6, "session_id": second, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:2", "alive": True},
+            ],
+            unknown={first},
+        )
+        self._request("action-18", "create", {"prompt": "work"})
+        outcome = module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
+        self.assertEqual(outcome["served"], [])
+        # The second window was never tried, so the prompt cannot be doubled.
+        self.assertEqual(dispatch.delivered, [(first, "work")])
+        self.assertIsNone(self._result("action-18"))
 
 
 if __name__ == "__main__":

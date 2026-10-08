@@ -430,6 +430,19 @@ class SessionDispatch:
 
     # -- actions -----------------------------------------------------------
     def deliver(self, session_id: str, text: str) -> Dict[str, Any]:
+        """Deliver a turn, keeping refusal distinct from an unknown outcome.
+
+        The gateway answers ``{"delivered": true}`` when it queues the turn and
+        ``{"delivered": false}`` when it refuses one (a busy window).  Any other
+        shape -- an empty body, a missing or non-boolean field -- tells us
+        nothing about whether the turn was queued.  Collapsing that into
+        ``False`` would let a caller retry the same prompt on another window and
+        deliver it twice, so the three outcomes stay distinct:
+
+        * ``accepted`` -- queued; the caller may proceed
+        * ``refused``  -- explicitly rejected; the caller may try another window
+        * ``unknown``  -- cannot tell; the caller must fail closed, never retry
+        """
         if not isinstance(text, str) or not text.strip():
             raise SessionError("text is required")
         data = self._call(
@@ -438,7 +451,18 @@ class SessionDispatch:
             method="POST",
             body={"text": text},
         )
-        return {"delivered": data.get("delivered") is True, "session_id": session_id}
+        flag = data.get("delivered") if isinstance(data, Mapping) else None
+        if flag is True:
+            state = "accepted"
+        elif flag is False:
+            state = "refused"
+        else:
+            state = "unknown"
+        return {
+            "session_id": session_id,
+            "state": state,
+            "delivered": flag if isinstance(flag, bool) else None,
+        }
 
     def history(self, session_id: str) -> Dict[str, Any]:
         data = self._call(
@@ -694,11 +718,19 @@ class MailboxServicer:
         for candidate in candidates:
             candidate_id = str(candidate["session_id"])
             candidate_baseline = self.dispatch.history(candidate_id)["count"]
-            if self.dispatch.deliver(candidate_id, prompt).get("delivered") is True:
+            state = self.dispatch.deliver(candidate_id, prompt).get("state")
+            if state == "accepted":
                 session = candidate
                 baseline = candidate_baseline
                 break
-            refused.append(candidate_id)
+            if state == "refused":
+                refused.append(candidate_id)
+                continue
+            # `unknown`: the turn may already be queued, so retrying on another
+            # window could deliver it twice.  Fail closed instead of rotating.
+            raise SessionError(
+                "window %s returned an unrecognised delivery outcome" % candidate_id
+            )
         if session is None:
             # Every candidate refused.  Writing a success here is the exact
             # false green this module exists to prevent: the monitor would
@@ -802,13 +834,18 @@ class MailboxServicer:
         if not live:
             return {"resumed": False, "threadId": thread_id, "reason": "window is gone"}
         baseline = self.dispatch.history(session_id)["count"]
-        delivered = self.dispatch.deliver(session_id, prompt)
-        if delivered.get("delivered") is not True:
+        state = self.dispatch.deliver(session_id, prompt).get("state")
+        if state == "refused":
             return {
                 "resumed": False,
                 "threadId": thread_id,
                 "reason": "window did not accept the turn",
             }
+        if state != "accepted":
+            # Unknown: the turn may already be queued; never answer `resumed`.
+            raise SessionError(
+                "window %s returned an unrecognised delivery outcome" % session_id
+            )
         # Advance the handle's baseline so a later `wait`/`get` on this handle
         # reads the resumed turn's reply, not the previous one.
         handle = self.dispatch.load_handle(thread_id)

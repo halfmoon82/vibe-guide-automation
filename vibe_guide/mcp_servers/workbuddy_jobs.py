@@ -543,9 +543,9 @@ class WorkBuddyJobs:
         chosen = str(target["session_id"])
         endpoint = str(target["endpoint"])
         baseline = self.dispatch.history(chosen)["count"]
-        delivered = self.dispatch.deliver(chosen, prompt)
-        if delivered.get("delivered") is not True:
-            raise ValueError("window %s did not accept the turn" % chosen)
+        state = self.dispatch.deliver(chosen, prompt).get("state")
+        if state != "accepted":
+            raise ValueError("window %s did not accept the turn (%s)" % (chosen, state))
         # Unique per dispatch: a bare session prefix would let two turns into
         # the same window overwrite each other's handle (and `task_id`).
         handle_id = "%s-%s" % (chosen[:8], os.urandom(4).hex())
@@ -664,9 +664,11 @@ class WorkBuddyJobs:
         if handle is not None:
             session_id = str(handle["session_id"])
             baseline = self.dispatch.history(session_id)["count"]
-            delivered = self.dispatch.deliver(session_id, text)
-            if delivered.get("delivered") is not True:
-                raise ValueError("window %s did not accept the turn" % session_id)
+            state = self.dispatch.deliver(session_id, text).get("state")
+            if state != "accepted":
+                raise ValueError(
+                    "window %s did not accept the turn (%s)" % (session_id, state)
+                )
             record = dict(handle)
             record["baseline"] = baseline
             record.setdefault("id", job_id)
