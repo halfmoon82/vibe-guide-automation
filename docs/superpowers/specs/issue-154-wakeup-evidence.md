@@ -1,8 +1,8 @@
 # Issue #154 完工唤醒实测证据
 
-实测日期：2026-10-08（Asia/Shanghai）  
-运行：`run-ce79518f6b1e489db738ffef70437a20`  
-节点：`issue-154` generation 4  
+实测日期：2026-10-08（Asia/Shanghai）
+运行：`run-ce79518f6b1e489db738ffef70437a20`
+节点：`issue-154` generation 4
 基线：`c2a04abea77d1bb456d695f5e83a3627503a5c93`
 
 ## 验收判据
