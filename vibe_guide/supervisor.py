@@ -174,15 +174,18 @@ class Supervisor:
 # ---------------------------------------------------------------------------
 # ISSUE-91: local supervisor preflight, address registry, and rotation.
 
-#: Rotate once the context has grown this much since the shift took over.
-#: Run 140 (2026-10-05): with an absolute 60k a fresh shift already sat at
-#: 44-70k after its handoff, so late shifts rotated minutes after taking over
-#: and each takeover cost more than the reset saved.  A shift registered
-#: without its session log has no takeover baseline and falls back to the old
-#: absolute reading (baseline 0).
-DEFAULT_ROTATE_TOKEN_THRESHOLD = 60000
-#: Rotate past this context whatever the baseline (the window is ~250k).
+# Absolute context size is primary; growth is an auxiliary rotation condition.
+DEFAULT_ROTATE_TOKEN_THRESHOLD = 80000
+DEFAULT_ROTATE_SOFT_CAP = 100000
 DEFAULT_ROTATE_HARD_CAP = 150000
+SUPERVISOR_OUTPUT_POLICY = (
+    "监工输出约束：CLI/bridge 的完整输出由运行时落盘，聊天只返回摘要和证据路径。"
+    "原生 wait_threads 必须通过工具编排保存完整返回，只向会话输出状态、cursor 和最新一条短消息（最多 200 字）；"
+    "遇到 errors、unknown 或需人工处理时保留原因。不得打印完整 reviewer JSON。"
+    "接班先读 handoff-summary.json；技能和历史报告仅按需读取，读过的同一 digest 不重复载入。"
+)
+SUPERVISOR_OUTPUT_LIMIT = 8192
+HANDOFF_SUMMARY_LIMIT = 24576
 
 
 def _read_json_file(path):
@@ -285,9 +288,9 @@ def supervisor_preflight(
 
     - ``unknown``: the session record could not be read or parsed (never
       collapsed into idle).
-    - ``rotate``: the context grew more than ``token_threshold`` since the
-      shift registered its takeover baseline (no baseline: since 0), or
-      passed the hard cap.
+    - ``rotate``: absolute hard cap, or soft cap plus growth threshold.
+      Missing baselines never manufacture growth. Soft warning requests a
+      compact artifact from the CLI; this function itself stays read-only.
     - ``work``: pending provider requests exist, or a bound worker has
       delivered/finished something not yet consumed.
     - ``idle``: workers are active, or the remaining nodes wait on a human
@@ -302,16 +305,15 @@ def supervisor_preflight(
     if tokens is None:
         return {"state": "unknown", "reason": "token usage unknown"}
     baseline = _takeover_baseline(paths, run_id, session_record)
-    hard_cap = max(DEFAULT_ROTATE_HARD_CAP, token_threshold)
-    if tokens > hard_cap:
+    if token_threshold <= 0:
+        return {"state": "unknown", "reason": "growth threshold must be positive"}
+    if tokens >= DEFAULT_ROTATE_HARD_CAP:
         return {"state": "rotate", "reason": "context over hard cap",
-                "tokens": tokens, "baseline": baseline}
-    if tokens - (baseline or 0) > token_threshold:
-        reason = (
-            "context grew past threshold since takeover"
-            if baseline is not None else "context over threshold"
-        )
-        return {"state": "rotate", "reason": reason, "tokens": tokens, "baseline": baseline}
+                "tokens": tokens, "baseline": baseline, "prepare_handoff": True}
+    if (tokens >= DEFAULT_ROTATE_SOFT_CAP and baseline is not None
+            and tokens - baseline >= token_threshold):
+        return {"state": "rotate", "reason": "context grew past threshold since takeover",
+                "tokens": tokens, "baseline": baseline, "prepare_handoff": True}
     try:
         holds = supervisor_holds(paths, run_id)
     except ValueError:
@@ -319,6 +321,7 @@ def supervisor_preflight(
     result = _mailbox_state(paths, run_id, holds)
     result.setdefault("tokens", tokens)
     result.setdefault("baseline", baseline)
+    result["prepare_handoff"] = tokens >= DEFAULT_ROTATE_SOFT_CAP
     return result
 
 
@@ -637,7 +640,7 @@ def current_supervisor_address(paths, run_id):
     }
 
 
-def heartbeat_prompt(plan_id, run_id):
+def heartbeat_prompt(plan_id, run_id, *, command_prefix="vibe"):
     """The one heartbeat instruction a supervisor shift may install.
 
     ISSUE-127 told the shift to make the preflight the first step of a
@@ -647,30 +650,33 @@ def heartbeat_prompt(plan_id, run_id):
     5-15x the design.  vibe now owns the wording; prd-guide §6.0 embeds this
     exact text and a test keeps the two identical.
     """
-    return (
+    prompt = (
         "vibe 监工心跳 · 计划 {plan} · 运行 {run}\n"
         "（本指令由 vibe 生成。建心跳时逐字照抄，只替换 <本会话记录路径>；不得另写、增删或合并步骤。）\n"
         "第 1 步，只跑这一条：\n"
-        "  vibe supervisor-preflight --run-id {run} --session-record <本会话记录路径>\n"
+        "  {cli} supervisor-preflight --run-id {run} --session-record <本会话记录路径>\n"
         "第 2 步，按输出的 state 走一个分支：\n"
         "  - idle：只回一个字，结束本轮，不再跑任何命令。\n"
         "  - work 或 unknown：按 prd-guide §6.1 服务信箱一轮，"
-        "推进用 vibe resume --plan {plan} --run-id {run}；状态只从磁盘读。\n"
-        "  - rotate：新开一个会话，让它跑 vibe supervisor-handoff --run-id {run} 并照输出接班；本会话不再做别的。\n"
+        "推进用 {cli} resume --plan {plan} --run-id {run}；状态只从磁盘读。\n"
+        "  - rotate：新开一个会话，让它跑 {cli} supervisor-handoff --run-id {run} 并照输出接班；本会话不再做别的。\n"
         "例行轮询不向用户汇报。"
-    ).format(plan=plan_id, run=run_id)
+    ).format(plan=plan_id, run=run_id, cli=command_prefix)
+    return prompt + ("\n" + SUPERVISOR_OUTPUT_POLICY if command_prefix != "vibe" else "")
 
 
-def supervisor_handoff(paths, run_id):
-    """Everything a new shift needs, in one read-only call.
+def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
+    """Generate a compact runtime artifact and bounded takeover instructions.
 
     Run 140: a takeover re-read several prd-guide sections, the authorization
     card and the full status (11-31 model calls, 0.4-1.7M input tokens) and
     landed at 44-70k context.  The facts live on disk; vibe prints them.
     Raises FileNotFoundError/ValueError when the run cannot be read.
     """
+    state_refs = _snapshot_refs(paths, run_id)
     snapshot = load_snapshot(paths, run_id)
     holds = supervisor_holds(paths, run_id)
+    summary_ref = _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_prefix)
     nodes = {
         node: (data.get("status") if isinstance(data, dict) else None)
         for node, data in (snapshot.nodes or {}).items()
@@ -693,14 +699,17 @@ def supervisor_handoff(paths, run_id):
         "nodes": nodes,
         "holds": holds,
         "pending": None if pending is None else len(pending),
-        "heartbeat_prompt": heartbeat_prompt(plan_id, run_id),
+        "heartbeat_prompt": heartbeat_prompt(plan_id, run_id, command_prefix=command_prefix),
+        "handoff_summary": summary_ref,
     }
     accepted = sum(1 for status in nodes.values() if status == "accepted")
     others = ["{}（{}）".format(node, status) for node, status in sorted(nodes.items())
               if status != "accepted"]
     lines = [
         "vibe 监工交接 · 计划 {} · 运行 {}".format(plan_id, run_id),
-        "（接班只需要本段。进度都在磁盘上，不必再翻 prd-guide、授权卡或完整状态。）",
+        "紧凑交接：{}（SHA-256 {}）".format(summary_ref["path"], summary_ref["sha256"]),
+        "接班先读 handoff-summary.json；摘要不是授权或验收证据，写操作前仍由运行时核对绑定。"
+        "技能和完整报告按需读取，不重复打印；完整证据见摘要中的路径与 digest。",
         "进度：运行 {}；已验收 {}/{}{}".format(
             snapshot.status, accepted, len(nodes),
             "；其余：" + "、".join(others) if others else ""),
@@ -725,7 +734,7 @@ def supervisor_handoff(paths, run_id):
         "Codex 为 ~/.codex/sessions/<年>/<月>/<日>/rollout-…-<本会话 id>.jsonl，"
         "Claude Code 为 ~/.claude/projects/<项目>/<本会话 id>.jsonl（用 ls 确认）。",
         "  2) 自建心跳，指令逐字用下面这段，只替换 <本会话记录路径>：",
-        heartbeat_prompt(plan_id, run_id),
+        heartbeat_prompt(plan_id, run_id, command_prefix=command_prefix),
         "  3) 置顶、改标题；删掉上一班的心跳，归档上一班会话"
         "（Claude Code 没有换班原语：上一班结束会话即可）。",
         "  4) 跑一次心跳指令第 1 步的预检，按输出走。",
@@ -733,4 +742,129 @@ def supervisor_handoff(paths, run_id):
         "--node <节点> --reason <一句话原因>，否则每次心跳都会被当成有事做。"
         "运行状态一变或挂起满 6 小时，预检会报 work（hold needs recheck）：复核后仍在等人就再跑一次同一条命令刷新。".format(run_id),
     ]
-    return payload, "\n".join(lines)
+    return payload, "\n".join(lines).replace("vibe supervisor-", command_prefix + " supervisor-")
+
+
+def _artifact_ref(path):
+    raw = path.read_bytes()
+    return {"path": str(path.resolve()), "sha256": hashlib.sha256(raw).hexdigest(),
+            "bytes": len(raw)}
+
+
+def _json_bytes(value):
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _snapshot_refs(paths, run_id):
+    directory = run_dir(paths, run_id)
+    return [_artifact_ref(directory / name)
+            for name in ("state.json", "state.previous.json", "events.jsonl")
+            if (directory / name).is_file()]
+
+
+def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_prefix):
+    from .state import _atomic_bytes
+    from .adapters.task_provider import ProviderActionStore
+
+    directory = run_dir(paths, run_id)
+    evidence = list(state_refs)
+    for name in ("tasks.json", "supervisor-registry.json", "supervisor-holds.json"):
+        path = directory / name
+        if path.is_file():
+            evidence.append(_artifact_ref(path))
+    if _snapshot_refs(paths, run_id) != state_refs:
+        raise ValueError("handoff snapshot changed; retry at next safe point")
+    plan_root = paths.vibe / "plans" / snapshot.plan_id
+    for path in (plan_root / "authorization.json", plan_root / "authorization-card.json",
+                 plan_root / "plan.json", paths.vibe / "proposals/skills/prd-guide/SKILL.md",
+                 paths.vibe / "proposals/skills/vibe-entry/SKILL.md"):
+        if path.is_file():
+            evidence.append(_artifact_ref(path))
+    tasks_path = directory / "tasks.json"
+    tasks_record = _read_json_file(tasks_path) if tasks_path.is_file() else {"bindings": []}
+    if not isinstance(tasks_record, dict) or not isinstance(tasks_record.get("bindings"), list):
+        raise ValueError("task registry unreadable")
+    # Retain the most recent generation for each role, never the whole history.
+    latest = {}
+    for task in tasks_record["bindings"]:
+        if not isinstance(task, dict):
+            raise ValueError("task binding invalid")
+        key = (task.get("issue_id"), task.get("role"))
+        previous = latest.get(key)
+        if previous is None or task.get("generation", 0) >= previous.get("generation", 0):
+            latest[key] = task
+    task_keys = ("issue_id", "role", "task_id", "threadId", "hostId", "provider", "mode",
+                 "worktree", "branch", "cursor", "generation", "status", "status_file", "handoff_file")
+    node_keys = ("status", "worktree", "branch", "active_role", "active_task", "retryable_action")
+    nodes = {}
+    for node, data in (snapshot.nodes or {}).items():
+        if not isinstance(data, dict):
+            raise ValueError("node state invalid")
+        nodes[node] = {k: data[k] for k in node_keys if k in data}
+        reason = data.get("reason") or (data.get("quarantine") or {}).get("reason")
+        if reason:
+            nodes[node]["blocked_reason"] = str(reason)[:200]
+    pending = ProviderActionStore(paths).pending(run_id)
+    pending_keys = ("action_id", "issue_id", "role", "operation", "generation", "sequence")
+    summary = {
+        "schema_version": 1, "run_id": run_id, "plan_id": snapshot.plan_id,
+        "run_status": snapshot.status,
+        "authorization_digest": snapshot.authorization_digest,
+        "node_contract_digest": snapshot.node_contract_digest,
+        "nodes": nodes, "tasks": [{k: t[k] for k in task_keys if k in t} for t in latest.values()],
+        "holds": {n: {"reason": h.get("reason"), "held_at": h.get("held_at")} for n, h in holds.items()},
+        "pending_actions": [{k: a[k] for k in pending_keys if k in a} for a in pending],
+        "pending_count": len(pending), "evidence": evidence,
+        "task_registry_status": "ok" if tasks_path.is_file() else "unknown",
+        "output_policy": SUPERVISOR_OUTPUT_POLICY,
+        "next_command": "{} supervisor-preflight --run-id {} --session-record <本会话记录路径>".format(command_prefix, run_id),
+        "resume_command": "{} resume --plan {} --run-id {}".format(command_prefix, snapshot.plan_id, run_id),
+        "instructions": "摘要仅用于定位。运行时继续核对授权、writer、generation 与 cursor。按需读证据，禁止将原始报告重复打印。",
+    }
+    raw = _json_bytes(summary)
+    if len(raw) > HANDOFF_SUMMARY_LIMIT:
+        # Never silently clip opaque cursors or identities. Keep the complete
+        # selected state in an immutable companion and make omissions explicit.
+        manifest = directory / ("handoff-details-" + hashlib.sha256(raw).hexdigest() + ".json")
+        _atomic_bytes(manifest, raw)
+        summary["details"] = _artifact_ref(manifest)
+        summary["details_omitted"] = True
+        summary["nodes"] = {n: {"status": d.get("status")} for n, d in nodes.items()}
+        summary["tasks"] = []
+        summary["pending_actions"] = []
+        raw = _json_bytes(summary)
+        if len(raw) > HANDOFF_SUMMARY_LIMIT:
+            summary["node_count"] = len(nodes)
+            summary["nodes"] = {}
+            summary["holds"] = {}
+            raw = _json_bytes(summary)
+        if len(raw) > HANDOFF_SUMMARY_LIMIT:
+            raise ValueError("handoff metadata exceeds byte budget")
+    # Detect state updates during artifact generation instead of certifying a
+    # digest from a different generation of the source files.
+    for ref in evidence:
+        if _artifact_ref(Path(ref["path"])) != ref:
+            raise ValueError("handoff source changed; retry at next safe point")
+    if _snapshot_refs(paths, run_id) != state_refs:
+        raise ValueError("handoff source changed; retry at next safe point")
+    path = directory / "handoff-summary.json"
+    _atomic_bytes(path, raw)
+    return _artifact_ref(path)
+
+
+def bounded_supervisor_output(paths, run_id, payload, rendered):
+    """Preserve full output on disk; limit UTF-8 bytes returned to chat."""
+    raw = rendered.encode("utf-8")
+    if len(raw) <= SUPERVISOR_OUTPUT_LIMIT:
+        return rendered
+    from .state import _atomic_bytes
+    directory = run_dir(paths, run_id, create=True) / "tool-output"
+    path = directory / (hashlib.sha256(raw).hexdigest() + ".txt")
+    _atomic_bytes(path, raw)
+    short = {k: payload[k] for k in ("command", "state", "status", "run_id", "plan_id",
+                                    "tokens", "baseline", "prepare_handoff", "pending", "handoff_summary", "handoff_status", "handoff_error")
+             if k in payload}
+    if "reason" in payload:
+        short["reason"] = str(payload["reason"])[:200]
+    short.update({"truncated": True, "output_evidence": _artifact_ref(path)})
+    return json.dumps(short, ensure_ascii=False, sort_keys=True)
