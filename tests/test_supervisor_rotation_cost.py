@@ -108,10 +108,10 @@ class CodexSessionLogTests(_Case):
     """Fix 3: the preflight reads the shift's own log; no hand-written record."""
 
     def test_reads_the_latest_context_from_a_codex_rollout(self):
-        path = _codex_rollout(self.tmp.name, [30000, 52000, 71000])
+        path = _codex_rollout(self.tmp.name, [30000, 52000, 150001])
         result = supervisor_preflight(self.paths, "run-1", path)
         self.assertEqual(result["state"], "rotate")
-        self.assertEqual(result["tokens"], 71000)
+        self.assertEqual(result["tokens"], 150001)
 
     def test_cumulative_totals_are_not_mistaken_for_context(self):
         path = _codex_rollout(self.tmp.name, [30000, 41000])
@@ -126,7 +126,7 @@ class CodexSessionLogTests(_Case):
 
     def test_hand_written_record_still_works(self):
         """Shifts installed before this change keep their old heartbeat."""
-        result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 70000))
+        result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 150001))
         self.assertEqual(result["state"], "rotate")
 
 
@@ -146,7 +146,7 @@ class RelativeThresholdTests(_Case):
     def test_rotates_once_growth_since_takeover_passes_the_threshold(self):
         path = _codex_rollout(self.tmp.name, [30000, 50000])
         self.register(session_record=path)
-        _codex_rollout(self.tmp.name, [30000, 50000, 110001])
+        _codex_rollout(self.tmp.name, [30000, 50000, 130001])
         result = supervisor_preflight(self.paths, "run-1", path)
         self.assertEqual(result["state"], "rotate")
         self.assertEqual(result["reason"], "context grew past threshold since takeover")
@@ -154,7 +154,7 @@ class RelativeThresholdTests(_Case):
     def test_growth_threshold_is_configurable(self):
         path = _codex_rollout(self.tmp.name, [50000])
         self.register(session_record=path)
-        _codex_rollout(self.tmp.name, [50000, 80000])
+        _codex_rollout(self.tmp.name, [50000, 100000])
         result = supervisor_preflight(self.paths, "run-1", path, token_threshold=20000)
         self.assertEqual(result["state"], "rotate")
 
@@ -166,26 +166,26 @@ class RelativeThresholdTests(_Case):
         self.assertEqual(result["state"], "rotate")
         self.assertEqual(result["reason"], "context over hard cap")
 
-    def test_configured_threshold_above_the_cap_lifts_the_cap(self):
+    def test_configured_growth_threshold_never_lifts_absolute_cap(self):
         rec = _record(self.tmp.name, DEFAULT_ROTATE_HARD_CAP + 1)
         with _patch_snapshot({"n1": "running"}):
             result = supervisor_preflight(
                 self.paths, "run-1", rec, token_threshold=DEFAULT_ROTATE_HARD_CAP * 2,
             )
-        self.assertEqual(result["state"], "idle", result)
+        self.assertEqual(result["state"], "rotate", result)
 
     def test_baseline_belongs_to_the_registered_log_only(self):
         """A different shift's log must not borrow this shift's baseline."""
         mine = _codex_rollout(self.tmp.name, [65000], name="mine.jsonl")
         self.register(session_record=mine)
-        other = _codex_rollout(self.tmp.name, [70000], name="other.jsonl")
+        other = _codex_rollout(self.tmp.name, [150001], name="other.jsonl")
         result = supervisor_preflight(self.paths, "run-1", other)
         self.assertEqual(result["state"], "rotate")
         self.assertIsNone(result["baseline"])
 
     def test_registration_without_a_log_keeps_the_absolute_threshold(self):
         self.register()
-        result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 70000))
+        result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 150001))
         self.assertEqual(result["state"], "rotate")
 
     def test_registering_the_same_shift_again_keeps_its_baseline(self):

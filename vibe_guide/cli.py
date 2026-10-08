@@ -38,6 +38,7 @@ from .supervisor import (
     release_supervisor_hold,
     set_supervisor_hold,
     supervisor_handoff,
+    bounded_supervisor_output,
     supervisor_holds,
     heartbeat_prompt,
     supervisor_preflight,
@@ -1272,7 +1273,7 @@ def _run_id(directory: Path, requested: Optional[str]) -> str:
 _PROTOCOL_REFRESH_COMMANDS = {"plan", "monitor", "resume"}
 
 
-def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
+def run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_prefix="vibe") -> CLIResult:
     # A package upgrade runs no project code, so an unedited protocol copy
     # left by an earlier release is brought current on the next working
     # command instead.
@@ -1291,7 +1292,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             refreshed = refresh_protocol_copies(ProjectPaths.from_cwd(Path(cwd)).root)
         except (OSError, ValueError):
             refreshed = []
-    result = _run_cli(argv, cwd, runner)
+    result = _run_cli(argv, cwd, runner, supervisor_command_prefix=supervisor_command_prefix)
     if refreshed:
         result = CLIResult(
             result.exit_code,
@@ -1304,7 +1305,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
     return result
 
 
-def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
+def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_prefix="vibe") -> CLIResult:
     parser = _parser()
     try:
         args = parser.parse_args(list(argv))
@@ -1450,7 +1451,18 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         if args.token_threshold is not None:
             kwargs["token_threshold"] = args.token_threshold
         payload = supervisor_preflight(paths, args.run_id, args.session_record, **kwargs)
-        code = SUCCESS if payload["state"] in {"idle", "work", "rotate"} else UNKNOWN
+        if payload.get("prepare_handoff"):
+            try:
+                handoff, _ = supervisor_handoff(paths, args.run_id, command_prefix=supervisor_command_prefix)
+                payload["handoff_summary"] = handoff["handoff_summary"]
+            except (FileNotFoundError, TypeError, ValueError, OSError) as error:
+                # A failed artifact must never turn a hard stop into the
+                # heartbeat's unknown -> resume branch.
+                payload = {**payload, "handoff_status": "unknown",
+                           "handoff_error": "handoff preparation failed: " + str(error)}
+                if payload["state"] != "rotate":
+                    payload["state"] = "unknown"
+        code = SUCCESS if payload["state"] in {"idle", "work", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
         return _result(code, {"command": args.command, **payload}, "监工预检：{}".format(payload["state"]), args.as_json)
 
     if args.command == "supervisor-register":
@@ -1466,7 +1478,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "登记失败：" + str(error), args.as_json)
         text = "监工地址已登记"
         if "baseline_context" in entry:
-            text += "；接班起点 {} token，换班按此后增长计算".format(entry["baseline_context"])
+            text += "；接班起点 {} token；100k 准备交接，150k 硬换班，增长阈值辅助判断".format(entry["baseline_context"])
         else:
             if not args.session_record:
                 why = "没给 --session-record"
@@ -1502,7 +1514,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
         except ValueError as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "运行编号不合法：" + str(error), args.as_json)
         try:
-            payload, text = supervisor_handoff(paths, args.run_id)
+            payload, text = supervisor_handoff(paths, args.run_id, command_prefix=supervisor_command_prefix)
         except (FileNotFoundError, TypeError, ValueError, OSError) as error:
             return _result(UNKNOWN, {"command": args.command, "status": "unknown", "reason": str(error)}, "交接信息读不到：" + str(error), args.as_json)
         return _result(SUCCESS, {"command": args.command, **payload}, text, args.as_json)
@@ -2557,12 +2569,21 @@ def handle_monitor(
     return run_cli(argv, Path.cwd(), runner=runner).exit_code
 
 
-def main(argv: Optional[Sequence[str]] = None, runner=None) -> int:
+def main(argv: Optional[Sequence[str]] = None, runner=None, *, supervisor_command_prefix="vibe") -> int:
     arguments = list(argv) if argv is not None else os.sys.argv[1:]
-    result = run_cli(arguments, Path.cwd(), runner=runner)
-    print(
-        json.dumps(result.payload, ensure_ascii=False, sort_keys=True)
-        if result.as_json
-        else result.text
-    )
+    result = run_cli(arguments, Path.cwd(), runner=runner, supervisor_command_prefix=supervisor_command_prefix)
+    rendered = (json.dumps(result.payload, ensure_ascii=False, sort_keys=True)
+                if result.as_json else result.text)
+    command = arguments[0] if arguments else ""
+    run_id = result.payload.get("run_id")
+    if not run_id and "--run-id" in arguments:
+        index = arguments.index("--run-id") + 1
+        run_id = arguments[index] if index < len(arguments) else None
+    if run_id and (command.startswith("supervisor-") or command in {"monitor", "resume", "status", "reconcile"}):
+        try:
+            rendered = bounded_supervisor_output(ProjectPaths.from_cwd(Path.cwd()), run_id, result.payload, rendered)
+        except (OSError, ValueError, TypeError) as error:
+            print(json.dumps({"status": "unknown", "reason": "output evidence unavailable: " + str(error)[:200]}))
+            return result.exit_code or UNKNOWN
+    print(rendered)
     return result.exit_code

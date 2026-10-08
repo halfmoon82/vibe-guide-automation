@@ -49,12 +49,12 @@ class PreflightTests(unittest.TestCase):
         self.paths = ProjectPaths(self.root)
 
     def test_over_threshold_rotates(self):
-        rec = _record(self.tmp.name, 70000)
+        rec = _record(self.tmp.name, 150001)
         result = supervisor_preflight(self.paths, "run-1", rec)
         self.assertEqual(result["state"], "rotate")
 
     def test_threshold_is_configurable(self):
-        rec = _record(self.tmp.name, 70000)
+        rec = _record(self.tmp.name, 120000)
         result = supervisor_preflight(
             self.paths, "run-1", rec, token_threshold=100000
         )
@@ -170,7 +170,7 @@ class PreflightTests(unittest.TestCase):
                 "input_tokens": 10, "cache_read_input_tokens": 20000,
                 "cache_creation_input_tokens": 500}}},
             {"type": "assistant", "message": {"usage": {
-                "input_tokens": 5, "cache_read_input_tokens": 70000,
+                "input_tokens": 5, "cache_read_input_tokens": 150000,
                 "cache_creation_input_tokens": 100}}},
         ]
         path.write_text(
@@ -179,7 +179,7 @@ class PreflightTests(unittest.TestCase):
         )
         result = supervisor_preflight(self.paths, "run-1", str(path))
         self.assertEqual(result["state"], "rotate")
-        self.assertEqual(result["tokens"], 70105)
+        self.assertEqual(result["tokens"], 150105)
 
     def test_missing_record_is_unknown_not_idle(self):
         result = supervisor_preflight(self.paths, "run-1", "/nonexistent.json")
@@ -263,10 +263,15 @@ class SupervisorCliTests(unittest.TestCase):
         self.assertEqual(result.payload["status"], "blocked_invalid")
 
     def test_preflight_cli_rotate(self):
+        from tests.support_v45_authorize import publish_complex_probe
+        self.root = publish_complex_probe(self)
+        self.cli(["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE"])
+        started = self.cli(["monitor", "--plan", "probe-plan", "--authorize", "AUTHORIZE"])
+        run_id = started.payload["run_id"]
         rec = Path(self.tmp.name) / "s.json"
-        rec.write_text(json.dumps({"token_count": 70000}), encoding="utf-8")
+        rec.write_text(json.dumps({"token_count": 150001}), encoding="utf-8")
         result = self.cli([
-            "supervisor-preflight", "--run-id", "run-1",
+            "supervisor-preflight", "--run-id", run_id,
             "--session-record", str(rec),
         ])
         self.assertEqual(result.exit_code, 0)
