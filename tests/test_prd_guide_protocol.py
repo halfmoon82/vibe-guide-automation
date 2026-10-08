@@ -38,6 +38,12 @@ def _product_spec():
 
 
 class ProtocolShippingTests(unittest.TestCase):
+    PRODUCT_SCOPE_RULE = (
+        "修改后，PRD 里每条验收例子的判定结果是否改变——不变就由监工自决并留痕，"
+        "变了才问产品经理；另外两类无论如何都问：新增第三方依赖（发布/安全对外承诺）、"
+        "执行模式从「可见可进入的任务」降级为「后台不可见」。"
+    )
+
     def test_every_shipped_rule_block_opens_with_its_own_heading(self):
         """New rule blocks are registered here, and headings identify them.
 
@@ -100,6 +106,32 @@ class ProtocolShippingTests(unittest.TestCase):
             self.assertIn(command, text, command)
         for marker in ("user_confirmed", "system_inferred", "needs_confirmation", "unverified"):
             self.assertIn(marker, text, marker)
+
+    def test_scope_rule_separates_product_scope_from_file_scope(self):
+        """File-list mechanics must not be presented as a product decision."""
+        from vibe_guide.protocols import load_protocol
+
+        text = load_protocol("prd-guide")
+        section_4 = text[text.index("## 4. 拆节点"):text.index("\n## 5. ", text.index("## 4. 拆节点"))]
+        section_6 = text[text.index("## 6. 服务监工信箱"):text.index("\n## 7. ", text.index("## 6. 服务监工信箱"))]
+        section_7 = text[text.index("## 7. 什么时候才能打断产品经理"):]
+
+        self.assertIn("产品范围", section_4)
+        self.assertIn("文件清单", section_4)
+        self.assertNotIn("其他文件漏列仍必须请产品经理授权", section_4)
+        self.assertIn("放行只由返工闭环决定", section_6)
+        self.assertNotIn("放行仍然是人的决定", section_6)
+        self.assertIn(self.PRODUCT_SCOPE_RULE, section_7)
+
+    def test_agents_rule_is_delivered_as_a_scoped_patch_suggestion(self):
+        """The host AGENTS file stays untouched; its requested change is reviewable."""
+        patch = ROOT / "docs" / "superpowers" / "specs" / "issue-157-agents-patch.md"
+        self.assertTrue(patch.is_file(), patch)
+        text = patch.read_text(encoding="utf-8")
+        self.assertIn("AGENTS.md §6", text)
+        self.assertIn(self.PRODUCT_SCOPE_RULE, text)
+        self.assertIn("只交补丁建议", text)
+        self.assertNotIn("直接修改 AGENTS.md", text)
 
 
 class MailboxSectionTests(unittest.TestCase):
