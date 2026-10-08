@@ -362,8 +362,10 @@ def dispatch_topology_for_node(
     ``TOPOLOGY_VISIBLE_SDD`` branch taken after a node reports delivered),
     which never dispatches a reviewer.  The run-level
     ``integration_review_evidence`` package is only ever derived from a
-    *reviewer* acceptance claim (``Monitor._derive_integration_acceptance``,
-    recorded by ``Monitor._record_integration_review``), so it stays empty.
+    *reviewer* acceptance claim in the normal dispatch flow
+    (``Monitor._derive_integration_acceptance``; the write itself is the
+    module-level ``monitor._record_integration_review`` alias of
+    ``evidence.record_integration_review``), so it stays empty.
     Measured on the real fixture (2026-10-07): the closeout node still ends
     up ``accepted``, but the run can never reach ``complete`` -- it stalls on
     ``integration review evidence is missing``.  With rule 2 in place the node
