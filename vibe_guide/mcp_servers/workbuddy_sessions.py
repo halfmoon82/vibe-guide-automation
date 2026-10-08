@@ -482,15 +482,28 @@ class SessionDispatch:
         * ``accepted`` -- queued; the caller may proceed
         * ``refused``  -- explicitly rejected; the caller may try another window
         * ``unknown``  -- cannot tell; the caller must fail closed, never retry
+
+        A POST that fails in transit is ``unknown`` too, and for the same
+        reason: a timeout or a dropped connection means the request may well
+        have arrived and been queued before its answer was lost.  Only the
+        lookup of the endpoint happens outside that judgement, because a window
+        that is not there was never sent anything.
         """
         if not isinstance(text, str) or not text.strip():
             raise SessionError("text is required")
-        data = self._call(
-            self._endpoint_for(session_id),
-            "/api/v1/sessions/%s/reply" % session_id,
-            method="POST",
-            body={"text": text},
-        )
+        endpoint = self._endpoint_for(session_id)
+        try:
+            data = self._call(
+                endpoint,
+                "/api/v1/sessions/%s/reply" % session_id,
+                method="POST",
+                body={"text": text},
+            )
+        except SessionError as error:
+            raise DeliveryUnknown(
+                "the reply to window %s was lost in transit: %s"
+                % (session_id, error)
+            ) from error
         flag = data.get("delivered") if isinstance(data, Mapping) else None
         if flag is True:
             state = "accepted"
@@ -686,8 +699,8 @@ class MailboxServicer:
                         "a previous sweep delivered this turn but never recorded "
                         "an outcome; the turn may already be queued"
                     )
-                    self._fail_terminally(action, action_id, result_dir, reason)
-                    _unlink(marker)
+                    if self._fail_terminally(action, action_id, result_dir, reason):
+                        _unlink(marker)
                     failed.append({"action_id": action_id, "reason": reason})
                     continue
                 operation = action.get("operation")
@@ -701,8 +714,12 @@ class MailboxServicer:
                     # Never retried: see ``DeliveryUnknown``.  A terminal
                     # negative result is the only answer that neither
                     # fabricates a worker nor invites a second delivery.
-                    self._fail_terminally(action, action_id, result_dir, str(error))
-                    _unlink(marker)
+                    # The marker only comes down once that answer is on disk;
+                    # clearing it while the write failed would leave the next
+                    # sweep with neither marker nor result, and it would
+                    # deliver the same prompt again.
+                    if self._fail_terminally(action, action_id, result_dir, str(error)):
+                        _unlink(marker)
                     failed.append({"action_id": action_id, "reason": str(error)})
                     continue
                 except (SessionError, ValueError, OSError) as error:
@@ -767,21 +784,25 @@ class MailboxServicer:
         action_id: str,
         result_dir: Path,
         reason: str,
-    ) -> None:
+    ) -> bool:
         """Answer a request we can never honestly answer, so it stops retrying.
 
         The payload claims no ``binding``, no ``located`` and no ``resumed``, so
         the provider reads it as a failed action rather than a successful one.
         That is deliberate: a success would fabricate a worker, and no answer at
         all would leave the request pending for another delivery attempt.
+
+        Returns whether the answer reached the disk.  A caller must not lower
+        the delivery marker when it did not: with no marker *and* no result the
+        next sweep has no way to tell this turn was already delivered and sends
+        it a second time.
         """
         payload = {"delivery": "unknown", "failed": True, "reason": reason}
         try:
             self._record(action, action_id, result_dir, payload)
         except OSError:
-            # The marker is still up, so the next sweep tries this again -- and
-            # fails it closed the same way instead of delivering it twice.
-            pass
+            return False
+        return True
 
     def _deliver(
         self,

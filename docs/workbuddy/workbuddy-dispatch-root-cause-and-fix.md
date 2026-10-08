@@ -449,3 +449,58 @@ monitor 不会点名它们，但不该因此判定契约破裂。
   变更，应单独走一次评审。
 - baseline 与投递之间隔一次往返：用户可见窗口若在这中间被人工输入，索引后移，
   `reply_after` 会返回那一轮人工输入的回复（串轮）。窗口可见性是本方案的前提。
+
+---
+
+## 10. 第四轮复审返工（2026-10-08）
+
+§9 的返工经**独立复审**，判定 **「需返工（小改）」**：P0=0，但 P1×1、P2×1 **均为 §9
+自己新引入**，且都还是「重复投递」这条红线。
+
+### 10.1 P1：终态结果写失败却仍放下标记（阻断）
+
+- **触发**：`_fail_terminally` 内部吞掉 `_record` 的 `OSError` 并正常返回，而 `serve()`
+  的两处调用点**无条件** `_unlink(marker)`。
+- **后果**：写结果失败（磁盘满 / 权限 / 目录被占）时，**标记被清、结果未落盘**；下一轮
+  sweep 既无标记也无结果 → 重新投递同一条 prompt。§9 的结论 2 和 `_fail_terminally`
+  自己的 docstring（「标记仍在上，下一轮 fail closed」）都被这一行推翻。
+- **修法**：`_fail_terminally` 改为返回**是否真的落盘**；`serve()` 只在返回 `True` 时
+  `_unlink(marker)`。标记就是「写失败」与「二次投递」之间唯一的那道墙。
+- **为什么原来的用例没抓到**：`test_a_crashed_delivery_is_never_delivered_twice` 用的是
+  正常可写的 `results/`，从未走到写失败分支。新增
+  `test_a_terminal_answer_that_cannot_be_written_keeps_the_marker` 把 `_record` 换成抛
+  `OSError` 的桩，断言标记仍在、且第二轮 sweep 一次都没投递。
+
+### 10.2 P2：传输层失败被当成「未入队」
+
+- **触发**：`_call` 把超时 / `URLError` / `OSError` 与 HTTP 状态错误一并归为
+  `SessionError`；`serve()` 据此清标记、留 pending。
+- **后果**：超时的语义是「请求已发出、响应丢失」，回合**可能已经入队**。下一轮重投 →
+  同一个任务在一个窗口里跑两遍。
+- **修法**：`deliver()` 把 **POST 本身**的失败一律转成 `DeliveryUnknown`。`_endpoint_for`
+  （窗口查找）刻意留在 wrap 之外——窗口不在意味着**什么都没发出去**，那是真正的瞬时错误，
+  可以安全地留 pending 重试。两种情况必须分开。
+
+### 10.3 P3
+
+- `WorkBuddyJobs._window_handle` 上一轮改走 `self.dispatch.load_handle` 后，**首行**在
+  `try/except SessionError` 之外，而 `WorkBuddyJobs.dispatch` 是惰性属性、构造
+  `SessionDispatch()` 会调 `gateway_token()`。在发现不到口令的机器上，纯 job 的
+  `get`/`reply`/`wait` 会从「回退 Jobs API」变成直接报错。改为捕获后回退到模块级
+  `load_handle`：窗口后端是可选能力，jobs 后端不是。
+
+### 10.4 测试与变异检验
+
+`tests/test_workbuddy_sessions.py` 38 → **42 项**，`tests/test_workbuddy_jobs_mcp.py` 51 → **52 项**。
+
+新增用例（终态写失败保标记、传输层丢失答复、窗口不在不算丢失答复、无口令时 job id 仍可解析）
+同样做了变异检验：
+
+| 变异 | 被抓到的用例 |
+|---|---|
+| `_fail_terminally` 写失败也返回 `True` | `test_a_terminal_answer_that_cannot_be_written_keeps_the_marker` |
+| `deliver` 不包装传输层异常 | `test_a_post_that_dies_in_transit_is_unknown` |
+| `_window_handle` 不设无口令回退 | `test_a_job_id_still_resolves_without_a_gateway_credential` |
+
+workbuddy/session 相关 5 模块 **130 项全绿**；全量 1515 项仍为同一批既有环境性失败
+（`test_v310_packaging` / `test_v2_acceptance` / `test_skill_install_cli`），无新增回归。

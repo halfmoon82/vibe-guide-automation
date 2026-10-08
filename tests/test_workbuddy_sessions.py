@@ -211,7 +211,15 @@ class GatewayTokenTests(unittest.TestCase):
 class FakeDispatch:
     """Enough of SessionDispatch for the servicer; no network, no processes."""
 
-    def __init__(self, sessions, replies=None, accept=True, refuse=None, unknown=None):
+    def __init__(
+        self,
+        sessions,
+        replies=None,
+        accept=True,
+        refuse=None,
+        unknown=None,
+        lose_reply=None,
+    ):
         self._sessions = sessions
         self._replies = replies or {}
         #: Whether a window accepts a delivered turn.  A busy window answers
@@ -223,6 +231,10 @@ class FakeDispatch:
         #: Session ids whose reply is unreadable (neither accepted nor refused);
         #: a sweep must fail closed rather than retry those on another window.
         self.unknown = set(unknown or ())
+        #: Session ids whose POST dies in transit (timeout, reset).  The turn
+        #: may have been queued before the answer was lost, so these are
+        #: ``unknown`` too -- never a refusal, never retried.
+        self.lose_reply = set(lose_reply or ())
         self.delivered = []
         self.handles = {}
 
@@ -241,6 +253,10 @@ class FakeDispatch:
 
     def deliver(self, session_id, text):
         self.delivered.append((session_id, text))
+        if session_id in self.lose_reply:
+            raise module.DeliveryUnknown(
+                "the reply to window %s was lost in transit" % session_id
+            )
         if not self.accept or session_id in self.refuse:
             state = "refused"
         elif session_id in self.unknown:
@@ -607,6 +623,64 @@ class MailboxTests(unittest.TestCase):
         self.assertEqual([item["action_id"] for item in outcome["skipped"]], ["action-21"])
         self.assertIsNone(self._result("action-21"))
 
+    def test_a_lost_reply_is_answered_terminally_not_retried(self):
+        # A POST that times out may still have been queued.  It must reach the
+        # same terminal answer as an unreadable body: not rotated to another
+        # window, and not left pending for the next sweep to deliver again.
+        first = "77777777-7777-4777-8777-777777777777"
+        second = "88888888-8888-4888-8888-888888888888"
+        dispatch = FakeDispatch(
+            [
+                {"pid": 5, "session_id": first, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:1", "alive": True},
+                {"pid": 6, "session_id": second, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:2", "alive": True},
+            ],
+            lose_reply={first},
+        )
+        self._request("action-23", "create", {"prompt": "work"})
+        servicer = module.MailboxServicer(dispatch)
+        outcome = servicer.serve(project_dir=str(self.project))
+        self.assertEqual(outcome["served"], [])
+        self.assertEqual(dispatch.delivered, [(first, "work")])
+        self.assertEqual([item["action_id"] for item in outcome["failed"]], ["action-23"])
+        self.assertTrue(self._result("action-23")["payload"]["failed"])
+        self.assertEqual(servicer.serve(project_dir=str(self.project))["failed"], [])
+        self.assertEqual(dispatch.delivered, [(first, "work")])
+
+    def test_a_terminal_answer_that_cannot_be_written_keeps_the_marker(self):
+        # The marker is the only thing standing between a failed result write
+        # and a second delivery.  Lowering it anyway would leave the next sweep
+        # with neither marker nor result, and it would send the prompt again.
+        first = "77777777-7777-4777-8777-777777777777"
+        second = "88888888-8888-4888-8888-888888888888"
+        dispatch = FakeDispatch(
+            [
+                {"pid": 5, "session_id": first, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:1", "alive": True},
+                {"pid": 6, "session_id": second, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:2", "alive": True},
+            ],
+            unknown={first},
+        )
+        self._request("action-24", "create", {"prompt": "work"})
+        servicer = module.MailboxServicer(dispatch)
+        marker = self.mailbox / "delivering" / "action-24.json"
+
+        def unwritable(*args, **kwargs):
+            raise OSError("no space left on device")
+
+        servicer._record = unwritable
+        outcome = servicer.serve(project_dir=str(self.project))
+        self.assertEqual(dispatch.delivered, [(first, "work")])
+        self.assertEqual([item["action_id"] for item in outcome["failed"]], ["action-24"])
+        self.assertTrue(marker.exists())
+        # Second sweep: the marker still stands, so nothing is delivered again.
+        again = servicer.serve(project_dir=str(self.project))
+        self.assertEqual(again["served"], [])
+        self.assertEqual(dispatch.delivered, [(first, "work")])
+        self.assertTrue(marker.exists())
+
     def test_a_window_that_dies_mid_sweep_does_not_abandon_the_action(self):
         # ``history`` failing on one candidate is a reason to try the next one,
         # not to leave the whole action unanswered.
@@ -637,9 +711,10 @@ class MailboxTests(unittest.TestCase):
 class _StubDispatch(module.SessionDispatch):
     """``SessionDispatch`` with the HTTP hop replaced by a canned body."""
 
-    def __init__(self, body, sessions):
+    def __init__(self, body, sessions, error=None):
         super().__init__(token="stub-token", sessions=sessions)
         self._body = body
+        self._error = error
         self.calls = []
 
     def sessions(self, refresh=False):
@@ -649,6 +724,8 @@ class _StubDispatch(module.SessionDispatch):
 
     def _call(self, endpoint, path, method="GET", body=None, timeout=30.0):
         self.calls.append((method, path, body))
+        if self._error is not None:
+            raise self._error
         return self._body
 
 
@@ -662,7 +739,7 @@ class DeliverOutcomeTests(unittest.TestCase):
 
     SESSION = "11111111-1111-4111-8111-111111111111"
 
-    def _dispatch(self, body):
+    def _dispatch(self, body, error=None):
         return _StubDispatch(
             body,
             [
@@ -674,6 +751,7 @@ class DeliverOutcomeTests(unittest.TestCase):
                     "alive": True,
                 }
             ],
+            error=error,
         )
 
     def test_a_queued_turn_is_accepted(self):
@@ -702,6 +780,24 @@ class DeliverOutcomeTests(unittest.TestCase):
         outcome = self._dispatch(["delivered"]).deliver(self.SESSION, "work")
         self.assertEqual(outcome["state"], "unknown")
         self.assertIsNone(outcome["delivered"])
+
+    def test_a_post_that_dies_in_transit_is_unknown(self):
+        # A timeout or a reset connection means the request may have arrived
+        # and been queued before its answer was lost.  Reading that as a
+        # refusal is what lets the caller rotate and run the task twice.
+        dispatch = self._dispatch(
+            None, error=module.SessionError("POST /reply failed: timed out")
+        )
+        with self.assertRaises(module.DeliveryUnknown):
+            dispatch.deliver(self.SESSION, "work")
+
+    def test_a_window_that_is_gone_is_not_a_lost_reply(self):
+        # No endpoint means nothing was sent, so the caller may retry later:
+        # this must stay a plain error, not a terminal unknown.
+        dispatch = _StubDispatch({}, [])
+        with self.assertRaises(module.SessionError) as caught:
+            dispatch.deliver(self.SESSION, "work")
+        self.assertNotIsInstance(caught.exception, module.DeliveryUnknown)
 
 
 if __name__ == "__main__":

@@ -295,6 +295,20 @@ class OperationMappingTests(unittest.TestCase):
         jobs, _ = self._jobs({("GET", "/api/v1/jobs/j1"): {"job": {"id": "j1", "state": "working"}}})
         self.assertEqual(jobs.get("j1"), {"id": "j1", "state": "working"})
 
+    def test_a_job_id_still_resolves_without_a_gateway_credential(self):
+        # Resolving a window handle goes through the dispatcher, and building
+        # the dispatcher needs a gateway credential.  On a host that has none,
+        # a plain job id must still read as a job instead of erroring -- the
+        # window backend is optional, the jobs backend is not.
+        jobs, _ = self._jobs(
+            {("GET", "/api/v1/jobs/j1"): {"job": {"id": "j1", "state": "working"}}}
+        )
+        no_credential = mock.PropertyMock(
+            side_effect=module._sessions.SessionError("no gateway credential")
+        )
+        with mock.patch.object(module.WorkBuddyJobs, "dispatch", no_credential):
+            self.assertEqual(jobs.get("j1"), {"id": "j1", "state": "working"})
+
     def test_list_asks_for_completed_jobs_only_when_requested(self):
         jobs, gateway = self._jobs({("GET", "/api/v1/jobs"): {"jobs": [{"id": "a", "cwd": "/x"}]},
                                     ("GET", "/api/v1/jobs?all=1"): {"jobs": [{"id": "a", "cwd": "/x"}, {"id": "b", "cwd": "/y"}]}})

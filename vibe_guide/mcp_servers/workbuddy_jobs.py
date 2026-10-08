@@ -576,10 +576,16 @@ class WorkBuddyJobs:
 
     def _window_handle(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Resolve an id to a window handle, or None when it is a job."""
-        # Read through the dispatcher, not the module-level helper: the two
-        # differ whenever a handle root is overridden, and a reader that
-        # disagrees with the writer silently loses every handle.
-        handle = self.dispatch.load_handle(job_id)
+        try:
+            # Read through the dispatcher, not the module-level helper: the two
+            # differ whenever a handle root is overridden, and a reader that
+            # disagrees with the writer silently loses every handle.
+            handle = self.dispatch.load_handle(job_id)
+        except _sessions.SessionError:
+            # Building the dispatcher needs a gateway credential.  On a host
+            # without one a plain job id must still resolve -- and be reported
+            # as a job -- instead of turning every get/reply/wait into an error.
+            handle = _sessions.load_handle(job_id)
         if isinstance(handle, dict) and handle.get("session_id"):
             return handle
         try:
