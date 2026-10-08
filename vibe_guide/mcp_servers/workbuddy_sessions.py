@@ -133,9 +133,13 @@ def _may_have_reached(error: BaseException) -> bool:
 
 #: The host's own session id.  The supervisor normally runs *inside* the very
 #: conversation it dispatches for, and that window is a live window on disk, so
-#: auto-pick will happily choose it.  A task delivered back into the supervisor's
-#: own thread collapses the two roles into one conversation, so the host session
-#: is excluded by default rather than left to an operator to remember.
+#: auto-pick will happily choose it.  Whether that is a collapse or the whole
+#: point depends on the topology, so the decision lives in ``_answer_create``:
+#: excluded for two-window work, allowed for the in-session protocol -- which is
+#: defined as dev and review subagents inside one session identity and is the
+#: only shape a host without a second credentialed window can serve at all
+#: (``adapters/registry.py``: ``visible-sdd`` "is exactly the in-session
+#: dev/review-subagent protocol, which is what WorkBuddy can actually serve").
 HOST_SESSION_ENV = "CODEBUDDY_SESSION_ID"
 
 
@@ -465,10 +469,13 @@ def candidate_sessions(
     busy (``delivered: false``) and try the next, instead of collapsing a
     multi-node sweep onto the first window that happens to be occupied.
 
-    ``exclude`` is how the orchestrator keeps itself out of the pool: a task
-    delivered into the window that is running the monitor lands as a user turn
-    in that same conversation, which collapses the roles the whole dispatch
-    topology exists to keep apart.
+    ``exclude`` is how the caller keeps the supervisor's own window out of the
+    pool.  A task delivered into the window that is running the monitor lands
+    as a user turn in that same conversation, which is exactly wrong when the
+    topology wants two windows -- and exactly right for the in-session
+    protocol, where dev and review subagents are defined to share one session
+    identity.  So this function does not decide it: the caller passes the host
+    session id in ``exclude`` or does not, per ``_answer_create``.
     """
     skip = set(exclude) if exclude else set()
     live = [
@@ -1170,27 +1177,52 @@ class MailboxServicer:
             "binding": {"task_id": handle_id, "host": endpoint},
         }
 
+    def _reachable(self, session_id: str) -> bool:
+        """Whether the gateway that owns this window actually serves it.
+
+        ``discover_sessions`` can only vouch for the *process* being alive.  A
+        session whose registration carries no endpoint inherits the ``--serve``
+        gateway's, and that gateway serves exactly one conversation (measured),
+        so a borrowed endpoint may well belong to somebody else.  Answering
+        ``located`` or ``visible`` off liveness alone would then confirm a
+        binding that nothing can be delivered into -- a false green on the very
+        gate whose job is to keep undeliverable bindings out.  One cheap read
+        settles it for real, and every failure mode lands on the fail-closed
+        side of the answer.
+        """
+        try:
+            self.dispatch.history(session_id)
+        except SessionError:
+            return False
+        return True
+
     def _answer_locate(self, request: Mapping[str, Any]) -> Dict[str, Any]:
         thread_id = request.get("threadId") or request.get("task_id")
         if not isinstance(thread_id, str) or not thread_id:
             raise SessionError("locate request carries no thread identity")
         session_id = self._resolve_session(thread_id)
-        # Fail closed: a window that is gone cannot be located, and claiming
-        # otherwise would let a dead binding through the supervisor's gate.
-        located = any(
+        # Fail closed, and fail *honestly*, on two separate questions.  Listed:
+        # the registry still knows this window.  Reachable: the gateway that
+        # owns it actually serves it -- see ``_reachable``.  A borrowed
+        # endpoint answers the first without the second, and answering
+        # ``located`` off either alone would let an undeliverable binding
+        # through the supervisor's gate.
+        listed = any(
             item.get("session_id") == session_id and item.get("alive")
             for item in self.dispatch.sessions(refresh=True)
         )
-        return {"located": located, "threadId": thread_id}
+        return {
+            "located": listed and self._reachable(session_id),
+            "threadId": thread_id,
+        }
 
     def _answer_visibility(self, request: Mapping[str, Any]) -> Dict[str, Any]:
         targets = request.get("targets")
         if not isinstance(targets, list) or not targets:
             raise SessionError("visibility request carries no targets")
-        sessions = self.dispatch.sessions(refresh=True)
-        alive = {
+        listed = {
             str(item.get("session_id"))
-            for item in sessions
+            for item in self.dispatch.sessions(refresh=True)
             if item.get("alive")
         }
         results = []
@@ -1200,7 +1232,12 @@ class MailboxServicer:
                 continue
             thread_id = str(target.get("threadId") or target.get("task_id") or "")
             session_id = self._resolve_session(thread_id) if thread_id else ""
-            present = session_id in alive
+            # Being listed is only half of it -- see ``_reachable``.
+            present = (
+                bool(session_id)
+                and session_id in listed
+                and self._reachable(session_id)
+            )
             results.append({"visible": present, "direct_enter": present})
         # `provider_action.visibility` reads the top level, not the list.
         visible = all(item["visible"] for item in results)

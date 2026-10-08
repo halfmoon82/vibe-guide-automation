@@ -123,6 +123,18 @@ class EndpointJoinTests(unittest.TestCase):
         found = module.discover_sessions(root=self.root)
         self.assertEqual([item["session_id"] for item in found], [HOST])
 
+    def test_the_join_does_not_leak_another_projects_window_into_the_pool(self):
+        # Every endpoint-less session inherits the same gateway, so the cwd
+        # filter is the only thing keeping another project's conversation out
+        # of this project's dispatch pool.
+        self._conversation("1.json", cwd="/repo")
+        self._conversation("2.json", sid="9db3a805-9fb8-4ce1-87e5-2c64c104e4c4", cwd="/other")
+        self._gateway()
+        found = module.discover_sessions(root=self.root)
+        self.assertEqual(len(found), 2)  # both are discovered ...
+        picked = module.candidate_sessions(found, cwd="/repo")
+        self.assertEqual([item["session_id"] for item in picked], [HOST])  # ... one is chosen
+
 
 class _FakeDispatch:
     """The slice of ``SessionDispatch`` the create path actually uses."""
@@ -220,6 +232,85 @@ class HostConversationPolicyTests(unittest.TestCase):
         self.assertEqual(dispatch.handles, {})
 
 
+class ReachabilityTests(unittest.TestCase):
+    """A window is only "there" if the gateway that owns it serves it.
+
+    ``discover_sessions`` hands every endpoint-less session the same gateway,
+    and that gateway serves exactly one conversation.  So "the process is
+    alive and the file is listed" is not enough to confirm a binding: the
+    reviewer's finding was that ``locate`` / ``visibility`` answered off
+    liveness alone, which would have confirmed a window nothing can be
+    delivered into.
+    """
+
+    SERVED = "served-here"  # listed and reachable
+    ELSEWHERE = "listed-but-elsewhere"  # listed, but the gateway does not serve it
+    GHOST = "readable-but-not-listed"  # reads answer, yet nothing is registered
+
+    class _Stub(module.SessionDispatch):
+        def __init__(self):
+            super().__init__(token="t")
+
+        def sessions(self, refresh=False):
+            return [
+                {
+                    "pid": os.getpid(),
+                    "session_id": sid,
+                    "endpoint": GATEWAY,
+                    "cwd": "/repo",
+                    "alive": True,
+                }
+                for sid in (ReachabilityTests.ELSEWHERE, ReachabilityTests.SERVED)
+            ]
+
+        def history(self, session_id):
+            # The ghost is the interesting one: a stub that answers reads for
+            # anything would let "not listed at all" pass as located.
+            if session_id == ReachabilityTests.ELSEWHERE:
+                raise module.SessionError(
+                    "GET /history failed: HTTP 404 SESSION_NOT_FOUND"
+                )
+            return {"session_id": session_id, "requests": [], "count": 1}
+
+        def load_handle(self, handle_id):
+            return None
+
+    def _servicer(self):
+        return module.MailboxServicer(self._Stub())
+
+    def test_a_window_the_gateway_actually_serves_is_located(self):
+        payload = self._servicer()._answer_locate({"threadId": self.SERVED})
+        self.assertTrue(payload["located"])
+
+    def test_a_listed_window_the_gateway_does_not_serve_is_not_located(self):
+        payload = self._servicer()._answer_locate({"threadId": self.ELSEWHERE})
+        self.assertFalse(payload["located"])
+
+    def test_a_window_that_is_not_listed_is_not_located_even_if_reads_answer(self):
+        payload = self._servicer()._answer_locate({"threadId": self.GHOST})
+        self.assertFalse(payload["located"])
+
+    def test_visibility_does_not_confirm_an_unserved_window(self):
+        payload = self._servicer()._answer_visibility(
+            {"targets": [{"threadId": self.ELSEWHERE}]}
+        )
+        self.assertFalse(payload["visible"])
+        self.assertFalse(payload["direct_enter"])
+
+    def test_visibility_does_not_confirm_an_unlisted_window(self):
+        payload = self._servicer()._answer_visibility(
+            {"targets": [{"threadId": self.GHOST}]}
+        )
+        self.assertFalse(payload["visible"])
+
+    def test_visibility_confirms_a_served_window(self):
+        payload = self._servicer()._answer_visibility(
+            {"targets": [{"threadId": self.SERVED}]}
+        )
+        self.assertTrue(payload["visible"])
+        self.assertTrue(payload["direct_enter"])
+
+
 class _FakeResponse:
     def __init__(self, body):
         self._body = body
@@ -306,6 +397,93 @@ class CredentialRotationTests(unittest.TestCase):
         with mock.patch.object(module.urllib.request, "urlopen", self._urlopen("good")):
             with self.assertRaises(module.SessionError):
                 dispatch.history("sid")
+
+    @staticmethod
+    def _failing(error):
+        """A urlopen that always fails, plus the credentials it was offered."""
+        seen = []
+
+        def fake(request, timeout=None):
+            seen.append(request.get_header("Authorization"))
+            raise error(request)
+
+        return fake, seen
+
+    def _http(self, code):
+        def build(request):
+            return urllib.error.HTTPError(
+                request.full_url, code, "boom", {}, io.BytesIO(b"{}")
+            )
+
+        return build
+
+    def test_a_500_never_rotates_and_is_sent_once(self):
+        # Only 401 is decided before the gateway looks at the request, so only
+        # 401 may be retried.  Pinned because widening the check to `>= 400`
+        # used to leave every other test green.
+        self._patch("_scanned_tokens", lambda *a, **k: ["good"])
+        fake, seen = self._failing(self._http(500))
+        dispatch = self._Stub()
+        with mock.patch.object(module.urllib.request, "urlopen", fake):
+            with self.assertRaises(module.SessionError):
+                dispatch.history("sid")
+        self.assertEqual(seen, ["Bearer stale"])
+        self.assertEqual(dispatch._token, "stale")
+
+    def test_a_404_never_rotates(self):
+        self._patch("_scanned_tokens", lambda *a, **k: ["good"])
+        fake, seen = self._failing(self._http(404))
+        dispatch = self._Stub()
+        with mock.patch.object(module.urllib.request, "urlopen", fake):
+            with self.assertRaises(module.SessionError):
+                dispatch.history("sid")
+        self.assertEqual(seen, ["Bearer stale"])
+        self.assertEqual(dispatch._token, "stale")
+
+    def test_a_500_on_a_delivery_is_unknown_and_is_posted_once(self):
+        # The delivery path is where a second attempt would run the worker
+        # twice, so the number of POSTs is the thing worth pinning.
+        self._patch("_scanned_tokens", lambda *a, **k: ["good"])
+        fake, seen = self._failing(self._http(500))
+        dispatch = self._Stub()
+        with mock.patch.object(module.urllib.request, "urlopen", fake):
+            with self.assertRaises(module.DeliveryUnknown):
+                dispatch.deliver("sid", "hello")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(dispatch._token, "stale")
+
+    def test_a_lost_connection_is_unknown_and_is_not_retried(self):
+        self._patch("_scanned_tokens", lambda *a, **k: ["good"])
+        fake, seen = self._failing(lambda request: OSError("connection reset"))
+        dispatch = self._Stub()
+        with mock.patch.object(module.urllib.request, "urlopen", fake):
+            with self.assertRaises(module.DeliveryUnknown):
+                dispatch.deliver("sid", "hello")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(dispatch._token, "stale")
+
+    def test_a_refused_connection_is_provably_unsent(self):
+        # `reached=False` is the one case where retrying is safe, because the
+        # bytes never got as far as the gateway.  Distinguishing it from a lost
+        # reply is the whole point of `TransportError.reached`.
+        self._patch("_scanned_tokens", lambda *a, **k: ["good"])
+
+        def fake(request, timeout=None):
+            raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+        dispatch = self._Stub()
+        with mock.patch.object(module.urllib.request, "urlopen", fake):
+            with self.assertRaises(module.TransportError) as caught:
+                dispatch.deliver("sid", "hello")
+        self.assertFalse(caught.exception.reached)
+
+    def test_no_credential_at_all_is_refused_at_construction(self):
+        self._patch("_scanned_tokens", lambda *a, **k: [])
+        with mock.patch.dict(
+            os.environ, {module.TOKEN_ENV: "", "CODEBUDDY_GATEWAY_PASSWORD": ""}
+        ):
+            with self.assertRaises(module.SessionError):
+                module.SessionDispatch()
 
     def test_an_explicit_token_is_never_second_guessed(self):
         self._patch(
