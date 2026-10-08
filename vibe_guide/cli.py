@@ -42,6 +42,8 @@ from .supervisor import (
     supervisor_holds,
     heartbeat_prompt,
     supervisor_preflight,
+    HOST_SHIFT_DIFFERENCES,
+    SESSION_RECORD_HINT,
 )
 from .change_requests import ChangeRequest, classify_merge_capability
 from .deploy import authorize_deploy, plan_deploy, verify_deploy, start_deploy
@@ -1163,13 +1165,17 @@ def _first_shift_handoff(
         "  1) 登记地址：vibe supervisor-register --run-id {} "
         "--provider <平台> --session-id <本会话 id> --host <本机标识> "
         "--session-record <本会话记录路径>\n"
-        "     <本会话记录路径> 是本会话自己的日志文件（Codex 为 ~/.codex/sessions/…/rollout-…-<本会话 id>.jsonl，"
-        "Claude Code 为 ~/.claude/projects/<项目>/<本会话 id>.jsonl），不要另写记录文件。\n"
+        "     {}\n"
         "  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n"
         "{}\n"
         "没登记地址，worker 的完工唤醒信号无处可发；没心跳，rotate 的阈值检测不会发生。\n"
-        "宿主差异：Codex 桌面两条都能自动建；Claude Code 没有换班原语，心跳降级为兜底机制。"
-    ).format(run_id, heartbeat_prompt(plan_id, run_id))
+        "{}"
+    ).format(
+        run_id,
+        SESSION_RECORD_HINT,
+        heartbeat_prompt(plan_id, run_id),
+        HOST_SHIFT_DIFFERENCES,
+    )
 
 
 def render_v41_closeout_status(snapshot: RunSnapshot) -> str:

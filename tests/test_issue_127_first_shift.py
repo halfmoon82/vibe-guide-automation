@@ -116,6 +116,10 @@ class MonitorFirstShiftTests(unittest.TestCase):
         _root, started = self._start()
         self.assertIn("Codex", started.text)
         self.assertIn("Claude Code", started.text)
+        # WorkBuddy was missing from both copies of this list until 2026-10-08:
+        # its session log path and its lack of automatic shift primitives are
+        # the difference a shift on that host has to be told about.
+        self.assertIn("WorkBuddy", started.text)
 
     def test_snapshot_text_is_a_plain_string_not_a_tuple(self):
         """Review P2: the append touched this expression, so pin its shape.
