@@ -76,13 +76,74 @@ class FakeGateway:
         pass
 
 
+class WindowStub:
+    """The slice of ``SessionDispatch`` the jobs server reaches for."""
+
+    def __init__(
+        self, sessions, handles=None, deliver_state="accepted", count=0, reply=None
+    ):
+        self._sessions = sessions
+        self._handles = handles or {}
+        self._deliver_state = deliver_state
+        self._count = count
+        self._reply = reply
+        self.delivered = []
+        self.saved = []
+
+    def sessions(self, refresh=False):
+        return [dict(item) for item in self._sessions]
+
+    def load_handle(self, handle_id):
+        return self._handles.get(handle_id)
+
+    def history(self, session_id):
+        return {
+            "session_id": session_id,
+            "count": self._count,
+            "requests": [{}] * self._count,
+        }
+
+    def reply_after(self, session_id, start_index):
+        return self._reply
+
+    def deliver(self, session_id, text):
+        self.delivered.append((session_id, text))
+        return {"session_id": session_id, "state": self._deliver_state}
+
+    def save_handle(self, record):
+        self.saved.append(dict(record))
+
+
+def _live_window(session):
+    return {
+        "pid": os.getpid(),
+        "session_id": session,
+        "cwd": "/repo",
+        "endpoint": "http://127.0.0.1:1",
+        "alive": True,
+    }
+
+
 class DispatchContractTests(unittest.TestCase):
     def test_every_native_tool_the_monitor_names_exists_here(self):
         expected = {
             tool.split("__", 1)[1]
             for tool in NATIVE_TOOL_MAP[WORKBUDDY_VISIBLE_PROVIDER].values()
         }
-        self.assertEqual(expected, set(TOOL_NAMES))
+        # The five native names are a contract with the monitor and must all
+        # be there.  Session-side helpers (`sessions`, `serve`) are ours to
+        # add: the monitor never names them, but the session needs them.
+        self.assertTrue(expected.issubset(set(TOOL_NAMES)))
+
+    def test_native_tools_and_session_helpers_do_not_overlap_in_meaning(self):
+        # `serve` answers mailbox requests; it is not a native action and must
+        # never be reachable as one.
+        native = {
+            tool.split("__", 1)[1]
+            for tool in NATIVE_TOOL_MAP[WORKBUDDY_VISIBLE_PROVIDER].values()
+        }
+        self.assertNotIn("serve", native)
+        self.assertNotIn("sessions", native)
 
     def test_the_server_name_is_the_prefix_the_map_assumes(self):
         for tool in NATIVE_TOOL_MAP[WORKBUDDY_VISIBLE_PROVIDER].values():
@@ -281,6 +342,91 @@ class OperationMappingTests(unittest.TestCase):
     def test_get_unwraps_the_job_envelope(self):
         jobs, _ = self._jobs({("GET", "/api/v1/jobs/j1"): {"job": {"id": "j1", "state": "working"}}})
         self.assertEqual(jobs.get("j1"), {"id": "j1", "state": "working"})
+
+    def test_a_job_id_still_resolves_without_a_gateway_credential(self):
+        # Resolving a window handle goes through the dispatcher, and building
+        # the dispatcher needs a gateway credential.  On a host that has none,
+        # a plain job id must still read as a job instead of erroring -- the
+        # window backend is optional, the jobs backend is not.
+        jobs, _ = self._jobs(
+            {("GET", "/api/v1/jobs/j1"): {"job": {"id": "j1", "state": "working"}}}
+        )
+        no_credential = mock.PropertyMock(
+            side_effect=module._sessions.SessionError("no gateway credential")
+        )
+        with mock.patch.object(module.WorkBuddyJobs, "dispatch", no_credential):
+            self.assertEqual(jobs.get("j1"), {"id": "j1", "state": "working"})
+
+    def test_wait_on_a_window_we_never_dispatched_into_says_so(self):
+        # A live window has no baseline unless this session delivered a turn
+        # into it, so there is nothing to wait for.  Saying that beats the
+        # downstream "unknown session handle", which reads as a bad id.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = WindowStub(
+            [
+                {
+                    "pid": os.getpid(),
+                    "session_id": session,
+                    "cwd": "/repo",
+                    "endpoint": "http://127.0.0.1:1",
+                    "alive": True,
+                }
+            ]
+        )
+        jobs = WorkBuddyJobs(
+            gateway=FakeGateway(), sleeper=lambda _seconds: None, dispatch=dispatch
+        )
+        with self.assertRaises(ValueError) as caught:
+            jobs.wait(session, timeout_seconds=0.1)
+        self.assertIn("has no dispatch handle", str(caught.exception))
+
+    def test_create_into_a_window_that_refuses_is_not_reported_as_dispatched(self):
+        # A busy window answers `delivered: false`.  Reporting a handle for it
+        # would tell the monitor a worker is running when none is.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = WindowStub([_live_window(session)], deliver_state="refused")
+        jobs = WorkBuddyJobs(
+            gateway=FakeGateway(), sleeper=lambda _seconds: None, dispatch=dispatch
+        )
+        with self.assertRaises(ValueError) as caught:
+            jobs.create(prompt="work", session_id=session)
+        self.assertIn("did not accept the turn", str(caught.exception))
+        self.assertEqual(dispatch.saved, [])
+
+    def test_reply_into_a_window_that_refuses_is_not_reported_as_resumed(self):
+        # Same guard on the resume path: `resumed: true` would make the provider
+        # clear its pending action and treat the node as running again.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = WindowStub(
+            [_live_window(session)],
+            handles={"h1": {"id": "h1", "session_id": session, "baseline": 0}},
+            deliver_state="refused",
+        )
+        jobs = WorkBuddyJobs(
+            gateway=FakeGateway(), sleeper=lambda _seconds: None, dispatch=dispatch
+        )
+        with self.assertRaises(ValueError) as caught:
+            jobs.reply("h1", "continue")
+        self.assertIn("did not accept the turn", str(caught.exception))
+        self.assertEqual(dispatch.saved, [])
+
+    def test_a_window_without_a_baseline_never_reports_a_settled_reply(self):
+        # A handle synthesised from a bare session id has no baseline: this
+        # session never dispatched a turn into it, so any reply in the history
+        # belongs to somebody else's turn.  Reporting it as this job's output
+        # would hand the monitor the previous turn's answer as if it were the
+        # new one -- the cross-turn read this module exists to prevent.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = WindowStub(
+            [_live_window(session)], count=3, reply="SOMEONE ELSE'S TURN"
+        )
+        jobs = WorkBuddyJobs(
+            gateway=FakeGateway(), sleeper=lambda _seconds: None, dispatch=dispatch
+        )
+        state = jobs.get(session)
+        self.assertEqual(state["state"], "working")
+        self.assertFalse(state["settled"])
+        self.assertIsNone(state["output"])
 
     def test_list_asks_for_completed_jobs_only_when_requested(self):
         jobs, gateway = self._jobs({("GET", "/api/v1/jobs"): {"jobs": [{"id": "a", "cwd": "/x"}]},

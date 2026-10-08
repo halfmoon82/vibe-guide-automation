@@ -47,6 +47,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from . import workbuddy_sessions as _sessions
+
 SERVER_NAME = "workbuddy_job"
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_VERSION = "1.0.0"
@@ -456,11 +458,33 @@ class Gateway:
 
 
 class WorkBuddyJobs:
-    """The five native actions, in the shape the mailbox expects."""
+    """The native actions, in the shape the mailbox expects.
 
-    def __init__(self, gateway: Optional[Gateway] = None, sleeper: Callable[[float], None] = time.sleep) -> None:
+    Two backends sit behind ``create``.  ``bash: true`` runs a shell job
+    through the gateway's Jobs API, which measured fine.  Anything else is an
+    *agent* turn — and a spawned agent job can never obtain model credentials,
+    because the CLI deletes its credential-bootstrap variables at startup and
+    the bootstrap socket only answers inside the sidecar's own launch window
+    (see ``workbuddy_sessions``).  So agent turns are delivered into an
+    already-running window session, which holds credentials from its own
+    startup, instead of into a job that would hang forever.
+    """
+
+    def __init__(
+        self,
+        gateway: Optional[Gateway] = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        dispatch: Optional[_sessions.SessionDispatch] = None,
+    ) -> None:
         self.gateway = gateway or Gateway()
         self._sleep = sleeper
+        self._dispatch = dispatch
+
+    @property
+    def dispatch(self) -> _sessions.SessionDispatch:
+        if self._dispatch is None:
+            self._dispatch = _sessions.SessionDispatch()
+        return self._dispatch
 
     def create(
         self,
@@ -472,9 +496,16 @@ class WorkBuddyJobs:
         permission_mode: Optional[str] = None,
         bash: Optional[bool] = None,
         bg_isolation: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt is required")
+        # Window dispatch is opt-in.  It is the only path on which an agent
+        # turn actually runs, but it is also the only one that writes into a
+        # session the user can see, so it must be asked for — either by naming
+        # the window here or by going through `serve`.
+        if session_id:
+            return self._create_in_window(prompt, cwd=cwd, session_id=session_id)
         body: Dict[str, Any] = {"prompt": prompt}
         optional = {
             "cwd": cwd,
@@ -489,8 +520,132 @@ class WorkBuddyJobs:
         result = self.gateway.call("POST", "/api/v1/jobs", body)
         return result if isinstance(result, dict) else {"raw": result}
 
+    def _create_in_window(
+        self,
+        prompt: str,
+        cwd: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Deliver an agent turn into a live window session.
+
+        Credentials only exist inside sessions the sidecar itself started, so
+        this is the only path on which an agent turn actually runs.  Concurrency
+        is therefore bounded by the number of open windows, and each window
+        takes one turn at a time.
+        """
+        target = _sessions.pick_session(
+            self.dispatch.sessions(refresh=True), session_id=session_id, cwd=cwd
+        )
+        if target is None:
+            raise ValueError(
+                "no live WorkBuddy window to dispatch into; open one and retry"
+            )
+        chosen = str(target["session_id"])
+        endpoint = str(target["endpoint"])
+        baseline = self.dispatch.history(chosen)["count"]
+        state = self.dispatch.deliver(chosen, prompt).get("state")
+        if state != "accepted":
+            raise ValueError("window %s did not accept the turn (%s)" % (chosen, state))
+        # Unique per dispatch: a bare session prefix would let two turns into
+        # the same window overwrite each other's handle (and `task_id`).
+        handle_id = "%s-%s" % (chosen[:8], os.urandom(4).hex())
+        self.dispatch.save_handle(
+            {
+                "id": handle_id,
+                "session_id": chosen,
+                "endpoint": endpoint,
+                "baseline": baseline,
+                "cwd": target.get("cwd") or cwd,
+            }
+        )
+        # `binding` is what `runners/provider_action.create` reads: `task_id`
+        # is the provider-neutral identity, `host` the endpoint owning it.
+        return {
+            "id": handle_id,
+            "shortId": handle_id,
+            "sessionId": chosen,
+            "kind": "window-session",
+            "state": "working",
+            "detail": "delivered",
+            "alive": True,
+            "settled": False,
+            "cwd": target.get("cwd") or cwd,
+            "endpoint": endpoint,
+            "binding": {"task_id": handle_id, "host": endpoint},
+        }
+
+    def _window_handle(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Resolve an id to a window handle, or None when it is a job."""
+        try:
+            # Read through the dispatcher, not the module-level helper: the two
+            # differ whenever a handle root is overridden, and a reader that
+            # disagrees with the writer silently loses every handle.
+            handle = self.dispatch.load_handle(job_id)
+        except _sessions.SessionError:
+            # Building the dispatcher needs a gateway credential.  On a host
+            # without one a plain job id must still resolve -- and be reported
+            # as a job -- instead of turning every get/reply/wait into an error.
+            handle = _sessions.load_handle(job_id)
+        if isinstance(handle, dict) and handle.get("session_id"):
+            return handle
+        try:
+            sessions = self.dispatch.sessions(refresh=True)
+        except _sessions.SessionError:
+            return None
+        for item in sessions:
+            if item.get("session_id") == job_id:
+                # No baseline: we did not dispatch this turn, so we cannot know
+                # which reply belongs to it.  A ``None`` baseline keeps
+                # ``_window_state`` from reporting a settled "done" off the
+                # tail of an unrelated earlier turn.
+                return {
+                    # The full session id, not a prefix: nothing was written
+                    # under a shorter name, and an id that resolves to no
+                    # handle file only produces a confusing error later.
+                    "id": job_id,
+                    "session_id": job_id,
+                    "endpoint": item.get("endpoint"),
+                    "cwd": item.get("cwd"),
+                    "baseline": None,
+                }
+        return None
+
+    def _window_state(self, handle: Mapping[str, Any]) -> Dict[str, Any]:
+        session_id = str(handle["session_id"])
+        baseline = handle.get("baseline")
+        history = self.dispatch.history(session_id)
+        # A missing baseline means we did not dispatch this turn; we can only
+        # report liveness, never a settled reply.
+        known = isinstance(baseline, int) and not isinstance(baseline, bool)
+        advanced = known and history["count"] > int(baseline)
+        reply = (
+            self.dispatch.reply_after(session_id, int(baseline)) if advanced else None
+        )
+        done = advanced and reply is not None
+        return {
+            "id": handle.get("id"),
+            "shortId": handle.get("id"),
+            "sessionId": session_id,
+            "kind": "window-session",
+            "state": "done" if done else "working",
+            "detail": "reply" if done else "delivered",
+            "alive": True,
+            "settled": done,
+            "output": reply,
+            "cwd": handle.get("cwd"),
+            "endpoint": handle.get("endpoint"),
+            "located": True,
+            "binding": {
+                "task_id": handle.get("id") or session_id,
+                "host": handle.get("endpoint"),
+            },
+        }
+
     def get(self, job_id: str) -> Dict[str, Any]:
         job_id = _require_id(job_id)
+        handle = self._window_handle(job_id)
+        if handle is not None:
+            return self._window_state(handle)
         result = self.gateway.call("GET", "/api/v1/jobs/" + job_id)
         if isinstance(result, Mapping) and isinstance(result.get("job"), Mapping):
             return dict(result["job"])
@@ -513,6 +668,34 @@ class WorkBuddyJobs:
         job_id = _require_id(job_id)
         if not isinstance(text, str) or not text:
             raise ValueError("text is required")
+        # A window binding is resumed by delivering the follow-up turn into the
+        # window; only a real job goes through the Jobs API.  Without this the
+        # provider's `resume` (native tool `workbuddy_job__reply`) would post to
+        # a jobs path that has no such job and park the run forever.
+        handle = self._window_handle(job_id)
+        if handle is not None:
+            session_id = str(handle["session_id"])
+            baseline = self.dispatch.history(session_id)["count"]
+            state = self.dispatch.deliver(session_id, text).get("state")
+            if state != "accepted":
+                raise ValueError(
+                    "window %s did not accept the turn (%s)" % (session_id, state)
+                )
+            record = dict(handle)
+            record["baseline"] = baseline
+            record.setdefault("id", job_id)
+            self.dispatch.save_handle(record)
+            return {
+                "id": handle.get("id") or job_id,
+                "shortId": handle.get("id") or job_id,
+                "sessionId": session_id,
+                "kind": "window-session",
+                "state": "working",
+                "detail": "delivered",
+                "alive": True,
+                "settled": False,
+                "resumed": True,
+            }
         body: Dict[str, Any] = {"text": text}
         if bash is not None:
             body["bash"] = bash
@@ -526,6 +709,23 @@ class WorkBuddyJobs:
         poll_seconds: float = 2.0,
     ) -> Dict[str, Any]:
         job_id = _require_id(job_id)
+        handle = self._window_handle(job_id)
+        if handle is not None:
+            handle_id = str(handle.get("id") or job_id)
+            if self.dispatch.load_handle(handle_id) is None:
+                # A live window we never dispatched into has no baseline, so
+                # there is no turn to wait for.  Saying so beats a downstream
+                # "unknown session handle", which reads as a bad id.
+                raise ValueError(
+                    "window session %s has no dispatch handle: this session "
+                    "never delivered a turn into it, so there is nothing to "
+                    "wait on" % job_id
+                )
+            return self.dispatch.wait(
+                handle_id,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=poll_seconds,
+            )
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
         if poll_seconds <= 0:
@@ -540,6 +740,32 @@ class WorkBuddyJobs:
             if time.monotonic() >= deadline:
                 return dict(last, wait_timed_out=True, timeout_seconds=timeout_seconds)
             self._sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+
+    def sessions(self) -> Dict[str, Any]:
+        """List the live windows an agent turn can be dispatched into."""
+        found = self.dispatch.sessions(refresh=True)
+        return {"sessions": found, "count": len(found)}
+
+    def serve(
+        self,
+        project_dir: Optional[str] = None,
+        limit: Optional[int] = None,
+        exclude: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Answer vibe's pending provider-action requests.
+
+        ``create`` / ``locate`` / ``visibility`` have no in-package writer —
+        only ``wait`` is completed, and that by worker self-report.  On Codex
+        the desktop app services them; on WorkBuddy the session has to.
+        """
+        skip = None
+        if isinstance(exclude, str) and exclude.strip():
+            skip = [item.strip() for item in exclude.split(",") if item.strip()]
+        servicer = _sessions.MailboxServicer(self.dispatch, exclude=skip)
+        return servicer.serve(
+            project_dir=project_dir,
+            limit=int(limit) if limit is not None else 50,
+        )
 
     def close(self) -> None:
         self.gateway.close()
@@ -572,6 +798,7 @@ TOOL_DEFINITIONS: Tuple[Dict[str, Any], ...] = (
                 "permission_mode": {"type": "string", "description": "Permission mode for the job."},
                 "bash": {"type": "boolean", "description": "Run the prompt as a shell command instead of an agent turn."},
                 "bg_isolation": {"type": "string", "enum": ["none", "worktree"], "description": "Background write isolation."},
+                "session_id": {"type": "string", "description": "Deliver into this window session instead of auto-picking one. Agent turns never run as spawned jobs."},
             },
             "required": ["prompt"],
         },
@@ -634,16 +861,43 @@ TOOL_DEFINITIONS: Tuple[Dict[str, Any], ...] = (
             "required": ["job_id"],
         },
     },
+    {
+        "name": "sessions",
+        "description": (
+            "List the live WorkBuddy windows an agent turn can be dispatched into. "
+            "Agent jobs spawned through the Jobs API never obtain model credentials, "
+            "so windows are the only dispatch targets that actually run."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "serve",
+        "description": (
+            "Answer vibe's pending provider-action requests (create/locate/visibility) "
+            "for this project by dispatching into a live window and writing the result "
+            "back to the mailbox. `wait` is left to worker self-report."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_dir": {"type": "string", "description": "Project root holding .vibe/ (default: CODEBUDDY_PROJECT_DIR or cwd)."},
+                "limit": {"type": "integer", "description": "Maximum requests to handle in one pass (default 50)."},
+                "exclude": {"type": "string", "description": "Comma-separated session ids never to dispatch into — pass the orchestrator's own window so a task is not delivered back into the run that is supervising it."},
+            },
+        },
+    },
 )
 
 TOOL_NAMES: Tuple[str, ...] = tuple(tool["name"] for tool in TOOL_DEFINITIONS)
 
 _ARGUMENTS: Dict[str, Tuple[str, ...]] = {
-    "create": ("prompt", "cwd", "name", "agent", "model", "permission_mode", "bash", "bg_isolation"),
+    "create": ("prompt", "cwd", "name", "agent", "model", "permission_mode", "bash", "bg_isolation", "session_id"),
     "get": ("job_id",),
     "list": ("cwd", "include_all"),
     "reply": ("job_id", "text", "bash"),
     "wait": ("job_id", "timeout_seconds", "poll_seconds"),
+    "sessions": (),
+    "serve": ("project_dir", "limit", "exclude"),
 }
 
 #: The published schemas, keyed by tool name, so the runtime check and the
