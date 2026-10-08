@@ -354,16 +354,21 @@ def dispatch_topology_for_node(
     4. the conservative ``dual-visible`` default.  UNKNOWN evidence never
        yields ``visible-sdd``.
 
-    Rule 2 is load-bearing, not redundant with rule 3.  Measured on the
-    real fixture (2026-10-07): removing it makes the monitor dispatch the
-    closeout node with ``role=developer`` like any other node, and the
-    run-level ``integration_review_evidence`` package is only ever derived
-    from a *reviewer* acceptance claim (``monitor._derive_integration_acceptance``).
-    The closeout node then still ends up ``accepted``, but the run can never
-    reach ``complete`` -- it stalls on ``integration review evidence is
-    missing``.  With the rule in place the node is dispatched twice, once
-    through the ruling and once as a reviewer, and the second dispatch is
-    what closes the run out.
+    Rule 2 is load-bearing, not redundant with rule 3.  Removing it does not
+    change the role the closeout node is *first* dispatched with -- that is
+    ``developer`` either way.  It changes the *topology*: rule 3 then rules
+    the node ``visible-sdd``, and a ``visible-sdd`` delivery returns early
+    through ``Monitor._accept_visible_sdd_delivery`` (the
+    ``TOPOLOGY_VISIBLE_SDD`` branch taken after a node reports delivered),
+    which never dispatches a reviewer.  The run-level
+    ``integration_review_evidence`` package is only ever derived from a
+    *reviewer* acceptance claim (``Monitor._derive_integration_acceptance``,
+    recorded by ``Monitor._record_integration_review``), so it stays empty.
+    Measured on the real fixture (2026-10-07): the closeout node still ends
+    up ``accepted``, but the run can never reach ``complete`` -- it stalls on
+    ``integration review evidence is missing``.  With rule 2 in place the node
+    is ruled ``dual-visible``, delivered, and then dispatched a second time as
+    a reviewer, and that second dispatch is what closes the run out.
     """
     contract = node.contract if isinstance(node.contract, dict) else {}
     persisted = contract.get("dispatch_topology")
