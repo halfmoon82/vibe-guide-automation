@@ -504,3 +504,67 @@ monitor 不会点名它们，但不该因此判定契约破裂。
 
 workbuddy/session 相关 5 模块 **130 项全绿**；全量 1515 项仍为同一批既有环境性失败
 （`test_v310_packaging` / `test_v2_acceptance` / `test_skill_install_cli`），无新增回归。
+
+---
+
+## 11. 第五轮复审返工（2026-10-08）
+
+§10 的返工经**独立复审**，判定 **「需返工（小改）」**：P0=0，P1×1、P2×1。
+
+### 11.1 P1：`save_handle` 失败把 §10.1 的洞又开了一次（阻断）
+
+- **触发**：`_answer_create`（`:940`）与 `_answer_resume`（`:1052`）在投递已 `accepted`
+  **之后**调 `dispatch.save_handle`。它写的是 handle root（`~/.workbuddy-ai/session-handles`），
+  与投递标记目录（项目 `.vibe/provider-actions/delivering`）**不在同一个文件系统**。
+- **后果**：handle 写失败（磁盘满 / 权限 / 配额）抛 `OSError`，被 `serve()` 的
+  `except (SessionError, ValueError, OSError)` 吞下，而该分支**无条件 `_unlink(marker)`**
+  ——标记已立、POST 已入队，却把标记放了下来，请求留 pending。下一轮 sweep 无标记无结果
+  → 重投同一 prompt。
+- **这是 §10.1 的同一个洞**：那一轮我只把 `_record` 那条路径堵上，`save_handle` 这条并行
+  路径漏了，而且当时没有任何用例覆盖它。
+- **修法**：把「谁有权放下标记」收拢成一条规则——**只有能证明「什么都没发出去」的地方才
+  放标记**，也就是 `_deliver` 内部：显式拒绝、或请求尚未离开（窗口查不到 / 连接被拒）。
+  `serve()` 的通用 `except` 分支不再动标记。此后任何发生在 `accepted` **之后**的失败
+  （`save_handle` 也好、别的新增簿记也好）都自动落在「标记留、下一轮终态失败」这条路上，
+  不需要再逐条堵。
+
+### 11.2 P2：传输层失败一律算「未知」，代价过大
+
+- **问题**：§10.2 把**所有** POST 传输失败升为 `DeliveryUnknown`。但「连接被拒」时请求
+  **根本没发出去**，与「已入队但响应丢失」被混为一谈 → 节点永久失败。方向是 fail-closed
+  没错，但不触红线却付了过高的代价。
+- **修法**：新增 `TransportError(SessionError)`，带 `reached` 字段；`_may_have_reached()`
+  只把**两种可证明「没送到」**的情形判为 `False`——连接被拒（`ConnectionRefusedError`）、
+  主机解析不了（`socket.gaierror`，含 `URLError` 里嵌套的 reason）。这两种降回普通错误，
+  可以安全重试；超时、连接重置等一律仍算「未知」，绝不重试。
+
+### 11.3 P3
+
+- `serve()` 在结果已存在时 `continue`，遗留的 `delivering` 标记永不清理。改为在**结果已
+  存在**这一处清掉——那是唯一能证明「回合已被记账」的地方。
+- `_window_handle` 对裸 session id 合成 `id=job_id[:8]`，`wait` 据此查 handle 文件必落空，
+  报「unknown session handle」——读起来像是 id 传错了。改为用完整 session id，并在 `wait`
+  里明确回答「这个窗口没有派发 handle，本会话没往里投过 turn，没有可等的东西」。
+
+### 11.4 测试与变异检验
+
+`tests/test_workbuddy_sessions.py` 42 → **47 项**，`tests/test_workbuddy_jobs_mcp.py` 52 → **53 项**。
+
+新增用例：投递后绑定失败不得重投、请求未发出时标记必须放下（否则好请求被误判终态失败）、
+结果已存在时清理陈旧标记、被拒连接不算丢失答复、只有被拒/解析失败算「没送到」、
+裸 session id 的 `wait` 要说实话。
+
+变异检验（四条，各自单独验，避免互相掩盖）：
+
+| 变异 | 被抓到的用例 |
+|---|---|
+| 通用 `except` 分支重新去清标记 | `test_a_bind_failure_after_delivery_is_not_delivered_again` |
+| `_deliver` 不再为「未发出」放下标记 | `test_a_window_that_vanishes_before_the_post_may_retry` |
+| `_may_have_reached` 恒为 `True` | `test_only_a_refusal_or_a_dead_host_counts_as_never_sent` |
+| 不清理陈旧标记 | `test_a_stale_marker_next_to_an_answer_is_cleared` |
+
+> 变异 1 与变异 2 会**互相掩盖**（通用分支的清标记把 `_deliver` 的缺失补上了），所以两条
+> 必须分开验——这本身说明「谁有权放标记」此前是散在两处的隐式约定，§11.1 的收拢修法正是
+> 为了消掉这个耦合。
+
+workbuddy/session 相关 5 模块 **135 项全绿**。

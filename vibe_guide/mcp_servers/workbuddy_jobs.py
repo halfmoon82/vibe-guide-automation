@@ -599,7 +599,10 @@ class WorkBuddyJobs:
                 # ``_window_state`` from reporting a settled "done" off the
                 # tail of an unrelated earlier turn.
                 return {
-                    "id": job_id[:8],
+                    # The full session id, not a prefix: nothing was written
+                    # under a shorter name, and an id that resolves to no
+                    # handle file only produces a confusing error later.
+                    "id": job_id,
                     "session_id": job_id,
                     "endpoint": item.get("endpoint"),
                     "cwd": item.get("cwd"),
@@ -708,8 +711,18 @@ class WorkBuddyJobs:
         job_id = _require_id(job_id)
         handle = self._window_handle(job_id)
         if handle is not None:
+            handle_id = str(handle.get("id") or job_id)
+            if self.dispatch.load_handle(handle_id) is None:
+                # A live window we never dispatched into has no baseline, so
+                # there is no turn to wait for.  Saying so beats a downstream
+                # "unknown session handle", which reads as a bad id.
+                raise ValueError(
+                    "window session %s has no dispatch handle: this session "
+                    "never delivered a turn into it, so there is nothing to "
+                    "wait on" % job_id
+                )
             return self.dispatch.wait(
-                str(handle.get("id") or job_id),
+                handle_id,
                 timeout_seconds=timeout_seconds,
                 poll_seconds=poll_seconds,
             )

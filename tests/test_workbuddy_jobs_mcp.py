@@ -76,6 +76,20 @@ class FakeGateway:
         pass
 
 
+class WindowStub:
+    """The slice of ``SessionDispatch`` the jobs server reaches for."""
+
+    def __init__(self, sessions, handles=None):
+        self._sessions = sessions
+        self._handles = handles or {}
+
+    def sessions(self, refresh=False):
+        return [dict(item) for item in self._sessions]
+
+    def load_handle(self, handle_id):
+        return self._handles.get(handle_id)
+
+
 class DispatchContractTests(unittest.TestCase):
     def test_every_native_tool_the_monitor_names_exists_here(self):
         expected = {
@@ -308,6 +322,29 @@ class OperationMappingTests(unittest.TestCase):
         )
         with mock.patch.object(module.WorkBuddyJobs, "dispatch", no_credential):
             self.assertEqual(jobs.get("j1"), {"id": "j1", "state": "working"})
+
+    def test_wait_on_a_window_we_never_dispatched_into_says_so(self):
+        # A live window has no baseline unless this session delivered a turn
+        # into it, so there is nothing to wait for.  Saying that beats the
+        # downstream "unknown session handle", which reads as a bad id.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = WindowStub(
+            [
+                {
+                    "pid": os.getpid(),
+                    "session_id": session,
+                    "cwd": "/repo",
+                    "endpoint": "http://127.0.0.1:1",
+                    "alive": True,
+                }
+            ]
+        )
+        jobs = WorkBuddyJobs(
+            gateway=FakeGateway(), sleeper=lambda _seconds: None, dispatch=dispatch
+        )
+        with self.assertRaises(ValueError) as caught:
+            jobs.wait(session, timeout_seconds=0.1)
+        self.assertIn("has no dispatch handle", str(caught.exception))
 
     def test_list_asks_for_completed_jobs_only_when_requested(self):
         jobs, gateway = self._jobs({("GET", "/api/v1/jobs"): {"jobs": [{"id": "a", "cwd": "/x"}]},

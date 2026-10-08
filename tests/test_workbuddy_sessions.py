@@ -219,6 +219,7 @@ class FakeDispatch:
         refuse=None,
         unknown=None,
         lose_reply=None,
+        vanish=None,
     ):
         self._sessions = sessions
         self._replies = replies or {}
@@ -235,6 +236,9 @@ class FakeDispatch:
         #: may have been queued before the answer was lost, so these are
         #: ``unknown`` too -- never a refusal, never retried.
         self.lose_reply = set(lose_reply or ())
+        #: Session ids that are gone by the time we look up their endpoint, so
+        #: the POST never leaves.  A plain error, not an unknown outcome.
+        self.vanish = set(vanish or ())
         self.delivered = []
         self.handles = {}
 
@@ -253,6 +257,8 @@ class FakeDispatch:
 
     def deliver(self, session_id, text):
         self.delivered.append((session_id, text))
+        if session_id in self.vanish:
+            raise module.SessionError("no live window session %s" % session_id)
         if session_id in self.lose_reply:
             raise module.DeliveryUnknown(
                 "the reply to window %s was lost in transit" % session_id
@@ -681,6 +687,81 @@ class MailboxTests(unittest.TestCase):
         self.assertEqual(dispatch.delivered, [(first, "work")])
         self.assertTrue(marker.exists())
 
+    def test_a_bind_failure_after_delivery_is_not_delivered_again(self):
+        # The turn is already queued by the time the handle write fails, and the
+        # handle lives on a different filesystem from the marker.  That failure
+        # must not lower the marker, or the next sweep sends the same prompt a
+        # second time -- the same defect the terminal-write guard closes.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = FakeDispatch(
+            [{"pid": 5, "session_id": session, "cwd": str(self.project),
+              "endpoint": "http://127.0.0.1:1", "alive": True}]
+        )
+        self._request("action-25", "create", {"prompt": "work"})
+
+        def unwritable(record):
+            raise OSError("handle root is read-only")
+
+        dispatch.save_handle = unwritable
+        servicer = module.MailboxServicer(dispatch)
+        first = servicer.serve(project_dir=str(self.project))
+        self.assertEqual(dispatch.delivered, [(session, "work")])
+        self.assertEqual(first["served"], [])
+        marker = self.mailbox / "delivering" / "action-25.json"
+        self.assertTrue(marker.exists())
+        # Second sweep: the marker stands, so the prompt is not sent again, and
+        # the request is answered terminally instead of staying pending.
+        second = servicer.serve(project_dir=str(self.project))
+        self.assertEqual(dispatch.delivered, [(session, "work")])
+        self.assertEqual([item["action_id"] for item in second["failed"]], ["action-25"])
+        self.assertTrue(self._result("action-25")["payload"]["failed"])
+        self.assertFalse(marker.exists())
+
+    def test_a_window_that_vanishes_before_the_post_may_retry(self):
+        # Nothing was sent, so the marker must come down: leaving it up would
+        # fail the action terminally over a window that merely went away.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = FakeDispatch(
+            [{"pid": 5, "session_id": session, "cwd": str(self.project),
+              "endpoint": "http://127.0.0.1:1", "alive": True}],
+            vanish={session},
+        )
+        self._request("action-26", "create", {"prompt": "work"})
+        servicer = module.MailboxServicer(dispatch)
+        outcome = servicer.serve(project_dir=str(self.project))
+        self.assertEqual([item["action_id"] for item in outcome["skipped"]], ["action-26"])
+        self.assertFalse((self.mailbox / "delivering" / "action-26.json").exists())
+        self.assertIsNone(self._result("action-26"))
+
+    def test_a_stale_marker_next_to_an_answer_is_cleared(self):
+        # Once a result exists the request is settled, so a marker left beside
+        # it is litter rather than evidence -- and litter that would otherwise
+        # never be collected.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = FakeDispatch(
+            [{"pid": 5, "session_id": session, "cwd": str(self.project),
+              "endpoint": "http://127.0.0.1:1", "alive": True}]
+        )
+        self._request("action-27", "create", {"prompt": "work"})
+        answered = {
+            "schema_version": 1,
+            "action_id": "action-27",
+            "request_digest": "d1",
+            "payload": {"sessionId": session, "binding": {"task_id": "t"}},
+        }
+        (self.mailbox / "results" / "action-27.json").write_text(
+            json.dumps(answered), encoding="utf-8"
+        )
+        marker = self.mailbox / "delivering" / "action-27.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{}", encoding="utf-8")
+        outcome = module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
+        self.assertEqual(outcome["served"], [])
+        self.assertEqual(dispatch.delivered, [])
+        # The answer was left exactly as it was, and the marker is gone.
+        self.assertEqual(self._result("action-27"), answered)
+        self.assertFalse(marker.exists())
+
     def test_a_window_that_dies_mid_sweep_does_not_abandon_the_action(self):
         # ``history`` failing on one candidate is a reason to try the next one,
         # not to leave the whole action unanswered.
@@ -786,10 +867,35 @@ class DeliverOutcomeTests(unittest.TestCase):
         # and been queued before its answer was lost.  Reading that as a
         # refusal is what lets the caller rotate and run the task twice.
         dispatch = self._dispatch(
-            None, error=module.SessionError("POST /reply failed: timed out")
+            None,
+            error=module.TransportError("POST /reply failed: timed out", reached=True),
         )
         with self.assertRaises(module.DeliveryUnknown):
             dispatch.deliver(self.SESSION, "work")
+
+    def test_a_refused_connection_is_not_a_lost_reply(self):
+        # A connection the gateway never accepted means nothing was sent, so
+        # the caller may retry later.  Failing the node over a gateway that is
+        # not listening would be a false alarm, not fail-closed.
+        dispatch = self._dispatch(
+            None,
+            error=module.TransportError("POST /reply failed: refused", reached=False),
+        )
+        with self.assertRaises(module.SessionError) as caught:
+            dispatch.deliver(self.SESSION, "work")
+        self.assertNotIsInstance(caught.exception, module.DeliveryUnknown)
+
+    def test_only_a_refusal_or_a_dead_host_counts_as_never_sent(self):
+        self.assertFalse(module._may_have_reached(ConnectionRefusedError()))
+        self.assertFalse(module._may_have_reached(module.socket.gaierror()))
+        # What urllib actually hands over: the real reason is nested.
+        self.assertFalse(
+            module._may_have_reached(
+                module.urllib.error.URLError(ConnectionRefusedError())
+            )
+        )
+        self.assertTrue(module._may_have_reached(TimeoutError()))
+        self.assertTrue(module._may_have_reached(ConnectionResetError()))
 
     def test_a_window_that_is_gone_is_not_a_lost_reply(self):
         # No endpoint means nothing was sent, so the caller may retry later:

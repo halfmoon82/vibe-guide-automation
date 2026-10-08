@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import subprocess
 import time
 import urllib.error
@@ -92,11 +93,37 @@ class DeliveryUnknown(SessionError):
     means the turn never left us -- no window, an explicit refusal, a rejected
     request -- so the mailbox request may safely stay pending for the next
     sweep.  This one means the gateway answered in a shape we cannot read
-    (empty body, missing or non-boolean ``delivered``): the turn may already be
-    queued, so retrying it on another window runs the task twice.  The servicer
-    answers it with a terminal negative result instead of leaving the request
-    pending, which is the only way to stop the retry without lying about it.
+    (empty body, missing or non-boolean ``delivered``) or died mid-request: the
+    turn may already be queued, so retrying it runs the task twice.  The
+    servicer answers it with a terminal negative result instead of leaving the
+    request pending, which is the only way to stop the retry without lying.
     """
+
+
+class TransportError(SessionError):
+    """A request never got an answer from the gateway.
+
+    ``reached`` records whether the bytes could have arrived.  A refused
+    connection or a host that does not resolve provably never got as far as the
+    gateway, so the caller may retry safely; a timeout or a reset connection
+    may have been served before its answer was lost, so it must not be retried.
+    """
+
+    def __init__(self, message: str, reached: bool = True) -> None:
+        super().__init__(message)
+        self.reached = reached
+
+
+def _may_have_reached(error: BaseException) -> bool:
+    """Whether a failed request could still have arrived at the gateway.
+
+    Only the two provable cases count as "never sent": the connection was
+    refused, or the host did not resolve.  Everything else -- a timeout, a
+    reset, a truncated read -- may have been served before its answer was lost,
+    so it has to be treated as ambiguous.
+    """
+    reason = getattr(error, "reason", error)
+    return not isinstance(reason, (ConnectionRefusedError, socket.gaierror))
 
 
 #: The host's own session id.  The supervisor normally runs *inside* the very
@@ -445,7 +472,10 @@ class SessionDispatch:
                 % (method, path, error.code, (" " + detail) if detail else "")
             ) from error
         except (urllib.error.URLError, OSError, ValueError) as error:
-            raise SessionError("%s %s failed: %s" % (method, path, error)) from error
+            raise TransportError(
+                "%s %s failed: %s" % (method, path, error),
+                reached=_may_have_reached(error),
+            ) from error
         if not raw:
             return {}
         try:
@@ -499,9 +529,22 @@ class SessionDispatch:
                 method="POST",
                 body={"text": text},
             )
-        except SessionError as error:
+        except TransportError as error:
+            if not error.reached:
+                # A refused connection never got as far as the gateway, so the
+                # turn was definitely not queued and retrying is safe.  Failing
+                # the node over a gateway that is not listening would be a
+                # false alarm.
+                raise
             raise DeliveryUnknown(
                 "the reply to window %s was lost in transit: %s"
+                % (session_id, error)
+            ) from error
+        except SessionError as error:
+            # The gateway answered with an error status.  Whether it queued the
+            # turn before failing is unknowable, so this is not a refusal.
+            raise DeliveryUnknown(
+                "window %s answered the delivery with an error: %s"
                 % (session_id, error)
             ) from error
         flag = data.get("delivered") if isinstance(data, Mapping) else None
@@ -682,13 +725,17 @@ class MailboxServicer:
                 if len(served) + len(skipped) + len(failed) >= limit:
                     break
                 action_id = path.stem
+                marker = marker_dir / path.name
                 if (result_dir / path.name).exists():
+                    # Answered already, so any marker left over is stale -- but
+                    # only clear it here, where a result proves the turn was
+                    # accounted for.
+                    _unlink(marker)
                     continue
                 action = _load_json(path)
                 if action is None:
                     skipped.append({"action_id": action_id, "reason": "unreadable"})
                     continue
-                marker = marker_dir / path.name
                 if marker.exists():
                     # A previous sweep raised this marker and never took it
                     # down: it crashed, or the result write failed, between
@@ -723,13 +770,16 @@ class MailboxServicer:
                     failed.append({"action_id": action_id, "reason": str(error)})
                     continue
                 except (SessionError, ValueError, OSError) as error:
-                    # Nothing was queued, so the request may stay pending and
-                    # this sweep moves on; the next one will try again.
-                    _unlink(marker)
+                    # ``_deliver`` has already decided whether anything was
+                    # queued, and lowered the marker only when it proved nothing
+                    # was.  An error raised *after* an accepted delivery -- a
+                    # failed ``save_handle``, say -- leaves the marker up, and
+                    # the next sweep answers this request terminally instead of
+                    # sending the prompt a second time.  Clearing it here would
+                    # undo exactly that.
                     skipped.append({"action_id": action_id, "reason": str(error)})
                     continue
                 if payload is None:
-                    _unlink(marker)
                     skipped.append(
                         {"action_id": action_id, "reason": "unsupported operation"}
                     )
@@ -812,14 +862,27 @@ class MailboxServicer:
     ) -> Dict[str, Any]:
         """Deliver one turn, holding a marker until we know nothing was queued.
 
-        The marker goes up before the POST and comes down only on an explicit
-        refusal -- the one answer that proves the turn was not queued.  A crash
-        or a failed result write therefore leaves it up, and the next sweep
-        fails the action closed instead of delivering the same prompt twice.
+        The marker goes up before the POST and comes down only when something
+        proves the turn was not queued -- an explicit refusal, or an error that
+        happened before the request left.  A crash, a lost reply or a failed
+        result write all leave it up, and the next sweep fails the action closed
+        instead of delivering the same prompt twice.
         """
         if marker is not None:
             _write_json(marker, {"session_id": session_id, "at": time.time()})
-        outcome = self.dispatch.deliver(session_id, text)
+        try:
+            outcome = self.dispatch.deliver(session_id, text)
+        except DeliveryUnknown:
+            # The turn may already be queued, and the marker is the only record
+            # of that.  It must survive for the next sweep to fail closed.
+            raise
+        except SessionError:
+            # ``deliver`` raises a plain error only before the request is sent:
+            # a window that is gone, or a connection that was refused.  Nothing
+            # was queued, so the marker comes down and the request may retry.
+            if marker is not None:
+                _unlink(marker)
+            raise
         if marker is not None and outcome.get("state") == "refused":
             _unlink(marker)
         return outcome
