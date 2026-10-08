@@ -82,7 +82,20 @@ class DispatchContractTests(unittest.TestCase):
             tool.split("__", 1)[1]
             for tool in NATIVE_TOOL_MAP[WORKBUDDY_VISIBLE_PROVIDER].values()
         }
-        self.assertEqual(expected, set(TOOL_NAMES))
+        # The five native names are a contract with the monitor and must all
+        # be there.  Session-side helpers (`sessions`, `serve`) are ours to
+        # add: the monitor never names them, but the session needs them.
+        self.assertTrue(expected.issubset(set(TOOL_NAMES)))
+
+    def test_native_tools_and_session_helpers_do_not_overlap_in_meaning(self):
+        # `serve` answers mailbox requests; it is not a native action and must
+        # never be reachable as one.
+        native = {
+            tool.split("__", 1)[1]
+            for tool in NATIVE_TOOL_MAP[WORKBUDDY_VISIBLE_PROVIDER].values()
+        }
+        self.assertNotIn("serve", native)
+        self.assertNotIn("sessions", native)
 
     def test_the_server_name_is_the_prefix_the_map_assumes(self):
         for tool in NATIVE_TOOL_MAP[WORKBUDDY_VISIBLE_PROVIDER].values():
