@@ -38,6 +38,21 @@ git diff <ref>...<ref>    # 看分支间差异
 
 ## 2.5 审查方法论（review 子代理必读）
 
+**第 0 步：覆盖面（先于三步法）**。三步法管的是「单条意见站不站得住」，管不了「有没有看全」——
+一个只审了 3 个文件、每条意见都无懈可击的 review，与审完全部 14 个文件的 review，在意见质量上无法区分。
+所以审查开始前必须先取得**确定性文件全集**：
+
+```bash
+ocr delegate preview --commit <sha>             # 单提交
+ocr delegate preview --from <base> --to <head>  # 分支范围
+```
+
+该命令由确定性工程（而非模型）选出可审查文件并按规则排除测试/生成物。对清单**逐文件**给出处置：
+审了，或跳过并写明理由（如「生成代码」「纯文档」「规则排除」）。清单拿不到时（工具不可用、
+范围不是 git 变更），在交付里显式声明 `coverage.mode = "none"` 并写明理由——**豁免的是工具，
+不是交代范围的义务**。交付时必须回报覆盖面（见第 5 节 `coverage` 字段），监工校验
+`listed = reviewed + 跳过数` 是否自洽。
+
 review 子代理产出意见前，每条候选意见必须走完「约定 → 可行执行 → 反驳」三步，
 未完成反驳的陈述只是候选，不是 finding：
 
@@ -99,6 +114,12 @@ fail-closed，不可重报。
      "protocol": "vibe_guide/protocols/visible-sdd-worker.md",
      "evidence_ref": "<本轮审查证据的非空引用，如 会话#轮次>",
      "clearance": {"p0": 0, "p1": 0, "p2": 0},
+     "coverage": {
+       "mode": "ocr",
+       "listed": 14,
+       "reviewed": 13,
+       "skipped": [{"file": "backend/.../FooMapper.xml", "reason": "纯 XML 映射，无逻辑"}]
+     },
      "environment_facts_ref": "none",
      "blocked_unknowns": []
    }
@@ -108,6 +129,15 @@ fail-closed，不可重报。
      等于这次交付没有经过本协议规定的会话内审查；
    - `clearance` 三个键都必须是整数 `0`（布尔不算）——P0–P2 未清零就返工，不要交付；
    - `evidence_ref` 必须是非空字符串，指向第 3 节写入交付记录的那轮审查结论。
+   - `coverage`：**必需字段**，本轮审查的覆盖面分母，来自第 2.5 节第 0 步的确定性文件清单。
+     - `mode: "ocr"`：`listed`（清单文件数，非负整数）、`reviewed`（实际审查数，非负整数）、
+       `skipped`（数组，逐项 `{"file": <非空>, "reason": <非空>}`）。监工校验
+       `listed == reviewed + len(skipped)`；不等、类型不对或 `skipped` 条目缺理由，一律
+       `acceptance_rejected`（可修正重报）。
+     - `mode: "none"`：未取得确定性清单时使用，必须带非空 `reason`。**这是显式豁免，不是省略字段**——
+       字段缺失一律拒收，豁免的是工具而不是交代范围的义务。
+     - 反面判据：`listed` 只写 `reviewed` 的数字（把分母当分子）会让校验直接不通过；覆盖面不完整
+       而靠调低 `listed` 绕过，等于把「漏审」写成「没这些文件」，属于伪造证据。
    - `environment_facts_ref`：字符串，指向派发提示中「环境事实与已知缺陷」一节对应的内容来源，监工门校验其存在；合同无环境事实声明时填 `"none"`，不得留空或省略字段。
    - `blocked_unknowns`：可空数组，缺省视为空；**非空时监工不得直接 acceptance**，必须产生一条人工/监工处置事件（逐项：已确认无虞 / 已转 P0–P2 返工 / 已补环境事实后复审）后方可继续。
 

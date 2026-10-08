@@ -39,6 +39,7 @@ def _good_review():
         "protocol": VISIBLE_SDD_PROTOCOL_REF,
         "evidence_ref": EVIDENCE_REF,
         "clearance": {"p0": 0, "p1": 0, "p2": 0},
+        "coverage": {"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": []},
         "environment_facts_ref": "none",
     }
 

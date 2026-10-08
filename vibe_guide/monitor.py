@@ -4521,6 +4521,20 @@ class Monitor:
                 "visible-sdd in-session review environment_facts_ref must be a non-empty string",
                 True,
             )
+        # Coverage denominator (protocol section 2.5 step 0): the review must
+        # state how many of the reviewable files it actually covered.  Without
+        # a denominator a review that silently skipped half the changeset is
+        # indistinguishable from an exhaustive one -- the clearance numbers
+        # only count findings, never coverage.  The field is therefore
+        # mandatory and its arithmetic is checked here instead of being
+        # trusted from prose.  ``mode: "none"`` is the explicit waiver path:
+        # it must carry a reason, so "did not obtain the list" is an auditable
+        # fact rather than a missing key.
+        coverage_failure = self._validate_visible_sdd_coverage(
+            review.get("coverage") if isinstance(review, dict) else None
+        )
+        if coverage_failure is not None:
+            return coverage_failure, True
         # ISSUE-02: the acceptance evidence is bound to the node contract it
         # reviewed.  The carried digest is the dispatch-time node digest and
         # must still equal the digest recomputed from the live contract; an
@@ -4534,6 +4548,78 @@ class Monitor:
             return (
                 "visible-sdd acceptance refused: contract digest does not match the live node contract",
                 False,
+            )
+        return None
+
+    @staticmethod
+    def _validate_visible_sdd_coverage(coverage: Any) -> Optional[str]:
+        """Validate the review's coverage denominator; ``None`` when acceptable.
+
+        The shipped protocol (visible-sdd-worker.md section 2.5 step 0)
+        requires the reviewer to obtain the deterministic reviewable-file list
+        (``ocr delegate preview``) and to account for every entry -- reviewed,
+        or skipped with a stated reason.  A review that never states its
+        denominator cannot be told apart from one that silently skipped files,
+        so ``coverage`` is a required field and its arithmetic must add up.
+
+        ``mode: "none"`` is the waiver path: it makes "no deterministic list
+        was obtained" a visible, reasoned fact instead of an absent key.  The
+        waiver covers the *tool*, never the obligation to account for scope.
+
+        Every branch returns a recoverable format error: the same worker
+        session can correct the payload and re-report on its live handle.
+        """
+        if not isinstance(coverage, dict):
+            return (
+                "visible-sdd in-session review coverage must be an object "
+                '({"mode": "ocr", "listed": N, "reviewed": M, "skipped": [...]} '
+                'or {"mode": "none", "reason": "..."})'
+            )
+        mode = coverage.get("mode")
+        if mode == "none":
+            reason = coverage.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                return (
+                    'visible-sdd in-session review coverage mode "none" requires '
+                    "a non-empty reason"
+                )
+            return None
+        if mode != "ocr":
+            return (
+                'visible-sdd in-session review coverage mode must be "ocr" or "none"'
+            )
+        listed = coverage.get("listed")
+        reviewed = coverage.get("reviewed")
+        for field_name, value in (("listed", listed), ("reviewed", reviewed)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                return (
+                    "visible-sdd in-session review coverage {} must be a "
+                    "non-negative integer".format(field_name)
+                )
+        skipped = coverage.get("skipped")
+        if not isinstance(skipped, list):
+            return (
+                "visible-sdd in-session review coverage skipped must be a list "
+                'of {"file", "reason"} objects'
+            )
+        for item in skipped:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("file"), str)
+                or not item.get("file", "").strip()
+                or not isinstance(item.get("reason"), str)
+                or not item.get("reason", "").strip()
+            ):
+                return (
+                    "visible-sdd in-session review coverage skipped entries must "
+                    'each carry non-empty "file" and "reason" strings'
+                )
+        if listed != reviewed + len(skipped):
+            return (
+                "visible-sdd in-session review coverage does not add up: "
+                "listed {} != reviewed {} + skipped {}".format(
+                    listed, reviewed, len(skipped)
+                )
             )
         return None
 
