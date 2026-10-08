@@ -4568,7 +4568,20 @@ class Monitor:
 
         Every branch returns a recoverable format error: the same worker
         session can correct the payload and re-report on its live handle.
+
+        Known ceiling: ``coverage`` is self-reported.  This validator checks
+        types and internal arithmetic only -- it never cross-checks ``listed``
+        against the real changeset or against the ``ocr delegate preview``
+        output, so a reviewer can still pass by declaring a *smaller*
+        changeset.  The protocol names that as fabrication (section 5); closing
+        it mechanically would need a ground truth this layer does not have.
+        ``CoverageDenominatorTests`` pins the accepted case, so adding the
+        cross-check later has to be a conscious change rather than a silent one.
         """
+        # ponytail: coverage 是自报字段，这里只校验类型与算术自洽
+        # （listed == reviewed + len(skipped)），不核对真实 git 变更集或
+        # preview 输出；需要机械证伪时，改为要求 coverage 附带 preview 输出的
+        # 确定性摘要（文件数/内容哈希）并与监工侧可复算的量比对。
         if not isinstance(coverage, dict):
             return (
                 "visible-sdd in-session review coverage must be an object "
@@ -4602,6 +4615,7 @@ class Monitor:
                 "visible-sdd in-session review coverage skipped must be a list "
                 'of {"file", "reason"} objects'
             )
+        seen_files = set()
         for item in skipped:
             if (
                 not isinstance(item, dict)
@@ -4614,6 +4628,16 @@ class Monitor:
                     "visible-sdd in-session review coverage skipped entries must "
                     'each carry non-empty "file" and "reason" strings'
                 )
+            # ``len(skipped)`` is an addend of the denominator, so duplicate
+            # entries would inflate it for free and turn "per-file
+            # disposition" back into "count the entries".
+            name = item["file"].strip()
+            if name in seen_files:
+                return (
+                    "visible-sdd in-session review coverage skipped lists {} "
+                    "more than once; account for each file once".format(name)
+                )
+            seen_files.add(name)
         if listed != reviewed + len(skipped):
             return (
                 "visible-sdd in-session review coverage does not add up: "

@@ -133,7 +133,8 @@ fail-closed，不可重报。
      - `mode: "ocr"`：`listed`（清单文件数，非负整数）、`reviewed`（实际审查数，非负整数）、
        `skipped`（数组，逐项 `{"file": <非空>, "reason": <非空>}`）。监工校验
        `listed == reviewed + len(skipped)`；不等、类型不对或 `skipped` 条目缺理由，一律
-       `acceptance_rejected`（可修正重报）。
+       `acceptance_rejected`（可修正重报）。同一文件不得重复计入 `skipped`（重复即拒）——
+       `skipped` 是逐文件处置，不是计数。
      - `mode: "none"`：未取得确定性清单时使用，必须带非空 `reason`。**这是显式豁免，不是省略字段**——
        字段缺失一律拒收，豁免的是工具而不是交代范围的义务。
      - 反面判据：`listed` 只写 `reviewed` 的数字（把分母当分子）会让校验直接不通过；覆盖面不完整

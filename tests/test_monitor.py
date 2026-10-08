@@ -4411,13 +4411,45 @@ class CoverageDenominatorTests(unittest.TestCase):
         self.assertIn("does not add up", reason or "")
 
     def test_understated_listed_is_caught(self):
-        # Lowering `listed` to the reviewed count is the tempting way to make
-        # the gate pass; the arithmetic check turns that into a visible
+        # Lowering `listed` while still declaring the skips is the sloppy way to
+        # make the gate pass; the arithmetic check turns that into a visible
         # mismatch instead of a clean clearance.
         reason = self.validate(
             {"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": [{"file": "a", "reason": "r"}]}
         )
         self.assertIn("does not add up", reason or "")
+
+    def test_understated_changeset_is_accepted_by_design(self):
+        # The known ceiling, pinned as an executable fact: a reviewer that
+        # really looked at 3 of 14 files passes by declaring `listed: 3` and
+        # dropping the skips.  The arithmetic is self-consistent and nothing at
+        # this layer can disprove it without a ground truth.  The gate raises
+        # *silent* omission to *explicit* fabrication; it does not eliminate the
+        # fabrication.
+        #
+        # This test fails the day someone adds a cross-check against the real
+        # changeset -- which is the point: that change has to be conscious, and
+        # the protocol section 5 wording has to move with it.
+        self.assertIsNone(
+            self.validate({"mode": "ocr", "listed": 3, "reviewed": 3, "skipped": []})
+        )
+
+    def test_duplicate_skipped_file_is_rejected(self):
+        # `len(skipped)` is an addend of the denominator, so a duplicate entry
+        # inflates the count for free.  The protocol promises a *per-file*
+        # disposition; the same file counted twice is not one.
+        reason = self.validate(
+            {
+                "mode": "ocr",
+                "listed": 2,
+                "reviewed": 0,
+                "skipped": [
+                    {"file": "a.xml", "reason": "generated"},
+                    {"file": " a.xml ", "reason": "generated"},
+                ],
+            }
+        )
+        self.assertIn("more than once", reason or "")
 
 
 if __name__ == "__main__":
