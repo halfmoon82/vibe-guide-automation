@@ -353,6 +353,24 @@ def dispatch_topology_for_node(
        ``visible-sdd`` topology enum value at the dispatch layer);
     4. the conservative ``dual-visible`` default.  UNKNOWN evidence never
        yields ``visible-sdd``.
+
+    Rule 2 is load-bearing, not redundant with rule 3.  Removing it does not
+    change the role the closeout node is *first* dispatched with -- that is
+    ``developer`` either way.  It changes the *topology*: rule 3 then rules
+    the node ``visible-sdd``, and a ``visible-sdd`` delivery returns early
+    through ``Monitor._accept_visible_sdd_delivery`` (the
+    ``TOPOLOGY_VISIBLE_SDD`` branch taken after a node reports delivered),
+    which never dispatches a reviewer.  The run-level
+    ``integration_review_evidence`` package is only ever derived from a
+    *reviewer* acceptance claim in the normal dispatch flow
+    (``Monitor._derive_integration_acceptance``; the write itself is the
+    module-level ``monitor._record_integration_review`` alias of
+    ``evidence.record_integration_review``), so it stays empty.
+    Measured on the real fixture (2026-10-07): the closeout node still ends
+    up ``accepted``, but the run can never reach ``complete`` -- it stalls on
+    ``integration review evidence is missing``.  With rule 2 in place the node
+    is ruled ``dual-visible``, delivered, and then dispatched a second time as
+    a reviewer, and that second dispatch is what closes the run out.
     """
     contract = node.contract if isinstance(node.contract, dict) else {}
     persisted = contract.get("dispatch_topology")
@@ -1346,6 +1364,7 @@ def refresh_authorization_card(
     previous: AuthorizationCard,
     workflow: Optional[Dict[str, Any]] = None,
     topology_rulings: Optional[Dict[str, str]] = None,
+    engine_attestation: Optional[Dict[str, Any]] = None,
 ) -> AuthorizationCard:
     """Rebuild a same-plan card while retaining its approved agent/capacity scope.
 
@@ -1354,6 +1373,17 @@ def refresh_authorization_card(
     from the live platform ruling through :func:`dispatch_topology_for_node`,
     so the refreshed card describes the dispatch the supervisor will actually
     perform rather than echoing the topology the first card recorded.
+
+    ``engine_attestation`` is the other half of the same argument for the
+    engine binding.  ``validate_engine_attestation`` refuses an attestation
+    older than a day, so a plan published more than a day ago cannot be
+    reauthorized at all while the refreshed card keeps naming the expired
+    evidence: ``Monitor._require_record`` reads the file, finds the recorded
+    reference intact but the evidence stale, and blocks before any provider
+    dispatch.  Passing a freshly observed attestation re-signs the card
+    against it, exactly as publication does.  Left ``None`` the previous
+    reference is carried forward unchanged, which is the historical behaviour
+    and still the only option for a caller that has no live observation.
     """
 
     authorize(previous, "AUTHORIZE")
@@ -1389,7 +1419,13 @@ def refresh_authorization_card(
         workflow=workflow,
         execution_engine=previous.execution_engine,
         engine_mode=previous.engine_mode,
-        engine_evidence_ref=previous.engine_evidence_ref,
+        # ``build_authorization_card`` refuses a reference that disagrees with
+        # the attestation it was handed, so the carried-forward reference is
+        # only passed when there is no fresh attestation to name instead.
+        engine_evidence_ref=(
+            "" if engine_attestation is not None else previous.engine_evidence_ref
+        ),
+        engine_attestation=engine_attestation,
         explicit_execution_mode_override=previous.explicit_execution_mode_override,
         workers=workers,
     )
