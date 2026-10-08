@@ -356,3 +356,22 @@ monitor 不会点名它们，但不该因此判定契约破裂。
 全量 1499 项：**3 失败 + 5 错误 + 1 skip**，全部为 `test_v2_acceptance` /
 `test_v310_packaging` / `test_cli` 的 `setuptools` 缺失（packaging 环境问题，
 返工前同样 3+5）；**workbuddy/session/provider 相关 0 失败**。
+
+---
+
+## 8. 复审返工（第二轮）
+
+§7 的返工经**独立复审**，判定「需返工」——两处**返工新引入**的 P2：
+
+| # | 问题 | 修法 |
+|---|---|---|
+| P2-1 | `used` 只在 `create` **成功后**记录 → 首个（pid 最小）窗口忙时，本 sweep 的每个节点都反复撞这同一个忙窗口，从未尝试空闲的其它窗口，**多窗口并发退化为 0**（fail-closed 但是可用性缺陷） | 新增 `candidate_sessions()`（按优先级返回全部候选窗口）；`_answer_create` **依次尝试**候选直到某窗口 `delivered:true`，全忙才拒绝 |
+| P2-2 | mailbox `resume`（`_answer_resume`）应答后**不回写 handle `baseline`** → 该 handle 后续经 `wait`/`get` 读取时会拿到**上一轮**回复（P1-4 的假绿从续派路径回流） | `_answer_resume` 投递成功后更新 handle `baseline`（对齐 `WorkBuddyJobs.reply` 的做法） |
+
+顺带 **P3-1**：`SessionDispatch.wait` 对缺失 / 非 int 的 `baseline` 改为**拒绝**（不再裸比较导致 `TypeError`）。
+
+测试 26 → **29 项**（新增「首个窗口忙时轮转到下一个」「resume 更新 handle baseline」）。
+全量 1501 项：3 失败 + 5 错误（同 setuptools 环境问题），**workbuddy/session 相关 0 失败**。
+
+其余 P3（`live()` 无调用点、`_pid_alive` 重复调用、`latest_reply` 成为死代码、
+投递成功但写结果失败的 at-least-once、HTTP 传输层测试未覆盖）**记录在案、不阻塞合并**。

@@ -299,17 +299,22 @@ def discover_sessions(
     return found
 
 
-def pick_session(
+def candidate_sessions(
     sessions: Sequence[Mapping[str, Any]],
     session_id: Optional[str] = None,
     cwd: Optional[str] = None,
     exclude: Optional[Sequence[str]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Choose the window to dispatch into.
+) -> List[Dict[str, Any]]:
+    """Every dispatchable window, best-first.
 
-    An explicit ``session_id`` wins when it is live.  Otherwise prefer a live
-    window already sitting in ``cwd`` — dispatching a task into a window that
-    is open on another directory hands the worker the wrong repo.
+    An explicit ``session_id`` yields at most that one window.  Otherwise only
+    live windows open on ``cwd`` are offered — dispatching into a window that
+    sits elsewhere hands the worker the wrong repo, so a cwd miss yields an
+    empty list (a refusal), never a fallback to an arbitrary window.
+
+    Returning the whole ordered list lets the caller skip a window that is
+    busy (``delivered: false``) and try the next, instead of collapsing a
+    multi-node sweep onto the first window that happens to be occupied.
 
     ``exclude`` is how the orchestrator keeps itself out of the pool: a task
     delivered into the window that is running the monitor lands as a user turn
@@ -323,19 +328,27 @@ def pick_session(
         if item.get("alive") and item.get("session_id") not in skip
     ]
     if session_id:
-        for item in live:
-            if item.get("session_id") == session_id:
-                return item
-        return None
+        return [item for item in live if item.get("session_id") == session_id]
     if cwd:
-        for item in live:
-            if item.get("cwd") == cwd:
-                return item
-        # Fail closed: no live window is open on this directory.  Dispatching
-        # into a window that sits elsewhere hands the worker the wrong repo,
-        # so a miss is a refusal, never a fallback to an arbitrary window.
-        return None
-    return live[0] if live else None
+        return [item for item in live if item.get("cwd") == cwd]
+    return live
+
+
+def pick_session(
+    sessions: Sequence[Mapping[str, Any]],
+    session_id: Optional[str] = None,
+    cwd: Optional[str] = None,
+    exclude: Optional[Sequence[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Choose the single best window to dispatch into.
+
+    Thin wrapper over :func:`candidate_sessions` for callers that only need the
+    first choice; see there for the selection rules.
+    """
+    candidates = candidate_sessions(
+        sessions, session_id=session_id, cwd=cwd, exclude=exclude
+    )
+    return candidates[0] if candidates else None
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +502,11 @@ class SessionDispatch:
         handle = self.load_handle(handle_id)
         if handle is None:
             raise SessionError("unknown session handle: %s" % handle_id)
-        baseline = handle.get("baseline", 0)
+        baseline = handle.get("baseline")
+        if not isinstance(baseline, int) or isinstance(baseline, bool):
+            # No baseline means we cannot tell this turn's reply from an
+            # earlier one; refuse rather than risk returning a stale reply.
+            raise SessionError("session handle %s has no baseline" % handle_id)
         session_id = str(handle["session_id"])
         deadline = time.monotonic() + timeout_seconds
         while True:
@@ -659,25 +676,40 @@ class MailboxServicer:
             skip.update(self._skip)
         if used:
             skip.update(used)
-        session = pick_session(
+        candidates = candidate_sessions(
             self.dispatch.sessions(refresh=True),
             cwd=str(root),
             exclude=sorted(skip),
         )
-        if session is None:
+        if not candidates:
             raise SessionError(
                 "no live WorkBuddy window to dispatch into; open one and retry"
             )
+        # Try windows best-first: a busy window answers ``delivered: false``,
+        # and the sweep must move on to the next one instead of collapsing
+        # every node onto the single occupied window.
+        session: Optional[Dict[str, Any]] = None
+        baseline = 0
+        refused: List[str] = []
+        for candidate in candidates:
+            candidate_id = str(candidate["session_id"])
+            candidate_baseline = self.dispatch.history(candidate_id)["count"]
+            if self.dispatch.deliver(candidate_id, prompt).get("delivered") is True:
+                session = candidate
+                baseline = candidate_baseline
+                break
+            refused.append(candidate_id)
+        if session is None:
+            # Every candidate refused.  Writing a success here is the exact
+            # false green this module exists to prevent: the monitor would
+            # believe a worker is running and wait forever for a self-report
+            # that can never come.
+            raise SessionError(
+                "no live window accepted the turn (refused by %s)"
+                % (", ".join(refused) or "none")
+            )
         session_id = str(session["session_id"])
         endpoint = str(session["endpoint"])
-        baseline = self.dispatch.history(session_id)["count"]
-        delivered = self.dispatch.deliver(session_id, prompt)
-        if delivered.get("delivered") is not True:
-            # A busy window answers ``delivered: false``.  Writing a success
-            # here is the exact false green this module exists to prevent: the
-            # monitor would believe a worker is running and wait forever for a
-            # self-report that can never come.
-            raise SessionError("window %s did not accept the turn" % session_id)
         # One handle per request: the action id is unique, so two nodes sharing
         # a window no longer collide on the handle id or the `task_id` binding.
         handle_id = str(action.get("action_id") or session_id[:8])
@@ -769,6 +801,7 @@ class MailboxServicer:
         )
         if not live:
             return {"resumed": False, "threadId": thread_id, "reason": "window is gone"}
+        baseline = self.dispatch.history(session_id)["count"]
         delivered = self.dispatch.deliver(session_id, prompt)
         if delivered.get("delivered") is not True:
             return {
@@ -776,4 +809,11 @@ class MailboxServicer:
                 "threadId": thread_id,
                 "reason": "window did not accept the turn",
             }
+        # Advance the handle's baseline so a later `wait`/`get` on this handle
+        # reads the resumed turn's reply, not the previous one.
+        handle = self.dispatch.load_handle(thread_id)
+        if isinstance(handle, Mapping):
+            record = dict(handle)
+            record["baseline"] = baseline
+            self.dispatch.save_handle(record)
         return {"resumed": True, "threadId": thread_id, "sessionId": session_id}

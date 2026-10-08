@@ -211,12 +211,15 @@ class GatewayTokenTests(unittest.TestCase):
 class FakeDispatch:
     """Enough of SessionDispatch for the servicer; no network, no processes."""
 
-    def __init__(self, sessions, replies=None, accept=True):
+    def __init__(self, sessions, replies=None, accept=True, refuse=None):
         self._sessions = sessions
         self._replies = replies or {}
-        #: Whether the window accepts a delivered turn.  A busy window answers
+        #: Whether a window accepts a delivered turn.  A busy window answers
         #: ``delivered: false`` and the servicer must refuse, not fake success.
         self.accept = accept
+        #: Session ids that individually refuse (a busy window), so a sweep can
+        #: be tested falling through to the next one.
+        self.refuse = set(refuse or ())
         self.delivered = []
         self.handles = {}
 
@@ -235,7 +238,8 @@ class FakeDispatch:
 
     def deliver(self, session_id, text):
         self.delivered.append((session_id, text))
-        return {"delivered": self.accept, "session_id": session_id}
+        ok = self.accept and session_id not in self.refuse
+        return {"delivered": ok, "session_id": session_id}
 
     def save_handle(self, record):
         self.handles[record["id"]] = dict(record)
@@ -388,7 +392,7 @@ class MailboxTests(unittest.TestCase):
         self._request("action-10", "create", {"prompt": "x"})
         outcome = module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
         self.assertEqual(outcome["served"], [])
-        self.assertIn("did not accept", outcome["skipped"][0]["reason"])
+        self.assertIn("accepted the turn", outcome["skipped"][0]["reason"])
         self.assertIsNone(self._result("action-10"))
 
     def test_several_nodes_fan_out_across_windows(self):
@@ -436,6 +440,42 @@ class MailboxTests(unittest.TestCase):
         self._request("action-14", "resume", {"threadId": "action-14", "prompt": "keep going"})
         module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
         self.assertFalse(self._result("action-14")["payload"]["resumed"])
+
+    def test_resume_advances_the_handle_baseline(self):
+        # After a resume the handle must point past the earlier turn, or a
+        # later read returns the previous reply as this turn's output.
+        session = "99999999-9999-4999-8999-999999999999"
+        dispatch = FakeDispatch(
+            [{"pid": 5, "session_id": session, "cwd": str(self.project),
+              "endpoint": "http://127.0.0.1:1", "alive": True}],
+            replies={session: {"count": 2, "reply": "OLD"}},
+        )
+        dispatch.save_handle({"id": "action-16", "session_id": session, "baseline": 0})
+        self._request("action-16", "resume", {"threadId": "action-16", "prompt": "again"})
+        module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
+        self.assertTrue(self._result("action-16")["payload"]["resumed"])
+        self.assertEqual(dispatch.handles["action-16"]["baseline"], 2)
+
+    def test_a_busy_first_window_falls_through_to_the_next(self):
+        # A sweep must not collapse onto the first window when it is occupied;
+        # it has to try the next live window on the project.
+        busy = "77777777-7777-4777-8777-777777777777"
+        idle = "88888888-8888-4888-8888-888888888888"
+        dispatch = FakeDispatch(
+            [
+                {"pid": 5, "session_id": busy, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:1", "alive": True},
+                {"pid": 6, "session_id": idle, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:2", "alive": True},
+            ],
+            refuse={busy},
+        )
+        self._request("action-17", "create", {"prompt": "work"})
+        outcome = module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
+        self.assertEqual([item["action_id"] for item in outcome["served"]], ["action-17"])
+        # The occupied window was tried first, then the free one accepted it.
+        self.assertEqual(dispatch.delivered, [(busy, "work"), (idle, "work")])
+        self.assertEqual(self._result("action-17")["payload"]["sessionId"], idle)
 
 
 if __name__ == "__main__":
