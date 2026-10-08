@@ -176,24 +176,29 @@ class DispatchTopologyRulingTests(unittest.TestCase):
         self.assertEqual(entry["mode"], "background")
         self.assertEqual(entry["limitations"], tuple(BACKGROUND_MODE_DISCLOSURES))
 
-    def test_integration_review_follows_its_platform_ruling(self):
-        """The closeout node is ruled by its platform, like every other node.
+    def test_integration_review_is_never_ruled_into_the_single_session_topology(self):
+        """The closeout node keeps its reviewer-role dispatch under any ruling.
 
-        It used to be pinned to ``dual-visible`` ahead of the live ruling.  That
-        pin contradicted the card: a platform with no visible-task lifecycle
-        cannot serve ``dual-visible`` at all, so the card advertised a dispatch
-        the supervisor would never perform -- the very card/dispatch split this
-        module exists to remove.  A plan that genuinely needs the
-        two-visible-session shape states it in the node contract, which still
-        wins over the ruling.
+        Removing this pin was tried and measured (2026-10-07).  With the pin
+        gone the monitor dispatched ``integration-review`` with
+        ``role=developer`` like any other node; the run-level
+        ``integration_review_evidence`` package is only ever derived from a
+        *reviewer* acceptance claim (``monitor._derive_integration_acceptance``),
+        so it stayed empty and the run stalled on ``integration review evidence
+        is missing`` instead of reaching ``complete``.  With the pin in place the
+        node is dispatched twice -- once through the ruling, once as a reviewer
+        -- and the second dispatch is what closes the run out.
+        ``tests/test_integration_review_closeout_entry.py`` pins the same
+        behaviour end to end.
         """
         node = _business_node("integration-review")
 
         self.assertEqual(
             dispatch_topology_for_node(node, {"workbuddy": "in_session_sdd"}),
-            "visible-sdd",
+            "dual-visible",
         )
-        self.assertEqual(dispatch_topology_for_node(node, {}), "dual-visible")
+        # A plan that genuinely needs the two-visible-session shape states it in
+        # the node contract, which still wins over the ruling.
         self.assertEqual(
             dispatch_topology_for_node(
                 _business_node("integration-review", dispatch_topology="dual-visible"),
@@ -626,6 +631,18 @@ class RefreshNamesFreshEngineEvidenceTests(unittest.TestCase):
             self.card.agent_id, {self.card.agent_id + ".subprocess": True}, "test", now,
         )
 
+    @staticmethod
+    def _fresh_timestamp():
+        """A timestamp that is fresh whenever the suite runs, not just today.
+
+        ``validate_engine_attestation`` refuses evidence older than a day, so a
+        literal such as ``2026-10-07T00:00:00Z`` makes these tests expire at the
+        next midnight: they passed on the day they were written and failed from
+        the following day on, which is indistinguishable from a real regression
+        until you notice the clock.
+        """
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
     def _refresh(self, **kwargs):
         # A complex plan refuses a refresh without the workflow evidence the
         # published card preserved.
@@ -645,7 +662,7 @@ class RefreshNamesFreshEngineEvidenceTests(unittest.TestCase):
         )
 
     def test_new_evidence_replaces_the_carried_reference(self):
-        fresh = self._attestation("2026-10-07T00:00:00Z")
+        fresh = self._attestation(self._fresh_timestamp())
         self.assertNotEqual(fresh["evidence_ref"], self.card.engine_evidence_ref)
 
         refreshed = self._refresh(engine_attestation=fresh)
@@ -661,7 +678,7 @@ class RefreshNamesFreshEngineEvidenceTests(unittest.TestCase):
         reference whenever it has fresh evidence to name instead.  Passing
         both is what the refresh must not do.
         """
-        fresh = self._attestation("2026-10-07T00:00:00Z")
+        fresh = self._attestation(self._fresh_timestamp())
 
         with self.assertRaisesRegex(ValueError, "does not match attestation"):
             build_authorization_card(
@@ -1026,10 +1043,10 @@ class CardPreviewTests(unittest.TestCase):
     def test_the_preview_reports_a_topology_move(self):
         """The fixture rules ``dual-visible``; a passing probe must move it.
 
-        This is the card-level half of the closeout-node change: once the
-        platform is ruled into the single-session topology, ``integration-review``
-        is dispatched that way too, and the preview says so before the card is
-        signed rather than after.
+        The card-level half of the preview's job: the business node follows the
+        new ruling, while the closeout node keeps the reviewer-role dispatch
+        that rule 2 of ``dispatch_topology_for_node`` reserves for it -- the run
+        cannot close out without it.
         """
         self._probe_in_session_sdd()
 
@@ -1040,7 +1057,7 @@ class CardPreviewTests(unittest.TestCase):
         workers = changed["workers"]["next"]
         self.assertEqual(
             {entry["node_id"]: entry["topology"] for entry in workers},
-            {"probe-node-a": "visible-sdd", "integration-review": "visible-sdd"},
+            {"probe-node-a": "visible-sdd", "integration-review": "dual-visible"},
         )
 
     def _probe_in_session_sdd(self):

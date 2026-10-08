@@ -9,6 +9,7 @@ import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
 from .models import (
+    INTEGRATION_REVIEW_NODE_ID,
     AgentCapabilities,
     DAGNode,
     Plan,
@@ -343,28 +344,33 @@ def dispatch_topology_for_node(
 
     1. an authorization-bound ``dispatch_topology`` persisted in the node
        contract (stamped when the plan was materialized);
-    2. the live platform ruling (``in_session_sdd`` is the manifest
+    2. ``integration-review`` is a reviewer-role closeout node by
+       construction, so the single-session developer topology can never
+       apply to it;
+    3. the live platform ruling (``in_session_sdd`` is the manifest
        capability-probe field name / ``DISPATCH_TOPOLOGY_MATRIX`` ruling
        value at the adapter layer; this function translates it into the
        ``visible-sdd`` topology enum value at the dispatch layer);
-    3. the conservative ``dual-visible`` default.  UNKNOWN evidence never
+    4. the conservative ``dual-visible`` default.  UNKNOWN evidence never
        yields ``visible-sdd``.
 
-    ``integration-review`` used to be pinned to ``dual-visible`` ahead of the
-    live ruling, on the grounds that a reviewer-role closeout node cannot run
-    as one session's in-session review.  That pin contradicted the rest of the
-    rule: a platform with no visible-task lifecycle (``visible_task.*``
-    false, as measured on WorkBuddy) cannot serve ``dual-visible`` at all, so
-    the card advertised a dispatch the supervisor would never perform -- the
-    same card/dispatch split this function exists to remove.  The closeout
-    node now follows its platform like every other node; a plan that genuinely
-    needs the two-visible-session shape states it in the node contract, which
-    rule 1 honours.
+    Rule 2 is load-bearing, not redundant with rule 3.  Measured on the
+    real fixture (2026-10-07): removing it makes the monitor dispatch the
+    closeout node with ``role=developer`` like any other node, and the
+    run-level ``integration_review_evidence`` package is only ever derived
+    from a *reviewer* acceptance claim (``monitor._derive_integration_acceptance``).
+    The closeout node then still ends up ``accepted``, but the run can never
+    reach ``complete`` -- it stalls on ``integration review evidence is
+    missing``.  With the rule in place the node is dispatched twice, once
+    through the ruling and once as a reviewer, and the second dispatch is
+    what closes the run out.
     """
     contract = node.contract if isinstance(node.contract, dict) else {}
     persisted = contract.get("dispatch_topology")
     if isinstance(persisted, str) and persisted in _WORKER_TOPOLOGIES:
         return persisted
+    if getattr(node, "id", "") == INTEGRATION_REVIEW_NODE_ID:
+        return WORKER_TOPOLOGY_DUAL_VISIBLE
     ruling = (topology_rulings or {}).get(node_adapter_id(node))
     if ruling == RULING_IN_SESSION_SDD:
         return WORKER_TOPOLOGY_VISIBLE_SDD
