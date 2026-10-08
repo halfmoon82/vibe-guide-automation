@@ -85,6 +85,38 @@ class SessionError(ValueError):
     """A session-side dispatch or mailbox operation was rejected."""
 
 
+class DeliveryUnknown(SessionError):
+    """A delivery may or may not have been queued, so it must never be retried.
+
+    Deliberately distinct from a plain :class:`SessionError`.  A plain error
+    means the turn never left us -- no window, an explicit refusal, a rejected
+    request -- so the mailbox request may safely stay pending for the next
+    sweep.  This one means the gateway answered in a shape we cannot read
+    (empty body, missing or non-boolean ``delivered``): the turn may already be
+    queued, so retrying it on another window runs the task twice.  The servicer
+    answers it with a terminal negative result instead of leaving the request
+    pending, which is the only way to stop the retry without lying about it.
+    """
+
+
+#: The host's own session id.  The supervisor normally runs *inside* the very
+#: conversation it dispatches for, and that window is a live window on disk, so
+#: auto-pick will happily choose it.  A task delivered back into the supervisor's
+#: own thread collapses the two roles into one conversation, so the host session
+#: is excluded by default rather than left to an operator to remember.
+HOST_SESSION_ENV = "CODEBUDDY_SESSION_ID"
+
+
+def host_session_id() -> Optional[str]:
+    """The host's own session id, or ``None`` when it is absent or malformed."""
+    value = os.environ.get(HOST_SESSION_ENV)
+    if isinstance(value, str):
+        value = value.strip()
+        if _SESSION_ID_RE.match(value):
+            return value
+    return None
+
+
 # ---------------------------------------------------------------------------
 # small JSON helpers
 # ---------------------------------------------------------------------------
@@ -103,6 +135,14 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     with open(str(tmp), "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
     os.replace(str(tmp), str(path))
+
+
+def _unlink(path: Path) -> None:
+    """Remove a bookkeeping file, tolerating the race where it is already gone."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def _exclusive_lock(path: Path) -> Optional[Any]:
@@ -602,8 +642,15 @@ class MailboxServicer:
         mailbox = root / ".vibe" / "provider-actions"
         request_dir = mailbox / "requests"
         result_dir = mailbox / "results"
+        #: One marker per in-flight delivery.  See ``_deliver``.
+        marker_dir = mailbox / "delivering"
         if not request_dir.is_dir():
-            return {"served": [], "skipped": [], "project_dir": str(root)}
+            return {
+                "served": [],
+                "skipped": [],
+                "failed": [],
+                "project_dir": str(root),
+            }
 
         # One servicer loop at a time: two concurrent ``serve`` calls would
         # otherwise both read the same unanswered request and both deliver it.
@@ -611,11 +658,15 @@ class MailboxServicer:
         try:
             served: List[Dict[str, Any]] = []
             skipped: List[Dict[str, Any]] = []
+            #: Requests answered with a terminal negative result.  They are not
+            #: failures of this sweep but answers the operator has to see: the
+            #: action will not be retried, so nobody else is coming.
+            failed: List[Dict[str, Any]] = []
             # Windows already used in this pass, so several nodes in one sweep
             # fan out across distinct windows instead of piling onto the first.
             used: List[str] = []
             for path in sorted(request_dir.glob("action-*.json")):
-                if len(served) + len(skipped) >= limit:
+                if len(served) + len(skipped) + len(failed) >= limit:
                     break
                 action_id = path.stem
                 if (result_dir / path.name).exists():
@@ -624,34 +675,133 @@ class MailboxServicer:
                 if action is None:
                     skipped.append({"action_id": action_id, "reason": "unreadable"})
                     continue
+                marker = marker_dir / path.name
+                if marker.exists():
+                    # A previous sweep raised this marker and never took it
+                    # down: it crashed, or the result write failed, between
+                    # delivering the turn and recording the outcome.  The turn
+                    # may already be queued, so answering the request again
+                    # would run the task twice.  Fail closed and say why.
+                    reason = (
+                        "a previous sweep delivered this turn but never recorded "
+                        "an outcome; the turn may already be queued"
+                    )
+                    self._fail_terminally(action, action_id, result_dir, reason)
+                    _unlink(marker)
+                    failed.append({"action_id": action_id, "reason": reason})
+                    continue
                 operation = action.get("operation")
                 request = action.get("request")
                 request = request if isinstance(request, dict) else {}
                 try:
-                    payload = self._answer(operation, request, action, root, used)
+                    payload = self._answer(
+                        operation, request, action, root, used, marker
+                    )
+                except DeliveryUnknown as error:
+                    # Never retried: see ``DeliveryUnknown``.  A terminal
+                    # negative result is the only answer that neither
+                    # fabricates a worker nor invites a second delivery.
+                    self._fail_terminally(action, action_id, result_dir, str(error))
+                    _unlink(marker)
+                    failed.append({"action_id": action_id, "reason": str(error)})
+                    continue
                 except (SessionError, ValueError, OSError) as error:
+                    # Nothing was queued, so the request may stay pending and
+                    # this sweep moves on; the next one will try again.
+                    _unlink(marker)
                     skipped.append({"action_id": action_id, "reason": str(error)})
                     continue
                 if payload is None:
-                    skipped.append({"action_id": action_id, "reason": "unsupported operation"})
+                    _unlink(marker)
+                    skipped.append(
+                        {"action_id": action_id, "reason": "unsupported operation"}
+                    )
                     continue
-                _write_json(
-                    result_dir / path.name,
-                    {
-                        "schema_version": action.get("schema_version", 1),
-                        "action_id": action_id,
-                        "request_digest": action.get("request_digest"),
-                        "payload": payload,
-                    },
-                )
+                try:
+                    self._record(action, action_id, result_dir, payload)
+                except OSError as error:
+                    # Delivered but unrecorded.  Keep the marker up so the next
+                    # sweep fails closed rather than delivering a second time.
+                    failed.append(
+                        {
+                            "action_id": action_id,
+                            "reason": "result write failed: %s" % error,
+                        }
+                    )
+                    continue
+                _unlink(marker)
                 served.append({"action_id": action_id, "operation": operation})
                 if operation == "create":
                     chosen = payload.get("sessionId")
                     if isinstance(chosen, str) and chosen:
                         used.append(chosen)
-            return {"served": served, "skipped": skipped, "project_dir": str(root)}
+            return {
+                "served": served,
+                "skipped": skipped,
+                "failed": failed,
+                "project_dir": str(root),
+            }
         finally:
             _release_lock(lock)
+
+    @staticmethod
+    def _record(
+        action: Mapping[str, Any],
+        action_id: str,
+        result_dir: Path,
+        payload: Mapping[str, Any],
+    ) -> None:
+        _write_json(
+            result_dir / (action_id + ".json"),
+            {
+                "schema_version": action.get("schema_version", 1),
+                "action_id": action_id,
+                "request_digest": action.get("request_digest"),
+                "payload": dict(payload),
+            },
+        )
+
+    def _fail_terminally(
+        self,
+        action: Mapping[str, Any],
+        action_id: str,
+        result_dir: Path,
+        reason: str,
+    ) -> None:
+        """Answer a request we can never honestly answer, so it stops retrying.
+
+        The payload claims no ``binding``, no ``located`` and no ``resumed``, so
+        the provider reads it as a failed action rather than a successful one.
+        That is deliberate: a success would fabricate a worker, and no answer at
+        all would leave the request pending for another delivery attempt.
+        """
+        payload = {"delivery": "unknown", "failed": True, "reason": reason}
+        try:
+            self._record(action, action_id, result_dir, payload)
+        except OSError:
+            # The marker is still up, so the next sweep tries this again -- and
+            # fails it closed the same way instead of delivering it twice.
+            pass
+
+    def _deliver(
+        self,
+        marker: Optional[Path],
+        session_id: str,
+        text: str,
+    ) -> Dict[str, Any]:
+        """Deliver one turn, holding a marker until we know nothing was queued.
+
+        The marker goes up before the POST and comes down only on an explicit
+        refusal -- the one answer that proves the turn was not queued.  A crash
+        or a failed result write therefore leaves it up, and the next sweep
+        fails the action closed instead of delivering the same prompt twice.
+        """
+        if marker is not None:
+            _write_json(marker, {"session_id": session_id, "at": time.time()})
+        outcome = self.dispatch.deliver(session_id, text)
+        if marker is not None and outcome.get("state") == "refused":
+            _unlink(marker)
+        return outcome
 
     def _answer(
         self,
@@ -660,15 +810,16 @@ class MailboxServicer:
         action: Mapping[str, Any],
         root: Path,
         used: Optional[Sequence[str]] = None,
+        marker: Optional[Path] = None,
     ) -> Optional[Dict[str, Any]]:
         if operation == "create":
-            return self._answer_create(request, action, root, used)
+            return self._answer_create(request, action, root, used, marker)
         if operation == "locate":
             return self._answer_locate(request)
         if operation == "visibility":
             return self._answer_visibility(request)
         if operation == "resume":
-            return self._answer_resume(request)
+            return self._answer_resume(request, marker)
         return None
 
     def _resolve_session(self, thread_id: str) -> str:
@@ -688,6 +839,7 @@ class MailboxServicer:
         action: Mapping[str, Any],
         root: Path,
         used: Optional[Sequence[str]] = None,
+        marker: Optional[Path] = None,
     ) -> Dict[str, Any]:
         prompt = request.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -696,6 +848,13 @@ class MailboxServicer:
         # window already claimed in this sweep, so a multi-node run fans out
         # across windows instead of piling every node onto the first one.
         skip = set(excluded_session_ids())
+        # The host's own conversation is a live window too, and it is the one
+        # target that must never be chosen: a task delivered back into the
+        # supervisor's thread collapses the two roles into one conversation.
+        # Excluded by default rather than left to an operator to remember.
+        own = host_session_id()
+        if own:
+            skip.add(own)
         if self._skip is not None:
             skip.update(self._skip)
         if used:
@@ -715,10 +874,17 @@ class MailboxServicer:
         session: Optional[Dict[str, Any]] = None
         baseline = 0
         refused: List[str] = []
+        unreachable: List[str] = []
         for candidate in candidates:
             candidate_id = str(candidate["session_id"])
-            candidate_baseline = self.dispatch.history(candidate_id)["count"]
-            state = self.dispatch.deliver(candidate_id, prompt).get("state")
+            try:
+                candidate_baseline = self.dispatch.history(candidate_id)["count"]
+            except SessionError as error:
+                # The window died between discovery and use.  That is a reason
+                # to try the next candidate, not to abandon the whole action.
+                unreachable.append("%s (%s)" % (candidate_id, error))
+                continue
+            state = self._deliver(marker, candidate_id, prompt).get("state")
             if state == "accepted":
                 session = candidate
                 baseline = candidate_baseline
@@ -727,9 +893,11 @@ class MailboxServicer:
                 refused.append(candidate_id)
                 continue
             # `unknown`: the turn may already be queued, so retrying on another
-            # window could deliver it twice.  Fail closed instead of rotating.
-            raise SessionError(
-                "window %s returned an unrecognised delivery outcome" % candidate_id
+            # window could deliver it twice.  Fail closed instead of rotating,
+            # and never leave the request pending -- see ``DeliveryUnknown``.
+            raise DeliveryUnknown(
+                "window %s returned an unrecognised delivery outcome; "
+                "the turn may already be queued" % candidate_id
             )
         if session is None:
             # Every candidate refused.  Writing a success here is the exact
@@ -737,8 +905,11 @@ class MailboxServicer:
             # believe a worker is running and wait forever for a self-report
             # that can never come.
             raise SessionError(
-                "no live window accepted the turn (refused by %s)"
-                % (", ".join(refused) or "none")
+                "no live window accepted the turn (refused by %s%s)"
+                % (
+                    ", ".join(refused) or "none",
+                    "; unreachable: " + ", ".join(unreachable) if unreachable else "",
+                )
             )
         session_id = str(session["session_id"])
         endpoint = str(session["endpoint"])
@@ -812,7 +983,9 @@ class MailboxServicer:
             "targets": results,
         }
 
-    def _answer_resume(self, request: Mapping[str, Any]) -> Dict[str, Any]:
+    def _answer_resume(
+        self, request: Mapping[str, Any], marker: Optional[Path] = None
+    ) -> Dict[str, Any]:
         """Resume a turn on the window that owns the thread.
 
         ``provider_action.poll`` refuses a resume result unless it carries
@@ -834,7 +1007,7 @@ class MailboxServicer:
         if not live:
             return {"resumed": False, "threadId": thread_id, "reason": "window is gone"}
         baseline = self.dispatch.history(session_id)["count"]
-        state = self.dispatch.deliver(session_id, prompt).get("state")
+        state = self._deliver(marker, session_id, prompt).get("state")
         if state == "refused":
             return {
                 "resumed": False,
@@ -842,9 +1015,12 @@ class MailboxServicer:
                 "reason": "window did not accept the turn",
             }
         if state != "accepted":
-            # Unknown: the turn may already be queued; never answer `resumed`.
-            raise SessionError(
-                "window %s returned an unrecognised delivery outcome" % session_id
+            # Unknown: the turn may already be queued, so answering `resumed`
+            # would be a guess and retrying would run it twice.  Never leave it
+            # pending -- see ``DeliveryUnknown``.
+            raise DeliveryUnknown(
+                "window %s returned an unrecognised delivery outcome; "
+                "the turn may already be queued" % session_id
             )
         # Advance the handle's baseline so a later `wait`/`get` on this handle
         # reads the resumed turn's reply, not the previous one.

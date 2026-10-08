@@ -576,7 +576,10 @@ class WorkBuddyJobs:
 
     def _window_handle(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Resolve an id to a window handle, or None when it is a job."""
-        handle = _sessions.load_handle(job_id)
+        # Read through the dispatcher, not the module-level helper: the two
+        # differ whenever a handle root is overridden, and a reader that
+        # disagrees with the writer silently loses every handle.
+        handle = self.dispatch.load_handle(job_id)
         if isinstance(handle, dict) and handle.get("session_id"):
             return handle
         try:

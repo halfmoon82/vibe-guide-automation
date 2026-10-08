@@ -260,6 +260,16 @@ class FakeDispatch:
         return self.handles.get(handle_id)
 
 
+class _VibePaths:
+    """The one method ``ProviderActionStore`` needs, pointed at a tmp dir."""
+
+    def __init__(self, vibe_dir):
+        self._vibe_dir = Path(vibe_dir)
+
+    def resolve_vibe_path(self, name):
+        return self._vibe_dir / name
+
+
 class MailboxTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -267,9 +277,15 @@ class MailboxTests(unittest.TestCase):
         self.mailbox = self.project / ".vibe" / "provider-actions"
         (self.mailbox / "requests").mkdir(parents=True)
         (self.mailbox / "results").mkdir(parents=True)
-        self.saved = {name: os.environ.get(name) for name in module.PROJECT_DIR_ENVS}
+        self.saved = {
+            name: os.environ.get(name)
+            for name in tuple(module.PROJECT_DIR_ENVS) + (module.HOST_SESSION_ENV,)
+        }
         for name in module.PROJECT_DIR_ENVS:
             os.environ.pop(name, None)
+        # Deterministic: the host's own session id is excluded from candidates,
+        # and the machine running the suite has a real one set.
+        os.environ.pop(module.HOST_SESSION_ENV, None)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -296,6 +312,12 @@ class MailboxTests(unittest.TestCase):
     def _result(self, action_id):
         path = self.mailbox / "results" / (action_id + ".json")
         return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+    def _store(self):
+        """The real provider-side mailbox reader, pointed at this tmp project."""
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+
+        return ProviderActionStore(_VibePaths(self.project / ".vibe"))
 
     def test_create_is_dispatched_into_a_window_and_bound(self):
         dispatch = FakeDispatch(
@@ -489,9 +511,11 @@ class MailboxTests(unittest.TestCase):
         self.assertEqual(dispatch.delivered, [(busy, "work"), (idle, "work")])
         self.assertEqual(self._result("action-17")["payload"]["sessionId"], idle)
 
-    def test_an_unknown_delivery_outcome_does_not_rotate(self):
+    def test_an_unknown_delivery_outcome_is_answered_terminally(self):
         # An unreadable gateway reply must not be treated as a refusal: the
-        # turn may already be queued, so rotating would deliver it twice.
+        # turn may already be queued, so rotating would deliver it twice.  It
+        # must also not be left pending, or the next sweep delivers it again --
+        # the answer is a terminal negative result nobody retries.
         first = "77777777-7777-4777-8777-777777777777"
         second = "88888888-8888-4888-8888-888888888888"
         dispatch = FakeDispatch(
@@ -504,11 +528,180 @@ class MailboxTests(unittest.TestCase):
             unknown={first},
         )
         self._request("action-18", "create", {"prompt": "work"})
-        outcome = module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
+        servicer = module.MailboxServicer(dispatch)
+        outcome = servicer.serve(project_dir=str(self.project))
         self.assertEqual(outcome["served"], [])
         # The second window was never tried, so the prompt cannot be doubled.
         self.assertEqual(dispatch.delivered, [(first, "work")])
-        self.assertIsNone(self._result("action-18"))
+        self.assertEqual([item["action_id"] for item in outcome["failed"]], ["action-18"])
+        result = self._result("action-18")
+        self.assertTrue(result["payload"]["failed"])
+        # No `binding`: the provider reads that as a failed action, never as a
+        # worker it should wait for.
+        self.assertNotIn("binding", result["payload"])
+        # And read it the way the consumer does, so "not pending" is measured
+        # rather than asserted: the store must hand back the payload and must
+        # stop listing the request as outstanding.
+        store = self._store()
+        self.assertIsNotNone(store.result("action-18"))
+        self.assertEqual(
+            [item["action_id"] for item in store.pending()], []
+        )
+        # A second sweep must not deliver anything: the request is answered.
+        again = servicer.serve(project_dir=str(self.project))
+        self.assertEqual(again["served"], [])
+        self.assertEqual(again["failed"], [])
+        self.assertEqual(dispatch.delivered, [(first, "work")])
+
+    def test_a_crashed_delivery_is_never_delivered_twice(self):
+        # A sweep that died between the POST and the result write leaves its
+        # marker behind.  The turn may be queued, so the next sweep must fail
+        # the action closed instead of sending the same prompt again.
+        session = "11111111-1111-4111-8111-111111111111"
+        dispatch = FakeDispatch(
+            [{"pid": 5, "session_id": session, "cwd": str(self.project),
+              "endpoint": "http://127.0.0.1:1", "alive": True}]
+        )
+        self._request("action-19", "create", {"prompt": "work"})
+        marker = self.mailbox / "delivering" / "action-19.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"session_id": session}), encoding="utf-8")
+        outcome = module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
+        self.assertEqual(dispatch.delivered, [])
+        self.assertEqual([item["action_id"] for item in outcome["failed"]], ["action-19"])
+        self.assertTrue(self._result("action-19")["payload"]["failed"])
+        self.assertFalse(marker.exists())
+
+    def test_the_host_conversation_is_never_a_target(self):
+        # The supervisor runs inside the very conversation it dispatches for,
+        # and that window is a live window on the project.  Picking it would
+        # deliver the task back into the supervisor's own thread.
+        own = "11111111-1111-4111-8111-111111111111"
+        other = "22222222-2222-4222-8222-222222222222"
+        os.environ[module.HOST_SESSION_ENV] = own
+        dispatch = FakeDispatch(
+            [
+                {"pid": 5, "session_id": own, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:1", "alive": True},
+                {"pid": 6, "session_id": other, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:2", "alive": True},
+            ]
+        )
+        self._request("action-20", "create", {"prompt": "work"})
+        module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
+        self.assertEqual(dispatch.delivered, [(other, "work")])
+
+    def test_the_host_conversation_alone_means_no_window(self):
+        # With only the host's own window live there is nothing to dispatch
+        # into, and saying otherwise would put the task back in this thread.
+        own = "11111111-1111-4111-8111-111111111111"
+        os.environ[module.HOST_SESSION_ENV] = own
+        dispatch = FakeDispatch(
+            [{"pid": 5, "session_id": own, "cwd": str(self.project),
+              "endpoint": "http://127.0.0.1:1", "alive": True}]
+        )
+        self._request("action-21", "create", {"prompt": "work"})
+        outcome = module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
+        self.assertEqual(dispatch.delivered, [])
+        self.assertEqual(outcome["served"], [])
+        self.assertEqual([item["action_id"] for item in outcome["skipped"]], ["action-21"])
+        self.assertIsNone(self._result("action-21"))
+
+    def test_a_window_that_dies_mid_sweep_does_not_abandon_the_action(self):
+        # ``history`` failing on one candidate is a reason to try the next one,
+        # not to leave the whole action unanswered.
+        dying = "11111111-1111-4111-8111-111111111111"
+        healthy = "22222222-2222-4222-8222-222222222222"
+        dispatch = FakeDispatch(
+            [
+                {"pid": 5, "session_id": dying, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:1", "alive": True},
+                {"pid": 6, "session_id": healthy, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:2", "alive": True},
+            ]
+        )
+        real_history = dispatch.history
+
+        def history(session_id):
+            if session_id == dying:
+                raise module.SessionError("no live window session %s" % session_id)
+            return real_history(session_id)
+
+        dispatch.history = history
+        self._request("action-22", "create", {"prompt": "work"})
+        outcome = module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
+        self.assertEqual([item["action_id"] for item in outcome["served"]], ["action-22"])
+        self.assertEqual(dispatch.delivered, [(healthy, "work")])
+
+
+class _StubDispatch(module.SessionDispatch):
+    """``SessionDispatch`` with the HTTP hop replaced by a canned body."""
+
+    def __init__(self, body, sessions):
+        super().__init__(token="stub-token", sessions=sessions)
+        self._body = body
+        self.calls = []
+
+    def sessions(self, refresh=False):
+        # ``refresh`` would re-scan the machine's processes; the stub stays on
+        # the window list it was handed.
+        return [dict(item) for item in self._sessions]
+
+    def _call(self, endpoint, path, method="GET", body=None, timeout=30.0):
+        self.calls.append((method, path, body))
+        return self._body
+
+
+class DeliverOutcomeTests(unittest.TestCase):
+    """The three delivery outcomes, read at the transport boundary.
+
+    The servicer tests above build ``state`` themselves, so on their own they
+    would stay green if ``deliver`` went back to collapsing everything into a
+    boolean.  These exercise the real mapping.
+    """
+
+    SESSION = "11111111-1111-4111-8111-111111111111"
+
+    def _dispatch(self, body):
+        return _StubDispatch(
+            body,
+            [
+                {
+                    "pid": 5,
+                    "session_id": self.SESSION,
+                    "cwd": "/repo",
+                    "endpoint": "http://127.0.0.1:1",
+                    "alive": True,
+                }
+            ],
+        )
+
+    def test_a_queued_turn_is_accepted(self):
+        outcome = self._dispatch({"delivered": True}).deliver(self.SESSION, "work")
+        self.assertEqual(outcome["state"], "accepted")
+        self.assertIs(outcome["delivered"], True)
+
+    def test_a_busy_window_is_refused(self):
+        outcome = self._dispatch({"delivered": False}).deliver(self.SESSION, "work")
+        self.assertEqual(outcome["state"], "refused")
+        self.assertIs(outcome["delivered"], False)
+
+    def test_an_empty_body_is_unknown_not_refused(self):
+        # ``_call`` answers ``{}`` for an empty 2xx body.  Reading that as a
+        # refusal is what let the same prompt be delivered to two windows.
+        outcome = self._dispatch({}).deliver(self.SESSION, "work")
+        self.assertEqual(outcome["state"], "unknown")
+        self.assertIsNone(outcome["delivered"])
+
+    def test_a_non_boolean_flag_is_unknown(self):
+        outcome = self._dispatch({"delivered": "yes"}).deliver(self.SESSION, "work")
+        self.assertEqual(outcome["state"], "unknown")
+        self.assertIsNone(outcome["delivered"])
+
+    def test_a_body_that_is_not_an_object_is_unknown(self):
+        outcome = self._dispatch(["delivered"]).deliver(self.SESSION, "work")
+        self.assertEqual(outcome["state"], "unknown")
+        self.assertIsNone(outcome["delivered"])
 
 
 if __name__ == "__main__":

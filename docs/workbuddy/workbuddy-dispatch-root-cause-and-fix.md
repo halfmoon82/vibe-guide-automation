@@ -375,3 +375,77 @@ monitor 不会点名它们，但不该因此判定契约破裂。
 
 其余 P3（`live()` 无调用点、`_pid_alive` 重复调用、`latest_reply` 成为死代码、
 投递成功但写结果失败的 at-least-once、HTTP 传输层测试未覆盖）**记录在案、不阻塞合并**。
+
+---
+
+## 9. 第三轮复审返工（2026-10-08）
+
+第二轮返工先修了一处「同 sweep 内轮转」的重复投递向量（`deliver()` 把「显式拒绝」与
+「响应未知」压成同一个 `False`）。第三轮**独立复审**判定 **「需返工（小改）」**：那次只
+挡住了同一轮扫描内的轮转，**跨轮重试仍然会重复投递**。
+
+### 9.1 P1：`unknown` 留在 pending → 跨轮重复投递（阻断）
+
+- **触发**：`/reply` 返回 2xx 但 body 里没有布尔 `delivered`（含空 body——`_call` 对空
+  响应体返回 `{}`）。
+- **后果**：`serve()` 把 `SessionError` 记进 `skipped` 就 `continue`，**不写 result 文件**。
+  请求因此永久 pending：provider 侧一直 `ProviderPending`，监工每次重跑 `serve` 都把
+  同一条 prompt 再投一次。第三轮的注释写着 "caller must fail closed, never retry"，而
+  实现正好相反——**跨轮重试**。
+- **修法**：新增 `DeliveryUnknown(SessionError)` 这一**独立**异常类型，语义是「回合可能
+  已入队，永不可重试」。`serve()` 捕获它后写一份**终态负结果**
+  （`{"delivery": "unknown", "failed": true, "reason": ...}`）：既没有 `binding`、也没有
+  `located`/`resumed`，provider 只能把它读成「动作失败」，于是**既不伪造 worker，也不
+  留在 pending**。`serve()` 的返回值新增 `failed` 桶，把这批「已终结、不会有人再重试」
+  的请求显式交给操作者。
+- **与普通 `SessionError` 的分工**：普通错误（没有窗口、显式拒绝、请求非法）意味着回合
+  **从未离开我们**，请求可以安全地留在 pending 等下一轮；只有 `DeliveryUnknown` 是终态。
+
+### 9.2 P2
+
+| # | 问题 | 修法 |
+|---|---|---|
+| P2-1 | `_write_json` 写在 `try` 之外：投递成功后写结果失败会抛穿 `serve()`（只 `finally` 解锁），整个 sweep 中断，且该请求留在 pending → 下轮重复投递 | 新增 `delivering/<action>.json` **投递标记**：POST 之前立起，仅在**显式拒绝**（唯一能证明「未入队」的答复）时放下。崩溃 / 写结果失败都会留下标记，下一轮据此**终态失败**而不是重投。写结果的 `OSError` 单独捕获，不再中断 sweep |
+| P2-2 | 自身窗口只靠人工排除：`skip` 只含 env + 构造参数 + 本轮 `used`，而监工通常就跑在它为之派发的那个会话里；操作者忘设 `WORKBUDDY_DISPATCH_EXCLUDE_SIDS` 时任务被投回监工自己的对话，角色塌陷 | 新增 `host_session_id()` 读 `CODEBUDDY_SESSION_ID`（按 UUID 校验），**默认**并入 `skip`；自身会话是唯一存活的窗口时如实报「无窗口可派」，不退回自身 |
+
+### 9.3 P3（顺带）
+
+- `WorkBuddyJobs._window_handle` 走模块级 `load_handle`，绕过 `dispatch` 的 handle_root；
+  显式覆盖 root 时读写分叉。改为走 `self.dispatch.load_handle`。
+- 首个候选 `history()` 失败会中断整条 action，不再轮转。改为记入 `unreachable` 并
+  **尝试下一个候选**，全失败时错误信息里带上不可达窗口。
+- `deliver()` 的三态此前**没有直接测试**：servicer 用例由 `FakeDispatch` 自己造 `state`，
+  把实现改回旧行为仍然全绿（自证循环）。新增 `DeliverOutcomeTests`，在**传输边界**上
+  用替换 `_call` 的桩验证 `accepted` / `refused` / `unknown`（空 body、非布尔字段、
+  非对象 body）四种形状。
+
+### 9.4 测试与变异检验
+
+`tests/test_workbuddy_sessions.py` 29 → **38 项**（新增：未知结果终态化、崩溃标记不重投、
+自身会话永不入选、只剩自身会话即无窗口、候选死亡不放弃整条 action、投递三态 ×5）。
+
+新用例做了**变异检验**，确认不是自证循环——四处变异各自被对应用例抓到：
+
+| 变异 | 被抓到的用例 |
+|---|---|
+| `unknown` 塌回 `refused` | `test_an_empty_body_is_unknown_not_refused` 等 3 项 |
+| `unknown` 留在 pending（回到 §9.1 的 bug） | `test_an_unknown_delivery_outcome_is_answered_terminally` |
+| 去掉崩溃标记护栏 | `test_a_crashed_delivery_is_never_delivered_twice` |
+| 去掉自身会话排除 | `test_the_host_conversation_is_never_a_target` 等 2 项 |
+
+「不再 pending」这条不是自说自话：用例直接用 provider 侧的 `ProviderActionStore` 读同一
+个 mailbox，断言 `store.result(action_id)` 非空、`store.pending()` 不再列出该请求。
+
+全量 1502 项：**2 失败 + 3 错误 + 1 skip**，全部落在
+`test_v310_packaging` / `test_v2_acceptance` / `test_skill_install_cli`；经核对这三个模块
+对 `workbuddy_sessions` / `workbuddy_jobs` **零引用**，属既有环境性问题（打包构建、
+本机 skill 数量），与本改动无因果关系。
+
+### 9.5 已知残留（不阻塞合并，记录在案）
+
+- **resume 的终态只解决「不重投」，未解决「不悬挂」**：`provider_action.poll` 对
+  `resumed` 非 `true` 的结果返回 `visibility_unknown` 并保留 `pending_action`，所以窗口
+  消失 / 拒收的 resume 仍是「已暴露但未收敛」。这是 provider 侧既有语义，改动它属于协议
+  变更，应单独走一次评审。
+- baseline 与投递之间隔一次往返：用户可见窗口若在这中间被人工输入，索引后移，
+  `reply_after` 会返回那一轮人工输入的回复（串轮）。窗口可见性是本方案的前提。
