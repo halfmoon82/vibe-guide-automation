@@ -762,6 +762,83 @@ class MailboxTests(unittest.TestCase):
         self.assertEqual(self._result("action-27"), answered)
         self.assertFalse(marker.exists())
 
+    def test_a_lost_reply_keeps_the_marker_when_the_answer_cannot_be_written(self):
+        # Two guards have to hold together.  A POST whose answer was lost may
+        # already be queued, and if the terminal answer cannot be written
+        # either, the marker is the only thing left saying "do not resend".
+        first = "77777777-7777-4777-8777-777777777777"
+        second = "88888888-8888-4888-8888-888888888888"
+        dispatch = FakeDispatch(
+            [
+                {"pid": 5, "session_id": first, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:1", "alive": True},
+                {"pid": 6, "session_id": second, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:2", "alive": True},
+            ],
+            lose_reply={first},
+        )
+        self._request("action-28", "create", {"prompt": "work"})
+        servicer = module.MailboxServicer(dispatch)
+        marker = self.mailbox / "delivering" / "action-28.json"
+
+        def unwritable(*args, **kwargs):
+            raise OSError("no space left on device")
+
+        servicer._record = unwritable
+        servicer.serve(project_dir=str(self.project))
+        self.assertEqual(dispatch.delivered, [(first, "work")])
+        self.assertTrue(marker.exists())
+        # Nothing may be sent again, on this sweep or the next.
+        again = servicer.serve(project_dir=str(self.project))
+        self.assertEqual(dispatch.delivered, [(first, "work")])
+        self.assertTrue(marker.exists())
+
+    def test_a_refused_turn_leaves_no_marker_behind(self):
+        # A refusal is proof nothing was queued, so the marker has to come down.
+        # Left up, it would fail a request that never left -- and that request
+        # would never be retried, even once a window frees up.
+        busy = "77777777-7777-4777-8777-777777777777"
+        dispatch = FakeDispatch(
+            [{"pid": 5, "session_id": busy, "cwd": str(self.project),
+              "endpoint": "http://127.0.0.1:1", "alive": True}],
+            refuse={busy},
+        )
+        self._request("action-29", "create", {"prompt": "work"})
+        servicer = module.MailboxServicer(dispatch)
+        first = servicer.serve(project_dir=str(self.project))
+        self.assertEqual([item["action_id"] for item in first["skipped"]], ["action-29"])
+        marker = self.mailbox / "delivering" / "action-29.json"
+        self.assertFalse(marker.exists())
+        self.assertIsNone(self._result("action-29"))
+        # The window frees up: the retry really does happen.
+        dispatch.refuse = set()
+        second = servicer.serve(project_dir=str(self.project))
+        self.assertEqual([item["action_id"] for item in second["served"]], ["action-29"])
+        self.assertEqual(dispatch.delivered, [(busy, "work"), (busy, "work")])
+
+    def test_a_candidate_that_vanishes_before_the_post_falls_through(self):
+        # The window can go away between the history read and the POST.  Nothing
+        # was sent, so the sweep must try the next candidate rather than leave
+        # the whole action unanswered for another round.
+        dying = "11111111-1111-4111-8111-111111111111"
+        healthy = "22222222-2222-4222-8222-222222222222"
+        dispatch = FakeDispatch(
+            [
+                {"pid": 5, "session_id": dying, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:1", "alive": True},
+                {"pid": 6, "session_id": healthy, "cwd": str(self.project),
+                 "endpoint": "http://127.0.0.1:2", "alive": True},
+            ],
+            vanish={dying},
+        )
+        self._request("action-30", "create", {"prompt": "work"})
+        outcome = module.MailboxServicer(dispatch).serve(project_dir=str(self.project))
+        self.assertEqual([item["action_id"] for item in outcome["served"]], ["action-30"])
+        self.assertEqual(dispatch.delivered, [(dying, "work"), (healthy, "work")])
+        self.assertEqual(self._result("action-30")["payload"]["sessionId"], healthy)
+        # Nothing was queued on the window that went away, so no marker is left.
+        self.assertFalse((self.mailbox / "delivering" / "action-30.json").exists())
+
     def test_a_window_that_dies_mid_sweep_does_not_abandon_the_action(self):
         # ``history`` failing on one candidate is a reason to try the next one,
         # not to leave the whole action unanswered.

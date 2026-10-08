@@ -568,3 +568,59 @@ workbuddy/session 相关 5 模块 **130 项全绿**；全量 1515 项仍为同�
 > 为了消掉这个耦合。
 
 workbuddy/session 相关 5 模块 **135 项全绿**。
+
+---
+
+## 12. 第六轮复审返工（2026-10-08）
+
+§11 的返工经**独立复审**：**P0 = 0，P1 = 0**。这是五轮以来第一次没有阻断项。
+剩下 1 个 P2 是**覆盖缺口**，不是代码缺陷。
+
+### 12.1 P2：`_deliver` 的两条标记护栏没有用例（护红线）
+
+第 11 轮把「谁有权放下标记」收拢到 `_deliver` 一处，但那一处有三种行为，其中两种
+**没有任何用例**。实测确认（我复现了复审给出的变异）：
+
+- 把 `except DeliveryUnknown: raise` 并进 `except SessionError`（即让 `DeliveryUnknown`
+  也放下标记）→ **102 项全绿**。
+- 删掉「显式拒绝放下标记」那一行 → **全绿**。
+
+为什么上一轮没覆盖到：`test_a_terminal_answer_that_cannot_be_written_keeps_the_marker`
+里 `FakeDispatch` 是**返回** `state="unknown"`，而 `_deliver` 的 `except DeliveryUnknown`
+分支只在 dispatch **抛出**时才走。用例写的是「返回值未知」，护栏管的是「抛异常」——
+两者看着像同一件事，实际隔着一层。这正是自证循环的典型形态。
+
+两条护栏失效的后果恰好就是两条红线：
+
+- 护栏 A 失效 + `_fail_terminally` 写盘也失败（磁盘满）→ 标记已放、结果未落 →
+  下一轮无标记无结果 → **重投同一 prompt**。
+- 护栏 B 失效（拒绝后标记不放下）→ 标记永久留下 → 下一轮被误判终态失败 →
+  **好请求永不重试**，即使窗口后来空出来。
+
+**修法**：补两条用例，并把它们写成「组合条件」而不是各自孤立——
+`test_a_lost_reply_keeps_the_marker_when_the_answer_cannot_be_written`（dispatch 抛
+`DeliveryUnknown` + `_record` 写失败）、`test_a_refused_turn_leaves_no_marker_behind`
+（全候选拒绝 → 无标记 → 窗口空出后**确实**重试成功）。两条变异随后都被抓到。
+
+### 12.2 P3
+
+- `_answer_create` 的轮转循环只包了 `history`，没包 `_deliver`：候选窗口在查端点与
+  POST 之间消失时（`_endpoint_for` 抛普通 `SessionError`），整条 action 被中止而不是
+  转下一个候选。窄竞态，但既然后果只是「多等一轮」，就没有理由不修。改为捕获后记入
+  `unreachable` 并 `continue`；`DeliveryUnknown` 仍原样抛出（它不能轮转）。
+  新增 `test_a_candidate_that_vanishes_before_the_post_falls_through`。
+- `_answer_resume` 的终态负结果**不被 provider 读成终态**：`provider_action.poll:1154`
+  只有 `result["resumed"] is True` 才清 `pending_action`，否则回 `visibility_unknown`，
+  最终落 `blocked_unknown`、pending 永不清。`_fail_terminally` 的 payload 没有
+  `resumed`，`resumed:false`（窗口已死）同理。**fail-closed，不触红线**，但与
+  `_answer_resume` docstring 所称「读成动作失败、不留 pending」不符——把 docstring
+  改成如实描述，并保留为**已知残留**（改 provider 语义属协议变更，单独评审）。
+
+### 12.3 测试
+
+`tests/test_workbuddy_sessions.py` 47 → **51 项**。workbuddy/session 相关 5 模块
+**139 项全绿**。
+
+> 六轮下来，每轮返工都引入了**新的同类问题**（第 3→4→5→6 轮全部围绕「重复投递」这条
+> 红线打转）。第 11 轮的「收拢成一条规则」是第一次让规则本身收敛而不是再加一个补丁；
+> 第 12 轮补上护栏用例后，这条不变式才第一次有了完整的回归保护。

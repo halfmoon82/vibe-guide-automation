@@ -968,7 +968,17 @@ class MailboxServicer:
                 # to try the next candidate, not to abandon the whole action.
                 unreachable.append("%s (%s)" % (candidate_id, error))
                 continue
-            state = self._deliver(marker, candidate_id, prompt).get("state")
+            try:
+                state = self._deliver(marker, candidate_id, prompt).get("state")
+            except DeliveryUnknown:
+                # The turn may already be queued: fail closed, never rotate.
+                raise
+            except SessionError as error:
+                # The window went away between the lookup and the POST, so
+                # nothing was sent.  That is a reason to try the next candidate,
+                # not to abandon the whole action.
+                unreachable.append("%s (%s)" % (candidate_id, error))
+                continue
             if state == "accepted":
                 session = candidate
                 baseline = candidate_baseline
@@ -1073,9 +1083,15 @@ class MailboxServicer:
         """Resume a turn on the window that owns the thread.
 
         ``provider_action.poll`` refuses a resume result unless it carries
-        ``resumed: true``.  A window that is gone must therefore answer
-        ``false`` here instead of being silently dropped: a dropped resume
-        parks the run at "provider resume is pending" forever.
+        ``resumed: true``, so a window that is gone answers ``false`` here
+        rather than being silently dropped.  Be precise about what that buys:
+        the provider turns ``false`` into ``visibility_unknown`` and leaves its
+        ``pending_action`` in place, so the node lands on ``blocked_unknown`` --
+        surfaced to the operator, but not resolved.  That is still better than
+        no answer at all, which parks the run on an unreported "pending"
+        forever, and it is never a second delivery.  Making the provider treat
+        an explicit failure as terminal is a protocol change, not this module's
+        call.
         """
         thread_id = request.get("threadId") or request.get("task_id")
         if not isinstance(thread_id, str) or not thread_id:
