@@ -821,6 +821,56 @@ class ExpiredEngineEvidenceReauthorizationTests(unittest.TestCase):
         names = [event["event"] for event in load_events(self.paths, self.snapshot.run_id)]
         self.assertNotIn("authorization_reauthorized", names)
 
+    def test_reauthorization_refreshes_workflow_before_public_resume(self):
+        state_path = self.paths.vibe / "state.json"
+        before = json.loads(state_path.read_text(encoding="utf-8"))
+        before["task_workflow"]["other-plan"] = {"preserved": True}
+        state_path.write_text(json.dumps(before), encoding="utf-8")
+        with self._aged_evidence():
+            self._reauthorize()
+
+        card = json.loads(self.card_path.read_text(encoding="utf-8"))
+        workflow = load_live_workflow(self.paths, "probe-plan")
+        self.assertEqual(
+            workflow["node_records"]["plan_confirmation"]["output"]["authorization_digest"],
+            card["digest"],
+        )
+        after = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(after["task_workflow"]["other-plan"], {"preserved": True})
+        for key in set(before) - {"task_workflow"}:
+            self.assertEqual(after[key], before[key])
+        resumed = run_cli(
+            ["resume", "--plan", "probe-plan", "--run-id", self.snapshot.run_id, "--json"],
+            self.root,
+        )
+        self.assertNotIn("workflow_evidence_stale", resumed.payload.get("reason", ""))
+        self.assertNotEqual(resumed.payload.get("status"), "blocked_design")
+        current = load_snapshot(self.paths, self.snapshot.run_id)
+        self.assertEqual(current.run_id, self.snapshot.run_id)
+        self.assertEqual(current.authorization_digest, card["digest"])
+
+    def test_workflow_refresh_failure_retains_invalidation_and_can_retry(self):
+        invalidation = self.directory / "authorization-invalidated.json"
+        invalidation.write_text(json.dumps({"reason": "contract correction"}), encoding="utf-8")
+        before = (self.paths.vibe / "state.json").read_bytes()
+        with patch.object(
+            cli_module, "materialize_workflow_evidence",
+            side_effect=OSError("workflow publication refused by test"),
+        ):
+            result = self._reauthorize()
+        self.assertNotEqual(result.payload.get("status"), "ok")
+        self.assertTrue(invalidation.exists())
+        self.assertEqual((self.paths.vibe / "state.json").read_bytes(), before)
+        self._reauthorize()
+        self.assertFalse(invalidation.exists())
+        current = load_snapshot(self.paths, self.snapshot.run_id)
+        self.assertEqual(current.run_id, self.snapshot.run_id)
+        resumed = run_cli(
+            ["resume", "--plan", "probe-plan", "--run-id", self.snapshot.run_id, "--json"],
+            self.root,
+        )
+        self.assertNotIn("workflow_evidence_stale", resumed.payload.get("reason", ""))
+
     def test_a_plan_without_an_engine_binding_stages_nothing(self):
         """Non-complex plans must not acquire evidence they cannot carry.
 
