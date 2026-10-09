@@ -179,11 +179,15 @@ DEFAULT_ROTATE_TOKEN_THRESHOLD = 80000
 DEFAULT_ROTATE_SOFT_CAP = 100000
 DEFAULT_ROTATE_HARD_CAP = 150000
 SUPERVISOR_OUTPUT_POLICY = (
-    "监工输出约束：CLI/bridge 的完整输出由运行时落盘，聊天只返回摘要和证据路径。"
-    "原生 wait_threads 必须通过工具编排保存完整返回，只向会话输出状态、cursor 和最新一条短消息（最多 200 字）；"
-    "遇到 errors、unknown 或需人工处理时保留原因。不得打印完整 reviewer JSON。"
-    "接班先读 handoff-summary.json；技能和历史报告仅按需读取，读过的同一 digest 不重复载入。"
+    "监工整批输出约束：每次工具编排合并后的返回最多 8192 UTF-8 字节，不能按每个子调用各算一份预算。"
+    "所有 shell、源码读取和原生工具完整结果先保存为 name/output 列表，再调用 "
+    "supervisor-output --run-id <run-id> --payload <批次 JSON 路径> --json；"
+    "只把该入口摘要返回聊天，完整结果仍用于真实 provider 回写，摘要不能替代结果。"
+    "相同批次 SHA 已读时只返回证据引用；需要下钻时只读相关片段，不重复载入完整协议或报告。"
+    "原生 wait_threads 仅保留状态、cursor、错误和最新消息（最多 200 字），不得打印完整 reviewer JSON。"
+    "接班先读 handoff-summary.json；已解决故障不重新调查。"
 )
+
 SUPERVISOR_OUTPUT_LIMIT = 8192
 HANDOFF_SUMMARY_LIMIT = 24576
 
@@ -283,6 +287,7 @@ def supervisor_preflight(
     session_record=None,
     *,
     token_threshold=DEFAULT_ROTATE_TOKEN_THRESHOLD,
+    context_hard_cap=DEFAULT_ROTATE_HARD_CAP,
 ):
     """Read-only disk check; returns exactly one of idle/work/rotate/unknown.
 
@@ -307,13 +312,15 @@ def supervisor_preflight(
     baseline = _takeover_baseline(paths, run_id, session_record)
     if token_threshold <= 0:
         return {"state": "unknown", "reason": "growth threshold must be positive"}
-    if tokens >= DEFAULT_ROTATE_HARD_CAP:
+    if type(context_hard_cap) is not int or context_hard_cap <= DEFAULT_ROTATE_SOFT_CAP:
+        return {"state": "unknown", "reason": "context hard cap must exceed soft cap"}
+    if tokens >= context_hard_cap:
         return {"state": "rotate", "reason": "context over hard cap",
-                "tokens": tokens, "baseline": baseline, "prepare_handoff": True}
+                "tokens": tokens, "baseline": baseline, "context_hard_cap": context_hard_cap, "prepare_handoff": True}
     if (tokens >= DEFAULT_ROTATE_SOFT_CAP and baseline is not None
             and tokens - baseline >= token_threshold):
         return {"state": "rotate", "reason": "context grew past threshold since takeover",
-                "tokens": tokens, "baseline": baseline, "prepare_handoff": True}
+                "tokens": tokens, "baseline": baseline, "context_hard_cap": context_hard_cap, "prepare_handoff": True}
     try:
         holds = supervisor_holds(paths, run_id)
     except ValueError:
@@ -321,6 +328,7 @@ def supervisor_preflight(
     result = _mailbox_state(paths, run_id, holds)
     result.setdefault("tokens", tokens)
     result.setdefault("baseline", baseline)
+    result["context_hard_cap"] = context_hard_cap
     result["prepare_handoff"] = tokens >= DEFAULT_ROTATE_SOFT_CAP
     return result
 
@@ -684,7 +692,7 @@ def heartbeat_prompt(plan_id, run_id, *, command_prefix="vibe"):
         "  - rotate：新开一个会话，让它跑 {cli} supervisor-handoff --run-id {run} 并照输出接班；本会话不再做别的。\n"
         "例行轮询不向用户汇报。"
     ).format(plan=plan_id, run=run_id, cli=command_prefix)
-    return prompt + ("\n" + SUPERVISOR_OUTPUT_POLICY if command_prefix != "vibe" else "")
+    return prompt + "\n" + SUPERVISOR_OUTPUT_POLICY.replace("supervisor-output --", command_prefix + " supervisor-output --").replace("<run-id>", run_id)
 
 
 def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):

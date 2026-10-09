@@ -3326,6 +3326,8 @@ class Monitor:
         contract.update(
             {
                 "node_id": node_id,
+                "title": getattr(node, "title", contract.get("title", "")),
+                "spec_path": getattr(self.plan, "spec_path", ""),
                 "role": role,
                 "worker": (
                     node.contract.get("reviewer_worker")

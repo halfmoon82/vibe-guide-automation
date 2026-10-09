@@ -866,8 +866,8 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
             binding = self._binding(paths, intent, observation, worktree, run_id)
             monitor = Monitor.__new__(Monitor)
             monitor.paths = paths
-            monitor.plan = SimpleNamespace(version=1)
-            monitor.nodes = {"BUG-V3-005": SimpleNamespace(contract={"files": []})}
+            monitor.plan = SimpleNamespace(version=1, spec_path="specs/business.md")
+            monitor.nodes = {"BUG-V3-005": SimpleNamespace(title="业务任务", contract={"files": []})}
             monitor._binding_cache = {}
             current = {
                 "status": "planned", "worker": "worker", "worktree": worktree,
@@ -891,14 +891,18 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
             monitor._record = lambda *args, **kwargs: None
             class Runner:
                 def start(self, contract, root):
+                    self_contracts.append(contract)
                     order.append("start")
                     return SimpleNamespace(run_id="handle-1")
                 def is_pending(self, handle):
                     return False
+            self_contracts = []
             with patch("vibe_guide.monitor.validate_runtime_contract", side_effect=lambda c, **kwargs: c), \
                  patch("vibe_guide.monitor.save_snapshot"):
                 monitor._start_task(snapshot, "BUG-V3-005", "developer", "implement", Runner(), False)
             self.assertLess(order.index("preflight"), order.index("bootstrap"))
+            self.assertEqual(self_contracts[0]["title"], "业务任务")
+            self.assertEqual(self_contracts[0]["spec_path"], "specs/business.md")
 
     def test_continuation_without_persisted_provenance_reaches_bootstrap_recovery(self):
         """A JSON-restored continuation must not be rejected before bootstrap."""

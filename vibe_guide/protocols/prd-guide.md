@@ -220,6 +220,7 @@ vibe 监工心跳 · 计划 <plan_id> · 运行 <run-id>
   - work 或 unknown：按 prd-guide §6.1 服务信箱一轮，推进用 vibe resume --plan <plan_id> --run-id <run-id>；状态只从磁盘读。
   - rotate：新开一个会话，让它跑 vibe supervisor-handoff --run-id <run-id> 并照输出接班；本会话不再做别的。
 例行轮询不向用户汇报。
+监工整批输出约束：每次工具编排合并后的返回最多 8192 UTF-8 字节，不能按每个子调用各算一份预算。所有 shell、源码读取和原生工具完整结果先保存为 name/output 列表，再调用 vibe supervisor-output --run-id <run-id> --payload <批次 JSON 路径> --json；只把该入口摘要返回聊天，完整结果仍用于真实 provider 回写，摘要不能替代结果。相同批次 SHA 已读时只返回证据引用；需要下钻时只读相关片段，不重复载入完整协议或报告。原生 wait_threads 仅保留状态、cursor、错误和最新消息（最多 200 字），不得打印完整 reviewer JSON。接班先读 handoff-summary.json；已解决故障不重新调查。
 ```
 
 不要自己另写心跳指令，也不要把信箱服务直接写进心跳：自写的心跳每次都跑一整轮 `vibe resume`，跳过预检、不登记、不换班，空闲心跳的成本是设计值的 5–15 倍（2026-10-03 实测）。
@@ -242,7 +243,14 @@ for action in store.pending():          # 先按当前 run/绑定证据收敛已
 
 心跳是 native-action consumer：`pending()` 只负责发现请求，必须由监工会话逐条调用
 `action["native_tool"]`，再用同一 `action_id`、`request_digest` 通过 `complete()` 回写结果；
-只跑 `resume` 不算消费信箱。旧 `create` 只有在当前 run、节点、角色、代次、授权摘要和
+只跑 `resume` 不算消费信箱。
+
+**整批输出门**：每次宿主工具编排的合并返回最多 8192 UTF-8 字节，不是每个子调用各有 8192 字节。shell/源码读取与原生工具结果统一保存为批次 JSON `[{"name":"wait_threads","output":<完整原生结果>}, ...]`，调用 `vibe supervisor-output --run-id <run-id> --payload <批次路径> --json`（runtime bridge 使用交接中的命令前缀）。只将该入口摘要送入会话；完整原生对象仍用于 provider 结果校验和回写，摘要不是成功证据。入口保留完整结果、SHA 和短状态，失败/unknown 不降级为成功；同一 SHA 再读只返回引用。需下钻时读取具体相关片段，已读的同 digest 协议/历史报告不重复全文载入；接班不重新调查已解决的故障。这个入口只限制通过它返回的结果，宿主不得另行打印原始批次绕过它。
+
+**续接目标不丢失**：收到明确开发、review 或接班请求后，后续 AGENTS/技能注入只补规则，不能把任务替换成“没有具体任务”。先按入口预检，再执行原请求；只有真正缺少会改变目标或授权的字段才提问。续接消息应包含目标、原合同、writer worktree/branch、白名单、本代状态/交付路径和 marker。原生 `active`/`resumed` 回执不证明实现推进；若只有规则确认而无执行/交付，在原任务明确重申未完成目标，保留 generation 与真实结果，不新建 writer。
+
+模型与监工独立：每个 developer/reviewer 按该 Issue 的难度、风险和已验证能力选择 WorkerProfile，派发和续接显式传模型及思考档位（deep→high、normal→medium）；不得因为监工使用某模型而默认继承。模型不可验证时保持 unknown，不以省略模型参数掩盖故障。
+旧 `create` 只有在当前 run、节点、角色、代次、授权摘要和
 `accepted`/更新代次证据全部匹配时，才可调用 `reconcile_stale()` 写入审计标记；原请求保留，
 不调用 native tool、不写伪造结果。任一证据缺失或冲突都继续保持 pending/unknown。
 
@@ -451,7 +459,7 @@ vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路
 - 输出 `idle`：所有节点都在运行、已完成或等人拍板，且无新请求。只回一字结束本轮，不做任何写。
 - **等人拍板必须登记**：监工决定把某个节点挂起等用户回答时，先跑 `vibe supervisor-hold --run-id <run-id> --node <节点> --reason <一句话原因>`；用户回复后先 `vibe supervisor-hold --run-id <run-id> --node <节点> --release` 再推进。不登记，挂起的请求每次心跳都被当成 `work`，空闲心跳的成本是设计值的数倍（2026-10-05 run 140 实测：60 次预检 46 次误判）。挂起的节点上有 worker 交付或结果时仍然是 `work`。挂起会记下当时全盘节点状态：此后任何节点状态变化，或挂起满 6 小时，预检报 `work`（`hold needs recheck`），复核后仍在等人就对每个挂起节点再跑一次同一条挂起命令刷新。挂起节点的待服务请求在用户答复并解除挂起之前不执行，换班后的新班次同样遵守。`review`/`rework` 状态的节点不能挂起（它们只靠监工推进）。
 - 输出 `work`：有待服务请求、worker 已完工（含已自报但监工还没领取的交付），或有节点处在就绪/重试/未知等需要推进的状态。按 §6.1 原流程服务信箱，状态一律只从磁盘读，不凭记忆。
-- 输出 `rotate`：本会话上下文自接班以来增长超过阈值（默认 6 万 token，可配 `--token-threshold`），或超过 15 万的绝对上限；登记时没给 `--session-record` 的班次没有接班起点，按绝对值计算。执行换班：新开会话，让它跑 `vibe supervisor-handoff --run-id <run-id>`——这一条打印接班需要的全部内容（进度、等人拍板事项、填好的同一段心跳指令、接班步骤），新会话照做即可，不必再翻本协议、授权卡或完整状态：用 `vibe supervisor-register --session-record` 登记、自建心跳、置顶、改标题；删除旧心跳，旧会话归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。
+- 输出 `rotate`：当前上下文达到 10 万且自接班以来增长至少 8 万 token（可配 `--token-threshold`），或达到 15 万的绝对上限（默认；用户明确临时覆盖时使用 `--context-hard-cap <tokens>`，增长阈值也需同步显式设置，不能只用 `--token-threshold` 冒充绝对上限已改变）；登记时没给 `--session-record` 的班次没有接班起点，按绝对值计算。执行换班：新开会话，让它跑 `vibe supervisor-handoff --run-id <run-id>`——这一条打印接班需要的全部内容（进度、等人拍板事项、填好的同一段心跳指令、接班步骤），新会话照做即可，不必再翻本协议、授权卡或完整状态：用 `vibe supervisor-register --session-record` 登记、自建心跳、置顶、改标题；删除旧心跳，旧会话归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。
 - 输出 `unknown`：会话记录读不到或解析失败。**不得当成 idle**，按 `work` 处理。
 
 监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> --session-record <日志>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run>` 查询；未登记返回 `unknown` 而非空成功。登记内容只允许 provider/会话 id/host，不得含凭据。

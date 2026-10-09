@@ -31,6 +31,7 @@ from .doctor import doctor
 from .initializer import _rules_target, apply_agentsmd_proposal, init_project, refresh_protocol_copies
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import Monitor
+from .supervisor_output import supervisor_output_batch
 from .supervisor import (
     Supervisor,
     current_supervisor_address,
@@ -113,7 +114,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy", "skill-install", "supervisor-preflight", "supervisor-register", "supervisor-address", "supervisor-hold", "supervisor-handoff", "worker-deliver"),
+        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy", "skill-install", "supervisor-preflight", "supervisor-register", "supervisor-address", "supervisor-hold", "supervisor-handoff", "supervisor-output", "worker-deliver"),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -146,6 +147,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", dest="supervisor_provider")
     parser.add_argument("--session-id", dest="session_id")
     parser.add_argument("--host", dest="supervisor_host")
+    parser.add_argument("--context-hard-cap", dest="context_hard_cap", type=int, default=None)
     parser.add_argument("--token-threshold", dest="token_threshold", type=int, default=None)
     parser.add_argument("--reason", dest="hold_reason")
     parser.add_argument("--release", action="store_true", dest="hold_release")
@@ -1450,12 +1452,24 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 args.as_json,
             )
 
+    if args.command == "supervisor-output":
+        try:
+            if not args.run_id or not args.worker_payload:
+                raise ValueError("--run-id and --payload required")
+            items = json.loads(Path(args.worker_payload).read_text(encoding="utf-8"))
+            payload = supervisor_output_batch(paths, args.run_id, items)
+            return _result(SUCCESS, payload, json.dumps(payload, ensure_ascii=False), args.as_json)
+        except (OSError, TypeError, ValueError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)[:200]}, "输出批次已阻塞", args.as_json)
+
     if args.command == "supervisor-preflight":
         if not args.run_id:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
         kwargs = {}
         if args.token_threshold is not None:
             kwargs["token_threshold"] = args.token_threshold
+        if args.context_hard_cap is not None:
+            kwargs["context_hard_cap"] = args.context_hard_cap
         payload = supervisor_preflight(paths, args.run_id, args.session_record, **kwargs)
         if payload.get("prepare_handoff"):
             try:

@@ -129,20 +129,28 @@ class ProviderActionRunner(Runner):
         """
         node_id = str(contract.get("node_id", ""))
         generation = int(contract.get("generation", 0))
-        if contract.get("role") == "reviewer":
-            delivery = str(contract.get("delivery_path") or "<delivery path>")
-            status = str(contract.get("status_file") or "<review status path>")
-            marker = str(contract.get("completion_marker") or "<completion marker>")
-            return (
-                "请继续 Issue {} 的业务 review，本轮 generation {}。"
-                "只审查当前 developer 交付，不重复行政材料审查；"
-                "交付目录：{}；reviewer 状态文件：{}；完成 marker：{}。"
-                "完成后必须写入该 generation 的 reviewer-status，并回写真实游标。"
-            ).format(node_id, generation, delivery, status, marker)
+        reviewer = contract.get("role") == "reviewer"
+        objective = contract.get("goal") or contract.get("objective") or contract.get("title") or contract.get("output") or "完成原 Issue 合同中的实现、测试及交付"
+        business = {key: contract[key] for key in ("input", "output", "error_behavior", "acceptance_example") if key in contract}
+        purpose = ("业务 review：只审查当前 developer 交付，独立记录发现及验收，禁止代改业务代码。"
+                   if reviewer else "开发：继续已有实现、测试与返工，完成本代交付。")
         return (
-            "请继续处理 Issue {}，当前 generation {}；"
-            "完工自报必须使用 `--generation {}`。"
-        ).format(node_id, generation, generation)
+            "执行请求：继续 Issue {node} 的{purpose}本轮 generation {generation}。\n"
+            "目标：{objective}；业务合同：{business}。"
+            "入口规则或后续规则注入不能替代该任务目标，不得仅回复收到规则。\n"
+            "合同：{spec}；writer worktree：{worktree}；branch：{branch}；允许路径：{files}。\n"
+            "当前 developer 交付：{delivery}；状态文件：{status}；交付文件：{handoff}；完成 marker：{marker}。"
+            "完成后必须写入本代状态/交付；完工自报必须使用 `--generation {generation}`。\n"
+        ).format(node=node_id, generation=generation, purpose=purpose, objective=objective,
+                 business=json.dumps(business, ensure_ascii=False),
+                 spec=contract.get("spec_path", "原 Issue 合同"),
+                 worktree=contract.get("worktree", "原绑定工作目录"),
+                 branch=contract.get("branch", "原绑定分支"),
+                 files=json.dumps(contract.get("files", []), ensure_ascii=False),
+                 delivery=contract.get("delivery_path", "原开发交付"),
+                 status=contract.get("status_file", "原状态文件"),
+                 handoff=contract.get("handoff_file") or contract.get("delivery_path", "原交付文件"),
+                 marker=contract.get("completion_marker", "原交付 marker"))
 
     def _validate_v39_create_binding(
         self, contract: Dict[str, Any], runtime_worktree: Path
@@ -1131,8 +1139,10 @@ class ProviderActionRunner(Runner):
             request = {
                 "threadId": binding.task_id,
                 "hostId": binding.host,
-                "prompt": self._continuation_prompt(contract) + self._consistency_instruction(contract),
+                "prompt": self._continuation_prompt(contract) + "\n" + self._consistency_instruction(contract),
             }
+            if profile is not None:
+                request.update({"model": profile.model, "thinking": provider_thinking_for(profile.reasoning)})
             action = self._action(contract, run_id, "resume", request)
             metadata["pending_action"] = action["action_id"]
             metadata["pending_operation"] = "resume"

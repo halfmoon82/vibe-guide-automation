@@ -374,6 +374,7 @@ class DispatchPromptTests(unittest.TestCase):
         from unittest.mock import patch
 
         from vibe_guide.runners import provider_action
+        from tests.test_heartbeat_native_actions import _profile
         from vibe_guide.runners.provider_action import ProviderActionRunner
 
         with tempfile.TemporaryDirectory() as d:
@@ -390,17 +391,27 @@ class DispatchPromptTests(unittest.TestCase):
             runner.binding_gate = lambda contract, binding: SimpleNamespace(verified=True)
             binding = SimpleNamespace(
                 task_id="t", host="mac", cursor=None, capability_contract_digest=None,
+                model="default", reasoning="normal", route_digest=_profile().route_digest,
             )
             contract = {
-                "run_id": "run-1", "node_id": "n1", "role": "developer",
+                "run_id": "run-1", "node_id": "issue-1", "role": "developer",
                 "generation": 3, "continuation": True,
+                "goal": "修复错误分类", "worktree": ".worktrees/issue-148",
+                "branch": "node/issue-148", "files": ["vibe_guide/monitor.py"],
+                "status_file": "developer-status.json", "handoff_file": "developer-delivery.md",
+                "worker_profile": _profile().to_dict(),
             }
             with patch.object(provider_action, "require_complex_monitor_dispatch"), \
                     patch.object(provider_action, "load_task_binding", return_value=binding), \
                     patch.object(provider_action, "binding_contract_enabled", return_value=False):
                 runner.start(contract, Path(d))
+            self.assertEqual(dict(seen)["resume"]["model"], "default")
+            self.assertEqual(dict(seen)["resume"]["thinking"], "medium")
             prompt = dict(seen)["resume"]["prompt"]
             self.assertIn("--generation 3", prompt)
+            for expected in ("修复错误分类", ".worktrees/issue-148", "node/issue-148", "vibe_guide/monitor.py", "developer-status.json", "developer-delivery.md", "执行请求"):
+                self.assertIn(expected, prompt)
+
             tail = prompt.split("一致性纠偏证据必须原样绑定：", 1)[1]
             json.loads(tail)
 

@@ -203,6 +203,17 @@ class HeartbeatNativeActionTests(unittest.TestCase):
         self.assertIn("reviewer-status.json", prompt)
         self.assertIn("reviewer-status.json:g10", prompt)
 
+    def test_continuation_carries_real_product_contract_for_both_roles(self):
+        runner = ProviderActionRunner.__new__(ProviderActionRunner)
+        for role in ('developer','reviewer'):
+            prompt=runner._continuation_prompt({'node_id':'issue-148','role':role,'generation':10,
+                'input':'类型错误', 'output':'结构化错误分类', 'error_behavior':'保留unknown',
+                'acceptance_example':'超时保持可恢复', 'spec_path':'docs/approved.md',
+                'worktree':'.worktrees/issue-148','branch':'node/issue-148','files':['src/errors.py'],
+                'status_file':'reviewer-status.json','handoff_file':'reviewer-delivery.md','delivery_path':'developer-delivery.md'})
+            for value in ('结构化错误分类','保留unknown','超时保持可恢复','docs/approved.md','.worktrees/issue-148','src/errors.py','reviewer-delivery.md','执行请求'):
+                self.assertIn(value,prompt)
+
     def test_delivered_event_projects_real_delivery_evidence_for_reviewer_continuation(self):
         monitor = Monitor.__new__(Monitor)
         monitor.nodes = {
