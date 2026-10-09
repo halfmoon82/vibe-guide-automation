@@ -76,6 +76,36 @@ class V39ModelRoutingTests(unittest.TestCase):
             self.assertEqual(request["thinking"], "high")
             self.assertEqual(request["route_digest"], profile.route_digest)
 
+    def test_provider_create_omits_thinking_after_parameter_recovery(self):
+        profile = WorkerProfile(
+            "developer", "gpt-6.1-sol", "deep", [],
+            {"issue_complexity_ref": "I-routing", "reasoning": "deep", "availability_evidence": "probe"},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = ProviderActionRunner(paths, "codex-app-visible", "codex-app-visible")
+            contract = {
+                "run_id": "run-routing",
+                "node_id": "I-routing",
+                "role": "developer",
+                "generation": 1,
+                "project_id": "project-1",
+                "worker_profile": profile.to_dict(),
+                "provider_options": {"omit_thinking": True},
+            }
+            captured = []
+
+            def capture_then_pending(_contract, _run_id, _operation, request):
+                captured.append(request)
+                raise ProviderPending("create pending")
+
+            with patch.object(runner, "_require_result", side_effect=capture_then_pending):
+                with self.assertRaises(ProviderPending):
+                    runner.task_binding(contract, paths.root, "run-routing", "start_pending")
+            self.assertEqual(len(captured), 1)
+            self.assertNotIn("thinking", captured[0])
+            self.assertEqual(captured[0]["model"], profile.model)
+
     def test_create_result_requires_actual_model_and_thinking_before_followup(self):
         profile = WorkerProfile(
             "developer", "gpt-5.6-sol", "deep", [],
@@ -114,6 +144,41 @@ class V39ModelRoutingTests(unittest.TestCase):
                     with self.assertRaises(ProviderUnavailable):
                         runner.task_binding(contract, paths.root, "run-routing", "start_pending")
                 self.assertEqual(calls, ["create"])
+
+    def test_create_result_without_optional_telemetry_keeps_verified_binding(self):
+        profile = WorkerProfile(
+            "developer", "gpt-5.6-sol", "deep", [],
+            {"issue_complexity_ref": "I-routing", "reasoning": "deep", "availability_evidence": "probe"},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = ProviderActionRunner(paths, "codex-app-visible", "codex-app-visible")
+            contract = {
+                "run_id": "run-routing",
+                "node_id": "I-routing",
+                "role": "developer",
+                "generation": 1,
+                "project_id": "project-1",
+                "routing_required": True,
+                "worker_profile": profile.to_dict(),
+            }
+            calls = []
+
+            def create_then_locate(_contract, _run_id, operation, _request):
+                calls.append(operation)
+                if operation == "create":
+                    return {"binding": {"threadId": "task-1", "hostId": "host-1"}}
+                if operation == "locate":
+                    return {"located": True}
+                return {"visible": True, "direct_enter": True}
+
+            with patch.object(runner, "_require_result", side_effect=create_then_locate):
+                binding = runner.task_binding(
+                    contract, paths.root, "run-routing", "start_pending"
+                )
+            self.assertEqual(binding.task_id, "task-1")
+            self.assertEqual(binding.host, "host-1")
+            self.assertEqual(calls, ["create", "locate", "visibility"])
 
     def test_invalid_branch_blocks_before_provider_io(self):
         for branch in ("/absolute-branch", "", " branch", "branch ", "bad branch", "a..b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b]", ".hidden", "branch.", "branch.lock", "foo/@{bar}"):

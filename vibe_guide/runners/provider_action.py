@@ -443,15 +443,23 @@ class ProviderActionRunner(Runner):
         profile = self._routing_profile(contract)
         if profile is not None:
             thinking = provider_thinking_for(profile.reasoning)
-            create_request.update(
-                {
-                    "model": profile.model,
-                    "thinking": thinking,
-                    "issue_id": node_id,
-                    "route_digest": profile.route_digest,
-                    "worker_profile": profile.to_dict(),
-                }
-            )
+            create_request.update({
+                "model": profile.model,
+                "issue_id": node_id,
+                "route_digest": profile.route_digest,
+                "worker_profile": profile.to_dict(),
+            })
+            # Some native Codex App versions reject an otherwise valid
+            # model/reasoning pair at request validation time.  The monitor's
+            # same-task recovery records this option after the first real
+            # rejection; omit only the optional thinking field and let the
+            # provider choose its supported default.
+            provider_options = contract.get("provider_options")
+            if not (
+                isinstance(provider_options, dict)
+                and provider_options.get("omit_thinking") is True
+            ):
+                create_request["thinking"] = thinking
         topology = str(contract.get("topology") or DEFAULT_TOPOLOGY)
         if topology not in _TOPOLOGIES:
             raise ValueError("task binding topology is invalid")
@@ -510,22 +518,32 @@ class ProviderActionRunner(Runner):
             or "selected_model" in profile.selection_basis
         )
         if routed_profile:
-            actual_model = created.get("actual_model")
-            actual_thinking = created.get("actual_thinking")
-            if (
-                not isinstance(actual_model, str)
-                or not actual_model.strip()
-                or actual_model.casefold() == "unknown"
-                or actual_model != profile.model
-            ):
-                raise ProviderUnavailable("provider actual model is blocked_unknown")
-            if (
-                not isinstance(actual_thinking, str)
-                or not actual_thinking.strip()
-                or actual_thinking.casefold() == "unknown"
-                or actual_thinking != create_request["thinking"]
-            ):
-                raise ProviderUnavailable("provider actual thinking is blocked_unknown")
+            # Native create responses from older Codex App versions may omit
+            # these optional telemetry fields even though they return a
+            # verified task binding.  The selected worker profile remains the
+            # supervisor's routing authority; absence of telemetry must not
+            # discard the task identity and strand the DAG.  If a provider
+            # does return either field, keep the existing fail-closed checks
+            # for malformed or conflicting telemetry.
+            if "actual_model" in created:
+                actual_model = created.get("actual_model")
+                if (
+                    not isinstance(actual_model, str)
+                    or not actual_model.strip()
+                    or actual_model.casefold() == "unknown"
+                    or actual_model != profile.model
+                ):
+                    raise ProviderUnavailable("provider actual model is blocked_unknown")
+            if "actual_thinking" in created:
+                actual_thinking = created.get("actual_thinking")
+                expected_thinking = create_request.get("thinking")
+                if (
+                    not isinstance(actual_thinking, str)
+                    or not actual_thinking.strip()
+                    or actual_thinking.casefold() == "unknown"
+                    or (expected_thinking is not None and actual_thinking != expected_thinking)
+                ):
+                    raise ProviderUnavailable("provider actual thinking is blocked_unknown")
         binding_data = created.get("binding")
         if not isinstance(binding_data, dict):
             raise ValueError("provider create result has no verified binding")

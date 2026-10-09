@@ -294,6 +294,26 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
     )
     if any(marker in normalized for marker in binding_markers):
         return _result("binding_unknown", "unknown")
+    # Native task creation can reject a model/reasoning combination before a
+    # task identity exists.  This is a provider request-shape problem: the
+    # monitor may retry the same role/generation after adapting the optional
+    # reasoning field, and must not turn it into a durable DAG block.
+    parameter_markers = (
+        "could not validate reasoning",
+        "reasoning effort",
+        "invalid reasoning",
+        "unsupported reasoning",
+        "reasoning level",
+        "invalid model",
+        "unsupported model",
+        "model/reasoning",
+        "model and reasoning",
+        "参数校验",
+        "思考程度",
+        "模型参数",
+    )
+    if any(marker in normalized for marker in parameter_markers):
+        return _result("retryable", "engineering")
     capacity_markers = ("429", "rate limit", "too many requests", "capacity", "quota", "限流", "容量", "配额")
     if any(marker in normalized for marker in capacity_markers):
         return _result("capacity_wait", "engineering")
@@ -442,6 +462,21 @@ class Monitor:
             if not worktree.is_absolute() and isinstance(project_root, str) and project_root:
                 worktree = Path(project_root) / worktree
             handle = runner.start(payload, worktree)
+        except ProviderUnavailable as error:
+            # Preserve the provider's actual request-shape diagnosis.  A
+            # broad catch here used to erase it as ``ProviderUnavailable``;
+            # the scheduler then treated every model/parameter rejection as
+            # an unknown binding and stopped the DAG.
+            failure = classify_provider_failure(error)
+            return {
+                "kind": str(failure["kind"]),
+                "reason_class": str(failure["kind"]),
+                "reason": redact_provider_text(str(error)),
+                "error_type": type(error).__name__,
+                "intent": payload.get("binding_intent") or (
+                    intent.to_dict() if hasattr(intent, "to_dict") else dict(intent)
+                ),
+            }
         except Exception as error:
             return {"kind": "retryable", "reason": type(error).__name__, "intent": payload.get("binding_intent") or (intent.to_dict() if hasattr(intent, "to_dict") else dict(intent))}
         # Existing runners expose RunHandle; only V4.4 contracts require
@@ -3096,7 +3131,7 @@ class Monitor:
             failure = classify_provider_failure(error)
             if failure["kind"] == "external_decision":
                 current["retryable_action"] = None
-            else:
+            elif failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
                 current["retryable_action"] = {
                     "role": role,
                     "phase": phase,
@@ -3110,10 +3145,41 @@ class Monitor:
                     "binding_digest": current.get("contract_digest", ""),
                     "last_observation_ref": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
                 }
+                current["status"] = self._v42_retry_status()
+                current["reason"] = redact_provider_text(str(error))
+                if "reasoning" in str(error).casefold() or "model" in str(error).casefold():
+                    options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
+                    options["omit_thinking"] = True
+                    current.setdefault("contract_overrides", {})["provider_options"] = options
+                    current["retryable_action"]["parameter_recovery"] = "omit_thinking"
+            else:
+                current["retryable_action"] = None
             current["active_task"] = None
             current["active_role"] = None
-            # Preserve the write-ahead intent for same-task retry.
-            self._mark_blocked_unknown(snapshot, node_id, str(error))
+            # Preserve the write-ahead intent for same-task retry.  Unknown
+            # binding/authorization evidence still fails closed; known
+            # engineering failures remain schedulable.
+            if failure["kind"] not in {"retryable", "capacity_wait", "repairable"}:
+                self._mark_blocked_unknown(snapshot, node_id, str(error))
+                # A pre-write binding observation has no provider handle yet,
+                # but it is still a recoverable same-generation action. Keep
+                # the retry marker after the fail-closed user status so the
+                # next heartbeat re-enters the original binding probe instead
+                # of merely repeating ``blocked_unknown``.
+                if failure["kind"] == "binding_unknown":
+                    current["retryable_action"] = {
+                        "role": role,
+                        "phase": phase,
+                        "continuation": continuation,
+                        "successor": False,
+                        "same_task": True,
+                        "same_task_required": True,
+                        "attempt": 1,
+                        "reason_class": "binding_unknown",
+                        "next_retry_at": time.time(),
+                        "binding_digest": current.get("contract_digest", ""),
+                        "last_observation_ref": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
+                    }
             if binding_contract_enabled(contract):
                 current["binding_phase"] = "binding_repair_pending"
             save_snapshot(self.paths, snapshot)
@@ -3162,23 +3228,57 @@ class Monitor:
             # must return a structured proof; legacy runners retain RunHandle
             # compatibility until their contract opts into 4.4.
             handle = self._dispatch_with_intent(runner, contract, intent)
-            if isinstance(handle, dict) and handle.get("kind") in {"binding_unknown", "retryable", "capacity_wait", "repairable"}:
-                current["status"] = "blocked_unknown"
-                current["reason"] = handle.get("reason", handle.get("kind"))
-                current["binding_phase"] = handle.get("kind")
+            if isinstance(handle, dict) and handle.get("kind") in {"binding_unknown", "provider_error", "retryable", "capacity_wait", "repairable"}:
+                reason = handle.get("reason", handle.get("kind"))
+                failure_kind = handle.get("reason_class")
+                if failure_kind is None and handle.get("kind") in {"retryable", "capacity_wait", "repairable"}:
+                    # _dispatch_with_intent deliberately normalizes an
+                    # untyped runner exception to a retryable engineering
+                    # outcome.  Do not reclassify that explicit phase from a
+                    # redacted/short reason such as ``ValueError``.
+                    failure_kind = handle.get("kind")
+                failure = (
+                    {"kind": failure_kind}
+                    if failure_kind in {"retryable", "capacity_wait", "repairable", "binding_unknown", "external_decision"}
+                    else classify_provider_failure({"kind": handle.get("kind"), "reason": reason})
+                )
+                if failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
+                    retry = {
+                        "role": role, "phase": phase,
+                        "continuation": continuation, "successor": False,
+                        "same_task": True, "same_task_required": True,
+                        "attempt": 1, "reason_class": failure["kind"],
+                        "next_retry_at": time.time(),
+                        "binding_digest": current.get("contract_digest", ""),
+                        "last_observation_ref": hashlib.sha256(str(reason).encode("utf-8")).hexdigest(),
+                    }
+                    current["status"] = self._v42_retry_status()
+                    current["reason"] = redact_provider_text(str(reason))
+                    current["binding_phase"] = "retry_pending"
+                    current["retryable_action"] = retry
+                    if "reasoning" in str(reason).casefold() or "model" in str(reason).casefold():
+                        options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
+                        options["omit_thinking"] = True
+                        current.setdefault("contract_overrides", {})["provider_options"] = options
+                        retry["parameter_recovery"] = "omit_thinking"
+                    self._record(snapshot, "retry_scheduled", {"run_id": snapshot.run_id, "node_id": node_id, "role": role, "reason_class": failure["kind"], "same_task_required": True, "parameter_recovery": retry.get("parameter_recovery")})
+                else:
+                    current["status"] = "blocked_unknown"
+                    current["reason"] = reason
+                    current["binding_phase"] = handle.get("kind")
+                    current["retryable_action"] = {
+                        "role": role, "phase": phase,
+                        "continuation": continuation, "successor": False,
+                        "same_task": True, "same_task_required": True,
+                        "attempt": 1, "reason_class": handle.get("kind"),
+                        "next_retry_at": time.time(),
+                        "binding_digest": current.get("contract_digest", ""),
+                        "last_observation_ref": "provider-pending",
+                    }
+                    self._record(snapshot, handle.get("kind", "binding_unknown"), {"run_id": snapshot.run_id, "node_id": node_id, "intent_digest": intent.get("intent_digest"), "proof": handle.get("proof")})
                 current["active_task"] = None
                 current["active_role"] = None
                 current["start_intent"] = None
-                current["retryable_action"] = {
-                    "role": role, "phase": phase,
-                    "continuation": continuation, "successor": False,
-                    "same_task": True, "same_task_required": True,
-                    "attempt": 1, "reason_class": handle.get("kind"),
-                    "next_retry_at": time.time(),
-                    "binding_digest": current.get("contract_digest", ""),
-                    "last_observation_ref": "provider-pending",
-                }
-                self._record(snapshot, handle.get("kind", "binding_unknown"), {"run_id": snapshot.run_id, "node_id": node_id, "intent_digest": intent.get("intent_digest"), "proof": handle.get("proof")})
                 save_snapshot(self.paths, snapshot)
                 return False
             if isinstance(handle, dict):
@@ -3213,6 +3313,56 @@ class Monitor:
             current["reason"] = str(error)
             save_snapshot(self.paths, snapshot)
             return False
+        except ProviderUnavailable as error:
+            # Provider request validation happens before a visible task has an
+            # identity.  Treat it as an engineering retry and preserve the
+            # original role/generation.  A parameter-validation failure also
+            # records the smallest safe adaptation: omit optional reasoning on
+            # the next native create request.
+            failure = classify_provider_failure(error)
+            if failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
+                previous = current.get("retryable_action")
+                attempt = int(previous.get("attempt", 0) or 0) + 1 if isinstance(previous, dict) else 1
+                retry = {
+                    "role": role,
+                    "phase": phase,
+                    "continuation": continuation,
+                    "successor": False,
+                    "same_task": True,
+                    "same_task_required": True,
+                    "attempt": attempt,
+                    "reason_class": failure["kind"],
+                    "next_retry_at": time.time() + min(60.0, float(2 ** min(attempt - 1, 5))),
+                    "binding_digest": current.get("contract_digest", ""),
+                    "last_observation_ref": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
+                }
+                current["retryable_action"] = retry
+                current["status"] = self._v42_retry_status()
+                current["active_task"] = None
+                current["active_role"] = None
+                current["start_intent"] = None
+                current["quarantine"] = None
+                current["reason"] = redact_provider_text(str(error))
+                if "reasoning" in str(error).casefold() or "model" in str(error).casefold():
+                    options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
+                    options["omit_thinking"] = True
+                    current.setdefault("contract_overrides", {})["provider_options"] = options
+                    retry["parameter_recovery"] = "omit_thinking"
+                self._record(
+                    snapshot,
+                    "retry_scheduled",
+                    {
+                        "run_id": snapshot.run_id,
+                        "node_id": node_id,
+                        "role": role,
+                        "reason_class": failure["kind"],
+                        "same_task_required": True,
+                        "parameter_recovery": retry.get("parameter_recovery"),
+                    },
+                )
+                save_snapshot(self.paths, snapshot)
+                return False
+            raise
         except Exception as error:
             if successor:
                 current["retryable_action"] = {

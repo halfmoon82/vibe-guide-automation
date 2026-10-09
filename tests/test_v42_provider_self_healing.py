@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +12,8 @@ from vibe_guide.monitor import Monitor, classify_provider_failure
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.supervisor import Supervisor
-from vibe_guide.adapters.task_provider import ProviderPending
+from vibe_guide.adapters.task_provider import ProviderPending, ProviderUnavailable
+from vibe_guide.adapters.task_provider import ProviderActionStore
 
 
 def _node(node_id="n1"):
@@ -36,6 +38,69 @@ class ProviderSelfHealingTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(classify_provider_failure({"reason": value})["kind"], "external")
         self.assertEqual(classify_provider_failure({"reason": "unexplained"})["kind"], "unknown")
+
+    def test_model_reasoning_validation_is_engineering(self):
+        result = classify_provider_failure({
+            "reason": (
+                'create_thread could not validate reasoning effort "high" '
+                'for model "gpt-6.1-sol"'
+            )
+        })
+        self.assertEqual(result["kind"], "engineering")
+
+    def test_create_parameter_failure_retries_without_blocking(self):
+        with tempfile.TemporaryDirectory() as root:
+            paths, node, plan, record = self._authorized(root)
+
+            class ParameterRejectingRunner(FakeRunner):
+                def start(self, contract, worktree):
+                    raise ProviderUnavailable(
+                        'create_thread could not validate reasoning effort "high" '
+                        'for model "gpt-6.1-sol"'
+                    )
+
+            monitor = Monitor(paths, plan, [node])
+            with patch("vibe_guide.monitor.require_entry", return_value=None):
+                snapshot = monitor.start(record, ParameterRejectingRunner())
+            current = snapshot.nodes[node.id]
+            self.assertEqual(current["status"], "retry_pending")
+            self.assertEqual(current["retryable_action"]["role"], "developer")
+            self.assertTrue(current["retryable_action"]["same_task_required"])
+            self.assertFalse(current["retryable_action"]["successor"])
+
+    def test_stale_resume_action_is_converged_after_newer_acceptance(self):
+        with tempfile.TemporaryDirectory() as root:
+            paths = ProjectPaths(Path(root))
+            store = ProviderActionStore(paths)
+            action = store.request(
+                operation="resume",
+                provider="codex-app-visible",
+                run_id="run-stale",
+                issue_id="n1",
+                role="developer",
+                generation=3,
+                native_tool="codex_app__send_message_to_thread",
+                request={"authorization_digest": "a" * 64, "threadId": "thread-1"},
+            )
+            evidence = {
+                "run_id": "run-stale",
+                "authorization_digest": "a" * 64,
+                "nodes": {
+                    "n1": {
+                        "status": "accepted",
+                        "accepted_generation": 4,
+                        "roles": {
+                            "developer": {"generation": 4, "accepted_generation": 4},
+                            "reviewer": {"generation": 0, "accepted_generation": 0},
+                        },
+                    }
+                },
+            }
+            changed = store.reconcile_stale("run-stale", evidence)
+            self.assertEqual(changed, [action["action_id"]])
+            self.assertEqual(store.pending(run_id="run-stale"), [])
+            audit = json.loads((paths.vibe / "provider-actions" / "stale" / (action["action_id"] + ".json")).read_text())
+            self.assertEqual(audit["reason"], "accepted_generation_superseded")
 
     def _authorized(self, root):
         paths = ProjectPaths(Path(root))

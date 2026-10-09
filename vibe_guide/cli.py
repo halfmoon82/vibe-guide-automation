@@ -1848,6 +1848,38 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None) -> CLIResult:
                 AuthorizationRecord.from_dict(
                     _read_json(directory / "authorization.json")
                 )
+                # Converge superseded mailbox actions before the resume tick.
+                # A previous heartbeat may leave a resume/wait request for a
+                # generation that is already accepted; repeatedly seeing that
+                # immutable request must not keep the supervisor in a zombie
+                # loop or trigger another native call.
+                current_snapshot = load_snapshot(paths, run_id)
+                accepted_evidence = {
+                    "run_id": run_id,
+                    "authorization_digest": getattr(current_snapshot, "authorization_digest", ""),
+                    "nodes": {
+                        node_id: {
+                            "status": data.get("status"),
+                            "accepted_generation": max(
+                                int(data.get("developer_generation", 0) or 0),
+                                int(data.get("review_generation", 0) or 0),
+                            ),
+                            "roles": {
+                                "developer": {
+                                    "generation": int(data.get("developer_generation", 0) or 0),
+                                    "accepted_generation": int(data.get("developer_generation", 0) or 0),
+                                },
+                                "reviewer": {
+                                    "generation": int(data.get("review_generation", 0) or 0),
+                                    "accepted_generation": int(data.get("review_generation", 0) or 0),
+                                },
+                            },
+                        }
+                        for node_id, data in (current_snapshot.nodes or {}).items()
+                        if isinstance(data, dict)
+                    },
+                }
+                ProviderActionStore(paths).reconcile_stale(run_id, accepted_evidence)
                 monitor = Monitor(
                     paths, plan, nodes,
                     topology_rulings=_observed_topology_rulings(paths),
