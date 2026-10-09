@@ -104,7 +104,7 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
   - `output`：交出什么。
   - `error_behavior`：出错时对用户的表现。
   - `acceptance_example`：一个具体的例子，验收者照着做就能判断通过与否。
-- `files`：这个节点会动的文件，项目相对路径。这是授权卡上的文件范围，宁可列全，不要漏。漏列的文件只有两类可由监工不问产品经理、自行补进该节点范围：`tests/` 下的测试文件，或项目 `.vibe/config.json` 的 `auto_scope_paths` 登记的机械附属文件；前提是在本仓库内、不涉及部署/凭据/外部系统配置、没有被其他未完成节点占用，并且补进去要留下纠偏记录（`scope_auto_expanded` 事件）。交付和验收汇报必须逐个节点列出 `scope_expansions`（`vibe status --json` 每个节点下的同名字段；为空也要写明无）。其他文件漏列仍必须请产品经理授权。
+- `files`：这个节点会动的文件，项目相对路径。这是工程文件清单，不是产品范围；它描述授权卡上的实现边界，扩展清单本身不等于产品设计变化。漏列的文件只有两类可由监工不问产品经理、自行补进该节点范围：`tests/` 下的测试文件，或项目 `.vibe/config.json` 的 `auto_scope_paths` 登记的机械附属文件；前提是在本仓库内、不涉及部署/凭据/外部系统配置、没有被其他未完成节点占用，并且补进去要留下纠偏记录（`scope_auto_expanded` 事件）。其他文件扩展按 §7 的产品范围判据判断，并在交付和验收汇报中逐个节点列出 `scope_expansions`（`vibe status --json` 每个节点下的同名字段；为空也要写明无）。
 - 节点 `id` 用小写字母、数字、连字符。不要写 `integration-review`，vibe 会自动追加最终整合审查节点。
 
 拆完用产品语言复述一遍给产品经理："一共三件事，前两件可以同时做，第三件要等第一件做完。"
@@ -299,7 +299,7 @@ for action in store.pending():          # .vibe/provider-actions/requests/ 里�
 ```
 
 - 全部清零就是 `findings: []`、`out_of_scope: []`。**只有 `resolved` 算清零**：`open`、`accepted`、`waived` 一律计入 `clearance`，报了会被判
-  `integration review acceptance still reports open P0-P2 findings`，节点落到 `blocked_unknown`。这一条是**格式约定，不是权限边界**：同一条 P0 写成 `resolved` 照样清零，vibe 不会去核对审查者此前报过的 `review_finding`。约定的作用是让自签豁免在证据包里留下痕迹——`waived` 过不去，想放行只能把它改写成 `resolved`，那就是一条明写在档案里的"我说修好了"。**所以放行仍然是人的决定，只是这道门不替人把关**：P0–P2 没修完就报 `review_finding` 事件让整合审查返工，别改字。
+  `integration review acceptance still reports open P0-P2 findings`，节点落到 `blocked_unknown`。这一条是**格式约定，不是权限边界**：同一条 P0 写成 `resolved` 照样清零，vibe 不会去核对审查者此前报过的 `review_finding`。约定的作用是让自签豁免在证据包里留下痕迹——`waived` 过不去，想放行只能把它改写成 `resolved`，那就是一条明写在档案里的"我说修好了"。**所以放行只由返工闭环决定，这道门不替人把关**：P0–P2 没修完就报 `review_finding` 事件让整合审查返工，别改字。
 - 两个判断里的 `evidence` **必须是非空字符串**。给嵌套对象会被拒（`... needs a status and a non-empty evidence string`）：落盘时 `evidence` 整个字段会被打码，对象里"看起来像敏感信息"的键会被丢掉，于是写进去的包回读时不再合法——顶层会先报一次 `complete`，下一次读又退回去。所以这里只收一句话。
 
 - **只能给这四个键，多一个就是 schema 错误**。`run_id`、`plan_id`、`plan_revision`、四个 digest、`aggregated_scope`、`clearance`、`agentsmd_acceptance_refs`、`unverified_or_excluded` 全部由 vibe 从 run 自己和计划的整合合同派生。这不是省事：审查者不能改写它被追责的血缘，也不能缩小它被要求覆盖的范围。
@@ -435,6 +435,8 @@ vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路
 监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> --session-record <日志>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run>` 查询；未登记返回 `unknown` 而非空成功。登记内容只允许 provider/会话 id/host，不得含凭据。
 
 ## 7. 什么时候才能打断产品经理
+
+**已批准判据（产品经理 2026-10-05 确认）**：修改后，PRD 里每条验收例子的判定结果是否改变——不变就由监工自决并留痕，变了才问产品经理；另外两类无论如何都问：新增第三方依赖（发布/安全对外承诺）、执行模式从「可见可进入的任务」降级为「后台不可见」。
 
 只有三类：产品设计要变、需要新的外部授权、要部署。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知、按 §4 `files` 规则可自动补进范围的测试文件和机械附属文件）由 vibe 的 Monitor 自行分类恢复；恢复不了的会标 `blocked_unknown` 等待，不会伪装成成功。agent 看到 `blocked_unknown` 或 `retry_pending` 时先按 §6 查信箱里有没有没服务完的请求，不要立刻报告失败。
 
