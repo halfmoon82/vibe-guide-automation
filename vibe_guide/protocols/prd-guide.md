@@ -386,8 +386,12 @@ reviewer 的 `accepted` 不受它约束——但每轮都回写游标本来就�
 
 WorkBuddy 那一行的依据是 2026-10-09 本机实测：同一份提示下，写明 worktree 的子代理落在 worktree 内，
 不写的落在**主项目根**；且子代理的 shell 状态不跨命令保持，每条命令都得重新 `cd`。
-所以在 WorkBuddy 上要么在派发提示里逐条写死 worktree，要么**放弃并行、节点串行**——
-不并行就没有两个 writer 改同一棵树的风险。
+所以在 WorkBuddy 上派发提示必须逐条写死 worktree，**节点串行也一样**——串行只是去掉了
+「两个 writer 改同一棵树」的风险，不钉 worktree 的子代理仍会落在主项目根、在错误的分支上开发。
+
+**唯一例外是交付自报**：`vibe worker-deliver` 必须回到**主项目目录**执行
+（visible-sdd-worker §5）——在 worktree 里执行会写进 worktree 自己的 `.vibe`，监工看不到。
+即：改文件、跑验证在 worktree 里，自报在主项目目录里。
 
 worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），vibe 不会替你建。
 
