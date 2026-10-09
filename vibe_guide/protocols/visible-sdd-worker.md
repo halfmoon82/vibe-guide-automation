@@ -167,7 +167,10 @@ developer 自报时还会**按 git 实况核对落点**（不看自报内容）�
 `cd <worktree>`、把活干在主项目里，但也可能是别的 writer 或一次未提交的合并，先看清主项目树再处理：
 若是本节点干错了地方，把改动挪进合同 worktree、恢复主项目树后再自报。git 读不出来时报
 `cannot verify delivery landing`，属于环境问题。以下情况不核对：reviewer（只读）；合同 worktree 就是主项目根（`.`）；
-派发没有 `child_binding`；同一 payload 的幂等重报。**已知盲区**：错落的改动若已提交到主项目分支，主项目树重新变干净，这项核对看不出来。
+派发没有 `child_binding`；同一 payload 的幂等重报。错落的改动若已提交到主项目分支：系统按派发时的主项目 HEAD
+（记在 `.vibe/provider-actions/dispatch-heads/`）查此后改过白名单文件的提交，有就报
+`the main project committed this node's allowlisted files after it was dispatched`，派发之前已合并的提交不算。
+**已知盲区**：记录这项之前就已派发的节点、或派发时读不到主项目 HEAD 的节点，不做提交历史核对。
 
 ## 6. 与本协议无关的事项
 

@@ -357,6 +357,8 @@ class ProviderActionStore:
                 raise ValueError("provider action request identity drift")
         else:
             self._atomic(path, payload)
+        if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
+            self._record_dispatch_head(run_id, issue_id, role, generation)
         probe = isinstance(request, dict) and request.get("purpose") == "binding_probe"
         if operation == "wait" and not probe:
             self._consume_archived_delivery(run_id, issue_id, role, generation)
@@ -642,6 +644,46 @@ class ProviderActionStore:
                 return binding
         return None
 
+    def _dispatch_head_path(self, run_id, issue_id, role, generation):
+        return self.root / 'dispatch-heads' / '{}-{}-{}-g{}.json'.format(
+            run_id, issue_id, role, generation
+        )
+
+    def _record_dispatch_head(self, run_id, issue_id, role, generation):
+        """Write-once: the main project HEAD when this generation was dispatched.
+
+        Kept beside, not inside, the request so the request digest and its
+        identity-drift check are untouched.  Later requests of the same
+        generation (locate / resume) keep the first value.
+        ponytail: an unreadable HEAD (no git, unborn branch) records nothing,
+        and the committed-landing check is then skipped for this generation.
+        """
+        import subprocess
+
+        path = self._dispatch_head_path(run_id, issue_id, role, generation)
+        if path.exists():
+            return
+        try:
+            done = subprocess.run(
+                ['git', '-C', str(self.paths.root), 'rev-parse', '--verify', '-q', 'HEAD'],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+        head = done.stdout.strip()
+        if done.returncode != 0 or len(head) not in (40, 64):
+            return
+        self._directory('dispatch-heads')
+        self._atomic(path, {'head': head})
+
+    def _dispatch_head(self, run_id, issue_id, role, generation):
+        path = self._dispatch_head_path(run_id, issue_id, role, generation)
+        if not path.is_file():
+            return None
+        value = self._read(path)
+        head = value.get('head') if isinstance(value, dict) else None
+        return head if isinstance(head, str) and head else None
+
     def _landing_problem(self, run_id, issue_id, role, generation):
         """``(kind, detail)`` when a developer's work is misplaced, else None.
 
@@ -653,10 +695,11 @@ class ProviderActionStore:
         tree while the monitor runs acceptance in the untouched worktree and
         reads a false green.
 
-        ponytail: work already *committed* onto the main tree's branch is not
-        seen (the main tree is clean again).  A positive "worktree has an
-        allowlisted change" check would catch it but wrongly refuses report-
-        only nodes and post-merge reworks; add it once those are told apart.
+        ponytail: work *committed* onto the main tree is caught only from the
+        main project HEAD recorded at dispatch (``dispatch-heads/``): any
+        commit since then touching an allowlisted file is refused.  Dispatches
+        made before that record existed (or with no readable HEAD) are not
+        history-checked.
         """
         import subprocess
 
@@ -729,6 +772,23 @@ class ProviderActionStore:
                 'the main project has uncommitted changes to this node\'s allowlisted '
                 'files: {} (a missing `cd <worktree>`, another writer, or a pending '
                 'merge -- check the main tree first)'.format(', '.join(sorted(changed)))
+            )
+        head = self._dispatch_head(run_id, issue_id, role, generation)
+        if head is None:
+            return None
+        log, error = git(
+            root, 'log', '--format=%h', head + '..HEAD', '--', *allowlist
+        )
+        if error:
+            return 'unverifiable', 'cannot read main project history since dispatch ({})'.format(error)
+        commits = log.split()
+        if commits:
+            return 'misplaced', (
+                'the main project committed this node\'s allowlisted files after it was '
+                'dispatched: {} (a missing `cd <worktree>`, another writer, or a merge '
+                'landed early -- check `git log {}..HEAD` in the main tree first)'.format(
+                    ', '.join(commits[:5]) + (' ...' if len(commits) > 5 else ''), head[:12]
+                )
             )
         return None
 
