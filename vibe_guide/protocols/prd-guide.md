@@ -373,9 +373,21 @@ reviewer 的 `accepted` 不受它约束——但每轮都回写游标本来就�
 
 ### 6.3 派发时必须遵守合同
 
-`request.child_binding` 里的 `worktree` 和 `branch` 是 vibe 按节点 id 派生的、每个节点互不相同的一对。**创建会话时必须把它的工作目录设成合同里的 `worktree`**（Claude Code 传 `cwd`），并让它在合同的 `branch` 上开发。
+`request.child_binding` 里的 `worktree` 和 `branch` 是 vibe 按节点 id 派生的、每个节点互不相同的一对。**创建会话时必须把它的工作目录设成合同里的 `worktree`**，并让它在合同的 `branch` 上开发。
 
 这不是形式要求：两个并行节点落进同一个目录同一个分支，就是两个 writer 改同一棵树，改动互相覆盖。`allowlist` 同理——被派发的会话只能碰这些文件。
+
+**这条要求各宿主能做到的程度不一样**：
+
+| 宿主 | 设定工作目录的方式 | 做不到时的后果 |
+|---|---|---|
+| Claude Code | 派发时传 `cwd` | 会话启动就落在 `worktree` 里 |
+| WorkBuddy | Agent 工具**没有 `cwd` 参数**，子代理默认继承派发方的目录 | 只能在派发提示里要求子代理**每条命令先 `cd <worktree>`**、写文件一律用绝对路径；**漏一条命令就落回主项目树** |
+
+WorkBuddy 那一行的依据是 2026-10-09 本机实测：同一份提示下，写明 worktree 的子代理落在 worktree 内，
+不写的落在**主项目根**；且子代理的 shell 状态不跨命令保持，每条命令都得重新 `cd`。
+所以在 WorkBuddy 上要么在派发提示里逐条写死 worktree，要么**放弃并行、节点串行**——
+不并行就没有两个 writer 改同一棵树的风险。
 
 worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），vibe 不会替你建。
 
