@@ -119,6 +119,31 @@ class ProviderActionRunner(Runner):
         )
         return capability + "\n" + consistency
 
+    @staticmethod
+    def _continuation_prompt(contract: Dict[str, Any]) -> str:
+        """Build a role-specific continuation contract.
+
+        Reviewer continuations must resume the current business review round;
+        a generic "continue Issue" prompt can otherwise repeat an old
+        administrative check and leave the durable status marker unchanged.
+        """
+        node_id = str(contract.get("node_id", ""))
+        generation = int(contract.get("generation", 0))
+        if contract.get("role") == "reviewer":
+            delivery = str(contract.get("delivery_path") or "<delivery path>")
+            status = str(contract.get("status_file") or "<review status path>")
+            marker = str(contract.get("completion_marker") or "<completion marker>")
+            return (
+                "请继续 Issue {} 的业务 review，本轮 generation {}。"
+                "只审查当前 developer 交付，不重复行政材料审查；"
+                "交付目录：{}；reviewer 状态文件：{}；完成 marker：{}。"
+                "完成后必须写入该 generation 的 reviewer-status，并回写真实游标。"
+            ).format(node_id, generation, delivery, status, marker)
+        return (
+            "请继续处理 Issue {}，当前 generation {}；"
+            "完工自报必须使用 `--generation {}`。"
+        ).format(node_id, generation, generation)
+
     def _validate_v39_create_binding(
         self, contract: Dict[str, Any], runtime_worktree: Path
     ) -> None:
@@ -1106,16 +1131,7 @@ class ProviderActionRunner(Runner):
             request = {
                 "threadId": binding.task_id,
                 "hostId": binding.host,
-                "prompt": "请继续处理 Issue {}。{}{}".format(
-                    contract["node_id"],
-                    # Every dispatch bumps the generation; a resumed developer
-                    # must self-report under the new one or the report is
-                    # refused as stale.
-                    "本轮完工自报改用 `--generation {}`（替换此前派发指令里的值，其余步骤不变）。".format(
-                        int(contract["generation"])
-                    ) if contract.get("role") == "developer" else "",
-                    self._consistency_instruction(contract),
-                ),
+                "prompt": self._continuation_prompt(contract) + self._consistency_instruction(contract),
             }
             action = self._action(contract, run_id, "resume", request)
             metadata["pending_action"] = action["action_id"]

@@ -524,7 +524,30 @@ class Monitor:
                 worktree = Path(project_root) / worktree
             handle = runner.start(payload, worktree)
         except Exception as error:
-            return {"kind": "retryable", "reason": type(error).__name__, "intent": payload.get("binding_intent") or (intent.to_dict() if hasattr(intent, "to_dict") else dict(intent))}
+            text = str(error).casefold()
+            if "worker model route conflicts" in text or "worker model routing" in text:
+                reason_code = "worker_profile_conflict"
+            elif "child binding" in text or "task binding" in text:
+                reason_code = "child_binding_conflict"
+            elif isinstance(error, (ValueError, TypeError)):
+                reason_code = "dispatch_contract_invalid"
+            else:
+                reason_code = "provider_unavailable"
+            action_basis = payload.get("binding_intent") or (
+                intent.to_dict() if hasattr(intent, "to_dict") else dict(intent)
+            )
+            action_ref = "dispatch-" + hashlib.sha256(
+                json.dumps(action_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:24]
+            return {
+                "kind": "contract_error" if reason_code != "provider_unavailable" else "retryable",
+                "reason": "provider dispatch contract rejected",
+                "reason_code": reason_code,
+                "phase": "start",
+                "action_ref": action_ref,
+                "advance_generation": False,
+                "intent": action_basis,
+            }
         # Existing runners expose RunHandle; only V4.4 contracts require
         # structured proof validation.  The call still traverses this helper.
         if contract.get("binding_contract_version") != "4.4" and hasattr(handle, "run_id"):
@@ -2058,6 +2081,81 @@ class Monitor:
                 continue
             if other.get("status") == "accepted":
                 continue
+            # A planned downstream node has no writer until its dispatch
+            # transaction creates an active task, start intent, or lease.
+            # Counting its eventual scope here creates a dependency cycle:
+            # the upstream correction can never start while the dormant
+            # downstream node waits for that correction.  Unknown states stay
+            # conservative and continue to hold their scope.
+            def _is_downstream(candidate: str, ancestor: str, seen=None) -> bool:
+                seen = set() if seen is None else seen
+                if candidate in seen:
+                    return False
+                seen.add(candidate)
+                dependencies = self.nodes.get(candidate).depends_on if candidate in self.nodes else []
+                return ancestor in dependencies or any(_is_downstream(dep, ancestor, seen) for dep in dependencies)
+            if (
+                other.get("status") == "planned"
+                and _is_downstream(other_id, node_id)
+                and not other.get("active_task")
+                and not other.get("start_intent")
+            ):
+                worktree = str(other.get("worktree") or "")
+                lease = None
+                lease_unknown = False
+                if not worktree and hasattr(self, "paths"):
+                    lease_unknown = True
+                if worktree and hasattr(self, "paths"):
+                    try:
+                        lease = read_writer_lease(self.paths, other_id, worktree)
+                    except (OSError, TypeError, ValueError):
+                        # A lease read failure is unresolved ownership, not
+                        # proof that the planned writer is dormant.
+                        lease_unknown = True
+                    else:
+                        # ``read_writer_lease`` intentionally maps malformed
+                        # records to ``None``.  Before treating that as a
+                        # clean absence, inspect the lease directory so a
+                        # corrupt ownership record remains fail-closed.
+                        lease_dir = self.paths.vibe / "leases"
+                        try:
+                            for candidate in lease_dir.glob("*.json"):
+                                try:
+                                    raw = json.loads(candidate.read_text(encoding="utf-8"))
+                                except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                                    lease_unknown = True
+                                    break
+                                if (
+                                    isinstance(raw, dict)
+                                    and raw.get("node_id") == other_id
+                                    and raw.get("worktree") == worktree
+                                    and raw.get("status") in {"active", "quarantined"}
+                                    and lease is None
+                                ):
+                                    lease_unknown = True
+                                    break
+                        except OSError:
+                            lease_unknown = True
+                pending_request = False
+                pending_unknown = False
+                if hasattr(self, "paths"):
+                    try:
+                        store = ProviderActionStore(self.paths)
+                        pending_request = any(
+                            store.has_request(snapshot.run_id, other_id, role)
+                            for role in ("developer", "reviewer")
+                        )
+                    except (OSError, TypeError, ValueError):
+                        pending_unknown = True
+                if lease_unknown or pending_unknown or pending_request:
+                    # Preserve the downstream reservation until every local
+                        # ownership/provider side effect is positively absent.
+                    write_scope = _write_scope_paths(self.nodes[other_id])
+                    held.extend(["."] if write_scope is None else write_scope)
+                    held.extend(self._node_scope_files(other_id, other))
+                    continue
+                if lease is None or not getattr(lease, "active", False):
+                    continue
             write_scope = _write_scope_paths(self.nodes[other_id])
             held.extend(["."] if write_scope is None else write_scope)
             held.extend(self._node_scope_files(other_id, other))
@@ -2791,7 +2889,7 @@ class Monitor:
                     str(retry["phase"]),
                     runner,
                     bool(retry.get("continuation")),
-                    bool(retry.get("successor")),
+                    bool(retry.get("successor") or reviewer_recovery),
                 ):
                     if current.get("status") != "blocked_unknown":
                         current["retryable_action"] = None
@@ -3038,6 +3136,13 @@ class Monitor:
                     or profile.route_digest != expected.route_digest
                 ):
                     raise ValueError("worker model profile conflicts with routing evidence")
+            expanded = list(profile.allowlist)
+            for item in current.get("scope_expansions", []):
+                if item not in expanded:
+                    expanded.append(item)
+            if expanded != list(profile.allowlist):
+                profile = replace(profile, allowlist=expanded)
+            contract["worker_profile"] = profile.to_dict()
             return profile
         if not routing_requested:
             return None
@@ -3065,7 +3170,88 @@ class Monitor:
             route_digest=profile.route_digest,
         )
         current.setdefault("contract_overrides", {})["worker_profile"] = profile.to_dict()
+        expanded = list(profile.allowlist)
+        for item in current.get("scope_expansions", []):
+            if item not in expanded:
+                expanded.append(item)
+        if expanded != list(profile.allowlist):
+            profile = replace(profile, allowlist=expanded)
+        contract["worker_profile"] = profile.to_dict()
         return profile
+
+    def _preflight_contract_failure(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        role: str,
+        phase: str,
+        continuation: bool,
+        generation: int,
+        generation_key: str,
+        error: Exception,
+        failure_phase: str,
+        successor: bool = False,
+    ) -> bool:
+        """Close a dispatch lease when local validation fails before intent.
+
+        Profile/routing/child-binding checks run after the scheduler acquires
+        the writer lease.  They are deterministic contract failures, so keep
+        the same task identity retryable, rewind the speculative generation,
+        and release that lease before the next heartbeat.
+        """
+        current = snapshot.nodes[node_id]
+        current[generation_key] = max(0, generation - 1)
+        current["active_task"] = None
+        current["active_role"] = None
+        current["start_intent"] = None
+        action_ref = "dispatch-" + hashlib.sha256(
+            (snapshot.run_id + "\0" + node_id + "\0" + role + "\0" + str(generation) + "\0" + failure_phase + "\0" + type(error).__name__).encode("utf-8")
+        ).hexdigest()[:24]
+        current["status"] = "blocked_unknown"
+        current["reason"] = "task binding rejected before start ({})".format(type(error).__name__)
+        if successor:
+            # A missing historical reviewer binding is a successor recovery
+            # path. Preserve its lineage marker so the scheduler can create
+            # the successor on the next cycle; it is not a same-task retry.
+            current["retryable_action"] = None
+            if role == "reviewer":
+                current["reviewer_started"] = True
+        else:
+            current["retryable_action"] = {
+                "role": role,
+                "phase": phase,
+                "continuation": continuation,
+                "successor": False,
+                "same_task": True,
+                "same_task_required": True,
+                "attempt": 1,
+                "reason_class": "contract_error",
+                "reason_code": "dispatch_contract_invalid",
+                "action_ref": action_ref,
+                "next_retry_at": time.time(),
+                "binding_digest": current.get("contract_digest", ""),
+                "last_observation_ref": action_ref,
+            }
+        try:
+            self._release_node_lease(snapshot, node_id)
+        except (OSError, TypeError, ValueError):
+            # Failure to verify/release ownership remains fail-closed; the
+            # retry marker prevents a successor writer from being created.
+            current["reason"] = current["reason"] + "; lease release unknown"
+        self._record(
+            snapshot,
+            "contract_error",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": role,
+                "phase": failure_phase,
+                "reason_code": "dispatch_contract_invalid",
+                "action_ref": action_ref,
+            },
+        )
+        save_snapshot(self.paths, snapshot)
+        return False
 
     def _start_task(
         self,
@@ -3117,6 +3303,15 @@ class Monitor:
             identity = str(prior_intent.get("task_id") or identity)
         else:
             generation = int(current.get(generation_key, 0)) + 1
+        # A first reviewer binding has no prior reviewer identity. If local
+        # validation fails, preserve the historical recovery marker so the
+        # next cycle can create the successor task.
+        successor_recovery = bool(successor) or (
+            role == "reviewer"
+            and generation == 1
+            and not current.get("reviewer_identity")
+            and not continuation
+        )
         if successor:
             identity = "{}:successor:{}".format(predecessor_identity, generation)
         current[generation_key] = generation
@@ -3184,6 +3379,19 @@ class Monitor:
             contract["predecessor_task_id"] = predecessor_task_id
         contract.setdefault("worktree", str(current["worktree"]))
         contract.setdefault("branch", str(current["branch"]))
+        if role == "reviewer" and continuation:
+            # Resume prompts must carry the real developer delivery facts
+            # observed by the monitor, bound to this snapshot generation.
+            delivery = current.get("delivery_evidence")
+            if isinstance(delivery, dict):
+                for key in ("completion_marker", "delivery_path", "thread_status"):
+                    value = delivery.get(key)
+                    if isinstance(value, str) and value.strip():
+                        contract[key] = value
+            contract.setdefault(
+                "status_file",
+                str(current.get("reviewer_status_file") or current.get("status_file") or node.contract.get("status_file", "")),
+            )
         contract.setdefault(
             "files", list((contract.get("worker_profile") or {}).get("allowlist", []))
         )
@@ -3191,9 +3399,18 @@ class Monitor:
             key in contract
             for key in ("routing_required", "issue_complexity", "model_probes", "models", "required_capabilities")
         )
-        profile = self._prepare_worker_profile(node, contract, current, role)
+        try:
+            profile = self._prepare_worker_profile(node, contract, current, role)
+        except (OSError, TypeError, ValueError) as error:
+            return self._preflight_contract_failure(
+                snapshot, node_id, role, phase, continuation, generation,
+                generation_key, error, "profile", successor_recovery,
+            )
         if profile is not None:
             contract["worker_profile"] = profile.to_dict()
+            # The profile is the canonical scope after auto-expansion. Keep
+            # every envelope projection aligned before adapter validation.
+            contract["files"] = list(profile.allowlist)
             if routing_requested:
                 contract["routing_required"] = True
         if binding_contract_enabled(contract):
@@ -3221,25 +3438,30 @@ class Monitor:
                 v2 = True
             if v2:
                 profile_data = contract.get("worker_profile") or {}
-                if profile_data and scope_expansions:
-                    allowlist = list(profile_data.get("allowlist", []))
-                    profile_data = dict(
-                        profile_data,
-                        allowlist=allowlist
-                        + [item for item in scope_expansions if item not in allowlist],
-                    )
                 if not profile_data:
                     profile_data = {"worker": str(contract.get("worker", "worker")), "model": "default", "reasoning": "normal", "fallbacks": [], "selection_basis": {"issue_complexity_ref": node_id, "complexity_band": "standard", "risk_tags": [], "availability_evidence": "runtime"}, "writer": str(contract.get("worker", "writer")), "worktree": str(contract.get("worktree", ".")), "branch": str(contract.get("branch", "branch-" + node_id)), "allowlist": list(contract.get("files", [node_id + ".py"]))}
                 profile = WorkerProfile(**profile_data)
-                validate_child_session_binding(snapshot.run_id, str(self.plan.version), record.digest, node_id, role, profile)
+                try:
+                    validate_child_session_binding(snapshot.run_id, str(self.plan.version), record.digest, node_id, role, profile)
+                except (OSError, TypeError, ValueError) as error:
+                    return self._preflight_contract_failure(
+                        snapshot, node_id, role, phase, continuation, generation,
+                        generation_key, error, "child_binding", successor_recovery,
+                    )
                 contract["child_origin"] = "worker_dispatch"
                 contract["child_binding"] = {"parent_run_id": snapshot.run_id, "plan_revision": str(self.plan.version), "authorization_digest": record.digest, "node_id": node_id, "role": role, "writer": profile.writer, "worktree": profile.worktree, "branch": profile.branch, "allowlist": profile.allowlist, "worker_profile": profile.to_dict(), "model": profile.model, "reasoning": profile.reasoning, "route_digest": profile.route_digest, "capability_contract_digest": snapshot.capability_contract_digest}
         try:
-            contract = validate_runtime_contract(
-                contract,
-                authorized_actions=record.allowed_actions,
-                authorized_files=tuple(record.file_scope) + tuple(scope_expansions),
-            )
+            try:
+                contract = validate_runtime_contract(
+                    contract,
+                    authorized_actions=record.allowed_actions,
+                    authorized_files=tuple(record.file_scope) + tuple(scope_expansions),
+                )
+            except (OSError, TypeError, ValueError) as error:
+                return self._preflight_contract_failure(
+                    snapshot, node_id, role, phase, continuation, generation,
+                    generation_key, error, "runtime_contract", successor_recovery,
+                )
             if self._binding_recovery_requested(contract):
                 self._preflight_binding_recovery(
                     snapshot, node_id, role, contract, current
@@ -3350,14 +3572,26 @@ class Monitor:
             save_snapshot(self.paths, snapshot)
             return False
         except (OSError, TypeError, ValueError) as error:
-            self._mark_blocked_unknown(
-                snapshot,
-                node_id,
-                "task binding rejected before start ({})".format(
-                    type(error).__name__
-                ),
+            if successor_recovery:
+                current[generation_key] = max(0, generation - 1)
+                current["active_task"] = None
+                current["active_role"] = None
+                current["start_intent"] = None
+                current["retryable_action"] = None
+                try:
+                    self._release_node_lease(snapshot, node_id)
+                except (OSError, TypeError, ValueError):
+                    pass
+                self._mark_blocked_unknown(
+                    snapshot, node_id,
+                    "task binding rejected before start ({})".format(type(error).__name__),
+                    quarantine_lease=False,
+                )
+                return False
+            return self._preflight_contract_failure(
+                snapshot, node_id, role, phase, continuation, generation,
+                generation_key, error, "binding_validation", successor,
             )
-            return False
 
         snapshot.tasks["{}:{}".format(node_id, role)] = binding.to_dict()
         # Write-ahead intent is immutable across provider retries.  Keep the
@@ -3422,23 +3656,32 @@ class Monitor:
             # must return a structured proof; legacy runners retain RunHandle
             # compatibility until their contract opts into 4.4.
             handle = self._dispatch_with_intent(runner, contract, intent)
-            if isinstance(handle, dict) and handle.get("kind") in {"binding_unknown", "retryable", "capacity_wait", "repairable"}:
+            if isinstance(handle, dict) and handle.get("kind") in {"binding_unknown", "retryable", "capacity_wait", "repairable", "contract_error"}:
+                if handle.get("kind") == "contract_error":
+                    # A deterministic local contract rejection is not a new
+                    # business attempt. Rewind the speculative generation and
+                    # retain a structured action reference for diagnosis.
+                    current[generation_key] = max(0, generation - 1)
                 current["status"] = "blocked_unknown"
                 current["reason"] = handle.get("reason", handle.get("kind"))
-                current["binding_phase"] = handle.get("kind")
+                current["binding_phase"] = handle.get("phase", handle.get("kind"))
                 current["active_task"] = None
                 current["active_role"] = None
                 current["start_intent"] = None
+                previous_retry = current.get("retryable_action")
+                previous_attempt = int(previous_retry.get("attempt", 0)) if isinstance(previous_retry, dict) else 0
                 current["retryable_action"] = {
                     "role": role, "phase": phase,
                     "continuation": continuation, "successor": False,
                     "same_task": True, "same_task_required": True,
-                    "attempt": 1, "reason_class": handle.get("kind"),
+                    "attempt": max(1, previous_attempt + 1), "reason_class": handle.get("kind"),
+                    "reason_code": handle.get("reason_code"),
+                    "action_ref": handle.get("action_ref"),
                     "next_retry_at": time.time(),
                     "binding_digest": current.get("contract_digest", ""),
-                    "last_observation_ref": "provider-pending",
+                    "last_observation_ref": handle.get("action_ref") or handle.get("kind"),
                 }
-                self._record(snapshot, handle.get("kind", "binding_unknown"), {"run_id": snapshot.run_id, "node_id": node_id, "intent_digest": intent.get("intent_digest"), "proof": handle.get("proof")})
+                self._record(snapshot, handle.get("kind", "binding_unknown"), {"run_id": snapshot.run_id, "node_id": node_id, "intent_digest": intent.get("intent_digest"), "proof": handle.get("proof"), "reason_code": handle.get("reason_code"), "action_ref": handle.get("action_ref"), "phase": handle.get("phase")})
                 save_snapshot(self.paths, snapshot)
                 return False
             if isinstance(handle, dict):
@@ -3875,8 +4118,8 @@ class Monitor:
             current["retryable_action"] = None
 
         if event.event in {"delivered", "complete"}:
+            delivery = event.data.get("delivery_evidence")
             if snapshot.execution_engine == "vibeguide_monitor":
-                delivery = event.data.get("delivery_evidence")
                 gate = evaluate_delivery_evidence(
                     {**current, "status": "DELIVERED"},
                     self._load_task_binding(snapshot, node_id, role),
@@ -3936,6 +4179,20 @@ class Monitor:
                     )
                     return
             self._record_runner_event(snapshot, node_id, event, active)
+            # Keep the provider's real delivery facts for reviewer
+            # continuation.  Synthetic prompt values must not replace event
+            # evidence received for this generation.
+            if isinstance(delivery, dict):
+                projected_delivery = {
+                    key: delivery.get(key)
+                    for key in ("completion_marker", "delivery_path", "thread_status")
+                    if isinstance(delivery.get(key), str) and delivery.get(key).strip()
+                }
+                if projected_delivery:
+                    current["delivery_evidence"] = projected_delivery
+                    current["completion_marker"] = projected_delivery.get("completion_marker", "")
+                    current["delivery_path"] = projected_delivery.get("delivery_path", "")
+                    current["thread_status"] = projected_delivery.get("thread_status", "")
             if role != "developer":
                 try:
                     self._set_binding_status(snapshot, node_id, role, "review")

@@ -235,10 +235,16 @@ from vibe_guide.paths import ProjectPaths
 from vibe_guide.adapters.task_provider import ProviderActionStore
 
 store = ProviderActionStore(ProjectPaths(<项目根>))
-for action in store.pending():          # .vibe/provider-actions/requests/ 里还没有结果的
+for action in store.pending():          # 先按当前 run/绑定证据收敛已确认 stale，再读未完成请求
     ...                                 # 按 action["native_tool"] 调对应桌面工具
     store.complete(action["action_id"], <结果 payload>)
 ```
+
+心跳是 native-action consumer：`pending()` 只负责发现请求，必须由监工会话逐条调用
+`action["native_tool"]`，再用同一 `action_id`、`request_digest` 通过 `complete()` 回写结果；
+只跑 `resume` 不算消费信箱。旧 `create` 只有在当前 run、节点、角色、代次、授权摘要和
+`accepted`/更新代次证据全部匹配时，才可调用 `reconcile_stale()` 写入审计标记；原请求保留，
+不调用 native tool、不写伪造结果。任一证据缺失或冲突都继续保持 pending/unknown。
 
 也可以直接读 `.vibe/provider-actions/requests/*.json`。回写建议走 `complete()`：结果文件必须恰好含 `schema_version` / `action_id` / `request_digest` / `payload` 四个键，且前三个与请求逐字对应，错一个就会被判"未绑定到请求"而拒收——`complete()` 替你填对。手写也能被接受，但没有理由自己去对 digest。
 
