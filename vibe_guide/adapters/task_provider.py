@@ -349,6 +349,12 @@ class ProviderActionStore:
             "request": request,
         }
         payload["request_digest"] = _canonical_digest(payload)
+        if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
+            # Before the request is visible to the host: the baseline must
+            # predate any work the dispatched worker could do.
+            self._record_dispatch_head(
+                run_id, issue_id, role, generation, request["child_binding"]
+            )
         directory = self._directory("requests")
         path = directory / (action_id + ".json")
         if path.exists():
@@ -357,8 +363,6 @@ class ProviderActionStore:
                 raise ValueError("provider action request identity drift")
         else:
             self._atomic(path, payload)
-        if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
-            self._record_dispatch_head(run_id, issue_id, role, generation)
         probe = isinstance(request, dict) and request.get("purpose") == "binding_probe"
         if operation == "wait" and not probe:
             self._consume_archived_delivery(run_id, issue_id, role, generation)
@@ -589,6 +593,13 @@ class ProviderActionStore:
                 kind, detail = problem
                 if kind == 'unverifiable':
                     raise ValueError('cannot verify delivery landing: ' + detail)
+                if kind == 'committed':
+                    raise ValueError(
+                        'worker delivery is not in the node worktree: ' + detail
+                        + '; if this node committed onto main by mistake, redo the work '
+                        'in the contract worktree and tell the supervisor which commits '
+                        'to undo'
+                    )
                 raise ValueError(
                     'worker delivery is not confined to the node worktree: ' + detail
                     + '; if this node forgot `cd <worktree>`, move the work into the '
@@ -649,14 +660,15 @@ class ProviderActionStore:
             run_id, issue_id, role, generation
         )
 
-    def _record_dispatch_head(self, run_id, issue_id, role, generation):
-        """Write-once: the main project HEAD when this generation was dispatched.
+    def _record_dispatch_head(self, run_id, issue_id, role, generation, binding=None):
+        """Write-once: main project HEAD (and node worktree HEAD) at dispatch.
 
         Kept beside, not inside, the request so the request digest and its
         identity-drift check are untouched.  Later requests of the same
         generation (locate / resume) keep the first value.
-        ponytail: an unreadable HEAD (no git, unborn branch) records nothing,
-        and the committed-landing check is then skipped for this generation.
+        ponytail: an unreadable HEAD (no git, unborn branch) or an unwritable
+        record (OSError) records nothing, and the committed-landing check is
+        then skipped for this generation; it never fails the dispatch.
         """
         import subprocess
 
@@ -673,16 +685,62 @@ class ProviderActionStore:
         head = done.stdout.strip()
         if done.returncode != 0 or len(head) not in (40, 64):
             return
-        self._directory('dispatch-heads')
-        self._atomic(path, {'head': head})
+        record = {'head': head}
+        worktree = self._binding_worktree(binding)
+        if worktree is not None and worktree.is_dir():
+            try:
+                done = subprocess.run(
+                    ['git', '-C', str(worktree), 'rev-parse', '--verify', '-q', 'HEAD'],
+                    capture_output=True, text=True, timeout=10,
+                )
+                own = done.stdout.strip()
+                if done.returncode == 0 and len(own) in (40, 64):
+                    record['worktree_head'] = own
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            directory = self._directory('dispatch-heads')
+        except OSError:
+            return
+        # O_EXCL: concurrent first requests of one generation keep one baseline
+        # (an existing file, symlink included, is never written through).
+        try:
+            descriptor = os.open(
+                str(directory / path.name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
+            )
+        except OSError:
+            return
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            handle.write(json.dumps(record) + '\n')
 
-    def _dispatch_head(self, run_id, issue_id, role, generation):
+    def _dispatch_record(self, run_id, issue_id, role, generation):
         path = self._dispatch_head_path(run_id, issue_id, role, generation)
         if not path.is_file():
+            return {}
+        # ponytail: a torn or unreadable record (crash between create and
+        # write) is treated as absent -- the history check is skipped.
+        try:
+            value = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(value, dict):
+            return {}
+        return {k: v for k, v in value.items()
+                if k in ('head', 'worktree_head') and isinstance(v, str) and v}
+
+    def _dispatch_head(self, run_id, issue_id, role, generation):
+        return self._dispatch_record(run_id, issue_id, role, generation).get('head')
+
+    def _binding_worktree(self, binding):
+        """Resolved contract worktree, or None when the binding names none."""
+        raw = str((binding or {}).get('worktree') or '').strip() if isinstance(binding, dict) else ''
+        if not raw:
             return None
-        value = self._read(path)
-        head = value.get('head') if isinstance(value, dict) else None
-        return head if isinstance(head, str) and head else None
+        root = Path(self.paths.root).resolve()
+        worktree = Path(raw)
+        if not worktree.is_absolute():
+            worktree = root / worktree
+        return worktree.resolve()
 
     def _landing_problem(self, run_id, issue_id, role, generation):
         """``(kind, detail)`` when a developer's work is misplaced, else None.
@@ -695,11 +753,13 @@ class ProviderActionStore:
         tree while the monitor runs acceptance in the untouched worktree and
         reads a false green.
 
-        ponytail: work *committed* onto the main tree is caught only from the
-        main project HEAD recorded at dispatch (``dispatch-heads/``): any
-        commit since then touching an allowlisted file is refused.  Dispatches
-        made before that record existed (or with no readable HEAD) are not
-        history-checked.
+        Work *committed* onto the main tree is caught from the HEADs recorded
+        at dispatch (``dispatch-heads/``): when the node worktree holds no
+        allowlisted change since its own dispatch HEAD, a main-project commit
+        since the main dispatch HEAD touching an allowlisted file is refused
+        (kind ``'committed'``).
+        ponytail: dispatches made before that record existed (or with no
+        readable HEAD) are not history-checked.
         """
         import subprocess
 
@@ -712,10 +772,7 @@ class ProviderActionStore:
         raw = str(binding.get('worktree') or '').strip()
         if not raw:
             return 'misplaced', 'contract has no worktree'
-        worktree = Path(raw)
-        if not worktree.is_absolute():
-            worktree = root / worktree
-        worktree = worktree.resolve()
+        worktree = self._binding_worktree(binding)
         if worktree == root:
             return None  # the node writes the main tree by contract
         if not worktree.is_dir():
@@ -773,22 +830,47 @@ class ProviderActionStore:
                 'files: {} (a missing `cd <worktree>`, another writer, or a pending '
                 'merge -- check the main tree first)'.format(', '.join(sorted(changed)))
             )
-        head = self._dispatch_head(run_id, issue_id, role, generation)
+        record = self._dispatch_record(run_id, issue_id, role, generation)
+        head = record.get('head')
         if head is None:
             return None
-        log, error = git(
-            root, 'log', '--format=%h', head + '..HEAD', '--', *allowlist
+        # History is only consulted when the worktree holds none of this
+        # node's work: a worker that forgot `cd` leaves it untouched, while a
+        # worker that did its job there is never blocked by legitimate merges
+        # of overlapping nodes into main.  ponytail: a report-only node whose
+        # allowlist overlaps a merge landed during its run is still refused;
+        # re-dispatching (new generation, new baseline) clears it.
+        dirty, error = git(
+            worktree, 'status', '--porcelain', '--untracked-files=all', '--', *allowlist
         )
+        if error:
+            return 'unverifiable', 'cannot read worktree status ({})'.format(error)
+        if dirty.strip():
+            return None
+        # Own commits are counted from the worktree's own dispatch HEAD, so a
+        # rework's earlier generations on the node branch do not count.
+        own_base = record.get('worktree_head') or head
+        own, error = git(worktree, 'log', '--format=%h', own_base + '..HEAD', '--', *allowlist)
+        if error:
+            return 'unverifiable', 'cannot read worktree history since dispatch ({})'.format(error)
+        if own.split():
+            return None
+        _, error = git(root, 'merge-base', '--is-ancestor', head, 'HEAD')
+        if error:
+            return 'unverifiable', (
+                'main project HEAD no longer descends from the dispatch baseline {} '
+                '(branch switched, history rewritten or gc); re-dispatch the node'.format(head[:12])
+            )
+        log, error = git(root, 'log', '--format=%h', head + '..HEAD', '--', *allowlist)
         if error:
             return 'unverifiable', 'cannot read main project history since dispatch ({})'.format(error)
         commits = log.split()
         if commits:
-            return 'misplaced', (
+            return 'committed', (
                 'the main project committed this node\'s allowlisted files after it was '
-                'dispatched: {} (a missing `cd <worktree>`, another writer, or a merge '
-                'landed early -- check `git log {}..HEAD` in the main tree first)'.format(
-                    ', '.join(commits[:5]) + (' ...' if len(commits) > 5 else ''), head[:12]
-                )
+                'dispatched while the node worktree has no such change: {} -- check '
+                '`git log {}..HEAD` in the main tree; do not revert commits you did not '
+                'make'.format(', '.join(commits[:5]) + (' ...' if len(commits) > 5 else ''), head[:12])
             )
         return None
 

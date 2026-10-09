@@ -168,9 +168,14 @@ developer 自报时还会**按 git 实况核对落点**（不看自报内容）�
 若是本节点干错了地方，把改动挪进合同 worktree、恢复主项目树后再自报。git 读不出来时报
 `cannot verify delivery landing`，属于环境问题。以下情况不核对：reviewer（只读）；合同 worktree 就是主项目根（`.`）；
 派发没有 `child_binding`；同一 payload 的幂等重报。错落的改动若已提交到主项目分支：系统按派发时的主项目 HEAD
-（记在 `.vibe/provider-actions/dispatch-heads/`）查此后改过白名单文件的提交，有就报
-`the main project committed this node's allowlisted files after it was dispatched`，派发之前已合并的提交不算。
-**已知盲区**：记录这项之前就已派发的节点、或派发时读不到主项目 HEAD 的节点，不做提交历史核对。
+（记在 `.vibe/provider-actions/dispatch-heads/`，同一代只记一次）核对。若本节点 worktree 自派发以来白名单文件没有任何改动或提交，
+而主项目此后有提交改过这些文件，就报
+`the main project committed this node's allowlisted files after it was dispatched`。
+派发之前已合并的提交不算；只要 worktree 里有本代的改动，监工期间合并的其他节点（白名单重叠）也不算。
+被拒时**不要回滚不是你提交的 commit**：在合同 worktree 里重做，并把要撤的 commit 告诉监工。
+主项目 HEAD 已不再是派发基线的后代（切了分支、改写了历史）时，报 `cannot verify delivery landing`，由监工重新派发。
+**已知盲区**：记录这项之前就已派发的节点、派发时读不到主项目 HEAD 的节点，不做提交历史核对；
+只出报告、而白名单与期间合并重叠的节点会被误拒，重新派发（新一代、新基线）即可。
 
 ## 6. 与本协议无关的事项
 
