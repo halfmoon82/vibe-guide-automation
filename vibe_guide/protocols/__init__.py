@@ -46,6 +46,10 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "bba7d6c7c6976b5713d170f48062e18a81ea02a43071cc36850023b379e2b40c",
         "c2c11e2c6db35977be5df3c8ad6ea272cbba58acf0ca873794a5172ab74c08ea",
         "d31adcdf3fb33d3b6e2fd557f7324cbdbd07a80acc0a8d18f5ce186c23971ac7",
+        # 2026-10-09: §6.3 says how WorkBuddy (no cwd parameter) pins a worktree.
+        "d8dfb3a043d330928b0798e4614b671eaf885aeb37d7ef7f7923e39091ec3e3f",
+        # 2026-10-09: §6.3 worker-deliver exception; serial nodes still pin.
+        "2f0c8e32a2efc532df33c4392901d3a6712e4df32ac9b073d86f18c2b0d5019d",
         "d93d32ba556b02d8e132bb78829e8b8eaf354e5420553908873c576597c7634e",
         "e93c430fa34d2db44ba7dd6383cc61c6bd013a2a536642f13f6c976850e26b26",
         "f2f90466346715fcf1b65a8f8cc3f5be6aa5244c676fe4fb38fc725c89610c38",

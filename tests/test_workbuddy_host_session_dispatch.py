@@ -509,5 +509,34 @@ class CredentialRotationTests(unittest.TestCase):
         self.assertEqual(module._scanned_tokens(lambda: text), ["aaa", "bbb"])
 
 
+class WorktreePinningOnWorkBuddyTests(unittest.TestCase):
+    """prd-guide §6.3 used to say only "Claude Code passes cwd".
+
+    Measured 2026-10-09: WorkBuddy's Agent tool has no cwd parameter, a
+    subagent told nothing lands in the main project root, and its shell state
+    does not survive between commands.  A supervisor reading §6.3 on WorkBuddy
+    must learn that the worktree is pinned by instruction, per command.
+    """
+
+    def test_prd_guide_states_the_workbuddy_worktree_rule(self):
+        from vibe_guide.protocols import load_protocol
+
+        text = load_protocol("prd-guide")
+        section = text[text.index("### 6.3"):text.index("#### 节点合同的环境事实")]
+        for token in ("WorkBuddy", "没有 `cwd` 参数", "每条命令先 `cd <worktree>`", "主项目",
+                      "节点串行也一样", "`vibe worker-deliver` 必须回到**主项目目录**执行"):
+            self.assertIn(token, section, token)
+        self.assertNotIn("放弃并行", section)
+
+    def test_worker_protocol_points_dev_subagent_at_the_rule(self):
+        from vibe_guide.protocols import load_protocol
+
+        text = load_protocol("visible-sdd-worker")
+        section = text[text.index("## 1."):text.index("## 2.")]
+        for token in ("worktree", "WorkBuddy", "每条命令先 `cd <worktree>`", "§6.3",
+                      "`vibe worker-deliver`：\n   它必须在主项目目录执行"):
+            self.assertIn(token, section, token)
+
+
 if __name__ == "__main__":
     unittest.main()
