@@ -434,6 +434,13 @@ class LandingCheckTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"allowlisted files: new\.py \("):
             self._deliver()
 
+    def test_worktree_side_rename_reports_the_new_path_only(self):
+        self._dispatch(allowlist=["app.py", "new.py"])
+        (self.root / "app.py").rename(self.root / "new.py")
+        self.git("add", "-N", "new.py")
+        with self.assertRaisesRegex(ValueError, r"allowlisted files: new\.py \("):
+            self._deliver()
+
     def test_unreadable_git_is_reported_as_unverifiable(self):
         plain = Path(self.tmp.name) / "not-a-repo"
         plain.mkdir()

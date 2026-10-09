@@ -722,7 +722,7 @@ class ProviderActionStore:
             if len(entry) < 4:
                 continue
             changed.add(entry[3:])
-            if entry[0] in 'RC':
+            if 'R' in entry[:2] or 'C' in entry[:2]:  # index or worktree side
                 next(entries, None)
         if changed:
             return 'misplaced', (
