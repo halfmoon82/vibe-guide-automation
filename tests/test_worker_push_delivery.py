@@ -497,6 +497,35 @@ class LandingCheckTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "^cannot verify delivery landing: main project HEAD no longer descends"):
             self._deliver()
 
+    def test_real_branch_switch_since_dispatch_is_unverifiable(self):
+        # Main moved to a branch that does not contain the dispatch baseline.
+        self._dispatch()
+        (self.root / "app.py").write_text("on main after dispatch\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "main moves")
+        self.git("checkout", "-q", "-b", "side", "HEAD~1")
+        self.git("checkout", "-q", "--orphan", "fresh-history")
+        self.git("commit", "-q", "-m", "rewritten")
+        with self.assertRaisesRegex(ValueError, "no longer descends from the dispatch baseline"):
+            self._deliver()
+
+    def test_symlinked_dispatch_record_is_not_written_through(self):
+        fresh = self._fresh_repo("fresh")
+        store = _store(fresh)
+        outside = Path(self.tmp.name) / "outside.json"
+        heads = store._directory("dispatch-heads")
+        (heads / store._dispatch_head_path("run-9", "n9", "developer", 1).name).symlink_to(outside)
+        store._record_dispatch_head("run-9", "n9", "developer", 1, {"worktree": "."})
+        self.assertFalse(outside.exists())
+
+    def test_failed_record_write_leaves_no_partial_file(self):
+        from unittest.mock import patch
+
+        fresh = self._fresh_repo("fresh")
+        store = _store(fresh)
+        with patch("vibe_guide.adapters.task_provider.os.write", side_effect=OSError("disk full")):
+            store._record_dispatch_head("run-9", "n9", "developer", 1, {"worktree": "."})
+        self.assertFalse(store._dispatch_head_path("run-9", "n9", "developer", 1).exists())
+
     def test_overlapping_merge_does_not_block_work_done_in_the_worktree(self):
         # Review P1: the supervisor merges another node touching app.py into
         # main while this node did its own work in its worktree.

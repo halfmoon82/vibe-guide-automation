@@ -710,8 +710,17 @@ class ProviderActionStore:
             )
         except OSError:
             return
-        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
-            handle.write(json.dumps(record) + '\n')
+        try:
+            try:
+                os.write(descriptor, (json.dumps(record) + '\n').encode('utf-8'))
+            finally:
+                os.close(descriptor)
+        except OSError:
+            # Never fail the dispatch; drop the partial record (read as absent).
+            try:
+                (directory / path.name).unlink()
+            except OSError:
+                pass
 
     def _dispatch_record(self, run_id, issue_id, role, generation):
         path = self._dispatch_head_path(run_id, issue_id, role, generation)
@@ -745,7 +754,8 @@ class ProviderActionStore:
     def _landing_problem(self, run_id, issue_id, role, generation):
         """``(kind, detail)`` when a developer's work is misplaced, else None.
 
-        ``kind`` is ``'misplaced'`` or ``'unverifiable'`` (git unreadable).
+        ``kind`` is ``'misplaced'``, ``'committed'`` (work landed as a main
+        project commit) or ``'unverifiable'`` (git unreadable).
         Checks real git facts, never the worker's own claim: the contract
         worktree must exist on the contract branch, and no allowlisted file
         may be uncommitted (modified, staged or untracked) in the main project
@@ -839,7 +849,10 @@ class ProviderActionStore:
         # worker that did its job there is never blocked by legitimate merges
         # of overlapping nodes into main.  ponytail: a report-only node whose
         # allowlist overlaps a merge landed during its run is still refused;
-        # re-dispatching (new generation, new baseline) clears it.
+        # re-dispatching (new generation, new baseline) clears it.  Leftover
+        # uncommitted edits already in the worktree at dispatch, or a worktree
+        # created after dispatch (no worktree_head, main head used instead),
+        # count as own work and pass.
         dirty, error = git(
             worktree, 'status', '--porcelain', '--untracked-files=all', '--', *allowlist
         )
@@ -852,7 +865,10 @@ class ProviderActionStore:
         own_base = record.get('worktree_head') or head
         own, error = git(worktree, 'log', '--format=%h', own_base + '..HEAD', '--', *allowlist)
         if error:
-            return 'unverifiable', 'cannot read worktree history since dispatch ({})'.format(error)
+            return 'unverifiable', (
+                'cannot read worktree history since dispatch ({}); re-dispatch the '
+                'node'.format(error)
+            )
         if own.split():
             return None
         _, error = git(root, 'merge-base', '--is-ancestor', head, 'HEAD')
