@@ -2184,6 +2184,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     )
             invalidation_path = _invalidation_path(directory)
             invalidation_to_clear = None
+            reauthorizing_current_run = _current_run_path(directory).exists()
             if invalidation_path.exists():
                 invalidation = _read_json(invalidation_path)
                 if not isinstance(invalidation, dict):
@@ -2296,6 +2297,11 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             _atomic_json(
                 _current_run_path(directory), {"run_id": snapshot.run_id}
             )
+            if reauthorizing_current_run and getattr(plan, "complexity_band", "") == "complex":
+                # Reauthorization rewrites the card and confirmation. Rebuild
+                # their live workflow evidence before resume verifies it again.
+                # Use the same explicit token; retain other plans/session gates.
+                materialize_workflow_evidence(paths, plan.plan_id, args.authorize)
             if invalidation_to_clear is not None:
                 invalidation_to_clear.unlink()
         except PreflightBlockedError as error:
