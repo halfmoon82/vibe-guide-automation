@@ -361,14 +361,15 @@ class LandingCheckTests(unittest.TestCase):
         git("worktree", "add", "-q", "-b", "node/n1", ".worktrees/n1")
         self.store = _store(self.root)
 
-    def _dispatch(self, worktree=".worktrees/n1", branch="node/n1", role="developer"):
+    def _dispatch(self, worktree=".worktrees/n1", branch="node/n1", role="developer",
+                  allowlist=("app.py",)):
         action_id = "action-create-run-1-n1-{}".format(role)
         (self.store._directory("requests") / (action_id + ".json")).write_text(json.dumps({
             "schema_version": 1, "action_id": action_id, "operation": "create",
             "provider": "workbuddy", "run_id": "run-1", "issue_id": "n1",
             "role": role, "generation": 1, "sequence": 0, "native_tool": "x",
             "request": {"child_binding": {
-                "worktree": worktree, "branch": branch, "allowlist": ["app.py"],
+                "worktree": worktree, "branch": branch, "allowlist": list(allowlist),
             }},
             "request_digest": "0" * 64,
         }), encoding="utf-8")
@@ -388,7 +389,7 @@ class LandingCheckTests(unittest.TestCase):
     def test_allowlisted_edit_in_main_tree_is_refused(self):
         self._dispatch()
         (self.root / "app.py").write_text("v2 in the wrong tree\n", encoding="utf-8")
-        with self.assertRaisesRegex(ValueError, "main project: app.py"):
+        with self.assertRaisesRegex(ValueError, "allowlisted files: app.py"):
             self._deliver()
         self.assertEqual(self._archived(), [])
 
@@ -411,11 +412,55 @@ class LandingCheckTests(unittest.TestCase):
         (self.root / "app.py").write_text("user edit\n", encoding="utf-8")
         self.assertTrue(self._deliver(role="reviewer")["recorded"])
 
+    def test_dot_worktree_means_main_tree_by_contract(self):
+        self._dispatch(worktree=".", branch="")
+        (self.root / "app.py").write_text("v2 in main by contract\n", encoding="utf-8")
+        self.assertTrue(self._deliver()["recorded"])
+
+    def test_absolute_worktree_path_is_resolved(self):
+        self._dispatch(worktree=str(self.root / ".worktrees" / "n1"))
+        self.assertTrue(self._deliver()["recorded"])
+
+    def test_untracked_allowlisted_file_in_main_tree_is_refused(self):
+        self._dispatch(allowlist=["app.py", "pkg/new.py"])
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg" / "new.py").write_text("x\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, r"allowlisted files: pkg/new\.py \("):
+            self._deliver()
+
+    def test_rename_reports_the_new_path_only(self):
+        self._dispatch(allowlist=["app.py", "new.py"])
+        self.git("mv", "app.py", "new.py")
+        with self.assertRaisesRegex(ValueError, r"allowlisted files: new\.py \("):
+            self._deliver()
+
+    def test_unreadable_git_is_reported_as_unverifiable(self):
+        plain = Path(self.tmp.name) / "not-a-repo"
+        plain.mkdir()
+        self._dispatch(worktree=str(plain))
+        with self.assertRaisesRegex(ValueError, "^cannot verify delivery landing"):
+            self._deliver()
+
+    def test_work_committed_onto_main_is_a_known_ceiling(self):
+        # ponytail ceiling (task_provider._landing_problem): once the misplaced
+        # work is committed the main tree is clean and the report passes.
+        self._dispatch()
+        (self.root / "app.py").write_text("v2\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "misplaced")
+        self.assertTrue(self._deliver()["recorded"])
+
+    def test_identical_rereport_is_not_rechecked(self):
+        self._dispatch()
+        self._deliver()
+        (self.root / "app.py").write_text("later main edit\n", encoding="utf-8")
+        self.assertTrue(self._deliver()["duplicate"])
+
     def test_worker_protocol_documents_the_landing_check(self):
         text = (Path(__file__).resolve().parents[1] / "vibe_guide" / "protocols"
                 / "visible-sdd-worker.md").read_text(encoding="utf-8")
-        for token in ("按 git 实况核对落点", "allowlisted files are modified in the main project",
-                      "reviewer 只读，不做此核对"):
+        for token in ("按 git 实况核对落点", "uncommitted changes to this node's allowlisted files",
+                      "reviewer（只读）", "合同 worktree 就是主项目根（`.`）", "已知盲区",
+                      "cannot verify delivery landing"):
             self.assertIn(token, text)
 
 

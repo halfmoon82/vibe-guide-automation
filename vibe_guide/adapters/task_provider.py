@@ -584,9 +584,13 @@ class ProviderActionStore:
         if role == 'developer':
             problem = self._landing_problem(run_id, issue_id, role, generation)
             if problem:
+                kind, detail = problem
+                if kind == 'unverifiable':
+                    raise ValueError('cannot verify delivery landing: ' + detail)
                 raise ValueError(
-                    'worker delivery landed outside the node worktree: ' + problem
-                    + '; move the work into the contract worktree and report again'
+                    'worker delivery is not confined to the node worktree: ' + detail
+                    + '; if this node forgot `cd <worktree>`, move the work into the '
+                    'contract worktree, restore the main tree, and report again'
                 )
         self._directory('deliveries')
         self._atomic(path, {
@@ -639,13 +643,20 @@ class ProviderActionStore:
         return None
 
     def _landing_problem(self, run_id, issue_id, role, generation):
-        """Why a developer's work is not in its contract worktree, or None.
+        """``(kind, detail)`` when a developer's work is misplaced, else None.
 
+        ``kind`` is ``'misplaced'`` or ``'unverifiable'`` (git unreadable).
         Checks real git facts, never the worker's own claim: the contract
         worktree must exist on the contract branch, and no allowlisted file
-        may be modified in the main project tree.  A worker that forgot to
-        ``cd`` would otherwise edit the main tree while the monitor runs
-        acceptance in the untouched worktree and reads a false green.
+        may be uncommitted (modified, staged or untracked) in the main project
+        tree.  A worker that forgot to ``cd`` would otherwise edit the main
+        tree while the monitor runs acceptance in the untouched worktree and
+        reads a false green.
+
+        ponytail: work already *committed* onto the main tree's branch is not
+        seen (the main tree is clean again).  A positive "worktree has an
+        allowlisted change" check would catch it but wrongly refuses report-
+        only nodes and post-merge reworks; add it once those are told apart.
         """
         import subprocess
 
@@ -655,16 +666,17 @@ class ProviderActionStore:
         if binding is None:
             return None
         root = Path(self.paths.root).resolve()
-        worktree = Path(str(binding.get('worktree') or ''))
-        if not str(worktree) or str(worktree) == '.':
-            return 'contract has no worktree'
+        raw = str(binding.get('worktree') or '').strip()
+        if not raw:
+            return 'misplaced', 'contract has no worktree'
+        worktree = Path(raw)
         if not worktree.is_absolute():
             worktree = root / worktree
         worktree = worktree.resolve()
         if worktree == root:
             return None  # the node writes the main tree by contract
         if not worktree.is_dir():
-            return 'worktree {} does not exist'.format(binding.get('worktree'))
+            return 'misplaced', 'worktree {} does not exist'.format(raw)
 
         def git(cwd, *args):
             try:
@@ -680,10 +692,10 @@ class ProviderActionStore:
 
         branch, error = git(worktree, 'branch', '--show-current')
         if error:
-            return 'cannot read worktree branch ({})'.format(error)
+            return 'unverifiable', 'cannot read worktree branch ({})'.format(error)
         expected = str(binding.get('branch') or '')
         if expected and branch.strip() != expected:
-            return 'worktree is on branch {!r}, contract says {!r}'.format(
+            return 'misplaced', 'worktree is on branch {!r}, contract says {!r}'.format(
                 branch.strip(), expected
             )
         # ponytail: "." or path-escaping allowlist entries are skipped -- they
@@ -696,13 +708,27 @@ class ProviderActionStore:
         ]
         if not allowlist:
             return None
-        status, error = git(root, 'status', '--porcelain', '--', *allowlist)
+        # -z: NUL-separated, unquoted paths; a rename entry is followed by
+        # its source path, which is skipped.  ponytail: gitignored files are
+        # not seen; node allowlists name tracked sources.
+        status, error = git(
+            root, 'status', '--porcelain', '-z', '--untracked-files=all', '--', *allowlist
+        )
         if error:
-            return 'cannot read main project status ({})'.format(error)
-        changed = sorted({line[3:].strip() for line in status.splitlines() if line.strip()})
+            return 'unverifiable', 'cannot read main project status ({})'.format(error)
+        changed = set()
+        entries = iter(status.split('\0'))
+        for entry in entries:
+            if len(entry) < 4:
+                continue
+            changed.add(entry[3:])
+            if entry[0] in 'RC':
+                next(entries, None)
         if changed:
-            return 'allowlisted files are modified in the main project: {}'.format(
-                ', '.join(changed)
+            return 'misplaced', (
+                'the main project has uncommitted changes to this node\'s allowlisted '
+                'files: {} (a missing `cd <worktree>`, another writer, or a pending '
+                'merge -- check the main tree first)'.format(', '.join(sorted(changed)))
             )
         return None
 
