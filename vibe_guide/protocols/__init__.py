@@ -50,6 +50,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "d8dfb3a043d330928b0798e4614b671eaf885aeb37d7ef7f7923e39091ec3e3f",
         # 2026-10-09: §6.3 worker-deliver exception; serial nodes still pin.
         "2f0c8e32a2efc532df33c4392901d3a6712e4df32ac9b073d86f18c2b0d5019d",
+        # 2026-10-09: #172 squash on top of #171 -- both edits in one text.
+        "52ab18b4f02bbe752e6e3c1949cb6b5a98facd5299e0fbe4123649ca4ef73c7d",
         "d93d32ba556b02d8e132bb78829e8b8eaf354e5420553908873c576597c7634e",
         "e93c430fa34d2db44ba7dd6383cc61c6bd013a2a536642f13f6c976850e26b26",
         "f2f90466346715fcf1b65a8f8cc3f5be6aa5244c676fe4fb38fc725c89610c38",
