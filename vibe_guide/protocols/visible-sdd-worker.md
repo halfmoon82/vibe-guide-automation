@@ -161,6 +161,11 @@ fail-closed，不可重报。
 不会领到上一代的存档。同一 payload 重复自报幂等，不产生
 第二个事件。监工侧校验门位置不变，也不信任唤醒信号的内容。
 
+developer 自报时还会**按 git 实况核对落点**（不看自报内容）：合同 `worktree` 必须存在且在合同分支上，
+主项目树里不得有合同白名单文件的改动。任一不满足即当场拒绝并写明原因（例如
+`allowlisted files are modified in the main project: app.py`）——这是漏了 `cd <worktree>`、
+把活干在主项目里的典型症状。处理方式：把改动挪进合同 worktree、恢复主项目树后再自报。reviewer 只读，不做此核对。
+
 ## 6. 与本协议无关的事项
 
 - 本协议不定义节点合同格式、授权卡签发或监工调度，那些由 vibe 核心与 prd-guide 协议负责。

@@ -331,6 +331,94 @@ class WorkerDeliverCliTests(unittest.TestCase):
         self.assertFalse((self.root.parent / "escaped-n1-developer.json").exists())
 
 
+class LandingCheckTests(unittest.TestCase):
+    """A developer report is refused when the work is not in its worktree.
+
+    Uses a real git repo + worktree: the check reads git facts, not the
+    worker's claim, so a fake tree would test nothing.
+    """
+
+    def setUp(self):
+        import subprocess
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "project"
+        self.root.mkdir()
+
+        def git(*args, cwd=self.root):
+            subprocess.run(["git", "-C", str(cwd)] + list(args), check=True,
+                           capture_output=True)
+
+        self.git = git
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "t@t")
+        git("config", "user.name", "t")
+        (self.root / "app.py").write_text("v1\n", encoding="utf-8")
+        (self.root / ".gitignore").write_text(".vibe/\n.worktrees/\n", encoding="utf-8")
+        git("add", "app.py", ".gitignore")
+        git("commit", "-q", "-m", "init")
+        git("worktree", "add", "-q", "-b", "node/n1", ".worktrees/n1")
+        self.store = _store(self.root)
+
+    def _dispatch(self, worktree=".worktrees/n1", branch="node/n1", role="developer"):
+        action_id = "action-create-run-1-n1-{}".format(role)
+        (self.store._directory("requests") / (action_id + ".json")).write_text(json.dumps({
+            "schema_version": 1, "action_id": action_id, "operation": "create",
+            "provider": "workbuddy", "run_id": "run-1", "issue_id": "n1",
+            "role": role, "generation": 1, "sequence": 0, "native_tool": "x",
+            "request": {"child_binding": {
+                "worktree": worktree, "branch": branch, "allowlist": ["app.py"],
+            }},
+            "request_digest": "0" * 64,
+        }), encoding="utf-8")
+
+    def _deliver(self, role="developer"):
+        return self.store.record_worker_delivery("run-1", "n1", role, dict(GOOD), 1)
+
+    def _archived(self):
+        return list((self.root / ".vibe" / "provider-actions" / "deliveries").glob("*.json"))
+
+    def test_work_in_the_worktree_is_recorded(self):
+        self._dispatch()
+        (self.root / ".worktrees" / "n1" / "app.py").write_text("v2\n", encoding="utf-8")
+        self.assertTrue(self._deliver()["recorded"])
+        self.assertEqual(len(self._archived()), 1)
+
+    def test_allowlisted_edit_in_main_tree_is_refused(self):
+        self._dispatch()
+        (self.root / "app.py").write_text("v2 in the wrong tree\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "main project: app.py"):
+            self._deliver()
+        self.assertEqual(self._archived(), [])
+
+    def test_missing_worktree_is_refused(self):
+        self._dispatch(worktree=".worktrees/gone")
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            self._deliver()
+        self.assertEqual(self._archived(), [])
+
+    def test_worktree_on_wrong_branch_is_refused(self):
+        self._dispatch()
+        self.git("checkout", "-q", "-b", "other", cwd=self.root / ".worktrees" / "n1")
+        with self.assertRaisesRegex(ValueError, "contract says 'node/n1'"):
+            self._deliver()
+
+    def test_reviewer_report_is_not_landing_checked(self):
+        # Reviewers are read-only; a user's own main-tree edit must not
+        # block their verdict.
+        self._dispatch(role="reviewer")
+        (self.root / "app.py").write_text("user edit\n", encoding="utf-8")
+        self.assertTrue(self._deliver(role="reviewer")["recorded"])
+
+    def test_worker_protocol_documents_the_landing_check(self):
+        text = (Path(__file__).resolve().parents[1] / "vibe_guide" / "protocols"
+                / "visible-sdd-worker.md").read_text(encoding="utf-8")
+        for token in ("按 git 实况核对落点", "allowlisted files are modified in the main project",
+                      "reviewer 只读，不做此核对"):
+            self.assertIn(token, text)
+
+
 class DispatchPromptTests(unittest.TestCase):
     def test_create_prompt_carries_completion_steps(self):
         with tempfile.TemporaryDirectory() as d:
