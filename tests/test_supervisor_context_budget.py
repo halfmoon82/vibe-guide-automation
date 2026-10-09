@@ -35,6 +35,19 @@ class ContextBudgetTests(unittest.TestCase):
         result = self.preflight(150000, token_threshold=300000)
         self.assertEqual(result['state'], 'rotate')
 
+    def test_explicit_temporary_cap_can_raise_next_shift_without_changing_default(self):
+        self.assertEqual(self.preflight(200000, token_threshold=250000, context_hard_cap=250000)['state'], 'work')
+        self.assertEqual(self.preflight(250000, token_threshold=250000, context_hard_cap=250000)['state'], 'rotate')
+        self.assertEqual(self.preflight(200000)['state'], 'rotate')
+
+    def test_public_preflight_accepts_temporary_cap(self):
+        from vibe_guide.cli import run_cli
+        self.record.write_text(json.dumps({'context_tokens':200000}))
+        with patch('vibe_guide.supervisor._mailbox_state', return_value={'state':'work'}), patch('vibe_guide.cli.supervisor_handoff', return_value=({'handoff_summary':{}},'')):
+            result=run_cli(['supervisor-preflight','--run-id','run-1','--session-record',str(self.record),'--context-hard-cap','250000','--token-threshold','250000','--json'],self.root)
+        self.assertEqual(result.exit_code,0,result.payload)
+        self.assertEqual(result.payload['state'],'work')
+
     def test_growth_is_auxiliary_to_absolute_warning(self):
         result = self.preflight(99999, token_threshold=1)
         self.assertEqual(result['state'], 'work')
