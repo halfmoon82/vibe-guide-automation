@@ -400,13 +400,116 @@ class ProviderActionStore:
     def pending(self, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
         request_dir = self._directory("requests")
         result_dir = self._directory("results")
+        stale_dir = self.root / "stale"
+        if stale_dir.is_symlink() or (stale_dir.exists() and not stale_dir.is_dir()):
+            raise ValueError("provider stale directory may not be a symlink or non-directory")
         result = []
         for path in sorted(request_dir.glob("action-*.json")):
-            if not (result_dir / path.name).exists():
-                action = self._read(path)
-                if run_id is None or action.get("run_id") == run_id:
-                    result.append(action)
+            if (result_dir / path.name).exists():
+                continue
+            action = self._read(path)
+            stale_path = stale_dir / path.name
+            if stale_path.is_symlink():
+                # A symlink marker cannot hide an immutable request.
+                result.append(action)
+                continue
+            if stale_path.exists():
+                try:
+                    stale = self._read(stale_path)
+                except (OSError, ValueError):
+                    stale = None
+                if (
+                    isinstance(stale, dict)
+                    and stale.get("status") == "stale"
+                    and stale.get("action_id") == action.get("action_id")
+                    and stale.get("request_digest") == action.get("request_digest")
+                ):
+                    continue
+            if run_id is None or action.get("run_id") == run_id:
+                result.append(action)
         return result
+
+    def reconcile_stale(self, run_id: str, evidence: Mapping[str, Any]) -> List[str]:
+        """Audit and hide superseded requests only with complete run evidence.
+
+        A stale marker is an audit record beside the immutable request.  It is
+        never a provider result and never invokes the native tool.  Missing or
+        mismatched run, authorization, node, role, generation, or accepted
+        evidence leaves the request pending for human/runtime reconciliation.
+        """
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run id is required")
+        if not isinstance(evidence, Mapping) or evidence.get("run_id") != run_id:
+            return []
+        authorization = evidence.get("authorization_digest")
+        if not isinstance(authorization, str) or len(authorization) != 64:
+            return []
+        nodes = evidence.get("nodes")
+        if not isinstance(nodes, Mapping):
+            return []
+        changed = []
+        request_dir = self._directory("requests")
+        stale_dir = self._directory("stale")
+        for path in sorted(request_dir.glob("action-*.json")):
+            if (self.root / "results" / path.name).exists() or (stale_dir / path.name).exists():
+                continue
+            action = self._read(path)
+            if action.get("run_id") != run_id or action.get("operation") != "create":
+                continue
+            request_envelope = action.get("request")
+            if isinstance(request_envelope, Mapping):
+                # Real ProviderActionStore.request places the authorization
+                # proof in the request envelope. If that envelope is present,
+                # a top-level copy cannot substitute for a missing value.
+                request_authorization = request_envelope.get("authorization_digest")
+            else:
+                # Legacy records without an envelope may use the top-level
+                # field, but this path is never combined with a partial
+                # envelope.
+                request_authorization = action.get("authorization_digest")
+            if request_authorization != authorization:
+                continue
+            issue_id = action.get("issue_id")
+            role = action.get("role")
+            generation = action.get("generation")
+            node = nodes.get(issue_id)
+            if not isinstance(node, Mapping) or node.get("status") != "accepted":
+                continue
+            accepted_generation = node.get("accepted_generation")
+            roles = node.get("roles")
+            role_evidence = roles.get(role) if isinstance(roles, Mapping) else None
+            role_accepted_generation = (
+                role_evidence.get("accepted_generation")
+                if isinstance(role_evidence, Mapping)
+                else None
+            )
+            if role_accepted_generation is None and isinstance(role_evidence, Mapping):
+                role_accepted_generation = role_evidence.get("generation")
+            if (
+                isinstance(generation, bool) or not isinstance(generation, int)
+                or not isinstance(accepted_generation, int)
+                or not isinstance(role_accepted_generation, int)
+                or role_accepted_generation <= generation
+                or not isinstance(role_evidence, Mapping)
+                or role_evidence.get("generation") != role_accepted_generation
+            ):
+                continue
+            audit = {
+                "schema_version": self.schema_version,
+                "status": "stale",
+                "reason": "accepted_generation_superseded",
+                "action_id": action.get("action_id"),
+                "request_digest": action.get("request_digest"),
+                "run_id": run_id,
+                "issue_id": issue_id,
+                "role": role,
+                "generation": generation,
+                "accepted_generation": accepted_generation,
+                "authorization_digest": authorization,
+            }
+            self._atomic(stale_dir / path.name, audit)
+            changed.append(str(action.get("action_id")))
+        return changed
 
     def record_worker_delivery(self, run_id, issue_id, role, payload, generation):
         """Worker self-reported delivery, idempotent and format-gated.

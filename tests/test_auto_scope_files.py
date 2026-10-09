@@ -590,11 +590,11 @@ class MonitorAutoScopeTests(unittest.TestCase):
         snapshot.nodes["n2"]["status"] = "accepted"
         self.assertEqual(monitor._files_held_by_other_active_nodes(snapshot, "n1"), [])
 
-    def test_sibling_with_root_allowlist_holds_every_file(self):
+    def test_dormant_downstream_root_allowlist_does_not_hold_scope(self):
         # P1-A ①: no files -> node_spec defaults the allowlist to ["."]
         # (the whole repository is writable), so it holds tests/ too.
-        # The card's write-scope gate only admits a whole-repo writer that is
-        # serialized behind the others, so n2 waits on n1 (status planned).
+        # A dormant downstream reservation has no writer yet and must not
+        # deadlock the upstream correction.
         n2 = _node("n2")
         n2.depends_on = ["n1"]
         n2.parallel_group = "g2"
@@ -603,8 +603,7 @@ class MonitorAutoScopeTests(unittest.TestCase):
         _monitor, _runner, snapshot = self._run_finding(
             [_node("n1"), n2], ["n1.py", "tests/test_n1.py"]
         )
-        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
-        self.assertEqual(self._scope_events(snapshot.run_id), [])
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
 
     def test_sibling_allowlist_directory_holds_files_beneath_it(self):
         # P1-A ②: the write allowlist names `tests`; files does not.
@@ -614,7 +613,6 @@ class MonitorAutoScopeTests(unittest.TestCase):
             [_node("n1"), n2], ["n1.py", "tests/test_n1.py"]
         )
         self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
-        self.assertEqual(self._scope_events(snapshot.run_id), [])
 
     def test_sibling_owned_paths_hold_files_beneath_them(self):
         n2 = _node("n2")
@@ -624,9 +622,9 @@ class MonitorAutoScopeTests(unittest.TestCase):
         )
         self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
 
-    def test_sibling_with_unverifiable_write_scope_holds_every_file(self):
-        # P1-A: no allowlist anywhere -> dag._write_scope_paths is None
-        # (unverifiable), which must count as the whole repository.
+    def test_dormant_downstream_unverifiable_scope_does_not_hold_scope(self):
+        # A dormant downstream node still has no writer even when its eventual
+        # scope is unverifiable; unknown active writers remain fail closed.
         n2 = _node("n2")
         n2.depends_on = ["n1"]
         n2.parallel_group = "g2"
@@ -635,8 +633,7 @@ class MonitorAutoScopeTests(unittest.TestCase):
             [_node("n1"), n2], ["n1.py", "tests/test_n1.py"]
         )
         self.assertEqual(snapshot.nodes["n2"]["status"], "planned")
-        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
-        self.assertEqual(self._scope_events(snapshot.run_id), [])
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
 
     def test_sibling_with_disjoint_allowlist_does_not_block(self):
         _monitor, _runner, snapshot = self._run_finding(

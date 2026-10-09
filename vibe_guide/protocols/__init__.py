@@ -49,6 +49,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "d93d32ba556b02d8e132bb78829e8b8eaf354e5420553908873c576597c7634e",
         "e93c430fa34d2db44ba7dd6383cc61c6bd013a2a536642f13f6c976850e26b26",
         "f2f90466346715fcf1b65a8f8cc3f5be6aa5244c676fe4fb38fc725c89610c38",
+        # 2026-10-09: heartbeat native-action consumer and stale reconciliation.
+        "e06e774bdd5082ce063b6782ef15862be5a03aaa0419d1cc8ab983fddd181c07",
     }),
     "vibe-entry": frozenset({
         "08140f273188868532d5724d4fb199d1ee48ac46c80cbc2786f46fce91e4ddff",

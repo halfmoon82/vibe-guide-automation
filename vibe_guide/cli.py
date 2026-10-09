@@ -2467,6 +2467,37 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 AuthorizationRecord.from_dict(
                     _read_json(directory / "authorization.json")
                 )
+                # Reconcile superseded create requests during the servicing
+                # turn, after the read-only heartbeat preflight. The request
+                # remains immutable and only a fully bound accepted snapshot
+                # can produce an audit marker.
+                current_snapshot = load_snapshot(paths, run_id)
+                accepted_evidence = {
+                    "run_id": run_id,
+                    "authorization_digest": getattr(current_snapshot, "authorization_digest", ""),
+                    "nodes": {
+                        node_id: {
+                            "status": data.get("status"),
+                            "accepted_generation": max(
+                                int(data.get("developer_generation", 0) or 0),
+                                int(data.get("review_generation", 0) or 0),
+                            ),
+                            "roles": {
+                                "developer": {
+                                    "generation": int(data.get("developer_generation", 0) or 0),
+                                    "accepted_generation": int(data.get("developer_generation", 0) or 0),
+                                },
+                                "reviewer": {
+                                    "generation": int(data.get("review_generation", 0) or 0),
+                                    "accepted_generation": int(data.get("review_generation", 0) or 0),
+                                },
+                            },
+                        }
+                        for node_id, data in (current_snapshot.nodes or {}).items()
+                        if isinstance(data, dict)
+                    },
+                }
+                ProviderActionStore(paths).reconcile_stale(run_id, accepted_evidence)
                 monitor = Monitor(
                     paths, plan, nodes,
                     topology_rulings=_observed_topology_rulings(paths),
