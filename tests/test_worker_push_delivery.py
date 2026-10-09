@@ -331,6 +331,146 @@ class WorkerDeliverCliTests(unittest.TestCase):
         self.assertFalse((self.root.parent / "escaped-n1-developer.json").exists())
 
 
+class LandingCheckTests(unittest.TestCase):
+    """A developer report is refused when the work is not in its worktree.
+
+    Uses a real git repo + worktree: the check reads git facts, not the
+    worker's claim, so a fake tree would test nothing.
+    """
+
+    def setUp(self):
+        import subprocess
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "project"
+        self.root.mkdir()
+
+        def git(*args, cwd=self.root):
+            subprocess.run(["git", "-C", str(cwd)] + list(args), check=True,
+                           capture_output=True)
+
+        self.git = git
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "t@t")
+        git("config", "user.name", "t")
+        (self.root / "app.py").write_text("v1\n", encoding="utf-8")
+        (self.root / ".gitignore").write_text(".vibe/\n.worktrees/\n", encoding="utf-8")
+        git("add", "app.py", ".gitignore")
+        git("commit", "-q", "-m", "init")
+        git("worktree", "add", "-q", "-b", "node/n1", ".worktrees/n1")
+        self.store = _store(self.root)
+
+    def _dispatch(self, worktree=".worktrees/n1", branch="node/n1", role="developer",
+                  allowlist=("app.py",)):
+        action_id = "action-create-run-1-n1-{}".format(role)
+        (self.store._directory("requests") / (action_id + ".json")).write_text(json.dumps({
+            "schema_version": 1, "action_id": action_id, "operation": "create",
+            "provider": "workbuddy", "run_id": "run-1", "issue_id": "n1",
+            "role": role, "generation": 1, "sequence": 0, "native_tool": "x",
+            "request": {"child_binding": {
+                "worktree": worktree, "branch": branch, "allowlist": list(allowlist),
+            }},
+            "request_digest": "0" * 64,
+        }), encoding="utf-8")
+
+    def _deliver(self, role="developer"):
+        return self.store.record_worker_delivery("run-1", "n1", role, dict(GOOD), 1)
+
+    def _archived(self):
+        return list((self.root / ".vibe" / "provider-actions" / "deliveries").glob("*.json"))
+
+    def test_work_in_the_worktree_is_recorded(self):
+        self._dispatch()
+        (self.root / ".worktrees" / "n1" / "app.py").write_text("v2\n", encoding="utf-8")
+        self.assertTrue(self._deliver()["recorded"])
+        self.assertEqual(len(self._archived()), 1)
+
+    def test_allowlisted_edit_in_main_tree_is_refused(self):
+        self._dispatch()
+        (self.root / "app.py").write_text("v2 in the wrong tree\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "allowlisted files: app.py"):
+            self._deliver()
+        self.assertEqual(self._archived(), [])
+
+    def test_missing_worktree_is_refused(self):
+        self._dispatch(worktree=".worktrees/gone")
+        with self.assertRaisesRegex(ValueError, "does not exist"):
+            self._deliver()
+        self.assertEqual(self._archived(), [])
+
+    def test_worktree_on_wrong_branch_is_refused(self):
+        self._dispatch()
+        self.git("checkout", "-q", "-b", "other", cwd=self.root / ".worktrees" / "n1")
+        with self.assertRaisesRegex(ValueError, "contract says 'node/n1'"):
+            self._deliver()
+
+    def test_reviewer_report_is_not_landing_checked(self):
+        # Reviewers are read-only; a user's own main-tree edit must not
+        # block their verdict.
+        self._dispatch(role="reviewer")
+        (self.root / "app.py").write_text("user edit\n", encoding="utf-8")
+        self.assertTrue(self._deliver(role="reviewer")["recorded"])
+
+    def test_dot_worktree_means_main_tree_by_contract(self):
+        self._dispatch(worktree=".", branch="")
+        (self.root / "app.py").write_text("v2 in main by contract\n", encoding="utf-8")
+        self.assertTrue(self._deliver()["recorded"])
+
+    def test_absolute_worktree_path_is_resolved(self):
+        self._dispatch(worktree=str(self.root / ".worktrees" / "n1"))
+        self.assertTrue(self._deliver()["recorded"])
+
+    def test_untracked_allowlisted_file_in_main_tree_is_refused(self):
+        self._dispatch(allowlist=["app.py", "pkg/new.py"])
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg" / "new.py").write_text("x\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, r"allowlisted files: pkg/new\.py \("):
+            self._deliver()
+
+    def test_rename_reports_the_new_path_only(self):
+        self._dispatch(allowlist=["app.py", "new.py"])
+        self.git("mv", "app.py", "new.py")
+        with self.assertRaisesRegex(ValueError, r"allowlisted files: new\.py \("):
+            self._deliver()
+
+    def test_worktree_side_rename_reports_the_new_path_only(self):
+        self._dispatch(allowlist=["app.py", "new.py"])
+        (self.root / "app.py").rename(self.root / "new.py")
+        self.git("add", "-N", "new.py")
+        with self.assertRaisesRegex(ValueError, r"allowlisted files: new\.py \("):
+            self._deliver()
+
+    def test_unreadable_git_is_reported_as_unverifiable(self):
+        plain = Path(self.tmp.name) / "not-a-repo"
+        plain.mkdir()
+        self._dispatch(worktree=str(plain))
+        with self.assertRaisesRegex(ValueError, "^cannot verify delivery landing"):
+            self._deliver()
+
+    def test_work_committed_onto_main_is_a_known_ceiling(self):
+        # ponytail ceiling (task_provider._landing_problem): once the misplaced
+        # work is committed the main tree is clean and the report passes.
+        self._dispatch()
+        (self.root / "app.py").write_text("v2\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "misplaced")
+        self.assertTrue(self._deliver()["recorded"])
+
+    def test_identical_rereport_is_not_rechecked(self):
+        self._dispatch()
+        self._deliver()
+        (self.root / "app.py").write_text("later main edit\n", encoding="utf-8")
+        self.assertTrue(self._deliver()["duplicate"])
+
+    def test_worker_protocol_documents_the_landing_check(self):
+        text = (Path(__file__).resolve().parents[1] / "vibe_guide" / "protocols"
+                / "visible-sdd-worker.md").read_text(encoding="utf-8")
+        for token in ("按 git 实况核对落点", "uncommitted changes to this node's allowlisted files",
+                      "reviewer（只读）", "合同 worktree 就是主项目根（`.`）", "已知盲区",
+                      "cannot verify delivery landing"):
+            self.assertIn(token, text)
+
+
 class DispatchPromptTests(unittest.TestCase):
     def test_create_prompt_carries_completion_steps(self):
         with tempfile.TemporaryDirectory() as d:

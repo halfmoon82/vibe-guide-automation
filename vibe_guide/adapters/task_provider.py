@@ -581,6 +581,17 @@ class ProviderActionStore:
                 run_id, issue_id, role, generation
             )
             return {'recorded': True, 'consumed': consumed, 'duplicate': True}
+        if role == 'developer':
+            problem = self._landing_problem(run_id, issue_id, role, generation)
+            if problem:
+                kind, detail = problem
+                if kind == 'unverifiable':
+                    raise ValueError('cannot verify delivery landing: ' + detail)
+                raise ValueError(
+                    'worker delivery is not confined to the node worktree: ' + detail
+                    + '; if this node forgot `cd <worktree>`, move the work into the '
+                    'contract worktree, restore the main tree, and report again'
+                )
         self._directory('deliveries')
         self._atomic(path, {
             'run_id': run_id,
@@ -612,6 +623,114 @@ class ProviderActionStore:
             ):
                 latest = generation
         return latest
+
+    def _child_binding(self, run_id, issue_id, role, generation):
+        """The monitor-written child binding for this exact generation."""
+        for path in sorted(self._directory('requests').glob('action-*.json')):
+            action = self._read(path)
+            if not isinstance(action, dict):
+                continue
+            request = action.get('request')
+            binding = request.get('child_binding') if isinstance(request, dict) else None
+            if (
+                isinstance(binding, dict)
+                and action.get('run_id') == run_id
+                and action.get('issue_id') == issue_id
+                and action.get('role') == role
+                and action.get('generation') == generation
+            ):
+                return binding
+        return None
+
+    def _landing_problem(self, run_id, issue_id, role, generation):
+        """``(kind, detail)`` when a developer's work is misplaced, else None.
+
+        ``kind`` is ``'misplaced'`` or ``'unverifiable'`` (git unreadable).
+        Checks real git facts, never the worker's own claim: the contract
+        worktree must exist on the contract branch, and no allowlisted file
+        may be uncommitted (modified, staged or untracked) in the main project
+        tree.  A worker that forgot to ``cd`` would otherwise edit the main
+        tree while the monitor runs acceptance in the untouched worktree and
+        reads a false green.
+
+        ponytail: work already *committed* onto the main tree's branch is not
+        seen (the main tree is clean again).  A positive "worktree has an
+        allowlisted change" check would catch it but wrongly refuses report-
+        only nodes and post-merge reworks; add it once those are told apart.
+        """
+        import subprocess
+
+        binding = self._child_binding(run_id, issue_id, role, generation)
+        # ponytail: dispatches without a child_binding (legacy / non-visible
+        # runners) are not checked; add a binding there to cover them.
+        if binding is None:
+            return None
+        root = Path(self.paths.root).resolve()
+        raw = str(binding.get('worktree') or '').strip()
+        if not raw:
+            return 'misplaced', 'contract has no worktree'
+        worktree = Path(raw)
+        if not worktree.is_absolute():
+            worktree = root / worktree
+        worktree = worktree.resolve()
+        if worktree == root:
+            return None  # the node writes the main tree by contract
+        if not worktree.is_dir():
+            return 'misplaced', 'worktree {} does not exist'.format(raw)
+
+        def git(cwd, *args):
+            try:
+                done = subprocess.run(
+                    ['git', '-C', str(cwd)] + list(args),
+                    capture_output=True, text=True, timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError) as error:
+                return None, type(error).__name__
+            if done.returncode != 0:
+                return None, (done.stderr.strip() or 'git failed')
+            return done.stdout, None
+
+        branch, error = git(worktree, 'branch', '--show-current')
+        if error:
+            return 'unverifiable', 'cannot read worktree branch ({})'.format(error)
+        expected = str(binding.get('branch') or '')
+        if expected and branch.strip() != expected:
+            return 'misplaced', 'worktree is on branch {!r}, contract says {!r}'.format(
+                branch.strip(), expected
+            )
+        # ponytail: "." or path-escaping allowlist entries are skipped -- they
+        # would match unrelated main-tree changes; real node allowlists are
+        # explicit relative files.
+        allowlist = [
+            item for item in (binding.get('allowlist') or [])
+            if isinstance(item, str) and item.strip() not in ('', '.')
+            and not Path(item).is_absolute() and '..' not in Path(item).parts
+        ]
+        if not allowlist:
+            return None
+        # -z: NUL-separated, unquoted paths; a rename entry is followed by
+        # its source path, which is skipped.  ponytail: gitignored files are
+        # not seen; node allowlists name tracked sources.
+        status, error = git(
+            root, 'status', '--porcelain', '-z', '--untracked-files=all', '--', *allowlist
+        )
+        if error:
+            return 'unverifiable', 'cannot read main project status ({})'.format(error)
+        changed = set()
+        entries = iter(status.split('\0'))
+        for entry in entries:
+            if len(entry) < 4:
+                continue
+            changed.add(entry[3:])
+            if 'R' in entry[:2] or 'C' in entry[:2]:  # index or worktree side
+                next(entries, None)
+        if changed:
+            return 'misplaced', (
+                'the main project has uncommitted changes to this node\'s allowlisted '
+                'files: {} (a missing `cd <worktree>`, another writer, or a pending '
+                'merge -- check the main tree first)'.format(', '.join(sorted(changed)))
+            )
+        return None
 
     def _delivery_path(self, run_id, issue_id, role, generation):
         return self.root / 'deliveries' / '{}-{}-{}-g{}.json'.format(
