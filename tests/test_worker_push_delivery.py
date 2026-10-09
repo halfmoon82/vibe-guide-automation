@@ -331,6 +331,13 @@ class WorkerDeliverCliTests(unittest.TestCase):
         self.assertFalse((self.root.parent / "escaped-n1-developer.json").exists())
 
 
+def subprocess_out(cwd, *args):
+    import subprocess
+
+    return subprocess.run(["git", "-C", str(cwd)] + list(args), check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
 class LandingCheckTests(unittest.TestCase):
     """A developer report is refused when the work is not in its worktree.
 
@@ -373,6 +380,8 @@ class LandingCheckTests(unittest.TestCase):
             }},
             "request_digest": "0" * 64,
         }), encoding="utf-8")
+        # Mirrors ProviderActionStore.request for a child-bound dispatch.
+        self.store._record_dispatch_head("run-1", "n1", role, 1, {"worktree": worktree})
 
     def _deliver(self, role="developer"):
         return self.store.record_worker_delivery("run-1", "n1", role, dict(GOOD), 1)
@@ -448,13 +457,199 @@ class LandingCheckTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "^cannot verify delivery landing"):
             self._deliver()
 
-    def test_work_committed_onto_main_is_a_known_ceiling(self):
-        # ponytail ceiling (task_provider._landing_problem): once the misplaced
-        # work is committed the main tree is clean and the report passes.
+    def test_work_committed_onto_main_after_dispatch_is_refused(self):
         self._dispatch()
         (self.root / "app.py").write_text("v2\n", encoding="utf-8")
         self.git("commit", "-q", "-am", "misplaced")
+        with self.assertRaisesRegex(ValueError, "committed this node's allowlisted files after it was dispatched"):
+            self._deliver()
+        self.assertEqual(self._archived(), [])
+
+    def test_unrelated_commit_after_dispatch_is_recorded(self):
+        self._dispatch()
+        (self.root / "other.py").write_text("x\n", encoding="utf-8")
+        self.git("add", "other.py")
+        self.git("commit", "-q", "-m", "unrelated")
         self.assertTrue(self._deliver()["recorded"])
+
+    def test_commit_before_dispatch_is_not_counted(self):
+        # A post-merge rework: earlier generations already landed on main.
+        (self.root / "app.py").write_text("merged earlier\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "merged")
+        self._dispatch()
+        self.assertTrue(self._deliver()["recorded"])
+
+    def test_dispatch_without_recorded_head_is_not_history_checked(self):
+        # ponytail ceiling: dispatches made before dispatch-heads existed.
+        self._dispatch()
+        self.store._dispatch_head_path("run-1", "n1", "developer", 1).unlink()
+        (self.root / "app.py").write_text("v2\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "misplaced")
+        self.assertTrue(self._deliver()["recorded"])
+
+    def test_branch_switch_since_dispatch_is_unverifiable(self):
+        # A rewritten / switched main history would list unrelated commits.
+        self._dispatch()
+        path = self.store._dispatch_head_path("run-1", "n1", "developer", 1)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["head"] = "f" * 40
+        path.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "^cannot verify delivery landing: main project HEAD no longer descends"):
+            self._deliver()
+
+    def test_real_branch_switch_since_dispatch_is_unverifiable(self):
+        # Main moved to a branch that does not contain the dispatch baseline.
+        self._dispatch()
+        (self.root / "app.py").write_text("on main after dispatch\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "main moves")
+        self.git("checkout", "-q", "-b", "side", "HEAD~1")
+        self.git("checkout", "-q", "--orphan", "fresh-history")
+        self.git("commit", "-q", "-m", "rewritten")
+        with self.assertRaisesRegex(ValueError, "no longer descends from the dispatch baseline"):
+            self._deliver()
+
+    def test_symlinked_dispatch_record_is_not_written_through(self):
+        fresh = self._fresh_repo("fresh")
+        store = _store(fresh)
+        outside = Path(self.tmp.name) / "outside.json"
+        heads = store._directory("dispatch-heads")
+        (heads / store._dispatch_head_path("run-9", "n9", "developer", 1).name).symlink_to(outside)
+        store._record_dispatch_head("run-9", "n9", "developer", 1, {"worktree": "."})
+        self.assertFalse(outside.exists())
+
+    def test_failed_record_write_leaves_no_partial_file(self):
+        from unittest.mock import patch
+
+        fresh = self._fresh_repo("fresh")
+        store = _store(fresh)
+        with patch("vibe_guide.adapters.task_provider.os.write", side_effect=OSError("disk full")):
+            store._record_dispatch_head("run-9", "n9", "developer", 1, {"worktree": "."})
+        self.assertFalse(store._dispatch_head_path("run-9", "n9", "developer", 1).exists())
+
+    def test_overlapping_merge_does_not_block_work_done_in_the_worktree(self):
+        # Review P1: the supervisor merges another node touching app.py into
+        # main while this node did its own work in its worktree.
+        self._dispatch()
+        wt = self.root / ".worktrees" / "n1"
+        (wt / "app.py").write_text("n1 work\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "n1 work", cwd=wt)
+        (self.root / "app.py").write_text("other node merged\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "merge other node")
+        self.assertTrue(self._deliver()["recorded"])
+
+    def test_uncommitted_worktree_work_also_counts_as_own_work(self):
+        self._dispatch()
+        (self.root / ".worktrees" / "n1" / "app.py").write_text("wip\n", encoding="utf-8")
+        (self.root / "app.py").write_text("other node merged\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "merge other node")
+        self.assertTrue(self._deliver()["recorded"])
+
+    def test_rework_commits_from_earlier_generations_do_not_count(self):
+        # Generation 1 committed on the node branch; generation 2 (the one
+        # dispatched here) is a report-only rework and main moved meanwhile.
+        wt = self.root / ".worktrees" / "n1"
+        (wt / "app.py").write_text("gen1\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "gen1", cwd=wt)
+        self._dispatch()
+        (self.root / "app.py").write_text("misplaced\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "misplaced")
+        with self.assertRaisesRegex(ValueError, "committed this node's allowlisted files"):
+            self._deliver()
+
+    def test_committed_refusal_does_not_tell_the_worker_to_revert(self):
+        self._dispatch()
+        (self.root / "app.py").write_text("v2\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "misplaced")
+        with self.assertRaises(ValueError) as caught:
+            self._deliver()
+        self.assertIn("do not revert commits you did not make", str(caught.exception))
+        self.assertNotIn("restore the main tree", str(caught.exception))
+
+    def test_unwritable_dispatch_heads_does_not_fail_the_request(self):
+        # Creating .vibe/ first would trip the session gate, so the blocked
+        # directory is simulated at the one place request() touches it.
+        from unittest.mock import patch
+
+        fresh = self._fresh_repo("fresh")
+        store = _store(fresh)
+        real = store._directory
+
+        def directory(name):
+            if name == "dispatch-heads":
+                raise PermissionError("read-only")
+            return real(name)
+
+        with patch.object(store, "_directory", side_effect=directory):
+            store.request(operation="create", provider="workbuddy", run_id="run-9",
+                          issue_id="n9", role="developer", generation=1, native_tool="x",
+                          request={"child_binding": {"worktree": ".worktrees/n9"}})
+        self.assertEqual(len(list(store._directory("requests").glob("action-*.json"))), 1)
+        self.assertIsNone(store._dispatch_head("run-9", "n9", "developer", 1))
+
+    def test_dispatch_head_is_recorded_before_the_request_is_visible(self):
+        # Review P2: a host that sees the request may start work at once.
+        from unittest.mock import patch
+
+        fresh = self._fresh_repo("fresh")
+        store = _store(fresh)
+        seen = []
+        real = store._record_dispatch_head
+
+        def record(*args):
+            seen.append(list(store._directory("requests").glob("action-*.json")))
+            return real(*args)
+
+        with patch.object(store, "_record_dispatch_head", side_effect=record):
+            store.request(operation="create", provider="workbuddy", run_id="run-9",
+                          issue_id="n9", role="developer", generation=1, native_tool="x",
+                          request={"child_binding": {"worktree": ".worktrees/n9"}})
+        self.assertEqual(seen, [[]])
+
+    def test_torn_dispatch_record_skips_the_history_check(self):
+        self._dispatch()
+        self.store._dispatch_head_path("run-1", "n1", "developer", 1).write_text("{", encoding="utf-8")
+        (self.root / "app.py").write_text("v2\n", encoding="utf-8")
+        self.git("commit", "-q", "-am", "misplaced")
+        self.assertTrue(self._deliver()["recorded"])
+
+    def _fresh_repo(self, name):
+        # No .vibe yet: the request gate lets only a pre-session store through
+        # without a full session, which is enough to exercise request().
+        fresh = Path(self.tmp.name) / name
+        fresh.mkdir()
+        for args in (("init", "-q", "-b", "main"), ("config", "user.email", "t@t"),
+                     ("config", "user.name", "t")):
+            self.git(*args, cwd=fresh)
+        (fresh / ".gitignore").write_text(".vibe/\n", encoding="utf-8")
+        self.git("add", ".gitignore", cwd=fresh)
+        self.git("commit", "-q", "-m", "init", cwd=fresh)
+        return fresh
+
+    def test_child_bound_request_records_the_dispatch_head(self):
+        fresh = self._fresh_repo("fresh")
+        store = _store(fresh)
+        store.request(operation="create", provider="workbuddy", run_id="run-9",
+                      issue_id="n9", role="developer", generation=1, native_tool="x",
+                      request={"child_binding": {"worktree": ".worktrees/n9"}})
+        self.assertEqual(store._dispatch_head("run-9", "n9", "developer", 1),
+                         subprocess_out(fresh, "rev-parse", "HEAD"))
+
+    def test_unbound_request_records_no_dispatch_head(self):
+        store = _store(self._fresh_repo("fresh"))
+        store.request(operation="wait", provider="workbuddy", run_id="run-9",
+                      issue_id="n9", role="developer", generation=1, native_tool="x",
+                      request={"threadId": "t"})
+        self.assertIsNone(store._dispatch_head("run-9", "n9", "developer", 1))
+
+    def test_dispatch_head_is_write_once_per_generation(self):
+        # locate / resume of the same generation must not move the baseline.
+        first = subprocess_out(self.root, "rev-parse", "HEAD")
+        self._dispatch()
+        (self.root / "other.py").write_text("x\n", encoding="utf-8")
+        self.git("add", "other.py")
+        self.git("commit", "-q", "-m", "later")
+        self.store._record_dispatch_head("run-1", "n1", "developer", 1, {"worktree": ".worktrees/n1"})
+        self.assertEqual(self.store._dispatch_head("run-1", "n1", "developer", 1), first)
 
     def test_identical_rereport_is_not_rechecked(self):
         self._dispatch()
@@ -467,7 +662,8 @@ class LandingCheckTests(unittest.TestCase):
                 / "visible-sdd-worker.md").read_text(encoding="utf-8")
         for token in ("按 git 实况核对落点", "uncommitted changes to this node's allowlisted files",
                       "reviewer（只读）", "合同 worktree 就是主项目根（`.`）", "已知盲区",
-                      "cannot verify delivery landing"):
+                      "cannot verify delivery landing", "派发时的主项目 HEAD",
+                      "committed this node's allowlisted files after it was dispatched"):
             self.assertIn(token, text)
 
 
