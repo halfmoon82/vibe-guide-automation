@@ -55,6 +55,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "52ab18b4f02bbe752e6e3c1949cb6b5a98facd5299e0fbe4123649ca4ef73c7d",
         # 2026-10-13: supervisor_single_shift switch (PRD #177 D1).
         "acabc77986f59c191acdb8a4cbd7876f26f0a17d8400bc30d5b3020b6f5785ad",
+        # 2026-10-13: absolute hard cap 150k -> 200k.
+        "1348b17f5bfe692c5f623bc1637f55926e396658057cfd08b6ad1add8fe6c5e8",
         "d93d32ba556b02d8e132bb78829e8b8eaf354e5420553908873c576597c7634e",
         "e93c430fa34d2db44ba7dd6383cc61c6bd013a2a536642f13f6c976850e26b26",
         "f2f90466346715fcf1b65a8f8cc3f5be6aa5244c676fe4fb38fc725c89610c38",

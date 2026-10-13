@@ -186,7 +186,7 @@ provider error 必须保留错误类型、原生错误码、是否可重试、�
 
 1. **故障接管**：当前监工会话失联、宿主拒绝服务或会话进入不可恢复错误，且租约到期；
 2. **能力接管**：当前会话按 §9 刷新能力、尝试已验证 adapter 后，仍缺少完成下一动作所必需的原生工具；
-3. **硬上限保险**：上下文达到硬上限保险线（沿用既有 `context_hard_cap`，默认 `DEFAULT_ROTATE_HARD_CAP` = 15 万，可配置），继续服务会导致上下文溢出。
+3. **硬上限保险**：上下文达到硬上限保险线（沿用既有 `context_hard_cap`，默认 `DEFAULT_ROTATE_HARD_CAP` = 20 万（2026-10-13 产品经理由 15 万上调），可配置），继续服务会导致上下文溢出。
 
 既有 `supervisor-preflight` 的软阈值 `rotate` 分支（达到 `DEFAULT_ROTATE_SOFT_CAP` = 10 万且自接班以来增长 ≥ `DEFAULT_ROTATE_TOKEN_THRESHOLD` = 8 万）改为不输出 `rotate`，按 idle/work 正常判定；`prepare_handoff` 提示保留，用于预先生成接管摘要。硬上限分支保留。用户显式传入的 `--context-hard-cap` 继续生效；`--token-threshold` 保留为兼容参数，不再单独触发换班。该行为变更受 §15 第 5 条的启用开关约束。
 

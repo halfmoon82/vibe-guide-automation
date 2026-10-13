@@ -58,9 +58,16 @@ class SingleShiftTests(unittest.TestCase):
         # The handoff summary is still prepared ahead of the hard cap.
         self.assertTrue(result['prepare_handoff'])
 
+    def test_switch_on_does_not_rotate_just_below_hard_cap(self):
+        self.write_config({FIELD_SUPERVISOR_SINGLE_SHIFT: True})
+        self.assertEqual(self.preflight(199999)['state'], 'work')
+
+    def test_switch_off_rotates_below_hard_cap_on_growth(self):
+        self.assertEqual(self.preflight(199999)['state'], 'rotate')
+
     def test_switch_on_still_rotates_at_hard_cap(self):
         self.write_config({FIELD_SUPERVISOR_SINGLE_SHIFT: True})
-        result = self.preflight(150000)
+        result = self.preflight(200000)
         self.assertEqual(result['state'], 'rotate')
         self.assertEqual(result['reason'], 'context over hard cap')
 
@@ -83,7 +90,7 @@ class SingleShiftTests(unittest.TestCase):
 
     def test_invalid_switch_cannot_hide_hard_cap(self):
         self.write_config({FIELD_SUPERVISOR_SINGLE_SHIFT: 'yes'})
-        self.assertEqual(self.preflight(150000)['state'], 'rotate')
+        self.assertEqual(self.preflight(200000)['state'], 'rotate')
 
     def test_unrelated_invalid_field_does_not_block_preflight(self):
         self.write_config({'max_active_worker_sessions': 0, FIELD_SUPERVISOR_SINGLE_SHIFT: True})
@@ -96,7 +103,7 @@ class SingleShiftTests(unittest.TestCase):
         (self.root / '.vibe' / 'config.json').write_text('{broken', encoding='utf-8')
         result = self.preflight(130000)
         self.assertEqual(result['state'], 'rotate')
-        self.assertEqual(self.preflight(150000)['state'], 'rotate')
+        self.assertEqual(self.preflight(200000)['state'], 'rotate')
         low = self.preflight(60000)
         self.assertEqual(low['state'], 'work')
         self.assertFalse(low['single_shift'])

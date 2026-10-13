@@ -178,7 +178,7 @@ class Supervisor:
 # Absolute context size is primary; growth is an auxiliary rotation condition.
 DEFAULT_ROTATE_TOKEN_THRESHOLD = 80000
 DEFAULT_ROTATE_SOFT_CAP = 100000
-DEFAULT_ROTATE_HARD_CAP = 150000
+DEFAULT_ROTATE_HARD_CAP = 200000
 SUPERVISOR_OUTPUT_POLICY = (
     "监工整批输出约束：每次工具编排合并后的返回最多 8192 UTF-8 字节，不能按每个子调用各算一份预算。"
     "所有 shell、源码读取和原生工具完整结果先保存为 name/output 列表，再调用 "

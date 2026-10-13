@@ -32,7 +32,7 @@ class ContextBudgetTests(unittest.TestCase):
         self.assertTrue(result['prepare_handoff'])
 
     def test_hard_cap_cannot_be_lifted_by_growth_setting(self):
-        result = self.preflight(150000, token_threshold=300000)
+        result = self.preflight(200000, token_threshold=300000)
         self.assertEqual(result['state'], 'rotate')
 
     def test_explicit_temporary_cap_can_raise_next_shift_without_changing_default(self):
@@ -163,7 +163,7 @@ class HandoffRecoveryTests(unittest.TestCase):
         from vibe_guide.cli import run_cli
         with tempfile.TemporaryDirectory() as directory:
             record=Path(directory)/'session.json'
-            record.write_text(json.dumps({'context_tokens':150000}))
+            record.write_text(json.dumps({'context_tokens':200000}))
             with patch('vibe_guide.cli.supervisor_handoff',side_effect=ValueError('handoff source changed; retry at next safe point')):
                 result=run_cli(['supervisor-preflight','--run-id','run-1','--session-record',str(record),'--json'],Path(directory))
             self.assertEqual(result.payload['state'],'rotate')
