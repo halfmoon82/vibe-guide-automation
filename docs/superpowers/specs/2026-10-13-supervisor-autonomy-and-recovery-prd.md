@@ -129,7 +129,7 @@ worker 完成或失败时必须先持久写入带交付引用的事件，再尝�
 
 唤醒分两档承诺（产品决策 D2）：
 
-- **兜底档（必须）**：不依赖推送，由 heartbeat 在一个心跳间隔内消费事件。现有心跳指令不含间隔数值；实现须在 vibe 生成的心跳指令（`heartbeat_prompt`）中给出唯一默认间隔，宿主建心跳时照用，授权卡与能力报告显示该值，验收以该值为准。
+- **兜底档（必须）**：不依赖推送，由 heartbeat 在一个心跳间隔内消费事件。现有心跳指令不含间隔数值；实现须在 vibe 生成的心跳指令（`heartbeat_prompt`）中给出唯一默认间隔，宿主建心跳时照用，授权卡与能力报告显示该值，验收以该值为准。具体数值在实施计划阶段由产品经理确认。
 - **推送档（验证后启用）**：宿主原生推送唤醒在受支持桌面 App 上经真实验证后，才承诺事件写入后 30 秒内消费。未验证的平台只承诺兜底档，能力报告必须标明。
 
 ### 6.2 idle 的定义与退出
@@ -190,7 +190,7 @@ provider error 必须保留错误类型、原生错误码、是否可重试、�
 
 既有 `supervisor-preflight` 的软阈值 `rotate` 分支（达到 `DEFAULT_ROTATE_SOFT_CAP` = 10 万且自接班以来增长 ≥ `DEFAULT_ROTATE_TOKEN_THRESHOLD` = 8 万）改为不输出 `rotate`，按 idle/work 正常判定；`prepare_handoff` 提示保留，用于预先生成接管摘要。硬上限分支保留。用户显式传入的 `--context-hard-cap` 继续生效；`--token-threshold` 保留为兼容参数，不再单独触发换班。该行为变更受 §15 第 5 条的启用开关约束。
 
-**有意取代的既有测试断言**：以下断言验证的是 D1 取消的软阈值换班行为，实现时改写为“软阈值不触发 `rotate`、硬上限仍触发”，不得删除用例：`tests/test_supervisor_rotation_cost.py` 中软阈值增长触发 `rotate` 及 `token_threshold` 可配置触发 `rotate` 的用例；`tests/test_supervisor_context_budget.py` 中 15 万以下仍断言 `rotate` 的用例。以下必须保持原样通过，作为兼容回归：硬上限触发 `rotate` 的用例（rotation_cost、context_budget、`tests/test_supervisor_registry.py`）、`test_handoff_preparation_race_cannot_clear_hard_stop`、`tests/test_heartbeat_canonical_prompt.py` 的四态断言、`tests/test_issue_127_first_shift.py` 与 rotation_cost 中校验协议文本含 `rotate` 分支的断言（协议改写后仍保留 `rotate` 分支）。
+**有意取代的既有测试断言**：以下断言验证的是 D1 取消的软阈值换班行为，实现时改写为“软阈值不触发 `rotate`、硬上限仍触发”，不得删除用例；改写后的用例须分别覆盖 §15 第 5 条开关的开、关两种状态（关闭时仍断言现有软阈值 `rotate`）：`tests/test_supervisor_rotation_cost.py` 中软阈值增长触发 `rotate` 及 `token_threshold` 可配置触发 `rotate` 的用例；`tests/test_supervisor_context_budget.py` 中 15 万以下仍断言 `rotate` 的用例。以下必须保持原样通过，作为兼容回归：硬上限触发 `rotate` 的用例（rotation_cost、context_budget，以及 `tests/test_supervisor_registry.py` 的 `test_over_threshold_rotates`、`test_preflight_cli_rotate`；该文件 `test_threshold_is_configurable` 断言非 `rotate`，在新行为下同样成立）、`test_handoff_preparation_race_cannot_clear_hard_stop`、`tests/test_heartbeat_canonical_prompt.py` 的四态断言、`tests/test_issue_127_first_shift.py` 与 rotation_cost 中校验协议文本含 `rotate` 分支的断言（协议改写后仍保留 `rotate` 分支）。
 
 **硬上限与权限继承冲突**：原监工逼近硬上限、而接管因权限无法继承失败（D4）时，原监工停止派发新 worker，只完成已发出动作的结果绑定与状态落盘，然后进入 `supervisor_unavailable` 边界通知用户一次（D6），不继续累积上下文至溢出。
 
@@ -339,7 +339,7 @@ provider 成功结果已绑定后再收到旧 timeout 或旧 generation failure�
 
 ### A13：单一监工持续服务
 
-在一个不少于 4 小时、至少含 20 次 idle 心跳的真实或回放 run 中，同一监工会话从开始服务到终态，不发生软阈值换班。idle 心跳增量以宿主报告的相邻两次 input token 之差计量：每次不超过 5,000 token，且最后 10 次 idle 心跳的平均增量不超过前 10 次平均增量的 1.2 倍（即增量不随运行时长增长）。报告监工会话累计 input（cached/uncached）与旧版同类 run 对照；没有可比对照时只报告实测值，不宣称节省。
+在一个不少于 4 小时、至少含 20 次 idle 心跳的真实或回放 run 中，同一监工会话从开始服务到终态，不发生软阈值换班。idle 心跳增量以 `supervisor-preflight` 读取上下文的同一口径（`_session_tokens`）取相邻两次之差计量，保证不同宿主可比：每次不超过 5,000 token，且最后 10 次 idle 心跳的平均增量不超过前 10 次平均增量的 1.2 倍或绝对值不超过 500 token（即增量不随运行时长增长）。报告监工会话累计 input（cached/uncached）与旧版同类 run 对照；没有可比对照时只报告实测值，不宣称节省。
 
 ## 15. 发布与兼容策略
 
@@ -347,7 +347,7 @@ provider 成功结果已绑定后再收到旧 timeout 或旧 generation failure�
 2. 再启用持久事件收件箱和结果绑定，保持现有 state/task 文件可读并提供一次性迁移。
 3. 对新 run 启用 supervisor lease 和唯一接管；旧 run 只有在 registry、授权摘要和 action generation 可验证时原地迁移。
 4. 启用静默 idle、增量读取、自动恢复和精简门禁。每阶段保留回滚开关，不回滚用户授权和已验收节点。
-5. 关闭软阈值换班必须兼容已合入的换班实现，并且只能在 §6.3“idle 心跳增量有上限”经 A13 口径实测通过后启用（以开关控制，默认关闭直至实测通过；开关关闭时保持现有软阈值行为）：保留 `supervisor-register`、`supervisor-preflight`、`supervisor-handoff`、`supervisor-hold` 命令及参数、`handoff-summary.json` 和接班起点记录的读写格式；已在运行的旧心跳指令中的 `rotate` 分支保持可执行，只是不再因软阈值被触发。协议文本（prd-guide §6.0/§6.5、vibe-entry、心跳指令）同步改写，并按既有规则补登记协议摘要。
+5. 关闭软阈值换班必须兼容已合入的换班实现，并且只能在 §6.3“idle 心跳增量有上限”经 A13 口径实测通过后启用（开关为 `.vibe/config.json` 中的单一布尔字段，不含凭据或路径；默认关闭直至实测通过；开关关闭时保持现有软阈值行为，现有测试原样通过）：保留 `supervisor-register`、`supervisor-preflight`、`supervisor-handoff`、`supervisor-hold` 命令及参数、`handoff-summary.json` 和接班起点记录的读写格式；已在运行的旧心跳指令中的 `rotate` 分支保持可执行，只是不再因软阈值被触发。协议文本（prd-guide §6.0/§6.5、vibe-entry、心跳指令）同步改写，并按既有规则补登记协议摘要。
 6. 发布前执行状态恢复、重复事件、竞态、权限继承、唯一 writer、独立 Review、真实 provider sandbox 和长时间 idle 唤醒测试。mock 通过不能替代至少一次受支持桌面 App 的真实验收。
 
 ## 16. 安全不变量
