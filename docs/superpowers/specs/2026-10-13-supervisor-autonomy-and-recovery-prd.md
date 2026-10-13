@@ -12,7 +12,7 @@
 
 | # | 决策 | 落点 |
 | --- | --- | --- |
-| D1 | **取消按 token 阈值的例行换班。** 同一监工会话持续服务整个 run；换班只用于故障接管和上下文硬上限保险。原因：例行换班的唯一目的是节省 token，但没有任何一次真实运行证明净节省，且样本 run 登记了 18 个监工身份、多次半接管和权限退化；run 140 中交接回合占全部输入 18%、未命中缓存输入 38%。监工上下文膨胀的根因是空闲心跳复述整轮状态，由 §6.3 与 §11 从源头处理。 | §2、§8、A5、A13 |
+| D1 | **取消例行（软阈值）换班。** 同一监工会话持续服务整个 run；换班只用于故障接管、能力接管和上下文硬上限保险。原因：例行换班的唯一目的是节省 token，但没有证据表明它带来净节省，反而观察到重放与权限退化成本：样本 run 登记了 18 个监工身份、多次半接管；run 140 中交接回合占全部输入 18%、未命中缓存输入 38%（来源：PR #142 提交说明中的实测）。监工上下文膨胀的根因是空闲心跳复述整轮状态，由 §6.3 与 §11 从源头处理。 | §2、§8、A5、A13 |
 | D2 | 唤醒时限先按心跳兜底承诺；原生推送唤醒经真实验证后再收紧到 30 秒。 | §6.2、A1、A4 |
 | D3 | engine attestation 只在受证明内容逐字节不变时自动重算；任何内容变化重新授权。 | §9 |
 | D4 | 接管监工必须继承已验证的权限 profile；继承失败则接管失败，不降级运行。 | §8.1、A6 |
@@ -119,7 +119,7 @@ run_id + supervisor_id + lease_epoch + owner_thread_id + host_id
 | 防僵尸心跳 | `SUPERVISOR_OUTPUT_POLICY`、`supervisor-output`、idle 一字回复 | 在既有输出约束上增加停滞检测 |
 | 接管摘要 | `supervisor-handoff`、`handoff-summary.json` | 保留，作为故障接管与硬上限接管的输入 |
 
-`owner_layer`、`next_action`、`retry_policy`、`user_interrupt`、`lease_epoch` 为新增数据字段。
+`owner_layer`、`next_action`、`retry_policy`、`user_interrupt`、`lease_epoch` 为新增数据字段。`supervisor_unavailable` 是新增的 blocker 原因码（`owner_layer = provider_host`、`user_interrupt = true`），不是新的 run 状态，也不得落为 `blocked_unknown`。`owner_layer` 映射白名单与 Review 结果处理放在同一模块（`review.py`）单一来源定义，以 finding 的 invariant/验收条件标识为键，并有契约测试覆盖“白名单外 → implementation”。
 
 ## 6. 持久唤醒合同
 
@@ -129,7 +129,7 @@ worker 完成或失败时必须先持久写入带交付引用的事件，再尝�
 
 唤醒分两档承诺（产品决策 D2）：
 
-- **兜底档（必须）**：不依赖推送，由 heartbeat 在一个心跳间隔内消费事件。心跳间隔由 vibe 生成的心跳指令统一给出，验收时以该数值为准。
+- **兜底档（必须）**：不依赖推送，由 heartbeat 在一个心跳间隔内消费事件。现有心跳指令不含间隔数值；实现须在 vibe 生成的心跳指令（`heartbeat_prompt`）中给出唯一默认间隔，宿主建心跳时照用，授权卡与能力报告显示该值，验收以该值为准。
 - **推送档（验证后启用）**：宿主原生推送唤醒在受支持桌面 App 上经真实验证后，才承诺事件写入后 30 秒内消费。未验证的平台只承诺兜底档，能力报告必须标明。
 
 ### 6.2 idle 的定义与退出
@@ -178,7 +178,7 @@ provider 结果先进入按 `action_id` 索引的持久收件箱（扩展既有 
 
 provider error 必须保留错误类型、原生错误码、是否可重试、需要的权限、建议动作和安全脱敏后的 stderr/结构化详情。不得把具体权限拒绝或工具缺失压缩为 `blocked_unknown`。
 
-## 8. 唯一接管（取代例行换班）
+## 8. 唯一接管（取代例行软阈值换班）
 
 ### 8.0 何时允许接管
 
@@ -186,9 +186,13 @@ provider error 必须保留错误类型、原生错误码、是否可重试、�
 
 1. **故障接管**：当前监工会话失联、宿主拒绝服务或会话进入不可恢复错误，且租约到期；
 2. **能力接管**：当前会话按 §9 刷新能力、尝试已验证 adapter 后，仍缺少完成下一动作所必需的原生工具；
-3. **硬上限保险**：上下文达到会话模型窗口的硬上限保险线（沿用既有 `context_hard_cap`，默认 15 万，可配置），继续服务会导致上下文溢出。
+3. **硬上限保险**：上下文达到硬上限保险线（沿用既有 `context_hard_cap`，默认 `DEFAULT_ROTATE_HARD_CAP` = 15 万，可配置），继续服务会导致上下文溢出。
 
-既有 `supervisor-preflight` 的“自接班以来增长 ≥ 8 万”且“≥ 10 万软阈值”的 `rotate` 分支改为只报告、不触发换班（可保留 `prepare_handoff` 提示，用于预先生成接管摘要）。硬上限分支保留。用户显式传入的 `--context-hard-cap` 继续生效；`--token-threshold` 保留为兼容参数，不再单独触发换班。
+既有 `supervisor-preflight` 的软阈值 `rotate` 分支（达到 `DEFAULT_ROTATE_SOFT_CAP` = 10 万且自接班以来增长 ≥ `DEFAULT_ROTATE_TOKEN_THRESHOLD` = 8 万）改为不输出 `rotate`，按 idle/work 正常判定；`prepare_handoff` 提示保留，用于预先生成接管摘要。硬上限分支保留。用户显式传入的 `--context-hard-cap` 继续生效；`--token-threshold` 保留为兼容参数，不再单独触发换班。该行为变更受 §15 第 5 条的启用开关约束。
+
+**有意取代的既有测试断言**：以下断言验证的是 D1 取消的软阈值换班行为，实现时改写为“软阈值不触发 `rotate`、硬上限仍触发”，不得删除用例：`tests/test_supervisor_rotation_cost.py` 中软阈值增长触发 `rotate` 及 `token_threshold` 可配置触发 `rotate` 的用例；`tests/test_supervisor_context_budget.py` 中 15 万以下仍断言 `rotate` 的用例。以下必须保持原样通过，作为兼容回归：硬上限触发 `rotate` 的用例（rotation_cost、context_budget、`tests/test_supervisor_registry.py`）、`test_handoff_preparation_race_cannot_clear_hard_stop`、`tests/test_heartbeat_canonical_prompt.py` 的四态断言、`tests/test_issue_127_first_shift.py` 与 rotation_cost 中校验协议文本含 `rotate` 分支的断言（协议改写后仍保留 `rotate` 分支）。
+
+**硬上限与权限继承冲突**：原监工逼近硬上限、而接管因权限无法继承失败（D4）时，原监工停止派发新 worker，只完成已发出动作的结果绑定与状态落盘，然后进入 `supervisor_unavailable` 边界通知用户一次（D6），不继续累积上下文至溢出。
 
 接管是一个事务，而不是“创建新会话并写摘要”：
 
@@ -222,7 +226,7 @@ failed handoff 后（产品决策 D6）：若原监工仍持有有效租约，�
 
 路由校验以任务创建时持久保存并仍满足安全边界的 binding 为准。全局 worker profile 或 route projection 后续变化，不能否定一个可验证且未被撤销的有效 binding；确需迁移时走 §8 的唯一接管或 successor 合同。
 
-engine attestation 的自动刷新只允许一种情况（产品决策 D3）：被证明的内容与已授权摘要逐字节一致，即冻结 manifest、提交 SHA、引擎代码与可信 runtime 内容均未变化，只因记录位置、序列化格式或时间戳需要重算 digest。此时监工重算并写 `attestation_refreshed` 事件（记录旧/新 digest 和不变内容的摘要）后继续同一 run。任何受证明内容的变化，包括 vibe 版本升级、引擎代码或协议变化，都使授权失效，必须重新授权；监工不得自行判断变化“是否影响安全”。
+engine attestation 的自动刷新只允许一种情况（产品决策 D3）：被证明的内容与已授权内容逐字节一致，即冻结 manifest、提交 SHA、引擎代码与可信 runtime 文件的内容摘要均未变化，只因记录位置、外层序列化格式或时间戳变化需要重算 attestation 的外层 digest。比对对象是上述内容的摘要，而不是外层 digest。此时监工重算并写 `attestation_refreshed` 事件（记录旧/新 digest 和不变内容的摘要）后继续同一 run。任何受证明内容的变化，包括 vibe 版本升级、引擎代码或协议变化，都使授权失效，必须重新授权；监工不得自行判断变化“是否影响安全”。
 
 ## 10. 阻塞所有权与路由
 
@@ -335,16 +339,16 @@ provider 成功结果已绑定后再收到旧 timeout 或旧 generation failure�
 
 ### A13：单一监工持续服务
 
-在一个不少于 4 小时、含多个 idle 段的真实或回放 run 中，同一监工会话从开始服务到终态，不发生例行换班；idle 心跳的上下文增量有固定上限并给出实测数值。报告监工会话累计 input（cached/uncached）与旧版同类 run 对照；没有可比对照时只报告实测值，不宣称节省。
+在一个不少于 4 小时、至少含 20 次 idle 心跳的真实或回放 run 中，同一监工会话从开始服务到终态，不发生软阈值换班。idle 心跳增量以宿主报告的相邻两次 input token 之差计量：每次不超过 5,000 token，且最后 10 次 idle 心跳的平均增量不超过前 10 次平均增量的 1.2 倍（即增量不随运行时长增长）。报告监工会话累计 input（cached/uncached）与旧版同类 run 对照；没有可比对照时只报告实测值，不宣称节省。
 
 ## 15. 发布与兼容策略
 
 1. 先以只读 shadow 模式计算事件、blocker owner 和下一动作，与现有监工输出对比。
 2. 再启用持久事件收件箱和结果绑定，保持现有 state/task 文件可读并提供一次性迁移。
 3. 对新 run 启用 supervisor lease 和唯一接管；旧 run 只有在 registry、授权摘要和 action generation 可验证时原地迁移。
-4. 关闭例行换班必须兼容已合入的换班实现：保留 `supervisor-register`、`supervisor-preflight`、`supervisor-handoff`、`supervisor-hold` 命令及参数、`handoff-summary.json` 和接班起点记录的读写格式；已在运行的旧心跳指令中的 `rotate` 分支保持可执行，只是不再因软阈值被触发。协议文本（prd-guide §6.0/§6.5、vibe-entry、心跳指令）同步改写，并按既有规则补登记协议摘要。
-5. 最后启用静默 idle、自动恢复和精简门禁。每阶段保留回滚开关，不回滚用户授权和已验收节点。
-5. 发布前执行状态恢复、重复事件、竞态、权限继承、唯一 writer、独立 Review、真实 provider sandbox 和长时间 idle 唤醒测试。mock 通过不能替代至少一次受支持桌面 App 的真实验收。
+4. 启用静默 idle、增量读取、自动恢复和精简门禁。每阶段保留回滚开关，不回滚用户授权和已验收节点。
+5. 关闭软阈值换班必须兼容已合入的换班实现，并且只能在 §6.3“idle 心跳增量有上限”经 A13 口径实测通过后启用（以开关控制，默认关闭直至实测通过；开关关闭时保持现有软阈值行为）：保留 `supervisor-register`、`supervisor-preflight`、`supervisor-handoff`、`supervisor-hold` 命令及参数、`handoff-summary.json` 和接班起点记录的读写格式；已在运行的旧心跳指令中的 `rotate` 分支保持可执行，只是不再因软阈值被触发。协议文本（prd-guide §6.0/§6.5、vibe-entry、心跳指令）同步改写，并按既有规则补登记协议摘要。
+6. 发布前执行状态恢复、重复事件、竞态、权限继承、唯一 writer、独立 Review、真实 provider sandbox 和长时间 idle 唤醒测试。mock 通过不能替代至少一次受支持桌面 App 的真实验收。
 
 ## 16. 安全不变量
 
