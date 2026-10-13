@@ -5,6 +5,8 @@
 适用范围：VibeGuide 已授权 DAG 的监工、心跳、worker 生命周期、provider 调用、换班与恢复
 证据样本：`session-f9a554fff82f6766` / `run-ce79518f6b1e489db738ffef70437a20`
 
+脱敏证据附件：[关键时间线与逐项索引](2026-10-13-supervisor-reliability-evidence-summary.md)。A10 的可执行脱敏夹具随产品实现交付，不阻塞本次 PRD/证据附件合并。
+
 ## 1. 问题与影响
 
 VibeGuide 的目标是在一次授权后自动推进开发、测试、独立 Review、返工和验收。当前监工可以保存大量状态和证据，但在真实长运行中没有稳定完成“事件发生 → 唤醒 → 执行动作 → 绑定结果 → 更新 DAG → 派发下一节点”的闭环。结果是 worker 已交付或 provider 已返回，监工仍长期 `idle`、重复心跳或进入 `blocked_unknown`；换班会话增加，却没有唯一接管者完成后续动作；用户还需要反复点击 `Allow once`。
