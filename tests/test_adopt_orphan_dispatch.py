@@ -320,6 +320,35 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
         self.assert_untouched(self.adopt(), 'a supervisor is running this run')
         self.assertTrue(lease.exists(), 'the live supervisor keeps its lease')
 
+    def test_adoption_overwritten_by_a_stale_save_is_restored_by_adopting_again(self):
+        self.build_orphan()
+        stale = load_snapshot(self.paths, self.run_id)
+        self.adopt()
+        # A heartbeat `resume` that loaded the snapshot before the adoption
+        # saves after it: its sequence covers the event, its nodes do not.
+        _directory, plan, nodes, _card = _load_plan(self.paths, 'probe-plan')
+        stale.event_sequence = len(load_events(self.paths, self.run_id))
+        Monitor(self.paths, plan, nodes)._record_topology_projection(stale, 'monitor.resume')
+        save_snapshot(self.paths, stale)
+        self.assertEqual(load_snapshot(self.paths, self.run_id).nodes[NODE]['developer_generation'], 0)
+        again = self.adopt()
+        self.assertIn('nodes', again.payload, again.payload)
+        self.assert_running_after_resume()
+
+    def test_lost_adoption_is_not_restored_once_its_lease_changed(self):
+        self.build_orphan()
+        stale = load_snapshot(self.paths, self.run_id)
+        self.adopt()
+        _directory, plan, nodes, _card = _load_plan(self.paths, 'probe-plan')
+        stale.event_sequence = len(load_events(self.paths, self.run_id))
+        Monitor(self.paths, plan, nodes)._record_topology_projection(stale, 'monitor.resume')
+        save_snapshot(self.paths, stale)
+        self._rewrite_lease(status='quarantined')
+        again = self.adopt()
+        self.assertEqual(again.payload.get('status'), 'blocked_unknown', again.payload)
+        self.assertIn('adopted writer lease changed', again.payload.get('reason', ''))
+        self.assertEqual(load_snapshot(self.paths, self.run_id).nodes[NODE]['developer_generation'], 0)
+
     def test_failed_start_leaves_a_retryable_adoption(self):
         self.build_orphan()
         with patch('vibe_guide.runners.provider_action.ProviderActionRunner.start',

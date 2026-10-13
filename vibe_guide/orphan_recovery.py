@@ -263,6 +263,40 @@ def _adopted(snapshot: RunSnapshot, node_id: str, events) -> Optional[Dict[str, 
     return None
 
 
+def _restore_lost_adoption(monitor, snapshot: RunSnapshot, node_id: str, done: Dict[str, Any]) -> None:
+    """Re-apply an adoption a concurrent stale snapshot save overwrote.
+
+    Only when the node is back exactly at its pre-adoption state and every
+    durable artifact the adoption wrote (binding, lease, handle) is unchanged.
+    """
+    current = snapshot.nodes[node_id]
+    generation = done.get("generation")
+    handle_id = done.get("handle_id")
+    _require(type(generation) is int and current.get("status") == "blocked_unknown"
+             and current.get("developer_generation", 0) == generation - 1
+             and current.get("developer_identity") is None
+             and current.get("active_task") is None and current.get("start_intent") is None
+             and node_id not in snapshot.handles
+             and isinstance(handle_id, str) and handle_id not in snapshot.handles.values(),
+             "already adopted and the node has moved on")
+    store = ProviderActionStore(monitor.paths)
+    _require(store._latest_generation(snapshot.run_id, node_id, _ROLE) == generation,
+             "already adopted and the node has moved on")
+    binding = load_task_binding(monitor.paths, node_id, _ROLE, run_id=snapshot.run_id)
+    _require(binding.task_id == done.get("task_id") and binding.generation == generation
+             and binding.status == "running", "adopted task binding changed")
+    leases = _leases_on(monitor.paths, node_id, binding.worktree)
+    _require(len(leases) == 1 and leases[0].get("status") == "active"
+             and leases[0].get("run_id") == snapshot.run_id
+             and leases[0].get("intent_digest") == done.get("intent_digest"),
+             "adopted writer lease changed")
+    handle = store._read(store._directory("handles") / (handle_id + ".json"))
+    _require(isinstance(handle, dict) and handle.get("task_id") == binding.task_id
+             and handle.get("run_id") == snapshot.run_id and handle.get("node_id") == node_id
+             and handle.get("generation") == generation, "adopted handle changed")
+    _apply_adoption(monitor, snapshot, node_id, binding, handle_id)
+
+
 def adopt_orphan_dispatch(monitor, run_id: str, node_id: str, action_id: str, runner) -> RunSnapshot:
     """Adopt with one event; every step before it is idempotent.
 
@@ -290,13 +324,14 @@ def _adopt_locked(monitor, run_id: str, node_id: str, action_id: str, runner) ->
     done = _adopted(snapshot, node_id, load_events(monitor.paths, run_id))
     if done is not None:
         current = snapshot.nodes[node_id]
-        _require(done.get("action_id") == action_id
-                 and (current.get("active_task") or {}).get("task_id") == done.get("task_id")
-                 and snapshot.handles.get(node_id) == done.get("handle_id"),
-                 "already adopted and the node has moved on")
+        _require(done.get("action_id") == action_id, "node was adopted from another action")
         # Replay above already restored any missing topology evidence;
         # every other drift keeps invalidating the authorization.
         monitor._validate_execution_topology(snapshot)
+        if not ((current.get("active_task") or {}).get("task_id") == done.get("task_id")
+                and snapshot.handles.get(node_id) == done.get("handle_id")):
+            _restore_lost_adoption(monitor, snapshot, node_id, done)
+            monitor._record_topology_projection(snapshot, _ENTRY)
         monitor._refresh_run_status(snapshot)
         save_snapshot(monitor.paths, snapshot)
         return snapshot
