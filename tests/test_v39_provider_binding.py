@@ -6,12 +6,14 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
-from vibe_guide.adapters.task_provider import ProviderPending, ProviderUnavailable
+from vibe_guide.adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
+from vibe_guide.capability_contract import build_contract, save_contract
 from vibe_guide.models import (
     BindingIntent,
     BindingObservation,
     BindingVerification,
     WaitThreadsCursorObservation,
+    WorkerProfile,
 )
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.provider_action import ProviderActionRunner
@@ -394,6 +396,177 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
             metadata = atomic.call_args[0][1]
             self.assertEqual(metadata["task_id"], "task-1")
             self.assertFalse(metadata["successor"])
+
+
+    def test_resume_request_uses_persisted_binding_profile_over_stale_contract_profile(self):
+        """A continuation resume must send the bound model, not the stale plan one.
+
+        Same drift class as the monitor-side gate: when the persisted binding
+        carries a different model route than the plan contract, the resume
+        request and handle metadata must record the binding's profile or the
+        resumed task runs under an unverifiable model.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            intent, observation, worktree, run_id = self._evidence(paths)
+            binding = self._binding(paths, intent, observation, worktree, run_id)
+            binding.model = "gpt-6.1-sol"
+            binding.reasoning = "deep"
+            binding.route_digest = "b" * 64
+            save_task_binding(paths, binding)
+            runner = ProviderActionRunner(paths, "codex-app-visible", "codex-app-visible")
+            stale_profile = {
+                "worker": "worker", "model": "gpt-5.6-sol", "reasoning": "normal",
+                "fallbacks": [],
+                "selection_basis": {
+                    "issue_complexity_ref": "BUG-V3-005",
+                    "complexity_band": "standard",
+                    "risk_tags": [], "availability_evidence": "test",
+                },
+                "writer": "writer", "worktree": worktree,
+                "branch": "codex/bug-v3-005", "allowlist": ["f.py"],
+            }
+            contract = {
+                "run_id": run_id, "node_id": "BUG-V3-005", "role": "developer",
+                "generation": 1, "binding_contract_version": "3.9", "continuation": True,
+                "binding_intent": intent, "binding_observation": observation,
+                "worker_profile": stale_profile,
+            }
+            captured = {}
+            def capture_action(contract_arg, run, op, request, sequence=0):
+                captured["request"] = request
+                return {"action_id": "resume-1"}
+            with patch.object(runner, "_action", side_effect=capture_action):
+                with patch.object(runner.store, "_atomic") as atomic:
+                    handle = runner.start(contract, Path(worktree))
+            self.assertTrue(handle.run_id)
+            self.assertEqual(captured["request"]["model"], "gpt-6.1-sol")
+            metadata = atomic.call_args[0][1]
+            self.assertEqual(metadata["model"], "gpt-6.1-sol")
+            self.assertEqual(metadata["route_digest"], "b" * 64)
+
+    def test_continuation_with_stale_child_binding_route_uses_registered_route(self):
+        """The monitor's real child envelope must not re-block an existing task."""
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            intent, observation, worktree, run_id = self._evidence(paths)
+            binding = self._binding(paths, intent, observation, worktree, run_id)
+            binding.model = "gpt-6.1-sol"
+            binding.reasoning = "deep"
+            binding.route_digest = "b" * 64
+            save_task_binding(paths, binding)
+            runner = ProviderActionRunner(paths, "codex-app-visible", "codex-app-visible")
+            stale_profile = {
+                "worker": "worker", "model": "gpt-5.6-sol", "reasoning": "normal",
+                "fallbacks": [],
+                "selection_basis": {
+                    "issue_complexity_ref": "BUG-V3-005",
+                    "complexity_band": "standard", "risk_tags": [],
+                    "availability_evidence": "test",
+                },
+                "writer": "writer", "worktree": worktree,
+                "branch": "codex/bug-v3-005", "allowlist": ["f.py"],
+            }
+            stale_profile["route_digest"] = WorkerProfile.from_dict(stale_profile).route_digest
+            contract = {
+                "run_id": run_id, "node_id": "BUG-V3-005", "role": "developer",
+                "generation": 1, "binding_contract_version": "3.9",
+                "continuation": True, "binding_intent": intent,
+                "binding_observation": observation,
+                "worker_profile": stale_profile,
+                "child_binding": {
+                    "worker_profile": stale_profile,
+                    "model": stale_profile["model"],
+                    "reasoning": stale_profile["reasoning"],
+                    "route_digest": stale_profile["route_digest"],
+                },
+            }
+            captured = {}
+            def capture_action(_contract, _run, _op, request, sequence=0):
+                captured["request"] = request
+                return {"action_id": "resume-1"}
+            with patch.object(runner, "_action", side_effect=capture_action):
+                runner.start(contract, Path(worktree))
+            self.assertEqual(captured["request"]["threadId"], "task-1")
+            self.assertEqual(captured["request"]["model"], "gpt-6.1-sol")
+            malformed = dict(contract)
+            malformed["child_binding"] = dict(contract["child_binding"], route_digest="0" * 64)
+            with patch.object(runner, "_action") as native_action:
+                with self.assertRaises(ProviderUnavailable):
+                    runner.start(malformed, Path(worktree))
+            native_action.assert_not_called()
+
+    def test_continuation_final_envelope_does_not_reassert_stale_child_route(self):
+        """A verified same-task resume must not carry a contradictory old route."""
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            intent, observation, worktree, run_id = self._evidence(paths)
+            binding = self._binding(paths, intent, observation, worktree, run_id)
+            binding.model = "bound-model"
+            binding.reasoning = "deep"
+            binding.route_digest = "b" * 64
+            save_task_binding(paths, binding)
+            capability = build_contract(paths.root, provider="codex-app-visible", host_id="host-1")
+            save_contract(paths, capability)
+            (paths.vibe / "state.json").write_text(
+                '{"workflow_version":2,"session_gate":"s0_required"}\n',
+                encoding="utf-8",
+            )
+            binding.capability_contract_digest = capability.contract_digest
+            save_task_binding(paths, binding)
+            runner = ProviderActionRunner(paths, "codex-app-visible", "codex-app-visible")
+            stale_profile = {
+                "worker": "worker", "model": "old-model", "reasoning": "normal",
+                "fallbacks": [], "selection_basis": {
+                    "issue_complexity_ref": "BUG-V3-005", "complexity_band": "standard",
+                    "risk_tags": [], "availability_evidence": "test",
+                },
+                "writer": "writer", "worktree": worktree,
+                "branch": "codex/bug-v3-005", "allowlist": ["f.py"],
+            }
+            stale_profile["route_digest"] = WorkerProfile.from_dict(stale_profile).route_digest
+            contract = {
+                "run_id": run_id, "node_id": "BUG-V3-005", "role": "developer",
+                "generation": 1, "binding_contract_version": "3.9",
+                "continuation": True, "binding_intent": intent,
+                "binding_observation": observation, "worker_profile": stale_profile,
+                "capability_contract_digest": capability.contract_digest,
+                "child_origin": "worker_dispatch",
+                "child_binding": {
+                    "worker_profile": stale_profile, "model": "old-model",
+                    "reasoning": "normal", "route_digest": stale_profile["route_digest"],
+                    "parent_run_id": run_id, "plan_revision": "1",
+                    "authorization_digest": "a" * 64,
+                    "node_id": "BUG-V3-005", "role": "developer", "writer": "writer",
+                    "worktree": worktree, "branch": "codex/bug-v3-005",
+                    "allowlist": ["f.py"],
+                    "capability_contract_digest": capability.contract_digest,
+                },
+            }
+            captured = {}
+            def capture_request(**kwargs):
+                captured.update(kwargs["request"])
+                return {"action_id": "resume-1"}
+            with patch.object(runner.store, "request", side_effect=capture_request):
+                runner.start(contract, Path(worktree))
+            self.assertEqual(captured["model"], "bound-model")
+            self.assertEqual(captured["thinking"], "high")
+            self.assertEqual(captured["origin"], "worker_dispatch")
+            child = captured["child_binding"]
+            self.assertEqual(child["model"], "old-model")
+            self.assertEqual(child["reasoning"], "normal")
+            self.assertEqual(child["worker_profile"]["model"], "old-model")
+            self.assertEqual(child["worker_profile"]["reasoning"], "normal")
+            self.assertEqual(
+                captured["continuation_route"],
+                {"model": "bound-model", "reasoning": "deep", "route_digest": "b" * 64},
+            )
+            gate_store = ProviderActionStore(paths)
+            gate_store.request(
+                operation="resume", provider="codex-app-visible", run_id=run_id,
+                issue_id="BUG-V3-005", role="developer", generation=1,
+                native_tool="codex_app__send_message_to_thread", request=captured,
+            )
 
     def test_binding_bootstrap_blocks_dirty_and_wrong_base_without_git_mutation(self):
         with tempfile.TemporaryDirectory() as directory:

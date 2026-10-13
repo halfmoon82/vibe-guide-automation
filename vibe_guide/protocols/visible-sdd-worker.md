@@ -18,7 +18,7 @@ dev 子代理实现 → review 子代理审查 →（存在 P0–P2）返工回 
    它必须在主项目目录执行。
 2. **review 子代理**：**独立上下文**、**只读**、**非作者视角**审查 dev 的 diff，按 P0（资金/数据正确性）、P1（逻辑缺陷/事务边界）、P2（边界条件/行为回归）、P3（建议）分级产出意见。review 子代理不得是 dev 子代理本人，不得复用 dev 的实现上下文。
 3. **返工**：存在 P0–P2 时逐条核实（reviewer 意见也要验证，不盲从）→ 由 dev 子代理修复 → 重跑定向验证（须为绿）。
-4. **复审**：返工后回到 review 子代理复审，保留审查身份与证据链；最多 3 轮，超限仍存 P0–P2 时转 blocked 并上报监工。
+4. **复审**：返工后回到 review 子代理复审，保留审查身份与证据链；最多 3 轮。三轮仍不收敛时由监工记录 `change_reviewer_or_split_node`，换 reviewer 或拆节点并保留唯一 writer；只有分歧会改变 PRD 验收判定时才升级产品决策。
 5. **收口**：某轮复审无 P0–P2 且验证绿后，按节点合同收口（提交/开 PR 等以授权卡为准）。
 
 ## 2. review 子代理只读红线（git 写禁令清单）
@@ -99,7 +99,7 @@ pm-ai-shipping 的 code-review / intended-vs-implemented），仅作参考不强
 ## 4. reviewer 独立性违规
 
 - review 子代理**代改业务代码**（任何对白名单文件的写入）= **违规**。
-- 发现违规时：该轮审查结论作废，节点转 **blocked**，并在会话交付中**记录**违规事实（谁、改了哪些文件、时间）供监工收口。
+- 发现违规时：该轮审查结论作废，记录谁、改了哪些文件和时间，退回 developer 返工并标记换 reviewer；随后由新的 reviewer 复审。
 - 违规后不得以"改得对"为由追认；修复只能由 dev 子代理完成、由 review 子代理复审。
 
 ## 5. 交付 payload 契约（监工校验字段）
@@ -144,7 +144,7 @@ fail-closed，不可重报。
      - 反面判据：`listed` 只写 `reviewed` 的数字（把分母当分子）会让校验直接不通过；覆盖面不完整
        而靠调低 `listed` 绕过，等于把「漏审」写成「没这些文件」，属于伪造证据。
    - `environment_facts_ref`：字符串，指向派发提示中「环境事实与已知缺陷」一节对应的内容来源，监工门校验其存在；合同无环境事实声明时填 `"none"`，不得留空或省略字段。
-   - `blocked_unknowns`：可空数组，缺省视为空；**非空时监工不得直接 acceptance**，必须产生一条人工/监工处置事件（逐项：已确认无虞 / 已转 P0–P2 返工 / 已补环境事实后复审）后方可继续。
+   - `blocked_unknowns`：可空数组，缺省视为空；**非空时监工不得直接 acceptance**，必须产生一条监工处置事件。`confirmed_benign`（已确认无虞）仅用于有确定证据证明无影响；`escalated_to_findings`（已转 P0–P2 返工）用于转成 P0–P2 返工；`resolved_with_facts`（已补环境事实后复审）用于补齐环境事实并完成复审。三类处置都要逐项写入事件链，未知不得静默放行。
 
 2. **`delivery_evidence`（交付证据门，引擎要求时必需）**：一个嵌套对象，含
    `completion_marker`、`delivery_path`、`thread_status`（只认 `complete` / `completed` /
@@ -176,6 +176,10 @@ developer 自报时还会**按 git 实况核对落点**（不看自报内容）�
 主项目 HEAD 已不再是派发基线的后代（切了分支、改写了历史）时，报 `cannot verify delivery landing`，由监工重新派发。
 **已知盲区**：记录这项之前就已派发的节点、派发时读不到主项目 HEAD 的节点，不做提交历史核对；
 只出报告、而白名单与期间合并重叠的节点会被误拒，重新派发（新一代、新基线）即可。
+
+3. **`decision_requests`（可选决策信箱入口）**：worker 发现需要产品经理拍板时，在交付事件中附带数组；每项含
+   `question`、至少两个带 `id`/`label`/`impact` 的 `options`，可带 `recommendation` 和证据引用。
+   监工会先把它们写入 `.vibe/decisions/requests/`，再把节点置为 `blocked_design`；不要把问题只写在自由文本 `known_gaps` 中。
 
 ## 6. 与本协议无关的事项
 

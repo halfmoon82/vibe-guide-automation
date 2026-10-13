@@ -72,6 +72,12 @@ class VibeEntryProtocolShippingTests(unittest.TestCase):
                 self.assertIn("可选", line, line)
                 self.assertNotIn("必须", line, line)
 
+    def test_authorized_monitor_engineering_recovery_is_not_re_scored(self):
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("vibe-entry")
+        self.assertIn("已授权 run 内的监工", text)
+        self.assertIn("不适用", text)
+
     def test_protocol_requires_observable_s1_output_line(self):
         """Every scored request must leave an observable S1 trace.
 

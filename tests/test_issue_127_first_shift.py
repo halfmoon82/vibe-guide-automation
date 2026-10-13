@@ -51,9 +51,12 @@ class PrdGuideOpeningStepTests(unittest.TestCase):
         self.assertIn("vibe supervisor-register", opening)
         self.assertIn("supervisor-address", opening)
 
-    def test_opening_step_makes_the_preflight_the_first_beat(self):
+    def test_opening_step_installs_the_native_beat_command(self):
         _section, opening = self.section_and_opening()
-        self.assertIn("vibe supervisor-preflight", opening)
+        self.assertIn(
+            "vibe supervisor-beat --run-id <run-id> --session-record <本会话记录路径>",
+            opening,
+        )
         self.assertIn("心跳", opening)
 
     def test_opening_step_states_what_breaks_without_it(self):
@@ -92,7 +95,12 @@ class MonitorFirstShiftTests(unittest.TestCase):
         _root, started = self._start()
         self.assertIsNotNone(started.payload.get("run_id"), started.text)
         self.assertIn("vibe supervisor-register", started.text)
-        self.assertIn("vibe supervisor-preflight", started.text)
+        self.assertIn(
+            "vibe supervisor-beat --run-id {} --session-record <本会话记录路径>".format(
+                started.payload["run_id"]
+            ),
+            started.text,
+        )
 
     def test_a_registered_shift_is_not_told_again(self):
         root, started = self._start(as_json=True)

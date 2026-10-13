@@ -11,6 +11,7 @@ from typing import Any, Dict
 
 from .config import load_supervisor_single_shift
 from .contracts import RunEvent
+from .decision_boundary import validate_boundary_category
 from .state import append_event, run_dir, save_snapshot, load_snapshot
 
 
@@ -382,26 +383,48 @@ def _mailbox_state(paths, run_id, holds):
         pending = None
     if pending is None:
         return {"state": "unknown", "reason": "provider mailbox unreadable"}
+    try:
+        from .decisions import DecisionMailbox
+
+        decisions = DecisionMailbox(paths).list_pending(run_id)
+    except (OSError, TypeError, ValueError):
+        return {"state": "unknown", "reason": "decision mailbox unreadable"}
     if unconsumed:
-        return {"state": "work", "reason": "worker delivery pending", "nodes": unconsumed}
+        return {"state": "work", "reason": "worker delivery pending", "nodes": unconsumed, "decisions": decisions}
     if unpolled:
-        return {"state": "work", "reason": "provider results not yet polled", "nodes": unpolled}
+        return {"state": "work", "reason": "provider results not yet polled", "nodes": unpolled, "decisions": decisions}
+    decision_state = {
+            "state": "decision",
+            "reason": "pending decisions",
+            "decisions": decisions,
+            "heartbeat": {"mode": "degraded_frequency", "paused": False},
+        }
+    decision_nodes = {entry.get("node_id") for entry in decisions}
+    independent_pending = [action for action in pending
+                           if action.get("issue_id") not in decision_nodes
+                           and action.get("issue_id") not in holds]
+    if independent_pending:
+        return {"state": "work", "reason": "pending provider requests",
+                "pending": len(independent_pending), "decisions": decisions}
 
     try:
         snapshot = load_snapshot(paths, run_id)
     except (FileNotFoundError, OSError, ValueError, TypeError):
         snapshot = None
     if snapshot is None:
+        if decisions:
+            return decision_state
         return {"state": "unknown", "reason": "run snapshot unavailable"}
     statuses = _node_statuses(snapshot)
     holds, stale = _valid_holds(holds, statuses, time.time())
     if stale:
-        return {"state": "work", "reason": "hold needs recheck", "nodes": stale}
+        return {"state": "work", "reason": "hold needs recheck", "nodes": stale, "decisions": decisions}
     # A request the supervisor parked for a human decision is not new work;
     # a delivery or result on that node still is (checked above).
-    pending = [action for action in pending if action.get("issue_id") not in holds]
+    pending = [action for action in pending if action.get("issue_id") not in holds
+               and action.get("issue_id") not in decision_nodes]
     if pending:
-        return {"state": "work", "reason": "pending provider requests", "pending": len(pending)}
+        return {"state": "work", "reason": "pending provider requests", "pending": len(pending), "decisions": decisions}
     # Idle is only safe when every node is either being worked on, finished,
     # or waiting on a human.  Anything else -- a delivery, a retry, a ready
     # node, an unknown state -- needs the supervisor's next resume.
@@ -410,7 +433,14 @@ def _mailbox_state(paths, run_id, holds):
         if status not in _IDLE_SAFE_STATUSES and node not in holds
     )
     if needs_service:
-        return {"state": "work", "reason": "nodes need servicing", "nodes": needs_service}
+        return {"state": "work", "reason": "nodes need servicing", "nodes": needs_service, "decisions": decisions}
+    if decisions:
+        dispatchable = sorted(node for node in (getattr(snapshot, "ready_set", None) or [])
+                              if node not in holds and node not in decision_nodes)
+        if dispatchable:
+            return {"state": "work", "reason": "dispatchable nodes",
+                    "nodes": dispatchable, "decisions": decisions}
+        return decision_state
     if holds:
         running = sorted(node for node, status in statuses.items() if status == "running")
         if running:
@@ -499,7 +529,7 @@ def _holds_path(paths, run_id, create=False):
 
 
 def supervisor_holds(paths, run_id):
-    """Return ``{node: {"reason", "held_at", "statuses"}}``; ValueError if unreadable."""
+    """Return ``{node: {"category", "reason", "held_at", "statuses"}}``."""
     path = _holds_path(paths, run_id)
     if not path.exists():
         return {}
@@ -530,10 +560,11 @@ def _write_holds(paths, run_id, holds):
             os.unlink(temporary)
 
 
-def set_supervisor_hold(paths, run_id, node, reason):
+def set_supervisor_hold(paths, run_id, node, reason, boundary_category=None):
     """Park ``node`` for a human decision; the node must exist in the run.
 
-    Holding again refreshes the hold to the run's current state.
+    Holding again refreshes the hold to the run's current state.  New and
+    refreshed holds must name one approved human-decision boundary.
     """
     if not isinstance(node, str) or not _NODE_ID.fullmatch(node):
         raise ValueError("hold node must be a simple node id")
@@ -542,6 +573,7 @@ def set_supervisor_hold(paths, run_id, node, reason):
     reason = reason.strip()
     if len(reason) > _HOLD_REASON_LIMIT:
         raise ValueError("hold reason is limited to {} characters".format(_HOLD_REASON_LIMIT))
+    boundary_category = validate_boundary_category(boundary_category)
     snapshot = load_snapshot(paths, run_id)
     if node not in (snapshot.nodes or {}):
         raise ValueError("node {} is not in this run".format(node))
@@ -555,7 +587,12 @@ def set_supervisor_hold(paths, run_id, node, reason):
     now = time.time()
     # Only this hold is refreshed; another hold voided by a change stays void
     # until the supervisor rechecks and re-holds that node too.
-    holds[node] = {"reason": reason, "held_at": now, "statuses": statuses}
+    holds[node] = {
+        "category": boundary_category,
+        "reason": reason,
+        "held_at": now,
+        "statuses": statuses,
+    }
     _write_holds(paths, run_id, holds)
     return holds
 
@@ -683,29 +720,20 @@ HOST_SHIFT_DIFFERENCES = (
 )
 
 
-def heartbeat_prompt(plan_id, run_id, *, command_prefix="vibe"):
-    """The one heartbeat instruction a supervisor shift may install.
+def heartbeat_command(run_id, *, command_prefix="vibe"):
+    """Return the complete one-line command a host may install as a beat."""
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("run_id is required")
+    if not isinstance(command_prefix, str) or not command_prefix.strip():
+        raise ValueError("command_prefix is required")
+    return "{} supervisor-beat --run-id {} --session-record <本会话记录路径>".format(
+        command_prefix.strip(), run_id
+    )
 
-    ISSUE-127 told the shift to make the preflight the first step of a
-    heartbeat it wrote itself.  On socialmore (5.0.1, Codex) the shift wrote a
-    prompt that ran a full `vibe resume` every beat instead, so the preflight,
-    the registration and the rotation never happened and an idle beat cost
-    5-15x the design.  vibe now owns the wording; prd-guide §6.0 embeds this
-    exact text and a test keeps the two identical.
-    """
-    prompt = (
-        "vibe 监工心跳 · 计划 {plan} · 运行 {run}\n"
-        "（本指令由 vibe 生成。建心跳时逐字照抄，只替换 <本会话记录路径>；不得另写、增删或合并步骤。）\n"
-        "第 1 步，只跑这一条：\n"
-        "  {cli} supervisor-preflight --run-id {run} --session-record <本会话记录路径>\n"
-        "第 2 步，按输出的 state 走一个分支：\n"
-        "  - idle：只回一个字，结束本轮，不再跑任何命令。\n"
-        "  - work 或 unknown：按 prd-guide §6.1 服务信箱一轮，"
-        "推进用 {cli} resume --plan {plan} --run-id {run}；状态只从磁盘读。\n"
-        "  - rotate：新开一个会话，让它跑 {cli} supervisor-handoff --run-id {run} 并照输出接班；本会话不再做别的。\n"
-        "例行轮询不向用户汇报。"
-    ).format(plan=plan_id, run=run_id, cli=command_prefix)
-    return prompt + "\n" + SUPERVISOR_OUTPUT_POLICY.replace("supervisor-output --", command_prefix + " supervisor-output --").replace("<run-id>", run_id)
+
+def heartbeat_prompt(plan_id, run_id, *, command_prefix="vibe"):
+    """Compatibility alias for the only heartbeat installation command."""
+    return heartbeat_command(run_id, command_prefix=command_prefix)
 
 
 def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
@@ -718,6 +746,14 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
     """
     state_refs = _snapshot_refs(paths, run_id)
     snapshot = load_snapshot(paths, run_id)
+    recovered_refs = _snapshot_refs(paths, run_id)
+    if recovered_refs != state_refs:
+        # load_snapshot may atomically restore the verified previous snapshot.
+        # Re-read after restoration; later concurrent drift still fails closed.
+        snapshot = load_snapshot(paths, run_id)
+        if _snapshot_refs(paths, run_id) != recovered_refs:
+            raise ValueError("handoff snapshot changed; retry at next safe point")
+        state_refs = recovered_refs
     holds = supervisor_holds(paths, run_id)
     summary_ref = _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_prefix)
     nodes = {
@@ -733,6 +769,12 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         ]
     except Exception:
         pending = None
+    try:
+        from .decisions import DecisionMailbox
+
+        decisions = DecisionMailbox(paths).list_pending(run_id)
+    except Exception:
+        decisions = None
     plan_id = snapshot.plan_id
     payload = {
         "status": "ok",
@@ -742,7 +784,9 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "nodes": nodes,
         "holds": holds,
         "pending": None if pending is None else len(pending),
-        "heartbeat_prompt": heartbeat_prompt(plan_id, run_id, command_prefix=command_prefix),
+        "decisions": decisions,
+        "heartbeat_command": heartbeat_command(run_id, command_prefix=command_prefix),
+        "heartbeat_prompt": heartbeat_command(run_id, command_prefix=command_prefix),
         "handoff_summary": summary_ref,
     }
     accepted = sum(1 for status in nodes.values() if status == "accepted")
@@ -764,24 +808,33 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         for node, entry in sorted(holds.items()):
             held_at = entry.get("held_at")
             hours = (time.time() - held_at) / 3600 if isinstance(held_at, (int, float)) else None
-            lines.append("  - {}：{}（已挂起 {}）".format(
-                node, entry.get("reason"),
+            lines.append("  - {}（类别 {}）：{}（已挂起 {}）".format(
+                node, entry.get("category") or "unknown", entry.get("reason"),
                 "{:.1f} 小时".format(hours) if hours is not None else "时长未知"))
     lines.append("信箱：待服务请求 {} 项（不含等人拍板的节点）".format(
         "未知" if pending is None else len(pending)))
+    lines.append("决策信箱：待回答 {} 项；心跳降频但不暂停".format(
+        "未知" if decisions is None else len(decisions)))
+    if decisions:
+        for decision in decisions:
+            lines.append("  - {}：{}（选项：{}）".format(
+                decision.get("decision_id"), decision.get("question"),
+                ", ".join(option.get("id", "") for option in decision.get("options", [])),
+            ))
     lines += [
         "接班步骤：",
         "  1) 登记：vibe supervisor-register --run-id {} --provider <平台> "
         "--session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>".format(run_id),
         "     " + SESSION_RECORD_HINT,
         "  2) 自建心跳，指令逐字用下面这段，只替换 <本会话记录路径>：",
-        heartbeat_prompt(plan_id, run_id, command_prefix=command_prefix),
+        heartbeat_command(run_id, command_prefix=command_prefix),
         "  3) 置顶、改标题；删掉上一班的心跳，归档上一班会话"
         "（Claude Code 没有换班原语：上一班结束会话即可）。",
         "  4) 跑一次心跳指令第 1 步的预检，按输出走。",
         HOST_SHIFT_DIFFERENCES,
         "监工挂起某个节点等用户拍板时，先登记：vibe supervisor-hold --run-id {} "
-        "--node <节点> --reason <一句话原因>，否则每次心跳都会被当成有事做。"
+        "--node <节点> --category <product_design|external_authorization|deploy> "
+        "--reason <一句话原因>，否则每次心跳都会被当成有事做。"
         "运行状态一变或挂起满 6 小时，预检会报 work（hold needs recheck）：复核后仍在等人就再跑一次同一条命令刷新。".format(run_id),
     ]
     return payload, "\n".join(lines).replace("vibe supervisor-", command_prefix + " supervisor-")
@@ -836,7 +889,8 @@ def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_p
         if previous is None or task.get("generation", 0) >= previous.get("generation", 0):
             latest[key] = task
     task_keys = ("issue_id", "role", "task_id", "threadId", "hostId", "provider", "mode",
-                 "worktree", "branch", "cursor", "generation", "status", "status_file", "handoff_file")
+                 "worktree", "branch", "cursor", "generation", "status", "status_file", "handoff_file",
+                 "model", "reasoning", "allowlist", "route_digest")
     node_keys = ("status", "worktree", "branch", "active_role", "active_task", "retryable_action")
     nodes = {}
     for node, data in (snapshot.nodes or {}).items():
@@ -847,7 +901,22 @@ def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_p
         if reason:
             nodes[node]["blocked_reason"] = str(reason)[:200]
     pending = ProviderActionStore(paths).pending(run_id)
-    pending_keys = ("action_id", "issue_id", "role", "operation", "generation", "sequence")
+    pending_keys = ("action_id", "issue_id", "role", "operation", "generation", "sequence",
+                    "request_digest", "native_tool")
+    source_root = Path(__file__).resolve().parent.parent
+    from .runners import provider_action
+    module_paths = {"supervisor": str(Path(__file__).resolve()),
+                    "task_provider": str(Path(__import__(ProviderActionStore.__module__,
+                        fromlist=["__file__"]).__file__).resolve()),
+                    "provider_action": str(Path(provider_action.__file__).resolve())}
+    runtime_evidence = [_artifact_ref(Path(path)) for path in module_paths.values()]
+    evidence.extend(runtime_evidence)
+    core_evidence = list(evidence)
+    pending_summary = []
+    for action in pending:
+        ref = _artifact_ref(paths.vibe / "provider-actions/requests" / (action["action_id"] + ".json"))
+        evidence.append(ref)
+        pending_summary.append(dict({k: action[k] for k in pending_keys if k in action}, evidence=ref))
     summary = {
         "schema_version": 1, "run_id": run_id, "plan_id": snapshot.plan_id,
         "run_status": snapshot.status,
@@ -855,11 +924,22 @@ def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_p
         "node_contract_digest": snapshot.node_contract_digest,
         "nodes": nodes, "tasks": [{k: t[k] for k in task_keys if k in t} for t in latest.values()],
         "holds": {n: {"reason": h.get("reason"), "held_at": h.get("held_at")} for n, h in holds.items()},
-        "pending_actions": [{k: a[k] for k in pending_keys if k in a} for a in pending],
+        "pending_actions": pending_summary,
+        "runtime": {"source_root": str(source_root), "command_prefix": command_prefix,
+                    "module_paths": module_paths, "evidence": runtime_evidence,
+                    "evidence_scope": "current_disk_sources_at_loaded_module_paths",
+                    "loaded_code_attested": False},
+        "service_protocol": (
+            "核对当前 run/授权、任务身份、writer、generation 和 cursor；读取动作 evidence，"
+            "按 native_tool 执行真实调用，保留完整原始结果；调用 ProviderActionStore.complete"
+            "(action_id, payload, request_digest=原请求摘要)，再执行 resume 并核验状态/cursor/交付变化。"
+            "已完成动作不重复调用；新观测使用新 sequence。工程失败按现有恢复协议继续，"
+            "不得用重复 preflight/resume 代替 native 调用；产品变化、外部授权或 deploy 才请求用户。"
+        ),
         "pending_count": len(pending), "evidence": evidence,
         "task_registry_status": "ok" if tasks_path.is_file() else "unknown",
         "output_policy": SUPERVISOR_OUTPUT_POLICY,
-        "next_command": "{} supervisor-preflight --run-id {} --session-record <本会话记录路径>".format(command_prefix, run_id),
+        "next_command": heartbeat_command(run_id, command_prefix=command_prefix),
         "resume_command": "{} resume --plan {} --run-id {}".format(command_prefix, snapshot.plan_id, run_id),
         "instructions": "摘要仅用于定位。运行时继续核对授权、writer、generation 与 cursor。按需读证据，禁止将原始报告重复打印。",
     }
@@ -874,6 +954,7 @@ def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_p
         summary["nodes"] = {n: {"status": d.get("status")} for n, d in nodes.items()}
         summary["tasks"] = []
         summary["pending_actions"] = []
+        summary["evidence"] = core_evidence
         raw = _json_bytes(summary)
         if len(raw) > HANDOFF_SUMMARY_LIMIT:
             summary["node_count"] = len(nodes)

@@ -88,10 +88,10 @@ class ContextBudgetTests(unittest.TestCase):
         from vibe_guide.supervisor import heartbeat_prompt
         prefix = "python3 /runtime/bridge.py cli"
         prompt = heartbeat_prompt('plan-1', 'run-1', command_prefix=prefix)
-        self.assertIn(prefix + " supervisor-preflight", prompt)
-        self.assertIn(prefix + " supervisor-handoff", prompt)
-        self.assertIn(prefix + " resume", prompt)
-        self.assertNotIn("  vibe supervisor-preflight", prompt)
+        self.assertEqual(
+            prompt,
+            prefix + " supervisor-beat --run-id run-1 --session-record <本会话记录路径>",
+        )
 
     def test_cli_caps_resume_output_without_changing_exit_code(self):
         from vibe_guide.cli import main, CLIResult
@@ -147,7 +147,10 @@ class HandoffRecoveryTests(unittest.TestCase):
         prefix = "python3 '/runtime/bridge with spaces.py' cli"
         result = run_cli(['supervisor-handoff', '--run-id', run_id, '--json'],root, supervisor_command_prefix=prefix)
         self.assertEqual(result.exit_code,0,result.payload)
-        self.assertIn(prefix+' supervisor-preflight', result.payload['heartbeat_prompt'])
+        self.assertEqual(
+            result.payload['heartbeat_prompt'],
+            prefix+' supervisor-beat --run-id {} --session-record <本会话记录路径>'.format(run_id),
+        )
         summary = json.loads(Path(result.payload['handoff_summary']['path']).read_text())
         self.assertTrue(summary['next_command'].startswith(prefix))
         self.assertTrue(summary['resume_command'].startswith(prefix))

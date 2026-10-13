@@ -18,31 +18,33 @@ from vibe_guide.protocols import load_protocol
 from vibe_guide.monitor import Monitor
 from vibe_guide.state import load_snapshot
 from vibe_guide.supervisor import Supervisor
-from vibe_guide.supervisor import heartbeat_prompt, register_supervisor_address
+from vibe_guide.supervisor import heartbeat_command, heartbeat_prompt, register_supervisor_address
 
 from tests.support_v45_authorize import publish_complex_probe
 
 
 class HeartbeatPromptShapeTests(unittest.TestCase):
-    def test_first_step_is_only_the_preflight(self):
-        text = heartbeat_prompt("plan-a", "run-b")
-        first = text.index("vibe supervisor-preflight --run-id run-b")
-        self.assertLess(first, text.index("vibe resume"))
-        self.assertIn("--session-record <本会话记录路径>", text)
-
-    def test_every_preflight_state_has_a_branch(self):
-        text = heartbeat_prompt("plan-a", "run-b")
-        for state in ("idle", "work", "unknown", "rotate"):
-            self.assertIn(state, text)
-
-    def test_work_branch_serves_this_run(self):
-        self.assertIn(
-            "vibe resume --plan plan-a --run-id run-b",
+    def test_compatibility_prompt_is_the_single_command(self):
+        self.assertEqual(
             heartbeat_prompt("plan-a", "run-b"),
+            heartbeat_command("run-b"),
         )
 
-    def test_prompt_forbids_rewriting(self):
-        self.assertIn("逐字", heartbeat_prompt("plan-a", "run-b"))
+    def test_command_uses_the_native_beat_entrypoint(self):
+        text = heartbeat_prompt("plan-a", "run-b")
+        self.assertEqual(
+            text,
+            "vibe supervisor-beat --run-id run-b --session-record <本会话记录路径>",
+        )
+
+    def test_command_is_one_line(self):
+        self.assertNotIn("\n", heartbeat_prompt("plan-a", "run-b"))
+
+    def test_plan_id_cannot_change_the_installed_command(self):
+        self.assertEqual(
+            heartbeat_prompt("plan-a", "run-b"),
+            heartbeat_prompt("plan-other", "run-b"),
+        )
 
 
 class ProtocolCarriesTheSameTextTests(unittest.TestCase):
@@ -55,11 +57,11 @@ class ProtocolCarriesTheSameTextTests(unittest.TestCase):
         opening = self.section("### 6.0", "### 6.1")
         self.assertIn(heartbeat_prompt("<plan_id>", "<run-id>"), opening)
 
-    def test_rotate_branch_reuses_the_same_prompt(self):
+    def test_rotate_branch_reuses_the_same_command(self):
         discipline = self.section("### 6.5", "## 7. ")
         rotate = [line for line in discipline.splitlines() if line.startswith("- 输出 `rotate`")]
         self.assertEqual(len(rotate), 1)
-        self.assertIn("同一段心跳指令", rotate[0])
+        self.assertIn("supervisor-handoff", rotate[0])
 
 
 class EntryProtocolPointsAtTheGeneratedPromptTests(unittest.TestCase):

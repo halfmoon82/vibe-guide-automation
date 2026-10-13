@@ -132,10 +132,10 @@ class AuthorizationLoopTests(unittest.TestCase):
             with self.subTest(internal=internal):
                 self.assertEqual(map_user_status(internal), visible)
 
-    def test_product_or_permission_block_maps_to_user_decision(self):
+    def test_reason_text_does_not_create_user_decision(self):
         self.assertEqual(
             map_user_status("blocked_unknown", "product scope changed"),
-            "需要你决定",
+            "自动修复中",
         )
 
     def test_retry_marker_overrides_running_internal_status(self):

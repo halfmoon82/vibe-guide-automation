@@ -117,6 +117,19 @@ class MailboxSectionTests(unittest.TestCase):
         from vibe_guide.protocols import load_protocol
         return load_protocol("prd-guide")
 
+    def test_protocol_embeds_the_generated_single_line_heartbeat_command(self):
+        from vibe_guide.supervisor import heartbeat_command
+        text = self.protocol()
+        command = heartbeat_command("<run-id>")
+        self.assertNotIn("\n", command)
+        self.assertIn(command, text)
+        self.assertIn("逐字照抄", text)
+        self.assertIn("supervisor-beat", text)
+        opening = text[text.index("### 6.0"):text.index("### 6.1")]
+        self.assertEqual(opening.count(command), 1)
+        self.assertNotIn("vibe 监工心跳", opening)
+        self.assertNotIn("vibe supervisor-preflight", opening)
+
     def section(self):
         """The mailbox section alone.
 

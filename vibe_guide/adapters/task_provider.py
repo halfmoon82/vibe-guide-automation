@@ -368,14 +368,41 @@ class ProviderActionStore:
             self._consume_archived_delivery(run_id, issue_id, role, generation)
         return payload
 
+    def action(self, action_id: str) -> Dict[str, Any]:
+        """Read immutable request identity, including after its callback finishes."""
+        if not isinstance(action_id, str) or not _SAFE_ID.fullmatch(action_id):
+            raise ValueError("provider action id is invalid")
+        action = self._read(self._directory("requests") / (action_id + ".json"))
+        unsigned = dict(action)
+        digest = unsigned.pop("request_digest", None)
+        basis = {key: action.get(key) for key in (
+            "operation", "provider", "run_id", "issue_id", "role", "generation", "sequence"
+        )}
+        if (action.get("schema_version") != self.schema_version
+                or action.get("action_id") != action_id
+                or action_id != "action-" + _canonical_digest(basis)[:32]
+                or digest != _canonical_digest(unsigned)
+                or not isinstance(action.get("request"), dict)):
+            raise ValueError("provider action request identity is invalid")
+        return action
+
+    def related_action(self, action: Dict[str, Any], operation: str, *, required=True) -> Optional[Dict[str, Any]]:
+        basis = {key: action[key] for key in (
+            "provider", "run_id", "issue_id", "role", "generation", "sequence"
+        )}
+        basis["operation"] = operation
+        action_id = "action-" + _canonical_digest(basis)[:32]
+        path = self._directory("requests") / (action_id + ".json")
+        if not required and not path.exists() and not path.is_symlink():
+            return None
+        return self.action(action_id)
+
     def result(self, action_id: str) -> Optional[Dict[str, Any]]:
         path = self._directory("results") / (action_id + ".json")
         if not path.exists():
             return None
         result = self._read(path)
-        request = self._read(
-            self._directory("requests") / (action_id + ".json")
-        )
+        request = self.action(action_id)
         if (
             set(result)
             != {"schema_version", "action_id", "request_digest", "payload"}
@@ -387,21 +414,38 @@ class ProviderActionStore:
             raise ValueError("provider action result is not bound to its request")
         return result["payload"]
 
-    def complete(self, action_id: str, payload: Dict[str, Any]) -> None:
-        request = self._read(
-            self._directory("requests") / (action_id + ".json")
-        )
+    def complete(self, action_id: str, payload: Dict[str, Any], *,
+                 request_digest: Optional[str] = None) -> bool:
+        """Keep the first bound result; retain conflicting callbacks as evidence.
+
+        A new observation belongs to a new action sequence, never a rewrite
+        of an action already consumed by a monitor or an earlier shift.
+        """
+        from ..state import interprocess_lock
+
+        if not isinstance(action_id, str) or not _SAFE_ID.fullmatch(action_id):
+            raise ValueError("provider action id is invalid")
+        request = self.action(action_id)
         if not isinstance(payload, dict):
             raise ValueError("provider action result payload must be an object")
-        self._atomic(
-            self._directory("results") / (action_id + ".json"),
-            {
-                "schema_version": self.schema_version,
-                "action_id": action_id,
-                "request_digest": request["request_digest"],
-                "payload": payload,
-            },
-        )
+        if request_digest is not None and request_digest != request["request_digest"]:
+            raise ValueError("provider action request digest mismatch")
+        record = {
+            "schema_version": self.schema_version,
+            "action_id": action_id,
+            "request_digest": request["request_digest"],
+            "payload": payload,
+        }
+        with interprocess_lock(self._directory("locks") / (action_id + ".lock")):
+            existing = self.result(action_id)
+            if existing is not None:
+                if existing == payload:
+                    return True
+                self._atomic(self._directory("observations") /
+                             (action_id + "-" + _canonical_digest(record) + ".json"), record)
+                return False
+            self._atomic(self._directory("results") / (action_id + ".json"), record)
+            return True
 
     def pending(self, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
         request_dir = self._directory("requests")
@@ -460,7 +504,10 @@ class ProviderActionStore:
             if (self.root / "results" / path.name).exists() or (stale_dir / path.name).exists():
                 continue
             action = self._read(path)
-            if action.get("run_id") != run_id or action.get("operation") != "create":
+            # Converge superseded actions for every mailbox operation. Older
+            # heartbeats could leave resume/wait requests after acceptance;
+            # keeping them pending causes a zombie native retry loop.
+            if action.get("run_id") != run_id:
                 continue
             request_envelope = action.get("request")
             if isinstance(request_envelope, Mapping):
@@ -906,6 +953,12 @@ class ProviderActionStore:
             return False
         if isinstance(generation, bool) or not isinstance(generation, int):
             return False
+        from ..state import interprocess_lock
+        identity = _canonical_digest([run_id, issue_id, role])
+        with interprocess_lock(self._directory('locks') / ('delivery-' + identity + '.lock')):
+            return self._consume_delivery_locked(run_id, issue_id, role, generation)
+
+    def _consume_delivery_locked(self, run_id, issue_id, role, generation):
         deliveries = self.root / 'deliveries'
         if not deliveries.is_dir():
             return False
@@ -947,7 +1000,9 @@ class ProviderActionStore:
                 result['event'] = payload.get('event', 'delivered')
                 result['status'] = 'completed'
                 result['idempotent_key'] = _canonical_digest(payload)
-                self.complete(action['action_id'], result)
+                if not self.complete(action['action_id'], result,
+                                     request_digest=action['request_digest']):
+                    continue
                 self._atomic(path, dict(report, consumed_by=action['action_id']))
                 return True
         return False

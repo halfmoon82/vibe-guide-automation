@@ -168,6 +168,21 @@ class VisibleSddReviewerViolationTests(unittest.TestCase):
         self.assertIn("blocked", self.text)
         self.assertIn("记录", self.text)
 
+    def test_violation_returns_to_developer_and_changes_reviewer(self):
+        self.assertIn("退回 developer", self.text)
+        self.assertIn("换 reviewer", self.text)
+
+    def test_three_rounds_have_a_recovery_route(self):
+        self.assertIn("三轮", self.text)
+        self.assertIn("换 reviewer", self.text)
+        self.assertIn("拆节点", self.text)
+
+    def test_blocked_unknown_dispositions_are_supervisor_actions(self):
+        self.assertIn("监工处置", self.text)
+        self.assertNotIn("人工/监工处置", self.text)
+        for token in ("confirmed_benign", "escalated_to_findings", "resolved_with_facts"):
+            self.assertIn(token, self.text)
+
 
 class VisibleSddAcceptanceStructureTests(unittest.TestCase):
     """V4.7 ISSUE-02: the acceptance evidence structure is fail-closed.

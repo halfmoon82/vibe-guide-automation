@@ -91,25 +91,16 @@ _USER_RECOVERY_STATUSES = {
     "retry_pending", "binding_probe_pending", "binding_repair_pending",
     "binding_repairing", "blocked_unknown", "unknown", "timeout", "failed", "stopped",
 }
-_USER_DECISION_MARKERS = (
-    "product", "scope", "permission", "credential", "irreversible", "security",
-    "产品", "范围", "权限", "凭据", "不可逆", "安全",
-)
-
-
 def map_user_status(status: Any, reason: Any = "") -> str:
     """Map internal V3.9 state to one of the four user-facing statuses.
 
     A mapping/dict is accepted as a convenience for snapshot node records;
-    technical fields remain untouched and are never surfaced by this helper.
-    Unknown states fail safe to the recoverable ``自动修复中`` label.
+    technical fields remain untouched and reason text is not interpreted as a
+    decision boundary.  Unknown states fail safe to the recoverable
+    ``自动修复中`` label.
     """
     if isinstance(status, dict):
         record = status
-        reason = record.get("reason", reason)
-        text = str(reason or "").casefold()
-        if any(marker in text for marker in _USER_DECISION_MARKERS):
-            return "需要你决定"
         if record.get("binding_phase") in _USER_RECOVERY_STATUSES:
             return "自动修复中"
         # A running node with no active handle but a durable retry marker is
@@ -118,8 +109,7 @@ def map_user_status(status: Any, reason: Any = "") -> str:
             return "自动修复中"
         status = record.get("status")
     value = str(status or "")
-    text = str(reason or "").casefold()
-    if value in _USER_DECISION_STATUSES or any(marker in text for marker in _USER_DECISION_MARKERS):
+    if value in _USER_DECISION_STATUSES:
         return "需要你决定"
     if value in _USER_PREPARING_STATUSES:
         return "准备中"
@@ -247,6 +237,10 @@ _EVENT_DATA_KEYS = {
     # pulled into a node's scope on its own ("tests_dir" / "auto_scope_paths").
     # Repository-relative paths and fixed rule names only.
     "scope_rules",
+    "trigger",
+    "acceptance_examples_unchanged",
+    "scope_reason",
+    "scope_transition",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",
@@ -265,6 +259,7 @@ _PROVIDER_TEXT_KEYS = {
     "message",
     "output",
     "reason",
+    "scope_reason",
     "stderr",
     "stdout",
     "traceback",
@@ -1273,16 +1268,54 @@ def load_snapshot(paths: ProjectPaths, run_id: str) -> RunSnapshot:
     directory = run_dir(paths, run_id, create=False)
     records = load_events(paths, run_id)
     failures: List[Exception] = []
-    for path in (directory / "state.json", directory / "state.previous.json"):
-        try:
-            snapshot = _decode_snapshot(path.read_bytes(), records)
-        except (FileNotFoundError, OSError, TypeError, ValueError) as error:
-            failures.append(error)
-            continue
-        if snapshot.run_id != run_id:
-            failures.append(ValueError("snapshot run id does not match its path"))
-            continue
-        return snapshot
+    state_path = directory / "state.json"
+    previous_path = directory / "state.previous.json"
+    try:
+        current_raw = state_path.read_bytes()
+        current_snapshot = _decode_snapshot(current_raw, records)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        failures.append(error)
+    else:
+        if current_snapshot.run_id == run_id:
+            return current_snapshot
+        failures.append(ValueError("snapshot run id does not match its path"))
+
+    # The current file was not usable.  Re-read both candidates while holding
+    # the same lock used by save_snapshot so a newer writer cannot land between
+    # selecting the recovery bytes and restoring state.json.
+    if not state_path.exists() and not previous_path.exists():
+        if failures:
+            raise ValueError("no valid snapshot for run " + run_id) from failures[-1]
+        raise ValueError("no valid snapshot for run " + run_id)
+
+    try:
+        with interprocess_lock(directory / ".state.lock"):
+            try:
+                current_raw = state_path.read_bytes()
+                current_snapshot = _decode_snapshot(current_raw, records)
+            except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+                failures.append(error)
+            else:
+                if current_snapshot.run_id == run_id:
+                    return current_snapshot
+                failures.append(ValueError("snapshot run id does not match its path"))
+
+            try:
+                previous_raw = previous_path.read_bytes()
+                previous_snapshot = _decode_snapshot(previous_raw, records)
+            except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+                failures.append(error)
+            else:
+                if previous_snapshot.run_id != run_id:
+                    failures.append(ValueError("snapshot run id does not match its path"))
+                else:
+                    try:
+                        _atomic_bytes(state_path, previous_raw)
+                    except (OSError, ValueError) as error:
+                        raise ValueError("snapshot recovery could not restore state") from error
+                    return previous_snapshot
+    except ValueError:
+        raise
     if failures:
         raise ValueError("no valid snapshot for run " + run_id) from failures[-1]
     raise ValueError("no valid snapshot for run " + run_id)

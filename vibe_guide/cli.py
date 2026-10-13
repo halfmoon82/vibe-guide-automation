@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import hashlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
@@ -30,8 +31,9 @@ from .dag import render_plan_artifacts, validate_dag, append_integration_review_
 from .doctor import doctor
 from .initializer import _rules_target, apply_agentsmd_proposal, init_project, refresh_protocol_copies
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
-from .monitor import Monitor
+from .monitor import Monitor, ScopeDecisionRequired
 from .supervisor_output import supervisor_output_batch
+from .supervisor_wakeup import preflight_with_checkpoint
 from .supervisor import (
     Supervisor,
     current_supervisor_address,
@@ -40,8 +42,8 @@ from .supervisor import (
     set_supervisor_hold,
     supervisor_handoff,
     bounded_supervisor_output,
+    heartbeat_command,
     supervisor_holds,
-    heartbeat_prompt,
     supervisor_preflight,
     HOST_SHIFT_DIFFERENCES,
     SESSION_RECORD_HINT,
@@ -85,6 +87,7 @@ from .evidence import evaluate_v41_closeout
 from .installation import run_install, run_upgrade, migrate_state
 from .skills import SkillSpec, install_project_skill
 from .models import InstallRequest
+from .decision_boundary import answer_decision, decision_list, raise_decision
 
 
 SUCCESS = 0
@@ -114,7 +117,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("scan", "init", "apply-agentsmd", "doctor", "install", "upgrade", "migrate-state", "attest", "plan", "authorize", "monitor", "reconcile", "status", "resume", "change-request", "deploy", "skill-install", "supervisor-preflight", "supervisor-register", "supervisor-address", "supervisor-hold", "supervisor-handoff", "supervisor-output", "worker-deliver"),
+        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue'),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -150,11 +153,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--context-hard-cap", dest="context_hard_cap", type=int, default=None)
     parser.add_argument("--token-threshold", dest="token_threshold", type=int, default=None)
     parser.add_argument("--reason", dest="hold_reason")
+    parser.add_argument("--category", dest="hold_category")
     parser.add_argument("--release", action="store_true", dest="hold_release")
     parser.add_argument("--node", dest="node_id")
     parser.add_argument("--role", dest="role", default="developer")
     parser.add_argument("--payload", dest="worker_payload")
     parser.add_argument("--generation", dest="worker_generation", type=int, default=None)
+    parser.add_argument("--id", dest="decision_id")
+    parser.add_argument("--choice", dest="decision_choice")
+    parser.add_argument("--digest", dest="decision_digest")
+    parser.add_argument("--via", dest="decision_via")
+    parser.add_argument("--note", dest="decision_note")
+    parser.add_argument("--question", dest="decision_question")
+    parser.add_argument("--options", dest="decision_options")
+    parser.add_argument("--recommendation", dest="decision_recommendation")
+    parser.add_argument("--decision-evidence", dest="decision_evidence")
     return parser
 
 
@@ -233,6 +246,18 @@ def _read_json(path: Path) -> Any:
         return json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("JSON input is invalid") from error
+
+
+def _decision_options(value: Optional[str]) -> list:
+    if not value:
+        raise ValueError("--options is required")
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        parsed = [item.strip() for item in value.split(",") if item.strip()]
+    if not isinstance(parsed, list):
+        raise ValueError("--options must be a JSON list or comma-separated values")
+    return parsed
 
 
 def _atomic_json(path: Path, payload: Any) -> None:
@@ -1096,9 +1121,12 @@ def _snapshot_result(
     handoff: str = "",
 ) -> CLIResult:
     retry_pending = any(
-        isinstance(node.get("retryable_action"), dict)
-        and node.get("status") == "running"
-        and not node.get("active_task")
+        node.get("status") == "retry_pending"
+        or (
+            isinstance(node.get("retryable_action"), dict)
+            and node.get("status") == "running"
+            and not node.get("active_task")
+        )
         for node in snapshot.nodes.values()
     )
     result_status = "retry_pending" if retry_pending else snapshot.status
@@ -1169,13 +1197,14 @@ def _first_shift_handoff(
         "--session-record <本会话记录路径>\n"
         "     {}\n"
         "  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n"
-        "{}\n"
+        "     {}\n"
+        "     每拍只运行这一条；输出 idle 时只回一个字，work/unknown/rotate 时按输出分支继续。\n"
         "没登记地址，worker 的完工唤醒信号无处可发；没心跳，rotate 的阈值检测不会发生。\n"
         "{}"
     ).format(
         run_id,
         SESSION_RECORD_HINT,
-        heartbeat_prompt(plan_id, run_id),
+        heartbeat_command(run_id),
         HOST_SHIFT_DIFFERENCES,
     )
 
@@ -1228,6 +1257,40 @@ def _persist_invalidation(directory: Optional[Path], reason: str) -> None:
                 "change_reason": "executable_contract_changed",
             },
         )
+
+
+_CONTRACT_DRIFT_ERROR_MARKERS = (
+    "a valid executable-contract authorization is required",
+    "authorization node scope does not match monitor scope",
+    "snapshot plan no longer matches monitor plan",
+    "snapshot authorization digest is inconsistent",
+    "snapshot contract digest is inconsistent",
+    "required_workflow_blocked: authorizing evidence is no longer present",
+    "integration lineage blocked_unknown: prd/spec source drift",
+    "workflow_evidence_stale: plan.json decisions no longer match the authorized evidence",
+    "workflow_evidence_stale: plan-confirmation.json is no longer bound to the authorized card digest",
+    "no longer matches the evidence recorded for",
+    "blocked_by_execution_topology_mismatch",
+    "execution_engine_unverified",
+)
+
+_TRANSIENT_ENGINE_ATTESTATION_ERROR = (
+    "execution_engine_unverified: engine attestation is missing or invalid"
+)
+
+
+def _is_contract_drift_error(error: BaseException) -> bool:
+    """Only durable contract evidence may create an invalidation marker.
+
+    Provider, filesystem, and other temporary read failures are unknown and
+    must remain retryable.  The monitor's contract gates use the stable
+    messages below; keeping the allowlist narrow prevents an incidental error
+    string such as ``temporary read failure`` from becoming a design decision.
+    """
+    message = str(error).casefold()
+    if _TRANSIENT_ENGINE_ATTESTATION_ERROR in message:
+        return False
+    return any(marker in message for marker in _CONTRACT_DRIFT_ERROR_MARKERS)
 
 
 def _is_capability_contract_unknown(error: BaseException) -> bool:
@@ -1462,7 +1525,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         except (OSError, TypeError, ValueError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)[:200]}, "输出批次已阻塞", args.as_json)
 
-    if args.command == "supervisor-preflight":
+    if args.command == "supervisor-beat":
         if not args.run_id:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
         kwargs = {}
@@ -1476,13 +1539,115 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 handoff, _ = supervisor_handoff(paths, args.run_id, command_prefix=supervisor_command_prefix)
                 payload["handoff_summary"] = handoff["handoff_summary"]
             except (FileNotFoundError, TypeError, ValueError, OSError) as error:
-                # A failed artifact must never turn a hard stop into the
-                # heartbeat's unknown -> resume branch.
                 payload = {**payload, "handoff_status": "unknown",
                            "handoff_error": "handoff preparation failed: " + str(error)}
                 if payload["state"] != "rotate":
                     payload["state"] = "unknown"
-        code = SUCCESS if payload["state"] in {"idle", "work", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
+        state = payload.get("state")
+        try:
+            plan_id = load_snapshot(paths, args.run_id).plan_id
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            plan_id = "<plan_id>"
+        if state == "idle":
+            text = "idle"
+        elif state == "decision":
+            text = "decision：读取决策信箱并向用户呈现未答卡片；心跳降频但不暂停，答案写回后恢复推进"
+        elif state == "work":
+            text = "work：按 prd-guide §6.1 服务信箱一轮，推进用 {} resume --plan {} --run-id {}".format(
+                supervisor_command_prefix, plan_id, args.run_id
+            )
+        elif state == "rotate":
+            text = "rotate：新开一个会话，让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(
+                supervisor_command_prefix, args.run_id
+            )
+        else:
+            text = "unknown：按 work 处理，推进用 {} resume --plan {} --run-id {}；原因：{}".format(
+                supervisor_command_prefix, plan_id, args.run_id, payload.get("reason", "状态未知")
+            )
+        code = SUCCESS if state in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
+        return _result(
+            code,
+            {"command": args.command, "heartbeat_command": heartbeat_command(args.run_id, command_prefix=supervisor_command_prefix), **payload},
+            text,
+            args.as_json,
+        )
+
+    if args.command == "decision-raise":
+        if not (args.run_id and args.node_id and args.decision_question):
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id, --node and --question are required"}, "缺少决策问题参数", args.as_json)
+        try:
+            evidence = json.loads(args.decision_evidence) if args.decision_evidence else {}
+            if not isinstance(evidence, dict):
+                raise ValueError("--decision-evidence must be a JSON object")
+            payload = raise_decision(
+                paths,
+                run_id=args.run_id,
+                node_id=args.node_id,
+                question=args.decision_question,
+                options=_decision_options(args.decision_options),
+                recommendation=args.decision_recommendation,
+                evidence=evidence,
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "决策写入失败：" + str(error), args.as_json)
+        notification = payload.get("notification") if isinstance(payload, dict) else None
+        if isinstance(notification, dict) and notification.get("status") == "unknown":
+            return _result(
+                UNKNOWN,
+                {"command": args.command, "status": "unknown", "reason": "decision notification bridge status unknown", **payload},
+                "决策已写入信箱，但通知桥状态未知",
+                args.as_json,
+            )
+        return _result(SUCCESS, {"command": args.command, "status": "pending", **payload}, "决策已写入信箱", args.as_json)
+
+    if args.command == "decision-list":
+        try:
+            decisions = decision_list(paths, args.run_id)
+        except (OSError, TypeError, ValueError) as error:
+            return _result(UNKNOWN, {"command": args.command, "status": "unknown", "reason": str(error)}, "决策信箱未知：" + str(error), args.as_json)
+        return _result(SUCCESS, {"command": args.command, "status": "ok", "decisions": decisions}, "待回答决策：{}项".format(len(decisions)), args.as_json)
+
+    if args.command == "decision-answer":
+        if not (args.decision_id and args.decision_choice):
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--id and --choice are required"}, "缺少决策答案参数", args.as_json)
+        try:
+            result = answer_decision(
+                paths,
+                args.decision_id,
+                args.decision_choice,
+                request_digest=args.decision_digest,
+                answered_via=args.decision_via,
+                note=args.decision_note,
+            )
+        except (OSError, TypeError, ValueError) as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "决策答案未写入：" + str(error), args.as_json)
+        return _result(SUCCESS, {"command": args.command, "status": "answered", "result": result}, "决策答案已写入", args.as_json)
+
+    if args.command == "supervisor-preflight":
+        if not args.run_id:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        kwargs = {}
+        if args.token_threshold is not None:
+            kwargs["token_threshold"] = args.token_threshold
+        if args.context_hard_cap is not None:
+            kwargs["context_hard_cap"] = args.context_hard_cap
+        def compute_preflight():
+            payload = supervisor_preflight(paths, args.run_id, args.session_record, **kwargs)
+            if payload.get("prepare_handoff"):
+                try:
+                    handoff, _ = supervisor_handoff(paths, args.run_id, command_prefix=supervisor_command_prefix)
+                    payload["handoff_summary"] = handoff["handoff_summary"]
+                except (FileNotFoundError, TypeError, ValueError, OSError) as error:
+                    # A failed artifact must never turn a hard stop into the
+                    # heartbeat's unknown -> resume branch.
+                    payload = {**payload, "handoff_status": "unknown",
+                               "handoff_error": "handoff preparation failed: " + str(error)}
+                    if payload["state"] != "rotate":
+                        payload["state"] = "unknown"
+            return payload
+        payload = preflight_with_checkpoint(paths, args.run_id, args.session_record,
+            compute_preflight, command_prefix=supervisor_command_prefix, **kwargs)
+        code = SUCCESS if payload["state"] in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
         return _result(code, {"command": args.command, **payload}, "监工预检：{}".format(payload["state"]), args.as_json)
 
     if args.command == "supervisor-register":
@@ -1520,8 +1685,18 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 holds = supervisor_holds(paths, args.run_id)
                 text = ("已解除挂起：" if released else "该节点没有挂起：") + args.node_id
             else:
-                holds = set_supervisor_hold(paths, args.run_id, args.node_id, args.hold_reason)
-                text = "已挂起 {} 等人拍板：{}".format(args.node_id, holds[args.node_id]["reason"])
+                holds = set_supervisor_hold(
+                    paths,
+                    args.run_id,
+                    args.node_id,
+                    args.hold_reason,
+                    boundary_category=args.hold_category,
+                )
+                text = "已挂起 {} 等人拍板（类别 {}）：{}".format(
+                    args.node_id,
+                    holds[args.node_id]["category"],
+                    holds[args.node_id]["reason"],
+                )
         except (FileNotFoundError, TypeError, ValueError, OSError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "挂起失败：" + str(error), args.as_json)
         return _result(SUCCESS, {"command": args.command, "status": "ok", "holds": holds}, text, args.as_json)
@@ -1566,6 +1741,85 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "自报格式错误：" + str(error), args.as_json)
         return _result(SUCCESS, {"command": args.command, "status": "recorded", **outcome}, "交付已登记", args.as_json)
+
+    if args.command == "scope-expand":
+        if not (args.run_id and args.node_id and args.worker_payload):
+            return _result(
+                BLOCKED,
+                {
+                    "command": args.command,
+                    "status": "blocked_invalid",
+                    "reason": "scope-expand requires --run-id, --node and --payload",
+                },
+                "缺少参数",
+                args.as_json,
+            )
+        try:
+            raw = args.worker_payload
+            if raw.startswith("@"):
+                raw = Path(raw[1:]).read_text(encoding="utf-8")
+            request = json.loads(raw)
+            if not isinstance(request, dict):
+                raise ValueError("scope expansion payload must be an object")
+            current = load_snapshot(paths, args.run_id)
+            _directory, plan, nodes, _card = _load_plan(paths, current.plan_id)
+            snapshot = Monitor(
+                paths,
+                plan,
+                nodes,
+                topology_rulings=_observed_topology_rulings(paths),
+            ).request_scope_expansion(
+                args.run_id,
+                args.node_id,
+                request,
+            )
+        except ScopeDecisionRequired as error:
+            return _result(
+                BLOCKED,
+                {
+                    "command": args.command,
+                    "status": "blocked_design",
+                    "reason": str(error),
+                },
+                "扩围已暂停：" + str(error),
+                args.as_json,
+            )
+        except PermissionError as error:
+            return _result(
+                UNKNOWN,
+                {
+                    "command": args.command,
+                    "status": "blocked_unknown",
+                    "reason": str(error),
+                },
+                "扩围状态未知：" + str(error),
+                args.as_json,
+            )
+        except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            return _result(
+                BLOCKED,
+                {
+                    "command": args.command,
+                    "status": "blocked_invalid",
+                    "reason": str(error),
+                },
+                "扩围登记失败：" + str(error),
+                args.as_json,
+            )
+        return _result(
+            SUCCESS,
+            {
+                "command": args.command,
+                "status": "recorded",
+                "run_id": snapshot.run_id,
+                "node_id": args.node_id,
+                "scope_expansions": snapshot.nodes[args.node_id].get(
+                    "scope_expansions", []
+                ),
+            },
+            "扩围已登记",
+            args.as_json,
+        )
 
     if args.command == "scan":
         payload = {
@@ -2414,16 +2668,76 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             directory, plan, nodes, _card = _load_plan(paths, args.plan)
             evidence_path = paths.resolve_relative(args.evidence)
             package = _read_json(evidence_path)
-            snapshot = Monitor(
+            monitor = Monitor(
                 paths, plan, nodes,
                 topology_rulings=_observed_topology_rulings(paths),
-            ).reconcile_evidence(args.run_id, package)
+            )
+            if isinstance(package, dict) and package.get('kind') == 'scope_correction':
+                snapshot = monitor.reconcile_scope(args.run_id, package)
+            elif isinstance(package, dict) and package.get('kind') == 'created_successor':
+                required = {'kind', 'node_id', 'action_id', 'request_digest',
+                            'predecessor_archive', 'preservation_path', 'preservation_digest'}
+                if set(package) != required or package['node_id'] not in monitor.nodes:
+                    raise ValueError('created successor reconciliation package is invalid')
+                target_runner = runner if runner is not None else _public_runner(paths, _card, nodes)
+                snapshot = monitor.reconcile_created_successor(args.run_id, package['node_id'],
+                    target_runner, **{key: package[key] for key in required - {'kind', 'node_id'}})
+                invalidation = _invalidation_path(directory)
+                if invalidation.exists():
+                    # Recheck the unchanged authorization and corrected runtime
+                    # projection; the old marker's prose is never permission.
+                    monitor._require_snapshot_authorization(snapshot)
+                    monitor._validate_execution_topology(snapshot)
+                    if invalidation.is_symlink() or _card.digest != snapshot.authorization_digest:
+                        raise ValueError('reconciled authorization does not match the current card')
+                    raw_invalidation = invalidation.read_bytes()
+                    marker = json.loads(raw_invalidation)
+                    if (not isinstance(marker, dict) or marker.get('status') != 'blocked_design'
+                            or marker.get('change_reason') != 'executable_contract_changed'):
+                        raise ValueError('invalidation requires a separate authorization decision')
+                    from .state import _atomic_bytes, run_dir, save_snapshot
+                    digest = hashlib.sha256(raw_invalidation).hexdigest()
+                    archive = run_dir(paths, args.run_id) / 'recovery' / ('invalidation-' + digest + '.json')
+                    if archive.parent.is_symlink() or archive.is_symlink():
+                        raise ValueError('invalidation archive may not traverse a symlink')
+                    _atomic_bytes(archive, raw_invalidation)
+                    monitor._record_topology_projection(snapshot, 'monitor.reconcile_successor',
+                        recovery_evidence={'invalidation_path': str(archive),
+                            'invalidation_digest': digest, 'authorization_digest': snapshot.authorization_digest})
+                    save_snapshot(paths, snapshot)
+                    if invalidation.read_bytes() != raw_invalidation:
+                        raise ValueError('invalidation changed during reconciliation')
+                    invalidation.unlink()
+            else:
+                snapshot = monitor.reconcile_evidence(args.run_id, package)
             return _snapshot_result("reconcile", snapshot, args.as_json)
         except (FileNotFoundError, OSError, TypeError, ValueError, PermissionError) as error:
             return _result(
                 UNKNOWN,
                 {"command": "reconcile", "status": "blocked_unknown", "reason": str(error)},
                 "对账已暂停：" + str(error),
+                args.as_json,
+            )
+
+    if args.command in {"repair", "requeue"}:
+        try:
+            if not args.plan or not args.run_id or not args.node_id:
+                raise ValueError("{} requires --plan, --run-id and --node".format(args.command))
+            _directory, plan, nodes, _card = _load_plan(paths, args.plan)
+            monitor = Monitor(
+                paths, plan, nodes,
+                topology_rulings=_observed_topology_rulings(paths),
+            )
+            payload = monitor.repair_node(args.node_id, args.run_id)
+            snapshot = load_snapshot(paths, args.run_id)
+            result = _snapshot_result(args.command, snapshot, args.as_json)
+            result.payload["repair"] = payload
+            return result
+        except (FileNotFoundError, OSError, TypeError, ValueError, PermissionError) as error:
+            return _result(
+                UNKNOWN,
+                {"command": args.command, "status": "blocked_unknown", "reason": str(error)},
+                "工程恢复已暂停：" + str(error),
                 args.as_json,
             )
 
@@ -2547,6 +2861,17 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     "计划仍是草案：" + str(error),
                     args.as_json,
                 )
+            if not _is_contract_drift_error(error):
+                return _result(
+                    UNKNOWN,
+                    {
+                        "command": args.command,
+                        "status": "unknown",
+                        "reason": str(error),
+                    },
+                    "状态未知：" + str(error),
+                    args.as_json,
+                )
             _persist_invalidation(
                 directory, "authorization invalidated: " + str(error)
             )
@@ -2573,11 +2898,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             )
         except (FileNotFoundError, OSError, TypeError, ValueError) as error:
             message = str(error)
-            if (
-                "authorization" in message
-                or "contract" in message
-                or "plan no longer" in message
-            ):
+            if _is_contract_drift_error(error):
                 _persist_invalidation(
                     directory, "authorization invalidated: " + message
                 )

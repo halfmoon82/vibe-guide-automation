@@ -201,6 +201,13 @@ def build_stage_handoff(prd: PRD, open_questions, evidence_refs):
 
 
 @dataclass(frozen=True)
+class ScopeExpansionResolution:
+    files: List[str]
+    scope_rules: List[Dict[str, str]]
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class ConsistencyResolution:
     field: str
     value: Any
@@ -213,6 +220,7 @@ class ConsistencyResolution:
     #: mechanical-file rule (see `auto_scope_rule`).  Empty when the
     #: correction stays inside the existing scope.
     scope_expanded_files: List[str] = field(default_factory=list)
+    scope_rules: List[Dict[str, str]] = field(default_factory=list)
 
 
 def _decision_reference(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -250,6 +258,43 @@ _CREDENTIAL_NAMES = {
     "id_rsa", "id_ed25519", "id_ecdsa",
 }
 _CREDENTIAL_PREFIXES = (".env.", "secrets.")
+_DEPENDENCY_FILE_NAMES = {
+    "cargo.lock", "cargo.toml", "composer.json", "composer.lock", "gemfile",
+    "gemfile.lock", "go.mod", "go.sum", "package-lock.json", "package.json",
+    "pdm.lock", "pnpm-lock.yaml", "poetry.lock", "pyproject.toml", "uv.lock",
+    "yarn.lock", "pip-compile.txt",
+}
+_EXTERNAL_CONFIG_ROOTS = {
+    ".circleci", "deploy", "deployment", "deployments", "helm", "infra", "k8s",
+    "kubernetes", "ops", "terraform",
+}
+_EXTERNAL_CONFIG_NAMES = {
+    ".gitlab-ci.yml", "azure-pipelines.yml", "docker-compose.yml",
+    "docker-compose.yaml", "dockerfile", "jenkinsfile", "compose.yml",
+    "compose.yaml", "chart.yaml", "values.yaml", "skaffold.yaml", "tiltfile",
+    "terraform.tfvars", "prod.tfvars", "setup.cfg", "tox.ini",
+}
+_CONVENTIONAL_SENSITIVE_NAMES = {
+    "setup.py", "requirements.py", "build.py", "kubeconfig.py",
+    "terraform.py", "compose.py",
+}
+_LOW_RISK_SCOPE_SUFFIXES = (
+    ".adoc", ".c", ".cc", ".cpp", ".cxx", ".cs", ".erl", ".ex", ".exs",
+    ".fs", ".fsx", ".go", ".h", ".hrl", ".hpp", ".java", ".js", ".kts",
+    ".kt", ".m", ".markdown", ".md", ".mm", ".php", ".py", ".pyi", ".rb",
+    ".rs", ".rst", ".scala", ".swift", ".ts",
+)
+_SCOPE_EXPANSION_KEYS = {
+    "files", "acceptance_examples_unchanged", "reason",
+    "adds_third_party_dependency", "visibility_downgrade",
+}
+_SENSITIVE_SCOPE_DIRS = {
+    ".aws", ".azure", ".docker", ".gcloud", ".kube", ".ssh",
+    "cert", "certs", "certificate", "certificates", "config", "configs",
+    "configuration", "configurations", "credential", "credentials", "env",
+    "environments", "key", "keys", "private", "secret", "secrets", ".config",
+}
+_SCOPE_REASON_LIMIT = 200
 
 
 def auto_scope_rule(path: Any, auto_scope_paths: Any = ()) -> Optional[str]:
@@ -283,6 +328,141 @@ def auto_scope_rule(path: Any, auto_scope_paths: Any = ()) -> Optional[str]:
     if path in set(auto_scope_paths or ()):
         return AUTO_SCOPE_RULE_CONFIG
     return None
+
+
+def _approved_scope_rule(path: str) -> Optional[str]:
+    """Return the approved #146 rule for a low-risk repository file."""
+
+    if auto_scope_rule(path) is None:
+        # Reuse the path and credential guard even though this path need not be
+        # under tests/ or the configured mechanical list.
+        if not is_repo_relative_path(path):
+            return None
+        if ":" in path or any(unicodedata.category(char) == "Cf" for char in path):
+            return None
+        parts = path.split("/")
+        if any(part.casefold() == ".git" for part in parts):
+            return None
+        name = parts[-1].casefold()
+        if (
+            name == ".env"
+            or name.startswith(_CREDENTIAL_PREFIXES)
+            or name in _CREDENTIAL_NAMES
+            or name.endswith(_CREDENTIAL_SUFFIXES)
+            or (name.startswith("service-account") and name.endswith(".json"))
+        ):
+            return None
+    else:
+        parts = path.split("/")
+        name = parts[-1].casefold()
+    lowered = [part.casefold() for part in parts]
+    if any(part in _SENSITIVE_SCOPE_DIRS for part in lowered[:-1]):
+        return None
+    if (
+        name in _DEPENDENCY_FILE_NAMES
+        or name.startswith("requirements")
+        and name.endswith((".in", ".txt", ".pip"))
+        or name.startswith("constraints")
+        and name.endswith((".in", ".txt", ".pip"))
+        or name in {"pipfile", "pipfile.lock", "environment.yml", "environment.yaml"}
+    ):
+        return None
+    if (
+        name == ".env"
+        or name.startswith(".env")
+        or name.endswith(".env")
+        or name in _CONVENTIONAL_SENSITIVE_NAMES
+        or name.startswith(("config", "configuration", "credential", "credentials", "env", "private", "secret", "secrets"))
+        or name.startswith(("deploy", "deployment", "release"))
+        or name.startswith("helmfile")
+        or name.startswith("kustomization")
+    ):
+        return None
+    if (
+        name in _EXTERNAL_CONFIG_NAMES
+        or name.startswith("docker-compose.")
+        or name.startswith("docker-compose-")
+        or name.startswith("dockerfile.")
+        or name.startswith("dockerfile-")
+        or lowered[0] in _EXTERNAL_CONFIG_ROOTS
+        or lowered[:2] == [".github", "workflows"]
+    ):
+        return None
+    if not name.endswith(_LOW_RISK_SCOPE_SUFFIXES):
+        return None
+    return "acceptance_unchanged"
+
+
+def resolve_scope_expansion(
+    request: Any,
+    authorized_files: Any,
+    node_files: Any = (),
+    auto_scope_paths: Any = (),
+    occupied_files: Any = (),
+) -> Optional[ScopeExpansionResolution]:
+    """Resolve one bounded file-scope expansion without changing product scope.
+
+    A list request is the legacy #144 mechanical rule.  A mapping is the #146
+    supervisor claim: the PRD acceptance examples keep the same result, with a
+    recorded reason and explicit denials for the two always-human boundaries.
+    """
+
+    claim = None
+    if isinstance(request, list):
+        files = request
+    elif isinstance(request, dict) and set(request) == _SCOPE_EXPANSION_KEYS:
+        claim = request
+        files = request.get("files")
+        reason = request.get("reason")
+        if (
+            request.get("acceptance_examples_unchanged") is not True
+            or request.get("adds_third_party_dependency") is not False
+            or request.get("visibility_downgrade") is not False
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or len(reason.strip()) > _SCOPE_REASON_LIMIT
+            or any(
+                unicodedata.category(char) in {"Cc", "Cf"}
+                for char in reason
+            )
+        ):
+            return None
+    else:
+        return None
+    if (
+        not isinstance(files, list)
+        or not files
+        or not all(isinstance(item, str) for item in files)
+        or len(files) != len(set(files))
+    ):
+        return None
+
+    occupied_keys = [_scope_compare_key(item) for item in occupied_files or ()]
+
+    def held(path: str) -> bool:
+        key = _scope_compare_key(path)
+        return any(_write_paths_overlap(key, other) for other in occupied_keys)
+
+    own_files = set(node_files or ())
+    card_files = set(authorized_files or ())
+    expanded: List[str] = []
+    rules: List[Dict[str, str]] = []
+    for item in files:
+        if item in own_files or (item in card_files and not held(item)):
+            continue
+        mechanical_rule = auto_scope_rule(item, auto_scope_paths)
+        rule = mechanical_rule if mechanical_rule is not None else (
+            _approved_scope_rule(item) if claim is not None else None
+        )
+        if held(item) or rule is None:
+            return None
+        expanded.append(item)
+        rules.append({"path": item, "rule": rule})
+    return ScopeExpansionResolution(
+        expanded,
+        rules,
+        claim["reason"].strip() if claim is not None else "",
+    )
 
 
 def _scope_compare_key(path: Any) -> str:
@@ -342,30 +522,20 @@ def resolve_consistency(
         or not candidates
     ):
         return None
-    # Scope = (card scope minus what another active node is writing) plus the
-    # node's own files, which occupancy never removes.  "Held" uses the DAG's
-    # write-overlap semantics on normalized keys, so a directory scope
-    # (``tests``) or a ``./`` spelling still counts.
-    occupied_keys = [_scope_compare_key(item) for item in occupied_files or ()]
-
-    def held(path: str) -> bool:
-        key = _scope_compare_key(path)
-        return any(_write_paths_overlap(key, other) for other in occupied_keys)
-
-    own_files = set(node_files or ())
-    card_files = set(authorized_files)
-    scope_expanded_files: List[str] = []
-    for item in files:
-        if item in own_files or (item in card_files and not held(item)):
-            continue
-        if (
-            "deploy" in action.casefold()
-            or held(item)
-            or auto_scope_rule(item, auto_scope_paths) is None
-        ):
-            return None
-        if item not in scope_expanded_files:
-            scope_expanded_files.append(item)
+    if "deploy" in action.casefold():
+        return None
+    expansion_request = inconsistency.get("scope_expansion", files)
+    if isinstance(expansion_request, dict):
+        expansion_request = dict(expansion_request, files=list(files))
+    scope_expansion = resolve_scope_expansion(
+        expansion_request,
+        authorized_files=authorized_files,
+        node_files=node_files,
+        auto_scope_paths=auto_scope_paths,
+        occupied_files=occupied_files,
+    )
+    if scope_expansion is None:
+        return None
     normalized = []
     for candidate in candidates:
         if not isinstance(candidate, dict) or candidate.get("source") not in EVIDENCE_PRIORITY:
@@ -448,7 +618,8 @@ def resolve_consistency(
         list(files),
         dict(expected_binding),
         decision_reference,
-        scope_expanded_files,
+        scope_expansion.files,
+        scope_expansion.scope_rules,
     )
 
 

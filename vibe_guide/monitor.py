@@ -45,7 +45,12 @@ from .models import (
 from .paths import ProjectPaths
 from .path_ownership import validate_path_ownership
 from .binding_lifecycle import VisibleSddAcceptance
-from .planner import auto_scope_rule, resolve_consistency
+from .planner import (
+    ScopeExpansionResolution,
+    auto_scope_rule,
+    resolve_consistency,
+    resolve_scope_expansion,
+)
 from . import dag as _dag_module
 from .dag import (
     _write_scope_paths,
@@ -70,14 +75,23 @@ from .state import (
     release_writer_lease,
     run_dir,
     save_snapshot,
+    interprocess_lock,
     validate_run_id,
 )
 from .task_registry import (
+    REGISTRY_SCHEMA_VERSION,
     TaskBinding,
+    _all_bindings,
+    _atomic_json,
+    _read_registry,
+    _registry_lock,
+    _run_tasks_path,
     binding_contract_enabled,
     load_task_binding,
     runtime_binding_gate,
     save_task_binding,
+    reconcile_shadowed_successor,
+    load_historical_task_binding,
 )
 from .config import load_project_config
 from .workflow_gate import require_capability_contract, require_entry, verify_workflow
@@ -109,6 +123,11 @@ from .evidence import (
     record_integration_review as _record_integration_review,
 )
 from .engine_attestation import validate_engine_attestation
+from .decision_boundary import ingest_worker_decisions
+
+
+class ScopeDecisionRequired(PermissionError):
+    """The requested expansion crosses a product-owned scope boundary."""
 
 
 # ISSUE-140 (design section 3.3): contract-declared invariant test commands
@@ -116,6 +135,7 @@ from .engine_attestation import validate_engine_attestation
 # from the already-authorized node contract and execution never leaves the
 # contract writer worktree, so this introduces no new authorization surface.
 DEFAULT_CONTRACT_TEST_TIMEOUT_SECONDS = 120
+DECISION_NOTIFICATION_UNKNOWN_REASON = "decision notification bridge status unknown"
 
 #: Compile/build command prefixes that can never prove a *behavioral*
 #: invariant (they only prove the code compiles).  Built-in and not reducible
@@ -272,21 +292,7 @@ def reconcile_pending_binding(snapshot: Any, node_id: str, runner: Any) -> bool:
 
 def _user_status(record: Dict[str, Any]) -> str:
     """Keep internal recovery detail behind the four public statuses."""
-    reason = str(record.get("reason") or "").casefold()
-    if any(marker in reason for marker in ("product", "scope", "permission", "credential", "irreversible", "security", "产品", "范围", "权限", "凭据", "不可逆", "安全")):
-        return "需要你决定"
-    if record.get("binding_phase") in {"retry_pending", "binding_probe_pending", "binding_repair_pending", "binding_repairing", "blocked_unknown", "unknown", "timeout", "failed", "stopped"}:
-        return "自动修复中"
-    if isinstance(record.get("retryable_action"), dict) and not record.get("active_task"):
-        return "自动修复中"
-    status = record.get("status")
-    if status in {"blocked_design", "blocked_deploy"}:
-        return "需要你决定"
-    if status in {"initialized", "planned", "brief_pending", "start_pending"}:
-        return "准备中"
-    if status in {"running", "review", "rework", "delivered", "accepted", "complete"}:
-        return "已启动"
-    return "自动修复中"
+    return map_user_status(record)
 
 
 def classify_observation(observation: Any) -> ObservationDisposition:
@@ -311,10 +317,14 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
 
     Provider bridges expose a mixture of structured observations and exception
     text.  Transient/repairable outcomes are engineering conditions and may be
-    retried on the same task identity; explicit user/system authorization
-    boundaries are external and must remain blocked.  Anything else is kept
-    ``unknown`` so callers fail closed rather than inventing a category.
+    retried on the same task identity.  Only structured user/system
+    authorization fields are external boundaries; free-form wording cannot
+    create one.  Anything else remains ``unknown`` so callers fail closed.
     """
+    if isinstance(observation, BaseException) and isinstance(
+        getattr(observation, "observation", None), dict
+    ):
+        observation = observation.observation
     class _ClassificationKind(str):
         """Current V4.5 kind with equality aliases for V4.2 callers."""
         _aliases = {
@@ -332,6 +342,12 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
     def _result(kind: str, legacy: str) -> Dict[str, str]:
         return {"kind": _ClassificationKind(kind), "legacy_kind": legacy}
 
+    structured_external = {
+        "external_decision", "external_authorization_required",
+        "credential_required", "login_required", "permission_required",
+        "product_scope_change", "deploy_required",
+        "irreversible_action_required", "system_permission_required",
+    }
     if isinstance(observation, BaseException):
         text = str(observation)
         kind = getattr(observation, "kind", None) or getattr(observation, "type", None)
@@ -339,31 +355,55 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
         values = [observation.get(key) for key in ("kind", "type", "status", "reason", "error", "message", "detail")]
         text = " ".join(str(value) for value in values if value is not None)
         kind = observation.get("kind") or observation.get("type")
-        if observation.get("credential_required") or observation.get("login_required") or observation.get("permission_required"):
+        if (
+            observation.get("credential_required")
+            or observation.get("login_required")
+            or observation.get("permission_required")
+            or observation.get("permission_denied")
+        ):
             return _result("external_decision", "external")
     else:
         text = str(observation or "")
         kind = None
     normalized = (str(kind or "") + " " + text).casefold()
-    external_markers = (
-        "login required", "log in required", "credential", "credentials",
-        "auth required", "authentication required", "permission required",
-        "permission denied", "access denied",
-        "system permission", "remote approval", "approval required",
-        "external approval", "sudo", "凭据", "登录", "系统权限", "远程批准",
-        "product scope", "scope change", "deploy", "deployment", "irreversible",
-        "security", "产品范围", "范围变更", "部署", "不可逆", "安全",
-        "external decision", "external_decision", "authorization", "授权", "产品决策",
-    )
-    if any(marker in normalized for marker in external_markers):
+    if str(kind or "").strip().casefold() in structured_external:
         return _result("external_decision", "external")
     binding_markers = (
         "identity conflict", "identity mismatch", "writer conflict", "lease conflict",
         "binding conflict", "binding mismatch", "task identity", "contract digest",
+        "permission required", "permission denied", "credential required",
+        "authorization digest", "login required", "system permission",
         "身份冲突", "租约冲突", "绑定冲突",
     )
     if any(marker in normalized for marker in binding_markers):
         return _result("binding_unknown", "unknown")
+    # A bound provider observation can carry a recovery class even when its
+    # message is new. Never let this hint override authorization or identity
+    # conflicts; it schedules reconciliation, not acceptance or availability.
+    if isinstance(observation, dict):
+        hint = observation.get("reason_class")
+        if isinstance(hint, str) and hint in {"engineering", "retryable", "capacity_wait", "repairable"}:
+            return _result("retryable" if hint == "engineering" else hint, "engineering")
+    # Native task creation can reject a model/reasoning combination before a
+    # task identity exists.  This is a provider request-shape problem: the
+    # monitor may retry the same role/generation after adapting the optional
+    # reasoning field, and must not turn it into a durable DAG block.
+    parameter_markers = (
+        "could not validate reasoning",
+        "reasoning effort",
+        "invalid reasoning",
+        "unsupported reasoning",
+        "reasoning level",
+        "invalid model",
+        "unsupported model",
+        "model/reasoning",
+        "model and reasoning",
+        "参数校验",
+        "思考程度",
+        "模型参数",
+    )
+    if any(marker in normalized for marker in parameter_markers):
+        return _result("retryable", "engineering")
     capacity_markers = ("429", "rate limit", "too many requests", "capacity", "quota", "限流", "容量", "配额")
     if any(marker in normalized for marker in capacity_markers):
         return _result("capacity_wait", "engineering")
@@ -380,6 +420,7 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
     repairable_markers = (
         "dirty checkout", "detached head", "detached", "branch drift", "worktree drift",
         "stale cursor", "dirty 工作树", "游离头", "分支漂移", "工作树漂移", "游标过期",
+        "contract test execution failed", "invariant test failed", "合同测试失败",
     )
     if any(marker in normalized for marker in repairable_markers):
         return _result("repairable", "engineering")
@@ -395,6 +436,24 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
     if any(marker in normalized for marker in engineering_markers):
         return _result("retryable", "engineering")
     return _result("binding_unknown", "unknown")
+
+
+def recovery_action_for_failure(observation: Any) -> str:
+    """Return the bounded engineering recovery entry for an observation.
+
+    The action is a routing hint only.  ``reconcile_binding`` is deliberately
+    separate from automatic retry so an unknown task identity can never be
+    dispatched blindly.
+    """
+    classification = classify_provider_failure(observation)
+    kind = str(classification.get("kind"))
+    if kind == "repairable":
+        return "repair_node"
+    if kind in {"retryable", "capacity_wait"}:
+        return "requeue_same_task"
+    if kind == "external_decision":
+        return "await_external_decision"
+    return "reconcile_binding"
 
 
 def self_heal_binding(snapshot: Any, node_id: str, observation: Any) -> HealingResult:
@@ -523,6 +582,44 @@ class Monitor:
             if not worktree.is_absolute() and isinstance(project_root, str) and project_root:
                 worktree = Path(project_root) / worktree
             handle = runner.start(payload, worktree)
+        except ProviderUnavailable as error:
+            # Preserve the provider's actual request-shape diagnosis.  A
+            # broad catch here used to erase it as ``ProviderUnavailable``;
+            # the scheduler then treated every model/parameter rejection as
+            # an unknown binding and stopped the DAG.
+            failure = classify_provider_failure(error)
+            error_text = str(error).casefold()
+            if "worker model route conflicts" in error_text or "worker model routing" in error_text:
+                reason_code = "worker_profile_conflict"
+            elif "child binding" in error_text or "task binding" in error_text:
+                reason_code = "child_binding_conflict"
+            else:
+                reason_code = None
+            if reason_code is not None:
+                action_basis = payload.get("binding_intent") or (
+                    intent.to_dict() if hasattr(intent, "to_dict") else dict(intent)
+                )
+                action_ref = "dispatch-" + hashlib.sha256(
+                    json.dumps(action_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()[:24]
+                return {
+                    "kind": "contract_error",
+                    "reason": "provider dispatch contract rejected",
+                    "reason_code": reason_code,
+                    "phase": "start",
+                    "action_ref": action_ref,
+                    "advance_generation": False,
+                    "intent": action_basis,
+                }
+            return {
+                "kind": str(failure["kind"]),
+                "reason_class": str(failure["kind"]),
+                "reason": redact_provider_text(str(error)),
+                "error_type": type(error).__name__,
+                "intent": payload.get("binding_intent") or (
+                    intent.to_dict() if hasattr(intent, "to_dict") else dict(intent)
+                ),
+            }
         except Exception as error:
             text = str(error).casefold()
             if "worker model route conflicts" in text or "worker model routing" in text:
@@ -729,7 +826,7 @@ class Monitor:
         snapshot.monitor_entry_evidence = entry
         snapshot.parallel_groups = {n: ([self.nodes[n].parallel_group] if self.nodes[n].parallel_group else []) for n in snapshot.started_nodes}
 
-    def _record_topology_projection(self, snapshot: RunSnapshot, entry: str) -> None:
+    def _record_topology_projection(self, snapshot: RunSnapshot, entry: str, recovery_evidence=None) -> None:
         self._refresh_execution_projection(snapshot, entry)
         self._record(snapshot, "execution_topology_observed", {
             "run_id": snapshot.run_id, "plan_revision": snapshot.plan_version,
@@ -737,6 +834,7 @@ class Monitor:
             "active_concurrency": snapshot.active_concurrency, "capacity": snapshot.capacity,
             "parallel_groups": snapshot.parallel_groups,
             "monitor_entry_evidence": entry,
+            **({"recovery_evidence": recovery_evidence} if recovery_evidence is not None else {}),
         })
 
     def _validate_execution_topology(self, snapshot: RunSnapshot) -> None:
@@ -1634,6 +1732,25 @@ class Monitor:
             active = current.get("active_task")
             if not isinstance(active, dict) or active.get("handle_id") != handle_id:
                 raise RuntimeError("active task cannot be reconciled for reauthorization")
+            # A provider may have completed the worker and persisted the
+            # terminal delivery before the supervisor received the terminal
+            # callback.  In that case ``stop`` is neither necessary nor
+            # reliable: asking the provider to stop an already-complete task
+            # produces the same unknown state as a dead provider handle.
+            # Reconcile the existing binding through the normal registry
+            # lifecycle and keep the task identity for rework continuation.
+            if self._reconcile_completed_delivery_for_transition(
+                snapshot, node_id, active
+            ):
+                role = str(active["role"])
+                self._set_binding_status(snapshot, node_id, role, "delivered")
+                current["old_task_reconciled"] = True
+                current["active_role"] = None
+                current["active_task"] = None
+                current["quarantine"] = None
+                snapshot.handles.pop(node_id, None)
+                self._release_node_lease(snapshot, node_id)
+                continue
             if not self._stop_active_for_transition(
                 snapshot,
                 node_id,
@@ -1899,6 +2016,135 @@ class Monitor:
         self._refresh_run_status(snapshot)
         save_snapshot(self.paths, snapshot)
         return snapshot
+
+    def reconcile_scope(self, run_id: str, package: Dict[str, Any]) -> RunSnapshot:
+        """Register mechanical scope for the original active developer.
+
+        This never creates provider actions; the caller delivers the resulting
+        evidence through the task's existing authorized continuation channel.
+        """
+        self._reset_binding_cache()
+        snapshot = load_snapshot(self.paths, run_id)
+        self._require_snapshot_authorization(snapshot)
+        self._reconcile_unapplied_events(snapshot)
+        if (not isinstance(package, dict) or set(package) != {
+                "kind", "node_id", "task_binding", "consistency"}
+                or package.get("kind") != "scope_correction"):
+            raise ValueError("scope correction package is invalid")
+        node_id = package["node_id"]
+        if not isinstance(node_id, str) or node_id not in self.nodes:
+            raise ValueError("scope correction node is invalid")
+        binding = self._load_task_binding(snapshot, node_id, "developer")
+        supplied = TaskBinding.from_dict(package["task_binding"]).to_dict()
+        actual = binding.to_dict()
+        if self._scope_binding_digest(supplied) != self._scope_binding_digest(actual):
+            raise ValueError("scope correction task binding is stale")
+        proof = {"consistency": package["consistency"],
+                 "active_task": copy.deepcopy(snapshot.nodes[node_id].get("active_task")),
+                 "binding_digest": self._scope_binding_digest(actual),
+                 "allowlist_before": list(supplied["allowlist"])}
+        resolution = self._validate_scope_correction(snapshot, node_id, proof)
+        allowed = list(supplied["allowlist"])
+        for item in resolution.files:
+            if item not in allowed:
+                allowed.append(item)
+        proof["allowlist_after"] = allowed
+        if actual["allowlist"] not in (supplied["allowlist"], allowed):
+            raise ValueError("scope correction allowlist is stale")
+        if not resolution.scope_expanded_files and actual["allowlist"] == allowed:
+            save_snapshot(self.paths, snapshot)
+            return snapshot
+        previous_sequence = snapshot.event_sequence
+        self._record(snapshot, "scope_correction_registered", {
+            "run_id": snapshot.run_id, "node_id": node_id, "proof": proof,
+            "files": list(resolution.files)})
+        snapshot.event_sequence = previous_sequence
+        self._reconcile_unapplied_events(snapshot)
+        save_snapshot(self.paths, snapshot)
+        return snapshot
+
+    @staticmethod
+    def _scope_binding_digest(binding: Dict[str, Any]) -> str:
+        values = {k: v for k, v in binding.items() if k != "allowlist"}
+        return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+    def _validate_scope_correction(self, snapshot: RunSnapshot, node_id: str,
+                                   proof: Dict[str, Any]):
+        required = {"consistency", "active_task", "binding_digest", "allowlist_before"}
+        if (not isinstance(proof, dict) or not required.issubset(proof)
+                or set(proof) - required - {"allowlist_after"}
+                or not isinstance(proof["consistency"], dict)
+                or not isinstance(proof["active_task"], dict)
+                or not isinstance(proof["binding_digest"], str)
+                or len(proof["binding_digest"]) != 64
+                or not isinstance(proof["allowlist_before"], list)
+                or not all(isinstance(p, str) and p for p in proof["allowlist_before"])):
+            raise ValueError("scope correction proof is invalid")
+        record = self._require_snapshot_authorization(snapshot)
+        current = snapshot.nodes[node_id]
+        active = current.get("active_task")
+        if (not isinstance(active, dict) or active.get("role") != "developer"
+                or not isinstance(active.get("handle_id"), str) or not active["handle_id"]
+                or not isinstance(active.get("task_id"), str) or not active["task_id"]
+                or type(active.get("generation")) is not int or active["generation"] < 0
+                or active != proof.get("active_task")
+                or snapshot.handles.get(node_id) != active.get("handle_id")):
+            raise ValueError("scope correction requires the original active developer")
+        binding = load_task_binding(self.paths, node_id, "developer", run_id=snapshot.run_id)
+        if (binding.status in {"archived", "stopped", "failed", "accepted", "delivered", "completed"}
+                or binding.issue_id != node_id or binding.role != "developer"
+                or binding.run_id != snapshot.run_id
+                or self._worktree_path({"worktree": binding.worktree}).resolve()
+                != self._worktree_path(current).resolve()
+                or binding.branch != current.get("branch")
+                or binding.task_id != active.get("task_id")
+                or binding.generation != active.get("generation")
+                or binding.task_id != current.get("developer_identity")
+                or binding.generation != current.get("developer_generation")
+                or self._scope_binding_digest(binding.to_dict()) != proof.get("binding_digest")):
+            raise ValueError("scope correction task identity or cursor is stale")
+        node = self.nodes[node_id]
+        resolution = resolve_consistency(proof.get("consistency"),
+            self.plan.decisions, node.contract, list(record.allowed_actions),
+            list(record.file_scope), self._consistency_binding(record, node),
+            node_files=self._node_scope_files(node_id, current),
+            auto_scope_paths=self._auto_scope_paths(),
+            occupied_files=self._files_held_by_other_active_nodes(snapshot, node_id))
+        if (resolution is None or resolution.action not in {"test", "rework", "develop"}
+                or resolution.field not in node.contract
+                or resolution.value != node.contract[resolution.field]):
+            raise ValueError("scope correction is not an authorized unchanged acceptance")
+        if any(auto_scope_rule(p, self._auto_scope_paths()) is None
+               for p in resolution.files if p not in binding.allowlist):
+            raise ValueError("scope correction files are not mechanical")
+        return resolution
+
+    def _apply_scope_correction(self, snapshot: RunSnapshot, node_id: str,
+                                proof: Dict[str, Any]) -> None:
+        resolution = self._validate_scope_correction(snapshot, node_id, proof)
+        binding = load_task_binding(self.paths, node_id, "developer", run_id=snapshot.run_id)
+        if self._scope_binding_digest(binding.to_dict()) != proof["binding_digest"]:
+            raise ValueError("scope correction binding changed during replay")
+        before, after = proof.get("allowlist_before"), proof.get("allowlist_after")
+        if not isinstance(before, list) or not isinstance(after, list):
+            raise ValueError("scope correction allowlist evidence is invalid")
+        expected = list(before)
+        for item in resolution.files:
+            if item not in expected:
+                expected.append(item)
+        if after != expected or binding.allowlist not in (before, after):
+            raise ValueError("scope correction allowlist drift")
+        if binding.allowlist != after:
+            expected_binding = binding.to_dict()
+            binding = replace(binding, allowlist=list(after))
+            save_task_binding(self.paths, binding, expected_binding=expected_binding)
+            self._binding_cache[(snapshot.run_id, node_id, "developer")] = binding
+        current = snapshot.nodes[node_id]
+        expanded = current.setdefault("scope_expansions", [])
+        for item in resolution.scope_expanded_files:
+            if item not in expanded:
+                expanded.append(item)
+        snapshot.tasks[node_id + ":developer"] = binding.to_dict()
 
     def _validate_reconciliation_package(
         self, snapshot: RunSnapshot, package: Dict[str, Any]
@@ -2168,6 +2414,175 @@ class Monitor:
             return load_project_config(self.paths.root).auto_scope_paths
         except ValueError:
             return ()
+
+    def _resolve_scope_request(
+        self, snapshot: RunSnapshot, node_id: str, request: Any
+    ):
+        record = self._snapshot_record(snapshot)
+        current = snapshot.nodes[node_id]
+        return resolve_scope_expansion(
+            request,
+            authorized_files=list(record.file_scope),
+            node_files=self._node_scope_files(node_id, current),
+            auto_scope_paths=self._auto_scope_paths(),
+            occupied_files=self._files_held_by_other_active_nodes(
+                snapshot, node_id
+            ),
+        )
+
+    @staticmethod
+    def _queue_scope_rework(current: Dict[str, Any]) -> None:
+        current["acceptance"] = None
+        current.pop("review_clearance", None)
+        current["status"] = "rework"
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = None
+        current["pair_archived"] = True
+        current["retryable_action"] = {
+            "role": "developer",
+            "phase": "rework",
+            "continuation": True,
+            "pending_schedule": True,
+            "successor": False,
+            "successor_candidate": False,
+        }
+
+    @staticmethod
+    def _invalidate_integration_review(snapshot: RunSnapshot) -> None:
+        current = snapshot.nodes.get("integration-review")
+        if not isinstance(current, dict) or current.get("status") != "accepted":
+            return
+        prior = snapshot.integration_review_evidence
+        history = []
+        if isinstance(prior, dict) and isinstance(prior.get("history"), list):
+            history = copy.deepcopy(prior["history"])
+        elif prior:
+            history = [copy.deepcopy(prior)]
+        snapshot.integration_review_evidence = {"history": history}
+        current["acceptance"] = None
+        current.pop("review_clearance", None)
+        current["status"] = "rework"
+        current["reason"] = None
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = None
+        current["pair_archived"] = True
+        current["retryable_action"] = {
+            "role": "reviewer",
+            "phase": "review",
+            "continuation": True,
+            "pending_schedule": True,
+            "successor": False,
+            "successor_candidate": False,
+        }
+
+    def _queue_integration_review_rework(self, snapshot: RunSnapshot) -> None:
+        current = snapshot.nodes.get("integration-review")
+        if not isinstance(current, dict) or current.get("status") not in {
+            "review", "rework"
+        }:
+            return
+        current["status"] = "rework"
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = None
+        current["retryable_action"] = {
+            "role": "reviewer",
+            "phase": "review",
+            "continuation": True,
+            "pending_schedule": True,
+            "successor": False,
+            "successor_candidate": False,
+        }
+        snapshot.handles.pop("integration-review", None)
+        self._release_node_lease(snapshot, "integration-review")
+
+    def _apply_scope_expansion(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        resolution: Any,
+        trigger: str,
+        *,
+        queue_rework: bool = False,
+        active: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        current = snapshot.nodes[node_id]
+        expansions = current.setdefault("scope_expansions", [])
+        for item in resolution.files:
+            if item not in expansions:
+                expansions.append(item)
+        event_data = {
+            "run_id": snapshot.run_id,
+            "node_id": node_id,
+            "files": list(resolution.files),
+            "scope_rules": list(resolution.scope_rules),
+        }
+        if resolution.reason or queue_rework:
+            event_data.update(
+                {
+                    "trigger": trigger,
+                    "acceptance_examples_unchanged": bool(resolution.reason),
+                    "scope_reason": resolution.reason,
+                    "scope_transition": (
+                        "queue_rework" if queue_rework else "none"
+                    ),
+                }
+            )
+        self._record(
+            snapshot,
+            "scope_auto_expanded",
+            event_data,
+            active,
+        )
+        if queue_rework:
+            self._queue_scope_rework(current)
+            if trigger == "integration_rework":
+                self._queue_integration_review_rework(snapshot)
+            else:
+                self._invalidate_integration_review(snapshot)
+
+    def request_scope_expansion(
+        self,
+        run_id: str,
+        node_id: str,
+        request: Any,
+        *,
+        trigger: str = "accepted_patch",
+    ) -> RunSnapshot:
+        """Queue an accepted-node patch through the original task identities."""
+
+        if trigger != "accepted_patch":
+            raise ValueError("unsupported scope expansion trigger")
+        self._reset_binding_cache()
+        snapshot = load_snapshot(self.paths, run_id)
+        self._require_snapshot_authorization(snapshot)
+        self._reconcile_unapplied_events(snapshot)
+        if node_id not in self.nodes or node_id not in snapshot.nodes:
+            raise ValueError("scope expansion node is outside the authorized DAG")
+        if is_integration_review_node(self.nodes[node_id]):
+            raise ValueError("accepted patch requires a business node")
+        current = snapshot.nodes[node_id]
+        if (
+            current.get("status") != "accepted"
+            or current.get("active_task") is not None
+            or node_id in snapshot.handles
+        ):
+            raise ValueError("accepted patch requires an inactive accepted node")
+        resolution = self._resolve_scope_request(snapshot, node_id, request)
+        if resolution is None or not resolution.files:
+            raise ScopeDecisionRequired("scope expansion requires product-manager review")
+        self._apply_scope_expansion(
+            snapshot,
+            node_id,
+            resolution,
+            trigger,
+            queue_rework=True,
+        )
+        self._refresh_run_status(snapshot)
+        save_snapshot(self.paths, snapshot)
+        return snapshot
 
     def _consistency_binding(
         self, record: AuthorizationRecord, node: DAGNode
@@ -2705,6 +3120,243 @@ class Monitor:
         current["old_task_reconciled"] = False
         current["retryable_action"] = None
 
+    def _recover_developer_delivery_projection(self, snapshot, node_id, *, require_receipt=False,
+                                               replay_sequence=None):
+        """Read an already-consumed, bound delivery; never synthesize completion."""
+        current = snapshot.nodes[node_id]
+        delivery = current.get('delivery_evidence')
+        store = ProviderActionStore(self.paths)
+        try:
+            developer = self._load_task_binding(snapshot, node_id, 'developer')
+        except FileNotFoundError:
+            # Older reviewer-only successor snapshots legitimately carried a
+            # validated delivery projection without a developer registry row.
+            # Keep that compatibility path for projection-only recovery, but
+            # never allow it to satisfy immutable receipt recovery.
+            if require_receipt:
+                raise ValueError('successor reconciliation developer delivery binding is unverified')
+            developer = None
+        generation = current.get('developer_generation')
+        status_verified = developer is not None and developer.status == 'delivered'
+        if require_receipt and developer is not None and developer.status == 'archived' and type(replay_sequence) is int:
+            # A later, authorized pair archive must not invalidate the immutable
+            # receipt being replayed. Initial recovery still requires delivered.
+            status_verified = any(
+                event.get('event') == 'pair_archived'
+                and event.get('sequence', 0) > replay_sequence
+                and event.get('data', {}).get('run_id') == snapshot.run_id
+                and event.get('data', {}).get('node_id') == node_id
+                and event.get('data', {}).get('clearance') == {'p0': 0, 'p1': 0, 'p2': 0}
+                and event.get('provenance', {}).get('role') == 'system'
+                and event.get('provenance', {}).get('authorization_digest') == snapshot.authorization_digest
+                and event.get('provenance', {}).get('node_contract_digest') == snapshot.node_contract_digest
+                for event in load_events(self.paths, snapshot.run_id)
+            )
+        if not require_receipt and isinstance(delivery, dict) and delivery.get('completion_marker'):
+            if developer is not None and (type(generation) is not int or generation < 1 or developer.generation != generation
+                    or developer.task_id != current.get('developer_identity')
+                    or not status_verified
+                    or developer.worktree != current.get('worktree')
+                    or developer.branch != current.get('branch')):
+                raise ValueError('successor reconciliation developer delivery binding is unverified')
+            return delivery, None
+        if developer is None:
+            raise ValueError('successor reconciliation developer delivery binding is unverified')
+        if (type(generation) is not int or generation < 1 or developer.generation != generation
+                or developer.task_id != current.get('developer_identity')
+                or not status_verified
+                or developer.worktree != current.get('worktree') or developer.branch != current.get('branch')):
+            raise ValueError('successor reconciliation developer delivery binding is unverified')
+        path = store._directory('deliveries') / f'{snapshot.run_id}-{node_id}-developer-g{generation}.json'
+        archived = store._read(path)
+        if (archived.get('run_id') != snapshot.run_id or archived.get('issue_id') != node_id
+                or archived.get('role') != 'developer' or archived.get('generation') != generation
+                or not isinstance(archived.get('consumed_by'), str)):
+            raise ValueError('successor reconciliation developer delivery receipt is unverified')
+        action = store.action(archived['consumed_by'])
+        request = action['request']
+        targets = request.get('targets')
+        result = store.result(action['action_id'])
+        if (action['run_id'] != snapshot.run_id or action['issue_id'] != node_id
+                or action['role'] != 'developer' or action['generation'] != generation
+                or action['provider'] != developer.provider or action['operation'] != 'wait'
+                or request.get('authorization_digest') != snapshot.authorization_digest
+                or request.get('plan_id') != self.plan.plan_id or request.get('plan_version') != self.plan.version
+                or not isinstance(targets, list) or len(targets) != 1 or not isinstance(targets[0], dict)
+                or targets[0].get('threadId') != developer.task_id or targets[0].get('hostId') != developer.host
+                or not isinstance(result, dict) or result.get('event') != 'delivered'
+                or result.get('status') not in ('complete', 'completed')
+                or not isinstance(archived.get('payload'), dict)
+                or result.get('delivery_evidence') != archived['payload'].get('delivery_evidence')):
+            raise ValueError('successor reconciliation developer delivery action is unverified')
+        delivery = result.get('delivery_evidence')
+        gate = evaluate_delivery_evidence({**current, 'status':'DELIVERED'}, developer, delivery)
+        if not gate.complete:
+            raise ValueError('successor reconciliation developer delivery is incomplete')
+        artifact = Path(delivery['delivery_path'])
+        root = self._worktree_path(current).resolve()
+        artifact = artifact if artifact.is_absolute() else root/artifact
+        if not artifact.resolve().is_relative_to(root) or not artifact.is_file():
+            raise ValueError('successor reconciliation developer delivery artifact is unverified')
+        return delivery, {'action_id':action['action_id'], 'request_digest':action['request_digest'],
+            'archive_path':str(path), 'archive_digest':hashlib.sha256(path.read_bytes()).hexdigest()}
+
+    def reconcile_created_successor(self, run_id, node_id, runner, *, action_id,
+                                    request_digest, predecessor_archive, preservation_path,
+                                    preservation_digest):
+        """Register an existing visible successor after a false local start.
+
+        The archive result is a native observation. This operation rechecks
+        current authorization and registers a setup-only task; normal binding
+        and writer gates still precede its continuation.
+        """
+        self._reset_binding_cache()
+        snapshot = load_snapshot(self.paths, run_id)
+        record = self._require_snapshot_authorization(snapshot)
+        current = snapshot.nodes[node_id]
+        if (current.get('active_task') is not None or node_id in snapshot.handles
+                or current.get('start_intent') is not None):
+            raise ValueError('successor reconciliation requires no active task or intent')
+        store = ProviderActionStore(self.paths)
+        action = store.action(action_id)
+        old = load_historical_task_binding(self.paths, run_id, node_id, 'reviewer',
+                                          action['request'].get('predecessor_task_id'))
+        if (old.mode != 'visible' or old.provider != getattr(runner, 'provider', None)
+                or old.status not in {'stopped', 'failed', 'archived'}
+                or not isinstance(predecessor_archive, dict)
+                or predecessor_archive.get('threadId') != old.task_id
+                or predecessor_archive.get('archived') is not True):
+            raise ValueError('successor predecessor archive is unverified')
+        if not self._proven_successor_action(snapshot, node_id, old.role, old.generation,
+            old.provider, action_id, request_digest, old.task_id, record.digest):
+            raise ValueError('successor reconciliation create lineage is invalid')
+        profile = action['request'].get('worker_profile')
+        if not isinstance(profile, dict):
+            raise ValueError('successor reconciliation requires the bound worker profile')
+        profile = WorkerProfile.from_dict(profile)
+        root = self._worktree_path(current)
+        def git(*args):
+            result = subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True)
+            if result.returncode:
+                raise ValueError('successor reconciliation Git observation failed')
+            return result.stdout if args[:1] == ('diff',) else result.stdout.strip()
+        if (git('symbolic-ref', '--short', 'HEAD') != old.branch
+                or profile.branch != old.branch or Path(profile.worktree).resolve() != root.resolve()
+                or profile.allowlist != old.allowlist):
+            raise ValueError('successor reconciliation writer scope is unverified')
+        head = git('rev-parse', 'HEAD')
+        # Reviewer recovery preserves the developer's delivered diff. Its
+        # frozen marker must include tracked and untracked content, rather
+        # than requiring that legitimate delivery to disappear.
+        delivery, delivery_recovery = self._recover_developer_delivery_projection(snapshot, node_id)
+        path = Path(preservation_path)
+        raw_preservation = path.read_bytes()
+        if hashlib.sha256(raw_preservation).hexdigest() != preservation_digest:
+            raise ValueError('successor reconciliation preservation digest mismatch')
+        preserved = json.loads(raw_preservation)
+        if (not isinstance(preserved, dict)
+                or not isinstance(preserved.get('reviewer_binding'), dict)
+                or not isinstance(preserved.get('cumulative_diff'), dict)):
+            raise ValueError('successor reconciliation preservation format is invalid')
+        if (preserved.get('run_id') != run_id or preserved.get('authorization_digest') != record.digest
+                or preserved.get('frozen_head') != head or preserved.get('branch') != old.branch
+                or preserved.get('worktree') != old.worktree
+                or preserved.get('allowlist') != old.allowlist
+                or preserved.get('reviewer_binding', {}).get('task_id') != old.task_id
+                or preserved.get('cumulative_diff', {}).get('stdout') != git('diff', '--binary', 'HEAD')):
+            raise ValueError('successor reconciliation preserved content changed')
+        untracked = git('ls-files', '--others', '--exclude-standard').splitlines()
+        hashes = {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in untracked}
+        if hashes != preserved.get('untracked_hashes'):
+            raise ValueError('successor reconciliation untracked content changed')
+        # Other nodes may not hold the same writer root. The original
+        # developer delivery is historical evidence, not another active task.
+        if any(other != node_id and (node.get('active_task') or other in snapshot.handles)
+               and self._worktree_path(node).resolve() == root.resolve()
+               for other, node in snapshot.nodes.items()):
+            raise ValueError('successor reconciliation writer root is already active')
+        created = store.result(action_id)
+        data = created.get('binding') if isinstance(created, dict) else None
+        if not isinstance(data, dict):
+            raise ValueError('successor reconciliation create result is missing')
+        task_id = data.get('threadId') or data.get('task_id')
+        host = data.get('hostId') or data.get('host')
+        raw = old.to_dict()
+        raw.update(task_id=task_id, platform_task_id=task_id, threadId=task_id,
+                   host=host, hostId=host,
+                   successor_of=old.task_id, status='created', cursor=None,
+                   binding_intent=None, binding_observation=None,
+                   binding_state='blocked_unknown', business_write_allowed=False,
+                   model=profile.model, reasoning=profile.reasoning, route_digest=profile.route_digest)
+        new = TaskBinding.from_dict(raw)
+        reconcile_shadowed_successor(self.paths, old, new, action_id=action_id,
+                                    request_digest=request_digest, authorization_digest=record.digest)
+        snapshot.tasks[node_id+':reviewer'] = new.to_dict()
+        if delivery_recovery is not None:
+            current['delivery_evidence'] = dict(delivery)
+            current.update({key:delivery[key] for key in ('completion_marker','delivery_path','thread_status')})
+        current['reviewer_identity'] = task_id
+        current['review_generation'] = old.generation
+        current['retryable_action'] = {'role': 'reviewer', 'phase': 'review', 'continuation': True,
+            'successor': False, 'same_task': True, 'same_task_required': True,
+            'successor_candidate': False, 'reason_class': 'engineering'}
+        current['status'] = 'blocked_unknown'
+        current['quarantine'] = None
+        self._record(snapshot, 'successor_registration_reconciled', {'run_id': run_id,
+            'node_id': node_id, 'proof': {'action_id': action_id, 'request_digest': request_digest,
+            'predecessor_task_id': old.task_id, 'task_id': task_id, 'head_sha': head,
+            'predecessor_archive': predecessor_archive,
+            'preservation_path': str(path), 'preservation_digest': preservation_digest,
+            **({'delivery_recovery':delivery_recovery} if delivery_recovery is not None else {})}})
+        self._record_topology_projection(snapshot, 'monitor.reconcile_successor')
+        self._refresh_run_status(snapshot)
+        save_snapshot(self.paths, snapshot)
+        return snapshot
+
+    def _proven_successor_action(
+        self, snapshot, node_id, role, generation, provider, action_id,
+        request_digest, predecessor, authorization_digest,
+    ) -> bool:
+        """Prove replay of one create transaction, never permission for a new writer."""
+        store = ProviderActionStore(self.paths)
+        try:
+            action = store.action(action_id)
+            if (action.get("request_digest") != request_digest
+                    or action.get("run_id") != snapshot.run_id
+                    or action.get("issue_id") != node_id or action.get("role") != role
+                    or action.get("generation") != generation
+                    or action.get("provider") != provider
+                    or action.get("operation") not in {"create", "locate", "visibility"}):
+                return False
+            created_action = store.related_action(action, "create")
+            for candidate in (action, created_action):
+                request = candidate["request"]
+                if (request.get("authorization_digest") != authorization_digest
+                        or request.get("plan_id") != getattr(self.plan, "plan_id", "")
+                        or request.get("plan_version") != self.plan.version):
+                    return False
+            request = created_action["request"]
+            if (request.get("successor") is not True
+                    or request.get("predecessor_task_id") != predecessor):
+                return False
+            if action["operation"] == "create":
+                return True
+            result = store.result(created_action["action_id"])
+            binding = result.get("binding") if isinstance(result, dict) else None
+            if not isinstance(binding, dict):
+                return False
+            task_id = binding.get("threadId") or binding.get("task_id")
+            host = binding.get("hostId") or binding.get("host")
+            if (not isinstance(task_id, str) or not task_id or task_id == predecessor
+                    or not isinstance(host, str) or not host):
+                return False
+            request = action["request"]
+            if action["operation"] == "locate":
+                return request.get("threadId") == task_id
+            return request.get("targets") == [{"threadId": task_id, "hostId": host}]
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+
     def _schedule_ready(
         self,
         snapshot: RunSnapshot,
@@ -2789,6 +3441,20 @@ class Monitor:
                         and current.get("active_task") is None
                     ):
                         current["quarantine"] = None
+                pending_successor = (
+                    retry.get("successor") is True
+                    and self._proven_successor_action(
+                        snapshot, node_id, str(retry.get("role")),
+                        int(current.get("review_generation" if retry.get("role") == "reviewer" else "developer_generation", 0)) + 1,
+                        getattr(runner, "provider", None), retry.get("pending_provider_action"),
+                        retry.get("request_digest"), retry.get("predecessor_task_id"),
+                        getattr(record, "digest", snapshot.authorization_digest),
+                    )
+                )
+                if retry.get("pending_provider_action") is not None and not pending_successor:
+                    current["reason"] = "pending successor transaction proof is invalid"
+                    current["status"] = "blocked_unknown"
+                    continue
                 if (
                     current.get("status") == "blocked_unknown"
                     and isinstance(current.get("quarantine"), dict)
@@ -2796,8 +3462,19 @@ class Monitor:
                     and retry.get("same_task") is not True
                     and current.get("active_task") is None
                     and not resumable_developer
+                    and not pending_successor
                 ):
-                    current["retryable_action"] = None
+                    current["retryable_action"] = {
+                        "action": "reconcile_binding",
+                        "manual_repair_required": True,
+                        "same_task": False,
+                        "same_task_required": True,
+                        "successor": False,
+                        "role": retry.get("role"),
+                        "phase": retry.get("phase"),
+                        "reason": "quarantined task has no proven active binding to resume",
+                    }
+                    current["recovery_action"] = "reconcile_binding"
                     current["reason"] = (
                         "quarantined task has no proven active binding to resume"
                     )
@@ -2832,6 +3509,8 @@ class Monitor:
                             "proof": "absent" if not predecessor else "stopped",
                         },
                     )
+                if retry.get("manual_repair_required") is True:
+                    continue
                 pending_schedule = retry.get("pending_schedule") is True
                 reviewer_recovery = retry.get("missing_binding_recovery") is True
                 # Respect the durable bounded-backoff deadline for V4.2
@@ -2891,7 +3570,7 @@ class Monitor:
                     bool(retry.get("continuation")),
                     bool(retry.get("successor") or reviewer_recovery),
                 ):
-                    if current.get("status") != "blocked_unknown":
+                    if current.get("status") not in {"blocked_unknown", "retry_pending"}:
                         current["retryable_action"] = None
                 continue
             if current.get("status") == "delivered" and not current.get("reviewer_started"):
@@ -2919,7 +3598,15 @@ class Monitor:
                         "writer lease is already owned by another run",
                     )
                     continue
-                self._start_task(snapshot, node_id, "reviewer", "review", runner, False)
+                self._start_task(
+                    snapshot,
+                    node_id,
+                    "reviewer",
+                    "review",
+                    runner,
+                    False,
+                    bool(current.get("reviewer_replacement_required")),
+                )
                 continue
             if current.get("status") != "planned":
                 continue
@@ -3496,6 +4183,15 @@ class Monitor:
             contract["task_id"] = identity
             self._save_task_binding(binding)
         except ProviderPending as error:
+            # Only a durable, bound successor action permits retrying the
+            # same create transaction. An unbound exception still fails
+            # closed; never turn it into permission for another writer.
+            action_id = getattr(error, "action_id", None)
+            pending_successor = successor and self._proven_successor_action(
+                snapshot, node_id, role, generation, getattr(runner, "provider", None),
+                action_id, getattr(error, "request_digest", None),
+                contract.get("predecessor_task_id"), contract["authorization_digest"],
+            )
             current[generation_key] = generation - 1
             if role == "reviewer" and generation == 1:
                 current["reviewer_started"] = False
@@ -3510,15 +4206,22 @@ class Monitor:
                 "role": role,
                 "phase": phase,
                 "continuation": continuation,
-                "successor": False,
-                "same_task": True,
-                "same_task_required": True,
+                "successor": pending_successor,
+                "same_task": not pending_successor,
+                "same_task_required": not pending_successor,
+                "successor_candidate": False,
                 "attempt": 1,
                 "reason_class": "engineering",
                 "next_retry_at": time.time(),
                 "binding_digest": current.get("contract_digest", ""),
                 "last_observation_ref": "provider-pending",
             }
+            if pending_successor:
+                current["retryable_action"].update({
+                    "pending_provider_action": action_id,
+                    "request_digest": getattr(error, "request_digest"),
+                    "predecessor_task_id": contract.get("predecessor_task_id"),
+                })
             if setup_identity:
                 current["retryable_action"]["setup_identity"] = str(setup_identity)
             # An asynchronous bridge response is a retry condition, not
@@ -3535,13 +4238,12 @@ class Monitor:
             # Preserve the write-ahead intent for same-task retry.
             if successor:
                 self._mark_blocked_unknown(snapshot, node_id, str(error), quarantine_lease=False)
-                current["retryable_action"] = {
-                    "role": role, "phase": phase, "continuation": continuation,
-                    "successor": False, "same_task": True, "same_task_required": True,
-                    "attempt": 1, "reason_class": "engineering", "next_retry_at": time.time(),
-                    "binding_digest": current.get("contract_digest", ""),
-                    "last_observation_ref": "provider-pending",
-                }
+                if pending_successor:
+                    self._record(snapshot, "successor_binding_pending", {
+                        "run_id": snapshot.run_id, "node_id": node_id,
+                        "proof": {"generation": generation, "provider": getattr(runner, "provider", None),
+                                  "retry": dict(current["retryable_action"])},
+                    })
                 save_snapshot(self.paths, snapshot)
             return False
         except ProviderUnavailable as error:
@@ -3551,7 +4253,7 @@ class Monitor:
             failure = classify_provider_failure(error)
             if failure["kind"] == "external_decision":
                 current["retryable_action"] = None
-            else:
+            elif failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
                 current["retryable_action"] = {
                     "role": role,
                     "phase": phase,
@@ -3565,10 +4267,41 @@ class Monitor:
                     "binding_digest": current.get("contract_digest", ""),
                     "last_observation_ref": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
                 }
+                current["status"] = self._v42_retry_status()
+                current["reason"] = redact_provider_text(str(error))
+                if "reasoning" in str(error).casefold() or "model" in str(error).casefold():
+                    options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
+                    options["omit_thinking"] = True
+                    current.setdefault("contract_overrides", {})["provider_options"] = options
+                    current["retryable_action"]["parameter_recovery"] = "omit_thinking"
+            else:
+                current["retryable_action"] = None
             current["active_task"] = None
             current["active_role"] = None
-            # Preserve the write-ahead intent for same-task retry.
-            self._mark_blocked_unknown(snapshot, node_id, str(error))
+            # Preserve the write-ahead intent for same-task retry.  Unknown
+            # binding/authorization evidence still fails closed; known
+            # engineering failures remain schedulable.
+            if failure["kind"] not in {"retryable", "capacity_wait", "repairable"}:
+                self._mark_blocked_unknown(snapshot, node_id, str(error))
+                # A pre-write binding observation has no provider handle yet,
+                # but it is still a recoverable same-generation action. Keep
+                # the retry marker after the fail-closed user status so the
+                # next heartbeat re-enters the original binding probe instead
+                # of merely repeating ``blocked_unknown``.
+                if failure["kind"] == "binding_unknown":
+                    current["retryable_action"] = {
+                        "role": role,
+                        "phase": phase,
+                        "continuation": continuation,
+                        "successor": False,
+                        "same_task": True,
+                        "same_task_required": True,
+                        "attempt": 1,
+                        "reason_class": "binding_unknown",
+                        "next_retry_at": time.time(),
+                        "binding_digest": current.get("contract_digest", ""),
+                        "last_observation_ref": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
+                    }
             if binding_contract_enabled(contract):
                 current["binding_phase"] = "binding_repair_pending"
             save_snapshot(self.paths, snapshot)
@@ -3658,32 +4391,62 @@ class Monitor:
             # must return a structured proof; legacy runners retain RunHandle
             # compatibility until their contract opts into 4.4.
             handle = self._dispatch_with_intent(runner, contract, intent)
-            if isinstance(handle, dict) and handle.get("kind") in {"binding_unknown", "retryable", "capacity_wait", "repairable", "contract_error"}:
+            if isinstance(handle, dict) and handle.get("kind") in {"binding_unknown", "provider_error", "retryable", "capacity_wait", "repairable", "contract_error"}:
+                reason = handle.get("reason", handle.get("kind"))
+                failure_kind = handle.get("reason_class")
+                if failure_kind is None and handle.get("kind") in {"retryable", "capacity_wait", "repairable"}:
+                    # Explicit runner phases are already engineering outcomes;
+                    # preserve them instead of reclassifying a short/redacted
+                    # reason such as ``ValueError``.
+                    failure_kind = handle.get("kind")
                 if handle.get("kind") == "contract_error":
-                    # A deterministic local contract rejection is not a new
-                    # business attempt. Rewind the speculative generation and
-                    # retain a structured action reference for diagnosis.
-                    current[generation_key] = max(0, generation - 1)
-                current["status"] = "blocked_unknown"
-                current["reason"] = handle.get("reason", handle.get("kind"))
-                current["binding_phase"] = handle.get("phase", handle.get("kind"))
+                    # Local profile/child contract drift is repairable and must
+                    # not become a product block or a new writer generation.
+                    failure_kind = "repairable"
+                failure = (
+                    {"kind": failure_kind}
+                    if failure_kind in {"retryable", "capacity_wait", "repairable", "binding_unknown", "external_decision"}
+                    else classify_provider_failure({"kind": handle.get("kind"), "reason": reason})
+                )
+                if failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
+                    previous_retry = current.get("retryable_action")
+                    previous_attempt = int(previous_retry.get("attempt", 0)) if isinstance(previous_retry, dict) else 0
+                    retry = {
+                        "role": role, "phase": phase,
+                        "continuation": continuation, "successor": False,
+                        "same_task": True, "same_task_required": True,
+                        "attempt": max(1, previous_attempt + 1), "reason_class": failure["kind"],
+                        "next_retry_at": time.time(),
+                        "binding_digest": current.get("contract_digest", ""),
+                        "last_observation_ref": handle.get("action_ref") or hashlib.sha256(str(reason).encode("utf-8")).hexdigest(),
+                    }
+                    current["status"] = self._v42_retry_status()
+                    current["reason"] = redact_provider_text(str(reason))
+                    current["binding_phase"] = "retry_pending"
+                    current["retryable_action"] = retry
+                    if "reasoning" in str(reason).casefold() or "model" in str(reason).casefold():
+                        options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
+                        options["omit_thinking"] = True
+                        current.setdefault("contract_overrides", {})["provider_options"] = options
+                        retry["parameter_recovery"] = "omit_thinking"
+                    self._record(snapshot, "retry_scheduled", {"run_id": snapshot.run_id, "node_id": node_id, "role": role, "reason_class": failure["kind"], "same_task_required": True, "parameter_recovery": retry.get("parameter_recovery")})
+                else:
+                    current["status"] = "blocked_unknown"
+                    current["reason"] = reason
+                    current["binding_phase"] = handle.get("kind")
+                    current["retryable_action"] = {
+                        "role": role, "phase": phase,
+                        "continuation": continuation, "successor": False,
+                        "same_task": True, "same_task_required": True,
+                        "attempt": 1, "reason_class": handle.get("kind"),
+                        "next_retry_at": time.time(),
+                        "binding_digest": current.get("contract_digest", ""),
+                        "last_observation_ref": "provider-pending",
+                    }
+                    self._record(snapshot, handle.get("kind", "binding_unknown"), {"run_id": snapshot.run_id, "node_id": node_id, "intent_digest": intent.get("intent_digest"), "proof": handle.get("proof")})
                 current["active_task"] = None
                 current["active_role"] = None
                 current["start_intent"] = None
-                previous_retry = current.get("retryable_action")
-                previous_attempt = int(previous_retry.get("attempt", 0)) if isinstance(previous_retry, dict) else 0
-                current["retryable_action"] = {
-                    "role": role, "phase": phase,
-                    "continuation": continuation, "successor": False,
-                    "same_task": True, "same_task_required": True,
-                    "attempt": max(1, previous_attempt + 1), "reason_class": handle.get("kind"),
-                    "reason_code": handle.get("reason_code"),
-                    "action_ref": handle.get("action_ref"),
-                    "next_retry_at": time.time(),
-                    "binding_digest": current.get("contract_digest", ""),
-                    "last_observation_ref": handle.get("action_ref") or handle.get("kind"),
-                }
-                self._record(snapshot, handle.get("kind", "binding_unknown"), {"run_id": snapshot.run_id, "node_id": node_id, "intent_digest": intent.get("intent_digest"), "proof": handle.get("proof"), "reason_code": handle.get("reason_code"), "action_ref": handle.get("action_ref"), "phase": handle.get("phase")})
                 save_snapshot(self.paths, snapshot)
                 return False
             if isinstance(handle, dict):
@@ -3718,6 +4481,56 @@ class Monitor:
             current["reason"] = str(error)
             save_snapshot(self.paths, snapshot)
             return False
+        except ProviderUnavailable as error:
+            # Provider request validation happens before a visible task has an
+            # identity.  Treat it as an engineering retry and preserve the
+            # original role/generation.  A parameter-validation failure also
+            # records the smallest safe adaptation: omit optional reasoning on
+            # the next native create request.
+            failure = classify_provider_failure(error)
+            if failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
+                previous = current.get("retryable_action")
+                attempt = int(previous.get("attempt", 0) or 0) + 1 if isinstance(previous, dict) else 1
+                retry = {
+                    "role": role,
+                    "phase": phase,
+                    "continuation": continuation,
+                    "successor": False,
+                    "same_task": True,
+                    "same_task_required": True,
+                    "attempt": attempt,
+                    "reason_class": failure["kind"],
+                    "next_retry_at": time.time() + min(60.0, float(2 ** min(attempt - 1, 5))),
+                    "binding_digest": current.get("contract_digest", ""),
+                    "last_observation_ref": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
+                }
+                current["retryable_action"] = retry
+                current["status"] = self._v42_retry_status()
+                current["active_task"] = None
+                current["active_role"] = None
+                current["start_intent"] = None
+                current["quarantine"] = None
+                current["reason"] = redact_provider_text(str(error))
+                if "reasoning" in str(error).casefold() or "model" in str(error).casefold():
+                    options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
+                    options["omit_thinking"] = True
+                    current.setdefault("contract_overrides", {})["provider_options"] = options
+                    retry["parameter_recovery"] = "omit_thinking"
+                self._record(
+                    snapshot,
+                    "retry_scheduled",
+                    {
+                        "run_id": snapshot.run_id,
+                        "node_id": node_id,
+                        "role": role,
+                        "reason_class": failure["kind"],
+                        "same_task_required": True,
+                        "parameter_recovery": retry.get("parameter_recovery"),
+                    },
+                )
+                save_snapshot(self.paths, snapshot)
+                return False
+            raise
         except Exception as error:
             if successor:
                 current["retryable_action"] = {
@@ -3792,14 +4605,11 @@ class Monitor:
             # as unknown until a provider-confirmed result is observed.  The
             # handle remains durable so the next tick can poll it; no second
             # writer is scheduled while this side effect is pending.
-            # A continuation after reauthorization carries an already
-            # accepted task identity.  Until the provider confirms the
-            # resume action, keep that continuation fail-closed so the CLI
-            # cannot report a successful reauthorization while the native
-            # action is still only queued.
-            current["status"] = (
-                "blocked_unknown" if continuation else self._v42_retry_status()
-            )
+            # A queued continuation is an engineering retry condition. Keep
+            # the quarantine and retry marker so acceptance remains gated on
+            # a bound provider result, while allowing the scheduler to poll
+            # the same action instead of presenting the run as blocked.
+            current["status"] = self._v42_retry_status()
             current["quarantine"] = {
                 "run_id": snapshot.run_id,
                 "handle_id": handle.run_id,
@@ -3936,6 +4746,15 @@ class Monitor:
                 ("reasoning", profile.reasoning),
             ):
                 current_value = getattr(binding, field_name, None)
+                if continuation and previous_binding is not None and current_value not in (None, ""):
+                    # The persisted binding is the verified record of the
+                    # model route that actually created this task.  The
+                    # plan-side worker profile is a stale projection for an
+                    # already-bound continuation; keep the registered route
+                    # instead of rewriting or refusing the same task.
+                    if current_value != getattr(previous_binding, field_name, None):
+                        raise ValueError("task binding {} does not match registered route".format(field_name))
+                    continue
                 if current_value not in (None, "", expected):
                     raise ValueError("task binding {} does not match worker profile".format(field_name))
                 setattr(binding, field_name, expected)
@@ -4109,6 +4928,53 @@ class Monitor:
         if evidence is not None:
             current.setdefault("evidence", []).append(redact_provider_text(evidence))
         role = active["role"]
+        if role == "reviewer" and self._reviewer_write_violation(event.data):
+            # A reviewer that touched business files invalidates the whole
+            # review round.  Stop that task, preserve the developer identity,
+            # and force the next review to use a fresh reviewer identity.
+            if not self._stop_active_for_transition(
+                snapshot, node_id, role, handle_id, runner, "stopped"
+            ):
+                return
+            current["status"] = "rework"
+            current["reason"] = (
+                "reviewer write violation; review round voided; returned to developer and reviewer replacement required"
+            )
+            current["recovery_action"] = "return_to_developer_and_change_reviewer"
+            current["reviewer_replacement_required"] = True
+            current["reviewer_started"] = False
+            # Keep the stopped identity as the successor predecessor so the
+            # next reviewer cannot accidentally reuse it.
+            current["reviewer_identity"] = active.get("task_id")
+            current["active_role"] = None
+            current["active_task"] = None
+            snapshot.handles.pop(node_id, None)
+            self._record(
+                snapshot,
+                "reviewer_write_violation",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "reason": current["reason"],
+                    "modified_files": event.data.get("reviewer_modified_files", []),
+                    "review_round_voided": True,
+                    "reviewer_replacement_required": True,
+                },
+                active,
+            )
+            try:
+                self._start_task(
+                    snapshot, node_id, "developer", "rework", runner, True, False
+                )
+            except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+                self._mark_blocked_unknown(
+                    snapshot,
+                    node_id,
+                    "reviewer violation could not return to developer ({})".format(
+                        type(error).__name__
+                    ),
+                )
+            return
         if event.event not in {
             "unknown",
             "timeout",
@@ -4118,6 +4984,64 @@ class Monitor:
             # A provider-confirmed event consumes any reauthorization retry
             # marker; the active handle now carries the durable continuation.
             current["retryable_action"] = None
+
+        # A worker may surface a product decision as part of a normal delivery.
+        # Persist it before changing lifecycle state so a shift can recover the
+        # same question from disk even when the worker session is archived.
+        decision_requests = (
+            event.data.get("decision_requests")
+            if isinstance(event.data, dict)
+            else None
+        )
+        if event.event in {"delivered", "complete"} and decision_requests:
+            try:
+                decisions, notifications = ingest_worker_decisions(
+                    self.paths, snapshot.run_id, node_id, decision_requests
+                )
+            except (OSError, TypeError, ValueError) as error:
+                self._mark_blocked_unknown(
+                    snapshot, node_id, "decision request could not be persisted ({})".format(type(error).__name__)
+                )
+                return
+            notification_unknown = any(
+                isinstance(item, dict) and item.get("status") == "unknown"
+                for item in notifications
+            )
+            decision_reason = (
+                DECISION_NOTIFICATION_UNKNOWN_REASON
+                if notification_unknown
+                else "decision pending"
+            )
+            self._record(
+                snapshot,
+                "decision_raised",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "decision_ids": [item["decision_id"] for item in decisions],
+                    "source": "worker_delivery",
+                    "reason": decision_reason,
+                },
+                active,
+            )
+            current["decision_ids"] = [item["decision_id"] for item in decisions]
+            current["status"] = "blocked_unknown" if notification_unknown else "blocked_design"
+            current["reason"] = decision_reason
+            if notification_unknown:
+                current["quarantine"] = {
+                    "run_id": snapshot.run_id,
+                    "handle_id": handle_id,
+                    "reason": decision_reason,
+                }
+                try:
+                    self._set_binding_status(snapshot, node_id, str(active["role"]), "blocked_unknown")
+                except (FileNotFoundError, OSError, TypeError, ValueError):
+                    pass
+            current["active_role"] = None
+            current["active_task"] = None
+            snapshot.handles.pop(node_id, None)
+            self._release_node_lease(snapshot, node_id)
+            return
 
         if event.event in {"delivered", "complete"}:
             delivery = event.data.get("delivery_evidence")
@@ -4229,7 +5153,15 @@ class Monitor:
                 return
             reviewer_continuation = False
             reviewer_successor = False
-            if current.get("reviewer_started"):
+            replacement_required = bool(
+                current.get("reviewer_replacement_required")
+            )
+            if replacement_required:
+                # A voided review round must never resume the reviewer that
+                # violated the write boundary. Keep its identity as the
+                # successor predecessor while the fresh binding is created.
+                reviewer_successor = True
+            elif current.get("reviewer_started"):
                 try:
                     reviewer_binding = self._load_task_binding(snapshot, node_id, "reviewer")
                 except FileNotFoundError:
@@ -4256,7 +5188,7 @@ class Monitor:
                         )
                         return
                     reviewer_continuation = True
-            self._start_task(
+            reviewer_started = self._start_task(
                 snapshot,
                 node_id,
                 "reviewer",
@@ -4265,6 +5197,10 @@ class Monitor:
                 reviewer_continuation,
                 reviewer_successor,
             )
+            if replacement_required and reviewer_started and current.get("status") == "review":
+                # Provider-pending/failed starts return without a confirmed
+                # review task and must keep the replacement gate closed.
+                current["reviewer_replacement_required"] = False
         elif event.event == "review_finding":
             if role != "reviewer":
                 self._mark_blocked_unknown(
@@ -4273,6 +5209,52 @@ class Monitor:
                 return
             self._record_runner_event(snapshot, node_id, event, active)
             if node_id == "integration-review":
+                target_node_id = event.data.get("target_node_id")
+                scope_request = event.data.get("scope_expansion")
+                if target_node_id is not None or scope_request is not None:
+                    if (
+                        not isinstance(target_node_id, str)
+                        or target_node_id == "integration-review"
+                        or target_node_id not in snapshot.nodes
+                        or snapshot.nodes[target_node_id].get("status") != "accepted"
+                    ):
+                        self._mark_blocked_unknown(
+                            snapshot,
+                            node_id,
+                            "integration scope expansion target is invalid",
+                        )
+                        return
+                    resolution = self._resolve_scope_request(
+                        snapshot, target_node_id, scope_request
+                    )
+                    if resolution is None or not resolution.files:
+                        current["status"] = "blocked_design"
+                        current["reason"] = redact_provider_text(
+                            "integration scope expansion requires product-manager review"
+                        )
+                        current["active_role"] = None
+                        current["active_task"] = None
+                        snapshot.handles.pop(node_id, None)
+                        self._release_node_lease(snapshot, node_id)
+                        self._record(
+                            snapshot,
+                            "blocked_design",
+                            {
+                                "run_id": snapshot.run_id,
+                                "node_id": node_id,
+                                "reason": current["reason"],
+                                "old_task_reconciled": True,
+                            },
+                        )
+                        return
+                    self._apply_scope_expansion(
+                        snapshot,
+                        target_node_id,
+                        resolution,
+                        "integration_rework",
+                        queue_rework=True,
+                        active=active,
+                    )
                 # The integration node is read-only: findings never create a
                 # business writer. Preserve the reviewer lineage and queue the
                 # same visible reviewer task for re-review.
@@ -4287,7 +5269,22 @@ class Monitor:
                 current.setdefault("integration_findings", []).append(redact_provider_text(event.data))
                 self._release_node_lease(snapshot, node_id)
                 return
-            if self._is_implementation_finding(event.data):
+            disposition = self._review_finding_disposition(event.data)
+            if disposition == "observation":
+                current.setdefault("review_observations", []).append(
+                    redact_provider_text(event.data)
+                )
+                return
+            if disposition == "implementation" and event.data.get("consistency") is None:
+                try:
+                    review_round = int(current.get("review_generation", 0))
+                except (TypeError, ValueError):
+                    review_round = 0
+                if review_round >= 3:
+                    current["status"] = "blocked_unknown"
+                    current["reason"] = "review loop limit reached; reconcile or repair required"
+                    current["recovery_action"] = "repair_node"
+                    return
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
@@ -4317,28 +5314,26 @@ class Monitor:
                     ):
                         return
                     if resolution.scope_expanded_files:
-                        expansions = current.setdefault("scope_expansions", [])
-                        for item in resolution.scope_expanded_files:
-                            if item not in expansions:
-                                expansions.append(item)
-                        self._record(
+                        scope_request = (
+                            event.data.get("consistency", {})
+                            .get("scope_expansion")
+                        )
+                        scope_reason = (
+                            scope_request.get("reason", "")
+                            if isinstance(scope_request, dict)
+                            else ""
+                        )
+                        expansion = ScopeExpansionResolution(
+                            list(resolution.scope_expanded_files),
+                            list(resolution.scope_rules),
+                            scope_reason,
+                        )
+                        self._apply_scope_expansion(
                             snapshot,
-                            "scope_auto_expanded",
-                            {
-                                "run_id": snapshot.run_id,
-                                "node_id": node_id,
-                                "files": list(resolution.scope_expanded_files),
-                                # A list, not a path-keyed dict: persistence
-                                # redacts by key name, so a path containing
-                                # e.g. "token" would be wiped.
-                                "scope_rules": [
-                                    {
-                                        "path": item,
-                                        "rule": auto_scope_rule(item, auto_paths),
-                                    }
-                                    for item in resolution.scope_expanded_files
-                                ],
-                            },
+                            node_id,
+                            expansion,
+                            "ordinary_rework",
+                            active=active,
                         )
                     current.setdefault("contract_overrides", {})[
                         resolution.field
@@ -4539,17 +5534,19 @@ class Monitor:
             raw_reason = event.data.get("reason", event.event)
             reason = str(redact_provider_text(raw_reason))
             failure = classify_provider_failure(event.data)
-            # A mailbox wait with no result is an evidence gap, rather than
-            # an engineering failure.  Keep the active handle and its wait
-            # request for reconciliation, but expose the node as unknown
-            # until the provider returns a terminal observation.
+            # A durable native wait that is still pending is a same-task
+            # retry.  It cannot prove completion, but it does not invalidate
+            # the already registered handle or binding.
+            # Integration review can also be waiting after a rejected claim
+            # or a lost acceptance snapshot.  Keep its existing recovery gate.
             if (
-                event.event == "visibility_unknown"
+                node_id == "integration-review"
+                and event.event == "visibility_unknown"
                 and str(raw_reason) == "provider wait is pending"
             ):
                 failure = {"kind": "binding_unknown", "legacy_kind": "unknown"}
             if failure.get("legacy_kind") == "engineering":
-                self._queue_active_retry(snapshot, node_id, raw_reason)
+                self._queue_active_retry(snapshot, node_id, raw_reason, observation=event.data)
                 self._set_binding_status(snapshot, node_id, role, "blocked_unknown")
                 current["status"] = self._v42_retry_status()
                 current["reason"] = reason
@@ -4574,7 +5571,7 @@ class Monitor:
             if failure.get("legacy_kind") == "engineering" and event.event != "stopped":
                 raw_reason = event.data.get("reason", event.event)
                 reason = str(redact_provider_text(raw_reason))
-                self._queue_active_retry(snapshot, node_id, raw_reason)
+                self._queue_active_retry(snapshot, node_id, raw_reason, observation=event.data)
                 self._set_binding_status(snapshot, node_id, role, "blocked_unknown")
                 current["status"] = self._v42_retry_status()
                 current["reason"] = reason
@@ -4631,6 +5628,63 @@ class Monitor:
         snapshot.handles.pop(node_id, None)
         snapshot.nodes[node_id]["active_role"] = None
         snapshot.nodes[node_id]["active_task"] = None
+        return True
+
+    def _reconcile_completed_delivery_for_transition(
+        self, snapshot: RunSnapshot, node_id: str, active: Dict[str, Any]
+    ) -> bool:
+        """Prove that an active handle already has a terminal delivery.
+
+        This is deliberately narrow.  It only accepts a delivery that is
+        already projected on the node, matches the active task binding, and
+        has a real in-worktree artifact containing its completion marker.  A
+        missing, stale, or malformed delivery falls back to the ordinary
+        provider stop proof and therefore keeps reauthorization fail-closed.
+        """
+        role = active.get("role")
+        if role not in {"developer", "reviewer"}:
+            return False
+        current = snapshot.nodes[node_id]
+        delivery = current.get("delivery_evidence")
+        if not isinstance(delivery, dict):
+            return False
+        marker = delivery.get("completion_marker")
+        delivery_path = delivery.get("delivery_path")
+        if not isinstance(marker, str) or not marker.strip():
+            return False
+        if not isinstance(delivery_path, str) or not delivery_path.strip():
+            return False
+        try:
+            binding = self._load_task_binding(snapshot, node_id, role)
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return False
+        generation_key = (
+            "review_generation" if role == "reviewer" else "developer_generation"
+        )
+        if (
+            binding.task_id != active.get("task_id")
+            or binding.task_id != current.get(role + "_identity")
+            or binding.generation != active.get("generation")
+            or binding.generation != current.get(generation_key)
+        ):
+            return False
+        if (
+            delivery.get("thread_status") not in {"complete", "completed", "DELIVERED"}
+            or binding.worktree != current.get("worktree")
+            or binding.branch != current.get("branch")
+        ):
+            return False
+        artifact = Path(delivery_path)
+        root = self._worktree_path(current).resolve()
+        try:
+            artifact = artifact if artifact.is_absolute() else root / artifact
+            artifact = artifact.resolve()
+            if not artifact.is_relative_to(root) or not artifact.is_file():
+                return False
+            if marker.encode("utf-8") not in artifact.read_bytes():
+                return False
+        except (OSError, ValueError, UnicodeError):
+            return False
         return True
 
     @staticmethod
@@ -5055,8 +6109,8 @@ class Monitor:
         return all(event.data.get(key) == value for key, value in claims.items())
 
     @staticmethod
-    def _is_implementation_finding(data: Dict[str, Any]) -> bool:
-        """Recognize an explicit P0-P2 implementation defect from review data."""
+    def _review_finding_severity(data: Dict[str, Any]):
+        """Extract a reviewer severity from the supported finding shapes."""
         values = []
         if isinstance(data, dict):
             values.append(data.get("severity"))
@@ -5068,11 +6122,66 @@ class Monitor:
                     if isinstance(nested, dict):
                         values.append(nested.get("severity"))
         for value in values:
-            if isinstance(value, str):
-                severity = value.strip().upper()
-                if severity in {"P0", "P1", "P2"}:
-                    return True
-        return False
+            if isinstance(value, str) and value.strip():
+                return value.strip().upper()
+        return None
+
+    @classmethod
+    def _review_finding_disposition(cls, data: Dict[str, Any]) -> str:
+        """Classify a reviewer finding before applying product-boundary logic.
+
+        P3 is an observation and cannot block a run.  Missing or non-standard
+        severities are malformed engineering feedback, so the same developer
+        gets a corrective pass instead of the node being escalated as a
+        product decision.  P0-P2 are implementation findings and likewise
+        return to the original developer.
+        """
+        severity = cls._review_finding_severity(data)
+        if severity == "P3":
+            return "observation"
+        if severity in {"P0", "P1", "P2"}:
+            return "implementation"
+        # A malformed severity with a consistency payload still goes through
+        # the approved-decision resolver: it may be a genuine product
+        # boundary disagreement.  When the consistency payload is absent,
+        # there is no product choice to resolve, so retry the same developer.
+        if isinstance(data, dict) and data.get("consistency"):
+            return "defer_to_consistency"
+        return "implementation"
+
+    @classmethod
+    def _is_implementation_finding(cls, data: Dict[str, Any]) -> bool:
+        """Recognize a finding that must return to the original developer."""
+        return cls._review_finding_disposition(data) == "implementation"
+
+    @staticmethod
+    def _reviewer_write_violation(data: Dict[str, Any]) -> bool:
+        """Recognize an explicit reviewer write violation from provider data."""
+        if not isinstance(data, dict):
+            return False
+        if data.get("reviewer_write_violation") is True:
+            return True
+        if data.get("reviewer_modified_files"):
+            return True
+        if data.get("business_code_edited") is True:
+            return True
+        kind = str(data.get("kind") or data.get("type") or "").casefold()
+        return kind in {"reviewer_write_violation", "reviewer_modified_business_code"}
+
+    @staticmethod
+    def _finding_changes_prd_acceptance(data: Dict[str, Any]) -> bool:
+        """Return whether an unresolved finding changes the product contract."""
+        if not isinstance(data, dict):
+            return False
+        return any(
+            data.get(key) is True
+            for key in (
+                "changes_prd_acceptance",
+                "changes_acceptance",
+                "product_scope_change",
+                "product_design_change",
+            )
+        )
 
     def _record_runner_event(
         self,
@@ -5086,7 +6195,8 @@ class Monitor:
         self._record(snapshot, event.event, data, active)
 
     def _queue_active_retry(
-        self, snapshot: RunSnapshot, node_id: str, reason: str, *, record_event: bool = True
+        self, snapshot: RunSnapshot, node_id: str, reason: str, *, record_event: bool = True,
+        observation: Optional[Dict[str, Any]] = None
     ) -> None:
         """Record a retry intent without allocating a new task identity.
 
@@ -5105,7 +6215,7 @@ class Monitor:
         generation = active.get("generation")
         if role not in {"developer", "reviewer"} or not isinstance(task_id, str):
             return
-        classification = classify_provider_failure({"reason": reason})
+        classification = classify_provider_failure(observation if observation is not None else {"reason": reason})
         if classification["kind"] == "external_decision":
             current["retryable_action"] = None
             return
@@ -5222,10 +6332,23 @@ class Monitor:
         classification = classify_provider_failure({"reason": reason})
         if classification["kind"] == "binding_unknown":
             current["status"] = "blocked_unknown"
+            current["recovery_action"] = "reconcile_binding"
+            retry = current.get("retryable_action")
+            if not isinstance(retry, dict):
+                current["retryable_action"] = {
+                    "action": "reconcile_binding",
+                    "manual_repair_required": True,
+                    "same_task": False,
+                    "same_task_required": True,
+                    "successor": False,
+                    "reason": reason,
+                }
         elif classification["kind"] == "external_decision":
             current["status"] = "blocked_design"
+            current["recovery_action"] = "await_external_decision"
         else:
             current["status"] = "retry_pending"
+            current["recovery_action"] = recovery_action_for_failure({"reason": reason})
             self.schedule_retry(node_id, reason, run_id=snapshot.run_id)
             snapshot = self._recovery_snapshot(node_id, snapshot.run_id)
             current = snapshot.nodes[node_id]
@@ -5255,6 +6378,7 @@ class Monitor:
         return {"node_id": node_id, "kind": classification["kind"], "preserved_identity": preserved,
                 "status": current.get("status"), "task_id": current.get("task_id"),
                 "generation": current.get("generation"), "repair_action": repair_action,
+                "recovery_action": current.get("recovery_action"),
                 "run_id": snapshot.run_id, "reconciliation": reconciliation}
 
     def _mark_blocked_unknown(
@@ -5275,6 +6399,8 @@ class Monitor:
             "handle_id": handle_id,
             "reason": reason,
         }
+        action = recovery_action_for_failure({"reason": reason})
+        current["recovery_action"] = action
         if isinstance(active, dict) and active.get("role") in {"developer", "reviewer"}:
             try:
                 self._set_binding_status(
@@ -5612,10 +6738,64 @@ class Monitor:
             if node_id not in snapshot.nodes:
                 raise ValueError("unapplied event references an unknown node")
             current = snapshot.nodes[node_id]
-            if record["event"] == "start_intent":
+            if record['event'] == 'successor_registration_reconciled':
+                proof = data.get('proof')
+                if provenance.get('role') != 'system' or not isinstance(proof, dict):
+                    raise ValueError('successor registration replay proof is invalid')
+                action = ProviderActionStore(self.paths).action(proof.get('action_id'))
+                new = load_task_binding(self.paths, node_id, 'reviewer', run_id=snapshot.run_id)
+                old = load_historical_task_binding(self.paths, snapshot.run_id, node_id, 'reviewer',
+                                                  proof.get('predecessor_task_id'))
+                if (new.task_id != proof.get('task_id') or new.successor_of != old.task_id
+                        or current.get('active_task') is not None or node_id in snapshot.handles
+                        or old.status not in {'stopped', 'failed', 'archived'}
+                        or not self._proven_successor_action(snapshot, node_id, 'reviewer', new.generation,
+                            new.provider, proof.get('action_id'), proof.get('request_digest'),
+                            old.task_id, snapshot.authorization_digest)):
+                    raise ValueError('successor registration replay lineage is invalid')
+                if proof.get('delivery_recovery') is not None:
+                    delivery, recovered = self._recover_developer_delivery_projection(
+                        snapshot, node_id, require_receipt=True, replay_sequence=record['sequence'])
+                    if recovered != proof['delivery_recovery']:
+                        raise ValueError('successor registration replay delivery receipt changed')
+                    current['delivery_evidence'] = dict(delivery)
+                    current.update({key:delivery[key] for key in ('completion_marker','delivery_path','thread_status')})
+                current['reviewer_identity'] = new.task_id
+                current['review_generation'] = new.generation
+                current['status'] = 'blocked_unknown'
+                current['quarantine'] = None
+                current['retryable_action'] = {'role': 'reviewer', 'phase': 'review', 'continuation': True,
+                    'successor': False, 'same_task': True, 'same_task_required': True,
+                    'successor_candidate': False, 'reason_class': 'engineering'}
+                snapshot.tasks[node_id+':reviewer'] = new.to_dict()
+            elif record["event"] == "start_intent":
                 self._reconcile_start_intent(
                     snapshot, node_id, data, provenance
                 )
+            elif record["event"] == "successor_binding_pending":
+                proof = data.get("proof")
+                retry = proof.get("retry") if isinstance(proof, dict) else None
+                generation = proof.get("generation") if isinstance(proof, dict) else None
+                role = retry.get("role") if isinstance(retry, dict) else None
+                generation_key = "review_generation" if role == "reviewer" else "developer_generation"
+                if (provenance.get("role") != "system" or role not in {"developer", "reviewer"}
+                        or type(generation) is not int
+                        or current.get(generation_key, 0) != generation - 1
+                        or current.get("active_task") is not None or node_id in snapshot.handles
+                        or retry.get("successor") is not True or retry.get("same_task") is not False
+                        or retry.get("same_task_required") is not False
+                        or retry.get("successor_candidate") is not False
+                        or retry.get("phase") not in ({"review"} if role == "reviewer" else {"develop", "rework", "implement"})
+                        or retry.get("continuation") is not False
+                        or not self._proven_successor_action(
+                            snapshot, node_id, role, generation, proof.get("provider"),
+                            retry.get("pending_provider_action"), retry.get("request_digest"),
+                            retry.get("predecessor_task_id"), snapshot.authorization_digest)):
+                    raise ValueError("pending successor replay proof is invalid")
+                current["retryable_action"] = dict(retry)
+                current["status"] = "blocked_unknown"
+                current["active_role"] = None
+                current["start_intent"] = None
             elif record["event"] == "start_confirmed":
                 self._reconcile_start_confirmed(
                     snapshot, node_id, data, provenance
@@ -5873,6 +7053,10 @@ class Monitor:
             elif record["event"] == "review_finding":
                 # The following transition event/start intent is authoritative.
                 self._registered_active_binding(snapshot, node_id, provenance)
+                if node_id == "integration-review":
+                    current.setdefault("integration_findings", []).append(
+                        redact_provider_text(data)
+                    )
             elif record["event"] in {"binding_self_healed", "binding_degraded", "action_isolated"}:
                 if provenance["role"] != "system":
                     raise ValueError("self-healing event lacks system provenance")
@@ -5903,11 +7087,21 @@ class Monitor:
                     current["isolated"] = True
                     current["retryable_action"] = None
                     current["quarantine"] = {"run_id": snapshot.run_id, "handle_id": snapshot.handles.get(node_id), "reason": current["reason"]}
+            elif record["event"] == "scope_correction_registered":
+                if provenance.get("role") != "system":
+                    raise ValueError("scope correction replay lacks system provenance")
+                self._apply_scope_correction(snapshot, node_id, data.get("proof", {}))
             elif record["event"] == "scope_auto_expanded":
                 expansions = current.setdefault("scope_expansions", [])
                 for item in data.get("files", []):
                     if item not in expansions:
                         expansions.append(item)
+                if data.get("scope_transition") == "queue_rework":
+                    self._queue_scope_rework(current)
+                    if data.get("trigger") == "integration_rework":
+                        self._queue_integration_review_rework(snapshot)
+                    else:
+                        self._invalidate_integration_review(snapshot)
             elif record["event"] == "consistency_corrected":
                 correction = {
                     key: data[key]
@@ -5933,6 +7127,23 @@ class Monitor:
                 current["old_task_reconciled"] = bool(
                     data.get("old_task_reconciled")
                 )
+                current["active_role"] = None
+                current["active_task"] = None
+                snapshot.handles.pop(node_id, None)
+                self._release_node_lease(snapshot, node_id)
+            elif record["event"] == "decision_raised":
+                reason = data.get("reason", "decision pending")
+                notification_unknown = reason == DECISION_NOTIFICATION_UNKNOWN_REASON
+                current["status"] = "blocked_unknown" if notification_unknown else "blocked_design"
+                current["reason"] = reason
+                current["decision_ids"] = list(data.get("decision_ids") or [])
+                current["old_task_reconciled"] = bool(data.get("old_task_reconciled"))
+                if notification_unknown:
+                    current["quarantine"] = {
+                        "run_id": snapshot.run_id,
+                        "handle_id": None,
+                        "reason": reason,
+                    }
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +12,8 @@ from vibe_guide.monitor import Monitor, classify_provider_failure
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.supervisor import Supervisor
-from vibe_guide.adapters.task_provider import ProviderPending
+from vibe_guide.adapters.task_provider import ProviderPending, ProviderUnavailable
+from vibe_guide.adapters.task_provider import ProviderActionStore
 
 
 def _node(node_id="n1"):
@@ -24,18 +26,94 @@ def _node(node_id="n1"):
 
 
 class ProviderSelfHealingTests(unittest.TestCase):
-    def test_failure_classification_covers_engineering_and_external(self):
+    def test_failure_classification_covers_engineering_unknown_and_external(self):
         engineering = ["timeout", "429 rate limit", "pending setup", "worker exited",
                        "snapshot interrupted", "disconnect", "empty response", "branch drift"]
         for value in engineering:
             with self.subTest(value=value):
                 self.assertEqual(classify_provider_failure({"reason": value})["kind"], "engineering")
-        external = ["login required", "credential missing", "system permission denied",
-                    "remote approval required"]
+        unknown = ["login required", "credential missing", "system permission denied",
+                   "remote approval required"]
+        for value in unknown:
+            with self.subTest(value=value):
+                self.assertEqual(
+                    classify_provider_failure({"reason": value})["kind"],
+                    "binding_unknown",
+                )
+        external = [
+            {"credential_required": True},
+            {"permission_required": True},
+        ]
         for value in external:
             with self.subTest(value=value):
-                self.assertEqual(classify_provider_failure({"reason": value})["kind"], "external")
+                self.assertEqual(
+                    classify_provider_failure(value)["kind"],
+                    "external_decision",
+                )
         self.assertEqual(classify_provider_failure({"reason": "unexplained"})["kind"], "unknown")
+
+    def test_model_reasoning_validation_is_engineering(self):
+        result = classify_provider_failure({
+            "reason": (
+                'create_thread could not validate reasoning effort "high" '
+                'for model "gpt-6.1-sol"'
+            )
+        })
+        self.assertEqual(result["kind"], "engineering")
+
+    def test_create_parameter_failure_retries_without_blocking(self):
+        with tempfile.TemporaryDirectory() as root:
+            paths, node, plan, record = self._authorized(root)
+
+            class ParameterRejectingRunner(FakeRunner):
+                def start(self, contract, worktree):
+                    raise ProviderUnavailable(
+                        'create_thread could not validate reasoning effort "high" '
+                        'for model "gpt-6.1-sol"'
+                    )
+
+            monitor = Monitor(paths, plan, [node])
+            with patch("vibe_guide.monitor.require_entry", return_value=None):
+                snapshot = monitor.start(record, ParameterRejectingRunner())
+            current = snapshot.nodes[node.id]
+            self.assertEqual(current["status"], "retry_pending")
+            self.assertEqual(current["retryable_action"]["role"], "developer")
+            self.assertTrue(current["retryable_action"]["same_task_required"])
+            self.assertFalse(current["retryable_action"]["successor"])
+
+    def test_stale_resume_action_is_converged_after_newer_acceptance(self):
+        with tempfile.TemporaryDirectory() as root:
+            paths = ProjectPaths(Path(root))
+            store = ProviderActionStore(paths)
+            action = store.request(
+                operation="resume",
+                provider="codex-app-visible",
+                run_id="run-stale",
+                issue_id="n1",
+                role="developer",
+                generation=3,
+                native_tool="codex_app__send_message_to_thread",
+                request={"authorization_digest": "a" * 64, "threadId": "thread-1"},
+            )
+            evidence = {
+                "run_id": "run-stale",
+                "authorization_digest": "a" * 64,
+                "nodes": {
+                    "n1": {
+                        "status": "accepted",
+                        "accepted_generation": 4,
+                        "roles": {
+                            "developer": {"generation": 4, "accepted_generation": 4},
+                            "reviewer": {"generation": 0, "accepted_generation": 0},
+                        },
+                    }
+                },
+            }
+            changed = store.reconcile_stale("run-stale", evidence)
+            self.assertEqual(changed, [action["action_id"]])
+            self.assertEqual(store.pending(run_id="run-stale"), [])
+            audit = json.loads((paths.vibe / "provider-actions" / "stale" / (action["action_id"] + ".json")).read_text())
+            self.assertEqual(audit["reason"], "accepted_generation_superseded")
 
     def _authorized(self, root):
         paths = ProjectPaths(Path(root))
@@ -68,6 +146,39 @@ class ProviderSelfHealingTests(unittest.TestCase):
             self.assertIn("next_retry_at", action)
             self.assertIn("binding_digest", action)
             self.assertIn("last_observation_ref", action)
+
+    def test_bound_engineering_failure_keeps_recovery_when_message_is_unrecognized(self):
+        with tempfile.TemporaryDirectory() as root:
+            paths, node, plan, record = self._authorized(root)
+            runner = FakeRunner(events={(node.id, "developer"): [("failed", {
+                "reason": "invalid encrypted reasoning", "reason_class": "engineering"})]})
+            monitor = Monitor(paths, plan, [node])
+            with patch("vibe_guide.monitor.require_entry", return_value=None):
+                first = monitor.start(record, runner)
+                task = first.nodes[node.id]["active_task"]
+                handle = first.handles[node.id]
+                failed = monitor.tick(first.run_id, runner)
+                recovered = Monitor(paths, plan, [node]).resume(first.run_id, runner)
+            for snapshot in (failed, recovered):
+                current = snapshot.nodes[node.id]
+                self.assertEqual(current["active_task"], task)
+                self.assertEqual(snapshot.handles[node.id], handle)
+                self.assertEqual(current["retryable_action"]["reason_class"], "retryable")
+                self.assertTrue(current["retryable_action"]["same_task_required"])
+                self.assertFalse(current["retryable_action"]["successor"])
+                self.assertNotEqual(snapshot.status, "failed")
+
+    def test_structured_engineering_hint_does_not_override_binding_or_permission(self):
+        for reason, expected in [("writer identity conflict", "binding_unknown"),
+                                 ("permission required", "binding_unknown")]:
+            self.assertEqual(classify_provider_failure({"reason": reason,
+                             "reason_class": "engineering"})["kind"], expected)
+
+    def test_malformed_recovery_hint_is_unknown_without_crashing(self):
+        for hint in ([], {}, True, 1, None):
+            with self.subTest(hint=hint):
+                self.assertEqual(classify_provider_failure({"reason": "opaque provider failure",
+                                 "reason_class": hint})["kind"], "binding_unknown")
 
     def test_pending_client_thread_never_becomes_formal_thread(self):
         with tempfile.TemporaryDirectory() as root:

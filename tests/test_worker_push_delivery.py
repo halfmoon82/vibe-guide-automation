@@ -668,6 +668,37 @@ class LandingCheckTests(unittest.TestCase):
 
 
 class DispatchPromptTests(unittest.TestCase):
+    def test_reviewer_create_includes_delivery_and_supervisor_consumer_boundary(self):
+        from vibe_guide.runners.provider_action import ProviderActionRunner
+        with tempfile.TemporaryDirectory() as d:
+            runner = ProviderActionRunner(ProjectPaths(Path(d)), 'codex', 'codex-app-visible')
+            seen = []
+            def native_result(contract, run_id, operation, request):
+                seen.append((operation, request))
+                return {'create': {'binding': {'task_id': 'reviewer', 'host': 'mac'}},
+                        'locate': {'located': True},
+                        'visibility': {'visible': True, 'direct_enter': True}}[operation]
+            runner._require_result = native_result
+            runner.task_binding({'node_id': 'n1', 'role': 'reviewer', 'generation': 4,
+                'project_id': 'p', 'topology': 'dual-visible', 'worktree': 'w',
+                'branch': 'b', 'files': []}, Path(d), 'run-1', 'review')
+            prompt = dict(seen)['create']['prompt']
+            for required in ('worker-deliver', '--role reviewer', '--generation 4',
+                             'supervisor-address --run-id run-1 --json', '已授权通道',
+                             '登记主监工', '不得调用 core resume'):
+                self.assertIn(required, prompt)
+
+    def test_both_continuations_keep_workers_out_of_run_consumption(self):
+        from vibe_guide.runners.provider_action import ProviderActionRunner
+        for role in ('developer', 'reviewer'):
+            with self.subTest(role=role):
+                prompt = ProviderActionRunner._continuation_prompt({
+                    'node_id': 'n1', 'role': role, 'generation': 4, 'run_id': 'run-1'})
+                for required in ('worker-deliver', '--run-id run-1', '--role ' + role, '--generation 4',
+                                 'supervisor-address --run-id run-1 --json',
+                                 '登记主监工', '不得调用 core resume'):
+                    self.assertIn(required, prompt)
+
     def test_create_prompt_carries_completion_steps(self):
         with tempfile.TemporaryDirectory() as d:
             from vibe_guide.runners.provider_action import ProviderActionRunner
