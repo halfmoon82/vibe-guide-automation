@@ -154,6 +154,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-threshold", dest="token_threshold", type=int, default=None)
     parser.add_argument("--reason", dest="hold_reason")
     parser.add_argument("--category", dest="hold_category")
+    parser.add_argument("--decision", dest="hold_decision")
+    parser.add_argument("--authorization-gap", dest="hold_authorization_gap")
     parser.add_argument("--release", action="store_true", dest="hold_release")
     parser.add_argument("--node", dest="node_id")
     parser.add_argument("--role", dest="role", default="developer")
@@ -1587,6 +1589,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 options=_decision_options(args.decision_options),
                 recommendation=args.decision_recommendation,
                 evidence=evidence,
+                category=args.hold_category,
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "决策写入失败：" + str(error), args.as_json)
@@ -1610,6 +1613,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
     if args.command == "decision-answer":
         if not (args.decision_id and args.decision_choice):
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--id and --choice are required"}, "缺少决策答案参数", args.as_json)
+        if not args.decision_digest:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--digest is required: use the digest printed in the request's answer_cli"}, "缺少 --digest：请用决策卡 answer_cli 里的摘要", args.as_json)
         try:
             result = answer_decision(
                 paths,
@@ -1691,11 +1696,16 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     args.node_id,
                     args.hold_reason,
                     boundary_category=args.hold_category,
+                    decision_id=args.hold_decision,
+                    authorization_gap=args.hold_authorization_gap,
                 )
-                text = "已挂起 {} 等人拍板（类别 {}）：{}".format(
+                entry = holds[args.node_id]
+                text = "已挂起 {} 等人拍板（类别 {}；{}）：{}".format(
                     args.node_id,
-                    holds[args.node_id]["category"],
-                    holds[args.node_id]["reason"],
+                    entry["category"],
+                    "决策 " + entry["decision_id"] if "decision_id" in entry
+                    else "授权缺口 " + entry["authorization_gap"],
+                    entry["reason"],
                 )
         except (FileNotFoundError, TypeError, ValueError, OSError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "挂起失败：" + str(error), args.as_json)

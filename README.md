@@ -77,7 +77,7 @@ vibe resume --plan <ID>                      从快照、任务登记和事件�
 vibe skill-install --source <GitHub> --sha <40hex> --name <名> [--subdir <子目录>] --confirm   按完整 SHA 拉取 GitHub skill，校验 subdir 合法性后物化到 .vibe/proposals/skills/<名>/ 并在 .vibe/config.json 登记；subdir 含 ..、绝对路径、首尾 / 或非法字符时拒绝且不落盘
 vibe supervisor-preflight --run-id <run> --session-record <file>   监工心跳预检，只读磁盘，输出 idle/work/rotate/unknown；<file> 直接用本会话日志（Codex rollout / Claude Code jsonl）
 vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> [--session-record <file>]   原子登记当前监工地址（保留历史，不含凭据）；给了日志就记下接班起点，换班按此后增长计算
-vibe supervisor-hold --run-id <run> --node <id> --category <product_design|external_authorization|deploy> --reason <原因>   登记/刷新"节点等人拍板"，预检据此判为空闲
+vibe supervisor-hold --run-id <run> --node <id> --category <product_acceptance|external_authorization> (--decision <决策ID>|--authorization-gap <缺口>) --reason <原因>   登记/刷新"节点等人拍板"，预检据此判为空闲；必须引用一条决策或一个授权缺口；product_design/deploy 仍可作别名（落盘存规范名），无 category 的旧挂起按 product_acceptance 读取
 vibe supervisor-hold --run-id <run> --node <id> --release   解除"节点等人拍板"
 vibe supervisor-handoff --run-id <run>             打印接班所需的全部内容（进度、等人事项、心跳指令、步骤），换班时新会话只跑这一条
 vibe supervisor-address --run-id <run>             查询当前监工地址；未登记返回 unknown

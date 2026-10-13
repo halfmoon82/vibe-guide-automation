@@ -58,6 +58,8 @@ vibe plan --request <request>     Run S0 and, when needed, explicit S1 and node-
 vibe monitor --plan <ID>         Start only with exact authorization and valid evidence
 vibe status --plan <ID>          Read the current snapshot without polling providers
 vibe resume --plan <ID>          Continue from snapshots, task records, and event evidence
+vibe supervisor-hold --run-id <run> --node <id> --category <product_acceptance|external_authorization> (--decision <decision-id>|--authorization-gap <gap>) --reason <why>   Park a node waiting on a human; must reference a decision or an authorization gap. product_design/deploy remain accepted aliases (stored canonical); legacy holds without a category read as product_acceptance
+vibe decision-answer --id <decision-id> --choice <option> --digest <digest>   --digest (printed in the request's answer_cli) is required; changing a decision's options voids the old answer and the decision is asked again
 vibe skill-install --source <GitHub> --sha <40hex> --name <name> [--subdir <dir>] --confirm   Fetch a GitHub skill at an exact SHA, validate an optional repo subdir, materialize into .vibe/proposals/skills/<name>/ and register it in .vibe/config.json; traversal, absolute, or edge-slash subdirs are rejected without writes
 ```
 

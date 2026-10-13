@@ -225,19 +225,22 @@ class RelativeThresholdTests(_Case):
 class HoldTests(_Case):
     """Fix 1: a node waiting on a human is idle, and the disk says so."""
 
-    def hold(self, node, reason="等用户拍板", category="product_design"):
+    def hold(self, node, reason="等用户拍板", category="product_acceptance"):
         return set_supervisor_hold(
             self.paths, "run-1", node, reason, boundary_category=category,
+            authorization_gap="待用户拍板",
         )
 
     def test_boundary_category_validator_accepts_only_the_approved_enum(self):
         self.assertIsNotNone(decision_boundary, "decision boundary module is required")
-        allowed = ("product_design", "external_authorization", "deploy")
-        self.assertEqual(decision_boundary.BOUNDARY_CATEGORIES, allowed)
-        for category in allowed:
+        canonical = ("product_acceptance", "external_authorization")
+        self.assertEqual(decision_boundary.BOUNDARY_CATEGORIES, canonical)
+        aliases = {"product_design": "product_acceptance", "deploy": "external_authorization"}
+        for category in canonical + tuple(aliases):
             with self.subTest(category=category):
                 self.assertEqual(
-                    decision_boundary.validate_boundary_category(category), category,
+                    decision_boundary.validate_boundary_category(category),
+                    aliases.get(category, category),
                 )
         for category in (None, "", "engineering", "unknown"):
             with self.subTest(category=category):
@@ -246,7 +249,7 @@ class HoldTests(_Case):
 
     def test_hold_requires_a_supported_boundary_category(self):
         with _patch_snapshot({"n1": "ready"}):
-            with self.assertRaisesRegex(ValueError, "product_design"):
+            with self.assertRaisesRegex(ValueError, "product_acceptance"):
                 set_supervisor_hold(self.paths, "run-1", "n1", "等用户拍板")
             with self.assertRaisesRegex(ValueError, "external_authorization"):
                 self.hold("n1", category="engineering")
@@ -257,7 +260,10 @@ class HoldTests(_Case):
             for category in ("product_design", "external_authorization", "deploy"):
                 with self.subTest(category=category):
                     holds = self.hold("n1", category=category)
-                    self.assertEqual(holds["n1"]["category"], category)
+                    self.assertEqual(
+                        holds["n1"]["category"],
+                        {"product_design": "product_acceptance", "deploy": "external_authorization"}.get(category, category),
+                    )
 
     def test_pending_request_of_a_held_node_is_idle(self):
         self.pending("integration-review")
@@ -435,11 +441,12 @@ class CliTests(unittest.TestCase):
         root, run_id, node = self.start()
         held = run_cli([
             "supervisor-hold", "--json", "--run-id", run_id,
-            "--node", node, "--category", "product_design", "--reason", "等用户拍板 A/B",
+            "--node", node, "--category", "product_design", "--authorization-gap", "待选 A/B",
+            "--reason", "等用户拍板 A/B",
         ], root)
         self.assertEqual(held.exit_code, 0, held.payload)
         self.assertEqual(held.payload["holds"][node]["reason"], "等用户拍板 A/B")
-        self.assertEqual(held.payload["holds"][node]["category"], "product_design")
+        self.assertEqual(held.payload["holds"][node]["category"], "product_acceptance")
         released = run_cli([
             "supervisor-hold", "--json", "--run-id", run_id, "--node", node, "--release",
         ], root)
@@ -450,7 +457,8 @@ class CliTests(unittest.TestCase):
         root, run_id, _node = self.start()
         result = run_cli([
             "supervisor-hold", "--json", "--run-id", run_id,
-            "--node", "no-such-node", "--category", "product_design", "--reason", "x",
+            "--node", "no-such-node", "--category", "product_design",
+            "--authorization-gap", "x", "--reason", "x",
         ], root)
         self.assertNotEqual(result.exit_code, 0)
         self.assertEqual(result.payload["status"], "blocked_invalid")
@@ -465,7 +473,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("product_design", missing.payload["reason"])
         unknown = run_cli([
             "supervisor-hold", "--json", "--run-id", run_id,
-            "--node", node, "--category", "engineering", "--reason", "工程问题",
+            "--node", node, "--category", "engineering",
+            "--authorization-gap", "x", "--reason", "工程问题",
         ], root)
         self.assertEqual(unknown.exit_code, 3, unknown.payload)
         self.assertIn("external_authorization", unknown.payload["reason"])
@@ -476,10 +485,14 @@ class CliTests(unittest.TestCase):
             with self.subTest(category=category):
                 result = run_cli([
                     "supervisor-hold", "--json", "--run-id", run_id,
-                    "--node", node, "--category", category, "--reason", "等用户拍板",
+                    "--node", node, "--category", category,
+                    "--authorization-gap", "待用户拍板", "--reason", "等用户拍板",
                 ], root)
                 self.assertEqual(result.exit_code, 0, result.payload)
-                self.assertEqual(result.payload["holds"][node]["category"], category)
+                self.assertEqual(
+                    result.payload["holds"][node]["category"],
+                    {"product_design": "product_acceptance", "deploy": "external_authorization"}.get(category, category),
+                )
 
     def test_register_records_the_takeover_baseline(self):
         root, run_id, _node = self.start()
@@ -505,7 +518,8 @@ class CliTests(unittest.TestCase):
         root, run_id, node = self.start()
         run_cli([
             "supervisor-hold", "--run-id", run_id, "--node", node,
-            "--category", "product_design", "--reason", "等用户拍板 A/B",
+            "--category", "product_design", "--authorization-gap", "待选 A/B",
+            "--reason", "等用户拍板 A/B",
         ], root)
         result = run_cli(["supervisor-handoff", "--run-id", run_id], root)
         self.assertEqual(result.exit_code, 0, result.text)
@@ -515,13 +529,13 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("vibe 监工心跳", result.text)
         self.assertNotIn("vibe supervisor-preflight", result.text)
         self.assertIn("等用户拍板 A/B", result.text)
-        self.assertIn("类别 product_design", result.text)
+        self.assertIn("类别 product_acceptance", result.text)
         self.assertIn("--session-record <本会话记录路径>", result.text)
         self.assertIn("vibe supervisor-register --run-id " + run_id, result.text)
         as_json = run_cli(["supervisor-handoff", "--json", "--run-id", run_id], root)
         self.assertEqual(as_json.payload["plan_id"], "probe-plan")
         self.assertEqual(list(as_json.payload["holds"]), [node])
-        self.assertEqual(as_json.payload["holds"][node]["category"], "product_design")
+        self.assertEqual(as_json.payload["holds"][node]["category"], "product_acceptance")
         self.assertIn(node, as_json.payload["nodes"])
 
     def test_hold_on_a_real_run_turns_the_preflight_idle(self):
@@ -535,7 +549,7 @@ class CliTests(unittest.TestCase):
         node = before.payload["nodes"][0]
         run_cli([
             "supervisor-hold", "--run-id", run_id, "--node", node,
-            "--category", "product_design", "--reason", "等用户拍板",
+            "--category", "product_design", "--authorization-gap", "待拍板", "--reason", "等用户拍板",
         ], root)
         after = run_cli([
             "supervisor-preflight", "--json", "--run-id", run_id, "--session-record", log,
@@ -565,7 +579,7 @@ class CliTests(unittest.TestCase):
         root, run_id, _node = self.start()
         log = _record(root, 30000)
         node = run_cli(["supervisor-preflight", "--json", "--run-id", run_id, "--session-record", log], root).payload["nodes"][0]
-        run_cli(["supervisor-hold", "--run-id", run_id, "--node", node, "--category", "product_design", "--reason", "等用户拍板"], root)
+        run_cli(["supervisor-hold", "--run-id", run_id, "--node", node, "--category", "product_design", "--authorization-gap", "待拍板", "--reason", "等用户拍板"], root)
         result = run_cli(["supervisor-beat", "--run-id", run_id, "--session-record", log], root)
         self.assertEqual(result.exit_code, 0, result.payload)
         self.assertEqual(result.text, "idle")
@@ -593,8 +607,8 @@ class DocumentationExampleTests(unittest.TestCase):
     """Shipped hold examples must stay aligned with the enforced CLI contract."""
 
     _CATEGORY_SYNTAX = re.compile(
-        r"--category\s+(?:<product_design\|external_authorization\|deploy>"
-        r"|product_design|external_authorization|deploy)"
+        r"--category\s+(?:<product_acceptance\|external_authorization>"
+        r"|product_acceptance|external_authorization)"
     )
 
     def test_shipped_hold_examples_require_category_but_release_does_not(self):
