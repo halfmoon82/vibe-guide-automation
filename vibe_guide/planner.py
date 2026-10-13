@@ -399,12 +399,16 @@ def resolve_scope_expansion(
     node_files: Any = (),
     auto_scope_paths: Any = (),
     occupied_files: Any = (),
+    acceptance_rule_approved: bool = False,
 ) -> Optional[ScopeExpansionResolution]:
     """Resolve one bounded file-scope expansion without changing product scope.
 
     A list request is the legacy #144 mechanical rule.  A mapping is the #146
     supervisor claim: the PRD acceptance examples keep the same result, with a
     recorded reason and explicit denials for the two always-human boundaries.
+    The claim may widen scope beyond `auto_scope_rule` only when the project
+    has approved that rule (``acceptance_rule_approved``, integrated PRD N5);
+    otherwise a claim is held to the same mechanical rule as a list request.
     """
 
     claim = None
@@ -452,7 +456,8 @@ def resolve_scope_expansion(
             continue
         mechanical_rule = auto_scope_rule(item, auto_scope_paths)
         rule = mechanical_rule if mechanical_rule is not None else (
-            _approved_scope_rule(item) if claim is not None else None
+            _approved_scope_rule(item)
+            if claim is not None and acceptance_rule_approved is True else None
         )
         if held(item) or rule is None:
             return None
@@ -494,6 +499,7 @@ def resolve_consistency(
     node_files: Optional[List[str]] = None,
     auto_scope_paths: Any = (),
     occupied_files: Any = (),
+    acceptance_rule_approved: bool = False,
 ) -> Optional[ConsistencyResolution]:
     """Resolve only one evidence-determined, authorized non-deploy correction.
 
@@ -533,6 +539,7 @@ def resolve_consistency(
         node_files=node_files,
         auto_scope_paths=auto_scope_paths,
         occupied_files=occupied_files,
+        acceptance_rule_approved=acceptance_rule_approved,
     )
     if scope_expansion is None:
         return None

@@ -161,6 +161,10 @@ V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 
 
 单班监工：`.vibe/config.json` 设 `"supervisor_single_shift": true` 后，同一监工会话服务整个运行，预检不再按上下文增长换班，只在达到 20 万绝对上限（或 `--context-hard-cap` 临时值）时输出 `rotate`。默认 false，沿用增长换班。非布尔值是配置错误，预检报 `unknown`；配置文件整体读不了时按默认处理并带 `config_warning`；绝对上限换班不受配置影响。
 
+按验收结果扩范围：`.vibe/config.json` 的 `acceptance_scope_rule_approved` 默认 false，此时监工自动扩范围只限 `tests/` 与 `auto_scope_paths`；只有产品经理批准并写入 `AGENTS.md` §6 的对应补丁后才设为 true，届时「所有 PRD 验收例子判定不变」的低风险文件也可自扩。
+
+决策通知桥：项目 `.vibe/config.json` 只能写 `"notify_bridge": {"enabled": true}`；要执行的命令与超时只从用户级 `$VIBE_HOME/config.json` 的 `notify_bridge` 读取。项目配置里写 `command` 会被拒绝并记为 UNKNOWN。
+
 ### WorkBuddy 派发桥（`workbuddy_job` MCP server）
 
 监工自己不执行桌面动作：它把请求写进 `.vibe/provider-actions/requests/`，写明要调的**原生工具名**，由桌面会话真正去调。WorkBuddy 的五个名字是 `workbuddy_job__create` / `__get` / `__list` / `__reply` / `__wait`——本包随附一个纯标准库的 stdio MCP server 提供它们：

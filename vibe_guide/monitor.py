@@ -2109,7 +2109,8 @@ class Monitor:
             list(record.file_scope), self._consistency_binding(record, node),
             node_files=self._node_scope_files(node_id, current),
             auto_scope_paths=self._auto_scope_paths(),
-            occupied_files=self._files_held_by_other_active_nodes(snapshot, node_id))
+            occupied_files=self._files_held_by_other_active_nodes(snapshot, node_id),
+            acceptance_rule_approved=self._acceptance_rule_approved())
         if (resolution is None or resolution.action not in {"test", "rework", "develop"}
                 or resolution.field not in node.contract
                 or resolution.value != node.contract[resolution.field]):
@@ -2415,6 +2416,13 @@ class Monitor:
         except ValueError:
             return ()
 
+    def _acceptance_rule_approved(self) -> bool:
+        # Invalid config never widens scope (integrated PRD N5).
+        try:
+            return load_project_config(self.paths.root).acceptance_scope_rule_approved
+        except ValueError:
+            return False
+
     def _resolve_scope_request(
         self, snapshot: RunSnapshot, node_id: str, request: Any
     ):
@@ -2428,6 +2436,7 @@ class Monitor:
             occupied_files=self._files_held_by_other_active_nodes(
                 snapshot, node_id
             ),
+            acceptance_rule_approved=self._acceptance_rule_approved(),
         )
 
     @staticmethod
@@ -5307,6 +5316,7 @@ class Monitor:
                     occupied_files=self._files_held_by_other_active_nodes(
                         snapshot, node_id
                     ),
+                    acceptance_rule_approved=self._acceptance_rule_approved(),
                 )
                 if resolution is not None:
                     if not self._stop_active_for_transition(

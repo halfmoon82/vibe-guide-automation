@@ -31,8 +31,8 @@ class NotificationBridge:
         self.paths = paths
         self.config = dict(config) if config is not None else self._load_config()
 
-    def _load_config(self) -> dict[str, Any]:
-        path = self.paths.resolve_vibe_path("config.json")
+    @staticmethod
+    def _read_json(path) -> dict[str, Any]:
         if path.is_symlink() or not path.is_file():
             return {}
         try:
@@ -41,12 +41,37 @@ class NotificationBridge:
             return {}
         return value if isinstance(value, dict) else {}
 
+    def _load_config(self) -> dict[str, Any]:
+        """Project config switches the bridge on; only user config names it.
+
+        The project ``.vibe/config.json`` travels with the repository, so it
+        may set ``notify_bridge.enabled`` and nothing else.  The command and
+        timeout come from the user-level ``$VIBE_HOME/config.json`` so a cloned
+        repository can never make this machine run a program (integrated PRD
+        N8).  A project config that names a command is refused, not ignored.
+        """
+        project = self._read_json(self.paths.resolve_vibe_path("config.json"))
+        project_bridge = project.get("notify_bridge")
+        if not isinstance(project_bridge, dict):
+            return {}
+        if set(project_bridge) - {"enabled"}:
+            return {"notify_bridge": {"enabled": True, "project_command": True}}
+        user = self._read_json(self.paths.resolve_vibe_home_path("config.json"))
+        user_bridge = user.get("notify_bridge")
+        merged = dict(user_bridge) if isinstance(user_bridge, dict) else {}
+        merged.pop("enabled", None)
+        merged["enabled"] = project_bridge.get("enabled")
+        return {"notify_bridge": merged}
+
     def notify(self, decision: Mapping[str, Any]) -> dict[str, Any]:
         bridge = self.config.get("notify_bridge") if isinstance(self.config, Mapping) else None
         if bridge is None and isinstance(self.config, Mapping) and "enabled" in self.config:
             bridge = self.config
         if not isinstance(bridge, Mapping) or bridge.get("enabled") is not True:
             return {"status": "disabled", "evidence": "notify_bridge:disabled"}
+        if bridge.get("project_command"):
+            return {"status": "unknown",
+                    "reason": "notify_bridge command must live in user-level config"}
         command = bridge.get("command")
         if not isinstance(command, str) or not command.strip():
             return {"status": "unknown", "reason": "notify bridge command is missing"}
