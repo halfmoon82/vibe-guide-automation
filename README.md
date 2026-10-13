@@ -200,6 +200,8 @@ vibe resume --plan example-plan --json
 
 恢复以 `.vibe/runs/<run-id>/state.json`、`tasks.json` 和 `events.jsonl` 为准。已登记的活动 handle 不会因重复 `resume` 创建第二 writer。计划或节点合同变化会持久化为 `blocked_design` 并使旧授权失效；provider unknown/timeout 会保持 `blocked_unknown`，不会转成成功或无事项。
 
+开发会话已经派发出去、却没登记进运行（节点停在 `blocked_unknown`、generation 0，同 run 同代的租约被隔离）时，用对账包 `{"kind": "adopted_dispatch", "node_id": "<节点>", "action_id": "<该节点的 create 请求 id>"}` 执行 `vibe reconcile --plan <ID> --run-id <run> --evidence <包路径>`，把原会话认回原运行：原 task_id 不变，租约改绑到当前授权，之后原会话照常用 `vibe worker-deliver --generation <原代数>` 交付。它只认磁盘上的结构化证据（本 run 的 create 请求与结果绑定、dispatch-head、唯一一份同代隔离租约、本 run 授权历史里出现过的派发授权）；缺一项或互相矛盾就保持 `blocked_unknown`，不会派出第二个 writer，也不会向会话发任何消息。
+
 已确认规则能够唯一判断、且仍处于当前项目、plan revision、授权文件/action 和非 deploy 边界内的实现纠偏，由监工自动执行并记录，不会再次作为产品取舍询问。纠偏证据必须绑定已批准决定、授权和 Issue 合同；未绑定文本不能冒充用户决定。合同变化后的 `monitor --plan <ID> --authorize AUTHORIZE` 会在同一 run 上审计旧授权与变更原因，保留原任务身份和 cursor，登记新授权后续接修正 DAG；旧任务终止或 continuation 无法证明时仍会 fail closed。
 
 授权卡是「发布时才签」的：执行门把在盘卡绑到 run 快照的 authorized digest 上，所以「卡已重出、尚未授权」在本产品里不可表示——只重出卡会让公开执行门以 `plan-confirmation.invalid` 关门。合同或 PRD 变化后要重新授权时，先用 `vibe monitor --plan <ID> --preview-card` 只读地看一遍将要签的卡：它报的是「相对当前在盘卡会改动哪些字段」（这才是要审的东西），并单独自检「刷新本身是否只动了引擎凭证字段」。确认后再跑带 `--authorize` 的那条，一次原子完成重新授权与派发。预览里的卡 digest 只是预览态——引擎凭证的时间戳进入凭证与卡的摘要，发布时会重新观测，所以别拿预览 digest 当审批凭据。
