@@ -6543,6 +6543,7 @@ class Monitor:
         current["active_role"] = None
         current["active_task"] = None
         current["quarantine"] = None
+        current["old_task_reconciled"] = True
         snapshot.handles.pop(node_id, None)
         self._release_node_lease(snapshot, node_id)
         self._record(snapshot, "blocked_design", {
@@ -6559,6 +6560,38 @@ class Monitor:
         pending: Optional[List[Dict[str, Any]]] = None
         pending_error: Optional[str] = None
         for node_id, current in list(snapshot.nodes.items()):
+            if (
+                current.get("status") == "blocked_unknown"
+                and current.get("owner_layer") == "supervisor_lifecycle"
+                and current.get("recovery_action") == LIFECYCLE_DECISION_RECOVERY_ACTION
+            ):
+                # The supervisor performed the recovery (decision-raise):
+                # close the loop once the mailbox holds a request for the node.
+                if pending is None and pending_error is None:
+                    try:
+                        pending = list(DecisionMailbox(self.paths).list_pending(snapshot.run_id))
+                    except (OSError, TypeError, ValueError) as error:
+                        pending_error = type(error).__name__
+                ids = [
+                    str(item.get("decision_id")) for item in pending or []
+                    if isinstance(item, dict) and item.get("node_id") == node_id and item.get("decision_id")
+                ]
+                if ids:
+                    current["status"] = "blocked_design"
+                    current["reason"] = "decision pending"
+                    current["decision_ids"] = ids
+                    current["quarantine"] = None
+                    current["owner_layer"] = "product_acceptance"
+                    current["recovery_action"] = None
+                    current["user_interrupt"] = True
+                    self._record(snapshot, "decision_raised", {
+                        "run_id": snapshot.run_id,
+                        "node_id": node_id,
+                        "decision_ids": ids,
+                        "source": "supervisor_lifecycle",
+                        "reason": "decision pending",
+                    })
+                continue
             if current.get("status") != "blocked_design":
                 continue
             if (
@@ -7004,6 +7037,9 @@ class Monitor:
                     "handle_id": snapshot.handles.get(node_id),
                     "reason": current["reason"],
                 }
+                for marker in ("owner_layer", "recovery_action", "user_interrupt"):
+                    if marker in data:
+                        current[marker] = data[marker]
             elif record["event"] == "retry_scheduled":
                 if provenance.get("role") not in {"developer", "reviewer"}:
                     raise ValueError("retry event lacks task provenance")
@@ -7330,6 +7366,13 @@ class Monitor:
                         "handle_id": None,
                         "reason": reason,
                     }
+                elif data.get("source") == "supervisor_lifecycle":
+                    # Lifecycle recovery closed: drop the defect markers and
+                    # the quarantine the blocked_unknown replay set.
+                    current["quarantine"] = None
+                    current["owner_layer"] = "product_acceptance"
+                    current["recovery_action"] = None
+                    current["user_interrupt"] = True
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)

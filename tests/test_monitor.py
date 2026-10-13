@@ -4860,6 +4860,76 @@ class MonitorRoutingTests(unittest.TestCase):
         self.assert_lifecycle_defect(ticked)
         self.assertIn("cannot be verified", ticked.nodes["n1"]["reason"])
 
+    def raise_for_n1(self, snapshot):
+        from vibe_guide.decisions import DecisionMailbox
+        return DecisionMailbox(self.paths).raise_decision(
+            run_id=snapshot.run_id, node_id="n1", question="Pick?",
+            options=[{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+        )["decision_id"]
+
+    def lifecycle_events(self, snapshot):
+        return [e["event"] for e in load_events(self.paths, snapshot.run_id)
+                if e["event"] in {"blocked_unknown", "decision_raised", "blocked_design"}]
+
+    def assert_back_to_decision(self, snapshot, decision_id):
+        from vibe_guide.monitor import _user_status
+        current = snapshot.nodes["n1"]
+        self.assertEqual(current["status"], "blocked_design")
+        self.assertEqual(_user_status(current), "需要你决定")
+        self.assertEqual(current["decision_ids"], [decision_id])
+        self.assertNotEqual(current.get("owner_layer"), "supervisor_lifecycle")
+        self.assertIsNone(current.get("recovery_action"))
+        self.assertIsNone(current.get("quarantine"))
+
+    def test_lifecycle_recovery_closes_when_decision_raised_via_tick(self):
+        monitor, runner, snapshot = self.undecided_run()
+        self.assert_lifecycle_defect(monitor.tick(snapshot.run_id, runner))
+        decision_id = self.raise_for_n1(snapshot)
+        again = monitor.tick(snapshot.run_id, runner)
+        self.assert_back_to_decision(again, decision_id)
+        self.assertEqual(self.lifecycle_events(snapshot), self.lifecycle_events(monitor.tick(snapshot.run_id, runner)))
+
+    def test_lifecycle_recovery_closes_when_decision_raised_via_resume(self):
+        monitor, runner, snapshot = self.undecided_run()
+        with patch("vibe_guide.monitor.require_entry", return_value=None):
+            self.assert_lifecycle_defect(monitor.resume(snapshot.run_id, runner))
+            decision_id = self.raise_for_n1(snapshot)
+            again = monitor.resume(snapshot.run_id, runner)
+        self.assert_back_to_decision(again, decision_id)
+
+    def test_lifecycle_without_new_decision_emits_no_event_spam(self):
+        monitor, runner, snapshot = self.undecided_run()
+        monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(self.lifecycle_events(snapshot), self.lifecycle_events(monitor.tick(snapshot.run_id, runner)))
+
+    def test_replay_restores_lifecycle_markers_and_closure(self):
+        monitor, runner, snapshot = self.undecided_run()
+        saved = load_snapshot(self.paths, snapshot.run_id)
+        saved.event_sequence = len(load_events(self.paths, snapshot.run_id))
+        save_snapshot(self.paths, saved)
+        # Router output is persisted only as events: reload the pre-router state.
+        stale = load_snapshot(self.paths, snapshot.run_id)
+        routed = load_snapshot(self.paths, snapshot.run_id)
+        monitor._route_undecided_blocked_design(routed)
+        replay = load_snapshot(self.paths, snapshot.run_id)
+        replay.event_sequence = stale.event_sequence
+        monitor._reconcile_unapplied_events(replay)
+        current = replay.nodes["n1"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertEqual(current["recovery_action"], "raise_missing_decision")
+        self.assertEqual(current["owner_layer"], "supervisor_lifecycle")
+        self.assertIs(current["user_interrupt"], False)
+        decision_id = self.raise_for_n1(snapshot)
+        monitor._route_undecided_blocked_design(routed)
+        replay2 = load_snapshot(self.paths, snapshot.run_id)
+        replay2.event_sequence = stale.event_sequence
+        monitor._reconcile_unapplied_events(replay2)
+        self.assert_back_to_decision(replay2, decision_id)
+
+    def test_external_authorization_marks_old_task_reconciled_live(self):
+        _, _, snapshot = self.failed_run({"reason": "login required", "credential_required": True})
+        self.assertIs(snapshot.nodes["n1"]["old_task_reconciled"], True)
+
     def test_blocked_design_with_pending_mailbox_decision_stays(self):
         from vibe_guide.decisions import DecisionMailbox
         monitor, runner, snapshot = self.undecided_run()
