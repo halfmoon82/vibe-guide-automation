@@ -58,6 +58,13 @@ class SingleShiftTests(unittest.TestCase):
         # The handoff summary is still prepared ahead of the hard cap.
         self.assertTrue(result['prepare_handoff'])
 
+    def test_switch_on_does_not_rotate_just_below_hard_cap(self):
+        self.write_config({FIELD_SUPERVISOR_SINGLE_SHIFT: True})
+        self.assertEqual(self.preflight(199999)['state'], 'work')
+
+    def test_switch_off_rotates_below_hard_cap_on_growth(self):
+        self.assertEqual(self.preflight(199999)['state'], 'rotate')
+
     def test_switch_on_still_rotates_at_hard_cap(self):
         self.write_config({FIELD_SUPERVISOR_SINGLE_SHIFT: True})
         result = self.preflight(200000)
