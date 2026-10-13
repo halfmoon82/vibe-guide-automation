@@ -241,6 +241,16 @@ _EVENT_DATA_KEYS = {
     "acceptance_examples_unchanged",
     "scope_reason",
     "scope_transition",
+    # orphan_dispatch_adopted: the provider action, dispatch baseline and
+    # old -> new lease intent that prove which session was re-bound.  Digests,
+    # action ids, a git SHA and a host name only; no provider text.
+    "action_id",
+    "request_digest",
+    "request_authorization_digest",
+    "intent_digest",
+    "previous_intent_digest",
+    "dispatch_head",
+    "host",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",
@@ -1551,3 +1561,62 @@ def release_writer_lease(
                     continue
                 released = True
         return released
+
+
+def rebind_writer_lease(
+    paths: ProjectPaths, node_id: str, worktree: str, run_id: str,
+    role: str, generation: int, previous_intent_digest: str, intent_digest: str,
+) -> bool:
+    """Move one same-run, same-generation quarantined lease to a new intent.
+
+    Only the orphan-adoption recovery uses this: the writer is unchanged, the
+    authorization that names it was re-issued.  Any other active/quarantined
+    lease on the node or writer root refuses the move.  Re-running after the
+    new lease was written (crash before the old one was removed) completes it.
+    """
+    validate_run_id(run_id)
+    new_path = _lease_path(paths, node_id, worktree, intent_digest, role, generation)
+    payload = {
+        "schema_version": LEASE_SCHEMA_VERSION,
+        "node_id": node_id,
+        "worktree": worktree,
+        "run_id": run_id,
+        "lease_id": _lease_id(node_id, worktree, run_id, role, generation, intent_digest),
+        "role": role, "generation": generation,
+        "intent_digest": intent_digest,
+        "status": "active",
+    }
+    with interprocess_lock(_lease_lock(paths)):
+        lease_dir = _safe_project_path(paths, ".vibe", "leases")
+        previous = []
+        for candidate in lease_dir.glob("*.json"):
+            try:
+                probe = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, ValueError, json.JSONDecodeError):
+                return False
+            if not isinstance(probe, dict):
+                return False
+            if probe.get("status") not in {"active", "quarantined"}:
+                continue
+            if probe.get("node_id") != node_id and probe.get("worktree") != worktree:
+                continue
+            if candidate == new_path and probe == payload:
+                continue
+            if (probe.get("node_id") == node_id and probe.get("worktree") == worktree
+                    and probe.get("run_id") == run_id and probe.get("role") == role
+                    and probe.get("generation") == generation
+                    and probe.get("intent_digest") == previous_intent_digest
+                    and probe.get("status") == "quarantined"):
+                previous.append(candidate)
+                continue
+            return False
+        if len(previous) > 1 or (not previous and not new_path.exists()):
+            return False
+        _atomic_bytes(
+            new_path,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        for candidate in previous:
+            if candidate != new_path:
+                candidate.unlink()
+        return True

@@ -124,6 +124,7 @@ from .evidence import (
 )
 from .engine_attestation import validate_engine_attestation
 from .decision_boundary import ingest_worker_decisions
+from .orphan_recovery import ORPHAN_DISPATCH_ADOPTED, replay_orphan_adoption
 
 
 class ScopeDecisionRequired(PermissionError):
@@ -524,6 +525,11 @@ class Monitor:
     @staticmethod
     def _prospective_intent_digest(snapshot: RunSnapshot, node_id: str, role: str, generation: int, current: Dict[str, Any]) -> str:
         payload = {"run_id": snapshot.run_id, "node_id": node_id, "role": role, "generation": generation, "task_id": current.get(role + "_identity") or f"{role}:{node_id}", "writer": current.get("writer") or current.get("worker") or role, "worktree": current.get("worktree", ""), "branch": current.get("branch", ""), "authorization_digest": snapshot.authorization_digest, "node_contract_digest": current.get("contract_digest") or snapshot.node_contract_digest}
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    @staticmethod
+    def _start_intent_digest(snapshot: RunSnapshot, node_id: str, role: str, task_id: str, generation: int, contract: Dict[str, Any], current: Dict[str, Any]) -> str:
+        payload = {"run_id": snapshot.run_id, "node_id": node_id, "role": role, "task_id": task_id, "generation": generation, "writer": contract.get("writer") or current.get("worker"), "worktree": contract.get("worktree") or current.get("worktree"), "branch": contract.get("branch") or current.get("branch"), "authorization_digest": snapshot.authorization_digest, "node_contract_digest": current.get("contract_digest") or getattr(snapshot, "node_contract_digest", "")}
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def _build_binding_intent(self, snapshot: RunSnapshot, node_id: str, role: str,
@@ -4343,7 +4349,7 @@ class Monitor:
         intent = dict(current.get("start_intent") or {})
         if intent.get("role") != role or intent.get("task_id") != identity or int(intent.get("generation", generation)) != generation:
             intent = {"intent_id": uuid.uuid4().hex, "role": role, "phase": phase, "task_id": identity, "generation": generation}
-        intent["intent_digest"] = hashlib.sha256(json.dumps({"run_id": snapshot.run_id, "node_id": node_id, "role": role, "task_id": identity, "generation": generation, "writer": contract.get("writer") or current.get("worker"), "worktree": contract.get("worktree") or current.get("worktree"), "branch": contract.get("branch") or current.get("branch"), "authorization_digest": snapshot.authorization_digest, "node_contract_digest": current.get("contract_digest") or getattr(snapshot, "node_contract_digest", "")}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        intent["intent_digest"] = self._start_intent_digest(snapshot, node_id, role, identity, generation, contract, current)
         contract["intent_digest"] = intent["intent_digest"]
         contract["start_intent"] = dict(intent)
         current["status"] = "start_pending"
@@ -6778,6 +6784,8 @@ class Monitor:
                     'successor': False, 'same_task': True, 'same_task_required': True,
                     'successor_candidate': False, 'reason_class': 'engineering'}
                 snapshot.tasks[node_id+':reviewer'] = new.to_dict()
+            elif record["event"] == ORPHAN_DISPATCH_ADOPTED:
+                replay_orphan_adoption(self, snapshot, node_id, data, provenance)
             elif record["event"] == "start_intent":
                 self._reconcile_start_intent(
                     snapshot, node_id, data, provenance
