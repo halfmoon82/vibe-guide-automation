@@ -238,6 +238,7 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
         before = {p.name for p in (self.store.root / 'requests').glob('*.json')}
         again = self.adopt()
         self.assertEqual(again.payload.get('status'), 'blocked_unknown', again.payload)
+        self.assertIn('node is not blocked_unknown', again.payload.get('reason', ''))
         self.assertEqual([e['event'] for e in load_events(self.paths, self.run_id)]
                          .count('orphan_dispatch_adopted'), 1)
         after = {p.name for p in (self.store.root / 'requests').glob('*.json')}

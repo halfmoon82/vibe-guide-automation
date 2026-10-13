@@ -216,8 +216,8 @@ def adopt_orphan_dispatch(monitor, run_id: str, node_id: str, action_id: str, ru
     # An adoption interrupted before its snapshot save is replayed first, so
     # it is seen as a registered writer rather than adopted a second time.
     monitor._reconcile_unapplied_events(snapshot)
-    monitor._validate_execution_topology(snapshot)
     proof = _collect(monitor, snapshot, record, node_id, action_id, runner)
+    monitor._validate_execution_topology(snapshot)
     current = snapshot.nodes[node_id]
     generation = proof["generation"]
     task_id = proof["task_id"]
