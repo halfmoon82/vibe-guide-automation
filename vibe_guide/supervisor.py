@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
+from .config import load_project_config
 from .contracts import RunEvent
 from .state import append_event, run_dir, save_snapshot, load_snapshot
 
@@ -288,6 +289,7 @@ def supervisor_preflight(
     *,
     token_threshold=DEFAULT_ROTATE_TOKEN_THRESHOLD,
     context_hard_cap=DEFAULT_ROTATE_HARD_CAP,
+    single_shift=None,
 ):
     """Read-only disk check; returns exactly one of idle/work/rotate/unknown.
 
@@ -296,6 +298,8 @@ def supervisor_preflight(
     - ``rotate``: absolute hard cap, or soft cap plus growth threshold.
       Missing baselines never manufacture growth. Soft warning requests a
       compact artifact from the CLI; this function itself stays read-only.
+      With ``single_shift`` (``supervisor_single_shift`` in
+      ``.vibe/config.json`` when not passed) only the hard cap rotates.
     - ``work``: pending provider requests exist, or a bound worker has
       delivered/finished something not yet consumed.
     - ``idle``: workers are active, or the remaining nodes wait on a human
@@ -314,10 +318,15 @@ def supervisor_preflight(
         return {"state": "unknown", "reason": "growth threshold must be positive"}
     if type(context_hard_cap) is not int or context_hard_cap <= DEFAULT_ROTATE_SOFT_CAP:
         return {"state": "unknown", "reason": "context hard cap must exceed soft cap"}
+    if single_shift is None:
+        try:
+            single_shift = load_project_config(paths.root).supervisor_single_shift
+        except ValueError:
+            return {"state": "unknown", "reason": "project config invalid"}
     if tokens >= context_hard_cap:
         return {"state": "rotate", "reason": "context over hard cap",
                 "tokens": tokens, "baseline": baseline, "context_hard_cap": context_hard_cap, "prepare_handoff": True}
-    if (tokens >= DEFAULT_ROTATE_SOFT_CAP and baseline is not None
+    if (not single_shift and tokens >= DEFAULT_ROTATE_SOFT_CAP and baseline is not None
             and tokens - baseline >= token_threshold):
         return {"state": "rotate", "reason": "context grew past threshold since takeover",
                 "tokens": tokens, "baseline": baseline, "context_hard_cap": context_hard_cap, "prepare_handoff": True}
@@ -330,6 +339,7 @@ def supervisor_preflight(
     result.setdefault("baseline", baseline)
     result["context_hard_cap"] = context_hard_cap
     result["prepare_handoff"] = tokens >= DEFAULT_ROTATE_SOFT_CAP
+    result["single_shift"] = bool(single_shift)
     return result
 
 

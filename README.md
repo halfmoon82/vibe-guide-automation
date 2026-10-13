@@ -158,6 +158,8 @@ V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 
 
 并发上限：`.vibe/config.json` 的 `max_active_worker_sessions` 控制同时活跃的 worker 会话数，默认 5（合法范围 1–64），与授权卡快照取较小者生效；显式但非法的值是配置错误，不会静默回落默认值。节点验收、P0–P2 清零且证据登记后归档会话，名额释放给后续 ready 节点。
 
+单班监工：`.vibe/config.json` 设 `"supervisor_single_shift": true` 后，同一监工会话服务整个运行，预检不再按上下文增长换班，只在达到 15 万绝对上限（或 `--context-hard-cap` 临时值）时输出 `rotate`。默认 false，沿用增长换班。非布尔值是配置错误，预检报 `unknown`。
+
 ### WorkBuddy 派发桥（`workbuddy_job` MCP server）
 
 监工自己不执行桌面动作：它把请求写进 `.vibe/provider-actions/requests/`，写明要调的**原生工具名**，由桌面会话真正去调。WorkBuddy 的五个名字是 `workbuddy_job__create` / `__get` / `__list` / `__reply` / `__wait`——本包随附一个纯标准库的 stdio MCP server 提供它们：

@@ -39,6 +39,11 @@ MAX_MAX_ACTIVE_WORKER_SESSIONS = 64
 #: is a general tool and must not presume any project's layout.
 FIELD_AUTO_SCOPE_PATHS = 'auto_scope_paths'
 
+#: Boolean field: when true one supervisor session serves the whole run and
+#: the preflight only rotates at the absolute context hard cap (PRD #177 D1).
+#: Default false keeps the shipped growth-based rotation unchanged.
+FIELD_SUPERVISOR_SINGLE_SHIFT = 'supervisor_single_shift'
+
 #: `ProjectConfig.source` value when the default was applied.
 SOURCE_DEFAULT = 'default'
 #: `ProjectConfig.source` value when an explicit configured value was used.
@@ -57,6 +62,7 @@ class ProjectConfig:
     #: Defaults to an empty tuple so two-argument construction keeps working.
     behavioral_command_blacklist_extra: tuple = ()
     auto_scope_paths: tuple = ()
+    supervisor_single_shift: bool = False
 
 
 def is_repo_relative_path(value):
@@ -91,6 +97,15 @@ def _auto_scope_paths(data):
             'paths without "." or ".." segments'
         )
     return tuple(dict.fromkeys(value))
+
+
+def _single_shift(data):
+    if FIELD_SUPERVISOR_SINGLE_SHIFT not in data:
+        return False
+    value = data[FIELD_SUPERVISOR_SINGLE_SHIFT]
+    if not isinstance(value, bool):
+        raise ValueError(f'{FIELD_SUPERVISOR_SINGLE_SHIFT} must be true or false')
+    return value
 
 
 def _config_path(root):
@@ -135,10 +150,11 @@ def load_project_config(root):
         raise ValueError('.vibe/config.json must contain a JSON object')
     blacklist_extra = _load_blacklist_extra(data)
     auto_scope_paths = _auto_scope_paths(data)
+    single_shift = _single_shift(data)
     if FIELD_MAX_ACTIVE_WORKER_SESSIONS not in data:
         return ProjectConfig(
             DEFAULT_MAX_ACTIVE_WORKER_SESSIONS, SOURCE_DEFAULT, blacklist_extra,
-            auto_scope_paths=auto_scope_paths,
+            auto_scope_paths=auto_scope_paths, supervisor_single_shift=single_shift,
         )
     value = data[FIELD_MAX_ACTIVE_WORKER_SESSIONS]
     # bool is a subclass of int; True/False are never a valid worker cap.
@@ -150,5 +166,6 @@ def load_project_config(root):
             f'{MIN_MAX_ACTIVE_WORKER_SESSIONS} and {MAX_MAX_ACTIVE_WORKER_SESSIONS}'
         )
     return ProjectConfig(
-        value, SOURCE_CONFIG, blacklist_extra, auto_scope_paths=auto_scope_paths
+        value, SOURCE_CONFIG, blacklist_extra, auto_scope_paths=auto_scope_paths,
+        supervisor_single_shift=single_shift,
     )
