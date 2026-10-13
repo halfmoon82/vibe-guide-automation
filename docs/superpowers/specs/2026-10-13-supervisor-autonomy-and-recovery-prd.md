@@ -1,6 +1,6 @@
 # VibeGuide 监工自治与恢复 PRD
 
-状态：提案
+状态：已被 [监工整合 PRD](2026-10-13-supervisor-integrated-prd.md) 整合；本文 §5–§9、§11、§13、§16 作为其规范性附录，冲突处以整合 PRD 为准
 日期：2026-10-13
 适用范围：VibeGuide 已授权 DAG 的监工、心跳、worker 生命周期、provider 调用、换班与恢复
 证据样本：`session-f9a554fff82f6766` / `run-ce79518f6b1e489db738ffef70437a20`
