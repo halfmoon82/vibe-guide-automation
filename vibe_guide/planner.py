@@ -280,7 +280,12 @@ _CONVENTIONAL_SENSITIVE_NAMES = {
 }
 #: Agent rule files decide what the supervisor may do; changing them is
 #: never an acceptance-unchanged engineering edit.
-_AGENT_RULE_FILE_NAMES = {"agents.md", "claude.md", "codebuddy.md", "gemini.md"}
+_AGENT_RULE_FILE_NAMES = {
+    "agents.md", "claude.md", "claude.local.md", "codebuddy.md", "gemini.md",
+    "copilot-instructions.md",
+}
+#: Agent and vibe control directories: rules, skills and protocols live here.
+_AGENT_CONTROL_DIRS = {".vibe", ".claude", ".cursor", ".codex", ".codebuddy"}
 _LOW_RISK_SCOPE_SUFFIXES = (
     ".adoc", ".c", ".cc", ".cpp", ".cxx", ".cs", ".erl", ".ex", ".exs",
     ".fs", ".fsx", ".go", ".h", ".hrl", ".hpp", ".java", ".js", ".kts",
@@ -359,7 +364,8 @@ def _approved_scope_rule(path: str) -> Optional[str]:
         parts = path.split("/")
         name = parts[-1].casefold()
     lowered = [part.casefold() for part in parts]
-    if any(part in _SENSITIVE_SCOPE_DIRS for part in lowered[:-1]):
+    if any(part in _SENSITIVE_SCOPE_DIRS or part in _AGENT_CONTROL_DIRS
+           for part in lowered[:-1]):
         return None
     if (
         name in _DEPENDENCY_FILE_NAMES

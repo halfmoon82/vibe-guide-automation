@@ -394,7 +394,9 @@ class ResolveConsistencyAutoScopeTests(unittest.TestCase):
                 )
 
     def test_agent_rule_files_never_auto_expand(self):
-        for path in ("AGENTS.md", "docs/CLAUDE.md", "CODEBUDDY.md"):
+        for path in ("AGENTS.md", "docs/CLAUDE.md", "CODEBUDDY.md", "CLAUDE.local.md",
+                     ".github/copilot-instructions.md", ".cursor/rules/a.md",
+                     ".vibe/proposals/skills/prd-guide/SKILL.md", ".claude/agents/x.md"):
             with self.subTest(path=path):
                 self.assertIsNone(resolve_scope_expansion(
                     _scope_claim([path]), authorized_files=["n1.py"],
