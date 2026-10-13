@@ -2712,6 +2712,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 from .orphan_recovery import ADOPTED_DISPATCH_PACKAGE, adopt_orphan_dispatch
                 if set(package) != ADOPTED_DISPATCH_PACKAGE or package['node_id'] not in monitor.nodes:
                     raise ValueError('adopted dispatch reconciliation package is invalid')
+                if _invalidation_path(directory).exists() or _invalidation_path(directory).is_symlink():
+                    raise ValueError('authorization is invalidated; reauthorize before adopting')
                 target_runner = runner if runner is not None else _public_runner(paths, _card, nodes)
                 snapshot = adopt_orphan_dispatch(monitor, args.run_id, package['node_id'],
                                                  package['action_id'], target_runner)

@@ -10,13 +10,15 @@ re-bind the original task from on-disk evidence only, and fail closed when
 that evidence is missing or contradictory.
 """
 import json
+import os
 import subprocess
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from tests.support_v45_authorize import publish_complex_probe
 from vibe_guide.adapters.task_provider import ProviderActionStore, _canonical_digest
-from vibe_guide.cli import _load_plan, _observed_topology_rulings, run_cli
+from vibe_guide.cli import _invalidation_path, _load_plan, _observed_topology_rulings, run_cli
 from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.state import (
@@ -275,6 +277,49 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
         self.assertIn('nodes', again.payload, again.payload)
         self.assert_running_after_resume()
 
+    def test_crash_between_adoption_and_topology_event_is_recovered_by_resume(self):
+        self.build_orphan()
+        original = Monitor._record_topology_projection
+        calls = []
+
+        def crash_once(monitor, snapshot, entry, *args, **kwargs):
+            if entry == 'monitor.reconcile_adopted_dispatch' and not calls:
+                calls.append(entry)
+                raise OSError('crash after the adoption event')
+            return original(monitor, snapshot, entry, *args, **kwargs)
+
+        with patch.object(Monitor, '_record_topology_projection', crash_once):
+            self.adopt()
+        self.assertEqual([e['event'] for e in load_events(self.paths, self.run_id)][-1],
+                         'orphan_dispatch_adopted')
+        self.assert_running_after_resume()
+        directory, _plan, _nodes, _card = _load_plan(self.paths, 'probe-plan')
+        self.assertFalse(_invalidation_path(directory).exists())
+
+    def test_rerun_never_launders_unrelated_topology_drift(self):
+        self.build_orphan()
+        self.adopt()
+        snapshot = load_snapshot(self.paths, self.run_id)
+        snapshot.topology_digest = '0' * 64
+        save_snapshot(self.paths, snapshot)
+        again = self.adopt()
+        self.assertEqual(again.payload.get('status'), 'blocked_unknown', again.payload)
+        self.assertIn('topology', again.payload.get('reason', ''))
+        self.assertEqual(load_snapshot(self.paths, self.run_id).topology_digest, '0' * 64)
+
+    def test_invalidated_authorization_refuses_adoption(self):
+        self.build_orphan()
+        directory, _plan, _nodes, _card = _load_plan(self.paths, 'probe-plan')
+        _invalidation_path(directory).write_text('{"status": "blocked_design"}')
+        self.assert_untouched(self.adopt(), 'authorization is invalidated')
+
+    def test_live_supervisor_refuses_adoption(self):
+        self.build_orphan()
+        lease = self.root / '.vibe' / 'runs' / self.run_id / 'supervisor.lease'
+        lease.write_text(json.dumps({'pid': os.getppid(), 'run_id': self.run_id}))
+        self.assert_untouched(self.adopt(), 'a supervisor is running this run')
+        self.assertTrue(lease.exists(), 'the live supervisor keeps its lease')
+
     def test_failed_start_leaves_a_retryable_adoption(self):
         self.build_orphan()
         with patch('vibe_guide.runners.provider_action.ProviderActionRunner.start',
@@ -292,7 +337,14 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
 
     def test_crash_inside_lease_rebind_is_finished_by_adopting_again(self):
         self.build_orphan()
-        with patch('pathlib.Path.unlink', side_effect=OSError('crash before old lease removal')):
+        real_unlink = Path.unlink
+
+        def crash_on_lease(path, *args, **kwargs):
+            if path.parent.name == 'leases':
+                raise OSError('crash before old lease removal')
+            return real_unlink(path, *args, **kwargs)
+
+        with patch('pathlib.Path.unlink', crash_on_lease):
             self.adopt()
         self.assertEqual(sorted(lease['status'] for lease in self.leases()), ['active', 'quarantined'])
         retried = self.adopt()

@@ -33,6 +33,7 @@ from .state import (
     run_dir,
     save_snapshot,
 )
+from .supervisor import SupervisorLease
 from .task_registry import TaskBinding, load_task_binding
 
 ORPHAN_DISPATCH_ADOPTED = "orphan_dispatch_adopted"
@@ -270,77 +271,86 @@ def adopt_orphan_dispatch(monitor, run_id: str, node_id: str, action_id: str, ru
     switches the node to running atomically (replay restores the same state).
     A crash after the event is finished by running the same command again.
     """
+    supervisor = SupervisorLease(monitor.paths)
     with interprocess_lock(run_dir(monitor.paths, run_id) / "adopt.lock"):
-        monitor._reset_binding_cache()
-        snapshot = load_snapshot(monitor.paths, run_id)
-        record = monitor._require_snapshot_authorization(snapshot)
-        monitor._reconcile_unapplied_events(snapshot)
-        done = _adopted(snapshot, node_id, load_events(monitor.paths, run_id))
-        if done is not None:
-            current = snapshot.nodes[node_id]
-            _require(done.get("action_id") == action_id
-                     and (current.get("active_task") or {}).get("task_id") == done.get("task_id")
-                     and snapshot.handles.get(node_id) == done.get("handle_id"),
-                     "already adopted and the node has moved on")
-            # Only the topology evidence can be missing after the event.
-            try:
-                monitor._validate_execution_topology(snapshot)
-            except PermissionError:
-                monitor._record_topology_projection(snapshot, _ENTRY)
-            monitor._refresh_run_status(snapshot)
-            save_snapshot(monitor.paths, snapshot)
-            return snapshot
-        proof = _collect(monitor, snapshot, record, node_id, action_id, runner)
-        monitor._validate_execution_topology(snapshot)
-        _require(len(load_events(monitor.paths, run_id)) == snapshot.event_sequence,
-                 "the run changed while adopting; retry")
+        # A supervisor cycle holding an older snapshot would overwrite the
+        # adoption; refuse while one is live instead of racing it.
+        _require(supervisor.acquire(run_id), "a supervisor is running this run; retry after it stops")
+        try:
+            return _adopt_locked(monitor, run_id, node_id, action_id, runner)
+        finally:
+            supervisor.release(run_id)
+
+
+def _adopt_locked(monitor, run_id: str, node_id: str, action_id: str, runner) -> RunSnapshot:
+    monitor._reset_binding_cache()
+    snapshot = load_snapshot(monitor.paths, run_id)
+    record = monitor._require_snapshot_authorization(snapshot)
+    monitor._reconcile_unapplied_events(snapshot)
+    done = _adopted(snapshot, node_id, load_events(monitor.paths, run_id))
+    if done is not None:
         current = snapshot.nodes[node_id]
-        generation = proof["generation"]
-        task_id = proof["task_id"]
-        child = proof["child"]
-
-        if proof["previous_intent_digest"] is not None:
-            _require(rebind_writer_lease(
-                monitor.paths, node_id, proof["worktree"], run_id, _ROLE, generation,
-                proof["previous_intent_digest"], proof["intent_digest"]),
-                "lease changed while it was being re-bound")
-        binding = proof["existing"] or TaskBinding(
-            provider=runner.provider, mode="visible", issue_id=node_id, role=_ROLE,
-            topology=proof["topology"], task_id=task_id, host=proof["host"],
-            worktree=proof["worktree"], branch=str(current.get("branch", "")),
-            status_file=str(current.get("status_file", "")),
-            handoff_file=str(current.get("handoff_file", "")),
-            threadId=task_id if runner.provider == CODEX_PROVIDER else None,
-            hostId=proof["host"] if runner.provider == CODEX_PROVIDER else None,
-            run_id=run_id, status="running", visible=True, generation=generation,
-            allowlist=list(child["allowlist"]),
-            capability_contract_digest=snapshot.capability_contract_digest,
-            route_digest=child.get("route_digest"), model=child.get("model"),
-            reasoning=child.get("reasoning"),
-        )
-        monitor._save_task_binding(binding)
-        # A non-continuation start only writes handle metadata (same handle id
-        # on every retry); nothing reaches the working session.
-        handle = runner.start(proof["contract"], monitor._worktree_path(current))
-        _require(isinstance(handle.run_id, str) and handle.run_id
-                 and handle.run_id not in snapshot.handles.values(),
-                 "provider handle is invalid or duplicated")
-
-        _apply_adoption(monitor, snapshot, node_id, binding, handle.run_id)
-        monitor._record(snapshot, ORPHAN_DISPATCH_ADOPTED, {
-            "run_id": run_id, "node_id": node_id, "role": _ROLE,
-            "task_id": task_id, "host": proof["host"], "generation": generation,
-            "handle_id": handle.run_id,
-            "action_id": action_id, "request_digest": proof["action"]["request_digest"],
-            "request_authorization_digest": proof["request_authorization_digest"],
-            "intent_digest": proof["intent_digest"],
-            "previous_intent_digest": proof["previous_intent_digest"],
-            "dispatch_head": proof["head"],
-        })
-        monitor._record_topology_projection(snapshot, _ENTRY)
+        _require(done.get("action_id") == action_id
+                 and (current.get("active_task") or {}).get("task_id") == done.get("task_id")
+                 and snapshot.handles.get(node_id) == done.get("handle_id"),
+                 "already adopted and the node has moved on")
+        # Replay above already restored any missing topology evidence;
+        # every other drift keeps invalidating the authorization.
+        monitor._validate_execution_topology(snapshot)
         monitor._refresh_run_status(snapshot)
         save_snapshot(monitor.paths, snapshot)
         return snapshot
+    proof = _collect(monitor, snapshot, record, node_id, action_id, runner)
+    monitor._validate_execution_topology(snapshot)
+    _require(len(load_events(monitor.paths, run_id)) == snapshot.event_sequence,
+             "the run changed while adopting; retry")
+    current = snapshot.nodes[node_id]
+    generation = proof["generation"]
+    task_id = proof["task_id"]
+    child = proof["child"]
+
+    if proof["previous_intent_digest"] is not None:
+        _require(rebind_writer_lease(
+            monitor.paths, node_id, proof["worktree"], run_id, _ROLE, generation,
+            proof["previous_intent_digest"], proof["intent_digest"]),
+            "lease changed while it was being re-bound")
+    binding = proof["existing"] or TaskBinding(
+        provider=runner.provider, mode="visible", issue_id=node_id, role=_ROLE,
+        topology=proof["topology"], task_id=task_id, host=proof["host"],
+        worktree=proof["worktree"], branch=str(current.get("branch", "")),
+        status_file=str(current.get("status_file", "")),
+        handoff_file=str(current.get("handoff_file", "")),
+        threadId=task_id if runner.provider == CODEX_PROVIDER else None,
+        hostId=proof["host"] if runner.provider == CODEX_PROVIDER else None,
+        run_id=run_id, status="running", visible=True, generation=generation,
+        allowlist=list(child["allowlist"]),
+        capability_contract_digest=snapshot.capability_contract_digest,
+        route_digest=child.get("route_digest"), model=child.get("model"),
+        reasoning=child.get("reasoning"),
+    )
+    monitor._save_task_binding(binding)
+    # A non-continuation start only writes handle metadata (same handle id
+    # on every retry); nothing reaches the working session.
+    handle = runner.start(proof["contract"], monitor._worktree_path(current))
+    _require(isinstance(handle.run_id, str) and handle.run_id
+             and handle.run_id not in snapshot.handles.values(),
+             "provider handle is invalid or duplicated")
+
+    _apply_adoption(monitor, snapshot, node_id, binding, handle.run_id)
+    monitor._record(snapshot, ORPHAN_DISPATCH_ADOPTED, {
+        "run_id": run_id, "node_id": node_id, "role": _ROLE,
+        "task_id": task_id, "host": proof["host"], "generation": generation,
+        "handle_id": handle.run_id,
+        "action_id": action_id, "request_digest": proof["action"]["request_digest"],
+        "request_authorization_digest": proof["request_authorization_digest"],
+        "intent_digest": proof["intent_digest"],
+        "previous_intent_digest": proof["previous_intent_digest"],
+        "dispatch_head": proof["head"],
+    })
+    monitor._record_topology_projection(snapshot, _ENTRY)
+    monitor._refresh_run_status(snapshot)
+    save_snapshot(monitor.paths, snapshot)
+    return snapshot
 
 
 def replay_orphan_adoption(monitor, snapshot: RunSnapshot, node_id: str,
@@ -359,3 +369,12 @@ def replay_orphan_adoption(monitor, snapshot: RunSnapshot, node_id: str,
     _require(binding.task_id == data.get("task_id") and binding.generation == generation,
              "replay task binding differs from the adoption")
     _apply_adoption(monitor, snapshot, node_id, binding, handle_id)
+    # A crash between the adoption event and its topology evidence would
+    # otherwise read as topology drift (an invalidated authorization) on the
+    # next resume; record the evidence the adoption did not get to write.
+    events = load_events(monitor.paths, snapshot.run_id)
+    position = max(index for index, event in enumerate(events)
+                   if event.get("event") == ORPHAN_DISPATCH_ADOPTED
+                   and (event.get("data") or {}).get("handle_id") == handle_id)
+    if not any(event.get("event") == "execution_topology_observed" for event in events[position:]):
+        monitor._record_topology_projection(snapshot, _ENTRY)
