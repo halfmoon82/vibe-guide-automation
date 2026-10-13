@@ -57,17 +57,23 @@ class NotificationBridge:
         """
         try:
             project_path = self.paths.resolve_vibe_path("config.json")
-            user_path = self.paths.resolve_vibe_home_path("config.json")
         except ValueError:
-            # A config that escapes its directory (e.g. a symlink) never
-            # breaks decision ingestion; the bridge is simply unknown.
-            return {"notify_bridge": {"enabled": True, "unreadable": True}}
+            # A project config escaping .vibe never switches the bridge on.
+            return {}
         project = self._read_json(project_path)
         project_bridge = project.get("notify_bridge")
         if not isinstance(project_bridge, dict):
             return {}
         if set(project_bridge) - {"enabled"}:
             return {"notify_bridge": {"enabled": True, "project_command": True}}
+        if project_bridge.get("enabled") is not True:
+            return {}
+        try:
+            user_path = self.paths.resolve_vibe_home_path("config.json")
+        except ValueError:
+            # A user config escaping VIBE_HOME (e.g. a dotfiles symlink) never
+            # breaks decision ingestion; the enabled bridge is simply unknown.
+            return {"notify_bridge": {"enabled": True, "unreadable": True}}
         user = self._read_json(user_path)
         user_bridge = user.get("notify_bridge")
         merged = dict(user_bridge) if isinstance(user_bridge, dict) else {}

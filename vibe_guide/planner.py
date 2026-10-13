@@ -278,6 +278,9 @@ _CONVENTIONAL_SENSITIVE_NAMES = {
     "setup.py", "requirements.py", "build.py", "kubeconfig.py",
     "terraform.py", "compose.py",
 }
+#: Agent rule files decide what the supervisor may do; changing them is
+#: never an acceptance-unchanged engineering edit.
+_AGENT_RULE_FILE_NAMES = {"agents.md", "claude.md", "codebuddy.md", "gemini.md"}
 _LOW_RISK_SCOPE_SUFFIXES = (
     ".adoc", ".c", ".cc", ".cpp", ".cxx", ".cs", ".erl", ".ex", ".exs",
     ".fs", ".fsx", ".go", ".h", ".hrl", ".hpp", ".java", ".js", ".kts",
@@ -372,6 +375,7 @@ def _approved_scope_rule(path: str) -> Optional[str]:
         or name.startswith(".env")
         or name.endswith(".env")
         or name in _CONVENTIONAL_SENSITIVE_NAMES
+        or name in _AGENT_RULE_FILE_NAMES
         or name.startswith(("config", "configuration", "credential", "credentials", "env", "private", "secret", "secrets"))
         or name.startswith(("deploy", "deployment", "release"))
         or name.startswith("helmfile")

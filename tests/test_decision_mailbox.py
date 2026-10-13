@@ -163,6 +163,14 @@ class DecisionMailboxTests(unittest.TestCase):
         self.assertEqual(notifications[0]["status"], "unknown")
         self.assertEqual(len(self.mailbox.list_pending("run-1")), 1)
 
+    def test_symlinked_user_config_does_not_affect_projects_without_bridge(self):
+        outside = Path(tempfile.mkdtemp()) / "config.json"
+        outside.write_text("{}", encoding="utf-8")
+        (self.home / "config.json").symlink_to(outside)
+        self.assertEqual(NotificationBridge(self.paths).notify({"decision_id": "dec-1"})["status"], "disabled")
+        self.write_bridge({"enabled": False})
+        self.assertEqual(NotificationBridge(self.paths).notify({"decision_id": "dec-1"})["status"], "disabled")
+
     def test_timeout_must_be_a_bounded_number(self):
         for value in (True, "Infinity", 1e309, 0, 301):
             with self.subTest(value=value):

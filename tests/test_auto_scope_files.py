@@ -393,6 +393,14 @@ class ResolveConsistencyAutoScopeTests(unittest.TestCase):
                     [{"path": path, "rule": "acceptance_unchanged"}],
                 )
 
+    def test_agent_rule_files_never_auto_expand(self):
+        for path in ("AGENTS.md", "docs/CLAUDE.md", "CODEBUDDY.md"):
+            with self.subTest(path=path):
+                self.assertIsNone(resolve_scope_expansion(
+                    _scope_claim([path]), authorized_files=["n1.py"],
+                    node_files=["n1.py"], acceptance_rule_approved=True,
+                ))
+
     def test_conventional_sensitive_names_are_refused_even_with_source_suffix(self):
         blocked = (
             "setup.py",
