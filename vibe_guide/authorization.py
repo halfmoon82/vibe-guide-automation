@@ -618,12 +618,19 @@ def _normalize_files(value: Any, path: str) -> List[str]:
     return result
 
 
-def _normalize_contract(value: Any, path: str = "contract") -> Any:
+_SCOPE_CONTRACT_KEYS = frozenset(("files", "allowlist"))
+
+
+def _normalize_contract(
+    value: Any, path: str = "contract", *, include_scope: bool = True
+) -> Any:
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, (list, tuple)):
         return [
-            _normalize_contract(item, "{}[{}]".format(path, index))
+            _normalize_contract(
+                item, "{}[{}]".format(path, index), include_scope=include_scope
+            )
             for index, item in enumerate(value)
         ]
     if isinstance(value, dict):
@@ -635,18 +642,24 @@ def _normalize_contract(value: Any, path: str = "contract") -> Any:
                 raise ValueError("raw secret fields are forbidden in executable contracts")
             item_path = path + "." + key
             normalized_key = key.casefold().replace("-", "_")
+            if not include_scope and normalized_key in _SCOPE_CONTRACT_KEYS:
+                continue
             if normalized_key in _ACTION_KEYS:
                 item = _normalize_action_value(value[key], item_path)
             elif normalized_key == "files":
                 item = _normalize_files(value[key], item_path)
             else:
-                item = _normalize_contract(value[key], item_path)
+                item = _normalize_contract(
+                    value[key], item_path, include_scope=include_scope
+                )
             result[key] = item
         return result
     raise ValueError("executable contract must be JSON-safe at " + path)
 
 
-def canonical_node_contracts(nodes: List[DAGNode]) -> Tuple[Dict[str, Any], ...]:
+def canonical_node_contracts(
+    nodes: List[DAGNode], *, include_scope: bool = True
+) -> Tuple[Dict[str, Any], ...]:
     if len({node.id for node in nodes}) != len(nodes):
         raise ValueError("duplicate executable node ids are not allowed")
     canonical = []
@@ -659,14 +672,21 @@ def canonical_node_contracts(nodes: List[DAGNode]) -> Tuple[Dict[str, Any], ...]
                 "integration_after": sorted(node.integration_after),
                 "parallel_group": node.parallel_group,
                 "status": node.status,
-                "contract": _normalize_contract(node.contract),
+                "contract": _normalize_contract(
+                    node.contract, include_scope=include_scope
+                ),
             }
         )
     return tuple(canonical)
 
 
 def executable_contract_digest(nodes: List[DAGNode]) -> str:
-    return _canonical_digest({"nodes": canonical_node_contracts(nodes)})
+    # File scope is authorized separately through ``AuthorizationRecord.file_scope``.
+    # A compliant scope expansion must refresh the write allowlist without
+    # invalidating an unchanged acceptance contract.
+    return _canonical_digest(
+        {"nodes": canonical_node_contracts(nodes, include_scope=False)}
+    )
 
 
 def integration_contract_projection(plan: Plan, nodes: List[DAGNode]) -> Dict[str, Any]:
@@ -728,6 +748,38 @@ def _scoped_values(value: Any, key_name: str) -> List[str]:
     return result
 
 
+def _authorization_file_scope(nodes: List[DAGNode]) -> Tuple[str, ...]:
+    """Return the effective write scope frozen into an authorization card."""
+
+    normalized_contracts = {
+        node.id: _normalize_contract(node.contract, "contract." + node.id)
+        for node in nodes
+    }
+    return tuple(
+        sorted(
+            {
+                path
+                for contract in normalized_contracts.values()
+                for key_name in ("files", "allowlist")
+                for path in _scoped_values(contract, key_name)
+            }
+        )
+    )
+
+
+def _scope_allows_path(authorized_files: Tuple[str, ...], path: str) -> bool:
+    """Return whether a file is covered by an exact or directory scope."""
+
+    if not authorized_files and path == ".":
+        return True
+    return any(
+        scope == "."
+        or path == scope
+        or path.startswith(scope.rstrip("/") + "/")
+        for scope in authorized_files
+    )
+
+
 def validate_runtime_contract(
     contract: Dict[str, Any],
     authorized_actions: Optional[Tuple[str, ...]] = None,
@@ -744,10 +796,15 @@ def validate_runtime_contract(
             if any(item not in allowed for item in _scoped_values(normalized, key)):
                 raise ValueError("runtime action is outside the authorized allowlist")
     if authorized_files is not None:
-        allowed_files = set(authorized_files)
+        scoped_paths = tuple(
+            _scoped_values(normalized, key_name)
+            for key_name in ("files", "allowlist")
+        )
+        paths = [item for values in scoped_paths for item in values]
         if any(
-            item not in allowed_files
-            for item in _scoped_values(normalized, "files")
+            not isinstance(item, str)
+            or not _scope_allows_path(authorized_files, item)
+            for item in paths
         ):
             raise ValueError("runtime file is outside the authorized scope")
     return normalized
@@ -1171,19 +1228,7 @@ def build_authorization_card(
         ]
         raise ValueError("blocked_dag write scope conflict: " + " | ".join(reasons))
     contract_digest = executable_contract_digest(nodes)
-    normalized_contracts = {
-        node.id: _normalize_contract(node.contract, "contract." + node.id)
-        for node in nodes
-    }
-    file_scope = tuple(
-        sorted(
-            {
-                path
-                for contract in normalized_contracts.values()
-                for path in _scoped_values(contract, "files")
-            }
-        )
-    )
+    file_scope = _authorization_file_scope(nodes)
     worker_scope = tuple(
         sorted(
             {
@@ -1531,9 +1576,12 @@ def is_authorization_valid(
     if nodes is not None:
         try:
             live_digest = executable_contract_digest(nodes)
+            live_file_scope = _authorization_file_scope(nodes)
         except (TypeError, ValueError):
             return False
         if not secrets.compare_digest(record.node_contract_digest, live_digest):
+            return False
+        if record.file_scope != live_file_scope:
             return False
     return True
 

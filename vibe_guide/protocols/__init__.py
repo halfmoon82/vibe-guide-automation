@@ -27,6 +27,8 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        "9223364689e4ccf6bcd1720dfa58a47d730ced15cb8b304a5074f6bd074e799e",
+        "f8bccb63f6ba536f26116211c5efb9c7838c46cc83f150e1c72d742ac5f7b5c3",
         "65abc91f34211959e4917b17b0a979c5ce961f658b5dff4fcec939663dad609f",
         "06e6c3cc275851e32127d378d6dcf3cec40dceafa3f8fe3c84058d528932ba93",
         "08591263683208c510570d6af2f3733bb0596ecd1c00bdb2dc8fc7206fabaa13",
@@ -39,6 +41,7 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "2526b81e2dc94cc865a6b47b5dd4ee933f922c627ee737531aaeaa8dd4aad6b2",
         "3f17774b7981938c52cf6c9a58476f3b46d1c4bf931328f78d0a0b689dabbd88",
         "524c8dcc8925d635361faf81deaa405f0ceae666f979f5f1d6002a31aaf4cca3",
+        "61cb93abacd89626877d47f1c83fdeafe7f683e280aa4012ed64e88824f947fb",
         "71c5130222474d5852c8233978e72f927c499d785f56948d78728acbd609a190",
         "94d652883bf2bf187793f41f1b000c097664674ec9a7de8355fe8c179e7bee65",
         "96d1c163c59b73e86a7967bc11ddf5dc6730d033ddf1b299efc0804eb3bf7e8b",
@@ -62,13 +65,26 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "f2f90466346715fcf1b65a8f8cc3f5be6aa5244c676fe4fb38fc725c89610c38",
         # 2026-10-09: heartbeat native-action consumer and stale reconciliation.
         "e06e774bdd5082ce063b6782ef15862be5a03aaa0419d1cc8ab983fddd181c07",
+        # 2026-10-10: #156 single-line supervisor beat command.
+        "62d464113310f1fb32a7fd3aeba880ae9d8034327fb05966ab6abb09faeb3777",
+        "26f3c0f75baab3d6928dac25e86f1bab2d26828db401630ba0ce9fded393d72f",
+        "7f5312b7dd47089720d54fbb22dd66e48602977c320b86ea6d3cdf6adbd794a4",
+        "ffc1eb7655a839357a602ff708ae203fca2406f74a1919180530f742bf7583f1",
+        "aaf782d07cc1a1c60e762a983d6fcac7143f67082ecffb7674d794ba58376e34",
+        "f204123e31fa2f8ea67033dc50cba547cda8e862245fcf5e0475b8cb4b36f29e",
+        "870acaa688f538bd8d09cbeba77442780a17fcb56696d79f79028640b2e1e8dd",
+        "8335aee5c16b30fef9de2f1ed009df58b43f97bee4716dc09aa3dfc623b7509e",
+        # 2026-10-13: native closeout integration after main reconciliation.
+        "cdae7db3e3ebfcacc6db84453d9a903ae5376e1aa2134ce7d9fc838052b46708",
     }),
     "vibe-entry": frozenset({
+        "3ec0a771d482d92eba7f155f212dab97beb3a4a3b6712e16d7dc3d81394797eb",
         "a0d8ad6b24ed85982695214359b754a136315865ce76a4ccb36e03b9c4c9ef00",
         "08140f273188868532d5724d4fb199d1ee48ac46c80cbc2786f46fce91e4ddff",
         "15253735f70ec99071c59d56e590ec50a903841802737fd5cf61d925dc435321",
         "2033500aac595e39e51d2bf4c42aaf757cb8ab94522b0c289587f68b15c500c2",
         "209d83d6f70e0444dce589630b95662fd369d38b7e9e3dfd7677293c6554ce24",
+        "42aa6fb24ca989b67973a92189fabf0b1e203206636901fd73f361c9773cd445",
         "6ab2be64c1366b290c2c779a61702d881d4ad53f59b688ccae423acf7a596df3",
         "8091f9d39f66ecb373956d41cf573073420b78be173c53371e51f94e2ee356a6",
         "8a231e030151ff3a2378aaf1d1cd95745c7374e7cb95b1d4935c641d53b7287d",

@@ -232,9 +232,7 @@ class VisibleSddValidateFirstTests(unittest.TestCase):
         )
 
     def test_rejection_reason_never_trips_the_user_decision_mapping(self):
-        """The raw validator text names claim keys like ``out_of_scope`` --
-        a user-decision marker.  The node must carry the fixed marker-free
-        text; the raw reason lives only in the redacted audit event."""
+        """Free-form validator text never creates a user-decision boundary."""
         from vibe_guide.evidence import build_integration_review_evidence
         from vibe_guide.state import map_user_status
 
@@ -244,16 +242,15 @@ class VisibleSddValidateFirstTests(unittest.TestCase):
         active = snapshot.nodes["sdd-a"]["active_task"]
         self.assertIsInstance(active, dict)
 
-        # The real raw reason the integration claim validator produces for a
-        # free-form acceptance; it contains a user-decision marker ("scope"),
-        # so the pre-fix code did surface "需要你决定" for it.
+        # The real raw reason contains "scope", but only structured status
+        # fields may create a user-decision boundary.
         with self.assertRaises(ValueError) as raised:
             build_integration_review_evidence(snapshot, "P0-P2 cleared", [], [])
         raw_reason = str(raised.exception)
         self.assertIn("out_of_scope", raw_reason)
         self.assertEqual(
             map_user_status({"status": "running", "reason": raw_reason}),
-            "需要你决定",
+            "已启动",
         )
 
         monitor._reject_acceptance_format(snapshot, "sdd-a", active, raw_reason)

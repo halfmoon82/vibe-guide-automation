@@ -208,20 +208,13 @@ vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本
 
 登记内容只允许 provider / 会话 id / host，不得含凭据。`<本会话记录路径>` 是本会话自己的日志文件（Codex 为 `~/.codex/sessions/<年>/<月>/<日>/rollout-…-<本会话 id>.jsonl`，Claude Code 为 `~/.claude/projects/<项目>/<本会话 id>.jsonl`），预检直接从里面读上下文大小，不要另写记录文件；登记时 vibe 顺带记下此刻的上下文作为接班起点，换班按此后的增长计算。worker 完工后的唤醒信号按这个地址发；没登记时 `vibe supervisor-address` 返回 `unknown`，唤醒信号无处可发，交付只能等监工被动 resume 才领取。
 
-**自建心跳**：vibe 是 CLI，没有常驻进程，心跳只能由宿主 agent 会话承载。用宿主平台原语建一个周期任务（Codex 桌面用 heartbeat automation，可以全自动），心跳指令**逐字使用 vibe 生成的这一段**——未登记时 `vibe monitor` 和 `vibe resume` 都会把填好计划与运行编号的版本打印出来，照抄那份，只替换 `<本会话记录路径>`：
+**自建心跳**：vibe 是 CLI，没有常驻进程，心跳只能由宿主 agent 会话承载。用宿主平台原语建一个周期任务（Codex 桌面用 heartbeat automation，可以全自动），心跳指令**逐字使用 vibe 生成的这一行**——未登记时 `vibe monitor` 和 `vibe resume` 都会把填好计划与运行编号的版本打印出来，照抄那份，只替换 `<本会话记录路径>`：
 
 ```text
-vibe 监工心跳 · 计划 <plan_id> · 运行 <run-id>
-（本指令由 vibe 生成。建心跳时逐字照抄，只替换 <本会话记录路径>；不得另写、增删或合并步骤。）
-第 1 步，只跑这一条：
-  vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路径>
-第 2 步，按输出的 state 走一个分支：
-  - idle：只回一个字，结束本轮，不再跑任何命令。
-  - work 或 unknown：按 prd-guide §6.1 服务信箱一轮，推进用 vibe resume --plan <plan_id> --run-id <run-id>；状态只从磁盘读。
-  - rotate：新开一个会话，让它跑 vibe supervisor-handoff --run-id <run-id> 并照输出接班；本会话不再做别的。
-例行轮询不向用户汇报。
-监工整批输出约束：每次工具编排合并后的返回最多 8192 UTF-8 字节，不能按每个子调用各算一份预算。所有 shell、源码读取和原生工具完整结果先保存为 name/output 列表，再调用 vibe supervisor-output --run-id <run-id> --payload <批次 JSON 路径> --json；只把该入口摘要返回聊天，完整结果仍用于真实 provider 回写，摘要不能替代结果。相同批次 SHA 已读时只返回证据引用；需要下钻时只读相关片段，不重复载入完整协议或报告。原生 wait_threads 仅保留状态、cursor、错误和最新消息（最多 200 字），不得打印完整 reviewer JSON。接班先读 handoff-summary.json；已解决故障不重新调查。
+vibe supervisor-beat --run-id <run-id> --session-record <本会话记录路径>
 ```
+
+逐字照抄这一行，不得另写；每拍只执行一次，按命令输出的分支继续。
 
 不要自己另写心跳指令，也不要把信箱服务直接写进心跳：自写的心跳每次都跑一整轮 `vibe resume`，跳过预检、不登记、不换班，空闲心跳的成本是设计值的 5–15 倍（2026-10-03 实测）。
 
@@ -456,8 +449,10 @@ worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），
 vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路径>
 ```
 
+- 每拍只运行生成命令一次，工具返回、重连和上下文恢复续接当前阶段。
+- 输出 `decision`：从 `.vibe/decisions/` 读取并渲染未答卡片；心跳降频但不暂停，答案写回后恢复频率。
 - 输出 `idle`：所有节点都在运行、已完成或等人拍板，且无新请求。只回一字结束本轮，不做任何写。
-- **等人拍板必须登记**：监工决定把某个节点挂起等用户回答时，先跑 `vibe supervisor-hold --run-id <run-id> --node <节点> --reason <一句话原因>`；用户回复后先 `vibe supervisor-hold --run-id <run-id> --node <节点> --release` 再推进。不登记，挂起的请求每次心跳都被当成 `work`，空闲心跳的成本是设计值的数倍（2026-10-05 run 140 实测：60 次预检 46 次误判）。挂起的节点上有 worker 交付或结果时仍然是 `work`。挂起会记下当时全盘节点状态：此后任何节点状态变化，或挂起满 6 小时，预检报 `work`（`hold needs recheck`），复核后仍在等人就对每个挂起节点再跑一次同一条挂起命令刷新。挂起节点的待服务请求在用户答复并解除挂起之前不执行，换班后的新班次同样遵守。`review`/`rework` 状态的节点不能挂起（它们只靠监工推进）。
+- **等人拍板必须登记**：监工决定把某个节点挂起等用户回答时，先跑 `vibe supervisor-hold --run-id <run-id> --node <节点> --category <product_design|external_authorization|deploy> --reason <一句话原因>`；用户回复后先 `vibe supervisor-hold --run-id <run-id> --node <节点> --release` 再推进。不登记，挂起的请求每次心跳都被当成 `work`，空闲心跳的成本是设计值的数倍（2026-10-05 run 140 实测：60 次预检 46 次误判）。挂起的节点上有 worker 交付或结果时仍然是 `work`。挂起会记下当时全盘节点状态：此后任何节点状态变化，或挂起满 6 小时，预检报 `work`（`hold needs recheck`），复核后仍在等人就对每个挂起节点再跑一次同一条挂起命令刷新。挂起节点的待服务请求在用户答复并解除挂起之前不执行，换班后的新班次同样遵守。`review`/`rework` 状态的节点不能挂起（它们只靠监工推进）。
 - 输出 `work`：有待服务请求、worker 已完工（含已自报但监工还没领取的交付），或有节点处在就绪/重试/未知等需要推进的状态。按 §6.1 原流程服务信箱，状态一律只从磁盘读，不凭记忆。
 - 输出 `rotate`：当前上下文达到 10 万且自接班以来增长至少 8 万 token（可配 `--token-threshold`），或达到 20 万的绝对上限（默认；用户明确临时覆盖时使用 `--context-hard-cap <tokens>`，增长阈值也需同步显式设置，不能只用 `--token-threshold` 冒充绝对上限已改变）；登记时没给 `--session-record` 的班次没有接班起点，按绝对值计算。项目 `.vibe/config.json` 设了 `"supervisor_single_shift": true` 时，同一监工会话服务整个运行，不再按增长换班，只在达到绝对上限时输出 `rotate`（预检输出带 `single_shift: true`）；默认不设，行为同上。执行换班：新开会话，让它跑 `vibe supervisor-handoff --run-id <run-id>`——这一条打印接班需要的全部内容（进度、等人拍板事项、填好的同一段心跳指令、接班步骤），新会话照做即可，不必再翻本协议、授权卡或完整状态：用 `vibe supervisor-register --session-record` 登记、自建心跳、置顶、改标题；删除旧心跳，旧会话归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。
 - 输出 `unknown`：会话记录读不到或解析失败。**不得当成 idle**，按 `work` 处理。
@@ -466,6 +461,15 @@ vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路
 
 ## 7. 什么时候才能打断产品经理
 
-只有三类：产品设计要变、需要新的外部授权、要部署。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知、按 §4 `files` 规则可自动补进范围的测试文件和机械附属文件）由 vibe 的 Monitor 自行分类恢复；恢复不了的会标 `blocked_unknown` 等待，不会伪装成成功。agent 看到 `blocked_unknown` 或 `retry_pending` 时先按 §6 查信箱里有没有没服务完的请求，不要立刻报告失败。
+只有三类：产品设计要变、需要新的外部授权、要部署。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知、按 §4 `files` 规则可自动补进范围的测试文件和机械附属文件）由 vibe 的 Monitor 自行分类恢复；恢复不了的会标 `blocked_unknown`，同时保留结构化 `recovery_action`，不伪装成成功也不静默丢掉入口。
+
+`blocked_unknown` 的标准恢复动作按原因执行：
+
+- `repair_node`：工作树、分支、合同测试或快照可由本地证据修复；保持原 task identity、generation、worktree 和 writer lease。
+- `requeue_same_task`：超时、断开、容量或 provider pending；只续接同一任务，按退避时间等待，不创建 successor。
+- `reconcile_binding`：绑定、身份、租约或 cursor 无法证明；先核对 task binding、worktree、branch、run 和 cursor，再通过 `vibe repair --plan <plan> --run-id <run> --node <node>` 或同一 Monitor 的 repair/requeue 入口恢复；未证明前不得盲派。
+- `await_external_decision`：命中产品、外部授权或 deploy 边界；保持 blocked，等待对应授权。
+
+可恢复动作都追加事件证据。三轮返工仍不收敛时，监工记录换 reviewer 或拆节点并保留唯一 writer；只有会改变 PRD 验收判定的分歧才升级产品决策。reviewer 代改业务文件时本轮作废，退回 developer，并更换 reviewer。agent 看到 `blocked_unknown` 或 `retry_pending` 时先按 §6 查信箱里有没有没服务完的请求，不要立刻报告失败。
 
 一个例外要告诉产品经理：在 Claude Code 桌面上派发，每个节点都需要他点一下确认卡片（§6.4）。这属于"需要新的外部授权"那一类，授权卡念完之后就要说清楚，不要让他以为授权一次就不用管了。

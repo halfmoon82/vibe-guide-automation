@@ -11,26 +11,27 @@ import hashlib
 import json
 import tempfile
 from datetime import datetime, timezone
+from types import SimpleNamespace
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from vibe_guide.authorization import authorize, build_authorization_card
 from vibe_guide.capability_contract import build_contract, save_contract
 from vibe_guide.config import load_project_config
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan
-from vibe_guide.monitor import Monitor
+from vibe_guide.monitor import Monitor, ScopeDecisionRequired
 from vibe_guide.paths import ProjectPaths
-from vibe_guide.planner import resolve_consistency
+from vibe_guide.planner import resolve_consistency, resolve_scope_expansion
 from vibe_guide.runners.fake import FakeRunner
-from vibe_guide.cli import _snapshot_result
+from vibe_guide.cli import _snapshot_result, run_cli
 from vibe_guide.models import INTEGRATION_REVIEW_NODE_ID
 from vibe_guide.dag import append_integration_review_node
 from vibe_guide.engine_attestation import create_engine_attestation
 from vibe_guide.planner import REQUIRED_COMPLEX_WORKFLOW, TaskContext
 from vibe_guide.task_registry import TaskBinding
 from vibe_guide.workflow_gate import create_task_workflow, record_workflow_node
-from vibe_guide.state import load_events, load_snapshot
+from vibe_guide.state import durable_projection, load_events, load_snapshot
 
 
 BINDING = {
@@ -66,6 +67,30 @@ def _inconsistency(files, binding=BINDING):
             {"source": "implementation", "value": "stale-name"},
         ],
     }
+
+
+def _scope_claim(files, reason="approved examples keep the same result"):
+    return {
+        "files": list(files),
+        "acceptance_examples_unchanged": True,
+        "reason": reason,
+        "adds_third_party_dependency": False,
+        "visibility_downgrade": False,
+    }
+
+
+CLEARED_INTEGRATION_CLAIM = {
+    "findings": [],
+    "iteration_compatibility": {
+        "status": "verified",
+        "evidence": "iteration compatibility checked",
+    },
+    "test_runtime_delivery": {
+        "status": "verified",
+        "evidence": "tests and runtime delivery checked",
+    },
+    "out_of_scope": [],
+}
 
 
 def _resolve(files, node_files=("n1.py",), auto_scope_paths=(), occupied_files=()):
@@ -167,6 +192,212 @@ class ResolveConsistencyAutoScopeTests(unittest.TestCase):
         result = _resolve(["n1.py"])
         self.assertIsNotNone(result)
         self.assertEqual(result.scope_expanded_files, [])
+
+    def test_approved_acceptance_boundary_expands_safe_repository_file(self):
+        result = resolve_scope_expansion(
+            _scope_claim(["n1.py", "vibe_guide/protocols/__init__.py"]),
+            authorized_files=["n1.py"],
+            node_files=["n1.py"],
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(
+            result.files, ["vibe_guide/protocols/__init__.py"]
+        )
+        self.assertEqual(
+            result.scope_rules,
+            [{"path": "vibe_guide/protocols/__init__.py", "rule": "acceptance_unchanged"}],
+        )
+
+    def test_product_boundaries_and_external_files_never_auto_expand(self):
+        blocked = (
+            _scope_claim(["pyproject.toml"]),
+            _scope_claim([".github/workflows/test.yml"]),
+            _scope_claim(["deploy/prod.yaml"]),
+            dict(_scope_claim(["safe.py"]), adds_third_party_dependency=True),
+            dict(_scope_claim(["safe.py"]), visibility_downgrade=True),
+            dict(_scope_claim(["safe.py"]), acceptance_examples_unchanged=False),
+            dict(_scope_claim(["safe.py"]), reason=""),
+        )
+        for claim in blocked:
+            with self.subTest(claim=claim):
+                self.assertIsNone(
+                    resolve_scope_expansion(
+                        claim,
+                        authorized_files=["n1.py"],
+                        node_files=["n1.py"],
+                    )
+                )
+
+    def test_scope_reason_rejects_control_characters_and_excessive_length(self):
+        for reason in (
+            "line one\nline two",
+            "tab\tseparated",
+            "hidden\u202etext",
+            "x" * 201,
+        ):
+            with self.subTest(reason=repr(reason)):
+                self.assertIsNone(
+                    resolve_scope_expansion(
+                        _scope_claim(["safe.py"], reason=reason),
+                        authorized_files=["n1.py"],
+                        node_files=["n1.py"],
+                    )
+                )
+
+    def test_scope_reason_is_redacted_in_durable_projection(self):
+        projected = durable_projection(
+            {"scope_reason": "token=super-secret password=hunter2"}
+        )
+        self.assertEqual(projected["scope_reason"], "[REDACTED_PROVIDER_TEXT]")
+
+    def test_sensitive_scope_aliases_remain_fail_closed(self):
+        blocked = (
+            "Secrets/Prod.yaml",
+            "credentials/rotation.json",
+            "REQUIREMENTS-prod.in",
+            "Pipfile.lock",
+            "Docker-Compose.Override.yml",
+            "Dockerfile.prod",
+            "deployments/blue.yaml",
+        )
+        for path in blocked:
+            with self.subTest(path=path):
+                self.assertIsNone(
+                    resolve_scope_expansion(
+                        _scope_claim([path]),
+                        authorized_files=["n1.py"],
+                        node_files=["n1.py"],
+                    )
+                )
+
+    def test_common_credential_dependency_and_deployment_aliases_remain_fail_closed(self):
+        blocked = (
+            ".ssh/config",
+            "secret-prod.yaml",
+            "prod.env",
+            "deployment.yaml",
+            "helmfile.yaml",
+            "kustomization.yaml",
+            "constraints-prod.txt",
+            ".SSH/CONFIG",
+            "SECRET-PROD.YAML",
+            "PROD.ENV",
+            "DEPLOYMENT.YAML",
+            "HELMFILE.YAML",
+            "KUSTOMIZATION.YAML",
+            "CONSTRAINTS-prod.TXT",
+        )
+        for path in blocked:
+            with self.subTest(path=path):
+                self.assertIsNone(
+                    resolve_scope_expansion(
+                        _scope_claim([path]),
+                        authorized_files=["n1.py"],
+                        node_files=["n1.py"],
+                    )
+                )
+
+    def test_container_infra_tooling_and_config_aliases_remain_fail_closed(self):
+        blocked = (
+            "compose.yaml",
+            "compose.yml",
+            "Chart.yaml",
+            "values.yaml",
+            "skaffold.yaml",
+            "Tiltfile",
+            "terraform.tfvars",
+            "prod.tfvars",
+            ".config/gcloud/credentials.db",
+            "pip-compile.txt",
+            "setup.cfg",
+            "tox.ini",
+            "COMPOSE.YAML",
+            "chart.yaml",
+            "values.YAML",
+            "SKAFFOLD.YAML",
+            "tiltfile",
+            "TERRAFORM.TFVARS",
+            "PROD.TFVARS",
+            ".CONFIG/GCLOUD/CREDENTIALS.DB",
+            "PIP-COMPILE.TXT",
+            "SETUP.CFG",
+            "TOX.INI",
+        )
+        for path in blocked:
+            with self.subTest(path=path):
+                self.assertIsNone(
+                    resolve_scope_expansion(
+                        _scope_claim([path]),
+                        authorized_files=["n1.py"],
+                        node_files=["n1.py"],
+                    )
+                )
+
+    def test_unknown_conventional_sensitive_paths_remain_fail_closed(self):
+        blocked = (
+            ".envrc",
+            "kubeconfig",
+            "application-default-credentials.json",
+            "Pulumi.yaml",
+            "serverless.yml",
+            "fly.toml",
+            "vercel.json",
+            "cloudbuild.yaml",
+            "buildspec.yml",
+            "pylock.toml",
+            "pom.xml",
+            "build.gradle",
+            "unknown.artifact",
+        )
+        for path in blocked:
+            with self.subTest(path=path):
+                self.assertIsNone(
+                    resolve_scope_expansion(
+                        _scope_claim([path]),
+                        authorized_files=["n1.py"],
+                        node_files=["n1.py"],
+                    )
+                )
+
+    def test_affirmative_low_risk_allowlist_accepts_source_and_document_paths(self):
+        for path in ("src/module.py", "docs/notes.md", "lib/helper.rs"):
+            with self.subTest(path=path):
+                result = resolve_scope_expansion(
+                    _scope_claim([path]),
+                    authorized_files=["n1.py"],
+                    node_files=["n1.py"],
+                )
+                self.assertIsNotNone(result)
+                self.assertEqual(result.files, [path])
+                self.assertEqual(
+                    result.scope_rules,
+                    [{"path": path, "rule": "acceptance_unchanged"}],
+                )
+
+    def test_conventional_sensitive_names_are_refused_even_with_source_suffix(self):
+        blocked = (
+            "setup.py",
+            "requirements.py",
+            "build.py",
+            "kubeconfig.py",
+            "terraform.py",
+            "compose.py",
+            "SETUP.PY",
+            "nested/Requirements.py",
+            "nested/build.PY",
+            "nested/KUBECONFIG.Py",
+            "nested/terraform.PY",
+            "nested/COMPOSE.PY",
+        )
+        for path in blocked:
+            with self.subTest(path=path):
+                self.assertIsNone(
+                    resolve_scope_expansion(
+                        _scope_claim([path]),
+                        authorized_files=["n1.py"],
+                        node_files=["n1.py"],
+                    )
+                )
 
 
 class AutoScopeConfigTests(unittest.TestCase):
@@ -376,7 +607,8 @@ class MonitorAutoScopeTests(unittest.TestCase):
         return self._drive(monitor, card, nodes, files)
 
     def _drive(self, monitor, card, nodes, files, runner_class=FakeRunner,
-               delivery=("complete", {"evidence": "delivery"})):
+               delivery=("complete", {"evidence": "delivery"}),
+               finding_overrides=None):
         self._monitor = monitor
         runner = runner_class(
             events={
@@ -391,20 +623,27 @@ class MonitorAutoScopeTests(unittest.TestCase):
         binding = [
             call for call in runner.start_calls if call["node_id"] == "n1"
         ][-1]["consistency_binding"]
+        finding = {
+            "finding": "fixture missing",
+            "in_contract": False,
+            "consistency": _inconsistency(files, binding),
+        }
+        overrides = (
+            finding_overrides(binding)
+            if callable(finding_overrides)
+            else finding_overrides
+        )
+        finding.update(overrides or {})
         runner.events[("n1", "reviewer")] = [
             (
                 "review_finding",
-                {
-                    "finding": "fixture missing",
-                    "in_contract": False,
-                    "consistency": _inconsistency(files, binding),
-                },
+                finding,
             )
         ]
         snapshot = monitor.tick(snapshot.run_id, runner)
         return monitor, runner, snapshot
 
-    def _run_complex_finding(self, business, files):
+    def _build_complex_plan(self, business):
         """Complex plan: vibe appends the read-only integration reviewer.
 
         Fixture mirrors tests/test_issue_88_delivery_gate.py (workflow
@@ -472,6 +711,10 @@ class MonitorAutoScopeTests(unittest.TestCase):
                 "thread_status": "complete",
             },
         })
+        return plan, nodes, card, monitor, delivered
+
+    def _run_complex_finding(self, business, files):
+        plan, nodes, card, monitor, delivered = self._build_complex_plan(business)
         return plan, self._drive(
             monitor, card, nodes, files, _BoundBindingRunner, delivered
         )
@@ -518,6 +761,356 @@ class MonitorAutoScopeTests(unittest.TestCase):
             events[0]["scope_rules"],
             [{"path": "vibe_guide/protocols/__init__.py", "rule": "auto_scope_paths"}],
         )
+
+    def test_implementation_finding_uses_the_same_scope_expansion_entry(self):
+        files = ["n1.py", "vibe_guide/protocols/__init__.py"]
+        plan = Plan(
+            "plan-1", 1, "docs/prd.md", ["n1"], "draft",
+            decisions=[dict(DECISION, question="canonical name")],
+        )
+        nodes = [_node("n1")]
+        monitor = Monitor(self.paths, plan, nodes)
+        card = build_authorization_card(plan, nodes, self.capabilities)
+        _monitor, runner, snapshot = self._drive(
+            monitor,
+            card,
+            nodes,
+            files,
+            finding_overrides=lambda binding: {
+                "severity": "P1",
+                "consistency": dict(
+                    _inconsistency(files, binding),
+                    scope_expansion=_scope_claim(files),
+                ),
+            },
+        )
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+        self.assertIn("vibe_guide/protocols/__init__.py", runner.start_calls[-1]["files"])
+        self.assertEqual(
+            self._scope_events(snapshot.run_id)[0]["scope_rules"],
+            [{"path": "vibe_guide/protocols/__init__.py", "rule": "acceptance_unchanged"}],
+        )
+
+    def test_accepted_patch_queues_same_node_rework_and_records_scope(self):
+        node = _node("n1")
+        plan = Plan(
+            "plan-1", 1, "docs/prd.md", [node.id], "draft",
+            decisions=[dict(DECISION, question="canonical name")],
+        )
+        monitor = Monitor(self.paths, plan, [node])
+        runner = FakeRunner(events={
+            ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+        })
+        snapshot = monitor.start(
+            authorize(build_authorization_card(plan, [node], self.capabilities), "AUTHORIZE"),
+            runner,
+        )
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+
+        snapshot = monitor.request_scope_expansion(
+            snapshot.run_id,
+            "n1",
+            _scope_claim(["vibe_guide/protocols/__init__.py"]),
+            trigger="accepted_patch",
+        )
+
+        current = snapshot.nodes["n1"]
+        self.assertEqual(current["status"], "rework")
+        self.assertIsNone(current["acceptance"])
+        self.assertTrue(current["retryable_action"]["continuation"])
+        self.assertEqual(
+            self._scope_events(snapshot.run_id)[0]["trigger"], "accepted_patch"
+        )
+
+    def test_accepted_patch_persists_redacted_scope_reason(self):
+        node = _node("n1")
+        plan = Plan(
+            "plan-1", 1, "docs/prd.md", [node.id], "draft",
+            decisions=[dict(DECISION, question="canonical name")],
+        )
+        monitor = Monitor(self.paths, plan, [node])
+        runner = FakeRunner(events={
+            ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+        })
+        snapshot = monitor.start(
+            authorize(build_authorization_card(plan, [node], self.capabilities), "AUTHORIZE"),
+            runner,
+        )
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        monitor.request_scope_expansion(
+            snapshot.run_id,
+            "n1",
+            _scope_claim(
+                ["vibe_guide/protocols/__init__.py"],
+                reason="token=super-secret password=hunter2",
+            ),
+        )
+        self.assertEqual(
+            self._scope_events(snapshot.run_id)[0]["scope_reason"],
+            "[REDACTED_PROVIDER_TEXT]",
+        )
+
+    def test_completed_run_patch_invalidates_and_requeues_integration_review(self):
+        plan, nodes, card, monitor, delivered = self._build_complex_plan(
+            [_node("n1")]
+        )
+        runner = _BoundBindingRunner(events={
+            ("n1", "developer"): [delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+            (INTEGRATION_REVIEW_NODE_ID, "developer"): [delivered],
+            (INTEGRATION_REVIEW_NODE_ID, "reviewer"): [(
+                "accepted", {"evidence": dict(CLEARED_INTEGRATION_CLAIM)}
+            )],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        for _ in range(4):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.status, "complete")
+
+        snapshot = monitor.request_scope_expansion(
+            snapshot.run_id,
+            "n1",
+            _scope_claim(["vibe_guide/protocols/__init__.py"]),
+        )
+
+        integration = snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]
+        self.assertEqual(snapshot.status, "running")
+        self.assertEqual(integration["status"], "rework")
+        self.assertIsNone(integration["acceptance"])
+        self.assertNotIn("review_clearance", integration)
+        self.assertEqual(integration["retryable_action"]["role"], "reviewer")
+        self.assertEqual(
+            integration["retryable_action"]["phase"], "review"
+        )
+        self.assertNotIn("clearance", snapshot.integration_review_evidence)
+        self.assertEqual(len(snapshot.integration_review_evidence["history"]), 1)
+
+    def test_accepted_patch_refuses_the_read_only_integration_node(self):
+        plan, nodes, card, monitor, delivered = self._build_complex_plan(
+            [_node("n1")]
+        )
+        runner = _BoundBindingRunner(events={
+            ("n1", "developer"): [delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+            (INTEGRATION_REVIEW_NODE_ID, "developer"): [delivered],
+            (INTEGRATION_REVIEW_NODE_ID, "reviewer"): [(
+                "accepted", {"evidence": dict(CLEARED_INTEGRATION_CLAIM)}
+            )],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        for _ in range(4):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+
+        with self.assertRaisesRegex(ValueError, "business node"):
+            monitor.request_scope_expansion(
+                snapshot.run_id,
+                INTEGRATION_REVIEW_NODE_ID,
+                _scope_claim(["tests/test_integration_patch.py"]),
+            )
+
+    def test_accepted_patch_queue_rework_replays_after_snapshot_write_failure(self):
+        node = _node("n1")
+        plan = Plan(
+            "plan-1", 1, "docs/prd.md", [node.id], "draft",
+            decisions=[dict(DECISION, question="canonical name")],
+        )
+        monitor = Monitor(self.paths, plan, [node])
+        runner = FakeRunner(events={
+            ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+        })
+        snapshot = monitor.start(
+            authorize(build_authorization_card(plan, [node], self.capabilities), "AUTHORIZE"),
+            runner,
+        )
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        with patch("vibe_guide.monitor.save_snapshot", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                monitor.request_scope_expansion(
+                    snapshot.run_id,
+                    "n1",
+                    _scope_claim(["vibe_guide/protocols/__init__.py"]),
+                )
+
+        recovered = monitor.resume(snapshot.run_id, FakeRunner(), poll_handles=False)
+        current = recovered.nodes["n1"]
+        self.assertEqual(current["status"], "rework")
+        self.assertEqual(
+            current["scope_expansions"], ["vibe_guide/protocols/__init__.py"]
+        )
+        self.assertEqual(current["retryable_action"]["role"], "developer")
+        self.assertTrue(current["retryable_action"]["pending_schedule"])
+
+    def test_integration_review_finding_expands_target_and_queues_rework(self):
+        files = ["tests/test_first.py", "tests/test_second.py"]
+        plan, nodes, card, monitor, delivered = self._build_complex_plan(
+            [_node("n1")]
+        )
+        runner = _BoundBindingRunner(events={
+            ("n1", "developer"): [delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+            (INTEGRATION_REVIEW_NODE_ID, "developer"): [delivered],
+            (INTEGRATION_REVIEW_NODE_ID, "reviewer"): [(
+                "review_finding",
+                {
+                    "finding": "two integration fixtures are required",
+                    "severity": "P1",
+                    "target_node_id": "n1",
+                    "scope_expansion": _scope_claim(files),
+                },
+            )],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        for _ in range(4):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+        self.assertEqual(snapshot.nodes["n1"]["scope_expansions"], files)
+        self.assertEqual(
+            snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["status"], "rework"
+        )
+        self.assertTrue(
+            snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["retryable_action"][
+                "pending_schedule"
+            ]
+        )
+        self.assertEqual(
+            self._scope_events(snapshot.run_id)[0]["trigger"],
+            "integration_rework",
+        )
+
+    def test_integration_scope_rework_replays_after_snapshot_write_failure(self):
+        plan, nodes, card, monitor, delivered = self._build_complex_plan(
+            [_node("n1")]
+        )
+        runner = _BoundBindingRunner(events={
+            ("n1", "developer"): [delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+            (INTEGRATION_REVIEW_NODE_ID, "developer"): [delivered],
+            (INTEGRATION_REVIEW_NODE_ID, "reviewer"): [(
+                "review_finding",
+                {
+                    "finding": "integration fixture required",
+                    "severity": "P1",
+                    "target_node_id": "n1",
+                    "scope_expansion": _scope_claim(["tests/test_integration.py"]),
+                },
+            )],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        for _ in range(3):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(
+            snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["status"], "review"
+        )
+
+        with patch("vibe_guide.monitor.save_snapshot", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                monitor.tick(snapshot.run_id, runner)
+
+        recovered = load_snapshot(self.paths, snapshot.run_id)
+        monitor._reconcile_unapplied_events(recovered)
+        integration = recovered.nodes[INTEGRATION_REVIEW_NODE_ID]
+        self.assertEqual(
+            recovered.nodes["n1"]["scope_expansions"],
+            ["tests/test_integration.py"],
+        )
+        self.assertEqual(integration["status"], "rework")
+        self.assertNotIn(INTEGRATION_REVIEW_NODE_ID, recovered.handles)
+        self.assertEqual(integration["retryable_action"]["role"], "reviewer")
+        self.assertTrue(integration["retryable_action"]["continuation"])
+
+    def test_scope_expand_cli_registers_accepted_patch(self):
+        node = _node("n1")
+        plan = Plan(
+            "plan-1", 1, "docs/prd.md", [node.id], "draft",
+            decisions=[dict(DECISION, question="canonical name")],
+        )
+        card = build_authorization_card(plan, [node], self.capabilities)
+        monitor = Monitor(self.paths, plan, [node])
+        runner = FakeRunner(events={
+            ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        plan_dir = self.paths.vibe / "plans" / plan.plan_id
+        plan_dir.mkdir(parents=True, exist_ok=True)
+        plan_payload = plan.to_dict()
+        plan_payload["status"] = "authorized"
+        (plan_dir / "plan.json").write_text(
+            json.dumps(plan_payload), encoding="utf-8"
+        )
+        (plan_dir / "nodes.json").write_text(
+            json.dumps([node.to_dict()]), encoding="utf-8"
+        )
+        (plan_dir / "authorization-card.json").write_text(
+            json.dumps(card.to_dict()), encoding="utf-8"
+        )
+
+        result = run_cli(
+            [
+                "scope-expand", "--run-id", snapshot.run_id, "--node", "n1",
+                "--payload", json.dumps(
+                    _scope_claim(["vibe_guide/protocols/__init__.py"])
+                ),
+                "--json",
+            ],
+            self.paths.root,
+        )
+
+        self.assertEqual(result.exit_code, 0, result.payload)
+        self.assertEqual(result.payload["status"], "recorded")
+        self.assertEqual(
+            load_snapshot(self.paths, snapshot.run_id).nodes["n1"]["status"],
+            "rework",
+        )
+
+    def test_scope_expand_cli_keeps_authorization_errors_unknown(self):
+        fake_snapshot = SimpleNamespace(run_id="run-1", plan_id="plan-1")
+        fake_monitor = Mock()
+        fake_monitor.request_scope_expansion.side_effect = PermissionError(
+            "snapshot authorization digest is inconsistent"
+        )
+        with patch("vibe_guide.cli.load_snapshot", return_value=fake_snapshot), patch(
+            "vibe_guide.cli._load_plan", return_value=(None, object(), [], None)
+        ), patch("vibe_guide.cli.Monitor", return_value=fake_monitor):
+            result = run_cli(
+                [
+                    "scope-expand", "--run-id", "run-1", "--node", "n1",
+                    "--payload", json.dumps(_scope_claim(["safe.py"])), "--json",
+                ],
+                self.paths.root,
+            )
+        self.assertEqual(result.exit_code, 4)
+        self.assertEqual(result.payload["status"], "blocked_unknown")
+
+    def test_scope_expand_cli_maps_only_scope_decision_to_design_block(self):
+        fake_snapshot = SimpleNamespace(run_id="run-1", plan_id="plan-1")
+        fake_monitor = Mock()
+        fake_monitor.request_scope_expansion.side_effect = ScopeDecisionRequired(
+            "scope expansion requires product-manager review"
+        )
+        with patch("vibe_guide.cli.load_snapshot", return_value=fake_snapshot), patch(
+            "vibe_guide.cli._load_plan", return_value=(None, object(), [], None)
+        ), patch("vibe_guide.cli.Monitor", return_value=fake_monitor):
+            result = run_cli(
+                [
+                    "scope-expand", "--run-id", "run-1", "--node", "n1",
+                    "--payload", json.dumps(_scope_claim(["safe.py"])), "--json",
+                ],
+                self.paths.root,
+            )
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(result.payload["status"], "blocked_design")
 
     def test_unlisted_file_still_stops_for_the_user(self):
         _monitor, _runner, snapshot = self._run_finding(

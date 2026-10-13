@@ -20,6 +20,7 @@ from vibe_guide.state import (
     append_event,
     load_events,
     load_snapshot,
+    read_writer_lease,
     release_writer_lease,
     save_snapshot,
 )
@@ -54,6 +55,11 @@ class ProviderRetryRunner(FakeRunner):
             status=status,
             generation=contract["generation"],
         )
+
+
+class StopUnavailableRunner(FakeRunner):
+    def stop(self, handle):
+        raise ProviderPending("provider terminal wait is still pending")
 
 
 class PollResponseLostRunner(FakeRunner):
@@ -495,6 +501,44 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(runner.binding_attempts, 2)
         self.assertEqual(snapshot.nodes["n1"]["status"], "running")
 
+    def test_pending_native_wait_keeps_same_task_retryable(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        runner = FakeRunner(events={
+            ("n1", "developer"): [
+                ("visibility_unknown", {"reason": "provider wait is pending"}),
+            ],
+        })
+        started = monitor.start(record, runner)
+        task = dict(started.nodes["n1"]["active_task"])
+        handle = started.handles["n1"]
+
+        with patch.object(monitor, "_v42_retry_status", return_value="retry_pending"):
+            waiting = monitor.tick(started.run_id, runner)
+
+        self.assertEqual(waiting.nodes["n1"]["status"], "retry_pending")
+        self.assertEqual(waiting.nodes["n1"]["active_task"], task)
+        self.assertEqual(waiting.handles["n1"], handle)
+        self.assertTrue(waiting.nodes["n1"]["retryable_action"]["same_task_required"])
+        self.assertFalse(any(
+            event["event"] == "blocked_unknown"
+            for event in load_events(self.paths, started.run_id)
+        ))
+
+    def test_invalid_provider_cursor_still_blocks_acceptance(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        runner = FakeRunner(events={
+            ("n1", "developer"): [
+                ("visibility_unknown", {"reason": "provider cursor is invalid"}),
+            ],
+        })
+        started = monitor.start(record, runner)
+
+        with patch.object(monitor, "_v42_retry_status", return_value="retry_pending"):
+            waiting = monitor.tick(started.run_id, runner)
+
+        self.assertEqual(waiting.nodes["n1"]["status"], "blocked_unknown")
+        self.assertEqual(waiting.handles["n1"], started.handles["n1"])
+
     def test_fresh_capability_contract_requires_explicit_reauthorization(self):
         monitor, record = self.authorized_monitor([node("n1")])
         runner = FakeRunner()
@@ -635,6 +679,58 @@ class MonitorTests(unittest.TestCase):
             fresh.contract_digest,
         )
         self.assertEqual(rebound.nodes["n1"]["status"], "rework")
+
+    def test_reauthorization_reconciles_active_worker_with_completed_delivery(self):
+        """A completed worker delivery must not deadlock same-run reauthorization."""
+        monitor, record = self.authorized_monitor([node("n1")])
+        initial_runner = FakeRunner()
+        snapshot = monitor.start(record, initial_runner)
+        current = snapshot.nodes["n1"]
+        delivery_root = self.paths.root / ".worktrees" / "n1"
+        delivery_root.mkdir(parents=True, exist_ok=True)
+        delivery = delivery_root / "delivery.md"
+        delivery.write_text("ISSUE_N1_DELIVERY_COMPLETE\n", encoding="utf-8")
+        current.update(
+            {
+                "status": "blocked_unknown",
+                "delivery_evidence": {
+                    "completion_marker": "ISSUE_N1_DELIVERY_COMPLETE",
+                    "delivery_path": str(delivery),
+                    "thread_status": "complete",
+                },
+                "thread_status": "complete",
+            }
+        )
+        developer = load_task_binding(
+            self.paths, "n1", "developer", run_id=snapshot.run_id
+        )
+        developer.status = "delivered"
+        save_task_binding(self.paths, developer)
+        save_snapshot(self.paths, snapshot)
+
+        changed = node("n1")
+        changed.contract["acceptance_example"] = "changed after delivery"
+        changed_plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+        changed_record = authorize(
+            build_authorization_card(changed_plan, [changed], self.capabilities),
+            "AUTHORIZE",
+        )
+        recovery_runner = StopUnavailableRunner()
+
+        rebound = Monitor(self.paths, changed_plan, [changed]).reauthorize(
+            snapshot.run_id,
+            changed_record,
+            recovery_runner,
+            "executable_contract_changed",
+        )
+
+        self.assertEqual(rebound.nodes["n1"]["status"], "rework")
+        developer_calls = [
+            call for call in recovery_runner.start_calls if call.get("role") == "developer"
+        ]
+        self.assertEqual(len(developer_calls), 1)
+        self.assertFalse(developer_calls[0]["successor"])
+        self.assertEqual(developer_calls[0]["task_id"], developer.task_id)
 
     def test_reauthorization_continues_delivered_developer_without_successor(self):
         monitor, record = self.authorized_monitor([node("n1")])
@@ -1169,7 +1265,133 @@ class MonitorTests(unittest.TestCase):
                     self.paths, "n1", ".worktrees/n1", snapshot.run_id
                 )
 
-    def test_blocked_design_stops_old_task_and_releases_lease_for_new_authorization(self):
+    def test_continuation_rework_keeps_persisted_binding_profile_over_stale_plan_profile(self):
+        """Rework continuation must not be gated by the stale plan worker profile.
+
+        The persisted task binding records the model route actually bound when
+        the task was created.  If the plan-side ``worker_profile`` later drifts
+        (e.g. routing evidence evolved between shifts), resuming the same task
+        must reuse the registered binding profile instead of failing closed
+        with ``dispatch_contract_invalid``.
+        """
+        nodes = [node("n1")]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("delivered", {"evidence": "delivery"})],
+                ("n1", "reviewer"): [
+                    ("review_finding", {"finding": "P1 rework", "severity": "P1"})
+                ],
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        # Simulate runtime routing drift: the task was actually bound under a
+        # different model route than the plan contract still declares.
+        binding = load_task_binding(
+            self.paths, "n1", "developer", run_id=snapshot.run_id
+        )
+        binding.model = "gpt-6.1-sol"
+        binding.reasoning = "deep"
+        binding.route_digest = "b" * 64
+        save_task_binding(self.paths, binding)
+
+        def existing_binding(contract, worktree, run_id, status):
+            bound = load_task_binding(
+                self.paths, contract["node_id"], contract["role"], run_id=run_id
+            )
+            bound.status = status
+            bound.generation = contract["generation"]
+            return bound
+
+        def binding_for(contract, worktree, run_id, status):
+            try:
+                return existing_binding(contract, worktree, run_id, status)
+            except FileNotFoundError:
+                return TaskBinding(
+                    provider="runner",
+                    mode="background",
+                    issue_id=contract["node_id"],
+                    role=contract["role"],
+                    task_id=contract["task_id"],
+                    worktree=str(worktree),
+                    branch=contract.get("branch", "branch-" + contract["node_id"]),
+                    run_id=run_id,
+                    status=status,
+                    generation=contract["generation"],
+                )
+
+        runner.task_binding = binding_for
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+        rework = runner.start_calls[-1]
+        self.assertEqual(rework["role"], "developer")
+        self.assertTrue(rework["continuation"])
+        persisted = load_task_binding(
+            self.paths, "n1", "developer", run_id=snapshot.run_id
+        )
+        self.assertEqual(persisted.model, "gpt-6.1-sol")
+        self.assertEqual(persisted.route_digest, "b" * 64)
+        release_writer_lease(
+            self.paths, "n1", ".worktrees/n1", snapshot.run_id
+        )
+
+
+    def test_missing_or_nonstandard_severity_reworks_original_developer(self):
+        for severity in (None, "high"):
+            with self.subTest(severity=severity):
+                nodes = [node("n1", worker="worker-original")]
+                monitor, record = self.authorized_monitor(nodes)
+                finding = {"finding": "review finding"}
+                if severity is not None:
+                    finding["severity"] = severity
+                runner = FakeRunner(
+                    events={
+                        ("n1", "developer"): [("delivered", {"evidence": "delivery"})],
+                        ("n1", "reviewer"): [("review_finding", finding)],
+                    }
+                )
+
+                snapshot = monitor.start(record, runner)
+                original_developer = runner.start_calls[0]
+                snapshot = monitor.tick(snapshot.run_id, runner)
+                snapshot = monitor.tick(snapshot.run_id, runner)
+
+                self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+                self.assertEqual(runner.start_calls[-1]["phase"], "rework")
+                self.assertEqual(runner.start_calls[-1]["task_id"], original_developer["task_id"])
+                self.assertTrue(runner.start_calls[-1]["continuation"])
+                self.assertFalse(runner.start_calls[-1]["successor"])
+                release_writer_lease(self.paths, "n1", ".worktrees/n1", snapshot.run_id)
+
+    def test_p3_finding_is_recorded_as_observation_without_blocking(self):
+        nodes = [node("n1", worker="worker-original")]
+        monitor, record = self.authorized_monitor(nodes)
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("delivered", {"evidence": "delivery"})],
+                ("n1", "reviewer"): [
+                    ("review_finding", {"finding": "optional cleanup", "severity": "P3"}),
+                    ("accepted", {"evidence": "review"}),
+                ],
+            }
+        )
+
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "review")
+        self.assertEqual(len(runner.start_calls), 2)
+        self.assertEqual(
+            snapshot.nodes["n1"]["review_observations"][0]["severity"],
+            "[REDACTED_PROVIDER_TEXT]",
+        )
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+
+    def test_missing_severity_reworks_instead_of_blocking_design(self):
         original = node("n1")
         monitor, record = self.authorized_monitor([original])
         runner = FakeRunner(
@@ -1193,15 +1415,8 @@ class MonitorTests(unittest.TestCase):
         old_reviewer_handle = snapshot.handles["n1"]
         snapshot = monitor.tick(snapshot.run_id, runner)
 
-        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_design")
-        self.assertIn(old_reviewer_handle, runner.stop_calls)
-        self.assertTrue(snapshot.nodes["n1"]["old_task_reconciled"])
-
-        corrected = node("n1")
-        corrected.contract["acceptance_example"] = "approved corrected outcome"
-        new_monitor, new_record = self.authorized_monitor([corrected])
-        restarted = new_monitor.start(new_record, FakeRunner())
-        self.assertEqual(restarted.nodes["n1"]["status"], "running")
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+        self.assertNotIn(old_reviewer_handle, runner.stop_calls)
 
     def test_unique_in_scope_consistency_is_corrected_but_real_choice_blocks(self):
         target = node("n1")
@@ -4301,6 +4516,78 @@ class ContractTestExecutionTests(unittest.TestCase):
 
         self.assertEqual(replay.nodes["n1"]["status"], "delivered")
         self.assertIsNone(replay.nodes["n1"].get("reason"))
+
+    def test_decision_raised_replay_releases_writer_lease(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        snapshot = monitor.start(record, FakeRunner())
+        current = snapshot.nodes["n1"]
+        worktree = current["worktree"]
+        self.assertIsNotNone(read_writer_lease(self.paths, "n1", worktree))
+        events_before = load_events(self.paths, snapshot.run_id)
+        active = current["active_task"]
+        append_event(
+            self.paths,
+            RunEvent(
+                "decision_raised",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": "n1",
+                    "decision_ids": ["dec-test"],
+                    "source": "worker_delivery",
+                },
+            ),
+            {
+                "role": active["role"],
+                "task_id": active["task_id"],
+                "handle_id": active["handle_id"],
+                "generation": active["generation"],
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+            },
+        )
+        replay = load_snapshot(self.paths, snapshot.run_id)
+        replay.event_sequence = len(events_before)
+
+        monitor._reconcile_unapplied_events(replay)
+
+        self.assertEqual(replay.nodes["n1"]["status"], "blocked_design")
+        self.assertIsNone(read_writer_lease(self.paths, "n1", worktree))
+
+    def test_worker_decision_notification_failure_stays_explicitly_unknown(self):
+        config_path = self.paths.vibe / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            json.dumps({
+                "notify_bridge": {"enabled": True, "command": "/definitely/missing"}
+            }),
+            encoding="utf-8",
+        )
+        monitor, record = self.authorized_monitor([node("n1")])
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        current = snapshot.nodes["n1"]
+        active = dict(current["active_task"])
+        event = RunEvent(
+            "delivered",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": "n1",
+                "role": active["role"],
+                "task_id": active["task_id"],
+                "handle_id": active["handle_id"],
+                "generation": active["generation"],
+                "decision_requests": [{"question": "Pick", "options": ["A", "B"]}],
+            },
+        )
+
+        monitor._apply_event(snapshot, "n1", active["handle_id"], event, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        self.assertEqual(
+            snapshot.nodes["n1"]["reason"],
+            "decision notification bridge status unknown",
+        )
+        self.assertIsNone(read_writer_lease(self.paths, "n1", current["worktree"]))
 
 
 class CoverageDenominatorTests(unittest.TestCase):

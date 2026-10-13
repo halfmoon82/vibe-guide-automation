@@ -549,14 +549,26 @@ class MailboxTests(unittest.TestCase):
             ],
             unknown={first},
         )
-        self._request("action-18", "create", {"prompt": "work"})
+        from unittest.mock import patch
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        from vibe_guide.paths import ProjectPaths
+
+        store = ProviderActionStore(ProjectPaths(self.project))
+        (self.project / ".vibe" / "state.json").write_text("{}", encoding="utf-8")
+        with patch("vibe_guide.adapters.task_provider.require_entry"):
+            action = store.request(
+                operation="create", provider="workbuddy", run_id="run-1",
+                issue_id="n1", role="developer", generation=1,
+                native_tool="workbuddy_sessions", request={"prompt": "work"},
+            )
+        action_id = action["action_id"]
         servicer = module.MailboxServicer(dispatch)
         outcome = servicer.serve(project_dir=str(self.project))
         self.assertEqual(outcome["served"], [])
         # The second window was never tried, so the prompt cannot be doubled.
         self.assertEqual(dispatch.delivered, [(first, "work")])
-        self.assertEqual([item["action_id"] for item in outcome["failed"]], ["action-18"])
-        result = self._result("action-18")
+        self.assertEqual([item["action_id"] for item in outcome["failed"]], [action_id])
+        result = self._result(action_id)
         self.assertTrue(result["payload"]["failed"])
         # No `binding`: the provider reads that as a failed action, never as a
         # worker it should wait for.
@@ -564,8 +576,7 @@ class MailboxTests(unittest.TestCase):
         # And read it the way the consumer does, so "not pending" is measured
         # rather than asserted: the store must hand back the payload and must
         # stop listing the request as outstanding.
-        store = self._store()
-        self.assertIsNotNone(store.result("action-18"))
+        self.assertIsNotNone(store.result(action_id))
         self.assertEqual(
             [item["action_id"] for item in store.pending()], []
         )

@@ -11,6 +11,7 @@ from vibe_guide.task_registry import (
     TaskBinding,
     load_task_binding,
     save_task_binding,
+    reconcile_shadowed_successor,
 )
 
 
@@ -89,6 +90,103 @@ class TaskRegistryTests(unittest.TestCase):
         continued.cursor = "cursor-2"
         save_task_binding(self.paths, continued)
         self.assertEqual(load_task_binding(self.paths, "N3", "developer").cursor, "cursor-2")
+
+    def test_stopped_predecessor_can_register_one_successor_and_preserve_history(self):
+        old = self.binding()
+        old.generation = 2
+        old.status = 'stopped'
+        save_task_binding(self.paths, old)
+        new = self.binding(task_id='thread-new')
+        new.generation = 3
+        new.successor_of = old.task_id
+        save_task_binding(self.paths, new)
+        loaded = load_task_binding(self.paths, 'N3', 'developer', run_id='run-1')
+        self.assertEqual(loaded.task_id, new.task_id)
+        path = self.paths.vibe / 'runs/run-1/tasks.json'
+        rows = json.loads(path.read_text())['bindings']
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]['cursor'], 'cursor-1')
+        save_task_binding(self.paths, new)
+        self.assertEqual(len(json.loads(path.read_text())['bindings']), 2)
+        old.cursor = 'historic-final'
+        save_task_binding(self.paths, old)
+        self.assertEqual(load_task_binding(self.paths, 'N3', 'developer', run_id='run-1').task_id,
+                         new.task_id)
+        old.status = 'running'
+        with self.assertRaises(ValueError):
+            save_task_binding(self.paths, old)
+        old.status = 'stopped'
+        new.status = 'stopped'
+        save_task_binding(self.paths, new)
+        new.generation = 1
+        with self.assertRaises(ValueError):
+            save_task_binding(self.paths, new)
+        new.generation = 3
+        old.generation = 4
+        with self.assertRaises(ValueError):
+            save_task_binding(self.paths, old)
+        with self.assertRaises(ValueError):
+            another = self.binding(task_id='thread-another')
+            another.generation = 3
+            another.successor_of = old.task_id
+            save_task_binding(self.paths, another)
+
+    def test_successor_cannot_change_scope_or_replace_a_live_task(self):
+        for field, value in [('status', 'running'), ('worktree', '.worktrees/other'),
+                             ('host', 'other'), ('branch', 'other'), ('allowlist', ['extra.py']),
+                             ('successor_of', 'other'), ('generation', 2)]:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as root:
+                paths = ProjectPaths(Path(root))
+                old = self.binding()
+                old.generation = 2
+                old.status = 'stopped'
+                new = self.binding(task_id='thread-new')
+                new.generation = 3
+                new.successor_of = old.task_id
+                if field == 'status':
+                    old.status = value
+                else:
+                    setattr(new, field, value)
+                save_task_binding(paths, old)
+                with self.assertRaises(ValueError):
+                    save_task_binding(paths, new)
+
+    def test_bound_created_successor_can_reconcile_false_same_generation_projection(self):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        from unittest.mock import patch
+        old = self.binding()
+        old.generation = 3
+        old.status = 'stopped'
+        save_task_binding(self.paths, old)
+        store = ProviderActionStore(self.paths)
+        (self.paths.vibe / 'state.json').write_text('{}')
+        basis = dict(provider=old.provider, run_id='run-1', issue_id='N3', role='developer',
+                     generation=3, native_tool='native')
+        with patch('vibe_guide.adapters.task_provider.require_entry'):
+            create = store.request(operation='create', request={'successor': True,
+                'predecessor_task_id': old.task_id, 'authorization_digest': 'a'*64}, **basis)
+            store.complete(create['action_id'], {'binding': {'task_id': 'new', 'host': 'local'}})
+            for operation, request, result in [
+                ('locate', {'threadId': 'new'}, {'located': True}),
+                ('visibility', {'targets': [{'threadId': 'new', 'hostId': 'local'}]},
+                 {'visible': True, 'direct_enter': True}),
+            ]:
+                action = store.request(operation=operation,
+                    request=dict(request, authorization_digest='a'*64), **basis)
+                store.complete(action['action_id'], result)
+        new = self.binding(task_id='new')
+        new.generation = 3
+        new.successor_of = old.task_id
+        reconcile_shadowed_successor(self.paths, old, new, action_id=create['action_id'],
+                                    request_digest=create['request_digest'], authorization_digest='a'*64)
+        self.assertEqual(load_task_binding(self.paths, 'N3', 'developer', run_id='run-1').task_id, 'new')
+        reconcile_shadowed_successor(self.paths, old, new, action_id=create['action_id'],
+                                    request_digest=create['request_digest'], authorization_digest='a'*64)
+        old.cursor = 'old-final'
+        save_task_binding(self.paths, old)
+        old.status = 'running'
+        with self.assertRaises(ValueError):
+            save_task_binding(self.paths, old)
 
     def test_developer_and_reviewer_must_be_distinct_tasks(self):
         save_task_binding(self.paths, self.binding())

@@ -140,8 +140,12 @@ class ProviderActionRunner(Runner):
             "入口规则或后续规则注入不能替代该任务目标，不得仅回复收到规则。\n"
             "合同：{spec}；writer worktree：{worktree}；branch：{branch}；允许路径：{files}。\n"
             "当前 developer 交付：{delivery}；状态文件：{status}；交付文件：{handoff}；完成 marker：{marker}。"
-            "完成后必须写入本代状态/交付；完工自报必须使用 `--generation {generation}`。\n"
+            "完成后必须写入本代状态/交付；在主项目目录执行 `vibe worker-deliver --run-id {run} --node {node} --role {role} --generation {generation} --payload '<交付 JSON>'`。"
+            "随后执行 `vibe supervisor-address --run-id {run} --json`，按已授权通道唤醒登记主监工；无推送能力由心跳领取。"
+            "运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。\n"
         ).format(node=node_id, generation=generation, purpose=purpose, objective=objective,
+                 role=contract.get('role', 'developer'),
+                 run=contract.get('run_id', '<原 run-id>'),
                  business=json.dumps(business, ensure_ascii=False),
                  spec=contract.get("spec_path", "原 Issue 合同"),
                  worktree=contract.get("worktree", "原绑定工作目录"),
@@ -223,14 +227,8 @@ class ProviderActionRunner(Runner):
                 if name in nested and nested[name] != values[name]:
                     raise ProviderUnavailable("provider binding contract is blocked_unknown")
 
-    def _action(
-        self,
-        contract: Dict[str, Any],
-        run_id: str,
-        operation: str,
-        request: Dict[str, Any],
-        sequence: int = 0,
-    ) -> Dict[str, Any]:
+    @staticmethod
+    def _request_envelope(contract, request):
         request = dict(request)
         for key in (
             "dispatcher", "complexity_band", "execution_engine", "engine_mode",
@@ -241,6 +239,13 @@ class ProviderActionRunner(Runner):
         if contract.get("child_origin") == "worker_dispatch":
             request["origin"] = "worker_dispatch"
             request["child_binding"] = contract.get("child_binding")
+        continuation_route = contract.get("continuation_route")
+        if isinstance(continuation_route, dict):
+            request["continuation_route"] = dict(continuation_route)
+        return request
+
+    def _action(self, contract, run_id, operation, request, sequence=0):
+        request = self._request_envelope(contract, request)
         return self.store.request(
             operation=operation,
             provider=self.provider,
@@ -300,13 +305,60 @@ class ProviderActionRunner(Runner):
         operation: str,
         request: Dict[str, Any],
     ) -> Dict[str, Any]:
-        action = self._action(contract, run_id, operation, request)
+        sequence = contract.get("_create_recovery_sequence", 0) if operation in {"create", "locate", "visibility"} else 0
+        action = self._action(contract, run_id, operation, request, sequence=sequence)
         result = self.store.result(action["action_id"])
         if result is None:
-            raise ProviderPending(
+            pending = ProviderPending(
                 "provider %s action is pending" % operation
             )
+            pending.action_id = action["action_id"]
+            pending.request_digest = action["request_digest"]
+            raise pending
+        if result.get("status") in ("failed", "error", "stopped") or result.get("failed") is True:
+            error = result.get("reason") or result.get("error") or "provider action failed"
+            if isinstance(error, dict):
+                error = error.get("message") or "provider action failed"
+            unavailable = ProviderUnavailable(str(error))
+            unavailable.observation = dict(result)
+            raise unavailable
         return result
+
+    def _parameter_recovery_contract(self, contract, run_id, request):
+        # Only a confirmed rejected create permits a second create sequence.
+        # Unknown outcomes and returned task/setup identities never do.
+        contract = dict(contract)
+        contract.pop("_create_recovery_sequence", None)
+        options = contract.get("provider_options")
+        if not isinstance(options, dict) or options.get("omit_thinking") is not True:
+            return contract
+        basis = {"provider": self.provider, "run_id": run_id,
+            "issue_id": str(contract["node_id"]), "role": str(contract["role"]),
+            "generation": int(contract["generation"]), "sequence": 0}
+        original = self.store.related_action(basis, "create", required=False)
+        if original is None:
+            return contract  # First request may already omit the optional field.
+        envelope = self._request_envelope(contract, request)
+        previous = dict(original["request"])
+        if previous == envelope:
+            return contract
+        if "thinking" not in previous:
+            raise ValueError("provider parameter recovery request identity drift")
+        previous.pop("thinking")
+        if previous != envelope:
+            raise ValueError("provider parameter recovery request identity drift")
+        result = self.store.result(original["action_id"])
+        from ..monitor import classify_provider_failure
+        if (not isinstance(result, dict) or result.get("task_created") is not False
+                or not (result.get("status") in ("failed", "error")
+                    or (result.get("status") is None and result.get("failed") is True))
+                or result.get("created") is True
+                or classify_provider_failure(result)["kind"] != "retryable"
+                or any(key in result for key in ("binding", "threadId", "taskId", "task_id",
+                    "sessionId", "session_id", "platform_task_id", "clientThreadId", "client_thread_id"))):
+            raise ProviderUnavailable("pending parameter recovery: requires confirmed create rejection without a task")
+        contract["_create_recovery_sequence"] = 1
+        return contract
 
     def _validate_v39_create_binding(
         self, contract: Dict[str, Any], runtime_worktree: Path
@@ -477,7 +529,7 @@ class ProviderActionRunner(Runner):
         project_id = contract.get("project_id")
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("visible provider contract requires project_id")
-        if role == "developer":
+        if role in {"developer", "reviewer"}:
             # ISSUE-91 worker-push-delivery: the worker session ends by
             # self-reporting.  The signal content is never trusted -- the
             # monitor's existing gates still decide; without a push
@@ -486,8 +538,8 @@ class ProviderActionRunner(Runner):
             # worktree the CLI would resolve that worktree's own .vibe and
             # the report would never reach the supervisor.
             root = shlex.quote(str(self.paths.root))
-            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须在主项目目录执行，不要在 worktree 里执行）：1) 先执行 `cd {} && vibe worker-deliver --run-id {} --node {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；格式错误会当场返回）；2) `cd {} && vibe supervisor-address --run-id {}` 查询监工地址；3) 若平台有推送能力，向监工发固定格式唤醒信号；没有就到此为止，监工心跳兜底拉取。信号内容不影响验收。".format(
-                role, node_id, root, run_id, node_id, generation, root, run_id,
+            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须在主项目目录执行，不要在 worktree 里执行）：1) 先执行 `cd {} && vibe worker-deliver --run-id {} --node {} --role {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；格式错误会当场返回）；2) `cd {} && vibe supervisor-address --run-id {} --json` 查询监工地址；3) 若平台有推送能力，按已授权通道向监工发固定格式唤醒信号；没有就到此为止，监工心跳兜底拉取。信号内容不影响验收。运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。".format(
+                role, node_id, root, run_id, node_id, role, generation, root, run_id,
             )
         else:
             head = "请执行 {} 任务，Issue {}。".format(role, node_id)
@@ -507,15 +559,23 @@ class ProviderActionRunner(Runner):
         profile = self._routing_profile(contract)
         if profile is not None:
             thinking = provider_thinking_for(profile.reasoning)
-            create_request.update(
-                {
-                    "model": profile.model,
-                    "thinking": thinking,
-                    "issue_id": node_id,
-                    "route_digest": profile.route_digest,
-                    "worker_profile": profile.to_dict(),
-                }
-            )
+            create_request.update({
+                "model": profile.model,
+                "issue_id": node_id,
+                "route_digest": profile.route_digest,
+                "worker_profile": profile.to_dict(),
+            })
+            # Some native Codex App versions reject an otherwise valid
+            # model/reasoning pair at request validation time.  The monitor's
+            # same-task recovery records this option after the first real
+            # rejection; omit only the optional thinking field and let the
+            # provider choose its supported default.
+            provider_options = contract.get("provider_options")
+            if not (
+                isinstance(provider_options, dict)
+                and provider_options.get("omit_thinking") is True
+            ):
+                create_request["thinking"] = thinking
         topology = str(contract.get("topology") or DEFAULT_TOPOLOGY)
         if topology not in _TOPOLOGIES:
             raise ValueError("task binding topology is invalid")
@@ -579,6 +639,7 @@ class ProviderActionRunner(Runner):
         if successor:
             create_request["successor"] = True
             create_request["predecessor_task_id"] = predecessor
+        contract = self._parameter_recovery_contract(contract, run_id, create_request)
         created = self._require_result(
             contract, run_id, "create", create_request
         )
@@ -587,22 +648,32 @@ class ProviderActionRunner(Runner):
             or "selected_model" in profile.selection_basis
         )
         if routed_profile:
-            actual_model = created.get("actual_model")
-            actual_thinking = created.get("actual_thinking")
-            if (
-                not isinstance(actual_model, str)
-                or not actual_model.strip()
-                or actual_model.casefold() == "unknown"
-                or actual_model != profile.model
-            ):
-                raise ProviderUnavailable("provider actual model is blocked_unknown")
-            if (
-                not isinstance(actual_thinking, str)
-                or not actual_thinking.strip()
-                or actual_thinking.casefold() == "unknown"
-                or actual_thinking != create_request["thinking"]
-            ):
-                raise ProviderUnavailable("provider actual thinking is blocked_unknown")
+            # Native create responses from older Codex App versions may omit
+            # these optional telemetry fields even though they return a
+            # verified task binding.  The selected worker profile remains the
+            # supervisor's routing authority; absence of telemetry must not
+            # discard the task identity and strand the DAG.  If a provider
+            # does return either field, keep the existing fail-closed checks
+            # for malformed or conflicting telemetry.
+            if "actual_model" in created:
+                actual_model = created.get("actual_model")
+                if (
+                    not isinstance(actual_model, str)
+                    or not actual_model.strip()
+                    or actual_model.casefold() == "unknown"
+                    or actual_model != profile.model
+                ):
+                    raise ProviderUnavailable("provider actual model is blocked_unknown")
+            if "actual_thinking" in created:
+                actual_thinking = created.get("actual_thinking")
+                expected_thinking = create_request.get("thinking")
+                if (
+                    not isinstance(actual_thinking, str)
+                    or not actual_thinking.strip()
+                    or actual_thinking.casefold() == "unknown"
+                    or (expected_thinking is not None and actual_thinking != expected_thinking)
+                ):
+                    raise ProviderUnavailable("provider actual thinking is blocked_unknown")
         binding_data = created.get("binding")
         if not isinstance(binding_data, dict):
             raise ValueError("provider create result has no verified binding")
@@ -1091,7 +1162,13 @@ class ProviderActionRunner(Runner):
                 ("model", profile.model),
                 ("reasoning", profile.reasoning),
             ):
-                if getattr(binding, field_name, None) not in (None, "", expected):
+                current_value = getattr(binding, field_name, None)
+                if contract.get("continuation") and current_value not in (None, ""):
+                    # The persisted binding is the verified record of the
+                    # route that created this task; resuming it must not be
+                    # gated by a stale plan-side profile projection.
+                    continue
+                if current_value not in (None, "", expected):
                     raise ProviderUnavailable("task binding worker model route is stale")
         verification = self.binding_gate(contract, binding)
         if binding_contract_enabled(contract) and not verification.verified:
@@ -1126,13 +1203,36 @@ class ProviderActionRunner(Runner):
             "plan_id": contract.get("plan_id"),
             "plan_version": contract.get("plan_version"),
         }
-        if profile is not None:
+        route_model = profile.model if profile is not None else None
+        route_reasoning = profile.reasoning if profile is not None else None
+        route_digest = profile.route_digest if profile is not None else None
+        if contract.get("continuation"):
+            # For continuation the registered binding route is authoritative;
+            # the contract profile is only a stale plan projection there.
+            route_model = binding.model or route_model
+            route_reasoning = binding.reasoning or route_reasoning
+            route_digest = binding.route_digest or route_digest
+            # ``child_binding`` remains the creation-time authorization and
+            # workspace proof required by ProviderActionStore.  It must not be
+            # rewritten with a later route: its WorkerProfile digest is tied
+            # to its original selection basis.  Carry the verified persisted
+            # route in a separate continuation field so the native request
+            # has an unambiguous current route without invalidating the child
+            # proof or inventing a new binding identity.
+            if route_model and route_reasoning and route_digest:
+                contract = dict(contract)
+                contract["continuation_route"] = {
+                    "model": route_model,
+                    "reasoning": route_reasoning,
+                    "route_digest": route_digest,
+                }
+        if route_model is not None:
             metadata.update(
                 {
-                    "model": profile.model,
-                    "reasoning": profile.reasoning,
-                    "thinking": provider_thinking_for(profile.reasoning),
-                    "route_digest": profile.route_digest,
+                    "model": route_model,
+                    "reasoning": route_reasoning,
+                    "thinking": provider_thinking_for(route_reasoning),
+                    "route_digest": route_digest,
                 }
             )
         if contract.get("continuation"):
@@ -1141,8 +1241,8 @@ class ProviderActionRunner(Runner):
                 "hostId": binding.host,
                 "prompt": self._continuation_prompt(contract) + "\n" + self._consistency_instruction(contract),
             }
-            if profile is not None:
-                request.update({"model": profile.model, "thinking": provider_thinking_for(profile.reasoning)})
+            if route_model is not None:
+                request.update({"model": route_model, "thinking": provider_thinking_for(route_reasoning)})
             action = self._action(contract, run_id, "resume", request)
             metadata["pending_action"] = action["action_id"]
             metadata["pending_operation"] = "resume"
@@ -1272,6 +1372,8 @@ class ProviderActionRunner(Runner):
         if status in {"timeout", "unknown", "error"}:
             return [RunEvent("visibility_unknown", {**claims, "reason": str(status)})]
         event_name = result.get("event")
+        if event_name is None and status in {"failed", "stopped"}:
+            event_name = status
         if event_name not in {
             "complete",
             "delivered",
@@ -1296,6 +1398,16 @@ class ProviderActionRunner(Runner):
         metadata["terminal_confirmed"] = True
         self.store._atomic(self._handle_path(handle.run_id), metadata)
         data = dict(claims)
+        if event_name in {"failed", "stopped"}:
+            # Native terminal errors must reach the monitor's recovery
+            # classifier, including explicit authorization boundaries.
+            for key in ("error", "reason", "reason_class", "credential_required", "login_required", "permission_required"):
+                if key in result:
+                    data[key] = result[key]
+            if not data.get("reason"):
+                error = result.get("error")
+                data["reason"] = (error.get("message", event_name) if isinstance(error, dict)
+                                  else str(error or event_name))
         # ``in_session_review`` carries the visible-sdd worker session's
         # review clearance (protocol/evidence_ref/p0-p2) that Monitor needs
         # to accept a single-session node (ISSUE-04).

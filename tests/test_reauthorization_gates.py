@@ -32,12 +32,16 @@ from unittest.mock import patch
 from vibe_guide import cli as cli_module
 from vibe_guide import monitor as monitor_module
 from vibe_guide.authorize_entry import load_live_workflow
+from vibe_guide.capability_contract import build_contract, save_contract
 from vibe_guide.authorization import (
     BACKGROUND_MODE_DISCLOSURES,
     authorize,
     build_authorization_card,
     dispatch_topology_for_node,
+    executable_contract_digest,
+    is_authorization_valid,
     refresh_authorization_card,
+    validate_runtime_contract,
 )
 from vibe_guide.cli import (
     _VOLATILE_CARD_FIELDS,
@@ -58,6 +62,7 @@ from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.state import load_events, load_snapshot
+from vibe_guide.task_registry import load_task_binding, save_task_binding
 
 from tests.support_v45_authorize import publish_complex_probe
 
@@ -71,6 +76,363 @@ def _business_node(node_id, adapter_id="workbuddy", **contract_overrides):
     }
     contract.update(contract_overrides)
     return DAGNode(node_id, node_id, [], [], "g1", contract, "ready")
+
+
+def _worker_profile(allowlist, node_id="alpha"):
+    return {
+        "worker": "codex",
+        "model": "test",
+        "reasoning": "normal",
+        "fallbacks": [],
+        "selection_basis": {
+            "issue_complexity_ref": node_id,
+            "complexity_band": "standard",
+            "risk_tags": [],
+            "availability_evidence": "test",
+        },
+        "writer": "writer",
+        "worktree": ".worktrees/" + node_id,
+        "branch": "branch-" + node_id,
+        "allowlist": allowlist,
+    }
+
+
+class ReauthorizationContractDigestTests(unittest.TestCase):
+    """File-scope changes must not invalidate acceptance evidence."""
+
+    def test_file_scope_expansion_keeps_the_node_contract_digest(self):
+        original = _business_node("alpha")
+        expanded = _business_node("alpha")
+        expanded.contract["files"].append("tests/test_alpha.py")
+
+        self.assertEqual(
+            executable_contract_digest([original]),
+            executable_contract_digest([expanded]),
+        )
+
+    def test_acceptance_semantics_still_change_the_node_contract_digest(self):
+        original = _business_node("alpha")
+        changed = _business_node("alpha", acceptance_example="verified_fact: changed")
+
+        self.assertNotEqual(
+            executable_contract_digest([original]),
+            executable_contract_digest([changed]),
+        )
+
+    def test_scope_expansion_still_changes_the_authorization_file_scope(self):
+        plan = Plan("plan-1", 1, "docs/prd.md", ["alpha"], "draft")
+        original = _business_node("alpha")
+        card = build_authorization_card(plan, [original], AgentCapabilities("fake", True, True, True, True, True, "full"))
+        expanded = _business_node("alpha", files=["alpha.py", "tests/test_alpha.py"])
+
+        refreshed = refresh_authorization_card(plan, [expanded], card)
+
+        self.assertEqual(refreshed.node_contract_digest, card.node_contract_digest)
+        self.assertIn("tests/test_alpha.py", refreshed.file_scope)
+        self.assertNotEqual(refreshed.digest, card.digest)
+
+    def test_worker_profile_allowlist_drift_invalidates_authorization(self):
+        plan = Plan("plan-1", 1, "docs/prd.md", ["alpha"], "draft")
+        original = _business_node(
+            "alpha", worker_profile=_worker_profile(["alpha.py"])
+        )
+        changed = _business_node(
+            "alpha", worker_profile=_worker_profile(["outside.py"])
+        )
+        capabilities = AgentCapabilities(
+            "fake", True, True, True, True, True, "full"
+        )
+        record = authorize(
+            build_authorization_card(plan, [original], capabilities), "AUTHORIZE"
+        )
+
+        self.assertFalse(is_authorization_valid(record, plan, [changed]))
+
+    def test_worker_profile_allowlist_drift_blocks_provider_start(self):
+        temporary = tempfile.TemporaryDirectory(prefix="vg-issue-147-allowlist-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        paths = ProjectPaths(root)
+        (paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (paths.vibe / "state.json").write_text(
+            '{"workflow_version": 2, "session_gate": "s0_required"}\n',
+            encoding="utf-8",
+        )
+        save_contract(paths, build_contract(root, provider="fake", host_id="local"))
+        capabilities = AgentCapabilities(
+            "fake", True, True, True, True, True, "full"
+        )
+        original = _business_node(
+            "alpha", worker_profile=_worker_profile(["alpha.py"])
+        )
+        changed = _business_node(
+            "alpha", worker_profile=_worker_profile(["outside.py"])
+        )
+        plan = Plan("plan-1", 1, "docs/prd.md", ["alpha"], "draft")
+        record = authorize(
+            build_authorization_card(plan, [original], capabilities), "AUTHORIZE"
+        )
+        runner = FakeRunner()
+
+        with self.assertRaises(PermissionError):
+            Monitor(paths, plan, [changed]).start(record, runner)
+        self.assertEqual(runner.start_calls, [])
+
+    def test_runtime_contract_rejects_worker_profile_allowlist_outside_scope(self):
+        with self.assertRaises(ValueError):
+            validate_runtime_contract(
+                {
+                    "files": ["alpha.py"],
+                    "worker_profile": {"allowlist": ["outside.py"]},
+                },
+                authorized_files=("alpha.py",),
+            )
+
+
+class ScopeOnlyReauthorizationTests(unittest.TestCase):
+    """A scope-only edit must not invalidate a downstream acceptance."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="vg-issue-147-")
+        self.root = Path(self.temporary.name)
+        self.paths = ProjectPaths(self.root)
+        (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (self.paths.vibe / "state.json").write_text(
+            '{"workflow_version": 2, "session_gate": "s0_required"}\n',
+            encoding="utf-8",
+        )
+        save_contract(
+            self.paths,
+            build_contract(self.root, provider="fake", host_id="local"),
+        )
+        self.capabilities = AgentCapabilities(
+            "fake", True, True, True, True, True, "full"
+        )
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    @staticmethod
+    def _nodes(a_files=None, a_acceptance="verified_fact: accepted"):
+        a = _business_node("a", files=a_files or ["a.py"], acceptance_example=a_acceptance)
+        b = _business_node("b")
+        b.depends_on = ["a"]
+        for current in (a, b):
+            current.contract["worker_profile"] = {
+                "worker": "codex",
+                "model": "test",
+                "reasoning": "normal",
+                "fallbacks": [],
+                "selection_basis": {
+                    "issue_complexity_ref": current.id,
+                    "complexity_band": "standard",
+                    "risk_tags": [],
+                    "availability_evidence": "test",
+                },
+                "writer": "writer",
+                "worktree": ".worktrees/" + current.id,
+                "branch": "branch-" + current.id,
+                "allowlist": list(current.contract["files"]),
+            }
+        return [a, b]
+
+    def _accepted_run(self):
+        nodes = self._nodes()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        runner = FakeRunner(
+            events={
+                (node_id, "developer"): [("complete", {"evidence": node_id})]
+                for node_id in ("a", "b")
+            }
+            | {
+                (node_id, "reviewer"): [("accepted", {"evidence": node_id})]
+                for node_id in ("a", "b")
+            }
+        )
+        monitor = Monitor(self.paths, plan, nodes)
+        snapshot = monitor.start(record, runner)
+        for _ in range(8):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(
+            {node_id: current["status"] for node_id, current in snapshot.nodes.items()},
+            {"a": "accepted", "b": "accepted"},
+        )
+        cursors = {}
+        for role in ("developer", "reviewer"):
+            binding = load_task_binding(self.paths, "b", role, run_id=snapshot.run_id)
+            binding.cursor = "cursor-b-" + role
+            save_task_binding(self.paths, binding)
+            cursors[role] = binding.cursor
+        return snapshot, nodes, cursors
+
+    def test_scope_only_expansion_keeps_a_and_b_accepted(self):
+        snapshot, _old_nodes, cursors = self._accepted_run()
+        changed_nodes = self._nodes(a_files=["a.py", "tests/test_a.py"])
+        changed_plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        changed_record = authorize(
+            build_authorization_card(changed_plan, changed_nodes, self.capabilities),
+            "AUTHORIZE",
+        )
+
+        rebound = Monitor(self.paths, changed_plan, changed_nodes).reauthorize(
+            snapshot.run_id,
+            changed_record,
+            FakeRunner(),
+            "executable_contract_changed",
+        )
+
+        self.assertEqual(rebound.nodes["a"]["status"], "accepted")
+        self.assertEqual(rebound.nodes["b"]["status"], "accepted")
+        for role, cursor in cursors.items():
+            self.assertEqual(
+                load_task_binding(self.paths, "b", role, run_id=snapshot.run_id).cursor,
+                cursor,
+            )
+
+    def test_acceptance_semantic_change_invalidates_downstream_b(self):
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        changed_nodes = self._nodes(a_acceptance="verified_fact: changed")
+        changed_plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        changed_record = authorize(
+            build_authorization_card(changed_plan, changed_nodes, self.capabilities),
+            "AUTHORIZE",
+        )
+
+        rebound = Monitor(self.paths, changed_plan, changed_nodes).reauthorize(
+            snapshot.run_id,
+            changed_record,
+            FakeRunner(),
+            "executable_contract_changed",
+        )
+
+        self.assertEqual(rebound.nodes["a"]["status"], "rework")
+        self.assertEqual(rebound.nodes["b"]["status"], "blocked_unknown")
+        self.assertIsNone(rebound.nodes["b"]["acceptance"])
+
+
+class TemporaryReadFailureTests(unittest.TestCase):
+    def test_resume_read_failure_stays_unknown_without_invalidation_marker(self):
+        root = Path(tempfile.mkdtemp(prefix="vg-temporary-read-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        paths = ProjectPaths(root)
+        directory = root / ".vibe" / "plans" / "probe-plan"
+        directory.mkdir(parents=True)
+        (root / ".vibe" / "state.json").write_text(
+            json.dumps({
+                "workflow_version": 4,
+                "execution_mode": "sdd_first",
+                "session_gate": "s0_required",
+                "capability_contract_required": True,
+            }),
+            encoding="utf-8",
+        )
+        plan = Plan("probe-plan", 1, "docs/prd.md", ["probe-node"], "authorized")
+        node = _business_node("probe-node")
+        card = build_authorization_card(
+            plan, [node], AgentCapabilities("fake", True, True, True, True, True, "full")
+        )
+        record = authorize(card, "AUTHORIZE")
+        (directory / "authorization.json").write_text(
+            json.dumps(record.to_dict()), encoding="utf-8"
+        )
+
+        with patch.object(
+            cli_module.Monitor,
+            "resume",
+            side_effect=PermissionError("temporary read failure"),
+        ), patch.object(
+            cli_module, "_load_plan", return_value=(directory, plan, [node], card)
+        ), patch.object(
+            cli_module, "require_capability_contract", return_value=None
+        ):
+            result = run_cli(
+                [
+                    "resume",
+                    "--plan", "probe-plan",
+                    "--run-id", "run-probe",
+                    "--json",
+                ],
+                root,
+                runner=FakeRunner(),
+            )
+
+        self.assertEqual(result.payload.get("status"), "unknown", result.payload)
+        self.assertFalse((directory / "authorization-invalidated.json").exists())
+
+    def test_engine_attestation_read_failure_stays_unknown_without_invalidation_marker(self):
+        root = publish_complex_probe(self)
+        paths = ProjectPaths(root)
+        authorized = run_cli(
+            ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
+            root,
+        )
+        self.assertEqual(authorized.payload.get("status"), "ok", authorized.payload)
+        directory, plan, nodes, card = _load_plan(paths, "probe-plan")
+        snapshot = Monitor(paths, plan, nodes).start(
+            authorize(card, "AUTHORIZE"), FakeRunner()
+        )
+        attestation_path = directory / "engine-attestation.json"
+        (directory / "authorization.json").write_text(
+            json.dumps(authorize(card, "AUTHORIZE").to_dict()), encoding="utf-8"
+        )
+        original_read_text = Path.read_text
+
+        def fail_attestation_read(path, *args, **kwargs):
+            if path == attestation_path:
+                raise PermissionError("temporary attestation read failure")
+            return original_read_text(path, *args, **kwargs)
+
+        with patch.object(Path, "read_text", fail_attestation_read):
+            result = run_cli(
+                [
+                    "resume",
+                    "--plan", "probe-plan",
+                    "--run-id", snapshot.run_id,
+                    "--json",
+                ],
+                root,
+                runner=FakeRunner(),
+            )
+
+        self.assertEqual(result.payload.get("status"), "unknown", result.payload)
+        self.assertIn("execution_engine_unverified", result.payload.get("reason", ""))
+        self.assertFalse((directory / "authorization-invalidated.json").exists())
+
+    def test_workflow_artifact_content_drift_invalidates_authorization(self):
+        root = publish_complex_probe(self)
+        paths = ProjectPaths(root)
+        authorized = run_cli(
+            ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
+            root,
+        )
+        self.assertEqual(authorized.payload.get("status"), "ok", authorized.payload)
+        directory, plan, nodes, card = _load_plan(paths, "probe-plan")
+        record = authorize(card, "AUTHORIZE")
+        runner = FakeRunner()
+        snapshot = Monitor(paths, plan, nodes).start(record, runner)
+        (directory / "authorization.json").write_text(
+            json.dumps(record.to_dict()), encoding="utf-8"
+        )
+        prd = directory / "prd.md"
+        prd.write_bytes(prd.read_bytes() + b"\nActual PRD content drift.\n")
+
+        result = run_cli(
+            [
+                "resume",
+                "--plan", "probe-plan",
+                "--run-id", snapshot.run_id,
+                "--json",
+            ],
+            root,
+            runner=runner,
+        )
+
+        self.assertEqual(result.payload.get("status"), "blocked_design", result.payload)
+        self.assertIn("workflow_evidence_stale", result.payload.get("reason", ""))
+        self.assertTrue((directory / "authorization-invalidated.json").exists())
 
 
 class DispatchTopologyRulingTests(unittest.TestCase):

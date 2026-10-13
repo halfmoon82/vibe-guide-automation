@@ -13,7 +13,9 @@ Observed on run 140 (2026-10-05, vibe 5.0.4 on Codex, 13 shifts in 10.5h):
 - A takeover re-read several prd-guide sections, the authorization card and
   the full status (11-31 calls).
 """
+import importlib
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,7 +25,7 @@ from vibe_guide.cli import run_cli
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.supervisor import (
     DEFAULT_ROTATE_HARD_CAP,
-    heartbeat_prompt,
+    heartbeat_command,
     register_supervisor_address,
     release_supervisor_hold,
     set_supervisor_hold,
@@ -32,6 +34,12 @@ from vibe_guide.supervisor import (
 )
 
 from tests.support_v45_authorize import publish_complex_probe
+
+
+try:
+    decision_boundary = importlib.import_module("vibe_guide.decision_boundary")
+except ModuleNotFoundError:
+    decision_boundary = None
 
 
 def _record(directory, tokens, name="session.json"):
@@ -217,11 +225,45 @@ class RelativeThresholdTests(_Case):
 class HoldTests(_Case):
     """Fix 1: a node waiting on a human is idle, and the disk says so."""
 
+    def hold(self, node, reason="等用户拍板", category="product_design"):
+        return set_supervisor_hold(
+            self.paths, "run-1", node, reason, boundary_category=category,
+        )
+
+    def test_boundary_category_validator_accepts_only_the_approved_enum(self):
+        self.assertIsNotNone(decision_boundary, "decision boundary module is required")
+        allowed = ("product_design", "external_authorization", "deploy")
+        self.assertEqual(decision_boundary.BOUNDARY_CATEGORIES, allowed)
+        for category in allowed:
+            with self.subTest(category=category):
+                self.assertEqual(
+                    decision_boundary.validate_boundary_category(category), category,
+                )
+        for category in (None, "", "engineering", "unknown"):
+            with self.subTest(category=category):
+                with self.assertRaises(ValueError):
+                    decision_boundary.validate_boundary_category(category)
+
+    def test_hold_requires_a_supported_boundary_category(self):
+        with _patch_snapshot({"n1": "ready"}):
+            with self.assertRaisesRegex(ValueError, "product_design"):
+                set_supervisor_hold(self.paths, "run-1", "n1", "等用户拍板")
+            with self.assertRaisesRegex(ValueError, "external_authorization"):
+                self.hold("n1", category="engineering")
+        self.assertEqual(supervisor_holds(self.paths, "run-1"), {})
+
+    def test_each_supported_category_is_persisted(self):
+        with _patch_snapshot({"n1": "ready"}):
+            for category in ("product_design", "external_authorization", "deploy"):
+                with self.subTest(category=category):
+                    holds = self.hold("n1", category=category)
+                    self.assertEqual(holds["n1"]["category"], category)
+
     def test_pending_request_of_a_held_node_is_idle(self):
         self.pending("integration-review")
         statuses = {"a": "accepted", "integration-review": "ready"}
         with _patch_snapshot(statuses):
-            set_supervisor_hold(self.paths, "run-1", "integration-review", "等用户拍板 A/B")
+            self.hold("integration-review", "等用户拍板 A/B")
             result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
         self.assertEqual(result["state"], "idle", result)
         self.assertEqual(result["held"], ["integration-review"])
@@ -231,7 +273,7 @@ class HoldTests(_Case):
         self.pending("n2")
         statuses = {"integration-review": "ready", "n2": "running"}
         with _patch_snapshot(statuses):
-            set_supervisor_hold(self.paths, "run-1", "integration-review", "等用户拍板")
+            self.hold("integration-review")
             result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
         self.assertEqual(result["state"], "work")
         self.assertEqual(result["pending"], 1)
@@ -239,14 +281,14 @@ class HoldTests(_Case):
     def test_other_nodes_needing_service_are_still_work(self):
         statuses = {"integration-review": "ready", "n2": "retry_pending"}
         with _patch_snapshot(statuses):
-            set_supervisor_hold(self.paths, "run-1", "integration-review", "等用户拍板")
+            self.hold("integration-review")
             result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
         self.assertEqual(result["state"], "work")
         self.assertEqual(result["nodes"], ["n2"])
 
     def test_a_delivery_on_a_held_node_still_wakes_the_supervisor(self):
         with _patch_snapshot({"integration-review": "ready"}):
-            set_supervisor_hold(self.paths, "run-1", "integration-review", "等用户拍板")
+            self.hold("integration-review")
             with patch(
                 "vibe_guide.adapters.task_provider.ProviderActionStore.unconsumed_deliveries",
                 return_value=["integration-review"],
@@ -257,7 +299,7 @@ class HoldTests(_Case):
     def test_release_restores_work(self):
         self.pending("integration-review")
         with _patch_snapshot({"integration-review": "ready"}):
-            set_supervisor_hold(self.paths, "run-1", "integration-review", "等用户拍板")
+            self.hold("integration-review")
             self.assertTrue(release_supervisor_hold(self.paths, "run-1", "integration-review"))
             self.assertFalse(release_supervisor_hold(self.paths, "run-1", "integration-review"))
             result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
@@ -276,7 +318,7 @@ class HoldTests(_Case):
         """Review P1: the held node is often not the DAG's last node."""
         statuses = {"a": "accepted", "x": "ready", "y": "planned"}
         with _patch_snapshot(statuses):
-            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            self.hold("x")
             result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
         self.assertEqual(result["state"], "idle", result)
         self.assertEqual(result["held"], ["x"])
@@ -285,7 +327,7 @@ class HoldTests(_Case):
         """Review round 2 P2: Z depends only on accepted A, so it can start now."""
         statuses = {"a": "accepted", "z": "planned", "x": "ready"}
         with _patch_snapshot(statuses, ready_set=["x", "z"]):
-            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            self.hold("x")
             result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
         self.assertEqual(result["state"], "work", result)
         self.assertEqual(result["nodes"], ["z"])
@@ -301,7 +343,7 @@ class HoldTests(_Case):
     def test_queued_nodes_behind_full_capacity_stay_idle_with_a_hold(self):
         statuses = {"x": "ready", "n1": "running", "n2": "planned"}
         with _patch_snapshot(statuses, ready_set=["x", "n2"]):
-            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            self.hold("x")
             result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
         self.assertEqual(result["state"], "idle", result)
         self.assertEqual(result["held"], ["x"])
@@ -309,7 +351,7 @@ class HoldTests(_Case):
     def test_hold_from_the_future_is_rechecked(self):
         """Review round 2 P3: a clock moved back must not extend a hold."""
         with _patch_snapshot({"x": "ready"}):
-            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            self.hold("x")
             earlier = __import__("time").time() - 3600
             with patch("vibe_guide.supervisor.time.time", return_value=earlier):
                 result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
@@ -318,11 +360,11 @@ class HoldTests(_Case):
     def test_re_holding_one_node_does_not_revive_another(self):
         """Review round 2 P3: each voided hold needs its own recheck."""
         with _patch_snapshot({"x": "ready", "y": "ready"}):
-            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板 x")
-            set_supervisor_hold(self.paths, "run-1", "y", "等用户拍板 y")
+            self.hold("x", "等用户拍板 x")
+            self.hold("y", "等用户拍板 y")
         changed = {"x": "blocked_unknown", "y": "ready"}
         with _patch_snapshot(changed):
-            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板 x")
+            self.hold("x", "等用户拍板 x")
             result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
         self.assertEqual(result["state"], "work", result)
         self.assertEqual(result["nodes"], ["y"])
@@ -330,7 +372,7 @@ class HoldTests(_Case):
     def test_any_status_change_since_the_hold_voids_it(self):
         """Review P2: a hold must not hide what happened after it."""
         with _patch_snapshot({"x": "ready", "y": "planned"}):
-            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            self.hold("x")
         for changed in ({"x": "blocked_unknown", "y": "planned"},
                         {"x": "ready", "y": "ready"},
                         {"x": "ready", "y": "planned", "z": "planned"}):
@@ -341,9 +383,9 @@ class HoldTests(_Case):
 
     def test_holding_again_refreshes_to_the_current_state(self):
         with _patch_snapshot({"x": "ready", "y": "planned"}):
-            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            self.hold("x")
         with _patch_snapshot({"x": "blocked_unknown", "y": "planned"}):
-            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            self.hold("x")
             result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
         self.assertEqual(result["state"], "idle", result)
 
@@ -352,7 +394,7 @@ class HoldTests(_Case):
         from vibe_guide.supervisor import HOLD_RECHECK_SECONDS
 
         with _patch_snapshot({"x": "ready"}):
-            set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+            self.hold("x")
             later = __import__("time").time() + HOLD_RECHECK_SECONDS + 1
             with patch("vibe_guide.supervisor.time.time", return_value=later):
                 result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 30000))
@@ -363,7 +405,7 @@ class HoldTests(_Case):
         for status in ("review", "rework"):
             with self.subTest(status=status), _patch_snapshot({"x": status}):
                 with self.assertRaises(ValueError):
-                    set_supervisor_hold(self.paths, "run-1", "x", "等用户拍板")
+                    self.hold("x")
 
     def test_preflight_on_an_unknown_run_creates_nothing(self):
         """Review P3: the preflight promises a read-only disk check."""
@@ -373,11 +415,11 @@ class HoldTests(_Case):
     def test_hold_needs_a_known_node_and_a_reason(self):
         with _patch_snapshot({"n1": "ready"}):
             with self.assertRaises(ValueError):
-                set_supervisor_hold(self.paths, "run-1", "typo", "等用户拍板")
+                self.hold("typo")
             with self.assertRaises(ValueError):
-                set_supervisor_hold(self.paths, "run-1", "n1", "  ")
+                self.hold("n1", "  ")
             with self.assertRaises(ValueError):
-                set_supervisor_hold(self.paths, "run-1", "n1", "x" * 201)
+                self.hold("n1", "x" * 201)
 
 
 class CliTests(unittest.TestCase):
@@ -393,10 +435,11 @@ class CliTests(unittest.TestCase):
         root, run_id, node = self.start()
         held = run_cli([
             "supervisor-hold", "--json", "--run-id", run_id,
-            "--node", node, "--reason", "等用户拍板 A/B",
+            "--node", node, "--category", "product_design", "--reason", "等用户拍板 A/B",
         ], root)
         self.assertEqual(held.exit_code, 0, held.payload)
         self.assertEqual(held.payload["holds"][node]["reason"], "等用户拍板 A/B")
+        self.assertEqual(held.payload["holds"][node]["category"], "product_design")
         released = run_cli([
             "supervisor-hold", "--json", "--run-id", run_id, "--node", node, "--release",
         ], root)
@@ -407,10 +450,36 @@ class CliTests(unittest.TestCase):
         root, run_id, _node = self.start()
         result = run_cli([
             "supervisor-hold", "--json", "--run-id", run_id,
-            "--node", "no-such-node", "--reason", "x",
+            "--node", "no-such-node", "--category", "product_design", "--reason", "x",
         ], root)
         self.assertNotEqual(result.exit_code, 0)
         self.assertEqual(result.payload["status"], "blocked_invalid")
+
+    def test_hold_cli_rejects_missing_or_unknown_category(self):
+        root, run_id, node = self.start()
+        missing = run_cli([
+            "supervisor-hold", "--json", "--run-id", run_id,
+            "--node", node, "--reason", "等用户拍板",
+        ], root)
+        self.assertEqual(missing.exit_code, 3, missing.payload)
+        self.assertIn("product_design", missing.payload["reason"])
+        unknown = run_cli([
+            "supervisor-hold", "--json", "--run-id", run_id,
+            "--node", node, "--category", "engineering", "--reason", "工程问题",
+        ], root)
+        self.assertEqual(unknown.exit_code, 3, unknown.payload)
+        self.assertIn("external_authorization", unknown.payload["reason"])
+
+    def test_hold_cli_accepts_each_supported_category(self):
+        root, run_id, node = self.start()
+        for category in ("product_design", "external_authorization", "deploy"):
+            with self.subTest(category=category):
+                result = run_cli([
+                    "supervisor-hold", "--json", "--run-id", run_id,
+                    "--node", node, "--category", category, "--reason", "等用户拍板",
+                ], root)
+                self.assertEqual(result.exit_code, 0, result.payload)
+                self.assertEqual(result.payload["holds"][node]["category"], category)
 
     def test_register_records_the_takeover_baseline(self):
         root, run_id, _node = self.start()
@@ -435,17 +504,24 @@ class CliTests(unittest.TestCase):
     def test_handoff_prints_everything_a_new_shift_needs(self):
         root, run_id, node = self.start()
         run_cli([
-            "supervisor-hold", "--run-id", run_id, "--node", node, "--reason", "等用户拍板 A/B",
+            "supervisor-hold", "--run-id", run_id, "--node", node,
+            "--category", "product_design", "--reason", "等用户拍板 A/B",
         ], root)
         result = run_cli(["supervisor-handoff", "--run-id", run_id], root)
         self.assertEqual(result.exit_code, 0, result.text)
-        self.assertIn(heartbeat_prompt("probe-plan", run_id), result.text)
+        command = heartbeat_command(run_id)
+        self.assertIn(command, result.text)
+        self.assertEqual(result.text.count(command), 1)
+        self.assertNotIn("vibe 监工心跳", result.text)
+        self.assertNotIn("vibe supervisor-preflight", result.text)
         self.assertIn("等用户拍板 A/B", result.text)
+        self.assertIn("类别 product_design", result.text)
         self.assertIn("--session-record <本会话记录路径>", result.text)
         self.assertIn("vibe supervisor-register --run-id " + run_id, result.text)
         as_json = run_cli(["supervisor-handoff", "--json", "--run-id", run_id], root)
         self.assertEqual(as_json.payload["plan_id"], "probe-plan")
         self.assertEqual(list(as_json.payload["holds"]), [node])
+        self.assertEqual(as_json.payload["holds"][node]["category"], "product_design")
         self.assertIn(node, as_json.payload["nodes"])
 
     def test_hold_on_a_real_run_turns_the_preflight_idle(self):
@@ -458,7 +534,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(before.payload["state"], "work", before.payload)
         node = before.payload["nodes"][0]
         run_cli([
-            "supervisor-hold", "--run-id", run_id, "--node", node, "--reason", "等用户拍板",
+            "supervisor-hold", "--run-id", run_id, "--node", node,
+            "--category", "product_design", "--reason", "等用户拍板",
         ], root)
         after = run_cli([
             "supervisor-preflight", "--json", "--run-id", run_id, "--session-record", log,
@@ -472,20 +549,90 @@ class CliTests(unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0)
         self.assertEqual(result.payload["status"], "blocked_invalid")
 
+    def test_supervisor_beat_is_a_single_line_command(self):
+        command = heartbeat_command("run-b")
+        self.assertEqual(command, "vibe supervisor-beat --run-id run-b --session-record <本会话记录路径>")
+        self.assertNotIn("\n", command)
+
+    def test_legacy_prompt_api_is_not_an_installation_surface(self):
+        root, run_id, _node = self.start()
+        handoff = run_cli(["supervisor-handoff", "--json", "--run-id", run_id], root)
+        self.assertEqual(handoff.payload["heartbeat_command"], heartbeat_command(run_id))
+        self.assertEqual(handoff.payload["heartbeat_prompt"], heartbeat_command(run_id))
+        self.assertNotIn("supervisor-preflight", handoff.payload["heartbeat_prompt"])
+
+    def test_supervisor_beat_idle_returns_only_idle(self):
+        root, run_id, _node = self.start()
+        log = _record(root, 30000)
+        node = run_cli(["supervisor-preflight", "--json", "--run-id", run_id, "--session-record", log], root).payload["nodes"][0]
+        run_cli(["supervisor-hold", "--run-id", run_id, "--node", node, "--category", "product_design", "--reason", "等用户拍板"], root)
+        result = run_cli(["supervisor-beat", "--run-id", run_id, "--session-record", log], root)
+        self.assertEqual(result.exit_code, 0, result.payload)
+        self.assertEqual(result.text, "idle")
+        self.assertEqual(result.payload["state"], "idle")
+
+    def test_supervisor_beat_work_and_rotate_explain_the_branch(self):
+        root, run_id, _node = self.start()
+        work_log = _record(root, 30000, "work.json")
+        work = run_cli(["supervisor-beat", "--run-id", run_id, "--session-record", work_log], root)
+        self.assertEqual(work.payload["state"], "work", work.payload)
+        self.assertIn("vibe resume", work.text)
+
+        rotate_log = _record(root, DEFAULT_ROTATE_HARD_CAP + 1, "rotate.json")
+        rotate = run_cli(["supervisor-beat", "--run-id", run_id, "--session-record", rotate_log], root)
+        self.assertEqual(rotate.payload["state"], "rotate", rotate.payload)
+        self.assertIn("vibe supervisor-handoff", rotate.text)
+
     def test_handoff_for_unknown_run_is_unknown(self):
         root, _run_id, _node = self.start()
         result = run_cli(["supervisor-handoff", "--json", "--run-id", "run-missing"], root)
         self.assertNotEqual(result.exit_code, 0)
 
 
-class HeartbeatRotateBranchTests(unittest.TestCase):
-    """Fix 4: the rotate branch hands over through vibe, not through prd-guide."""
+class DocumentationExampleTests(unittest.TestCase):
+    """Shipped hold examples must stay aligned with the enforced CLI contract."""
 
-    def test_rotate_branch_runs_the_handoff_command(self):
-        text = heartbeat_prompt("plan-a", "run-b")
-        rotate = [line for line in text.splitlines() if line.strip().startswith("- rotate")]
-        self.assertEqual(len(rotate), 1)
-        self.assertIn("vibe supervisor-handoff --run-id run-b", rotate[0])
+    _CATEGORY_SYNTAX = re.compile(
+        r"--category\s+(?:<product_design\|external_authorization\|deploy>"
+        r"|product_design|external_authorization|deploy)"
+    )
+
+    def test_shipped_hold_examples_require_category_but_release_does_not(self):
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        prd_guide = (root / "vibe_guide" / "protocols" / "prd-guide.md").read_text(
+            encoding="utf-8"
+        )
+
+        readme_examples = [
+            line.strip()
+            for line in readme.splitlines()
+            if line.strip().startswith("vibe supervisor-hold ")
+        ]
+        self.assertEqual(len(readme_examples), 2)
+
+        create_or_refresh = [line for line in readme_examples if "--release" not in line]
+        release = [line for line in readme_examples if "--release" in line]
+        self.assertTrue(create_or_refresh)
+        self.assertTrue(release)
+        for command in create_or_refresh:
+            self.assertRegex(command, self._CATEGORY_SYNTAX)
+        for command in release:
+            self.assertNotIn("--category", command)
+
+        prd_commands = re.findall(r"`(vibe supervisor-hold[^`]+)`", prd_guide)
+        prd_create_or_refresh = [command for command in prd_commands if "--release" not in command]
+        prd_release = [command for command in prd_commands if "--release" in command]
+        self.assertTrue(prd_create_or_refresh)
+        self.assertTrue(prd_release)
+        for command in prd_create_or_refresh:
+            self.assertRegex(command, self._CATEGORY_SYNTAX)
+        for command in prd_release:
+            self.assertNotIn("--category", command)
+
+        refresh_lines = [line for line in prd_guide.splitlines() if "挂起命令刷新" in line]
+        self.assertTrue(refresh_lines)
+        self.assertTrue(any(self._CATEGORY_SYNTAX.search(line) for line in refresh_lines))
 
 
 if __name__ == "__main__":

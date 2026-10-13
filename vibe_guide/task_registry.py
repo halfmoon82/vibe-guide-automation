@@ -520,7 +520,8 @@ def _all_bindings(paths: ProjectPaths) -> List[TaskBinding]:
     return result
 
 
-def save_task_binding(paths: ProjectPaths, binding: TaskBinding) -> None:
+def save_task_binding(paths: ProjectPaths, binding: TaskBinding, *,
+                      expected_binding: Optional[Dict[str, Any]] = None) -> None:
     # Reconstruct from the persistence form so a token assigned after
     # construction is reduced to a digest before any durable or comparison use.
     persistent = TaskBinding.from_dict(binding.to_dict())
@@ -531,6 +532,42 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding) -> None:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with interprocess_lock(lock_path):
         existing = _all_bindings(paths)
+        same_role = [item for item in existing if item.issue_id == persistent.issue_id
+                     and item.role == persistent.role and item.run_id == persistent.run_id]
+        matched = next((item for item in same_role
+                        if item.composite_identity == persistent.composite_identity), None)
+        if expected_binding is not None and (
+            matched is None or matched.to_dict() != expected_binding
+        ):
+            raise ValueError("task binding changed during conditional update")
+        successor = False
+        if matched is not None and matched.successor_of != persistent.successor_of:
+            raise ValueError("immutable successor ancestry drift")
+        if matched is not None and persistent.generation < matched.generation:
+            raise ValueError("task generation cannot regress")
+        if matched is not None and any(item.successor_of == matched.task_id for item in same_role):
+            if persistent.generation != matched.generation:
+                raise ValueError("historical predecessor generation is immutable")
+        if matched is None and same_role:
+            latest = sorted(same_role, key=lambda item: item.generation)[-1]
+            successor = (
+                persistent.successor_of == latest.task_id
+                and persistent.task_id != latest.task_id
+                and not any(item.task_id == persistent.task_id for item in same_role)
+                and persistent.generation > latest.generation
+                and all(item.status in {"stopped", "failed", "archived"} for item in same_role)
+                and all(getattr(latest, key) == getattr(persistent, key) for key in (
+                    "provider", "mode", "host", "worktree", "branch", "topology",
+                    "allowlist", "capability_contract_digest",
+                ))
+            )
+            if not successor:
+                raise ValueError("immutable task identity drift")
+        if matched is not None and persistent.status not in {"stopped", "failed", "archived"}:
+            if any(item.task_id != persistent.task_id and (item.generation > persistent.generation
+                                                          or item.successor_of == persistent.task_id)
+                   for item in same_role):
+                raise ValueError("historical predecessor cannot become active")
         for current in existing:
             if current.issue_id != persistent.issue_id:
                 continue
@@ -550,6 +587,12 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding) -> None:
                     raise ValueError("immutable task binding topology drift")
                 if (
                     current.composite_identity != persistent.composite_identity
+                    and not (current.run_id == persistent.run_id
+                             and (successor or matched is not None)
+                             and (current.status in {"stopped", "failed", "archived"}
+                                  or (matched is not None and persistent.status in {"stopped", "failed", "archived"}
+                                      and (persistent.generation < current.generation
+                                           or current.successor_of == persistent.task_id))))
                     and (
                         current.run_id == persistent.run_id
                         or current.status not in _TERMINAL_STATUSES
@@ -564,9 +607,7 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding) -> None:
         )
         replaced = False
         for index, current in enumerate(destination_values):
-            if current.issue_id == persistent.issue_id and current.role == persistent.role:
-                if current.composite_identity != persistent.composite_identity:
-                    raise ValueError("immutable task identity drift")
+            if current.composite_identity == persistent.composite_identity:
                 destination_values[index] = persistent
                 replaced = True
                 break
@@ -580,6 +621,124 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding) -> None:
                 "bindings": [item.to_dict() for item in destination_values],
             },
         )
+
+
+def reconcile_shadowed_successor(
+    paths: ProjectPaths, predecessor: TaskBinding, successor: TaskBinding,
+    *, action_id: str, request_digest: str, authorization_digest: str,
+) -> None:
+    """Recover an already-created task hidden by a false predecessor projection.
+
+    This narrow transaction preserves both same-generation rows. Ordinary
+    registration still requires increasing generations. No task is started
+    and no write permission is granted here.
+    """
+    from .adapters.task_provider import ProviderActionStore
+    store = ProviderActionStore(paths)
+    old = TaskBinding.from_dict(predecessor.to_dict())
+    new = TaskBinding.from_dict(successor.to_dict())
+    action = store.action(action_id)
+    request = action['request']
+    if (action.get('request_digest') != request_digest or action.get('operation') != 'create'
+            or action.get('provider') != old.provider or action.get('run_id') != old.run_id
+            or action.get('issue_id') != old.issue_id or action.get('role') != old.role
+            or action.get('generation') != old.generation
+            or request.get('authorization_digest') != authorization_digest
+            or request.get('successor') is not True
+            or request.get('predecessor_task_id') != old.task_id):
+        raise ValueError('shadowed successor create proof is invalid')
+    created = store.result(action_id)
+    binding = created.get('binding') if isinstance(created, dict) else None
+    if not isinstance(binding, dict):
+        raise ValueError('shadowed successor has no bound create result')
+    task_id = binding.get('threadId') or binding.get('task_id')
+    host = binding.get('hostId') or binding.get('host')
+    if (new.task_id != task_id or new.host != host or not task_id or task_id == old.task_id
+            or new.successor_of != old.task_id or new.mode != 'visible'
+            or new.status != 'created' or new.business_write_allowed is not False
+            or any(getattr(old, key) != getattr(new, key) for key in (
+                'provider', 'mode', 'issue_id', 'role', 'run_id', 'generation',
+                'worktree', 'branch', 'topology', 'allowlist', 'capability_contract_digest'))):
+        raise ValueError('shadowed successor scope or identity is invalid')
+    for operation in ('locate', 'visibility'):
+        observation = store.related_action(action, operation)
+        target = observation['request']
+        if (target.get('authorization_digest') != authorization_digest
+                or target.get('plan_id') != request.get('plan_id')
+                or target.get('plan_version') != request.get('plan_version')
+                or (operation == 'locate' and target.get('threadId') != task_id)
+                or (operation == 'visibility' and target.get('targets') != [{'threadId': task_id, 'hostId': host}])):
+            raise ValueError('shadowed successor observation target is invalid')
+        result = store.result(observation['action_id'])
+        required = ('located',) if operation == 'locate' else ('visible', 'direct_enter')
+        if not isinstance(result, dict) or any(result.get(key) is not True for key in required):
+            raise ValueError('shadowed successor visibility is unverified')
+    destination = _run_tasks_path(paths, old.run_id, create=False)
+    with interprocess_lock(_registry_lock(paths)):
+        revision, rows = _read_registry(destination, old.run_id)
+        matches = [item for item in rows if item.issue_id == old.issue_id and item.role == old.role]
+        existing_new = next((item for item in matches if item.task_id == task_id), None)
+        if existing_new is not None:
+            if (existing_new.composite_identity != new.composite_identity or existing_new.successor_of != old.task_id
+                    or old.status not in {'stopped', 'failed', 'archived'}):
+                raise ValueError('shadowed successor replay identity drift')
+        elif (len(matches) != 1 or matches[0].to_dict() != old.to_dict()
+                or old.status not in {'stopped', 'failed', 'archived'}):
+            raise ValueError('shadowed successor registry changed or predecessor is active')
+        # A native action at this generation would make the predecessor's
+        # start real. A false local start-confirmed marker alone cannot.
+        for path in store._directory('requests').glob('action-*.json'):
+            candidate = store._read(path)
+            if (any(not isinstance(candidate.get(key), str) or not candidate[key].strip()
+                    for key in ('run_id', 'issue_id', 'role'))
+                    or candidate['role'] not in {'developer', 'reviewer'}
+                    or type(candidate.get('generation')) is not int or candidate['generation'] < 0):
+                raise ValueError('provider action request scope is invalid')
+            if (candidate.get('run_id') != old.run_id or candidate.get('issue_id') != old.issue_id
+                    or candidate.get('role') != old.role or candidate.get('generation') != old.generation):
+                continue
+            # Other runs may retain legacy request envelopes. Their contents
+            # confer no permission here; validate every current-scope action
+            # before using it to rule out an active predecessor.
+            candidate = store.action(path.stem)
+            target = candidate['request']
+            if (candidate.get('operation') == 'resume' and target.get('threadId') == old.task_id
+                    or candidate.get('operation') in {'wait', 'visibility'}
+                    and any(item.get('threadId') == old.task_id for item in target.get('targets', []) if isinstance(item, dict))):
+                raise ValueError('predecessor has a native action at the successor generation')
+        if existing_new is not None:
+            history = destination.parent / ('shadowed-successor-' + action_id + '.json')
+            evidence = json.loads(history.read_text())
+            if (evidence.get('action_id') != action_id or evidence.get('request_digest') != request_digest
+                    or evidence.get('authorization_digest') != authorization_digest
+                    or evidence.get('successor') != new.to_dict()
+                    or evidence.get('predecessor') != old.to_dict()):
+                raise ValueError('shadowed successor replay evidence drift')
+            return
+        if any(item.task_id == new.task_id for item in _all_bindings(paths)):
+            raise ValueError('shadowed successor identity is already registered')
+        evidence = {'action_id': action_id, 'request_digest': request_digest,
+                    'authorization_digest': authorization_digest, 'predecessor': old.to_dict(),
+                    'successor': new.to_dict(), 'registry_revision': revision}
+        history = destination.parent / ('shadowed-successor-' + action_id + '.json')
+        if history.exists():
+            if json.loads(history.read_text()) != evidence:
+                raise ValueError('shadowed successor recovery evidence drift')
+        else:
+            _atomic_json(history, evidence)
+        rows.append(new)
+        _atomic_json(destination, {'schema_version': REGISTRY_SCHEMA_VERSION,
+                                  'revision': revision+1, 'bindings': [item.to_dict() for item in rows]})
+
+
+def load_historical_task_binding(paths, run_id, issue_id, role, task_id):
+    with interprocess_lock(_registry_lock(paths)):
+        _, rows = _read_registry(_run_tasks_path(paths, run_id, create=False), run_id)
+        matches = [item for item in rows if item.issue_id == issue_id
+                   and item.role == role and item.task_id == task_id]
+        if len(matches) != 1:
+            raise ValueError('historical task binding is ambiguous or missing')
+        return matches[0]
 
 
 def load_task_binding(

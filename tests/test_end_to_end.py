@@ -737,13 +737,13 @@ class EndToEndTests(unittest.TestCase):
             )
             if any(action["operation"] == "wait" for action in store.pending()):
                 break
-        self.assertEqual((started.exit_code, started.payload["status"]), (4, "blocked_unknown"))
+        self.assertEqual((started.exit_code, started.payload["status"]), (4, "retry_pending"))
         run_id = started.payload["run_id"]
 
         waiting = self.run_cli(
             ["resume", "--plan", "public-reauth-reconcile", "--json"]
         )
-        self.assertEqual((waiting.exit_code, waiting.payload["status"]), (4, "blocked_unknown"))
+        self.assertEqual((waiting.exit_code, waiting.payload["status"]), (4, "retry_pending"))
         pending_wait = [action for action in store.pending() if action["operation"] == "wait"]
         self.assertEqual(len(pending_wait), 1)
 
@@ -801,14 +801,14 @@ class EndToEndTests(unittest.TestCase):
             ]
         )
         self.assertEqual(second_retry.exit_code, 4)
-        self.assertEqual(second_retry.payload["status"], "blocked_unknown")
+        self.assertEqual(second_retry.payload["status"], "retry_pending")
         events = load_events(ProjectPaths(self.root), run_id)
         self.assertEqual(
             len([event for event in events if event["event"] == "authorization_reauthorized"]),
             1,
         )
         current = load_snapshot(ProjectPaths(self.root), run_id)
-        self.assertEqual(current.nodes["api"]["status"], "blocked_unknown")
+        self.assertEqual(current.nodes["api"]["status"], "retry_pending")
         bindings = json.loads(
             (self.root / ".vibe/runs" / run_id / "tasks.json").read_text(encoding="utf-8")
         )["bindings"]
@@ -866,7 +866,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertNotEqual(reauthorized.payload["status"], "complete")
         self.assertNotEqual(reauthorized.exit_code, 0)
         snapshot = load_snapshot(ProjectPaths(self.root), reauthorized.payload["run_id"])
-        self.assertEqual(snapshot.nodes["api"]["status"], "blocked_unknown")
+        self.assertEqual(snapshot.nodes["api"]["status"], "retry_pending")
         self.assertEqual(snapshot.nodes["api"]["retryable_action"]["phase"], "rework")
         self.assertTrue(
             any(action["operation"] == "resume" for action in store.pending())

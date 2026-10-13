@@ -1,4 +1,5 @@
 import json
+import os
 import io
 import shutil
 import tempfile
@@ -7,8 +8,9 @@ import sys
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 
-from vibe_guide.cli import _observed_adapter, main
+from vibe_guide.cli import _observed_adapter, _snapshot_result, main
 from vibe_guide.adapters.task_provider import ProviderPending
 from vibe_guide.capability_contract import build_contract, save_contract
 from vibe_guide.paths import ProjectPaths
@@ -18,7 +20,12 @@ from vibe_guide.state import load_events
 
 class CliContractTests(unittest.TestCase):
     def run_cli(self, *args):
-        return subprocess.run([sys.executable, "-m", "vibe_guide", *args], text=True, capture_output=True)
+        # Do not inherit the live parent project's session gate/run state.
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
+            return subprocess.run([sys.executable, "-m", "vibe_guide", *args],
+                                  cwd=directory, env=env, text=True, capture_output=True)
 
     def test_scan_json_succeeds(self):
         result = self.run_cli("scan", "--json")
@@ -47,6 +54,22 @@ class CliContractTests(unittest.TestCase):
             paths = ProjectPaths(Path(directory))
             with self.assertRaises(ProviderPending):
                 _observed_adapter(paths, "codex")
+
+    def test_active_pending_node_without_retry_marker_is_not_reported_running(self):
+        snapshot = SimpleNamespace(
+            run_id="run-pending",
+            status="running",
+            nodes={
+                "n1": {
+                    "status": "retry_pending",
+                    "active_task": {"handle_id": "bridge-1"},
+                    "retryable_action": None,
+                }
+            },
+        )
+        result = _snapshot_result("resume", snapshot, as_json=True)
+        self.assertEqual(result.exit_code, 4)
+        self.assertEqual(result.payload["status"], "retry_pending")
 
     def test_unauthorized_monitor_does_not_call_runner(self):
         class SpyRunner:

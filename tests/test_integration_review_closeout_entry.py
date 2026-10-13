@@ -457,7 +457,7 @@ class MailboxClosesTheRunTests(unittest.TestCase):
     def reply(action, waits, reviewer_evidence):
         operation = action["operation"]
         if operation == "create":
-            return {"binding": {"task_id": "sess_" + action["action_id"][:8], "host": "probe"}}
+            return {"binding": {"task_id": "sess_" + action["action_id"], "host": "probe"}}
         if operation == "locate":
             return {"located": True}
         if operation == "visibility":
