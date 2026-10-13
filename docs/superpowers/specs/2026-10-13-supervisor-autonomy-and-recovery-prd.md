@@ -347,7 +347,7 @@ provider 成功结果已绑定后再收到旧 timeout 或旧 generation failure�
 2. 再启用持久事件收件箱和结果绑定，保持现有 state/task 文件可读并提供一次性迁移。
 3. 对新 run 启用 supervisor lease 和唯一接管；旧 run 只有在 registry、授权摘要和 action generation 可验证时原地迁移。
 4. 启用静默 idle、增量读取、自动恢复和精简门禁。每阶段保留回滚开关，不回滚用户授权和已验收节点。
-5. 关闭软阈值换班必须兼容已合入的换班实现，并且只能在 §6.3“idle 心跳增量有上限”经 A13 口径实测通过后启用（开关为 `.vibe/config.json` 中的单一布尔字段，不含凭据或路径；默认关闭直至实测通过；开关关闭时保持现有软阈值行为，现有测试原样通过）：保留 `supervisor-register`、`supervisor-preflight`、`supervisor-handoff`、`supervisor-hold` 命令及参数、`handoff-summary.json` 和接班起点记录的读写格式；已在运行的旧心跳指令中的 `rotate` 分支保持可执行，只是不再因软阈值被触发。协议文本（prd-guide §6.0/§6.5、vibe-entry、心跳指令）同步改写，并按既有规则补登记协议摘要。
+5. 关闭软阈值换班必须兼容已合入的换班实现，并且只能在 §6.3“idle 心跳增量有上限”经 A13 口径实测通过后启用（开关为 `.vibe/config.json` 中的单一布尔字段，不含凭据或路径；默认关闭直至实测通过；开关关闭时保持现有软阈值行为，现有测试原样通过）：保留 `supervisor-register`、`supervisor-preflight`、`supervisor-handoff`、`supervisor-hold` 命令及参数、`handoff-summary.json` 和接班起点记录的读写格式；已在运行的旧心跳指令中的 `rotate` 分支保持可执行，只是不再因软阈值被触发。协议文本（prd-guide §6.0/§6.5、vibe-entry、心跳指令）与开关同批上线并按开关状态描述，开关关闭时协议仍描述现有软阈值行为；按既有规则补登记协议摘要。开关字段名按 `vibe_guide/config.py` 现有字段登记方式定义。
 6. 发布前执行状态恢复、重复事件、竞态、权限继承、唯一 writer、独立 Review、真实 provider sandbox 和长时间 idle 唤醒测试。mock 通过不能替代至少一次受支持桌面 App 的真实验收。
 
 ## 16. 安全不变量
