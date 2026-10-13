@@ -253,6 +253,14 @@ _EVENT_DATA_KEYS = {
     "previous_intent_digest",
     "dispatch_head",
     "host",
+    # decision_raised events lost decision_ids on write, so a replayed decision
+    # node looked decision-less and was misrouted as a lifecycle defect.  The
+    # rest record routing markers (fixed enums / booleans), never provider text.
+    "decision_ids",
+    "old_task_reconciled",
+    "owner_layer",
+    "recovery_action",
+    "user_interrupt",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",
