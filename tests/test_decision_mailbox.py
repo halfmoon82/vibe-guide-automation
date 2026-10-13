@@ -140,6 +140,39 @@ class DecisionMailboxTests(unittest.TestCase):
         (self.root / ".vibe" / "config.json").write_text("{}", encoding="utf-8")
         self.assertEqual(NotificationBridge(self.paths).notify({"decision_id": "dec-1"})["status"], "disabled")
 
+    def test_relative_user_command_never_runs_a_repository_file(self):
+        self.write_bridge({"enabled": True}, {"command": "./bridge"})
+        with patch("vibe_guide.decision_boundary.subprocess.run") as run:
+            _records, notifications = ingest_worker_decisions(
+                self.paths, "run-1", "issue-1",
+                [{"question": "Pick", "options": ["A", "B"]}],
+            )
+        run.assert_not_called()
+        self.assertIn("absolute", notifications[0]["reason"])
+
+    def test_symlinked_user_config_is_unknown_and_decision_still_lands(self):
+        outside = Path(tempfile.mkdtemp()) / "config.json"
+        outside.write_text(json.dumps({"notify_bridge": {"command": "/usr/bin/true"}}), encoding="utf-8")
+        self.write_bridge({"enabled": True})
+        (self.home / "config.json").symlink_to(outside)
+        records, notifications = ingest_worker_decisions(
+            self.paths, "run-1", "issue-1",
+            [{"question": "Pick", "options": ["A", "B"]}],
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(notifications[0]["status"], "unknown")
+        self.assertEqual(len(self.mailbox.list_pending("run-1")), 1)
+
+    def test_timeout_must_be_a_bounded_number(self):
+        for value in (True, "Infinity", 1e309, 0, 301):
+            with self.subTest(value=value):
+                self.write_bridge({"enabled": True}, {"command": "/usr/bin/true", "timeout_seconds": value})
+                request = self.mailbox.raise_decision(run_id="run-1", node_id="n", question="Q%s" % value, options=["A", "B"])
+                with patch("vibe_guide.decision_boundary.subprocess.run") as run:
+                    result = NotificationBridge(self.paths).notify(request)
+                run.assert_not_called()
+                self.assertEqual(result["status"], "unknown")
+
     def test_enabled_without_user_command_is_unknown(self):
         self.write_bridge({"enabled": True})
         result = NotificationBridge(self.paths).notify({"decision_id": "dec-1"})

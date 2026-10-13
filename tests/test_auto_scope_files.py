@@ -851,6 +851,32 @@ class MonitorAutoScopeTests(unittest.TestCase):
             self._scope_events(snapshot.run_id)[0]["trigger"], "accepted_patch"
         )
 
+    def test_accepted_patch_without_approved_rule_asks_product_manager(self):
+        # Integrated PRD N5 / AC-B1a at the monitor level.
+        node = _node("n1")
+        plan = Plan(
+            "plan-1", 1, "docs/prd.md", [node.id], "draft",
+            decisions=[dict(DECISION, question="canonical name")],
+        )
+        monitor = Monitor(self.paths, plan, [node])
+        runner = FakeRunner(events={
+            ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+        })
+        snapshot = monitor.start(
+            authorize(build_authorization_card(plan, [node], self.capabilities), "AUTHORIZE"),
+            runner,
+        )
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        with self.assertRaises(ScopeDecisionRequired):
+            monitor.request_scope_expansion(
+                snapshot.run_id, "n1",
+                _scope_claim(["vibe_guide/protocols/__init__.py"]),
+                trigger="accepted_patch",
+            )
+        self.assertEqual(self._scope_events(snapshot.run_id), [])
+
     def test_accepted_patch_persists_redacted_scope_reason(self):
         self._approve_acceptance_rule()
         node = _node("n1")
