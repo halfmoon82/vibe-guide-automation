@@ -132,6 +132,27 @@ def _load_blacklist_extra(data):
     return tuple(item.strip() for item in value)
 
 
+def load_supervisor_single_shift(root):
+    """Read only `supervisor_single_shift`, for the supervisor heartbeat.
+
+    The heartbeat preflight must not be blocked by an unrelated bad field, so
+    this does not validate the rest of the file.  Returns ``(value, warning)``:
+    a missing or unreadable file falls back to ``False`` (the shipped
+    behaviour) with a warning string; a present non-boolean switch still
+    raises ValueError naming the field.
+    """
+    path = _config_path(root)
+    if not path.exists():
+        return False, None
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return False, '.vibe/config.json unreadable; single shift off'
+    if not isinstance(data, dict):
+        return False, '.vibe/config.json is not an object; single shift off'
+    return _single_shift(data), None
+
+
 def load_project_config(root):
     """Load the project config for `root`.
 

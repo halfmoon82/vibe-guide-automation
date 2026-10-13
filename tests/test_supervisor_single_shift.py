@@ -73,13 +73,34 @@ class SingleShiftTests(unittest.TestCase):
         self.write_config({FIELD_SUPERVISOR_SINGLE_SHIFT: True})
         self.assertEqual(self.preflight(130000, single_shift=False)['state'], 'rotate')
 
-    def test_invalid_value_is_unknown_not_silently_default(self):
+    def test_invalid_switch_is_unknown_not_silently_default(self):
         self.write_config({FIELD_SUPERVISOR_SINGLE_SHIFT: 'yes'})
         with self.assertRaises(ValueError):
             load_project_config(self.root)
         result = self.preflight(130000)
         self.assertEqual(result['state'], 'unknown')
-        self.assertEqual(result['reason'], 'project config invalid')
+        self.assertEqual(result['reason'], 'supervisor_single_shift invalid')
+
+    def test_invalid_switch_cannot_hide_hard_cap(self):
+        self.write_config({FIELD_SUPERVISOR_SINGLE_SHIFT: 'yes'})
+        self.assertEqual(self.preflight(150000)['state'], 'rotate')
+
+    def test_unrelated_invalid_field_does_not_block_preflight(self):
+        self.write_config({'max_active_worker_sessions': 0, FIELD_SUPERVISOR_SINGLE_SHIFT: True})
+        result = self.preflight(130000)
+        self.assertEqual(result['state'], 'work')
+        self.assertTrue(result['single_shift'])
+
+    def test_unreadable_config_keeps_shipped_rotation_with_warning(self):
+        (self.root / '.vibe').mkdir(exist_ok=True)
+        (self.root / '.vibe' / 'config.json').write_text('{broken', encoding='utf-8')
+        result = self.preflight(130000)
+        self.assertEqual(result['state'], 'rotate')
+        self.assertEqual(self.preflight(150000)['state'], 'rotate')
+        low = self.preflight(60000)
+        self.assertEqual(low['state'], 'work')
+        self.assertFalse(low['single_shift'])
+        self.assertIn('unreadable', low['config_warning'])
 
     def test_cli_preflight_reads_switch(self):
         self.write_config({FIELD_SUPERVISOR_SINGLE_SHIFT: True})

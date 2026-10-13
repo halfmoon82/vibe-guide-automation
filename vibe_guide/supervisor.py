@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-from .config import load_project_config
+from .config import load_supervisor_single_shift
 from .contracts import RunEvent
 from .state import append_event, run_dir, save_snapshot, load_snapshot
 
@@ -318,14 +318,15 @@ def supervisor_preflight(
         return {"state": "unknown", "reason": "growth threshold must be positive"}
     if type(context_hard_cap) is not int or context_hard_cap <= DEFAULT_ROTATE_SOFT_CAP:
         return {"state": "unknown", "reason": "context hard cap must exceed soft cap"}
-    if single_shift is None:
-        try:
-            single_shift = load_project_config(paths.root).supervisor_single_shift
-        except ValueError:
-            return {"state": "unknown", "reason": "project config invalid"}
     if tokens >= context_hard_cap:
         return {"state": "rotate", "reason": "context over hard cap",
                 "tokens": tokens, "baseline": baseline, "context_hard_cap": context_hard_cap, "prepare_handoff": True}
+    config_warning = None
+    if single_shift is None:
+        try:
+            single_shift, config_warning = load_supervisor_single_shift(paths.root)
+        except ValueError:
+            return {"state": "unknown", "reason": "supervisor_single_shift invalid"}
     if (not single_shift and tokens >= DEFAULT_ROTATE_SOFT_CAP and baseline is not None
             and tokens - baseline >= token_threshold):
         return {"state": "rotate", "reason": "context grew past threshold since takeover",
@@ -340,6 +341,8 @@ def supervisor_preflight(
     result["context_hard_cap"] = context_hard_cap
     result["prepare_handoff"] = tokens >= DEFAULT_ROTATE_SOFT_CAP
     result["single_shift"] = bool(single_shift)
+    if config_warning:
+        result["config_warning"] = config_warning
     return result
 
 
