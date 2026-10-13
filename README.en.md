@@ -81,7 +81,7 @@ Platform topology is ruled by the adapter registry's `DISPATCH_TOPOLOGY_MATRIX` 
 
 Concurrency cap: `max_active_worker_sessions` in `.vibe/config.json` caps simultaneously active worker sessions (default 5, valid range 1–64) and takes effect as the minimum with the authorization-card snapshot; an explicit but invalid value is a configuration error, never silently replaced. Accepted and archived sessions release capacity for later ready nodes.
 
-Single-shift supervisor: with `"supervisor_single_shift": true` in `.vibe/config.json`, one supervisor session serves the whole run; the preflight no longer rotates on context growth and only outputs `rotate` at the 150k absolute cap (or a temporary `--context-hard-cap`). Default false keeps growth-based rotation. A non-boolean value makes the preflight report `unknown`; an unreadable config file falls back to the default with a `config_warning`.
+Single-shift supervisor: with `"supervisor_single_shift": true` in `.vibe/config.json`, one supervisor session serves the whole run; the preflight no longer rotates on context growth and only outputs `rotate` at the 200k absolute cap (or a temporary `--context-hard-cap`). Default false keeps growth-based rotation. A non-boolean value makes the preflight report `unknown`; an unreadable config file falls back to the default with a `config_warning`.
 
 ## Governance boundaries
 

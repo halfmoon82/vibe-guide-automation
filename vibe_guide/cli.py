@@ -1498,7 +1498,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "登记失败：" + str(error), args.as_json)
         text = "监工地址已登记"
         if "baseline_context" in entry:
-            text += "；接班起点 {} token；100k 准备交接，150k 硬换班，增长阈值辅助判断".format(entry["baseline_context"])
+            text += "；接班起点 {} token；100k 准备交接，200k 硬换班，增长阈值辅助判断".format(entry["baseline_context"])
         else:
             if not args.session_record:
                 why = "没给 --session-record"

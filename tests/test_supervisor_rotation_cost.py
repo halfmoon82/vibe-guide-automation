@@ -108,10 +108,10 @@ class CodexSessionLogTests(_Case):
     """Fix 3: the preflight reads the shift's own log; no hand-written record."""
 
     def test_reads_the_latest_context_from_a_codex_rollout(self):
-        path = _codex_rollout(self.tmp.name, [30000, 52000, 150001])
+        path = _codex_rollout(self.tmp.name, [30000, 52000, 200001])
         result = supervisor_preflight(self.paths, "run-1", path)
         self.assertEqual(result["state"], "rotate")
-        self.assertEqual(result["tokens"], 150001)
+        self.assertEqual(result["tokens"], 200001)
 
     def test_cumulative_totals_are_not_mistaken_for_context(self):
         path = _codex_rollout(self.tmp.name, [30000, 41000])
@@ -126,7 +126,7 @@ class CodexSessionLogTests(_Case):
 
     def test_hand_written_record_still_works(self):
         """Shifts installed before this change keep their old heartbeat."""
-        result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 150001))
+        result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 200001))
         self.assertEqual(result["state"], "rotate")
 
 
@@ -178,14 +178,14 @@ class RelativeThresholdTests(_Case):
         """A different shift's log must not borrow this shift's baseline."""
         mine = _codex_rollout(self.tmp.name, [65000], name="mine.jsonl")
         self.register(session_record=mine)
-        other = _codex_rollout(self.tmp.name, [150001], name="other.jsonl")
+        other = _codex_rollout(self.tmp.name, [200001], name="other.jsonl")
         result = supervisor_preflight(self.paths, "run-1", other)
         self.assertEqual(result["state"], "rotate")
         self.assertIsNone(result["baseline"])
 
     def test_registration_without_a_log_keeps_the_absolute_threshold(self):
         self.register()
-        result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 150001))
+        result = supervisor_preflight(self.paths, "run-1", _record(self.tmp.name, 200001))
         self.assertEqual(result["state"], "rotate")
 
     def test_registering_the_same_shift_again_keeps_its_baseline(self):
