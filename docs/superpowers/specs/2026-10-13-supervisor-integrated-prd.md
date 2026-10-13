@@ -33,7 +33,7 @@
 | B3 | 等答期间心跳降频、不暂停 | B / #141 |
 | B4 | 通知桥只做接口：一个可选向导项、一个出站 hook、一条入站 CLI；bot、文案、凭据全在用户侧 | B / #141 |
 | B5 | #128 入口分诊只做 vibe 侧：分诊钩子、评测脚手架、服务不可用时的规则兜底 | B |
-| B6 | Claude Code 与 WorkBuddy 走会话内 SDD，只需证明能原生并行派发子代理；Codex 路径不变 | B |
+| B6 | Claude Code 与 WorkBuddy 走会话内 SDD，只需证明能原生并行派发子代理；Codex 路径不变。WorkBuddy 依据 2026-10-06 决定（其可见任务作业实测永不启动） | B |
 | B7 | 本迭代允许开发和审查任务执行 commit / push / 开 PR / merge，独立终审通过后执行并记录；不得直推受保护主干；deploy 仍单独授权 | B |
 
 ### 0.2 本 PRD 新定（冲突裁决，需产品经理确认）
@@ -85,7 +85,7 @@ A 的下列条文按本 PRD 改写，其余附录条文照常有效：
 ## 3. 非目标
 
 - 不降低唯一 writer、独立 reviewer、授权绑定、真实系统权限与 deploy 单独授权等边界。
-- 不做具体 IM bot、webhook server 或凭据存放；不暂停心跳。
+- 不做具体 IM bot、模板或示例脚本，不建 webhook server，不存凭据；不暂停心跳（#141 §7）。
 - 不实现真实决策网关服务与评测集标注（B5）。
 - 无同类对照与价格数据时，不宣称节省 token 或费用。
 - 不删除已合入 main 的换班相关命令和数据格式（`supervisor-register`、`supervisor-preflight`、`supervisor-handoff`、`supervisor-hold`、`handoff-summary.json`、接班起点记录）。
@@ -168,7 +168,7 @@ N 的实测：同一宿主与模型下，从心跳指令到空闲回复的相邻
 - **规则加载**：Claude Code 下入口规则真实生效，`vibe doctor` 不报假绿。
 - **对齐门例外（#152）**：`init` 时必须出现「是否在用户级规则中加入 vibe 监工会话例外」的决策项，必须明确回答，回答「不应用」可以继续；选择应用时先展示将写入的差异，经显式授权后，只在用户级规则文件中写入带标记块的例外片段，写前备份、可一键回滚，重复执行幂等。例外只作用于带监工会话标记的会话：已签授权卡的 run 内，只在 §5.7 的边界判隐藏区，心跳与接班回合按 light 处理。
 - **会话轻装（#155）**：监工会话只加载所需内容；轻装前后的首次上下文需真实测量对比，未测到前不宣称下降。
-- **会话内 SDD（B6）**：Claude Code 登记真实能力事实（可见任务全 false、`in_session_sdd` 为 true）后，`vibe plan --from-prd` 不再被可见生命周期门拒绝，拓扑裁为会话内 SDD；Codex 与 WorkBuddy 的既有判定逐字不变（WorkBuddy 按 B6 走会话内 SDD）。按 D7 至少完成一次 Claude Code 真实验收，否则标「未验证」。
+- **会话内 SDD（B6）**：Claude Code 登记真实能力事实（可见任务全 false、`in_session_sdd` 为 true）后，`vibe plan --from-prd` 不再被可见生命周期门拒绝，拓扑裁为会话内 SDD；Codex 的既有判定逐字不变；WorkBuddy 按 B6 在有来源证明时由 guide 改为会话内 SDD，否则失败即关闭、回落 guide。按 D7 至少完成一次 Claude Code 真实验收，否则标「未验证」。
 
 ### 5.10 入口分诊
 
