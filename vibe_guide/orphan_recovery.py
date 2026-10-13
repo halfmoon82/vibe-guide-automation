@@ -20,16 +20,17 @@ write; the node stays ``blocked_unknown``.
 """
 import json
 import subprocess
-import uuid
 from typing import Any, Dict, Optional
 
-from .adapters.task_provider import ProviderActionStore
+from .adapters.task_provider import ProviderActionStore, require_complex_monitor_dispatch
 from .providers import CODEX_PROVIDER
 from .state import (
     RunSnapshot,
+    interprocess_lock,
     load_events,
     load_snapshot,
     rebind_writer_lease,
+    run_dir,
     save_snapshot,
 )
 from .task_registry import TaskBinding, load_task_binding
@@ -132,7 +133,7 @@ def _collect(monitor, snapshot: RunSnapshot, record, node_id: str, action_id: st
              "create request names another plan")
     _authorization_lineage(paths, snapshot.run_id, node_id, digest, record.digest)
     topology = monitor._node_dispatch_topology(monitor.nodes[node_id])
-    _require(request.get("topology", topology) == topology,
+    _require(request.get("topology") == topology,
              "create request topology differs from the current ruling")
     allowlist = child.get("allowlist")
     _require(isinstance(allowlist, list) and all(isinstance(item, str) for item in allowlist),
@@ -163,8 +164,9 @@ def _collect(monitor, snapshot: RunSnapshot, record, node_id: str, action_id: st
         existing = load_task_binding(paths, node_id, _ROLE, run_id=snapshot.run_id)
     except FileNotFoundError:
         existing = None
+    # A binding left by an adoption interrupted before its event is resumed.
     _require(existing is None or (existing.task_id == task_id and existing.generation == generation
-                                  and existing.status == "start_pending"),
+                                  and existing.status == "running"),
              "node already has another developer task binding")
 
     head = store._dispatch_record(snapshot.run_id, node_id, _ROLE, generation).get("head")
@@ -190,94 +192,43 @@ def _collect(monitor, snapshot: RunSnapshot, record, node_id: str, action_id: st
     intent_digest = monitor._start_intent_digest(
         snapshot, node_id, _ROLE, task_id, generation, contract, current)
     leases = _leases_on(paths, node_id, worktree)
-    _require(len(leases) == 1, "expected exactly one lease on the writer root")
-    lease = leases[0]
-    _require(lease.get("node_id") == node_id and lease.get("worktree") == worktree
-             and lease.get("run_id") == snapshot.run_id and lease.get("role") == _ROLE
-             and lease.get("generation") == generation,
-             "lease belongs to another run, role or generation")
-    _require(lease.get("status") == "quarantined"
-             or (lease.get("status") == "active" and lease.get("intent_digest") == intent_digest),
+    _require(1 <= len(leases) <= 2, "expected exactly one lease on the writer root")
+    for lease in leases:
+        _require(lease.get("node_id") == node_id and lease.get("worktree") == worktree
+                 and lease.get("run_id") == snapshot.run_id and lease.get("role") == _ROLE
+                 and lease.get("generation") == generation,
+                 "lease belongs to another run, role or generation")
+    quarantined = [lease for lease in leases if lease.get("status") == "quarantined"]
+    rebound = [lease for lease in leases if lease.get("status") == "active"
+               and lease.get("intent_digest") == intent_digest]
+    # Two leases only as the rebind's own crash window: old quarantined + new.
+    _require(len(quarantined) + len(rebound) == len(leases) and len(quarantined) <= 1
+             and len(rebound) <= 1 and (len(leases) == 1 or (quarantined and rebound)),
              "lease is held by another intent")
+    previous_intent_digest = quarantined[0].get("intent_digest") if quarantined else None
+
+    contract = _start_contract(monitor, snapshot, record, node_id, task_id, generation)
+    try:
+        # The same proof ProviderActionRunner.start() demands, checked before
+        # the first write so a refusal leaves nothing half-adopted.
+        require_complex_monitor_dispatch(contract, paths)
+    except PermissionError as error:
+        _require(False, "monitor dispatch proof is invalid ({})".format(error))
     return {
         "action": action, "child": child, "task_id": task_id, "host": host,
         "generation": generation, "head": head, "topology": topology,
         "intent_digest": intent_digest, "worktree": worktree,
         # None when an interrupted adoption already moved the lease.
-        "previous_intent_digest": lease.get("intent_digest") if lease.get("status") == "quarantined" else None,
+        "previous_intent_digest": previous_intent_digest, "contract": contract,
         "request_authorization_digest": digest, "existing": existing,
     }
 
 
-def adopt_orphan_dispatch(monitor, run_id: str, node_id: str, action_id: str, runner) -> RunSnapshot:
-    monitor._reset_binding_cache()
-    snapshot = load_snapshot(monitor.paths, run_id)
-    record = monitor._require_snapshot_authorization(snapshot)
-    # An adoption interrupted before its snapshot save is replayed first, so
-    # it is seen as a registered writer rather than adopted a second time.
-    monitor._reconcile_unapplied_events(snapshot)
-    proof = _collect(monitor, snapshot, record, node_id, action_id, runner)
-    monitor._validate_execution_topology(snapshot)
-    current = snapshot.nodes[node_id]
-    generation = proof["generation"]
-    task_id = proof["task_id"]
-    child = proof["child"]
-
-    if proof["previous_intent_digest"] is not None:
-        _require(rebind_writer_lease(
-            monitor.paths, node_id, proof["worktree"], run_id, _ROLE, generation,
-            proof["previous_intent_digest"], proof["intent_digest"]),
-            "lease changed while it was being re-bound")
-    binding = proof["existing"] or TaskBinding(
-        provider=runner.provider, mode="visible", issue_id=node_id, role=_ROLE,
-        topology=proof["topology"], task_id=task_id, host=proof["host"],
-        worktree=proof["worktree"], branch=str(current.get("branch", "")),
-        status_file=str(current.get("status_file", "")),
-        handoff_file=str(current.get("handoff_file", "")),
-        threadId=task_id if runner.provider == CODEX_PROVIDER else None,
-        hostId=proof["host"] if runner.provider == CODEX_PROVIDER else None,
-        run_id=run_id, status="start_pending", visible=True, generation=generation,
-        allowlist=list(child["allowlist"]),
-        capability_contract_digest=snapshot.capability_contract_digest,
-        route_digest=child.get("route_digest"), model=child.get("model"),
-        reasoning=child.get("reasoning"),
-    )
-    monitor._save_task_binding(binding)
-    snapshot.tasks["{}:{}".format(node_id, _ROLE)] = binding.to_dict()
-
-    current["developer_identity"] = task_id
-    current["developer_generation"] = generation
-    current["retryable_action"] = None
-    monitor._record(snapshot, ORPHAN_DISPATCH_ADOPTED, {
-        "run_id": run_id, "node_id": node_id, "role": _ROLE,
-        "task_id": task_id, "host": proof["host"], "generation": generation,
-        "action_id": action_id, "request_digest": proof["action"]["request_digest"],
-        "request_authorization_digest": proof["request_authorization_digest"],
-        "intent_digest": proof["intent_digest"],
-        "previous_intent_digest": proof["previous_intent_digest"],
-        "dispatch_head": proof["head"],
-    })
-    intent = {"intent_id": uuid.uuid4().hex, "role": _ROLE, "phase": "develop",
-              "task_id": task_id, "generation": generation,
-              "intent_digest": proof["intent_digest"]}
-    current["status"] = "start_pending"
-    current["active_role"] = _ROLE
-    current["active_task"] = {"role": _ROLE, "task_id": task_id,
-                              "generation": generation, "handle_id": None}
-    current["start_intent"] = intent
-    monitor._record(snapshot, "start_intent",
-                    {"run_id": run_id, "node_id": node_id, **intent}, current["active_task"])
-    # Every save keeps the started set in step with the recorded topology;
-    # resume treats a drift as an invalidated authorization.
-    monitor._record_topology_projection(snapshot, _ENTRY)
-    save_snapshot(monitor.paths, snapshot)
-
-    # The provider runner only persists handle metadata for a non-continuation
-    # start: no message reaches the working session.
-    handle = runner.start({
-        "node_id": node_id, "role": _ROLE, "generation": generation, "run_id": run_id,
-        "task_id": task_id, "continuation": False, "successor": False,
-        "dispatcher": "monitor", "plan_id": monitor.plan.plan_id,
+def _start_contract(monitor, snapshot, record, node_id, task_id, generation) -> Dict[str, Any]:
+    return {
+        "node_id": node_id, "role": _ROLE, "generation": generation,
+        "run_id": snapshot.run_id, "task_id": task_id, "continuation": False,
+        "successor": False, "dispatcher": "monitor", "plan_id": monitor.plan.plan_id,
         "plan_version": monitor.plan.version,
         "complexity_band": getattr(monitor.plan, "complexity_band", ""),
         "execution_engine": getattr(record, "execution_engine", "monitor"),
@@ -285,42 +236,126 @@ def adopt_orphan_dispatch(monitor, run_id: str, node_id: str, action_id: str, ru
         "engine_evidence_ref": getattr(record, "engine_evidence_ref", ""),
         "authorization_digest": record.digest,
         "capability_contract_digest": snapshot.capability_contract_digest,
-    }, monitor._worktree_path(current))
-    _require(isinstance(handle.run_id, str) and handle.run_id
-             and handle.run_id not in snapshot.handles.values(),
-             "provider handle is invalid or duplicated")
-    monitor._set_binding_status(snapshot, node_id, _ROLE, "running")
-    current["active_task"]["handle_id"] = handle.run_id
-    current["start_intent"] = None
-    current["status"] = "running"
-    current["quarantine"] = None
-    current["reason"] = None
-    snapshot.handles[node_id] = handle.run_id
-    monitor._record(snapshot, "start_confirmed", {
-        "run_id": run_id, "node_id": node_id, "role": _ROLE, "phase": "develop",
-        "task_id": task_id, "generation": generation, "handle_id": handle.run_id,
-    }, current["active_task"])
-    monitor._record_topology_projection(snapshot, _ENTRY)
-    monitor._refresh_run_status(snapshot)
-    save_snapshot(monitor.paths, snapshot)
-    return snapshot
+    }
+
+
+def _apply_adoption(monitor, snapshot: RunSnapshot, node_id: str, binding: TaskBinding,
+                    handle_id: str) -> None:
+    current = snapshot.nodes[node_id]
+    current.update({
+        "developer_identity": binding.task_id, "developer_generation": binding.generation,
+        "active_role": _ROLE, "start_intent": None, "status": "running",
+        "quarantine": None, "reason": None, "retryable_action": None,
+        "active_task": {"role": _ROLE, "task_id": binding.task_id,
+                        "generation": binding.generation, "handle_id": handle_id},
+    })
+    snapshot.handles[node_id] = handle_id
+    snapshot.tasks["{}:{}".format(node_id, _ROLE)] = binding.to_dict()
+    monitor._refresh_execution_projection(snapshot, _ENTRY)
+
+
+def _adopted(snapshot: RunSnapshot, node_id: str, events) -> Optional[Dict[str, Any]]:
+    for event in events[: snapshot.event_sequence]:
+        data = event.get("data") or {}
+        if event.get("event") == ORPHAN_DISPATCH_ADOPTED and data.get("node_id") == node_id:
+            return data
+    return None
+
+
+def adopt_orphan_dispatch(monitor, run_id: str, node_id: str, action_id: str, runner) -> RunSnapshot:
+    """Adopt with one event; every step before it is idempotent.
+
+    Lease rebind, task binding and handle metadata are written first and
+    re-done on retry; the single ``orphan_dispatch_adopted`` event then
+    switches the node to running atomically (replay restores the same state).
+    A crash after the event is finished by running the same command again.
+    """
+    with interprocess_lock(run_dir(monitor.paths, run_id) / "adopt.lock"):
+        monitor._reset_binding_cache()
+        snapshot = load_snapshot(monitor.paths, run_id)
+        record = monitor._require_snapshot_authorization(snapshot)
+        monitor._reconcile_unapplied_events(snapshot)
+        done = _adopted(snapshot, node_id, load_events(monitor.paths, run_id))
+        if done is not None:
+            current = snapshot.nodes[node_id]
+            _require(done.get("action_id") == action_id
+                     and (current.get("active_task") or {}).get("task_id") == done.get("task_id")
+                     and snapshot.handles.get(node_id) == done.get("handle_id"),
+                     "already adopted and the node has moved on")
+            # Only the topology evidence can be missing after the event.
+            try:
+                monitor._validate_execution_topology(snapshot)
+            except PermissionError:
+                monitor._record_topology_projection(snapshot, _ENTRY)
+            monitor._refresh_run_status(snapshot)
+            save_snapshot(monitor.paths, snapshot)
+            return snapshot
+        proof = _collect(monitor, snapshot, record, node_id, action_id, runner)
+        monitor._validate_execution_topology(snapshot)
+        _require(len(load_events(monitor.paths, run_id)) == snapshot.event_sequence,
+                 "the run changed while adopting; retry")
+        current = snapshot.nodes[node_id]
+        generation = proof["generation"]
+        task_id = proof["task_id"]
+        child = proof["child"]
+
+        if proof["previous_intent_digest"] is not None:
+            _require(rebind_writer_lease(
+                monitor.paths, node_id, proof["worktree"], run_id, _ROLE, generation,
+                proof["previous_intent_digest"], proof["intent_digest"]),
+                "lease changed while it was being re-bound")
+        binding = proof["existing"] or TaskBinding(
+            provider=runner.provider, mode="visible", issue_id=node_id, role=_ROLE,
+            topology=proof["topology"], task_id=task_id, host=proof["host"],
+            worktree=proof["worktree"], branch=str(current.get("branch", "")),
+            status_file=str(current.get("status_file", "")),
+            handoff_file=str(current.get("handoff_file", "")),
+            threadId=task_id if runner.provider == CODEX_PROVIDER else None,
+            hostId=proof["host"] if runner.provider == CODEX_PROVIDER else None,
+            run_id=run_id, status="running", visible=True, generation=generation,
+            allowlist=list(child["allowlist"]),
+            capability_contract_digest=snapshot.capability_contract_digest,
+            route_digest=child.get("route_digest"), model=child.get("model"),
+            reasoning=child.get("reasoning"),
+        )
+        monitor._save_task_binding(binding)
+        # A non-continuation start only writes handle metadata (same handle id
+        # on every retry); nothing reaches the working session.
+        handle = runner.start(proof["contract"], monitor._worktree_path(current))
+        _require(isinstance(handle.run_id, str) and handle.run_id
+                 and handle.run_id not in snapshot.handles.values(),
+                 "provider handle is invalid or duplicated")
+
+        _apply_adoption(monitor, snapshot, node_id, binding, handle.run_id)
+        monitor._record(snapshot, ORPHAN_DISPATCH_ADOPTED, {
+            "run_id": run_id, "node_id": node_id, "role": _ROLE,
+            "task_id": task_id, "host": proof["host"], "generation": generation,
+            "handle_id": handle.run_id,
+            "action_id": action_id, "request_digest": proof["action"]["request_digest"],
+            "request_authorization_digest": proof["request_authorization_digest"],
+            "intent_digest": proof["intent_digest"],
+            "previous_intent_digest": proof["previous_intent_digest"],
+            "dispatch_head": proof["head"],
+        })
+        monitor._record_topology_projection(snapshot, _ENTRY)
+        monitor._refresh_run_status(snapshot)
+        save_snapshot(monitor.paths, snapshot)
+        return snapshot
 
 
 def replay_orphan_adoption(monitor, snapshot: RunSnapshot, node_id: str,
                            data: Dict[str, Any], provenance: Dict[str, Any]) -> None:
-    """Re-apply the identity half of an adoption whose snapshot was lost.
-
-    The following ``start_intent`` / ``start_confirmed`` events replay through
-    their normal handlers once the node names the adopted task again.
-    """
+    """Re-apply an adoption whose snapshot save was lost."""
     current = snapshot.nodes[node_id]
     generation: Optional[int] = data.get("generation")
+    handle_id = data.get("handle_id")
     _require(provenance.get("role") == "system", "replay lacks system provenance")
     _require(type(generation) is int and current.get("developer_generation", 0) == generation - 1
-             and current.get("active_task") is None and node_id not in snapshot.handles,
+             and current.get("active_task") is None and node_id not in snapshot.handles
+             and isinstance(handle_id, str) and handle_id
+             and handle_id not in snapshot.handles.values(),
              "replay does not follow the recorded node state")
     binding = load_task_binding(monitor.paths, node_id, _ROLE, run_id=snapshot.run_id)
     _require(binding.task_id == data.get("task_id") and binding.generation == generation,
              "replay task binding differs from the adoption")
-    current["developer_identity"] = binding.task_id
-    current["retryable_action"] = None
+    _apply_adoption(monitor, snapshot, node_id, binding, handle_id)

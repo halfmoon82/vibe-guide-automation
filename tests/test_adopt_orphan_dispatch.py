@@ -205,6 +205,7 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
         names = [e['event'] for e in events]
         adopted = events[names.index('orphan_dispatch_adopted')]
         data = adopted['data']
+        self.assertEqual(data['handle_id'], snapshot.handles[NODE])
         self.assertEqual(data['action_id'], self.create['action_id'])
         self.assertEqual(data['request_digest'], self.create['request_digest'])
         self.assertEqual(data['task_id'], TASK)
@@ -215,35 +216,88 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
         self.assertEqual(data['request_authorization_digest'], self.old_digest)
         self.assertEqual(adopted['provenance']['authorization_digest'],
                          snapshot.authorization_digest)
-        self.assertLess(names.index('orphan_dispatch_adopted'), names.index('start_intent'))
-        self.assertLess(names.index('start_intent'), names.index('start_confirmed'))
+        # One event switches the node; no start_intent half-state exists.
+        self.assertEqual(names[names.index('orphan_dispatch_adopted'):],
+                         ['orphan_dispatch_adopted', 'execution_topology_observed'])
 
-    def test_adoption_interrupted_before_save_replays_and_never_repeats(self):
+    def assert_running_after_resume(self):
+        result = run_cli(['resume', '--plan', 'probe-plan', '--run-id', self.run_id, '--json'],
+                         self.root)
+        self.assertNotIn('invalidated', str(result.payload.get('reason')), result.payload)
+        snapshot = load_snapshot(self.paths, self.run_id)
+        current = snapshot.nodes[NODE]
+        # An unanswered wait leaves any started task in same-task retry.
+        self.assertIn(current['status'], {'running', 'retry_pending'}, current)
+        self.assertEqual((current['developer_identity'], current['developer_generation']), (TASK, 1))
+        self.assertEqual(current['active_task']['task_id'], TASK)
+        self.assertEqual(snapshot.handles[NODE], current['active_task']['handle_id'])
+        retry = current.get('retryable_action')
+        self.assertTrue(retry is None or (retry['same_task'] and retry['task_id'] == TASK), retry)
+        self.assertEqual(load_task_binding(self.paths, NODE, 'developer',
+                                           run_id=self.run_id).task_id, TASK)
+        lease, = self.leases()
+        self.assertEqual(lease['status'], 'active')
+        self.assertEqual([e['event'] for e in load_events(self.paths, self.run_id)]
+                         .count('orphan_dispatch_adopted'), 1)
+
+    def test_crash_before_snapshot_save_is_recovered_by_resume(self):
         self.build_orphan()
         with patch('vibe_guide.orphan_recovery.save_snapshot',
                    side_effect=OSError('crash before the snapshot save')):
             self.adopt()
         self.assertEqual(load_snapshot(self.paths, self.run_id).nodes[NODE]['developer_generation'], 0)
-        names = [e['event'] for e in load_events(self.paths, self.run_id)]
-        self.assertEqual(names[-3:], ['orphan_dispatch_adopted', 'start_intent',
-                                      'execution_topology_observed'])
-        snapshot = load_snapshot(self.paths, self.run_id)
-        _directory, plan, nodes, _card = _load_plan(self.paths, 'probe-plan')
-        Monitor(self.paths, plan, nodes)._reconcile_unapplied_events(snapshot)
-        current = snapshot.nodes[NODE]
-        self.assertEqual(current['developer_identity'], TASK)
-        self.assertEqual(current['developer_generation'], 1)
-        self.assertEqual(current['active_task']['task_id'], TASK)
-        self.assertEqual(current['start_intent']['task_id'], TASK)
-        before = {p.name for p in (self.store.root / 'requests').glob('*.json')}
+        self.assert_running_after_resume()
+
+    def test_crash_before_snapshot_save_is_finished_by_adopting_again(self):
+        self.build_orphan()
+        with patch('vibe_guide.orphan_recovery.save_snapshot',
+                   side_effect=OSError('crash before the snapshot save')):
+            self.adopt()
         again = self.adopt()
-        self.assertEqual(again.payload.get('status'), 'blocked_unknown', again.payload)
-        self.assertIn('node is not blocked_unknown', again.payload.get('reason', ''))
-        self.assertEqual([e['event'] for e in load_events(self.paths, self.run_id)]
-                         .count('orphan_dispatch_adopted'), 1)
-        after = {p.name for p in (self.store.root / 'requests').glob('*.json')}
-        self.assertEqual(after, before)
-        self.assertEqual(len(self.leases()), 1)
+        self.assertIn('nodes', again.payload, again.payload)
+        self.assert_running_after_resume()
+
+    def test_crash_between_adoption_and_topology_event_is_finished_by_adopting_again(self):
+        self.build_orphan()
+        original = Monitor._record_topology_projection
+        calls = []
+
+        def crash_once(monitor, snapshot, entry, *args, **kwargs):
+            if entry == 'monitor.reconcile_adopted_dispatch' and not calls:
+                calls.append(entry)
+                raise OSError('crash after the adoption event')
+            return original(monitor, snapshot, entry, *args, **kwargs)
+
+        with patch.object(Monitor, '_record_topology_projection', crash_once):
+            self.adopt()
+        self.assertEqual(calls, ['monitor.reconcile_adopted_dispatch'])
+        again = self.adopt()
+        self.assertIn('nodes', again.payload, again.payload)
+        self.assert_running_after_resume()
+
+    def test_failed_start_leaves_a_retryable_adoption(self):
+        self.build_orphan()
+        with patch('vibe_guide.runners.provider_action.ProviderActionRunner.start',
+                   side_effect=ValueError('provider handle store unavailable')):
+            failed = self.adopt()
+        self.assertEqual(failed.payload.get('status'), 'blocked_unknown', failed.payload)
+        self.assertNotIn('orphan_dispatch_adopted',
+                         [e['event'] for e in load_events(self.paths, self.run_id)])
+        current = load_snapshot(self.paths, self.run_id).nodes[NODE]
+        self.assertEqual((current['status'], current['developer_generation']), ('blocked_unknown', 0))
+        run_cli(['resume', '--plan', 'probe-plan', '--run-id', self.run_id], self.root)
+        retried = self.adopt()
+        self.assertIn('nodes', retried.payload, retried.payload)
+        self.assert_running_after_resume()
+
+    def test_crash_inside_lease_rebind_is_finished_by_adopting_again(self):
+        self.build_orphan()
+        with patch('pathlib.Path.unlink', side_effect=OSError('crash before old lease removal')):
+            self.adopt()
+        self.assertEqual(sorted(lease['status'] for lease in self.leases()), ['active', 'quarantined'])
+        retried = self.adopt()
+        self.assertIn('nodes', retried.payload, retried.payload)
+        self.assert_running_after_resume()
 
     def test_original_session_delivery_is_received_after_adoption(self):
         self.build_orphan()
@@ -283,9 +337,11 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
         self.build_orphan()
         self.adopt()
         handles = dict(load_snapshot(self.paths, self.run_id).handles)
+        before = {p.name for p in (self.store.root / 'requests').glob('*.json')}
         again = self.adopt()
-        self.assertEqual(again.payload.get('status'), 'blocked_unknown', again.payload)
+        self.assertIn('nodes', again.payload, again.payload)
         self.assertEqual(load_snapshot(self.paths, self.run_id).handles, handles)
+        self.assertEqual({p.name for p in (self.store.root / 'requests').glob('*.json')}, before)
         self.assertEqual(len(self.leases()), 1)
         self.assertEqual([e['event'] for e in load_events(self.paths, self.run_id)]
                          .count('orphan_dispatch_adopted'), 1)
@@ -334,6 +390,7 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
             'lease_id': 'c' * 64, 'status': 'active'}))
         result = self.adopt()
         self.assertEqual(result.payload.get('status'), 'blocked_unknown', result.payload)
+        self.assertIn('lease belongs to another', result.payload.get('reason', ''))
         current = load_snapshot(self.paths, self.run_id).nodes[NODE]
         self.assertEqual(current['developer_generation'], 0)
         self.assertIsNone(current['active_task'])
@@ -358,8 +415,46 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
         save_snapshot(self.paths, snapshot)
         result = self.adopt()
         self.assertEqual(result.payload.get('status'), 'blocked_unknown', result.payload)
+        self.assertIn("not the node's next generation", result.payload.get('reason', ''))
         with self.assertRaises(FileNotFoundError):
             load_task_binding(self.paths, NODE, 'developer', run_id=self.run_id)
+
+    def test_later_generation_create_fails_closed(self):
+        self.build_orphan()
+        self._write_action('create', {'prompt': 'later'}, generation=2)
+        self.assert_untouched(self.adopt(), 'a later generation was already dispatched')
+
+    def test_second_create_of_the_generation_fails_closed(self):
+        self.build_orphan()
+        self._write_action('create', {'prompt': 'again'}, sequence=1)
+        self.assert_untouched(self.adopt(), 'more than one create')
+
+    def test_contradicting_visibility_result_fails_closed(self):
+        self.build_orphan()
+        self._write_action('visibility', {'targets': [{'threadId': TASK, 'hostId': HOST}]},
+                           {'visible': False, 'direct_enter': False})
+        self.assert_untouched(self.adopt(), 'visibility result contradicts')
+
+    def test_task_bound_to_another_node_fails_closed(self):
+        self.build_orphan()
+        snapshot = load_snapshot(self.paths, self.run_id)
+        snapshot.nodes['integration-review']['reviewer_identity'] = TASK
+        save_snapshot(self.paths, snapshot)
+        self.assert_untouched(self.adopt(), 'already bound to integration-review')
+
+    def test_reauthorization_that_changed_the_node_fails_closed(self):
+        self.build_orphan()
+        real = load_events(self.paths, self.run_id)
+
+        def changed(paths, run_id):
+            events = [dict(e) for e in real]
+            for event in events:
+                if event['event'] == 'authorization_reauthorized':
+                    event['data'] = dict(event['data'], affected_nodes=[NODE])
+            return events
+
+        with patch('vibe_guide.orphan_recovery.load_events', side_effect=changed):
+            self.assert_untouched(self.adopt(), 'node contract changed')
 
     def test_package_with_unknown_fields_is_rejected(self):
         self.build_orphan()
