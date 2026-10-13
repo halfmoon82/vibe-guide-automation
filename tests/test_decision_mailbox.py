@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,8 +17,21 @@ from vibe_guide.paths import ProjectPaths
 class DecisionMailboxTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
+        self.home = Path(tempfile.mkdtemp())
+        env = patch.dict(os.environ, {"VIBE_HOME": str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
         self.paths = ProjectPaths.from_cwd(self.root)
         self.mailbox = DecisionMailbox(self.paths)
+
+    def write_bridge(self, project, user=None):
+        config_path = self.root / ".vibe" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({"notify_bridge": project}), encoding="utf-8")
+        if user is not None:
+            (self.home / "config.json").write_text(
+                json.dumps({"notify_bridge": user}), encoding="utf-8"
+            )
 
     def test_raise_from_supervisor_and_worker_share_one_durable_request(self):
         first = self.mailbox.raise_decision(
@@ -91,18 +105,7 @@ class DecisionMailboxTests(unittest.TestCase):
             self.mailbox.result(request["decision_id"])
 
     def test_worker_originated_decision_uses_configured_notification_bridge(self):
-        config_path = self.root / ".vibe" / "config.json"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(
-            json.dumps({
-                "notify_bridge": {
-                    "enabled": True,
-                    "command": "/usr/bin/true",
-                    "timeout_seconds": 10,
-                }
-            }),
-            encoding="utf-8",
-        )
+        self.write_bridge({"enabled": True}, {"command": "/usr/bin/true", "timeout_seconds": 10})
         with patch("vibe_guide.decision_boundary.subprocess.run") as run:
             run.return_value.returncode = 0
             records, notifications = ingest_worker_decisions(
@@ -114,17 +117,78 @@ class DecisionMailboxTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(notifications, [{"status": "accepted", "evidence": "notify_bridge:exit0"}])
         run.assert_called_once()
+        self.assertEqual(run.call_args.args[0][0], "/usr/bin/true")
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_project_config_cannot_name_the_bridge_command(self):
+        # Integrated PRD N8 / AC-D6: a cloned repository must not make this
+        # machine run a program.
+        self.write_bridge({"enabled": True, "command": "/usr/bin/true"},
+                          {"command": "/usr/bin/true"})
+        with patch("vibe_guide.decision_boundary.subprocess.run") as run:
+            _records, notifications = ingest_worker_decisions(
+                self.paths, "run-1", "issue-1",
+                [{"question": "Pick", "options": ["A", "B"]}],
+            )
+        run.assert_not_called()
+        self.assertEqual(notifications[0]["status"], "unknown")
+        self.assertIn("user-level", notifications[0]["reason"])
+
+    def test_user_command_needs_project_switch(self):
+        self.write_bridge({"enabled": False}, {"command": "/usr/bin/true"})
+        self.assertEqual(NotificationBridge(self.paths).notify({"decision_id": "dec-1"})["status"], "disabled")
+        (self.root / ".vibe" / "config.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(NotificationBridge(self.paths).notify({"decision_id": "dec-1"})["status"], "disabled")
+
+    def test_relative_user_command_never_runs_a_repository_file(self):
+        self.write_bridge({"enabled": True}, {"command": "./bridge"})
+        with patch("vibe_guide.decision_boundary.subprocess.run") as run:
+            _records, notifications = ingest_worker_decisions(
+                self.paths, "run-1", "issue-1",
+                [{"question": "Pick", "options": ["A", "B"]}],
+            )
+        run.assert_not_called()
+        self.assertIn("absolute", notifications[0]["reason"])
+
+    def test_symlinked_user_config_is_unknown_and_decision_still_lands(self):
+        outside = Path(tempfile.mkdtemp()) / "config.json"
+        outside.write_text(json.dumps({"notify_bridge": {"command": "/usr/bin/true"}}), encoding="utf-8")
+        self.write_bridge({"enabled": True})
+        (self.home / "config.json").symlink_to(outside)
+        records, notifications = ingest_worker_decisions(
+            self.paths, "run-1", "issue-1",
+            [{"question": "Pick", "options": ["A", "B"]}],
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(notifications[0]["status"], "unknown")
+        self.assertEqual(len(self.mailbox.list_pending("run-1")), 1)
+
+    def test_symlinked_user_config_does_not_affect_projects_without_bridge(self):
+        outside = Path(tempfile.mkdtemp()) / "config.json"
+        outside.write_text("{}", encoding="utf-8")
+        (self.home / "config.json").symlink_to(outside)
+        self.assertEqual(NotificationBridge(self.paths).notify({"decision_id": "dec-1"})["status"], "disabled")
+        self.write_bridge({"enabled": False})
+        self.assertEqual(NotificationBridge(self.paths).notify({"decision_id": "dec-1"})["status"], "disabled")
+
+    def test_timeout_must_be_a_bounded_number(self):
+        for value in (True, "Infinity", 1e309, 0, 301):
+            with self.subTest(value=value):
+                self.write_bridge({"enabled": True}, {"command": "/usr/bin/true", "timeout_seconds": value})
+                request = self.mailbox.raise_decision(run_id="run-1", node_id="n", question="Q%s" % value, options=["A", "B"])
+                with patch("vibe_guide.decision_boundary.subprocess.run") as run:
+                    result = NotificationBridge(self.paths).notify(request)
+                run.assert_not_called()
+                self.assertEqual(result["status"], "unknown")
+
+    def test_enabled_without_user_command_is_unknown(self):
+        self.write_bridge({"enabled": True})
+        result = NotificationBridge(self.paths).notify({"decision_id": "dec-1"})
+        self.assertEqual(result["status"], "unknown")
 
     def test_cli_reports_notification_bridge_failure_as_unknown_while_request_stays_pending(self):
         (self.root / ".project-root").write_text("fixture\n", encoding="utf-8")
-        config_path = self.root / ".vibe" / "config.json"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(
-            json.dumps({
-                "notify_bridge": {"enabled": True, "command": "/definitely/missing"}
-            }),
-            encoding="utf-8",
-        )
+        self.write_bridge({"enabled": True}, {"command": "/definitely/missing"})
 
         result = run_cli(
             [

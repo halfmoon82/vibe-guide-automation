@@ -198,6 +198,7 @@ class ResolveConsistencyAutoScopeTests(unittest.TestCase):
             _scope_claim(["n1.py", "vibe_guide/protocols/__init__.py"]),
             authorized_files=["n1.py"],
             node_files=["n1.py"],
+            acceptance_rule_approved=True,
         )
         self.assertIsNotNone(result)
         self.assertEqual(
@@ -207,6 +208,23 @@ class ResolveConsistencyAutoScopeTests(unittest.TestCase):
             result.scope_rules,
             [{"path": "vibe_guide/protocols/__init__.py", "rule": "acceptance_unchanged"}],
         )
+
+    def test_claim_is_held_to_mechanical_rule_until_project_approves(self):
+        # Integrated PRD N5 / AC-B1a: before the AGENTS.md §6 patch is
+        # approved, an acceptance-unchanged claim cannot widen scope past
+        # tests/ and auto_scope_paths.
+        for flag in (False, None, "true", 1):
+            with self.subTest(flag=flag):
+                kwargs = {} if flag is None else {"acceptance_rule_approved": flag}
+                self.assertIsNone(resolve_scope_expansion(
+                    _scope_claim(["n1.py", "vibe_guide/protocols/__init__.py"]),
+                    authorized_files=["n1.py"], node_files=["n1.py"], **kwargs,
+                ))
+        held = resolve_scope_expansion(
+            _scope_claim(["n1.py", "tests/test_n1.py"]),
+            authorized_files=["n1.py"], node_files=["n1.py"],
+        )
+        self.assertEqual(held.files, ["tests/test_n1.py"])
 
     def test_product_boundaries_and_external_files_never_auto_expand(self):
         blocked = (
@@ -366,6 +384,7 @@ class ResolveConsistencyAutoScopeTests(unittest.TestCase):
                     _scope_claim([path]),
                     authorized_files=["n1.py"],
                     node_files=["n1.py"],
+                    acceptance_rule_approved=True,
                 )
                 self.assertIsNotNone(result)
                 self.assertEqual(result.files, [path])
@@ -373,6 +392,16 @@ class ResolveConsistencyAutoScopeTests(unittest.TestCase):
                     result.scope_rules,
                     [{"path": path, "rule": "acceptance_unchanged"}],
                 )
+
+    def test_agent_rule_files_never_auto_expand(self):
+        for path in ("AGENTS.md", "docs/CLAUDE.md", "CODEBUDDY.md", "CLAUDE.local.md",
+                     ".github/copilot-instructions.md", ".cursor/rules/a.md",
+                     ".vibe/proposals/skills/prd-guide/SKILL.md", ".claude/agents/x.md"):
+            with self.subTest(path=path):
+                self.assertIsNone(resolve_scope_expansion(
+                    _scope_claim([path]), authorized_files=["n1.py"],
+                    node_files=["n1.py"], acceptance_rule_approved=True,
+                ))
 
     def test_conventional_sensitive_names_are_refused_even_with_source_suffix(self):
         blocked = (
@@ -597,6 +626,11 @@ class MonitorAutoScopeTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def _approve_acceptance_rule(self):
+        (self.paths.vibe / "config.json").write_text(
+            json.dumps({"acceptance_scope_rule_approved": True}), encoding="utf-8"
+        )
+
     def _run_finding(self, nodes, files):
         plan = Plan(
             "plan-1", 1, "docs/prd.md", [item.id for item in nodes], "draft",
@@ -763,6 +797,7 @@ class MonitorAutoScopeTests(unittest.TestCase):
         )
 
     def test_implementation_finding_uses_the_same_scope_expansion_entry(self):
+        self._approve_acceptance_rule()
         files = ["n1.py", "vibe_guide/protocols/__init__.py"]
         plan = Plan(
             "plan-1", 1, "docs/prd.md", ["n1"], "draft",
@@ -792,6 +827,7 @@ class MonitorAutoScopeTests(unittest.TestCase):
         )
 
     def test_accepted_patch_queues_same_node_rework_and_records_scope(self):
+        self._approve_acceptance_rule()
         node = _node("n1")
         plan = Plan(
             "plan-1", 1, "docs/prd.md", [node.id], "draft",
@@ -825,7 +861,34 @@ class MonitorAutoScopeTests(unittest.TestCase):
             self._scope_events(snapshot.run_id)[0]["trigger"], "accepted_patch"
         )
 
+    def test_accepted_patch_without_approved_rule_asks_product_manager(self):
+        # Integrated PRD N5 / AC-B1a at the monitor level.
+        node = _node("n1")
+        plan = Plan(
+            "plan-1", 1, "docs/prd.md", [node.id], "draft",
+            decisions=[dict(DECISION, question="canonical name")],
+        )
+        monitor = Monitor(self.paths, plan, [node])
+        runner = FakeRunner(events={
+            ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+        })
+        snapshot = monitor.start(
+            authorize(build_authorization_card(plan, [node], self.capabilities), "AUTHORIZE"),
+            runner,
+        )
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        with self.assertRaises(ScopeDecisionRequired):
+            monitor.request_scope_expansion(
+                snapshot.run_id, "n1",
+                _scope_claim(["vibe_guide/protocols/__init__.py"]),
+                trigger="accepted_patch",
+            )
+        self.assertEqual(self._scope_events(snapshot.run_id), [])
+
     def test_accepted_patch_persists_redacted_scope_reason(self):
+        self._approve_acceptance_rule()
         node = _node("n1")
         plan = Plan(
             "plan-1", 1, "docs/prd.md", [node.id], "draft",
@@ -856,6 +919,7 @@ class MonitorAutoScopeTests(unittest.TestCase):
         )
 
     def test_completed_run_patch_invalidates_and_requeues_integration_review(self):
+        self._approve_acceptance_rule()
         plan, nodes, card, monitor, delivered = self._build_complex_plan(
             [_node("n1")]
         )
@@ -914,6 +978,7 @@ class MonitorAutoScopeTests(unittest.TestCase):
             )
 
     def test_accepted_patch_queue_rework_replays_after_snapshot_write_failure(self):
+        self._approve_acceptance_rule()
         node = _node("n1")
         plan = Plan(
             "plan-1", 1, "docs/prd.md", [node.id], "draft",
@@ -1028,6 +1093,7 @@ class MonitorAutoScopeTests(unittest.TestCase):
         self.assertTrue(integration["retryable_action"]["continuation"])
 
     def test_scope_expand_cli_registers_accepted_patch(self):
+        self._approve_acceptance_rule()
         node = _node("n1")
         plan = Plan(
             "plan-1", 1, "docs/prd.md", [node.id], "draft",

@@ -19,6 +19,7 @@ def validate_boundary_category(category):
     return value
 
 import json
+import os
 from pathlib import Path
 import subprocess
 from typing import Any, Mapping, Optional
@@ -26,13 +27,17 @@ from typing import Any, Mapping, Optional
 from .decisions import DecisionMailbox, canonical_digest, normalize_options
 
 
+#: Upper bound for the user-configured bridge timeout, in seconds.
+_MAX_BRIDGE_TIMEOUT = 300.0
+
+
 class NotificationBridge:
     def __init__(self, paths, config: Optional[Mapping[str, Any]] = None):
         self.paths = paths
         self.config = dict(config) if config is not None else self._load_config()
 
-    def _load_config(self) -> dict[str, Any]:
-        path = self.paths.resolve_vibe_path("config.json")
+    @staticmethod
+    def _read_json(path) -> dict[str, Any]:
         if path.is_symlink() or not path.is_file():
             return {}
         try:
@@ -41,15 +46,59 @@ class NotificationBridge:
             return {}
         return value if isinstance(value, dict) else {}
 
+    def _load_config(self) -> dict[str, Any]:
+        """Project config switches the bridge on; only user config names it.
+
+        The project ``.vibe/config.json`` travels with the repository, so it
+        may set ``notify_bridge.enabled`` and nothing else.  The command and
+        timeout come from the user-level ``$VIBE_HOME/config.json`` so a cloned
+        repository can never make this machine run a program (integrated PRD
+        N8).  A project config that names a command is refused, not ignored.
+        """
+        try:
+            project_path = self.paths.resolve_vibe_path("config.json")
+        except ValueError:
+            # A project config escaping .vibe never switches the bridge on.
+            return {}
+        project = self._read_json(project_path)
+        project_bridge = project.get("notify_bridge")
+        if not isinstance(project_bridge, dict):
+            return {}
+        if set(project_bridge) - {"enabled"}:
+            return {"notify_bridge": {"enabled": True, "project_command": True}}
+        if project_bridge.get("enabled") is not True:
+            return {}
+        try:
+            user_path = self.paths.resolve_vibe_home_path("config.json")
+        except ValueError:
+            # A user config escaping VIBE_HOME (e.g. a dotfiles symlink) never
+            # breaks decision ingestion; the enabled bridge is simply unknown.
+            return {"notify_bridge": {"enabled": True, "unreadable": True}}
+        user = self._read_json(user_path)
+        user_bridge = user.get("notify_bridge")
+        merged = dict(user_bridge) if isinstance(user_bridge, dict) else {}
+        merged.pop("enabled", None)
+        merged["enabled"] = project_bridge.get("enabled")
+        return {"notify_bridge": merged}
+
     def notify(self, decision: Mapping[str, Any]) -> dict[str, Any]:
         bridge = self.config.get("notify_bridge") if isinstance(self.config, Mapping) else None
         if bridge is None and isinstance(self.config, Mapping) and "enabled" in self.config:
             bridge = self.config
         if not isinstance(bridge, Mapping) or bridge.get("enabled") is not True:
             return {"status": "disabled", "evidence": "notify_bridge:disabled"}
+        if bridge.get("project_command"):
+            return {"status": "unknown",
+                    "reason": "notify_bridge command must live in user-level config"}
+        if bridge.get("unreadable"):
+            return {"status": "unknown", "reason": "notify bridge config is unreadable"}
         command = bridge.get("command")
         if not isinstance(command, str) or not command.strip():
             return {"status": "unknown", "reason": "notify bridge command is missing"}
+        if not os.path.isabs(command):
+            # The bridge runs with the project root as cwd; a relative command
+            # would execute a file from the repository.
+            return {"status": "unknown", "reason": "notify bridge command must be an absolute path"}
         decision_id = decision.get("decision_id") if isinstance(decision, Mapping) else None
         if not isinstance(decision_id, str) or not decision_id:
             return {"status": "unknown", "reason": "decision id is missing"}
@@ -57,9 +106,12 @@ class NotificationBridge:
         if request_path.is_symlink() or not request_path.is_file():
             return {"status": "unknown", "reason": "decision request is unreadable"}
         try:
-            timeout = float(bridge.get("timeout_seconds", 10))
-            if timeout <= 0:
-                raise ValueError("notify bridge timeout must be positive")
+            raw_timeout = bridge.get("timeout_seconds", 10)
+            if isinstance(raw_timeout, bool):
+                raise ValueError("notify bridge timeout must be a number")
+            timeout = float(raw_timeout)
+            if not 0 < timeout <= _MAX_BRIDGE_TIMEOUT:
+                raise ValueError("notify bridge timeout out of range")
             completed = subprocess.run(
                 [command, "push", str(request_path.resolve())],
                 cwd=str(self.paths.root),

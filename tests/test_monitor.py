@@ -4556,6 +4556,8 @@ class ContractTestExecutionTests(unittest.TestCase):
     def test_worker_decision_notification_failure_stays_explicitly_unknown(self):
         config_path = self.paths.vibe / "config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
+        # Integrated PRD N8: the project only switches the bridge on; a
+        # project-level command is refused, which is also UNKNOWN.
         config_path.write_text(
             json.dumps({
                 "notify_bridge": {"enabled": True, "command": "/definitely/missing"}

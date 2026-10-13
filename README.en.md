@@ -83,6 +83,10 @@ Concurrency cap: `max_active_worker_sessions` in `.vibe/config.json` caps simult
 
 Single-shift supervisor: with `"supervisor_single_shift": true` in `.vibe/config.json`, one supervisor session serves the whole run; the preflight no longer rotates on context growth and only outputs `rotate` at the 200k absolute cap (or a temporary `--context-hard-cap`). Default false keeps growth-based rotation. A non-boolean value makes the preflight report `unknown`; an unreadable config file falls back to the default with a `config_warning`.
 
+Acceptance-based scope expansion: `acceptance_scope_rule_approved` in `.vibe/config.json` defaults to false, keeping supervisor auto-scope to `tests/` and `auto_scope_paths`. Set it to true only after the product manager approves and writes the matching `AGENTS.md` §6 patch; then low-risk files whose change keeps every PRD acceptance example unchanged may also be added.
+
+Decision notification bridge: the project `.vibe/config.json` may only contain `"notify_bridge": {"enabled": true}`; the command and timeout are read only from `notify_bridge` in the user-level `$VIBE_HOME/config.json`. A project-level `command` is refused and recorded as UNKNOWN.
+
 ## Governance boundaries
 
 - `scan` is read-only.

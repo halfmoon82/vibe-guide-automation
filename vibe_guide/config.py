@@ -44,6 +44,12 @@ FIELD_AUTO_SCOPE_PATHS = 'auto_scope_paths'
 #: Default false keeps the shipped growth-based rotation unchanged.
 FIELD_SUPERVISOR_SINGLE_SHIFT = 'supervisor_single_shift'
 
+#: Boolean field: true only after the product manager has approved and
+#: written the AGENTS.md §6 patch that lets the supervisor widen a node's
+#: scope when every PRD acceptance example keeps its result (integrated PRD
+#: N5).  Default false keeps auto-scope to `tests/` and `auto_scope_paths`.
+FIELD_ACCEPTANCE_SCOPE_RULE = 'acceptance_scope_rule_approved'
+
 #: `ProjectConfig.source` value when the default was applied.
 SOURCE_DEFAULT = 'default'
 #: `ProjectConfig.source` value when an explicit configured value was used.
@@ -63,6 +69,7 @@ class ProjectConfig:
     behavioral_command_blacklist_extra: tuple = ()
     auto_scope_paths: tuple = ()
     supervisor_single_shift: bool = False
+    acceptance_scope_rule_approved: bool = False
 
 
 def is_repo_relative_path(value):
@@ -105,6 +112,15 @@ def _single_shift(data):
     value = data[FIELD_SUPERVISOR_SINGLE_SHIFT]
     if not isinstance(value, bool):
         raise ValueError(f'{FIELD_SUPERVISOR_SINGLE_SHIFT} must be true or false')
+    return value
+
+
+def _acceptance_scope_rule(data):
+    if FIELD_ACCEPTANCE_SCOPE_RULE not in data:
+        return False
+    value = data[FIELD_ACCEPTANCE_SCOPE_RULE]
+    if not isinstance(value, bool):
+        raise ValueError(f'{FIELD_ACCEPTANCE_SCOPE_RULE} must be true or false')
     return value
 
 
@@ -172,10 +188,12 @@ def load_project_config(root):
     blacklist_extra = _load_blacklist_extra(data)
     auto_scope_paths = _auto_scope_paths(data)
     single_shift = _single_shift(data)
+    acceptance_rule = _acceptance_scope_rule(data)
     if FIELD_MAX_ACTIVE_WORKER_SESSIONS not in data:
         return ProjectConfig(
             DEFAULT_MAX_ACTIVE_WORKER_SESSIONS, SOURCE_DEFAULT, blacklist_extra,
             auto_scope_paths=auto_scope_paths, supervisor_single_shift=single_shift,
+            acceptance_scope_rule_approved=acceptance_rule,
         )
     value = data[FIELD_MAX_ACTIVE_WORKER_SESSIONS]
     # bool is a subclass of int; True/False are never a valid worker cap.
@@ -189,4 +207,5 @@ def load_project_config(root):
     return ProjectConfig(
         value, SOURCE_CONFIG, blacklist_extra, auto_scope_paths=auto_scope_paths,
         supervisor_single_shift=single_shift,
+        acceptance_scope_rule_approved=acceptance_rule,
     )
