@@ -74,6 +74,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "f204123e31fa2f8ea67033dc50cba547cda8e862245fcf5e0475b8cb4b36f29e",
         "870acaa688f538bd8d09cbeba77442780a17fcb56696d79f79028640b2e1e8dd",
         "8335aee5c16b30fef9de2f1ed009df58b43f97bee4716dc09aa3dfc623b7509e",
+        # 2026-10-13: native closeout integration after main reconciliation.
+        "cdae7db3e3ebfcacc6db84453d9a903ae5376e1aa2134ce7d9fc838052b46708",
     }),
     "vibe-entry": frozenset({
         "3ec0a771d482d92eba7f155f212dab97beb3a4a3b6712e16d7dc3d81394797eb",
