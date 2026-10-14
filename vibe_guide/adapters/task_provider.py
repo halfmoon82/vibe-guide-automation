@@ -29,7 +29,7 @@ class ProviderUnavailable(RuntimeError):
     """A provider cannot safely create or continue a task."""
 
 
-class UnresolvedNativeTool(ValueError):
+class UnresolvedNativeTool(RuntimeError):
     """The host could not resolve the native tool the caller asked for.
 
     Observed 2026-10-14: a model gateway route stripped the ``fn__<server>__``
@@ -53,17 +53,18 @@ class UnresolvedNativeTool(ValueError):
                 called_tool, expected_tool, action_id, attempts, advice))
 
 
-_UNRESOLVED_TOOL = re.compile(r"No such tool available:\s*([\w.-]+)", re.IGNORECASE)
+_UNRESOLVED_TOOL = re.compile(
+    r"\s*(?:<tool_use_error>)?\s*(?:Error:\s*)?No such tool available:\s*`?([\w.-]+)", re.IGNORECASE)
 
 
 def _unresolved_tool_name(payload: Dict[str, Any]) -> Optional[str]:
-    # Only the error fields: a wait result may quote this text in transcript events.
-    for key in ("error", "reason", "message", "detail"):
-        value = payload.get(key)
+    # Top-level values that *are* the host reply; nested transcript events and
+    # mid-sentence mentions are ordinary results.
+    for value in payload.values():
         if isinstance(value, dict):
             value = value.get("message")
         if isinstance(value, str):
-            match = _UNRESOLVED_TOOL.search(value)
+            match = _UNRESOLVED_TOOL.match(value)
             if match:
                 return match.group(1)
     return None
@@ -491,7 +492,7 @@ class ProviderActionStore:
         return result["payload"]
 
     def complete(self, action_id: str, payload: Dict[str, Any], *,
-                 request_digest: Optional[str] = None) -> bool:
+                 request_digest: Optional[str] = None, native: bool = True) -> bool:
         """Keep the first bound result; retain conflicting callbacks as evidence.
 
         A new observation belongs to a new action sequence, never a rewrite
@@ -506,7 +507,8 @@ class ProviderActionStore:
             raise ValueError("provider action result payload must be an object")
         if request_digest is not None and request_digest != request["request_digest"]:
             raise ValueError("provider action request digest mismatch")
-        called_tool = _unresolved_tool_name(payload)
+        # ``native=False``: a worker self-report, not a native tool reply.
+        called_tool = _unresolved_tool_name(payload) if native else None
         if called_tool is not None:
             self._record_unresolved_tool(request, called_tool, payload)
         record = {
@@ -1100,7 +1102,7 @@ class ProviderActionStore:
                 result['status'] = 'completed'
                 result['idempotent_key'] = _canonical_digest(payload)
                 if not self.complete(action['action_id'], result,
-                                     request_digest=action['request_digest']):
+                                     request_digest=action['request_digest'], native=False):
                     continue
                 self._atomic(path, dict(report, consumed_by=action['action_id']))
                 return True

@@ -74,6 +74,36 @@ class UnresolvedNativeToolTests(unittest.TestCase):
         self.assertTrue(self.store.complete(self.action_id, {"events": [], "cursor": "c1"}))
         self.assertEqual(self.store.result(self.action_id), {"events": [], "cursor": "c1"})
 
+    def test_raw_host_reply_is_caught_under_any_top_level_key(self):
+        for payload in ({"result": HOST_ERROR}, {"output": "  " + HOST_ERROR},
+                        {"error": {"message": HOST_ERROR}}, {"detail": "Error: No such tool available: spawn_task"}):
+            with self.subTest(payload=payload):
+                with self.assertRaises(UnresolvedNativeTool):
+                    self.store.complete(self.action_id, payload)
+        self.assertIsNone(self.store.result(self.action_id))
+
+    def test_error_is_not_a_value_error(self):
+        # Callers catch ValueError as "invalid record"; this must not be swallowed there.
+        self.assertFalse(issubclass(UnresolvedNativeTool, ValueError))
+
+    def test_mid_sentence_mention_is_a_normal_result(self):
+        payload = {"reason": "上次出现 No such tool available: x，已排除", "cursor": "c3"}
+        self.assertTrue(self.store.complete(self.action_id, payload))
+
+    def test_worker_self_report_is_not_screened(self):
+        payload = {"reason": HOST_ERROR, "status": "completed"}
+        self.assertTrue(self.store.complete(self.action_id, payload, native=False))
+        self.assertEqual(self._observations(), [])
+
+    def test_delivery_consumer_does_not_screen_worker_text(self):
+        report = {"run_id": "run-1", "issue_id": "n1", "role": "developer", "generation": 1,
+                  "payload": {"reason": HOST_ERROR}}
+        self.store._directory("deliveries")
+        self.store._atomic(self.store._delivery_path("run-1", "n1", "developer", 1), report)
+        self.assertTrue(self.store._consume_delivery_locked("run-1", "n1", "developer", 1))
+        self.assertEqual(self.store.result(self.action_id)["reason"], HOST_ERROR)
+        self.assertEqual(self._observations(), [])
+
     def test_transcript_text_quoting_the_error_is_a_normal_result(self):
         payload = {"events": [{"text": "earlier: " + HOST_ERROR}], "cursor": "c2"}
         self.assertTrue(self.store.complete(self.action_id, payload))
