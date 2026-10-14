@@ -100,7 +100,9 @@ class LaunchTest(LauncherCase):
         config = ClaudeBgConfig("/abs/s.json", git_user_name="Bot", git_user_email="bot@x.io")
         self.launcher(config=config).launch("developer", "n1", self.contract)
         git = [(a, c) for a, c in self.fake.calls if a[0] == "git"]
-        self.assertEqual([a for a, _ in git], [["git", "config", "user.name", "Bot"], ["git", "config", "user.email", "bot@x.io"]])
+        # --worktree: plain `git config` in a linked worktree writes the shared
+        # .git/config and changes the identity of every other worktree.
+        self.assertEqual([a for a, _ in git], [["git", "config", "--worktree", "user.name", "Bot"], ["git", "config", "--worktree", "user.email", "bot@x.io"]])
         self.assertTrue(all(c == self.worktree for _, c in git))
         self.assertEqual(self.fake.calls[0][0][0], "git")
 

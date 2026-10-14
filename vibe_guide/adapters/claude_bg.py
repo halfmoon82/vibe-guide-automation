@@ -251,7 +251,9 @@ class ClaudeBgLauncher:
             ("user.email", self.config.git_user_email),
         ):
             if value:
-                self._require_ok(self._run(["git", "config", key, value], worktree), "git config")
+                # Plain `git config` in a linked worktree writes the shared
+                # .git/config; --worktree refuses unless worktreeConfig is on.
+                self._require_ok(self._run(["git", "config", "--worktree", key, value], worktree), "git config")
         out = self._require_ok(
             self._run(
                 self._claude(
