@@ -5,14 +5,24 @@ from vibe_guide.adapters.registry import AdapterRegistry
 
 
 class NativeDispatchTests(unittest.TestCase):
-    def test_non_codex_never_falls_back_to_background(self):
-        env = Environment(commands={"claude-code.agent": True}, facts={
+    def test_claude_code_background_only_after_verified_launch_fact(self):
+        facts = {
             "claude-code.shell": True, "claude-code.subprocess": True,
             "claude-code.worktree": True,
-        })
+        }
         adapter = AdapterRegistry(background_launchers={"claude-code": lambda: {}}).get("claude-code")
+        # Without the verified background-launch fact it stays guide.
+        env = Environment(commands={"claude-code.agent": True}, facts=dict(facts))
+        self.assertEqual(adapter.detect(env).capabilities.mode, "guide")
+        # Registered true with provenance: degraded background provider.
+        env = Environment(
+            commands={"claude-code.agent": True},
+            facts=dict(facts, **{"claude-code.background_task.launch": True}),
+            provenance={"claude-code.background_task.launch": "probe-bg"},
+        )
         caps = adapter.detect(env).capabilities
-        self.assertEqual(caps.mode, "guide")
+        self.assertEqual(caps.mode, "background")
+        self.assertEqual(caps.provider, "claude-code-background")
 
     def test_agent_presence_alone_cannot_verify_codex_native_dispatch(self):
         env = Environment(commands={"codex.agent": True}, facts={

@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import hashlib
+import importlib
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
@@ -18,10 +19,13 @@ from .authorization import (
     AuthorizationRecord,
     authorize,
     build_authorization_card,
+    dispatch_topology_for_node,
     refresh_authorization_card,
 )
 from .adapters.base import (
+    BACKGROUND_LAUNCH_LIMITATIONS,
     Environment as AdapterEnvironment,
+    TOPOLOGY_BACKGROUND,
     TOPOLOGY_IN_SESSION_SDD,
 )
 from .adapters.registry import AdapterRegistry
@@ -317,36 +321,113 @@ def _authorization_card(data: Dict[str, Any]) -> AuthorizationCard:
     return AuthorizationCard(**converted)
 
 
-def _observed_topology_rulings(paths: ProjectPaths) -> dict:
+def _card_discloses_background(card: Optional[AuthorizationCard]) -> bool:
+    """True when the authorization card already discloses a background worker."""
+    if card is None:
+        return False
+    workers = getattr(card, "workers", None) or ()
+    entries = workers.values() if isinstance(workers, dict) else workers
+    return any(isinstance(entry, dict) and entry.get("mode") == "background" for entry in entries)
+
+
+def _observed_topology_rulings(
+    paths: ProjectPaths, card: Optional[AuthorizationCard] = None
+) -> dict:
     """Return ``{adapter_id: dispatch ruling}`` from the recorded bridge.
 
     The ruling re-derives the ISSUE-07 topology decision from the capability
     facts and provenance the desktop session published.  Any missing or
     invalid evidence yields an empty mapping, and the monitor then keeps its
     conservative dual-visible default: UNKNOWN never upgrades to visible-sdd.
+
+    A verified background-launch fact rules ``background``.  A run whose
+    existing ``card`` never disclosed a background worker keeps its original
+    (non-background) path, so the card the user approved and the dispatch can
+    not diverge; the first-publication card (``card=None``) is not walked back.
     """
     try:
         observed = observe_capabilities(paths)
     except (ProviderPending, OSError, TypeError, ValueError):
         return {}
-    probe = observed.adapter_id + ".in_session_sdd"
-    evidence = observed.detection.evidence
-    provenance = observed.detection.capabilities.provenance
-    facts = {}
-    provenance_map = {}
-    if probe in evidence:
-        facts[probe] = bool(evidence[probe])
-        source = provenance.get(probe)
-        if isinstance(source, str) and source:
-            provenance_map[probe] = source
+    probes = [observed.adapter_id + ".in_session_sdd"]
     try:
         adapter = AdapterRegistry().get(observed.adapter_id)
-        decision = adapter.topology_decision(
+    except KeyError:
+        return {}
+    background_probe = adapter.manifest.get("background_probe")
+    if background_probe:
+        probes.append(background_probe)
+    evidence = observed.detection.evidence
+    provenance = observed.detection.capabilities.provenance
+
+    def ruling(names):
+        facts = {}
+        provenance_map = {}
+        for name in names:
+            if name in evidence:
+                facts[name] = bool(evidence[name])
+                source = provenance.get(name)
+                if isinstance(source, str) and source:
+                    provenance_map[name] = source
+        return adapter.topology_decision(
             AdapterEnvironment(facts=facts, provenance=provenance_map)
-        )
+        ).topology
+
+    try:
+        topology = ruling(probes)
+        if (
+            topology == TOPOLOGY_BACKGROUND
+            and card is not None
+            and not _card_discloses_background(card)
+        ):
+            topology = ruling(probes[:1])
     except (KeyError, TypeError, ValueError):
         return {}
-    return {observed.adapter_id: decision.topology}
+    return {observed.adapter_id: topology}
+
+
+def _background_launcher_problem() -> Optional[str]:
+    """Why the verified background launcher cannot be used, or None when it can."""
+    try:
+        module = importlib.import_module("vibe_guide.adapters.claude_bg")
+    except ImportError:
+        return "后台启动器未安装（缺少 vibe_guide.adapters.claude_bg）"
+    check = getattr(module, "configuration_problem", None)
+    if not callable(check):
+        return None
+    try:
+        problem = check()
+    except Exception as error:  # message withheld: it may carry paths or secrets
+        return "后台启动器配置检查失败：" + type(error).__name__
+    return problem if isinstance(problem, str) and problem else None
+
+
+def _background_worker_entries(
+    nodes: List[DAGNode], topology_rulings: Optional[Dict[str, str]]
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Card worker entries disclosing the background downgrade, or None.
+
+    ``None`` when no node is ruled ``background`` so the card stays exactly
+    what it was without the background fact.
+    """
+    background_nodes = [
+        node for node in nodes
+        if dispatch_topology_for_node(node, topology_rulings) == TOPOLOGY_BACKGROUND
+    ]
+    if not background_nodes:
+        return None
+    problem = _background_launcher_problem()
+    limitations = list(BACKGROUND_LAUNCH_LIMITATIONS)
+    if problem:
+        limitations.append("后台启动器不可用：" + problem)
+    return {
+        node.id: {
+            "topology": TOPOLOGY_BACKGROUND,
+            "mode": "background",
+            "limitations": list(limitations),
+        }
+        for node in background_nodes
+    }
 
 
 def _observed_engine_attestation(paths: ProjectPaths, plan: Plan) -> Dict[str, Any]:
@@ -442,11 +523,27 @@ def _observed_adapter(paths: ProjectPaths, adapter_id: str):
     # subagents instead).  Anything else stays refused.
     dispatchable = (
         capabilities.mode == TOPOLOGY_IN_SESSION_SDD
+        or capabilities.mode == "background"
         or (capabilities.mode == "visible" and capabilities.visible_automation)
     )
     if not result.detected or not dispatchable:
         raise ValueError("selected provider has no verified dispatch lifecycle")
     return result
+
+
+def _background_runner(paths: ProjectPaths, adapter_id: str, provider: str):
+    """Build the background-session runner.
+
+    Interface assumption shared with the bg-launcher node: the module
+    ``vibe_guide.runners.claude_bg`` exposes ``ClaudeBgRunner`` constructed
+    with the same positional arguments as ``ProviderActionRunner``
+    (``paths, adapter_id, provider``).
+    """
+    try:
+        from .runners.claude_bg import ClaudeBgRunner
+    except ImportError as error:
+        raise ValueError("后台运行器未安装：vibe_guide.runners.claude_bg") from error
+    return ClaudeBgRunner(paths, adapter_id, provider)
 
 
 def _public_runner(
@@ -457,6 +554,20 @@ def _public_runner(
     if any(node.contract.get("adapter_id") != card.agent_id for node in nodes):
         raise ValueError("node adapter routing does not match authorization")
     observed = _observed_adapter(paths, card.agent_id)
+    if observed.capabilities.mode == "background":
+        if _card_discloses_background(card):
+            return _background_runner(paths, observed.adapter_id, observed.capabilities.provider)
+        # The approved card never disclosed a background downgrade: keep the
+        # visible / in-session path it was authorized for.
+        if not (
+            observed.capabilities.in_session_sdd or observed.capabilities.visible_automation
+        ):
+            raise ValueError("selected provider has no verified dispatch lifecycle")
+        return ProviderActionRunner(
+            paths,
+            observed.adapter_id,
+            AdapterRegistry().get(observed.adapter_id).manifest["provider"],
+        )
     return ProviderActionRunner(
         paths,
         observed.adapter_id,
@@ -590,6 +701,7 @@ def _publish_plan(
         # Planning remains usable for explicitly injected/background test paths;
         # the public monitor rechecks live observed capability before execution.
         pass
+    _first_card_rulings = _observed_topology_rulings(paths)
     card = build_authorization_card(
         plan,
         nodes,
@@ -598,7 +710,8 @@ def _publish_plan(
         allowed_actions=source.get("allowed_actions"),
         remote_git_actions=source.get("remote_git_actions", "deny"),
         engine_attestation=engine_attestation,
-        topology_rulings=_observed_topology_rulings(paths),
+        topology_rulings=_first_card_rulings,
+        workers=_background_worker_entries(nodes, _first_card_rulings),
     )
 
     plans_root = destination.parent
@@ -843,7 +956,7 @@ def _require_public_execution_gate(
             refreshed = refresh_authorization_card(
                 plan, nodes, card,
                 workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
-                topology_rulings=_observed_topology_rulings(paths),
+                topology_rulings=_observed_topology_rulings(paths, card),
             )
             if _verified_same_run_reauthorization(
                 paths, directory, plan, nodes, refreshed
@@ -978,7 +1091,7 @@ def _derive_card_preview(
         return payload, card
     run_id = _run_id(directory, None)
     workflow = load_snapshot(paths, run_id).workflow
-    topology_rulings = _observed_topology_rulings(paths)
+    topology_rulings = _observed_topology_rulings(paths, card)
     carry_error = ""
     try:
         carried = refresh_authorization_card(
@@ -1767,7 +1880,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 paths,
                 plan,
                 nodes,
-                topology_rulings=_observed_topology_rulings(paths),
+                topology_rulings=_observed_topology_rulings(paths, _card),
             ).request_scope_expansion(
                 args.run_id,
                 args.node_id,
@@ -2098,7 +2211,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         # in-session SDD topology (concurrent in-session subagents instead of
         # a visible task window), or guide-only.  ``.get`` keeps summaries
         # written before the key existed readable.
-        if summary["visible_automation"]:
+        if summary.get("mode") == "background":
+            dispatch_note = "可派发降级后台会话（桌面不可见，只能终端 attach 进入）"
+        elif summary["visible_automation"]:
             dispatch_note = "可派发可见任务"
         elif summary.get("in_session_sdd"):
             dispatch_note = "可派发会话内 SDD 子代理（无可见任务窗口自动化）"
@@ -2466,7 +2581,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     card = refresh_authorization_card(
                         plan, nodes, card,
                         workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
-                        topology_rulings=_observed_topology_rulings(paths),
+                        topology_rulings=_observed_topology_rulings(paths, card),
                         engine_attestation=engine_attestation,
                     )
                     record = authorize(card, args.authorize)
@@ -2474,7 +2589,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                         runner = _public_runner(paths, card, nodes)
                     snapshot = Monitor(
                         paths, plan, nodes,
-                        topology_rulings=_observed_topology_rulings(paths),
+                        topology_rulings=_observed_topology_rulings(paths, card),
                     ).reauthorize(
                         _run_id(directory, None),
                         record,
@@ -2513,7 +2628,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     card = refresh_authorization_card(
                         plan, nodes, card,
                         workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
-                        topology_rulings=_observed_topology_rulings(paths),
+                        topology_rulings=_observed_topology_rulings(paths, card),
                         engine_attestation=engine_attestation,
                     )
                     record = authorize(card, args.authorize)
@@ -2521,7 +2636,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                         runner = _public_runner(paths, card, nodes)
                     snapshot = Monitor(
                         paths, plan, nodes,
-                        topology_rulings=_observed_topology_rulings(paths),
+                        topology_rulings=_observed_topology_rulings(paths, card),
                     ).reauthorize(
                         _run_id(directory, None),
                         record,
@@ -2537,7 +2652,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     runner = _public_runner(paths, card, nodes)
                 snapshot = Monitor(
                     paths, plan, nodes,
-                    topology_rulings=_observed_topology_rulings(paths),
+                    topology_rulings=_observed_topology_rulings(paths, card),
                 ).start(record, runner)
             # Publishing a plan records confirmation, not execution
             # authorization.  Once the user supplies the exact authorization
@@ -2639,7 +2754,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         if args.watch:
             supervisor = Supervisor(
                 paths,
-                Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths)),
+                Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card)),
                 runner,
                 snapshot.run_id,
             )
@@ -2670,7 +2785,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             package = _read_json(evidence_path)
             monitor = Monitor(
                 paths, plan, nodes,
-                topology_rulings=_observed_topology_rulings(paths),
+                topology_rulings=_observed_topology_rulings(paths, _card),
             )
             if isinstance(package, dict) and package.get('kind') == 'scope_correction':
                 snapshot = monitor.reconcile_scope(args.run_id, package)
@@ -2735,7 +2850,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             _directory, plan, nodes, _card = _load_plan(paths, args.plan)
             monitor = Monitor(
                 paths, plan, nodes,
-                topology_rulings=_observed_topology_rulings(paths),
+                topology_rulings=_observed_topology_rulings(paths, _card),
             )
             payload = monitor.repair_node(args.node_id, args.run_id)
             snapshot = load_snapshot(paths, args.run_id)
@@ -2843,7 +2958,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 ProviderActionStore(paths).reconcile_stale(run_id, accepted_evidence)
                 monitor = Monitor(
                     paths, plan, nodes,
-                    topology_rulings=_observed_topology_rulings(paths),
+                    topology_rulings=_observed_topology_rulings(paths, _card),
                 )
                 # The CLI performs the normal resume tick immediately after
                 # reattachment; let that tick own the single provider poll.

@@ -128,6 +128,15 @@ class DetectionResult:
 
 TOPOLOGY_IN_SESSION_SDD = "in_session_sdd"
 TOPOLOGY_DUAL_VISIBLE = "dual-visible"
+TOPOLOGY_BACKGROUND = "background"
+
+# Disclosure for a verified-background Claude Code launch.  Each entry carries
+# the keyword authorization.BACKGROUND_LIMITATION_REQUIREMENTS machine-checks.
+BACKGROUND_LAUNCH_LIMITATIONS = (
+    "桌面不可见：后台会话不出现在桌面 App 侧边栏，只能在终端查看",
+    "不可直接进入：只能在终端用 claude attach <会话短 id> 进入",
+    "返工续接受限：返工可续接同一后台会话，须先停止再用完整会话 ID 续接",
+)
 
 _TOPOLOGY_VALUES = {TOPOLOGY_IN_SESSION_SDD, TOPOLOGY_DUAL_VISIBLE}
 _CONSERVATIVE_TOPOLOGY_SPEC = {"probe_pass": TOPOLOGY_DUAL_VISIBLE, "probe_unknown": TOPOLOGY_DUAL_VISIBLE}
@@ -158,6 +167,7 @@ class ManifestAdapter:
     _allowed_fields = {
         "id", "display_name", "agent_probe", "provider", "background_provider",
         "background_fallback", "session_prompt", "probes", "native_control_plane",
+        "background_probe",
     }
 
     def __init__(self, manifest: Mapping[str, Any], background_launcher=None):
@@ -190,7 +200,7 @@ class ManifestAdapter:
         unknown = set(manifest) - cls._allowed_fields
         if unknown:
             raise ManifestError("unsupported manifest fields: %s" % ", ".join(sorted(unknown)))
-        missing = (cls._allowed_fields - {"native_control_plane"}) - set(manifest)
+        missing = (cls._allowed_fields - {"native_control_plane", "background_probe"}) - set(manifest)
         if missing:
             raise ManifestError("manifest missing fields: %s" % ", ".join(sorted(missing)))
         if not isinstance(manifest["id"], str) or not re.match(r"^[a-z0-9-]+$", manifest["id"]):
@@ -216,6 +226,16 @@ class ManifestAdapter:
             if name in seen:
                 raise ManifestError("duplicate manifest probe: %s" % name)
             seen.add(name)
+        if "background_probe" in manifest:
+            background_probe = manifest["background_probe"]
+            if (
+                not isinstance(background_probe, str)
+                or not background_probe.startswith(manifest["id"] + ".")
+                or background_probe == manifest["id"] + "."
+            ):
+                raise ManifestError("manifest background_probe must be provider-namespaced")
+            if background_probe in seen:
+                raise ManifestError("manifest background_probe duplicates a probe")
         required_probe_name = manifest["id"] + ".in_session_sdd"
         if not any(
             probe.get("kind") == "fact" and probe.get("name") == required_probe_name
@@ -250,6 +270,14 @@ class ManifestAdapter:
             environment = Environment.from_mapping(environment)
         evidence = {probe["name"]: self._probe(environment, probe) for probe in self.manifest["probes"]}
         provenance = {name: environment.fact_source(name) for name in evidence}
+        # The verified-background-launch fact is an optional stated fact, not a
+        # manifest probe: it joins evidence only when the session stated it, so
+        # an unregistered fact leaves the report exactly as it was.
+        background_probe = self.manifest.get("background_probe")
+        if background_probe and background_probe in environment.facts:
+            evidence[background_probe] = environment.has_fact(background_probe, self.id)
+            provenance[background_probe] = environment.fact_source(background_probe)
+        background_status, _background_ref = self.background_launch_status(environment)
         command_seen = environment.has_command(self.manifest["agent_probe"])
         agent_seen = self.id in set(environment.available_agents) or environment.has_fact(self.id + ".agent", self.id)
         detected = command_seen or agent_seen
@@ -286,6 +314,9 @@ class ManifestAdapter:
         if not subprocess:
             level, mode, provider = "guide", "guide", ""
             limitations = ("无法启动 subprocess；仅保留向导能力",)
+        elif background_status == "pass":
+            level, mode, provider = "background", TOPOLOGY_BACKGROUND, self.manifest["background_provider"]
+            limitations = BACKGROUND_LAUNCH_LIMITATIONS
         elif visible:
             level, mode, provider = "full", "visible", self.manifest["provider"]
             limitations = ()
@@ -313,6 +344,26 @@ class ManifestAdapter:
     def capabilities(self, environment: Environment) -> AdapterCapabilities:
         return self.detect(environment).capabilities
 
+    def background_launch_status(self, environment: Environment) -> Tuple[str, Optional[str]]:
+        """Rule the optional verified-background-launch fact: (status, evidence_ref).
+
+        Fail-closed: only a True fact carrying provenance is a pass; a missing
+        fact, or a pass without provenance, is UNKNOWN and never upgrades.
+        """
+        probe = self.manifest.get("background_probe")
+        if not probe:
+            return "unsupported", None
+        if not isinstance(environment, Environment):
+            environment = Environment.from_mapping(environment)
+        if probe not in environment.facts:
+            return "unknown", None
+        evidence_ref = environment.fact_source(probe)
+        if environment.has_fact(probe, self.id):
+            if not evidence_ref:
+                return "unknown", None
+            return "pass", evidence_ref
+        return "unsupported", evidence_ref
+
     def topology_decision(self, environment: Environment) -> TopologyDecision:
         """Rule the dispatch topology from the `in_session_sdd` probe evidence.
 
@@ -324,6 +375,12 @@ class ManifestAdapter:
         """
         if not isinstance(environment, Environment):
             environment = Environment.from_mapping(environment)
+        background_status, background_ref = self.background_launch_status(environment)
+        if background_status == "pass":
+            return TopologyDecision(
+                self.id, self.manifest["background_probe"], "pass",
+                TOPOLOGY_BACKGROUND, background_ref, upgraded=True,
+            )
         spec = dict(_CONSERVATIVE_TOPOLOGY_SPEC)
         if self.topology_spec:
             for key in ("probe_pass", "probe_unknown"):

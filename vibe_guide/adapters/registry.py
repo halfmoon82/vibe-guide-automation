@@ -1,5 +1,6 @@
 """Discovery and strict selection of the seven manifest adapters."""
 
+import importlib
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Sequence
 
@@ -10,7 +11,7 @@ from .base import (
     ManifestAdapter,
     ManifestError,
 )
-from .task_provider import TaskProviderAdapter
+from .task_provider import ProviderUnavailable, TaskProviderAdapter
 
 
 SUPPORTED_ADAPTER_IDS = frozenset({
@@ -58,13 +59,45 @@ if set(DISPATCH_TOPOLOGY_MATRIX) != SUPPORTED_ADAPTER_IDS or any(
     raise ManifestError("dispatch topology matrix does not match the supported adapter set and topology values")
 
 
+# Verified background launchers shipped with vibe: adapter id -> (module, class).
+# Resolved lazily -- building a registry never imports the launcher module.
+DEFAULT_BACKGROUND_LAUNCHERS = {
+    "claude-code": ("vibe_guide.adapters.claude_bg", "ClaudeBgLauncher"),
+}
+
+
+class _LazyBackgroundLauncher:
+    """Imports and instantiates the configured launcher on first ``launch``."""
+
+    def __init__(self, module_name: str, class_name: str):
+        self._module_name = module_name
+        self._class_name = class_name
+
+    def launch(self, role, issue_id, contract_path):
+        try:
+            module = importlib.import_module(self._module_name)
+            launcher = getattr(module, self._class_name)()
+        except (ImportError, AttributeError) as error:
+            raise ProviderUnavailable(
+                "verified background launcher is not configured: %s" % type(error).__name__
+            ) from error
+        return launcher.launch(role, issue_id, contract_path)
+
+
+def _default_launchers() -> Dict[str, _LazyBackgroundLauncher]:
+    return {
+        adapter_id: _LazyBackgroundLauncher(module_name, class_name)
+        for adapter_id, (module_name, class_name) in DEFAULT_BACKGROUND_LAUNCHERS.items()
+    }
+
+
 class AdapterRegistry:
     def __init__(self, manifest_dir: Optional[Path] = None, background_launchers=None):
         self.manifest_dir = Path(manifest_dir or Path(__file__).parent / "manifests")
         paths = sorted(self.manifest_dir.glob("*.yaml"))
         if not paths:
             raise ManifestError("adapter manifest directory is empty: %s" % self.manifest_dir)
-        launchers = background_launchers or {}
+        launchers = _default_launchers() if background_launchers is None else background_launchers
         self._adapters: Dict[str, ManifestAdapter] = {}
         for path in paths:
             adapter = ManifestAdapter.from_path(path, background_launcher=launchers.get(path.stem))

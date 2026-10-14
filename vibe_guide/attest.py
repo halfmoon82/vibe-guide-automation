@@ -27,12 +27,23 @@ def expected_fact_names(adapter_id: str) -> List[str]:
     return [probe["name"] for probe in adapter.manifest["probes"]]
 
 
+def optional_fact_names(adapter_id: str) -> List[str]:
+    """Stated-if-observed facts the manifest accepts beyond its required probes."""
+    try:
+        adapter = AdapterRegistry().get(adapter_id)
+    except KeyError as error:
+        raise ValueError("unknown adapter: {}".format(adapter_id)) from error
+    name = adapter.manifest.get("background_probe")
+    return [name] if name else []
+
+
 def validate_session_facts(adapter_id: str, facts: Any) -> Dict[str, bool]:
     """Fail closed unless every manifest fact is stated exactly once as a bool."""
     if not isinstance(facts, Mapping):
         raise TypeError("facts must be a JSON object mapping fact name to true/false")
     expected = expected_fact_names(adapter_id)
-    unknown = sorted(str(key) for key in facts if key not in expected)
+    optional = optional_fact_names(adapter_id)
+    unknown = sorted(str(key) for key in facts if key not in expected and key not in optional)
     if unknown:
         raise ValueError("facts contain names the {} manifest does not probe: {}".format(adapter_id, ", ".join(unknown)))
     missing = [name for name in expected if name not in facts]
@@ -41,7 +52,11 @@ def validate_session_facts(adapter_id: str, facts: Any) -> Dict[str, bool]:
     non_bool = [name for name in expected if type(facts[name]) is not bool]
     if non_bool:
         raise ValueError("facts must be true or false, not strings or unknown: {}".format(", ".join(non_bool)))
-    return {name: facts[name] for name in expected}
+    stated_optional = [name for name in optional if name in facts]
+    non_bool = [name for name in stated_optional if type(facts[name]) is not bool]
+    if non_bool:
+        raise ValueError("facts must be true or false, not strings or unknown: {}".format(", ".join(non_bool)))
+    return {name: facts[name] for name in expected + stated_optional}
 
 
 def record_session_capabilities(paths: Any, adapter_id: str, facts: Any, provenance: Any, project_id: Optional[str] = None) -> Dict[str, Any]:
