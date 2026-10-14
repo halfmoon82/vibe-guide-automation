@@ -10,9 +10,11 @@ nor permanent unavailability.
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from ..paths import ProjectPaths
@@ -48,12 +50,23 @@ class CommandResult:
 
 CommandExecutor = Callable[[Sequence[str], Path, float], CommandResult]
 
+# Set by the Claude Code desktop host for its own sessions; inherited by a
+# background session it makes the session ignore --settings apiKeyHelper and
+# come up "Not logged in" (verified live 2026-10-14, the only variable needed).
+_HOST_ONLY_ENV = ("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",)
+
+# Waits before each resume attempt after `claude stop` (seconds; live: 0s
+# copies, 5s continued the same session).
+_RESUME_SETTLE_SECONDS = (5, 10, 20)
+
 
 def subprocess_executor(argv: Sequence[str], cwd: Path, timeout: float) -> CommandResult:
+    env = {key: value for key, value in os.environ.items() if key not in _HOST_ONLY_ENV}
     try:
         done = subprocess.run(
             list(argv),
             cwd=str(cwd),
+            env=env,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -171,8 +184,10 @@ class ClaudeBgLauncher:
         prompt_builder: Optional[Callable[[str, str, Path], str]] = None,
         model: Optional[str] = None,
         transcript_locator: Callable[[str], Optional[Path]] = _default_transcript_locator,
+        sleeper: Callable[[float], None] = time.sleep,
     ):
         self.routing = routing
+        self.sleeper = sleeper
         self.config = config
         self.executor = executor
         self.prompt_builder = prompt_builder
@@ -254,27 +269,34 @@ class ClaudeBgLauncher:
                 # Plain `git config` in a linked worktree writes the shared
                 # .git/config; --worktree refuses unless worktreeConfig is on.
                 self._require_ok(self._run(["git", "config", "--worktree", key, value], worktree), "git config")
-        out = self._require_ok(
-            self._run(
-                self._claude(
-                    "--bg",
-                    "-n",
-                    "%s-%s" % (issue_id, role),
-                    "--model",
-                    self.model,
-                    "--settings",
-                    self.config.settings_path,
-                    "--permission-mode",
-                    "bypassPermissions",
-                    prompt,
+        name = "%s-%s" % (issue_id, role)
+        started_ms = int(time.time() * 1000)
+        try:
+            out = self._require_ok(
+                self._run(
+                    self._claude(
+                        "--bg",
+                        "-n",
+                        name,
+                        "--model",
+                        self.model,
+                        "--settings",
+                        self.config.settings_path,
+                        "--permission-mode",
+                        "bypassPermissions",
+                        # A prompt starting with "-" is otherwise read as an option (live).
+                        "--",
+                        prompt,
+                    ),
+                    worktree,
                 ),
-                worktree,
-            ),
-            "claude --bg",
-        )
-        match = _BACKGROUNDED.search(out)
-        if not match:
-            raise ClaudeBgUnknown("cannot parse 'backgrounded' short id from claude output")
+                "claude --bg",
+            )
+            match = _BACKGROUNDED.search(out)
+            if not match:
+                raise ClaudeBgUnknown("cannot parse 'backgrounded' short id from claude output")
+        except ClaudeBgUnknown as error:
+            raise ClaudeBgUnknown("%s; %s" % (error.reason, self._stop_strays(name, started_ms)))
         short_id = match.group(1)
         try:
             return self._bind(short_id, role, issue_id)
@@ -287,6 +309,32 @@ class ClaudeBgLauncher:
                 "session %s started but could not be confirmed (%s); stop attempted"
                 % (short_id, error.reason)
             )
+
+    def _stop_strays(self, name: str, started_ms: int) -> str:
+        """Stop sessions this failed launch may have started (live: a client
+        timeout still leaves a working bypassPermissions session)."""
+        try:
+            entries = self._entries()
+        except ClaudeBgUnknown as error:
+            return "stray check unknown (%s)" % error.reason
+        stopped = []
+        for item in entries:
+            started = item.get("startedAt")
+            session_id = item.get("sessionId")
+            if (
+                item.get("name") == name
+                and self._same_dir(item.get("cwd"))
+                and isinstance(started, (int, float)) and not isinstance(started, bool)
+                and started >= started_ms - 5000
+                and item.get("state") != "stopped"
+                and isinstance(session_id, str) and _UUID.fullmatch(session_id)
+            ):
+                try:
+                    self._run(self._claude("stop", session_id[:8]), self._worktree())
+                    stopped.append(session_id[:8])
+                except ClaudeBgUnknown:
+                    stopped.append(session_id[:8] + "(stop unknown)")
+        return "stray sessions stopped: %s" % (", ".join(stopped) or "none")
 
     def _bind(self, short_id: str, role: str, issue_id: str) -> Dict[str, Any]:
         found = [
@@ -374,19 +422,32 @@ class ClaudeBgLauncher:
             state = self.status(task_id)
             if state == "working":
                 raise ClaudeBgUnknown("session %s is still working and could not be stopped" % short)
-        result = self._run(self._claude("--bg", "--resume", task_id, message), worktree)
-        combined = _ANSI.sub("", (result.stdout or "") + "\n" + (result.stderr or ""))
-        if result.returncode != 0:
-            tail = combined.strip()[-200:]
-            raise ClaudeBgUnknown("claude --bg --resume failed (exit %s): %s" % (result.returncode, tail))
-        match = _BACKGROUNDED.search(combined)
-        if "started a copy" in combined or not match or match.group(1) != short:
+        for attempt, delay in enumerate(_RESUME_SETTLE_SECONDS):
+            # `claude stop` returns before the session stops counting as
+            # running; resuming inside that window starts a copy (live).
+            self.sleeper(delay)
+            result = self._run(self._claude("--bg", "--resume", task_id, "--", message), worktree)
+            combined = _ANSI.sub("", (result.stdout or "") + "\n" + (result.stderr or ""))
+            if result.returncode != 0:
+                tail = combined.strip()[-200:]
+                raise ClaudeBgUnknown("claude --bg --resume failed (exit %s): %s" % (result.returncode, tail))
+            match = _BACKGROUNDED.search(combined)
+            if "started a copy" not in combined and match and match.group(1) == short:
+                return
             copy = match.group(1) if match else None
             if copy and copy != short:
-                try:
-                    self._run(self._claude("stop", copy), worktree)
-                except ClaudeBgUnknown:
-                    pass
+                for op in ("stop", "rm"):
+                    try:
+                        self._run(self._claude(op, copy), worktree)
+                    except ClaudeBgUnknown:
+                        pass
+            if "is already running" in combined and attempt + 1 < len(_RESUME_SETTLE_SECONDS):
+                continue
+            if "is already running" in combined:
+                raise ClaudeBgUnknown(
+                    "session %s still running after stop; resume gave up after %d attempts (copy %s removed)"
+                    % (short, len(_RESUME_SETTLE_SECONDS), copy or "unknown")
+                )
             raise ClaudeBgUnknown(
                 "resume of %s did not continue the same session (copy short id: %s); copy stop attempted"
                 % (short, copy or "unknown")

@@ -33,6 +33,8 @@ class FakeClaude:
         self.agents_error = None
         self.resume_out = "backgrounded · %s · node\n" % SHORT
         self.resume_err = ""
+        self.resume_outs = []
+        self.bg_error = None
 
     def __call__(self, argv, cwd, timeout):
         self.calls.append((list(argv), Path(cwd)))
@@ -47,8 +49,13 @@ class FakeClaude:
             entry = {"kind": "background", "sessionId": UUID, "cwd": self.agents_cwd, "state": self.state}
             return CommandResult(0, json.dumps([entry]))
         if "--resume" in argv:
+            if self.resume_outs:
+                out, err = self.resume_outs.pop(0)
+                return CommandResult(0, out, err)
             return CommandResult(self.returncodes.get("resume", 0), self.resume_out, self.resume_err)
         if "--bg" in argv:
+            if self.bg_error:
+                raise self.bg_error
             return CommandResult(self.returncodes.get("bg", 0), self.launch_out)
         key = argv[1] if len(argv) > 1 else argv[0]
         return CommandResult(self.returncodes.get(key, 0), "")
@@ -69,6 +76,7 @@ class LauncherCase(unittest.TestCase):
 
     def launcher(self, **kw):
         config = kw.pop("config", self.config)
+        kw.setdefault("sleeper", lambda seconds: None)
         return ClaudeBgLauncher(self.routing, config, executor=self.fake, **kw)
 
 
@@ -91,6 +99,13 @@ class LaunchTest(LauncherCase):
             self.assertIn(token, argv)
         self.assertEqual(argv[argv.index("--model") + 1], "opus")
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "bypassPermissions")
+
+    def test_prompt_follows_double_dash(self):
+        # Live: a prompt starting with "-" is parsed as an option without "--".
+        self.contract.write_text("-- starts with a dash", encoding="utf-8")
+        self.launcher().launch("developer", "n1", self.contract)
+        argv, _ = self.fake.calls[0]
+        self.assertEqual(argv[-2:], ["--", "-- starts with a dash"])
 
     def test_ansi_in_output_is_tolerated(self):
         self.fake.launch_out = "\x1b[32mbackgrounded\x1b[0m · %s · n\n" % SHORT
@@ -141,7 +156,7 @@ class LaunchTest(LauncherCase):
         self.fake.error = ClaudeBgUnknown("claude command not found")
         with self.assertRaises(ClaudeBgUnknown) as ctx:
             self.launcher().launch("developer", "n1", self.contract)
-        self.assertEqual(ctx.exception.reason, "claude command not found")
+        self.assertTrue(ctx.exception.reason.startswith("claude command not found"))
 
     def test_missing_worktree_is_unknown(self):
         routing = BackgroundTaskRouting("h", str(self.tmp / "nope"), "b", "s", "h")
@@ -165,6 +180,21 @@ class DefaultExecutorTest(unittest.TestCase):
             subprocess_executor(["sleep", "5"], Path.cwd(), 0.2)
         self.assertIn("timed out", ctx.exception.reason)
 
+    def test_desktop_host_auth_flag_is_not_inherited(self):
+        # Live 2026-10-14: launched from a Claude Code desktop session, the
+        # inherited flag makes every background session "Not logged in".
+        import os
+        import sys
+        env = {"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "1", "VIBE_KEEP_ME": "yes"}
+        with mock.patch.dict(os.environ, env):
+            out = subprocess_executor(
+                [sys.executable, "-I", "-c",
+                 "import os; print(os.environ.get('CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST', '-'),"
+                 " os.environ.get('VIBE_KEEP_ME', '-'))"],
+                Path.cwd(), 10,
+            )
+        self.assertEqual(out.stdout.split(), ["-", "yes"])
+
 
 class StatusTest(LauncherCase):
     def test_five_states(self):
@@ -187,7 +217,7 @@ class ControlTest(LauncherCase):
     def test_resume_stops_then_resumes_with_full_uuid_only(self):
         self.launcher().resume(UUID, "rework please")
         self.assertEqual(self.fake.calls[0][0], ["claude", "stop", SHORT])
-        self.assertEqual(self.fake.calls[1][0], ["claude", "--bg", "--resume", UUID, "rework please"])
+        self.assertEqual(self.fake.calls[1][0], ["claude", "--bg", "--resume", UUID, "--", "rework please"])
         self.assertEqual(len(self.fake.calls), 2)
 
     def test_resume_rejects_short_id(self):
@@ -276,6 +306,57 @@ class ResumeSafetyTest(LauncherCase):
             self.launcher().resume(UUID, "x")
 
 
+RUNNING_COPY = (
+    "backgrounded · %s · node\n" % COPY,
+    "note: session %s is already running in the background, so this started a copy as %s." % (SHORT, COPY),
+)
+CONTINUED = ("backgrounded · %s · node\n" % SHORT, "note: woke session %s with its saved options" % SHORT)
+
+
+class ResumeSettleTest(LauncherCase):
+    """Live 2026-10-14: right after `claude stop` the session still counts as
+    running for a few seconds and an immediate resume starts a copy."""
+
+    def setUp(self):
+        super().setUp()
+        self.sleeps = []
+
+    def launcher(self, **kw):
+        return super().launcher(sleeper=self.sleeps.append, **kw)
+
+    def argvs(self):
+        return [a for a, _ in self.fake.calls]
+
+    def test_waits_after_stop_before_resuming(self):
+        self.launcher().resume(UUID, "x")
+        self.assertTrue(self.sleeps and self.sleeps[0] > 0)
+
+    def test_still_running_copy_is_removed_and_resume_retried(self):
+        self.fake.resume_outs = [RUNNING_COPY, CONTINUED]
+        self.launcher().resume(UUID, "x")
+        argvs = self.argvs()
+        self.assertEqual([a for a in argvs if "--resume" in a], [["claude", "--bg", "--resume", UUID, "--", "x"]] * 2)
+        self.assertIn(["claude", "stop", COPY], argvs)
+        self.assertIn(["claude", "rm", COPY], argvs)
+        self.assertEqual(len(self.sleeps), 2)
+        self.assertGreater(self.sleeps[1], self.sleeps[0])
+
+    def test_gives_up_after_bounded_retries(self):
+        self.fake.resume_outs = [RUNNING_COPY] * 10
+        with self.assertRaises(ClaudeBgUnknown) as ctx:
+            self.launcher().resume(UUID, "x")
+        self.assertIn("still running", ctx.exception.reason)
+        self.assertEqual(len([a for a in self.argvs() if "--resume" in a]), 3)
+
+    def test_saved_options_copy_is_not_retried(self):
+        flags = ("backgrounded · %s · node\n" % COPY,
+                 "note: background session %s keeps its own saved options, so the flags you passed started a copy as %s." % (SHORT, COPY))
+        self.fake.resume_outs = [flags, CONTINUED]
+        with self.assertRaises(ClaudeBgUnknown):
+            self.launcher().resume(UUID, "x")
+        self.assertEqual(len([a for a in self.argvs() if "--resume" in a]), 1)
+
+
 class HardeningTest(LauncherCase):
     def argvs(self):
         return [a for a, _ in self.fake.calls]
@@ -287,6 +368,31 @@ class HardeningTest(LauncherCase):
         self.assertIn(SHORT, ctx.exception.reason)
         self.assertIn("stop", ctx.exception.reason)
         self.assertIn(["claude", "stop", SHORT], self.argvs())
+
+    def test_launch_timeout_stops_stray_session_it_started(self):
+        # Live: a launch that times out client-side still leaves a working
+        # bypassPermissions session behind.
+        old = "bbbbbbbb-1111-4222-8333-444455556666"
+        self.fake.bg_error = ClaudeBgUnknown("claude timed out after 60s")
+        self.fake.agents_out = json.dumps([
+            {"sessionId": UUID, "name": "n1-developer", "cwd": str(self.worktree),
+             "state": "working", "startedAt": 10 ** 13},
+            {"sessionId": old, "name": "n1-developer", "cwd": str(self.worktree),
+             "state": "working", "startedAt": 0},
+        ])
+        with self.assertRaises(ClaudeBgUnknown) as ctx:
+            self.launcher().launch("developer", "n1", self.contract)
+        self.assertIn("timed out", ctx.exception.reason)
+        self.assertIn(SHORT, ctx.exception.reason)
+        self.assertIn(["claude", "stop", SHORT], self.argvs())
+        self.assertNotIn(["claude", "stop", old[:8]], self.argvs())
+
+    def test_launch_failure_cleanup_query_failure_is_reported(self):
+        self.fake.bg_error = ClaudeBgUnknown("claude timed out after 60s")
+        self.fake.agents_error = ClaudeBgUnknown("claude agents timed out")
+        with self.assertRaises(ClaudeBgUnknown) as ctx:
+            self.launcher().launch("developer", "n1", self.contract)
+        self.assertIn("stray check unknown", ctx.exception.reason)
 
     def test_failed_stop_during_cleanup_is_ignored(self):
         self.fake.agents_out = "[]"

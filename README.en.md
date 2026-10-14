@@ -111,6 +111,8 @@ Viewing background workers: in a terminal run `claude agents --json --all` to li
 
 Permissions and commit identity: workers run with `bypassPermissions`; the safety boundary is worktree isolation plus the authorization card. If the machine has no global git `user.name` / `user.email`, commit authors will be the machine name. `git_user_name` / `git_user_email` in the user-level `claude_bg` set an identity for the worker's worktree only, and require `git config extensions.worktreeConfig true` in the repo; otherwise the launch fails with the reason (the main repo's identity is never changed).
 
+Accepted on real sessions (2026-10-14, Claude Code 2.1.260): background dispatch → delivery → review finds a defect → rework continues the same session → re-review passes, with no clicks, in about 30 seconds. Re-run locally with `VIBE_LIVE_CLAUDE_BG=1 python3 -m unittest tests.test_claude_bg_live -v` (skipped by default; it starts real background sessions and spends usage). Workers must run in a linked worktree (`.worktrees/<node>`): in the main checkout, newer Claude Code background sessions open their own worktree and write there, so deliveries do not land where expected.
+
 Unverified, do not treat as available: pre-assigning a session id with `--session-id`, combining `-w` with `--bg`, recovery after a long task / sleep / daemon exit, and `--bg` under the desktop-bundled CLI.
 
 ## Governance boundaries
