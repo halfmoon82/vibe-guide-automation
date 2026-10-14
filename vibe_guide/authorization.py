@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import PurePosixPath
 import secrets
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .models import (
     INTEGRATION_REVIEW_NODE_ID,
@@ -686,6 +686,37 @@ def executable_contract_digest(nodes: List[DAGNode]) -> str:
     # invalidating an unchanged acceptance contract.
     return _canonical_digest(
         {"nodes": canonical_node_contracts(nodes, include_scope=False)}
+    )
+
+
+def legacy_executable_contract_digest(nodes: List[DAGNode]) -> str:
+    """The digest as computed up to v5.0.7, before PR #182 dropped file scope.
+
+    Read side only: runs authorized, dispatched or reauthorized under v5.0.7
+    persisted this value, and must still prove their lineage after an
+    upgrade.  Never use it to write a new digest.
+    """
+    return _canonical_digest(
+        {"nodes": canonical_node_contracts(nodes, include_scope=True)}
+    )
+
+
+def executable_contract_digest_algorithms() -> Tuple[Callable[[List[DAGNode]], str], ...]:
+    """Every algorithm a persisted contract digest may legitimately use.
+
+    Current first.  A proof made of several digests must be satisfied by one
+    algorithm throughout; mixing them is not a lineage any release wrote.
+    """
+    return (executable_contract_digest, legacy_executable_contract_digest)
+
+
+def executable_contract_digest_matches(nodes: List[DAGNode], digest: Any) -> bool:
+    """Whether ``digest`` is the current or the v5.0.7 digest of ``nodes``."""
+    if not isinstance(digest, str):
+        return False
+    return any(
+        secrets.compare_digest(digest, algorithm(nodes))
+        for algorithm in executable_contract_digest_algorithms()
     )
 
 
@@ -1575,11 +1606,13 @@ def is_authorization_valid(
         return False
     if nodes is not None:
         try:
-            live_digest = executable_contract_digest(nodes)
+            digest_matches = executable_contract_digest_matches(
+                nodes, record.node_contract_digest
+            )
             live_file_scope = _authorization_file_scope(nodes)
         except (TypeError, ValueError):
             return False
-        if not secrets.compare_digest(record.node_contract_digest, live_digest):
+        if not digest_matches:
             return False
         if record.file_scope != live_file_scope:
             return False

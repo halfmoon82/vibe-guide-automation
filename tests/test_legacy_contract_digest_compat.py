@@ -28,12 +28,14 @@ from vibe_guide.authorization import (
     is_authorization_valid,
 )
 from vibe_guide.capability_contract import build_contract, save_contract
+from vibe_guide.contracts import RunEvent
 from vibe_guide.models import AgentCapabilities, Plan
 from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.state import (
     _decode_snapshot,
+    append_event,
     load_events,
     load_snapshot,
     run_dir,
@@ -62,7 +64,8 @@ def _foreign_digest(nodes):
 def _writes_with(algorithm):
     """Simulate an older vibe that computed every contract digest with ``algorithm``."""
     with ExitStack() as stack:
-        for module in ("authorization", "monitor", "state"):
+        # Every module that mints a digest with its own binding of the name.
+        for module in ("authorization", "monitor"):
             stack.enter_context(
                 patch("vibe_guide.{}.executable_contract_digest".format(module), algorithm)
             )
@@ -256,7 +259,8 @@ class ReauthorizationTransitionReplayCompatTests(_RunFixture):
         )
 
         self.assertEqual(replayed.authorization_digest, changed_record.digest)
-        self.assertEqual(replayed.nodes["a"]["status"], rebound.nodes["a"]["status"])
+        self.assertEqual(replayed.node_contract_digest, _v507_digest(changed_nodes))
+        self.assertIsNone(replayed.nodes["a"]["acceptance"])
 
     def test_tampered_live_contract_still_refuses_the_transition(self):
         preserved, rebound, _changed_nodes, _record = (
@@ -289,24 +293,48 @@ class DualVisibleAcceptanceCompatTests(_RunFixture):
         self.assertEqual(snapshot.nodes["b"]["status"], "accepted", snapshot.nodes["b"].get("reason"))
 
     def test_v507_acceptance_lost_with_the_snapshot_replays(self):
+        """An accepted event recorded with the v5.0.7 digest, snapshot not yet saved."""
         nodes = _nodes()
-        runner = self._runner()
+        runner = FakeRunner(events={("a", "developer"): [("complete", {"evidence": "a"})]})
         with _writes_with(_v507_digest):
             monitor = Monitor(self.paths, self.plan, nodes)
             snapshot = monitor.start(self._record(nodes), runner)
-            preserved = None
-            for _ in range(8):
-                before = deepcopy(snapshot)
+            for _ in range(4):
                 snapshot = monitor.tick(snapshot.run_id, runner)
-                if snapshot.nodes["a"]["status"] == "accepted":
-                    preserved = before
+                if snapshot.nodes["a"].get("active_role") == "reviewer":
                     break
-        self.assertIsNotNone(preserved)
-        save_snapshot(self.paths, preserved)
+        current = snapshot.nodes["a"]
+        self.assertEqual(current.get("active_role"), "reviewer")
+        self.assertEqual(current["contract_digest"], _v507_digest([nodes[0]]))
+        active = current["active_task"]
+        append_event(
+            self.paths,
+            RunEvent(
+                "accepted",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": "a",
+                    "evidence": "a",
+                    "contract_digest": current["contract_digest"],
+                    "authorization_epoch": snapshot.authorization_digest,
+                },
+            ),
+            {
+                "role": "reviewer",
+                "task_id": active["task_id"],
+                "handle_id": snapshot.handles["a"],
+                "generation": active["generation"],
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+            },
+        )
 
         recovered = Monitor(self.paths, self.plan, _nodes()).tick(snapshot.run_id, runner)
 
         self.assertEqual(recovered.nodes["a"]["status"], "accepted", recovered.nodes["a"].get("reason"))
+        self.assertEqual(
+            recovered.nodes["a"]["acceptance"]["contract_digest"], _v507_digest([nodes[0]])
+        )
 
     def test_digest_matching_neither_algorithm_is_still_refused_live(self):
         nodes = _nodes()
