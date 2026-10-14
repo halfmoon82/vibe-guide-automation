@@ -33,8 +33,17 @@ _DELIVERY_FORMAT_REASONS = (
 )
 
 
-def evaluate_delivery_evidence(node: Any, binding: Any, artifacts: Any) -> DeliveryEvidence:
-    """Require complete, current delivery evidence before dependency unlock."""
+def evaluate_delivery_evidence(
+    node: Any, binding: Any, artifacts: Any, self_report_receipt: bool = False
+) -> DeliveryEvidence:
+    """Require complete, current delivery evidence before dependency unlock.
+
+    ``self_report_receipt`` is the caller's proof that the delivery arrived
+    through ``vibe worker-deliver`` for this binding's task and generation
+    (``ProviderActionStore.self_report_receipt``).  It replaces only the
+    cursor -- a self-report never pages the session, so it has none -- and
+    every identity, host and worktree requirement still applies.
+    """
     get = lambda value, key, default=None: value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
     reasons: List[str] = []
     if get(node, "status") not in {"DELIVERED", "delivered"}:
@@ -45,7 +54,7 @@ def evaluate_delivery_evidence(node: Any, binding: Any, artifacts: Any) -> Deliv
         reasons.append("host identity is missing")
     if get(binding, "worktree") in (None, "") or get(binding, "branch") in (None, ""):
         reasons.append("worktree or branch is missing")
-    if get(binding, "cursor") in (None, ""):
+    if get(binding, "cursor") in (None, "") and not self_report_receipt:
         reasons.append("current cursor is missing")
     if not isinstance(artifacts, dict) or not artifacts.get("completion_marker"):
         reasons.append("completion marker is missing")
