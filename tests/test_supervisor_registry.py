@@ -283,10 +283,6 @@ class SupervisorCliTests(unittest.TestCase):
         self.assertEqual(result.payload["state"], "rotate")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class LeaseEpochTests(unittest.TestCase):
     """Supervisor lease epoch: CAS takeover, stale-writer rejection, legacy."""
 
@@ -435,3 +431,51 @@ class LeaseEpochTests(unittest.TestCase):
         entry = register_supervisor_address(self.paths, "run-1", self._addr("A"))
         self.assertEqual(entry["lease_epoch"], 1)
         self.assertEqual(read_lease_epoch(self.paths, "run-1"), 1)
+
+
+    def _split_register_b(self):
+        """Register A, then B with the final registry write failing."""
+        import vibe_guide.supervisor as sup
+        register_supervisor_address(self.paths, "run-1", self._addr("A"))
+        real = sup._write_registry
+        calls = []
+
+        def flaky(path, registry):
+            calls.append(1)
+            if isinstance(registry.get("current"), dict) and registry["current"]["session_id"] == "B":
+                raise OSError("disk full")
+            return real(path, registry)
+
+        with patch("vibe_guide.supervisor._write_registry", flaky):
+            with self.assertRaises(OSError):
+                register_supervisor_address(self.paths, "run-1", self._addr("B"))
+        self.assertEqual(read_lease_epoch(self.paths, "run-1"), 2)
+
+    def test_i_split_write_is_repaired_by_retry(self):
+        self._split_register_b()
+        entry = register_supervisor_address(self.paths, "run-1", self._addr("B"))
+        self.assertEqual(entry["lease_epoch"], 2)
+        current = current_supervisor_address(self.paths, "run-1")
+        self.assertEqual(current["current"]["session_id"], "B")
+        self.assertEqual(read_lease_epoch(self.paths, "run-1"), 2)
+        third = register_supervisor_address(self.paths, "run-1", self._addr("C"))
+        self.assertEqual(third["lease_epoch"], 3)
+
+    def test_j_split_write_old_shift_cannot_reregister(self):
+        self._split_register_b()
+        with self.assertRaises(SupervisorLeaseConflict):
+            register_supervisor_address(self.paths, "run-1", self._addr("A"))
+        current = current_supervisor_address(self.paths, "run-1")
+        self.assertEqual(current["current"]["session_id"], "A")
+        self.assertEqual(read_lease_epoch(self.paths, "run-1"), 2)
+
+    def test_k_split_write_successor_uses_disk_epoch(self):
+        self._split_register_b()
+        entry = register_supervisor_address(self.paths, "run-1", self._addr("C"))
+        self.assertEqual(entry["lease_epoch"], 3)
+        self.assertEqual(
+            current_supervisor_address(self.paths, "run-1")["current"]["session_id"], "C")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -23,6 +23,10 @@ def _valid_epoch(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
+def _recover_hint(path: Path) -> str:
+    return "; confirm no supervisor is running this run, then remove %s to recover" % path
+
+
 def _read_lease_record(path: Path):
     """Return the lease record, or None when no file exists.
 
@@ -34,15 +38,15 @@ def _read_lease_record(path: Path):
     except FileNotFoundError:
         return None
     except OSError as error:
-        raise SupervisorLeaseConflict("supervisor lease is unreadable: %s" % error)
+        raise SupervisorLeaseConflict("supervisor lease is unreadable: %s%s" % (error, _recover_hint(path)))
     try:
         record = json.loads(text)
     except ValueError:
-        raise SupervisorLeaseConflict("supervisor lease is malformed")
+        raise SupervisorLeaseConflict("supervisor lease is malformed" + _recover_hint(path))
     if not isinstance(record, dict):
-        raise SupervisorLeaseConflict("supervisor lease is malformed")
+        raise SupervisorLeaseConflict("supervisor lease is malformed" + _recover_hint(path))
     if "lease_epoch" in record and not _valid_epoch(record["lease_epoch"]):
-        raise SupervisorLeaseConflict("supervisor lease has an invalid lease_epoch")
+        raise SupervisorLeaseConflict("supervisor lease has an invalid lease_epoch" + _recover_hint(path))
     return record
 
 
@@ -768,14 +772,10 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
             if forbidden in str(key).lower():
                 raise ValueError("supervisor address must not carry credentials")
     path = _registry_path(paths, run_id)
-    observed = _read_json_file(path)
-    observed_current = observed.get("current") if isinstance(observed, dict) else None
     if expected_epoch is None:
-        if isinstance(observed_current, dict):
-            legacy = observed_current.get("lease_epoch", 0)
-            expected_epoch = legacy if _valid_epoch(legacy) else 0
-        else:
-            expected_epoch = read_lease_epoch(paths, run_id)
+        # The lease file is authoritative; the registry can lag it after a
+        # crash between the CAS and the registry write.
+        expected_epoch = read_lease_epoch(paths, run_id)
     lease = SupervisorLease(paths)
     with lease.lock(run_id):
         registry = _read_json_file(path)
@@ -788,7 +788,14 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
         if not isinstance(rejected, list):
             rejected = []
         current = registry.get("current")
-        on_disk = read_lease_epoch(paths, run_id)
+        lease_record = _read_lease_record(lease.path(run_id))
+        on_disk = _record_epoch(lease_record)
+        disk_owner = lease_record.get("owner") if lease_record else None
+        if not isinstance(disk_owner, dict):
+            disk_owner = None
+        owns_disk = disk_owner is not None and (
+            disk_owner.get("provider"), disk_owner.get("session_id"), disk_owner.get("host")
+        ) == (provider, session_id, host)
 
         def reject(reason):
             rejected.append({
@@ -803,12 +810,18 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
             raise SupervisorLeaseConflict(reason)
 
         same_shift = isinstance(current, dict) and current.get("session_id") == session_id
-        if not same_shift and any(
+        if owns_disk and not same_shift:
+            # This session already won the CAS but died before the registry
+            # write: repair the registry without a second epoch bump.
+            epoch = on_disk
+        elif not same_shift and any(
             isinstance(item, dict) and item.get("session_id") == session_id
             for item in history
         ):
             reject("superseded supervisor %s cannot re-register" % session_id)
-        if same_shift:
+        elif same_shift:
+            if disk_owner is not None and not owns_disk:
+                reject("supervisor lease is owned by another session")
             epoch = on_disk
         else:
             try:
