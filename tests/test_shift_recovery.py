@@ -341,6 +341,84 @@ if __name__ == '__main__':
     unittest.main()
 
 
+class PromptTemplateUpgradeTests(unittest.TestCase):
+    """A vibe upgrade may rewrite the dispatch prompt template mid-run.
+
+    The worker already received the original prompt, so a request whose
+    result is bound keeps its original bytes; any other field change, or a
+    request not yet answered, is still identity drift.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.paths = ProjectPaths(Path(self.tmp.name))
+        self.paths.vibe.mkdir(parents=True, exist_ok=True)
+        (self.paths.vibe / 'state.json').write_text('{}')
+        gate = patch('vibe_guide.adapters.task_provider.require_entry')
+        gate.start()
+        self.addCleanup(gate.stop)
+        self.store = ProviderActionStore(self.paths)
+        self.request = {'prompt': 'old template', 'model': 'm1', 'issue_id': 'n1'}
+        self.old = self.emit(self.request)
+        self.path = self.store.root / 'requests' / (self.old['action_id'] + '.json')
+
+    def emit(self, request, operation='create', native_tool='ccd_session__spawn_task'):
+        return self.store.request(operation=operation, provider='claude-code-visible',
+            run_id='run-1', issue_id='n1', role='developer', generation=1,
+            native_tool=native_tool, request=request)
+
+    def test_bound_request_keeps_original_prompt(self):
+        self.store.complete(self.old['action_id'], {'binding': {'task_id': 't1', 'host': 'h'}})
+        before = self.path.read_bytes()
+        again = self.emit({**self.request, 'prompt': 'new template'})
+        self.assertEqual(again, self.old)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertIsNotNone(self.store.result(self.old['action_id']))
+
+    def test_unbound_prompt_change_is_still_drift(self):
+        with self.assertRaisesRegex(ValueError, 'identity drift'):
+            self.emit({**self.request, 'prompt': 'new template'})
+
+    def test_bound_non_prompt_change_is_still_drift(self):
+        self.store.complete(self.old['action_id'], {'binding': {'task_id': 't1', 'host': 'h'}})
+        for change in ({'model': 'm2'}, {'prompt': 'new template', 'model': 'm2'}):
+            with self.subTest(change=change):
+                with self.assertRaisesRegex(ValueError, 'identity drift'):
+                    self.emit({**self.request, **change})
+        with self.assertRaisesRegex(ValueError, 'identity drift'):
+            self.emit({**self.request, 'prompt': 'new template'}, native_tool='other_tool')
+        without_prompt = {k: v for k, v in self.request.items() if k != 'prompt'}
+        with self.assertRaisesRegex(ValueError, 'identity drift'):
+            self.emit(without_prompt)
+
+    def test_bound_resume_prompt_change_is_still_drift(self):
+        # Continuation facts (paths, files, delivery) live only in the prompt.
+        request = {'threadId': 't1', 'hostId': 'h', 'prompt': 'old continuation'}
+        old = self.emit(request, operation='resume', native_tool='ccd_session_mgmt__send_message')
+        self.store.complete(old['action_id'], {'status': 'resumed'})
+        with self.assertRaisesRegex(ValueError, 'identity drift'):
+            self.emit({**request, 'prompt': 'new continuation'}, operation='resume',
+                      native_tool='ccd_session_mgmt__send_message')
+
+    def test_exempt_replay_does_not_backfill_dispatch_head(self):
+        # A request dispatched before dispatch-heads existed must not get a
+        # late baseline recorded after the worker already worked.
+        binding = {'worktree': '.worktrees/n1', 'branch': 'node/n1'}
+        request = {**self.request, 'issue_id': 'n2', 'child_binding': binding}
+        with patch.object(ProviderActionStore, '_record_dispatch_head'):
+            old = self.store.request(operation='create', provider='claude-code-visible',
+                run_id='run-1', issue_id='n2', role='developer', generation=1,
+                native_tool='ccd_session__spawn_task', request=request)
+        self.store.complete(old['action_id'], {'binding': {'task_id': 't2', 'host': 'h'}})
+        with patch.object(ProviderActionStore, '_record_dispatch_head') as record:
+            again = self.store.request(operation='create', provider='claude-code-visible',
+                run_id='run-1', issue_id='n2', role='developer', generation=1,
+                native_tool='ccd_session__spawn_task', request={**request, 'prompt': 'new template'})
+        self.assertEqual(again, old)
+        record.assert_not_called()
+
+
 class ParameterRecoveryReceiptTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
