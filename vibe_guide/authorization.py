@@ -689,6 +689,26 @@ def executable_contract_digest(nodes: List[DAGNode]) -> str:
     )
 
 
+def legacy_executable_contract_digest(nodes: List[DAGNode]) -> str:
+    # 5.0.7 and earlier digested file scope too.  Runs those versions
+    # authorized persist this form, so readers must still recognize it; it is
+    # never written for new authorizations.
+    return _canonical_digest({"nodes": canonical_node_contracts(nodes)})
+
+
+def executable_contract_digest_matches(nodes: List[DAGNode], digest: Any) -> bool:
+    """True when ``digest`` is the current or the 5.0.7 digest of ``nodes``."""
+    if not isinstance(digest, str):
+        return False
+    return any(
+        secrets.compare_digest(digest, candidate)
+        for candidate in (
+            executable_contract_digest(nodes),
+            legacy_executable_contract_digest(nodes),
+        )
+    )
+
+
 def integration_contract_projection(plan: Plan, nodes: List[DAGNode]) -> Dict[str, Any]:
     """The integration contract the card freezes, from its two sources.
 
@@ -1575,11 +1595,13 @@ def is_authorization_valid(
         return False
     if nodes is not None:
         try:
-            live_digest = executable_contract_digest(nodes)
+            digest_matches = executable_contract_digest_matches(
+                nodes, record.node_contract_digest
+            )
             live_file_scope = _authorization_file_scope(nodes)
         except (TypeError, ValueError):
             return False
-        if not secrets.compare_digest(record.node_contract_digest, live_digest):
+        if not digest_matches:
             return False
         if record.file_scope != live_file_scope:
             return False

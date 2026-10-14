@@ -22,6 +22,7 @@ from .authorization import (
     digest_integration_contract,
     dispatch_topology_for_node,
     executable_contract_digest,
+    executable_contract_digest_matches,
     integration_contract_projection,
     is_authorization_valid,
     node_adapter_id,
@@ -1688,11 +1689,15 @@ class Monitor:
             node_id: executable_contract_digest([self.nodes[node_id]])
             for node_id in snapshot.nodes
         }
+        # A node is unchanged when its previous digest still binds the new
+        # contract.  Runs from 5.0.7 hold the scope-inclusive form, which a
+        # plain comparison with the new digest would always call changed.
         changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if previous_node_contract_digests[node_id]
-            != new_node_contract_digests[node_id]
+            if not executable_contract_digest_matches(
+                [self.nodes[node_id]], previous_node_contract_digests[node_id]
+            )
         )
         affected_nodes = affected_node_closure(
             list(self.nodes.values()), changed_nodes
@@ -1725,8 +1730,9 @@ class Monitor:
             }
             if (
                 node_id not in affected_nodes
-                and previous_node_contract_digests.get(node_id)
-                == new_node_contract_digests[node_id]
+                and executable_contract_digest_matches(
+                    [self.nodes[node_id]], previous_node_contract_digests.get(node_id)
+                )
                 and evidence["contract_digest"]
                 == previous_node_contract_digests[node_id]
             ):
@@ -2744,8 +2750,9 @@ class Monitor:
         expected_changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if previous_node_contract_digests[node_id]
-            != node_contract_digests[node_id]
+            if not executable_contract_digest_matches(
+                [self.nodes[node_id]], previous_node_contract_digests[node_id]
+            )
         )
         if changed_nodes != expected_changed_nodes:
             raise ValueError("reauthorization changed node lineage is invalid")
@@ -2787,7 +2794,9 @@ class Monitor:
                 or set(evidence) != {"contract_digest", "authorization_epoch"}
                 or evidence["contract_digest"]
                 != previous_node_contract_digests[node_id]
-                or evidence["contract_digest"] != node_contract_digests[node_id]
+                or not executable_contract_digest_matches(
+                    [self.nodes[node_id]], evidence["contract_digest"]
+                )
                 or evidence["authorization_epoch"] != previous.digest
             ):
                 raise ValueError("retained acceptance evidence is invalid")
@@ -2817,9 +2826,10 @@ class Monitor:
             current["quarantine"] = None
             if current.get("status") == "accepted":
                 if node_id in retained_acceptances:
-                    evidence = retained_acceptances[node_id]
+                    # The retained acceptance now binds the replacement digest,
+                    # which differs from the evidence only for 5.0.7 runs.
                     current["acceptance"] = {
-                        "contract_digest": evidence["contract_digest"],
+                        "contract_digest": node_contract_digests[node_id],
                         "authorization_epoch": replacement.digest,
                     }
                     continue
@@ -3031,6 +3041,16 @@ class Monitor:
             raise ValueError("node contract content is unreadable")
         return executable_contract_digest([node])
 
+    def _live_node_contract_digest_matches(self, node_id: str, digest: Any) -> bool:
+        """Whether ``digest`` binds the live node contract.
+
+        Runs dispatched by 5.0.7 stamped the scope-inclusive digest, so both
+        the current and that form are recognized.  Raises like
+        ``_live_node_contract_digest`` when the contract is unreadable.
+        """
+        self._live_node_contract_digest(node_id)
+        return executable_contract_digest_matches([self.nodes[node_id]], digest)
+
     def _replay_visible_sdd_acceptance(
         self,
         snapshot: RunSnapshot,
@@ -3077,7 +3097,9 @@ class Monitor:
         contract_digest = data.get("contract_digest")
         authorization_epoch = data.get("authorization_epoch")
         try:
-            live_digest = self._live_node_contract_digest(node_id)
+            live_digest_matches = self._live_node_contract_digest_matches(
+                node_id, contract_digest
+            )
         except ValueError as error:
             raise ValueError(
                 "unapplied visible-sdd acceptance node contract is unreadable"
@@ -3089,7 +3111,7 @@ class Monitor:
                 character not in "0123456789abcdef" for character in contract_digest
             )
             or contract_digest != current.get("contract_digest")
-            or contract_digest != live_digest
+            or not live_digest_matches
             or authorization_epoch != snapshot.authorization_digest
         ):
             raise ValueError("unapplied acceptance contract epoch is stale")
@@ -5450,7 +5472,9 @@ class Monitor:
             # _accept_visible_sdd_delivery.  A drifted or unreadable contract
             # must not silently bind a stale snapshot digest.
             try:
-                live_digest = self._live_node_contract_digest(node_id)
+                live_digest_matches = self._live_node_contract_digest_matches(
+                    node_id, current.get("contract_digest")
+                )
             except ValueError as error:
                 self._mark_blocked_unknown(
                     snapshot,
@@ -5460,7 +5484,7 @@ class Monitor:
                     ),
                 )
                 return
-            if current.get("contract_digest") != live_digest:
+            if not live_digest_matches:
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
@@ -5870,10 +5894,12 @@ class Monitor:
         # unreadable contract or a drifted one refuses the acceptance instead
         # of writing an empty, placeholder or stale digest.
         try:
-            live_digest = self._live_node_contract_digest(node_id)
+            live_digest_matches = self._live_node_contract_digest_matches(
+                node_id, current.get("contract_digest")
+            )
         except ValueError as error:
             return "visible-sdd acceptance refused: {}".format(error), False
-        if current.get("contract_digest") != live_digest:
+        if not live_digest_matches:
             return (
                 "visible-sdd acceptance refused: contract digest does not match the live node contract",
                 False,
@@ -6972,7 +6998,9 @@ class Monitor:
                 # replay path at _replay_visible_sdd_acceptance.  A snapshot
                 # copy alone cannot detect a drifted contract.
                 try:
-                    live_digest = self._live_node_contract_digest(node_id)
+                    live_digest_matches = self._live_node_contract_digest_matches(
+                        node_id, contract_digest
+                    )
                 except ValueError as error:
                     raise ValueError(
                         "unapplied dual-visible acceptance node contract is unreadable"
@@ -6982,7 +7010,7 @@ class Monitor:
                     or len(contract_digest) != 64
                     or any(character not in "0123456789abcdef" for character in contract_digest)
                     or contract_digest != current.get("contract_digest")
-                    or contract_digest != live_digest
+                    or not live_digest_matches
                     or authorization_epoch != snapshot.authorization_digest
                 ):
                     raise ValueError("unapplied acceptance contract epoch is stale")

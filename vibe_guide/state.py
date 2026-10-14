@@ -19,7 +19,9 @@ from .authorization import (
     AuthorizationRecord,
     affected_node_closure,
     executable_contract_digest,
+    executable_contract_digest_matches,
     is_authorization_integrity_valid,
+    legacy_executable_contract_digest,
 )
 from .contracts import RunEvent
 from .models import (
@@ -1120,21 +1122,34 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 authorized_nodes.append(authorized_node)
         except (json.JSONDecodeError, TypeError, ValueError) as error:
             raise ValueError("reauthorization authorized DAG proof is invalid") from error
-        if (
-            executable_contract_digest(authorized_nodes)
-            != replacement.node_contract_digest
-            or any(
-                executable_contract_digest([node])
-                != node_contract_digests[node.id]
-                for node in authorized_nodes
-            )
+        # 5.0.7 wrote these digests with file scope included.  The aggregate
+        # selects the algorithm and every per-node digest must use the same
+        # one, so a proof mixing the two is rejected.
+        digest_algorithm = next(
+            (
+                algorithm
+                for algorithm in (
+                    executable_contract_digest,
+                    legacy_executable_contract_digest,
+                )
+                if algorithm(authorized_nodes) == replacement.node_contract_digest
+            ),
+            None,
+        )
+        if digest_algorithm is None or any(
+            digest_algorithm([node]) != node_contract_digests[node.id]
+            for node in authorized_nodes
         ):
             raise ValueError("reauthorization authorized DAG proof is invalid")
+        authorized_by_id = {node.id: node for node in authorized_nodes}
+        # The previous digest may be the 5.0.7 form; a node is unchanged when
+        # either form of it still binds the authorized contract.
         expected_changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if previous_node_contract_digests[node_id]
-            != node_contract_digests[node_id]
+            if not executable_contract_digest_matches(
+                [authorized_by_id[node_id]], previous_node_contract_digests[node_id]
+            )
         )
         retained_ids = set(retained_acceptances)
         invalidated_ids = set(invalidated_acceptances)
@@ -1155,12 +1170,14 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 or not isinstance(evidence, dict)
                 or set(evidence) != {"contract_digest", "authorization_epoch"}
                 or evidence["contract_digest"] != previous_node_contract_digests[node_id]
-                or evidence["contract_digest"] != node_contract_digests[node_id]
+                or not executable_contract_digest_matches(
+                    [authorized_by_id[node_id]], evidence["contract_digest"]
+                )
                 or evidence["authorization_epoch"] != previous.digest
             ):
                 raise ValueError("retained acceptance proof is invalid")
             retained_acceptance_proofs.append(
-                (node_id, evidence["contract_digest"], replacement.digest)
+                (node_id, node_contract_digests[node_id], replacement.digest)
             )
         for node_id, evidence in invalidated_acceptances.items():
             if (
