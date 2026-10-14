@@ -146,6 +146,8 @@ class HandoffExecutionTests(unittest.TestCase):
             self.assertEqual(summary['runtime']['evidence_scope'], 'current_disk_sources_at_loaded_module_paths')
             self.assertIn('request_digest', summary['service_protocol'])
             self.assertIn('resume', summary['service_protocol'])
+            self.assertIn('UnresolvedNativeTool', summary['service_protocol'])
+            self.assertIn('不交班', summary['service_protocol'])
             self.assertLessEqual(Path(payload['handoff_summary']['path']).stat().st_size, 24576)
 
 

@@ -238,6 +238,8 @@ for action in store.pending():          # 先按当前 run/绑定证据收敛已
 `action["native_tool"]`，再用同一 `action_id`、`request_digest` 通过 `complete()` 回写结果；
 只跑 `resume` 不算消费信箱。
 
+**宿主报"找不到工具"时不交班**：调用 `native_tool` 得到 `No such tool available: <短名>`，说明本会话这一轮的工具名被截短了（2026-10-14 实测：部分模型网关线路会去掉 `fn__<server>__` 前缀），不是任务或节点失败。把这条原样回复交给 `complete()`：它不入库，只存为证据，请求保持待处理，并抛出 `UnresolvedNativeTool`（带 `attempts` 次数）。第 1 次：按工具清单里的全名再调一次；第 2 次仍失败：停止服务信箱，向产品经理报告"工具名路由故障"，等线路修好。不要开交班会话——新会话走的是同一条线路，会重复失败。
+
 **整批输出门**：每次宿主工具编排的合并返回最多 8192 UTF-8 字节，不是每个子调用各有 8192 字节。shell/源码读取与原生工具结果统一保存为批次 JSON `[{"name":"wait_threads","output":<完整原生结果>}, ...]`，调用 `vibe supervisor-output --run-id <run-id> --payload <批次路径> --json`（runtime bridge 使用交接中的命令前缀）。只将该入口摘要送入会话；完整原生对象仍用于 provider 结果校验和回写，摘要不是成功证据。入口保留完整结果、SHA 和短状态，失败/unknown 不降级为成功；同一 SHA 再读只返回引用。需下钻时读取具体相关片段，已读的同 digest 协议/历史报告不重复全文载入；接班不重新调查已解决的故障。这个入口只限制通过它返回的结果，宿主不得另行打印原始批次绕过它。
 
 **续接目标不丢失**：收到明确开发、review 或接班请求后，后续 AGENTS/技能注入只补规则，不能把任务替换成“没有具体任务”。先按入口预检，再执行原请求；只有真正缺少会改变目标或授权的字段才提问。续接消息应包含目标、原合同、writer worktree/branch、白名单、本代状态/交付路径和 marker。原生 `active`/`resumed` 回执不证明实现推进；若只有规则确认而无执行/交付，在原任务明确重申未完成目标，保留 generation 与真实结果，不新建 writer。
@@ -469,6 +471,7 @@ vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路
 
 - `repair_node`：工作树、分支、合同测试或快照可由本地证据修复；保持原 task identity、generation、worktree 和 writer lease。
 - `requeue_same_task`：超时、断开、容量或 provider pending；只续接同一任务，按退避时间等待，不创建 successor。
+- 宿主报 `No such tool available`：不是节点故障，不进入上面任何一类，按 §6.1 重试一次后停下报告，不交班。
 - `reconcile_binding`：绑定、身份、租约或 cursor 无法证明；先核对 task binding、worktree、branch、run 和 cursor，再通过 `vibe repair --plan <plan> --run-id <run> --node <node>` 或同一 Monitor 的 repair/requeue 入口恢复；未证明前不得盲派。
 - `await_external_decision`：命中产品、外部授权或 deploy 边界；保持 blocked，等待对应授权。
 
