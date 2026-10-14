@@ -189,6 +189,8 @@ vibe 只记路径，不读也不存密钥。`model` 默认 sonnet，监工每次
 
 权限与提交身份：worker 以 `bypassPermissions` 运行，安全边界是 worktree 隔离与授权卡；本机若没配全局 git `user.name` / `user.email`，提交作者会是机器名。可在用户级 `claude_bg` 里写 `git_user_name` / `git_user_email` 只给 worker 的 worktree 设身份，前提是仓库已开 `git config extensions.worktreeConfig true`，否则启动会失败并报原因（不会改动主仓库的身份）。
 
+已真机验收（2026-10-14，Claude Code 2.1.260）：后台派发 → 交付 → 审查发现缺陷 → 返工续接同一会话 → 复审通过，全程无人点击，约 30 秒；本机复跑：`VIBE_LIVE_CLAUDE_BG=1 python3 -m unittest tests.test_claude_bg_live -v`（默认跳过，会真实启动后台会话并消耗额度）。worker 必须在独立 worktree（`.worktrees/<节点>`）里运行：新版 Claude Code 的后台会话在仓库主目录会自己另开 worktree 写文件，交付落不到预期位置。
+
 未验证、不得当作可用：`--session-id` 预指定会话 id、`-w` 与 `--bg` 合用、长任务/休眠/daemon 退出后的恢复、桌面内置 CLI 下的 `--bg`。
 
 ### WorkBuddy 派发桥（`workbuddy_job` MCP server）
