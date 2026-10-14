@@ -18,7 +18,7 @@ import uuid
 from .authorization import (
     AuthorizationRecord,
     affected_node_closure,
-    executable_contract_digest,
+    contract_digest_matches,
     is_authorization_integrity_valid,
 )
 from .contracts import RunEvent
@@ -1120,14 +1120,13 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 authorized_nodes.append(authorized_node)
         except (json.JSONDecodeError, TypeError, ValueError) as error:
             raise ValueError("reauthorization authorized DAG proof is invalid") from error
-        if (
-            executable_contract_digest(authorized_nodes)
-            != replacement.node_contract_digest
-            or any(
-                executable_contract_digest([node])
-                != node_contract_digests[node.id]
-                for node in authorized_nodes
-            )
+        # Each record is checked against the formula of the version that
+        # wrote it; 5.0.7 still digested file scope.
+        if not contract_digest_matches(
+            replacement.node_contract_digest, authorized_nodes
+        ) or any(
+            not contract_digest_matches(node_contract_digests[node.id], [node])
+            for node in authorized_nodes
         ):
             raise ValueError("reauthorization authorized DAG proof is invalid")
         expected_changed_nodes = sorted(

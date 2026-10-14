@@ -689,6 +689,25 @@ def executable_contract_digest(nodes: List[DAGNode]) -> str:
     )
 
 
+def legacy_executable_contract_digest(nodes: List[DAGNode]) -> str:
+    # The 5.0.7 formula, file scope included.  Runs authorized under 5.0.7
+    # carry it in their records; it is only ever compared, never written.
+    return _canonical_digest({"nodes": canonical_node_contracts(nodes)})
+
+
+def contract_digest_matches(digest: Any, nodes: List[DAGNode]) -> bool:
+    """Whether a recorded digest proves ``nodes`` under either formula.
+
+    The legacy formula digests strictly more than the current one, so a
+    legacy match is the same contract recorded before 5.0.8.
+    """
+    if not isinstance(digest, str):
+        return False
+    return secrets.compare_digest(
+        digest, executable_contract_digest(nodes)
+    ) or secrets.compare_digest(digest, legacy_executable_contract_digest(nodes))
+
+
 def integration_contract_projection(plan: Plan, nodes: List[DAGNode]) -> Dict[str, Any]:
     """The integration contract the card freezes, from its two sources.
 
@@ -1575,11 +1594,13 @@ def is_authorization_valid(
         return False
     if nodes is not None:
         try:
-            live_digest = executable_contract_digest(nodes)
+            contract_matches = contract_digest_matches(
+                record.node_contract_digest, nodes
+            )
             live_file_scope = _authorization_file_scope(nodes)
         except (TypeError, ValueError):
             return False
-        if not secrets.compare_digest(record.node_contract_digest, live_digest):
+        if not contract_matches:
             return False
         if record.file_scope != live_file_scope:
             return False
