@@ -360,13 +360,38 @@ class ProviderActionStore:
         if path.exists():
             existing = self._read(path)
             if existing != payload:
-                raise ValueError("provider action request identity drift")
+                if not self._prompt_only_upgrade(existing, payload):
+                    raise ValueError("provider action request identity drift")
+                # The worker already acted on the original prompt; keep it.
+                payload = existing
         else:
             self._atomic(path, payload)
         probe = isinstance(request, dict) and request.get("purpose") == "binding_probe"
         if operation == "wait" and not probe:
             self._consume_archived_delivery(run_id, issue_id, role, generation)
         return payload
+
+    def _prompt_only_upgrade(self, existing: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+        """A newer vibe rewrote only the prompt of a request already answered.
+
+        Every identity field must match; only ``request.prompt`` may differ,
+        and only once the host bound a result to the original request.
+        """
+        old_request = existing.get("request")
+        new_request = payload.get("request")
+        if not isinstance(old_request, dict) or not isinstance(new_request, dict):
+            return False
+        strip = lambda value: {k: v for k, v in value.items() if k not in {"request", "request_digest"}}
+        if strip(existing) != strip(payload):
+            return False
+        if {k: v for k, v in old_request.items() if k != "prompt"} != {
+            k: v for k, v in new_request.items() if k != "prompt"
+        }:
+            return False
+        try:
+            return self.result(existing["action_id"]) is not None
+        except (OSError, TypeError, ValueError):
+            return False
 
     def action(self, action_id: str) -> Dict[str, Any]:
         """Read immutable request identity, including after its callback finishes."""
