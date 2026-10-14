@@ -551,7 +551,7 @@ class CliTests(unittest.TestCase):
 
     def test_supervisor_beat_is_a_single_line_command(self):
         command = heartbeat_command("run-b")
-        self.assertEqual(command, "vibe supervisor-beat --run-id run-b --session-record <本会话记录路径>")
+        self.assertEqual(command, "vibe supervisor-beat --run-id run-b --accept-decision --session-record <本会话记录路径>")
         self.assertNotIn("\n", command)
 
     def test_legacy_prompt_api_is_not_an_installation_surface(self):

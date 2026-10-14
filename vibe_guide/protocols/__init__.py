@@ -80,6 +80,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "4a5b7b344ab688db332cec606350800ee25b4c98ccafd00e1c0e68b626fb2f44",
         # 2026-10-14: §6.4 resume wording and attest prerequisite.
         "b72a2d622269183724af0c7e3198f88779549ca5f009f20a322b3aca03dae687",
+        # 2026-10-14: heartbeat --accept-decision + N1 intervals.
+        "85c507fb3e0788f310b5da4987eefd88fbcef549de51865ad9b2491c301cba40",
     }),
     "vibe-entry": frozenset({
         "3ec0a771d482d92eba7f155f212dab97beb3a4a3b6712e16d7dc3d81394797eb",
@@ -93,6 +95,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "8091f9d39f66ecb373956d41cf573073420b78be173c53371e51f94e2ee356a6",
         "8a231e030151ff3a2378aaf1d1cd95745c7374e7cb95b1d4935c641d53b7287d",
         "e0a321c246cd2636a31612d643d7982c91ab5b473c80056b67cd800c853cd78e",
+        # 2026-10-14: heartbeat --accept-decision + N1 intervals.
+        "cfff1ae864a712bb1d110e82c95bfac801f313b9f19470c37843bd3c78dae5b1",
     }),
 }
 

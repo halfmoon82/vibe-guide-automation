@@ -67,11 +67,16 @@ class NativeIntegrationTests(unittest.TestCase):
                 question='Pick', options=['A', 'B'])
             for command in ('supervisor-beat', 'supervisor-preflight'):
                 with self.subTest(command=command):
-                    result = run_cli([command, '--run-id', 'local-acceptance',
+                    result = run_cli([command, '--run-id', 'local-acceptance', '--accept-decision',
                                       '--session-record', str(record)], root)
                     self.assertEqual(result.payload['state'], 'decision')
                     self.assertEqual(result.exit_code, 0)
                     self.assertIn('decision', result.text)
+                    legacy = run_cli([command, '--run-id', 'local-acceptance',
+                                      '--session-record', str(record)], root)
+                    self.assertEqual(legacy.payload['state'], 'work')
+                    self.assertIs(legacy.payload['decision_only'], True)
+                    self.assertEqual(legacy.exit_code, 0)
 
     def test_decision_does_not_hide_independent_pending_request(self):
         self._independent_work_with_decision(pending=[{'issue_id': 'n2'}])

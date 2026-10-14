@@ -90,7 +90,7 @@ class ContextBudgetTests(unittest.TestCase):
         prompt = heartbeat_prompt('plan-1', 'run-1', command_prefix=prefix)
         self.assertEqual(
             prompt,
-            prefix + " supervisor-beat --run-id run-1 --session-record <本会话记录路径>",
+            prefix + " supervisor-beat --run-id run-1 --accept-decision --session-record <本会话记录路径>",
         )
 
     def test_cli_caps_resume_output_without_changing_exit_code(self):
@@ -149,7 +149,7 @@ class HandoffRecoveryTests(unittest.TestCase):
         self.assertEqual(result.exit_code,0,result.payload)
         self.assertEqual(
             result.payload['heartbeat_prompt'],
-            prefix+' supervisor-beat --run-id {} --session-record <本会话记录路径>'.format(run_id),
+            prefix+' supervisor-beat --run-id {} --accept-decision --session-record <本会话记录路径>'.format(run_id),
         )
         summary = json.loads(Path(result.payload['handoff_summary']['path']).read_text())
         self.assertTrue(summary['next_command'].startswith(prefix))

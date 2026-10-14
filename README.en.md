@@ -58,6 +58,8 @@ vibe plan --request <request>     Run S0 and, when needed, explicit S1 and node-
 vibe monitor --plan <ID>         Start only with exact authorization and valid evidence
 vibe status --plan <ID>          Read the current snapshot without polling providers
 vibe resume --plan <ID>          Continue from snapshots, task records, and event evidence
+vibe supervisor-preflight --run-id <run> [--accept-decision] --session-record <file>   Read-only heartbeat preflight; prints idle/work/decision/rotate/unknown. `decision` is printed only with `--accept-decision`; without it the same situation (only unanswered decisions left) prints work
+vibe supervisor-beat --run-id <run> --accept-decision --session-record <file>   Heartbeat entry point: preflight, output branch and next-beat interval (default 10 minutes; 30 once a platform's push wake is verified and registered; 60 while only unanswered decisions remain). Persisted to `.vibe/runs/<run>/heartbeat-interval.json` and printed by `supervisor-handoff`. Push wake registry `.vibe/push-wake-verification.json`: `{"platforms": {"<provider>": {"success": [{"evidence_ref": "..."}], "failure": [{"evidence_ref": "..."}]}}}`; at least one success and one failure evidence are required; an unreadable file falls back to 10 minutes with the reason in the output
 vibe skill-install --source <GitHub> --sha <40hex> --name <name> [--subdir <dir>] --confirm   Fetch a GitHub skill at an exact SHA, validate an optional repo subdir, materialize into .vibe/proposals/skills/<name>/ and register it in .vibe/config.json; traversal, absolute, or edge-slash subdirs are rejected without writes
 ```
 
