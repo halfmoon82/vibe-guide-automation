@@ -363,10 +363,10 @@ class PromptTemplateUpgradeTests(unittest.TestCase):
         self.old = self.emit(self.request)
         self.path = self.store.root / 'requests' / (self.old['action_id'] + '.json')
 
-    def emit(self, request):
-        return self.store.request(operation='create', provider='claude-code-visible',
+    def emit(self, request, operation='create', native_tool='ccd_session__spawn_task'):
+        return self.store.request(operation=operation, provider='claude-code-visible',
             run_id='run-1', issue_id='n1', role='developer', generation=1,
-            native_tool='ccd_session__spawn_task', request=request)
+            native_tool=native_tool, request=request)
 
     def test_bound_request_keeps_original_prompt(self):
         self.store.complete(self.old['action_id'], {'binding': {'task_id': 't1', 'host': 'h'}})
@@ -386,6 +386,37 @@ class PromptTemplateUpgradeTests(unittest.TestCase):
             with self.subTest(change=change):
                 with self.assertRaisesRegex(ValueError, 'identity drift'):
                     self.emit({**self.request, **change})
+        with self.assertRaisesRegex(ValueError, 'identity drift'):
+            self.emit({**self.request, 'prompt': 'new template'}, native_tool='other_tool')
+        without_prompt = {k: v for k, v in self.request.items() if k != 'prompt'}
+        with self.assertRaisesRegex(ValueError, 'identity drift'):
+            self.emit(without_prompt)
+
+    def test_bound_resume_prompt_change_is_still_drift(self):
+        # Continuation facts (paths, files, delivery) live only in the prompt.
+        request = {'threadId': 't1', 'hostId': 'h', 'prompt': 'old continuation'}
+        old = self.emit(request, operation='resume', native_tool='ccd_session_mgmt__send_message')
+        self.store.complete(old['action_id'], {'status': 'resumed'})
+        with self.assertRaisesRegex(ValueError, 'identity drift'):
+            self.emit({**request, 'prompt': 'new continuation'}, operation='resume',
+                      native_tool='ccd_session_mgmt__send_message')
+
+    def test_exempt_replay_does_not_backfill_dispatch_head(self):
+        # A request dispatched before dispatch-heads existed must not get a
+        # late baseline recorded after the worker already worked.
+        binding = {'worktree': '.worktrees/n1', 'branch': 'node/n1'}
+        request = {**self.request, 'issue_id': 'n2', 'child_binding': binding}
+        with patch.object(ProviderActionStore, '_record_dispatch_head'):
+            old = self.store.request(operation='create', provider='claude-code-visible',
+                run_id='run-1', issue_id='n2', role='developer', generation=1,
+                native_tool='ccd_session__spawn_task', request=request)
+        self.store.complete(old['action_id'], {'binding': {'task_id': 't2', 'host': 'h'}})
+        with patch.object(ProviderActionStore, '_record_dispatch_head') as record:
+            again = self.store.request(operation='create', provider='claude-code-visible',
+                run_id='run-1', issue_id='n2', role='developer', generation=1,
+                native_tool='ccd_session__spawn_task', request={**request, 'prompt': 'new template'})
+        self.assertEqual(again, old)
+        record.assert_not_called()
 
 
 class ParameterRecoveryReceiptTests(unittest.TestCase):

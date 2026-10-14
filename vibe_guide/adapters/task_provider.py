@@ -349,22 +349,26 @@ class ProviderActionStore:
             "request": request,
         }
         payload["request_digest"] = _canonical_digest(payload)
+        directory = self._directory("requests")
+        path = directory / (action_id + ".json")
+        existing = self._read(path) if path.exists() else None
+        if existing is not None and existing != payload:
+            if not self._prompt_only_upgrade(existing, payload):
+                if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
+                    self._record_dispatch_head(
+                        run_id, issue_id, role, generation, request["child_binding"]
+                    )
+                raise ValueError("provider action request identity drift")
+            # The worker already acted on the original prompt; keep it, and do
+            # not record a dispatch baseline after the fact.
+            return existing
         if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
             # Before the request is visible to the host: the baseline must
             # predate any work the dispatched worker could do.
             self._record_dispatch_head(
                 run_id, issue_id, role, generation, request["child_binding"]
             )
-        directory = self._directory("requests")
-        path = directory / (action_id + ".json")
-        if path.exists():
-            existing = self._read(path)
-            if existing != payload:
-                if not self._prompt_only_upgrade(existing, payload):
-                    raise ValueError("provider action request identity drift")
-                # The worker already acted on the original prompt; keep it.
-                payload = existing
-        else:
+        if existing is None:
             self._atomic(path, payload)
         probe = isinstance(request, dict) and request.get("purpose") == "binding_probe"
         if operation == "wait" and not probe:
@@ -372,14 +376,20 @@ class ProviderActionStore:
         return payload
 
     def _prompt_only_upgrade(self, existing: Dict[str, Any], payload: Dict[str, Any]) -> bool:
-        """A newer vibe rewrote only the prompt of a request already answered.
+        """A newer vibe rewrote only the prompt template of an answered create.
 
-        Every identity field must match; only ``request.prompt`` may differ,
-        and only once the host bound a result to the original request.
+        Only ``create``: continuation prompts carry contract facts (paths,
+        files, delivery) that exist nowhere else.  Every other field must
+        match, both prompts must be strings, and the host must already have
+        bound a result to the original request.
         """
+        if existing.get("operation") != "create" or payload.get("operation") != "create":
+            return False
         old_request = existing.get("request")
         new_request = payload.get("request")
         if not isinstance(old_request, dict) or not isinstance(new_request, dict):
+            return False
+        if not isinstance(old_request.get("prompt"), str) or not isinstance(new_request.get("prompt"), str):
             return False
         strip = lambda value: {k: v for k, v in value.items() if k not in {"request", "request_digest"}}
         if strip(existing) != strip(payload):
