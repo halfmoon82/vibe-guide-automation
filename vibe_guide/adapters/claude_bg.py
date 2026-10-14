@@ -1,0 +1,408 @@
+"""Claude Code background-session launcher (degraded, invisible provider).
+
+Drives ``claude --bg`` sessions through an injectable command executor so unit
+tests never start a real ``claude``.  Credentials (an ``apiKeyHelper`` settings
+file path) and the default model come only from the user-level
+``$VIBE_HOME/config.json``; vibe records the path, never reads or stores keys.
+Anything it cannot verify is reported as ``ClaudeBgUnknown`` -- neither success
+nor permanent unavailability.
+"""
+
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import re
+import subprocess
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+
+from ..paths import ProjectPaths
+from .task_provider import BackgroundTaskRouting, ProviderUnavailable, VisibilityResult
+
+CLAUDE_BG_PROVIDER = "claude-code-background"
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_BACKGROUNDED = re.compile(r"backgrounded\s*[·•.]\s*([0-9a-f]{8})\b")
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_STATES = {"working", "done", "failed", "blocked", "stopped"}
+_DEFAULT_TIMEOUT = 60.0
+
+
+class ClaudeBgUnknown(ProviderUnavailable):
+    """The background state is unknown; carries the reason."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class ClaudeBgConfigRefused(ValueError):
+    """The project config tried to set a user-level-only background setting."""
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+CommandExecutor = Callable[[Sequence[str], Path, float], CommandResult]
+
+
+def subprocess_executor(argv: Sequence[str], cwd: Path, timeout: float) -> CommandResult:
+    try:
+        done = subprocess.run(
+            list(argv),
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except FileNotFoundError:
+        raise ClaudeBgUnknown("claude command not found")
+    except subprocess.TimeoutExpired:
+        raise ClaudeBgUnknown("%s timed out after %ss" % (argv[0], timeout))
+    except OSError as error:
+        raise ClaudeBgUnknown("cannot run %s: %s" % (argv[0], error))
+    return CommandResult(done.returncode, done.stdout or "", done.stderr or "")
+
+
+@dataclass(frozen=True)
+class ClaudeBgConfig:
+    settings_path: str
+    model: str = "sonnet"
+    claude_command: str = "claude"
+    git_user_name: Optional[str] = None
+    git_user_email: Optional[str] = None
+    timeout: float = _DEFAULT_TIMEOUT
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def load_claude_bg_config(paths: ProjectPaths) -> ClaudeBgConfig:
+    """Read ``claude_bg`` settings from the user-level config only."""
+    try:
+        project_dir = paths.vibe_dir
+        project_path = project_dir / "config.json"
+        if project_path.is_symlink():
+            raise ClaudeBgUnknown("cannot verify project config: config.json is a symlink")
+        paths.resolve_vibe_path("config.json")
+    except ValueError as error:
+        raise ClaudeBgUnknown("cannot verify project config: %s" % error)
+    project = {}
+    if project_path.exists():
+        try:
+            project = json.loads(project_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ClaudeBgUnknown("cannot verify project config: %s" % type(error).__name__)
+        if not isinstance(project, dict):
+            raise ClaudeBgUnknown("cannot verify project config: not a JSON object")
+    if "claude_bg" in project:
+        section = project["claude_bg"]
+        if not isinstance(section, dict):
+            raise ClaudeBgConfigRefused(
+                "project config claude_bg must be an object with only 'enabled'; "
+                "credentials, command and model can only be written in the "
+                "user-level $VIBE_HOME/config.json"
+            )
+        extra = sorted(set(section) - {"enabled"})
+        if extra:
+            raise ClaudeBgConfigRefused(
+                "project config must not set claude_bg.%s; credentials, command and "
+                "model can only be written in the user-level $VIBE_HOME/config.json"
+                % ", ".join(extra)
+            )
+    try:
+        user = _read_json(paths.resolve_vibe_home_path("config.json"))
+    except ValueError:
+        raise ClaudeBgUnknown("user-level config escapes VIBE_HOME")
+    bg = user.get("claude_bg")
+    bg = bg if isinstance(bg, dict) else {}
+    settings_path = bg.get("settings_path")
+    if not isinstance(settings_path, str) or not settings_path.strip():
+        raise ClaudeBgUnknown(
+            "background credentials not configured: set claude_bg.settings_path "
+            "in the user-level $VIBE_HOME/config.json"
+        )
+    if not Path(settings_path).is_absolute():
+        raise ClaudeBgUnknown("claude_bg.settings_path must be an absolute path")
+
+    def text(name: str, default: Optional[str]) -> Optional[str]:
+        value = bg.get(name)
+        return value if isinstance(value, str) and value.strip() else default
+
+    timeout = bg.get("timeout")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+        timeout = _DEFAULT_TIMEOUT
+    return ClaudeBgConfig(
+        settings_path=settings_path,
+        model=text("model", "sonnet"),
+        claude_command=text("claude_command", "claude"),
+        git_user_name=text("git_user_name", None),
+        git_user_email=text("git_user_email", None),
+        timeout=float(timeout),
+    )
+
+
+def _default_transcript_locator(task_id: str) -> Optional[Path]:
+    root = Path.home() / ".claude" / "projects"
+    if not _UUID.fullmatch(task_id) or not root.is_dir():
+        return None
+    for candidate in root.glob("*/%s.jsonl" % task_id):
+        return candidate
+    return None
+
+
+class ClaudeBgLauncher:
+    def __init__(
+        self,
+        routing: BackgroundTaskRouting,
+        config: ClaudeBgConfig,
+        executor: CommandExecutor = subprocess_executor,
+        prompt_builder: Optional[Callable[[str, str, Path], str]] = None,
+        model: Optional[str] = None,
+        transcript_locator: Callable[[str], Optional[Path]] = _default_transcript_locator,
+    ):
+        self.routing = routing
+        self.config = config
+        self.executor = executor
+        self.prompt_builder = prompt_builder
+        self.model = model or config.model
+        self.transcript_locator = transcript_locator
+
+    # -- helpers -----------------------------------------------------------
+    def _run(self, argv: List[str], cwd: Path) -> CommandResult:
+        return self.executor(argv, cwd, self.config.timeout)
+
+    def _claude(self, *args: str) -> List[str]:
+        return [self.config.claude_command] + list(args)
+
+    def _worktree(self) -> Path:
+        path = Path(self.routing.worktree)
+        if not path.is_dir():
+            raise ClaudeBgUnknown("worktree is not an existing directory: %s" % path)
+        return path
+
+    def _require_ok(self, result: CommandResult, what: str) -> str:
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "").strip()[-200:]
+            raise ClaudeBgUnknown("%s failed (exit %s): %s" % (what, result.returncode, tail))
+        return _ANSI.sub("", result.stdout or "")
+
+    def _entries(self) -> List[Mapping[str, Any]]:
+        out = self._require_ok(
+            self._run(self._claude("agents", "--json", "--all"), self._cwd_for_query()),
+            "claude agents",
+        )
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            raise ClaudeBgUnknown("claude agents output is not valid JSON")
+        if isinstance(data, dict):
+            data = data.get("agents", data.get("sessions"))
+        if not isinstance(data, list):
+            raise ClaudeBgUnknown("claude agents output has no session list")
+        return [item for item in data if isinstance(item, dict)]
+
+    def _cwd_for_query(self) -> Path:
+        return self._worktree()
+
+    def _find(self, task_id: str) -> Mapping[str, Any]:
+        for item in self._entries():
+            if item.get("sessionId") == task_id:
+                return item
+        raise ClaudeBgUnknown("session %s not found in claude agents" % task_id)
+
+    @staticmethod
+    def _short(task_id: str) -> str:
+        if not isinstance(task_id, str) or not _UUID.fullmatch(task_id):
+            raise ClaudeBgUnknown("full lowercase session UUID required, got %r" % (task_id,))
+        return task_id[:8]
+
+    def _same_dir(self, value: Any) -> bool:
+        if not isinstance(value, str):
+            return False
+        try:
+            return Path(value).resolve() == Path(self.routing.worktree).resolve()
+        except OSError:
+            return False
+
+    # -- operations --------------------------------------------------------
+    def launch(self, role: str, issue_id: str, contract_path: Path) -> Dict[str, Any]:
+        worktree = self._worktree()
+        if self.prompt_builder:
+            prompt = self.prompt_builder(role, issue_id, Path(contract_path))
+        else:
+            try:
+                prompt = Path(contract_path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as error:
+                raise ClaudeBgUnknown("cannot read contract: %s" % error)
+        for key, value in (
+            ("user.name", self.config.git_user_name),
+            ("user.email", self.config.git_user_email),
+        ):
+            if value:
+                # Plain `git config` in a linked worktree writes the shared
+                # .git/config; --worktree refuses unless worktreeConfig is on.
+                self._require_ok(self._run(["git", "config", "--worktree", key, value], worktree), "git config")
+        out = self._require_ok(
+            self._run(
+                self._claude(
+                    "--bg",
+                    "-n",
+                    "%s-%s" % (issue_id, role),
+                    "--model",
+                    self.model,
+                    "--settings",
+                    self.config.settings_path,
+                    "--permission-mode",
+                    "bypassPermissions",
+                    prompt,
+                ),
+                worktree,
+            ),
+            "claude --bg",
+        )
+        match = _BACKGROUNDED.search(out)
+        if not match:
+            raise ClaudeBgUnknown("cannot parse 'backgrounded' short id from claude output")
+        short_id = match.group(1)
+        try:
+            return self._bind(short_id, role, issue_id)
+        except ClaudeBgUnknown as error:
+            try:
+                self._run(self._claude("stop", short_id), worktree)
+            except ClaudeBgUnknown:
+                pass
+            raise ClaudeBgUnknown(
+                "session %s started but could not be confirmed (%s); stop attempted"
+                % (short_id, error.reason)
+            )
+
+    def _bind(self, short_id: str, role: str, issue_id: str) -> Dict[str, Any]:
+        found = [
+            item
+            for item in self._entries()
+            if isinstance(item.get("sessionId"), str) and item["sessionId"][:8] == short_id
+        ]
+        if not found:
+            raise ClaudeBgUnknown("session %s not found in claude agents" % short_id)
+        if len(found) > 1:
+            raise ClaudeBgUnknown("short id %s matches several sessions" % short_id)
+        entry = found[0]
+        session_id = entry["sessionId"]
+        if not _UUID.fullmatch(session_id):
+            raise ClaudeBgUnknown("claude agents returned a malformed session id")
+        if not self._same_dir(entry.get("cwd")):
+            raise ClaudeBgUnknown("session %s cwd missing or outside the authorized worktree" % short_id)
+        return {
+            "task_id": session_id,
+            "short_id": short_id,
+            "provider": CLAUDE_BG_PROVIDER,
+            "mode": "background",
+            "role": role,
+            "issue_id": issue_id,
+            "host": self.routing.host,
+            "worktree": self.routing.worktree,
+            "branch": self.routing.branch,
+            "status_file": self.routing.status_file,
+            "handoff_file": self.routing.handoff_file,
+        }
+
+    def status(self, task_id: str) -> str:
+        self._short(task_id)
+        state = self._find(task_id).get("state")
+        if state not in _STATES:
+            raise ClaudeBgUnknown("unknown session state: %r" % (state,))
+        return state
+
+    def final_reply(self, task_id: str) -> Optional[str]:
+        self._short(task_id)
+        path = self.transcript_locator(task_id)
+        if path is None:
+            return None
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as error:
+            raise ClaudeBgUnknown("cannot read transcript: %s" % error)
+        reply = None
+        for line in lines:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict) or item.get("type") != "assistant":
+                continue
+            message = item.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, str):
+                parts = [content]
+            elif isinstance(content, list):
+                parts = [
+                    block.get("text")
+                    for block in content
+                    if isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                ]
+            else:
+                parts = []
+            if parts:
+                reply = "\n".join(parts)
+        return reply
+
+    def stop(self, task_id: str) -> None:
+        short = self._short(task_id)
+        self._require_ok(self._run(self._claude("stop", short), self._worktree()), "claude stop")
+
+    def resume(self, task_id: str, message: str) -> None:
+        # A short id would copy the session instead of continuing it.
+        short = self._short(task_id)
+        worktree = self._worktree()
+        stopped = self._run(self._claude("stop", short), worktree)
+        if stopped.returncode != 0:
+            # Only resume when the session is verifiably not running.
+            state = self.status(task_id)
+            if state == "working":
+                raise ClaudeBgUnknown("session %s is still working and could not be stopped" % short)
+        result = self._run(self._claude("--bg", "--resume", task_id, message), worktree)
+        combined = _ANSI.sub("", (result.stdout or "") + "\n" + (result.stderr or ""))
+        if result.returncode != 0:
+            tail = combined.strip()[-200:]
+            raise ClaudeBgUnknown("claude --bg --resume failed (exit %s): %s" % (result.returncode, tail))
+        match = _BACKGROUNDED.search(combined)
+        if "started a copy" in combined or not match or match.group(1) != short:
+            copy = match.group(1) if match else None
+            if copy and copy != short:
+                try:
+                    self._run(self._claude("stop", copy), worktree)
+                except ClaudeBgUnknown:
+                    pass
+            raise ClaudeBgUnknown(
+                "resume of %s did not continue the same session (copy short id: %s); copy stop attempted"
+                % (short, copy or "unknown")
+            )
+
+    def remove(self, task_id: str) -> None:
+        short = self._short(task_id)
+        self._require_ok(self._run(self._claude("rm", short), self._worktree()), "claude rm")
+
+    def visibility(self, task_id: Optional[str] = None) -> VisibilityResult:
+        return VisibilityResult(
+            False,
+            False,
+            ("桌面不可见", "只能终端 attach 进入", "返工可续接同一会话"),
+            CLAUDE_BG_PROVIDER,
+        )
+
+    def locate(self, task_id: str) -> Dict[str, Any]:
+        return {"command": "claude attach %s" % self._short(task_id), "terminal_only": True}
