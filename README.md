@@ -165,6 +165,32 @@ V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 
 
 决策通知桥：项目 `.vibe/config.json` 只能写 `"notify_bridge": {"enabled": true}`；要执行的命令与超时只从用户级 `$VIBE_HOME/config.json` 的 `notify_bridge` 读取。项目配置里写 `command` 会被拒绝并记为 UNKNOWN。
 
+### Claude Code 后台派发（降级后台）
+
+配置后，在 Claude Code 上授权一次即可无人值守派发 worker：监工用 `claude --bg` 启动后台会话（provider 为 `claude-code-background`）。这是降级后台，有三条限制：桌面侧边栏看不到这些会话；只能在真实终端里 `claude attach <short-id>` 进入；返工续接的是同一个会话。未配置时行为不变，仍需逐个点卡片。
+
+1. 准备一个只含 `apiKeyHelper` 的 Claude Code 设置文件（放在仓库外，不要把密钥写进任何 vibe 文件）。后台会话不认 `~/.claude/settings.json` 的 env 块里的 key，所以需要这个文件：
+
+```json
+{"apiKeyHelper": "<读取你密钥的脚本的绝对路径>"}
+```
+
+2. 在**用户级** `$VIBE_HOME/config.json`（默认 `~/.vibe-guide/config.json`）登记：
+
+```json
+{"claude_bg": {"settings_path": "<设置文件绝对路径>", "model": "sonnet"}}
+```
+
+vibe 只记路径，不读也不存密钥。`model` 默认 sonnet，监工每次派发仍显式传 `--model`（可按节点换）。项目 `.vibe/config.json` 的 `claude_bg` 只能写 `enabled`，写凭据、命令或模型会被拒绝（仓库会被别人克隆）。
+
+3. 在 Claude Code 会话里用 `vibe attest` 登记能力事实时，把 `claude-code.background_task.launch` 记为 `true`（依据是本机实测 `claude --bg` 可启动）。登记成功会显示 `级别 background`；若第 2 步没配好，同一行会写明「后台启动器不可用：<原因>」，授权卡上也会列出。`vibe scan` 不报告派发方式，不用它判断。
+
+查看后台 worker：在终端运行 `claude agents --json --all` 看所有后台会话及其 `state`（working / done / failed / blocked / stopped），用 `claude attach <short-id>` 进入（必须真实终端；非 TTY 下不带 `--json` 的 `claude agents` 会报错）。关闭终端标签不会结束会话。不要在后台会话运行时用前台 `claude --resume` 续它（会被拒绝，这是防双写）。
+
+权限与提交身份：worker 以 `bypassPermissions` 运行，安全边界是 worktree 隔离与授权卡；本机若没配全局 git `user.name` / `user.email`，提交作者会是机器名。可在用户级 `claude_bg` 里写 `git_user_name` / `git_user_email` 只给 worker 的 worktree 设身份，前提是仓库已开 `git config extensions.worktreeConfig true`，否则启动会失败并报原因（不会改动主仓库的身份）。
+
+未验证、不得当作可用：`--session-id` 预指定会话 id、`-w` 与 `--bg` 合用、长任务/休眠/daemon 退出后的恢复、桌面内置 CLI 下的 `--bg`。
+
 ### WorkBuddy 派发桥（`workbuddy_job` MCP server）
 
 监工自己不执行桌面动作：它把请求写进 `.vibe/provider-actions/requests/`，写明要调的**原生工具名**，由桌面会话真正去调。WorkBuddy 的五个名字是 `workbuddy_job__create` / `__get` / `__list` / `__reply` / `__wait`——本包随附一个纯标准库的 stdio MCP server 提供它们：

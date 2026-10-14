@@ -76,6 +76,10 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "8335aee5c16b30fef9de2f1ed009df58b43f97bee4716dc09aa3dfc623b7509e",
         # 2026-10-13: native closeout integration after main reconciliation.
         "cdae7db3e3ebfcacc6db84453d9a903ae5376e1aa2134ce7d9fc838052b46708",
+        # 2026-10-14: §6.4 Claude Code background (claude-code-background) column.
+        "4a5b7b344ab688db332cec606350800ee25b4c98ccafd00e1c0e68b626fb2f44",
+        # 2026-10-14: §6.4 resume wording and attest prerequisite.
+        "b72a2d622269183724af0c7e3198f88779549ca5f009f20a322b3aca03dae687",
     }),
     "vibe-entry": frozenset({
         "3ec0a771d482d92eba7f155f212dab97beb3a4a3b6712e16d7dc3d81394797eb",
