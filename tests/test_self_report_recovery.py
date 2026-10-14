@@ -206,6 +206,30 @@ class SelfReportRecoveryTests(unittest.TestCase):
         self.store.complete(later['action_id'], {'status': 'timeout', 'cursor': TASK + ':2'})
         self.assert_refused(self.reconcile(), 'a later wait was already answered')
 
+    def test_node_blocked_for_another_reason_is_refused(self):
+        self.stuck()
+        snapshot = load_snapshot(self.paths, self.run_id)
+        Monitor = __import__('vibe_guide.monitor', fromlist=['Monitor']).Monitor
+        _directory, plan, nodes, _card = __import__('vibe_guide.cli', fromlist=['_load_plan'])._load_plan(
+            self.paths, 'probe-plan')
+        Monitor(self.paths, plan, nodes)._record(snapshot, 'scope_correction_registered',
+                                                 {'run_id': self.run_id, 'node_id': NODE})
+        save_snapshot(self.paths, snapshot)
+        self.assert_refused(self.reconcile(), 'node saw a scope_correction_registered event')
+
+    def test_result_not_written_by_the_mailbox_is_refused(self):
+        self.stuck()
+        archive = self.store.root / 'deliveries' / '{}-{}-developer-g1.json'.format(self.run_id, NODE)
+        report = json.loads(archive.read_text())
+        original = self.store.action(report['consumed_by'])
+        # Same delivery, but a hand-written result: no mailbox idempotent key.
+        forged = {k: v for k, v in self.store.result(report['consumed_by']).items()
+                  if k != 'idempotent_key'}
+        handwritten = self._write_action('wait', original['request'], forged, sequence=9)
+        report['consumed_by'] = handwritten['action_id']
+        archive.write_text(json.dumps(report))
+        self.assert_refused(self.reconcile(), 'no consumed self-report receipt')
+
     def test_live_supervisor_refuses(self):
         import os
         self.stuck()

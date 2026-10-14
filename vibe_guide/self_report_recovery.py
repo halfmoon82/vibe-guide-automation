@@ -16,7 +16,9 @@ tests) judges it again.  It only applies when, from structured evidence:
   and the binding is that task and generation with no cursor;
 * the generation's archive was consumed by a same-generation wait aimed at
   that task/host, whose bound result is the archived delivery;
-* no delivery event was recorded for that generation yet;
+* since the task started, the node recorded only the refusal and its
+  re-polls (no delivery, scope, decision or other lifecycle event), and the
+  pre-fix gate refuses that result for the cursor alone;
 * the fixed gate passes on that result.
 
 Anything else raises ``ValueError`` before the first write.  A newer wait the
@@ -35,6 +37,9 @@ SELF_REPORT_DELIVERY_RECONCILED = "self_report_delivery_reconciled"
 SELF_REPORTED_DELIVERY_PACKAGE = frozenset({"kind", "node_id"})
 _ROLE = "developer"
 _ENTRY = "monitor.reconcile_self_reported_delivery"
+#: The only node events the cursor refusal and its re-polls leave behind.
+_STUCK_PATTERN = frozenset({"blocked_unknown", "retry_scheduled", "unknown", "timeout",
+                            "acceptance_rejected"})
 
 
 def _require(condition: bool, reason: str) -> None:
@@ -94,14 +99,29 @@ def _collect(monitor, snapshot, node_id: str, runner) -> Dict[str, Any]:
     _require(receipt is not None, "no consumed self-report receipt for this task and generation")
     result = store.result(receipt["action_id"])
 
-    for event in load_events(monitor.paths, snapshot.run_id):
+    # Why the node is blocked is not readable from its reason (persisted
+    # provider text is redacted), so it is re-derived from evidence: since
+    # this task started, the node saw only the stuck pattern.
+    started = None
+    events = load_events(monitor.paths, snapshot.run_id)
+    for index, event in enumerate(events):
+        data = event.get("data") or {}
+        if data.get("node_id") != node_id:
+            continue
         provenance = event.get("provenance") or {}
-        _require(not (event.get("event") in {"delivered", "complete"}
-                      and (event.get("data") or {}).get("node_id") == node_id
-                      and provenance.get("task_id") == task_id
-                      and provenance.get("generation") == generation),
-                 "a delivery was already recorded for this generation")
+        if ((event.get("event") == "start_confirmed" and provenance.get("task_id") == task_id
+             and provenance.get("generation") == generation)
+                or (event.get("event") == "orphan_dispatch_adopted"
+                    and data.get("task_id") == task_id and data.get("generation") == generation)):
+            started = index
+    _require(started is not None, "no start of this task is recorded")
+    for event in events[started + 1:]:
+        if (event.get("data") or {}).get("node_id") == node_id:
+            _require(event.get("event") in _STUCK_PATTERN,
+                     "node saw a {} event after the task started".format(event.get("event")))
 
+    # With no cursor on the binding, the fixed gate passing means the pre-fix
+    # gate refused this result for the cursor alone.
     gate = evaluate_delivery_evidence({**current, "status": "DELIVERED"}, binding, delivery,
                                       self_report_receipt=True)
     _require(gate.complete, "delivery evidence is still incomplete: " + "; ".join(gate.reasons))

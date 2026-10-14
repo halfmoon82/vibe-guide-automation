@@ -1141,6 +1141,8 @@ class ProviderActionStore:
                 or action.get('generation') != generation
                 or targets != [{'threadId': task_id, 'hostId': host}]
                 or not isinstance(result, dict) or 'cursor' in result
+                # Written only by _consume_delivery_locked, from this archive.
+                or result.get('idempotent_key') != _canonical_digest(payload)
                 or result.get('event') not in {'delivered', 'complete'}
                 or not isinstance(delivery_evidence, dict)
                 or result.get('delivery_evidence') != payload.get('delivery_evidence')
