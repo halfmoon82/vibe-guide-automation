@@ -357,10 +357,17 @@ for action in store.pending():          # 先按当前 run/绑定证据收敛已
   `stale` 判 `... evidence is unknown or expired`。
 
 **`cursor` 在复杂计划的 developer 终态里也是必需的**：绑定上的游标只有你回写时
-才会被写进去（`vibe_guide/runners/provider_action.py:1153-1162`），不给就等于绑定没有游标，交付证据门
+才会被写进去（`ProviderActionRunner._wait_result`），不给就等于绑定没有游标，交付证据门
 报 `current cursor is missing`。这道门只挂在 `delivered` / `complete` 上，所以
 reviewer 的 `accepted` 不受它约束——但每轮都回写游标本来就是对的（`wait` 靠它
 接着上一次的位置读），所以上表两行都给了。
+
+**唯一例外是 worker 自报（`vibe worker-deliver`）**：自报由 vibe 自己交给同代的
+`wait`，没有翻过会话，所以没有游标；vibe 也会丢掉 payload 里 worker 自带的
+`cursor`（游标是监工的读取位置，不是 worker 的说法）。交付证据门改认"自报回执"：
+该代存档已被一个指向本任务 task/host 的同代 `wait` 领走，且那份结果就是存档里的
+交付。身份、host、worktree、branch 照旧必须齐。所以 worker 已自报的节点，**不要**
+再手工回写一份带游标的同代 `wait` 结果。
 
 `resume` 只看 `resumed`，**完全不读 `binding`**。按 `create` 的形状回写它，
 `resumed` 就是缺的，这一轮会报 `visibility_unknown` 事件，节点落到

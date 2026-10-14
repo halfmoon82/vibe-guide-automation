@@ -1097,7 +1097,10 @@ class ProviderActionStore:
                     and request.get('purpose') == 'binding_probe'
                 )
             ):
-                result = dict(payload)
+                # The cursor is the servicer's read position in the session,
+                # never the worker's claim: a self-report carries none, and
+                # the delivery gate accepts the receipt below instead.
+                result = {key: value for key, value in payload.items() if key != 'cursor'}
                 result['event'] = payload.get('event', 'delivered')
                 result['status'] = 'completed'
                 result['idempotent_key'] = _canonical_digest(payload)
@@ -1107,6 +1110,63 @@ class ProviderActionStore:
                 self._atomic(path, dict(report, consumed_by=action['action_id']))
                 return True
         return False
+
+    def self_report_receipt(self, run_id, issue_id, role, generation, task_id, host,
+                            delivery_evidence):
+        """The wait action that took this generation's self-report, or None.
+
+        Proves the delivery came through ``worker-deliver`` for exactly this
+        task: the archive was consumed by a same-generation ``wait`` aimed at
+        the registered task/host, and that wait's bound result is the
+        archive's delivery.  It stands in for a cursor, which a self-report
+        never has; it never vouches for any other identity field.
+        """
+        try:
+            path = self._delivery_path(run_id, issue_id, role, generation)
+            archived = self._read(path)
+            payload = archived.get('payload')
+            action_id = archived.get('consumed_by')
+            if (archived.get('run_id') != run_id or archived.get('issue_id') != issue_id
+                    or archived.get('role') != role or archived.get('generation') != generation
+                    or not isinstance(payload, dict) or not isinstance(action_id, str)
+                    or action_id == 'superseded'):
+                return None
+            action = self.action(action_id)
+            result = self.result(action_id)
+            targets = action['request'].get('targets')
+        except (OSError, TypeError, ValueError, KeyError):
+            return None
+        if (action.get('operation') != 'wait' or action.get('run_id') != run_id
+                or action.get('issue_id') != issue_id or action.get('role') != role
+                or action.get('generation') != generation
+                or targets != [{'threadId': task_id, 'hostId': host}]
+                or not isinstance(result, dict) or 'cursor' in result
+                or result.get('event') not in {'delivered', 'complete'}
+                or not isinstance(delivery_evidence, dict)
+                or result.get('delivery_evidence') != payload.get('delivery_evidence')
+                or delivery_evidence != payload.get('delivery_evidence')):
+            return None
+        return action
+
+    def retire_wait(self, action_id, reason):
+        """Hide one unanswered ``wait`` with an audit marker; never a result.
+
+        Only for a wait whose question was already answered by an earlier
+        bound result of the same task (the self-report recovery).  A wait that
+        has a result is history and stays visible.
+        """
+        action = self.action(action_id)
+        if action.get('operation') != 'wait':
+            raise ValueError('only a wait request can be retired')
+        if self.result(action_id) is not None:
+            raise ValueError('an answered wait cannot be retired')
+        self._atomic(self._directory('stale') / (action_id + '.json'), {
+            'schema_version': self.schema_version,
+            'status': 'stale',
+            'reason': reason,
+            'action_id': action_id,
+            'request_digest': action['request_digest'],
+        })
 
     def unpolled_results(self, run_id):
         """Read-only list of nodes whose pending action already has a result.

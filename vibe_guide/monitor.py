@@ -126,6 +126,7 @@ from .evidence import (
 from .engine_attestation import validate_engine_attestation
 from .decision_boundary import ingest_worker_decisions
 from .orphan_recovery import ORPHAN_DISPATCH_ADOPTED, replay_orphan_adoption
+from .self_report_recovery import SELF_REPORT_DELIVERY_RECONCILED
 
 
 class ScopeDecisionRequired(PermissionError):
@@ -3227,7 +3228,11 @@ class Monitor:
                 or result.get('delivery_evidence') != archived['payload'].get('delivery_evidence')):
             raise ValueError('successor reconciliation developer delivery action is unverified')
         delivery = result.get('delivery_evidence')
-        gate = evaluate_delivery_evidence({**current, 'status':'DELIVERED'}, developer, delivery)
+        receipt = store.self_report_receipt(snapshot.run_id, node_id, 'developer', generation,
+                                            developer.task_id, developer.host or developer.hostId,
+                                            delivery)
+        gate = evaluate_delivery_evidence({**current, 'status':'DELIVERED'}, developer, delivery,
+                                          self_report_receipt=receipt is not None)
         if not gate.complete:
             raise ValueError('successor reconciliation developer delivery is incomplete')
         artifact = Path(delivery['delivery_path'])
@@ -4896,6 +4901,16 @@ class Monitor:
             return None, "integration review acceptance still reports open P0-P2 findings", False
         return package, None, False
 
+    def _self_report_receipt(self, snapshot, node_id, role, active, binding, delivery):
+        """The consumed ``worker-deliver`` wait for the active task, or None."""
+        if not isinstance(active, dict) or binding.task_id != active.get("task_id") \
+                or binding.generation != active.get("generation"):
+            return None
+        return ProviderActionStore(self.paths).self_report_receipt(
+            snapshot.run_id, node_id, role, active.get("generation"),
+            binding.task_id, binding.host or binding.hostId, delivery,
+        )
+
     def _reject_acceptance_format(
         self,
         snapshot: RunSnapshot,
@@ -5083,10 +5098,14 @@ class Monitor:
         if event.event in {"delivered", "complete"}:
             delivery = event.data.get("delivery_evidence")
             if snapshot.execution_engine == "vibeguide_monitor":
+                binding = self._load_task_binding(snapshot, node_id, role)
                 gate = evaluate_delivery_evidence(
                     {**current, "status": "DELIVERED"},
-                    self._load_task_binding(snapshot, node_id, role),
+                    binding,
                     delivery,
+                    self_report_receipt=self._self_report_receipt(
+                        snapshot, node_id, role, active, binding, delivery
+                    ) is not None,
                 )
                 if not gate.complete:
                     if gate.classification == "acceptance_rejected":
@@ -6812,6 +6831,21 @@ class Monitor:
                 snapshot.tasks[node_id+':reviewer'] = new.to_dict()
             elif record["event"] == ORPHAN_DISPATCH_ADOPTED:
                 replay_orphan_adoption(self, snapshot, node_id, data, provenance)
+            elif record["event"] == SELF_REPORT_DELIVERY_RECONCILED:
+                # The recovery only lifts the cursor-only refusal on the same
+                # registered task; the delivery event recorded after it is
+                # replayed by its own branch.
+                active = current.get("active_task")
+                if (provenance.get("role") != "system" or not isinstance(active, dict)
+                        or active.get("task_id") != data.get("task_id")
+                        or active.get("generation") != data.get("generation")
+                        or snapshot.handles.get(node_id) != data.get("handle_id")):
+                    raise ValueError("self-report recovery replay does not follow the node state")
+                current["status"] = "running"
+                current["retryable_action"] = None
+                current["quarantine"] = None
+                current["reason"] = None
+                current["recovery_action"] = None
             elif record["event"] == "start_intent":
                 self._reconcile_start_intent(
                     snapshot, node_id, data, provenance

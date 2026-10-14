@@ -82,6 +82,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "b72a2d622269183724af0c7e3198f88779549ca5f009f20a322b3aca03dae687",
         # 2026-10-14: §6.1/§7 unresolved native tool: retry once, then stop, no handoff.
         "9179bef46af413f27c0954f265777778f42af5a93d6012b0b5dd83e585ab0b08",
+        # 2026-10-15: §6.2 worker-deliver self-report needs no cursor (receipt instead).
+        "8e6b6b2dadfc9b5e3cc6396189f17c169e434c8cd023f002055f2f9849474bee",
     }),
     "vibe-entry": frozenset({
         "3ec0a771d482d92eba7f155f212dab97beb3a4a3b6712e16d7dc3d81394797eb",
