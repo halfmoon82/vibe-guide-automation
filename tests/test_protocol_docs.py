@@ -85,7 +85,8 @@ class PrdGuideBackgroundTests(unittest.TestCase):
     def test_background_bullet_pitfalls(self):
         bg = _bullet(self.s64, "- **Claude Code 后台")
         for needle in (
-            "**不带任何其他参数**，否则会复制出新会话",
+            "**除完整会话 id 和返工消息外不带任何其他参数**（如 `-n`、`--model`），否则会复制出新会话",
+            "`vibe attest` 登记了 `claude-code.background_task.launch` 为真",
             "先 `claude stop`，再用**完整会话 id**",
             "`acceptEdits` 第一条 Bash 就卡在 `blocked`",
             "`dontAsk` 直接拒绝 Bash 却报 `done`",
@@ -116,24 +117,51 @@ class ReadmeBackgroundTests(unittest.TestCase):
         for name, heading in self.CASES:
             with self.subTest(name):
                 sec = _readme_section(ROOT / name, heading)
-                for needle in ("$VIBE_HOME/config.json", "claude_background",
-                               "settings_file", "default_model", "apiKeyHelper",
-                               "claude attach"):
+                for needle in ("$VIBE_HOME/config.json", "claude_bg", "settings_path",
+                               "apiKeyHelper", "claude attach",
+                               "claude-code.background_task.launch"):
                     self.assertIn(needle, sec)
                 blocks = re.findall(r"```json\n(.*?)\n```", sec, re.S)
                 self.assertGreaterEqual(len(blocks), 2)
                 for block in blocks:
                     json.loads(block)
 
-    def test_scan_not_attest_and_unverified_boundary(self):
+    def test_config_example_is_what_the_launcher_reads(self):
+        # "A writes == B reads": feed the README example to the real loader.
+        try:
+            from vibe_guide.adapters.claude_bg import load_claude_bg_config
+        except ImportError:
+            self.skipTest("background launcher not in this tree")
+        import os
+        import tempfile
+        from unittest import mock
+        from vibe_guide.paths import ProjectPaths
+        for name, heading in self.CASES:
+            with self.subTest(name):
+                sec = _readme_section(ROOT / name, heading)
+                example = next(
+                    json.loads(b) for b in re.findall(r"```json\n(.*?)\n```", sec, re.S)
+                    if "claude_bg" in json.loads(b)
+                )
+                example["claude_bg"]["settings_path"] = "/abs/settings.json"
+                with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as proj:
+                    Path(home, "config.json").write_text(json.dumps(example), encoding="utf-8")
+                    Path(proj, ".vibe").mkdir()
+                    with mock.patch.dict(os.environ, {"VIBE_HOME": home}):
+                        config = load_claude_bg_config(ProjectPaths(Path(proj)))
+                self.assertEqual(config.settings_path, "/abs/settings.json")
+                self.assertEqual(config.model, example["claude_bg"]["model"])
+
+    def test_enable_steps_and_unverified_boundary(self):
         for name, heading, unverified in (
             ("README.md", self.CASES[0][1], "未验证、不得当作可用：`--session-id`"),
             ("README.en.md", self.CASES[1][1], "Unverified, do not treat as available: pre-assigning a session id with `--session-id`"),
         ):
             with self.subTest(name):
                 sec = _readme_section(ROOT / name, heading)
-                self.assertIn("`vibe scan --json`", sec)
-                self.assertNotIn("vibe attest", sec)
+                # scan reports no capability mode; the session's attest does.
+                self.assertIn("`vibe attest", sec)
+                self.assertNotIn("mode=background", sec.split("`vibe attest", 1)[0])
                 self.assertIn(unverified, sec)
 
     def test_no_secret_or_real_path(self):

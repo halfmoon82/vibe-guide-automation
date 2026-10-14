@@ -178,16 +178,16 @@ V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 
 2. 在**用户级** `$VIBE_HOME/config.json`（默认 `~/.vibe-guide/config.json`）登记：
 
 ```json
-{"claude_background": {"settings_file": "<设置文件绝对路径>", "default_model": "sonnet"}}
+{"claude_bg": {"settings_path": "<设置文件绝对路径>", "model": "sonnet"}}
 ```
 
-vibe 只记路径，不读也不存密钥。`default_model` 默认 sonnet，监工每次派发仍显式传 `--model`（可按节点换）。写在项目 `.vibe/config.json` 会被拒绝（仓库会被别人克隆）。
+vibe 只记路径，不读也不存密钥。`model` 默认 sonnet，监工每次派发仍显式传 `--model`（可按节点换）。项目 `.vibe/config.json` 的 `claude_bg` 只能写 `enabled`，写凭据、命令或模型会被拒绝（仓库会被别人克隆）。
 
-3. 登记后运行只读的 `vibe scan --json`，查看能力报告： claude-code 应显示 `mode=background`、`provider=claude-code-background`；若显示未配置，会写明原因。
+3. 在 Claude Code 会话里用 `vibe attest` 登记能力事实时，把 `claude-code.background_task.launch` 记为 `true`（依据是本机实测 `claude --bg` 可启动）。登记成功会显示 `级别 background`；若第 2 步没配好，同一行会写明「后台启动器不可用：<原因>」，授权卡上也会列出。`vibe scan` 不报告派发方式，不用它判断。
 
 查看后台 worker：在终端运行 `claude agents --json --all` 看所有后台会话及其 `state`（working / done / failed / blocked / stopped），用 `claude attach <short-id>` 进入（必须真实终端；非 TTY 下不带 `--json` 的 `claude agents` 会报错）。关闭终端标签不会结束会话。不要在后台会话运行时用前台 `claude --resume` 续它（会被拒绝，这是防双写）。
 
-权限与提交身份：worker 以 `bypassPermissions` 运行，安全边界是 worktree 隔离与授权卡；本机若没配全局 git `user.name` / `user.email`，提交作者会是机器名。
+权限与提交身份：worker 以 `bypassPermissions` 运行，安全边界是 worktree 隔离与授权卡；本机若没配全局 git `user.name` / `user.email`，提交作者会是机器名。可在用户级 `claude_bg` 里写 `git_user_name` / `git_user_email` 只给 worker 的 worktree 设身份，前提是仓库已开 `git config extensions.worktreeConfig true`，否则启动会失败并报原因（不会改动主仓库的身份）。
 
 未验证、不得当作可用：`--session-id` 预指定会话 id、`-w` 与 `--bg` 合用、长任务/休眠/daemon 退出后的恢复、桌面内置 CLI 下的 `--bg`。
 

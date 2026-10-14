@@ -100,16 +100,16 @@ Once configured, one authorization on Claude Code lets the supervisor dispatch w
 2. Register it in the **user-level** `$VIBE_HOME/config.json` (default `~/.vibe-guide/config.json`):
 
 ```json
-{"claude_background": {"settings_file": "<absolute path of the settings file>", "default_model": "sonnet"}}
+{"claude_bg": {"settings_path": "<absolute path of the settings file>", "model": "sonnet"}}
 ```
 
-vibe records the path only; it never reads or stores the key. `default_model` defaults to sonnet, and the supervisor still passes `--model` explicitly on every dispatch (it may vary per node). Putting this in the project `.vibe/config.json` is refused (repos get cloned by others).
+vibe records the path only; it never reads or stores the key. `model` defaults to sonnet, and the supervisor still passes `--model` explicitly on every dispatch (it may vary per node). In the project `.vibe/config.json`, `claude_bg` may only contain `enabled`; credentials, command or model there are refused (repos get cloned by others).
 
-3. After registering, run the read-only `vibe scan --json` and check the capability report: it should show claude-code with `mode=background` and `provider=claude-code-background`; if it shows not configured, it states why.
+3. When the Claude Code session registers its capability facts with `vibe attest`, state `claude-code.background_task.launch` as `true` (evidence: `claude --bg` was observed to start on this machine). A successful registration reports `level background`; if step 2 is not configured, the same line says "background launcher unavailable: <reason>" (in Chinese), and the authorization card lists it too. `vibe scan` does not report the dispatch mode; do not use it for this.
 
 Viewing background workers: in a terminal run `claude agents --json --all` to list every background session with its `state` (working / done / failed / blocked / stopped), and `claude attach <short-id>` to enter one (a real terminal is required; without a TTY, `claude agents` without `--json` errors out). Closing the terminal tab does not end the session. Do not resume a running background session with foreground `claude --resume` (it is refused, to prevent double writers).
 
-Permissions and commit identity: workers run with `bypassPermissions`; the safety boundary is worktree isolation plus the authorization card. If the machine has no global git `user.name` / `user.email`, commit authors will be the machine name.
+Permissions and commit identity: workers run with `bypassPermissions`; the safety boundary is worktree isolation plus the authorization card. If the machine has no global git `user.name` / `user.email`, commit authors will be the machine name. `git_user_name` / `git_user_email` in the user-level `claude_bg` set an identity for the worker's worktree only, and require `git config extensions.worktreeConfig true` in the repo; otherwise the launch fails with the reason (the main repo's identity is never changed).
 
 Unverified, do not treat as available: pre-assigning a session id with `--session-id`, combining `-w` with `--bg`, recovery after a long task / sleep / daemon exit, and `--bg` under the desktop-bundled CLI.
 
