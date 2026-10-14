@@ -363,6 +363,22 @@ def _remove_block(text, start, end):
     return text[:start] + text[end:]
 
 
+def _strip_restored_block(data, label, notes):
+    """Backup bytes minus an intact vibe block; hand-edited blocks stay."""
+    try:
+        text = data.decode("utf-8")
+        found = _find_block(text)
+    except (UnicodeDecodeError, HostRulesError):
+        found = (0, 0, None, False) if b"vibe-guide:host-supervisor-rules" in data else None
+    if found is None:
+        return data
+    start, end, _version, intact = found
+    if not intact:
+        notes.append(label + "：备份中的旧标记块被人工改过，已按备份原样恢复，旧块仍在文件里")
+        return data
+    return _remove_block(text, start, end).encode("utf-8")
+
+
 def _rollback_one(home, entry):
     """Undo one entry; returns (label, note or None)."""
     label = entry.get("path") if isinstance(entry, dict) else None
@@ -387,7 +403,12 @@ def _rollback_one(home, entry):
     mode = stat.S_IMODE(os.lstat(path).st_mode)
     note = None
     if own_backup and _sha(data) == entry.get("written_sha256"):
-        _atomic_write_bytes(path, backup_bytes, mode)
+        # The backup holds whatever this apply replaced, which after an
+        # upgrade is an older vibe block; restoring it verbatim would leave
+        # the exception active while reporting rolled_back.
+        notes = []
+        _atomic_write_bytes(path, _strip_restored_block(backup_bytes, label, notes), mode)
+        note = notes[0] if notes else None
     else:
         found = _find_block(text)
         if found is None:

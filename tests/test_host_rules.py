@@ -450,6 +450,55 @@ class ReworkTests(HostRulesTestBase):
         self.assertEqual(self.agents.read_bytes(), self.originals[self.agents] + b"\n")
         self.assertEqual(backup.read_bytes(), b"FOREIGN\n")
 
+    def _as_v2(self):
+        body = host_rules.SNIPPET_BODY + "- v2 新增的一条。\n"
+        return mock.patch.multiple(
+            host_rules, SNIPPET_VERSION=2, SNIPPET_BODY=body,
+            CURRENT_BLOCK=host_rules._render_block(body, 2),
+        )
+
+    def test_rollback_after_upgrade_removes_every_vibe_block(self):
+        self.apply()
+        with self._as_v2():
+            upgraded = self.apply()
+            self.assertEqual(upgraded.payload["host_rules"]["status"], "applied")
+            self.assertIn("v2 新增的一条", self.claude.read_text(encoding="utf-8"))
+            result = self.init("--host-rules", "rollback")
+            self.assertEqual(result.payload["host_rules"]["status"], "rolled_back")
+            self.assertEqual(self.claude.read_bytes(), self.originals[self.claude])
+            self.assertNotIn(host_rules.END_MARKER, self.agents.read_text(encoding="utf-8"))
+            doc = doctor(scan_project(ProjectPaths.from_cwd(self.project)))
+            self.assertEqual(doc.facts["host_rules"]["files"]["~/.claude/CLAUDE.md"], "not_applied")
+            self.assertEqual(doc.facts["host_rules"]["files"]["~/AGENTS.md"], "not_applied")
+            self.assertEqual(self.record()["decision"], "rolled_back")
+
+    def test_rollback_removes_preexisting_older_block(self):
+        original = self.originals[self.claude].decode("utf-8")
+        self.claude.write_text(
+            original + "\n" + host_rules._render_block("## 旧版\n", 0) + "\n", encoding="utf-8")
+        self.apply()
+        self.init("--host-rules", "rollback")
+        text = self.claude.read_text(encoding="utf-8")
+        self.assertNotIn(host_rules.END_MARKER, text)
+        self.assertEqual(text, original)
+
+    def test_rollback_keeps_hand_edited_block_from_backup_with_note(self):
+        original = self.originals[self.claude].decode("utf-8")
+        edited_old = host_rules._render_block("## 旧版\n", 0).replace("旧版", "旧板")
+        self.claude.write_text(original + "\n" + edited_old + "\n", encoding="utf-8")
+        before = self.claude.read_bytes()
+        # A hand-edited block blocks apply, so plant the state apply would leave.
+        backup = Path(str(self.claude) + host_rules.BACKUP_SUFFIX)
+        backup.write_bytes(before)
+        written = (original + "\n" + host_rules.CURRENT_BLOCK + "\n").encode("utf-8")
+        self.claude.write_bytes(written)
+        result = host_rules.rollback(self.home, {"decision": "apply", "applied": [
+            {"path": "~/.claude/CLAUDE.md", "backup": "~/.claude/CLAUDE.md" + host_rules.BACKUP_SUFFIX,
+             "written_sha256": host_rules._sha(written), "backup_sha256": host_rules._sha(before)}]})
+        self.assertEqual(result["status"], "rolled_back")
+        self.assertEqual(self.claude.read_bytes(), before)
+        self.assertTrue(any("人工改过" in n for n in result["notes"]), result)
+
     def test_doctor_warns_on_modified_block_without_changing_readiness(self):
         self.init()
         paths = ProjectPaths.from_cwd(self.project)
