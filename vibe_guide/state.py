@@ -20,6 +20,7 @@ from .authorization import (
     affected_node_closure,
     executable_contract_digest,
     is_authorization_integrity_valid,
+    legacy_executable_contract_digest,
 )
 from .contracts import RunEvent
 from .models import (
@@ -1120,14 +1121,23 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 authorized_nodes.append(authorized_node)
         except (json.JSONDecodeError, TypeError, ValueError) as error:
             raise ValueError("reauthorization authorized DAG proof is invalid") from error
-        if (
-            executable_contract_digest(authorized_nodes)
-            != replacement.node_contract_digest
-            or any(
-                executable_contract_digest([node])
-                != node_contract_digests[node.id]
-                for node in authorized_nodes
-            )
+        # 5.0.7 wrote these digests with file scope included.  The aggregate
+        # selects the algorithm and every per-node digest must use the same
+        # one, so a proof mixing the two is rejected.
+        digest_algorithm = next(
+            (
+                algorithm
+                for algorithm in (
+                    executable_contract_digest,
+                    legacy_executable_contract_digest,
+                )
+                if algorithm(authorized_nodes) == replacement.node_contract_digest
+            ),
+            None,
+        )
+        if digest_algorithm is None or any(
+            digest_algorithm([node]) != node_contract_digests[node.id]
+            for node in authorized_nodes
         ):
             raise ValueError("reauthorization authorized DAG proof is invalid")
         expected_changed_nodes = sorted(
