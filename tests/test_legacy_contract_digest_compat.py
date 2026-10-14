@@ -25,6 +25,7 @@ from vibe_guide.authorization import (
     authorize,
     build_authorization_card,
     executable_contract_digest,
+    executable_contract_digest_matches,
     is_authorization_valid,
 )
 from vibe_guide.capability_contract import build_contract, save_contract
@@ -275,6 +276,104 @@ class ReauthorizationTransitionReplayCompatTests(_RunFixture):
             )
 
 
+class DigestMatchInputTests(_RunFixture):
+    """A malformed persisted digest is a mismatch, never a crash."""
+
+    def test_non_ascii_digest_is_a_mismatch_not_a_type_error(self):
+        self.assertFalse(executable_contract_digest_matches(_nodes(), "\u00e9"))
+
+    def test_non_canonical_digests_are_mismatches(self):
+        nodes = _nodes()
+        current = executable_contract_digest(nodes)
+        for digest in (None, 7, "", current.upper(), current[:-1], current + "0", "\u00e9" * 64):
+            with self.subTest(digest=digest):
+                self.assertFalse(executable_contract_digest_matches(nodes, digest))
+
+    def test_both_algorithms_still_match(self):
+        nodes = _nodes()
+        self.assertTrue(executable_contract_digest_matches(nodes, executable_contract_digest(nodes)))
+        self.assertTrue(executable_contract_digest_matches(nodes, _v507_digest(nodes)))
+
+
+class ReauthorizeLegacyRunTests(_RunFixture):
+    """Reauthorizing a v5.0.7 run under current code keeps unchanged acceptances."""
+
+    def _v507_accepted_run(self):
+        with _writes_with(_v507_digest):
+            snapshot = self._accepted_run()
+        self.assertEqual(snapshot.nodes["a"]["contract_digest"], _v507_digest([_nodes()[0]]))
+        return snapshot
+
+    def _reauthorize(self, run_id, nodes):
+        rebound = Monitor(self.paths, self.plan, nodes).reauthorize(
+            run_id, self._record(nodes), FakeRunner(), "executable_contract_changed"
+        )
+        transition = [
+            record["data"]
+            for record in load_events(self.paths, run_id)
+            if record["event"] == "authorization_reauthorized"
+        ][-1]
+        return rebound, transition
+
+    def test_unchanged_contract_keeps_every_acceptance(self):
+        snapshot = self._v507_accepted_run()
+        nodes = _nodes()
+
+        rebound, transition = self._reauthorize(snapshot.run_id, nodes)
+
+        self.assertEqual(transition["changed_nodes"], [])
+        self.assertEqual(transition["affected_nodes"], [])
+        self.assertEqual(sorted(transition["retained_acceptances"]), ["a", "b"])
+        for node_id, node in zip(("a", "b"), nodes):
+            current = rebound.nodes[node_id]
+            self.assertEqual(current["status"], "accepted")
+            self.assertEqual(current["contract_digest"], executable_contract_digest([node]))
+            self.assertEqual(current["acceptance"]["contract_digest"], current["contract_digest"])
+        loaded = load_snapshot(self.paths, snapshot.run_id)
+        self.assertEqual(loaded.nodes["a"]["status"], "accepted")
+        self.assertEqual(loaded.nodes["b"]["status"], "accepted")
+
+    def test_changed_upstream_invalidates_itself_and_its_downstream(self):
+        snapshot = self._v507_accepted_run()
+
+        rebound, transition = self._reauthorize(
+            snapshot.run_id, _nodes(a_acceptance="verified_fact: changed")
+        )
+
+        self.assertEqual(transition["changed_nodes"], ["a"])
+        self.assertEqual(transition["affected_nodes"], ["a", "b"])
+        self.assertEqual(transition["retained_acceptances"], {})
+        self.assertEqual(rebound.nodes["a"]["status"], "rework")
+        self.assertEqual(rebound.nodes["b"]["status"], "blocked_unknown")
+        self.assertIsNone(rebound.nodes["b"]["acceptance"])
+        load_snapshot(self.paths, snapshot.run_id)
+
+    def test_changed_downstream_keeps_the_unchanged_upstream(self):
+        snapshot = self._v507_accepted_run()
+        nodes = _nodes()
+        nodes[1].contract["acceptance_example"] = "verified_fact: b changed"
+
+        rebound, transition = self._reauthorize(snapshot.run_id, nodes)
+
+        self.assertEqual(transition["changed_nodes"], ["b"])
+        self.assertEqual(transition["affected_nodes"], ["b"])
+        self.assertEqual(sorted(transition["retained_acceptances"]), ["a"])
+        self.assertEqual(rebound.nodes["a"]["status"], "accepted")
+        self.assertNotEqual(rebound.nodes["b"]["status"], "accepted")
+        loaded = load_snapshot(self.paths, snapshot.run_id)
+        self.assertEqual(loaded.nodes["a"]["status"], "accepted")
+
+    def test_scope_change_still_counts_as_changed_for_a_v507_digest(self):
+        """The v5.0.7 digest froze the scope; it cannot vouch for a new scope."""
+        snapshot = self._v507_accepted_run()
+
+        _rebound, transition = self._reauthorize(
+            snapshot.run_id, _nodes(a_files=["a.py", "tests/test_a.py"])
+        )
+
+        self.assertEqual(transition["changed_nodes"], ["a"])
+
+
 class DualVisibleAcceptanceCompatTests(_RunFixture):
     """Dual-visible acceptance: live path and replay of a lost acceptance."""
 
@@ -291,6 +390,53 @@ class DualVisibleAcceptanceCompatTests(_RunFixture):
 
         self.assertEqual(snapshot.nodes["a"]["status"], "accepted", snapshot.nodes["a"].get("reason"))
         self.assertEqual(snapshot.nodes["b"]["status"], "accepted", snapshot.nodes["b"].get("reason"))
+
+    def _reviewer_running_with_unapplied_acceptance(self, event_digest=None):
+        """v5.0.7 run, node ``a`` under review, accepted event appended but unapplied."""
+        nodes = _nodes()
+        runner = FakeRunner(events={("a", "developer"): [("complete", {"evidence": "a"})]})
+        with _writes_with(_v507_digest):
+            monitor = Monitor(self.paths, self.plan, nodes)
+            snapshot = monitor.start(self._record(nodes), runner)
+            for _ in range(4):
+                snapshot = monitor.tick(snapshot.run_id, runner)
+                if snapshot.nodes["a"].get("active_role") == "reviewer":
+                    break
+        current = snapshot.nodes["a"]
+        self.assertEqual(current.get("active_role"), "reviewer")
+        active = current["active_task"]
+        append_event(
+            self.paths,
+            RunEvent(
+                "accepted",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": "a",
+                    "evidence": "a",
+                    "contract_digest": event_digest or current["contract_digest"],
+                    "authorization_epoch": snapshot.authorization_digest,
+                },
+            ),
+            {
+                "role": "reviewer",
+                "task_id": active["task_id"],
+                "handle_id": snapshot.handles["a"],
+                "generation": active["generation"],
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+            },
+        )
+        return snapshot, runner
+
+    def test_non_ascii_digest_in_a_replayed_acceptance_is_stale_not_a_crash(self):
+        snapshot, runner = self._reviewer_running_with_unapplied_acceptance("\u00e9")
+
+        with self.assertRaisesRegex(ValueError, "stale"):
+            Monitor(self.paths, self.plan, _nodes()).tick(snapshot.run_id, runner)
+
+        self.assertNotEqual(
+            load_snapshot(self.paths, snapshot.run_id).nodes["a"]["status"], "accepted"
+        )
 
     def test_v507_acceptance_lost_with_the_snapshot_replays(self):
         """An accepted event recorded with the v5.0.7 digest, snapshot not yet saved."""
@@ -342,6 +488,23 @@ class DualVisibleAcceptanceCompatTests(_RunFixture):
         with _writes_with(_v507_digest):
             snapshot = Monitor(self.paths, self.plan, nodes).start(self._record(nodes), runner)
         snapshot.nodes["a"]["contract_digest"] = _foreign_digest([nodes[0]])
+        save_snapshot(self.paths, snapshot)
+
+        monitor = Monitor(self.paths, self.plan, _nodes())
+        for _ in range(4):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+            if snapshot.nodes["a"]["status"] == "blocked_unknown":
+                break
+
+        self.assertEqual(snapshot.nodes["a"]["status"], "blocked_unknown")
+        self.assertIn("does not match the live node contract", snapshot.nodes["a"]["reason"])
+
+    def test_non_ascii_digest_is_refused_live_without_crashing(self):
+        nodes = _nodes()
+        runner = self._runner()
+        with _writes_with(_v507_digest):
+            snapshot = Monitor(self.paths, self.plan, nodes).start(self._record(nodes), runner)
+        snapshot.nodes["a"]["contract_digest"] = "\u00e9"
         save_snapshot(self.paths, snapshot)
 
         monitor = Monitor(self.paths, self.plan, _nodes())
@@ -408,6 +571,49 @@ class VisibleSddAcceptanceCompatTests(unittest.TestCase):
         self.assertIn(
             "does not match the live node contract", snapshot.nodes["sdd-a"]["reason"]
         )
+
+
+    def test_non_ascii_digest_is_refused_live_without_crashing(self):
+        monitor, runner, snapshot = self._v507_started()
+        snapshot.nodes["sdd-a"]["contract_digest"] = "\u00e9"
+        save_snapshot(self.paths, snapshot)
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown")
+        self.assertIn(
+            "does not match the live node contract", snapshot.nodes["sdd-a"]["reason"]
+        )
+
+    def test_non_ascii_digest_in_a_replayed_acceptance_is_stale_not_a_crash(self):
+        monitor, runner, snapshot = self._v507_started()
+        active = snapshot.nodes["sdd-a"]["active_task"]
+        snapshot.nodes["sdd-a"]["contract_digest"] = "\u00e9"
+        save_snapshot(self.paths, snapshot)
+        append_event(
+            self.paths,
+            RunEvent(
+                "accepted",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": "sdd-a",
+                    "evidence": _visible_sdd.EVIDENCE_REF,
+                    "contract_digest": "\u00e9",
+                    "authorization_epoch": snapshot.authorization_digest,
+                },
+            ),
+            {
+                "role": "reviewer",
+                "task_id": active["task_id"],
+                "handle_id": None,
+                "generation": active["generation"],
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "stale"):
+            monitor.tick(snapshot.run_id, runner)
 
 
 if __name__ == "__main__":
