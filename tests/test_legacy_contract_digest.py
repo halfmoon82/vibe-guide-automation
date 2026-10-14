@@ -14,10 +14,12 @@ formula is still refused.
 import json
 import unittest
 from contextlib import ExitStack
+from copy import deepcopy
 from unittest.mock import patch
 
 from tests.support_v45_authorize import publish_complex_probe
 from tests import test_adopt_orphan_dispatch as adopt_suite
+from tests import test_visible_sdd_contract as sdd_suite
 from vibe_guide.authorization import (
     AuthorizationRecord,
     executable_contract_digest,
@@ -161,6 +163,60 @@ class AdoptionAfterFormulaOnlyReauthorizationTests(unittest.TestCase):
         self.assertEqual(current['developer_identity'], adopt_suite.TASK)
         lease, = case.leases()
         self.assertEqual(lease['status'], 'active')
+
+
+
+class AcceptanceOfLegacyDispatchTests(unittest.TestCase):
+    """A node dispatched under 5.0.7 carries a legacy ``contract_digest``.
+
+    Accepting its delivery under 5.0.8 compares that digest with the live
+    contract; the same contract must be accepted on the live and replay paths.
+    """
+
+    def setUp(self):
+        self.case = sdd_suite.VisibleSddAcceptanceMonitorTests(
+            'test_accepted_event_reuses_dispatch_time_executable_contract_digest')
+        self.case.setUp()
+        self.addCleanup(self.case.tearDown)
+        with as_507():
+            self.monitor, record = self.case._monitor()
+            self.runner = self.case._runner()
+            self.snapshot = self.monitor.start(record, self.runner)
+        node = self.monitor.nodes['sdd-a']
+        self.assertEqual(self.snapshot.nodes['sdd-a']['contract_digest'],
+                         legacy_executable_contract_digest([node]))
+        self.assertNotEqual(self.snapshot.nodes['sdd-a']['contract_digest'],
+                            executable_contract_digest([node]))
+
+    def test_live_delivery_of_legacy_dispatch_is_accepted(self):
+        snapshot = self.monitor.tick(self.snapshot.run_id, self.runner)
+        current = snapshot.nodes['sdd-a']
+        self.assertEqual(current['status'], 'accepted', current.get('reason'))
+        self.assertEqual(current['acceptance']['contract_digest'],
+                         self.snapshot.nodes['sdd-a']['contract_digest'])
+
+    def test_replay_of_legacy_acceptance_is_accepted(self):
+        from vibe_guide.state import save_snapshot
+
+        preserved = deepcopy(self.snapshot)
+        with as_507():
+            accepted = self.monitor.tick(self.snapshot.run_id, self.runner)
+        self.assertEqual(accepted.nodes['sdd-a']['status'], 'accepted')
+        save_snapshot(self.case.paths, preserved)
+        recovered = self.monitor.tick(self.snapshot.run_id, self.runner)
+        self.assertEqual(recovered.nodes['sdd-a']['status'], 'accepted')
+
+    def test_legacy_dispatch_with_forged_digest_is_still_refused(self):
+        import hashlib
+        from vibe_guide.state import save_snapshot
+
+        self.snapshot.nodes['sdd-a']['contract_digest'] = hashlib.sha256(
+            b'smuggled contract').hexdigest()
+        save_snapshot(self.case.paths, self.snapshot)
+        snapshot = self.monitor.tick(self.snapshot.run_id, self.runner)
+        self.assertEqual(snapshot.nodes['sdd-a']['status'], 'blocked_unknown')
+        self.assertIn('does not match the live node contract',
+                      snapshot.nodes['sdd-a']['reason'])
 
 
 if __name__ == '__main__':
