@@ -83,7 +83,14 @@ class LegacyRunTests(unittest.TestCase):
 
     def test_507_reauthorized_run_loads(self):
         self.start_507_run(reauthorize=True)
-        self.assertEqual(load_snapshot(self.paths, self.run_id).run_id, self.run_id)
+        snapshot = load_snapshot(self.paths, self.run_id)
+        # Not a silent fallback to a snapshot older than the reauthorization.
+        self.assertEqual(snapshot.authorization_digest,
+                         self.reauthorizations()[0]['authorization_digest'])
+        events = load_events(self.paths, self.run_id)
+        reauth_index = next(i for i, e in enumerate(events)
+                            if e['event'] == 'authorization_reauthorized')
+        self.assertGreater(snapshot.event_sequence, reauth_index)
         self.assertNotEqual(self.status().get('status'), 'unknown')
 
     def test_507_authorization_stays_valid_without_reauthorization(self):
@@ -205,6 +212,14 @@ class AcceptanceOfLegacyDispatchTests(unittest.TestCase):
         save_snapshot(self.case.paths, preserved)
         recovered = self.monitor.tick(self.snapshot.run_id, self.runner)
         self.assertEqual(recovered.nodes['sdd-a']['status'], 'accepted')
+
+    def test_malformed_dispatch_digest_blocks_the_node(self):
+        from vibe_guide.state import save_snapshot
+
+        self.snapshot.nodes['sdd-a']['contract_digest'] = '指纹' * 32
+        save_snapshot(self.case.paths, self.snapshot)
+        snapshot = self.monitor.tick(self.snapshot.run_id, self.runner)
+        self.assertEqual(snapshot.nodes['sdd-a']['status'], 'blocked_unknown')
 
     def test_legacy_dispatch_with_forged_digest_is_still_refused(self):
         import hashlib

@@ -701,7 +701,7 @@ def contract_digest_matches(digest: Any, nodes: List[DAGNode]) -> bool:
     The legacy formula digests strictly more than the current one, so a
     legacy match is the same contract recorded before 5.0.8.
     """
-    if not isinstance(digest, str):
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
         return False
     return secrets.compare_digest(
         digest, executable_contract_digest(nodes)
