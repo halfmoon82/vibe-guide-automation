@@ -1689,11 +1689,15 @@ class Monitor:
             node_id: executable_contract_digest([self.nodes[node_id]])
             for node_id in snapshot.nodes
         }
+        # A node is unchanged when its previous digest still binds the new
+        # contract.  Runs from 5.0.7 hold the scope-inclusive form, which a
+        # plain comparison with the new digest would always call changed.
         changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if previous_node_contract_digests[node_id]
-            != new_node_contract_digests[node_id]
+            if not executable_contract_digest_matches(
+                [self.nodes[node_id]], previous_node_contract_digests[node_id]
+            )
         )
         affected_nodes = affected_node_closure(
             list(self.nodes.values()), changed_nodes
@@ -1726,8 +1730,9 @@ class Monitor:
             }
             if (
                 node_id not in affected_nodes
-                and previous_node_contract_digests.get(node_id)
-                == new_node_contract_digests[node_id]
+                and executable_contract_digest_matches(
+                    [self.nodes[node_id]], previous_node_contract_digests.get(node_id)
+                )
                 and evidence["contract_digest"]
                 == previous_node_contract_digests[node_id]
             ):
@@ -2745,8 +2750,9 @@ class Monitor:
         expected_changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if previous_node_contract_digests[node_id]
-            != node_contract_digests[node_id]
+            if not executable_contract_digest_matches(
+                [self.nodes[node_id]], previous_node_contract_digests[node_id]
+            )
         )
         if changed_nodes != expected_changed_nodes:
             raise ValueError("reauthorization changed node lineage is invalid")
@@ -2788,7 +2794,9 @@ class Monitor:
                 or set(evidence) != {"contract_digest", "authorization_epoch"}
                 or evidence["contract_digest"]
                 != previous_node_contract_digests[node_id]
-                or evidence["contract_digest"] != node_contract_digests[node_id]
+                or not executable_contract_digest_matches(
+                    [self.nodes[node_id]], evidence["contract_digest"]
+                )
                 or evidence["authorization_epoch"] != previous.digest
             ):
                 raise ValueError("retained acceptance evidence is invalid")
@@ -2818,9 +2826,10 @@ class Monitor:
             current["quarantine"] = None
             if current.get("status") == "accepted":
                 if node_id in retained_acceptances:
-                    evidence = retained_acceptances[node_id]
+                    # The retained acceptance now binds the replacement digest,
+                    # which differs from the evidence only for 5.0.7 runs.
                     current["acceptance"] = {
-                        "contract_digest": evidence["contract_digest"],
+                        "contract_digest": node_contract_digests[node_id],
                         "authorization_epoch": replacement.digest,
                     }
                     continue

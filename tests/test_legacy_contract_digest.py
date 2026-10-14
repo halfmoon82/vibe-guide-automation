@@ -98,6 +98,68 @@ class LegacyContractDigestTests(unittest.TestCase):
             )
         return snapshot, changed
 
+    def _accepted_507_run(self):
+        """Both nodes accepted under 5.0.7, so every stored digest is the old form."""
+        nodes = self._nodes()
+        runner = self._accepting_runner()
+        with _as_written_by_507():
+            snapshot = Monitor(self.paths, self.plan, nodes).start(
+                self._record(nodes), runner
+            )
+            monitor = Monitor(self.paths, self.plan, nodes)
+            for _ in range(10):
+                snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(
+            {node_id: current["status"] for node_id, current in snapshot.nodes.items()},
+            {"a": "accepted", "b": "accepted"},
+        )
+        return snapshot
+
+    def _reauthorize_under_new_code(self, snapshot, nodes):
+        rebound = Monitor(self.paths, self.plan, nodes).reauthorize(
+            snapshot.run_id,
+            self._record(nodes),
+            FakeRunner(),
+            "executable_contract_changed",
+        )
+        load_snapshot(self.paths, rebound.run_id)
+        Monitor(self.paths, self.plan, nodes).tick(rebound.run_id, FakeRunner())
+        return rebound
+
+    def test_new_code_reauthorization_keeps_unchanged_507_acceptances(self):
+        snapshot = self._accepted_507_run()
+        changed = self._nodes()
+        changed[1].contract["files"].append("tests/test_b.py")
+        changed[1].contract["worker_profile"]["allowlist"].append("tests/test_b.py")
+        rebound = self._reauthorize_under_new_code(snapshot, changed)
+        # a is untouched and keeps its acceptance, rebound to the new digest.
+        # b's 5.0.7 digest bound its old file scope, so it cannot prove the
+        # edit was scope-only and is reworked exactly as 5.0.7 would.
+        self.assertEqual(rebound.nodes["a"]["status"], "accepted")
+        self.assertEqual(
+            rebound.nodes["a"]["acceptance"]["contract_digest"],
+            executable_contract_digest([changed[0]]),
+        )
+        self.assertNotEqual(rebound.nodes["b"]["status"], "accepted")
+        self.assertIsNone(rebound.nodes["b"]["acceptance"])
+
+    def test_new_code_reauthorization_of_unchanged_507_dag_keeps_everything(self):
+        snapshot = self._accepted_507_run()
+        rebound = self._reauthorize_under_new_code(snapshot, self._nodes())
+        self.assertEqual(
+            {node_id: current["status"] for node_id, current in rebound.nodes.items()},
+            {"a": "accepted", "b": "accepted"},
+        )
+
+    def test_new_code_reauthorization_still_invalidates_a_507_semantic_change(self):
+        snapshot = self._accepted_507_run()
+        changed = ScopeOnlyReauthorizationTests._nodes(
+            a_acceptance="verified_fact: changed"
+        )
+        rebound = self._reauthorize_under_new_code(snapshot, changed)
+        self.assertEqual(rebound.nodes["a"]["status"], "rework")
+        self.assertEqual(rebound.nodes["b"]["status"], "blocked_unknown")
+
     def _decode_with(self, run_id, mutate_event=None, mutate_state=None):
         records = copy.deepcopy(load_events(self.paths, run_id))
         state = json.loads((run_dir(self.paths, run_id) / "state.json").read_text("utf-8"))
