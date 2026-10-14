@@ -561,7 +561,9 @@ def _claude_bg_launcher_factory(paths: ProjectPaths):
     """
 
     def factory(contract: dict, worktree: Path):
-        from .adapters import claude_bg
+        # Same lookup as _background_launcher_problem: sys.modules, not a stale
+        # package attribute.
+        claude_bg = importlib.import_module("vibe_guide.adapters.claude_bg")
         from .adapters.task_provider import BackgroundTaskRouting
 
         fallback = "provider-actions/deliveries/{}-{}-{}-g{}.json".format(

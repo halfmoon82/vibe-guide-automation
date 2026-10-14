@@ -933,6 +933,15 @@ class LauncherFactoryTests(ProjectCase):
         )
         self.assertEqual(launcher.config, {"cfg": 1})
 
+    def test_factory_reads_sys_modules_after_package_attribute_is_bound(self):
+        # Another suite importing the real module binds vibe_guide.adapters.claude_bg
+        # as a package attribute; the factory must still honour sys.modules.
+        import vibe_guide.adapters as adapters_pkg
+        stale = types.ModuleType(LAUNCHER_MODULE)
+        with mock.patch.object(adapters_pkg, "claude_bg", stale, create=True):
+            launcher, _ = self.build(self.contract())
+        self.assertIsInstance(launcher, FakeBgLauncher)
+
     def test_missing_files_fall_back_to_the_runner_delivery_path(self):
         launcher, _ = self.build(self.contract(host=""))
         expected = "provider-actions/deliveries/r1-n1-developer-g2.json"
