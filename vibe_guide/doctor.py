@@ -1,5 +1,7 @@
 from dataclasses import dataclass
+from pathlib import Path
 import re
+from . import host_rules
 from .diagnostics import diagnose_skill, build_skill_reference_proposal, build_agentsmd_proposal, check_agents_contract
 from .scanner import WORKBUDDY_ORIGIN, legacy_entry_rule_lines
 
@@ -19,6 +21,14 @@ class DoctorReport:
     def __post_init__(self):
         if self.proposals is None:
             self.proposals = []
+
+
+def _host_rules_facts(report):
+    """Host-rule exception facts; doctor must never fail on them."""
+    try:
+        return host_rules.status(Path(report.root), Path.home())
+    except Exception as error:  # noqa: BLE001 - diagnostics stay best-effort
+        return {'decision': 'unknown', 'files': {}, 'reason': error.__class__.__name__}
 
 
 def doctor(report):
@@ -106,7 +116,15 @@ def doctor(report):
             ),
         },
         'agents': {'available': available_agents},
+        'host_rules': _host_rules_facts(report),
     }
+    for label, state in sorted(facts['host_rules'].get('files', {}).items()):
+        # An unanswered decision stays a fact only; a hand-edited or
+        # outdated block means the exception no longer says what vibe wrote.
+        if state == 'modified':
+            issues.append(label + ': vibe 监工会话例外标记块被人工改过')
+        elif state == 'stale':
+            issues.append(label + ': vibe 监工会话例外标记块不是当前版本')
     malformed = bool(report.skill_records_error or len(valid_skills) != len(report.skills))
     status = 'blocked' if malformed else ('attention' if issues else 'ready')
     proposals = []

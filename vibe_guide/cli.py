@@ -36,6 +36,7 @@ from .config import load_project_config
 from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import doctor
 from .initializer import _rules_target, apply_agentsmd_proposal, init_project, refresh_protocol_copies
+from . import host_rules
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import Monitor, ScopeDecisionRequired
 from .supervisor_output import supervisor_output_batch
@@ -127,6 +128,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
+    parser.add_argument("--host-rules", dest="host_rules", choices=("skip", "apply", "rollback"),
+                        help="init: 回答「是否在用户级规则中加入 vibe 监工会话例外」")
+    parser.add_argument("--host-rules-digest", dest="host_rules_digest",
+                        help="init --host-rules apply: 授权预览差异的摘要")
     parser.add_argument("--request")
     parser.add_argument("--plan-id")
     parser.add_argument("--plan")
@@ -2023,9 +2028,20 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             "paths": initialized.paths,
         }
         summary = "初始化完成" if initialized.changed else "初始化无需变更"
-        if initialized.notes:
-            payload["notes"] = list(initialized.notes)
-            summary += "；请注意：" + "；".join(initialized.notes)
+        notes = list(initialized.notes)
+        # Runs after init on purpose: a host-rules refusal never changes
+        # init's own status or exit code (#152).
+        host_payload = host_rules.init_step(
+            paths.root, Path.home(), args.host_rules, args.host_rules_digest
+        )
+        payload["host_rules"] = host_payload
+        if host_payload.get("status") == "blocked":
+            notes.append("用户级规则未写入：" + str(host_payload.get("reason", "")))
+        if notes:
+            payload["notes"] = notes
+            summary += "；请注意：" + "；".join(notes)
+        if host_payload.get("status") != "blocked":
+            summary += "\n" + host_rules.summary_text(host_payload)
         return _result(SUCCESS, payload, summary, args.as_json)
 
     if args.command == "apply-agentsmd":

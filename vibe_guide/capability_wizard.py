@@ -5,7 +5,7 @@ from typing import Any, Iterable, Mapping, Union
 from .capability_contract import CapabilityAuthorization, CapabilityItem
 
 
-_SENSITIVE = {"remote_write", "remote_git_write", "remote_merge", "credentials", "system_permissions", "platform_login", "deploy", "notify_bridge"}
+_SENSITIVE = {"remote_write", "remote_git_write", "remote_merge", "credentials", "system_permissions", "platform_login", "deploy", "notify_bridge", "host_supervisor_rules"}
 _REQUIRED = {"filesystem", "local_filesystem", "python_runtime", "git"}
 
 
