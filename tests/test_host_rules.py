@@ -196,6 +196,9 @@ class ApplyTests(HostRulesTestBase):
         self.assertEqual(files["~/.claude/CLAUDE.md"], "current")
         self.assertEqual(files["~/.codex/AGENTS.md"], "absent")
         self.assertFalse(any("监工会话例外" in issue for issue in doc.issues))
+        self.assertEqual(doc.warnings, [])
+        for entry in record["applied"]:
+            self.assertRegex(entry["backup_sha256"], "^[0-9a-f]{64}$")
 
     def test_reapply_and_reinit_are_idempotent(self):
         self.apply()
@@ -254,9 +257,10 @@ class ApplyTests(HostRulesTestBase):
             doc.facts["host_rules"]["files"]["~/.claude/CLAUDE.md"], "modified"
         )
         self.assertTrue(
-            any("~/.claude/CLAUDE.md" in i and "人工改过" in i for i in doc.issues),
-            doc.issues,
+            any("~/.claude/CLAUDE.md" in w and "人工改过" in w for w in doc.warnings),
+            doc.warnings,
         )
+        self.assertFalse(any("人工改过" in i for i in doc.issues))
         before = _tree(self.home)
         preview = self.init("--host-rules", "apply")
         self.assertEqual(preview.payload["host_rules"]["status"], "blocked")
@@ -272,7 +276,7 @@ class ApplyTests(HostRulesTestBase):
         self.claude.write_text("# 全局规则\n\n" + old_block + "\n尾部\n", encoding="utf-8")
         doc = doctor(scan_project(ProjectPaths.from_cwd(self.project)))
         self.assertEqual(doc.facts["host_rules"]["files"]["~/.claude/CLAUDE.md"], "stale")
-        self.assertTrue(any("不是当前版本" in i for i in doc.issues), doc.issues)
+        self.assertTrue(any("不是当前版本" in w for w in doc.warnings), doc.warnings)
         self.apply()
         text = self.claude.read_text(encoding="utf-8")
         self.assertTrue(text.startswith("# 全局规则\n\n"))
@@ -361,6 +365,110 @@ class ApplyTests(HostRulesTestBase):
         )
         self.init("--host-rules", "rollback")
         self.assertEqual(victim.read_text(encoding="utf-8"), victim_text)
+
+
+class ReworkTests(HostRulesTestBase):
+    """Review round 1: F1 (backup ownership), F2 (cross-project), F3 (doctor)."""
+
+    def edit_outside_block(self):
+        with self.agents.open("a", encoding="utf-8") as stream:
+            stream.write("\n用户在块后追加的一行。\n")
+        return self.agents.read_text(encoding="utf-8")
+
+    def test_reapply_when_current_then_rollback_keeps_user_edit(self):
+        self.apply()
+        entries_before = self.record()["applied"]
+        self.edit_outside_block()
+        again = self.apply()
+        self.assertEqual(again.payload["host_rules"]["status"], "current")
+        self.assertEqual(self.record()["applied"], entries_before)
+        result = self.init("--host-rules", "rollback")
+        self.assertEqual(result.payload["host_rules"]["status"], "rolled_back")
+        text = self.agents.read_text(encoding="utf-8")
+        self.assertNotIn(host_rules.END_MARKER, text)
+        self.assertIn("用户在块后追加的一行。", text)
+        self.assertTrue(text.startswith(self.originals[self.agents].decode("utf-8")))
+        self.assertFalse(os.path.lexists(str(self.agents) + host_rules.BACKUP_SUFFIX))
+        self.assertEqual(self.claude.read_bytes(), self.originals[self.claude])
+
+    def _second_project(self):
+        other = self.project.parent / "project-d"
+        other.mkdir()
+        return lambda *extra: run_cli(["init", "--confirm", *extra, "--json"], other)
+
+    def test_two_projects_rollbacks_keep_edit_and_never_restore_foreign_backup(self):
+        self.apply()  # project C writes the block and owns the backups
+        init_d = self._second_project()
+        preview = init_d("--host-rules", "apply")
+        applied_d = init_d("--host-rules", "apply", "--host-rules-digest",
+                           preview.payload["host_rules"]["digest"])
+        self.assertEqual(applied_d.payload["host_rules"]["status"], "current")
+        record_d = json.loads(
+            (self.project.parent / "project-d" / ".vibe" / "host-rules.json").read_text())
+        self.assertTrue(all(e.get("restore") == "block" for e in record_d["applied"]))
+        self.assertTrue(all("written_sha256" not in e for e in record_d["applied"]))
+        edited = self.edit_outside_block()
+        backup = Path(str(self.agents) + host_rules.BACKUP_SUFFIX)
+        backup_bytes = backup.read_bytes()
+
+        rolled_d = init_d("--host-rules", "rollback")
+        self.assertEqual(rolled_d.payload["host_rules"]["status"], "rolled_back")
+        text = self.agents.read_text(encoding="utf-8")
+        self.assertNotIn(host_rules.END_MARKER, text)
+        self.assertIn("用户在块后追加的一行。", text)
+        self.assertEqual(backup.read_bytes(), backup_bytes)  # C's backup left alone
+        self.assertNotEqual(text, edited)
+
+        # F2: C's rollback finds no block and must not get stuck in "apply".
+        rolled_c = self.init("--host-rules", "rollback")
+        hr = rolled_c.payload["host_rules"]
+        self.assertEqual(hr["status"], "rolled_back", hr)
+        self.assertTrue(any("标记块已不在，视为已回滚" in n for n in hr["notes"]), hr)
+        self.assertEqual(self.record()["decision"], "rolled_back")
+        self.assertIn("用户在块后追加的一行。", self.agents.read_text(encoding="utf-8"))
+        self.assertNotIn(host_rules.END_MARKER, self.agents.read_text(encoding="utf-8"))
+        self.assertEqual(self.init("--host-rules", "skip").payload["host_rules"]["decision"], "skip")
+
+    def test_stale_backup_is_replaced_on_write_and_never_restored(self):
+        backup = Path(str(self.agents) + host_rules.BACKUP_SUFFIX)
+        backup.write_bytes(b"STALE OLDER CONTENT\n")
+        self.apply()
+        self.assertEqual(backup.read_bytes(), self.originals[self.agents])
+        self.init("--host-rules", "rollback")
+        self.assertEqual(self.agents.read_bytes(), self.originals[self.agents])
+
+    def test_foreign_backup_with_current_block_is_neither_restored_nor_deleted(self):
+        self.agents.write_text(
+            self.originals[self.agents].decode("utf-8") + "\n\n" + host_rules.CURRENT_BLOCK + "\n",
+            encoding="utf-8")
+        backup = Path(str(self.agents) + host_rules.BACKUP_SUFFIX)
+        backup.write_bytes(b"FOREIGN\n")
+        self.apply()
+        entry = next(e for e in self.record()["applied"] if e["path"] == "~/AGENTS.md")
+        self.assertEqual(entry, {"path": "~/AGENTS.md", "restore": "block"})
+        self.init("--host-rules", "rollback")
+        self.assertEqual(self.agents.read_bytes(), self.originals[self.agents] + b"\n")
+        self.assertEqual(backup.read_bytes(), b"FOREIGN\n")
+
+    def test_doctor_warns_on_modified_block_without_changing_readiness(self):
+        self.init()
+        paths = ProjectPaths.from_cwd(self.project)
+        baseline = doctor(scan_project(paths))
+        baseline_cli = self.cli("doctor")
+        self.apply()
+        text = self.claude.read_text(encoding="utf-8")
+        self.claude.write_text(text.replace("light", "lite", 1), encoding="utf-8")
+        report = doctor(scan_project(paths))
+        self.assertEqual((report.ok, report.status, report.issues),
+                         (baseline.ok, baseline.status, baseline.issues))
+        self.assertTrue(any("人工改过" in w for w in report.warnings), report.warnings)
+        result = self.cli("doctor")
+        self.assertEqual(result.exit_code, baseline_cli.exit_code)
+        self.assertEqual(result.payload["status"], baseline_cli.payload["status"])
+        self.assertEqual(result.payload["issues"], baseline_cli.payload["issues"])
+        self.assertTrue(any("人工改过" in w for w in result.payload["warnings"]))
+        plain = run_cli(["doctor"], self.project)
+        self.assertIn("提醒：", plain.text)
 
 
 if __name__ == "__main__":

@@ -17,10 +17,15 @@ class DoctorReport:
     facts: dict
     status: str = 'ready'
     proposals: list = None
+    # Advisory findings that must not change readiness, e.g. user-level
+    # files outside the project that a test or CI machine cannot control.
+    warnings: list = None
 
     def __post_init__(self):
         if self.proposals is None:
             self.proposals = []
+        if self.warnings is None:
+            self.warnings = []
 
 
 def _host_rules_facts(report):
@@ -118,13 +123,16 @@ def doctor(report):
         'agents': {'available': available_agents},
         'host_rules': _host_rules_facts(report),
     }
+    warnings = []
     for label, state in sorted(facts['host_rules'].get('files', {}).items()):
         # An unanswered decision stays a fact only; a hand-edited or
         # outdated block means the exception no longer says what vibe wrote.
+        # These live in the user's home, so they warn without touching
+        # project readiness.
         if state == 'modified':
-            issues.append(label + ': vibe 监工会话例外标记块被人工改过')
+            warnings.append(label + ': vibe 监工会话例外标记块被人工改过')
         elif state == 'stale':
-            issues.append(label + ': vibe 监工会话例外标记块不是当前版本')
+            warnings.append(label + ': vibe 监工会话例外标记块不是当前版本')
     malformed = bool(report.skill_records_error or len(valid_skills) != len(report.skills))
     status = 'blocked' if malformed else ('attention' if issues else 'ready')
     proposals = []
@@ -135,4 +143,4 @@ def doctor(report):
         contract = check_agents_contract(report.agentsmd_content, ['Vibe Guide', 'Project guidance'])
         if not contract.ok:
             proposals.append('.vibe/proposals/agentsmd/proposal.md')
-    return DoctorReport(not issues, issues, facts, status=status, proposals=proposals)
+    return DoctorReport(not issues, issues, facts, status=status, proposals=proposals, warnings=warnings)

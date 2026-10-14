@@ -212,39 +212,93 @@ def _backup_path(path):
     return Path(str(path) + BACKUP_SUFFIX)
 
 
-def _ensure_backup(path, original, rel):
-    """Create the pre-vibe backup once; an existing one keeps the oldest original.
+def _regular_bytes(path):
+    """Bytes of *path* when it is a regular file (not a symlink), else None."""
+    try:
+        if stat.S_ISREG(os.lstat(path).st_mode):
+            return path.read_bytes()
+    except FileNotFoundError:
+        return None
+    return None
 
-    Returns True when this call created it (so a failed apply can remove it).
+
+def _write_backup(path, original, rel):
+    """Write the bytes this apply is about to replace, then verify them.
+
+    The backup is always rewritten: a stale one left by an older apply (or by
+    another project) must never be what a later rollback restores. Returns
+    the previous backup bytes (or None) so a failed apply can put them back.
     """
     backup = _backup_path(path)
-    if os.path.lexists(backup):
-        if backup.is_symlink() or not backup.is_file():
-            raise HostRulesError(_label(rel) + "：备份位置已被非普通文件占用，备份失败")
-        return False
+    if os.path.lexists(backup) and (backup.is_symlink() or not backup.is_file()):
+        raise HostRulesError(_label(rel) + "：备份位置已被非普通文件占用，备份失败")
+    previous = _regular_bytes(backup)
     try:
-        with open(backup, "xb") as stream:
-            stream.write(original)
-            stream.flush()
-            os.fsync(stream.fileno())
+        _atomic_write_bytes(backup, original, 0o600)
         if backup.read_bytes() != original:
             raise OSError("backup verification mismatch")
     except OSError as error:
-        if backup.is_file() and not backup.is_symlink():
-            backup.unlink()
+        _restore_backup(backup, previous)
         raise HostRulesError(
             _label(rel) + "：备份失败（" + error.__class__.__name__ + "）"
         ) from None
-    return True
+    return previous
 
 
-def _entry(rel, written):
+def _restore_backup(backup, previous):
+    try:
+        if previous is None:
+            if backup.is_file() and not backup.is_symlink():
+                backup.unlink()
+        else:
+            _atomic_write_bytes(backup, previous, 0o600)
+    except OSError:
+        pass
+
+
+def _entry(rel, written, backed_up):
+    """Restore-capable entry: rollback may restore the backup only while both
+    the file and the backup still hold exactly these bytes."""
     path_label = _label(rel)
-    return {"path": path_label, "backup": path_label + BACKUP_SUFFIX, "written_sha256": _sha(written)}
+    return {
+        "path": path_label,
+        "backup": path_label + BACKUP_SUFFIX,
+        "written_sha256": _sha(written),
+        "backup_sha256": _sha(backed_up),
+    }
 
 
-def apply(home, digest):
-    """Write the snippet only when *digest* matches a fresh, clean plan."""
+def _valid_entry(entry, label):
+    if not isinstance(entry, dict) or entry.get("path") != label:
+        return False
+    if entry.get("restore") == "block":
+        return True
+    return all(
+        isinstance(entry.get(key), str) and re.fullmatch("[0-9a-f]{64}", entry[key])
+        for key in ("written_sha256", "backup_sha256")
+    )
+
+
+def _current_entry(label, previous):
+    """Entry for a file this apply did not write.
+
+    Nothing was backed up now, so a fresh restore-capable entry would let a
+    rollback restore someone else's (or an outdated) backup over later edits.
+    Keep this project's earlier entry when it is well-formed (rollback
+    re-checks its hashes); otherwise rollback may only remove the block.
+    """
+    for entry in previous or ():
+        if _valid_entry(entry, label):
+            return entry
+    return {"path": label, "restore": "block"}
+
+
+def apply(home, digest, previous=None):
+    """Write the snippet only when *digest* matches a fresh, clean plan.
+
+    *previous* is this project's recorded entry list, reused for files that
+    are already current.
+    """
     plan = plan_apply(home)
     if plan["errors"]:
         return {"status": "blocked", "reason": "；".join(plan["errors"]), "entries": [], "paths": []}
@@ -255,7 +309,11 @@ def apply(home, digest):
             "entries": [], "paths": [],
         }
     changes = [t for t in plan["targets"] if t["action"] != "current"]
-    entries = [_entry(t["rel"], t["proposed"]) for t in plan["targets"]]
+    entries = [
+        _entry(t["rel"], t["proposed"], t["current"]) if t["action"] != "current"
+        else _current_entry(t["path"], previous)
+        for t in plan["targets"]
+    ]
     if not changes:
         return {"status": "current", "entries": entries, "paths": []}
     home = Path(home)
@@ -267,15 +325,14 @@ def apply(home, digest):
                 "reason": target["path"] + "：文件或所在目录不可写，未写入任何文件",
                 "entries": [], "paths": [],
             }
-    created = []
+    saved = []
     try:
         for target in changes:
-            path = home / target["rel"]
-            if _ensure_backup(path, target["current"], target["rel"]):
-                created.append(_backup_path(path))
+            backup = _backup_path(home / target["rel"])
+            saved.append((backup, _write_backup(home / target["rel"], target["current"], target["rel"])))
     except HostRulesError as error:
-        for backup in created:
-            backup.unlink()
+        for backup, previous_bytes in saved:
+            _restore_backup(backup, previous_bytes)
         return {"status": "blocked", "reason": str(error) + "，未写入任何文件", "entries": [], "paths": []}
     written = []
     try:
@@ -290,8 +347,8 @@ def apply(home, digest):
         for target in written:
             path = home / target["rel"]
             _atomic_write_bytes(path, target["current"], stat.S_IMODE(os.lstat(path).st_mode))
-        for backup in created:
-            backup.unlink()
+        for backup, previous_bytes in saved:
+            _restore_backup(backup, previous_bytes)
         reason = str(error) if isinstance(error, HostRulesError) else error.__class__.__name__
         return {"status": "blocked", "reason": "写入失败，已恢复原文件：" + reason, "entries": [], "paths": []}
     return {"status": "applied", "entries": entries, "paths": [t["path"] for t in changes]}
@@ -307,6 +364,7 @@ def _remove_block(text, start, end):
 
 
 def _rollback_one(home, entry):
+    """Undo one entry; returns (label, note or None)."""
     label = entry.get("path") if isinstance(entry, dict) else None
     if not isinstance(label, str) or not label.startswith("~/") or label[2:] not in CANDIDATES:
         raise HostRulesError(str(label) + "：不是 vibe 管理的用户级规则文件，拒绝回滚")
@@ -317,21 +375,31 @@ def _rollback_one(home, entry):
         raise HostRulesError(label + "：文件不存在，无法回滚")
     data, text = read
     backup = _backup_path(path)
-    has_backup = backup.is_file() and not backup.is_symlink()
+    backup_bytes = _regular_bytes(backup)
+    # A backup is ours only if it still holds exactly what this entry saved;
+    # anything else belongs to another apply and is neither restored nor removed.
+    own_backup = (
+        entry.get("restore") != "block"
+        and backup_bytes is not None
+        and isinstance(entry.get("backup_sha256"), str)
+        and _sha(backup_bytes) == entry["backup_sha256"]
+    )
     mode = stat.S_IMODE(os.lstat(path).st_mode)
-    if has_backup and _sha(data) == entry.get("written_sha256"):
-        _atomic_write_bytes(path, backup.read_bytes(), mode)
+    note = None
+    if own_backup and _sha(data) == entry.get("written_sha256"):
+        _atomic_write_bytes(path, backup_bytes, mode)
     else:
         found = _find_block(text)
         if found is None:
-            raise HostRulesError(label + "：未找到标记块，无法回滚")
-        start, end, _version, intact = found
-        if not intact:
-            raise HostRulesError(label + "：标记块被人工改过，拒绝回滚")
-        _atomic_write_bytes(path, _remove_block(text, start, end).encode("utf-8"), mode)
-    if has_backup:
+            note = label + "：标记块已不在，视为已回滚"
+        else:
+            start, end, _version, intact = found
+            if not intact:
+                raise HostRulesError(label + "：标记块被人工改过，拒绝回滚")
+            _atomic_write_bytes(path, _remove_block(text, start, end).encode("utf-8"), mode)
+    if own_backup:
         backup.unlink()
-    return label
+    return label, note
 
 
 def rollback(home, record):
@@ -340,10 +408,13 @@ def rollback(home, record):
     entries = (record.get("applied") or []) if record.get("decision") == "apply" else []
     if not entries:
         return {"status": "noop", "reason": "没有已应用的例外，无需回滚", "restored": [], "remaining": []}
-    restored, remaining, errors = [], [], []
+    restored, remaining, errors, notes = [], [], [], []
     for entry in entries:
         try:
-            restored.append(_rollback_one(home, entry))
+            label, note = _rollback_one(home, entry)
+            restored.append(label)
+            if note:
+                notes.append(note)
         except HostRulesError as error:
             errors.append(str(error))
             remaining.append(entry)
@@ -354,7 +425,7 @@ def rollback(home, record):
         status = "rolled_back"
     else:
         status = "partial" if restored else "blocked"
-    result = {"status": status, "restored": restored, "remaining": remaining}
+    result = {"status": status, "restored": restored, "remaining": remaining, "notes": notes}
     if errors:
         result["reason"] = "；".join(errors)
     return result
@@ -500,6 +571,8 @@ def _init_step(root, home, choice, digest):
         payload = {"decision": decision, "status": result["status"], "paths": result["restored"]}
         if result.get("reason"):
             payload["reason"] = result["reason"]
+        if result.get("notes"):
+            payload["notes"] = result["notes"]
         if result["status"] == "rolled_back":
             write_record(root, "rolled_back")
             payload["decision"] = "rolled_back"
@@ -520,7 +593,8 @@ def _init_step(root, home, choice, digest):
         if all(t["action"] == "current" for t in plan["targets"]):
             payload["note"] = "用户级规则已是当前版本；运行上面的命令只会登记决定"
         return payload
-    result = apply(home, digest)
+    previous = record.get("applied") if record and record.get("decision") == "apply" else None
+    result = apply(home, digest, previous)
     if result["status"] == "blocked":
         return {"decision": decision, "status": "blocked", "reason": result["reason"]}
     if not (record and record.get("decision") == "apply" and record.get("applied") == result["entries"]):
@@ -545,7 +619,8 @@ def summary_text(payload):
         "answered": "用户级规则决定：" + str(payload.get("decision")),
         "applied": "已写入用户级规则例外：" + "、".join(payload.get("paths", [])) + "（已备份，可回滚）",
         "current": "用户级规则例外已是当前版本，未改动",
-        "rolled_back": "已回滚用户级规则例外：" + "、".join(payload.get("paths", [])),
+        "rolled_back": "已回滚用户级规则例外：" + "、".join(payload.get("paths", []))
+        + "".join("；" + note for note in payload.get("notes", [])),
         "noop": "没有已应用的用户级规则例外，无需回滚",
     }
     if state in texts:

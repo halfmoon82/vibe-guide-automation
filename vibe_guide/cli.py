@@ -2118,12 +2118,15 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             "facts": report.facts,
             "provider_bridge": bridge_payload,
             "proposals": report.proposals,
+            "warnings": list(report.warnings),
         }
         text = (
             "环境检查通过"
             if ready
             else "环境检查发现问题：" + "；".join(issues)
         )
+        if report.warnings:
+            text += "；提醒：" + "；".join(report.warnings)
         return _result(
             SUCCESS if status == "attention" or ready else BLOCKED, payload, text, args.as_json
         )
