@@ -12,77 +12,172 @@ from typing import Any, Dict
 from .config import load_supervisor_single_shift
 from .contracts import RunEvent
 from .decision_boundary import validate_boundary_category
-from .state import append_event, run_dir, save_snapshot, load_snapshot
+from .state import append_event, interprocess_lock, run_dir, save_snapshot, load_snapshot
+
+
+class SupervisorLeaseConflict(ValueError):
+    """Lost a lease compare-and-swap, or a stale-epoch supervisor tried to write."""
+
+
+def _valid_epoch(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _read_lease_record(path: Path):
+    """Return the lease record, or None when no file exists.
+
+    A file that exists but cannot be parsed is never read as epoch 0: that
+    would let a corrupt file reset the counter and readmit a stale writer.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SupervisorLeaseConflict("supervisor lease is unreadable: %s" % error)
+    try:
+        record = json.loads(text)
+    except ValueError:
+        raise SupervisorLeaseConflict("supervisor lease is malformed")
+    if not isinstance(record, dict):
+        raise SupervisorLeaseConflict("supervisor lease is malformed")
+    if "lease_epoch" in record and not _valid_epoch(record["lease_epoch"]):
+        raise SupervisorLeaseConflict("supervisor lease has an invalid lease_epoch")
+    return record
+
+
+def _record_epoch(record) -> int:
+    # Legacy records carry no epoch and read as 0.
+    return 0 if record is None else record.get("lease_epoch", 0)
+
+
+def read_lease_epoch(paths, run_id: str) -> int:
+    """On-disk lease epoch for a run; 0 when there is no lease file."""
+    path = run_dir(paths, run_id, create=True) / "supervisor.lease"
+    return _record_epoch(_read_lease_record(path))
 
 
 class SupervisorLease:
     def __init__(self, paths, *, pid=None):
         self.paths = paths
         self.pid = int(pid or os.getpid())
+        self.lease_epoch = None
+        self._run_id = None
 
     def path(self, run_id: str) -> Path:
         return run_dir(self.paths, run_id, create=True) / "supervisor.lease"
 
-    def _payload(self, run_id: str) -> Dict[str, Any]:
-        now = time.time()
-        return {"pid": self.pid, "run_id": run_id, "started_at": now, "heartbeat": now}
+    def lock(self, run_id: str):
+        return interprocess_lock(self.path(run_id).parent / ".supervisor-lease.lock")
 
-    def acquire(self, run_id: str) -> bool:
+    def _write(self, run_id: str, record: Dict[str, Any]) -> None:
         path = self.path(run_id)
-        payload = self._payload(run_id)
-        try:
-            descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            try:
-                current = json.loads(path.read_text(encoding="utf-8"))
-                pid = int(current.get("pid", 0))
-                same_process = pid == self.pid
-                if not same_process and pid > 0:
-                    os.kill(pid, 0)
-                    return False
-                if same_process and current.get("run_id") == run_id:
-                    return False
-                path.unlink()
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                try:
-                    path.unlink()
-                except OSError:
-                    return False
-            return self.acquire(run_id)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, sort_keys=True)
-            stream.flush()
-            os.fsync(stream.fileno())
-        self._run_id = run_id
-        return True
-
-    def heartbeat(self, run_id: str) -> None:
-        path = self.path(run_id)
-        try:
-            current = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return
-        if current.get("pid") != self.pid or current.get("run_id") != run_id:
-            return
-        current["heartbeat"] = time.time()
         descriptor, temporary = tempfile.mkstemp(prefix=".supervisor.", dir=str(path.parent))
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(current, stream, sort_keys=True)
+                json.dump(record, stream, sort_keys=True)
                 stream.flush(); os.fsync(stream.fileno())
             os.replace(temporary, str(path))
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
+    def _record(self, run_id: str, epoch: int, owner, released=False, started_at=None) -> Dict[str, Any]:
+        now = time.time()
+        return {
+            "pid": self.pid, "run_id": run_id,
+            "started_at": started_at or now, "heartbeat": now,
+            "lease_epoch": epoch, "owner": owner, "released": released,
+        }
+
+    def cas_locked(self, run_id: str, expected_epoch: int, owner=None) -> int:
+        """Upgrade the epoch by one if it still equals ``expected_epoch``.
+
+        The caller must hold ``self.lock(run_id)``.  This is the only place
+        the epoch changes.
+        """
+        found = _record_epoch(_read_lease_record(self.path(run_id)))
+        if found != expected_epoch:
+            raise SupervisorLeaseConflict(
+                "supervisor lease takeover lost: expected epoch %s, found %s"
+                % (expected_epoch, found)
+            )
+        new_epoch = expected_epoch + 1
+        self._write(run_id, self._record(run_id, new_epoch, owner))
+        self._run_id = run_id
+        self.lease_epoch = new_epoch
+        return new_epoch
+
+    def takeover(self, run_id: str, expected_epoch: int, *, owner=None) -> int:
+        if not _valid_epoch(expected_epoch):
+            raise ValueError("expected_epoch must be a non-negative integer")
+        with self.lock(run_id):
+            return self.cas_locked(run_id, expected_epoch, owner)
+
+    def acquire(self, run_id: str) -> bool:
+        with self.lock(run_id):
+            current = _read_lease_record(self.path(run_id))
+            if current is not None and not current.get("released"):
+                pid = current.get("pid")
+                pid = pid if isinstance(pid, int) and not isinstance(pid, bool) else 0
+                if pid == self.pid:
+                    if current.get("run_id") == run_id:
+                        return False
+                elif pid > 0:
+                    try:
+                        os.kill(pid, 0)
+                        return False
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        return False
+                    except OSError:
+                        pass
+            epoch = _record_epoch(current)
+            owner = current.get("owner") if current else None
+            self._write(run_id, self._record(run_id, epoch, owner))
+            self._run_id = run_id
+            self.lease_epoch = epoch
+            return True
+
+    def ensure_current(self, run_id: str) -> None:
+        if self.lease_epoch is None or self._run_id != run_id:
+            raise SupervisorLeaseConflict("supervisor lease was never acquired for run %s" % run_id)
+        found = read_lease_epoch(self.paths, run_id)
+        if found != self.lease_epoch:
+            raise SupervisorLeaseConflict(
+                "supervisor lease epoch is stale: holding %s, current %s"
+                % (self.lease_epoch, found)
+            )
+
+    def heartbeat(self, run_id: str) -> None:
+        with self.lock(run_id):
+            try:
+                current = _read_lease_record(self.path(run_id))
+            except SupervisorLeaseConflict:
+                return
+            if (
+                current is None or current.get("pid") != self.pid
+                or current.get("run_id") != run_id
+                or _record_epoch(current) != self.lease_epoch
+            ):
+                return
+            current["heartbeat"] = time.time()
+            self._write(run_id, current)
+
     def release(self, run_id: str) -> None:
-        path = self.path(run_id)
-        try:
-            current = json.loads(path.read_text(encoding="utf-8"))
-            if current.get("pid") == self.pid:
-                path.unlink()
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return
+        with self.lock(run_id):
+            try:
+                current = _read_lease_record(self.path(run_id))
+            except SupervisorLeaseConflict:
+                return
+            if (
+                current is None or current.get("pid") != self.pid
+                or _record_epoch(current) != self.lease_epoch
+            ):
+                return
+            current["released"] = True
+            self._write(run_id, current)
 
 
 class Supervisor:
@@ -92,6 +187,10 @@ class Supervisor:
         self.runner = runner
         self.run_id = run_id
         self.lease = lease or SupervisorLease(paths)
+        try:
+            monitor.lease_guard = lambda: self.lease.ensure_current(self.run_id)
+        except AttributeError:
+            pass
 
     def recover_or_start(self, run_id: str = None) -> Dict[str, Any]:
         target = run_id or self.run_id
@@ -99,7 +198,14 @@ class Supervisor:
         return {"stale_pid_recovered": acquired, "active_supervisors": 1 if acquired else 0}
 
     def run_once(self):
-        if not self.lease.acquire(self.run_id) and not getattr(self.lease, "_run_id", None):
+        if (
+            getattr(self.lease, "_run_id", None) == self.run_id
+            and getattr(self.lease, "lease_epoch", None) is not None
+        ):
+            # Already holding: a newer epoch means this supervisor is stale and
+            # must stop before any write.
+            self.lease.ensure_current(self.run_id)
+        elif not self.lease.acquire(self.run_id):
             raise RuntimeError("supervisor lease is held by another process")
         heartbeat_data = {"run_id": self.run_id, "status": "active"}
         heartbeat_provenance = None
@@ -121,6 +227,7 @@ class Supervisor:
             # A first-cycle heartbeat has no snapshot lineage yet; Monitor
             # start/resume will establish it before any provider write.
             pass
+        self.lease.ensure_current(self.run_id)
         append_event(self.paths, RunEvent("supervisor_heartbeat", heartbeat_data), heartbeat_provenance)
         self.lease.heartbeat(self.run_id)
         self.monitor.resume(self.run_id, self.runner, poll_handles=False)
@@ -132,9 +239,11 @@ class Supervisor:
         if snapshot_for_reconcile is not None:
             for node_id in snapshot_for_reconcile.nodes:
                 reconcile_pending_binding(snapshot_for_reconcile, node_id, self.runner)
+            self.lease.ensure_current(self.run_id)
             save_snapshot(self.paths, snapshot_for_reconcile)
         snapshot = self.monitor.tick(self.run_id, self.runner)
         if hasattr(snapshot, "run_id"):
+            self.lease.ensure_current(self.run_id)
             save_snapshot(self.paths, snapshot)
         return snapshot
 
@@ -614,7 +723,23 @@ def _registry_path(paths, run_id):
     return run_dir(paths, run_id, create=True) / _REGISTRY_NAME
 
 
-def register_supervisor_address(paths, run_id, address, *, session_record=None):
+def _write_registry(path, registry):
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".supervisor-registry-", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(registry, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, str(path))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def register_supervisor_address(paths, run_id, address, *, session_record=None, expected_epoch=None):
     """Atomically record the current supervisor address; keeps history.
 
     With ``session_record`` (the shift's own session log) the current context
@@ -622,6 +747,10 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None):
     keyed by a digest of the log path rather than the path itself.  An
     unreadable log still registers -- the wake-up address matters more -- and
     the entry simply carries no baseline.
+
+    A new (successor) session upgrades the lease epoch by compare-and-swap
+    against ``expected_epoch`` -- by default the epoch observed before taking
+    the lock -- so two candidates racing for the same run cannot both win.
     """
     if not isinstance(address, dict):
         raise TypeError("address must be a mapping")
@@ -639,50 +768,84 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None):
             if forbidden in str(key).lower():
                 raise ValueError("supervisor address must not carry credentials")
     path = _registry_path(paths, run_id)
-    registry = _read_json_file(path)
-    if not isinstance(registry, dict):
-        registry = {}
-    history = registry.get("history")
-    if not isinstance(history, list):
-        history = []
-    current = registry.get("current")
-    if isinstance(current, dict):
-        history.append(current)
-    entry = {
-        "provider": provider,
-        "session_id": session_id,
-        "host": host,
-        "registered_at": time.time(),
-    }
-    if session_record is not None and Path(str(session_record)).expanduser().is_absolute():
-        record = _read_json_file(session_record)
-        baseline = _session_tokens(record) if record is not None else None
-        digest = _record_digest(session_record)
-        if (
-            isinstance(current, dict)
-            and current.get("session_id") == session_id
-            and current.get("session_record_digest") == digest
-            and isinstance(current.get("baseline_context"), int)
+    observed = _read_json_file(path)
+    observed_current = observed.get("current") if isinstance(observed, dict) else None
+    if expected_epoch is None:
+        if isinstance(observed_current, dict):
+            legacy = observed_current.get("lease_epoch", 0)
+            expected_epoch = legacy if _valid_epoch(legacy) else 0
+        else:
+            expected_epoch = read_lease_epoch(paths, run_id)
+    lease = SupervisorLease(paths)
+    with lease.lock(run_id):
+        registry = _read_json_file(path)
+        if not isinstance(registry, dict):
+            registry = {}
+        history = registry.get("history")
+        if not isinstance(history, list):
+            history = []
+        rejected = registry.get("rejected")
+        if not isinstance(rejected, list):
+            rejected = []
+        current = registry.get("current")
+        on_disk = read_lease_epoch(paths, run_id)
+
+        def reject(reason):
+            rejected.append({
+                "provider": provider, "session_id": session_id, "host": host,
+                "expected_epoch": expected_epoch, "found_epoch": on_disk,
+                "reason": reason, "at": time.time(),
+            })
+            kept = {"history": history, "rejected": rejected[-20:]}
+            if isinstance(current, dict):
+                kept["current"] = current
+            _write_registry(path, kept)
+            raise SupervisorLeaseConflict(reason)
+
+        same_shift = isinstance(current, dict) and current.get("session_id") == session_id
+        if not same_shift and any(
+            isinstance(item, dict) and item.get("session_id") == session_id
+            for item in history
         ):
-            # Registering the same shift again must not push its rotation out.
-            baseline = current["baseline_context"]
-        if baseline is not None and digest is not None:
-            entry["baseline_context"] = baseline
-            entry["session_record_digest"] = digest
-    registry = {"current": entry, "history": history}
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=".supervisor-registry-", dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(registry, stream, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, str(path))
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+            reject("superseded supervisor %s cannot re-register" % session_id)
+        if same_shift:
+            epoch = on_disk
+        else:
+            try:
+                epoch = lease.cas_locked(
+                    run_id, expected_epoch,
+                    {"provider": provider, "session_id": session_id, "host": host},
+                )
+            except SupervisorLeaseConflict as error:
+                reject(str(error))
+        if isinstance(current, dict):
+            history.append(current)
+        entry = {
+            "provider": provider,
+            "session_id": session_id,
+            "host": host,
+            "registered_at": time.time(),
+            "lease_epoch": epoch,
+        }
+        if session_record is not None and Path(str(session_record)).expanduser().is_absolute():
+            record = _read_json_file(session_record)
+            baseline = _session_tokens(record) if record is not None else None
+            digest = _record_digest(session_record)
+            if (
+                isinstance(current, dict)
+                and current.get("session_id") == session_id
+                and current.get("session_record_digest") == digest
+                and isinstance(current.get("baseline_context"), int)
+            ):
+                # Registering the same shift again must not push its rotation out.
+                baseline = current["baseline_context"]
+            if baseline is not None and digest is not None:
+                entry["baseline_context"] = baseline
+                entry["session_record_digest"] = digest
+        _write_registry(
+            path,
+            {"current": entry, "history": history, "rejected": rejected[-20:]},
+        )
     return entry
 
 
@@ -695,6 +858,7 @@ def current_supervisor_address(paths, run_id):
         "status": "ok",
         "current": registry["current"],
         "history": registry.get("history", []),
+        "lease_epoch": read_lease_epoch(paths, run_id),
     }
 
 

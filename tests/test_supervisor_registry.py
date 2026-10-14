@@ -13,7 +13,12 @@ from pathlib import Path
 from vibe_guide.cli import run_cli
 from vibe_guide.paths import ProjectPaths
 from unittest.mock import patch
+from vibe_guide.state import run_dir
 from vibe_guide.supervisor import (
+    Supervisor,
+    SupervisorLease,
+    SupervisorLeaseConflict,
+    read_lease_epoch,
     current_supervisor_address,
     register_supervisor_address,
     supervisor_preflight,
@@ -280,3 +285,153 @@ class SupervisorCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeaseEpochTests(unittest.TestCase):
+    """Supervisor lease epoch: CAS takeover, stale-writer rejection, legacy."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.paths = ProjectPaths(Path(self._tmp.name))
+
+    def _race(self, calls):
+        import threading
+        barrier = threading.Barrier(len(calls))
+        results = [None] * len(calls)
+
+        def work(index, call):
+            barrier.wait()
+            try:
+                results[index] = ("ok", call())
+            except SupervisorLeaseConflict as error:
+                results[index] = ("conflict", str(error))
+
+        threads = [threading.Thread(target=work, args=(i, c)) for i, c in enumerate(calls)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return results
+
+    def _addr(self, name):
+        return {"provider": "codex", "session_id": name, "host": "local"}
+
+    def test_a_concurrent_takeover_only_one_wins(self):
+        one = SupervisorLease(self.paths, pid=111)
+        two = SupervisorLease(self.paths, pid=222)
+        results = self._race([
+            lambda: one.takeover("run-1", 0),
+            lambda: two.takeover("run-1", 0),
+        ])
+        self.assertEqual(sorted(r[0] for r in results), ["conflict", "ok"])
+        self.assertEqual([r[1] for r in results if r[0] == "ok"], [1])
+        self.assertEqual(read_lease_epoch(self.paths, "run-1"), 1)
+
+    def test_b_concurrent_successor_registration(self):
+        register_supervisor_address(self.paths, "run-1", self._addr("A"))
+        self.assertEqual(read_lease_epoch(self.paths, "run-1"), 1)
+        results = self._race([
+            lambda: register_supervisor_address(
+                self.paths, "run-1", self._addr("B"), expected_epoch=1),
+            lambda: register_supervisor_address(
+                self.paths, "run-1", self._addr("C"), expected_epoch=1),
+        ])
+        self.assertEqual(sorted(r[0] for r in results), ["conflict", "ok"])
+        winner = [r[1] for r in results if r[0] == "ok"][0]
+        current = current_supervisor_address(self.paths, "run-1")
+        self.assertEqual(current["current"]["session_id"], winner["session_id"])
+        self.assertEqual(current["lease_epoch"], 2)
+        self.assertEqual(current["current"]["lease_epoch"], 2)
+        registry = json.loads((run_dir(self.paths, "run-1") / "supervisor-registry.json").read_text())
+        self.assertEqual(len(registry["rejected"]), 1)
+        loser = registry["rejected"][0]
+        self.assertNotEqual(loser["session_id"], winner["session_id"])
+        self.assertEqual((loser["expected_epoch"], loser["found_epoch"]), (1, 2))
+        self.assertTrue(loser["reason"])
+
+    def test_c_stale_supervisor_write_rejected(self):
+        class Mon:
+            def __init__(self):
+                self.calls = []
+
+            def resume(self, run_id, runner, poll_handles=False):
+                self.calls.append("resume")
+
+            def tick(self, run_id, runner):
+                self.calls.append("tick")
+                return {"run_id": run_id}
+
+        monitor = Mon()
+        old = Supervisor(self.paths, monitor, object(), "run-1")
+        old.run_once()
+        self.assertEqual(monitor.calls, ["resume", "tick"])
+        events = run_dir(self.paths, "run-1") / "events.jsonl"
+        before = events.read_text().count("\n")
+        new = SupervisorLease(self.paths, pid=424242)
+        self.assertEqual(new.takeover("run-1", read_lease_epoch(self.paths, "run-1")), 1)
+        with self.assertRaises(SupervisorLeaseConflict):
+            old.run_once()
+        self.assertEqual(monitor.calls, ["resume", "tick"])
+        self.assertEqual(events.read_text().count("\n"), before)
+
+    def test_d_monitor_guard_blocks_snapshot_write(self):
+        from vibe_guide.monitor import Monitor
+        monitor = Monitor.__new__(Monitor)
+        monitor.paths = self.paths
+
+        def deny():
+            raise SupervisorLeaseConflict("stale")
+
+        monitor.lease_guard = deny
+        with patch("vibe_guide.monitor.save_snapshot") as saved:
+            with self.assertRaises(SupervisorLeaseConflict):
+                monitor._save_snapshot(object())
+            saved.assert_not_called()
+            monitor.lease_guard = None
+            monitor._save_snapshot("snap")
+            saved.assert_called_once_with(self.paths, "snap")
+
+    def test_e_legacy_lease_and_registry(self):
+        lease = SupervisorLease(self.paths, pid=111)
+        path = lease.path("run-1")
+        path.write_text(json.dumps({"pid": 999999, "run_id": "run-1", "heartbeat": 0}))
+        self.assertEqual(read_lease_epoch(self.paths, "run-1"), 0)
+        self.assertEqual(lease.takeover("run-1", 0), 1)
+        with self.assertRaises(SupervisorLeaseConflict):
+            SupervisorLease(self.paths, pid=222).takeover("run-1", 0)
+        # legacy registry: current entry without lease_epoch, no lease file
+        path.unlink()
+        reg = run_dir(self.paths, "run-2", create=True) / "supervisor-registry.json"
+        reg.write_text(json.dumps({"current": {
+            "provider": "codex", "session_id": "OLD", "host": "local",
+            "registered_at": 1.0}, "history": []}))
+        entry = register_supervisor_address(self.paths, "run-2", self._addr("NEW"))
+        self.assertEqual(entry["lease_epoch"], 1)
+        self.assertEqual(read_lease_epoch(self.paths, "run-2"), 1)
+
+    def test_f_release_keeps_epoch(self):
+        one = SupervisorLease(self.paths, pid=os.getpid())
+        one.takeover("run-1", 0)
+        one.release("run-1")
+        self.assertTrue(one.path("run-1").exists())
+        self.assertEqual(read_lease_epoch(self.paths, "run-1"), 1)
+        other = SupervisorLease(self.paths, pid=777)
+        self.assertTrue(other.acquire("run-1"))
+        self.assertEqual(other.lease_epoch, 1)
+        self.assertEqual(read_lease_epoch(self.paths, "run-1"), 1)
+
+    def test_g_superseded_session_cannot_reregister(self):
+        for name in ("A", "B"):
+            register_supervisor_address(self.paths, "run-1", self._addr(name))
+        with self.assertRaises(SupervisorLeaseConflict):
+            register_supervisor_address(self.paths, "run-1", self._addr("A"))
+        current = current_supervisor_address(self.paths, "run-1")
+        self.assertEqual(current["current"]["session_id"], "B")
+        self.assertEqual(current["lease_epoch"], 2)
+
+    def test_h_same_session_reregister_keeps_epoch(self):
+        register_supervisor_address(self.paths, "run-1", self._addr("A"))
+        entry = register_supervisor_address(self.paths, "run-1", self._addr("A"))
+        self.assertEqual(entry["lease_epoch"], 1)
+        self.assertEqual(read_lease_epoch(self.paths, "run-1"), 1)

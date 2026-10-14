@@ -886,6 +886,9 @@ class Monitor:
         topology_rulings: Optional[Any] = None,
     ):
         self.paths = paths
+        # Set by Supervisor: raises when this process no longer holds the
+        # current supervisor lease epoch, so a stale supervisor cannot write.
+        self.lease_guard = None
         self.plan = plan
         self.nodes = {node.id: node for node in nodes}
         # Platform dispatch-topology rulings (adapter_id -> ruling), normally
@@ -1119,7 +1122,17 @@ class Monitor:
             self._binding_cache[key] = binding
         return binding
 
+    def _guard_lease(self) -> None:
+        guard = getattr(self, "lease_guard", None)
+        if guard is not None:
+            guard()
+
+    def _save_snapshot(self, snapshot: Any) -> None:
+        self._guard_lease()
+        save_snapshot(self.paths, snapshot)
+
     def _save_task_binding(self, binding: TaskBinding) -> None:
+        self._guard_lease()
         save_task_binding(self.paths, binding)
         if binding.run_id is not None:
             self._binding_cache[(binding.run_id, binding.issue_id, binding.role)] = binding
@@ -1328,7 +1341,7 @@ class Monitor:
             "repaired": result.repaired, "isolated": result.isolated,
             "binding": frozen_binding,
         })
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return result
 
     def isolate_affected_action(self, snapshot: RunSnapshot, node_id: str, reason: str) -> None:
@@ -1337,7 +1350,7 @@ class Monitor:
             "run_id": snapshot.run_id, "node_id": node_id,
             "reason": reason, "disposition": "degraded", "action": "isolate", "isolated": True,
         })
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
 
     def merge_change_request_local(
         self,
@@ -1365,7 +1378,7 @@ class Monitor:
             },
         )
         self._record_topology_projection(snapshot, "monitor.merge_local")
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return evidence
 
     # Short alias for callers that already operate in the Monitor boundary.
@@ -1415,7 +1428,7 @@ class Monitor:
             "evidence": prepared.to_dict(),
             "external_execution": "not_performed",
         })
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return prepared
 
     def start(
@@ -1535,14 +1548,14 @@ class Monitor:
         # now: the projection was refreshed above, so this records exactly the
         # state the validator is about to read.
         self._record_topology_projection(snapshot, "monitor.start")
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         if not self._context_allows_dispatch(snapshot, runner):
-            save_snapshot(self.paths, snapshot)
+            self._save_snapshot(snapshot)
             return snapshot
         self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
         self._record_topology_projection(snapshot, "monitor.start")
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return snapshot
 
     def resume(self, run_id: str, runner: Runner, poll_handles: bool = True) -> RunSnapshot:
@@ -1619,7 +1632,7 @@ class Monitor:
                 self._schedule_ready(snapshot, runner, recover_missing_reviewer=True)
         self._refresh_run_status(snapshot)
         self._record_topology_projection(snapshot, "monitor.resume")
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return snapshot
 
     def reauthorize(
@@ -1678,7 +1691,7 @@ class Monitor:
             self._schedule_ready(snapshot, runner)
             self._refresh_run_status(snapshot)
             self._record_topology_projection(snapshot, "monitor.reauthorize")
-            save_snapshot(self.paths, snapshot)
+            self._save_snapshot(snapshot)
             return snapshot
 
         previous = self._snapshot_record(snapshot)
@@ -1772,7 +1785,7 @@ class Monitor:
                 runner,
                 "stopped",
             ):
-                save_snapshot(self.paths, snapshot)
+                self._save_snapshot(snapshot)
                 raise RuntimeError("active task stop cannot be proven for reauthorization")
             snapshot.nodes[node_id]["old_task_reconciled"] = True
 
@@ -1838,7 +1851,7 @@ class Monitor:
         self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
         self._record_topology_projection(snapshot, "monitor.reauthorize")
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return snapshot
 
     def tick(self, run_id: str, runner: Runner) -> RunSnapshot:
@@ -1853,7 +1866,7 @@ class Monitor:
             self._schedule_ready(snapshot, runner)
         self._record_topology_projection(snapshot, "monitor.tick")
         self._refresh_run_status(snapshot)
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return snapshot
 
     def record_integration_review(self, run_id: str, evidence: Dict[str, Any]) -> RunSnapshot:
@@ -1871,7 +1884,7 @@ class Monitor:
         })
         self._refresh_run_status(snapshot)
         self._record_topology_projection(snapshot, "monitor.record_integration_review")
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return snapshot
 
     def record_blocked_unknown_disposition(
@@ -1944,7 +1957,7 @@ class Monitor:
             },
         )
         self._refresh_run_status(snapshot)
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return snapshot
 
     def reconcile_evidence(self, run_id: str, package: Dict[str, Any]) -> RunSnapshot:
@@ -2027,7 +2040,7 @@ class Monitor:
             self._reconcile_unapplied_events(snapshot)
 
         self._refresh_run_status(snapshot)
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return snapshot
 
     def reconcile_scope(self, run_id: str, package: Dict[str, Any]) -> RunSnapshot:
@@ -2065,7 +2078,7 @@ class Monitor:
         if actual["allowlist"] not in (supplied["allowlist"], allowed):
             raise ValueError("scope correction allowlist is stale")
         if not resolution.scope_expanded_files and actual["allowlist"] == allowed:
-            save_snapshot(self.paths, snapshot)
+            self._save_snapshot(snapshot)
             return snapshot
         previous_sequence = snapshot.event_sequence
         self._record(snapshot, "scope_correction_registered", {
@@ -2073,7 +2086,7 @@ class Monitor:
             "files": list(resolution.files)})
         snapshot.event_sequence = previous_sequence
         self._reconcile_unapplied_events(snapshot)
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return snapshot
 
     @staticmethod
@@ -2603,7 +2616,7 @@ class Monitor:
             queue_rework=True,
         )
         self._refresh_run_status(snapshot)
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return snapshot
 
     def _consistency_binding(
@@ -3352,7 +3365,7 @@ class Monitor:
             **({'delivery_recovery':delivery_recovery} if delivery_recovery is not None else {})}})
         self._record_topology_projection(snapshot, 'monitor.reconcile_successor')
         self._refresh_run_status(snapshot)
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return snapshot
 
     def _proven_successor_action(
@@ -3979,7 +3992,7 @@ class Monitor:
                 "action_ref": action_ref,
             },
         )
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return False
 
     def _start_task(
@@ -4286,7 +4299,7 @@ class Monitor:
                         "proof": {"generation": generation, "provider": getattr(runner, "provider", None),
                                   "retry": dict(current["retryable_action"])},
                     })
-                save_snapshot(self.paths, snapshot)
+                self._save_snapshot(snapshot)
             return False
         except ProviderUnavailable as error:
             current[generation_key] = generation - 1
@@ -4346,7 +4359,7 @@ class Monitor:
                     }
             if binding_contract_enabled(contract):
                 current["binding_phase"] = "binding_repair_pending"
-            save_snapshot(self.paths, snapshot)
+            self._save_snapshot(snapshot)
             return False
         except (OSError, TypeError, ValueError) as error:
             if successor_recovery:
@@ -4397,7 +4410,7 @@ class Monitor:
             current["active_task"],
         )
         # The intent and lease are durable before the external side effect.
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         # ISSUE-140 (expected_red): a TDD node must observe its invariant
         # commands failing before the first developer dispatch.  The flag is
         # node state, so rework/continuation never re-runs the observation.
@@ -4423,10 +4436,10 @@ class Monitor:
                     node_id,
                     "contract test execution failed: {}".format(expected_red_failure),
                 )
-                save_snapshot(self.paths, snapshot)
+                self._save_snapshot(snapshot)
                 return False
             current["expected_red_observed"] = True
-            save_snapshot(self.paths, snapshot)
+            self._save_snapshot(snapshot)
         self._require_snapshot_authorization(snapshot)
         try:
             # All starts pass through the intent transaction.  V4.4 providers
@@ -4489,12 +4502,12 @@ class Monitor:
                 current["active_task"] = None
                 current["active_role"] = None
                 current["start_intent"] = None
-                save_snapshot(self.paths, snapshot)
+                self._save_snapshot(snapshot)
                 return False
             if isinstance(handle, dict):
                 provider_run_id = handle.get("run_id") or handle.get("provider_task_id") or handle.get("task_id")
                 if not isinstance(provider_run_id, str) or not provider_run_id:
-                    current["status"] = "blocked_unknown"; current["reason"] = "provider proof has no task handle"; save_snapshot(self.paths, snapshot); return False
+                    current["status"] = "blocked_unknown"; current["reason"] = "provider proof has no task handle"; self._save_snapshot(snapshot); return False
                 handle = RunHandle(provider_run_id)
         except ProviderPending as error:
             # A bridge setup token (clientThreadId) is not a formal task. Keep
@@ -4521,7 +4534,7 @@ class Monitor:
             current["start_intent"] = None
             # Preserve the write-ahead intent for same-task retry.
             current["reason"] = str(error)
-            save_snapshot(self.paths, snapshot)
+            self._save_snapshot(snapshot)
             return False
         except ProviderUnavailable as error:
             # Provider request validation happens before a visible task has an
@@ -4570,7 +4583,7 @@ class Monitor:
                         "parameter_recovery": retry.get("parameter_recovery"),
                     },
                 )
-                save_snapshot(self.paths, snapshot)
+                self._save_snapshot(snapshot)
                 return False
             raise
         except Exception as error:
@@ -4589,7 +4602,7 @@ class Monitor:
                     type(error).__name__
                 ),
             )
-            save_snapshot(self.paths, snapshot)
+            self._save_snapshot(snapshot)
             return False
 
         if (
@@ -4602,7 +4615,7 @@ class Monitor:
                 node_id,
                 "provider returned a duplicate or invalid active handle",
             )
-            save_snapshot(self.paths, snapshot)
+            self._save_snapshot(snapshot)
             return False
 
         current["status"] = self._running_status(role, phase)
@@ -4638,9 +4651,9 @@ class Monitor:
                     type(error).__name__
                 ),
             )
-            save_snapshot(self.paths, snapshot)
+            self._save_snapshot(snapshot)
             return False
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         pending = getattr(runner, "is_pending", None)
         if callable(pending) and pending(handle):
             # Keep the active lease, but expose the unresolved bridge action
@@ -4672,7 +4685,7 @@ class Monitor:
                     "binding_digest": current.get("contract_digest", ""),
                     "last_observation_ref": "provider-pending",
                 }
-            save_snapshot(self.paths, snapshot)
+            self._save_snapshot(snapshot)
         return True
 
     @staticmethod
@@ -5125,7 +5138,7 @@ class Monitor:
                             },
                             active,
                         )
-                        save_snapshot(self.paths, snapshot)
+                        self._save_snapshot(snapshot)
                         return
                     self._mark_blocked_unknown(snapshot, node_id, "; ".join(gate.reasons))
                     return
@@ -6382,7 +6395,7 @@ class Monitor:
         self._record(snapshot, "retry_scheduled", {"run_id": snapshot.run_id, "node_id": node_id,
             "reason_class": classification["kind"], "reason": reason,
             "same_task_required": True, "next_retry_at": current.get("retryable_action", {}).get("next_retry_at") if isinstance(current.get("retryable_action"), dict) else None})
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
 
     def repair_node(self, node_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
         """Repair a node in place; identity fields are immutable across repair."""
@@ -6435,7 +6448,7 @@ class Monitor:
             "repair_action": repair_action, "same_task": True,
             "reconciliation": reconciliation,
             "task_id": current.get("task_id"), "generation": current.get("generation")})
-        save_snapshot(self.paths, snapshot)
+        self._save_snapshot(snapshot)
         return {"node_id": node_id, "kind": classification["kind"], "preserved_identity": preserved,
                 "status": current.get("status"), "task_id": current.get("task_id"),
                 "generation": current.get("generation"), "repair_action": repair_action,
@@ -6506,6 +6519,7 @@ class Monitor:
             "authorization_digest": snapshot.authorization_digest,
             "node_contract_digest": snapshot.node_contract_digest,
         }
+        self._guard_lease()
         snapshot.event_sequence = append_event(
             self.paths, RunEvent(event_name, data), provenance
         )
