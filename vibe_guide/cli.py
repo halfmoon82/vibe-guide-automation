@@ -19,7 +19,9 @@ from .authorization import (
     AuthorizationRecord,
     authorize,
     build_authorization_card,
+    INTEGRATION_REVIEW_NODE_ID,
     dispatch_topology_for_node,
+    node_adapter_id,
     refresh_authorization_card,
 )
 from .adapters.base import (
@@ -349,7 +351,7 @@ def _observed_topology_rulings(
         observed = observe_capabilities(paths)
     except (ProviderPending, OSError, TypeError, ValueError):
         return {}
-    probes = [observed.adapter_id + ".in_session_sdd"]
+    probes = [observed.adapter_id + ".in_session_sdd", observed.adapter_id + ".subprocess"]
     try:
         adapter = AdapterRegistry().get(observed.adapter_id)
     except KeyError:
@@ -380,54 +382,75 @@ def _observed_topology_rulings(
             and card is not None
             and not _card_discloses_background(card)
         ):
-            topology = ruling(probes[:1])
+            topology = ruling(probes[:-1] if background_probe else probes)
     except (KeyError, TypeError, ValueError):
         return {}
     return {observed.adapter_id: topology}
 
 
-def _background_launcher_problem() -> Optional[str]:
-    """Why the verified background launcher cannot be used, or None when it can."""
+def _background_launcher_problem(paths: ProjectPaths) -> Optional[str]:
+    """Why the verified background launcher cannot be used, or None when it can.
+
+    Exception messages are never copied out: they may carry paths or secrets.
+    """
     try:
         module = importlib.import_module("vibe_guide.adapters.claude_bg")
     except ImportError:
         return "后台启动器未安装（缺少 vibe_guide.adapters.claude_bg）"
-    check = getattr(module, "configuration_problem", None)
-    if not callable(check):
-        return None
+    except Exception as error:
+        return "后台启动器加载失败：" + type(error).__name__
     try:
-        problem = check()
-    except Exception as error:  # message withheld: it may carry paths or secrets
+        module.load_claude_bg_config(paths)
+    except (module.ClaudeBgUnknown, module.ClaudeBgConfigRefused) as error:
+        reason = getattr(error, "reason", None) or str(error)
+        return "后台启动器未配置：" + str(reason)
+    except Exception as error:
         return "后台启动器配置检查失败：" + type(error).__name__
-    return problem if isinstance(problem, str) and problem else None
+    return None
+
+
+def _background_execution_note(topology: str) -> str:
+    return "该节点在本运行中同样由后台会话执行（拓扑保持 {}：先交付、再派独立 reviewer 复审）".format(topology)
 
 
 def _background_worker_entries(
-    nodes: List[DAGNode], topology_rulings: Optional[Dict[str, str]]
+    nodes: List[DAGNode],
+    topology_rulings: Optional[Dict[str, str]],
+    paths: ProjectPaths,
 ) -> Optional[Dict[str, Dict[str, Any]]]:
     """Card worker entries disclosing the background downgrade, or None.
 
     ``None`` when no node is ruled ``background`` so the card stays exactly
-    what it was without the background fact.
+    what it was without the background fact.  Once any node is background,
+    the same background runner executes the rest of the run (for instance the
+    integration-review closeout), so those nodes get a disclosure entry too --
+    keeping the topology the supervisor actually dispatches them under.
     """
-    background_nodes = [
-        node for node in nodes
-        if dispatch_topology_for_node(node, topology_rulings) == TOPOLOGY_BACKGROUND
-    ]
-    if not background_nodes:
+    ruled = {node.id: dispatch_topology_for_node(node, topology_rulings) for node in nodes}
+    if TOPOLOGY_BACKGROUND not in ruled.values():
         return None
-    problem = _background_launcher_problem()
-    limitations = list(BACKGROUND_LAUNCH_LIMITATIONS)
-    if problem:
-        limitations.append("后台启动器不可用：" + problem)
-    return {
-        node.id: {
-            "topology": TOPOLOGY_BACKGROUND,
-            "mode": "background",
-            "limitations": list(limitations),
-        }
-        for node in background_nodes
+    problem = _background_launcher_problem(paths)
+    background_adapters = {
+        node_adapter_id(node) for node in nodes if ruled[node.id] == TOPOLOGY_BACKGROUND
     }
+    unavailable = ["后台启动器不可用：" + problem] if problem else []
+    entries: Dict[str, Dict[str, Any]] = {}
+    for node in nodes:
+        topology = ruled[node.id]
+        limitations = list(BACKGROUND_LAUNCH_LIMITATIONS)
+        if topology != TOPOLOGY_BACKGROUND:
+            # Only nodes the same background runner executes: the closeout
+            # node, or a node routed to a background-ruled platform.
+            if node.id != INTEGRATION_REVIEW_NODE_ID and node_adapter_id(node) not in background_adapters:
+                continue
+            limitations.append(_background_execution_note(topology))
+        entry = {
+            "topology": topology,
+            "mode": "background" if topology == TOPOLOGY_BACKGROUND else "visible",
+            "limitations": limitations + unavailable,
+        }
+        entries[node.id] = entry
+    return entries
 
 
 def _observed_engine_attestation(paths: ProjectPaths, plan: Plan) -> Dict[str, Any]:
@@ -531,19 +554,47 @@ def _observed_adapter(paths: ProjectPaths, adapter_id: str):
     return result
 
 
-def _background_runner(paths: ProjectPaths, adapter_id: str, provider: str):
-    """Build the background-session runner.
+def _claude_bg_launcher_factory(paths: ProjectPaths):
+    """Return ``factory(contract, worktree) -> ClaudeBgLauncher`` for the runner.
 
-    Interface assumption shared with the bg-launcher node: the module
-    ``vibe_guide.runners.claude_bg`` exposes ``ClaudeBgRunner`` constructed
-    with the same positional arguments as ``ProviderActionRunner``
-    (``paths, adapter_id, provider``).
+    The launcher module is imported lazily when the factory is called.
     """
+
+    def factory(contract: dict, worktree: Path):
+        from .adapters import claude_bg
+        from .adapters.task_provider import BackgroundTaskRouting
+
+        fallback = "provider-actions/deliveries/{}-{}-{}-g{}.json".format(
+            contract.get("run_id"),
+            contract.get("node_id"),
+            contract.get("role") or "developer",
+            contract.get("generation"),
+        )
+        binding = contract.get("child_binding")
+        model = binding.get("model") if isinstance(binding, dict) else None
+        if not isinstance(model, str) or not model.strip() or model.strip() == "default":
+            model = None
+        routing = BackgroundTaskRouting(
+            host=str(contract.get("host") or "local"),
+            worktree=str(worktree),
+            branch=str(contract.get("branch") or ""),
+            status_file=str(contract.get("status_file") or fallback),
+            handoff_file=str(contract.get("handoff_file") or fallback),
+        )
+        return claude_bg.ClaudeBgLauncher(
+            routing, claude_bg.load_claude_bg_config(paths), model=model
+        )
+
+    return factory
+
+
+def _background_runner(paths: ProjectPaths, adapter_id: str, provider: str):
+    """Build the background-session runner (``vibe_guide.runners.claude_bg``)."""
     try:
         from .runners.claude_bg import ClaudeBgRunner
     except ImportError as error:
         raise ValueError("后台运行器未安装：vibe_guide.runners.claude_bg") from error
-    return ClaudeBgRunner(paths, adapter_id, provider)
+    return ClaudeBgRunner(_claude_bg_launcher_factory(paths), paths=paths)
 
 
 def _public_runner(
@@ -711,7 +762,7 @@ def _publish_plan(
         remote_git_actions=source.get("remote_git_actions", "deny"),
         engine_attestation=engine_attestation,
         topology_rulings=_first_card_rulings,
-        workers=_background_worker_entries(nodes, _first_card_rulings),
+        workers=_background_worker_entries(nodes, _first_card_rulings, paths),
     )
 
     plans_root = destination.parent

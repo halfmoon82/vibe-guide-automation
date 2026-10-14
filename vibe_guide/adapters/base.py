@@ -376,7 +376,7 @@ class ManifestAdapter:
         if not isinstance(environment, Environment):
             environment = Environment.from_mapping(environment)
         background_status, background_ref = self.background_launch_status(environment)
-        if background_status == "pass":
+        if background_status == "pass" and environment.has_fact(self.id + ".subprocess", self.id):
             return TopologyDecision(
                 self.id, self.manifest["background_probe"], "pass",
                 TOPOLOGY_BACKGROUND, background_ref, upgraded=True,
