@@ -2266,6 +2266,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         # written before the key existed readable.
         if summary.get("mode") == "background":
             dispatch_note = "可派发降级后台会话（桌面不可见，只能终端 attach 进入）"
+            problem = _background_launcher_problem(paths)
+            if problem:
+                dispatch_note += "；但后台启动器不可用：" + problem
         elif summary["visible_automation"]:
             dispatch_note = "可派发可见任务"
         elif summary.get("in_session_sdd"):

@@ -585,6 +585,19 @@ class AttestOptionalFactTests(unittest.TestCase):
         )
         self.assertIn("可派发降级后台会话（桌面不可见，只能终端 attach 进入）", result.text)
 
+    def test_attest_cli_discloses_unavailable_launcher(self):
+        # The background fact alone does not make launches work; say so at
+        # attest time, same wording as the authorization card.
+        root = Path(tempfile.mkdtemp(prefix="bgw-attcli-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        run_cli(["init", "--confirm", "--json"], root)
+        (root / "facts.json").write_text(json.dumps(self.facts(**{BG: True})), encoding="utf-8")
+        with inject(**{LAUNCHER_MODULE: launcher_module(error=FakeBgUnknown("not configured"))}):
+            result = run_cli(
+                ["attest", "--adapter", "claude-code", "--facts", "facts.json", "--provenance", "p"], root
+            )
+        self.assertIn("后台启动器不可用：", result.text)
+
 
 def make_node(node_id, files, adapter_id="claude-code"):
     return DAGNode(
