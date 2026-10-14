@@ -29,9 +29,18 @@ from vibe_guide.models import AgentCapabilities, Plan
 from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
-from vibe_guide.state import _decode_snapshot, load_events, load_snapshot, run_dir
+from vibe_guide.state import (
+    _decode_snapshot,
+    load_events,
+    load_snapshot,
+    run_dir,
+    save_snapshot,
+)
 
-from tests.test_reauthorization_gates import ScopeOnlyReauthorizationTests
+# Module imports, not class imports: a TestCase bound at module level here
+# would be collected and run a second time by discovery.
+from tests import test_reauthorization_gates as _reauthorization_gates
+from tests import test_visible_sdd_contract as _visible_sdd_contract
 
 
 def _digest_as_507(nodes):
@@ -74,7 +83,7 @@ class LegacyContractDigestTests(unittest.TestCase):
 
     @staticmethod
     def _nodes(a_files=None):
-        return ScopeOnlyReauthorizationTests._nodes(a_files=a_files)
+        return _reauthorization_gates.ScopeOnlyReauthorizationTests._nodes(a_files=a_files)
 
     def _record(self, nodes):
         return authorize(
@@ -97,6 +106,34 @@ class LegacyContractDigestTests(unittest.TestCase):
                 "executable_contract_changed",
             )
         return snapshot, changed
+
+    def test_dual_visible_replay_accepts_a_507_acceptance(self):
+        """A 5.0.7 acceptance event left unapplied replays under new code."""
+        nodes = self._nodes()
+        runner = self._accepting_runner()
+        with _as_written_by_507():
+            snapshot = Monitor(self.paths, self.plan, nodes).start(
+                self._record(nodes), runner
+            )
+            monitor = Monitor(self.paths, self.plan, nodes)
+            preserved = None
+            for _ in range(10):
+                if snapshot.nodes["b"]["status"] == "review":
+                    preserved = copy.deepcopy(snapshot)
+                snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertIsNotNone(preserved)
+        self.assertEqual(snapshot.nodes["b"]["status"], "accepted")
+        save_snapshot(self.paths, preserved)
+
+        recovered = Monitor(self.paths, self.plan, nodes).tick(
+            snapshot.run_id, runner
+        )
+
+        self.assertEqual(recovered.nodes["b"]["status"], "accepted")
+        self.assertEqual(
+            recovered.nodes["b"]["acceptance"]["contract_digest"],
+            _digest_as_507([nodes[1]]),
+        )
 
     def _accepted_507_run(self):
         """Both nodes accepted under 5.0.7, so every stored digest is the old form."""
@@ -153,7 +190,7 @@ class LegacyContractDigestTests(unittest.TestCase):
 
     def test_new_code_reauthorization_still_invalidates_a_507_semantic_change(self):
         snapshot = self._accepted_507_run()
-        changed = ScopeOnlyReauthorizationTests._nodes(
+        changed = _reauthorization_gates.ScopeOnlyReauthorizationTests._nodes(
             a_acceptance="verified_fact: changed"
         )
         rebound = self._reauthorize_under_new_code(snapshot, changed)
@@ -274,6 +311,32 @@ class LegacyContractDigestTests(unittest.TestCase):
                 snapshot.run_id, mutate_event=mix_event, mutate_state=mix_state
             )
 
+
+
+class LegacyVisibleSddReplayTests(unittest.TestCase):
+    setUp = _visible_sdd_contract.VisibleSddAcceptanceMonitorTests.setUp
+    tearDown = _visible_sdd_contract.VisibleSddAcceptanceMonitorTests.tearDown
+    _monitor = _visible_sdd_contract.VisibleSddAcceptanceMonitorTests._monitor
+    _runner = staticmethod(_visible_sdd_contract.VisibleSddAcceptanceMonitorTests._runner)
+
+    def test_visible_sdd_replay_accepts_a_507_acceptance(self):
+        with _as_written_by_507():
+            monitor, record = self._monitor()
+            runner = self._runner()
+            snapshot = monitor.start(record, runner)
+            preserved = copy.deepcopy(snapshot)
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
+        legacy = _digest_as_507([monitor.nodes["sdd-a"]])
+        self.assertEqual(snapshot.nodes["sdd-a"]["contract_digest"], legacy)
+        save_snapshot(self.paths, preserved)
+
+        recovered = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(recovered.nodes["sdd-a"]["status"], "accepted")
+        self.assertEqual(
+            recovered.nodes["sdd-a"]["acceptance"]["contract_digest"], legacy
+        )
 
 if __name__ == "__main__":
     unittest.main()
