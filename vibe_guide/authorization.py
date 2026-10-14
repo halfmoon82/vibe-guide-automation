@@ -701,6 +701,9 @@ def legacy_executable_contract_digest(nodes: List[DAGNode]) -> str:
     )
 
 
+_CONTRACT_DIGEST = re.compile(r"[0-9a-f]{64}")
+
+
 def executable_contract_digest_algorithms() -> Tuple[Callable[[List[DAGNode]], str], ...]:
     """Every algorithm a persisted contract digest may legitimately use.
 
@@ -711,8 +714,13 @@ def executable_contract_digest_algorithms() -> Tuple[Callable[[List[DAGNode]], s
 
 
 def executable_contract_digest_matches(nodes: List[DAGNode], digest: Any) -> bool:
-    """Whether ``digest`` is the current or the v5.0.7 digest of ``nodes``."""
-    if not isinstance(digest, str):
+    """Whether ``digest`` is the current or the v5.0.7 digest of ``nodes``.
+
+    Anything but 64 lowercase hex characters is a mismatch.  The check comes
+    first because ``secrets.compare_digest`` raises ``TypeError`` on
+    non-ASCII text, and a corrupt persisted digest must be refused, not crash.
+    """
+    if not isinstance(digest, str) or not _CONTRACT_DIGEST.fullmatch(digest):
         return False
     return any(
         secrets.compare_digest(digest, algorithm(nodes))

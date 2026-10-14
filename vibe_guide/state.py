@@ -19,6 +19,7 @@ from .authorization import (
     AuthorizationRecord,
     affected_node_closure,
     executable_contract_digest_algorithms,
+    executable_contract_digest_matches,
     is_authorization_integrity_valid,
 )
 from .contracts import RunEvent
@@ -1131,11 +1132,15 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
             for algorithm in executable_contract_digest_algorithms()
         ):
             raise ValueError("reauthorization authorized DAG proof is invalid")
+        authorized_by_id = {node.id: node for node in authorized_nodes}
+        # Unchanged means the previous digest binds the authorized contract
+        # under either algorithm (a v5.0.7 digest never equals a current one).
         expected_changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if previous_node_contract_digests[node_id]
-            != node_contract_digests[node_id]
+            if not executable_contract_digest_matches(
+                [authorized_by_id[node_id]], previous_node_contract_digests[node_id]
+            )
         )
         retained_ids = set(retained_acceptances)
         invalidated_ids = set(invalidated_acceptances)
@@ -1156,12 +1161,14 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 or not isinstance(evidence, dict)
                 or set(evidence) != {"contract_digest", "authorization_epoch"}
                 or evidence["contract_digest"] != previous_node_contract_digests[node_id]
-                or evidence["contract_digest"] != node_contract_digests[node_id]
+                or not executable_contract_digest_matches(
+                    [authorized_by_id[node_id]], evidence["contract_digest"]
+                )
                 or evidence["authorization_epoch"] != previous.digest
             ):
                 raise ValueError("retained acceptance proof is invalid")
             retained_acceptance_proofs.append(
-                (node_id, evidence["contract_digest"], replacement.digest)
+                (node_id, node_contract_digests[node_id], replacement.digest)
             )
         for node_id, evidence in invalidated_acceptances.items():
             if (
