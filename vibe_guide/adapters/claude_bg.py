@@ -318,22 +318,33 @@ class ClaudeBgLauncher:
         except ClaudeBgUnknown as error:
             return "stray check unknown (%s)" % error.reason
         stopped = []
+        unreadable = False
         for item in entries:
             started = item.get("startedAt")
             session_id = item.get("sessionId")
             if (
-                item.get("name") == name
-                and self._same_dir(item.get("cwd"))
-                and isinstance(started, (int, float)) and not isinstance(started, bool)
-                and started >= started_ms - 5000
-                and item.get("state") != "stopped"
-                and isinstance(session_id, str) and _UUID.fullmatch(session_id)
+                item.get("name") != name
+                or not self._same_dir(item.get("cwd"))
+                or item.get("state") == "stopped"
+                or not isinstance(session_id, str)
+                or not _UUID.fullmatch(session_id)
             ):
-                try:
-                    self._run(self._claude("stop", session_id[:8]), self._worktree())
-                    stopped.append(session_id[:8])
-                except ClaudeBgUnknown:
-                    stopped.append(session_id[:8] + "(stop unknown)")
+                continue
+            # startedAt is epoch milliseconds (live: 1789700548837).
+            if not isinstance(started, (int, float)) or isinstance(started, bool):
+                unreadable = True
+                continue
+            if started < started_ms - 5000:
+                continue
+            short = session_id[:8]
+            try:
+                result = self._run(self._claude("stop", short), self._worktree())
+                stopped.append(short if result.returncode == 0 else short + "(stop failed)")
+            except ClaudeBgUnknown:
+                stopped.append(short + "(stop unknown)")
+        if unreadable:
+            return "stray check unknown (session start time unreadable); stopped: %s" % (
+                ", ".join(stopped) or "none")
         return "stray sessions stopped: %s" % (", ".join(stopped) or "none")
 
     def _bind(self, short_id: str, role: str, issue_id: str) -> Dict[str, Any]:
@@ -435,18 +446,20 @@ class ClaudeBgLauncher:
             if "started a copy" not in combined and match and match.group(1) == short:
                 return
             copy = match.group(1) if match else None
+            cleaned = True
             if copy and copy != short:
                 for op in ("stop", "rm"):
                     try:
-                        self._run(self._claude(op, copy), worktree)
+                        cleaned = self._run(self._claude(op, copy), worktree).returncode == 0 and cleaned
                     except ClaudeBgUnknown:
-                        pass
+                        cleaned = False
             if "is already running" in combined and attempt + 1 < len(_RESUME_SETTLE_SECONDS):
                 continue
             if "is already running" in combined:
                 raise ClaudeBgUnknown(
-                    "session %s still running after stop; resume gave up after %d attempts (copy %s removed)"
-                    % (short, len(_RESUME_SETTLE_SECONDS), copy or "unknown")
+                    "session %s still running after stop; resume gave up after %d attempts (copy %s %s)"
+                    % (short, len(_RESUME_SETTLE_SECONDS), copy or "unknown",
+                       "removed" if cleaned else "cleanup failed")
                 )
             raise ClaudeBgUnknown(
                 "resume of %s did not continue the same session (copy short id: %s); copy stop attempted"

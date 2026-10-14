@@ -341,6 +341,14 @@ class ResumeSettleTest(LauncherCase):
         self.assertEqual(len(self.sleeps), 2)
         self.assertGreater(self.sleeps[1], self.sleeps[0])
 
+    def test_copy_stop_failure_is_not_reported_as_removed(self):
+        self.fake.resume_outs = [RUNNING_COPY] * 10
+        self.fake.returncodes["stop"] = 1
+        self.fake.returncodes["rm"] = 1
+        with self.assertRaises(ClaudeBgUnknown) as ctx:
+            self.launcher().resume(UUID, "x")
+        self.assertIn("cleanup failed", ctx.exception.reason)
+
     def test_gives_up_after_bounded_retries(self):
         self.fake.resume_outs = [RUNNING_COPY] * 10
         with self.assertRaises(ClaudeBgUnknown) as ctx:
@@ -386,6 +394,38 @@ class HardeningTest(LauncherCase):
         self.assertIn(SHORT, ctx.exception.reason)
         self.assertIn(["claude", "stop", SHORT], self.argvs())
         self.assertNotIn(["claude", "stop", old[:8]], self.argvs())
+
+    def stray(self, **override):
+        entry = {"sessionId": UUID, "name": "n1-developer", "cwd": str(self.worktree),
+                 "state": "working", "startedAt": 10 ** 13}
+        entry.update(override)
+        return entry
+
+    def launch_failing(self, entries):
+        self.fake.bg_error = ClaudeBgUnknown("claude timed out after 60s")
+        self.fake.agents_out = json.dumps(entries)
+        with self.assertRaises(ClaudeBgUnknown) as ctx:
+            self.launcher().launch("developer", "n1", self.contract)
+        return ctx.exception.reason
+
+    def test_stray_check_spares_other_names_dirs_and_stopped(self):
+        # Each guard alone must keep a session out of the stop list.
+        for override in ({"name": "n2-developer"}, {"cwd": str(self.tmp)}, {"state": "stopped"}):
+            with self.subTest(override=override):
+                self.fake.calls.clear()
+                reason = self.launch_failing([self.stray(**override)])
+                self.assertNotIn(["claude", "stop", SHORT], self.argvs())
+                self.assertIn("stopped: none", reason)
+
+    def test_stray_stop_failure_is_not_reported_as_stopped(self):
+        self.fake.returncodes["stop"] = 1
+        reason = self.launch_failing([self.stray()])
+        self.assertIn(SHORT + "(stop failed)", reason)
+
+    def test_stray_with_unreadable_start_time_is_unknown_not_none(self):
+        reason = self.launch_failing([self.stray(startedAt="2026-10-14T09:00:00Z")])
+        self.assertNotIn(["claude", "stop", SHORT], self.argvs())
+        self.assertIn("stray check unknown", reason)
 
     def test_launch_failure_cleanup_query_failure_is_reported(self):
         self.fake.bg_error = ClaudeBgUnknown("claude timed out after 60s")
