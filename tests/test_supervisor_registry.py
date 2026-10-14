@@ -477,5 +477,28 @@ class LeaseEpochTests(unittest.TestCase):
             current_supervisor_address(self.paths, "run-1")["current"]["session_id"], "C")
 
 
+    def test_l_split_owner_recovering_after_successor_is_superseded(self):
+        self._split_register_b()
+        entry = register_supervisor_address(self.paths, "run-1", self._addr("C"))
+        self.assertEqual(entry["lease_epoch"], 3)
+        with self.assertRaises(SupervisorLeaseConflict):
+            register_supervisor_address(self.paths, "run-1", self._addr("B"))
+        current = current_supervisor_address(self.paths, "run-1")
+        self.assertEqual(current["current"]["session_id"], "C")
+        self.assertEqual(read_lease_epoch(self.paths, "run-1"), 3)
+        recovered = [h for h in current["history"] if h.get("session_id") == "B"]
+        self.assertEqual(len(recovered), 1)
+        self.assertTrue(recovered[0]["recovered_from_lease"])
+        self.assertEqual(recovered[0]["lease_epoch"], 2)
+
+    def test_m_same_session_different_host_spelling_is_same_shift(self):
+        register_supervisor_address(
+            self.paths, "run-1", {"provider": "codex", "session_id": "A", "host": "mac"})
+        entry = register_supervisor_address(
+            self.paths, "run-1", {"provider": "codex", "session_id": "A", "host": "mac2"})
+        self.assertEqual(entry["lease_epoch"], 1)
+        self.assertEqual(read_lease_epoch(self.paths, "run-1"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -727,6 +727,15 @@ def _registry_path(paths, run_id):
     return run_dir(paths, run_id, create=True) / _REGISTRY_NAME
 
 
+def _same_session(left, right) -> bool:
+    """Session identity is provider + session_id; host spelling may vary."""
+    return (
+        isinstance(left, dict) and isinstance(right, dict)
+        and left.get("provider") == right.get("provider")
+        and left.get("session_id") == right.get("session_id")
+    )
+
+
 def _write_registry(path, registry):
     descriptor, temporary = tempfile.mkstemp(
         prefix=".supervisor-registry-", dir=str(path.parent)
@@ -793,9 +802,8 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
         disk_owner = lease_record.get("owner") if lease_record else None
         if not isinstance(disk_owner, dict):
             disk_owner = None
-        owns_disk = disk_owner is not None and (
-            disk_owner.get("provider"), disk_owner.get("session_id"), disk_owner.get("host")
-        ) == (provider, session_id, host)
+        this_session = {"provider": provider, "session_id": session_id}
+        owns_disk = _same_session(disk_owner, this_session)
 
         def reject(reason):
             rejected.append({
@@ -809,7 +817,8 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
             _write_registry(path, kept)
             raise SupervisorLeaseConflict(reason)
 
-        same_shift = isinstance(current, dict) and current.get("session_id") == session_id
+        same_shift = _same_session(current, this_session)
+        recovered_owner = None
         if owns_disk and not same_shift:
             # This session already won the CAS but died before the registry
             # write: repair the registry without a second epoch bump.
@@ -831,8 +840,21 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
                 )
             except SupervisorLeaseConflict as error:
                 reject(str(error))
+            if disk_owner is not None and not _same_session(disk_owner, current):
+                # The previous disk owner won its CAS but never reached the
+                # registry; record it as superseded so it cannot re-register.
+                recovered_owner = {
+                    "provider": disk_owner.get("provider"),
+                    "session_id": disk_owner.get("session_id"),
+                    "host": disk_owner.get("host"),
+                    "lease_epoch": on_disk,
+                    "registered_at": time.time(),
+                    "recovered_from_lease": True,
+                }
         if isinstance(current, dict):
             history.append(current)
+        if recovered_owner is not None:
+            history.append(recovered_owner)
         entry = {
             "provider": provider,
             "session_id": session_id,
