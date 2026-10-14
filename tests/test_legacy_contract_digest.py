@@ -22,7 +22,9 @@ from vibe_guide.authorization import (
     build_authorization_card,
     canonical_node_contracts,
     executable_contract_digest,
+    executable_contract_digest_matches,
     is_authorization_valid,
+    legacy_executable_contract_digest,
 )
 from vibe_guide.capability_contract import build_contract, save_contract
 from vibe_guide.models import AgentCapabilities, Plan
@@ -337,6 +339,27 @@ class LegacyVisibleSddReplayTests(unittest.TestCase):
         self.assertEqual(
             recovered.nodes["sdd-a"]["acceptance"]["contract_digest"], legacy
         )
+
+
+class MalformedContractDigestTests(unittest.TestCase):
+    """A corrupt persisted digest is a mismatch, never a crash."""
+
+    def test_both_algorithms_still_match(self):
+        self.assertTrue(
+            executable_contract_digest_matches([], executable_contract_digest([]))
+        )
+        self.assertTrue(
+            executable_contract_digest_matches(
+                [], legacy_executable_contract_digest([])
+            )
+        )
+
+    def test_malformed_digests_are_mismatches_not_errors(self):
+        current = executable_contract_digest([])
+        for digest in ("\u00e9", "\u00e9" * 64, current.upper(), current[:-1], "", None, 7):
+            with self.subTest(digest=digest):
+                self.assertFalse(executable_contract_digest_matches([], digest))
+
 
 if __name__ == "__main__":
     unittest.main()
