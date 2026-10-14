@@ -274,7 +274,8 @@ class HeartbeatIntervalTests(unittest.TestCase):
             handoff, text = supervisor_handoff(self.paths, 'run-1')
         self.assertEqual(handoff['heartbeat_interval']['minutes'], 60)
         self.assertIn('心跳间隔：当前 60 分钟', text)
-        DecisionMailbox(self.paths).answer(request['decision_id'], 'A')
+        DecisionMailbox(self.paths).answer(request['decision_id'], 'A',
+            request_digest=request['request_digest'])
         after = run_cli(args, self.root)
         self.assertNotEqual(after.payload['state'], 'decision')
         self.assertEqual(after.payload['heartbeat_interval']['minutes'], 10)
