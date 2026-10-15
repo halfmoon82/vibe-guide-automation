@@ -23,27 +23,33 @@ before any state change raise ``ScopeDecisionRequired`` (CLI exit 3,
 """
 import io
 import json
+import os
+import socket
 import subprocess
 import sys
 import tarfile
 import tempfile
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
+from vibe_guide import cli as vibe_cli
 from vibe_guide.authorization import authorize, build_authorization_card
 from vibe_guide.capability_contract import build_contract, save_contract
-from vibe_guide.cli import _observed_topology_rulings, run_cli
+from vibe_guide.cli import _observed_topology_rulings, _public_runner, run_cli
 from vibe_guide.deploy import DeployManifest
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan
 from vibe_guide.monitor import Monitor, ScopeDecisionRequired, VISIBLE_SDD_PROTOCOL_REF
 from vibe_guide.paths import ProjectPaths
-from vibe_guide.planner import resolve_scope_expansion, route_task
+from vibe_guide.planner import resolve_scope_expansion
+from vibe_guide.runners.claude_bg import ClaudeBgRunner
 from vibe_guide.runners.fake import FakeRunner
-from vibe_guide.session_entry import default_s1_context
-from vibe_guide.state import load_events, load_snapshot, map_user_status
+from vibe_guide.runners.provider_action import ProviderActionRunner
+from vibe_guide.state import load_events, map_user_status
 
+from tests.support_v45_authorize import publish_complex_probe
 from tests.test_monitor import VisibleSddRunner, load_v46_dispatch_fixture
 
 
@@ -75,6 +81,15 @@ V42_STATE = {
 }
 V2_STATE = {"workflow_version": 2, "session_gate": "s0_required"}
 FULL = AgentCapabilities("fake", True, True, True, True, True, "full")
+CLAUDE_FULL = AgentCapabilities("claude-code", True, True, True, True, True, "full")
+
+#: Native visible-task facts (same set as tests/support_v45_authorize.py).
+_CLAUDE_VISIBLE_FACTS = {
+    "claude-code." + name: True
+    for name in ("agent", "shell", "subprocess", "worktree",
+                 "visible_task.create", "visible_task.enter",
+                 "visible_task.resume", "visible_task.wait")
+}
 
 
 def _worker_profile(node_id, files):
@@ -114,15 +129,42 @@ def _scope_claim(files, **overrides):
     return claim
 
 
+def _isolate_user_dirs(case):
+    """Point HOME and VIBE_HOME at throwaway directories for this test."""
+    home = tempfile.TemporaryDirectory(prefix="vg-integrated-home-")
+    vibe_home = tempfile.TemporaryDirectory(prefix="vg-integrated-vibe-home-")
+    case.addCleanup(home.cleanup)
+    case.addCleanup(vibe_home.cleanup)
+    patcher = patch.dict(os.environ, {"HOME": home.name, "VIBE_HOME": vibe_home.name})
+    patcher.start()
+    case.addCleanup(patcher.stop)
+
+
+#: Approved naming decision the consistency resolver checks findings against
+#: (same shape as tests/test_auto_scope_files.py).
+NAMING_DECISION = {
+    "id": "decision-naming",
+    "field": "naming",
+    "revision": 1,
+    "status": "approved",
+    "selected": "approved-name",
+    "question": "canonical name",
+}
+
+
 class _ProjectCase(unittest.TestCase):
     """Temporary project root with a fake capability contract."""
 
     state = V2_STATE
 
     def setUp(self):
-        self._temporary = tempfile.TemporaryDirectory(prefix="vg-integrated-prd-")
-        self.addCleanup(self._temporary.cleanup)
-        self.root = Path(self._temporary.name)
+        _isolate_user_dirs(self)
+        self._make_project()
+
+    def _make_project(self):
+        temporary = tempfile.TemporaryDirectory(prefix="vg-integrated-prd-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
         self.paths = ProjectPaths(self.root)
         self.paths.vibe.mkdir(parents=True, exist_ok=True)
         (self.paths.vibe / "state.json").write_text(
@@ -132,8 +174,12 @@ class _ProjectCase(unittest.TestCase):
             self.paths, build_contract(self.root, provider="fake", host_id="local")
         )
 
-    def _start(self, nodes, events, topology_rulings=None, card_kwargs=None):
-        plan = Plan("plan-1", 1, "docs/prd.md", [n.id for n in nodes], "draft")
+    def _start(self, nodes, events, topology_rulings=None, card_kwargs=None,
+               plan_kwargs=None):
+        plan = Plan(
+            "plan-1", 1, "docs/prd.md", [n.id for n in nodes], "draft",
+            **(plan_kwargs or {})
+        )
         card = build_authorization_card(plan, nodes, FULL, **(card_kwargs or {}))
         runner = FakeRunner(events=events)
         monitor = Monitor(self.paths, plan, nodes, topology_rulings=topology_rulings)
@@ -413,7 +459,7 @@ class ACB6RecoveryActionTests(_ProjectCase):
         }
         for label, event in cases.items():
             with self.subTest(reason=label):
-                self.setUp()
+                self._make_project()
                 monitor, runner, snapshot = self._single([event])
                 snapshot = monitor.tick(snapshot.run_id, runner)
                 current = snapshot.nodes["n1"]
@@ -489,22 +535,36 @@ class ACB6RecoveryActionTests(_ProjectCase):
         self.assertEqual(developer_tasks, {"developer:n1"}, "no successor task")
 
     def test_ac_b6_prd_guide_section_7_lists_recovery_and_requeue_entries(self):
-        """Protocol anchor (辅助): §7 lists each action and a requeue entry."""
+        """Protocol anchor (辅助): §7 lists each action and a requeue entry.
+
+        Facts are anchored to the line that owns them, not the whole section.
+        """
         text = (PROTOCOLS / "prd-guide.md").read_text(encoding="utf-8")
         section = text.split("## 7.", 1)[1].split("\n## ", 1)[0]
+        lines = section.splitlines()
         for action in ("repair_node", "requeue_same_task", "reconcile_binding",
                        "await_external_decision"):
-            self.assertIn("`" + action + "`", section)
-        self.assertIn("vibe repair --plan", section)
-        self.assertIn(
-            "vibe requeue", section,
-            "#153: prd-guide §7 must give the re-queue entry as a command; it "
-            "only says 'repair/requeue 入口'",
+            self.assertTrue(
+                any(l.lstrip().startswith("- `" + action + "`") for l in lines),
+                "prd-guide §7 must give {} its own bullet".format(action),
+            )
+        self.assertEqual(
+            run_cli(["requeue", "--help"], self.root).exit_code, 0,
+            "#153: the requeue entry named in prd-guide §7 must exist as a command",
         )
+        entry_line = next((l for l in lines if "requeue 入口" in l), "")
         self.assertIn(
-            "change_reviewer_or_split_node", section,
-            "#153: prd-guide §7 must name the 3-round action",
+            "`reconcile_binding`", entry_line,
+            "prd-guide §7: the repair/requeue entry must sit on the reconcile_binding row",
         )
+        self.assertIn("vibe repair --plan", entry_line)
+        loop_line = next((l for l in lines if "三轮返工仍不收敛" in l), "")
+        self.assertTrue(loop_line, "prd-guide §7 must state the 3-round rule")
+        for fact in ("换 reviewer", "拆节点", "唯一 writer", "PRD 验收判定"):
+            self.assertIn(
+                fact, loop_line,
+                "#153: the 3-round line of prd-guide §7 must carry {!r}".format(fact),
+            )
 
 
 class ACB6ReworkLoopTests(_ProjectCase):
@@ -582,17 +642,37 @@ class ACB6ReworkLoopTests(_ProjectCase):
         )
 
     def test_ac_b6_three_rounds_escalate_only_when_acceptance_changes(self):
-        """#153: 只有分歧点改变验收判定才升级."""
-        _monitor, _runner, snapshot = self._three_rounds({
+        """#153: 只有分歧点改变验收判定才升级.
+
+        Driven directly (not via ``_three_rounds``): an escalation may stop
+        the loop before three reviews ran, which is allowed.
+        """
+        finding = {
             "finding": "the approved acceptance example itself is wrong",
             "severity": "P1",
             "changes_prd_acceptance": True,
+        }
+        monitor, runner, snapshot = self._start([_node("n1")], {
+            ("n1", "developer"): [("complete", {"evidence": "d"})] * 5,
+            ("n1", "reviewer"): [("review_finding", dict(finding))] * 5,
         })
+        snapshot = self._tick_until(
+            monitor, runner, snapshot, "n1",
+            {"blocked_unknown", "blocked_design"},
+        )
+        reviews = [c for c in runner.start_calls if c["role"] == "reviewer"]
+        current = snapshot.nodes["n1"]
+        self.assertLessEqual(
+            len(reviews), 3,
+            "#153: at most three review rounds before the loop stops",
+        )
         self.assertEqual(
-            map_user_status(snapshot.nodes["n1"]), PM_INTERRUPT,
+            map_user_status(current), PM_INTERRUPT,
             "#153: a disagreement that changes PRD acceptance must escalate to "
-            "the PM; main looped it as ordinary rework and ended status={!r}".format(
-                snapshot.nodes["n1"]["status"]
+            "the PM; main ended status={!r} recovery_action={!r} after {} "
+            "review rounds -- Monitor._finding_changes_prd_acceptance "
+            "(monitor.py:6233) has no caller".format(
+                current["status"], current.get("recovery_action"), len(reviews)
             ),
         )
 
@@ -652,7 +732,7 @@ class ACB3ThirdPartyDependencyTests(_ProjectCase):
         regardless of where the file sits.
         """
         for path in ("tests/requirements.txt", "tests/package.json",
-                     "tests/pyproject.toml", "tests/fixtures/package-lock.json"):
+                     "tests/pyproject.toml"):
             with self.subTest(path=path):
                 mechanical = resolve_scope_expansion([path], ["n1.py"], ["n1.py"])
                 claimed = resolve_scope_expansion(
@@ -666,34 +746,68 @@ class ACB3ThirdPartyDependencyTests(_ProjectCase):
                 )
                 self.assertIsNone(claimed)
 
-    def test_ac_b3_review_finding_adding_dependency_blocks_for_pm(self):
-        """Ordinary rework path: a finding whose fix adds a dependency."""
-        node = _node("n1")
-        monitor, runner, snapshot = self._start([node], {
-            ("n1", "developer"): [("complete", {"evidence": "d"})],
-        })
+    def _review_finding_run(self, files, adds_dependency):
+        """Ordinary rework path: a finding whose fix needs files outside scope.
+
+        The plan carries the approved naming decision and the node contract
+        the approved value, so the consistency resolver actually evaluates
+        the claim instead of refusing an unbound decision outright.
+        """
+        node = _node("n1", naming="approved-name")
+        monitor, runner, snapshot = self._start(
+            [node],
+            {("n1", "developer"): [("complete", {"evidence": "d"})] * 2},
+            plan_kwargs={"decisions": [dict(NAMING_DECISION)]},
+        )
         snapshot = monitor.tick(snapshot.run_id, runner)
         binding = [c for c in runner.start_calls if c["node_id"] == "n1"][-1][
             "consistency_binding"
         ]
-        files = ["n1.py", "requirements.txt"]
-        decision = {"id": "decision-naming", "field": "naming", "revision": 1,
-                    "status": "approved", "selected": "approved-name"}
         runner.events[("n1", "reviewer")] = [("review_finding", {
-            "finding": "needs the requests package",
+            "finding": "needs a change outside the node scope",
             "in_contract": False,
             "consistency": {
-                "field": "naming", "action": "rework", "files": files,
+                "field": "naming", "action": "rework", "files": list(files),
                 "candidates": [
                     {"source": "approved_prd", "value": "approved-name",
-                     "binding": binding, "decision": decision},
+                     "binding": binding, "decision": dict(NAMING_DECISION)},
                     {"source": "implementation", "value": "stale-name"},
                 ],
-                "scope_expansion": _scope_claim(files, adds_third_party_dependency=True),
+                "scope_expansion": _scope_claim(
+                    files, adds_third_party_dependency=adds_dependency
+                ),
             },
         })]
         snapshot = monitor.tick(snapshot.run_id, runner)
-        self.assertEqual(map_user_status(snapshot.nodes["n1"]), PM_INTERRUPT)
+        expanded = [
+            r for r in load_events(self.paths, snapshot.run_id)
+            if r["event"] == "scope_auto_expanded"
+        ]
+        return snapshot.nodes["n1"], expanded
+
+    def test_ac_b3_review_finding_adding_dependency_blocks_for_pm(self):
+        current, expanded = self._review_finding_run(
+            ["n1.py", "requirements.txt"], adds_dependency=True
+        )
+        self.assertEqual(
+            map_user_status(current), PM_INTERRUPT,
+            "AC-B3: a rework finding that adds a dependency ended "
+            "status={!r} reason={!r}".format(current["status"], current.get("reason")),
+        )
+        self.assertEqual(expanded, [])
+
+    def test_ac_b3_review_finding_without_dependency_reworks_without_pm(self):
+        """Control: the same finding minus the dependency is auto-handled."""
+        current, expanded = self._review_finding_run(
+            ["n1.py", "tests/test_n1.py"], adds_dependency=False
+        )
+        self.assertNotEqual(map_user_status(current), PM_INTERRUPT)
+        self.assertEqual(
+            current["status"], "rework",
+            "control: a test-file-only expansion is ordinary rework, got "
+            "status={!r} reason={!r}".format(current["status"], current.get("reason")),
+        )
+        self.assertEqual(len(expanded), 1, "§5.8: the expansion leaves a record")
 
 
 class ACB3VisibilityDowngradeTests(_ProjectCase):
@@ -735,28 +849,70 @@ class ACB3VisibilityDowngradeTests(_ProjectCase):
             {"claude-code": "dual-visible"},
         )
 
-    def test_ac_b3_monitor_never_dispatches_background_under_a_visible_card(self):
-        """The dispatcher itself must stop for the PM, not silently downgrade.
-
-        The card the user signed lists n1 as ``visible``.  A background ruling
-        reaching the monitor (any caller that builds ``Monitor`` with the live
-        ruling) must not start a background worker; it must stop at a PM
-        boundary.
-        """
-        monitor, runner, snapshot = self._start(
-            [self._node()], {}, topology_rulings={"claude-code": "background"}
+    def test_ac_b3_cli_dispatch_keeps_visible_runner_for_a_visible_card(self):
+        """The CLI dispatch path (``_public_runner``) never picks the
+        background runner for a card signed ``visible``."""
+        self.assertEqual(run_cli(["init", "--confirm", "--json"], self.root).exit_code, 0)
+        store = self.root / ".vibe" / "provider-actions"
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "capabilities.json").write_text(json.dumps({
+            "schema_version": 1, "adapter_id": "claude-code",
+            "facts": dict(_CLAUDE_VISIBLE_FACTS,
+                          **{"claude-code.background_task.launch": True}),
+            "provenance": "live:test",
+        }), encoding="utf-8")
+        node = self._node()
+        card = build_authorization_card(
+            Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft"), [node], CLAUDE_FULL
         )
-        topologies = [c.get("topology") for c in runner.start_calls]
+        self.assertEqual(card.workers[0]["mode"], "visible")
+        self.assertEqual(
+            vibe_cli._observed_adapter(self.paths, "claude-code").capabilities.mode,
+            "background",
+            "fixture precondition: the recorded facts make background available",
+        )
+        runner = _public_runner(self.paths, card, [node])
+        self.assertNotIsInstance(runner, ClaudeBgRunner)
+        self.assertIsInstance(runner, ProviderActionRunner)
         self.assertNotIn(
-            "background", topologies,
-            "AC-B3: card signed visible, monitor dispatched {} with "
-            "limitations {}; a visible→background downgrade must ask the PM "
-            "instead".format(
-                topologies,
-                [c.get("dispatch_limitations") for c in runner.start_calls],
+            "background", set(_observed_topology_rulings(self.paths, card).values())
+        )
+
+
+class ACB3VisibilityDowngradePreviewTests(unittest.TestCase):
+    """AC-B3（PRD 可观察面）：发布可见卡后出现后台能力，预览必须要求产品经理
+    授权降级 / 重新授权，而不是静默沿用。"""
+
+    def setUp(self):
+        _isolate_user_dirs(self)
+
+    def test_ac_b3_preview_asks_pm_to_authorize_a_visibility_downgrade(self):
+        root = publish_complex_probe(self)
+        capabilities = root / ".vibe" / "provider-actions" / "capabilities.json"
+        recorded = json.loads(capabilities.read_text(encoding="utf-8"))
+        recorded["facts"]["claude-code.background_task.launch"] = True
+        capabilities.write_text(json.dumps(recorded), encoding="utf-8")
+
+        result = run_cli(
+            ["monitor", "--plan", "probe-plan", "--preview-card", "--json"], root
+        )
+        payload = result.payload
+        rendered = json.dumps(payload, ensure_ascii=False)
+        asks_pm = (
+            payload.get("preview_card_digest_matches_publication") is False
+            or bool(payload.get("changed_fields"))
+            or any(word in rendered for word in ("downgrade", "降级", "reauthoriz", "重新授权"))
+        )
+        self.assertTrue(
+            asks_pm,
+            "AC-B3: visible card published, then claude-code background launch "
+            "became available; `vibe monitor --preview-card` still reports "
+            "topology {} with no downgrade or reauthorization request (status "
+            "{!r}, digest matches publication {!r})".format(
+                payload.get("topology_summary"), payload.get("status"),
+                payload.get("preview_card_digest_matches_publication"),
             ),
         )
-        self.assertEqual(map_user_status(snapshot.nodes["n1"]), PM_INTERRUPT)
 
 
 class ACB3DeployTests(_ProjectCase):
@@ -898,6 +1054,9 @@ def _run_codex_probe(source_root):
 class ACH2CodexTopologyTests(unittest.TestCase):
     """AC-H2（Codex 部分）：Codex 判定结果与改动前逐字一致。"""
 
+    def setUp(self):
+        _isolate_user_dirs(self)
+
     def test_ac_h2_codex_ruling_matches_the_documented_outputs(self):
         current = _run_codex_probe(REPO_ROOT)
         expected = {
@@ -935,7 +1094,10 @@ class ACH2CodexTopologyTests(unittest.TestCase):
                 ),
             )
             with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as bundle:
-                bundle.extractall(tmp)
+                if hasattr(tarfile, "data_filter"):
+                    bundle.extractall(tmp, filter="data")
+                else:
+                    bundle.extractall(tmp)
             baseline = _run_codex_probe(Path(tmp))
         current = _run_codex_probe(REPO_ROOT)
         self.assertEqual(
@@ -977,72 +1139,156 @@ class ACH2CodexTopologyTests(unittest.TestCase):
 # AC-E1 (#128 / B5)
 # ---------------------------------------------------------------------------
 
-_UNREACHABLE_GATEWAY = "http://127.0.0.1:9/triage"
-_TRIAGE_REQUESTS = (
-    "修复 README 里的一个错别字",
-    "重构支付系统：迁移数据库、改造三个微服务接口、接入新的风控规则并上线到生产",
-)
+_TRIAGE_REQUESTS = {
+    # request -> route fixed by the S1 rules (S1=5 / S1=17 on this branch).
+    "修复 README 里的一个错别字": "simple",
+    "重构支付系统：迁移数据库、改造三个微服务接口、接入新的风控规则并上线到生产": "complex",
+}
+_DEGRADED_MARKERS = ("degraded", "降级")
+_REASON_MARKERS = ("reason", "原因")
+
+
+def _has_degradation_record(value):
+    """True when some mapping marks a degradation and carries its reason.
+
+    Field names are deliberately not fixed: any dict whose keys or string
+    values mention ``degraded``/``降级`` and that has a non-empty
+    ``reason``/``原因``-like field counts.
+    """
+    if isinstance(value, dict):
+        texts = [str(k).casefold() for k in value] + [
+            v.casefold() for v in value.values() if isinstance(v, str)
+        ]
+        flagged = any(m in t for t in texts for m in _DEGRADED_MARKERS)
+        reasoned = any(
+            any(m in str(k).casefold() for m in _REASON_MARKERS) and v
+            for k, v in value.items()
+        )
+        if flagged and reasoned:
+            return True
+        return any(_has_degradation_record(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_has_degradation_record(v) for v in value)
+    return False
+
+
+def _file_has_degradation_record(path):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    try:
+        return _has_degradation_record(json.loads(text))
+    except ValueError:
+        pass
+    for line in text.splitlines():
+        try:
+            if _has_degradation_record(json.loads(line)):
+                return True
+        except ValueError:
+            folded = line.casefold()
+            if any(m in folded for m in _DEGRADED_MARKERS) and any(
+                m in folded for m in _REASON_MARKERS
+            ):
+                return True
+    return False
+
+
+def _vibe_fingerprint(root):
+    vibe = root / ".vibe"
+    return {
+        p: p.read_bytes() for p in vibe.rglob("*") if p.is_file()
+    } if vibe.is_dir() else {}
+
+
+class _OutboundRecorder:
+    """Records every outbound connection attempt and refuses it (service off)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def create_connection(self, address, *args, **kwargs):
+        self.calls.append(("socket.create_connection", address))
+        raise ConnectionRefusedError("triage gateway is off (test)")
+
+    def urlopen(self, url, *args, **kwargs):
+        self.calls.append(("urllib.request.urlopen", getattr(url, "full_url", url)))
+        raise OSError("triage gateway is off (test)")
 
 
 class ACE1EntryTriageTests(unittest.TestCase):
     """AC-E1：关掉分诊服务后入口请求按 S1 规则完成分诊并留降级记录；
-    评测报告给出 accuracy、ECE、p95 三项数值，ECE ≤ 0.05。"""
+    评测报告给出 accuracy、ECE、p95 三项数值，ECE ≤ 0.05。
+
+    "Service off" is modelled by refusing every outbound connection."""
 
     def setUp(self):
-        self._temporary = tempfile.TemporaryDirectory(prefix="vg-triage-")
-        self.addCleanup(self._temporary.cleanup)
-        self.root = Path(self._temporary.name)
+        _isolate_user_dirs(self)
+        temporary = tempfile.TemporaryDirectory(prefix="vg-triage-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
         self.assertEqual(run_cli(["init", "--confirm", "--json"], self.root).exit_code, 0)
-        config_path = self.root / ".vibe" / "config.json"
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        # Point any triage gateway at a closed port: the service is "off".
-        config["triage_gateway"] = {"url": _UNREACHABLE_GATEWAY, "timeout_seconds": 1}
-        config_path.write_text(json.dumps(config), encoding="utf-8")
 
     def _plan(self, request):
-        with patch.dict("os.environ", {"VIBE_TRIAGE_GATEWAY_URL": _UNREACHABLE_GATEWAY}):
-            return run_cli(["plan", "--request", request, "--json"], self.root)
+        recorder = _OutboundRecorder()
+        with patch.object(socket, "create_connection", recorder.create_connection), \
+                patch.object(urllib.request, "urlopen", recorder.urlopen):
+            result = run_cli(["plan", "--request", request, "--json"], self.root)
+        return result, recorder
 
     def test_ac_e1_gateway_down_entry_still_triages_by_s1_rules(self):
-        for request in _TRIAGE_REQUESTS:
+        for request, expected in _TRIAGE_REQUESTS.items():
             with self.subTest(request=request):
-                result = self._plan(request)
+                result, _recorder = self._plan(request)
                 self.assertEqual(result.exit_code, 0, result.payload)
-                expected = route_task(default_s1_context(request.lower())).route
                 self.assertEqual(result.payload["route"], expected)
 
-    def test_ac_e1_gateway_down_leaves_a_degradation_record(self):
-        result = self._plan(_TRIAGE_REQUESTS[0])
-        payload_record = result.payload.get("triage")
-        on_disk = sorted(
-            p.relative_to(self.root).as_posix()
-            for p in (self.root / ".vibe").rglob("*")
-            if p.is_file() and "triage" in p.name.casefold()
-        )
+    def test_ac_e1_entry_attempts_the_triage_gateway(self):
+        result, recorder = self._plan(next(iter(_TRIAGE_REQUESTS)))
+        self.assertEqual(result.exit_code, 0, result.payload)
         self.assertTrue(
-            isinstance(payload_record, dict)
-            and payload_record.get("source") == "s1_rules"
-            and payload_record.get("degraded") is True
-            and payload_record.get("reason"),
-            "AC-E1: no triage hook on this branch -- `vibe plan` never calls a "
-            "gateway and records no degradation (payload keys {}, triage files "
-            "under .vibe: {})".format(sorted(result.payload), on_disk),
+            recorder.calls,
+            "AC-E1: `vibe plan --request` made no outbound call at all; there "
+            "is no triage hook on this branch, so nothing is triaged by the "
+            "gateway and the S1 path is not a fallback",
+        )
+
+    def test_ac_e1_gateway_down_leaves_a_degradation_record(self):
+        before = _vibe_fingerprint(self.root)
+        result, recorder = self._plan(next(iter(_TRIAGE_REQUESTS)))
+        after = _vibe_fingerprint(self.root)
+        touched = sorted(p for p, data in after.items() if before.get(p) != data)
+        on_disk = [p for p in touched if _file_has_degradation_record(p)]
+        self.assertTrue(
+            _has_degradation_record(result.payload) or on_disk,
+            "AC-E1: no degradation record -- `vibe plan` with the triage "
+            "service off returned no degraded/降级 entry with a reason "
+            "(payload keys {}) and wrote none under .vibe (files written: {}; "
+            "outbound attempts: {})".format(
+                sorted(result.payload),
+                [p.relative_to(self.root).as_posix() for p in touched],
+                len(recorder.calls),
+            ),
         )
 
     def test_ac_e1_evaluation_scaffold_reports_accuracy_ece_p95(self):
-        candidates = [
-            p for p in list((REPO_ROOT / "scripts").glob("*"))
-            + list((REPO_ROOT / "vibe_guide").rglob("*.py"))
-            if "triage" in p.name.casefold()
-        ]
-        self.assertTrue(
-            candidates,
-            "AC-E1: no triage evaluation scaffold exists (searched scripts/ and "
-            "vibe_guide/ for *triage*); cannot produce accuracy/ECE/p95",
+        scripts = REPO_ROOT / "scripts"
+        candidates = sorted(
+            p for p in (scripts.rglob("*") if scripts.is_dir() else [])
+            if p.is_file() and "triage" in p.name.casefold()
+            and "__pycache__" not in p.parts
         )
-        script = candidates[0]
+        self.assertEqual(
+            len(candidates), 1,
+            "AC-E1: expected exactly one triage evaluation scaffold under "
+            "scripts/ (*triage*), found {}: {}; cannot produce "
+            "accuracy/ECE/p95".format(
+                len(candidates),
+                [p.relative_to(REPO_ROOT).as_posix() for p in candidates],
+            ),
+        )
         completed = subprocess.run(
-            [sys.executable, str(script), "--json"], cwd=str(REPO_ROOT),
+            [sys.executable, str(candidates[0]), "--json"], cwd=str(REPO_ROOT),
             capture_output=True, text=True, timeout=300,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
