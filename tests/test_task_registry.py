@@ -383,6 +383,39 @@ class TaskRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             save_task_binding(self.paths, reviewer)
 
+    def _mark_run_status(self, run_id, status):
+        state = self.paths.root / ".vibe" / "runs" / run_id / "state.json"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"run_id": run_id, "status": status}))
+
+    def test_completed_run_binding_does_not_block_same_issue_in_new_run(self):
+        # A run that finished without archiving its pair leaves a
+        # non-terminal binding behind; it must not block the same issue id
+        # from registering in a later run.
+        old = self.binding()
+        old.status = "delivered"
+        save_task_binding(self.paths, old)
+        self._mark_run_status("run-1", "complete")
+
+        fresh = self.binding(task_id="thread-new")
+        fresh.run_id = "run-2"
+        save_task_binding(self.paths, fresh)
+        self.assertEqual(
+            load_task_binding(self.paths, "N3", "developer", run_id="run-2").task_id,
+            "thread-new",
+        )
+
+    def test_unfinished_run_binding_still_blocks_same_issue_in_new_run(self):
+        old = self.binding()
+        old.status = "delivered"
+        save_task_binding(self.paths, old)
+        self._mark_run_status("run-1", "blocked_unknown")
+
+        fresh = self.binding(task_id="thread-new")
+        fresh.run_id = "run-2"
+        with self.assertRaisesRegex(ValueError, "immutable task identity drift"):
+            save_task_binding(self.paths, fresh)
+
     def test_mode_and_topology_must_agree(self):
         with self.assertRaises(ValueError):
             TaskBinding(
