@@ -686,8 +686,57 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None):
     return entry
 
 
-def current_supervisor_address(paths, run_id):
-    """Return the registered supervisor address or an explicit unknown."""
+#: The push tool a worker uses to wake a supervisor, per host family.  Issue
+#: #208: dispatch text used to say "the authorized channel, fixed format"
+#: without naming either, so workers could only skip the wake-up.  A host is
+#: listed here only with real receipt evidence (Codex: #167); the others say
+#: plainly that there is no channel and the heartbeat collects the delivery.
+WAKE_CHANNELS = {
+    "codex": "send_message_to_thread",
+}
+WAKE_NO_CHANNEL_REASON = {
+    "claude": "Claude Code 没有已验证的推送通道（#154 实测 unverified），等监工心跳拉取",
+    "workbuddy": "WorkBuddy 没有推送通道，等监工心跳拉取",
+}
+
+
+def wake_signal(run_id, node_id=None, role=None, generation=None):
+    """Return the fixed one-line wake-up text.
+
+    It only tells the supervisor where to look; the supervisor never trusts
+    it and re-checks the self-report and native wait as before.
+    """
+    return "vibe-wake run={} node={} role={} generation={}".format(
+        run_id,
+        node_id or "<node>",
+        role or "<role>",
+        generation if generation is not None else "<generation>",
+    )
+
+
+def wake_instruction(address, run_id, node_id=None, role=None, generation=None):
+    """Return how a worker wakes ``address``: channel, target and signal."""
+    provider = str(address.get("provider") or "").lower()
+    family = next((name for name in ("codex", "claude", "workbuddy") if provider.startswith(name)), None)
+    channel = WAKE_CHANNELS.get(family)
+    if channel is None:
+        reason = WAKE_NO_CHANNEL_REASON.get(
+            family, "平台 {} 没有已登记的推送通道，等监工心跳拉取".format(provider or "未知")
+        )
+        return {"channel": None, "reason": reason}
+    return {
+        "channel": channel,
+        "target": address.get("session_id"),
+        "signal": wake_signal(run_id, node_id, role, generation),
+    }
+
+
+def current_supervisor_address(paths, run_id, *, node_id=None, role=None, generation=None):
+    """Return the registered supervisor address or an explicit unknown.
+
+    An ``ok`` answer also carries ``wake``: the push channel, its target and
+    the filled-in signal, or ``channel: null`` with the reason there is none.
+    """
     registry = _read_json_file(_registry_path(paths, run_id))
     if not isinstance(registry, dict) or not isinstance(registry.get("current"), dict):
         return {"status": "unknown", "reason": "no supervisor registered"}
@@ -695,6 +744,7 @@ def current_supervisor_address(paths, run_id):
         "status": "ok",
         "current": registry["current"],
         "history": registry.get("history", []),
+        "wake": wake_instruction(registry["current"], run_id, node_id, role, generation),
     }
 
 
