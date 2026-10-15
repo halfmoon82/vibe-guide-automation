@@ -457,8 +457,8 @@ def _observed_engine_attestation(paths: ProjectPaths, plan: Plan) -> Dict[str, A
     """Re-observe the engine evidence a same-plan reauthorization has to name.
 
     Publication stamps the plan's ``engine-attestation.json`` once, and
-    ``validate_engine_attestation`` refuses evidence older than a day.  A plan
-    published more than a day ago therefore could not be reauthorized at all:
+    ``validate_engine_attestation`` refuses evidence older than 72 hours.  A plan
+    published more than 72 hours ago therefore could not be reauthorized at all:
     the refreshed card would keep naming the expired reference, and
     ``Monitor._require_record`` reads the file, finds the recorded reference
     intact but the evidence stale, and blocks before any provider dispatch is

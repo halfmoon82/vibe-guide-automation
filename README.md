@@ -236,7 +236,7 @@ worker 用 `vibe worker-deliver` 自报的交付不带游标（游标只来自�
 
 授权卡是「发布时才签」的：执行门把在盘卡绑到 run 快照的 authorized digest 上，所以「卡已重出、尚未授权」在本产品里不可表示——只重出卡会让公开执行门以 `plan-confirmation.invalid` 关门。合同或 PRD 变化后要重新授权时，先用 `vibe monitor --plan <ID> --preview-card` 只读地看一遍将要签的卡：它报的是「相对当前在盘卡会改动哪些字段」（这才是要审的东西），并单独自检「刷新本身是否只动了引擎凭证字段」。确认后再跑带 `--authorize` 的那条，一次原子完成重新授权与派发。预览里的卡 digest 只是预览态——引擎凭证的时间戳进入凭证与卡的摘要，发布时会重新观测，所以别拿预览 digest 当审批凭据。
 
-计划发布超过 24 小时后，`engine-attestation.json` 会过期，`monitor --authorize` 会以 `execution_engine_unverified` 拒绝，而重新发布计划不是一条可用出路。同一 plan revision 上的重新授权会按发布路径同样的方式**重新观测**引擎凭证并重签，凭证先落盘、卡后发布，重新授权失败则逐字节还原，不需要重新发布计划。
+计划发布超过 72 小时后，`engine-attestation.json` 会过期，`monitor --authorize` 会以 `execution_engine_unverified` 拒绝，而重新发布计划不是一条可用出路。同一 plan revision 上的重新授权会按发布路径同样的方式**重新观测**引擎凭证并重签，凭证先落盘、卡后发布，重新授权失败则逐字节还原，不需要重新发布计划。
 
 桌面 App 原生能力不能由 Python 直接调用时，public CLI 使用 `.vibe/provider-actions/` 的 provider-neutral request/result bridge。`monitor/resume` 会写入有界、digest 绑定的 `create/locate/visibility/resume/wait` 请求；App 会话按 `native_tool` 调用公开能力并回写绑定结果。Codex 映射到 `create_thread`、`navigate_to_codex_page`、`send_message_to_thread` 和 `wait_threads`；其他 provider 必须先接入并验证自己的等价桌面控制面。未完成原生探针时不允许 background fallback；在真实 task ID、host、定位和可见性全部核验前，状态保持 `blocked_unknown`；node-spec 中的 provider/mode/thread/host 自声明不会成为证据。
 
