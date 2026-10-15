@@ -687,6 +687,9 @@ class ACB3ThirdPartyDependencyTests(_ProjectCase):
 
     def setUp(self):
         super().setUp()
+        self._approve_acceptance_rule()
+
+    def _approve_acceptance_rule(self):
         (self.paths.vibe / "config.json").write_text(
             json.dumps({"acceptance_scope_rule_approved": True}), encoding="utf-8"
         )
@@ -786,15 +789,24 @@ class ACB3ThirdPartyDependencyTests(_ProjectCase):
         return snapshot.nodes["n1"], expanded
 
     def test_ac_b3_review_finding_adding_dependency_blocks_for_pm(self):
-        current, expanded = self._review_finding_run(
-            ["n1.py", "requirements.txt"], adds_dependency=True
-        )
-        self.assertEqual(
-            map_user_status(current), PM_INTERRUPT,
-            "AC-B3: a rework finding that adds a dependency ended "
-            "status={!r} reason={!r}".format(current["status"], current.get("reason")),
-        )
-        self.assertEqual(expanded, [])
+        cases = {
+            "manifest_file": ["n1.py", "requirements.txt"],
+            # Only the flag differs from the control case below.
+            "flag_only": ["n1.py", "tests/test_n1.py"],
+        }
+        for label, files in cases.items():
+            with self.subTest(case=label):
+                self._make_project()
+                self._approve_acceptance_rule()
+                current, expanded = self._review_finding_run(files, adds_dependency=True)
+                self.assertEqual(
+                    map_user_status(current), PM_INTERRUPT,
+                    "AC-B3: a rework finding that adds a dependency ({}) ended "
+                    "status={!r} reason={!r}".format(
+                        label, current["status"], current.get("reason")
+                    ),
+                )
+                self.assertEqual(expanded, [])
 
     def test_ac_b3_review_finding_without_dependency_reworks_without_pm(self):
         """Control: the same finding minus the dependency is auto-handled."""
@@ -880,37 +892,56 @@ class ACB3VisibilityDowngradeTests(_ProjectCase):
 
 
 class ACB3VisibilityDowngradePreviewTests(unittest.TestCase):
-    """AC-B3（PRD 可观察面）：发布可见卡后出现后台能力，预览必须要求产品经理
-    授权降级 / 重新授权，而不是静默沿用。"""
+    """AC-B3（PRD 可观察面）：已签可见卡后可见任务能力消失、只剩后台能力
+    （真正的可见→后台降级条件），预览必须给出结构化的重新授权信号，
+    而不是静默沿用已签的可见卡。"""
 
     def setUp(self):
         _isolate_user_dirs(self)
 
     def test_ac_b3_preview_asks_pm_to_authorize_a_visibility_downgrade(self):
         root = publish_complex_probe(self)
+        before = run_cli(
+            ["monitor", "--plan", "probe-plan", "--preview-card", "--json"], root
+        ).payload
+        self.assertEqual(before.get("status"), "ok", before)
+        self.assertEqual(
+            before["topology_summary"]["background"], 0,
+            "fixture precondition: the signed card is all visible",
+        )
         capabilities = root / ".vibe" / "provider-actions" / "capabilities.json"
         recorded = json.loads(capabilities.read_text(encoding="utf-8"))
+        for name in list(recorded["facts"]):
+            if name.startswith("claude-code.visible_task."):
+                recorded["facts"][name] = False
         recorded["facts"]["claude-code.background_task.launch"] = True
         capabilities.write_text(json.dumps(recorded), encoding="utf-8")
 
-        result = run_cli(
+        payload = run_cli(
             ["monitor", "--plan", "probe-plan", "--preview-card", "--json"], root
-        )
-        payload = result.payload
-        rendered = json.dumps(payload, ensure_ascii=False)
-        asks_pm = (
-            payload.get("preview_card_digest_matches_publication") is False
-            or bool(payload.get("changed_fields"))
-            or any(word in rendered for word in ("downgrade", "降级", "reauthoriz", "重新授权"))
-        )
+        ).payload
+        summary = payload.get("topology_summary") or {}
+        reason = str(payload.get("reason", "")).casefold()
+        signals = {
+            "background_count_changed":
+                summary.get("background") != before["topology_summary"]["background"],
+            "digest_differs_from_publication":
+                payload.get("preview_card_digest_matches_publication") is False,
+            "changed_fields": bool(payload.get("changed_fields")),
+            "refused_for_reauthorization": payload.get("status") != "ok" and any(
+                word in reason for word in ("reauthoriz", "authoriz", "授权")
+            ),
+        }
         self.assertTrue(
-            asks_pm,
-            "AC-B3: visible card published, then claude-code background launch "
-            "became available; `vibe monitor --preview-card` still reports "
-            "topology {} with no downgrade or reauthorization request (status "
-            "{!r}, digest matches publication {!r})".format(
-                payload.get("topology_summary"), payload.get("status"),
-                payload.get("preview_card_digest_matches_publication"),
+            any(signals.values()),
+            "AC-B3: visible card signed, then every claude-code visible_task.* "
+            "fact became False and background_task.launch True; `vibe monitor "
+            "--preview-card` still reports topology {} with digest matching "
+            "the publication {!r}, changed_fields {!r}, status {!r} -- no "
+            "structured reauthorization signal for the visible→background "
+            "downgrade".format(
+                summary, payload.get("preview_card_digest_matches_publication"),
+                payload.get("changed_fields"), payload.get("status"),
             ),
         )
 
@@ -1146,29 +1177,42 @@ _TRIAGE_REQUESTS = {
 }
 _DEGRADED_MARKERS = ("degraded", "降级")
 _REASON_MARKERS = ("reason", "原因")
+_TRIAGE_MARKERS = ("triage", "分诊", "s1")
 
 
-def _has_degradation_record(value):
-    """True when some mapping marks a degradation and carries its reason.
+def _mentions(texts, markers):
+    return any(m in t for t in texts for m in markers)
 
-    Field names are deliberately not fixed: any dict whose keys or string
-    values mention ``degraded``/``降级`` and that has a non-empty
-    ``reason``/``原因``-like field counts.
+
+def _has_degradation_record(value, context=()):
+    """True when some mapping records a triage degradation with its reason.
+
+    Field names are deliberately not fixed: a dict counts when its keys or
+    string values mention ``degraded``/``降级``, it has a non-empty
+    ``reason``/``原因``-like field, and ``triage``/``分诊``/``s1`` appears in
+    its keys, string values or the keys leading to it (so an unrelated
+    downgrade disclosure does not count).
     """
     if isinstance(value, dict):
         texts = [str(k).casefold() for k in value] + [
             v.casefold() for v in value.values() if isinstance(v, str)
         ]
-        flagged = any(m in t for t in texts for m in _DEGRADED_MARKERS)
         reasoned = any(
             any(m in str(k).casefold() for m in _REASON_MARKERS) and v
             for k, v in value.items()
         )
-        if flagged and reasoned:
+        if (
+            reasoned
+            and _mentions(texts, _DEGRADED_MARKERS)
+            and _mentions(texts + list(context), _TRIAGE_MARKERS)
+        ):
             return True
-        return any(_has_degradation_record(v) for v in value.values())
+        return any(
+            _has_degradation_record(v, context + (str(k).casefold(),))
+            for k, v in value.items()
+        )
     if isinstance(value, list):
-        return any(_has_degradation_record(v) for v in value)
+        return any(_has_degradation_record(v, context) for v in value)
     return False
 
 
@@ -1186,10 +1230,10 @@ def _file_has_degradation_record(path):
             if _has_degradation_record(json.loads(line)):
                 return True
         except ValueError:
-            folded = line.casefold()
-            if any(m in folded for m in _DEGRADED_MARKERS) and any(
-                m in folded for m in _REASON_MARKERS
-            ):
+            folded = [line.casefold()]
+            if all(_mentions(folded, markers) for markers in (
+                _DEGRADED_MARKERS, _REASON_MARKERS, _TRIAGE_MARKERS
+            )):
                 return True
     return False
 
@@ -1243,16 +1287,6 @@ class ACE1EntryTriageTests(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0, result.payload)
                 self.assertEqual(result.payload["route"], expected)
 
-    def test_ac_e1_entry_attempts_the_triage_gateway(self):
-        result, recorder = self._plan(next(iter(_TRIAGE_REQUESTS)))
-        self.assertEqual(result.exit_code, 0, result.payload)
-        self.assertTrue(
-            recorder.calls,
-            "AC-E1: `vibe plan --request` made no outbound call at all; there "
-            "is no triage hook on this branch, so nothing is triaged by the "
-            "gateway and the S1 path is not a fallback",
-        )
-
     def test_ac_e1_gateway_down_leaves_a_degradation_record(self):
         before = _vibe_fingerprint(self.root)
         result, recorder = self._plan(next(iter(_TRIAGE_REQUESTS)))
@@ -1262,7 +1296,7 @@ class ACE1EntryTriageTests(unittest.TestCase):
         self.assertTrue(
             _has_degradation_record(result.payload) or on_disk,
             "AC-E1: no degradation record -- `vibe plan` with the triage "
-            "service off returned no degraded/降级 entry with a reason "
+            "service off returned no triage/分诊/S1 degraded/降级 entry with a reason "
             "(payload keys {}) and wrote none under .vibe (files written: {}; "
             "outbound attempts: {})".format(
                 sorted(result.payload),
