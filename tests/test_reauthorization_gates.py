@@ -1119,7 +1119,7 @@ class ExpiredEngineEvidenceReauthorizationTests(unittest.TestCase):
 
     def _aged_evidence(self):
         real = monitor_module.validate_engine_attestation
-        beyond = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat().replace(
+        beyond = (datetime.now(timezone.utc) + timedelta(days=4)).isoformat().replace(
             "+00:00", "Z"
         )
 

@@ -105,7 +105,7 @@ def validate_engine_attestation(
     plan_revision: int,
     expected_digest: Optional[str] = None,
     now: Optional[str] = None,
-    max_age_seconds: int = 86400,
+    max_age_seconds: int = 72 * 3600,
 ) -> None:
     """Raise ValueError unless attestation identity and content are intact."""
     if not isinstance(attestation, Mapping):
