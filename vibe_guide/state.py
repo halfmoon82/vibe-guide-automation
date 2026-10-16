@@ -142,6 +142,10 @@ CONSISTENCY_CORRECTION_KEYS = (
     "decision",
 )
 _EVENT_DATA_KEYS = {
+    # Fixed-enum cause (and repo node id) of a decision-less blocked_design,
+    # so the monitor can register vibe-authored decision text after a replay.
+    "blocked_design_cause",
+    "blocked_design_target",
     *CONSISTENCY_CORRECTION_KEYS,
     "authorization_digest",
     "authorization_epoch",

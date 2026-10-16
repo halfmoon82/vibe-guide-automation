@@ -124,7 +124,7 @@ from .evidence import (
     record_integration_review as _record_integration_review,
 )
 from .engine_attestation import validate_engine_attestation
-from .decision_boundary import ingest_worker_decisions
+from .decision_boundary import ingest_worker_decisions, raise_decision
 from .orphan_recovery import ORPHAN_DISPATCH_ADOPTED, replay_orphan_adoption
 from .self_report_recovery import SELF_REPORT_DELIVERY_RECONCILED
 from .decisions import DecisionMailbox
@@ -146,6 +146,37 @@ DECISION_NOTIFICATION_UNKNOWN_REASON = "decision notification bridge status unkn
 # product_acceptance / external_authorization may suspend) or returns the node
 # to its developer.
 LIFECYCLE_DECISION_RECOVERY_ACTION = "raise_missing_decision"
+# Decision-less blocked_design producers record a fixed enum cause; the monitor
+# registers a vibe-authored (never provider-derived) decision for it.
+_BLOCKED_DESIGN_DECISIONS = {
+    "integration_scope_review": {
+        "question": "整合审查要求把文件扩进已验收节点的范围，自动规则无法判定，需要产品经理复核是否允许扩范围",
+        "options": [
+            {"id": "approve_scope_expansion", "label": "允许扩范围",
+             "impact": "退回该节点返工，按扩后的范围修改"},
+            {"id": "keep_scope", "label": "不扩范围",
+             "impact": "该节点范围不变，整合审查另寻修法"},
+        ],
+    },
+    "out_of_contract_finding": {
+        "question": "审查发现节点合同之外的问题，无法自动判定唯一修法，需要产品经理决定是否纳入本节点（审查原文见该节点 reviewer 交付）",
+        "options": [
+            {"id": "accept_as_contract_change", "label": "纳入本节点",
+             "impact": "变更合同后返工"},
+            {"id": "defer_finding", "label": "不纳入",
+             "impact": "登记为后续问题，本节点按原合同验收"},
+        ],
+    },
+}
+_BLOCKED_DESIGN_GENERIC_DECISION = {
+    "question": "节点停在等待产品决策，但没有登记原因，需要产品经理确认如何处理",
+    "options": [
+        {"id": "return_to_developer", "label": "无需决策",
+         "impact": "退回开发继续"},
+        {"id": "pause_node", "label": "暂停该节点",
+         "impact": "等待进一步说明"},
+    ],
+}
 
 #: Compile/build command prefixes that can never prove a *behavioral*
 #: invariant (they only prove the code compiles).  Built-in and not reducible
@@ -5303,6 +5334,8 @@ class Monitor:
                     )
                     if resolution is None or not resolution.files:
                         current["status"] = "blocked_design"
+                        current["blocked_design_cause"] = "integration_scope_review"
+                        current["blocked_design_target"] = target_node_id
                         current["reason"] = redact_provider_text(
                             "integration scope expansion requires product-manager review"
                         )
@@ -5318,8 +5351,11 @@ class Monitor:
                                 "node_id": node_id,
                                 "reason": current["reason"],
                                 "old_task_reconciled": True,
+                                "blocked_design_cause": "integration_scope_review",
+                                "blocked_design_target": target_node_id,
                             },
                         )
+                        self._ensure_blocked_design_decision(snapshot, node_id)
                         return
                     self._apply_scope_expansion(
                         snapshot,
@@ -5456,6 +5492,7 @@ class Monitor:
                 ):
                     return
                 current["status"] = "blocked_design"
+                current["blocked_design_cause"] = "out_of_contract_finding"
                 current["reason"] = redact_provider_text(
                     event.data.get("finding", "out-of-contract finding")
                 )
@@ -5472,8 +5509,10 @@ class Monitor:
                         "node_id": node_id,
                         "reason": current["reason"],
                         "old_task_reconciled": True,
+                        "blocked_design_cause": "out_of_contract_finding",
                     },
                 )
+                self._ensure_blocked_design_decision(snapshot, node_id)
                 return
             current["active_role"] = None
             current["active_task"] = None
@@ -6555,6 +6594,53 @@ class Monitor:
             "recovery_action": "await_external_decision",
         }, active if isinstance(active, dict) else None)
 
+    def _ensure_blocked_design_decision(self, snapshot: RunSnapshot, node_id: str) -> bool:
+        """Register the missing decision for a decision-less blocked_design.
+
+        Text is vibe-authored and fixed per cause; provider finding text never
+        reaches the mailbox.  Returns False (state untouched) when the mailbox
+        write fails so the caller can fall back to the lifecycle state.
+        """
+        current = snapshot.nodes[node_id]
+        cause = current.get("blocked_design_cause")
+        spec = _BLOCKED_DESIGN_DECISIONS.get(cause, _BLOCKED_DESIGN_GENERIC_DECISION)
+        evidence: Dict[str, Any] = {"cause": cause if cause in _BLOCKED_DESIGN_DECISIONS else "unknown"}
+        if cause == "integration_scope_review":
+            if isinstance(current.get("blocked_design_target"), str):
+                evidence["target_node_id"] = current["blocked_design_target"]
+        elif cause == "out_of_contract_finding":
+            evidence["role"] = "reviewer"
+            if isinstance(current.get("review_generation"), int):
+                evidence["review_generation"] = current["review_generation"]
+        try:
+            result = raise_decision(
+                self.paths,
+                run_id=snapshot.run_id,
+                node_id=node_id,
+                question=spec["question"],
+                options=[dict(item) for item in spec["options"]],
+                recommendation=None,
+                evidence=evidence,
+            )
+            decision_id = str(result["request"]["decision_id"])
+        except (OSError, TypeError, ValueError):
+            return False
+        self._record(snapshot, "decision_raised", {
+            "run_id": snapshot.run_id,
+            "node_id": node_id,
+            "decision_ids": [decision_id],
+            "source": "monitor_blocked_design",
+            "reason": "decision pending",
+        })
+        current["decision_ids"] = [decision_id]
+        current["status"] = "blocked_design"
+        current["reason"] = "decision pending"
+        current["owner_layer"] = "product_acceptance"
+        current["user_interrupt"] = True
+        current["recovery_action"] = None
+        current["quarantine"] = None
+        return True
+
     def _route_undecided_blocked_design(self, snapshot: RunSnapshot) -> None:
         """Turn a decision-less blocked_design into a lifecycle recovery state."""
         pending: Optional[List[Dict[str, Any]]] = None
@@ -6576,6 +6662,8 @@ class Monitor:
                     str(item.get("decision_id")) for item in pending or []
                     if isinstance(item, dict) and item.get("node_id") == node_id and item.get("decision_id")
                 ]
+                if not ids and pending_error is None and self._ensure_blocked_design_decision(snapshot, node_id):
+                    continue
                 if ids:
                     current["status"] = "blocked_design"
                     current["reason"] = "decision pending"
@@ -6608,6 +6696,8 @@ class Monitor:
             if pending_error is None and any(
                 isinstance(item, dict) and item.get("node_id") == node_id for item in pending or []
             ):
+                continue
+            if pending_error is None and self._ensure_blocked_design_decision(snapshot, node_id):
                 continue
             if pending_error is None:
                 reason = "blocked_design has no decision record; supervisor lifecycle defect"
@@ -7349,6 +7439,10 @@ class Monitor:
                     current["user_interrupt"] = data["owner_layer"] == "external_authorization"
                 if data.get("recovery_action"):
                     current["recovery_action"] = data["recovery_action"]
+                if data.get("blocked_design_cause"):
+                    current["blocked_design_cause"] = data["blocked_design_cause"]
+                if data.get("blocked_design_target"):
+                    current["blocked_design_target"] = data["blocked_design_target"]
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
@@ -7366,7 +7460,7 @@ class Monitor:
                         "handle_id": None,
                         "reason": reason,
                     }
-                elif data.get("source") == "supervisor_lifecycle":
+                elif data.get("source") in {"supervisor_lifecycle", "monitor_blocked_design"}:
                     # Lifecycle recovery closed: drop the defect markers and
                     # the quarantine the blocked_unknown replay set.
                     current["quarantine"] = None

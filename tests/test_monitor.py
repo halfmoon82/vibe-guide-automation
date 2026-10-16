@@ -4779,6 +4779,10 @@ class MonitorRoutingTests(unittest.TestCase):
         save_snapshot(self.paths, snapshot)
         return monitor, runner, snapshot
 
+    def mailbox_down(self):
+        """Decision-mailbox write failure: the lifecycle fallback applies."""
+        return patch("vibe_guide.monitor.raise_decision", side_effect=OSError("mailbox down"))
+
     def assert_lifecycle_defect(self, snapshot):
         from vibe_guide.monitor import _user_status
         current = snapshot.nodes["n1"]
@@ -4845,13 +4849,20 @@ class MonitorRoutingTests(unittest.TestCase):
 
     def test_undecided_blocked_design_is_lifecycle_defect_on_resume(self):
         monitor, runner, snapshot = self.undecided_run()
-        with patch("vibe_guide.monitor.require_entry", return_value=None):
+        with patch("vibe_guide.monitor.require_entry", return_value=None), self.mailbox_down():
             resumed = monitor.resume(snapshot.run_id, runner)
         self.assert_lifecycle_defect(resumed)
 
+    def test_undecided_blocked_design_registers_decision_when_mailbox_works(self):
+        monitor, runner, snapshot = self.undecided_run()
+        ticked = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(ticked.nodes["n1"]["status"], "blocked_design")
+        self.assertEqual(len(ticked.nodes["n1"]["decision_ids"]), 1)
+
     def test_undecided_blocked_design_is_lifecycle_defect_on_tick(self):
         monitor, runner, snapshot = self.undecided_run()
-        self.assert_lifecycle_defect(monitor.tick(snapshot.run_id, runner))
+        with self.mailbox_down():
+            self.assert_lifecycle_defect(monitor.tick(snapshot.run_id, runner))
 
     def test_unverifiable_mailbox_is_lifecycle_defect_not_decision(self):
         monitor, runner, snapshot = self.undecided_run()
@@ -4883,7 +4894,8 @@ class MonitorRoutingTests(unittest.TestCase):
 
     def test_lifecycle_recovery_closes_when_decision_raised_via_tick(self):
         monitor, runner, snapshot = self.undecided_run()
-        self.assert_lifecycle_defect(monitor.tick(snapshot.run_id, runner))
+        with self.mailbox_down():
+            self.assert_lifecycle_defect(monitor.tick(snapshot.run_id, runner))
         decision_id = self.raise_for_n1(snapshot)
         again = monitor.tick(snapshot.run_id, runner)
         self.assert_back_to_decision(again, decision_id)
@@ -4892,7 +4904,8 @@ class MonitorRoutingTests(unittest.TestCase):
     def test_lifecycle_recovery_closes_when_decision_raised_via_resume(self):
         monitor, runner, snapshot = self.undecided_run()
         with patch("vibe_guide.monitor.require_entry", return_value=None):
-            self.assert_lifecycle_defect(monitor.resume(snapshot.run_id, runner))
+            with self.mailbox_down():
+                self.assert_lifecycle_defect(monitor.resume(snapshot.run_id, runner))
             decision_id = self.raise_for_n1(snapshot)
             again = monitor.resume(snapshot.run_id, runner)
         self.assert_back_to_decision(again, decision_id)
@@ -4910,7 +4923,8 @@ class MonitorRoutingTests(unittest.TestCase):
         # Router output is persisted only as events: reload the pre-router state.
         stale = load_snapshot(self.paths, snapshot.run_id)
         routed = load_snapshot(self.paths, snapshot.run_id)
-        monitor._route_undecided_blocked_design(routed)
+        with self.mailbox_down():
+            monitor._route_undecided_blocked_design(routed)
         replay = load_snapshot(self.paths, snapshot.run_id)
         replay.event_sequence = stale.event_sequence
         monitor._reconcile_unapplied_events(replay)
