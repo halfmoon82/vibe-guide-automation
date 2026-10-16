@@ -1023,7 +1023,8 @@ class DispatchPromptTests(unittest.TestCase):
                 'branch': 'b', 'files': []}, Path(d), 'run-1', 'review')
             prompt = dict(seen)['create']['prompt']
             for required in ('worker-deliver', '--role reviewer', '--generation 4',
-                             'supervisor-address --run-id run-1 --json', '已授权通道',
+                             'supervisor-address --run-id run-1 --node n1 --role reviewer --generation 4 --json',
+                             'wake.channel',
                              '登记主监工', '不得调用 core resume',
                              # ISSUE-219: the session root is the only vantage
                              # that sees the sandbox the host actually granted,
@@ -1038,7 +1039,7 @@ class DispatchPromptTests(unittest.TestCase):
                 prompt = ProviderActionRunner._continuation_prompt({
                     'node_id': 'n1', 'role': role, 'generation': 4, 'run_id': 'run-1'})
                 for required in ('worker-deliver', '--run-id run-1', '--role ' + role, '--generation 4',
-                                 'supervisor-address --run-id run-1 --json',
+                                 'supervisor-address --run-id run-1 --node n1 --role {} --generation 4 --json'.format(role),
                                  '登记主监工', '不得调用 core resume',
                                  'delivery_evidence.session_cwd'):
                     self.assertIn(required, prompt)

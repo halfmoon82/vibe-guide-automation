@@ -468,7 +468,7 @@ vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路
 - 输出 `rotate`：当前上下文达到 10 万且自接班以来增长至少 8 万 token（可配 `--token-threshold`），或达到 20 万的绝对上限（默认；用户明确临时覆盖时使用 `--context-hard-cap <tokens>`，增长阈值也需同步显式设置，不能只用 `--token-threshold` 冒充绝对上限已改变）；登记时没给 `--session-record` 的班次没有接班起点，按绝对值计算。项目 `.vibe/config.json` 设了 `"supervisor_single_shift": true` 时，同一监工会话服务整个运行，不再按增长换班，只在达到绝对上限时输出 `rotate`（预检输出带 `single_shift: true`）；默认不设，行为同上。执行换班：新开会话，让它跑 `vibe supervisor-handoff --run-id <run-id>`——这一条打印接班需要的全部内容（进度、等人拍板事项、填好的同一段心跳指令、接班步骤），新会话照做即可，不必再翻本协议、授权卡或完整状态：用 `vibe supervisor-register --session-record` 登记、自建心跳、置顶、改标题；删除旧心跳，旧会话归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。
 - 输出 `unknown`：会话记录读不到或解析失败。**不得当成 idle**，按 `work` 处理。
 
-监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> --session-record <日志>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run>` 查询；未登记返回 `unknown` 而非空成功。登记内容只允许 provider/会话 id/host，不得含凭据。
+监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> --session-record <日志>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run> [--node <n> --role <r> --generation <g>]` 查询；未登记返回 `unknown` 而非空成功。登记后的回答带 `wake`：Codex 为 `channel=send_message_to_thread`、`target`（监工会话 id）与填好的一行 `signal`（`vibe-wake run=… node=… role=… generation=…`），worker 用该工具原样发送；Claude Code 等没有已验证推送通道的平台 `channel` 为 null 并写明原因，worker 不发，由心跳领取。监工不信任信号内容。登记内容只允许 provider/会话 id/host，不得含凭据。
 
 ## 7. 什么时候才能打断产品经理
 

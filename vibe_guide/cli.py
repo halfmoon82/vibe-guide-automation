@@ -1884,11 +1884,20 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         if not args.run_id:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
         try:
-            payload = current_supervisor_address(paths, args.run_id)
+            payload = current_supervisor_address(
+                paths, args.run_id, node_id=args.node_id,
+                role=args.role if args.node_id else None,
+                generation=args.worker_generation,
+            )
         except (OSError, TypeError, ValueError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "查询失败：" + str(error), args.as_json)
         code = SUCCESS if payload["status"] == "ok" else UNKNOWN
-        return _result(code, {"command": args.command, **payload}, "监工地址查询：{}".format(payload["status"]), args.as_json)
+        text = "监工地址查询：{}".format(payload["status"])
+        wake = payload.get("wake")
+        if wake:
+            text += "\n" + ("唤醒：用 {} 向 {} 发送「{}」".format(wake["channel"], wake["target"], wake["signal"])
+                            if wake["channel"] else "唤醒：无推送通道（{}）".format(wake["reason"]))
+        return _result(code, {"command": args.command, **payload}, text, args.as_json)
 
     if args.command == "worker-deliver":
         # Worker self-report: validate against the delivery gate shape, then

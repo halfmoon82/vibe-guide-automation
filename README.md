@@ -80,7 +80,7 @@ vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host 
 vibe supervisor-hold --run-id <run> --node <id> --category <product_design|external_authorization|deploy> --reason <原因>   登记/刷新"节点等人拍板"，预检据此判为空闲
 vibe supervisor-hold --run-id <run> --node <id> --release   解除"节点等人拍板"
 vibe supervisor-handoff --run-id <run>             打印接班所需的全部内容（进度、等人事项、心跳指令、步骤），换班时新会话只跑这一条
-vibe supervisor-address --run-id <run>             查询当前监工地址；未登记返回 unknown
+vibe supervisor-address --run-id <run>             查询当前监工地址；未登记返回 unknown；带 --node/--role/--generation 时 wake 字段给出推送工具与填好的唤醒信号
 vibe worker-deliver --run-id <run> --node <id> --generation <n> --payload '<json>'   worker 在主项目目录自报交付（嵌套 delivery_evidence），格式错误当场返回
 ```
 
