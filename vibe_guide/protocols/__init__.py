@@ -86,6 +86,10 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "8e6b6b2dadfc9b5e3cc6396189f17c169e434c8cd023f002055f2f9849474bee",
         # 2026-10-14: heartbeat --accept-decision + N1 intervals.
         "85c507fb3e0788f310b5da4987eefd88fbcef549de51865ad9b2491c301cba40",
+        # 2026-10-16: heartbeat-contract merged onto main (#211 §6.x patches).
+        "578fd47330714a53c2de616aafff3a0a9604a79ff272374aa50d2baa58a5bb35",
+        # 2026-10-16: combined text once decision-boundary (#184) and heartbeat-contract both land.
+        "5b7aa976a0f9b2ac20ca014a38a101635d274bad40d1a57bc4920b179ed5f38e",
     }),
     "vibe-entry": frozenset({
         "3ec0a771d482d92eba7f155f212dab97beb3a4a3b6712e16d7dc3d81394797eb",

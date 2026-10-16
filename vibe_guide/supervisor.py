@@ -771,7 +771,12 @@ def heartbeat_interval(paths, run_id, *, decision_only):
     if decision_only:
         return {"minutes": HEARTBEAT_INTERVAL_DECISION_MINUTES, "mode": "decision",
                 "reason": "only unanswered decisions remain", "provider": None}
-    address = current_supervisor_address(paths, run_id)
+    try:
+        address = current_supervisor_address(paths, run_id)
+    except (ValueError, OSError) as error:
+        # A damaged lease must not stop the beat: fall back to the default cadence.
+        return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
+                "reason": "supervisor address unreadable: " + str(error)[:200], "provider": None}
     provider = None
     if address.get("status") == "ok":
         provider = address["current"].get("provider")
