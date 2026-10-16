@@ -76,15 +76,15 @@ class EngineeringRecoveryClassificationTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(classify_provider_failure(value)["kind"], "external_decision")
 
-    def test_plain_authorization_and_permission_errors_stay_unknown(self):
+    def test_plain_authorization_and_permission_errors_are_auto_recoverable(self):
         for reason in (
             "authorization digest mismatch",
             "permission denied writing .vibe/x",
         ):
             with self.subTest(reason=reason):
                 classification = classify_provider_failure({"reason": reason})
-                self.assertEqual(classification["kind"], "binding_unknown")
-                self.assertEqual(classification["legacy_kind"], "unknown")
+                self.assertEqual(classification["kind"], "repairable")
+                self.assertEqual(classification["legacy_kind"], "engineering")
 
     def test_user_status_uses_state_code_not_reason_keywords(self):
         for mapper in (map_user_status, _user_status):

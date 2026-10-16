@@ -213,7 +213,7 @@ class ProviderSelfHealingTests(unittest.TestCase):
             with patch("vibe_guide.monitor.require_entry", return_value=None):
                 started = monitor.start(record, runner)
                 snapshot = monitor.tick(started.run_id, runner)
-            self.assertEqual(snapshot.nodes[node.id]["status"], "blocked_unknown")
+            self.assertEqual(snapshot.nodes[node.id]["status"], "blocked_design")
             self.assertIsNone(snapshot.nodes[node.id]["retryable_action"])
 
 

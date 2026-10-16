@@ -4866,5 +4866,239 @@ class CoverageDenominatorTests(unittest.TestCase):
         self.assertIn("more than once", reason or "")
 
 
+class MonitorRoutingTests(unittest.TestCase):
+    """PRD 2026-10-13 §5.5/§5.7 #148, AC-B2: blocked_design routing."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.paths = ProjectPaths(Path(self.temporary.name))
+        (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (self.paths.vibe / "state.json").write_text('{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8")
+        save_contract(self.paths, build_contract(self.paths.root, provider="fake", host_id="local"))
+        self.capabilities = AgentCapabilities("fake", True, True, True, True, True, "full")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def authorized_monitor(self, nodes):
+        plan = Plan("plan-1", 1, "docs/prd.md", [item.id for item in nodes], "draft")
+        card = build_authorization_card(plan, nodes, self.capabilities)
+        return Monitor(self.paths, plan, nodes), authorize(card, "AUTHORIZE")
+
+    def failed_run(self, data):
+        monitor, record = self.authorized_monitor([node("n1")])
+        runner = FakeRunner(events={("n1", "developer"): [("failed", data)]})
+        with patch("vibe_guide.monitor.require_entry", return_value=None):
+            started = monitor.start(record, runner)
+        return monitor, runner, monitor.tick(started.run_id, runner)
+
+    def undecided_run(self, **extra):
+        monitor, record = self.authorized_monitor([node("n1")])
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        current = snapshot.nodes["n1"]
+        current.update({"status": "blocked_design", "reason": "design decision required",
+                        "active_role": None, "active_task": None, "retryable_action": None})
+        current.update(extra)
+        snapshot.handles.pop("n1", None)
+        save_snapshot(self.paths, snapshot)
+        return monitor, runner, snapshot
+
+    def assert_lifecycle_defect(self, snapshot):
+        from vibe_guide.monitor import _user_status
+        current = snapshot.nodes["n1"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertEqual(current["recovery_action"], "raise_missing_decision")
+        self.assertEqual(current["owner_layer"], "supervisor_lifecycle")
+        self.assertNotEqual(_user_status(current), "需要你决定")
+        self.assertNotEqual(snapshot.status, "blocked_design")
+
+    def test_classify_plain_permission_text_is_repairable_structured_stays_external(self):
+        from vibe_guide.monitor import classify_provider_failure, recovery_action_for_failure
+        for reason in ("permission denied writing .vibe/x", "authorization digest mismatch"):
+            with self.subTest(reason=reason):
+                self.assertEqual(classify_provider_failure({"reason": reason})["kind"], "repairable")
+                self.assertEqual(recovery_action_for_failure({"reason": reason}), "repair_node")
+        self.assertEqual(classify_provider_failure({"reason": "system permission denied"})["kind"], "binding_unknown")
+        self.assertEqual(classify_provider_failure({"credential_required": True})["kind"], "external_decision")
+
+    def test_structured_credential_required_waits_for_user_and_survives_resume_and_tick(self):
+        from vibe_guide.monitor import _user_status
+        monitor, runner, snapshot = self.failed_run({"reason": "login required", "credential_required": True})
+        current = snapshot.nodes["n1"]
+        self.assertEqual(current["status"], "blocked_design")
+        self.assertEqual(_user_status(current), "需要你决定")
+        self.assertIsNone(current["retryable_action"])
+        self.assertEqual(current["recovery_action"], "await_external_decision")
+        with patch("vibe_guide.monitor.require_entry", return_value=None):
+            resumed = monitor.resume(snapshot.run_id, runner)
+        self.assertEqual(resumed.nodes["n1"]["status"], "blocked_design")
+        ticked = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(ticked.nodes["n1"]["status"], "blocked_design")
+        self.assertEqual(ticked.nodes["n1"]["recovery_action"], "await_external_decision")
+
+    def test_plain_permission_denied_text_failure_is_retried(self):
+        # V4.2 projects expose the engineering phase as retry_pending.
+        (self.paths.vibe / "state.json").write_text(
+            '{"workflow_version": 4, "execution_mode": "sdd_first", '
+            '"session_gate": "s0_required", "capability_contract_required": true}\n',
+            encoding="utf-8")
+        _, _, snapshot = self.failed_run({"reason": "permission denied writing .vibe/x"})
+        current = snapshot.nodes["n1"]
+        self.assertEqual(current["status"], "retry_pending")
+        self.assertIsNotNone(current.get("retryable_action"))
+
+    def test_repair_node_on_permission_denied_goes_to_retry_pending(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        snapshot = monitor.start(record, FakeRunner())
+        current = snapshot.nodes["n1"]
+        current.update({"status": "blocked_unknown", "reason": "permission denied writing .vibe/x"})
+        save_snapshot(self.paths, snapshot)
+        # Provider text is redacted on disk, so feed repair_node the raw text
+        # the supervisor would hold in memory.
+        original = monitor._recovery_snapshot
+
+        def with_raw_reason(node_id, run_id=None):
+            loaded = original(node_id, run_id)
+            loaded.nodes[node_id]["reason"] = "permission denied writing .vibe/x"
+            return loaded
+
+        with patch.object(monitor, "_recovery_snapshot", side_effect=with_raw_reason):
+            result = monitor.repair_node("n1", snapshot.run_id)
+        self.assertEqual(result["status"], "retry_pending")
+        self.assertEqual(load_snapshot(self.paths, snapshot.run_id).nodes["n1"]["status"], "retry_pending")
+
+    def test_undecided_blocked_design_is_lifecycle_defect_on_resume(self):
+        monitor, runner, snapshot = self.undecided_run()
+        with patch("vibe_guide.monitor.require_entry", return_value=None):
+            resumed = monitor.resume(snapshot.run_id, runner)
+        self.assert_lifecycle_defect(resumed)
+
+    def test_undecided_blocked_design_without_cause_never_raises_a_decision(self):
+        monitor, runner, snapshot = self.undecided_run()
+        ticked = monitor.tick(snapshot.run_id, runner)
+        self.assert_lifecycle_defect(ticked)
+        from vibe_guide.decisions import DecisionMailbox
+        self.assertEqual(DecisionMailbox(self.paths).list_pending(snapshot.run_id), [])
+
+    def test_undecided_blocked_design_is_lifecycle_defect_on_tick(self):
+        monitor, runner, snapshot = self.undecided_run()
+        self.assert_lifecycle_defect(monitor.tick(snapshot.run_id, runner))
+
+    def test_unverifiable_mailbox_is_lifecycle_defect_not_decision(self):
+        monitor, runner, snapshot = self.undecided_run()
+        with patch("vibe_guide.decisions.DecisionMailbox.list_pending", side_effect=ValueError("bad")):
+            ticked = monitor.tick(snapshot.run_id, runner)
+        self.assert_lifecycle_defect(ticked)
+        self.assertIn("cannot be verified", ticked.nodes["n1"]["reason"])
+
+    def raise_for_n1(self, snapshot):
+        from vibe_guide.decisions import DecisionMailbox
+        return DecisionMailbox(self.paths).raise_decision(
+            run_id=snapshot.run_id, node_id="n1", question="Pick?",
+            options=[{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+        )["decision_id"]
+
+    def lifecycle_events(self, snapshot):
+        return [e["event"] for e in load_events(self.paths, snapshot.run_id)
+                if e["event"] in {"blocked_unknown", "decision_raised", "blocked_design"}]
+
+    def assert_back_to_decision(self, snapshot, decision_id):
+        from vibe_guide.monitor import _user_status
+        current = snapshot.nodes["n1"]
+        self.assertEqual(current["status"], "blocked_design")
+        self.assertEqual(_user_status(current), "需要你决定")
+        self.assertEqual(current["decision_ids"], [decision_id])
+        self.assertNotEqual(current.get("owner_layer"), "supervisor_lifecycle")
+        self.assertIsNone(current.get("recovery_action"))
+        self.assertIsNone(current.get("quarantine"))
+
+    def test_lifecycle_recovery_closes_when_decision_raised_via_tick(self):
+        monitor, runner, snapshot = self.undecided_run()
+        self.assert_lifecycle_defect(monitor.tick(snapshot.run_id, runner))
+        decision_id = self.raise_for_n1(snapshot)
+        again = monitor.tick(snapshot.run_id, runner)
+        self.assert_back_to_decision(again, decision_id)
+        self.assertEqual(self.lifecycle_events(snapshot), self.lifecycle_events(monitor.tick(snapshot.run_id, runner)))
+
+    def test_lifecycle_recovery_closes_when_decision_raised_via_resume(self):
+        monitor, runner, snapshot = self.undecided_run()
+        with patch("vibe_guide.monitor.require_entry", return_value=None):
+            self.assert_lifecycle_defect(monitor.resume(snapshot.run_id, runner))
+            decision_id = self.raise_for_n1(snapshot)
+            again = monitor.resume(snapshot.run_id, runner)
+        self.assert_back_to_decision(again, decision_id)
+
+    def test_lifecycle_without_new_decision_emits_no_event_spam(self):
+        monitor, runner, snapshot = self.undecided_run()
+        monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(self.lifecycle_events(snapshot), self.lifecycle_events(monitor.tick(snapshot.run_id, runner)))
+
+    def test_replay_restores_lifecycle_markers_and_closure(self):
+        monitor, runner, snapshot = self.undecided_run()
+        saved = load_snapshot(self.paths, snapshot.run_id)
+        saved.event_sequence = len(load_events(self.paths, snapshot.run_id))
+        save_snapshot(self.paths, saved)
+        # Router output is persisted only as events: reload the pre-router state.
+        stale = load_snapshot(self.paths, snapshot.run_id)
+        routed = load_snapshot(self.paths, snapshot.run_id)
+        monitor._route_undecided_blocked_design(routed)
+        replay = load_snapshot(self.paths, snapshot.run_id)
+        replay.event_sequence = stale.event_sequence
+        monitor._reconcile_unapplied_events(replay)
+        current = replay.nodes["n1"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertEqual(current["recovery_action"], "raise_missing_decision")
+        self.assertEqual(current["owner_layer"], "supervisor_lifecycle")
+        self.assertIs(current["user_interrupt"], False)
+        decision_id = self.raise_for_n1(snapshot)
+        monitor._route_undecided_blocked_design(routed)
+        replay2 = load_snapshot(self.paths, snapshot.run_id)
+        replay2.event_sequence = stale.event_sequence
+        monitor._reconcile_unapplied_events(replay2)
+        self.assert_back_to_decision(replay2, decision_id)
+
+    def test_external_authorization_marks_old_task_reconciled_live(self):
+        _, _, snapshot = self.failed_run({"reason": "login required", "credential_required": True})
+        self.assertIs(snapshot.nodes["n1"]["old_task_reconciled"], True)
+
+    def test_blocked_design_with_pending_mailbox_decision_stays(self):
+        from vibe_guide.decisions import DecisionMailbox
+        monitor, runner, snapshot = self.undecided_run()
+        DecisionMailbox(self.paths).raise_decision(
+            run_id=snapshot.run_id, node_id="n1", question="Pick?",
+            options=[{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+        )
+        ticked = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(ticked.nodes["n1"]["status"], "blocked_design")
+
+    def test_blocked_design_with_decision_ids_stays(self):
+        monitor, runner, snapshot = self.undecided_run(decision_ids=["dec-x"])
+        ticked = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(ticked.nodes["n1"]["status"], "blocked_design")
+
+    def test_decision_ids_survive_event_persistence_and_replay(self):
+        monitor, record = self.authorized_monitor([node("n1")])
+        snapshot = monitor.start(record, FakeRunner())
+        active = snapshot.nodes["n1"]["active_task"]
+        before = len(load_events(self.paths, snapshot.run_id))
+        append_event(
+            self.paths,
+            RunEvent("decision_raised", {"run_id": snapshot.run_id, "node_id": "n1",
+                                         "decision_ids": ["dec-test"], "source": "worker_delivery"}),
+            {"role": active["role"], "task_id": active["task_id"], "handle_id": active["handle_id"],
+             "generation": active["generation"], "authorization_digest": snapshot.authorization_digest,
+             "node_contract_digest": snapshot.node_contract_digest},
+        )
+        persisted = load_events(self.paths, snapshot.run_id)[before]
+        self.assertEqual(persisted["data"].get("decision_ids"), ["dec-test"])
+        replay = load_snapshot(self.paths, snapshot.run_id)
+        replay.event_sequence = before
+        monitor._reconcile_unapplied_events(replay)
+        self.assertEqual(replay.nodes["n1"]["decision_ids"], ["dec-test"])
+        monitor._route_undecided_blocked_design(replay)
+        self.assertEqual(replay.nodes["n1"]["status"], "blocked_design")
+
+
 if __name__ == "__main__":
     unittest.main()

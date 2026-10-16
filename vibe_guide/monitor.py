@@ -124,9 +124,10 @@ from .evidence import (
     record_integration_review as _record_integration_review,
 )
 from .engine_attestation import validate_engine_attestation
-from .decision_boundary import ingest_worker_decisions
+from .decision_boundary import NotificationBridge, ingest_worker_decisions
 from .orphan_recovery import ORPHAN_DISPATCH_ADOPTED, replay_orphan_adoption
 from .self_report_recovery import SELF_REPORT_DELIVERY_RECONCILED
+from .decisions import DecisionMailbox
 
 
 class ScopeDecisionRequired(PermissionError):
@@ -139,6 +140,35 @@ class ScopeDecisionRequired(PermissionError):
 # contract writer worktree, so this introduces no new authorization surface.
 DEFAULT_CONTRACT_TEST_TIMEOUT_SECONDS = 120
 DECISION_NOTIFICATION_UNKNOWN_REASON = "decision notification bridge status unknown"
+# A node that reaches blocked_design with no decision record is a supervisor
+# lifecycle defect, not a wait-for-user.  Recovery: the supervisor either
+# records the missing decision via `vibe decision-raise` (only
+# product_acceptance / external_authorization may suspend) or returns the node
+# to its developer.
+LIFECYCLE_DECISION_RECOVERY_ACTION = "raise_missing_decision"
+# Decision-less blocked_design producers record a fixed enum cause; the monitor
+# registers a vibe-authored (never provider-derived) decision for it.
+_BLOCKED_DESIGN_MAX_ATTEMPTS = 20
+_BLOCKED_DESIGN_DECISIONS = {
+    "integration_scope_review": {
+        "question": "整合审查要求把文件扩进已验收节点的范围，自动规则无法判定，需要产品经理复核是否允许扩范围",
+        "options": [
+            {"id": "approve_scope_expansion", "label": "允许扩范围",
+             "impact": "选此项后由监工把文件并入该节点范围并安排该节点返工"},
+            {"id": "keep_scope", "label": "不扩范围",
+             "impact": "选此项后该节点范围不变，由监工安排整合审查另寻修法"},
+        ],
+    },
+    "out_of_contract_finding": {
+        "question": "审查发现节点合同之外的问题，无法自动判定唯一修法，需要产品经理决定是否纳入本节点（审查原文见该节点 reviewer 交付）",
+        "options": [
+            {"id": "accept_as_contract_change", "label": "纳入本节点",
+             "impact": "选此项后由监工变更合同并安排该节点返工"},
+            {"id": "defer_finding", "label": "不纳入",
+             "impact": "选此项后由监工把该问题登记为后续问题，本节点按原合同验收"},
+        ],
+    },
+}
 
 #: Compile/build command prefixes that can never prove a *behavioral*
 #: invariant (they only prove the code compiles).  Built-in and not reducible
@@ -322,7 +352,10 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
     text.  Transient/repairable outcomes are engineering conditions and may be
     retried on the same task identity.  Only structured user/system
     authorization fields are external boundaries; free-form wording cannot
-    create one.  Anything else remains ``unknown`` so callers fail closed.
+    create one.  Plain-text "permission denied" / "authorization digest"
+    errors are engineering failures and repairable (auto-recoverable); free-form "permission
+    required" / "credential required" / "login required" stay fail-closed
+    ``binding_unknown``.  Anything else remains ``unknown`` so callers fail closed.
     """
     if isinstance(observation, BaseException) and isinstance(
         getattr(observation, "observation", None), dict
@@ -374,8 +407,8 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
     binding_markers = (
         "identity conflict", "identity mismatch", "writer conflict", "lease conflict",
         "binding conflict", "binding mismatch", "task identity", "contract digest",
-        "permission required", "permission denied", "credential required",
-        "authorization digest", "login required", "system permission",
+        "permission required", "credential required",
+        "login required", "system permission",
         "身份冲突", "租约冲突", "绑定冲突",
     )
     if any(marker in normalized for marker in binding_markers):
@@ -424,6 +457,10 @@ def classify_provider_failure(observation: Any) -> Dict[str, str]:
         "dirty checkout", "detached head", "detached", "branch drift", "worktree drift",
         "stale cursor", "dirty 工作树", "游离头", "分支漂移", "工作树漂移", "游标过期",
         "contract test execution failed", "invariant test failed", "合同测试失败",
+        # Local-evidence-recoverable (AC-B2).  Kept out of retryable_markers so
+        # the provider parameter-recovery gate (kind == "retryable") never
+        # treats a rejected create as licence for a second task.
+        "permission denied", "authorization digest",
     )
     if any(marker in normalized for marker in repairable_markers):
         return _result("repairable", "engineering")
@@ -1585,6 +1622,7 @@ class Monitor:
             raise PermissionError("capability_contract_unknown: run binding mismatch")
         self._require_snapshot_authorization(snapshot)
         self._reconcile_unapplied_events(snapshot)
+        self._route_undecided_blocked_design(snapshot)
         for node_id, current in snapshot.nodes.items():
             if current.get("status") == "start_pending":
                 self._mark_blocked_unknown(
@@ -1847,6 +1885,7 @@ class Monitor:
         self._require_snapshot_authorization(snapshot)
         self._validate_execution_topology(snapshot)
         self._reconcile_unapplied_events(snapshot)
+        self._route_undecided_blocked_design(snapshot)
         self._poll_active_handles(snapshot, runner)
         self._record_topology_projection(snapshot, "monitor.tick")
         if self._context_allows_dispatch(snapshot, runner):
@@ -4323,7 +4362,9 @@ class Monitor:
             # Preserve the write-ahead intent for same-task retry.  Unknown
             # binding/authorization evidence still fails closed; known
             # engineering failures remain schedulable.
-            if failure["kind"] not in {"retryable", "capacity_wait", "repairable"}:
+            if failure["kind"] == "external_decision":
+                self._mark_external_authorization_required(snapshot, node_id, str(error))
+            elif failure["kind"] not in {"retryable", "capacity_wait", "repairable"}:
                 self._mark_blocked_unknown(snapshot, node_id, str(error))
                 # A pre-write binding observation has no provider handle yet,
                 # but it is still a recoverable same-generation action. Keep
@@ -4344,7 +4385,7 @@ class Monitor:
                         "binding_digest": current.get("contract_digest", ""),
                         "last_observation_ref": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
                     }
-            if binding_contract_enabled(contract):
+            if binding_contract_enabled(contract) and failure["kind"] != "external_decision":
                 current["binding_phase"] = "binding_repair_pending"
             save_snapshot(self.paths, snapshot)
             return False
@@ -5285,6 +5326,8 @@ class Monitor:
                     )
                     if resolution is None or not resolution.files:
                         current["status"] = "blocked_design"
+                        current["blocked_design_cause"] = "integration_scope_review"
+                        current["blocked_design_target"] = target_node_id
                         current["reason"] = redact_provider_text(
                             "integration scope expansion requires product-manager review"
                         )
@@ -5300,8 +5343,11 @@ class Monitor:
                                 "node_id": node_id,
                                 "reason": current["reason"],
                                 "old_task_reconciled": True,
+                                "blocked_design_cause": "integration_scope_review",
+                                "blocked_design_target": target_node_id,
                             },
                         )
+                        self._ensure_blocked_design_decision(snapshot, node_id)
                         return
                     self._apply_scope_expansion(
                         snapshot,
@@ -5438,6 +5484,7 @@ class Monitor:
                 ):
                     return
                 current["status"] = "blocked_design"
+                current["blocked_design_cause"] = "out_of_contract_finding"
                 current["reason"] = redact_provider_text(
                     event.data.get("finding", "out-of-contract finding")
                 )
@@ -5454,8 +5501,10 @@ class Monitor:
                         "node_id": node_id,
                         "reason": current["reason"],
                         "old_task_reconciled": True,
+                        "blocked_design_cause": "out_of_contract_finding",
                     },
                 )
+                self._ensure_blocked_design_decision(snapshot, node_id)
                 return
             current["active_role"] = None
             current["active_task"] = None
@@ -5621,8 +5670,7 @@ class Monitor:
         elif event.event in {"failed", "stopped", "terminal_failed"}:
             failure = classify_provider_failure(event.data)
             if failure["kind"] == "external_decision":
-                current["retryable_action"] = None
-                self._mark_blocked_unknown(
+                self._mark_external_authorization_required(
                     snapshot, node_id,
                     str(redact_provider_text(event.data.get("reason", event.event))),
                 )
@@ -6367,6 +6415,9 @@ class Monitor:
             current["status"] = "blocked_design"
             current["reason"] = redact_provider_text(reason)
             current["retryable_action"] = None
+            current["recovery_action"] = "await_external_decision"
+            current["owner_layer"] = "external_authorization"
+            current["user_interrupt"] = True
         else:
             previous = current.get("retryable_action") if isinstance(current.get("retryable_action"), dict) else {}
             attempt = int(previous.get("attempt", 0) or 0) + 1
@@ -6377,7 +6428,7 @@ class Monitor:
                           "reason": redact_provider_text(reason),
                           "next_retry_at": float(next_retry_at if next_retry_at is not None else time.time() + delay)})
             current["retryable_action"] = retry
-            current["status"] = "retry_pending" if classification["kind"] in {"retryable", "capacity_wait"} else "blocked_unknown"
+            current["status"] = "retry_pending" if classification["kind"] in {"retryable", "capacity_wait", "repairable"} else "blocked_unknown"
             current["reason"] = redact_provider_text(reason)
         self._record(snapshot, "retry_scheduled", {"run_id": snapshot.run_id, "node_id": node_id,
             "reason_class": classification["kind"], "reason": reason,
@@ -6407,6 +6458,8 @@ class Monitor:
         elif classification["kind"] == "external_decision":
             current["status"] = "blocked_design"
             current["recovery_action"] = "await_external_decision"
+            current["owner_layer"] = "external_authorization"
+            current["user_interrupt"] = True
         else:
             current["status"] = "retry_pending"
             current["recovery_action"] = recovery_action_for_failure({"reason": reason})
@@ -6449,6 +6502,7 @@ class Monitor:
         reason: str,
         quarantine_lease: bool = True,
         retryable_same_task: bool = False,
+        extra_event_data: Optional[Dict[str, Any]] = None,
     ) -> None:
         current = snapshot.nodes[node_id]
         active = current.get("active_task")
@@ -6484,12 +6538,212 @@ class Monitor:
         }
         if retryable_same_task:
             event_data["retryable_same_task"] = True
+        if extra_event_data:
+            event_data.update(extra_event_data)
         self._record(
             snapshot,
             "blocked_unknown",
             event_data,
             active if isinstance(active, dict) else None,
         )
+
+    def _mark_external_authorization_required(
+        self, snapshot: RunSnapshot, node_id: str, reason: str,
+        active: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Park a node on a structured external authorization boundary.
+
+        Unlike blocked_unknown this is a legitimate wait-for-user: the status
+        maps to 需要你决定 and no engineering retry budget is consumed.
+        """
+        # Lease check first, outside any try: the binding write below sits in
+        # an ``except ValueError`` that would swallow the guard's conflict
+        # error, and the lease release would then run before ``_record``
+        # stops a superseded supervisor (see _ensure_blocked_design_decision).
+        guard = getattr(self, "_guard_lease", None)
+        if guard is not None:
+            guard(snapshot.run_id)
+        current = snapshot.nodes[node_id]
+        if active is None and isinstance(current.get("active_task"), dict):
+            active = current["active_task"]
+        if isinstance(active, dict) and active.get("role") in {"developer", "reviewer"}:
+            try:
+                self._set_binding_status(snapshot, node_id, str(active["role"]), "blocked_unknown")
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                pass
+        redacted = redact_provider_text(reason)
+        current["status"] = "blocked_design"
+        current["reason"] = redacted
+        current["retryable_action"] = None
+        current["recovery_action"] = "await_external_decision"
+        current["owner_layer"] = "external_authorization"
+        current["user_interrupt"] = True
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = None
+        current["old_task_reconciled"] = True
+        snapshot.handles.pop(node_id, None)
+        self._release_node_lease(snapshot, node_id)
+        self._record(snapshot, "blocked_design", {
+            "run_id": snapshot.run_id,
+            "node_id": node_id,
+            "reason": redacted,
+            "old_task_reconciled": True,
+            "owner_layer": "external_authorization",
+            "recovery_action": "await_external_decision",
+        }, active if isinstance(active, dict) else None)
+
+    def _ensure_blocked_design_decision(self, snapshot: RunSnapshot, node_id: str) -> bool:
+        """Register the missing decision for a decision-less blocked_design.
+
+        Text is vibe-authored and fixed per cause; provider finding text never
+        reaches the mailbox.  Returns False (state untouched) when the mailbox
+        write fails so the caller can fall back to the lifecycle state.
+        """
+        # The supervisor-lease node supplies ``_guard_lease`` (absent before it
+        # merges).  It must run before the mailbox write and the push: those
+        # side effects are not covered by the lease check in ``_record``, so a
+        # superseded supervisor would otherwise leave a request and a
+        # notification behind.  Its exception propagates on purpose.
+        guard = getattr(self, "_guard_lease", None)
+        if guard is not None:
+            guard(snapshot.run_id)
+        current = snapshot.nodes[node_id]
+        cause = current.get("blocked_design_cause")
+        spec = _BLOCKED_DESIGN_DECISIONS.get(cause)
+        if spec is None:
+            # Unknown cause: not a product decision; the lifecycle route owns it.
+            return False
+        evidence: Dict[str, Any] = {"cause": cause}
+        if cause == "integration_scope_review":
+            if isinstance(current.get("blocked_design_target"), str):
+                evidence["target_node_id"] = current["blocked_design_target"]
+        elif cause == "out_of_contract_finding":
+            evidence["role"] = "reviewer"
+            if isinstance(current.get("review_generation"), int):
+                evidence["review_generation"] = current["review_generation"]
+        try:
+            mailbox = DecisionMailbox(self.paths)
+            for attempt in range(1, _BLOCKED_DESIGN_MAX_ATTEMPTS + 1):
+                # An answered request is closed: a new block for the same cause
+                # needs a new question text (hence a new id) to reach the PM.
+                question = spec["question"] if attempt == 1 else "{}（第 {} 次）".format(spec["question"], attempt)
+                # Mailbox write only: notifying inside the loop would re-push
+                # every previously answered decision.
+                record = mailbox.raise_decision(
+                    run_id=snapshot.run_id,
+                    node_id=node_id,
+                    question=question,
+                    options=[dict(item) for item in spec["options"]],
+                    recommendation=None,
+                    evidence=evidence,
+                )
+                decision_id = str(record["decision_id"])
+                if mailbox.result(decision_id) is None:
+                    break
+            else:
+                return False
+        except (OSError, TypeError, ValueError):
+            return False
+        # One push per newly adopted decision.  The request is already on
+        # disk, so a bridge failure is an unknown status, never a blocker.
+        try:
+            notification = NotificationBridge(self.paths).notify(record)
+            notification_status = str(notification.get("status")) if isinstance(notification, dict) else "unknown"
+        except Exception:
+            notification_status = "unknown"
+        self._record(snapshot, "decision_raised", {
+            "run_id": snapshot.run_id,
+            "node_id": node_id,
+            "decision_ids": [decision_id],
+            "source": "monitor_blocked_design",
+            "reason": "decision pending",
+            "notification_status": notification_status,
+            "old_task_reconciled": True,
+        })
+        current["old_task_reconciled"] = True
+        current["decision_ids"] = [decision_id]
+        current["status"] = "blocked_design"
+        current["reason"] = "decision pending"
+        current["owner_layer"] = "product_acceptance"
+        current["user_interrupt"] = True
+        current["recovery_action"] = None
+        current["quarantine"] = None
+        return True
+
+    def _route_undecided_blocked_design(self, snapshot: RunSnapshot) -> None:
+        """Turn a decision-less blocked_design into a lifecycle recovery state."""
+        pending: Optional[List[Dict[str, Any]]] = None
+        pending_error: Optional[str] = None
+        for node_id, current in list(snapshot.nodes.items()):
+            if (
+                current.get("status") == "blocked_unknown"
+                and current.get("owner_layer") == "supervisor_lifecycle"
+                and current.get("recovery_action") == LIFECYCLE_DECISION_RECOVERY_ACTION
+            ):
+                # The supervisor performed the recovery (decision-raise):
+                # close the loop once the mailbox holds a request for the node.
+                if pending is None and pending_error is None:
+                    try:
+                        pending = list(DecisionMailbox(self.paths).list_pending(snapshot.run_id))
+                    except (OSError, TypeError, ValueError) as error:
+                        pending_error = type(error).__name__
+                ids = [
+                    str(item.get("decision_id")) for item in pending or []
+                    if isinstance(item, dict) and item.get("node_id") == node_id and item.get("decision_id")
+                ]
+                if not ids and pending_error is None and self._ensure_blocked_design_decision(snapshot, node_id):
+                    continue
+                if ids:
+                    current["status"] = "blocked_design"
+                    current["reason"] = "decision pending"
+                    current["decision_ids"] = ids
+                    current["quarantine"] = None
+                    current["owner_layer"] = "product_acceptance"
+                    current["recovery_action"] = None
+                    current["user_interrupt"] = True
+                    self._record(snapshot, "decision_raised", {
+                        "run_id": snapshot.run_id,
+                        "node_id": node_id,
+                        "decision_ids": ids,
+                        "source": "supervisor_lifecycle",
+                        "reason": "decision pending",
+                    })
+                continue
+            if current.get("status") != "blocked_design":
+                continue
+            if (
+                current.get("recovery_action") == "await_external_decision"
+                or current.get("owner_layer") == "external_authorization"
+                or current.get("decision_ids")
+            ):
+                continue
+            if pending is None and pending_error is None:
+                try:
+                    pending = list(DecisionMailbox(self.paths).list_pending(snapshot.run_id))
+                except (OSError, TypeError, ValueError) as error:
+                    pending_error = type(error).__name__
+            if pending_error is None and any(
+                isinstance(item, dict) and item.get("node_id") == node_id for item in pending or []
+            ):
+                continue
+            if pending_error is None and self._ensure_blocked_design_decision(snapshot, node_id):
+                continue
+            if pending_error is None:
+                reason = "blocked_design has no decision record; supervisor lifecycle defect"
+            else:
+                reason = "decision record cannot be verified ({}); supervisor lifecycle defect".format(pending_error)
+            self._mark_blocked_unknown(
+                snapshot, node_id, reason, quarantine_lease=False,
+                extra_event_data={
+                    "owner_layer": "supervisor_lifecycle",
+                    "recovery_action": LIFECYCLE_DECISION_RECOVERY_ACTION,
+                    "user_interrupt": False,
+                },
+            )
+            current["recovery_action"] = LIFECYCLE_DECISION_RECOVERY_ACTION
+            current["owner_layer"] = "supervisor_lifecycle"
+            current["user_interrupt"] = False
 
     def _record(
         self,
@@ -6903,6 +7157,9 @@ class Monitor:
                     "handle_id": snapshot.handles.get(node_id),
                     "reason": current["reason"],
                 }
+                for marker in ("owner_layer", "recovery_action", "user_interrupt"):
+                    if marker in data:
+                        current[marker] = data[marker]
             elif record["event"] == "retry_scheduled":
                 if provenance.get("role") not in {"developer", "reviewer"}:
                     raise ValueError("retry event lacks task provenance")
@@ -7207,6 +7464,15 @@ class Monitor:
                 current["old_task_reconciled"] = bool(
                     data.get("old_task_reconciled")
                 )
+                if data.get("owner_layer"):
+                    current["owner_layer"] = data["owner_layer"]
+                    current["user_interrupt"] = data["owner_layer"] == "external_authorization"
+                if data.get("recovery_action"):
+                    current["recovery_action"] = data["recovery_action"]
+                if data.get("blocked_design_cause"):
+                    current["blocked_design_cause"] = data["blocked_design_cause"]
+                if data.get("blocked_design_target"):
+                    current["blocked_design_target"] = data["blocked_design_target"]
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
@@ -7224,6 +7490,13 @@ class Monitor:
                         "handle_id": None,
                         "reason": reason,
                     }
+                elif data.get("source") in {"supervisor_lifecycle", "monitor_blocked_design"}:
+                    # Lifecycle recovery closed: drop the defect markers and
+                    # the quarantine the blocked_unknown replay set.
+                    current["quarantine"] = None
+                    current["owner_layer"] = "product_acceptance"
+                    current["recovery_action"] = None
+                    current["user_interrupt"] = True
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
