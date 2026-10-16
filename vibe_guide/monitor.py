@@ -1122,17 +1122,22 @@ class Monitor:
             self._binding_cache[key] = binding
         return binding
 
-    def _guard_lease(self) -> None:
+    def _guard_lease(self, run_id: Optional[str] = None) -> None:
         guard = getattr(self, "lease_guard", None)
         if guard is not None:
             guard()
+        elif run_id is not None:
+            # Plain ``resume`` / heartbeat paths build a Monitor without the
+            # --watch guard; a superseded supervisor session must still stop.
+            from .supervisor import ensure_caller_not_superseded
+            ensure_caller_not_superseded(self.paths, run_id)
 
     def _save_snapshot(self, snapshot: Any) -> None:
-        self._guard_lease()
+        self._guard_lease(getattr(snapshot, "run_id", None))
         save_snapshot(self.paths, snapshot)
 
     def _save_task_binding(self, binding: TaskBinding) -> None:
-        self._guard_lease()
+        self._guard_lease(binding.run_id)
         save_task_binding(self.paths, binding)
         if binding.run_id is not None:
             self._binding_cache[(binding.run_id, binding.issue_id, binding.role)] = binding
@@ -6519,7 +6524,7 @@ class Monitor:
             "authorization_digest": snapshot.authorization_digest,
             "node_contract_digest": snapshot.node_contract_digest,
         }
-        self._guard_lease()
+        self._guard_lease(getattr(snapshot, "run_id", None))
         snapshot.event_sequence = append_event(
             self.paths, RunEvent(event_name, data), provenance
         )

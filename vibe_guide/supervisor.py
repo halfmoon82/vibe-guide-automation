@@ -736,6 +736,65 @@ def _same_session(left, right) -> bool:
     )
 
 
+_CALLER_SESSION_ENV = (
+    "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_HOST_SESSION_ID",
+    "CODEBUDDY_SESSION_ID", "CODEX_THREAD_ID",
+)
+
+
+def caller_session_ids(environ=None):
+    """All non-empty host session ids in the environment (deduplicated, ordered)."""
+    environ = os.environ if environ is None else environ
+    found = []
+    for name in _CALLER_SESSION_ENV:
+        value = environ.get(name)
+        if isinstance(value, str) and value and value not in found:
+            found.append(value)
+    return tuple(found)
+
+
+def superseded_caller_reason(paths, run_id, session_ids):
+    """Reason string when the caller is a superseded supervisor, else None.
+
+    ``session_ids`` are all ids the caller's host exposes; any one matching the
+    registry current means it is the current supervisor.
+
+    Missing, unreadable or malformed registry keeps the old behavior (None).
+    """
+    if not session_ids:
+        return None
+    try:
+        registry = _read_json_file(_registry_path(paths, run_id))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(registry, dict):
+        return None
+    current = registry.get("current")
+    if isinstance(current, dict) and current.get("session_id") in session_ids:
+        return None
+    history = registry.get("history")
+    stale = None
+    if isinstance(history, list):
+        stale = next((
+            item.get("session_id") for item in history
+            if isinstance(item, dict) and item.get("session_id") in session_ids
+        ), None)
+    if stale is not None:
+        successor = current.get("session_id") if isinstance(current, dict) else None
+        epoch = current.get("lease_epoch") if isinstance(current, dict) else None
+        return (
+            "supervisor session %s was superseded by %s (lease epoch %s); exit read-only"
+            % (stale, successor, epoch)
+        )
+    return None
+
+
+def ensure_caller_not_superseded(paths, run_id, environ=None):
+    reason = superseded_caller_reason(paths, run_id, caller_session_ids(environ))
+    if reason:
+        raise SupervisorLeaseConflict(reason)
+
+
 def _write_registry(path, registry):
     descriptor, temporary = tempfile.mkstemp(
         prefix=".supervisor-registry-", dir=str(path.parent)
