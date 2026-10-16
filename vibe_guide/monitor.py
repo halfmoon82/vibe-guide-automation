@@ -6556,6 +6556,13 @@ class Monitor:
         Unlike blocked_unknown this is a legitimate wait-for-user: the status
         maps to 需要你决定 and no engineering retry budget is consumed.
         """
+        # Lease check first, outside any try: the binding write below sits in
+        # an ``except ValueError`` that would swallow the guard's conflict
+        # error, and the lease release would then run before ``_record``
+        # stops a superseded supervisor (see _ensure_blocked_design_decision).
+        guard = getattr(self, "_guard_lease", None)
+        if guard is not None:
+            guard(snapshot.run_id)
         current = snapshot.nodes[node_id]
         if active is None and isinstance(current.get("active_task"), dict):
             active = current["active_task"]
