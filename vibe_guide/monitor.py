@@ -6593,6 +6593,14 @@ class Monitor:
         reaches the mailbox.  Returns False (state untouched) when the mailbox
         write fails so the caller can fall back to the lifecycle state.
         """
+        # The supervisor-lease node supplies ``_guard_lease`` (absent before it
+        # merges).  It must run before the mailbox write and the push: those
+        # side effects are not covered by the lease check in ``_record``, so a
+        # superseded supervisor would otherwise leave a request and a
+        # notification behind.  Its exception propagates on purpose.
+        guard = getattr(self, "_guard_lease", None)
+        if guard is not None:
+            guard(snapshot.run_id)
         current = snapshot.nodes[node_id]
         cause = current.get("blocked_design_cause")
         spec = _BLOCKED_DESIGN_DECISIONS.get(cause)

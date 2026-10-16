@@ -51,6 +51,12 @@ class _Base(unittest.TestCase):
         save_snapshot(self.paths, snapshot)
         return monitor, runner, snapshot
 
+    def answer_pending(self, decision_id, choice):
+        """Answer with the request digest (required once decision-boundary lands)."""
+        mailbox = DecisionMailbox(self.paths)
+        request = next(r for r in mailbox.list_pending() if r["decision_id"] == decision_id)
+        return mailbox.answer(decision_id, choice, request_digest=request["request_digest"])
+
     def decision_events(self, run_id):
         return [
             e for e in load_events(self.paths, run_id)
@@ -172,7 +178,7 @@ class LifecycleFallbackTests(_Base):
     def test_reblock_for_same_cause_after_answer_gets_a_new_pending_decision(self):
         monitor, runner, snapshot = self.undecided(blocked_design_cause="integration_scope_review")
         first = monitor.tick(snapshot.run_id, runner).nodes["n1"]["decision_ids"][0]
-        DecisionMailbox(self.paths).answer(first, "keep_scope")
+        self.answer_pending(first, "keep_scope")
         self.assertEqual(self.pending_for(snapshot.run_id, "n1"), [])
         self.reblock(snapshot)
         second = monitor.tick(snapshot.run_id, runner).nodes["n1"]
@@ -202,11 +208,10 @@ class LifecycleFallbackTests(_Base):
 
     def test_answered_suffix_bound_falls_back_to_lifecycle(self):
         monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
-        mailbox = DecisionMailbox(self.paths)
         for _ in range(20):
             live = load_snapshot(self.paths, snapshot.run_id)
             self.assertTrue(monitor._ensure_blocked_design_decision(live, "n1"))
-            mailbox.answer(live.nodes["n1"]["decision_ids"][0], "defer_finding")
+            self.answer_pending(live.nodes["n1"]["decision_ids"][0], "defer_finding")
         live = load_snapshot(self.paths, snapshot.run_id)
         self.assertIs(monitor._ensure_blocked_design_decision(live, "n1"), False)
         self.assertEqual(self.pending_for(snapshot.run_id, "n1"), [])
@@ -228,7 +233,7 @@ class LifecycleFallbackTests(_Base):
         with self.spy_notify() as spy:
             first = monitor.tick(snapshot.run_id, runner).nodes["n1"]["decision_ids"][0]
             self.assertEqual([c.args[1]["decision_id"] for c in spy.call_args_list], [first])
-            DecisionMailbox(self.paths).answer(first, "keep_scope")
+            self.answer_pending(first, "keep_scope")
             self.reblock(snapshot)
             second = monitor.tick(snapshot.run_id, runner).nodes["n1"]["decision_ids"][0]
         self.assertNotEqual(first, second)
@@ -236,12 +241,11 @@ class LifecycleFallbackTests(_Base):
 
     def test_exhausted_cap_never_notifies_and_adds_no_events(self):
         monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
-        mailbox = DecisionMailbox(self.paths)
         for _ in range(20):
             live = load_snapshot(self.paths, snapshot.run_id)
             self.assertTrue(monitor._ensure_blocked_design_decision(live, "n1"))
             save_snapshot(self.paths, live)
-            mailbox.answer(live.nodes["n1"]["decision_ids"][0], "defer_finding")
+            self.answer_pending(live.nodes["n1"]["decision_ids"][0], "defer_finding")
         self.reblock(snapshot)
         with self.spy_notify() as spy:
             monitor.tick(snapshot.run_id, runner)
