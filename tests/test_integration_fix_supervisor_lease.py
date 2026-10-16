@@ -109,12 +109,55 @@ class CallerGuardTests(unittest.TestCase):
                 self.monitor._save_snapshot(self._snap())
             saved.assert_not_called()
 
-    def test_h_watch_guard_path_skips_identity_check(self):
+    def test_h_watch_guard_does_not_bypass_identity_check(self):
         self._register("S1", "S2")
         self.monitor.lease_guard = lambda: None
         with self._env("S1"), patch("vibe_guide.monitor.save_snapshot") as saved:
+            with self.assertRaises(SupervisorLeaseConflict):
+                self.monitor._save_snapshot(self._snap())
+            saved.assert_not_called()
+        with self._env("S2"), patch("vibe_guide.monitor.save_snapshot") as saved:
             self.monitor._save_snapshot(self._snap())
             saved.assert_called_once()
+
+    def test_superseded_supervisor_start_is_read_only(self):
+        from vibe_guide.supervisor import Supervisor
+
+        class Mon:
+            calls = []
+
+            def resume(self, *args, **kwargs):
+                self.calls.append("resume")
+
+            def tick(self, *args, **kwargs):
+                self.calls.append("tick")
+
+        self._register("S1", "S2")
+        lease_path = run_dir(self.paths, "run-1") / "supervisor.lease"
+        before = lease_path.read_bytes()
+        monitor = Mon()
+        supervisor = Supervisor(self.paths, monitor, object(), "run-1")
+        with self._env("S1"):
+            with self.assertRaises(SupervisorLeaseConflict):
+                supervisor.recover_or_start()
+            with self.assertRaises(SupervisorLeaseConflict):
+                supervisor.run_once()
+        self.assertEqual(lease_path.read_bytes(), before)
+        self.assertEqual(monitor.calls, [])
+
+    def test_record_event_rejected_for_superseded_identity(self):
+        self._register("S1", "S2")
+        snap = self._snap()
+        snap.authorization_digest = "a"
+        snap.node_contract_digest = "n"
+        with self._env("S1"), patch("vibe_guide.monitor.append_event") as appended:
+            with self.assertRaises(SupervisorLeaseConflict) as ctx:
+                self.monitor._record(snap, "blocked_unknown", {})
+            appended.assert_not_called()
+            self.assertIn("current supervisor session", str(ctx.exception))
+        with self._env("S2"), patch("vibe_guide.monitor.append_event", return_value=7) as appended:
+            self.monitor._record(snap, "blocked_unknown", {})
+            appended.assert_called_once()
 
     def _env_multi(self, **values):
         env = {key: "" for key in ENV}

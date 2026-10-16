@@ -198,10 +198,12 @@ class Supervisor:
 
     def recover_or_start(self, run_id: str = None) -> Dict[str, Any]:
         target = run_id or self.run_id
+        ensure_caller_not_superseded(self.paths, target)
         acquired = self.lease.acquire(target)
         return {"stale_pid_recovered": acquired, "active_supervisors": 1 if acquired else 0}
 
     def run_once(self):
+        ensure_caller_not_superseded(self.paths, self.run_id)
         if (
             getattr(self.lease, "_run_id", None) == self.run_id
             and getattr(self.lease, "lease_epoch", None) is not None
@@ -783,7 +785,8 @@ def superseded_caller_reason(paths, run_id, session_ids):
         successor = current.get("session_id") if isinstance(current, dict) else None
         epoch = current.get("lease_epoch") if isinstance(current, dict) else None
         return (
-            "supervisor session %s was superseded by %s (lease epoch %s); exit read-only"
+            "supervisor session %s was superseded by %s (lease epoch %s); exit read-only; "
+            "run this from the current supervisor session or a new session"
             % (stale, successor, epoch)
         )
     return None

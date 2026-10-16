@@ -1126,9 +1126,9 @@ class Monitor:
         guard = getattr(self, "lease_guard", None)
         if guard is not None:
             guard()
-        elif run_id is not None:
-            # Plain ``resume`` / heartbeat paths build a Monitor without the
-            # --watch guard; a superseded supervisor session must still stop.
+        if run_id is not None:
+            # Independent of the --watch guard: a superseded session starting
+            # its own watch must still stop (the lease pid check cannot see it).
             from .supervisor import ensure_caller_not_superseded
             ensure_caller_not_superseded(self.paths, run_id)
 
