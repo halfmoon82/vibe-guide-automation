@@ -2137,11 +2137,21 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             "changed": applied.changed,
             "paths": applied.paths,
         }
-        summary = (
-            rules_name + " 能力规则已生效"
-            if applied.changed
-            else rules_name + " 能力规则无需变更"
-        )
+        if not applied.changed:
+            summary = rules_name + " 能力规则无需变更"
+        elif rules_name in applied.paths:
+            summary = (
+                rules_name + " 能力规则已生效（写入 "
+                + "、".join(applied.paths) + "）"
+            )
+        else:
+            # The rules were already in place; what changed is that Claude Code
+            # can finally read them.  Saying "rules written" here would read as
+            # if the rules file had been touched.
+            summary = (
+                "规则已在 " + rules_name + "，已补 " + "、".join(applied.paths)
+                + " 的引入行，Claude Code 现在能读到"
+            )
         if applied.notes:
             payload["notes"] = list(applied.notes)
             summary += "；请注意：" + "；".join(applied.notes)

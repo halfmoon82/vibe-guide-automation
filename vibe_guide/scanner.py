@@ -56,6 +56,119 @@ def resolve_rules_file(root):
     return None
 
 
+#: Claude Code loads only its own project memory file and never reads
+#: AGENTS.md, so rules written there reach every other host and this one not
+#: at all (#126).  The two names below are its project footprint: the memory
+#: file it loads, and the host directory a project gets once Claude Code has
+#: run in it.
+CLAUDE_ENTRY_FILE = 'CLAUDE.md'
+CLAUDE_PROJECT_DIR = '.claude'
+#: Claude Code's import syntax; a line of this shape pulls a file into the
+#: session that reads the memory file.
+CLAUDE_IMPORT_PREFIX = '@'
+
+
+def claude_code_project(root):
+    """True when the project carries a Claude Code footprint.
+
+    Only project-local evidence counts.  `vibe doctor` must return the same
+    verdict for a project whatever shell or host ran it, so an environment
+    variable -- which describes the caller, not the project -- is deliberately
+    not part of this test.  The writer accepts the session marker as well
+    (`claude_code_session`), because it is deciding whether to *create* the
+    footprint rather than reporting on it.
+
+    A `.claude` symlink to a directory counts: a project that shares one
+    `.claude` still opens its Claude Code sessions through it, so the rules
+    have to reach it.  That differs from `.vibe`, which `scan_project` refuses
+    to follow -- there a symlink would mean the project's own state is
+    somewhere else, which is a different claim.
+    """
+    base = Path(root)
+    entry = base / CLAUDE_ENTRY_FILE
+    try:
+        if entry.is_file() or entry.is_symlink():
+            return True
+        return (base / CLAUDE_PROJECT_DIR).is_dir()
+    except OSError:
+        return False
+
+
+#: Set to "1" by Claude Code for every process a session spawns -- verified in
+#: the installed bundle (2.1.295), where `CLAUDECODE: "1"` is added to the child
+#: environment beside `CLAUDE_CODE_SESSION_ID`.  Only the *writer* reads this,
+#: and only to decide whether creating CLAUDE.md is welcome: the caller being
+#: the host that reads that file is what makes it welcome.  `vibe doctor` must
+#: not read it -- a verdict about a project cannot depend on who ran the check.
+CLAUDE_SESSION_ENV = 'CLAUDECODE'
+
+
+def claude_code_session(environ=None):
+    """True when the caller is a Claude Code session rather than a plain shell."""
+    env = os.environ if environ is None else environ
+    return bool(env.get(CLAUDE_SESSION_ENV))
+
+
+def claude_import_line(rules_name):
+    """The memory-file line that makes Claude Code read `rules_name`."""
+    return CLAUDE_IMPORT_PREFIX + rules_name
+
+
+def claude_entry_imports(text, rules_name):
+    """True when `text` carries a live import of `rules_name`.
+
+    Only a standalone line counts.  Claude Code ignores an import written
+    inside a fenced block or quoted with `>`, and counting one of those would
+    report the project as covered while a session still reads nothing.
+    """
+    wanted = claude_import_line(rules_name)
+    fence = None
+    for line in text.splitlines():
+        marker = fence_marker(line)
+        if fence is None:
+            if marker:
+                fence = marker
+                continue
+            if line.strip() == wanted:
+                return True
+        elif marker and marker[0] == fence[0] and len(marker) >= len(fence):
+            fence = None
+    return False
+
+
+def claude_entry_reaches_rules(root, rules_name):
+    """True when a Claude Code session in `root` ends up reading `rules_name`.
+
+    Either the memory file *is* the rules file -- a symlink resolving to it --
+    or it imports it.  A missing or unreadable memory file reaches nothing,
+    which keeps the verdict fail-closed rather than silently green.
+
+    `RuntimeError` is in the catch because `Path.resolve()` raises it for a
+    symlink loop on Python 3.9-3.12 (3.13 turned it into `OSError`), and this
+    package supports 3.9 -- an unreachable file is exactly what a loop is.
+    """
+    base = Path(root)
+    entry = base / CLAUDE_ENTRY_FILE
+    try:
+        if entry.is_symlink():
+            return entry.resolve() == (base / rules_name).resolve()
+        if not entry.is_file():
+            return False
+        text = entry.read_text(encoding='utf-8')
+    except (OSError, RuntimeError, UnicodeDecodeError):
+        return False
+    return claude_entry_imports(text, rules_name)
+
+
+def fence_marker(line):
+    """Return a code-fence marker (`` ``` `` or `~~~`) opening or closing a block."""
+    stripped = line.lstrip()
+    for char in ("`", "~"):
+        if stripped.startswith(char * 3):
+            return char * (len(stripped) - len(stripped.lstrip(char)))
+    return ""
+
+
 CAPABILITY_RULE_MARKER = "Capability and Tool Truth"
 CAPABILITY_RULES = """## Capability and Tool Truth
 
@@ -93,6 +206,11 @@ class ScanReport:
     agent_commands: Dict[str, bool] = field(default_factory=dict)
     skill_records_error: Optional[str] = None
     rules_file: Optional[str] = None
+    #: A Claude Code footprint was found in the project.  The rules only reach
+    #: that host through its own memory file, so the two fields below are
+    #: reported together: host without reach is the #126 failure.
+    claude_code_host: bool = False
+    claude_rules_loaded: bool = False
 
 
 @dataclass
@@ -435,6 +553,13 @@ def scan_project(paths):
     git_version = _run('git', '--version')
     rules_file = resolve_rules_file(root)
     agentsmd = root / (rules_file or RULES_FILE_CANDIDATES[0])
+    # Claude Code reads its own memory file, never AGENTS.md, so the rules are
+    # only wired for that host when its entry file imports the rules file (or
+    # is it).  Reported, not repaired: `apply-agentsmd` is what writes.
+    claude_host = claude_code_project(root)
+    claude_loaded = bool(
+        rules_file and claude_entry_reaches_rules(root, rules_file)
+    )
     vibe = root / '.vibe'
     agentsmd_exists = rules_file is not None
     if not vibe.exists() or vibe.is_symlink() or not vibe.is_dir():
@@ -466,6 +591,8 @@ def scan_project(paths):
         agent_commands=commands,
         skill_records_error=skill_records_error,
         rules_file=rules_file,
+        claude_code_host=claude_host,
+        claude_rules_loaded=claude_loaded,
     )
 
 

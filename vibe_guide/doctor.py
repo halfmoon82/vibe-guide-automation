@@ -47,6 +47,11 @@ def doctor(report):
     # Older / hand-built ScanReport objects predate the field, so fall back to
     # the historical name rather than raising AttributeError.
     rules_file = getattr(report, 'rules_file', None)
+    # Direct attributes, no fallback: `scanner.ScanReport` is the only thing
+    # that builds a report (it is the one construction site in the package),
+    # so a default here would be defensive code with nothing to defend.
+    claude_host = bool(report.claude_code_host)
+    claude_loaded = bool(report.claude_rules_loaded)
     valid_skills = [skill for skill in report.skills if skill.get('valid')]
     # Configured means pinned to a github source and commit (AGENTS.md §7);
     # an unpinned host copy is listed under host_provided, never counted.
@@ -87,6 +92,12 @@ def doctor(report):
             (rules_file or 'AGENTS.md') + ' line ' + str(number)
             + ': legacy entry rule conflicts with New Session Entry'
         )
+    # Claude Code loads CLAUDE.md and never AGENTS.md, so rules written to the
+    # shared file reach that host only through an import line (#126).  Gated on
+    # a rules file existing: with none, "missing AGENTS.md" already says it,
+    # and "not loaded" would describe a file that is not there.
+    if claude_host and rules_file and not claude_loaded:
+        issues.append('rules file not loaded by host: Claude Code')
     if not report.knowledge_exists:
         issues.append('missing .vibe/knowledge')
     if report.skill_records_error:
@@ -109,6 +120,12 @@ def doctor(report):
             'present': report.agentsmd_exists,
             'file': rules_file,
             'legacy_entry_lines': legacy_entry_lines,
+        },
+        # Reported as a pair: a host the project carries but the rules do not
+        # reach is the #126 failure, and either half alone reads as fine.
+        'claude_code': {
+            'host': claude_host,
+            'rules_loaded': claude_loaded,
         },
         'knowledge': {'present': report.knowledge_exists},
         'skills': {
