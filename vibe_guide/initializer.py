@@ -13,6 +13,7 @@ from .scanner import (
     WORKBUDDY_ORIGIN,
     build_agentsmd_patch,
     claude_code_project,
+    claude_code_session,
     claude_entry_imports,
     claude_entry_reaches_rules,
     claude_import_line,
@@ -681,14 +682,19 @@ def _ensure_claude_import(root, rules_name):
     """Make Claude Code's memory file reach `rules_name`.
 
     Returns the name of the file written (or None) and the notes the user
-    should read.  Silent when the project carries no Claude Code footprint --
-    creating CLAUDE.md in a project that never ran that host would hand a new
-    host the project's context, which is not this command's call.
+    should read.
+
+    Runs when the project already carries a Claude Code footprint, and also
+    when the *caller* is one: `vibe apply-agentsmd` invoked from a Claude Code
+    session is that host setting up the project it is about to read, so
+    creating CLAUDE.md is welcome rather than a file invented behind the
+    user's back.  A plain shell in a project with no footprint gets nothing --
+    guessing there would hand a new host the project's context.
 
     Never writes through a symlink and never rewrites a line that is already
     there, so a project wired by hand keeps exactly the bytes it had.
     """
-    if not claude_code_project(root):
+    if not (claude_code_project(root) or claude_code_session()):
         return None, []
     entry = root / CLAUDE_ENTRY_FILE
     if entry.is_symlink():
@@ -715,6 +721,13 @@ def _ensure_claude_import(root, rules_name):
         ]
     if claude_entry_imports(existing, rules_name):
         return None, []
+    # mkstemp creates 0600, so a replace would silently tighten a memory file
+    # the user had made group-readable.  Carry the old mode across; a new file
+    # keeps mkstemp's default, which is what a new AGENTS.md gets too.
+    try:
+        previous_mode = entry.stat().st_mode if entry.exists() else None
+    except OSError:
+        previous_mode = None
     line = claude_import_line(rules_name)
     if existing:
         separator = "" if existing.endswith("\n") else "\n"
@@ -734,6 +747,11 @@ def _ensure_claude_import(root, rules_name):
     finally:
         if temporary.exists():
             temporary.unlink()
+    if previous_mode is not None:
+        try:
+            os.chmod(str(entry), previous_mode)
+        except OSError:
+            pass
     return CLAUDE_ENTRY_FILE, []
 
 

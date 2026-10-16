@@ -19,6 +19,9 @@ from vibe_guide.doctor import doctor
 from vibe_guide.initializer import _rules_target
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.scanner import (
+    claude_code_project,
+    claude_code_session,
+    claude_entry_imports,
     claude_entry_reaches_rules,
     scan_project,
 )
@@ -41,9 +44,15 @@ class HostRulesReachTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         # Unset would fall back to ~/.workbuddy, so pin an empty host dir.
+        # CLAUDECODE is cleared rather than left alone: this suite may itself be
+        # run from a Claude Code session, and the writer reads that marker --
+        # inheriting it would make "no footprint means no CLAUDE.md" pass or
+        # fail depending on who ran pytest.  The tests that want the marker set
+        # it themselves.
         patcher = mock.patch.dict(os.environ, {
             "WORKBUDDY_CONFIG_DIR": str(Path(self._tmp.name) / "no-host"),
             "CODEBUDDY_CONFIG_DIR": "",
+            "CLAUDECODE": "",
         })
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -179,6 +188,115 @@ class HostRulesReachTests(unittest.TestCase):
     def test_a_project_without_claude_code_gets_no_claude_md(self):
         self.assertEqual(self._apply().exit_code, 0)
         self.assertFalse((self.root / "CLAUDE.md").exists())
+
+    def test_a_claude_code_session_may_create_the_memory_file_it_will_read(self):
+        # Fresh clone, no footprint yet, vibe invoked from inside Claude Code:
+        # the caller *is* the host that reads CLAUDE.md, so creating it is that
+        # host setting up its own project rather than a file invented behind
+        # the user's back.  Without the marker the same project gets nothing.
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            self.assertIs(claude_code_session(), True)
+            self.assertIs(claude_code_project(self.root), False)
+            self.assertEqual(self._apply().exit_code, 0)
+        self.assertIn("@AGENTS.md", (self.root / "CLAUDE.md").read_text(encoding="utf-8"))
+        # And the footprint it just created is what `doctor` now judges, so the
+        # check goes green without ever reading the caller's environment.
+        self.assertNotIn('rules file not loaded by host: Claude Code', self._issues())
+
+    def test_the_session_marker_is_not_part_of_the_project_verdict(self):
+        # A project cannot be reported on differently because of who ran the
+        # check, so `scan_project` must ignore the marker entirely.
+        self._write("AGENTS.md", "## Capability and Tool Truth\n\n- rule\n")
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            report = self._scan()
+        self.assertIs(report.claude_code_host, False)
+        self.assertIs(report.claude_rules_loaded, False)
+
+    def test_a_symlinked_dot_claude_directory_is_a_footprint(self):
+        shared = Path(self._tmp.name) / "shared-claude"
+        shared.mkdir()
+        (self.root / ".claude").symlink_to(shared)
+        self.assertIs(claude_code_project(self.root), True)
+        self.assertEqual(self._apply().exit_code, 0)
+        self.assertIn("@AGENTS.md", (self.root / "CLAUDE.md").read_text(encoding="utf-8"))
+
+    def test_a_symlink_loop_is_reported_not_raised(self):
+        # `Path.resolve()` raises RuntimeError for a loop on Python 3.9-3.12,
+        # where this package still runs.  A loop reaches no rules, so the only
+        # acceptable outcome is the ordinary "not loaded" verdict.
+        self._write("AGENTS.md", "## Capability and Tool Truth\n\n- rule\n")
+        (self.root / "CLAUDE.md").symlink_to("CLAUDE.md")
+        self.assertIs(claude_entry_reaches_rules(self.root, "AGENTS.md"), False)
+        self.assertIs(self._scan().claude_rules_loaded, False)
+        self.assertIn('rules file not loaded by host: Claude Code', self._issues())
+
+    def test_an_existing_memory_file_keeps_its_mode(self):
+        entry = self._write("CLAUDE.md", "# claude rules\n")
+        os.chmod(entry, 0o644)
+        self.assertEqual(self._apply().exit_code, 0)
+        self.assertIn("@AGENTS.md", entry.read_text(encoding="utf-8"))
+        self.assertEqual(entry.stat().st_mode & 0o777, 0o644)
+
+    def test_the_only_form_that_counts_is_the_bare_import_line(self):
+        # Claude Code's syntax has not been calibrated against a live session
+        # here, so anything but the exact line the writer produces counts as
+        # *not* imported.  Wrong in that direction shows up as a doctor warning
+        # and a redundant line; wrong in the other direction is a silent host
+        # that reads nothing.
+        for text in (
+            "@./AGENTS.md\n",
+            "see @AGENTS.md\n",
+            "  @AGENTS.md\n\n",          # trailing blank lines are fine
+        ):
+            with self.subTest(text=text):
+                self.assertIs(
+                    claude_entry_imports(text, "AGENTS.md"),
+                    text.strip() == "@AGENTS.md",
+                    text,
+                )
+        self.assertIs(claude_entry_imports("@AGENTS.md\n", "AGENTS.md"), True)
+
+    def test_the_fence_state_machine_covers_both_markers(self):
+        for fence in ("```", "~~~", "````"):
+            with self.subTest(fence=fence):
+                self.assertIs(
+                    claude_entry_imports(
+                        "# rules\n\n" + fence + "\n@AGENTS.md\n" + fence + "\n",
+                        "AGENTS.md",
+                    ),
+                    False,
+                )
+                # The same fence closed, then a real import after it.
+                self.assertIs(
+                    claude_entry_imports(
+                        fence + "\n@AGENTS.md\n" + fence + "\n@AGENTS.md\n",
+                        "AGENTS.md",
+                    ),
+                    True,
+                )
+
+    def test_an_unclosed_fence_hides_everything_after_it(self):
+        # One opening marker and no close: the import is inside the block as
+        # far as any reader is concerned, so it must not count.
+        for fence in ("```", "~~~"):
+            with self.subTest(fence=fence):
+                self.assertIs(
+                    claude_entry_imports(
+                        "# rules\n" + fence + "\n@AGENTS.md\n", "AGENTS.md"
+                    ),
+                    False,
+                )
+
+    def test_the_cli_says_which_file_it_wrote(self):
+        # Existing project: the rules are already in AGENTS.md, only the import
+        # is new.  The summary must not read as if the rules file was rewritten.
+        self.assertEqual(self._apply().exit_code, 0)
+        self.assertFalse((self.root / "CLAUDE.md").exists())
+        self._write("CLAUDE.md", "# claude rules\n")
+        applied = run_cli(["apply-agentsmd", "--confirm"], self.root)
+        self.assertEqual(applied.exit_code, 0, applied.text)
+        self.assertIn("CLAUDE.md", applied.text)
+        self.assertIn("引入行", applied.text)
 
     # -- what the check must not accept --------------------------------------
 

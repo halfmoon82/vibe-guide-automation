@@ -32,10 +32,11 @@ def doctor(report):
     # Older / hand-built ScanReport objects predate the field, so fall back to
     # the historical name rather than raising AttributeError.
     rules_file = getattr(report, 'rules_file', None)
-    # Same reason: a report built before the Claude Code fields existed must
-    # still produce a verdict rather than an AttributeError.
-    claude_host = bool(getattr(report, 'claude_code_host', False))
-    claude_loaded = bool(getattr(report, 'claude_rules_loaded', False))
+    # Direct attributes, no fallback: `scanner.ScanReport` is the only thing
+    # that builds a report (it is the one construction site in the package),
+    # so a default here would be defensive code with nothing to defend.
+    claude_host = bool(report.claude_code_host)
+    claude_loaded = bool(report.claude_rules_loaded)
     valid_skills = [skill for skill in report.skills if skill.get('valid')]
     # Configured means pinned to a github source and commit (AGENTS.md §7);
     # an unpinned host copy is listed under host_provided, never counted.

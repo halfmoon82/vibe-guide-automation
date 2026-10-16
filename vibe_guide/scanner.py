@@ -74,7 +74,15 @@ def claude_code_project(root):
     Only project-local evidence counts.  `vibe doctor` must return the same
     verdict for a project whatever shell or host ran it, so an environment
     variable -- which describes the caller, not the project -- is deliberately
-    not part of this test.
+    not part of this test.  The writer accepts the session marker as well
+    (`claude_code_session`), because it is deciding whether to *create* the
+    footprint rather than reporting on it.
+
+    A `.claude` symlink to a directory counts: a project that shares one
+    `.claude` still opens its Claude Code sessions through it, so the rules
+    have to reach it.  That differs from `.vibe`, which `scan_project` refuses
+    to follow -- there a symlink would mean the project's own state is
+    somewhere else, which is a different claim.
     """
     base = Path(root)
     entry = base / CLAUDE_ENTRY_FILE
@@ -84,6 +92,21 @@ def claude_code_project(root):
         return (base / CLAUDE_PROJECT_DIR).is_dir()
     except OSError:
         return False
+
+
+#: Set to "1" by Claude Code for every process a session spawns -- verified in
+#: the installed bundle (2.1.295), where `CLAUDECODE: "1"` is added to the child
+#: environment beside `CLAUDE_CODE_SESSION_ID`.  Only the *writer* reads this,
+#: and only to decide whether creating CLAUDE.md is welcome: the caller being
+#: the host that reads that file is what makes it welcome.  `vibe doctor` must
+#: not read it -- a verdict about a project cannot depend on who ran the check.
+CLAUDE_SESSION_ENV = 'CLAUDECODE'
+
+
+def claude_code_session(environ=None):
+    """True when the caller is a Claude Code session rather than a plain shell."""
+    env = os.environ if environ is None else environ
+    return bool(env.get(CLAUDE_SESSION_ENV))
 
 
 def claude_import_line(rules_name):
@@ -119,6 +142,10 @@ def claude_entry_reaches_rules(root, rules_name):
     Either the memory file *is* the rules file -- a symlink resolving to it --
     or it imports it.  A missing or unreadable memory file reaches nothing,
     which keeps the verdict fail-closed rather than silently green.
+
+    `RuntimeError` is in the catch because `Path.resolve()` raises it for a
+    symlink loop on Python 3.9-3.12 (3.13 turned it into `OSError`), and this
+    package supports 3.9 -- an unreachable file is exactly what a loop is.
     """
     base = Path(root)
     entry = base / CLAUDE_ENTRY_FILE
@@ -128,7 +155,7 @@ def claude_entry_reaches_rules(root, rules_name):
         if not entry.is_file():
             return False
         text = entry.read_text(encoding='utf-8')
-    except (OSError, UnicodeDecodeError):
+    except (OSError, RuntimeError, UnicodeDecodeError):
         return False
     return claude_entry_imports(text, rules_name)
 
