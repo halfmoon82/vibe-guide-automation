@@ -1898,11 +1898,18 @@ class MonitorTests(unittest.TestCase):
         #
         # Scope of the fix: this pins the path taken by runs authorized under
         # the current scope-free digest.  A run whose snapshot still holds the
-        # 5.0.7 scope-inclusive per-node digests cannot prove the edit was
-        # scope-only -- the old contract is not recoverable from a digest -- so
-        # it is still reworked, exactly as 5.0.7 did.  That limitation is
-        # pinned by ``tests/test_legacy_contract_digest.py``
+        # 5.0.7 scope-inclusive per-node digests is still reworked, exactly as
+        # 5.0.7 did, because a digest cannot be reversed into the contract it
+        # bound.  That limitation is pinned by
+        # ``tests/test_legacy_contract_digest.py``
         # (``test_new_code_reauthorization_keeps_unchanged_507_acceptances``).
+        #
+        # It is not a dead end, though.  ``snapshot.authorization['file_scope']``
+        # is persisted, so a verification-style rule -- rebuild the candidate
+        # old contract from the scope delta and accept the node only when that
+        # rebuild reproduces the stored digest -- could decide these runs too.
+        # This change does not implement that rule and this test does not cover
+        # it; the conservative "reworked" behaviour below is what ships.
         upstream = node("n1")
         downstream = node("n2", ["n1"])
         monitor, record = self.authorized_monitor([upstream, downstream])
