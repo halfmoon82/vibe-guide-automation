@@ -17,6 +17,32 @@ SCHEMA_VERSION = 1
 _MAX_RECORD_BYTES = 64 * 1024
 _DECISION_ID = re.compile(r"^dec-[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
+#: Holds and decisions share two canonical boundary categories; the older
+#: names stay accepted as aliases and are always stored canonical.
+BOUNDARY_CATEGORIES = ("product_acceptance", "external_authorization")
+BOUNDARY_CATEGORY_ALIASES = {
+    "product_design": "product_acceptance",
+    "deploy": "external_authorization",
+}
+#: Records written before categories existed read as this.
+LEGACY_BOUNDARY_CATEGORY = "product_acceptance"
+
+
+def validate_boundary_category(category):
+    """Return the canonical boundary category or fail before any state write."""
+    value = category.strip() if isinstance(category, str) else ""
+    value = BOUNDARY_CATEGORY_ALIASES.get(value, value)
+    if value not in BOUNDARY_CATEGORIES:
+        raise ValueError(
+            "category must be one of: {} (aliases: {}); engineering changes that "
+            "do not change PRD acceptance must be decided and recorded by the supervisor"
+            .format(
+                ", ".join(BOUNDARY_CATEGORIES),
+                ", ".join("{}→{}".format(old, new) for old, new in BOUNDARY_CATEGORY_ALIASES.items()),
+            )
+        )
+    return value
+
 
 def canonical_digest(value: Any) -> str:
     return hashlib.sha256(
@@ -108,7 +134,7 @@ class DecisionMailbox:
         }
         return canonical_digest(unsigned)
 
-    def raise_decision(
+    def _build_record(
         self,
         *,
         run_id: str,
@@ -118,6 +144,7 @@ class DecisionMailbox:
         recommendation: Optional[str] = None,
         evidence: Optional[Mapping[str, Any]] = None,
         asked_at: Optional[float] = None,
+        category: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not isinstance(run_id, str) or not run_id.strip() or not isinstance(node_id, str) or not node_id.strip():
             raise ValueError("run_id and node_id are required")
@@ -126,50 +153,85 @@ class DecisionMailbox:
         normalized = normalize_options(options)
         if recommendation is not None and recommendation not in {item["id"] for item in normalized}:
             raise ValueError("recommendation must be one of the options")
-        stable = {
-            "run_id": run_id,
-            "node_id": node_id,
-            "question": question,
-            "options": normalized,
-            "recommendation": recommendation,
-        }
-        decision_id = "dec-" + canonical_digest(stable)[:24]
-        path = self._request_path(decision_id)
-        if path.exists():
-            existing = self._load_request(decision_id)
-            return existing
-        record: Dict[str, Any] = {
+        canonical_category = (
+            LEGACY_BOUNDARY_CATEGORY if category is None else validate_boundary_category(category)
+        )
+        decision_id = "dec-" + canonical_digest(
+            {"run_id": run_id, "node_id": node_id, "question": question}
+        )[:24]
+        self._request_path(decision_id)
+        return {
             "schema_version": SCHEMA_VERSION,
             "decision_id": decision_id,
             "run_id": run_id,
             "node_id": node_id,
             "question": question,
+            "category": canonical_category,
             "options": normalized,
             "recommendation": recommendation,
             "evidence": dict(evidence or {}),
             "asked_at": time.time() if asked_at is None else asked_at,
         }
+
+    def raise_decision(self, **kwargs) -> Dict[str, Any]:
+        return self._store_record(self._build_record(**kwargs))
+
+    def _store_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Write a validated record; identical content is idempotent."""
+        decision_id = record["decision_id"]
+        path = self._request_path(decision_id)
+        if path.exists():
+            existing = self._load_request(decision_id)
+            if all(existing.get(key) == record[key] for key in ("options", "recommendation", "category")):
+                return existing
+            # Changed content supersedes the request: the old answer is kept
+            # only as archived evidence and the decision is pending again.
+            self._archive_result(decision_id, existing)
         record["request_digest"] = self._request_digest(record)
         record["answer_cli"] = "vibe decision-answer --id {} --choice <option_id> --digest {}".format(decision_id, record["request_digest"])
         _atomic_json(path, record)
-        return record
+        return self._presented(record)
+
+    def _archive_result(self, decision_id: str, old_request: Mapping[str, Any]) -> None:
+        result_path = self._result_path(decision_id)
+        if result_path.is_symlink():
+            raise ValueError("decision result must be a regular file")
+        if not result_path.exists():
+            return
+        archive = self.results / "superseded"
+        if archive.is_symlink():
+            raise ValueError("decision path may not be a symlink")
+        archive.mkdir(parents=True, exist_ok=True)
+        os.replace(
+            str(result_path),
+            str(archive / "{}-{}.json".format(decision_id, str(old_request.get("request_digest"))[:16])),
+        )
+
+    @staticmethod
+    def _presented(record: Mapping[str, Any]) -> Dict[str, Any]:
+        """Return a copy that always carries a category (legacy default)."""
+        shown = dict(record)
+        shown.setdefault("category", LEGACY_BOUNDARY_CATEGORY)
+        return shown
 
     def ingest_worker_requests(self, run_id: str, node_id: str, requests: Iterable[Mapping[str, Any]]) -> list[Dict[str, Any]]:
         if not isinstance(requests, Iterable) or isinstance(requests, (str, bytes, Mapping)):
             raise ValueError("decision_requests must be a list")
-        records = []
+        # All-or-nothing: validate and build every record before any write.
+        built = []
         for item in requests:
             if not isinstance(item, Mapping):
                 raise ValueError("decision request must be an object")
-            records.append(self.raise_decision(
+            built.append(self._build_record(
                 run_id=run_id,
                 node_id=node_id,
                 question=item.get("question", ""),
                 options=item.get("options", ()),
                 recommendation=item.get("recommendation"),
                 evidence=item.get("evidence") or item.get("evidence_binding") or {},
+                category=item.get("category"),
             ))
-        return records
+        return [self._store_record(record) for record in built]
 
     def _load_request(self, decision_id: str) -> Dict[str, Any]:
         record = _read_json(self._request_path(decision_id))
@@ -178,7 +240,7 @@ class DecisionMailbox:
         if record.get("request_digest") != self._request_digest(record):
             raise ValueError("decision request digest does not match its options")
         normalize_options(record.get("options", ()))
-        return record
+        return self._presented(record)
 
     def _load_result(self, decision_id: str, request: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         request = request or self._load_request(decision_id)
@@ -229,14 +291,16 @@ class DecisionMailbox:
         answered_via: Optional[str] = None,
         note: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if not isinstance(request_digest, str) or not request_digest.strip():
+            raise ValueError("decision answer requires --digest of the current request")
         record = self._load_request(decision_id)
+        if request_digest != record["request_digest"]:
+            raise ValueError("decision request digest is stale")
         if self._result_path(decision_id).exists():
             existing = self._load_result(decision_id, record)
             if existing.get("choice") == choice:
                 return existing
             raise ValueError("decision already has a different answer")
-        if request_digest is not None and request_digest != record["request_digest"]:
-            raise ValueError("decision request digest is stale")
         choices = {item["id"] for item in normalize_options(record["options"])}
         if choice not in choices:
             raise ValueError("choice is not one of the current options")
@@ -259,8 +323,8 @@ class DecisionMailbox:
 
     def render_pending(self, run_id: Optional[str] = None) -> list[str]:
         return [
-            "{}：{}（选项：{}；已等待未知时长）".format(
-                item["decision_id"], item["question"], ", ".join(option["id"] for option in item["options"])
+            "{}：[{}] {}（选项：{}；已等待未知时长）".format(
+                item["decision_id"], item["category"], item["question"], ", ".join(option["id"] for option in item["options"])
             )
             for item in self.list_pending(run_id)
         ]

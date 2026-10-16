@@ -1,22 +1,11 @@
-"""Shared human-decision boundary categories."""
+"""Shared human-decision boundary categories.
 
-BOUNDARY_CATEGORIES = (
-    "product_design",
-    "external_authorization",
-    "deploy",
-)
-
-
-def validate_boundary_category(category):
-    """Return a supported boundary category or fail before any state write."""
-    value = category.strip() if isinstance(category, str) else ""
-    if value not in BOUNDARY_CATEGORIES:
-        raise ValueError(
-            "hold category must be one of: {}; engineering changes that do not "
-            "change PRD acceptance must be decided and recorded by the supervisor"
-            .format(", ".join(BOUNDARY_CATEGORIES))
-        )
-    return value
+Holds and decisions use two canonical categories: ``product_acceptance`` and
+``external_authorization``.  ``product_design`` and ``deploy`` stay accepted
+as aliases but are always stored canonical; records without a category are
+read as ``product_acceptance``.  The definitions live in ``decisions`` so the
+mailbox can validate without a circular import.
+"""
 
 import json
 import os
@@ -24,7 +13,15 @@ from pathlib import Path
 import subprocess
 from typing import Any, Mapping, Optional
 
-from .decisions import DecisionMailbox, canonical_digest, normalize_options
+from .decisions import (
+    BOUNDARY_CATEGORIES,
+    BOUNDARY_CATEGORY_ALIASES,
+    LEGACY_BOUNDARY_CATEGORY,
+    DecisionMailbox,
+    canonical_digest,
+    normalize_options,
+    validate_boundary_category,
+)
 
 
 #: Upper bound for the user-configured bridge timeout, in seconds.
@@ -151,6 +148,10 @@ def answer_decision(paths, decision_id, choice, **kwargs):
 
 
 __all__ = [
+    "BOUNDARY_CATEGORIES",
+    "BOUNDARY_CATEGORY_ALIASES",
+    "LEGACY_BOUNDARY_CATEGORY",
+    "validate_boundary_category",
     "DecisionMailbox",
     "NotificationBridge",
     "answer_decision",

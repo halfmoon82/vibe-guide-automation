@@ -78,7 +78,7 @@ vibe skill-install --source <GitHub> --sha <40hex> --name <名> [--subdir <子�
 vibe supervisor-preflight --run-id <run> [--accept-decision] --session-record <file>   监工心跳预检，只读磁盘，输出 idle/work/decision/rotate/unknown；只有带 `--accept-decision` 才会输出 decision，不带时同一情形（只剩未答决策）输出 work；<file> 直接用本会话日志（Codex rollout / Claude Code jsonl）
 vibe supervisor-beat --run-id <run> --accept-decision --session-record <file>   心跳入口：预检 + 输出分支 + 下一拍间隔（默认 10 分钟；平台推送唤醒经验证登记后 30；只剩未答决策 60），并写入 `.vibe/runs/<run>/heartbeat-interval.json`，接班时 `supervisor-handoff` 会打印。推送唤醒登记文件 `.vibe/push-wake-verification.json`：`{"platforms": {"<provider>": {"success": [{"evidence_ref": "..."}], "failure": [{"evidence_ref": "..."}]}}}`，成功与失败各至少一条证据才算验证；文件读不到时按 10 分钟并在输出里写明原因
 vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> [--session-record <file>]   原子登记当前监工地址（保留历史，不含凭据）；给了日志就记下接班起点，换班按此后增长计算
-vibe supervisor-hold --run-id <run> --node <id> --category <product_design|external_authorization|deploy> --reason <原因>   登记/刷新"节点等人拍板"，预检据此判为空闲
+vibe supervisor-hold --run-id <run> --node <id> --category <product_acceptance|external_authorization> (--decision <决策ID>|--authorization-gap <缺口>) --reason <原因>   登记/刷新"节点等人拍板"，预检据此判为空闲；必须引用一条决策或一个授权缺口；product_design/deploy 仍可作别名（落盘存规范名），无 category 的旧挂起按 product_acceptance 读取
 vibe supervisor-hold --run-id <run> --node <id> --release   解除"节点等人拍板"
 vibe supervisor-handoff --run-id <run>             打印接班所需的全部内容（进度、等人事项、心跳指令、步骤），换班时新会话只跑这一条
 vibe supervisor-address --run-id <run>             查询当前监工地址；未登记返回 unknown；带 --node/--role/--generation 时 wake 字段给出推送工具与填好的唤醒信号

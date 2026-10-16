@@ -11,7 +11,7 @@ from typing import Any, Dict
 
 from .config import load_supervisor_single_shift
 from .contracts import RunEvent
-from .decision_boundary import validate_boundary_category
+from .decision_boundary import LEGACY_BOUNDARY_CATEGORY, validate_boundary_category
 from .state import append_event, run_dir, save_snapshot, load_snapshot
 
 
@@ -554,7 +554,27 @@ def supervisor_holds(paths, run_id):
         isinstance(node, str) and isinstance(entry, dict) for node, entry in holds.items()
     ):
         raise ValueError("supervisor holds malformed")
-    return holds
+    return {node: _normalized_hold(entry) for node, entry in holds.items()}
+
+
+def _normalized_hold(entry):
+    """Canonical category on read: aliases map over, a missing one is legacy.
+
+    Any other present value is tampering or corruption and fails closed.
+    """
+    if entry.get("category") is None:
+        entry = dict(entry)
+        entry["category"] = LEGACY_BOUNDARY_CATEGORY
+        entry["category_source"] = "legacy_default"
+        return entry
+    try:
+        category = validate_boundary_category(entry["category"])
+    except ValueError:
+        raise ValueError("supervisor holds malformed") from None
+    if entry["category"] != category:
+        entry = dict(entry)
+        entry["category"] = category
+    return entry
 
 
 def _write_holds(paths, run_id, holds):
@@ -572,7 +592,8 @@ def _write_holds(paths, run_id, holds):
             os.unlink(temporary)
 
 
-def set_supervisor_hold(paths, run_id, node, reason, boundary_category=None):
+def set_supervisor_hold(paths, run_id, node, reason, boundary_category=None,
+                        decision_id=None, authorization_gap=None):
     """Park ``node`` for a human decision; the node must exist in the run.
 
     Holding again refreshes the hold to the run's current state.  New and
@@ -586,6 +607,34 @@ def set_supervisor_hold(paths, run_id, node, reason, boundary_category=None):
     if len(reason) > _HOLD_REASON_LIMIT:
         raise ValueError("hold reason is limited to {} characters".format(_HOLD_REASON_LIMIT))
     boundary_category = validate_boundary_category(boundary_category)
+    has_decision = isinstance(decision_id, str) and bool(decision_id.strip())
+    has_gap = isinstance(authorization_gap, str) and bool(authorization_gap.strip())
+    if decision_id is not None and not has_decision or authorization_gap is not None and not has_gap:
+        raise ValueError("hold reference must be a non-empty string")
+    if has_decision == has_gap:
+        raise ValueError(
+            "hold must reference a decision id (--decision) or an authorization gap "
+            "(--authorization-gap), exactly one of them"
+        )
+    reference = {}
+    if has_decision:
+        decision_id = decision_id.strip()
+        try:
+            from .decisions import DecisionMailbox
+            decision = DecisionMailbox(paths)._load_request(decision_id)
+        except (OSError, ValueError):
+            raise ValueError("decision {} not found".format(decision_id)) from None
+        if decision.get("run_id") != run_id or decision.get("node_id") != node:
+            raise ValueError("decision {} belongs to another run or node".format(decision_id))
+        if decision.get("category") != boundary_category:
+            raise ValueError("decision {} has category {}, not {}".format(
+                decision_id, decision.get("category"), boundary_category))
+        reference["decision_id"] = decision_id
+    else:
+        gap = authorization_gap.strip()
+        if len(gap) > _HOLD_REASON_LIMIT:
+            raise ValueError("authorization gap is limited to {} characters".format(_HOLD_REASON_LIMIT))
+        reference["authorization_gap"] = gap
     snapshot = load_snapshot(paths, run_id)
     if node not in (snapshot.nodes or {}):
         raise ValueError("node {} is not in this run".format(node))
@@ -604,6 +653,7 @@ def set_supervisor_hold(paths, run_id, node, reason, boundary_category=None):
         "reason": reason,
         "held_at": now,
         "statuses": statuses,
+        **reference,
     }
     _write_holds(paths, run_id, holds)
     return holds
@@ -953,8 +1003,14 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         for node, entry in sorted(holds.items()):
             held_at = entry.get("held_at")
             hours = (time.time() - held_at) / 3600 if isinstance(held_at, (int, float)) else None
-            lines.append("  - {}（类别 {}）：{}（已挂起 {}）".format(
-                node, entry.get("category") or "unknown", entry.get("reason"),
+            if entry.get("decision_id"):
+                reference = "决策 " + str(entry["decision_id"])
+            elif entry.get("authorization_gap"):
+                reference = "授权缺口 " + str(entry["authorization_gap"])
+            else:
+                reference = "无引用（旧记录，下次刷新须补）"
+            lines.append("  - {}（类别 {}；{}）：{}（已挂起 {}）".format(
+                node, entry.get("category") or "unknown", reference, entry.get("reason"),
                 "{:.1f} 小时".format(hours) if hours is not None else "时长未知"))
     lines.append("信箱：待服务请求 {} 项（不含等人拍板的节点）".format(
         "未知" if pending is None else len(pending)))
@@ -965,8 +1021,8 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
                  if interval else "心跳间隔：未记录，按默认 {} 分钟建".format(HEARTBEAT_INTERVAL_DEFAULT_MINUTES))
     if decisions:
         for decision in decisions:
-            lines.append("  - {}：{}（选项：{}）".format(
-                decision.get("decision_id"), decision.get("question"),
+            lines.append("  - {}（类别 {}）：{}（选项：{}）".format(
+                decision.get("decision_id"), decision.get("category"), decision.get("question"),
                 ", ".join(option.get("id", "") for option in decision.get("options", [])),
             ))
     lines += [
@@ -981,8 +1037,10 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "  4) 跑一次心跳指令第 1 步的预检，按输出走。",
         HOST_SHIFT_DIFFERENCES,
         "监工挂起某个节点等用户拍板时，先登记：vibe supervisor-hold --run-id {} "
-        "--node <节点> --category <product_design|external_authorization|deploy> "
-        "--reason <一句话原因>，否则每次心跳都会被当成有事做。"
+        "--node <节点> --category <product_acceptance|external_authorization> "
+        "--decision <决策ID>|--authorization-gap <缺口> --reason <一句话原因>，"
+        "否则每次心跳都会被当成有事做。product_design/deploy 仍可作别名，落盘一律存规范名；"
+        "没有 category 的旧挂起按 product_acceptance 读取，下次刷新须补上 category 和引用。"
         "运行状态一变或挂起满 6 小时，预检会报 work（hold needs recheck）：复核后仍在等人就再跑一次同一条命令刷新。".format(run_id),
     ]
     return payload, "\n".join(lines).replace("vibe supervisor-", command_prefix + " supervisor-")
