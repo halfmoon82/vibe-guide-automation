@@ -64,6 +64,7 @@ python3 -m vibe_guide --help
 ```text
 vibe scan                                    只读扫描项目，不创建 .vibe/
 vibe init --confirm                          确认后初始化最小项目状态；重复执行不改写
+vibe init --confirm --host-rules skip|apply|rollback [--host-rules-digest <摘要>]   回答「是否在用户级规则中加入 vibe 监工会话例外」
 vibe doctor                                  报告可观察的环境、Skill 和 Agent 命令事实
 vibe attest --adapter <id> --facts <json>    登记本会话实测到的能力（复杂计划发布前必做一次）
 vibe plan --request <请求>                   先走 S0/S1 分流；complex 请求生成 draft
@@ -102,6 +103,23 @@ vibe init --confirm       # 创建缺失的最小 .vibe/ 结构
 ```
 
 已有 `AGENTS.md` 不会被覆盖。缺失规则时只在 `.vibe/proposals/agentsmd/` 生成建议（能力真相、复杂请求入口、`New Session Entry`、`Engineering Principles` 四个规则块），由 `vibe apply-agentsmd --confirm` 经人工评审后合入。外部 Skill 的安装不由 `init` 隐式触发。
+
+### 用户级规则：vibe 监工会话例外（必答决策项）
+
+`init` 会提出一个必须回答的问题：「是否在用户级规则中加入 vibe 监工会话例外？」。没回答时 `init` 照常完成，输出里带 `host_rules.status = decision_required` 和回答命令，不写任何用户级文件。
+
+```bash
+vibe init --confirm --host-rules skip                                  # 不应用：只在 .vibe/host-rules.json 记下决定
+vibe init --confirm --host-rules apply                                 # 只预览：展示将写入的差异和授权摘要，不写入
+vibe init --confirm --host-rules apply --host-rules-digest <摘要>      # 授权：摘要与当前差异一致才写入
+vibe init --confirm --host-rules rollback                              # 回滚：恢复原文件
+```
+
+- 只写已存在的用户级规则文件（`~/.claude/CLAUDE.md`、`~/.codex/AGENTS.md`、`~/AGENTS.md`），不新建；内容是一段带版本和校验值的标记块，文件其余部分不动。
+- 写前在同目录留 `<文件>.vibe-host-rules.bak` 备份并校验；任一备份失败、文件或目录不可写、路径含符号链接、标记块被人工改过，都整体不写并说明原因，`init` 其余部分照常完成。
+- 重复执行幂等：已是当前版本时不改文件、不新增备份。回滚时文件未再改动则按备份逐字节恢复；之后有人改过文件其他部分则只移除标记块。
+- 例外只作用于带监工会话标记的会话（已用 `vibe supervisor-register` 登记、授权卡已签、当前回合由 `vibe supervisor-beat` 心跳或 `vibe supervisor-handoff` 接班发起）：这些回合按 light 处理，只有 vibe 边界判定需要用户的事项才停下；其他会话和其他项目的对齐门不变。
+- `vibe doctor` 在 `facts.host_rules` 报告决定和每个文件状态；标记块被人工改过或不是当前版本时列为问题。
 
 ### V2 能力合同（监工与 worker 共用）
 
