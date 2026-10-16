@@ -8,7 +8,7 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 ## 安装
 
-当前发行版本为 `5.0.9`。版本真相以仓库中匹配的 `v5.0.9` tag、对应提交和 Release 资产为准；版本引用的写法约定：反引号 v 形式（如本句的 tag）只用于当前 release tag，历史版本写作 V4.5.0 这样大写、无反引号的形式，否则 release-tag-gate 会判为旧 tag 残留。`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
+当前发行版本为 `5.0.14`。版本真相以仓库中匹配的 `v5.0.14` tag、对应提交和 Release 资产为准；版本引用的写法约定：反引号 v 形式（如本句的 tag）只用于当前 release tag，历史版本写作 V4.5.0 这样大写、无反引号的形式，否则 release-tag-gate 会判为旧 tag 残留。`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
 
 ### 安装与初始化前提
 
@@ -24,7 +24,7 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 1. 先查询最新 tag，不根据 README、`dist/` 文件名或历史记忆判断版本：
    `git ls-remote --tags --sort='-v:refname' https://github.com/halfmoon82/vibe-guide-automation.git 'refs/tags/v*'`
-2. 选择最新稳定 tag（当前应为 `v5.0.9`），核对 tag、提交和可下载 Release 资产版本一致；无法核对时保持 `unknown`，不要猜测。
+2. 选择最新稳定 tag（当前应为 `v5.0.14`），核对 tag、提交和可下载 Release 资产版本一致；无法核对时保持 `unknown`，不要猜测。
 3. 在目标环境安装该版本，并验证：
    `python3 -c "import vibe_guide; print(vibe_guide.__version__)"`
    `vibe --help`
@@ -190,6 +190,8 @@ vibe 只记路径，不读也不存密钥。`model` 默认 sonnet，监工每次
 
 权限与提交身份：worker 以 `bypassPermissions` 运行，安全边界是 worktree 隔离与授权卡；本机若没配全局 git `user.name` / `user.email`，提交作者会是机器名。可在用户级 `claude_bg` 里写 `git_user_name` / `git_user_email` 只给 worker 的 worktree 设身份，前提是仓库已开 `git config extensions.worktreeConfig true`，否则启动会失败并报原因（不会改动主仓库的身份）。
 
+已真机验收（2026-10-14，Claude Code 2.1.260）：后台派发 → 交付 → 审查发现缺陷 → 返工续接同一会话 → 复审通过，全程无人点击，约 30 秒；本机复跑：`VIBE_LIVE_CLAUDE_BG=1 python3 -m unittest tests.test_claude_bg_live -v`（默认跳过，会真实启动后台会话并消耗额度）。worker 必须在独立 worktree（`.worktrees/<节点>`）里运行：新版 Claude Code 的后台会话在仓库主目录会自己另开 worktree 写文件，交付落不到预期位置。
+
 未验证、不得当作可用：`--session-id` 预指定会话 id、`-w` 与 `--bg` 合用、长任务/休眠/daemon 退出后的恢复、桌面内置 CLI 下的 `--bg`。
 
 ### WorkBuddy 派发桥（`workbuddy_job` MCP server）
@@ -229,11 +231,13 @@ vibe resume --plan example-plan --json
 
 开发会话已经派发出去、却没登记进运行（节点停在 `blocked_unknown`、generation 0，同 run 同代的租约被隔离）时，用对账包 `{"kind": "adopted_dispatch", "node_id": "<节点>", "action_id": "<该节点的 create 请求 id>"}` 执行 `vibe reconcile --plan <ID> --run-id <run> --evidence <包路径>`，把原会话认回原运行：原 task_id 不变，租约改绑到当前授权，之后原会话照常用 `vibe worker-deliver --generation <原代数>` 交付。它只认磁盘上的结构化证据（本 run 的 create 请求与结果绑定、dispatch-head、唯一一份同代隔离租约、本 run 授权历史里出现过的派发授权）；缺一项或互相矛盾就保持 `blocked_unknown`，不会派出第二个 writer，也不会向会话发任何消息。认领由一条 `orphan_dispatch_adopted` 事件整体生效；中途中断时重跑同一条命令或直接 `resume` 即可续完，已认领后重跑不会再改动。认领前先暂停该 run 的监工心跳自动化与监工循环（有存活的监工进程持有 run 租约时会拒绝；若并发的 `resume` 用旧快照覆盖了认领结果，重跑同一条认领命令会在租约、任务登记和 handle 均未变时恢复它），授权已失效（计划目录存在失效标记）时也会拒绝，须先重新授权。
 
+worker 用 `vibe worker-deliver` 自报的交付不带游标（游标只来自监工翻会话时回写的 `wait` 结果）；交付证据门对自报改认"自报回执"——同代存档被指向本任务 task/host 的同代 `wait` 领走、且结果就是存档里的交付——身份、host、worktree、branch 照旧必须齐。5.0.11 及更早版本不认回执，完整的自报交付会被判 `blocked_unknown`（原因 `current cursor is missing`）且不会自愈。升级后对这样的节点用对账包 `{"kind": "self_reported_delivery", "node_id": "<节点>"}` 执行 `vibe reconcile --plan <ID> --run-id <run> --evidence <包路径>`：它把同一份已绑定的结果按修复后的门重新判一次（visible-sdd 的会话内审查、合同测试等其余门全部照跑），先记一条 `self_report_delivery_reconciled`，再走正常的 `delivered` 路径；监工后来补发、还没有结果的同代 `wait` 会留审计标记后退役，不向会话发任何消息，也不编造游标。只认结构化证据：节点仍登记着该 developer 任务与 handle、任务登记没有游标、存档已被本任务同代 `wait` 领走且结果与存档一致、该代还没记过交付；缺一项、后补的 `wait` 已有结果、有存活监工持有 run 租约或授权已失效时都会拒绝并保持原状。原因文本落盘时被打码，它靠事件判断"只因游标被拦"：本任务开工后该节点只能出现 `blocked_unknown`、`retry_scheduled`、`unknown`、`timeout`、`acceptance_rejected`，其余任何节点事件即拒绝；登录/权限类轮询失败也只留下 `blocked_unknown`，事件上与缺游标无法区分，所以只在确认节点是因 `current cursor is missing` 被拦时使用（放行后验收门、会话内审查、合同测试照旧全部重判）。
+
 已确认规则能够唯一判断、且仍处于当前项目、plan revision、授权文件/action 和非 deploy 边界内的实现纠偏，由监工自动执行并记录，不会再次作为产品取舍询问。纠偏证据必须绑定已批准决定、授权和 Issue 合同；未绑定文本不能冒充用户决定。合同变化后的 `monitor --plan <ID> --authorize AUTHORIZE` 会在同一 run 上审计旧授权与变更原因，保留原任务身份和 cursor，登记新授权后续接修正 DAG；旧任务终止或 continuation 无法证明时仍会 fail closed。
 
 授权卡是「发布时才签」的：执行门把在盘卡绑到 run 快照的 authorized digest 上，所以「卡已重出、尚未授权」在本产品里不可表示——只重出卡会让公开执行门以 `plan-confirmation.invalid` 关门。合同或 PRD 变化后要重新授权时，先用 `vibe monitor --plan <ID> --preview-card` 只读地看一遍将要签的卡：它报的是「相对当前在盘卡会改动哪些字段」（这才是要审的东西），并单独自检「刷新本身是否只动了引擎凭证字段」。确认后再跑带 `--authorize` 的那条，一次原子完成重新授权与派发。预览里的卡 digest 只是预览态——引擎凭证的时间戳进入凭证与卡的摘要，发布时会重新观测，所以别拿预览 digest 当审批凭据。
 
-计划发布超过 24 小时后，`engine-attestation.json` 会过期，`monitor --authorize` 会以 `execution_engine_unverified` 拒绝，而重新发布计划不是一条可用出路。同一 plan revision 上的重新授权会按发布路径同样的方式**重新观测**引擎凭证并重签，凭证先落盘、卡后发布，重新授权失败则逐字节还原，不需要重新发布计划。
+计划发布超过 72 小时后，`engine-attestation.json` 会过期，`monitor --authorize` 会以 `execution_engine_unverified` 拒绝，而重新发布计划不是一条可用出路。同一 plan revision 上的重新授权会按发布路径同样的方式**重新观测**引擎凭证并重签，凭证先落盘、卡后发布，重新授权失败则逐字节还原，不需要重新发布计划。
 
 桌面 App 原生能力不能由 Python 直接调用时，public CLI 使用 `.vibe/provider-actions/` 的 provider-neutral request/result bridge。`monitor/resume` 会写入有界、digest 绑定的 `create/locate/visibility/resume/wait` 请求；App 会话按 `native_tool` 调用公开能力并回写绑定结果。Codex 映射到 `create_thread`、`navigate_to_codex_page`、`send_message_to_thread` 和 `wait_threads`；其他 provider 必须先接入并验证自己的等价桌面控制面。未完成原生探针时不允许 background fallback；在真实 task ID、host、定位和可见性全部核验前，状态保持 `blocked_unknown`；node-spec 中的 provider/mode/thread/host 自声明不会成为证据。
 

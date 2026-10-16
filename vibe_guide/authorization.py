@@ -1449,7 +1449,7 @@ def refresh_authorization_card(
 
     ``engine_attestation`` is the other half of the same argument for the
     engine binding.  ``validate_engine_attestation`` refuses an attestation
-    older than a day, so a plan published more than a day ago cannot be
+    older than 72 hours, so a plan published more than 72 hours ago cannot be
     reauthorized at all while the refreshed card keeps naming the expired
     evidence: ``Monitor._require_record`` reads the file, finds the recorded
     reference intact but the evidence stale, and blocks before any provider

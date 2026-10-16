@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from ..paths import ProjectPaths
@@ -26,6 +27,47 @@ from ..providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER
 
 class ProviderUnavailable(RuntimeError):
     """A provider cannot safely create or continue a task."""
+
+
+class UnresolvedNativeTool(RuntimeError):
+    """The host could not resolve the native tool the caller asked for.
+
+    Observed 2026-10-14: a model gateway route stripped the ``fn__<server>__``
+    prefix from helper tool calls, so the host answered "No such tool
+    available".  That is a routing fault in the calling session, not a
+    provider outcome; the request stays pending.
+    """
+
+    def __init__(self, action_id: str, called_tool: str, expected_tool: str, attempts: int):
+        self.action_id = action_id
+        self.called_tool = called_tool
+        self.expected_tool = expected_tool
+        self.attempts = attempts
+        if attempts < 2:
+            advice = "retry the native call once; the request stays pending"
+        else:
+            advice = ("stop servicing the mailbox and report a tool routing fault to the user; "
+                      "do not hand off, a new session hits the same route")
+        super().__init__(
+            "host could not resolve native tool {!r} (expected {!r}) for {}; attempt {}: {}".format(
+                called_tool, expected_tool, action_id, attempts, advice))
+
+
+_UNRESOLVED_TOOL = re.compile(
+    r"\s*(?:<tool_use_error>)?\s*(?:Error:\s*)?No such tool available:\s*`?([\w.-]+)", re.IGNORECASE)
+
+
+def _unresolved_tool_name(payload: Dict[str, Any]) -> Optional[str]:
+    # Top-level values that *are* the host reply; nested transcript events and
+    # mid-sentence mentions are ordinary results.
+    for value in payload.values():
+        if isinstance(value, dict):
+            value = value.get("message")
+        if isinstance(value, str):
+            match = _UNRESOLVED_TOOL.match(value)
+            if match:
+                return match.group(1)
+    return None
 
 
 class ProviderPending(RuntimeError):
@@ -349,24 +391,59 @@ class ProviderActionStore:
             "request": request,
         }
         payload["request_digest"] = _canonical_digest(payload)
+        directory = self._directory("requests")
+        path = directory / (action_id + ".json")
+        existing = self._read(path) if path.exists() else None
+        if existing is not None and existing != payload:
+            if not self._prompt_only_upgrade(existing, payload):
+                if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
+                    self._record_dispatch_head(
+                        run_id, issue_id, role, generation, request["child_binding"]
+                    )
+                raise ValueError("provider action request identity drift")
+            # The worker already acted on the original prompt; keep it, and do
+            # not record a dispatch baseline after the fact.
+            return existing
         if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
             # Before the request is visible to the host: the baseline must
             # predate any work the dispatched worker could do.
             self._record_dispatch_head(
                 run_id, issue_id, role, generation, request["child_binding"]
             )
-        directory = self._directory("requests")
-        path = directory / (action_id + ".json")
-        if path.exists():
-            existing = self._read(path)
-            if existing != payload:
-                raise ValueError("provider action request identity drift")
-        else:
+        if existing is None:
             self._atomic(path, payload)
         probe = isinstance(request, dict) and request.get("purpose") == "binding_probe"
         if operation == "wait" and not probe:
             self._consume_archived_delivery(run_id, issue_id, role, generation)
         return payload
+
+    def _prompt_only_upgrade(self, existing: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+        """A newer vibe rewrote only the prompt template of an answered create.
+
+        Only ``create``: continuation prompts carry contract facts (paths,
+        files, delivery) that exist nowhere else.  Every other field must
+        match, both prompts must be strings, and the host must already have
+        bound a result to the original request.
+        """
+        if existing.get("operation") != "create" or payload.get("operation") != "create":
+            return False
+        old_request = existing.get("request")
+        new_request = payload.get("request")
+        if not isinstance(old_request, dict) or not isinstance(new_request, dict):
+            return False
+        if not isinstance(old_request.get("prompt"), str) or not isinstance(new_request.get("prompt"), str):
+            return False
+        strip = lambda value: {k: v for k, v in value.items() if k not in {"request", "request_digest"}}
+        if strip(existing) != strip(payload):
+            return False
+        if {k: v for k, v in old_request.items() if k != "prompt"} != {
+            k: v for k, v in new_request.items() if k != "prompt"
+        }:
+            return False
+        try:
+            return self.result(existing["action_id"]) is not None
+        except (OSError, TypeError, ValueError):
+            return False
 
     def action(self, action_id: str) -> Dict[str, Any]:
         """Read immutable request identity, including after its callback finishes."""
@@ -415,7 +492,7 @@ class ProviderActionStore:
         return result["payload"]
 
     def complete(self, action_id: str, payload: Dict[str, Any], *,
-                 request_digest: Optional[str] = None) -> bool:
+                 request_digest: Optional[str] = None, native: bool = True) -> bool:
         """Keep the first bound result; retain conflicting callbacks as evidence.
 
         A new observation belongs to a new action sequence, never a rewrite
@@ -430,6 +507,10 @@ class ProviderActionStore:
             raise ValueError("provider action result payload must be an object")
         if request_digest is not None and request_digest != request["request_digest"]:
             raise ValueError("provider action request digest mismatch")
+        # ``native=False``: a worker self-report, not a native tool reply.
+        called_tool = _unresolved_tool_name(payload) if native else None
+        if called_tool is not None:
+            self._record_unresolved_tool(request, called_tool, payload)
         record = {
             "schema_version": self.schema_version,
             "action_id": action_id,
@@ -446,6 +527,26 @@ class ProviderActionStore:
                 return False
             self._atomic(self._directory("results") / (action_id + ".json"), record)
             return True
+
+    def _record_unresolved_tool(self, request: Dict[str, Any], called_tool: str,
+                                payload: Dict[str, Any]) -> None:
+        """Keep the host reply as evidence and raise; never store it as a result."""
+        action_id = request["action_id"]
+        directory = self._directory("observations")
+        prefix = action_id + "-unresolved-tool-"
+        record = {
+            "schema_version": self.schema_version,
+            "kind": "unresolved_native_tool",
+            "action_id": action_id,
+            "request_digest": request["request_digest"],
+            "expected_tool": request.get("native_tool"),
+            "called_tool": called_tool,
+            "observed_at": time.time(),
+            "payload": payload,
+        }
+        self._atomic(directory / (prefix + _canonical_digest(record)[:16] + ".json"), record)
+        attempts = len(list(directory.glob(prefix + "*.json")))
+        raise UnresolvedNativeTool(action_id, called_tool, str(request.get("native_tool")), attempts)
 
     def pending(self, run_id: Optional[str] = None) -> List[Dict[str, Any]]:
         request_dir = self._directory("requests")
@@ -996,16 +1097,78 @@ class ProviderActionStore:
                     and request.get('purpose') == 'binding_probe'
                 )
             ):
-                result = dict(payload)
+                # The cursor is the servicer's read position in the session,
+                # never the worker's claim: a self-report carries none, and
+                # the delivery gate accepts the receipt below instead.
+                result = {key: value for key, value in payload.items() if key != 'cursor'}
                 result['event'] = payload.get('event', 'delivered')
                 result['status'] = 'completed'
                 result['idempotent_key'] = _canonical_digest(payload)
                 if not self.complete(action['action_id'], result,
-                                     request_digest=action['request_digest']):
+                                     request_digest=action['request_digest'], native=False):
                     continue
                 self._atomic(path, dict(report, consumed_by=action['action_id']))
                 return True
         return False
+
+    def self_report_receipt(self, run_id, issue_id, role, generation, task_id, host,
+                            delivery_evidence):
+        """The wait action that took this generation's self-report, or None.
+
+        Proves the delivery came through ``worker-deliver`` for exactly this
+        task: the archive was consumed by a same-generation ``wait`` aimed at
+        the registered task/host, and that wait's bound result is the
+        archive's delivery.  It stands in for a cursor, which a self-report
+        never has; it never vouches for any other identity field.
+        """
+        try:
+            path = self._delivery_path(run_id, issue_id, role, generation)
+            archived = self._read(path)
+            payload = archived.get('payload')
+            action_id = archived.get('consumed_by')
+            if (archived.get('run_id') != run_id or archived.get('issue_id') != issue_id
+                    or archived.get('role') != role or archived.get('generation') != generation
+                    or not isinstance(payload, dict) or not isinstance(action_id, str)
+                    or action_id == 'superseded'):
+                return None
+            action = self.action(action_id)
+            result = self.result(action_id)
+            targets = action['request'].get('targets')
+        except (OSError, TypeError, ValueError, KeyError):
+            return None
+        if (action.get('operation') != 'wait' or action.get('run_id') != run_id
+                or action.get('issue_id') != issue_id or action.get('role') != role
+                or action.get('generation') != generation
+                or targets != [{'threadId': task_id, 'hostId': host}]
+                or not isinstance(result, dict) or 'cursor' in result
+                # Written only by _consume_delivery_locked, from this archive.
+                or result.get('idempotent_key') != _canonical_digest(payload)
+                or result.get('event') not in {'delivered', 'complete'}
+                or not isinstance(delivery_evidence, dict)
+                or result.get('delivery_evidence') != payload.get('delivery_evidence')
+                or delivery_evidence != payload.get('delivery_evidence')):
+            return None
+        return action
+
+    def retire_wait(self, action_id, reason):
+        """Hide one unanswered ``wait`` with an audit marker; never a result.
+
+        Only for a wait whose question was already answered by an earlier
+        bound result of the same task (the self-report recovery).  A wait that
+        has a result is history and stays visible.
+        """
+        action = self.action(action_id)
+        if action.get('operation') != 'wait':
+            raise ValueError('only a wait request can be retired')
+        if self.result(action_id) is not None:
+            raise ValueError('an answered wait cannot be retired')
+        self._atomic(self._directory('stale') / (action_id + '.json'), {
+            'schema_version': self.schema_version,
+            'status': 'stale',
+            'reason': reason,
+            'action_id': action_id,
+            'request_digest': action['request_digest'],
+        })
 
     def unpolled_results(self, run_id):
         """Read-only list of nodes whose pending action already has a result.

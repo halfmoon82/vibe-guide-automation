@@ -83,7 +83,7 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
             self.store.complete(action_id, result)
         return payload
 
-    def build_orphan(self, *, authorization=None, located=True):
+    def build_orphan(self, *, authorization=None, located=True, stamp_topology=True):
         """Leave the node exactly as the trunk-source supervisor left it."""
         digest = authorization or self.old_digest
         _directory, plan, nodes, _card = _load_plan(self.paths, 'probe-plan')
@@ -98,10 +98,14 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
                  'writer': 'worker', 'worktree': self.worktree_rel, 'branch': self.branch,
                  'allowlist': list(ALLOWLIST),
                  'capability_contract_digest': snapshot.capability_contract_digest}
+        request = {**envelope, 'origin': 'worker_dispatch', 'child_binding': child,
+                   'topology': topology, 'prompt': 'fixture'}
+        if not stamp_topology:
+            # The provider bridge only stamps ``topology`` on visible-sdd
+            # creates; a default dual-visible create leaves the key out.
+            request.pop('topology')
         self.create = self._write_action(
-            'create', {**envelope, 'origin': 'worker_dispatch', 'child_binding': child,
-                       'topology': topology, 'prompt': 'fixture'},
-            {'binding': {'host': HOST, 'task_id': TASK}})
+            'create', request, {'binding': {'host': HOST, 'task_id': TASK}})
         self._write_action('locate', {**envelope, 'threadId': TASK}, {'located': located})
         heads = self.store._directory('dispatch-heads')
         (heads / '{}-{}-developer-g1.json'.format(self.run_id, NODE)).write_text(
@@ -242,6 +246,16 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
         self.assertEqual([e['event'] for e in load_events(self.paths, self.run_id)]
                          .count('orphan_dispatch_adopted'), 1)
 
+    def test_dual_visible_create_without_topology_key_is_adopted(self):
+        """Production dual-visible creates carry no ``topology`` key."""
+        self.build_orphan(stamp_topology=False)
+        self.assertNotIn('topology', self.create['request'])
+        result = self.adopt()
+        self.assertIn('nodes', result.payload, result.payload)
+        current = load_snapshot(self.paths, self.run_id).nodes[NODE]
+        self.assertEqual(current['status'], 'running')
+        self.assertEqual(current['developer_identity'], TASK)
+
     def test_crash_before_snapshot_save_is_recovered_by_resume(self):
         self.build_orphan()
         with patch('vibe_guide.orphan_recovery.save_snapshot',
@@ -380,24 +394,27 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
         self.assertIn('nodes', retried.payload, retried.payload)
         self.assert_running_after_resume()
 
-    def test_original_session_delivery_is_received_after_adoption(self):
-        self.build_orphan()
-        self.adopt()
+    def self_report(self, **extra):
+        """The original session's `vibe worker-deliver`, from real work."""
         (self.writer / 'README.md').write_text('probe\n')
         _git(self.writer, 'add', 'README.md')
         _git(self.writer, 'commit', '-m', 'work')
         delivery = self.writer / 'delivery.md'
         delivery.write_text('done\n')
-        # The mailbox servicer pages the session and supplies its cursor, as
-        # for any normally started task; the delivery gate requires one.
-        payload = {'cursor': TASK + ':1',
-                   'delivery_evidence': {'completion_marker': 'DELIVERY_COMPLETE',
+        payload = {'delivery_evidence': {'completion_marker': 'DELIVERY_COMPLETE',
                                          'delivery_path': str(delivery),
-                                         'thread_status': 'completed'}}
+                                         'thread_status': 'completed'}, **extra}
         delivered = run_cli(['worker-deliver', '--run-id', self.run_id, '--node', NODE,
                              '--role', 'developer', '--generation', '1',
                              '--payload', json.dumps(payload), '--json'], self.root)
         self.assertTrue(delivered.payload.get('recorded'), delivered.payload)
+        return payload
+
+    def test_original_session_delivery_is_received_after_adoption(self):
+        self.build_orphan()
+        self.adopt()
+        # No cursor: a self-report has none, and the gate must not need one.
+        self.self_report()
         run_cli(['resume', '--plan', 'probe-plan', '--run-id', self.run_id], self.root)
         archive = (self.store.root / 'deliveries'
                    / '{}-{}-developer-g1.json'.format(self.run_id, NODE))
@@ -413,6 +430,20 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
         current = load_snapshot(self.paths, self.run_id).nodes[NODE]
         self.assertEqual(current['delivery_evidence']['completion_marker'], 'DELIVERY_COMPLETE')
         self.assertEqual(current['developer_generation'], 1)
+
+    def test_self_reported_cursor_never_reaches_the_binding(self):
+        self.build_orphan()
+        self.adopt()
+        self.self_report(cursor='worker-invented')
+        run_cli(['resume', '--plan', 'probe-plan', '--run-id', self.run_id], self.root)
+        archive = (self.store.root / 'deliveries'
+                   / '{}-{}-developer-g1.json'.format(self.run_id, NODE))
+        result = self.store.result(json.loads(archive.read_text())['consumed_by'])
+        self.assertNotIn('cursor', result)
+        binding = load_task_binding(self.paths, NODE, 'developer', run_id=self.run_id)
+        self.assertIsNone(binding.cursor)
+        self.assertEqual([e['event'] for e in load_events(self.paths, self.run_id)]
+                         .count('delivered'), 1)
 
     def test_second_adoption_never_creates_a_second_writer(self):
         self.build_orphan()

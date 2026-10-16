@@ -34,7 +34,7 @@ from .state import (
     save_snapshot,
 )
 from .supervisor import SupervisorLease
-from .task_registry import TaskBinding, load_task_binding
+from .task_registry import DEFAULT_TOPOLOGY, TaskBinding, load_task_binding
 
 ORPHAN_DISPATCH_ADOPTED = "orphan_dispatch_adopted"
 ADOPTED_DISPATCH_PACKAGE = frozenset({"kind", "node_id", "action_id"})
@@ -134,7 +134,9 @@ def _collect(monitor, snapshot: RunSnapshot, record, node_id: str, action_id: st
              "create request names another plan")
     _authorization_lineage(paths, snapshot.run_id, node_id, digest, record.digest)
     topology = monitor._node_dispatch_topology(monitor.nodes[node_id])
-    _require(request.get("topology") == topology,
+    # The bridge stamps ``topology`` only on visible-sdd creates; an absent
+    # key is the default ruling it dispatched under (provider_action.py).
+    _require((request.get("topology") or DEFAULT_TOPOLOGY) == topology,
              "create request topology differs from the current ruling")
     allowlist = child.get("allowlist")
     _require(isinstance(allowlist, list) and all(isinstance(item, str) for item in allowlist),

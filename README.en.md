@@ -6,7 +6,7 @@ Vibe Guide is a local CLI for scanning a project, planning work, and running a r
 
 ## Installation
 
-The current release is **5.0.9**. Treat the matching `v5.0.9` tag, commit, and Release assets as the version source of truth; `dist/` is only a local build cache, not a download entry point. Release validation covers the wheel, source distribution, and source installation separately. Local builds only produce verification artifacts; they do not create tags or releases, push, merge, or deploy.
+The current release is **5.0.14**. Treat the matching `v5.0.14` tag, commit, and Release assets as the version source of truth; `dist/` is only a local build cache, not a download entry point. Release validation covers the wheel, source distribution, and source installation separately. Local builds only produce verification artifacts; they do not create tags or releases, push, merge, or deploy.
 
 ### Installation and initialization prerequisites
 
@@ -22,7 +22,7 @@ When a user asks to install or upgrade, the Agent must:
 
 1. Query the newest tag instead of trusting README text, `dist/` filenames, or memory:
    `git ls-remote --tags --sort='-v:refname' https://github.com/halfmoon82/vibe-guide-automation.git 'refs/tags/v*'`
-2. Select the newest stable tag (currently `v5.0.9`) and verify that the tag, commit, and downloadable Release assets agree. If that cannot be verified, keep the result `unknown`.
+2. Select the newest stable tag (currently `v5.0.14`) and verify that the tag, commit, and downloadable Release assets agree. If that cannot be verified, keep the result `unknown`.
 3. Install that version and verify both:
    `python3 -c "import vibe_guide; print(vibe_guide.__version__)"`
    `vibe --help`
@@ -34,7 +34,7 @@ An Agent must not assume that downloading or installing the package automaticall
 Install the published wheel:
 
 ```bash
-python3 -m pip install --user --upgrade vibe_guide-5.0.9-py3-none-any.whl
+python3 -m pip install --user --upgrade vibe_guide-5.0.14-py3-none-any.whl
 vibe --help
 ```
 
@@ -112,6 +112,8 @@ vibe records the path only; it never reads or stores the key. `model` defaults t
 Viewing background workers: in a terminal run `claude agents --json --all` to list every background session with its `state` (working / done / failed / blocked / stopped), and `claude attach <short-id>` to enter one (a real terminal is required; without a TTY, `claude agents` without `--json` errors out). Closing the terminal tab does not end the session. Do not resume a running background session with foreground `claude --resume` (it is refused, to prevent double writers).
 
 Permissions and commit identity: workers run with `bypassPermissions`; the safety boundary is worktree isolation plus the authorization card. If the machine has no global git `user.name` / `user.email`, commit authors will be the machine name. `git_user_name` / `git_user_email` in the user-level `claude_bg` set an identity for the worker's worktree only, and require `git config extensions.worktreeConfig true` in the repo; otherwise the launch fails with the reason (the main repo's identity is never changed).
+
+Accepted on real sessions (2026-10-14, Claude Code 2.1.260): background dispatch → delivery → review finds a defect → rework continues the same session → re-review passes, with no clicks, in about 30 seconds. Re-run locally with `VIBE_LIVE_CLAUDE_BG=1 python3 -m unittest tests.test_claude_bg_live -v` (skipped by default; it starts real background sessions and spends usage). Workers must run in a linked worktree (`.worktrees/<node>`): in the main checkout, newer Claude Code background sessions open their own worktree and write there, so deliveries do not land where expected.
 
 Unverified, do not treat as available: pre-assigning a session id with `--session-id`, combining `-w` with `--bg`, recovery after a long task / sleep / daemon exit, and `--bg` under the desktop-bundled CLI.
 

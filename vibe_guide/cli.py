@@ -463,8 +463,8 @@ def _observed_engine_attestation(paths: ProjectPaths, plan: Plan) -> Dict[str, A
     """Re-observe the engine evidence a same-plan reauthorization has to name.
 
     Publication stamps the plan's ``engine-attestation.json`` once, and
-    ``validate_engine_attestation`` refuses evidence older than a day.  A plan
-    published more than a day ago therefore could not be reauthorized at all:
+    ``validate_engine_attestation`` refuses evidence older than 72 hours.  A plan
+    published more than 72 hours ago therefore could not be reauthorized at all:
     the refreshed card would keep naming the expired reference, and
     ``Monitor._require_record`` reads the file, finds the recorded reference
     intact but the evidence stale, and blocks before any provider dispatch is
@@ -2920,6 +2920,16 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 target_runner = runner if runner is not None else _public_runner(paths, _card, nodes)
                 snapshot = adopt_orphan_dispatch(monitor, args.run_id, package['node_id'],
                                                  package['action_id'], target_runner)
+            elif isinstance(package, dict) and package.get('kind') == 'self_reported_delivery':
+                from .self_report_recovery import (
+                    SELF_REPORTED_DELIVERY_PACKAGE, reconcile_self_reported_delivery)
+                if set(package) != SELF_REPORTED_DELIVERY_PACKAGE or package['node_id'] not in monitor.nodes:
+                    raise ValueError('self-reported delivery reconciliation package is invalid')
+                if _invalidation_path(directory).exists() or _invalidation_path(directory).is_symlink():
+                    raise ValueError('authorization is invalidated; reauthorize before reconciling')
+                target_runner = runner if runner is not None else _public_runner(paths, _card, nodes)
+                snapshot = reconcile_self_reported_delivery(monitor, args.run_id,
+                                                            package['node_id'], target_runner)
             else:
                 snapshot = monitor.reconcile_evidence(args.run_id, package)
             return _snapshot_result("reconcile", snapshot, args.as_json)

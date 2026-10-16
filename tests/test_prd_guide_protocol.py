@@ -296,8 +296,9 @@ class MailboxSectionTests(unittest.TestCase):
             (ROOT / "vibe_guide" / "monitor.py").read_text(encoding="utf-8"),
         )
         developer = next(p for p in terminal if p.get("event") == "complete")
-        # The cursor reaches the binding only from this payload
-        # (provider_action.py:1153-1160), so omitting it fails the gate.
+        # On the servicer path the cursor reaches the binding only from this
+        # payload (ProviderActionRunner._wait_result), so omitting it fails the
+        # gate; only a worker-deliver receipt stands in for it.
         self.assertIn("cursor", developer)
         self.assertEqual(gate(developer).status, "DELIVERED", gate(developer).reasons)
         flat = {k: v for k, v in developer.items() if k != "delivery_evidence"}
@@ -392,6 +393,12 @@ class MailboxSectionTests(unittest.TestCase):
         # The rows print a cursor either way, so softening this claim back to
         # "可以不给" changed nothing a payload assertion could see.
         self.assertIn("**`cursor` 在复杂计划的 developer 终态里也是必需的**", section)
+        # The self-report exception, whole: without "不要再手工回写" a servicer
+        # that read only the rule above would forge a cursor for a self-report.
+        self.assertIn(
+            "所以 worker 已自报的节点，**不要**\n再手工回写一份带游标的同代 `wait` 结果。",
+            section,
+        )
 
     def test_protocol_states_the_per_platform_dispatch_boundary(self):
         """Unattended dispatch is a platform fact, not a vibe feature.
