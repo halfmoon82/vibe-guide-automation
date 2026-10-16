@@ -5,7 +5,7 @@ absent the check is skipped.  A superseded supervisor must not leave a
 decision request or push a notification behind.
 """
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from vibe_guide.decision_boundary import NotificationBridge
 from vibe_guide.state import load_events, load_snapshot
@@ -55,7 +55,10 @@ class LeaseGuardOrderTests(_Base):
         monitor._guard_lease = Mock(return_value=None)
         with self.spy_notify() as spy:
             self.assertTrue(monitor._ensure_blocked_design_decision(live, "n1"))
-        monitor._guard_lease.assert_called_once_with(live.run_id)
+        # On the merged tree _record also guards, so only the first call is
+        # this function's own pre-write check.
+        self.assertGreaterEqual(monitor._guard_lease.call_count, 1)
+        self.assertEqual(monitor._guard_lease.call_args_list[0], call(live.run_id))
         self.assertEqual(spy.call_count, 1)
         self.assertEqual(len(self.request_files()), 1)
 
