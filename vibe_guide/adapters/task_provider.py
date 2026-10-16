@@ -739,12 +739,6 @@ class ProviderActionStore:
             )
         if delivery.get('thread_status') not in {'complete', 'completed', 'DELIVERED'}:
             raise ValueError('worker delivery thread_status is not terminal')
-        # ISSUE-219: the session root the worker observed, when it reports one.
-        # Optional -- an older prompt does not ask for it, and a missing value
-        # is not evidence of a bad session, so it never blocks a delivery.
-        session_cwd = delivery.get('session_cwd')
-        if session_cwd is not None and not isinstance(session_cwd, str):
-            raise ValueError('worker delivery session_cwd must be a string')
         event = payload.get('event', 'delivered')
         if event not in _WORKER_DELIVERY_EVENTS:
             raise ValueError('worker delivery event is unsupported')
@@ -860,18 +854,24 @@ class ProviderActionStore:
 
         Silent when the worker reports nothing -- prompts older than this check
         do not carry the field, and a missing field is not evidence of a bad
-        session.  Advisory only, and it names both roots so a host that
-        legitimately places a session elsewhere can be told apart by eye.
+        session.  Advisory only: a value that cannot be read as a path, or is
+        not absolute, is treated as not reported rather than refused, so this
+        check can never be the reason a delivery fails.  The message names both
+        roots it compared so a host that legitimately places a session
+        elsewhere can be told apart by eye.
         """
         delivery = payload.get('delivery_evidence') if isinstance(payload, Mapping) else None
         raw = delivery.get('session_cwd') if isinstance(delivery, Mapping) else None
         if not isinstance(raw, str) or not raw.strip():
             return None
-        try:
-            session = Path(raw.strip()).expanduser().resolve()
-        except (OSError, RuntimeError, ValueError):
+        reported = Path(raw.strip()).expanduser()
+        if not reported.is_absolute():
+            # A relative path would be resolved against whatever directory the
+            # CLI happened to run in, which says nothing about the session.
             return None
-        if not session.is_absolute():
+        try:
+            session = reported.resolve()
+        except (OSError, RuntimeError, ValueError):
             return None
         root = Path(self.paths.root).resolve()
         roots = [root]
@@ -884,11 +884,11 @@ class ProviderActionStore:
             return None
         return (
             'this worker reported its session root as {}, which is outside the contract '
-            'project root {} and its node worktree -- such a session is very likely '
+            'project root {} and its node worktree {} -- such a session is very likely '
             'projectless, so its write sandbox may not cover the contract paths and '
             'every write, commit and self-report raises its own approval prompt.  Tell '
             'the supervisor so the node can be re-dispatched against a saved project.'
-            .format(session, root)
+            .format(session, root, worktree if worktree is not None else '(none)')
         )
 
     def _latest_generation(self, run_id, issue_id, role):

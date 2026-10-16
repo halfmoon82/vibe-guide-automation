@@ -844,13 +844,45 @@ class LandingCheckTests(unittest.TestCase):
         self._dispatch()
         self.assertNotIn("warnings", self._deliver())
 
-    def test_non_string_session_root_is_refused(self):
+    def test_unreadable_session_root_is_ignored_not_fatal(self):
+        # Review N3: the field cannot change any gate decision, so it must
+        # never be able to fail a delivery.  A malformed value is "not
+        # reported", the same as an absent one.
+        self._dispatch()
+        for raw in (7, None, "", "   ", {"path": "/tmp"}):
+            with self.subTest(session_cwd=raw):
+                payload = {
+                    "delivery_evidence": dict(GOOD["delivery_evidence"],
+                                              session_cwd=raw),
+                }
+                outcome = self.store.record_worker_delivery(
+                    "run-1", "n1", "developer", payload, 1)
+                self.assertTrue(outcome["recorded"])
+                self.assertNotIn("warnings", outcome)
+
+    def test_relative_session_root_is_ignored(self):
+        # Review N1: a relative path resolves against whatever directory the
+        # CLI ran in, which says nothing about the session.  It must be
+        # skipped rather than silently interpreted.
         self._dispatch()
         payload = {
-            "delivery_evidence": dict(GOOD["delivery_evidence"], session_cwd=7),
+            "delivery_evidence": dict(GOOD["delivery_evidence"], session_cwd="."),
         }
-        with self.assertRaises(ValueError):
-            self.store.record_worker_delivery("run-1", "n1", "developer", payload, 1)
+        self.assertNotIn("warnings", self.store.record_worker_delivery(
+            "run-1", "n1", "developer", payload, 1))
+
+    def test_session_root_warning_names_the_worktree_it_compared(self):
+        # Review N5: the message must name both roots, not just the project.
+        self._dispatch()
+        stray = self.root.parent / "Codex" / "2026-10-15" / "m-en-00"
+        stray.mkdir(parents=True)
+        payload = {
+            "delivery_evidence": dict(GOOD["delivery_evidence"],
+                                      session_cwd=str(stray)),
+        }
+        warning = self.store.record_worker_delivery(
+            "run-1", "n1", "developer", payload, 1)["warnings"][0]
+        self.assertIn(str((self.root / ".worktrees" / "n1").resolve()), warning)
 
     def test_worker_protocol_documents_the_project_mount_requirement(self):
         text = (Path(__file__).resolve().parents[1] / "vibe_guide" / "protocols"

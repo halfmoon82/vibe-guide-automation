@@ -40,10 +40,11 @@ dev 子代理实现 → review 子代理审查 →（存在 P0–P2）返工回 
   后果是每一次写文件、`git add`/`commit`、`vibe worker-deliver` 自报都会各自弹一次人工批准——
   单个节点的正常交付流程会产生十几次打断，且打断点不可预测（带重定向/管道的命令不被 prefix rule
   匹配）。**遇到这种情况停下告诉监工**，不要在逐条批准里硬推完。
-- **自报时必须带会话工作目录**：把本会话的 cwd 原样写进 `delivery_evidence.session_cwd`。
-  这是链路里**唯一能看到实际沙箱**的观测点——派发请求里写没写 projectId 与宿主实际给了什么沙箱
-  是两件事（2026-10-16 实测：create 请求带了有效 projectId，worker 仍落成 projectless）。不填
-  就无法核对，等于把这一层保护关掉。
+- **自报时必须带会话工作目录**：把本会话的 cwd（绝对路径）原样写进
+  `delivery_evidence.session_cwd`。这是链路里**唯一能看到实际沙箱**的观测点——派发请求里写没写
+  projectId 与宿主实际给了什么沙箱是两件事（2026-10-16 实测：create 请求带了有效 projectId，
+  worker 仍落成 projectless）。这是**你的义务**，不是可选项；vibe 侧对该字段只做提示不做门禁
+  （缺省/不可读视为未上报，不拒收交付），所以漏填不会被报错拦住，只会让这一层保护失效。
 - 自报交付时若看到 `warnings`，把原文转告监工，由监工重新派发（新 project 挂载、新一代）。
   两种告警都属此类：「create 请求没有要求 project 挂载」与「你的会话根不在项目树/worktree 内」。
   这两条是**提示不是拒绝**：交付照常登记，但该节点的沙箱很可能覆盖不到合同路径。
@@ -175,7 +176,9 @@ fail-closed，不可重报。
 
 2. **`delivery_evidence`（交付证据门，引擎要求时必需）**：一个嵌套对象，含
    `completion_marker`、`delivery_path`、`thread_status`（只认 `complete` / `completed` /
-   `DELIVERED`）。摊平成顶层三个字段不算，门读不到。
+   `DELIVERED`）。摊平成顶层三个字段不算，门读不到。另带 **`session_cwd`**（见 §1.5：
+   你本会话的工作目录，绝对路径）——它**不是门禁字段**，缺省或不可读时 vibe 只当「未上报」，
+   不拒收交付；但漏填等于放弃唯一的沙箱核对手段。
 
 被拒后如何重报：按上面的形状补齐字段，在同一会话里再次交付即可；旧的 `acceptance_rejected`
 记录保留在事件日志里作为审计痕迹，不阻塞后续 acceptance。
