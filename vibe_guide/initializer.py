@@ -5,12 +5,18 @@ import json, tempfile
 
 from .scanner import (
     AGENTSMD_BLOCKS,
+    CLAUDE_ENTRY_FILE,
     ENGINEERING_PRINCIPLES_CURRENT_SENTINEL,
     ENGINEERING_PRINCIPLES_MARKER,
     VIBE_ENTRY_CURRENT_SENTINEL,
     VIBE_ENTRY_RULE_MARKER,
     WORKBUDDY_ORIGIN,
     build_agentsmd_patch,
+    claude_code_project,
+    claude_entry_imports,
+    claude_entry_reaches_rules,
+    claude_import_line,
+    fence_marker,
     legacy_entry_rule_lines,
     missing_agentsmd_blocks,
     resolve_rules_file,
@@ -522,7 +528,7 @@ def _proposal_sections(proposal):
     boundaries = set()
     fence = None
     for index, line in enumerate(lines):
-        marker = _fence_marker(line)
+        marker = fence_marker(line)
         if fence is None:
             if marker:
                 fence = marker
@@ -550,22 +556,20 @@ def _proposal_sections(proposal):
     return [section for section in (item.strip("\n") for item in sections) if section.strip()]
 
 
-def _fence_marker(line):
-    """Return a code-fence marker (`` ``` `` or `~~~`) opening or closing a block."""
-    stripped = line.lstrip()
-    for char in ("`", "~"):
-        if stripped.startswith(char * 3):
-            return char * (len(stripped) - len(stripped.lstrip(char)))
-    return ""
-
-
 def _rules_target(root):
     """Pick the rule file `apply-agentsmd` appends to.
 
     A project already carrying a host-loaded rule file gets the rules there,
     so a WorkBuddy project's CODEBUDDY.md -- the only file its host reads --
-    actually receives them.  A project with none still gets AGENTS.md, which
-    is what every host loads and what older releases always wrote.
+    actually receives them.  A project with none still gets AGENTS.md, the
+    file older releases always wrote and the one the integration contract
+    cites.
+
+    This is *not* "the file every host loads": no single name is.  Claude Code
+    loads only CLAUDE.md, so AGENTS.md reaches it solely through an import
+    line there (#126).  Writing the rules is therefore half the job --
+    `apply_agentsmd_proposal` calls `_ensure_claude_import` for the other half,
+    and `vibe doctor` reports the gap when the import is missing.
 
     The target must be the file the integration contract cites, which is
     AGENTS.md whenever it reads as a file (a symlink followed).  A symlink
@@ -635,17 +639,90 @@ def apply_agentsmd_proposal(paths, confirm):
         section for section in sections
         if section.splitlines()[0].strip() not in existing
     ]
-    if not pending:
-        return InitResult(False, [], _legacy_entry_notes(target.name, existing))
-    proposal = "\n\n".join(pending) + "\n"
+    if pending:
+        proposal = "\n\n".join(pending) + "\n"
 
+        if existing:
+            separator = "" if existing.endswith("\n") else "\n"
+            content = existing + separator + "\n" + proposal.lstrip("\n")
+        else:
+            content = proposal
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix="." + target.name + ".", dir=str(root)
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(str(temporary), str(target))
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+        written = [target.name]
+        notes = _legacy_entry_notes(target.name, content)
+    else:
+        written = []
+        notes = _legacy_entry_notes(target.name, existing)
+
+    # Writing the rules is only half the job: Claude Code reads CLAUDE.md and
+    # never AGENTS.md, so without the import line the rules sit in a file that
+    # host does not open (#126).  Repaired on *every* confirmed apply, not just
+    # when the rules file changed -- a project that already carried the rules
+    # still needs the import the first time it runs under this release.
+    claude_written, claude_notes = _ensure_claude_import(root, target.name)
+    if claude_written:
+        written.append(claude_written)
+    return InitResult(bool(written), written, notes + claude_notes)
+
+
+def _ensure_claude_import(root, rules_name):
+    """Make Claude Code's memory file reach `rules_name`.
+
+    Returns the name of the file written (or None) and the notes the user
+    should read.  Silent when the project carries no Claude Code footprint --
+    creating CLAUDE.md in a project that never ran that host would hand a new
+    host the project's context, which is not this command's call.
+
+    Never writes through a symlink and never rewrites a line that is already
+    there, so a project wired by hand keeps exactly the bytes it had.
+    """
+    if not claude_code_project(root):
+        return None, []
+    entry = root / CLAUDE_ENTRY_FILE
+    if entry.is_symlink():
+        if claude_entry_reaches_rules(root, rules_name):
+            return None, []
+        # Someone else's link: writing "through" it would land in a file this
+        # project does not own, so name the gap and leave the choice to them.
+        return None, [
+            CLAUDE_ENTRY_FILE + ' 未指向 ' + rules_name + '：Claude Code 读不到规则，'
+            '请人工把 ' + CLAUDE_ENTRY_FILE + ' 改为 ' + claude_import_line(rules_name)
+            + ' 或改指 ' + rules_name + '。'
+        ]
+    if entry.exists() and not entry.is_file():
+        return None, [
+            CLAUDE_ENTRY_FILE + ' 不是普通文件，未写入引入行：Claude Code 读不到 '
+            + rules_name + '。'
+        ]
+    try:
+        existing = entry.read_text(encoding="utf-8") if entry.exists() else ""
+    except (OSError, UnicodeDecodeError):
+        return None, [
+            CLAUDE_ENTRY_FILE + ' 无法按 UTF-8 读取，未写入引入行：Claude Code 读不到 '
+            + rules_name + '。'
+        ]
+    if claude_entry_imports(existing, rules_name):
+        return None, []
+    line = claude_import_line(rules_name)
     if existing:
         separator = "" if existing.endswith("\n") else "\n"
-        content = existing + separator + "\n" + proposal.lstrip("\n")
+        content = existing + separator + line + "\n"
     else:
-        content = proposal
+        content = line + "\n"
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix="." + target.name + ".", dir=str(root)
+        prefix="." + CLAUDE_ENTRY_FILE + ".", dir=str(root)
     )
     temporary = Path(temporary_name)
     try:
@@ -653,11 +730,11 @@ def apply_agentsmd_proposal(paths, confirm):
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(str(temporary), str(target))
+        os.replace(str(temporary), str(entry))
     finally:
         if temporary.exists():
             temporary.unlink()
-    return InitResult(True, [target.name], _legacy_entry_notes(target.name, content))
+    return CLAUDE_ENTRY_FILE, []
 
 
 def _legacy_entry_notes(name, content):

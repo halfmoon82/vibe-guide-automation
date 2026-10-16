@@ -2076,7 +2076,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             "paths": applied.paths,
         }
         summary = (
-            rules_name + " 能力规则已生效"
+            rules_name + " 能力规则已生效（写入 " + "、".join(applied.paths) + "）"
             if applied.changed
             else rules_name + " 能力规则无需变更"
         )
