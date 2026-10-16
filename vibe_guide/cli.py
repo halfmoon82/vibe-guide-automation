@@ -2035,12 +2035,16 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             paths.root, Path.home(), args.host_rules, args.host_rules_digest
         )
         payload["host_rules"] = host_payload
+        # "blocked" always means no user file was left changed; the one
+        # state where files stay written without a record says so plainly.
         if host_payload.get("status") == "blocked":
             notes.append("用户级规则未写入：" + str(host_payload.get("reason", "")))
+        elif host_payload.get("status") == "written_unrecorded":
+            notes.append("用户级规则已写入但未登记：" + str(host_payload.get("reason", "")))
         if notes:
             payload["notes"] = notes
             summary += "；请注意：" + "；".join(notes)
-        if host_payload.get("status") != "blocked":
+        if host_payload.get("status") not in {"blocked", "written_unrecorded"}:
             summary += "\n" + host_rules.summary_text(host_payload)
         return _result(SUCCESS, payload, summary, args.as_json)
 

@@ -351,7 +351,41 @@ def apply(home, digest, previous=None):
             _restore_backup(backup, previous_bytes)
         reason = str(error) if isinstance(error, HostRulesError) else error.__class__.__name__
         return {"status": "blocked", "reason": "写入失败，已恢复原文件：" + reason, "entries": [], "paths": []}
-    return {"status": "applied", "entries": entries, "paths": [t["path"] for t in changes]}
+    # Private undo info (never persisted): the exact bytes each written file
+    # and its backup held before this call, so a failed record write can
+    # take back precisely this apply and nothing else.
+    previous_backups = dict(saved)
+    undo = [
+        {
+            "path": home / t["rel"], "label": t["path"], "before": t["current"],
+            "backup": _backup_path(home / t["rel"]),
+            "backup_before": previous_backups[_backup_path(home / t["rel"])],
+        }
+        for t in written
+    ]
+    return {"status": "applied", "entries": entries, "paths": [t["path"] for t in changes], "_undo": undo}
+
+
+def _undo_apply(undo):
+    """Put back what one apply() call wrote; returns labels that failed.
+
+    This is an undo, not a rollback: the pre-write bytes go back verbatim,
+    and each backup returns to its own prior state (old bytes or absent).
+    """
+    failed = []
+    for item in undo:
+        try:
+            path = item["path"]
+            _atomic_write_bytes(path, item["before"], stat.S_IMODE(os.lstat(path).st_mode))
+            backup = item["backup"]
+            if item["backup_before"] is None:
+                if os.path.lexists(backup):
+                    backup.unlink()
+            else:
+                _atomic_write_bytes(backup, item["backup_before"], 0o600)
+        except OSError:
+            failed.append(item)
+    return failed
 
 
 def _remove_block(text, start, end):
@@ -473,6 +507,28 @@ def read_record(root):
     if not isinstance(data, dict) or data.get("decision") not in DECISIONS:
         raise HostRulesError(".vibe/host-rules.json 内容无效")
     return data
+
+
+def _record_writable(root):
+    """True when .vibe/host-rules.json can be written right now.
+
+    Checked before apply touches any user file, so a project-side failure
+    never leaves an unrecorded block that rollback cannot find.
+    """
+    try:
+        path = _record_path(root)
+    except HostRulesError:
+        return False
+    directory = path.parent
+    if directory.is_symlink() or not directory.is_dir() or not os.access(directory, os.W_OK):
+        return False
+    try:
+        descriptor, temporary = tempfile.mkstemp(prefix=".host-rules.probe.", dir=str(directory))
+    except OSError:
+        return False
+    os.close(descriptor)
+    os.unlink(temporary)
+    return True
 
 
 def write_record(root, decision, applied=None):
@@ -614,12 +670,36 @@ def _init_step(root, home, choice, digest):
         if all(t["action"] == "current" for t in plan["targets"]):
             payload["note"] = "用户级规则已是当前版本；运行上面的命令只会登记决定"
         return payload
+    if not _record_writable(root):
+        return {
+            "decision": decision, "status": "blocked",
+            "reason": "项目记录 .vibe/host-rules.json 不可写，未写入任何用户级文件",
+        }
     previous = record.get("applied") if record and record.get("decision") == "apply" else None
     result = apply(home, digest, previous)
     if result["status"] == "blocked":
         return {"decision": decision, "status": "blocked", "reason": result["reason"]}
     if not (record and record.get("decision") == "apply" and record.get("applied") == result["entries"]):
-        write_record(root, "apply", result["entries"])
+        try:
+            write_record(root, "apply", result["entries"])
+        except (OSError, HostRulesError) as error:
+            failed = _undo_apply(result.get("_undo", []))
+            if not failed:
+                return {
+                    "decision": decision, "status": "blocked",
+                    "reason": "记录写入失败，已撤回本次写入的用户级文件：" + error.__class__.__name__,
+                }
+            return {
+                "decision": decision, "status": "written_unrecorded",
+                "paths": [item["label"] for item in failed],
+                "reason": (
+                    "记录写入失败（" + error.__class__.__name__ + "），以下文件仍含例外标记块且未登记："
+                    + "、".join(
+                        item["label"] + "（可手工用 " + item["label"] + BACKUP_SUFFIX + " 恢复）"
+                        for item in failed
+                    )
+                ),
+            }
     return {"decision": "apply", "status": result["status"], "paths": result["paths"]}
 
 
@@ -643,6 +723,7 @@ def summary_text(payload):
         "rolled_back": "已回滚用户级规则例外：" + "、".join(payload.get("paths", []))
         + "".join("；" + note for note in payload.get("notes", [])),
         "noop": "没有已应用的用户级规则例外，无需回滚",
+        "written_unrecorded": "用户级规则已写入但未登记：" + str(payload.get("reason", "")),
     }
     if state in texts:
         return texts[state]
