@@ -21,6 +21,34 @@ dev 子代理实现 → review 子代理审查 →（存在 P0–P2）返工回 
 4. **复审**：返工后回到 review 子代理复审，保留审查身份与证据链；最多 3 轮。三轮仍不收敛时由监工记录 `change_reviewer_or_split_node`，换 reviewer 或拆节点并保留唯一 writer；只有分歧会改变 PRD 验收判定时才升级产品决策。
 5. **收口**：某轮复审无 P0–P2 且验证绿后，按节点合同收口（提交/开 PR 等以授权卡为准）。
 
+## 1.5 派发前提：worker 会话必须挂载 project
+
+**worker 的写权限不来自派发负载。** 一句话记法：**worker 权限来自 project 挂载 + app 沙箱默认值，
+派发负载不能携带权限。** 沙箱档案在**会话创建那一刻**由「挂在哪个 project + app/project
+沙箱默认值」决定；`create_thread` 一类的创建调用**不接受** sandbox / approval 参数。所以派发提示里
+写「给予完全访问」没有任何工程效力，监工也不要试图在 prompt 里授权。
+
+因此：
+
+- 监工派发 visible worker 时**必须挂载 project**（Git 项目按 worktree 环境创建）——合同 worktree
+  才会落进会话的可写根。**禁止静默落 projectless。** 这条要求约束的是**会话创建**：`create`
+  必须带 `target.type=project` 与非空 `projectId`。`resume` / 返工代次复用已存在的会话，
+  **不能改变挂载**，因此不重新做挂载决定；派发记录里返工代次继承创建代次登记的挂载值。
+- 项目未在宿主上保存时**显式处置**：先保存 project；或由产品经理确认走 projectless 并接受
+  逐条授权。两者都做不到就停下报告，不要硬派。
+- 落成 **projectless** 的会话，其可写根只有宿主生成的临时目录，**不覆盖合同 worktree 与主项目树**。
+  后果是每一次写文件、`git add`/`commit`、`vibe worker-deliver` 自报都会各自弹一次人工批准——
+  单个节点的正常交付流程会产生十几次打断，且打断点不可预测（带重定向/管道的命令不被 prefix rule
+  匹配）。**遇到这种情况停下告诉监工**，不要在逐条批准里硬推完。
+- **自报时必须带会话工作目录**：把本会话的 cwd（绝对路径）原样写进
+  `delivery_evidence.session_cwd`。这是链路里**唯一能看到实际沙箱**的观测点——派发请求里写没写
+  projectId 与宿主实际给了什么沙箱是两件事（2026-10-16 实测：create 请求带了有效 projectId，
+  worker 仍落成 projectless）。这是**你的义务**，不是可选项；vibe 侧对该字段只做提示不做门禁
+  （缺省/不可读视为未上报，不拒收交付），所以漏填不会被报错拦住，只会让这一层保护失效。
+- 自报交付时若看到 `warnings`，把原文转告监工，由监工重新派发（新 project 挂载、新一代）。
+  两种告警都属此类：「create 请求没有要求 project 挂载」与「你的会话根不在项目树/worktree 内」。
+  这两条是**提示不是拒绝**：交付照常登记，但该节点的沙箱很可能覆盖不到合同路径。
+
 ## 2. review 子代理只读红线（git 写禁令清单）
 
 派给 review 子代理的任务提示必须**显式禁止一切 git 写操作**。以下命令清单一字不差写进提示，review 子代理不得执行：
@@ -148,7 +176,9 @@ fail-closed，不可重报。
 
 2. **`delivery_evidence`（交付证据门，引擎要求时必需）**：一个嵌套对象，含
    `completion_marker`、`delivery_path`、`thread_status`（只认 `complete` / `completed` /
-   `DELIVERED`）。摊平成顶层三个字段不算，门读不到。
+   `DELIVERED`）。摊平成顶层三个字段不算，门读不到。另带 **`session_cwd`**（见 §1.5：
+   你本会话的工作目录，绝对路径）——它**不是门禁字段**，缺省或不可读时 vibe 只当「未上报」，
+   不拒收交付；但漏填等于放弃唯一的沙箱核对手段。
 
 被拒后如何重报：按上面的形状补齐字段，在同一会话里再次交付即可；旧的 `acceptance_rejected`
 记录保留在事件日志里作为审计痕迹，不阻塞后续 acceptance。
