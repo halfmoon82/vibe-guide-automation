@@ -27,7 +27,13 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-16: run-9edb07bb integration merge (5 nodes on top of #210).
+        "4bcee2236f297a664d8c8aa087590856298433546e1a7a61e56dc33b0418ceea",
+        # intermediate text of that merge (main + heartbeat-contract only).
+        "db6afb43acad8ccec154be3ed60f6b0a9f8e222ef4ced2b23a3411a897e2ed48",
         "12a69ed8e93c57af77fa531a2749fb8b479280bbc1891e4ae90e769926ba579e",
+        # 2026-10-13: N4 hold/decision categories + references (#151).
+        "f8021c6c2f0ba4c78e90c91706c70f2faac47f7d6cb8eede909ba2c54ae98134",
         "9223364689e4ccf6bcd1720dfa58a47d730ced15cb8b304a5074f6bd074e799e",
         "f8bccb63f6ba536f26116211c5efb9c7838c46cc83f150e1c72d742ac5f7b5c3",
         "65abc91f34211959e4917b17b0a979c5ce961f658b5dff4fcec939663dad609f",
@@ -85,6 +91,12 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "9179bef46af413f27c0954f265777778f42af5a93d6012b0b5dd83e585ab0b08",
         # 2026-10-14: §6.2 worker-deliver self-report needs no cursor (receipt instead).
         "8e6b6b2dadfc9b5e3cc6396189f17c169e434c8cd023f002055f2f9849474bee",
+        # 2026-10-14: heartbeat --accept-decision + N1 intervals.
+        "85c507fb3e0788f310b5da4987eefd88fbcef549de51865ad9b2491c301cba40",
+        # 2026-10-16: heartbeat-contract merged onto main (#211 §6.x patches).
+        "578fd47330714a53c2de616aafff3a0a9604a79ff272374aa50d2baa58a5bb35",
+        # 2026-10-16: combined text once decision-boundary (#184) and heartbeat-contract both land.
+        "5b7aa976a0f9b2ac20ca014a38a101635d274bad40d1a57bc4920b179ed5f38e",
     }),
     "vibe-entry": frozenset({
         "3ec0a771d482d92eba7f155f212dab97beb3a4a3b6712e16d7dc3d81394797eb",
@@ -98,6 +110,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "8091f9d39f66ecb373956d41cf573073420b78be173c53371e51f94e2ee356a6",
         "8a231e030151ff3a2378aaf1d1cd95745c7374e7cb95b1d4935c641d53b7287d",
         "e0a321c246cd2636a31612d643d7982c91ab5b473c80056b67cd800c853cd78e",
+        # 2026-10-14: heartbeat --accept-decision + N1 intervals.
+        "cfff1ae864a712bb1d110e82c95bfac801f313b9f19470c37843bd3c78dae5b1",
     }),
 }
 

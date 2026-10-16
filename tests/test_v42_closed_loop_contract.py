@@ -152,7 +152,7 @@ class V42ClosedLoopContractTests(unittest.TestCase):
                 started = monitor.start(record, runner)
                 snapshot = monitor.tick(started.run_id, runner)
 
-            self.assertEqual(snapshot.nodes[node.id]["status"], "blocked_unknown")
+            self.assertEqual(snapshot.nodes[node.id]["status"], "blocked_design")
             self.assertIsNone(snapshot.nodes[node.id]["retryable_action"])
 
 

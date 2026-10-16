@@ -36,6 +36,7 @@ from .config import load_project_config
 from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import doctor
 from .initializer import _rules_target, apply_agentsmd_proposal, init_project, refresh_protocol_copies
+from . import host_rules
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import Monitor, ScopeDecisionRequired
 from .supervisor_output import supervisor_output_batch
@@ -49,6 +50,11 @@ from .supervisor import (
     supervisor_handoff,
     bounded_supervisor_output,
     heartbeat_command,
+    heartbeat_interval,
+    record_heartbeat_interval,
+    HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
+    HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
+    HEARTBEAT_INTERVAL_DECISION_MINUTES,
     supervisor_holds,
     supervisor_preflight,
     HOST_SHIFT_DIFFERENCES,
@@ -127,6 +133,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
+    parser.add_argument("--host-rules", dest="host_rules", choices=("skip", "apply", "rollback"),
+                        help="init: 回答「是否在用户级规则中加入 vibe 监工会话例外」")
+    parser.add_argument("--host-rules-digest", dest="host_rules_digest",
+                        help="init --host-rules apply: 授权预览差异的摘要")
     parser.add_argument("--request")
     parser.add_argument("--plan-id")
     parser.add_argument("--plan")
@@ -153,6 +163,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--name", dest="skill_name")
     parser.add_argument("--subdir", dest="skill_subdir", default="")
     parser.add_argument("--session-record", dest="session_record")
+    parser.add_argument("--accept-decision", action="store_true", dest="accept_decision")
     parser.add_argument("--provider", dest="supervisor_provider")
     parser.add_argument("--session-id", dest="session_id")
     parser.add_argument("--host", dest="supervisor_host")
@@ -160,6 +171,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--token-threshold", dest="token_threshold", type=int, default=None)
     parser.add_argument("--reason", dest="hold_reason")
     parser.add_argument("--category", dest="hold_category")
+    parser.add_argument("--decision", dest="hold_decision")
+    parser.add_argument("--authorization-gap", dest="hold_authorization_gap")
     parser.add_argument("--release", action="store_true", dest="hold_release")
     parser.add_argument("--node", dest="node_id")
     parser.add_argument("--role", dest="role", default="developer")
@@ -1328,6 +1341,17 @@ def _snapshot_result(
     )
 
 
+def _beat_interval(paths: ProjectPaths, run_id: str, payload: Dict[str, Any], *, persist: bool) -> Dict[str, Any]:
+    """Next-beat interval for a preflight payload; persisting never changes the state."""
+    interval = heartbeat_interval(paths, run_id, decision_only=bool(payload.get("decision_only")))
+    if persist:
+        try:
+            interval = {**interval, **record_heartbeat_interval(paths, run_id, interval)}
+        except (OSError, ValueError, TypeError) as error:
+            interval = {**interval, "persist_error": str(error)[:200]}
+    return interval
+
+
 def _first_shift_handoff(
     paths: ProjectPaths, plan_id: str, run_id: str, run_status: Optional[str] = None
 ) -> str:
@@ -1364,13 +1388,18 @@ def _first_shift_handoff(
         "     {}\n"
         "  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n"
         "     {}\n"
-        "     每拍只运行这一条；输出 idle 时只回一个字，work/unknown/rotate 时按输出分支继续。\n"
+        "     心跳按 {} 分钟建；命令输出会给出下一拍间隔（{}/{}/{} 分钟），与当前周期不一致时按输出调整。\n"
+        "     每拍只运行这一条；输出 idle 时只回一个字，decision 时向用户呈现未答卡片，work/unknown/rotate 时按输出分支继续。\n"
         "没登记地址，worker 的完工唤醒信号无处可发；没心跳，rotate 的阈值检测不会发生。\n"
         "{}"
     ).format(
         run_id,
         SESSION_RECORD_HINT,
         heartbeat_command(run_id),
+        HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
+        HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
+        HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
+        HEARTBEAT_INTERVAL_DECISION_MINUTES,
         HOST_SHIFT_DIFFERENCES,
     )
 
@@ -1699,7 +1728,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             kwargs["token_threshold"] = args.token_threshold
         if args.context_hard_cap is not None:
             kwargs["context_hard_cap"] = args.context_hard_cap
-        payload = supervisor_preflight(paths, args.run_id, args.session_record, **kwargs)
+        payload = supervisor_preflight(paths, args.run_id, args.session_record,
+                                       accept_decision=args.accept_decision, **kwargs)
         if payload.get("prepare_handoff"):
             try:
                 handoff, _ = supervisor_handoff(paths, args.run_id, command_prefix=supervisor_command_prefix)
@@ -1714,22 +1744,27 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             plan_id = load_snapshot(paths, args.run_id).plan_id
         except (FileNotFoundError, OSError, TypeError, ValueError):
             plan_id = "<plan_id>"
+        interval = _beat_interval(paths, args.run_id, payload, persist=True)
+        payload["heartbeat_interval"] = interval
+        tail = "；下一拍间隔 {} 分钟".format(interval["minutes"])
         if state == "idle":
+            # 保持输出恰为 "idle"（既有测试与"只回一个字"的约定）；间隔见 JSON 的 heartbeat_interval。
             text = "idle"
         elif state == "decision":
-            text = "decision：读取决策信箱并向用户呈现未答卡片；心跳降频但不暂停，答案写回后恢复推进"
+            text = "decision：读取决策信箱并向用户呈现未答卡片；心跳降频到 {} 分钟但不暂停，答案写回后恢复{}".format(
+                HEARTBEAT_INTERVAL_DECISION_MINUTES, tail)
         elif state == "work":
             text = "work：按 prd-guide §6.1 服务信箱一轮，推进用 {} resume --plan {} --run-id {}".format(
                 supervisor_command_prefix, plan_id, args.run_id
-            )
+            ) + tail
         elif state == "rotate":
             text = "rotate：新开一个会话，让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(
                 supervisor_command_prefix, args.run_id
-            )
+            ) + tail
         else:
             text = "unknown：按 work 处理，推进用 {} resume --plan {} --run-id {}；原因：{}".format(
                 supervisor_command_prefix, plan_id, args.run_id, payload.get("reason", "状态未知")
-            )
+            ) + tail
         code = SUCCESS if state in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
         return _result(
             code,
@@ -1753,6 +1788,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 options=_decision_options(args.decision_options),
                 recommendation=args.decision_recommendation,
                 evidence=evidence,
+                category=args.hold_category,
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "决策写入失败：" + str(error), args.as_json)
@@ -1776,6 +1812,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
     if args.command == "decision-answer":
         if not (args.decision_id and args.decision_choice):
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--id and --choice are required"}, "缺少决策答案参数", args.as_json)
+        if not args.decision_digest:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--digest is required: use the digest printed in the request's answer_cli"}, "缺少 --digest：请用决策卡 answer_cli 里的摘要", args.as_json)
         try:
             result = answer_decision(
                 paths,
@@ -1798,7 +1836,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         if args.context_hard_cap is not None:
             kwargs["context_hard_cap"] = args.context_hard_cap
         def compute_preflight():
-            payload = supervisor_preflight(paths, args.run_id, args.session_record, **kwargs)
+            payload = supervisor_preflight(paths, args.run_id, args.session_record,
+                                           accept_decision=args.accept_decision, **kwargs)
             if payload.get("prepare_handoff"):
                 try:
                     handoff, _ = supervisor_handoff(paths, args.run_id, command_prefix=supervisor_command_prefix)
@@ -1812,7 +1851,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                         payload["state"] = "unknown"
             return payload
         payload = preflight_with_checkpoint(paths, args.run_id, args.session_record,
-            compute_preflight, command_prefix=supervisor_command_prefix, **kwargs)
+            compute_preflight, command_prefix=supervisor_command_prefix,
+            accept_decision=args.accept_decision, **kwargs)
+        interval = _beat_interval(paths, args.run_id, payload, persist=False)
+        payload = {**payload, "heartbeat_interval": interval}
         code = SUCCESS if payload["state"] in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
         return _result(code, {"command": args.command, **payload}, "监工预检：{}".format(payload["state"]), args.as_json)
 
@@ -1857,11 +1899,16 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     args.node_id,
                     args.hold_reason,
                     boundary_category=args.hold_category,
+                    decision_id=args.hold_decision,
+                    authorization_gap=args.hold_authorization_gap,
                 )
-                text = "已挂起 {} 等人拍板（类别 {}）：{}".format(
+                entry = holds[args.node_id]
+                text = "已挂起 {} 等人拍板（类别 {}；{}）：{}".format(
                     args.node_id,
-                    holds[args.node_id]["category"],
-                    holds[args.node_id]["reason"],
+                    entry["category"],
+                    "决策 " + entry["decision_id"] if "decision_id" in entry
+                    else "授权缺口 " + entry["authorization_gap"],
+                    entry["reason"],
                 )
         except (FileNotFoundError, TypeError, ValueError, OSError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "挂起失败：" + str(error), args.as_json)
@@ -2038,9 +2085,24 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             "paths": initialized.paths,
         }
         summary = "初始化完成" if initialized.changed else "初始化无需变更"
-        if initialized.notes:
-            payload["notes"] = list(initialized.notes)
-            summary += "；请注意：" + "；".join(initialized.notes)
+        notes = list(initialized.notes)
+        # Runs after init on purpose: a host-rules refusal never changes
+        # init's own status or exit code (#152).
+        host_payload = host_rules.init_step(
+            paths.root, Path.home(), args.host_rules, args.host_rules_digest
+        )
+        payload["host_rules"] = host_payload
+        # "blocked" always means no user file was left changed; the one
+        # state where files stay written without a record says so plainly.
+        if host_payload.get("status") == "blocked":
+            notes.append("用户级规则未写入：" + str(host_payload.get("reason", "")))
+        elif host_payload.get("status") == "written_unrecorded":
+            notes.append("用户级规则已写入但未登记：" + str(host_payload.get("reason", "")))
+        if notes:
+            payload["notes"] = notes
+            summary += "；请注意：" + "；".join(notes)
+        if host_payload.get("status") not in {"blocked", "written_unrecorded"}:
+            summary += "\n" + host_rules.summary_text(host_payload)
         return _result(SUCCESS, payload, summary, args.as_json)
 
     if args.command == "apply-agentsmd":
@@ -2117,12 +2179,15 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             "facts": report.facts,
             "provider_bridge": bridge_payload,
             "proposals": report.proposals,
+            "warnings": list(report.warnings),
         }
         text = (
             "环境检查通过"
             if ready
             else "环境检查发现问题：" + "；".join(issues)
         )
+        if report.warnings:
+            text += "；提醒：" + "；".join(report.warnings)
         return _result(
             SUCCESS if status == "attention" or ready else BLOCKED, payload, text, args.as_json
         )

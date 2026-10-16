@@ -142,6 +142,13 @@ CONSISTENCY_CORRECTION_KEYS = (
     "decision",
 )
 _EVENT_DATA_KEYS = {
+    # Fixed-enum cause (and repo node id) of a decision-less blocked_design,
+    # so the monitor can register vibe-authored decision text after a replay.
+    "blocked_design_cause",
+    "blocked_design_target",
+    # Notification bridge outcome (accepted/unknown/disabled) of a decision the
+    # monitor registered itself; kept as evidence for the PM-visibility chain.
+    "notification_status",
     *CONSISTENCY_CORRECTION_KEYS,
     "authorization_digest",
     "authorization_epoch",
@@ -253,6 +260,14 @@ _EVENT_DATA_KEYS = {
     "previous_intent_digest",
     "dispatch_head",
     "host",
+    # decision_raised events lost decision_ids on write, so a replayed decision
+    # node looked decision-less and was misrouted as a lifecycle defect.  The
+    # rest record routing markers (fixed enums / booleans), never provider text.
+    "decision_ids",
+    "old_task_reconciled",
+    "owner_layer",
+    "recovery_action",
+    "user_interrupt",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",

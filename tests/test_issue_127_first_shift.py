@@ -54,7 +54,7 @@ class PrdGuideOpeningStepTests(unittest.TestCase):
     def test_opening_step_installs_the_native_beat_command(self):
         _section, opening = self.section_and_opening()
         self.assertIn(
-            "vibe supervisor-beat --run-id <run-id> --session-record <本会话记录路径>",
+            "vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>",
             opening,
         )
         self.assertIn("心跳", opening)
@@ -96,7 +96,7 @@ class MonitorFirstShiftTests(unittest.TestCase):
         self.assertIsNotNone(started.payload.get("run_id"), started.text)
         self.assertIn("vibe supervisor-register", started.text)
         self.assertIn(
-            "vibe supervisor-beat --run-id {} --session-record <本会话记录路径>".format(
+            "vibe supervisor-beat --run-id {} --accept-decision --session-record <本会话记录路径>".format(
                 started.payload["run_id"]
             ),
             started.text,

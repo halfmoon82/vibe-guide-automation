@@ -53,17 +53,39 @@ The package supports Python 3.9 and later paths covered by the repository's rele
 ```text
 vibe scan                         Read-only project scan; does not create .vibe/
 vibe init --confirm               Initialize the minimum project state after confirmation
+vibe init --confirm --host-rules skip|apply|rollback [--host-rules-digest <digest>]   Answer the supervisor-session exception decision item
 vibe doctor                       Report observable environment, Skill, and Agent facts
 vibe plan --request <request>     Run S0 and, when needed, explicit S1 and node-spec checks
 vibe monitor --plan <ID>         Start only with exact authorization and valid evidence
 vibe status --plan <ID>          Read the current snapshot without polling providers
 vibe resume --plan <ID>          Continue from snapshots, task records, and event evidence
+vibe supervisor-preflight --run-id <run> [--accept-decision] --session-record <file>   Read-only heartbeat preflight; prints idle/work/decision/rotate/unknown. `decision` is printed only with `--accept-decision`; without it the same situation (only unanswered decisions left) prints work
+vibe supervisor-beat --run-id <run> --accept-decision --session-record <file>   Heartbeat entry point: preflight, output branch and next-beat interval (default 10 minutes; 30 once a platform's push wake is verified and registered; 60 while only unanswered decisions remain). Persisted to `.vibe/runs/<run>/heartbeat-interval.json` and printed by `supervisor-handoff`. Push wake registry `.vibe/push-wake-verification.json`: `{"platforms": {"<provider>": {"success": [{"evidence_ref": "..."}], "failure": [{"evidence_ref": "..."}]}}}`; at least one success and one failure evidence are required; an unreadable file falls back to 10 minutes with the reason in the output
+vibe supervisor-hold --run-id <run> --node <id> --category <product_acceptance|external_authorization> (--decision <decision-id>|--authorization-gap <gap>) --reason <why>   Park a node waiting on a human; must reference a decision or an authorization gap. product_design/deploy remain accepted aliases (stored canonical); legacy holds without a category read as product_acceptance
+vibe decision-answer --id <decision-id> --choice <option> --digest <digest>   --digest (printed in the request's answer_cli) is required; changing a decision's options voids the old answer and the decision is asked again
 vibe skill-install --source <GitHub> --sha <40hex> --name <name> [--subdir <dir>] --confirm   Fetch a GitHub skill at an exact SHA, validate an optional repo subdir, materialize into .vibe/proposals/skills/<name>/ and register it in .vibe/config.json; traversal, absolute, or edge-slash subdirs are rejected without writes
 ```
 
 Every command supports `--json`. Exit codes are `0` for success, `2` for argument errors, `3` for confirmation or design blocking, and `4` for unknown external or runtime state.
 
 New-session entry: the host agent self-screens S0/S1 in-session following `.vibe/proposals/skills/vibe-entry/SKILL.md` (materialized by `vibe init`, never rewritten). Requests scored <=8 are executed directly and 9-15 get a light plan, neither touching vibe; every scored request emits one S1 score-and-band line; only requests scored >15 (or uncertain) enter `vibe scan` + `vibe plan --request --s1`. The protocol is fully self-contained and needs no external skill.
+
+## User-level rules: vibe supervisor-session exception
+
+`init` asks a must-answer question: whether to add the vibe supervisor-session exception to the user-level rule files. Until answered, `init` still completes, reports `host_rules.status = decision_required` with the answer commands, and writes no user-level file.
+
+```bash
+vibe init --confirm --host-rules skip                              # do not apply; only records the decision in .vibe/host-rules.json
+vibe init --confirm --host-rules apply                             # preview only: shows the diff and an authorization digest
+vibe init --confirm --host-rules apply --host-rules-digest <digest> # writes only if the digest matches the current diff
+vibe init --confirm --host-rules rollback                          # restore the original files
+```
+
+- Only existing user rule files (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/AGENTS.md`) are touched, never created; the change is one versioned, checksummed marker block.
+- A verified `<file>.vibe-host-rules.bak` backup is written first. Any backup failure, unwritable file or directory, symlinked path, or hand-edited block means nothing is written and the reason is reported; the rest of `init` still completes.
+- Re-running is idempotent. Rollback restores the backup byte-for-byte when the file is unchanged since apply, otherwise removes only the block.
+- The exception applies only to sessions carrying the supervisor-session marker (registered via `vibe supervisor-register`, signed authorization card, turn started by `vibe supervisor-beat` or `vibe supervisor-handoff`); all other sessions and projects keep their alignment-gate behaviour.
+- `vibe doctor` reports the decision and per-file state under `facts.host_rules`, and flags hand-edited or outdated blocks.
 
 ## V4.2 engine evidence
 

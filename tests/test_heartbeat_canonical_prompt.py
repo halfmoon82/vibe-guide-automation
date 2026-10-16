@@ -18,7 +18,15 @@ from vibe_guide.protocols import load_protocol
 from vibe_guide.monitor import Monitor
 from vibe_guide.state import load_snapshot
 from vibe_guide.supervisor import Supervisor
-from vibe_guide.supervisor import heartbeat_command, heartbeat_prompt, register_supervisor_address
+from vibe_guide.supervisor import (
+    HEARTBEAT_INTERVAL_DECISION_MINUTES,
+    HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
+    HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
+    PUSH_WAKE_VERIFICATION_RELATIVE,
+    heartbeat_command,
+    heartbeat_prompt,
+    register_supervisor_address,
+)
 
 from tests.support_v45_authorize import publish_complex_probe
 
@@ -34,7 +42,7 @@ class HeartbeatPromptShapeTests(unittest.TestCase):
         text = heartbeat_prompt("plan-a", "run-b")
         self.assertEqual(
             text,
-            "vibe supervisor-beat --run-id run-b --session-record <本会话记录路径>",
+            "vibe supervisor-beat --run-id run-b --accept-decision --session-record <本会话记录路径>",
         )
 
     def test_command_is_one_line(self):
@@ -62,6 +70,26 @@ class ProtocolCarriesTheSameTextTests(unittest.TestCase):
         rotate = [line for line in discipline.splitlines() if line.startswith("- 输出 `rotate`")]
         self.assertEqual(len(rotate), 1)
         self.assertIn("supervisor-handoff", rotate[0])
+
+
+class ProtocolCarriesIntervalRulesTests(unittest.TestCase):
+    def test_decision_line_names_flag_legacy_work_and_interval(self):
+        text = load_protocol("prd-guide")
+        start = text.index("### 6.5")
+        discipline = text[start:text.index("## 7. ", start)]
+        lines = [line for line in discipline.splitlines() if line.startswith("- 输出 `decision`")]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("--accept-decision", lines[0])
+        self.assertIn("work", lines[0])
+        self.assertIn(str(HEARTBEAT_INTERVAL_DECISION_MINUTES), lines[0])
+
+    def test_opening_step_names_all_three_intervals(self):
+        text = load_protocol("prd-guide")
+        opening = text[text.index("### 6.0"):text.index("### 6.1")]
+        for minutes in (HEARTBEAT_INTERVAL_DEFAULT_MINUTES, HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
+                        HEARTBEAT_INTERVAL_DECISION_MINUTES):
+            self.assertIn("{} 分钟".format(minutes), opening)
+        self.assertIn(PUSH_WAKE_VERIFICATION_RELATIVE, opening)
 
 
 class EntryProtocolPointsAtTheGeneratedPromptTests(unittest.TestCase):

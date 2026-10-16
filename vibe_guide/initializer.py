@@ -88,6 +88,7 @@ def _validate_initialization_paths(root):
         root / '.vibe' / 'config.json',
         root / '.vibe' / 'state.json',
         root / '.vibe' / 'session-contract.json',
+        root / '.vibe' / 'host-rules.json',
         root / '.vibe' / 'proposals' / 'agentsmd' / 'proposal.md',
         root / '.vibe' / 'proposals' / 'skills' / 'proposal.md',
         root / PRD_GUIDE_PROPOSAL_RELATIVE,

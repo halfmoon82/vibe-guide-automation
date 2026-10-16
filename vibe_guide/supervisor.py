@@ -11,78 +11,177 @@ from typing import Any, Dict
 
 from .config import load_supervisor_single_shift
 from .contracts import RunEvent
-from .decision_boundary import validate_boundary_category
-from .state import append_event, run_dir, save_snapshot, load_snapshot
+from .decision_boundary import LEGACY_BOUNDARY_CATEGORY, validate_boundary_category
+from .state import append_event, interprocess_lock, run_dir, save_snapshot, load_snapshot
+
+
+class SupervisorLeaseConflict(ValueError):
+    """Lost a lease compare-and-swap, or a stale-epoch supervisor tried to write."""
+
+
+def _valid_epoch(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _recover_hint(path: Path) -> str:
+    return "; confirm no supervisor is running this run, then remove %s to recover" % path
+
+
+def _read_lease_record(path: Path):
+    """Return the lease record, or None when no file exists.
+
+    A file that exists but cannot be parsed is never read as epoch 0: that
+    would let a corrupt file reset the counter and readmit a stale writer.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SupervisorLeaseConflict("supervisor lease is unreadable: %s%s" % (error, _recover_hint(path)))
+    try:
+        record = json.loads(text)
+    except ValueError:
+        raise SupervisorLeaseConflict("supervisor lease is malformed" + _recover_hint(path))
+    if not isinstance(record, dict):
+        raise SupervisorLeaseConflict("supervisor lease is malformed" + _recover_hint(path))
+    if "lease_epoch" in record and not _valid_epoch(record["lease_epoch"]):
+        raise SupervisorLeaseConflict("supervisor lease has an invalid lease_epoch" + _recover_hint(path))
+    return record
+
+
+def _record_epoch(record) -> int:
+    # Legacy records carry no epoch and read as 0.
+    return 0 if record is None else record.get("lease_epoch", 0)
+
+
+def read_lease_epoch(paths, run_id: str) -> int:
+    """On-disk lease epoch for a run; 0 when there is no lease file."""
+    path = run_dir(paths, run_id, create=True) / "supervisor.lease"
+    return _record_epoch(_read_lease_record(path))
 
 
 class SupervisorLease:
     def __init__(self, paths, *, pid=None):
         self.paths = paths
         self.pid = int(pid or os.getpid())
+        self.lease_epoch = None
+        self._run_id = None
 
     def path(self, run_id: str) -> Path:
         return run_dir(self.paths, run_id, create=True) / "supervisor.lease"
 
-    def _payload(self, run_id: str) -> Dict[str, Any]:
-        now = time.time()
-        return {"pid": self.pid, "run_id": run_id, "started_at": now, "heartbeat": now}
+    def lock(self, run_id: str):
+        return interprocess_lock(self.path(run_id).parent / ".supervisor-lease.lock")
 
-    def acquire(self, run_id: str) -> bool:
+    def _write(self, run_id: str, record: Dict[str, Any]) -> None:
         path = self.path(run_id)
-        payload = self._payload(run_id)
-        try:
-            descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            try:
-                current = json.loads(path.read_text(encoding="utf-8"))
-                pid = int(current.get("pid", 0))
-                same_process = pid == self.pid
-                if not same_process and pid > 0:
-                    os.kill(pid, 0)
-                    return False
-                if same_process and current.get("run_id") == run_id:
-                    return False
-                path.unlink()
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                try:
-                    path.unlink()
-                except OSError:
-                    return False
-            return self.acquire(run_id)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, sort_keys=True)
-            stream.flush()
-            os.fsync(stream.fileno())
-        self._run_id = run_id
-        return True
-
-    def heartbeat(self, run_id: str) -> None:
-        path = self.path(run_id)
-        try:
-            current = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return
-        if current.get("pid") != self.pid or current.get("run_id") != run_id:
-            return
-        current["heartbeat"] = time.time()
         descriptor, temporary = tempfile.mkstemp(prefix=".supervisor.", dir=str(path.parent))
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                json.dump(current, stream, sort_keys=True)
+                json.dump(record, stream, sort_keys=True)
                 stream.flush(); os.fsync(stream.fileno())
             os.replace(temporary, str(path))
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
+    def _record(self, run_id: str, epoch: int, owner, released=False, started_at=None) -> Dict[str, Any]:
+        now = time.time()
+        return {
+            "pid": self.pid, "run_id": run_id,
+            "started_at": started_at or now, "heartbeat": now,
+            "lease_epoch": epoch, "owner": owner, "released": released,
+        }
+
+    def cas_locked(self, run_id: str, expected_epoch: int, owner=None) -> int:
+        """Upgrade the epoch by one if it still equals ``expected_epoch``.
+
+        The caller must hold ``self.lock(run_id)``.  This is the only place
+        the epoch changes.
+        """
+        found = _record_epoch(_read_lease_record(self.path(run_id)))
+        if found != expected_epoch:
+            raise SupervisorLeaseConflict(
+                "supervisor lease takeover lost: expected epoch %s, found %s"
+                % (expected_epoch, found)
+            )
+        new_epoch = expected_epoch + 1
+        self._write(run_id, self._record(run_id, new_epoch, owner))
+        self._run_id = run_id
+        self.lease_epoch = new_epoch
+        return new_epoch
+
+    def takeover(self, run_id: str, expected_epoch: int, *, owner=None) -> int:
+        if not _valid_epoch(expected_epoch):
+            raise ValueError("expected_epoch must be a non-negative integer")
+        with self.lock(run_id):
+            return self.cas_locked(run_id, expected_epoch, owner)
+
+    def acquire(self, run_id: str) -> bool:
+        with self.lock(run_id):
+            current = _read_lease_record(self.path(run_id))
+            if current is not None and not current.get("released"):
+                pid = current.get("pid")
+                pid = pid if isinstance(pid, int) and not isinstance(pid, bool) else 0
+                if pid == self.pid:
+                    if current.get("run_id") == run_id:
+                        return False
+                elif pid > 0:
+                    try:
+                        os.kill(pid, 0)
+                        return False
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        return False
+                    except OSError:
+                        pass
+            epoch = _record_epoch(current)
+            owner = current.get("owner") if current else None
+            self._write(run_id, self._record(run_id, epoch, owner))
+            self._run_id = run_id
+            self.lease_epoch = epoch
+            return True
+
+    def ensure_current(self, run_id: str) -> None:
+        if self.lease_epoch is None or self._run_id != run_id:
+            raise SupervisorLeaseConflict("supervisor lease was never acquired for run %s" % run_id)
+        found = read_lease_epoch(self.paths, run_id)
+        if found != self.lease_epoch:
+            raise SupervisorLeaseConflict(
+                "supervisor lease epoch is stale: holding %s, current %s"
+                % (self.lease_epoch, found)
+            )
+
+    def heartbeat(self, run_id: str) -> None:
+        with self.lock(run_id):
+            try:
+                current = _read_lease_record(self.path(run_id))
+            except SupervisorLeaseConflict:
+                return
+            if (
+                current is None or current.get("pid") != self.pid
+                or current.get("run_id") != run_id
+                or _record_epoch(current) != self.lease_epoch
+            ):
+                return
+            current["heartbeat"] = time.time()
+            self._write(run_id, current)
+
     def release(self, run_id: str) -> None:
-        path = self.path(run_id)
-        try:
-            current = json.loads(path.read_text(encoding="utf-8"))
-            if current.get("pid") == self.pid:
-                path.unlink()
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return
+        with self.lock(run_id):
+            try:
+                current = _read_lease_record(self.path(run_id))
+            except SupervisorLeaseConflict:
+                return
+            if (
+                current is None or current.get("pid") != self.pid
+                or _record_epoch(current) != self.lease_epoch
+            ):
+                return
+            current["released"] = True
+            self._write(run_id, current)
 
 
 class Supervisor:
@@ -92,14 +191,27 @@ class Supervisor:
         self.runner = runner
         self.run_id = run_id
         self.lease = lease or SupervisorLease(paths)
+        try:
+            monitor.lease_guard = lambda: self.lease.ensure_current(self.run_id)
+        except AttributeError:
+            pass
 
     def recover_or_start(self, run_id: str = None) -> Dict[str, Any]:
         target = run_id or self.run_id
+        ensure_caller_not_superseded(self.paths, target)
         acquired = self.lease.acquire(target)
         return {"stale_pid_recovered": acquired, "active_supervisors": 1 if acquired else 0}
 
     def run_once(self):
-        if not self.lease.acquire(self.run_id) and not getattr(self.lease, "_run_id", None):
+        ensure_caller_not_superseded(self.paths, self.run_id)
+        if (
+            getattr(self.lease, "_run_id", None) == self.run_id
+            and getattr(self.lease, "lease_epoch", None) is not None
+        ):
+            # Already holding: a newer epoch means this supervisor is stale and
+            # must stop before any write.
+            self.lease.ensure_current(self.run_id)
+        elif not self.lease.acquire(self.run_id):
             raise RuntimeError("supervisor lease is held by another process")
         heartbeat_data = {"run_id": self.run_id, "status": "active"}
         heartbeat_provenance = None
@@ -121,6 +233,7 @@ class Supervisor:
             # A first-cycle heartbeat has no snapshot lineage yet; Monitor
             # start/resume will establish it before any provider write.
             pass
+        self.lease.ensure_current(self.run_id)
         append_event(self.paths, RunEvent("supervisor_heartbeat", heartbeat_data), heartbeat_provenance)
         self.lease.heartbeat(self.run_id)
         self.monitor.resume(self.run_id, self.runner, poll_handles=False)
@@ -132,9 +245,11 @@ class Supervisor:
         if snapshot_for_reconcile is not None:
             for node_id in snapshot_for_reconcile.nodes:
                 reconcile_pending_binding(snapshot_for_reconcile, node_id, self.runner)
+            self.lease.ensure_current(self.run_id)
             save_snapshot(self.paths, snapshot_for_reconcile)
         snapshot = self.monitor.tick(self.run_id, self.runner)
         if hasattr(snapshot, "run_id"):
+            self.lease.ensure_current(self.run_id)
             save_snapshot(self.paths, snapshot)
         return snapshot
 
@@ -291,8 +406,9 @@ def supervisor_preflight(
     token_threshold=DEFAULT_ROTATE_TOKEN_THRESHOLD,
     context_hard_cap=DEFAULT_ROTATE_HARD_CAP,
     single_shift=None,
+    accept_decision=False,
 ):
-    """Read-only disk check; returns exactly one of idle/work/rotate/unknown.
+    """Read-only disk check; returns exactly one of idle/work/decision/rotate/unknown.
 
     - ``unknown``: the session record could not be read or parsed (never
       collapsed into idle).
@@ -301,6 +417,11 @@ def supervisor_preflight(
       compact artifact from the CLI; this function itself stays read-only.
       With ``single_shift`` (``supervisor_single_shift`` in
       ``.vibe/config.json`` when not passed) only the hard cap rotates.
+    - ``decision``: only pending human decisions remain and the caller passed
+      ``accept_decision`` (the current heartbeat command does).  A legacy
+      heartbeat that does not know this state gets ``work`` for the same
+      situation, resumes, and ``resume`` renders the decision cards.  Both
+      forms carry ``decision_only`` so the beat can pick the 60-minute interval.
     - ``work``: pending provider requests exist, or a bound worker has
       delivered/finished something not yet consumed.
     - ``idle``: workers are active, or the remaining nodes wait on a human
@@ -337,6 +458,12 @@ def supervisor_preflight(
     except ValueError:
         return {"state": "unknown", "reason": "supervisor holds unreadable"}
     result = _mailbox_state(paths, run_id, holds)
+    if result.get("state") == "decision":
+        result["decision_only"] = True
+        if not accept_decision:
+            result = {key: value for key, value in result.items() if key != "heartbeat"}
+            result["state"] = "work"
+            result["reason"] = "pending decisions (legacy heartbeat: resume renders the cards)"
     result.setdefault("tokens", tokens)
     result.setdefault("baseline", baseline)
     result["context_hard_cap"] = context_hard_cap
@@ -542,7 +669,27 @@ def supervisor_holds(paths, run_id):
         isinstance(node, str) and isinstance(entry, dict) for node, entry in holds.items()
     ):
         raise ValueError("supervisor holds malformed")
-    return holds
+    return {node: _normalized_hold(entry) for node, entry in holds.items()}
+
+
+def _normalized_hold(entry):
+    """Canonical category on read: aliases map over, a missing one is legacy.
+
+    Any other present value is tampering or corruption and fails closed.
+    """
+    if entry.get("category") is None:
+        entry = dict(entry)
+        entry["category"] = LEGACY_BOUNDARY_CATEGORY
+        entry["category_source"] = "legacy_default"
+        return entry
+    try:
+        category = validate_boundary_category(entry["category"])
+    except ValueError:
+        raise ValueError("supervisor holds malformed") from None
+    if entry["category"] != category:
+        entry = dict(entry)
+        entry["category"] = category
+    return entry
 
 
 def _write_holds(paths, run_id, holds):
@@ -560,7 +707,8 @@ def _write_holds(paths, run_id, holds):
             os.unlink(temporary)
 
 
-def set_supervisor_hold(paths, run_id, node, reason, boundary_category=None):
+def set_supervisor_hold(paths, run_id, node, reason, boundary_category=None,
+                        decision_id=None, authorization_gap=None):
     """Park ``node`` for a human decision; the node must exist in the run.
 
     Holding again refreshes the hold to the run's current state.  New and
@@ -574,6 +722,34 @@ def set_supervisor_hold(paths, run_id, node, reason, boundary_category=None):
     if len(reason) > _HOLD_REASON_LIMIT:
         raise ValueError("hold reason is limited to {} characters".format(_HOLD_REASON_LIMIT))
     boundary_category = validate_boundary_category(boundary_category)
+    has_decision = isinstance(decision_id, str) and bool(decision_id.strip())
+    has_gap = isinstance(authorization_gap, str) and bool(authorization_gap.strip())
+    if decision_id is not None and not has_decision or authorization_gap is not None and not has_gap:
+        raise ValueError("hold reference must be a non-empty string")
+    if has_decision == has_gap:
+        raise ValueError(
+            "hold must reference a decision id (--decision) or an authorization gap "
+            "(--authorization-gap), exactly one of them"
+        )
+    reference = {}
+    if has_decision:
+        decision_id = decision_id.strip()
+        try:
+            from .decisions import DecisionMailbox
+            decision = DecisionMailbox(paths)._load_request(decision_id)
+        except (OSError, ValueError):
+            raise ValueError("decision {} not found".format(decision_id)) from None
+        if decision.get("run_id") != run_id or decision.get("node_id") != node:
+            raise ValueError("decision {} belongs to another run or node".format(decision_id))
+        if decision.get("category") != boundary_category:
+            raise ValueError("decision {} has category {}, not {}".format(
+                decision_id, decision.get("category"), boundary_category))
+        reference["decision_id"] = decision_id
+    else:
+        gap = authorization_gap.strip()
+        if len(gap) > _HOLD_REASON_LIMIT:
+            raise ValueError("authorization gap is limited to {} characters".format(_HOLD_REASON_LIMIT))
+        reference["authorization_gap"] = gap
     snapshot = load_snapshot(paths, run_id)
     if node not in (snapshot.nodes or {}):
         raise ValueError("node {} is not in this run".format(node))
@@ -592,6 +768,7 @@ def set_supervisor_hold(paths, run_id, node, reason, boundary_category=None):
         "reason": reason,
         "held_at": now,
         "statuses": statuses,
+        **reference,
     }
     _write_holds(paths, run_id, holds)
     return holds
@@ -614,7 +791,92 @@ def _registry_path(paths, run_id):
     return run_dir(paths, run_id, create=True) / _REGISTRY_NAME
 
 
-def register_supervisor_address(paths, run_id, address, *, session_record=None):
+def _same_session(left, right) -> bool:
+    """Session identity is provider + session_id; host spelling may vary."""
+    return (
+        isinstance(left, dict) and isinstance(right, dict)
+        and left.get("provider") == right.get("provider")
+        and left.get("session_id") == right.get("session_id")
+    )
+
+
+_CALLER_SESSION_ENV = (
+    "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_HOST_SESSION_ID",
+    "CODEBUDDY_SESSION_ID", "CODEX_THREAD_ID",
+)
+
+
+def caller_session_ids(environ=None):
+    """All non-empty host session ids in the environment (deduplicated, ordered)."""
+    environ = os.environ if environ is None else environ
+    found = []
+    for name in _CALLER_SESSION_ENV:
+        value = environ.get(name)
+        if isinstance(value, str) and value and value not in found:
+            found.append(value)
+    return tuple(found)
+
+
+def superseded_caller_reason(paths, run_id, session_ids):
+    """Reason string when the caller is a superseded supervisor, else None.
+
+    ``session_ids`` are all ids the caller's host exposes; any one matching the
+    registry current means it is the current supervisor.
+
+    Missing, unreadable or malformed registry keeps the old behavior (None).
+    """
+    if not session_ids:
+        return None
+    try:
+        registry = _read_json_file(_registry_path(paths, run_id))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(registry, dict):
+        return None
+    current = registry.get("current")
+    if isinstance(current, dict) and current.get("session_id") in session_ids:
+        return None
+    history = registry.get("history")
+    stale = None
+    if isinstance(history, list):
+        stale = next((
+            item.get("session_id") for item in history
+            if isinstance(item, dict) and item.get("session_id") in session_ids
+        ), None)
+    if stale is not None:
+        successor = current.get("session_id") if isinstance(current, dict) else None
+        epoch = current.get("lease_epoch") if isinstance(current, dict) else None
+        return (
+            "supervisor session %s was superseded by %s (lease epoch %s); exit read-only; "
+            "run this from the current supervisor session or a new session"
+            % (stale, successor, epoch)
+        )
+    return None
+
+
+def ensure_caller_not_superseded(paths, run_id, environ=None):
+    reason = superseded_caller_reason(paths, run_id, caller_session_ids(environ))
+    if reason:
+        raise SupervisorLeaseConflict(reason)
+
+
+def _write_registry(path, registry):
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".supervisor-registry-", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(registry, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, str(path))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def register_supervisor_address(paths, run_id, address, *, session_record=None, expected_epoch=None):
     """Atomically record the current supervisor address; keeps history.
 
     With ``session_record`` (the shift's own session log) the current context
@@ -622,6 +884,10 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None):
     keyed by a digest of the log path rather than the path itself.  An
     unreadable log still registers -- the wake-up address matters more -- and
     the entry simply carries no baseline.
+
+    A new (successor) session upgrades the lease epoch by compare-and-swap
+    against ``expected_epoch`` -- by default the epoch observed before taking
+    the lock -- so two candidates racing for the same run cannot both win.
     """
     if not isinstance(address, dict):
         raise TypeError("address must be a mapping")
@@ -639,50 +905,106 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None):
             if forbidden in str(key).lower():
                 raise ValueError("supervisor address must not carry credentials")
     path = _registry_path(paths, run_id)
-    registry = _read_json_file(path)
-    if not isinstance(registry, dict):
-        registry = {}
-    history = registry.get("history")
-    if not isinstance(history, list):
-        history = []
-    current = registry.get("current")
-    if isinstance(current, dict):
-        history.append(current)
-    entry = {
-        "provider": provider,
-        "session_id": session_id,
-        "host": host,
-        "registered_at": time.time(),
-    }
-    if session_record is not None and Path(str(session_record)).expanduser().is_absolute():
-        record = _read_json_file(session_record)
-        baseline = _session_tokens(record) if record is not None else None
-        digest = _record_digest(session_record)
-        if (
-            isinstance(current, dict)
-            and current.get("session_id") == session_id
-            and current.get("session_record_digest") == digest
-            and isinstance(current.get("baseline_context"), int)
+    if expected_epoch is None:
+        # The lease file is authoritative; the registry can lag it after a
+        # crash between the CAS and the registry write.
+        expected_epoch = read_lease_epoch(paths, run_id)
+    lease = SupervisorLease(paths)
+    with lease.lock(run_id):
+        registry = _read_json_file(path)
+        if not isinstance(registry, dict):
+            registry = {}
+        history = registry.get("history")
+        if not isinstance(history, list):
+            history = []
+        rejected = registry.get("rejected")
+        if not isinstance(rejected, list):
+            rejected = []
+        current = registry.get("current")
+        lease_record = _read_lease_record(lease.path(run_id))
+        on_disk = _record_epoch(lease_record)
+        disk_owner = lease_record.get("owner") if lease_record else None
+        if not isinstance(disk_owner, dict):
+            disk_owner = None
+        this_session = {"provider": provider, "session_id": session_id}
+        owns_disk = _same_session(disk_owner, this_session)
+
+        def reject(reason):
+            rejected.append({
+                "provider": provider, "session_id": session_id, "host": host,
+                "expected_epoch": expected_epoch, "found_epoch": on_disk,
+                "reason": reason, "at": time.time(),
+            })
+            kept = {"history": history, "rejected": rejected[-20:]}
+            if isinstance(current, dict):
+                kept["current"] = current
+            _write_registry(path, kept)
+            raise SupervisorLeaseConflict(reason)
+
+        same_shift = _same_session(current, this_session)
+        recovered_owner = None
+        if owns_disk and not same_shift:
+            # This session already won the CAS but died before the registry
+            # write: repair the registry without a second epoch bump.
+            epoch = on_disk
+        elif not same_shift and any(
+            isinstance(item, dict) and item.get("session_id") == session_id
+            for item in history
         ):
-            # Registering the same shift again must not push its rotation out.
-            baseline = current["baseline_context"]
-        if baseline is not None and digest is not None:
-            entry["baseline_context"] = baseline
-            entry["session_record_digest"] = digest
-    registry = {"current": entry, "history": history}
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=".supervisor-registry-", dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(registry, stream, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, str(path))
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+            reject("superseded supervisor %s cannot re-register" % session_id)
+        elif same_shift:
+            if disk_owner is not None and not owns_disk:
+                reject("supervisor lease is owned by another session")
+            epoch = on_disk
+        else:
+            try:
+                epoch = lease.cas_locked(
+                    run_id, expected_epoch,
+                    {"provider": provider, "session_id": session_id, "host": host},
+                )
+            except SupervisorLeaseConflict as error:
+                reject(str(error))
+            if disk_owner is not None and not _same_session(disk_owner, current):
+                # The previous disk owner won its CAS but never reached the
+                # registry; record it as superseded so it cannot re-register.
+                recovered_owner = {
+                    "provider": disk_owner.get("provider"),
+                    "session_id": disk_owner.get("session_id"),
+                    "host": disk_owner.get("host"),
+                    "lease_epoch": on_disk,
+                    "registered_at": time.time(),
+                    "recovered_from_lease": True,
+                }
+        if isinstance(current, dict):
+            history.append(current)
+        if recovered_owner is not None:
+            history.append(recovered_owner)
+        entry = {
+            "provider": provider,
+            "session_id": session_id,
+            "host": host,
+            "registered_at": time.time(),
+            "lease_epoch": epoch,
+        }
+        if session_record is not None and Path(str(session_record)).expanduser().is_absolute():
+            record = _read_json_file(session_record)
+            baseline = _session_tokens(record) if record is not None else None
+            digest = _record_digest(session_record)
+            if (
+                isinstance(current, dict)
+                and current.get("session_id") == session_id
+                and current.get("session_record_digest") == digest
+                and isinstance(current.get("baseline_context"), int)
+            ):
+                # Registering the same shift again must not push its rotation out.
+                baseline = current["baseline_context"]
+            if baseline is not None and digest is not None:
+                entry["baseline_context"] = baseline
+                entry["session_record_digest"] = digest
+        _write_registry(
+            path,
+            {"current": entry, "history": history, "rejected": rejected[-20:]},
+        )
     return entry
 
 
@@ -745,6 +1067,7 @@ def current_supervisor_address(paths, run_id, *, node_id=None, role=None, genera
         "current": registry["current"],
         "history": registry.get("history", []),
         "wake": wake_instruction(registry["current"], run_id, node_id, role, generation),
+        "lease_epoch": read_lease_epoch(paths, run_id),
     }
 
 
@@ -770,13 +1093,95 @@ HOST_SHIFT_DIFFERENCES = (
 )
 
 
+#: One source for the beat cadence.  Default 10 minutes; 30 once a platform's
+#: push wake-up is registered as verified (success and failure evidence both);
+#: 60 while the only open item is an unanswered human decision.
+HEARTBEAT_INTERVAL_DEFAULT_MINUTES = 10
+HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES = 30
+HEARTBEAT_INTERVAL_DECISION_MINUTES = 60
+PUSH_WAKE_VERIFICATION_RELATIVE = ".vibe/push-wake-verification.json"
+_HEARTBEAT_INTERVAL_FILE = "heartbeat-interval.json"
+
+
+def _push_wake_verified(paths, provider):
+    """Return (verified, reason); an unreadable registry is named, never silent."""
+    path = Path(paths.root) / PUSH_WAKE_VERIFICATION_RELATIVE
+    if not path.exists():
+        return False, "no push wake verification registered"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        platforms = data["platforms"]
+        if not isinstance(platforms, dict):
+            raise ValueError("platforms must be an object")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return False, "push wake verification unreadable: {}".format(str(error)[:120])
+    entry = platforms.get(provider)
+    if not isinstance(entry, dict):
+        return False, "push wake for {} is not registered".format(provider)
+    for kind in ("success", "failure"):
+        records = entry.get(kind)
+        if not (isinstance(records, list) and any(
+                isinstance(item, dict) and isinstance(item.get("evidence_ref"), str)
+                and item["evidence_ref"].strip() for item in records)):
+            return False, "push wake for {} lacks a {} evidence".format(provider, kind)
+    return True, "push wake for {} verified with success and failure evidence".format(provider)
+
+
+def heartbeat_interval(paths, run_id, *, decision_only):
+    """Pick the next beat interval in minutes with the reason it was chosen."""
+    if decision_only:
+        return {"minutes": HEARTBEAT_INTERVAL_DECISION_MINUTES, "mode": "decision",
+                "reason": "only unanswered decisions remain", "provider": None}
+    try:
+        address = current_supervisor_address(paths, run_id)
+    except (ValueError, OSError) as error:
+        # A damaged lease must not stop the beat: fall back to the default cadence.
+        return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
+                "reason": "supervisor address unreadable: " + str(error)[:200], "provider": None}
+    provider = None
+    if address.get("status") == "ok":
+        provider = address["current"].get("provider")
+    if not isinstance(provider, str) or not provider:
+        return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
+                "reason": "supervisor provider unknown: " + str(address.get("reason", "no provider")),
+                "provider": None}
+    verified, reason = _push_wake_verified(paths, provider)
+    if verified:
+        return {"minutes": HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES, "mode": "push_verified",
+                "reason": reason, "provider": provider}
+    return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
+            "reason": reason, "provider": provider}
+
+
+def read_heartbeat_interval(paths, run_id):
+    """Read the persisted interval state; None when absent or unreadable."""
+    data = _read_json_file(run_dir(paths, run_id) / _HEARTBEAT_INTERVAL_FILE)
+    return data if isinstance(data, dict) and isinstance(data.get("minutes"), int) else None
+
+
+def record_heartbeat_interval(paths, run_id, interval, *, clock=None):
+    """Persist the interval so a takeover supervisor restores it from disk."""
+    from .state import _atomic_bytes
+
+    now = (clock or time.time)()
+    previous = read_heartbeat_interval(paths, run_id)
+    since = previous.get("since") if previous and previous.get("mode") == interval["mode"] else None
+    entry = {
+        "minutes": interval["minutes"], "mode": interval["mode"],
+        "reason": interval["reason"], "provider": interval.get("provider"),
+        "since": since if since is not None else now, "updated_at": now,
+    }
+    _atomic_bytes(run_dir(paths, run_id) / _HEARTBEAT_INTERVAL_FILE, _json_bytes(entry))
+    return entry
+
+
 def heartbeat_command(run_id, *, command_prefix="vibe"):
     """Return the complete one-line command a host may install as a beat."""
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("run_id is required")
     if not isinstance(command_prefix, str) or not command_prefix.strip():
         raise ValueError("command_prefix is required")
-    return "{} supervisor-beat --run-id {} --session-record <本会话记录路径>".format(
+    return "{} supervisor-beat --run-id {} --accept-decision --session-record <本会话记录路径>".format(
         command_prefix.strip(), run_id
     )
 
@@ -835,6 +1240,7 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "holds": holds,
         "pending": None if pending is None else len(pending),
         "decisions": decisions,
+        "heartbeat_interval": read_heartbeat_interval(paths, run_id),
         "heartbeat_command": heartbeat_command(run_id, command_prefix=command_prefix),
         "heartbeat_prompt": heartbeat_command(run_id, command_prefix=command_prefix),
         "handoff_summary": summary_ref,
@@ -858,17 +1264,26 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         for node, entry in sorted(holds.items()):
             held_at = entry.get("held_at")
             hours = (time.time() - held_at) / 3600 if isinstance(held_at, (int, float)) else None
-            lines.append("  - {}（类别 {}）：{}（已挂起 {}）".format(
-                node, entry.get("category") or "unknown", entry.get("reason"),
+            if entry.get("decision_id"):
+                reference = "决策 " + str(entry["decision_id"])
+            elif entry.get("authorization_gap"):
+                reference = "授权缺口 " + str(entry["authorization_gap"])
+            else:
+                reference = "无引用（旧记录，下次刷新须补）"
+            lines.append("  - {}（类别 {}；{}）：{}（已挂起 {}）".format(
+                node, entry.get("category") or "unknown", reference, entry.get("reason"),
                 "{:.1f} 小时".format(hours) if hours is not None else "时长未知"))
     lines.append("信箱：待服务请求 {} 项（不含等人拍板的节点）".format(
         "未知" if pending is None else len(pending)))
     lines.append("决策信箱：待回答 {} 项；心跳降频但不暂停".format(
         "未知" if decisions is None else len(decisions)))
+    interval = payload["heartbeat_interval"]
+    lines.append("心跳间隔：当前 {} 分钟（{}，{}）".format(interval["minutes"], interval.get("mode"), interval.get("reason"))
+                 if interval else "心跳间隔：未记录，按默认 {} 分钟建".format(HEARTBEAT_INTERVAL_DEFAULT_MINUTES))
     if decisions:
         for decision in decisions:
-            lines.append("  - {}：{}（选项：{}）".format(
-                decision.get("decision_id"), decision.get("question"),
+            lines.append("  - {}（类别 {}）：{}（选项：{}）".format(
+                decision.get("decision_id"), decision.get("category"), decision.get("question"),
                 ", ".join(option.get("id", "") for option in decision.get("options", [])),
             ))
     lines += [
@@ -883,8 +1298,10 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "  4) 跑一次心跳指令第 1 步的预检，按输出走。",
         HOST_SHIFT_DIFFERENCES,
         "监工挂起某个节点等用户拍板时，先登记：vibe supervisor-hold --run-id {} "
-        "--node <节点> --category <product_design|external_authorization|deploy> "
-        "--reason <一句话原因>，否则每次心跳都会被当成有事做。"
+        "--node <节点> --category <product_acceptance|external_authorization> "
+        "--decision <决策ID>|--authorization-gap <缺口> --reason <一句话原因>，"
+        "否则每次心跳都会被当成有事做。product_design/deploy 仍可作别名，落盘一律存规范名；"
+        "没有 category 的旧挂起按 product_acceptance 读取，下次刷新须补上 category 和引用。"
         "运行状态一变或挂起满 6 小时，预检会报 work（hold needs recheck）：复核后仍在等人就再跑一次同一条命令刷新。".format(run_id),
     ]
     return payload, "\n".join(lines).replace("vibe supervisor-", command_prefix + " supervisor-")
