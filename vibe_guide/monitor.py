@@ -124,7 +124,7 @@ from .evidence import (
     record_integration_review as _record_integration_review,
 )
 from .engine_attestation import validate_engine_attestation
-from .decision_boundary import ingest_worker_decisions, raise_decision
+from .decision_boundary import NotificationBridge, ingest_worker_decisions
 from .orphan_recovery import ORPHAN_DISPATCH_ADOPTED, replay_orphan_adoption
 from .self_report_recovery import SELF_REPORT_DELIVERY_RECONCILED
 from .decisions import DecisionMailbox
@@ -6613,8 +6613,9 @@ class Monitor:
                 # An answered request is closed: a new block for the same cause
                 # needs a new question text (hence a new id) to reach the PM.
                 question = spec["question"] if attempt == 1 else "{}（第 {} 次）".format(spec["question"], attempt)
-                result = raise_decision(
-                    self.paths,
+                # Mailbox write only: notifying inside the loop would re-push
+                # every previously answered decision.
+                record = mailbox.raise_decision(
                     run_id=snapshot.run_id,
                     node_id=node_id,
                     question=question,
@@ -6622,15 +6623,20 @@ class Monitor:
                     recommendation=None,
                     evidence=evidence,
                 )
-                decision_id = str(result["request"]["decision_id"])
+                decision_id = str(record["decision_id"])
                 if mailbox.result(decision_id) is None:
                     break
             else:
                 return False
-            notification = result.get("notification")
-            notification_status = str(notification.get("status")) if isinstance(notification, dict) else "unknown"
         except (OSError, TypeError, ValueError):
             return False
+        # One push per newly adopted decision.  The request is already on
+        # disk, so a bridge failure is an unknown status, never a blocker.
+        try:
+            notification = NotificationBridge(self.paths).notify(record)
+            notification_status = str(notification.get("status")) if isinstance(notification, dict) else "unknown"
+        except Exception:
+            notification_status = "unknown"
         self._record(snapshot, "decision_raised", {
             "run_id": snapshot.run_id,
             "node_id": node_id,

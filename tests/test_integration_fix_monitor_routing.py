@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from vibe_guide.authorization import authorize, build_authorization_card
+from vibe_guide.decision_boundary import NotificationBridge
 from vibe_guide.decisions import DecisionMailbox
 from vibe_guide.models import INTEGRATION_REVIEW_NODE_ID
 from vibe_guide.runners.fake import FakeRunner
@@ -216,6 +217,51 @@ class LifecycleFallbackTests(_Base):
         with patch("vibe_guide.monitor.DecisionMailbox.result", side_effect=ValueError("bad")):
             self.assertIs(monitor._ensure_blocked_design_decision(live, "n1"), False)
 
+    def spy_notify(self, side_effect=None):
+        return patch.object(
+            NotificationBridge, "notify", autospec=True,
+            side_effect=side_effect or (lambda bridge, record: {"status": "accepted"}),
+        )
+
+    def test_one_notify_per_new_decision_not_per_suffix_attempt(self):
+        monitor, runner, snapshot = self.undecided(blocked_design_cause="integration_scope_review")
+        with self.spy_notify() as spy:
+            first = monitor.tick(snapshot.run_id, runner).nodes["n1"]["decision_ids"][0]
+            self.assertEqual([c.args[1]["decision_id"] for c in spy.call_args_list], [first])
+            DecisionMailbox(self.paths).answer(first, "keep_scope")
+            self.reblock(snapshot)
+            second = monitor.tick(snapshot.run_id, runner).nodes["n1"]["decision_ids"][0]
+        self.assertNotEqual(first, second)
+        self.assertEqual([c.args[1]["decision_id"] for c in spy.call_args_list], [first, second])
+
+    def test_exhausted_cap_never_notifies_and_adds_no_events(self):
+        monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
+        mailbox = DecisionMailbox(self.paths)
+        for _ in range(20):
+            live = load_snapshot(self.paths, snapshot.run_id)
+            self.assertTrue(monitor._ensure_blocked_design_decision(live, "n1"))
+            save_snapshot(self.paths, live)
+            mailbox.answer(live.nodes["n1"]["decision_ids"][0], "defer_finding")
+        self.reblock(snapshot)
+        with self.spy_notify() as spy:
+            monitor.tick(snapshot.run_id, runner)
+            count = len(self.decision_events(snapshot.run_id))
+            monitor.tick(snapshot.run_id, runner)
+            monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(spy.call_count, 0)
+        self.assertEqual(len(self.decision_events(snapshot.run_id)), count)
+
+    def test_notify_exception_still_adopts_decision_with_unknown_status(self):
+        monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
+        with self.spy_notify(side_effect=RuntimeError("bridge hung")):
+            current = monitor.tick(snapshot.run_id, runner).nodes["n1"]
+        self.assertEqual(current["status"], "blocked_design")
+        self.assertEqual(len(current["decision_ids"]), 1)
+        events = [e for e in load_events(self.paths, snapshot.run_id)
+                  if e["event"] == "decision_raised"
+                  and e["data"].get("source") == "monitor_blocked_design"]
+        self.assertEqual(events[0]["data"]["notification_status"], "unknown")
+
     def test_decision_raised_event_carries_notification_status_and_reconciled_flag(self):
         monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
         monitor.tick(snapshot.run_id, runner)
@@ -228,7 +274,7 @@ class LifecycleFallbackTests(_Base):
 
     def test_mailbox_failure_falls_back_then_recovers_without_event_spam(self):
         monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
-        with patch("vibe_guide.monitor.raise_decision", side_effect=OSError("disk")):
+        with patch("vibe_guide.monitor.DecisionMailbox.raise_decision", side_effect=OSError("disk")):
             first = monitor.tick(snapshot.run_id, runner)
             count = len(self.decision_events(snapshot.run_id))
             second = monitor.tick(snapshot.run_id, runner)
