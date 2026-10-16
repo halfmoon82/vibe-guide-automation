@@ -864,12 +864,16 @@ class ProviderActionStore:
         raw = delivery.get('session_cwd') if isinstance(delivery, Mapping) else None
         if not isinstance(raw, str) or not raw.strip():
             return None
-        reported = Path(raw.strip()).expanduser()
-        if not reported.is_absolute():
-            # A relative path would be resolved against whatever directory the
-            # CLI happened to run in, which says nothing about the session.
-            return None
+        # ``expanduser`` can raise on its own (a ``~user`` with no such user),
+        # so it stays inside the guard: this field is advisory and must never
+        # be the reason a delivery fails.
         try:
+            reported = Path(raw.strip()).expanduser()
+            if not reported.is_absolute():
+                # A relative path would be resolved against whatever directory
+                # the CLI happened to run in, which says nothing about the
+                # session.
+                return None
             session = reported.resolve()
         except (OSError, RuntimeError, ValueError):
             return None

@@ -847,9 +847,12 @@ class LandingCheckTests(unittest.TestCase):
     def test_unreadable_session_root_is_ignored_not_fatal(self):
         # Review N3: the field cannot change any gate decision, so it must
         # never be able to fail a delivery.  A malformed value is "not
-        # reported", the same as an absent one.
+        # reported", the same as an absent one.  ``~nosuchuser/x`` is the one
+        # that bites: ``Path.expanduser`` raises RuntimeError on it, and an
+        # uncaught raise here would crash the worker's only delivery channel.
         self._dispatch()
-        for raw in (7, None, "", "   ", {"path": "/tmp"}):
+        for raw in (7, None, "", "   ", {"path": "/tmp"}, "~nosuchuser12345/x",
+                    "\x00"):
             with self.subTest(session_cwd=raw):
                 payload = {
                     "delivery_evidence": dict(GOOD["delivery_evidence"],
