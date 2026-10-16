@@ -74,6 +74,13 @@ class EngineAttestationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "future"):
             validate_engine_attestation(future, "p", 1, now="2026-09-06T00:00:00Z")
 
+    def test_validate_default_max_age_is_72_hours(self):
+        attestation = self._create(now="2026-09-06T00:00:00Z")
+        validate_engine_attestation(attestation, "p", 1, now="2026-09-08T23:59:00Z")
+        validate_engine_attestation(attestation, "p", 1, now="2026-09-09T00:00:00Z")
+        with self.assertRaisesRegex(ValueError, "expired"):
+            validate_engine_attestation(attestation, "p", 1, now="2026-09-09T00:00:01Z")
+
     def test_monitor_rejects_missing_attestation_before_provider_call(self):
         """A verified-looking card cannot bypass the on-disk engine evidence gate."""
         from vibe_guide.monitor import Monitor

@@ -997,9 +997,9 @@ class RefreshNamesFreshEngineEvidenceTests(unittest.TestCase):
     def _fresh_timestamp():
         """A timestamp that is fresh whenever the suite runs, not just today.
 
-        ``validate_engine_attestation`` refuses evidence older than a day, so a
+        ``validate_engine_attestation`` refuses evidence older than 72 hours, so a
         literal such as ``2026-10-07T00:00:00Z`` makes these tests expire at the
-        next midnight: they passed on the day they were written and failed from
+        end of the window: they passed on the day they were written and failed from
         the following day on, which is indistinguishable from a real regression
         until you notice the clock.
         """
@@ -1067,9 +1067,9 @@ class RefreshNamesFreshEngineEvidenceTests(unittest.TestCase):
 class ExpiredEngineEvidenceReauthorizationTests(unittest.TestCase):
     """A plan older than the evidence window must still be reauthorizable.
 
-    ``validate_engine_attestation`` refuses evidence older than a day, and the
+    ``validate_engine_attestation`` refuses evidence older than 72 hours, and the
     only writer of ``engine-attestation.json`` is publication, which refuses to
-    run for a plan that already exists.  A plan published yesterday therefore
+    run for a plan that already exists.  A plan published three days ago therefore
     had no supported way back: the refreshed card kept naming the expired
     reference and ``Monitor._require_record`` blocked before any dispatch was
     considered.
@@ -1119,7 +1119,7 @@ class ExpiredEngineEvidenceReauthorizationTests(unittest.TestCase):
 
     def _aged_evidence(self):
         real = monitor_module.validate_engine_attestation
-        beyond = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat().replace(
+        beyond = (datetime.now(timezone.utc) + timedelta(days=4)).isoformat().replace(
             "+00:00", "Z"
         )
 

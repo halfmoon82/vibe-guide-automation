@@ -143,6 +143,7 @@ class ProviderActionRunner(Runner):
             "完成后必须写入本代状态/交付；在主项目目录执行 `vibe worker-deliver --run-id {run} --node {node} --role {role} --generation {generation} --payload '<交付 JSON>'`。"
             "随后执行 `vibe supervisor-address --run-id {run} --node {node} --role {role} --generation {generation} --json`；"
             "`wake.channel` 非空时用该工具向 `wake.target` 原样发送 `wake.signal`，唤醒登记主监工；为 null 或地址 unknown 时不发，由心跳领取。"
+            "自报时把你本会话的工作目录原样写进交付 JSON 的 `delivery_evidence.session_cwd`：监工用它核对本会话是否真的挂载了 project，不填就无法核对。"
             "运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。\n"
         ).format(node=node_id, generation=generation, purpose=purpose, objective=objective,
                  role=contract.get('role', 'developer'),
@@ -539,7 +540,7 @@ class ProviderActionRunner(Runner):
             # worktree the CLI would resolve that worktree's own .vibe and
             # the report would never reach the supervisor.
             root = shlex.quote(str(self.paths.root))
-            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须在主项目目录执行，不要在 worktree 里执行）：1) 先执行 `cd {} && vibe worker-deliver --run-id {} --node {} --role {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；格式错误会当场返回）；2) `cd {} && vibe supervisor-address --run-id {} --node {} --role {} --generation {} --json` 查询监工地址与唤醒方式；3) 返回的 `wake.channel` 非空时，用该工具向 `wake.target` 原样发送 `wake.signal` 一行（Codex 为 `send_message_to_thread`）；`wake.channel` 为 null 或地址为 unknown 时不发，到此为止，监工心跳兜底拉取（Claude Code 目前没有已验证的推送通道）。唤醒信号内容不影响验收。运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。".format(
+            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须在主项目目录执行，不要在 worktree 里执行）：0) 先把**你本会话的工作目录**（会话环境给出的 cwd；project 挂载的会话在项目树或 worktree 内，projectless 会话在宿主生成的临时目录）原样写进交付 JSON 的 `delivery_evidence.session_cwd`——监工用它核对本会话是否真的挂载了 project，不填就无法核对；1) 先执行 `cd {} && vibe worker-deliver --run-id {} --node {} --role {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；格式错误会当场返回）；2) `cd {} && vibe supervisor-address --run-id {} --node {} --role {} --generation {} --json` 查询监工地址与唤醒方式；3) 返回的 `wake.channel` 非空时，用该工具向 `wake.target` 原样发送 `wake.signal` 一行（Codex 为 `send_message_to_thread`）；`wake.channel` 为 null 或地址为 unknown 时不发，到此为止，监工心跳兜底拉取（Claude Code 目前没有已验证的推送通道）。唤醒信号内容不影响验收。运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。".format(
                 role, node_id, root, run_id, node_id, role, generation,
                 root, run_id, node_id, role, generation,
             )

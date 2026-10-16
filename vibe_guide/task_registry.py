@@ -433,6 +433,19 @@ def _run_tasks_path(paths: ProjectPaths, run_id: Optional[str], create: bool) ->
     return run_dir(paths, run_id, create=create) / "tasks.json"
 
 
+def _run_is_complete(paths: ProjectPaths, run_id: Optional[str]) -> bool:
+    # A completed run may still hold a non-terminal pair that was never
+    # archived; its bindings are history and must not block the same issue
+    # id in a later run.  Unreadable state fails closed (not complete).
+    if not run_id:
+        return False
+    try:
+        state = json.loads((run_dir(paths, run_id) / "state.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(state, dict) and state.get("status") == "complete"
+
+
 def _read_registry(
     path: Path, expected_run_id: Optional[str] = None
 ) -> Tuple[int, List[TaskBinding]]:
@@ -582,7 +595,8 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding, *,
             if current.role == persistent.role:
                 if current.topology != persistent.topology and (
                     current.run_id == persistent.run_id
-                    or current.status not in _TERMINAL_STATUSES
+                    or (current.status not in _TERMINAL_STATUSES
+                        and not _run_is_complete(paths, current.run_id))
                 ):
                     raise ValueError("immutable task binding topology drift")
                 if (
@@ -595,7 +609,8 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding, *,
                                            or current.successor_of == persistent.task_id))))
                     and (
                         current.run_id == persistent.run_id
-                        or current.status not in _TERMINAL_STATUSES
+                        or (current.status not in _TERMINAL_STATUSES
+                            and not _run_is_complete(paths, current.run_id))
                     )
                 ):
                     raise ValueError("immutable task identity drift")

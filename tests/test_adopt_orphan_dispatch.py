@@ -83,7 +83,7 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
             self.store.complete(action_id, result)
         return payload
 
-    def build_orphan(self, *, authorization=None, located=True):
+    def build_orphan(self, *, authorization=None, located=True, stamp_topology=True):
         """Leave the node exactly as the trunk-source supervisor left it."""
         digest = authorization or self.old_digest
         _directory, plan, nodes, _card = _load_plan(self.paths, 'probe-plan')
@@ -98,10 +98,14 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
                  'writer': 'worker', 'worktree': self.worktree_rel, 'branch': self.branch,
                  'allowlist': list(ALLOWLIST),
                  'capability_contract_digest': snapshot.capability_contract_digest}
+        request = {**envelope, 'origin': 'worker_dispatch', 'child_binding': child,
+                   'topology': topology, 'prompt': 'fixture'}
+        if not stamp_topology:
+            # The provider bridge only stamps ``topology`` on visible-sdd
+            # creates; a default dual-visible create leaves the key out.
+            request.pop('topology')
         self.create = self._write_action(
-            'create', {**envelope, 'origin': 'worker_dispatch', 'child_binding': child,
-                       'topology': topology, 'prompt': 'fixture'},
-            {'binding': {'host': HOST, 'task_id': TASK}})
+            'create', request, {'binding': {'host': HOST, 'task_id': TASK}})
         self._write_action('locate', {**envelope, 'threadId': TASK}, {'located': located})
         heads = self.store._directory('dispatch-heads')
         (heads / '{}-{}-developer-g1.json'.format(self.run_id, NODE)).write_text(
@@ -241,6 +245,16 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
         self.assertEqual(lease['status'], 'active')
         self.assertEqual([e['event'] for e in load_events(self.paths, self.run_id)]
                          .count('orphan_dispatch_adopted'), 1)
+
+    def test_dual_visible_create_without_topology_key_is_adopted(self):
+        """Production dual-visible creates carry no ``topology`` key."""
+        self.build_orphan(stamp_topology=False)
+        self.assertNotIn('topology', self.create['request'])
+        result = self.adopt()
+        self.assertIn('nodes', result.payload, result.payload)
+        current = load_snapshot(self.paths, self.run_id).nodes[NODE]
+        self.assertEqual(current['status'], 'running')
+        self.assertEqual(current['developer_identity'], TASK)
 
     def test_crash_before_snapshot_save_is_recovered_by_resume(self):
         self.build_orphan()

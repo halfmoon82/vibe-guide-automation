@@ -457,8 +457,8 @@ def _observed_engine_attestation(paths: ProjectPaths, plan: Plan) -> Dict[str, A
     """Re-observe the engine evidence a same-plan reauthorization has to name.
 
     Publication stamps the plan's ``engine-attestation.json`` once, and
-    ``validate_engine_attestation`` refuses evidence older than a day.  A plan
-    published more than a day ago therefore could not be reauthorized at all:
+    ``validate_engine_attestation`` refuses evidence older than 72 hours.  A plan
+    published more than 72 hours ago therefore could not be reauthorized at all:
     the refreshed card would keep naming the expired reference, and
     ``Monitor._require_record`` reads the file, finds the recorded reference
     intact but the evidence stale, and blocks before any provider dispatch is
@@ -1915,7 +1915,13 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "自报格式错误：" + str(error), args.as_json)
-        return _result(SUCCESS, {"command": args.command, "status": "recorded", **outcome}, "交付已登记", args.as_json)
+        # Advisory notes (e.g. a dispatch that recorded no project mount) must
+        # reach the worker's eyes, not just the JSON payload -- the worker is
+        # the one who can tell the supervisor to re-dispatch (issue #219).
+        message = "交付已登记"
+        for warning in outcome.get("warnings", []) or []:
+            message += "；注意：" + str(warning)
+        return _result(SUCCESS, {"command": args.command, "status": "recorded", **outcome}, message, args.as_json)
 
     if args.command == "scope-expand":
         if not (args.run_id and args.node_id and args.worker_payload):
