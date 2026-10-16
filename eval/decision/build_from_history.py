@@ -17,6 +17,43 @@
 `planner.ROUTE_SIMPLE_MAX_SCORE`（8）/ `ROUTE_LIGHT_PLAN_MAX_SCORE`（15）
 及协议 §2 的阈值表同一套。
 
+## 受认的两种判定行书写
+
+产出侧不只一种写法，两种都来自同一次真实评分，都收：
+
+1. 卡片/可验证行：`S1：11→轻规划（不触碰 vibe）`（协议 §2 规定的形状，
+   常并入 `[对齐门]` 卡片的 `S1：` 字段）。
+2. 评分明细结论行：`S1 评估: 步骤(5) + 范围(3) + … = 15 → 轻规划执行`
+   —— 分数与档位在同一行里齐全，同样自洽可验。实测 55 行，与形状 1
+   零共现，是独立漏收的一池。
+
+## 配对规则（v2，2026-10-16 修正）
+
+判定行与**紧邻其上一条用户消息**配对。v1 的规则是「最近一条被接受的用户
+消息」——被拒的消息（心跳、短消息、宿主注入）不更新锚点，于是**心跳回合
+自己的判定会错配到上一条真实用户请求上**。v1 漏斗实测：217 个配对判定里
+只有 87 个干净，130 个在请求与判定行之间插过机器/注入/短消息；v1 报的
+11 组「冲突标签」在改为紧邻配对后**全部消失**——冲突本身就是错配的
+artifact，不是真实标签噪声。v1 数据集里有 9 行带错配标签。
+
+判定行紧前的消息若是机器生成（心跳 `vibe supervisor-beat`、跨会话投递、
+Stop hook 反馈、`<system-reminder>`/`<task-notification>` 宿主注入、
+OpenClaw Guardian 定时指令等），说明这次评分不是给用户请求打的，整条
+丢弃并计数。
+
+## 短消息
+
+v1 用 `--min-chars 8` 过滤短消息，把「跑完了，继续」「同意续授权」这类
+真实用户判定一并丢了，还制造了错配锚点。v2 不过滤长度：短消息也是生产
+真实打分的请求（退化样本由去重/冲突规则自然处理）。
+
+## 脱敏
+
+`state` 逐字保留用户请求，但凭据/PII 形状机械替换后入集（路由判定不依赖
+凭据值）：11 位手机号、`pass=…`、`host=rm-…` RDS 地址。替换处留下
+`[REDACTED:…]` 占位符，README 有披露。含生产凭据的请求只进本地集
+（`route.jsonl` 不入库），`run_eval` 发往推理后端前也应知悉这一点。
+
 ## 标签校验
 
 每行 S1 必须**自洽**：`<=8 → simple`、`9-15 → light_plan`、`>15 → complex`。
@@ -42,9 +79,17 @@ import re
 import sys
 from pathlib import Path
 
-#: 协议 §2 的判定行。只认这四种档位说法，避免把普通叙述里的"S1"当成判定。
+#: 判定行形状 1：协议 §2 的可验证行（含并入 [对齐门] 卡片的 S1： 字段）。
 _S1_LINE = re.compile(
     r"S1[：:]\s*(\d{1,2})\s*→\s*(直接执行|轻规划|vibe\s*正式路由|正式路由|进入复杂流程)"
+)
+
+#: 判定行形状 2：评分明细的结论行。`S1 评估: 步骤(…) + … + 读码(…) = 15 → 轻规划执行`。
+#: 分数与结论之间允许换行（实测有 `= 13 / → 轻规划执行` 的断行），Span 上限 300
+#: 字符，足够覆盖五维明细、又不至于把两处独立评分串成一个。
+_S1_DETAIL = re.compile(
+    r"S1\s*评估[：:]?[\s\S]{0,300}?=\s*(\d{1,2})\s*→\s*"
+    r"(直接执行|轻规划|vibe\s*正式路由|正式路由|进入复杂流程)执行?"
 )
 
 #: 判定行里的档位说法 → 代码档位名。
@@ -86,7 +131,17 @@ _NOT_A_USER_REQUEST = tuple(re.compile(pattern) for pattern in (
     r"^\[Cross-session",
     r"^\[vibe",
     r"^\[Agent",
+    # --- 抽样后补：OpenClaw Guardian 定时指令（LaunchAgent 触发，
+    #     顶着"# 标题 + ## 角色"的任务书形状，容易被当成用户请求）---
+    r"^# OpenClaw Guardian",
 ))
+
+#: 入集前脱敏：凭据/PII 形状 → 占位符。路由判定不依赖这些值。
+_REDACTIONS = (
+    (re.compile(r"1[3-9]\d{9}"), "[REDACTED:phone]"),
+    (re.compile(r"(pass=)\S+"), r"\1[REDACTED]"),
+    (re.compile(r"host=rm-[\w.-]+"), "host=[REDACTED:db-host]"),
+)
 
 #: 判据冻结在这一行：issue #128 要求「问法逐字定稿后改动必须重新评测」。
 CANONICAL_QUESTION = {
@@ -101,8 +156,8 @@ CANONICAL_QUESTION = {
 }
 
 #: 默认的会话记录根。取**全部项目**而不是只取 vibeguide：vibe 的入口路由器是
-#: 仓库无关的通用库，别的项目里真实的入口评分同样是它的合法输入（实测不加宽
-#: 只有 73 条，加宽后 92 条）。本机 Claude Code 把每个项目的历史放在这里。
+#: 仓库无关的通用库，别的项目里真实的入口评分同样是它的合法输入。本机 Claude
+#: Code 把每个项目的历史放在这里。
 DEFAULT_SOURCE = "~/.claude/projects/*/*.jsonl"
 
 
@@ -119,6 +174,20 @@ def band_word(text: str) -> str:
         if word in text:
             return band
     raise ValueError(text)
+
+
+def redact(text: str) -> str:
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def is_machine_message(text: str) -> bool:
+    """Host/machine injections: start with '<' (system-reminder, task-notification)
+    or match one of the source-verified patterns above."""
+    if text.startswith("<"):
+        return True
+    return any(p.search(text) for p in _NOT_A_USER_REQUEST)
 
 
 def _text_of(entry):
@@ -153,24 +222,32 @@ def _user_text(entry):
     return content if isinstance(content, str) else ""
 
 
-def pairs(source_glob: str, min_chars: int):
+def _decisions_in(prose: str):
+    """Yield ``(score, band_word_text)`` for every accepted decision line in prose."""
+    for match in _S1_LINE.finditer(prose):
+        yield int(match.group(1)), match.group(2)
+    for match in _S1_DETAIL.finditer(prose):
+        yield int(match.group(1)), match.group(2)
+
+
+def pairs(source_glob: str):
     """Yield ``(request, score, band)`` from the real decisions in the records.
 
-    Pairing rule: the nearest preceding user message.  The protocol has the
-    agent print the line immediately after scoring, so the message it scored is
-    the last one before it.  Failure mode to keep in mind: a decision whose
-    request never appears as a user message (a scheduled wake-up, a resumed
-    session) pairs with whatever the user said last, which is wrong.  Such
-    rows are indistinguishable from good ones downstream, so the count of
-    decisions is reported separately from the count of usable pairs.
+    Pairing rule (v2): the **immediately preceding** user-role message.  The
+    protocol has the agent print the line right after scoring, and any user-role
+    message in between (heartbeat, host injection) is itself a scored turn —
+    so adjacency is the only pairing that does not mis-attribute someone
+    else's decision to this request.  v1's "nearest accepted" anchor silently
+    attached heartbeat decisions to older user requests; see module docstring.
     """
-    found, used, inconsistent, orphans = [], 0, 0, 0
+    found = []
+    stats = {"decision_lines": 0, "inconsistent": 0, "orphans": 0, "machine_paired": 0}
     for path in sorted(glob.glob(os.path.expanduser(source_glob))):
         try:
             stream = open(path, errors="ignore")
         except OSError:
             continue
-        last_request = ""
+        prev_request = None
         with stream:
             for line in stream:
                 try:
@@ -182,31 +259,34 @@ def pairs(source_glob: str, min_chars: int):
                 text = _user_text(entry)
                 if text:
                     candidate = " ".join(text.strip().split())
-                    if (
-                        len(candidate) >= min_chars
-                        and not candidate.startswith("<")
-                        and not any(p.search(candidate) for p in _NOT_A_USER_REQUEST)
-                    ):
-                        last_request = candidate
+                    if candidate:
+                        prev_request = candidate
                     continue
                 prose = _text_of(entry)
                 if not prose:
                     continue
-                for match in _S1_LINE.finditer(prose):
-                    score, band = int(match.group(1)), band_word(match.group(2))
+                for score, word in _decisions_in(prose):
+                    stats["decision_lines"] += 1
+                    try:
+                        band = band_word(word)
+                    except ValueError:
+                        stats["inconsistent"] += 1
+                        continue
                     if band_for_score(score) != band:
-                        inconsistent += 1
+                        stats["inconsistent"] += 1
                         continue
-                    if not last_request:
-                        orphans += 1
+                    if prev_request is None:
+                        stats["orphans"] += 1
                         continue
-                    found.append((last_request, score, band))
-                    used += 1
-    return found, inconsistent, orphans
+                    if is_machine_message(prev_request):
+                        stats["machine_paired"] += 1
+                        continue
+                    found.append((prev_request, score, band))
+    return found, stats
 
 
-def build(source_glob: str, min_chars: int):
-    found, inconsistent, orphans = pairs(source_glob, min_chars)
+def build(source_glob: str):
+    found, stats = pairs(source_glob)
     seen, rows = set(), []
     for request, score, band in found:
         key = (request, band)
@@ -228,15 +308,20 @@ def build(source_glob: str, min_chars: int):
         labels.setdefault(row["state"], set()).add(row["expected"])
     conflicting = {state for state, bands in labels.items() if len(bands) > 1}
     kept = [row for row in rows if row["state"] not in conflicting]
+    redacted = 0
     for index, row in enumerate(kept, 1):
         row["id"] = "vr-%03d" % index
+        clean = redact(row["state"])
+        if clean != row["state"]:
+            redacted += 1
+            row["state"] = clean
     return kept, {
-        "decisions": len(found),
-        "inconsistent": inconsistent,
-        "orphans": orphans,
+        **stats,
+        "paired_decisions": len(found),
         "duplicate_pairs": len(found) - len(rows),
         "conflicting_labels": len(conflicting),
         "rows_dropped_conflict": len(rows) - len(kept),
+        "rows_redacted": redacted,
     }
 
 
@@ -244,12 +329,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=DEFAULT_SOURCE)
     parser.add_argument("--out", default="eval/decision/route.jsonl")
-    parser.add_argument("--min-chars", type=int, default=8)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    rows, stats = build(args.source, args.min_chars)
+    rows, stats = build(args.source)
     if not rows:
         print("没有可用的判定行：检查 --source 是否指向存在的会话记录", file=sys.stderr)
         return 2
