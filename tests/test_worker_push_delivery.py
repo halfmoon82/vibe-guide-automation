@@ -9,7 +9,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vibe_guide.adapters.task_provider import ProviderActionStore
+from vibe_guide.adapters.task_provider import (
+    ProviderActionStore,
+    _requested_project_mount,
+)
 from vibe_guide.cli import run_cli
 from vibe_guide.paths import ProjectPaths
 
@@ -338,13 +341,15 @@ class WorkerDeliverCliTests(unittest.TestCase):
         _dispatched(store)
         path = store._dispatch_head_path("run-1", "n1", "developer", 1)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"head": "a" * 40}), encoding="utf-8")
+        path.write_text(json.dumps({"head": "a" * 40, "project_mount": "none"}),
+                        encoding="utf-8")
         result = self.cli([
             "worker-deliver", "--generation", "1", "--run-id", "run-1", "--node", "n1",
             "--payload", json.dumps(GOOD),
         ])
         self.assertEqual(result.exit_code, 0, result.payload)
-        self.assertIn("without a recorded project mount", result.payload["warnings"][0])
+        self.assertIn("asked the host for no project mount",
+                      result.payload["warnings"][0])
         self.assertIn("注意：", result.text)
 
     def test_delivery_without_a_warning_keeps_the_plain_message(self):
@@ -353,8 +358,26 @@ class WorkerDeliverCliTests(unittest.TestCase):
         _dispatched(store)
         path = store._dispatch_head_path("run-1", "n1", "developer", 1)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"head": "a" * 40, "project_id": "p-1"}),
+        path.write_text(json.dumps({"head": "a" * 40,
+                                    "project_mount": "project:p-1"}),
                         encoding="utf-8")
+        result = self.cli([
+            "worker-deliver", "--generation", "1", "--run-id", "run-1", "--node", "n1",
+            "--payload", json.dumps(GOOD),
+        ])
+        self.assertEqual(result.exit_code, 0, result.payload)
+        self.assertNotIn("warnings", result.payload)
+        self.assertNotIn("注意：", result.text)
+
+    def test_legacy_record_keeps_the_plain_message(self):
+        # A record written before the mount field existed must not warn: those
+        # are the runs that already worked (review P2).
+        store = _store(self.root)
+        _wait_request(store)
+        _dispatched(store)
+        path = store._dispatch_head_path("run-1", "n1", "developer", 1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"head": "a" * 40}), encoding="utf-8")
         result = self.cli([
             "worker-deliver", "--generation", "1", "--run-id", "run-1", "--node", "n1",
             "--payload", json.dumps(GOOD),
@@ -402,23 +425,27 @@ class LandingCheckTests(unittest.TestCase):
         self.store = _store(self.root)
 
     def _dispatch(self, worktree=".worktrees/n1", branch="node/n1", role="developer",
-                  allowlist=("app.py",), project_id="project-1"):
-        action_id = "action-create-run-1-n1-{}".format(role)
+                  allowlist=("app.py",), project_id="project-1", generation=1):
+        request = {
+            "child_binding": {
+                "worktree": worktree, "branch": branch, "allowlist": list(allowlist),
+            },
+            "target": {"type": "project", "projectId": project_id},
+        }
+        action_id = "action-create-run-1-n1-{}-g{}".format(role, generation)
         (self.store._directory("requests") / (action_id + ".json")).write_text(json.dumps({
             "schema_version": 1, "action_id": action_id, "operation": "create",
             "provider": "workbuddy", "run_id": "run-1", "issue_id": "n1",
-            "role": role, "generation": 1, "sequence": 0, "native_tool": "x",
-            "request": {
-                "child_binding": {
-                    "worktree": worktree, "branch": branch, "allowlist": list(allowlist),
-                },
-                "target": {"type": "project", "projectId": project_id},
-            },
+            "role": role, "generation": generation, "sequence": 0, "native_tool": "x",
+            "request": request,
             "request_digest": "0" * 64,
         }), encoding="utf-8")
-        # Mirrors ProviderActionStore.request for a child-bound dispatch.
+        # Mirrors ProviderActionStore.request for a child-bound dispatch.  The
+        # mount value comes from the production helper, so a change to what a
+        # request records cannot drift away from what these tests assert.
         self.store._record_dispatch_head(
-            "run-1", "n1", role, 1, {"worktree": worktree}, project_id,
+            "run-1", "n1", role, generation, request["child_binding"],
+            _requested_project_mount(request, "create"),
         )
 
     def _deliver(self, role="developer"):
@@ -705,25 +732,27 @@ class LandingCheckTests(unittest.TestCase):
                       "committed this node's allowlisted files after it was dispatched"):
             self.assertIn(token, text)
 
-    # --- ISSUE-219: a dispatch that recorded no project mount says so -------
+    # --- ISSUE-219: what a dispatch recorded about its project mount --------
     #
     # vibe cannot observe the sandbox roots the host granted the worker, so the
-    # only checkable fact is what the create request asked for.  A dispatch
-    # with no recorded mount is the one shape observed to produce a
-    # projectless session, whose writes each raise their own approval prompt.
-    # The note is advisory: delivery still lands.
+    # dispatch record stores the mount the create request *asked* for.  Only an
+    # explicit "asked for none" warns; a record that predates the field, and a
+    # generation with no record at all, are legacy and stay silent.  The note
+    # is advisory: delivery still lands.
 
-    def _record(self):
-        path = self.store._dispatch_head_path("run-1", "n1", "developer", 1)
+    def _record(self, generation=1):
+        path = self.store._dispatch_head_path("run-1", "n1", "developer", generation)
         return json.loads(path.read_text(encoding="utf-8"))
 
     def test_project_mount_from_the_create_request_is_recorded(self):
         self._dispatch(project_id="project-7")
-        self.assertEqual(self._record()["project_id"], "project-7")
+        self.assertEqual(self._record()["project_mount"], "project:project-7")
 
-    def test_blank_project_mount_records_nothing(self):
+    def test_create_that_asked_for_no_mount_records_an_explicit_none(self):
+        # Not the same as an absent key: absent means the record predates the
+        # field, and the two must never be confused (review P2).
         self._dispatch(project_id="   ")
-        self.assertNotIn("project_id", self._record())
+        self.assertEqual(self._record()["project_mount"], "none")
 
     def test_recorded_mount_produces_no_warning(self):
         self._dispatch(project_id="project-7")
@@ -734,13 +763,26 @@ class LandingCheckTests(unittest.TestCase):
         outcome = self._deliver()
         self.assertTrue(outcome["recorded"])
         self.assertEqual(len(self._archived()), 1)
-        self.assertIn("without a recorded project mount", outcome["warnings"][0])
+        self.assertIn("asked the host for no project mount", outcome["warnings"][0])
 
-    def test_legacy_dispatch_without_any_record_is_not_warned(self):
+    def test_dispatch_without_any_record_is_not_warned(self):
         # ponytail ceiling: dispatches predating dispatch-heads.  Warning there
         # would fire on every run that already worked.
         self._dispatch()
         self.store._dispatch_head_path("run-1", "n1", "developer", 1).unlink()
+        self.assertNotIn("warnings", self._deliver())
+
+    def test_record_predating_the_field_is_not_warned(self):
+        # Review P2: the first cut warned on any record without a mount, which
+        # is every record written before this change -- a false alarm on runs
+        # that already worked.  The modelling matters: the file exists, it just
+        # has no mount field.
+        self._dispatch()
+        path = self.store._dispatch_head_path("run-1", "n1", "developer", 1)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record.pop("project_mount", None)
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertNotIn("project_mount", self._record())
         self.assertNotIn("warnings", self._deliver())
 
     def test_reviewer_delivery_also_carries_the_warning(self):
@@ -749,7 +791,7 @@ class LandingCheckTests(unittest.TestCase):
         self._dispatch(role="reviewer", project_id=None)
         outcome = self._deliver(role="reviewer")
         self.assertTrue(outcome["recorded"])
-        self.assertIn("without a recorded project mount", outcome["warnings"][0])
+        self.assertIn("asked the host for no project mount", outcome["warnings"][0])
 
     def test_duplicate_report_keeps_the_warning(self):
         self._dispatch(project_id=None)
@@ -758,12 +800,175 @@ class LandingCheckTests(unittest.TestCase):
         self.assertTrue(again["duplicate"])
         self.assertTrue(again["warnings"])
 
+    def test_session_root_inside_the_project_is_not_warned(self):
+        # The one ground truth: what the worker session reports about itself.
+        self._dispatch()
+        payload = {
+            "delivery_evidence": dict(GOOD["delivery_evidence"],
+                                      session_cwd=str(self.root)),
+        }
+        self.assertNotIn("warnings", self.store.record_worker_delivery(
+            "run-1", "n1", "developer", payload, 1))
+
+    def test_session_root_outside_the_project_warns(self):
+        # Review P2: a valid projectId in the request proves nothing -- the
+        # 2026-10-16 run's create named one and the session was still opened
+        # projectless, starting under Documents/Codex.  Only the worker's own
+        # reported session root can see that.
+        self._dispatch()
+        stray = self.root.parent / "Codex" / "2026-10-15" / "m-en-00"
+        stray.mkdir(parents=True)
+        payload = {
+            "delivery_evidence": dict(GOOD["delivery_evidence"],
+                                      session_cwd=str(stray)),
+        }
+        outcome = self.store.record_worker_delivery(
+            "run-1", "n1", "developer", payload, 1)
+        self.assertTrue(outcome["recorded"])
+        self.assertIn("very likely projectless", outcome["warnings"][0])
+
+    def test_session_root_inside_the_node_worktree_is_not_warned(self):
+        # A worktree environment may place the session in the node worktree,
+        # which is a legitimate mount even though it is a separate tree.
+        self._dispatch()
+        payload = {
+            "delivery_evidence": dict(GOOD["delivery_evidence"],
+                                      session_cwd=str(self.root / ".worktrees" / "n1")),
+        }
+        self.assertNotIn("warnings", self.store.record_worker_delivery(
+            "run-1", "n1", "developer", payload, 1))
+
+    def test_absent_session_root_is_not_evidence(self):
+        # Prompts older than this check do not carry the field; a missing value
+        # is not a bad session and must never turn into a warning.
+        self._dispatch()
+        self.assertNotIn("warnings", self._deliver())
+
+    def test_non_string_session_root_is_refused(self):
+        self._dispatch()
+        payload = {
+            "delivery_evidence": dict(GOOD["delivery_evidence"], session_cwd=7),
+        }
+        with self.assertRaises(ValueError):
+            self.store.record_worker_delivery("run-1", "n1", "developer", payload, 1)
+
     def test_worker_protocol_documents_the_project_mount_requirement(self):
         text = (Path(__file__).resolve().parents[1] / "vibe_guide" / "protocols"
                 / "visible-sdd-worker.md").read_text(encoding="utf-8")
         for token in ("必须挂载 project", "禁止静默落 projectless",
-                      "派发负载不能携带权限", "停下告诉监工"):
+                      "派发负载不能携带权限", "停下告诉监工",
+                      "delivery_evidence.session_cwd", "不能改变挂载"):
             self.assertIn(token, text)
+
+
+class ProjectMountRecordTests(unittest.TestCase):
+    """ISSUE-219 review P1: a rework generation must inherit its create's mount.
+
+    These drive ``ProviderActionStore.request`` -- the wiring the monitor
+    actually uses -- instead of hand-writing the dispatch record, so the
+    inheritance a rework depends on is exercised end to end.  A resume cannot
+    change a session's mount, so a rework that recorded "no mount asked for"
+    would fire the delivery warning on every rework round.
+    """
+
+    def setUp(self):
+        import subprocess
+        from unittest.mock import patch
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "project"
+        self.root.mkdir()
+
+        def git(*args):
+            subprocess.run(["git", "-C", str(self.root)] + list(args), check=True,
+                           capture_output=True)
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "t@t")
+        git("config", "user.name", "t")
+        (self.root / "app.py").write_text("v1\n", encoding="utf-8")
+        git("add", "app.py")
+        git("commit", "-q", "-m", "init")
+        git("worktree", "add", "-q", "-b", "node/n1", ".worktrees/n1")
+        (self.root / ".vibe").mkdir()
+        (self.root / ".vibe" / "state.json").write_text("{}", encoding="utf-8")
+        gate = patch("vibe_guide.adapters.task_provider.require_entry")
+        gate.start()
+        self.addCleanup(gate.stop)
+        self.store = _store(self.root)
+
+    _BINDING = {
+        "worktree": ".worktrees/n1", "branch": "node/n1", "allowlist": ["app.py"],
+    }
+
+    def _create(self, project_id="project-7", generation=1):
+        return self.store.request(
+            operation="create", provider="codex", run_id="run-1", issue_id="n1",
+            role="developer", generation=generation,
+            native_tool="codex_app__create_thread",
+            request={
+                "prompt": "work",
+                "child_binding": dict(self._BINDING),
+                "target": {"type": "project", "projectId": project_id},
+            },
+        )
+
+    def _resume(self, generation):
+        return self.store.request(
+            operation="resume", provider="codex", run_id="run-1", issue_id="n1",
+            role="developer", generation=generation,
+            native_tool="codex_app__send_message_to_thread",
+            request={
+                "threadId": "t-1", "hostId": "h-1", "prompt": "rework",
+                "child_binding": dict(self._BINDING),
+            },
+        )
+
+    def _record(self, generation):
+        return self.store._dispatch_record("run-1", "n1", "developer", generation)
+
+    def test_create_records_the_mount_it_asked_for(self):
+        self._create(project_id="project-7")
+        self.assertEqual(self._record(1)["project_mount"], "project:project-7")
+
+    def test_rework_generation_inherits_the_create_mount(self):
+        self._create(project_id="project-7")
+        self._resume(2)
+        self.assertEqual(self._record(2)["project_mount"], "project:project-7")
+
+    def test_rework_generation_is_not_warned(self):
+        self._create(project_id="project-7")
+        self._resume(2)
+        outcome = self.store.record_worker_delivery(
+            "run-1", "n1", "developer", dict(GOOD), 2)
+        self.assertTrue(outcome["recorded"])
+        self.assertNotIn("warnings", outcome)
+
+    def test_rework_generation_of_a_mountless_create_is_still_warned(self):
+        # Inheritance must not launder a genuinely mountless lineage.
+        self._create(project_id="   ")
+        self._resume(2)
+        self.assertEqual(self._record(2)["project_mount"], "none")
+        outcome = self.store.record_worker_delivery(
+            "run-1", "n1", "developer", dict(GOOD), 2)
+        self.assertIn("asked the host for no project mount", outcome["warnings"][0])
+
+    def test_unwritable_record_leaves_the_mount_absent_not_none(self):
+        # ponytail: an unwritable dispatch record is treated as absent.  Absent
+        # is legacy, never "asked for none", so it must not warn.
+        from unittest.mock import patch
+
+        with patch("vibe_guide.adapters.task_provider.os.write",
+                   side_effect=OSError("disk full")):
+            self._create(project_id="project-7")
+        self.assertFalse(
+            self.store._dispatch_head_path("run-1", "n1", "developer", 1).exists()
+        )
+        outcome = self.store.record_worker_delivery(
+            "run-1", "n1", "developer", dict(GOOD), 1)
+        self.assertTrue(outcome["recorded"])
+        self.assertNotIn("warnings", outcome)
 
 
 class DispatchPromptTests(unittest.TestCase):
@@ -784,7 +989,11 @@ class DispatchPromptTests(unittest.TestCase):
             prompt = dict(seen)['create']['prompt']
             for required in ('worker-deliver', '--role reviewer', '--generation 4',
                              'supervisor-address --run-id run-1 --json', '已授权通道',
-                             '登记主监工', '不得调用 core resume'):
+                             '登记主监工', '不得调用 core resume',
+                             # ISSUE-219: the session root is the only vantage
+                             # that sees the sandbox the host actually granted,
+                             # so every dispatch prompt has to ask for it.
+                             'delivery_evidence.session_cwd'):
                 self.assertIn(required, prompt)
 
     def test_both_continuations_keep_workers_out_of_run_consumption(self):
@@ -795,7 +1004,8 @@ class DispatchPromptTests(unittest.TestCase):
                     'node_id': 'n1', 'role': role, 'generation': 4, 'run_id': 'run-1'})
                 for required in ('worker-deliver', '--run-id run-1', '--role ' + role, '--generation 4',
                                  'supervisor-address --run-id run-1 --json',
-                                 '登记主监工', '不得调用 core resume'):
+                                 '登记主监工', '不得调用 core resume',
+                                 'delivery_evidence.session_cwd'):
                     self.assertIn(required, prompt)
 
     def test_create_prompt_carries_completion_steps(self):

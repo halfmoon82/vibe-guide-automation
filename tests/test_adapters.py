@@ -237,11 +237,14 @@ class AdapterTests(unittest.TestCase):
         })
         self.assertEqual(set(captured), {"prompt", "target", "model", "thinking", "title"})
 
-    def test_project_target_without_project_id_is_refused_not_created_projectless(self):
-        # ISSUE-219: the host answers a missing `projectId` by creating a
-        # projectless thread whose write sandbox does not cover the contract
-        # worktree.  Dropping the key silently is what produced a dozen
-        # per-action approval prompts per node, so it must fail loudly.
+    def test_create_without_a_project_mount_is_refused_not_created_projectless(self):
+        # ISSUE-219: the host answers a create without a project mount by
+        # opening a projectless thread whose write sandbox does not cover the
+        # contract worktree.  Dropping the key silently is what produced a
+        # dozen per-action approval prompts per node, so it must fail loudly.
+        # Every shape that is not a named project mount is refused, including
+        # target types this bridge has never been given: the only target it
+        # may forward is the project mount the monitor builds.
         calls = []
         bridge, _ = codex_bridge(create_thread=lambda request: calls.append(request))
         for target in (
@@ -249,6 +252,9 @@ class AdapterTests(unittest.TestCase):
             {"type": "project", "projectId": "", "environment": {"type": "local"}},
             {"type": "project", "projectId": "   ", "environment": {"type": "local"}},
             {"type": "project", "projectId": None, "environment": {"type": "local"}},
+            {"environment": {"type": "local"}},
+            {"type": "projectless"},
+            {},
         ):
             with self.subTest(target=target), self.assertRaises(ProviderUnavailable):
                 bridge.create({"prompt": "work", "target": target})
@@ -264,14 +270,6 @@ class AdapterTests(unittest.TestCase):
         })
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["target"]["projectId"], "project-1")
-
-    def test_non_project_target_is_not_project_mount_checked(self):
-        # The guard is scoped to project targets; a host that never asked for a
-        # project mount is out of its remit.
-        calls = []
-        bridge, _ = codex_bridge(create_thread=lambda request: calls.append(request))
-        bridge.create({"prompt": "work", "target": {"type": "local"}})
-        self.assertEqual(len(calls), 1)
 
     def test_codex_wait_parses_public_polls_error_and_timeout(self):
         responses = iter([

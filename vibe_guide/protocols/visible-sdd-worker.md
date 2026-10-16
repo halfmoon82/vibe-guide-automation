@@ -31,16 +31,22 @@ dev 子代理实现 → review 子代理审查 →（存在 P0–P2）返工回 
 因此：
 
 - 监工派发 visible worker 时**必须挂载 project**（Git 项目按 worktree 环境创建）——合同 worktree
-  才会落进会话的可写根。**禁止静默落 projectless。**
+  才会落进会话的可写根。**禁止静默落 projectless。** 这条要求约束的是**会话创建**：`create`
+  必须带 `target.type=project` 与非空 `projectId`。`resume` / 返工代次复用已存在的会话，
+  **不能改变挂载**，因此不重新做挂载决定；派发记录里返工代次继承创建代次登记的挂载值。
 - 项目未在宿主上保存时**显式处置**：先保存 project；或由产品经理确认走 projectless 并接受
   逐条授权。两者都做不到就停下报告，不要硬派。
 - 落成 **projectless** 的会话，其可写根只有宿主生成的临时目录，**不覆盖合同 worktree 与主项目树**。
   后果是每一次写文件、`git add`/`commit`、`vibe worker-deliver` 自报都会各自弹一次人工批准——
   单个节点的正常交付流程会产生十几次打断，且打断点不可预测（带重定向/管道的命令不被 prefix rule
   匹配）。**遇到这种情况停下告诉监工**，不要在逐条批准里硬推完。
-- 自报交付时若看到 `warnings` 里出现「dispatched without a recorded project mount」，把原文转告监工，
-  由监工重新派发（新 project 挂载、新一代）。这条是**提示不是拒绝**：交付照常登记，但该节点的
-  沙箱很可能覆盖不到合同路径。
+- **自报时必须带会话工作目录**：把本会话的 cwd 原样写进 `delivery_evidence.session_cwd`。
+  这是链路里**唯一能看到实际沙箱**的观测点——派发请求里写没写 projectId 与宿主实际给了什么沙箱
+  是两件事（2026-10-16 实测：create 请求带了有效 projectId，worker 仍落成 projectless）。不填
+  就无法核对，等于把这一层保护关掉。
+- 自报交付时若看到 `warnings`，把原文转告监工，由监工重新派发（新 project 挂载、新一代）。
+  两种告警都属此类：「create 请求没有要求 project 挂载」与「你的会话根不在项目树/worktree 内」。
+  这两条是**提示不是拒绝**：交付照常登记，但该节点的沙箱很可能覆盖不到合同路径。
 
 ## 2. review 子代理只读红线（git 写禁令清单）
 

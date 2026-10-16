@@ -222,20 +222,35 @@ def _canonical_digest(value: Any) -> str:
     ).hexdigest()
 
 
-def _request_project_mount(request: Any) -> Optional[str]:
-    """``projectId`` the create request asks the host to mount, or ``None``.
+_PROJECT_MOUNT_NONE = 'none'
+
+
+def _requested_project_mount(request: Any, operation: str) -> Optional[str]:
+    """Mount to record for a dispatch request, or ``None`` to inherit one.
+
+    ``'project:<id>'`` when a session-creating request named a mount,
+    ``'none'`` when it named none -- the shape that asks the host for a
+    projectless worker (issue #219) -- and ``None`` for locate / resume /
+    wait.  Those cannot move a session that already exists to another
+    project, so their record inherits the generation that created it; without
+    that, a rework would look exactly like a dispatch that asked for no
+    mount at all.
 
     Only the *requested* mount is knowable here: vibe never sees the sandbox
-    roots the host actually gave the session.  Recording what was asked for is
-    what lets a later delivery report say "this dispatch could not pin the
-    worker to a project" instead of leaving the user to infer it from a trail
-    of approval prompts (issue #219).
+    roots the host actually granted a session.  Recording what was asked for
+    keeps "this dispatch never asked for a project" distinguishable from
+    "this dispatch asked and the host did something else" (which the worker's
+    own reported session root is the only way to see).
     """
-    target = request.get("target") if isinstance(request, Mapping) else None
-    if not isinstance(target, Mapping):
+    if operation != 'create':
         return None
-    value = target.get("projectId")
-    return value.strip() if isinstance(value, str) and value.strip() else None
+    target = request.get('target') if isinstance(request, Mapping) else None
+    if not isinstance(target, Mapping):
+        return _PROJECT_MOUNT_NONE
+    value = target.get('projectId')
+    if isinstance(value, str) and value.strip():
+        return 'project:' + value.strip()
+    return _PROJECT_MOUNT_NONE
 
 
 class ProviderActionStore:
@@ -415,7 +430,7 @@ class ProviderActionStore:
                 if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
                     self._record_dispatch_head(
                         run_id, issue_id, role, generation, request["child_binding"],
-                        _request_project_mount(request),
+                        _requested_project_mount(request, operation),
                     )
                 raise ValueError("provider action request identity drift")
             # The worker already acted on the original prompt; keep it, and do
@@ -426,7 +441,7 @@ class ProviderActionStore:
             # predate any work the dispatched worker could do.
             self._record_dispatch_head(
                 run_id, issue_id, role, generation, request["child_binding"],
-                _request_project_mount(request),
+                _requested_project_mount(request, operation),
             )
         if existing is None:
             self._atomic(path, payload)
@@ -724,6 +739,12 @@ class ProviderActionStore:
             )
         if delivery.get('thread_status') not in {'complete', 'completed', 'DELIVERED'}:
             raise ValueError('worker delivery thread_status is not terminal')
+        # ISSUE-219: the session root the worker observed, when it reports one.
+        # Optional -- an older prompt does not ask for it, and a missing value
+        # is not evidence of a bad session, so it never blocks a delivery.
+        session_cwd = delivery.get('session_cwd')
+        if session_cwd is not None and not isinstance(session_cwd, str):
+            raise ValueError('worker delivery session_cwd must be a string')
         event = payload.get('event', 'delivered')
         if event not in _WORKER_DELIVERY_EVENTS:
             raise ValueError('worker delivery event is unsupported')
@@ -746,7 +767,7 @@ class ProviderActionStore:
             )
         path = self._delivery_path(run_id, issue_id, role, generation)
         existing = self._read(path) if path.exists() else None
-        warnings = self._delivery_warnings(run_id, issue_id, role, generation)
+        warnings = self._delivery_warnings(run_id, issue_id, role, generation, payload)
         if isinstance(existing, dict) and existing.get('payload') == payload:
             if existing.get('consumed_by'):
                 return self._delivery_outcome(False, True, warnings)
@@ -792,32 +813,82 @@ class ProviderActionStore:
             outcome['warnings'] = list(warnings)
         return outcome
 
-    def _delivery_warnings(self, run_id, issue_id, role, generation):
+    def _delivery_warnings(self, run_id, issue_id, role, generation, payload):
         """Advisory notes that must reach the worker without blocking delivery."""
-        warning = self._project_mount_warning(run_id, issue_id, role, generation)
-        return [warning] if warning else []
+        warnings = [
+            self._project_mount_warning(run_id, issue_id, role, generation),
+            self._session_root_warning(run_id, issue_id, role, generation, payload),
+        ]
+        return [warning for warning in warnings if warning]
 
     def _project_mount_warning(self, run_id, issue_id, role, generation):
-        """Warn when the dispatch never pinned the worker to a project.
+        """Warn when the create that started this session asked for no mount.
 
-        vibe cannot see the sandbox roots the host actually granted; all it
-        knows is the mount the create request asked for.  A dispatch with no
-        recorded project mount is the one shape observed to produce a
-        projectless session, whose write sandbox does not cover the contract
-        worktree -- so say so rather than let the user work it out from a trail
-        of per-action approval prompts (issue #219).
+        Only an explicit ``'none'`` warns.  A generation with no record at
+        all, and a record written before the field existed, are both legacy:
+        they are skipped, because warning there would fire on runs that
+        already worked (review P2).  A rework generation inherits its
+        creator's value, so it never looks like a dispatch that asked for
+        nothing (review P1).
 
-        Advisory only.  Legacy dispatches predate the record and are skipped,
-        never refused: blocking here would break runs that already worked.
+        Advisory only -- delivery still lands.  This reports what the request
+        asked for, never what the host granted: a host that opens a
+        projectless thread despite a named mount is invisible here and is
+        caught by :meth:`_session_root_warning` instead.
         """
         record = self._dispatch_record(run_id, issue_id, role, generation)
-        if not record or record.get('project_id'):
+        if record.get('project_mount') != _PROJECT_MOUNT_NONE:
             return None
         return (
-            'this node was dispatched without a recorded project mount, so its worker '
-            'sandbox may not cover the contract worktree: writes, commits and '
-            'self-reports can each raise a per-action user approval prompt.  Tell the '
-            'supervisor so the node can be re-dispatched against a saved project.'
+            'this node was dispatched by a create request that asked the host for no '
+            'project mount, so its worker session may be projectless: the contract '
+            'worktree is then outside the writable roots, and writes, commits and '
+            'self-reports each raise their own approval prompt.  Tell the supervisor '
+            'so the node can be re-dispatched against a saved project.'
+        )
+
+    def _session_root_warning(self, run_id, issue_id, role, generation, payload):
+        """Warn when the worker reports a session root outside the project.
+
+        The one ground truth for issue #219 is what the worker session observes
+        about itself: the failing run's create request *did* name a valid
+        ``projectId`` and the session was still opened projectless, starting in
+        a host-generated directory under ``Documents/Codex`` while the contract
+        worktree and the main project tree sat elsewhere.  Neither the request
+        nor vibe can see the sandbox roots the host granted, so the session
+        directory the worker reports is the only checkable fact.
+
+        Silent when the worker reports nothing -- prompts older than this check
+        do not carry the field, and a missing field is not evidence of a bad
+        session.  Advisory only, and it names both roots so a host that
+        legitimately places a session elsewhere can be told apart by eye.
+        """
+        delivery = payload.get('delivery_evidence') if isinstance(payload, Mapping) else None
+        raw = delivery.get('session_cwd') if isinstance(delivery, Mapping) else None
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            session = Path(raw.strip()).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        if not session.is_absolute():
+            return None
+        root = Path(self.paths.root).resolve()
+        roots = [root]
+        worktree = self._binding_worktree(
+            self._child_binding(run_id, issue_id, role, generation)
+        )
+        if worktree is not None:
+            roots.append(worktree)
+        if any(session == candidate or candidate in session.parents for candidate in roots):
+            return None
+        return (
+            'this worker reported its session root as {}, which is outside the contract '
+            'project root {} and its node worktree -- such a session is very likely '
+            'projectless, so its write sandbox may not cover the contract paths and '
+            'every write, commit and self-report raises its own approval prompt.  Tell '
+            'the supervisor so the node can be re-dispatched against a saved project.'
+            .format(session, root)
         )
 
     def _latest_generation(self, run_id, issue_id, role):
@@ -863,17 +934,21 @@ class ProviderActionStore:
         )
 
     def _record_dispatch_head(self, run_id, issue_id, role, generation, binding=None,
-                              project_id=None):
+                              project_mount=None):
         """Write-once: main project HEAD (and node worktree HEAD) at dispatch.
 
         Kept beside, not inside, the request so the request digest and its
         identity-drift check are untouched.  Later requests of the same
         generation (locate / resume) keep the first value.
 
-        ``project_id`` records the mount the create request asked the host for
-        (see :func:`_request_project_mount`); a record without one is the only
-        shape known to produce a projectless session, so the delivery report
-        warns on it.
+        ``project_mount`` is the mount a session-creating request asked the
+        host for (see :func:`_requested_project_mount`).  A generation that
+        cannot create a session (locate / resume) passes ``None`` and inherits
+        the newest earlier generation's value, because a resume cannot move an
+        existing session to another project; without that, every rework would
+        record "no mount asked for" and the delivery report would warn on it.
+        An absent key means the record predates the field (legacy) -- never
+        "no mount".
 
         ponytail: an unreadable HEAD (no git, unborn branch) or an unwritable
         record (OSError) records nothing, and the committed-landing check is
@@ -895,8 +970,11 @@ class ProviderActionStore:
         if done.returncode != 0 or len(head) not in (40, 64):
             return
         record = {'head': head}
-        if isinstance(project_id, str) and project_id.strip():
-            record['project_id'] = project_id.strip()
+        mount = project_mount or self._inherited_project_mount(
+            run_id, issue_id, role, generation
+        )
+        if mount is not None:
+            record['project_mount'] = mount
         worktree = self._binding_worktree(binding)
         if worktree is not None and worktree.is_dir():
             try:
@@ -946,7 +1024,29 @@ class ProviderActionStore:
         if not isinstance(value, dict):
             return {}
         return {k: v for k, v in value.items()
-                if k in ('head', 'worktree_head', 'project_id') and isinstance(v, str) and v}
+                if k in ('head', 'worktree_head', 'project_mount')
+                and isinstance(v, str) and v}
+
+    def _inherited_project_mount(self, run_id, issue_id, role, generation):
+        """Mount recorded for the newest earlier generation, or ``None``.
+
+        A resume or locate cannot change a session's mount: the session
+        already exists.  Inheriting is what keeps a rework generation -- whose
+        request carries no target -- from reading as a dispatch that asked for
+        no project at all (review P1).
+        """
+        try:
+            earlier = int(generation) - 1
+        except (TypeError, ValueError):
+            return None
+        while earlier >= 1:
+            mount = self._dispatch_record(run_id, issue_id, role, earlier).get(
+                'project_mount'
+            )
+            if mount:
+                return mount
+            earlier -= 1
+        return None
 
     def _dispatch_head(self, run_id, issue_id, role, generation):
         return self._dispatch_record(run_id, issue_id, role, generation).get('head')
@@ -1465,22 +1565,33 @@ class CodexAppBridge:
             if key in request
         }
         target = request["target"]
-        # A project target with no usable id must never reach the native tool.
-        # The host answers a missing ``projectId`` by creating a *projectless*
-        # thread whose write sandbox covers only its generated directory --
-        # not the contract worktree.  Every write, commit and self-report then
-        # raises its own approval prompt (issue #219), and nothing downstream
-        # can tell that from a normal dispatch.  Fail loudly instead.
-        if str(target.get("type") or "").strip() == "project":
-            project_id = target.get("projectId")
-            if not (isinstance(project_id, str) and project_id.strip()):
-                raise ProviderUnavailable(
-                    "visible worker create requires a project mount: target.projectId "
-                    "is missing or blank.  A projectless worker session cannot write "
-                    "the contract worktree, so every write, commit and self-report "
-                    "would need its own user approval.  Save the project on the host "
-                    "and re-attest project_id before dispatching."
-                )
+        # A visible worker create must name a project mount.  The host answers
+        # a create without one by opening a *projectless* thread whose write
+        # sandbox covers only its generated directory -- not the contract
+        # worktree -- so every write, commit and self-report then raises its
+        # own approval prompt (issue #219).  vibe never sees the sandbox roots
+        # a session ends up with, so the one checkable thing here is that the
+        # request asked for a mount at all: fail loudly rather than let a
+        # malformed target reach the native tool.
+        #
+        # Reach: this is the choke point for a desktop session that routes its
+        # create through this bridge.  It is not the fix for the observed
+        # incident -- that run's create named a valid ``projectId`` and still
+        # landed projectless, so a session calling the native tool directly is
+        # outside this guard's reach.  The delivery report's session-root check
+        # is the part that can see that.
+        project_id = target.get("projectId")
+        if str(target.get("type") or "").strip() != "project" or not (
+            isinstance(project_id, str) and project_id.strip()
+        ):
+            raise ProviderUnavailable(
+                "visible worker create requires a project mount: target.type must be "
+                "project and target.projectId must be a non-blank string.  A "
+                "projectless worker session cannot write the contract worktree, so "
+                "every write, commit and self-report would need its own user "
+                "approval.  Save the project on the host and re-attest project_id "
+                "before dispatching."
+            )
         public_target = {
             key: target[key]
             for key in ("type", "projectId", "environment")
