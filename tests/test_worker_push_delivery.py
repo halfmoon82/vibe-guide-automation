@@ -330,6 +330,39 @@ class WorkerDeliverCliTests(unittest.TestCase):
         self.assertEqual(result.payload["status"], "blocked_invalid")
         self.assertFalse((self.root.parent / "escaped-n1-developer.json").exists())
 
+    def test_delivery_warning_reaches_the_payload_and_the_message(self):
+        # ISSUE-219: the advisory must reach the worker's eyes, not only the
+        # JSON -- the worker is who can tell the supervisor to re-dispatch.
+        store = _store(self.root)
+        _wait_request(store)
+        _dispatched(store)
+        path = store._dispatch_head_path("run-1", "n1", "developer", 1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"head": "a" * 40}), encoding="utf-8")
+        result = self.cli([
+            "worker-deliver", "--generation", "1", "--run-id", "run-1", "--node", "n1",
+            "--payload", json.dumps(GOOD),
+        ])
+        self.assertEqual(result.exit_code, 0, result.payload)
+        self.assertIn("without a recorded project mount", result.payload["warnings"][0])
+        self.assertIn("注意：", result.text)
+
+    def test_delivery_without_a_warning_keeps_the_plain_message(self):
+        store = _store(self.root)
+        _wait_request(store)
+        _dispatched(store)
+        path = store._dispatch_head_path("run-1", "n1", "developer", 1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"head": "a" * 40, "project_id": "p-1"}),
+                        encoding="utf-8")
+        result = self.cli([
+            "worker-deliver", "--generation", "1", "--run-id", "run-1", "--node", "n1",
+            "--payload", json.dumps(GOOD),
+        ])
+        self.assertEqual(result.exit_code, 0, result.payload)
+        self.assertNotIn("warnings", result.payload)
+        self.assertNotIn("注意：", result.text)
+
 
 def subprocess_out(cwd, *args):
     import subprocess
@@ -369,19 +402,24 @@ class LandingCheckTests(unittest.TestCase):
         self.store = _store(self.root)
 
     def _dispatch(self, worktree=".worktrees/n1", branch="node/n1", role="developer",
-                  allowlist=("app.py",)):
+                  allowlist=("app.py",), project_id="project-1"):
         action_id = "action-create-run-1-n1-{}".format(role)
         (self.store._directory("requests") / (action_id + ".json")).write_text(json.dumps({
             "schema_version": 1, "action_id": action_id, "operation": "create",
             "provider": "workbuddy", "run_id": "run-1", "issue_id": "n1",
             "role": role, "generation": 1, "sequence": 0, "native_tool": "x",
-            "request": {"child_binding": {
-                "worktree": worktree, "branch": branch, "allowlist": list(allowlist),
-            }},
+            "request": {
+                "child_binding": {
+                    "worktree": worktree, "branch": branch, "allowlist": list(allowlist),
+                },
+                "target": {"type": "project", "projectId": project_id},
+            },
             "request_digest": "0" * 64,
         }), encoding="utf-8")
         # Mirrors ProviderActionStore.request for a child-bound dispatch.
-        self.store._record_dispatch_head("run-1", "n1", role, 1, {"worktree": worktree})
+        self.store._record_dispatch_head(
+            "run-1", "n1", role, 1, {"worktree": worktree}, project_id,
+        )
 
     def _deliver(self, role="developer"):
         return self.store.record_worker_delivery("run-1", "n1", role, dict(GOOD), 1)
@@ -526,6 +564,7 @@ class LandingCheckTests(unittest.TestCase):
             store._record_dispatch_head("run-9", "n9", "developer", 1, {"worktree": "."})
         self.assertFalse(store._dispatch_head_path("run-9", "n9", "developer", 1).exists())
 
+
     def test_overlapping_merge_does_not_block_work_done_in_the_worktree(self):
         # Review P1: the supervisor merges another node touching app.py into
         # main while this node did its own work in its worktree.
@@ -664,6 +703,66 @@ class LandingCheckTests(unittest.TestCase):
                       "reviewer（只读）", "合同 worktree 就是主项目根（`.`）", "已知盲区",
                       "cannot verify delivery landing", "派发时的主项目 HEAD",
                       "committed this node's allowlisted files after it was dispatched"):
+            self.assertIn(token, text)
+
+    # --- ISSUE-219: a dispatch that recorded no project mount says so -------
+    #
+    # vibe cannot observe the sandbox roots the host granted the worker, so the
+    # only checkable fact is what the create request asked for.  A dispatch
+    # with no recorded mount is the one shape observed to produce a
+    # projectless session, whose writes each raise their own approval prompt.
+    # The note is advisory: delivery still lands.
+
+    def _record(self):
+        path = self.store._dispatch_head_path("run-1", "n1", "developer", 1)
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_project_mount_from_the_create_request_is_recorded(self):
+        self._dispatch(project_id="project-7")
+        self.assertEqual(self._record()["project_id"], "project-7")
+
+    def test_blank_project_mount_records_nothing(self):
+        self._dispatch(project_id="   ")
+        self.assertNotIn("project_id", self._record())
+
+    def test_recorded_mount_produces_no_warning(self):
+        self._dispatch(project_id="project-7")
+        self.assertNotIn("warnings", self._deliver())
+
+    def test_missing_mount_warns_without_blocking_delivery(self):
+        self._dispatch(project_id=None)
+        outcome = self._deliver()
+        self.assertTrue(outcome["recorded"])
+        self.assertEqual(len(self._archived()), 1)
+        self.assertIn("without a recorded project mount", outcome["warnings"][0])
+
+    def test_legacy_dispatch_without_any_record_is_not_warned(self):
+        # ponytail ceiling: dispatches predating dispatch-heads.  Warning there
+        # would fire on every run that already worked.
+        self._dispatch()
+        self.store._dispatch_head_path("run-1", "n1", "developer", 1).unlink()
+        self.assertNotIn("warnings", self._deliver())
+
+    def test_reviewer_delivery_also_carries_the_warning(self):
+        # A reviewer reads the worktree too; the sandbox note is not
+        # developer-only even though the landing *check* is.
+        self._dispatch(role="reviewer", project_id=None)
+        outcome = self._deliver(role="reviewer")
+        self.assertTrue(outcome["recorded"])
+        self.assertIn("without a recorded project mount", outcome["warnings"][0])
+
+    def test_duplicate_report_keeps_the_warning(self):
+        self._dispatch(project_id=None)
+        self.assertTrue(self._deliver()["warnings"])
+        again = self._deliver()
+        self.assertTrue(again["duplicate"])
+        self.assertTrue(again["warnings"])
+
+    def test_worker_protocol_documents_the_project_mount_requirement(self):
+        text = (Path(__file__).resolve().parents[1] / "vibe_guide" / "protocols"
+                / "visible-sdd-worker.md").read_text(encoding="utf-8")
+        for token in ("必须挂载 project", "禁止静默落 projectless",
+                      "派发负载不能携带权限", "停下告诉监工"):
             self.assertIn(token, text)
 
 

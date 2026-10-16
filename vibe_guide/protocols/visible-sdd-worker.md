@@ -21,6 +21,27 @@ dev 子代理实现 → review 子代理审查 →（存在 P0–P2）返工回 
 4. **复审**：返工后回到 review 子代理复审，保留审查身份与证据链；最多 3 轮。三轮仍不收敛时由监工记录 `change_reviewer_or_split_node`，换 reviewer 或拆节点并保留唯一 writer；只有分歧会改变 PRD 验收判定时才升级产品决策。
 5. **收口**：某轮复审无 P0–P2 且验证绿后，按节点合同收口（提交/开 PR 等以授权卡为准）。
 
+## 1.5 派发前提：worker 会话必须挂载 project
+
+**worker 的写权限不来自派发负载。** 一句话记法：**worker 权限来自 project 挂载 + app 沙箱默认值，
+派发负载不能携带权限。** 沙箱档案在**会话创建那一刻**由「挂在哪个 project + app/project
+沙箱默认值」决定；`create_thread` 一类的创建调用**不接受** sandbox / approval 参数。所以派发提示里
+写「给予完全访问」没有任何工程效力，监工也不要试图在 prompt 里授权。
+
+因此：
+
+- 监工派发 visible worker 时**必须挂载 project**（Git 项目按 worktree 环境创建）——合同 worktree
+  才会落进会话的可写根。**禁止静默落 projectless。**
+- 项目未在宿主上保存时**显式处置**：先保存 project；或由产品经理确认走 projectless 并接受
+  逐条授权。两者都做不到就停下报告，不要硬派。
+- 落成 **projectless** 的会话，其可写根只有宿主生成的临时目录，**不覆盖合同 worktree 与主项目树**。
+  后果是每一次写文件、`git add`/`commit`、`vibe worker-deliver` 自报都会各自弹一次人工批准——
+  单个节点的正常交付流程会产生十几次打断，且打断点不可预测（带重定向/管道的命令不被 prefix rule
+  匹配）。**遇到这种情况停下告诉监工**，不要在逐条批准里硬推完。
+- 自报交付时若看到 `warnings` 里出现「dispatched without a recorded project mount」，把原文转告监工，
+  由监工重新派发（新 project 挂载、新一代）。这条是**提示不是拒绝**：交付照常登记，但该节点的
+  沙箱很可能覆盖不到合同路径。
+
 ## 2. review 子代理只读红线（git 写禁令清单）
 
 派给 review 子代理的任务提示必须**显式禁止一切 git 写操作**。以下命令清单一字不差写进提示，review 子代理不得执行：

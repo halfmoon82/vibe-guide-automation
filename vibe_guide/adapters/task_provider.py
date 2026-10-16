@@ -222,6 +222,22 @@ def _canonical_digest(value: Any) -> str:
     ).hexdigest()
 
 
+def _request_project_mount(request: Any) -> Optional[str]:
+    """``projectId`` the create request asks the host to mount, or ``None``.
+
+    Only the *requested* mount is knowable here: vibe never sees the sandbox
+    roots the host actually gave the session.  Recording what was asked for is
+    what lets a later delivery report say "this dispatch could not pin the
+    worker to a project" instead of leaving the user to infer it from a trail
+    of approval prompts (issue #219).
+    """
+    target = request.get("target") if isinstance(request, Mapping) else None
+    if not isinstance(target, Mapping):
+        return None
+    value = target.get("projectId")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
 class ProviderActionStore:
     """Bounded request/result mailbox between the CLI and a desktop session."""
 
@@ -398,7 +414,8 @@ class ProviderActionStore:
             if not self._prompt_only_upgrade(existing, payload):
                 if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
                     self._record_dispatch_head(
-                        run_id, issue_id, role, generation, request["child_binding"]
+                        run_id, issue_id, role, generation, request["child_binding"],
+                        _request_project_mount(request),
                     )
                 raise ValueError("provider action request identity drift")
             # The worker already acted on the original prompt; keep it, and do
@@ -408,7 +425,8 @@ class ProviderActionStore:
             # Before the request is visible to the host: the baseline must
             # predate any work the dispatched worker could do.
             self._record_dispatch_head(
-                run_id, issue_id, role, generation, request["child_binding"]
+                run_id, issue_id, role, generation, request["child_binding"],
+                _request_project_mount(request),
             )
         if existing is None:
             self._atomic(path, payload)
@@ -728,13 +746,14 @@ class ProviderActionStore:
             )
         path = self._delivery_path(run_id, issue_id, role, generation)
         existing = self._read(path) if path.exists() else None
+        warnings = self._delivery_warnings(run_id, issue_id, role, generation)
         if isinstance(existing, dict) and existing.get('payload') == payload:
             if existing.get('consumed_by'):
-                return {'recorded': True, 'consumed': False, 'duplicate': True}
+                return self._delivery_outcome(False, True, warnings)
             consumed = self._consume_archived_delivery(
                 run_id, issue_id, role, generation
             )
-            return {'recorded': True, 'consumed': consumed, 'duplicate': True}
+            return self._delivery_outcome(consumed, True, warnings)
         if role == 'developer':
             problem = self._landing_problem(run_id, issue_id, role, generation)
             if problem:
@@ -764,7 +783,42 @@ class ProviderActionStore:
             'consumed_by': None,
         })
         consumed = self._consume_archived_delivery(run_id, issue_id, role, generation)
-        return {'recorded': True, 'consumed': consumed, 'duplicate': False}
+        return self._delivery_outcome(consumed, False, warnings)
+
+    @staticmethod
+    def _delivery_outcome(consumed, duplicate, warnings):
+        outcome = {'recorded': True, 'consumed': consumed, 'duplicate': duplicate}
+        if warnings:
+            outcome['warnings'] = list(warnings)
+        return outcome
+
+    def _delivery_warnings(self, run_id, issue_id, role, generation):
+        """Advisory notes that must reach the worker without blocking delivery."""
+        warning = self._project_mount_warning(run_id, issue_id, role, generation)
+        return [warning] if warning else []
+
+    def _project_mount_warning(self, run_id, issue_id, role, generation):
+        """Warn when the dispatch never pinned the worker to a project.
+
+        vibe cannot see the sandbox roots the host actually granted; all it
+        knows is the mount the create request asked for.  A dispatch with no
+        recorded project mount is the one shape observed to produce a
+        projectless session, whose write sandbox does not cover the contract
+        worktree -- so say so rather than let the user work it out from a trail
+        of per-action approval prompts (issue #219).
+
+        Advisory only.  Legacy dispatches predate the record and are skipped,
+        never refused: blocking here would break runs that already worked.
+        """
+        record = self._dispatch_record(run_id, issue_id, role, generation)
+        if not record or record.get('project_id'):
+            return None
+        return (
+            'this node was dispatched without a recorded project mount, so its worker '
+            'sandbox may not cover the contract worktree: writes, commits and '
+            'self-reports can each raise a per-action user approval prompt.  Tell the '
+            'supervisor so the node can be re-dispatched against a saved project.'
+        )
 
     def _latest_generation(self, run_id, issue_id, role):
         """Highest generation the monitor has dispatched for this node/role."""
@@ -808,12 +862,19 @@ class ProviderActionStore:
             run_id, issue_id, role, generation
         )
 
-    def _record_dispatch_head(self, run_id, issue_id, role, generation, binding=None):
+    def _record_dispatch_head(self, run_id, issue_id, role, generation, binding=None,
+                              project_id=None):
         """Write-once: main project HEAD (and node worktree HEAD) at dispatch.
 
         Kept beside, not inside, the request so the request digest and its
         identity-drift check are untouched.  Later requests of the same
         generation (locate / resume) keep the first value.
+
+        ``project_id`` records the mount the create request asked the host for
+        (see :func:`_request_project_mount`); a record without one is the only
+        shape known to produce a projectless session, so the delivery report
+        warns on it.
+
         ponytail: an unreadable HEAD (no git, unborn branch) or an unwritable
         record (OSError) records nothing, and the committed-landing check is
         then skipped for this generation; it never fails the dispatch.
@@ -834,6 +895,8 @@ class ProviderActionStore:
         if done.returncode != 0 or len(head) not in (40, 64):
             return
         record = {'head': head}
+        if isinstance(project_id, str) and project_id.strip():
+            record['project_id'] = project_id.strip()
         worktree = self._binding_worktree(binding)
         if worktree is not None and worktree.is_dir():
             try:
@@ -883,7 +946,7 @@ class ProviderActionStore:
         if not isinstance(value, dict):
             return {}
         return {k: v for k, v in value.items()
-                if k in ('head', 'worktree_head') and isinstance(v, str) and v}
+                if k in ('head', 'worktree_head', 'project_id') and isinstance(v, str) and v}
 
     def _dispatch_head(self, run_id, issue_id, role, generation):
         return self._dispatch_record(run_id, issue_id, role, generation).get('head')
@@ -1402,6 +1465,22 @@ class CodexAppBridge:
             if key in request
         }
         target = request["target"]
+        # A project target with no usable id must never reach the native tool.
+        # The host answers a missing ``projectId`` by creating a *projectless*
+        # thread whose write sandbox covers only its generated directory --
+        # not the contract worktree.  Every write, commit and self-report then
+        # raises its own approval prompt (issue #219), and nothing downstream
+        # can tell that from a normal dispatch.  Fail loudly instead.
+        if str(target.get("type") or "").strip() == "project":
+            project_id = target.get("projectId")
+            if not (isinstance(project_id, str) and project_id.strip()):
+                raise ProviderUnavailable(
+                    "visible worker create requires a project mount: target.projectId "
+                    "is missing or blank.  A projectless worker session cannot write "
+                    "the contract worktree, so every write, commit and self-report "
+                    "would need its own user approval.  Save the project on the host "
+                    "and re-attest project_id before dispatching."
+                )
         public_target = {
             key: target[key]
             for key in ("type", "projectId", "environment")

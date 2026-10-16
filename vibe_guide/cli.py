@@ -1906,7 +1906,13 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "自报格式错误：" + str(error), args.as_json)
-        return _result(SUCCESS, {"command": args.command, "status": "recorded", **outcome}, "交付已登记", args.as_json)
+        # Advisory notes (e.g. a dispatch that recorded no project mount) must
+        # reach the worker's eyes, not just the JSON payload -- the worker is
+        # the one who can tell the supervisor to re-dispatch (issue #219).
+        message = "交付已登记"
+        for warning in outcome.get("warnings", []) or []:
+            message += "；注意：" + str(warning)
+        return _result(SUCCESS, {"command": args.command, "status": "recorded", **outcome}, message, args.as_json)
 
     if args.command == "scope-expand":
         if not (args.run_id and args.node_id and args.worker_payload):
