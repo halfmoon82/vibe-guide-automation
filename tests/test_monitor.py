@@ -8,7 +8,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from vibe_guide.authorization import AuthorizationRecord, authorize, build_authorization_card
+from vibe_guide.authorization import (
+    AuthorizationRecord,
+    authorize,
+    build_authorization_card,
+    is_authorization_valid,
+)
 from vibe_guide.contracts import RunEvent, RunHandle
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan, node_branch
 from vibe_guide.monitor import Monitor, VISIBLE_SDD_PROTOCOL_REF
@@ -1877,6 +1882,109 @@ class MonitorTests(unittest.TestCase):
         self._assert_reauthorization_rejects_observed_continuation_mismatch(
             cursor="wrong-cursor"
         )
+
+    def test_reauthorization_retains_acceptance_when_only_file_scope_expands(self):
+        # ISSUE-147: run 140 (``run-182893a5...``) lost four accepted nodes to a
+        # one-line file addition.  Its ``authorization_reauthorized`` transition
+        # differs from the state it replaced in exactly one place --
+        # ``file_scope`` gaining ``vibe_guide/protocols/__init__.py`` -- yet
+        # ``changed_nodes`` was ``['contract-env-facts']``, which pulled in
+        # three accepted descendants.  File scope is authorized separately from
+        # the acceptance contract, so a compliant scope expansion must refresh
+        # the write allowlist without invalidating the expanded node or its
+        # descendants.  The other half of the criterion -- an acceptance change
+        # still invalidating the downstream suffix -- is
+        # ``test_reauthorization_invalidates_accepted_downstream_suffix_and_recovers``.
+        upstream = node("n1")
+        downstream = node("n2", ["n1"])
+        monitor, record = self.authorized_monitor([upstream, downstream])
+        runner = FakeRunner(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery-n1"})],
+                ("n1", "reviewer"): [("accepted", {"evidence": "review-n1"})],
+                ("n2", "developer"): [("complete", {"evidence": "delivery-n2"})],
+                ("n2", "reviewer"): [("accepted", {"evidence": "review-n2"})],
+            }
+        )
+        snapshot = monitor.start(record, runner)
+        for _ in range(6):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertTrue(
+            all(item["status"] == "accepted" for item in snapshot.nodes.values())
+        )
+        old_acceptance = {
+            node_id: dict(snapshot.nodes[node_id]["acceptance"])
+            for node_id in ("n1", "n2")
+        }
+
+        # Only the write scope grows: one extra file, nothing about the
+        # acceptance contract moves.
+        expanded = node("n1")
+        expanded.contract["files"] = ["n1.py", "tests/test_n1.py"]
+        expanded_nodes = [expanded, node("n2", ["n1"])]
+        expanded_plan = Plan("plan-1", 1, "docs/prd.md", ["n1", "n2"], "draft")
+        expanded_record = authorize(
+            build_authorization_card(expanded_plan, expanded_nodes, self.capabilities),
+            "AUTHORIZE",
+        )
+        # Faithful to the run that produced this issue: the reauthorization was
+        # forced by a capability-contract change (a protocol digest
+        # registration), not by the node contracts.  Refresh the saved contract
+        # so the trigger is real rather than a label.
+        previous_capability_digest = snapshot.capability_contract_digest
+        fresh = build_contract(
+            self.paths.root,
+            provider="fake",
+            host_id="local",
+            facts={
+                "protocol.digest": {
+                    "status": "verified_available",
+                    "scope": "task",
+                    "route": "functions.exec",
+                    "evidence_ref": "live:issue-147",
+                }
+            },
+        )
+        save_contract(self.paths, fresh)
+        self.assertNotEqual(previous_capability_digest, fresh.contract_digest)
+        recovered = Monitor(self.paths, expanded_plan, expanded_nodes).reauthorize(
+            snapshot.run_id,
+            expanded_record,
+            FakeRunner(),
+            "capability_contract_changed",
+        )
+        self.assertEqual(recovered.capability_contract_digest, fresh.contract_digest)
+
+        transition = [
+            event
+            for event in load_events(self.paths, snapshot.run_id)
+            if event["event"] == "authorization_reauthorized"
+        ][-1]["data"]
+        self.assertEqual(transition["changed_nodes"], [])
+        self.assertEqual(transition["affected_nodes"], [])
+        self.assertEqual(sorted(transition["retained_acceptances"]), ["n1", "n2"])
+        self.assertEqual(transition["invalidated_acceptances"], {})
+        for node_id in ("n1", "n2"):
+            self.assertEqual(recovered.nodes[node_id]["status"], "accepted")
+            self.assertEqual(
+                recovered.nodes[node_id]["acceptance"]["contract_digest"],
+                old_acceptance[node_id]["contract_digest"],
+            )
+
+        # Retaining the acceptance must not degenerate into ignoring the scope
+        # change: the write allowlist is authorized separately and still has to
+        # move.  ``is_authorization_valid`` re-derives it from the live nodes,
+        # so the expanded record verifies while the pre-expansion one no longer
+        # does.  Without this half a "retain" implemented as "stop digesting
+        # scope anywhere" would pass every assertion above.
+        self.assertIn("tests/test_n1.py", expanded_record.file_scope)
+        self.assertTrue(
+            is_authorization_valid(expanded_record, expanded_plan, expanded_nodes)
+        )
+        self.assertFalse(
+            is_authorization_valid(record, expanded_plan, expanded_nodes)
+        )
+        self.assertEqual(recovered.authorization_digest, expanded_record.digest)
 
     def test_reauthorization_invalidates_accepted_downstream_suffix_and_recovers(self):
         upstream = node("n1")
