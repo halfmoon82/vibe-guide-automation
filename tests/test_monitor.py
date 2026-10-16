@@ -1895,6 +1895,14 @@ class MonitorTests(unittest.TestCase):
         # descendants.  The other half of the criterion -- an acceptance change
         # still invalidating the downstream suffix -- is
         # ``test_reauthorization_invalidates_accepted_downstream_suffix_and_recovers``.
+        #
+        # Scope of the fix: this pins the path taken by runs authorized under
+        # the current scope-free digest.  A run whose snapshot still holds the
+        # 5.0.7 scope-inclusive per-node digests cannot prove the edit was
+        # scope-only -- the old contract is not recoverable from a digest -- so
+        # it is still reworked, exactly as 5.0.7 did.  That limitation is
+        # pinned by ``tests/test_legacy_contract_digest.py``
+        # (``test_new_code_reauthorization_keeps_unchanged_507_acceptances``).
         upstream = node("n1")
         downstream = node("n2", ["n1"])
         monitor, record = self.authorized_monitor([upstream, downstream])
@@ -1927,10 +1935,12 @@ class MonitorTests(unittest.TestCase):
             build_authorization_card(expanded_plan, expanded_nodes, self.capabilities),
             "AUTHORIZE",
         )
-        # Faithful to the run that produced this issue: the reauthorization was
-        # forced by a capability-contract change (a protocol digest
-        # registration), not by the node contracts.  Refresh the saved contract
-        # so the trigger is real rather than a label.
+        # Stronger than the run that produced this issue.  That run labelled its
+        # transition ``capability_contract_changed`` while its capability digest
+        # stayed at ``5a7ced24...`` on both sides, so the label was never backed
+        # by a real change.  Here the saved contract is genuinely replaced,
+        # which exercises the stricter path: the reauthorization still has to
+        # retain the acceptances.
         previous_capability_digest = snapshot.capability_contract_digest
         fresh = build_contract(
             self.paths.root,
