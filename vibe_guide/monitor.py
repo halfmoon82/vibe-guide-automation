@@ -148,34 +148,26 @@ DECISION_NOTIFICATION_UNKNOWN_REASON = "decision notification bridge status unkn
 LIFECYCLE_DECISION_RECOVERY_ACTION = "raise_missing_decision"
 # Decision-less blocked_design producers record a fixed enum cause; the monitor
 # registers a vibe-authored (never provider-derived) decision for it.
+_BLOCKED_DESIGN_MAX_ATTEMPTS = 20
 _BLOCKED_DESIGN_DECISIONS = {
     "integration_scope_review": {
         "question": "整合审查要求把文件扩进已验收节点的范围，自动规则无法判定，需要产品经理复核是否允许扩范围",
         "options": [
             {"id": "approve_scope_expansion", "label": "允许扩范围",
-             "impact": "退回该节点返工，按扩后的范围修改"},
+             "impact": "选此项后由监工把文件并入该节点范围并安排该节点返工"},
             {"id": "keep_scope", "label": "不扩范围",
-             "impact": "该节点范围不变，整合审查另寻修法"},
+             "impact": "选此项后该节点范围不变，由监工安排整合审查另寻修法"},
         ],
     },
     "out_of_contract_finding": {
         "question": "审查发现节点合同之外的问题，无法自动判定唯一修法，需要产品经理决定是否纳入本节点（审查原文见该节点 reviewer 交付）",
         "options": [
             {"id": "accept_as_contract_change", "label": "纳入本节点",
-             "impact": "变更合同后返工"},
+             "impact": "选此项后由监工变更合同并安排该节点返工"},
             {"id": "defer_finding", "label": "不纳入",
-             "impact": "登记为后续问题，本节点按原合同验收"},
+             "impact": "选此项后由监工把该问题登记为后续问题，本节点按原合同验收"},
         ],
     },
-}
-_BLOCKED_DESIGN_GENERIC_DECISION = {
-    "question": "节点停在等待产品决策，但没有登记原因，需要产品经理确认如何处理",
-    "options": [
-        {"id": "return_to_developer", "label": "无需决策",
-         "impact": "退回开发继续"},
-        {"id": "pause_node", "label": "暂停该节点",
-         "impact": "等待进一步说明"},
-    ],
 }
 
 #: Compile/build command prefixes that can never prove a *behavioral*
@@ -6603,8 +6595,11 @@ class Monitor:
         """
         current = snapshot.nodes[node_id]
         cause = current.get("blocked_design_cause")
-        spec = _BLOCKED_DESIGN_DECISIONS.get(cause, _BLOCKED_DESIGN_GENERIC_DECISION)
-        evidence: Dict[str, Any] = {"cause": cause if cause in _BLOCKED_DESIGN_DECISIONS else "unknown"}
+        spec = _BLOCKED_DESIGN_DECISIONS.get(cause)
+        if spec is None:
+            # Unknown cause: not a product decision; the lifecycle route owns it.
+            return False
+        evidence: Dict[str, Any] = {"cause": cause}
         if cause == "integration_scope_review":
             if isinstance(current.get("blocked_design_target"), str):
                 evidence["target_node_id"] = current["blocked_design_target"]
@@ -6613,16 +6608,27 @@ class Monitor:
             if isinstance(current.get("review_generation"), int):
                 evidence["review_generation"] = current["review_generation"]
         try:
-            result = raise_decision(
-                self.paths,
-                run_id=snapshot.run_id,
-                node_id=node_id,
-                question=spec["question"],
-                options=[dict(item) for item in spec["options"]],
-                recommendation=None,
-                evidence=evidence,
-            )
-            decision_id = str(result["request"]["decision_id"])
+            mailbox = DecisionMailbox(self.paths)
+            for attempt in range(1, _BLOCKED_DESIGN_MAX_ATTEMPTS + 1):
+                # An answered request is closed: a new block for the same cause
+                # needs a new question text (hence a new id) to reach the PM.
+                question = spec["question"] if attempt == 1 else "{}（第 {} 次）".format(spec["question"], attempt)
+                result = raise_decision(
+                    self.paths,
+                    run_id=snapshot.run_id,
+                    node_id=node_id,
+                    question=question,
+                    options=[dict(item) for item in spec["options"]],
+                    recommendation=None,
+                    evidence=evidence,
+                )
+                decision_id = str(result["request"]["decision_id"])
+                if mailbox.result(decision_id) is None:
+                    break
+            else:
+                return False
+            notification = result.get("notification")
+            notification_status = str(notification.get("status")) if isinstance(notification, dict) else "unknown"
         except (OSError, TypeError, ValueError):
             return False
         self._record(snapshot, "decision_raised", {
@@ -6631,7 +6637,10 @@ class Monitor:
             "decision_ids": [decision_id],
             "source": "monitor_blocked_design",
             "reason": "decision pending",
+            "notification_status": notification_status,
+            "old_task_reconciled": True,
         })
+        current["old_task_reconciled"] = True
         current["decision_ids"] = [decision_id]
         current["status"] = "blocked_design"
         current["reason"] = "decision pending"

@@ -35,6 +35,21 @@ class _Base(unittest.TestCase):
             if item.get("node_id") == node_id
         ]
 
+    def undecided(self, **extra):
+        node = fx._node("n1")
+        plan = fx.Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+        card = build_authorization_card(plan, [node], self.capabilities)
+        monitor = fx.Monitor(self.paths, plan, [node])
+        runner = FakeRunner()
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        current = snapshot.nodes["n1"]
+        current.update({"status": "blocked_design", "reason": "design decision required",
+                        "active_role": None, "active_task": None, "retryable_action": None})
+        current.update(extra)
+        snapshot.handles.pop("n1", None)
+        save_snapshot(self.paths, snapshot)
+        return monitor, runner, snapshot
+
     def decision_events(self, run_id):
         return [
             e for e in load_events(self.paths, run_id)
@@ -114,34 +129,102 @@ class ProducerRegistersDecisionTests(_Base):
 
 
 class LifecycleFallbackTests(_Base):
-    def undecided(self, **extra):
-        node = fx._node("n1")
-        plan = fx.Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
-        card = build_authorization_card(plan, [node], self.capabilities)
-        monitor = fx.Monitor(self.paths, plan, [node])
-        runner = FakeRunner()
-        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+    def assert_lifecycle(self, snapshot):
         current = snapshot.nodes["n1"]
-        current.update({"status": "blocked_design", "reason": "design decision required",
-                        "active_role": None, "active_task": None, "retryable_action": None})
-        current.update(extra)
-        snapshot.handles.pop("n1", None)
-        save_snapshot(self.paths, snapshot)
-        return monitor, runner, snapshot
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertEqual(current["recovery_action"], "raise_missing_decision")
+        self.assertEqual(current["owner_layer"], "supervisor_lifecycle")
+        self.assertIs(current["user_interrupt"], False)
+        self.assertEqual(self.pending_for(snapshot.run_id, "n1"), [])
+        self.assertFalse(current.get("decision_ids"))
 
-    def test_legacy_without_cause_registers_generic_decision(self):
+    def test_legacy_without_cause_goes_lifecycle_on_tick_without_decision(self):
+        monitor, runner, snapshot = self.undecided()
+        self.assert_lifecycle(monitor.tick(snapshot.run_id, runner))
+        self.assert_lifecycle(monitor.tick(snapshot.run_id, runner))
+
+    def test_legacy_without_cause_goes_lifecycle_on_resume_without_decision(self):
         monitor, runner, snapshot = self.undecided()
         with patch("vibe_guide.monitor.require_entry", return_value=None):
-            resumed = monitor.resume(snapshot.run_id, runner)
-        resumed = monitor.tick(snapshot.run_id, runner)
-        current = resumed.nodes["n1"]
-        self.assertEqual(current["status"], "blocked_design")
-        self.assertEqual(len(current["decision_ids"]), 1)
+            self.assert_lifecycle(monitor.resume(snapshot.run_id, runner))
+
+    def test_unknown_cause_value_also_goes_lifecycle(self):
+        monitor, runner, snapshot = self.undecided(blocked_design_cause="something_else")
+        self.assert_lifecycle(monitor.tick(snapshot.run_id, runner))
+
+    def test_ensure_returns_false_for_missing_cause_and_writes_nothing(self):
+        monitor, runner, snapshot = self.undecided()
+        live = load_snapshot(self.paths, snapshot.run_id)
+        before = len(load_events(self.paths, snapshot.run_id))
+        self.assertIs(monitor._ensure_blocked_design_decision(live, "n1"), False)
+        self.assertEqual(len(load_events(self.paths, snapshot.run_id)), before)
+        self.assertEqual(self.pending_for(snapshot.run_id, "n1"), [])
+
+    def test_option_impacts_do_not_promise_automatic_execution(self):
+        monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
+        monitor.tick(snapshot.run_id, runner)
+        options = {o["id"]: o["impact"] for o in self.pending_for(snapshot.run_id, "n1")[0]["options"]}
+        self.assertEqual(options["accept_as_contract_change"], "选此项后由监工变更合同并安排该节点返工")
+        for impact in options.values():
+            self.assertTrue(impact.startswith("选此项后"), impact)
+
+    def test_reblock_for_same_cause_after_answer_gets_a_new_pending_decision(self):
+        monitor, runner, snapshot = self.undecided(blocked_design_cause="integration_scope_review")
+        first = monitor.tick(snapshot.run_id, runner).nodes["n1"]["decision_ids"][0]
+        DecisionMailbox(self.paths).answer(first, "keep_scope")
+        self.assertEqual(self.pending_for(snapshot.run_id, "n1"), [])
+        self.reblock(snapshot)
+        second = monitor.tick(snapshot.run_id, runner).nodes["n1"]
+        self.assertEqual(second["status"], "blocked_design")
+        self.assertNotEqual(second["decision_ids"], [first])
         pending = self.pending_for(snapshot.run_id, "n1")
-        self.assertIn("没有登记原因", pending[0]["question"])
-        self.assertEqual(
-            {o["id"] for o in pending[0]["options"]}, {"return_to_developer", "pause_node"}
-        )
+        self.assertEqual([p["decision_id"] for p in pending], second["decision_ids"])
+        self.assertIn("（第 2 次）", pending[0]["question"])
+        state = _mailbox_state(self.paths, snapshot.run_id, {})
+        self.assertEqual(state["state"], "decision")
+        self.assertEqual([d["decision_id"] for d in state["decisions"]], second["decision_ids"])
+
+    def reblock(self, snapshot):
+        again = load_snapshot(self.paths, snapshot.run_id)
+        again.nodes["n1"].update({"status": "blocked_design", "decision_ids": [],
+                                  "owner_layer": None, "recovery_action": None})
+        save_snapshot(self.paths, again)
+
+    def test_pending_request_is_idempotent_across_ensure_calls(self):
+        monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
+        live = load_snapshot(self.paths, snapshot.run_id)
+        self.assertTrue(monitor._ensure_blocked_design_decision(live, "n1"))
+        ids = list(live.nodes["n1"]["decision_ids"])
+        self.assertTrue(monitor._ensure_blocked_design_decision(live, "n1"))
+        self.assertEqual(live.nodes["n1"]["decision_ids"], ids)
+        self.assertEqual(len(self.pending_for(snapshot.run_id, "n1")), 1)
+
+    def test_answered_suffix_bound_falls_back_to_lifecycle(self):
+        monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
+        mailbox = DecisionMailbox(self.paths)
+        for _ in range(20):
+            live = load_snapshot(self.paths, snapshot.run_id)
+            self.assertTrue(monitor._ensure_blocked_design_decision(live, "n1"))
+            mailbox.answer(live.nodes["n1"]["decision_ids"][0], "defer_finding")
+        live = load_snapshot(self.paths, snapshot.run_id)
+        self.assertIs(monitor._ensure_blocked_design_decision(live, "n1"), False)
+        self.assertEqual(self.pending_for(snapshot.run_id, "n1"), [])
+
+    def test_result_read_error_counts_as_failure(self):
+        monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
+        live = load_snapshot(self.paths, snapshot.run_id)
+        with patch("vibe_guide.monitor.DecisionMailbox.result", side_effect=ValueError("bad")):
+            self.assertIs(monitor._ensure_blocked_design_decision(live, "n1"), False)
+
+    def test_decision_raised_event_carries_notification_status_and_reconciled_flag(self):
+        monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
+        monitor.tick(snapshot.run_id, runner)
+        events = [e for e in load_events(self.paths, snapshot.run_id)
+                  if e["event"] == "decision_raised"
+                  and e["data"].get("source") == "monitor_blocked_design"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["data"]["notification_status"], "disabled")
+        self.assertIs(events[0]["data"]["old_task_reconciled"], True)
 
     def test_mailbox_failure_falls_back_then_recovers_without_event_spam(self):
         monitor, runner, snapshot = self.undecided(blocked_design_cause="out_of_contract_finding")
@@ -166,9 +249,9 @@ class LifecycleFallbackTests(_Base):
         )
 
 
-class ReplayTests(LifecycleFallbackTests):
+class ReplayTests(_Base):
     def test_replay_matches_live(self):
-        monitor, runner, snapshot = self.undecided(blocked_design_cause="integration_scope_review")
+        monitor, runner, snapshot = self.undecided(blocked_design_cause="integration_scope_review", old_task_reconciled=True)
         stale = load_snapshot(self.paths, snapshot.run_id)
         live = load_snapshot(self.paths, snapshot.run_id)
         monitor._route_undecided_blocked_design(live)
@@ -176,7 +259,7 @@ class ReplayTests(LifecycleFallbackTests):
         replay.event_sequence = stale.event_sequence
         monitor._reconcile_unapplied_events(replay)
         for key in ("status", "decision_ids", "owner_layer", "recovery_action",
-                    "user_interrupt", "quarantine"):
+                    "user_interrupt", "quarantine", "old_task_reconciled"):
             self.assertEqual(replay.nodes["n1"].get(key), live.nodes["n1"].get(key), key)
         self.assertEqual(live.nodes["n1"]["status"], "blocked_design")
 

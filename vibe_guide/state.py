@@ -146,6 +146,9 @@ _EVENT_DATA_KEYS = {
     # so the monitor can register vibe-authored decision text after a replay.
     "blocked_design_cause",
     "blocked_design_target",
+    # Notification bridge outcome (accepted/unknown/disabled) of a decision the
+    # monitor registered itself; kept as evidence for the PM-visibility chain.
+    "notification_status",
     *CONSISTENCY_CORRECTION_KEYS,
     "authorization_digest",
     "authorization_epoch",
