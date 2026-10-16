@@ -85,6 +85,12 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "9179bef46af413f27c0954f265777778f42af5a93d6012b0b5dd83e585ab0b08",
         # 2026-10-14: §6.2 worker-deliver self-report needs no cursor (receipt instead).
         "8e6b6b2dadfc9b5e3cc6396189f17c169e434c8cd023f002055f2f9849474bee",
+        # 2026-10-14: heartbeat --accept-decision + N1 intervals.
+        "85c507fb3e0788f310b5da4987eefd88fbcef549de51865ad9b2491c301cba40",
+        # 2026-10-16: heartbeat-contract merged onto main (#211 §6.x patches).
+        "578fd47330714a53c2de616aafff3a0a9604a79ff272374aa50d2baa58a5bb35",
+        # 2026-10-16: combined text once decision-boundary (#184) and heartbeat-contract both land.
+        "5b7aa976a0f9b2ac20ca014a38a101635d274bad40d1a57bc4920b179ed5f38e",
     }),
     "vibe-entry": frozenset({
         "3ec0a771d482d92eba7f155f212dab97beb3a4a3b6712e16d7dc3d81394797eb",
@@ -98,6 +104,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "8091f9d39f66ecb373956d41cf573073420b78be173c53371e51f94e2ee356a6",
         "8a231e030151ff3a2378aaf1d1cd95745c7374e7cb95b1d4935c641d53b7287d",
         "e0a321c246cd2636a31612d643d7982c91ab5b473c80056b67cd800c853cd78e",
+        # 2026-10-14: heartbeat --accept-decision + N1 intervals.
+        "cfff1ae864a712bb1d110e82c95bfac801f313b9f19470c37843bd3c78dae5b1",
     }),
 }
 

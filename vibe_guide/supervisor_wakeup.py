@@ -45,7 +45,7 @@ def _host_turn(session_record):
 def preflight_with_checkpoint(paths, run_id, session_record, compute, *,
                               token_threshold=supervisor.DEFAULT_ROTATE_TOKEN_THRESHOLD,
                               context_hard_cap=supervisor.DEFAULT_ROTATE_HARD_CAP,
-                              command_prefix='vibe'):
+                              command_prefix='vibe', accept_decision=False):
     """Persist admission once for a bound Codex turn, including CLI handoff.
 
     Work resumes from the durable mailbox after compaction/restart. Idle and
@@ -76,7 +76,7 @@ def preflight_with_checkpoint(paths, run_id, session_record, compute, *,
         'run_status': snapshot.status,
         'address': address, 'turn_id': turn[1],
         'token_threshold': token_threshold, 'context_hard_cap': context_hard_cap,
-        'command_prefix': command_prefix,
+        'command_prefix': command_prefix, 'accept_decision': bool(accept_decision),
     }
     path = directory / 'supervisor-wakeup.json'
     if path.is_symlink():

@@ -49,6 +49,11 @@ from .supervisor import (
     supervisor_handoff,
     bounded_supervisor_output,
     heartbeat_command,
+    heartbeat_interval,
+    record_heartbeat_interval,
+    HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
+    HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
+    HEARTBEAT_INTERVAL_DECISION_MINUTES,
     supervisor_holds,
     supervisor_preflight,
     HOST_SHIFT_DIFFERENCES,
@@ -153,6 +158,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--name", dest="skill_name")
     parser.add_argument("--subdir", dest="skill_subdir", default="")
     parser.add_argument("--session-record", dest="session_record")
+    parser.add_argument("--accept-decision", action="store_true", dest="accept_decision")
     parser.add_argument("--provider", dest="supervisor_provider")
     parser.add_argument("--session-id", dest="session_id")
     parser.add_argument("--host", dest="supervisor_host")
@@ -1328,6 +1334,17 @@ def _snapshot_result(
     )
 
 
+def _beat_interval(paths: ProjectPaths, run_id: str, payload: Dict[str, Any], *, persist: bool) -> Dict[str, Any]:
+    """Next-beat interval for a preflight payload; persisting never changes the state."""
+    interval = heartbeat_interval(paths, run_id, decision_only=bool(payload.get("decision_only")))
+    if persist:
+        try:
+            interval = {**interval, **record_heartbeat_interval(paths, run_id, interval)}
+        except (OSError, ValueError, TypeError) as error:
+            interval = {**interval, "persist_error": str(error)[:200]}
+    return interval
+
+
 def _first_shift_handoff(
     paths: ProjectPaths, plan_id: str, run_id: str, run_status: Optional[str] = None
 ) -> str:
@@ -1364,13 +1381,18 @@ def _first_shift_handoff(
         "     {}\n"
         "  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n"
         "     {}\n"
-        "     每拍只运行这一条；输出 idle 时只回一个字，work/unknown/rotate 时按输出分支继续。\n"
+        "     心跳按 {} 分钟建；命令输出会给出下一拍间隔（{}/{}/{} 分钟），与当前周期不一致时按输出调整。\n"
+        "     每拍只运行这一条；输出 idle 时只回一个字，decision 时向用户呈现未答卡片，work/unknown/rotate 时按输出分支继续。\n"
         "没登记地址，worker 的完工唤醒信号无处可发；没心跳，rotate 的阈值检测不会发生。\n"
         "{}"
     ).format(
         run_id,
         SESSION_RECORD_HINT,
         heartbeat_command(run_id),
+        HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
+        HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
+        HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
+        HEARTBEAT_INTERVAL_DECISION_MINUTES,
         HOST_SHIFT_DIFFERENCES,
     )
 
@@ -1699,7 +1721,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             kwargs["token_threshold"] = args.token_threshold
         if args.context_hard_cap is not None:
             kwargs["context_hard_cap"] = args.context_hard_cap
-        payload = supervisor_preflight(paths, args.run_id, args.session_record, **kwargs)
+        payload = supervisor_preflight(paths, args.run_id, args.session_record,
+                                       accept_decision=args.accept_decision, **kwargs)
         if payload.get("prepare_handoff"):
             try:
                 handoff, _ = supervisor_handoff(paths, args.run_id, command_prefix=supervisor_command_prefix)
@@ -1714,22 +1737,27 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             plan_id = load_snapshot(paths, args.run_id).plan_id
         except (FileNotFoundError, OSError, TypeError, ValueError):
             plan_id = "<plan_id>"
+        interval = _beat_interval(paths, args.run_id, payload, persist=True)
+        payload["heartbeat_interval"] = interval
+        tail = "；下一拍间隔 {} 分钟".format(interval["minutes"])
         if state == "idle":
+            # 保持输出恰为 "idle"（既有测试与"只回一个字"的约定）；间隔见 JSON 的 heartbeat_interval。
             text = "idle"
         elif state == "decision":
-            text = "decision：读取决策信箱并向用户呈现未答卡片；心跳降频但不暂停，答案写回后恢复推进"
+            text = "decision：读取决策信箱并向用户呈现未答卡片；心跳降频到 {} 分钟但不暂停，答案写回后恢复{}".format(
+                HEARTBEAT_INTERVAL_DECISION_MINUTES, tail)
         elif state == "work":
             text = "work：按 prd-guide §6.1 服务信箱一轮，推进用 {} resume --plan {} --run-id {}".format(
                 supervisor_command_prefix, plan_id, args.run_id
-            )
+            ) + tail
         elif state == "rotate":
             text = "rotate：新开一个会话，让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(
                 supervisor_command_prefix, args.run_id
-            )
+            ) + tail
         else:
             text = "unknown：按 work 处理，推进用 {} resume --plan {} --run-id {}；原因：{}".format(
                 supervisor_command_prefix, plan_id, args.run_id, payload.get("reason", "状态未知")
-            )
+            ) + tail
         code = SUCCESS if state in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
         return _result(
             code,
@@ -1798,7 +1826,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         if args.context_hard_cap is not None:
             kwargs["context_hard_cap"] = args.context_hard_cap
         def compute_preflight():
-            payload = supervisor_preflight(paths, args.run_id, args.session_record, **kwargs)
+            payload = supervisor_preflight(paths, args.run_id, args.session_record,
+                                           accept_decision=args.accept_decision, **kwargs)
             if payload.get("prepare_handoff"):
                 try:
                     handoff, _ = supervisor_handoff(paths, args.run_id, command_prefix=supervisor_command_prefix)
@@ -1812,7 +1841,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                         payload["state"] = "unknown"
             return payload
         payload = preflight_with_checkpoint(paths, args.run_id, args.session_record,
-            compute_preflight, command_prefix=supervisor_command_prefix, **kwargs)
+            compute_preflight, command_prefix=supervisor_command_prefix,
+            accept_decision=args.accept_decision, **kwargs)
+        interval = _beat_interval(paths, args.run_id, payload, persist=False)
+        payload = {**payload, "heartbeat_interval": interval}
         code = SUCCESS if payload["state"] in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
         return _result(code, {"command": args.command, **payload}, "监工预检：{}".format(payload["state"]), args.as_json)
 

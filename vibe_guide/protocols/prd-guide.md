@@ -211,10 +211,10 @@ vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本
 **自建心跳**：vibe 是 CLI，没有常驻进程，心跳只能由宿主 agent 会话承载。用宿主平台原语建一个周期任务（Codex 桌面用 heartbeat automation，可以全自动），心跳指令**逐字使用 vibe 生成的这一行**——未登记时 `vibe monitor` 和 `vibe resume` 都会把填好计划与运行编号的版本打印出来，照抄那份，只替换 `<本会话记录路径>`：
 
 ```text
-vibe supervisor-beat --run-id <run-id> --session-record <本会话记录路径>
+vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>
 ```
 
-逐字照抄这一行，不得另写；每拍只执行一次，按命令输出的分支继续。
+逐字照抄这一行，不得另写；每拍只执行一次，按命令输出的分支继续。心跳周期按 10 分钟建；命令输出末尾给出下一拍间隔：默认 10 分钟，某平台的推送唤醒经真实验证（成功、失败各至少一次原始证据）登记在 `.vibe/push-wake-verification.json` 后为 30 分钟，只剩未答决策时为 60 分钟；与当前周期不一致时按输出调整。
 
 不要自己另写心跳指令，也不要把信箱服务直接写进心跳：自写的心跳每次都跑一整轮 `vibe resume`，跳过预检、不登记、不换班，空闲心跳的成本是设计值的 5–15 倍（2026-10-03 实测）。
 
@@ -452,16 +452,16 @@ worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），
 
 - **WorkBuddy**：`workbuddy_job__*` 五个工具名已登记，对应 WorkBuddy 官方 Jobs API，但**还没有在真实会话里跑通过**。在本机实测之前，不要把它当成已验证的派发路径，也不要据此承诺授权后不用人看。
 
-### 6.5 监工心跳纪律（预检 → idle/work/rotate）
+### 6.5 监工心跳纪律（预检 → idle/work/decision/rotate/unknown）
 
 每次心跳的第一步只跑本地预检，只读磁盘：
 
 ```bash
-vibe supervisor-preflight --run-id <run-id> --session-record <本会话记录路径>
+vibe supervisor-preflight --run-id <run-id> --accept-decision --session-record <本会话记录路径>
 ```
 
 - 每拍只运行生成命令一次，工具返回、重连和上下文恢复续接当前阶段。
-- 输出 `decision`：从 `.vibe/decisions/` 读取并渲染未答卡片；心跳降频但不暂停，答案写回后恢复频率。
+- 输出 `decision`：只有带 `--accept-decision` 才会输出（只剩未答决策、无其他可服务事项时）；旧版指令同一情形收到 `work`，按 `work` 走 resume，由 resume 渲染决策卡片。从 `.vibe/decisions/` 读取并渲染未答卡片；心跳降频到 60 分钟但不暂停，答案消费后恢复；降频状态写在 `.vibe/runs/<run-id>/heartbeat-interval.json`，接班时 `vibe supervisor-handoff` 会打印。
 - 输出 `idle`：所有节点都在运行、已完成或等人拍板，且无新请求。只回一字结束本轮，不做任何写。
 - **等人拍板必须登记**：监工决定把某个节点挂起等用户回答时，先跑 `vibe supervisor-hold --run-id <run-id> --node <节点> --category <product_design|external_authorization|deploy> --reason <一句话原因>`；用户回复后先 `vibe supervisor-hold --run-id <run-id> --node <节点> --release` 再推进。不登记，挂起的请求每次心跳都被当成 `work`，空闲心跳的成本是设计值的数倍（2026-10-05 run 140 实测：60 次预检 46 次误判）。挂起的节点上有 worker 交付或结果时仍然是 `work`。挂起会记下当时全盘节点状态：此后任何节点状态变化，或挂起满 6 小时，预检报 `work`（`hold needs recheck`），复核后仍在等人就对每个挂起节点再跑一次同一条挂起命令刷新。挂起节点的待服务请求在用户答复并解除挂起之前不执行，换班后的新班次同样遵守。`review`/`rework` 状态的节点不能挂起（它们只靠监工推进）。
 - 输出 `work`：有待服务请求、worker 已完工（含已自报但监工还没领取的交付），或有节点处在就绪/重试/未知等需要推进的状态。按 §6.1 原流程服务信箱，状态一律只从磁盘读，不凭记忆。

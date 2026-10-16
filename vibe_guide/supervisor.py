@@ -291,8 +291,9 @@ def supervisor_preflight(
     token_threshold=DEFAULT_ROTATE_TOKEN_THRESHOLD,
     context_hard_cap=DEFAULT_ROTATE_HARD_CAP,
     single_shift=None,
+    accept_decision=False,
 ):
-    """Read-only disk check; returns exactly one of idle/work/rotate/unknown.
+    """Read-only disk check; returns exactly one of idle/work/decision/rotate/unknown.
 
     - ``unknown``: the session record could not be read or parsed (never
       collapsed into idle).
@@ -301,6 +302,11 @@ def supervisor_preflight(
       compact artifact from the CLI; this function itself stays read-only.
       With ``single_shift`` (``supervisor_single_shift`` in
       ``.vibe/config.json`` when not passed) only the hard cap rotates.
+    - ``decision``: only pending human decisions remain and the caller passed
+      ``accept_decision`` (the current heartbeat command does).  A legacy
+      heartbeat that does not know this state gets ``work`` for the same
+      situation, resumes, and ``resume`` renders the decision cards.  Both
+      forms carry ``decision_only`` so the beat can pick the 60-minute interval.
     - ``work``: pending provider requests exist, or a bound worker has
       delivered/finished something not yet consumed.
     - ``idle``: workers are active, or the remaining nodes wait on a human
@@ -337,6 +343,12 @@ def supervisor_preflight(
     except ValueError:
         return {"state": "unknown", "reason": "supervisor holds unreadable"}
     result = _mailbox_state(paths, run_id, holds)
+    if result.get("state") == "decision":
+        result["decision_only"] = True
+        if not accept_decision:
+            result = {key: value for key, value in result.items() if key != "heartbeat"}
+            result["state"] = "work"
+            result["reason"] = "pending decisions (legacy heartbeat: resume renders the cards)"
     result.setdefault("tokens", tokens)
     result.setdefault("baseline", baseline)
     result["context_hard_cap"] = context_hard_cap
@@ -770,13 +782,95 @@ HOST_SHIFT_DIFFERENCES = (
 )
 
 
+#: One source for the beat cadence.  Default 10 minutes; 30 once a platform's
+#: push wake-up is registered as verified (success and failure evidence both);
+#: 60 while the only open item is an unanswered human decision.
+HEARTBEAT_INTERVAL_DEFAULT_MINUTES = 10
+HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES = 30
+HEARTBEAT_INTERVAL_DECISION_MINUTES = 60
+PUSH_WAKE_VERIFICATION_RELATIVE = ".vibe/push-wake-verification.json"
+_HEARTBEAT_INTERVAL_FILE = "heartbeat-interval.json"
+
+
+def _push_wake_verified(paths, provider):
+    """Return (verified, reason); an unreadable registry is named, never silent."""
+    path = Path(paths.root) / PUSH_WAKE_VERIFICATION_RELATIVE
+    if not path.exists():
+        return False, "no push wake verification registered"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        platforms = data["platforms"]
+        if not isinstance(platforms, dict):
+            raise ValueError("platforms must be an object")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return False, "push wake verification unreadable: {}".format(str(error)[:120])
+    entry = platforms.get(provider)
+    if not isinstance(entry, dict):
+        return False, "push wake for {} is not registered".format(provider)
+    for kind in ("success", "failure"):
+        records = entry.get(kind)
+        if not (isinstance(records, list) and any(
+                isinstance(item, dict) and isinstance(item.get("evidence_ref"), str)
+                and item["evidence_ref"].strip() for item in records)):
+            return False, "push wake for {} lacks a {} evidence".format(provider, kind)
+    return True, "push wake for {} verified with success and failure evidence".format(provider)
+
+
+def heartbeat_interval(paths, run_id, *, decision_only):
+    """Pick the next beat interval in minutes with the reason it was chosen."""
+    if decision_only:
+        return {"minutes": HEARTBEAT_INTERVAL_DECISION_MINUTES, "mode": "decision",
+                "reason": "only unanswered decisions remain", "provider": None}
+    try:
+        address = current_supervisor_address(paths, run_id)
+    except (ValueError, OSError) as error:
+        # A damaged lease must not stop the beat: fall back to the default cadence.
+        return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
+                "reason": "supervisor address unreadable: " + str(error)[:200], "provider": None}
+    provider = None
+    if address.get("status") == "ok":
+        provider = address["current"].get("provider")
+    if not isinstance(provider, str) or not provider:
+        return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
+                "reason": "supervisor provider unknown: " + str(address.get("reason", "no provider")),
+                "provider": None}
+    verified, reason = _push_wake_verified(paths, provider)
+    if verified:
+        return {"minutes": HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES, "mode": "push_verified",
+                "reason": reason, "provider": provider}
+    return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
+            "reason": reason, "provider": provider}
+
+
+def read_heartbeat_interval(paths, run_id):
+    """Read the persisted interval state; None when absent or unreadable."""
+    data = _read_json_file(run_dir(paths, run_id) / _HEARTBEAT_INTERVAL_FILE)
+    return data if isinstance(data, dict) and isinstance(data.get("minutes"), int) else None
+
+
+def record_heartbeat_interval(paths, run_id, interval, *, clock=None):
+    """Persist the interval so a takeover supervisor restores it from disk."""
+    from .state import _atomic_bytes
+
+    now = (clock or time.time)()
+    previous = read_heartbeat_interval(paths, run_id)
+    since = previous.get("since") if previous and previous.get("mode") == interval["mode"] else None
+    entry = {
+        "minutes": interval["minutes"], "mode": interval["mode"],
+        "reason": interval["reason"], "provider": interval.get("provider"),
+        "since": since if since is not None else now, "updated_at": now,
+    }
+    _atomic_bytes(run_dir(paths, run_id) / _HEARTBEAT_INTERVAL_FILE, _json_bytes(entry))
+    return entry
+
+
 def heartbeat_command(run_id, *, command_prefix="vibe"):
     """Return the complete one-line command a host may install as a beat."""
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("run_id is required")
     if not isinstance(command_prefix, str) or not command_prefix.strip():
         raise ValueError("command_prefix is required")
-    return "{} supervisor-beat --run-id {} --session-record <本会话记录路径>".format(
+    return "{} supervisor-beat --run-id {} --accept-decision --session-record <本会话记录路径>".format(
         command_prefix.strip(), run_id
     )
 
@@ -835,6 +929,7 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "holds": holds,
         "pending": None if pending is None else len(pending),
         "decisions": decisions,
+        "heartbeat_interval": read_heartbeat_interval(paths, run_id),
         "heartbeat_command": heartbeat_command(run_id, command_prefix=command_prefix),
         "heartbeat_prompt": heartbeat_command(run_id, command_prefix=command_prefix),
         "handoff_summary": summary_ref,
@@ -865,6 +960,9 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "未知" if pending is None else len(pending)))
     lines.append("决策信箱：待回答 {} 项；心跳降频但不暂停".format(
         "未知" if decisions is None else len(decisions)))
+    interval = payload["heartbeat_interval"]
+    lines.append("心跳间隔：当前 {} 分钟（{}，{}）".format(interval["minutes"], interval.get("mode"), interval.get("reason"))
+                 if interval else "心跳间隔：未记录，按默认 {} 分钟建".format(HEARTBEAT_INTERVAL_DEFAULT_MINUTES))
     if decisions:
         for decision in decisions:
             lines.append("  - {}：{}（选项：{}）".format(
