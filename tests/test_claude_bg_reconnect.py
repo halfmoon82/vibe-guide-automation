@@ -236,8 +236,13 @@ class MonitorBackgroundTests(unittest.TestCase):
         registry = self.paths.vibe / "runs" / snapshot.run_id / "tasks.json"
         data = json.loads(registry.read_text(encoding="utf-8"))
         for binding in data["bindings"]:
-            binding["mode"] = "visible"
+            # A loadable visible binding, so only the mode guard can refuse it.
+            binding.update(mode="visible", topology="dual-visible", visible=True,
+                           threadId="thread-1", hostId="local", limitations=[])
         registry.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(
+            load_task_binding(self.paths, "bg", "developer", run_id=snapshot.run_id).mode, "visible"
+        )
         store = ProviderActionStore(self.paths)
         with self.assertRaisesRegex(ValueError, "no dispatched task"):
             store.record_worker_delivery(snapshot.run_id, "bg", "developer", dict(GOOD), generation)
