@@ -122,6 +122,41 @@ class EngineEvidenceRenewalTests(_RunFixture):
         self.assertFalse(self._invalidation().exists(), result.payload)
         self.assertNotEqual(result.payload.get("status"), "ok")
 
+    def _append(self, path):
+        path.write_text(path.read_text(encoding="utf-8") + "\n额外一行改动\n", encoding="utf-8")
+
+    def _assert_invalidated_not_renewed(self):
+        monitor_patch, cli_patch = self._aged()
+        with monitor_patch, cli_patch:
+            result = self._resume()
+        self.assertEqual(result.payload.get("status"), "blocked_design", result.payload)
+        self.assertTrue(self._invalidation().exists())
+        self.assertEqual(self._events("authorization_reauthorized"), [])
+
+    def test_expired_evidence_does_not_launder_an_edited_spec(self):
+        self._append(sorted((self.directory / "specs").glob("*.md"))[0])
+        self._assert_invalidated_not_renewed()
+
+    def test_expired_evidence_does_not_launder_an_edited_issue(self):
+        self._append(sorted((self.directory / "issues").glob("*.md"))[0])
+        self._assert_invalidated_not_renewed()
+
+    def test_expired_evidence_judges_an_allowlist_edit_like_fresh_evidence(self):
+        nodes_path = self.directory / "nodes.json"
+        payload = json.loads(nodes_path.read_text(encoding="utf-8"))
+        target = payload["nodes"][0] if isinstance(payload, dict) else payload[0]
+        target["allowlist"] = list(target.get("allowlist", [])) + ["extra/x.py"]
+        nodes_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        fresh = self._resume()
+        fresh_invalidated = self._invalidation().exists()
+        self.assertTrue(fresh_invalidated, fresh.payload)  # non-vacuous baseline
+        self._invalidation().unlink()
+        monitor_patch, cli_patch = self._aged()
+        with monitor_patch, cli_patch:
+            aged = self._resume()
+        self.assertTrue(self._invalidation().exists(), aged.payload)
+        self.assertEqual(self._events("authorization_reauthorized"), [])
+
     def test_fresh_evidence_is_left_alone(self):
         result = self._resume()
         self.assertNotEqual(result.payload.get("status"), "blocked_design", result.payload)

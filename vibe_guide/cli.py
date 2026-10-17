@@ -87,7 +87,12 @@ from .scanner import scan_project
 from .diagnostics import screen_session, require_session_screened
 from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
 from .workflow_gate import is_v42_sdd_first_state, require_capability_contract
-from .authorize_entry import AuthorizationDenied, materialize_workflow_evidence
+from .authorize_entry import (
+    AuthorizationDenied,
+    load_live_workflow,
+    materialize_workflow_evidence,
+    verify_workflow_artifacts,
+)
 from .attest import record_session_capabilities
 from .protocols import PRD_GUIDE_NAME, load_protocol
 from .state import _atomic_bytes, load_events, load_snapshot, validate_run_id
@@ -1122,6 +1127,17 @@ def _renew_engine_attestation_if_stale(
         == require_capability_contract(paths).contract_digest
     )
     if not contract_unchanged:
+        return None
+    # Same workflow-evidence drift test resume applies under fresh evidence:
+    # an expired attestation must never launder an edited Spec/Issue/node file.
+    # Any drift (or missing evidence) falls through to the ordinary gate, which
+    # invalidates the authorization.
+    live_workflow = load_live_workflow(paths, plan.plan_id)
+    if live_workflow is None:
+        return None
+    try:
+        verify_workflow_artifacts(paths, live_workflow, run_started=True)
+    except AuthorizationDenied:
         return None
     fresh = _observed_engine_attestation(paths, plan)
     refreshed = refresh_authorization_card(
