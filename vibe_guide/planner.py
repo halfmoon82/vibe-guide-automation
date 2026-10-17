@@ -308,10 +308,13 @@ _SCOPE_REASON_LIMIT = 200
 def _is_dependency_manifest_name(name: str) -> bool:
     """Whether ``name`` declares third-party dependencies.
 
-    A manifest is the dependency fact itself, so it never qualifies for an
-    acceptance-unchanged scope expansion -- not under ``tests/``, not in the
-    configured ``auto_scope_paths`` list, and not through an approved claim
-    (B1: a new dependency is always a product-manager question).
+    A manifest outside ``tests/`` is the product dependency fact itself, so
+    it never qualifies for an acceptance-unchanged scope expansion -- not in
+    the configured ``auto_scope_paths`` list and not through an approved
+    claim (B1: a new product dependency is always a product-manager
+    question).  Manifests under ``tests/`` stay governed by the mechanical
+    ``tests_dir`` rule: the PM ruled (2026-10-15) they do not count as a new
+    third-party dependency and may auto-expand.
     """
     return (
         name in _DEPENDENCY_FILE_NAMES
@@ -341,8 +344,6 @@ def auto_scope_rule(path: Any, auto_scope_paths: Any = ()) -> Optional[str]:
     if any(part.casefold() == ".git" for part in path.split("/")):
         return None
     name = path.rsplit("/", 1)[-1].casefold()
-    if _is_dependency_manifest_name(name):
-        return None
     if (
         name == ".env"
         or name.startswith(_CREDENTIAL_PREFIXES)

@@ -727,27 +727,43 @@ class ACB3ThirdPartyDependencyTests(_ProjectCase):
                     acceptance_rule_approved=True,
                 ))
 
-    def test_ac_b3_dependency_manifest_under_tests_still_asks_pm(self):
-        """A manifest placed under tests/ still declares a third-party dependency.
+    def test_ac_b3_dependency_manifest_under_tests_may_auto_expand(self):
+        """PM decision 2 (2026-10-15): a manifest under tests/ may auto-expand.
 
-        Neither the mechanical ``tests_dir`` rule nor an approved claim may
-        auto-expand it: B1 says a new dependency is always a PM question,
-        regardless of where the file sits.
+        The PM ruled that a dependency manifest placed under ``tests/`` does
+        not count as a new third-party dependency, so the mechanical
+        ``tests_dir`` rule and an approved claim both widen scope for it.
+        Manifests elsewhere are the product dependency fact itself and stay
+        blocked (see the root-path case above).  This test used to assert
+        the opposite; the ruling said the assertion was what had to change
+        (run-9edb07bb integration-review reports g2/g3).
         """
         for path in ("tests/requirements.txt", "tests/package.json",
                      "tests/pyproject.toml"):
             with self.subTest(path=path):
                 mechanical = resolve_scope_expansion([path], ["n1.py"], ["n1.py"])
+                self.assertIsNotNone(
+                    mechanical,
+                    "PM decision 2: {} under tests/ must auto-expand via the "
+                    "tests_dir rule".format(path),
+                )
+                self.assertEqual(
+                    mechanical.scope_rules,
+                    [{"path": path, "rule": "tests_dir"}],
+                )
                 claimed = resolve_scope_expansion(
                     _scope_claim([path]), ["n1.py"], ["n1.py"],
                     acceptance_rule_approved=True,
                 )
-                self.assertIsNone(
-                    mechanical,
-                    "AC-B3: {} auto-expanded via rule {!r} without asking the "
-                    "PM".format(path, mechanical and mechanical.scope_rules),
+                self.assertIsNotNone(
+                    claimed,
+                    "PM decision 2: an approved claim must also widen {} "
+                    "under tests/".format(path),
                 )
-                self.assertIsNone(claimed)
+                self.assertEqual(
+                    claimed.scope_rules,
+                    [{"path": path, "rule": "tests_dir"}],
+                )
 
     def _review_finding_run(self, files, adds_dependency):
         """Ordinary rework path: a finding whose fix needs files outside scope.
