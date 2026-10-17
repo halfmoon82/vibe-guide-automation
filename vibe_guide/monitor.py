@@ -3671,6 +3671,17 @@ class Monitor:
                 ):
                     if current.get("status") not in {"blocked_unknown", "retry_pending"}:
                         current["retryable_action"] = None
+                    if (
+                        str(retry.get("role")) == "reviewer"
+                        and current.get("reviewer_replacement_required")
+                        and current.get("status") == "review"
+                    ):
+                        # A scheduled successor review is now live: close the
+                        # replacement gate exactly like the delivery-time
+                        # successor dispatch does above.  Leaving it open
+                        # would force yet another fresh identity on the next
+                        # review round instead of continuing this reviewer.
+                        current["reviewer_replacement_required"] = False
                 continue
             if current.get("status") == "delivered" and not current.get("reviewer_started"):
                 if self._node_dispatch_topology(node) == TOPOLOGY_VISIBLE_SDD:
@@ -4103,6 +4114,13 @@ class Monitor:
         current[generation_key] = generation
         if role == "reviewer":
             current["reviewer_started"] = True
+            if successor:
+                # A fresh reviewer identity starts a fresh unconverged-loop
+                # budget: the three-finding limit exists to stop ping-pong
+                # under one reviewer, so replacing the reviewer must actually
+                # break the loop instead of parking on the successor's very
+                # first finding (#153).
+                current["review_loop_rounds"] = 0
 
         contract = dict(node.contract)
         contract.update(current.get("contract_overrides", {}))
@@ -4806,6 +4824,13 @@ class Monitor:
         # The registered binding must match the dispatch ruling.  A bridge
         # that cannot honor the ruled topology (e.g. no visible session for a
         # visible-sdd node) is fail-closed, never silently downgraded.
+        if continuation and previous_binding is not None and previous_binding.successor_of and not binding.successor_of:
+            # Immutable ancestry (task_registry.save_task_binding): resuming a
+            # successor task must keep its predecessor link.  Dropping it makes
+            # the registry refuse the continuation as "immutable successor
+            # ancestry drift" and strands the node in blocked_unknown after a
+            # replacement reviewer's next finding.
+            binding.successor_of = previous_binding.successor_of
         expected_topology = str(contract.get("topology") or TOPOLOGY_DUAL_VISIBLE)
         if binding.topology != expected_topology:
             raise ValueError(
@@ -5396,14 +5421,91 @@ class Monitor:
                 )
                 return
             if disposition == "implementation" and event.data.get("consistency") is None:
+                if self._finding_changes_prd_acceptance(event.data):
+                    # A disagreement about the acceptance judgment itself is a
+                    # product decision: escalate to the PM instead of spending
+                    # the engineering rework budget on it (#153).
+                    if not self._stop_active_for_transition(
+                        snapshot, node_id, role, handle_id, runner, "blocked_design"
+                    ):
+                        return
+                    current["status"] = "blocked_design"
+                    current["blocked_design_cause"] = "out_of_contract_finding"
+                    current["reason"] = redact_provider_text(
+                        event.data.get("finding", "out-of-contract finding")
+                    )
+                    current["old_task_reconciled"] = True
+                    current["active_role"] = None
+                    current["active_task"] = None
+                    snapshot.handles.pop(node_id, None)
+                    self._release_node_lease(snapshot, node_id)
+                    self._record(
+                        snapshot,
+                        "blocked_design",
+                        {
+                            "run_id": snapshot.run_id,
+                            "node_id": node_id,
+                            "reason": current["reason"],
+                            "old_task_reconciled": True,
+                            "blocked_design_cause": "out_of_contract_finding",
+                        },
+                    )
+                    self._ensure_blocked_design_decision(snapshot, node_id)
+                    return
                 try:
-                    review_round = int(current.get("review_generation", 0))
+                    review_round = int(current.get("review_loop_rounds", 0)) + 1
                 except (TypeError, ValueError):
-                    review_round = 0
+                    review_round = 1
+                current["review_loop_rounds"] = review_round
                 if review_round >= 3:
+                    # Three unconverged rework rounds: the fix is a different
+                    # reviewer (or a split node), never another automatic
+                    # rework round and never a PM question (#153).  Park the
+                    # node with the documented action; executing it
+                    # (``vibe repair``) dispatches a successor reviewer.
+                    if not self._stop_active_for_transition(
+                        snapshot, node_id, role, handle_id, runner, "stopped"
+                    ):
+                        return
                     current["status"] = "blocked_unknown"
-                    current["reason"] = "review loop limit reached; reconcile or repair required"
-                    current["recovery_action"] = "repair_node"
+                    current["reason"] = (
+                        "review loop limit reached; change reviewer or split node required"
+                    )
+                    current["recovery_action"] = "change_reviewer_or_split_node"
+                    current["reviewer_replacement_required"] = True
+                    current["reviewer_started"] = False
+                    # Keep the stopped identity as the successor predecessor so
+                    # the replacement review cannot accidentally reuse it.
+                    current["reviewer_identity"] = active.get("task_id")
+                    current["active_role"] = None
+                    current["active_task"] = None
+                    snapshot.handles.pop(node_id, None)
+                    self._release_node_lease(snapshot, node_id)
+                    self._record(
+                        snapshot,
+                        "review_loop_limit_reached",
+                        {
+                            "run_id": snapshot.run_id,
+                            "node_id": node_id,
+                            "reason": current["reason"],
+                            "recovery_action": "change_reviewer_or_split_node",
+                            # The durable schema keeps structured values only
+                            # under pass-through keys, so the replay branch
+                            # restores the park from ``proof`` -- top-level
+                            # review_round / reviewer_replacement_required
+                            # would be dropped by _sanitize_event_data, and a
+                            # top-level ``reason`` would be redacted as
+                            # provider text even though it is a vibe-authored
+                            # fixed string.
+                            "proof": {
+                                "park_reason": current["reason"],
+                                "review_loop_rounds": review_round,
+                                "reviewer_replacement_required": True,
+                                "reviewer_identity": current.get("reviewer_identity"),
+                            },
+                        },
+                        active,
+                    )
                     return
                 current["active_role"] = None
                 current["active_task"] = None
@@ -5880,6 +5982,11 @@ class Monitor:
             "acceptance paused: blocked_unknown items await disposition"
         )
         current["blocked_unknowns_pending"] = list(undisposed)
+        # The recovery entry is the disposition recorder itself: every pending
+        # item is answered through Monitor.record_blocked_unknown_disposition
+        # (#153).  Naming it keeps this blocked_unknown on the same "every
+        # reason names a documented action" contract as the other causes.
+        current["recovery_action"] = "record_blocked_unknown_disposition"
         active = current.get("active_task")
         self._record(
             snapshot,
@@ -6459,6 +6566,52 @@ class Monitor:
         current = snapshot.nodes[node_id]
         before = {key: current.get(key) for key in ("task_id", "generation", "writer", "lease", "cursor", "intent_digest", "contract_digest")}
         reason = str(current.get("reason") or "repair requested")
+        if (
+            current.get("recovery_action") == "change_reviewer_or_split_node"
+            and current.get("reviewer_replacement_required")
+        ):
+            # A three-round unconverged review loop (#153) is repaired by
+            # replacing the reviewer identity, not by re-polling the stopped
+            # task.  Every identity field stays untouched (so
+            # ``preserved_identity`` remains true); only the live handle is
+            # retired and a retry marker queues the successor review for the
+            # scheduler, which dispatches it with a fresh reviewer task id.
+            current["status"] = "rework"
+            current["reviewer_started"] = False
+            # Retire the pair slot so the scheduler's ``pending_schedule``
+            # retry can dispatch the successor review inside the concurrency
+            # budget; the dispatch itself re-activates the slot.
+            current["pair_archived"] = True
+            current["retryable_action"] = {
+                "action": "change_reviewer_or_split_node",
+                "role": "reviewer",
+                "phase": "review",
+                "continuation": False,
+                "pending_schedule": True,
+                "successor": True,
+                "same_task": False,
+                "same_task_required": False,
+                "predecessor_task_id": current.get("reviewer_identity"),
+                "reason": reason,
+            }
+            after = {key: current.get(key) for key in before}
+            preserved = before == after
+            reconciliation = {
+                "git": {"observed": False},
+                "provider": {"observed": False, "status": "unavailable"},
+            }
+            self._record(snapshot, "node_repaired", {"run_id": snapshot.run_id, "node_id": node_id,
+                "kind": "reviewer_replacement", "preserved_identity": preserved,
+                "repair_action": "change_reviewer_or_split_node", "same_task": False,
+                "reconciliation": reconciliation,
+                "task_id": current.get("task_id"), "generation": current.get("generation")})
+            self._save_snapshot(snapshot)
+            return {"node_id": node_id, "kind": "reviewer_replacement", "preserved_identity": preserved,
+                    "status": current.get("status"), "task_id": current.get("task_id"),
+                    "generation": current.get("generation"),
+                    "repair_action": "change_reviewer_or_split_node",
+                    "recovery_action": current.get("recovery_action"),
+                    "run_id": snapshot.run_id, "reconciliation": reconciliation}
         classification = classify_provider_failure({"reason": reason})
         if classification["kind"] == "binding_unknown":
             current["status"] = "blocked_unknown"
@@ -7516,6 +7669,40 @@ class Monitor:
                     current["owner_layer"] = "product_acceptance"
                     current["recovery_action"] = None
                     current["user_interrupt"] = True
+                current["active_role"] = None
+                current["active_task"] = None
+                snapshot.handles.pop(node_id, None)
+                self._release_node_lease(snapshot, node_id)
+            elif record["event"] == "review_loop_limit_reached":
+                # Crash-window twin of the live three-round park: the event
+                # was appended but the snapshot save missed it.  Restore the
+                # same fail-closed park so the recovery entry stays executable
+                # instead of degrading to the generic manual-reconciliation
+                # state (the known cost of the older reviewer_write_violation
+                # event, which has no such branch).
+                proof = data.get("proof")
+                if (
+                    data.get("recovery_action") != "change_reviewer_or_split_node"
+                    or not isinstance(proof, dict)
+                    or not isinstance(proof.get("park_reason"), str)
+                    or not proof.get("park_reason")
+                    or not isinstance(proof.get("review_loop_rounds"), int)
+                    or isinstance(proof.get("review_loop_rounds"), bool)
+                    or proof.get("reviewer_replacement_required") is not True
+                    or not isinstance(proof.get("reviewer_identity"), str)
+                    or not proof.get("reviewer_identity")
+                ):
+                    raise ValueError("replayed review loop limit evidence is invalid")
+                current["status"] = "blocked_unknown"
+                # Restore the vibe-authored park reason from ``proof``: the
+                # top-level ``reason`` is redacted as provider text on write
+                # (``reason`` is a _PROVIDER_TEXT_KEYS member).
+                current["reason"] = proof["park_reason"]
+                current["recovery_action"] = "change_reviewer_or_split_node"
+                current["reviewer_replacement_required"] = True
+                current["reviewer_started"] = False
+                current["review_loop_rounds"] = proof["review_loop_rounds"]
+                current["reviewer_identity"] = proof["reviewer_identity"]
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)

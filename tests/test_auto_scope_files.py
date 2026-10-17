@@ -1332,5 +1332,60 @@ class MonitorAutoScopeTests(unittest.TestCase):
         )
 
 
+class AgentsSectionSixPatchTests(unittest.TestCase):
+    """#157 landed: AGENTS.md §6 separates product scope from file lists.
+
+    The patch is the host rule the ``acceptance_scope_rule_approved`` flag
+    depends on (config.py: the flag is "true only after the product manager
+    has approved and written the AGENTS.md §6 patch").  Anchoring the text
+    keeps the shipped rule and the config flag from drifting apart.
+    """
+
+    REPO_ROOT = Path(__file__).resolve().parents[1]
+
+    def _section_six(self):
+        text = (self.REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("## 6. 监工与授权", text)
+        return text.split("## 6. 监工与授权", 1)[1].split("\n## ", 1)[0]
+
+    def test_section_six_carries_the_acceptance_judgment_criterion(self):
+        section = self._section_six()
+        for fact in (
+            "验收例子",  # the judgment-unchanged criterion
+            "acceptance_scope_rule_approved",  # the flag, paired with this rule
+            "第三方依赖",  # always-human boundary 1
+            "后台不可见",  # always-human boundary 2 (visible->background)
+            "依赖清单",  # manifests never auto-expand, at any path
+            "唯一 writer",  # engineering boundary survives the patch
+        ):
+            self.assertIn(
+                fact, section,
+                "#157: AGENTS.md §6 must state {!r}".format(fact),
+            )
+
+    def test_section_six_keeps_the_flag_paired_with_the_rule(self):
+        section = self._section_six()
+        flag_line = next(
+            (l for l in section.splitlines() if "acceptance_scope_rule_approved" in l),
+            "",
+        )
+        self.assertTrue(
+            flag_line,
+            "#157: AGENTS.md §6 must name the acceptance_scope_rule_approved flag",
+        )
+        self.assertIn(
+            "本节规则", flag_line,
+            "#157: the flag line must say the switch pairs with this section",
+        )
+
+    def test_flag_stays_off_by_default_until_the_project_opts_in(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = ProjectPaths(Path(temporary))
+            paths.vibe.mkdir(parents=True, exist_ok=True)
+            self.assertFalse(
+                load_project_config(paths.root).acceptance_scope_rule_approved
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -305,6 +305,27 @@ _SENSITIVE_SCOPE_DIRS = {
 _SCOPE_REASON_LIMIT = 200
 
 
+def _is_dependency_manifest_name(name: str) -> bool:
+    """Whether ``name`` declares third-party dependencies.
+
+    A manifest outside ``tests/`` is the product dependency fact itself, so
+    it never qualifies for an acceptance-unchanged scope expansion -- not in
+    the configured ``auto_scope_paths`` list and not through an approved
+    claim (B1: a new product dependency is always a product-manager
+    question).  Manifests under ``tests/`` stay governed by the mechanical
+    ``tests_dir`` rule: the PM ruled (2026-10-15) they do not count as a new
+    third-party dependency and may auto-expand.
+    """
+    return (
+        name in _DEPENDENCY_FILE_NAMES
+        or name.startswith("requirements")
+        and name.endswith((".in", ".txt", ".pip"))
+        or name.startswith("constraints")
+        and name.endswith((".in", ".txt", ".pip"))
+        or name in {"pipfile", "pipfile.lock", "environment.yml", "environment.yaml"}
+    )
+
+
 def auto_scope_rule(path: Any, auto_scope_paths: Any = ()) -> Optional[str]:
     """Return why `path` may join a node's scope without the user, else None.
 
@@ -367,14 +388,7 @@ def _approved_scope_rule(path: str) -> Optional[str]:
     if any(part in _SENSITIVE_SCOPE_DIRS or part in _AGENT_CONTROL_DIRS
            for part in lowered[:-1]):
         return None
-    if (
-        name in _DEPENDENCY_FILE_NAMES
-        or name.startswith("requirements")
-        and name.endswith((".in", ".txt", ".pip"))
-        or name.startswith("constraints")
-        and name.endswith((".in", ".txt", ".pip"))
-        or name in {"pipfile", "pipfile.lock", "environment.yml", "environment.yaml"}
-    ):
+    if _is_dependency_manifest_name(name):
         return None
     if (
         name == ".env"
