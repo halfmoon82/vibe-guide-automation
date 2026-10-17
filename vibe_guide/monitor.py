@@ -5396,14 +5396,78 @@ class Monitor:
                 )
                 return
             if disposition == "implementation" and event.data.get("consistency") is None:
+                if self._finding_changes_prd_acceptance(event.data):
+                    # A disagreement about the acceptance judgment itself is a
+                    # product decision: escalate to the PM instead of spending
+                    # the engineering rework budget on it (#153).
+                    if not self._stop_active_for_transition(
+                        snapshot, node_id, role, handle_id, runner, "blocked_design"
+                    ):
+                        return
+                    current["status"] = "blocked_design"
+                    current["blocked_design_cause"] = "out_of_contract_finding"
+                    current["reason"] = redact_provider_text(
+                        event.data.get("finding", "out-of-contract finding")
+                    )
+                    current["old_task_reconciled"] = True
+                    current["active_role"] = None
+                    current["active_task"] = None
+                    snapshot.handles.pop(node_id, None)
+                    self._release_node_lease(snapshot, node_id)
+                    self._record(
+                        snapshot,
+                        "blocked_design",
+                        {
+                            "run_id": snapshot.run_id,
+                            "node_id": node_id,
+                            "reason": current["reason"],
+                            "old_task_reconciled": True,
+                            "blocked_design_cause": "out_of_contract_finding",
+                        },
+                    )
+                    self._ensure_blocked_design_decision(snapshot, node_id)
+                    return
                 try:
                     review_round = int(current.get("review_generation", 0))
                 except (TypeError, ValueError):
                     review_round = 0
                 if review_round >= 3:
+                    # Three unconverged rework rounds: the fix is a different
+                    # reviewer (or a split node), never another automatic
+                    # rework round and never a PM question (#153).  Park the
+                    # node with the documented action; executing it
+                    # (``vibe repair``) dispatches a successor reviewer.
+                    if not self._stop_active_for_transition(
+                        snapshot, node_id, role, handle_id, runner, "stopped"
+                    ):
+                        return
                     current["status"] = "blocked_unknown"
-                    current["reason"] = "review loop limit reached; reconcile or repair required"
-                    current["recovery_action"] = "repair_node"
+                    current["reason"] = (
+                        "review loop limit reached; change reviewer or split node required"
+                    )
+                    current["recovery_action"] = "change_reviewer_or_split_node"
+                    current["reviewer_replacement_required"] = True
+                    current["reviewer_started"] = False
+                    # Keep the stopped identity as the successor predecessor so
+                    # the replacement review cannot accidentally reuse it.
+                    current["reviewer_identity"] = active.get("task_id")
+                    current["active_role"] = None
+                    current["active_task"] = None
+                    snapshot.handles.pop(node_id, None)
+                    self._release_node_lease(snapshot, node_id)
+                    self._record(
+                        snapshot,
+                        "review_loop_limit_reached",
+                        {
+                            "run_id": snapshot.run_id,
+                            "node_id": node_id,
+                            "reason": current["reason"],
+                            "review_round": review_round,
+                            "reviewer_replacement_required": True,
+                            "recovery_action": "change_reviewer_or_split_node",
+                        },
+                        active,
+                    )
                     return
                 current["active_role"] = None
                 current["active_task"] = None
@@ -5880,6 +5944,11 @@ class Monitor:
             "acceptance paused: blocked_unknown items await disposition"
         )
         current["blocked_unknowns_pending"] = list(undisposed)
+        # The recovery entry is the disposition recorder itself: every pending
+        # item is answered through Monitor.record_blocked_unknown_disposition
+        # (#153).  Naming it keeps this blocked_unknown on the same "every
+        # reason names a documented action" contract as the other causes.
+        current["recovery_action"] = "record_blocked_unknown_disposition"
         active = current.get("active_task")
         self._record(
             snapshot,
@@ -6459,6 +6528,52 @@ class Monitor:
         current = snapshot.nodes[node_id]
         before = {key: current.get(key) for key in ("task_id", "generation", "writer", "lease", "cursor", "intent_digest", "contract_digest")}
         reason = str(current.get("reason") or "repair requested")
+        if (
+            current.get("recovery_action") == "change_reviewer_or_split_node"
+            and current.get("reviewer_replacement_required")
+        ):
+            # A three-round unconverged review loop (#153) is repaired by
+            # replacing the reviewer identity, not by re-polling the stopped
+            # task.  Every identity field stays untouched (so
+            # ``preserved_identity`` remains true); only the live handle is
+            # retired and a retry marker queues the successor review for the
+            # scheduler, which dispatches it with a fresh reviewer task id.
+            current["status"] = "rework"
+            current["reviewer_started"] = False
+            # Retire the pair slot so the scheduler's ``pending_schedule``
+            # retry can dispatch the successor review inside the concurrency
+            # budget; the dispatch itself re-activates the slot.
+            current["pair_archived"] = True
+            current["retryable_action"] = {
+                "action": "change_reviewer_or_split_node",
+                "role": "reviewer",
+                "phase": "review",
+                "continuation": False,
+                "pending_schedule": True,
+                "successor": True,
+                "same_task": False,
+                "same_task_required": False,
+                "predecessor_task_id": current.get("reviewer_identity"),
+                "reason": reason,
+            }
+            after = {key: current.get(key) for key in before}
+            preserved = before == after
+            reconciliation = {
+                "git": {"observed": False},
+                "provider": {"observed": False, "status": "unavailable"},
+            }
+            self._record(snapshot, "node_repaired", {"run_id": snapshot.run_id, "node_id": node_id,
+                "kind": "reviewer_replacement", "preserved_identity": preserved,
+                "repair_action": "change_reviewer_or_split_node", "same_task": False,
+                "reconciliation": reconciliation,
+                "task_id": current.get("task_id"), "generation": current.get("generation")})
+            self._save_snapshot(snapshot)
+            return {"node_id": node_id, "kind": "reviewer_replacement", "preserved_identity": preserved,
+                    "status": current.get("status"), "task_id": current.get("task_id"),
+                    "generation": current.get("generation"),
+                    "repair_action": "change_reviewer_or_split_node",
+                    "recovery_action": current.get("recovery_action"),
+                    "run_id": snapshot.run_id, "reconciliation": reconciliation}
         classification = classify_provider_failure({"reason": reason})
         if classification["kind"] == "binding_unknown":
             current["status"] = "blocked_unknown"
