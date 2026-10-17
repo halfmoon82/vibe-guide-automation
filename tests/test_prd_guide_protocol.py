@@ -102,6 +102,158 @@ class ProtocolShippingTests(unittest.TestCase):
             self.assertIn(marker, text, marker)
 
 
+class ScopeRuleSectionTests(unittest.TestCase):
+    """§4/§6.2/§7 must not present a file-list change as a product decision.
+
+    Issue #145: the same word "范围" meant both the product scope (a product
+    manager boundary) and the authorization card's file list (an engineering
+    detail), so a one-file correction asked the product manager to re-authorize.
+    The protocol now separates them and names the approved criterion; these
+    tests pin the wording to the code that implements it.
+    """
+
+    PRODUCT_SCOPE_RULE = (
+        "修改后，PRD 里每条验收例子的判定结果是否改变——不变就由监工自决并留痕，"
+        "变了才问产品经理；另外两类无论如何都问：新增第三方依赖（发布/安全对外承诺）、"
+        "执行模式从「可见可进入的任务」降级为「后台不可见」。"
+    )
+
+    def _sections(self):
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("prd-guide")
+        return text, self._section(text, "## 4. 拆节点"), \
+            self._section(text, "## 6. 服务监工信箱"), \
+            self._section(text, "## 7. 什么时候才能打断产品经理")
+
+    def _section(self, text, heading):
+        """Return one numbered section, up to the next heading at the same level.
+
+        Slicing to the next ``## `` keeps an assertion from being satisfied by
+        a later section; a renamed heading fails here with a readable message
+        instead of an opaque ValueError from ``str.index``.
+        """
+        self.assertIn(heading, text, "protocol section heading moved: " + heading)
+        start = text.index(heading)
+        rest = text[start + len(heading):]
+        end = rest.find("\n## ")
+        return heading + (rest if end == -1 else rest[:end])
+
+    def test_file_list_is_an_engineering_boundary_not_a_product_one(self):
+        _text, section_4, _section_6, _section_7 = self._sections()
+        self.assertIn("工程文件清单", section_4)
+        self.assertIn("不是产品范围", section_4)
+        self.assertNotIn("其他文件漏列仍必须请产品经理授权", section_4)
+
+    def test_both_scope_criteria_are_named(self):
+        _text, section_4, _section_6, _section_7 = self._sections()
+        self.assertIn("判据一", section_4)
+        self.assertIn("判据二", section_4)
+        # Criterion two is opt-in per project: the protocol must name the very
+        # config field the monitor reads, and must say that it is conditional.
+        # Naming the field without the condition reads as "always available",
+        # which sends the supervisor back to the product manager for a file
+        # that the default configuration would reject.
+        from vibe_guide.config import FIELD_ACCEPTANCE_SCOPE_RULE
+        self.assertIn(FIELD_ACCEPTANCE_SCOPE_RULE, section_4)
+        self.assertIn(
+            "只在项目于 `.vibe/config.json` 写入 `{}: true` 后生效".format(
+                FIELD_ACCEPTANCE_SCOPE_RULE
+            ),
+            section_4,
+        )
+        self.assertIn("未开启的项目一律按判据一处理", section_4)
+        # Criterion two is limited to low-risk files; without that qualifier the
+        # prose promises more than `_approved_scope_rule` allows.
+        self.assertIn("低风险源码或文档", section_4)
+        # And criterion one is described truthfully: a registered
+        # `auto_scope_paths` entry is the product manager's own pre-approval,
+        # so that branch does not re-check the dependency/sensitive lists.
+        self.assertIn("不再逐条检查", section_4)
+        # Matching is exact; a reader who registers a glob would otherwise
+        # expect it to work and see nothing expand.
+        self.assertIn("不支持通配符", section_4)
+        # The pointer has to name the function that actually decides the
+        # suffix whitelist and the exclusions, not just half of it.
+        self.assertIn("planner._approved_scope_rule", section_4)
+        # Files outside both criteria still need a separate authorization.
+        self.assertIn("请产品经理单独授权", section_4)
+
+    def test_scope_expansion_payload_shape_matches_the_code(self):
+        """#146 residual: the claim shape was implemented but never documented.
+
+        The documented key list is parsed and compared as a set, so renaming a
+        key, adding a sixth key or spelling one in another case fails here.
+        Substring matching over the whole section would survive all three
+        (``files`` also appears elsewhere).
+        """
+        from vibe_guide.planner import _SCOPE_EXPANSION_KEYS
+        _text, section_4, _section_6, _section_7 = self._sections()
+        marker = "**恰好五个键**："
+        self.assertIn(marker, section_4)
+        sentence = section_4.split(marker, 1)[1].split("。", 1)[0]
+        documented = set(re.findall(r"`([^`]+)`", sentence)) - {"true", "false"}
+        self.assertEqual(documented, set(_SCOPE_EXPANSION_KEYS))
+        self.assertIn("vibe scope-expand", section_4)
+        # The call is only accepted on a settled node; the prose has to say so
+        # or a supervisor tries it mid-development and gets a hard error.
+        self.assertIn("已验收、当前没有活跃任务", section_4)
+
+    def test_a_bad_path_rejects_the_whole_request(self):
+        """No partial expansion: one rejected path must not let the rest through."""
+        from vibe_guide.planner import resolve_scope_expansion
+        _text, section_4, _section_6, _section_7 = self._sections()
+        self.assertIn("不做部分补入", section_4)
+        # The prose claim is checked against the code it describes, in both
+        # accepted shapes: the legacy path list and the five-key claim.
+        self.assertIsNone(
+            resolve_scope_expansion(
+                ["tests/test_a.py", "src/app.css"], authorized_files=[], node_files=()
+            )
+        )
+        self.assertIsNone(
+            resolve_scope_expansion(
+                ["tests/test_a.py", "tests/test_a.py"], authorized_files=[], node_files=()
+            )
+        )
+        claim = {
+            "files": ["tests/test_a.py", "src/app.css"],
+            "acceptance_examples_unchanged": True,
+            "adds_third_party_dependency": False,
+            "visibility_downgrade": False,
+            "reason": "mechanical follow-up",
+        }
+        self.assertIsNone(
+            resolve_scope_expansion(
+                claim, authorized_files=[], node_files=(), acceptance_rule_approved=True
+            )
+        )
+
+    def test_release_is_not_a_second_human_approval_gate(self):
+        _text, _section_4, section_6, _section_7 = self._sections()
+        self.assertIn("没有第二道人工审批门", section_6)
+        self.assertNotIn("放行仍然是人的决定", section_6)
+        # The paragraph still has to say the gate does not verify the claim.
+        self.assertIn("这道门只记账", section_6)
+
+    def test_interrupt_criterion_is_stated_verbatim(self):
+        _text, _section_4, _section_6, section_7 = self._sections()
+        self.assertIn(self.PRODUCT_SCOPE_RULE, section_7)
+
+    def test_interrupt_criterion_carries_its_enabling_condition(self):
+        """§7 is what the supervisor reads before interrupting; it must not
+        imply that criterion two works without the project's opt-in."""
+        from vibe_guide.config import FIELD_ACCEPTANCE_SCOPE_RULE
+        _text, _section_4, _section_6, section_7 = self._sections()
+        self.assertIn(FIELD_ACCEPTANCE_SCOPE_RULE, section_7)
+        self.assertIn("只在项目开启", section_7)
+        self.assertIn("未开启的项目按判据一处理", section_7)
+        # A file outside criterion one still needs a separate authorization;
+        # saying otherwise would leave the supervisor with no executable exit.
+        self.assertIn("文件本身越界", section_7)
+        self.assertIn("会问产品经理", section_7)
+        self.assertNotIn("登记为后续问题", section_7)
+
+
 class MailboxSectionTests(unittest.TestCase):
     """The mailbox section must stay true to the code that serves it.
 
