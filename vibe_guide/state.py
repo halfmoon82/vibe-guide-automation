@@ -146,6 +146,12 @@ _EVENT_DATA_KEYS = {
     # so the monitor can register vibe-authored decision text after a replay.
     "blocked_design_cause",
     "blocked_design_target",
+    "blocked_design_files",
+    # decision_answer_applied: which consumed answers moved the node, and the
+    # fixed-enum transition they selected.  Replay needs both to land on the
+    # same state after a restart.
+    "answer_action",
+    "decision_answers",
     # Notification bridge outcome (accepted/unknown/disabled) of a decision the
     # monitor registered itself; kept as evidence for the PM-visibility chain.
     "notification_status",
