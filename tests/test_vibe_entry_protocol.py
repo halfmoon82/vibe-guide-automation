@@ -98,7 +98,9 @@ class VibeEntryProtocolShippingTests(unittest.TestCase):
         text = load_protocol("vibe-entry")
         self.assertIn("排查", text)
         self.assertIn("只读", text)
-        self.assertIn("拿不准一律按 >15 处理", text)
+        self.assertIn("拿不准按轻规划处理", text)
+        self.assertNotIn("拿不准一律按 >15 处理", text)
+        self.assertIn("3 个以上可同时开工", text)
 
     def test_protocol_states_host_statusline_merge_rule(self):
         # Same merge rule as the AGENTS.md block: hosts with their own

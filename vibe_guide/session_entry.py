@@ -5,7 +5,7 @@ It deliberately has no provider, writer, or monitor side effects; execution is
 handled by the later authorization boundary.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import os
@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .planner import RouteResult, S0Result, S1Score, TaskContext, classify_s0, parse_s1_context, route_task, score_s1
+from .planner import RouteResult, S0Result, S1Score, TaskContext, EXPLICIT_COMPLEX_FLAG, asks_for_complex, classify_s0, is_continuation_message, parse_s1_context, route_task, score_s1
 
 
 def _normalize_request(request: str) -> str:
@@ -258,10 +258,42 @@ def materialize_session_entry(paths: Any, entry: SessionEntry) -> Path:
     return root
 
 
+CONTINUE_CURRENT = "continue_current"
+
+
+class ContinuationMessage(ValueError):
+    """The request only confirms/selects/continues work already under way."""
+
+
+def entry_route(request: str, s1: Any = None, current_tier: Optional[str] = None) -> Dict[str, Any]:
+    """Route a message without creating a plan: simple / light_plan / complex /
+    continue_current.
+
+    A confirm/select/continue reply returns ``continue_current`` carrying the
+    session's current tier; it is never re-scored.  Everything else is scored
+    and routed exactly as ``build_session_entry`` would.
+    """
+    normalized = _normalize_request(request)
+    if not normalized:
+        raise ValueError("request is required")
+    if s1 is None and is_continuation_message(normalized):
+        return {"route": CONTINUE_CURRENT, "tier": current_tier, "score_line": None, "unmet_conditions": []}
+    entry = build_session_entry(normalized, s1)
+    return {
+        "route": entry.route.route,
+        "tier": entry.route.route,
+        "score_line": entry.route.score_line,
+        "unmet_conditions": list(entry.route.unmet_conditions),
+    }
+
+
 def build_session_entry(request: str, s1: Any = None, plan_id: Optional[str] = None) -> SessionEntry:
     normalized = _normalize_request(request)
     if not normalized:
         raise ValueError("request is required")
+    if s1 is None and is_continuation_message(normalized):
+        # An explicit --s1 is the caller choosing to score it anyway.
+        raise ContinuationMessage("确认/选择/续接类消息延续当前档位，不生成新计划")
     s0 = classify_s0(normalized)
     context = parse_s1_context(s1)
     if context is None and s1 is not None and str(s1).strip():
@@ -270,6 +302,8 @@ def build_session_entry(request: str, s1: Any = None, plan_id: Optional[str] = N
         raise ValueError("--s1 must be five integers between 0 and 5, separated by commas")
     if context is None:
         context = default_s1_context(normalized)
+    if asks_for_complex(normalized) and EXPLICIT_COMPLEX_FLAG not in context.force_upgrade_flags:
+        context = replace(context, force_upgrade_flags=list(context.force_upgrade_flags) + [EXPLICIT_COMPLEX_FLAG])
     score = score_s1(context)
     route = route_task(context)
     resolved_plan_id = str(plan_id).strip() if isinstance(plan_id, str) and plan_id.strip() else stable_plan_id(normalized)

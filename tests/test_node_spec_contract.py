@@ -64,7 +64,7 @@ class _ProjectCase(unittest.TestCase):
 
     def plan_from_prd(self, spec_name, plan_id="pm-plan", request=COMPLEX_REQUEST):
         return run_cli(
-            ["plan", "--json", "--request", request, "--plan-id", plan_id, "--from-prd", spec_name],
+            ["plan", "--json", "--request", request, "--plan-id", plan_id, "--s1", "5,5,5,5,5", "--from-prd", spec_name],
             self.root,
         )
 
@@ -171,7 +171,7 @@ class ProductSpecPublishTests(_ProjectCase):
 
 class DraftAndRoutingTests(_ProjectCase):
     def test_draft_plan_is_reported_as_draft_not_json_error(self):
-        drafted = run_cli(["plan", "--json", "--request", COMPLEX_REQUEST], self.root)
+        drafted = run_cli(["plan", "--json", "--request", COMPLEX_REQUEST, "--s1", "5,5,5,5,5"], self.root)
         self.assertEqual(drafted.payload.get("status"), "planned", drafted.payload)
         plan_id = drafted.payload["plan_id"]
         draft = json.loads((self.root / drafted.payload["materialized_path"] / "plan.json").read_text(encoding="utf-8"))
@@ -182,7 +182,7 @@ class DraftAndRoutingTests(_ProjectCase):
         self.assertNotIn("regular file", result.payload.get("reason", ""))
 
     def test_status_and_resume_report_a_draft_as_design_state(self):
-        drafted = run_cli(["plan", "--json", "--request", COMPLEX_REQUEST], self.root)
+        drafted = run_cli(["plan", "--json", "--request", COMPLEX_REQUEST, "--s1", "5,5,5,5,5"], self.root)
         plan_id = drafted.payload["plan_id"]
         for command in ("status", "resume"):
             result = run_cli([command, "--json", "--plan", plan_id], self.root)
@@ -204,14 +204,14 @@ class DraftAndRoutingTests(_ProjectCase):
         result = run_cli(["plan", "--json", "--request", COMPLEX_REQUEST, "--s1", "garbage"], self.root)
         self.assertNotEqual(result.payload.get("status"), "ok")
         self.assertIn("--s1", result.payload.get("reason", ""))
-        self.assertEqual(build_session_entry(COMPLEX_REQUEST, s1=None).route.route, "complex")
+        self.assertEqual(build_session_entry(COMPLEX_REQUEST, s1=None).route.route, "light_plan")
 
 
 class NormalizedSpecModelContractTests(_ProjectCase):
     def test_normalized_keys_are_accepted_by_models(self):
         from vibe_guide.node_spec import normalize_node_spec
         self.write_capabilities()
-        entry = build_session_entry(COMPLEX_REQUEST, plan_id="pm-plan")
+        entry = build_session_entry(COMPLEX_REQUEST, s1="5,5,5,5,5", plan_id="pm-plan")
         normalized = normalize_node_spec(_product_spec(), entry, self.paths)
         self.assertEqual(normalized["complexity_band"], "complex")
         for node in normalized["nodes"]:
@@ -225,7 +225,7 @@ class NormalizedSpecModelContractTests(_ProjectCase):
     def test_normalize_fills_missing_but_does_not_overwrite_present_fields(self):
         from vibe_guide.node_spec import normalize_node_spec
         self.write_capabilities()
-        entry = build_session_entry(COMPLEX_REQUEST, plan_id="pm-plan")
+        entry = build_session_entry(COMPLEX_REQUEST, s1="5,5,5,5,5", plan_id="pm-plan")
         spec = _product_spec()
         spec["remote_git_actions"] = "allow"
         spec["nodes"][0]["parallel_group"] = ""

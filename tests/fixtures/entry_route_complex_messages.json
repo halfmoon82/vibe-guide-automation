@@ -1,0 +1,98 @@
+[
+  {
+    "id": "vr-006",
+    "message": "直接拆两个PR做2"
+  },
+  {
+    "id": "vr-007",
+    "message": "等PR1跑通再合并PR2"
+  },
+  {
+    "id": "vr-008",
+    "message": "选A"
+  },
+  {
+    "id": "vr-023",
+    "message": "都删掉并归档，然后发 v5.0.16"
+  },
+  {
+    "id": "vr-024",
+    "message": "macmini@MacminideMac-mini vibeguide % npm install -g @anthropic-ai/claude-code added 2 packages in 11s npm warn install-scripts 1 package has install scripts not yet covered by allowScripts: npm warn install-scripts @anthropic-ai/claude-code@2.1.301 (postinstall: node install.cjs) npm warn install-scripts npm warn install-scripts Run `npm install -g --allow-scripts=@anthropic-ai/claude-code` to allow these scripts once, or `npm config set allow-scripts=@anthropic-ai/claude-code --location=user` to allow them for all global installs. macmini@MacminideMac-mini vibeguide % npm config set allow-scripts=@anthropic-ai/claude-code --location=user macmini@MacminideMac-mini vibeguide %"
+  },
+  {
+    "id": "vr-025",
+    "message": "授权"
+  },
+  {
+    "id": "vr-030",
+    "message": "好，开始写后台派发器，走正式路由"
+  },
+  {
+    "id": "vr-036",
+    "message": "选1，按你的推荐来。git远端动作再次确认允许"
+  },
+  {
+    "id": "vr-048",
+    "message": "去远端拉取PR177，你来接手推进"
+  },
+  {
+    "id": "vr-052",
+    "message": "合并，然后我们需要讨论一下怎么实施，因为现在本机的vibeguide还是那套例行换班逻辑"
+  },
+  {
+    "id": "vr-057",
+    "message": "就用我我们的待开发PRD测试可以吗？"
+  },
+  {
+    "id": "vr-058",
+    "message": "你统一看一下A和B，已经远端新合并的几个PR，然后A的设计，重新整合成一个新的PRD，注意，不要和今天新合并的几个PR有冲突，如有冲突，以新的设计为准"
+  },
+  {
+    "id": "vr-059",
+    "message": "全部同意，合并吧。对方已经提交到PR182"
+  },
+  {
+    "id": "vr-060",
+    "message": "同意，开始规划"
+  },
+  {
+    "id": "vr-061",
+    "message": "授权，开关打开，新会话当监工"
+  },
+  {
+    "id": "vr-069",
+    "message": "#209 也开始修吧"
+  },
+  {
+    "id": "vr-070",
+    "message": "接受，先走 PRD 补丁和实施计划"
+  },
+  {
+    "id": "vr-071",
+    "message": "允许，发布吧"
+  },
+  {
+    "id": "vr-083",
+    "message": "再试一次，把你那个提示词发进来不就好了吗？"
+  },
+  {
+    "id": "vr-094",
+    "message": "3"
+  },
+  {
+    "id": "vr-095",
+    "message": "我不太明白，你能具体帮我做完剩下的两步吗？"
+  },
+  {
+    "id": "vr-096",
+    "message": "可以，按这个顺序开始"
+  },
+  {
+    "id": "vr-097",
+    "message": "批准，发布 5.0.10 并升级本机"
+  },
+  {
+    "id": "vr-098",
+    "message": "批准，发布 5.0.11 并升级本机"
+  }
+]

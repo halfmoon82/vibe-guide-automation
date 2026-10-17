@@ -440,7 +440,7 @@ class SensitiveNodeIdJourneyTests(unittest.TestCase):
         )
         self.assertEqual(attested.payload["status"], "ok", attested.payload)
         published = self.cli(
-            "plan", "--request", REQUEST, "--plan-id", "pm-plan",
+            "plan", "--request", REQUEST, "--plan-id", "pm-plan", "--s1", "5,5,5,5,5",
             "--from-prd", "product-spec.json",
         )
         self.assertEqual(published.payload["status"], "ok", published.payload)
