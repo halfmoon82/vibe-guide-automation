@@ -152,7 +152,9 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
      "issue_ref": "str", "dag_nodes": ["node id"], "runtime_acceptance": "str"}
   ],
   "rationale?": {"framing|tradeoffs|flow|acceptance": "verified_fact: ..."},
-  "remote_git_actions?": "allow|deny"
+  "remote_git_actions?": "allow|deny",
+  "heartbeat_interval_minutes?": "10|30",
+  "rotate_hard_cap?": "150000|200000|300000"
 }
 ```
 
@@ -180,13 +182,21 @@ vibe attest --adapter <claude-code|codex|...> --facts <facts.json> --provenance 
 vibe plan --request "<产品经理的原话>" --plan-id <plan_id> --from-prd <product-spec.json> --json
 ```
 
+发布前还要问产品经理两个运行参数，答案写进产品 spec 顶层，缺省值由发布补齐：
+
+- `heartbeat_interval_minutes`：空闲基准心跳间隔，`10` 或 `30`，缺省 `10`。`30` 只在当前平台的推送唤醒已验证、且该平台有已登记的推送通道时可用；不可用时卡上照样列出并写明原因，硬选它会被拒绝发布。等答 60 分钟仍由 vibe 推导，不进卡。
+- `rotate_hard_cap`：换班硬上限，`150000` / `200000` / `300000`，缺省 `200000`。`300000` 只在宿主报告的上下文窗口不小于 30 万时可用：Codex 把窗口写在会话记录里，发布时加 `--session-record <本会话记录路径>` 传入该记录；Claude Code 不报窗口，因此恒不可用。依据是宿主在 30 万之前就会自动压缩，换班不会触发，选 30 万等于悄悄变成「永不换班」。
+
+两项都计入授权摘要，改任一项要用新的 `plan_id` 重新发布、重新授权，与改 `remote_git_actions` 同规则。运行时以授权记录里的值为准：条件不再满足时（推送登记被撤、接班会话窗口更小）退回默认值，并在预检 `reason` 里写明，不静默。没有这两项的旧计划保持改动前的行为不变：空闲间隔仍按推送唤醒是否已验证在 10/30 之间自动选，硬上限 200000。
+
 用 §1 草案的同一个 `plan_id` 发布，vibe 会替换这份草案（草案从未持有授权）；已发布或已授权的计划不会被覆盖，仍报 `plan already exists`。发布同样不必传 `--s1`，vibe 沿用草案记下的评分，只升不降。
 
 替换中途被打断（如 Ctrl-C）或 reason 含 `draft could not be restored` 时，先确认草案有没有被挪开：位置以 reason 里给出的路径为准，没给路径就找 `.vibe/plans/.<plan_id>.draft.*/draft`（命中多个时别猜：把每个目录的修改时间和其中 `plan.json` 的状态列给产品经理，请他选）。①找不到：草案没被挪动，直接按原命令重新发布；②找到了且 `.vibe/plans/<plan_id>` 不存在：把它整个挪回这个位置，再按原命令重新发布；③找到了且 `.vibe/plans/<plan_id>` 已存在就不要覆盖，也不要当成本次发布成功（那里可能是别的会话的发布，有授权卡也证明不了是你的）：从挪开的草案里取回产品 spec 放到 `.vibe/plans` 之外（见 §5.1），告诉产品经理这个编号已被占用，再换一个新的 `plan_id` 重新发布，`--s1` 照挪开草案 `plan.json` 里 `route_result.dimensions` 的 `steps,domains,uncertainty,failure_cost,toolchain` 依次填。旧编号下那份计划原样留着：不念它的卡、不对它 `vibe authorize` 或 `vibe monitor`，授权和开工只用新编号；把它的编号和 `plan.json` 的状态列给产品经理，说明它可能是本次被打断的发布，也可能是别的会话的，清不清理由产品经理决定。处理完后，挪开的草案移到废纸篓，剩下的空隐藏目录可以删掉。
 
 - `status: ok`：vibe 已生成 PRD、Spec、Issue、DAG 审计、授权卡、planning-brief。把 `authorization_card` 用产品语言念给产品经理：要做哪几件事、哪些同时开工、每件事一个开发任务加一个独立审查任务、发布前选定的远端 Git 开关（卡上的 `remote_git_actions`）、永远不含部署/发布/生产写入/凭据/对外通信。
+- 念卡时把两个运行参数一起念：卡上的 `heartbeat_interval_minutes` 与 `rotate_hard_cap`，以及 `heartbeat_interval_options` / `rotate_hard_cap_options` 里标着不可用的档位和原因。不可用的档位是产品经理该知道的选项，不是内部细节——别只念能用的那些，也别替他决定。
 - 念卡时分开说两件事，别让 `allow` 听起来像"允许了又排除了"：`excluded_actions` 里的推送/合并是说开发任务自己永远不推送；`allowed_actions` 里的推送/合并是说产品经理允许后，这些动作进入授权范围；vibe 只在独立终审通过后校验并记录，不代为执行。选 `deny` 时 `allowed_actions` 不含任何远端 Git 动作，`excluded_actions` 照样列着推送/合并。
-- 产品经理此时想改远端 Git 开关：`vibe authorize` 改不了它。把产品 spec 复制到 `.vibe/plans` 之外（见 §5.1），改其中的 `remote_git_actions`，用一个新的 `plan_id` 重新发布（`--plan-id <新编号> --s1 <s1>`，`<s1>` 照抄首次发布结果里的 `s1`：草案已被替换，新编号没有评分可沿用），再念新卡。
+- 产品经理此时想改远端 Git 开关或上面两个运行参数：`vibe authorize` 改不了它们。把产品 spec 复制到 `.vibe/plans` 之外（见 §5.1），改其中的 `remote_git_actions` / `heartbeat_interval_minutes` / `rotate_hard_cap`，用一个新的 `plan_id` 重新发布（`--plan-id <新编号> --s1 <s1>`，`<s1>` 照抄首次发布结果里的 `s1`：草案已被替换，新编号没有评分可沿用），再念新卡。想选 30 万档时，这次发布还要带 `--session-record`，否则窗口未知、该档仍不可用。
 - `status: blocked` 且 reason 以 `product_spec_requires_complex_route` 开头：请求被评成了非复杂路径，vibe 拒绝丢掉产品 spec。用 §1 草案的 `plan_id` 发布，或按 §1 用 `--s1` 显式升级。
 - `status: blocked` 且 reason 含 `product decisions remain unresolved`：回到 §2 把决策问清楚。
 - `status: blocked` 且 reason 含 `engine_attestation_unavailable`：先做 §5.2。
@@ -225,7 +235,7 @@ vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本
 vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>
 ```
 
-逐字照抄这一行，不得另写；每拍只执行一次，按命令输出的分支继续。心跳周期按 10 分钟建；命令输出末尾给出下一拍间隔：默认 10 分钟，某平台的推送唤醒经真实验证（成功、失败各至少一次原始证据）登记在 `.vibe/push-wake-verification.json` 后为 30 分钟，只剩未答决策时为 60 分钟；与当前周期不一致时按输出调整。
+逐字照抄这一行，不得另写；每拍只执行一次，按命令输出的分支继续。心跳周期按授权卡上的 `heartbeat_interval_minutes` 建（缺省 10 分钟）；命令输出末尾给出下一拍间隔：卡上选了 10 就是 10，选了 30 就是 30，只剩未答决策时为 60 分钟；与当前周期不一致时按输出调整。卡上没记这项的旧运行保持原规则：某平台的推送唤醒经真实验证（成功、失败各至少一次原始证据）登记在 `.vibe/push-wake-verification.json` 后为 30 分钟。
 
 不要自己另写心跳指令，也不要把信箱服务直接写进心跳：自写的心跳每次都跑一整轮 `vibe resume`，跳过预检、不登记、不换班，空闲心跳的成本是设计值的 5–15 倍（2026-10-03 实测）。
 

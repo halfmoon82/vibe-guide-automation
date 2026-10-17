@@ -9,9 +9,16 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
+from .authorization import (
+    DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
+    DEFAULT_ROTATE_HARD_CAP_TOKENS,
+    HEARTBEAT_INTERVAL_CHOICES,
+    ROTATE_HARD_CAP_CHOICES,
+)
 from .config import load_supervisor_single_shift
 from .contracts import RunEvent
 from .decision_boundary import LEGACY_BOUNDARY_CATEGORY, validate_boundary_category
+from .providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER, WORKBUDDY_VISIBLE_PROVIDER
 from .state import append_event, interprocess_lock, run_dir, save_snapshot, load_snapshot
 
 
@@ -294,7 +301,10 @@ class Supervisor:
 # Absolute context size is primary; growth is an auxiliary rotation condition.
 DEFAULT_ROTATE_TOKEN_THRESHOLD = 80000
 DEFAULT_ROTATE_SOFT_CAP = 100000
-DEFAULT_ROTATE_HARD_CAP = 200000
+#: The pre-209 default, and the value an authorization that recorded no choice
+#: still runs with.  Defined once in ``authorization`` (the card schema owns
+#: which values a card may carry); this alias is the runtime's name for it.
+DEFAULT_ROTATE_HARD_CAP = DEFAULT_ROTATE_HARD_CAP_TOKENS
 SUPERVISOR_OUTPUT_POLICY = (
     "监工整批输出约束：每次工具编排合并后的返回最多 8192 UTF-8 字节，不能按每个子调用各算一份预算。"
     "所有 shell、源码读取和原生工具完整结果先保存为 name/output 列表，再调用 "
@@ -385,6 +395,71 @@ def _session_tokens(record):
     return None
 
 
+#: The field a host writes into its session record for the model's window.
+_CONTEXT_WINDOW_FIELD = "model_context_window"
+
+
+def _context_window(record):
+    """The context window a session record reports, or None.
+
+    Codex writes ``model_context_window`` on its token-count payload; Claude
+    Code writes no window at all.  UNKNOWN stays UNKNOWN: guessing a window is
+    how a cap the host can never reach gets offered as usable.
+    """
+    if not isinstance(record, dict):
+        return None
+    seen = [record]
+    payload = record.get("payload")
+    if isinstance(payload, dict):
+        seen.append(payload)
+        info = payload.get("info")
+        if isinstance(info, dict):
+            seen.append(info)
+    for item in seen:
+        value = item.get(_CONTEXT_WINDOW_FIELD)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def context_window_from_record(path):
+    """Read a session record and return its reported context window, or None.
+
+    A host appends the window on one line of a JSONL log, not necessarily the
+    line that reports usage, so the file is scanned newest-first instead of
+    reusing ``_read_json_file`` (which stops at the first usage-bearing line).
+    """
+    if path is None:
+        return None
+    try:
+        # The protocol writes this flag as ``~/.codex/sessions/...``; without
+        # expansion that path silently reads as "window unknown", which is how a
+        # product manager who did hand over the record still gets "300k
+        # unavailable" with no way to tell why.
+        text = Path(path).expanduser().read_text(encoding="utf-8")
+    except (OSError, TypeError, UnicodeDecodeError):
+        return None
+    try:
+        whole = json.loads(text)
+    except ValueError:
+        whole = None
+    window = _context_window(whole)
+    if window is not None:
+        return window
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # a line still being written
+        window = _context_window(entry)
+        if window is not None:
+            return window
+    return None
+
+
 # Nodes a developer is actively on, finished nodes and nodes waiting on a
 # human or an upstream node need no supervisor resume.  ``review`` and
 # ``rework`` are deliberately excluded: reviewers have no self-report channel
@@ -398,13 +473,31 @@ _IDLE_SAFE_STATUSES = frozenset(
 )
 
 
+def _with_cap_reason(result, cap_reason):
+    """Name a downgraded hard cap on a preflight result.
+
+    The PRD patch requires the fallback to be stated, not silent.  Only ever
+    called for a run whose authorization recorded a cap above the default and
+    whose session cannot reach it, so a pre-209 run's payload keeps exactly the
+    shape it had before the option existed.
+    """
+    if not cap_reason:
+        return result
+    result["rotate_hard_cap_downgrade"] = cap_reason
+    existing = result.get("reason")
+    result["reason"] = (
+        "{}; {}".format(existing, cap_reason) if existing else cap_reason
+    )
+    return result
+
+
 def supervisor_preflight(
     paths,
     run_id,
     session_record=None,
     *,
     token_threshold=DEFAULT_ROTATE_TOKEN_THRESHOLD,
-    context_hard_cap=DEFAULT_ROTATE_HARD_CAP,
+    context_hard_cap=None,
     single_shift=None,
     accept_decision=False,
 ):
@@ -417,6 +510,9 @@ def supervisor_preflight(
       compact artifact from the CLI; this function itself stays read-only.
       With ``single_shift`` (``supervisor_single_shift`` in
       ``.vibe/config.json`` when not passed) only the hard cap rotates.
+      ``context_hard_cap=None`` means "the cap this run authorized": it is read
+      from the run's authorization record (ISSUE-209) and downgraded to the
+      default with a reason when this session's reported window cannot reach it.
     - ``decision``: only pending human decisions remain and the caller passed
       ``accept_decision`` (the current heartbeat command does).  A legacy
       heartbeat that does not know this state gets ``work`` for the same
@@ -432,17 +528,31 @@ def supervisor_preflight(
     record = _read_json_file(session_record)
     if record is None:
         return {"state": "unknown", "reason": "session record unreadable"}
+    # Resolved before any state branch so a downgrade is named on every exit
+    # path, including "unknown": a beat that cannot tell why its cap changed is
+    # how a smaller takeover window turns into an unexplained late rotation.
+    cap_reason = None
+    if context_hard_cap is None:
+        context_hard_cap, cap_reason = rotate_hard_cap_for_run(
+            paths, run_id, session_record
+        )
     tokens = _session_tokens(record)
     if tokens is None:
-        return {"state": "unknown", "reason": "token usage unknown"}
+        return _with_cap_reason(
+            {"state": "unknown", "reason": "token usage unknown"}, cap_reason
+        )
     baseline = _takeover_baseline(paths, run_id, session_record)
     if token_threshold <= 0:
         return {"state": "unknown", "reason": "growth threshold must be positive"}
     if type(context_hard_cap) is not int or context_hard_cap <= DEFAULT_ROTATE_SOFT_CAP:
         return {"state": "unknown", "reason": "context hard cap must exceed soft cap"}
     if tokens >= context_hard_cap:
-        return {"state": "rotate", "reason": "context over hard cap",
-                "tokens": tokens, "baseline": baseline, "context_hard_cap": context_hard_cap, "prepare_handoff": True}
+        return _with_cap_reason(
+            {"state": "rotate", "reason": "context over hard cap",
+             "tokens": tokens, "baseline": baseline,
+             "context_hard_cap": context_hard_cap, "prepare_handoff": True},
+            cap_reason,
+        )
     config_warning = None
     if single_shift is None:
         try:
@@ -451,8 +561,12 @@ def supervisor_preflight(
             return {"state": "unknown", "reason": "supervisor_single_shift invalid"}
     if (not single_shift and tokens >= DEFAULT_ROTATE_SOFT_CAP and baseline is not None
             and tokens - baseline >= token_threshold):
-        return {"state": "rotate", "reason": "context grew past threshold since takeover",
-                "tokens": tokens, "baseline": baseline, "context_hard_cap": context_hard_cap, "prepare_handoff": True}
+        return _with_cap_reason(
+            {"state": "rotate", "reason": "context grew past threshold since takeover",
+             "tokens": tokens, "baseline": baseline,
+             "context_hard_cap": context_hard_cap, "prepare_handoff": True},
+            cap_reason,
+        )
     try:
         holds = supervisor_holds(paths, run_id)
     except ValueError:
@@ -467,6 +581,8 @@ def supervisor_preflight(
     result.setdefault("tokens", tokens)
     result.setdefault("baseline", baseline)
     result["context_hard_cap"] = context_hard_cap
+    if cap_reason:
+        result = _with_cap_reason(result, cap_reason)
     result["prepare_handoff"] = tokens >= DEFAULT_ROTATE_SOFT_CAP
     result["single_shift"] = bool(single_shift)
     if config_warning:
@@ -1036,15 +1152,27 @@ def wake_signal(run_id, node_id=None, role=None, generation=None):
     )
 
 
-def wake_instruction(address, run_id, node_id=None, role=None, generation=None):
-    """Return how a worker wakes ``address``: channel, target and signal."""
-    provider = str(address.get("provider") or "").lower()
-    family = next((name for name in ("codex", "claude", "workbuddy") if provider.startswith(name)), None)
+def wake_channel(provider):
+    """Return ``(channel, reason)`` for push wake-ups on ``provider``.
+
+    One definition shared by :func:`wake_instruction` (which also needs the
+    target and the signal) and the authorization card's 30-minute availability:
+    a card must never offer a cadence the dispatch path could not wake.
+    """
+    family = _provider_family(provider)
     channel = WAKE_CHANNELS.get(family)
     if channel is None:
-        reason = WAKE_NO_CHANNEL_REASON.get(
-            family, "平台 {} 没有已登记的推送通道，等监工心跳拉取".format(provider or "未知")
+        return None, WAKE_NO_CHANNEL_REASON.get(
+            family,
+            "平台 {} 没有已登记的推送通道，等监工心跳拉取".format(provider or "未知"),
         )
+    return channel, ""
+
+
+def wake_instruction(address, run_id, node_id=None, role=None, generation=None):
+    """Return how a worker wakes ``address``: channel, target and signal."""
+    channel, reason = wake_channel(address.get("provider"))
+    if channel is None:
         return {"channel": None, "reason": reason}
     return {
         "channel": channel,
@@ -1103,6 +1231,66 @@ PUSH_WAKE_VERIFICATION_RELATIVE = ".vibe/push-wake-verification.json"
 _HEARTBEAT_INTERVAL_FILE = "heartbeat-interval.json"
 
 
+#: Provider spellings that name the same push wake-up path.  The control-plane
+#: names come from ``providers``, which owns them; the other entries are adapter
+#: ids -- a manifest's ``id`` field, which has no constant of its own and is
+#: spelled the same way by ``supervisor_wakeup``.  ``-background`` is
+#: deliberately absent: it is a different wake path, and substituting its
+#: registration would offer 30 minutes on a visible task whose wake-up was never
+#: verified.
+_WAKE_PROVIDER_GROUPS = {
+    "codex": ("codex", "codex-app", CODEX_PROVIDER),
+    "claude": ("claude-code", CLAUDE_CODE_PROVIDER),
+    "workbuddy": ("workbuddy", WORKBUDDY_VISIBLE_PROVIDER),
+}
+
+
+def _provider_family(provider):
+    """The platform family a provider string belongs to, or None.
+
+    Used where the *platform* is what matters (the wake channel is per platform,
+    not per dispatch path), so any spelling of a platform resolves the same.
+    """
+    value = str(provider or "").lower()
+    return next(
+        (name for name in ("codex", "claude", "workbuddy") if value.startswith(name)),
+        None,
+    )
+
+
+def _wake_provider_group(provider):
+    """The push wake-up path a provider spelling belongs to, or None.
+
+    Stricter than :func:`_provider_family` on purpose: the push-wake registry is
+    keyed per wake path, so ``codex-background`` must never answer for
+    ``codex-app-visible`` even though both are the codex platform.
+    """
+    value = str(provider or "").lower()
+    return next(
+        (family for family, names in _WAKE_PROVIDER_GROUPS.items() if value in names),
+        None,
+    )
+
+
+def _push_wake_entry(platforms, provider):
+    """The registry entry for a wake path: exact key first, then its aliases.
+
+    Iterates the declared alias order rather than the registry's key order, so
+    which spelling a project happened to register cannot change the answer.
+    """
+    entry = platforms.get(provider)
+    if isinstance(entry, dict):
+        return entry
+    group = _wake_provider_group(provider)
+    if group is None:
+        return None
+    for name in _WAKE_PROVIDER_GROUPS[group]:
+        candidate = platforms.get(name)
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
 def _push_wake_verified(paths, provider):
     """Return (verified, reason); an unreadable registry is named, never silent."""
     path = Path(paths.root) / PUSH_WAKE_VERIFICATION_RELATIVE
@@ -1115,7 +1303,7 @@ def _push_wake_verified(paths, provider):
             raise ValueError("platforms must be an object")
     except (OSError, ValueError, KeyError, TypeError) as error:
         return False, "push wake verification unreadable: {}".format(str(error)[:120])
-    entry = platforms.get(provider)
+    entry = _push_wake_entry(platforms, provider)
     if not isinstance(entry, dict):
         return False, "push wake for {} is not registered".format(provider)
     for kind in ("success", "failure"):
@@ -1125,6 +1313,135 @@ def _push_wake_verified(paths, provider):
                 and item["evidence_ref"].strip() for item in records)):
             return False, "push wake for {} lacks a {} evidence".format(provider, kind)
     return True, "push wake for {} verified with success and failure evidence".format(provider)
+
+
+def _push_wake_available(paths, provider):
+    """Return ``(available, reason)`` for the 30-minute idle base."""
+    if not isinstance(provider, str) or not provider:
+        return False, "supervisor provider unknown: the platform's push wake-up cannot be checked"
+    verified, reason = _push_wake_verified(paths, provider)
+    if not verified:
+        return False, reason
+    channel, channel_reason = wake_channel(provider)
+    if channel is None:
+        return False, channel_reason
+    return True, reason
+
+
+def heartbeat_interval_options(paths, provider):
+    """Every idle base a card may offer, with availability and the reason.
+
+    Unavailable tiers are listed, never hidden (product decision 2026-10-13):
+    the product manager should see that 30 minutes exists and why it cannot be
+    chosen yet, not silently get a two-option card on one platform and a
+    one-option card on another.
+    """
+    entries = []
+    for minutes in HEARTBEAT_INTERVAL_CHOICES:
+        if minutes == HEARTBEAT_INTERVAL_DEFAULT_MINUTES:
+            entries.append({"minutes": minutes, "available": True, "reason": ""})
+            continue
+        available, reason = _push_wake_available(paths, provider)
+        entries.append({"minutes": minutes, "available": available, "reason": reason})
+    return entries
+
+
+def rotate_hard_cap_options(window):
+    """Every rotation hard cap a card may offer, with availability and reason.
+
+    A cap above the default is offered only when the host reports a window at
+    least that large.  Both hosts compact before then -- Claude Code's standard
+    window is 200k, and Codex compacted at 218,097 of a reported 249,036 -- so a
+    cap the host would compact before reaching never fires, and choosing it
+    would silently mean "never rotate".
+    """
+    entries = []
+    for tokens in ROTATE_HARD_CAP_CHOICES:
+        available, reason = True, ""
+        if tokens > DEFAULT_ROTATE_HARD_CAP:
+            if window is None:
+                available = False
+                reason = (
+                    "host context window unknown: this host reports no window, so a "
+                    "{:,} cap could never be reached before the host compacts".format(tokens)
+                )
+            elif window < tokens:
+                available = False
+                reason = (
+                    "host reports a {:,}-token context window, so a {:,} cap could "
+                    "never be reached before the host compacts".format(window, tokens)
+                )
+        entries.append({"tokens": tokens, "available": available, "reason": reason})
+    return entries
+
+
+def authorization_choices(paths, run_id):
+    """The ISSUE-209 choices this run's authorization recorded.
+
+    Absent keys stay absent rather than being defaulted: a run authorized
+    before the option existed keeps exactly the cadence and hard cap it ran
+    with before, which is what the acceptance criterion requires.
+    """
+    try:
+        snapshot = load_snapshot(paths, run_id)
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return {}
+    # A run whose snapshot cannot name its plan has no authorization to read;
+    # tests and recovery paths hand in stand-in snapshots, so this stays a
+    # lookup rather than an attribute that must exist.
+    plan_id = getattr(snapshot, "plan_id", None)
+    if not isinstance(plan_id, str) or not plan_id:
+        return {}
+    try:
+        path = paths.resolve_vibe_path(Path("plans") / plan_id / "authorization.json")
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    choices = {}
+    for key, allowed in (
+        ("heartbeat_interval_minutes", HEARTBEAT_INTERVAL_CHOICES),
+        ("rotate_hard_cap", ROTATE_HARD_CAP_CHOICES),
+    ):
+        value = data.get(key)
+        # The record is signed, but a corrupted or hand-edited file must not be
+        # able to set a cap the card vocabulary does not contain: an arbitrary
+        # integer there is exactly the "silently never rotate" the option exists
+        # to prevent, so anything outside the offered tiers reads as absent.
+        if type(value) is int and value in allowed:
+            choices[key] = value
+    return choices
+
+
+def rotate_hard_cap_for_run(paths, run_id, session_record):
+    """Return ``(effective hard cap, downgrade reason or None)`` for this run.
+
+    The authorized cap applies as-is unless it is above the default and this
+    session's reported window cannot reach it: a takeover session may be
+    smaller than the one the plan was published from, and the PRD patch requires
+    falling back to the default *and* naming the reason, never rotating late
+    without saying so.
+    """
+    chosen = authorization_choices(paths, run_id).get("rotate_hard_cap")
+    if chosen is None:
+        return DEFAULT_ROTATE_HARD_CAP, None
+    if chosen <= DEFAULT_ROTATE_HARD_CAP:
+        return chosen, None
+    window = context_window_from_record(session_record)
+    if window is None:
+        return DEFAULT_ROTATE_HARD_CAP, (
+            "authorization chose a {:,}-token rotation hard cap but this session "
+            "reports no context window; using the default {:,}".format(
+                chosen, DEFAULT_ROTATE_HARD_CAP)
+        )
+    if window < chosen:
+        return DEFAULT_ROTATE_HARD_CAP, (
+            "authorization chose a {:,}-token rotation hard cap but this session "
+            "reports a {:,}-token window; using the default {:,}".format(
+                chosen, window, DEFAULT_ROTATE_HARD_CAP)
+        )
+    return chosen, None
 
 
 def heartbeat_interval(paths, run_id, *, decision_only):
@@ -1145,7 +1462,23 @@ def heartbeat_interval(paths, run_id, *, decision_only):
         return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
                 "reason": "supervisor provider unknown: " + str(address.get("reason", "no provider")),
                 "provider": None}
-    verified, reason = _push_wake_verified(paths, provider)
+    verified, reason = _push_wake_available(paths, provider)
+    chosen = authorization_choices(paths, run_id).get("heartbeat_interval_minutes")
+    if chosen == HEARTBEAT_INTERVAL_DEFAULT_MINUTES:
+        # The product manager chose the default, so a verified push wake-up does
+        # not quietly upgrade the cadence behind their back.
+        return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
+                "reason": "authorization selected the {}-minute base".format(chosen),
+                "provider": provider}
+    if chosen is not None:
+        if verified:
+            return {"minutes": chosen, "mode": "push_verified",
+                    "reason": reason, "provider": provider}
+        return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
+                "reason": "authorization selected {} minutes but {}".format(chosen, reason),
+                "provider": provider}
+    # No recorded choice: a run authorized before the option existed keeps the
+    # pre-209 rule, where a verified push wake-up is enough on its own.
     if verified:
         return {"minutes": HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES, "mode": "push_verified",
                 "reason": reason, "provider": provider}

@@ -62,7 +62,7 @@ def _host_turn(session_record):
 
 def preflight_with_checkpoint(paths, run_id, session_record, compute, *,
                               token_threshold=supervisor.DEFAULT_ROTATE_TOKEN_THRESHOLD,
-                              context_hard_cap=supervisor.DEFAULT_ROTATE_HARD_CAP,
+                              context_hard_cap=None,
                               command_prefix='vibe', accept_decision=False):
     """Persist admission once for a bound Codex turn, including CLI handoff.
 
@@ -70,10 +70,18 @@ def preflight_with_checkpoint(paths, run_id, session_record, compute, *,
     unknown observations are rechecked so arrivals or repaired evidence cannot
     be hidden. Live context caps, changed contracts and changed shifts always
     override the hint. Never use this receipt as permission to execute an action.
+
+    ``context_hard_cap=None`` resolves the cap this run authorized, exactly as
+    the preflight itself does; the receipt binding then records the effective
+    value, so a downgrade cannot be served from a stale cached result.
     """
     turn = _host_turn(session_record)
     if turn is None:
         return compute()
+    if context_hard_cap is None:
+        context_hard_cap, _reason = supervisor.rotate_hard_cap_for_run(
+            paths, run_id, session_record
+        )
     directory = run_dir(paths, run_id)
     registry = supervisor._read_json_file(directory / 'supervisor-registry.json')
     address = registry.get('current') if isinstance(registry, dict) else None
