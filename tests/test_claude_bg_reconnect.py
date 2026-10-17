@@ -118,6 +118,17 @@ class RunnerReconnectTests(unittest.TestCase):
         data = self.runner(FakeLauncher("blocked")).poll(handle)[0].data
         self.assertEqual(data["generation"], 4)
 
+    def test_delivery_is_reemitted_after_a_restart(self):
+        # The monitor drops the handle once it applies ``delivered``; a
+        # handle still polled after a restart means that event was lost.
+        report = {"payload": {"summary": "done"}}
+        first = ClaudeBgRunner(lambda c, w: FakeLauncher(), delivery_reader=lambda claims: report, paths=self.paths)
+        handle = first.start(dict(self.contract), Path("/tmp"))
+        self.assertEqual([event.event for event in first.poll(handle)], ["delivered"])
+
+        restarted = ClaudeBgRunner(lambda c, w: FakeLauncher(), delivery_reader=lambda claims: report, paths=self.paths)
+        self.assertEqual([event.event for event in restarted.poll(handle)], ["delivered"])
+
     def test_unknown_handle_without_record_stays_blocked_unknown(self):
         events = self.runner(FakeLauncher()).poll(RunHandle("claude-bg-n1-ghost"))
         self.assertEqual([event.event for event in events], ["blocked_unknown"])

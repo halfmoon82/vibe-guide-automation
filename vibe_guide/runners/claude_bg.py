@@ -55,8 +55,7 @@ class ClaudeBgRunner(Runner):
         return value if isinstance(value, dict) and isinstance(value.get("payload"), dict) else None
 
     def _register(self, launcher, contract: dict, session_id: str,
-                  worktree: Path, handle_id: Optional[str] = None,
-                  delivered: bool = False) -> RunHandle:
+                  worktree: Path, handle_id: Optional[str] = None) -> RunHandle:
         if handle_id is None:
             # Unique across processes: a restarted runner must never reissue
             # a handle a persisted session record already owns.
@@ -67,7 +66,10 @@ class ClaudeBgRunner(Runner):
         handle = RunHandle(handle_id)
         self._sessions[handle.run_id] = {
             "launcher": launcher,
-            "delivered": delivered,
+            # In memory only: the monitor drops a handle once it applies
+            # ``delivered``, so a handle still polled after a restart means
+            # that event was lost and must be emitted again.
+            "delivered": False,
             "contract": {key: contract[key] for key in _LAUNCHER_KEYS if key in contract},
             "worktree": str(worktree),
             "claims": {
@@ -95,7 +97,7 @@ class ClaudeBgRunner(Runner):
         """Write the session record a restarted runner adopts from."""
         session = self._sessions[handle_id]
         path = self._record_path(handle_id)
-        record = {key: session[key] for key in ("contract", "worktree", "claims", "delivered")}
+        record = {key: session[key] for key in ("contract", "worktree", "claims")}
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp")
         temporary.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
@@ -117,8 +119,7 @@ class ClaudeBgRunner(Runner):
         except (ValueError, OSError, UnicodeDecodeError, KeyError, TypeError):
             return None
         launcher = self.launcher_factory(contract, worktree)
-        self._register(launcher, contract, session_id, worktree,
-                       handle_id=handle_id, delivered=record.get("delivered") is True)
+        self._register(launcher, contract, session_id, worktree, handle_id=handle_id)
         return self._sessions[handle_id]
 
     def start(self, contract: dict, worktree: Path) -> RunHandle:
@@ -191,7 +192,6 @@ class ClaudeBgRunner(Runner):
         report = self.delivery_reader(dict(claims))
         if report:
             session["delivered"] = True
-            self._persist(handle.run_id)
             return [RunEvent("delivered", dict(claims, payload=report["payload"]))]
         try:
             state = session["launcher"].status(claims["session_id"])
