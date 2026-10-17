@@ -97,6 +97,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "578fd47330714a53c2de616aafff3a0a9604a79ff272374aa50d2baa58a5bb35",
         # 2026-10-16: combined text once decision-boundary (#184) and heartbeat-contract both land.
         "5b7aa976a0f9b2ac20ca014a38a101635d274bad40d1a57bc4920b179ed5f38e",
+        # 2026-10-17: answered decisions are consumed by the run (heartbeat-wake, §6.5).
+        "fc271522236eeb9a943c59b077547bab251ce5ff33a2997954ebda4433d01612",
     }),
     "vibe-entry": frozenset({
         "3ec0a771d482d92eba7f155f212dab97beb3a4a3b6712e16d7dc3d81394797eb",

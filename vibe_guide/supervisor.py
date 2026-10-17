@@ -513,9 +513,11 @@ def _mailbox_state(paths, run_id, holds):
     try:
         from .decisions import DecisionMailbox
 
-        decisions = DecisionMailbox(paths).list_pending(run_id)
-    except (OSError, TypeError, ValueError):
-        return {"state": "unknown", "reason": "decision mailbox unreadable"}
+        mailbox = DecisionMailbox(paths)
+        decisions = mailbox.list_pending(run_id)
+        answered = mailbox.list_answered(run_id)
+    except (OSError, TypeError, ValueError) as error:
+        return {"state": "unknown", "reason": "decision mailbox unreadable: {}".format(error)}
     if unconsumed:
         return {"state": "work", "reason": "worker delivery pending", "nodes": unconsumed, "decisions": decisions}
     if unpolled:
@@ -543,6 +545,20 @@ def _mailbox_state(paths, run_id, holds):
             return decision_state
         return {"state": "unknown", "reason": "run snapshot unavailable"}
     statuses = _node_statuses(snapshot)
+    # An answered decision is closed: its hold no longer parks anything, and a
+    # node still in blocked_design behind it waits for the supervisor's resume
+    # to consume the answer, not for the human.
+    answered_ids = {entry["decision_id"] for entry in answered}
+    holds = {node: entry for node, entry in holds.items()
+             if entry.get("decision_id") not in answered_ids}
+    unconsumed_answers = sorted(
+        node for node, status in statuses.items()
+        if status == "blocked_design" and answered_ids.intersection(
+            (snapshot.nodes.get(node) or {}).get("decision_ids") or ())
+    )
+    if unconsumed_answers:
+        return {"state": "work", "reason": "answered decisions pending (resume consumes the answer)",
+                "nodes": unconsumed_answers, "decisions": decisions}
     holds, stale = _valid_holds(holds, statuses, time.time())
     if stale:
         return {"state": "work", "reason": "hold needs recheck", "nodes": stale, "decisions": decisions}

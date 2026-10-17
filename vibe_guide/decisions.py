@@ -282,6 +282,26 @@ class DecisionMailbox:
                 result.append(record)
         return result
 
+    def list_answered(self, run_id: Optional[str] = None) -> list[Dict[str, Any]]:
+        """Requests that carry a valid answer; a damaged answer raises ValueError."""
+        if self.requests.is_symlink() or self.results.is_symlink():
+            raise ValueError("decision mailbox path may not be a symlink")
+        if not self.requests.is_dir():
+            return []
+        answered = []
+        for path in sorted(self.requests.glob("dec-*.json")):
+            record = self._load_request(path.stem)
+            if run_id is not None and record.get("run_id") != run_id:
+                continue
+            result_path = self._result_path(path.stem)
+            if result_path.is_symlink():
+                raise ValueError("decision result must be a regular file")
+            if result_path.exists():
+                result = self._load_result(path.stem, record)
+                answered.append({"decision_id": path.stem, "node_id": record.get("node_id"),
+                                 "choice": result["choice"]})
+        return answered
+
     def answer(
         self,
         decision_id: str,

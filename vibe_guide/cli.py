@@ -1825,7 +1825,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             )
         except (OSError, TypeError, ValueError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "决策答案未写入：" + str(error), args.as_json)
-        return _result(SUCCESS, {"command": args.command, "status": "answered", "result": result}, "决策答案已写入", args.as_json)
+        return _result(SUCCESS, {"command": args.command, "status": "answered", "result": result, "resume_hint": _ANSWER_RESUME_HINT}, "决策答案已写入。" + _ANSWER_RESUME_HINT, args.as_json)
 
     if args.command == "supervisor-preflight":
         if not args.run_id:
@@ -3225,6 +3225,9 @@ def handle_monitor(
     if as_json:
         argv.append("--json")
     return run_cli(argv, Path.cwd(), runner=runner).exit_code
+
+
+_ANSWER_RESUME_HINT = "想马上续跑，去监工会话说继续；否则最晚下一次心跳自动接上"
 
 
 def main(argv: Optional[Sequence[str]] = None, runner=None, *, supervisor_command_prefix="vibe") -> int:
