@@ -189,6 +189,30 @@ class RunnerTest(unittest.TestCase):
             handle = runner.start(dict(self.contract), root)
             self.assertEqual(runner.poll(handle), [])
 
+    def test_monitor_payload_without_contract_path_launches_with_written_prompt(self):
+        # The monitor's start payload carries spec_path/worktree/files, never
+        # contract_path; a KeyError here was retried forever without launching.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / ".vibe").mkdir()
+            (root / "home").mkdir()
+            runner = ClaudeBgRunner(lambda c, w: self.launcher, paths=ProjectPaths(root, vibe_home=root / "home"))
+            contract = {
+                "node_id": "n1", "role": "developer", "run_id": "r1", "generation": 3,
+                "spec_path": ".vibe/plans/p1/prd.md", "worktree": ".worktrees/n1",
+                "branch": "node/n1", "files": ["a.py"], "output": "交付 X",
+            }
+            runner.start(contract, root / ".worktrees" / "n1")
+            launch = [c for c in self.launcher.calls if c[0] == "launch"]
+            self.assertEqual(len(launch), 1)
+            prompt_path = Path(launch[0][3])
+            self.assertTrue(prompt_path.is_file())
+            self.assertTrue(str(prompt_path).startswith(str(root / ".vibe")))
+            text = prompt_path.read_text(encoding="utf-8")
+            self.assertIn("vibe worker-deliver --run-id r1 --node n1 --role developer --generation 3", text)
+            self.assertIn(".worktrees/n1", text)
+            self.assertIn(".vibe/plans/p1/prd.md", text)
+
 
 if __name__ == "__main__":
     unittest.main()

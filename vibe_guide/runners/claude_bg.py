@@ -77,8 +77,29 @@ class ClaudeBgRunner(Runner):
             launcher.resume(resume_id, str(contract.get("rework_message") or ""))
             task_id = resume_id
         else:
-            task_id = launcher.launch(role, node_id, Path(contract["contract_path"]))["task_id"]
+            contract_path = contract.get("contract_path") or self._write_prompt(contract)
+            task_id = launcher.launch(role, node_id, Path(contract_path))["task_id"]
         return self._register(launcher, contract, task_id)
+
+    def _write_prompt(self, contract: dict) -> Path:
+        """Materialize the worker prompt for a monitor payload.
+
+        The monitor hands the runner its dispatch contract (spec_path,
+        worktree, files, ...), never a ``contract_path``; the launcher reads
+        its prompt from a file, so write the same continuation prompt the
+        visible providers send under the project's ``.vibe``.
+        """
+        from .provider_action import ProviderActionRunner
+
+        paths = self._paths or ProjectPaths.from_cwd(Path.cwd())
+        name = "provider-actions/prompts/{}-{}-{}-g{}.md".format(
+            contract.get("run_id"), contract["node_id"],
+            contract.get("role", "developer"), contract.get("generation"),
+        )
+        path = paths.resolve_vibe_path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(ProviderActionRunner._continuation_prompt(contract), encoding="utf-8")
+        return path
 
     def adopt(self, contract: dict, worktree: Path, task_id: str) -> RunHandle:
         """Rebind an existing session by its persisted full UUID (after a restart)."""
