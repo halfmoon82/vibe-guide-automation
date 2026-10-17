@@ -756,6 +756,42 @@ def load_historical_task_binding(paths, run_id, issue_id, role, task_id):
         return matches[0]
 
 
+def active_registry_issues(
+    paths: ProjectPaths, run_id: str, known_issue_ids: Iterable[str]
+) -> List[str]:
+    """Issue ids that currently hold a worker-session slot in the run registry.
+
+    A slot is held by any non-terminal binding (unknown states keep occupying
+    it).  Raises ``ValueError`` when the registry is unreadable or
+    self-contradictory, so callers can keep the capacity state unknown instead
+    of guessing a count.
+    """
+    validate_run_id(run_id)
+    known = set(known_issue_ids)
+    lock_path = _registry_lock(paths)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with interprocess_lock(lock_path):
+            _revision, bindings = _read_registry(
+                _run_tasks_path(paths, run_id, create=False), run_id
+            )
+    except OSError as error:
+        raise ValueError("task registry is unreadable") from error
+    live: Dict[Tuple[str, str, int], str] = {}
+    active = set()
+    for item in bindings:
+        if item.status in _TERMINAL_STATUSES:
+            continue
+        if item.issue_id not in known:
+            raise ValueError("task registry holds a session for an unknown issue")
+        slot = (item.issue_id, item.role, item.generation)
+        if slot in live and live[slot] != item.task_id:
+            raise ValueError("task registry holds two live sessions for one slot")
+        live[slot] = item.task_id
+        active.add(item.issue_id)
+    return sorted(active)
+
+
 def load_task_binding(
     paths: ProjectPaths,
     issue_id: str,

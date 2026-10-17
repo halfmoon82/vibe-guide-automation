@@ -87,6 +87,7 @@ from .task_registry import (
     _read_registry,
     _registry_lock,
     _run_tasks_path,
+    active_registry_issues,
     binding_contract_enabled,
     load_task_binding,
     runtime_binding_gate,
@@ -864,7 +865,7 @@ class Monitor:
         snapshot.ready_set = ready
         snapshot.topology_digest = digest
         snapshot.started_nodes = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
-        snapshot.active_concurrency = len(snapshot.started_nodes)
+        snapshot.active_concurrency = len(self._occupied_nodes(snapshot)[0])
         snapshot.capacity = self._effective_worker_session_limit(
             self._snapshot_record(snapshot)
         )
@@ -882,6 +883,65 @@ class Monitor:
             **({"recovery_evidence": recovery_evidence} if recovery_evidence is not None else {}),
         })
 
+    def _occupied_nodes(self, snapshot: RunSnapshot) -> Tuple[List[str], Optional[str]]:
+        """Nodes holding a worker-session slot, plus why the registry was unreadable.
+
+        The task registry is the source of truth for live sessions; the
+        snapshot's own started set only adds nodes the registry has not yet
+        recorded.  An unreadable or contradictory registry yields the snapshot
+        view and a reason, never a guessed count.
+        """
+        started = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
+        if not hasattr(self, "paths"):
+            return sorted(started), None
+        try:
+            registered = active_registry_issues(self.paths, snapshot.run_id, self.nodes)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            return sorted(started), str(error)
+        return sorted(set(started) | set(registered)), None
+
+    def _reconcile_capacity(self, snapshot: RunSnapshot) -> None:
+        """Correct the capacity counter from the task registry; never void authorization.
+
+        Exceeding the effective capacity is a dispatch condition (new starts
+        pause until a slot frees), not topology drift.  A stored counter that
+        disagrees with the registry is rewritten and logged; an unreadable or
+        contradictory registry holds dispatch as ``blocked_unknown``.
+        """
+        hold = self.__dict__.setdefault("_capacity_hold", {})
+        reported = self.__dict__.setdefault("_capacity_unknown_reported", set())
+        occupied, unknown = self._occupied_nodes(snapshot)
+        if unknown is None and not hasattr(snapshot, "run_id"):
+            return
+        if unknown is not None:
+            key = (snapshot.run_id, unknown)
+            if key not in reported:
+                reported.add(key)
+                self._record(snapshot, "capacity_registry_unknown", {
+                    "run_id": snapshot.run_id, "capacity": snapshot.capacity,
+                    "change_reason": "capacity_registry_unknown", "reason": unknown,
+                })
+            hold[snapshot.run_id] = unknown
+            return
+        hold.pop(snapshot.run_id, None)
+        if getattr(snapshot, "active_concurrency", None) in (None, len(occupied)):
+            return
+        previous = snapshot.active_concurrency
+        snapshot.active_concurrency = len(occupied)
+        self._record(snapshot, "capacity_counter_corrected", {
+            "run_id": snapshot.run_id, "capacity": snapshot.capacity,
+            "active_concurrency": snapshot.active_concurrency,
+            "started_nodes": occupied,
+            "change_reason": "capacity_counter_corrected_from_registry",
+            "reason": "stored active_concurrency {} disagrees with task registry {}; capacity {}".format(
+                previous, len(occupied), snapshot.capacity),
+        })
+        self._record_topology_projection(snapshot, snapshot.monitor_entry_evidence)
+
+    def _apply_capacity_hold(self, snapshot: RunSnapshot) -> None:
+        if self.__dict__.get("_capacity_hold", {}).get(snapshot.run_id) and snapshot.status != "complete":
+            snapshot.status = "blocked_unknown"
+
     def _validate_execution_topology(self, snapshot: RunSnapshot) -> None:
         if getattr(self.plan, "complexity_band", "") != "complex":
             return
@@ -893,8 +953,7 @@ class Monitor:
         started = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
         if list(snapshot.started_nodes) != started:
             raise PermissionError("blocked_by_execution_topology_mismatch: started-set drift")
-        if snapshot.active_concurrency != len(started) or (snapshot.capacity and snapshot.active_concurrency > snapshot.capacity):
-            raise PermissionError("blocked_by_execution_topology_mismatch: capacity drift")
+        self._reconcile_capacity(snapshot)
         expected_groups = {n: ([self.nodes[n].parallel_group] if self.nodes[n].parallel_group else []) for n in started}
         if snapshot.parallel_groups != expected_groups:
             raise PermissionError("blocked_by_execution_topology_mismatch: parallel-group drift")
@@ -1723,6 +1782,7 @@ class Monitor:
             if not (poll_handles is False and replay_retry_pending):
                 self._schedule_ready(snapshot, runner, recover_missing_reviewer=True)
         self._refresh_run_status(snapshot)
+        self._apply_capacity_hold(snapshot)
         self._record_topology_projection(snapshot, "monitor.resume")
         self._save_snapshot(snapshot)
         return snapshot
@@ -1959,6 +2019,7 @@ class Monitor:
             self._schedule_ready(snapshot, runner)
         self._record_topology_projection(snapshot, "monitor.tick")
         self._refresh_run_status(snapshot)
+        self._apply_capacity_hold(snapshot)
         self._save_snapshot(snapshot)
         return snapshot
 
@@ -3509,6 +3570,27 @@ class Monitor:
         except (OSError, ValueError, TypeError, KeyError):
             return False
 
+    def _count_active_sessions(self, snapshot: RunSnapshot) -> int:
+        """Worker-session slots in use: the larger of snapshot and task registry."""
+        by_snapshot = sum(
+            1
+            for node_id, current in snapshot.nodes.items()
+            if current.get("status") not in {"stopped", "failed"}
+            and not current.get("pair_archived")
+            and (
+                int(current.get("developer_generation", 0)) > 0
+                or current.get("retryable_action") is not None
+                or isinstance(current.get("active_task"), dict)
+                or node_id in snapshot.handles
+            )
+        )
+        by_registry = len([
+            n for n in self._occupied_nodes(snapshot)[0]
+            if not snapshot.nodes.get(n, {}).get("pair_archived")
+            and snapshot.nodes.get(n, {}).get("status") not in {"stopped", "failed"}
+        ])
+        return max(by_snapshot, by_registry)
+
     def _schedule_ready(
         self,
         snapshot: RunSnapshot,
@@ -3535,18 +3617,12 @@ class Monitor:
         # candidates blocked_unknown, so the planned branch below never sees
         # them.
         self._refuse_path_ownership_conflicts(snapshot)
-        active_sessions = sum(
-            1
-            for node_id, current in snapshot.nodes.items()
-            if current.get("status") not in {"stopped", "failed"}
-            and not current.get("pair_archived")
-            and (
-                int(current.get("developer_generation", 0)) > 0
-                or current.get("retryable_action") is not None
-                or isinstance(current.get("active_task"), dict)
-                or node_id in snapshot.handles
-            )
-        )
+        active_sessions = self._count_active_sessions(snapshot)
+        # The task registry outranks the snapshot counters; an unreadable or
+        # contradictory registry holds new dispatch (blocked_unknown) rather
+        # than guessing how many slots are free.
+        self._reconcile_capacity(snapshot)
+        capacity_held = snapshot.run_id in self.__dict__.get("_capacity_hold", {})
         for node_id, node in self.nodes.items():
             current = snapshot.nodes[node_id]
             was_active_session = not current.get("pair_archived") and (
@@ -3782,7 +3858,7 @@ class Monitor:
                 continue
             if not self._brief_allows_first_write(snapshot, node_id, node):
                 continue
-            if active_sessions >= session_limit:
+            if capacity_held or active_sessions >= session_limit:
                 continue
             if not all(
                 snapshot.nodes[dependency].get("status") == "accepted"
@@ -3798,10 +3874,10 @@ class Monitor:
                     "writer lease is already owned by another run",
                 )
                 continue
-            if self._start_task(
-                snapshot, node_id, "developer", "develop", runner, False
-            ):
-                active_sessions += 1
+            self._start_task(snapshot, node_id, "developer", "develop", runner, False)
+            # A create left pending (retry marker, no handle yet) still holds
+            # its slot, so recount instead of trusting the start result.
+            active_sessions = self._count_active_sessions(snapshot)
 
     def _brief_allows_first_write(
         self, snapshot: RunSnapshot, node_id: str, node: DAGNode
