@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from dataclasses import replace
 from pathlib import Path
 from datetime import datetime, timezone
@@ -234,14 +235,72 @@ BLOCKED_UNKNOWN_DISPOSITION_KINDS = (
     "confirmed_benign",
     "escalated_to_findings",
     "resolved_with_facts",
+    # Structural pending-verification item: only real devices, production or
+    # the acceptance period can verify it, so the node proceeds to acceptance
+    # and the item is listed in the delivery/acceptance report.
+    "deferred_to_acceptance",
 )
 
 #: Dispositions that release an item for acceptance.  ``escalated_to_findings``
 #: documents that the unknown is a real defect the worker session must rework;
 #: it is recorded for the audit chain but never clears the gate.
 BLOCKED_UNKNOWN_CLEARING_DISPOSITIONS = frozenset(
-    {"confirmed_benign", "resolved_with_facts"}
+    {"confirmed_benign", "resolved_with_facts", "deferred_to_acceptance"}
 )
+
+#: Structural pending-verification classifier.  An item is structural only when
+#: it names an environment that cannot be reached before acceptance AND defers
+#: to the acceptance period (or is an unpersisted throwaway verification
+#: script).  Anything else stays an ordinary blocked_unknown.
+_PV_ENVIRONMENT_MARKERS = (
+    "真机", "实机", "真实设备", "生产环境", "生产数据", "线上", "微信", "真实环境",
+    "real device", "production", "on-device", "live environment",
+)
+_PV_DEFERRAL_MARKERS = ("验收期", "acceptance period", "acceptance phase")
+_PV_FILLER = (
+    "验收期", "只能", "需要", "才能", "完成", "验证", "真实设备", "生产环境",
+    "真机", "实机", "仅", "需", "在", "的", "了",
+)
+
+
+def is_structural_pending_verification(item: Any) -> bool:
+    """True when ``item`` can only be verified on real devices/production/acceptance."""
+    if not isinstance(item, str) or not item.strip():
+        return False
+    text = item.lower()
+    if "验证脚本" in text and "不入库" in text:
+        return True
+    if not any(marker in text for marker in _PV_ENVIRONMENT_MARKERS):
+        return False
+    return any(marker in text for marker in _PV_DEFERRAL_MARKERS) or (
+        "只能" in text and "验证" in text
+    )
+
+
+def _pv_core_tokens(item: str) -> frozenset:
+    text = item.lower()
+    for filler in sorted(_PV_FILLER, key=len, reverse=True):
+        text = text.replace(filler, " ")
+    tokens = set()
+    for chunk in re.findall(r"[a-z][a-z-]*|[\u4e00-\u9fff]+", text):
+        if chunk[0].isascii():
+            tokens.add(chunk)
+        elif len(chunk) == 1:
+            tokens.add(chunk)
+        else:
+            tokens.update(chunk[index:index + 2] for index in range(len(chunk) - 1))
+    return frozenset(tokens)
+
+
+def same_pending_verification(first: Any, second: Any) -> bool:
+    """Whether two structural items are one matter reported in different words."""
+    if not (is_structural_pending_verification(first)
+            and is_structural_pending_verification(second)):
+        return False
+    if first.strip() == second.strip():
+        return True
+    left, right = _pv_core_tokens(first), _pv_core_tokens(second)
+    return bool(left) and bool(right) and (left <= right or right <= left)
 
 #: Disclosure recorded when a node is dispatched without a visible bridge.
 BACKGROUND_TOPOLOGY_DISCLOSURE = (
@@ -2092,6 +2151,10 @@ class Monitor:
                 "blocked_unknown disposition already recorded for this item and kind"
             )
         dispositions.append({"item": item, "disposition": disposition, "note": note})
+        if disposition == "deferred_to_acceptance":
+            current.setdefault("acceptance_pending_verification", []).append(
+                {"item": item, "note": note}
+            )
         # Any disposition answers the paused item, so it leaves pending; the
         # acceptance gate separately requires a *clearing* disposition before
         # a re-delivery carrying the same item may pass.
@@ -5340,6 +5403,7 @@ class Monitor:
                         return
                     self._mark_blocked_unknown(snapshot, node_id, reason)
                     return
+                self._defer_structural_pending_items(snapshot, node_id, event, current)
                 undisposed = self._undisposed_blocked_unknowns(
                     current, event.data.get("in_session_review")
                 )
@@ -5941,6 +6005,58 @@ class Monitor:
             return False
         return True
 
+    def _defer_structural_pending_items(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        event: RunEvent,
+        current: Dict[str, Any],
+    ) -> None:
+        """Dispose structural pending-verification items without pausing.
+
+        Items only real devices, production or the acceptance period can verify
+        get a ``deferred_to_acceptance`` disposition (one audit event) and join
+        ``acceptance_pending_verification`` for the delivery/acceptance report.
+        An item already disposed, even in other words, is not disposed again.
+        Items that cannot be judged structural are left to the normal gate.
+        """
+        review = event.data.get("in_session_review")
+        items = review.get("blocked_unknowns") if isinstance(review, dict) else None
+        if not isinstance(items, list):
+            return
+        dispositions = current.setdefault("blocked_unknown_dispositions", [])
+        for item in items:
+            if not is_structural_pending_verification(item):
+                continue
+            if any(
+                entry.get("disposition") in BLOCKED_UNKNOWN_CLEARING_DISPOSITIONS
+                and (entry.get("item") == item
+                     or same_pending_verification(item, entry.get("item")))
+                for entry in dispositions
+            ):
+                continue
+            note = "结构性待验项：只能在真机、生产环境或验收期验证，随交付进入验收汇报"
+            dispositions.append(
+                {"item": item, "disposition": "deferred_to_acceptance", "note": note}
+            )
+            current.setdefault("acceptance_pending_verification", []).append(
+                {"item": item, "note": note}
+            )
+            current["blocked_unknowns_pending"] = [
+                pending for pending in current.get("blocked_unknowns_pending") or []
+                if pending != item
+            ]
+            self._record(
+                snapshot,
+                "blocked_unknown_disposition",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "disposition": "deferred_to_acceptance",
+                    "proof": {"item": item, "note": note},
+                },
+            )
+
     @staticmethod
     def _undisposed_blocked_unknowns(
         current: Dict[str, Any], review: Any
@@ -5981,7 +6097,13 @@ class Monitor:
                 cleared.add(entry.get("item"))
         undisposed = [item for item in pending if item not in answered]
         for item in payload_items:
-            if item not in cleared and item not in undisposed:
+            # A structural item re-reported in other words keeps the original
+            # clearing disposition instead of being disposed a second time.
+            if item in cleared or any(
+                same_pending_verification(item, done) for done in cleared
+            ):
+                continue
+            if item not in undisposed:
                 undisposed.append(item)
         return undisposed
 
@@ -7694,13 +7816,14 @@ class Monitor:
                     or disposition not in BLOCKED_UNKNOWN_DISPOSITION_KINDS
                 ):
                     raise ValueError("replayed blocked_unknown disposition is invalid")
+                replay_note = proof.get("note", "") if isinstance(proof.get("note", ""), str) else ""
                 current.setdefault("blocked_unknown_dispositions", []).append(
-                    {
-                        "item": item,
-                        "disposition": disposition,
-                        "note": proof.get("note", "") if isinstance(proof.get("note", ""), str) else "",
-                    }
+                    {"item": item, "disposition": disposition, "note": replay_note}
                 )
+                if disposition == "deferred_to_acceptance":
+                    current.setdefault("acceptance_pending_verification", []).append(
+                        {"item": item, "note": replay_note}
+                    )
                 # Mirror the live path: any disposition answers the pending
                 # item; only clearing kinds release the acceptance gate.
                 pending = current.get("blocked_unknowns_pending") or []

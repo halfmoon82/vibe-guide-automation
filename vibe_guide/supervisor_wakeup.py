@@ -11,6 +11,24 @@ from . import supervisor
 from .state import _atomic_bytes, interprocess_lock, run_dir
 
 
+#: Idle beats with nothing servable stretch to this multiple of the base cadence
+#: (capped), and snap back on a new delivery or wake-up.
+IDLE_BACKOFF_FACTOR = 3
+IDLE_BACKOFF_CAP_MINUTES = 60
+
+
+def idle_heartbeat_minutes(preflight, *, base_minutes, new_delivery=False):
+    """Beat interval for a preflight result: only idle (nothing to serve) backs off.
+
+    ``work``, ``decision``, ``rotate`` and ``unknown`` keep the base cadence, and
+    a new delivery or wake-up restores it immediately.  Pure: the caller decides
+    when to persist the interval.
+    """
+    if new_delivery or not isinstance(preflight, dict) or preflight.get('state') != 'idle':
+        return base_minutes
+    return max(base_minutes, min(base_minutes * IDLE_BACKOFF_FACTOR, IDLE_BACKOFF_CAP_MINUTES))
+
+
 def _host_turn(session_record):
     session = started = context = None
     active = False
