@@ -5493,8 +5493,12 @@ class Monitor:
                             # under pass-through keys, so the replay branch
                             # restores the park from ``proof`` -- top-level
                             # review_round / reviewer_replacement_required
-                            # would be dropped by _sanitize_event_data.
+                            # would be dropped by _sanitize_event_data, and a
+                            # top-level ``reason`` would be redacted as
+                            # provider text even though it is a vibe-authored
+                            # fixed string.
                             "proof": {
+                                "park_reason": current["reason"],
                                 "review_loop_rounds": review_round,
                                 "reviewer_replacement_required": True,
                                 "reviewer_identity": current.get("reviewer_identity"),
@@ -7679,19 +7683,25 @@ class Monitor:
                 proof = data.get("proof")
                 if (
                     data.get("recovery_action") != "change_reviewer_or_split_node"
-                    or not isinstance(data.get("reason"), str)
                     or not isinstance(proof, dict)
+                    or not isinstance(proof.get("park_reason"), str)
+                    or not proof.get("park_reason")
+                    or not isinstance(proof.get("review_loop_rounds"), int)
+                    or isinstance(proof.get("review_loop_rounds"), bool)
                     or proof.get("reviewer_replacement_required") is not True
                     or not isinstance(proof.get("reviewer_identity"), str)
                     or not proof.get("reviewer_identity")
                 ):
                     raise ValueError("replayed review loop limit evidence is invalid")
                 current["status"] = "blocked_unknown"
-                current["reason"] = data["reason"]
+                # Restore the vibe-authored park reason from ``proof``: the
+                # top-level ``reason`` is redacted as provider text on write
+                # (``reason`` is a _PROVIDER_TEXT_KEYS member).
+                current["reason"] = proof["park_reason"]
                 current["recovery_action"] = "change_reviewer_or_split_node"
                 current["reviewer_replacement_required"] = True
                 current["reviewer_started"] = False
-                current["review_loop_rounds"] = proof.get("review_loop_rounds", 3)
+                current["review_loop_rounds"] = proof["review_loop_rounds"]
                 current["reviewer_identity"] = proof["reviewer_identity"]
                 current["active_role"] = None
                 current["active_task"] = None

@@ -713,6 +713,13 @@ class ACB6ReworkLoopTests(_ProjectCase):
         current = stale.nodes["n1"]
         self.assertEqual(current["status"], "blocked_unknown")
         self.assertEqual(
+            current.get("reason"),
+            "review loop limit reached; change reviewer or split node required",
+            "PR #238 P3-1: the replay must restore the vibe-authored park "
+            "reason, not the [REDACTED_PROVIDER_TEXT] placeholder the "
+            "top-level reason key is redacted to on write",
+        )
+        self.assertEqual(
             current.get("recovery_action"), "change_reviewer_or_split_node"
         )
         self.assertIs(current.get("reviewer_replacement_required"), True)
