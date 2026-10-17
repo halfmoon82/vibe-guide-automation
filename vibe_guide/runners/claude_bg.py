@@ -98,6 +98,12 @@ class ClaudeBgRunner(Runner):
         session = self._sessions[handle_id]
         path = self._record_path(handle_id)
         record = {key: session[key] for key in ("contract", "worktree", "claims")}
+        # .vibe never stores absolute user paths: keep project worktrees relative.
+        root = (self._paths or ProjectPaths.from_cwd(Path.cwd())).root
+        try:
+            record["worktree"] = Path(session["worktree"]).relative_to(root).as_posix()
+        except ValueError:
+            pass
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp")
         temporary.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
@@ -116,6 +122,8 @@ class ClaudeBgRunner(Runner):
             contract = dict(record["contract"], task_id=claims["task_id"],
                             generation=claims.get("generation"))
             worktree = Path(record["worktree"])
+            if not worktree.is_absolute():
+                worktree = (self._paths or ProjectPaths.from_cwd(Path.cwd())).root / worktree
         except (ValueError, OSError, UnicodeDecodeError, KeyError, TypeError):
             return None
         launcher = self.launcher_factory(contract, worktree)

@@ -7,6 +7,7 @@ identity the monitor did not register, a fresh ``vibe resume`` could not find
 the handle at all, and ``vibe worker-deliver`` refused every report because
 background dispatch writes no ``requests/`` record.
 """
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -129,6 +130,32 @@ class RunnerReconnectTests(unittest.TestCase):
         restarted = ClaudeBgRunner(lambda c, w: FakeLauncher(), delivery_reader=lambda claims: report, paths=self.paths)
         self.assertEqual([event.event for event in restarted.poll(handle)], ["delivered"])
 
+    def test_record_keeps_project_paths_relative(self):
+        worktree = self.paths.root / ".worktrees" / "n1"
+        handle = self.runner(FakeLauncher()).start(dict(self.contract), worktree)
+        record = self.paths.resolve_vibe_path(
+            "provider-actions/claude-bg-sessions/{}.json".format(handle.run_id)
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(str(self.paths.root), record)
+
+        seen = []
+        restarted = ClaudeBgRunner(
+            lambda c, w: seen.append(w) or FakeLauncher("blocked"),
+            delivery_reader=lambda claims: None, paths=self.paths,
+        )
+        restarted.poll(handle)
+        self.assertEqual(seen, [worktree])
+
+    def test_record_under_another_handle_name_is_not_adopted(self):
+        handle = self.runner(FakeLauncher()).start(dict(self.contract), Path("/tmp"))
+        sessions = self.paths.resolve_vibe_path("provider-actions/claude-bg-sessions")
+        forged = "claude-bg-n1-9-deadbeef"
+        (sessions / (forged + ".json")).write_text(
+            (sessions / (handle.run_id + ".json")).read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        events = self.runner(FakeLauncher()).poll(RunHandle(forged))
+        self.assertEqual([event.event for event in events], ["blocked_unknown"])
+
     def test_unknown_handle_without_record_stays_blocked_unknown(self):
         events = self.runner(FakeLauncher()).poll(RunHandle("claude-bg-n1-ghost"))
         self.assertEqual([event.event for event in events], ["blocked_unknown"])
@@ -202,6 +229,18 @@ class MonitorBackgroundTests(unittest.TestCase):
                 continue
             with self.assertRaises(ValueError):
                 store.record_worker_delivery(snapshot.run_id, "bg", "developer", dict(GOOD), wrong)
+
+    def test_visible_binding_without_request_record_is_refused(self):
+        snapshot = self.start(FakeLauncher())
+        generation = load_task_binding(self.paths, "bg", "developer", run_id=snapshot.run_id).generation
+        registry = self.paths.vibe / "runs" / snapshot.run_id / "tasks.json"
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        for binding in data["bindings"]:
+            binding["mode"] = "visible"
+        registry.write_text(json.dumps(data), encoding="utf-8")
+        store = ProviderActionStore(self.paths)
+        with self.assertRaisesRegex(ValueError, "no dispatched task"):
+            store.record_worker_delivery(snapshot.run_id, "bg", "developer", dict(GOOD), generation)
 
     def test_self_report_for_an_undispatched_node_is_still_refused(self):
         snapshot = self.start(FakeLauncher())
