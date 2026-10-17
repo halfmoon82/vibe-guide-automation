@@ -27,6 +27,10 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-17: §5.3 documents the two card choices (idle heartbeat base,
+        # rotation hard cap), their availability rules and the republish rule;
+        # §6 reads the cadence from the card instead of promising an automatic 30 (#209).
+        "4ef389e8a32feee47c4d43fb5add9ec3b591e5a726e2621690833f4660040a3c",
         # 2026-10-17: §4/§6.2/§7 separate the product scope from the engineering
         # file list, name both auto-expansion criteria and the claim payload (#145).
         "12cacd7ba5c1bbb825831c0c7c6d09408d8fbc9063f0f6edd0bcdade3a9fe126",

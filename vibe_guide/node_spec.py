@@ -48,6 +48,9 @@ PRODUCT_SPEC_FIELDS: Dict[str, Any] = {
     ],
     "rationale?": {"framing|tradeoffs|flow|acceptance": "verified_fact: ..."},
     "remote_git_actions?": "allow|deny",
+    # ISSUE-209 card choices; the protocol's §5.1 block must match this exactly.
+    "heartbeat_interval_minutes?": "10|30",
+    "rotate_hard_cap?": "150000|200000|300000",
 }
 
 #: Fields vibe derives.  A product spec carrying any of them is rejected.

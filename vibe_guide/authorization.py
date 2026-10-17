@@ -48,6 +48,17 @@ _SENSITIVE_NAMES = (
     "token",
 )
 
+# ISSUE-209: two operational choices the product manager makes on the card
+# instead of accepting a hard-coded constant.  Both are ordinary authorization
+# fields: they are bound into the card digest, so changing either one requires a
+# new publication and a new authorization.  The option tuples are the schema's
+# own vocabulary (what a card may carry); ``supervisor`` decides what to do with
+# the value at runtime and is the only reader of them.
+HEARTBEAT_INTERVAL_CHOICES = (10, 30)
+DEFAULT_HEARTBEAT_INTERVAL_MINUTES = 10
+ROTATE_HARD_CAP_CHOICES = (150000, 200000, 300000)
+DEFAULT_ROTATE_HARD_CAP_TOKENS = 200000
+
 # V4.6 ISSUE-02: structured per-node worker declarations on authorization
 # cards.  Every node records its dispatch topology and the identity source of
 # its worker session; the vocabulary mirrors vibe_guide.task_registry so a
@@ -916,6 +927,8 @@ def _authorization_payload(
     workers: Optional[Any] = None,
     topology_summary: Optional[Dict[str, Any]] = None,
     contract_test_commands: Optional[Dict[str, Any]] = None,
+    heartbeat_interval_minutes: Optional[int] = None,
+    rotate_hard_cap: Optional[int] = None,
 ) -> Dict[str, Any]:
     payload = {
         "schema_version": AUTHORIZATION_SCHEMA_VERSION,
@@ -964,6 +977,15 @@ def _authorization_payload(
             str(node_id): tuple(sorted(commands))
             for node_id, commands in sorted(contract_test_commands.items())
         }
+    # ISSUE-209, same digest-preservation rule: a recorded choice is bound into
+    # the digest, and the keys stay absent when no choice was recorded so every
+    # authorization issued before the option existed keeps its digest bit for
+    # bit.  Absent is therefore meaningful, not "the default": the runtime reads
+    # it as "this run predates the option" and keeps the pre-209 behaviour.
+    if heartbeat_interval_minutes is not None:
+        payload["heartbeat_interval_minutes"] = heartbeat_interval_minutes
+    if rotate_hard_cap is not None:
+        payload["rotate_hard_cap"] = rotate_hard_cap
     return payload
 
 
@@ -997,6 +1019,15 @@ class AuthorizationCard:
     workers: Tuple[Dict[str, Any], ...] = None
     topology_summary: Dict[str, Any] = None
     contract_test_commands: Dict[str, Tuple[str, ...]] = None
+    # ISSUE-209 choices.  ``None`` means the authorization predates the option
+    # and the runtime keeps its pre-209 behaviour; the two ``*_options`` fields
+    # are the availability the publication observed.  They are unsigned: they
+    # describe this publication's environment, not what the product manager
+    # approved, so they never enter the digest.
+    heartbeat_interval_minutes: Optional[int] = None
+    rotate_hard_cap: Optional[int] = None
+    heartbeat_interval_options: Tuple[Dict[str, Any], ...] = ()
+    rotate_hard_cap_options: Tuple[Dict[str, Any], ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -1011,8 +1042,14 @@ class AuthorizationCard:
             "remote_git_actions_options": ["allow", "deny"],
             "remote_git_actions_scope": list(_REMOTE_GIT_ACTIONS_SCOPE),
             "deploy_authorization": "separate",
+            "heartbeat_interval_options": [
+                dict(item) for item in self.heartbeat_interval_options or ()
+            ],
+            "rotate_hard_cap_options": [
+                dict(item) for item in self.rotate_hard_cap_options or ()
+            ],
         })
-        return result
+        return _drop_unset_card_fields(result)
 
 
 @dataclass(frozen=True)
@@ -1045,6 +1082,13 @@ class AuthorizationRecord:
     workers: Tuple[Dict[str, Any], ...] = None
     topology_summary: Dict[str, Any] = None
     contract_test_commands: Dict[str, Tuple[str, ...]] = None
+    # ISSUE-209 choices.  ``None`` means the authorization predates the option
+    # and the runtime keeps its pre-209 behaviour.  Only the choice is part of
+    # the record: which tiers were *available* when the card was published is
+    # card metadata, not something the product manager approved, so the record
+    # keeps carrying exactly the keys it carried before.
+    heartbeat_interval_minutes: Optional[int] = None
+    rotate_hard_cap: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -1055,7 +1099,7 @@ class AuthorizationRecord:
             "remote_git_actions_scope": list(_REMOTE_GIT_ACTIONS_SCOPE),
             "deploy_authorization": "separate",
         })
-        return result
+        return _drop_unset_card_fields(result)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AuthorizationRecord":
@@ -1074,15 +1118,25 @@ class AuthorizationRecord:
             "digest",
             "agent_id",
         }
-        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"}
+        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "heartbeat_interval_options", "rotate_hard_cap_options"}
         if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
             raise ValueError("authorization record schema is invalid")
         if data["schema_version"] != AUTHORIZATION_SCHEMA_VERSION:
             raise ValueError("unsupported authorization record schema")
         converted = dict(data)
-        for key in ("remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"):
+        for key in ("remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization",
+                    "heartbeat_interval_options", "rotate_hard_cap_options"):
             converted.pop(key, None)
         converted.setdefault("remote_git_actions", "deny")
+        converted.setdefault("heartbeat_interval_minutes", None)
+        converted.setdefault("rotate_hard_cap", None)
+        _validate_card_choice(
+            converted["heartbeat_interval_minutes"], HEARTBEAT_INTERVAL_CHOICES,
+            "heartbeat interval minutes",
+        )
+        _validate_card_choice(
+            converted["rotate_hard_cap"], ROTATE_HARD_CAP_CHOICES, "rotation hard cap"
+        )
         if converted["remote_git_actions"] not in {"allow", "deny"}:
             raise ValueError("authorization remote git action switch is invalid")
         for key in ("required_workflow", "skipped_nodes", "integration_review_scope"):
@@ -1221,6 +1275,103 @@ def is_deploy_authorization_valid(record: DeployAuthorizationRecord, manifest_di
     return secrets.compare_digest(record.digest, _canonical_digest(canonical))
 
 
+def _validate_card_choice(value: Any, choices: Tuple[int, ...], label: str) -> Optional[int]:
+    """Refuse a value the card is not allowed to carry.
+
+    ``None`` stays legal: it means this authorization predates the option, and
+    the runtime keeps its pre-option behaviour for it.  That is why the value is
+    never defaulted here -- defaulting would erase the difference between "the
+    product manager chose the default" and "this card never had the choice".
+    """
+    if value is None:
+        return None
+    if type(value) is not int or value not in choices:
+        raise ValueError(
+            label + " must be one of " + ", ".join(str(item) for item in choices)
+        )
+    return value
+
+
+def _normalized_option_entries(
+    options: Any, key: str, choices: Tuple[int, ...], label: str
+) -> Tuple[Dict[str, Any], ...]:
+    """Validate the availability list a publication observed.
+
+    Every option is listed, available or not, with the reason it is not
+    (product decision 2026-10-13: an unusable tier is named, never hidden), so
+    the shape is fixed here instead of at each reader.
+    """
+    if options is None:
+        return ()
+    if not isinstance(options, (list, tuple)):
+        raise ValueError(label + " options must be a sequence")
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+    for item in options:
+        if not isinstance(item, dict):
+            raise ValueError(label + " option must be an object")
+        unknown = set(item) - {key, "available", "reason"}
+        if unknown:
+            raise ValueError(
+                label + " option has unknown keys: "
+                + ", ".join(sorted(str(name) for name in unknown))
+            )
+        value = item.get(key)
+        if type(value) is not int or value not in choices:
+            raise ValueError(label + " option is not an allowed value")
+        if value in seen:
+            raise ValueError(label + " options contain a duplicate value")
+        seen.add(value)
+        available = item.get("available")
+        if type(available) is not bool:
+            raise ValueError(label + " option availability must be a boolean")
+        reason = item.get("reason") or ""
+        if not isinstance(reason, str):
+            raise ValueError(label + " option reason must be a string")
+        if not available and not reason.strip():
+            raise ValueError(label + " option is unavailable without a reason")
+        entries.append({key: value, "available": available, "reason": reason})
+    return tuple(entries)
+
+
+def _require_offered(
+    options: Tuple[Dict[str, Any], ...], key: str, chosen: Optional[int], label: str
+) -> Optional[int]:
+    """Refuse a choice the publication did not observe as available.
+
+    A choice the product manager made from a card that named the tier
+    unavailable must fail at publication rather than be silently downgraded at
+    the first beat.  Callers that re-derive no availability (a same-run refresh
+    carrying an already approved choice) skip this check: the runtime re-checks
+    the condition and reports any fallback in its own reason.
+    """
+    if chosen is None:
+        return None
+    entry = next((item for item in options if item.get(key) == chosen), None)
+    if entry is None:
+        raise ValueError(label + " was not offered by this publication")
+    if entry.get("available") is not True:
+        raise ValueError(label + " is unavailable: " + str(entry.get("reason")))
+    return chosen
+
+
+def _drop_unset_card_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialize an unrecorded ISSUE-209 choice exactly like a pre-209 card.
+
+    Absent-when-unset, the same rule ``contract_test_commands`` follows: a card
+    or record that recorded no choice -- and observed no availability, which is
+    what a pre-209 card did -- must be byte-identical to the ones issued before
+    the option existed, so their stored digests keep verifying.
+    """
+    for key in ("heartbeat_interval_minutes", "rotate_hard_cap"):
+        if result.get(key) is None:
+            result.pop(key, None)
+    for key in ("heartbeat_interval_options", "rotate_hard_cap_options"):
+        if not result.get(key):
+            result.pop(key, None)
+    return result
+
+
 def build_authorization_card(
     plan: Plan,
     nodes: List[DAGNode],
@@ -1242,6 +1393,11 @@ def build_authorization_card(
     explicit_execution_mode_override: Optional[Dict[str, Any]] = None,
     workers: Optional[Dict[str, Any]] = None,
     topology_rulings: Optional[Dict[str, str]] = None,
+    heartbeat_interval_minutes: Optional[int] = None,
+    rotate_hard_cap: Optional[int] = None,
+    heartbeat_interval_options: Optional[Any] = None,
+    rotate_hard_cap_options: Optional[Any] = None,
+    enforce_choice_availability: bool = True,
 ) -> AuthorizationCard:
     node_ids = tuple(sorted(node.id for node in nodes))
     if node_ids != tuple(sorted(plan.node_ids)):
@@ -1394,6 +1550,32 @@ def build_authorization_card(
             contract_test_commands[node.id] = [
                 item["test_command"] for _index, item in entries
             ]
+    heartbeat_interval_minutes = _validate_card_choice(
+        heartbeat_interval_minutes, HEARTBEAT_INTERVAL_CHOICES,
+        "heartbeat interval minutes",
+    )
+    rotate_hard_cap = _validate_card_choice(
+        rotate_hard_cap, ROTATE_HARD_CAP_CHOICES, "rotation hard cap"
+    )
+    heartbeat_options = _normalized_option_entries(
+        heartbeat_interval_options, "minutes", HEARTBEAT_INTERVAL_CHOICES,
+        "heartbeat interval",
+    )
+    rotate_options = _normalized_option_entries(
+        rotate_hard_cap_options, "tokens", ROTATE_HARD_CAP_CHOICES,
+        "rotation hard cap",
+    )
+    # Only a freshly requested choice is checked against observed availability;
+    # a carried-forward one (options not observed) is left to the runtime.
+    if enforce_choice_availability and heartbeat_interval_options is not None:
+        _require_offered(
+            heartbeat_options, "minutes", heartbeat_interval_minutes,
+            "heartbeat interval",
+        )
+    if enforce_choice_availability and rotate_hard_cap_options is not None:
+        _require_offered(
+            rotate_options, "tokens", rotate_hard_cap, "rotation hard cap"
+        )
     canonical = _authorization_payload(
         plan.plan_id,
         plan.version,
@@ -1421,9 +1603,16 @@ def build_authorization_card(
         workers=normalized_workers,
         topology_summary=topology_summary,
         contract_test_commands=contract_test_commands,
+        heartbeat_interval_minutes=heartbeat_interval_minutes,
+        rotate_hard_cap=rotate_hard_cap,
     )
     digest = _canonical_digest(canonical)
     canonical["engine_authorization_digest"] = digest
+    # Observed availability is not signed: it describes this publication's
+    # environment, not the approval.  Adding it after the digest keeps both the
+    # digest and the record schema unchanged for a caller that passes none.
+    canonical["heartbeat_interval_options"] = heartbeat_options
+    canonical["rotate_hard_cap_options"] = rotate_options
     card = AuthorizationCard(digest=digest, **canonical)
     # The issuing path checks its own output: a card the validator would
     # refuse must not be signed in the first place (ISSUE-08).
@@ -1438,6 +1627,8 @@ def refresh_authorization_card(
     workflow: Optional[Dict[str, Any]] = None,
     topology_rulings: Optional[Dict[str, str]] = None,
     engine_attestation: Optional[Dict[str, Any]] = None,
+    heartbeat_interval_options: Optional[Any] = None,
+    rotate_hard_cap_options: Optional[Any] = None,
 ) -> AuthorizationCard:
     """Rebuild a same-plan card while retaining its approved agent/capacity scope.
 
@@ -1501,6 +1692,28 @@ def refresh_authorization_card(
         engine_attestation=engine_attestation,
         explicit_execution_mode_override=previous.explicit_execution_mode_override,
         workers=workers,
+        heartbeat_interval_minutes=previous.heartbeat_interval_minutes,
+        rotate_hard_cap=previous.rotate_hard_cap,
+        # A caller that observed nothing keeps the availability the approved
+        # card recorded: the alternative -- emitting an empty list -- would
+        # erase the reason a tier was unavailable from the refreshed card.
+        heartbeat_interval_options=(
+            heartbeat_interval_options
+            if heartbeat_interval_options is not None
+            else previous.heartbeat_interval_options
+        ),
+        rotate_hard_cap_options=(
+            rotate_hard_cap_options
+            if rotate_hard_cap_options is not None
+            else previous.rotate_hard_cap_options
+        ),
+        # A refresh re-signs an approved choice, it does not re-approve it.  If
+        # the environment stopped supporting that choice, blocking here would
+        # make the plan impossible to reauthorize at all; the runtime falls back
+        # to the default and names the reason in its preflight, which is the
+        # behaviour the PRD patch specifies.  The freshly observed availability
+        # is still carried, so the reviewer sees the tier is gone.
+        enforce_choice_availability=False,
     )
 
 
@@ -1542,6 +1755,8 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         workers=card.workers,
         topology_summary=card.topology_summary,
         contract_test_commands=card.contract_test_commands,
+        heartbeat_interval_minutes=card.heartbeat_interval_minutes,
+        rotate_hard_cap=card.rotate_hard_cap,
     )
     if card.schema_version != AUTHORIZATION_SCHEMA_VERSION:
         raise ValueError("unsupported authorization card schema")
@@ -1579,6 +1794,8 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         workers=card.workers,
         topology_summary=card.topology_summary,
         contract_test_commands=card.contract_test_commands,
+        heartbeat_interval_minutes=card.heartbeat_interval_minutes,
+        rotate_hard_cap=card.rotate_hard_cap,
     )
 
 
@@ -1644,6 +1861,8 @@ def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
         workers=record.workers,
         topology_summary=record.topology_summary,
         contract_test_commands=record.contract_test_commands,
+        heartbeat_interval_minutes=record.heartbeat_interval_minutes,
+        rotate_hard_cap=record.rotate_hard_cap,
     )
     if not secrets.compare_digest(record.digest, _canonical_digest(canonical)):
         # V3/V4 records pre-dating execution-engine binding remain readable

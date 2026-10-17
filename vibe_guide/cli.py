@@ -52,11 +52,15 @@ from .supervisor import (
     bounded_supervisor_output,
     heartbeat_command,
     heartbeat_interval,
+    heartbeat_interval_options,
+    rotate_hard_cap_options,
+    context_window_from_record,
     read_heartbeat_interval,
     record_heartbeat_interval,
     HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
     HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
     HEARTBEAT_INTERVAL_DECISION_MINUTES,
+    DEFAULT_ROTATE_HARD_CAP,
     supervisor_holds,
     supervisor_preflight,
     HOST_SHIFT_DIFFERENCES,
@@ -332,6 +336,17 @@ def _authorization_card(data: Dict[str, Any]) -> AuthorizationCard:
     converted = dict(data)
     for key in ("remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"):
         converted.pop(key, None)
+    # The availability lists are unsigned metadata that must round-trip: a card
+    # read back and rewritten (a refresh) would otherwise lose the reason a tier
+    # was unavailable, which is the half the product manager reads.
+    for key in ("heartbeat_interval_options", "rotate_hard_cap_options"):
+        value = converted.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)) and all(isinstance(item, dict) for item in value):
+            converted[key] = tuple(dict(item) for item in value)
+        else:
+            converted.pop(key, None)
     for key in (
         "node_ids",
         "file_scope",
@@ -695,7 +710,7 @@ def _replace_draft(destination: Path, staging: Path) -> None:
 
 
 def _publish_plan(
-    paths: ProjectPaths, plan_id: str, source: Any
+    paths: ProjectPaths, plan_id: str, source: Any, session_record: Optional[str] = None
 ) -> Tuple[Plan, List[DAGNode], AuthorizationCard]:
     # Callers hand over a normalized spec dict; a path is still accepted for
     # the legacy direct-publish callers.
@@ -775,6 +790,18 @@ def _publish_plan(
         # the public monitor rechecks live observed capability before execution.
         pass
     _first_card_rulings = _observed_topology_rulings(paths)
+    # ISSUE-209: the card offers both operational choices with the availability
+    # this publication actually observed, and records the product manager's
+    # selection.  Availability comes from the platform's registered push
+    # wake-up and from the context window the publishing session reports; an
+    # unusable tier is listed with its reason, never hidden.
+    _heartbeat_options = heartbeat_interval_options(paths, capabilities.agent_id)
+    _rotate_options = rotate_hard_cap_options(context_window_from_record(session_record))
+    # An explicit ``null`` in the spec means "not stated", not "record nothing":
+    # a fresh publication always records a choice, and only a card written
+    # before the option existed is allowed to carry none.
+    _heartbeat_choice = source.get("heartbeat_interval_minutes")
+    _rotate_choice = source.get("rotate_hard_cap")
     card = build_authorization_card(
         plan,
         nodes,
@@ -785,6 +812,16 @@ def _publish_plan(
         engine_attestation=engine_attestation,
         topology_rulings=_first_card_rulings,
         workers=_background_worker_entries(nodes, _first_card_rulings, paths),
+        heartbeat_interval_minutes=(
+            HEARTBEAT_INTERVAL_DEFAULT_MINUTES
+            if _heartbeat_choice is None
+            else _heartbeat_choice
+        ),
+        rotate_hard_cap=(
+            DEFAULT_ROTATE_HARD_CAP if _rotate_choice is None else _rotate_choice
+        ),
+        heartbeat_interval_options=_heartbeat_options,
+        rotate_hard_cap_options=_rotate_options,
     )
 
     plans_root = destination.parent
@@ -1330,6 +1367,26 @@ def _derive_card_preview(
     return payload, published
 
 
+def _render_card_options(options: Any, key: str, unit: str) -> str:
+    """Render one availability list: every tier, with the reason it is not.
+
+    The card never hides an unusable tier (product decision 2026-10-13), so the
+    human render has to name it and its reason rather than print the usable
+    subset only.
+    """
+    entries = [item for item in (options or ()) if isinstance(item, dict)]
+    if not entries:
+        return "未观测"
+    parts = []
+    for item in entries:
+        label = "{:,} {}".format(item.get(key), unit)
+        if item.get("available"):
+            parts.append(label)
+        else:
+            parts.append("{}（不可用：{}）".format(label, item.get("reason") or "未记录原因"))
+    return "、".join(parts)
+
+
 def _render_card_preview(payload: Dict[str, Any], card: AuthorizationCard) -> str:
     """Render the human-readable half of a card preview."""
     summary = card.topology_summary or {}
@@ -1354,6 +1411,22 @@ def _render_card_preview(payload: Dict[str, Any], card: AuthorizationCard) -> st
                 entry.get("node_id"), entry.get("topology"), entry.get("role")
             )
         )
+    lines.append(
+        "心跳间隔：{} 分钟｜可选 {}".format(
+            card.heartbeat_interval_minutes
+            if card.heartbeat_interval_minutes is not None
+            else "未记录（按默认 {}）".format(HEARTBEAT_INTERVAL_DEFAULT_MINUTES),
+            _render_card_options(card.heartbeat_interval_options, "minutes", "分钟"),
+        )
+    )
+    lines.append(
+        "换班硬上限：{}｜可选 {}".format(
+            "{:,}".format(card.rotate_hard_cap)
+            if card.rotate_hard_cap is not None
+            else "未记录（按默认 {:,}）".format(DEFAULT_ROTATE_HARD_CAP),
+            _render_card_options(card.rotate_hard_cap_options, "tokens", "token"),
+        )
+    )
     changed = payload.get("changed_fields") or {}
     if isinstance(changed, dict) and changed:
         lines.append("相对当前在盘卡，本次重新授权将改动 " + str(len(changed)) + " 个字段：")
@@ -2703,7 +2776,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     "downstream_artifact": None,
                 }
                 return _result(BLOCKED, payload, "规划已暂停：需要确认 PRD 证据", args.as_json)
-            plan, nodes, card = _publish_plan(paths, entry.plan_id, source)
+            plan, nodes, card = _publish_plan(
+                paths, entry.plan_id, source, session_record=args.session_record
+            )
         except PermissionError as error:
             if _is_capability_contract_unknown(error):
                 return _result(

@@ -1453,3 +1453,73 @@ class MethodologyReferenceTests(unittest.TestCase):
 
     def test_no_markdown_side_effects(self):
         self.assertIn("另存", self.section)
+
+
+class CardOptionProtocolTests(unittest.TestCase):
+    """§5.3 must describe the two card choices exactly as the code offers them.
+
+    Issue #209 moved the idle heartbeat base and the rotation hard cap from
+    constants to authorization-card choices.  The protocol is the only place an
+    agent learns to ask for them, so a tier that exists in code but not in the
+    document is a choice nobody can make, and a tier the document promises but
+    the code refuses is a publish that fails after the product manager decided.
+    """
+
+    def _section(self):
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("prd-guide")
+        self.assertIn("### 5.3", text, "§5.3 heading moved")
+        rest = text[text.index("### 5.3"):]
+        end = rest.find("\n## 6.")
+        self.assertNotEqual(end, -1, "§5.3 must still be followed by §6")
+        return rest[:end]
+
+    def test_every_offered_interval_appears_with_its_default(self):
+        from vibe_guide.authorization import (
+            DEFAULT_HEARTBEAT_INTERVAL_MINUTES, HEARTBEAT_INTERVAL_CHOICES,
+        )
+        section = self._section()
+        self.assertIn("`heartbeat_interval_minutes`", section)
+        for minutes in HEARTBEAT_INTERVAL_CHOICES:
+            self.assertIn("`{}`".format(minutes), section)
+        self.assertIn("缺省 `{}`".format(DEFAULT_HEARTBEAT_INTERVAL_MINUTES), section)
+
+    def test_every_offered_cap_appears_with_its_default(self):
+        from vibe_guide.authorization import (
+            DEFAULT_ROTATE_HARD_CAP_TOKENS, ROTATE_HARD_CAP_CHOICES,
+        )
+        section = self._section()
+        self.assertIn("`rotate_hard_cap`", section)
+        for tokens in ROTATE_HARD_CAP_CHOICES:
+            self.assertIn("`{}`".format(tokens), section)
+        self.assertIn("缺省 `{}`".format(DEFAULT_ROTATE_HARD_CAP_TOKENS), section)
+
+    def test_both_availability_conditions_name_their_evidence(self):
+        section = self._section()
+        self.assertIn("推送唤醒已验证", section)
+        self.assertIn("30 万", section)
+        self.assertIn("--session-record", section)
+
+    def test_republish_fallback_and_legacy_rules_are_all_stated(self):
+        section = self._section()
+        self.assertIn("新的 `plan_id` 重新发布", section)
+        self.assertIn("预检 `reason`", section)
+        self.assertIn("没有这两项的旧计划", section)
+        self.assertIn("60 分钟", section)
+
+    def test_the_schema_block_names_exactly_the_offered_tiers(self):
+        # Both directions matter: a tier added to the schema but not to the code
+        # is a publish that fails after the product manager chose it, and the
+        # reverse is a choice no agent can ever ask for.
+        from vibe_guide.authorization import (
+            HEARTBEAT_INTERVAL_CHOICES, ROTATE_HARD_CAP_CHOICES,
+        )
+        from vibe_guide.node_spec import PRODUCT_SPEC_FIELDS
+        self.assertEqual(
+            PRODUCT_SPEC_FIELDS["heartbeat_interval_minutes?"],
+            "|".join(str(item) for item in HEARTBEAT_INTERVAL_CHOICES),
+        )
+        self.assertEqual(
+            PRODUCT_SPEC_FIELDS["rotate_hard_cap?"],
+            "|".join(str(item) for item in ROTATE_HARD_CAP_CHOICES),
+        )
