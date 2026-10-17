@@ -41,7 +41,7 @@ from . import host_rules
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import Monitor, ScopeDecisionRequired
 from .supervisor_output import supervisor_output_batch
-from .supervisor_wakeup import preflight_with_checkpoint
+from .supervisor_wakeup import idle_heartbeat_minutes, preflight_with_checkpoint
 from .supervisor import (
     Supervisor,
     current_supervisor_address,
@@ -52,6 +52,7 @@ from .supervisor import (
     bounded_supervisor_output,
     heartbeat_command,
     heartbeat_interval,
+    read_heartbeat_interval,
     record_heartbeat_interval,
     HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
     HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
@@ -1450,6 +1451,23 @@ def _snapshot_result(
 def _beat_interval(paths: ProjectPaths, run_id: str, payload: Dict[str, Any], *, persist: bool) -> Dict[str, Any]:
     """Next-beat interval for a preflight payload; persisting never changes the state."""
     interval = heartbeat_interval(paths, run_id, decision_only=bool(payload.get("decision_only")))
+    # Consecutive idle beats (nothing servable) back off from whichever base
+    # tier applies, starting with the second one.  Any other state -- a new
+    # delivery or wake-up shows up as work -- resets the streak and restores the
+    # base cadence on that same beat.
+    previous = read_heartbeat_interval(paths, run_id)
+    streak = 0
+    if payload.get("state") == "idle":
+        earlier = previous.get("idle_streak") if previous else 0
+        streak = (earlier if type(earlier) is int and earlier > 0 else 0) + 1
+    base_minutes = interval["minutes"]
+    interval = {**interval, "idle_streak": streak}
+    if streak >= 2:
+        slowed = idle_heartbeat_minutes(payload, base_minutes=base_minutes)
+        if slowed != base_minutes:
+            interval = {**interval, "minutes": slowed, "mode": "idle_backoff",
+                        "reason": "{} consecutive idle beats; backed off from {} ({} min)".format(
+                            streak, interval["mode"], base_minutes)}
     if persist:
         try:
             interval = {**interval, **record_heartbeat_interval(paths, run_id, interval)}

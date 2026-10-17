@@ -201,5 +201,51 @@ class IdleCadenceTests(unittest.TestCase):
         )
 
 
+class IdleBackoffWiringTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.paths = ProjectPaths(Path(self.tmp.name))
+        (self.paths.vibe / "runs/run-1").mkdir(parents=True)
+
+    def beat(self, state, **extra):
+        from vibe_guide.cli import _beat_interval
+        return _beat_interval(self.paths, "run-1", {"state": state, **extra}, persist=True)
+
+    def test_consecutive_idle_beats_back_off_then_delivery_restores(self):
+        from vibe_guide.supervisor import read_heartbeat_interval
+        first = self.beat("idle")
+        self.assertEqual(first["minutes"], 10)
+        second = self.beat("idle")
+        self.assertEqual((second["minutes"], second["mode"]), (30, "idle_backoff"))
+        third = self.beat("idle")
+        self.assertEqual(third["minutes"], 30)
+        self.assertEqual(read_heartbeat_interval(self.paths, "run-1")["minutes"], 30)
+        restored = self.beat("work")
+        self.assertEqual((restored["minutes"], restored["mode"]), (10, "default"))
+        self.assertEqual(read_heartbeat_interval(self.paths, "run-1")["minutes"], 10)
+        self.assertEqual(self.beat("idle")["minutes"], 10)  # streak restarted
+
+    def test_decision_only_stays_at_60(self):
+        for _ in range(3):
+            interval = self.beat("decision", decision_only=True)
+            self.assertEqual((interval["minutes"], interval["mode"]), (60, "decision"))
+
+    def test_backoff_is_capped_at_60_from_a_higher_base(self):
+        from unittest.mock import patch
+        high = {"minutes": 30, "mode": "push_verified", "reason": "r", "provider": "p"}
+        with patch("vibe_guide.cli.heartbeat_interval", return_value=high):
+            self.beat("idle")
+            self.assertEqual(self.beat("idle")["minutes"], 60)
+
+    def test_preflight_does_not_persist_but_reads_streak(self):
+        from vibe_guide.cli import _beat_interval
+        self.beat("idle")
+        shown = _beat_interval(self.paths, "run-1", {"state": "idle"}, persist=False)
+        self.assertEqual(shown["minutes"], 30)
+        from vibe_guide.supervisor import read_heartbeat_interval
+        self.assertEqual(read_heartbeat_interval(self.paths, "run-1")["idle_streak"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
