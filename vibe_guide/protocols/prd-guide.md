@@ -472,7 +472,7 @@ vibe supervisor-preflight --run-id <run-id> --accept-decision --session-record <
 
 ## 7. 什么时候才能打断产品经理
 
-只有四类：产品范围或设计要变、部署或对外发布、涉及凭据或系统权限、授权卡外的不可撤销动作。`supervisor-hold` 与 `decision-raise` 只接受这四类（落盘仍是 `product_acceptance` / `external_authorization` 两个规范类别；`credentials`、`system_permission`、`irreversible_action` 是 `external_authorization` 的别名），其他类别（如 `engineering`）直接报错并提示走自愈。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知、按 §4 `files` 规则可自动补进范围的测试文件和机械附属文件）由 vibe 的 Monitor 自行分类恢复；只能在真机、生产环境或验收期验证的结构性待验项，Monitor 自动记为 `deferred_to_acceptance` 处置、节点照常进入验收，并单列在交付与验收汇报的“验收期待验项”里，同一事项换措辞重报沿用原处置、不产生第二条处置事件；判断不了是否结构性的仍按普通未知项保持 `blocked_unknown`；恢复不了的会标 `blocked_unknown`，同时保留结构化 `recovery_action`，不伪装成成功也不静默丢掉入口。
+只有四类：产品范围或设计要变、部署或对外发布、涉及凭据或系统权限、授权卡外的不可撤销动作。`supervisor-hold` 与 `decision-raise` 只接受这四类（落盘仍是 `product_acceptance` / `external_authorization` 两个规范类别；`credentials`、`system_permission`、`irreversible_action` 是 `external_authorization` 的别名），其他类别（如 `engineering`）直接报错并提示走自愈。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知、按 §4 `files` 规则可自动补进范围的测试文件和机械附属文件）由 vibe 的 Monitor 自行分类恢复；结构性待验项**只认固定句式**：「[真机/生产环境/线上前缀]＋事项名词短语（≤12 字，不含否定、程度、谓语或“出现/发生/显示/返回/反馈/报错”类词）＋[10/10]＋只能/仅能/需/须/待＋[在]验收期/上线后/真机上/生产环境＋验证/确认/完成」，英文同理（“<短名词> can only be verified in the acceptance period”），另认“验证脚本不入库/仅本地运行”；其余说法一律按未知处理、保持 `blocked_unknown`。符合句式、只能在真机、生产环境或验收期验证的事项，Monitor 自动记为 `deferred_to_acceptance` 处置、节点照常进入验收，并单列在交付与验收汇报的“验收期待验项”里，同一事项换措辞重报沿用原处置、不产生第二条处置事件；判断不了是否结构性的仍按普通未知项保持 `blocked_unknown`；恢复不了的会标 `blocked_unknown`，同时保留结构化 `recovery_action`，不伪装成成功也不静默丢掉入口。
 
 `blocked_unknown` 的标准恢复动作按原因执行：
 

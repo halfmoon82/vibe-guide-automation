@@ -265,7 +265,7 @@ _PV_DEFECT_MARKERS = (
     "黑屏", "超时", "重复", "漏", "偶发",
     "crash", "fail", "error", "corrupt", "lost", "wrong", "regress", "broken", "bug",
     "hang", "hung", "freeze", "frozen", "timeout", "timed out", "duplicate", "flaky",
-    "leak",
+    "leak", "闪烁", "发热", "打不开", "收不到", "登录不上", "加载很慢",
 )
 #: Wording that describes something already seen happen ("出现/发生/报/显示/发现
 #: + noun").  Deliberately broad: a false hit only keeps the item blocked_unknown.
@@ -292,20 +292,63 @@ def _pv_reports_defect(text: str) -> bool:
     return False
 
 
+#: The ONLY wordings accepted as a structural pending-verification item (also
+#: documented in prd-guide.md); anything else is "unknown" and stays
+#: blocked_unknown.  Shape: [env prefix] <short noun phrase> [10/10]
+#: <only/need modal> [在] <acceptance-time word> <verify verb>, nothing else.
+_PV_ZH_NOUN = r"[A-Za-z\u4e00-\u9fff]{1,12}?"
+_PV_ZH_TEMPLATE = re.compile(
+    r"^(?:(?:真机|实机|生产环境|线上|真实设备|生产)(?:上|中)?)?"
+    r"(?P<noun>" + _PV_ZH_NOUN + r")"
+    r"(?:\s*\d+/\d+)?\s*"
+    r"(?:只能|仅能|仅|需要|需|须|待)在?"
+    r"(?:验收期|上线后|真机上|生产环境|实机|线上)(?:上|中)?"
+    r"(?:验证|确认|完成|验收)$"
+)
+_PV_EN_TEMPLATE = re.compile(
+    r"^(?P<noun>[a-z]+(?: [a-z]+){0,3}?)(?: \d+/\d+)? "
+    r"(?:can only be|must be|needs to be|to be|only) "
+    r"(?:verified|confirmed|validated|completed) "
+    r"(?:in|during|on|after) (?:the )?"
+    r"(?:acceptance period|acceptance phase|production|a real device|real device|release)$"
+)
+_PV_SCRIPT_TEMPLATE = re.compile(
+    r"^(?:临时)?验证脚本(?:不入库|仅本地运行)"
+    r"(?:[，,](?:临时)?验证脚本(?:不入库|仅本地运行))?$"
+)
+#: Negation / predicate / degree words that make a noun phrase a report about
+#: something that happened rather than a thing that cannot be checked yet.
+_PV_NOUN_EXCLUDED_ZH = (
+    "不", "没", "无", "未", "很", "太", "严重", "偶", "常", "总是", "老是", "反馈",
+    "返回", "出现", "发生", "显示", "发现", "报", "慢", "差", "卡", "闪", "热",
+    "收不", "打不", "登录不", "错", "坏", "挂", "断", "丢", "漏", "死",
+)
+_PV_NOUN_EXCLUDED_EN = re.compile(
+    r"\b(?:not|no|cannot|never|without|very|too|slow|sometimes|intermittent|"
+    r"returns?|shows?|reports?|working|stuck|missing)\b"
+)
+
+
 def is_structural_pending_verification(item: Any) -> bool:
-    """True when ``item`` can only be verified on real devices/production/acceptance."""
+    """True only for the whitelisted wording of a real-device/production/acceptance item.
+
+    The defect/observation word lists stay as a second safety net; the main
+    path is the sentence template.  Anything not judgeable is False.
+    """
     if not isinstance(item, str) or not item.strip():
         return False
-    text = item.lower()
+    text = " ".join(item.strip().lower().split())
     if _pv_reports_defect(text):
         return False
-    if "验证脚本" in text and "不入库" in text:
+    if _PV_SCRIPT_TEMPLATE.fullmatch(text):
         return True
-    if not any(marker in text for marker in _PV_ENVIRONMENT_MARKERS):
-        return False
-    return any(marker in text for marker in _PV_DEFERRAL_MARKERS) or (
-        "只能" in text and "验证" in text
-    )
+    zh = _PV_ZH_TEMPLATE.fullmatch(text)
+    if zh:
+        return not any(word in zh.group("noun") for word in _PV_NOUN_EXCLUDED_ZH)
+    en = _PV_EN_TEMPLATE.fullmatch(text)
+    if en:
+        return not _PV_NOUN_EXCLUDED_EN.search(en.group("noun"))
+    return False
 
 
 def _pv_core_tokens(item: str) -> frozenset:
