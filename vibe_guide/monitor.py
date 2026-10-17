@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from dataclasses import replace
 from pathlib import Path
 from datetime import datetime, timezone
@@ -87,6 +88,7 @@ from .task_registry import (
     _read_registry,
     _registry_lock,
     _run_tasks_path,
+    active_registry_issues,
     binding_contract_enabled,
     load_task_binding,
     runtime_binding_gate,
@@ -233,14 +235,167 @@ BLOCKED_UNKNOWN_DISPOSITION_KINDS = (
     "confirmed_benign",
     "escalated_to_findings",
     "resolved_with_facts",
+    # Structural pending-verification item: only real devices, production or
+    # the acceptance period can verify it, so the node proceeds to acceptance
+    # and the item is listed in the delivery/acceptance report.
+    "deferred_to_acceptance",
 )
 
 #: Dispositions that release an item for acceptance.  ``escalated_to_findings``
 #: documents that the unknown is a real defect the worker session must rework;
 #: it is recorded for the audit chain but never clears the gate.
 BLOCKED_UNKNOWN_CLEARING_DISPOSITIONS = frozenset(
-    {"confirmed_benign", "resolved_with_facts"}
+    {"confirmed_benign", "resolved_with_facts", "deferred_to_acceptance"}
 )
+
+#: Structural pending-verification classifier.  An item is structural only when
+#: it names an environment that cannot be reached before acceptance AND defers
+#: to the acceptance period (or is an unpersisted throwaway verification
+#: script).  Anything else stays an ordinary blocked_unknown.
+_PV_ENVIRONMENT_MARKERS = (
+    "真机", "实机", "真实设备", "生产环境", "生产数据", "线上", "微信", "真实环境",
+    "real device", "production", "on-device", "live environment",
+)
+#: An item that reports an already observed defect is never structural: it is a
+#: finding, not something that merely cannot be checked yet.  One list, used by
+#: both the classifier and the same-item comparison.
+_PV_DEFECT_MARKERS = (
+    "崩溃", "失败", "报错", "错误", "异常", "丢失", "算错", "不一致", "损坏", "回归",
+    "出错", "故障", "缺陷", "不对", "有误", "闪退", "卡死", "卡住", "无响应", "白屏",
+    "黑屏", "超时", "重复", "漏", "偶发",
+    "crash", "fail", "error", "corrupt", "lost", "wrong", "regress", "broken", "bug",
+    "hang", "hung", "freeze", "frozen", "timeout", "timed out", "duplicate", "flaky",
+    "leak", "闪烁", "发热", "打不开", "收不到", "登录不上", "加载很慢",
+)
+#: Wording that describes something already seen happen ("出现/发生/报/显示/发现
+#: + noun").  Deliberately broad: a false hit only keeps the item blocked_unknown.
+_PV_OBSERVED_MARKERS = (
+    "出现", "发生", "显示", "发现", "看到", "观察到", "抛出", "报",
+    "observed", "occur", "shows", "showed", "found", "reported", "throws", "saw",
+    "appears",
+)
+_PV_DEFERRAL_MARKERS = ("验收期", "acceptance period", "acceptance phase")
+_PV_FILLER = (
+    "验收期", "只能", "需要", "才能", "完成", "验证", "真实设备", "生产环境",
+    "真机", "实机", "仅", "需", "在", "的", "了",
+)
+
+
+def _pv_reports_defect(text: str) -> bool:
+    """Defect or already-observed wording; ASCII words match at word starts only."""
+    for marker in _PV_DEFECT_MARKERS + _PV_OBSERVED_MARKERS:
+        if marker[0].isascii():
+            if re.search(r"\b" + re.escape(marker), text):
+                return True
+        elif marker in text:
+            return True
+    return False
+
+
+#: The ONLY wordings accepted as a structural pending-verification item (also
+#: documented in prd-guide.md); anything else is "unknown" and stays
+#: blocked_unknown.  Shape: [env prefix] <short noun phrase> [10/10]
+#: <only/need modal> [在] <acceptance-time word> <verify verb>, nothing else.
+_PV_ZH_NOUN = r"[A-Za-z\u4e00-\u9fff]{1,8}?"
+_PV_ZH_TEMPLATE = re.compile(
+    r"^(?:(?:真机|实机|生产环境|线上|真实设备|生产)(?:上|中)?)?"
+    r"(?P<noun>" + _PV_ZH_NOUN + r")"
+    r"(?:\s*\d+/\d+)?\s*"
+    r"(?:只能|仅能|仅|需要|需|须|待)在?"
+    r"(?:验收期|上线后|真机上|生产环境|实机|线上)(?:上|中)?"
+    r"(?:验证|确认|完成|验收)$"
+)
+_PV_EN_TEMPLATE = re.compile(
+    r"^(?P<noun>[a-z]+(?: [a-z]+){0,4}?)(?: \d+/\d+)? "
+    r"(?:can only be|must be|needs to be|to be|only) "
+    r"(?:verified|confirmed|validated|completed) "
+    r"(?:in|during|on|after) (?:the )?"
+    r"(?:acceptance period|acceptance phase|production|a real device|real device|release)$"
+)
+_PV_SCRIPT_TEMPLATE = re.compile(
+    r"^(?:临时)?验证脚本(?:不入库|仅本地运行)"
+    r"(?:[，,](?:临时)?验证脚本(?:不入库|仅本地运行))?$"
+)
+#: Negation / predicate / degree words that make a noun phrase a report about
+#: something that happened rather than a thing that cannot be checked yet.
+_PV_NOUN_EXCLUDED_ZH = (
+    "不", "没", "无", "未", "很", "太", "严重", "偶", "常", "总是", "老是", "反馈",
+    "返回", "出现", "发生", "显示", "发现", "报", "慢", "差", "卡", "闪", "热",
+    "收不", "打不", "登录不", "错", "坏", "挂", "断", "丢", "漏", "死",
+)
+#: A phrase that ENDS in a state/degree word reports a condition, not a thing.
+_PV_NOUN_STATE_SUFFIX_ZH = (
+    "空白", "模糊", "低", "高", "慢", "快", "失灵", "失效", "延迟", "多扣", "少扣",
+    "爆音", "错位", "偏", "乱", "跳", "了", "多", "少", "大", "小", "长", "短",
+    "弱", "强", "卡", "闪", "抖",
+)
+#: Digits with a unit/number word inside the phrase ("十分钟", "3 秒") never pass.
+_PV_NUMBER_ZH = re.compile(r"[零一二两三四五六七八九十百千万几半]+(?:分钟|秒|小时|天|次|个|条|倍|%|元|块)")
+_PV_NOUN_EXCLUDED_EN = re.compile(
+    r"\b(?:not|no|cannot|never|without|very|too|slow|sometimes|intermittent|"
+    r"returns?|shows?|reports?|working|stuck|missing|late|delayed|delay|slow|"
+    r"blurry|blank|wrong|broken|low|high|fast|laggy|jittery|failing|failed)\b"
+)
+
+
+def is_structural_pending_verification(item: Any) -> bool:
+    """True only for the whitelisted wording of a real-device/production/acceptance item.
+
+    The defect/observation word lists stay as a second safety net; the main
+    path is the sentence template.  Anything not judgeable is False.
+    """
+    if not isinstance(item, str) or not item.strip():
+        return False
+    text = " ".join(item.strip().lower().split())
+    if _pv_reports_defect(text):
+        return False
+    if _PV_SCRIPT_TEMPLATE.fullmatch(text):
+        return True
+    zh = _PV_ZH_TEMPLATE.fullmatch(text)
+    if zh:
+        noun = zh.group("noun")
+        return not (
+            any(word in noun for word in _PV_NOUN_EXCLUDED_ZH)
+            or noun.endswith(_PV_NOUN_STATE_SUFFIX_ZH)
+            or _PV_NUMBER_ZH.search(noun)
+        )
+    en = _PV_EN_TEMPLATE.fullmatch(text)
+    if en:
+        return not _PV_NOUN_EXCLUDED_EN.search(en.group("noun"))
+    return False
+
+
+def _pv_core_tokens(item: str) -> frozenset:
+    text = item.lower()
+    for filler in sorted(_PV_FILLER, key=len, reverse=True):
+        text = text.replace(filler, " ")
+    tokens = set()
+    for chunk in re.findall(r"[a-z][a-z-]*|[\u4e00-\u9fff]+", text):
+        if chunk[0].isascii():
+            tokens.add(chunk)
+        elif len(chunk) == 1:
+            tokens.add(chunk)
+        else:
+            tokens.update(chunk[index:index + 2] for index in range(len(chunk) - 1))
+    return frozenset(tokens)
+
+
+def same_pending_verification(first: Any, second: Any) -> bool:
+    """Whether two structural items are one matter reported in different words."""
+    if not (is_structural_pending_verification(first)
+            and is_structural_pending_verification(second)):
+        return False
+    if first.strip() == second.strip():
+        return True
+    left, right = _pv_core_tokens(first), _pv_core_tokens(second)
+    if not left or not right:
+        return False
+    # Extra words on one side must only name the environment; any other extra
+    # word (e.g. a different feature) makes it a different matter.
+    extras = (left ^ right)
+    return (left <= right or right <= left) and all(
+        any(token in marker for marker in _PV_ENVIRONMENT_MARKERS) for token in extras
+    )
 
 #: Disclosure recorded when a node is dispatched without a visible bridge.
 BACKGROUND_TOPOLOGY_DISCLOSURE = (
@@ -864,7 +1019,7 @@ class Monitor:
         snapshot.ready_set = ready
         snapshot.topology_digest = digest
         snapshot.started_nodes = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
-        snapshot.active_concurrency = len(snapshot.started_nodes)
+        snapshot.active_concurrency = len(self._occupied_nodes(snapshot)[0])
         snapshot.capacity = self._effective_worker_session_limit(
             self._snapshot_record(snapshot)
         )
@@ -882,6 +1037,65 @@ class Monitor:
             **({"recovery_evidence": recovery_evidence} if recovery_evidence is not None else {}),
         })
 
+    def _occupied_nodes(self, snapshot: RunSnapshot) -> Tuple[List[str], Optional[str]]:
+        """Nodes holding a worker-session slot, plus why the registry was unreadable.
+
+        The task registry is the source of truth for live sessions; the
+        snapshot's own started set only adds nodes the registry has not yet
+        recorded.  An unreadable or contradictory registry yields the snapshot
+        view and a reason, never a guessed count.
+        """
+        started = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
+        if not hasattr(self, "paths"):
+            return sorted(started), None
+        try:
+            registered = active_registry_issues(self.paths, snapshot.run_id, self.nodes)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            return sorted(started), str(error)
+        return sorted(set(started) | set(registered)), None
+
+    def _reconcile_capacity(self, snapshot: RunSnapshot) -> None:
+        """Correct the capacity counter from the task registry; never void authorization.
+
+        Exceeding the effective capacity is a dispatch condition (new starts
+        pause until a slot frees), not topology drift.  A stored counter that
+        disagrees with the registry is rewritten and logged; an unreadable or
+        contradictory registry holds dispatch as ``blocked_unknown``.
+        """
+        hold = self.__dict__.setdefault("_capacity_hold", {})
+        reported = self.__dict__.setdefault("_capacity_unknown_reported", set())
+        occupied, unknown = self._occupied_nodes(snapshot)
+        if unknown is None and not hasattr(snapshot, "run_id"):
+            return
+        if unknown is not None:
+            key = (snapshot.run_id, unknown)
+            if key not in reported:
+                reported.add(key)
+                self._record(snapshot, "capacity_registry_unknown", {
+                    "run_id": snapshot.run_id, "capacity": snapshot.capacity,
+                    "change_reason": "capacity_registry_unknown", "reason": unknown,
+                })
+            hold[snapshot.run_id] = unknown
+            return
+        hold.pop(snapshot.run_id, None)
+        if getattr(snapshot, "active_concurrency", None) in (None, len(occupied)):
+            return
+        previous = snapshot.active_concurrency
+        snapshot.active_concurrency = len(occupied)
+        self._record(snapshot, "capacity_counter_corrected", {
+            "run_id": snapshot.run_id, "capacity": snapshot.capacity,
+            "active_concurrency": snapshot.active_concurrency,
+            "started_nodes": occupied,
+            "change_reason": "capacity_counter_corrected_from_registry",
+            "reason": "stored active_concurrency {} disagrees with task registry {}; capacity {}".format(
+                previous, len(occupied), snapshot.capacity),
+        })
+        self._record_topology_projection(snapshot, snapshot.monitor_entry_evidence)
+
+    def _apply_capacity_hold(self, snapshot: RunSnapshot) -> None:
+        if self.__dict__.get("_capacity_hold", {}).get(snapshot.run_id) and snapshot.status != "complete":
+            snapshot.status = "blocked_unknown"
+
     def _validate_execution_topology(self, snapshot: RunSnapshot) -> None:
         if getattr(self.plan, "complexity_band", "") != "complex":
             return
@@ -893,8 +1107,7 @@ class Monitor:
         started = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
         if list(snapshot.started_nodes) != started:
             raise PermissionError("blocked_by_execution_topology_mismatch: started-set drift")
-        if snapshot.active_concurrency != len(started) or (snapshot.capacity and snapshot.active_concurrency > snapshot.capacity):
-            raise PermissionError("blocked_by_execution_topology_mismatch: capacity drift")
+        self._reconcile_capacity(snapshot)
         expected_groups = {n: ([self.nodes[n].parallel_group] if self.nodes[n].parallel_group else []) for n in started}
         if snapshot.parallel_groups != expected_groups:
             raise PermissionError("blocked_by_execution_topology_mismatch: parallel-group drift")
@@ -912,7 +1125,55 @@ class Monitor:
             if latest.get(key) != value:
                 raise PermissionError("blocked_by_execution_topology_mismatch: topology evidence drift")
         if latest.get("monitor_entry_evidence") != snapshot.monitor_entry_evidence:
-            raise PermissionError("blocked_by_execution_topology_mismatch: monitor entry evidence drift")
+            raise PermissionError(
+                "blocked_by_execution_topology_mismatch: monitor entry evidence drift "
+                "(snapshot={!r}, events={!r})".format(
+                    snapshot.monitor_entry_evidence, latest.get("monitor_entry_evidence")
+                )
+            )
+
+    def _heal_entry_evidence(self, snapshot: RunSnapshot) -> None:
+        """Re-record the entry evidence projection from the event stream.
+
+        The snapshot's ``monitor_entry_evidence`` is bookkeeping written by the
+        last monitor entry point; the event stream is the source of truth for
+        which entry ran last.  When only that one field disagrees (a recovery
+        entry such as ``monitor.reconcile_adopted_dispatch`` saved the snapshot
+        after the stream's last observation), the stream wins: the projection
+        is re-recorded and the correction is logged with both actual values.
+        Any other topology disagreement is left for the normal check to reject.
+        """
+        if getattr(self.plan, "complexity_band", "") != "complex":
+            return
+        observed = [
+            e for e in load_events(self.paths, snapshot.run_id)
+            if e.get("event") == "execution_topology_observed"
+        ]
+        if not observed:
+            return
+        latest = observed[-1].get("data", {})
+        stream_entry = latest.get("monitor_entry_evidence")
+        if (
+            not isinstance(stream_entry, str)
+            or not stream_entry.startswith("monitor.")
+            or stream_entry == snapshot.monitor_entry_evidence
+        ):
+            return
+        expected = {
+            "run_id": snapshot.run_id, "plan_revision": snapshot.plan_version,
+            "node_ids": sorted(self.nodes), "started_nodes": snapshot.started_nodes,
+            "active_concurrency": snapshot.active_concurrency,
+            "capacity": snapshot.capacity, "parallel_groups": snapshot.parallel_groups,
+        }
+        if any(latest.get(key) != value for key, value in expected.items()):
+            return
+        self._record(snapshot, "monitor_entry_evidence_reconciled", {
+            "run_id": snapshot.run_id,
+            "previous_monitor_entry_evidence": snapshot.monitor_entry_evidence,
+            "monitor_entry_evidence": stream_entry,
+            "change_reason": "event_stream_is_source_of_truth",
+        })
+        snapshot.monitor_entry_evidence = stream_entry
 
     def __init__(
         self,
@@ -1640,6 +1901,7 @@ class Monitor:
             raise PermissionError("capability_contract_unknown: run binding mismatch")
         self._require_snapshot_authorization(snapshot)
         self._reconcile_unapplied_events(snapshot)
+        self._heal_entry_evidence(snapshot)
         self._route_undecided_blocked_design(snapshot)
         for node_id, current in snapshot.nodes.items():
             if current.get("status") == "start_pending":
@@ -1674,6 +1936,7 @@ class Monitor:
             if not (poll_handles is False and replay_retry_pending):
                 self._schedule_ready(snapshot, runner, recover_missing_reviewer=True)
         self._refresh_run_status(snapshot)
+        self._apply_capacity_hold(snapshot)
         self._record_topology_projection(snapshot, "monitor.resume")
         self._save_snapshot(snapshot)
         return snapshot
@@ -1910,6 +2173,7 @@ class Monitor:
             self._schedule_ready(snapshot, runner)
         self._record_topology_projection(snapshot, "monitor.tick")
         self._refresh_run_status(snapshot)
+        self._apply_capacity_hold(snapshot)
         self._save_snapshot(snapshot)
         return snapshot
 
@@ -1982,6 +2246,10 @@ class Monitor:
                 "blocked_unknown disposition already recorded for this item and kind"
             )
         dispositions.append({"item": item, "disposition": disposition, "note": note})
+        if disposition == "deferred_to_acceptance":
+            current.setdefault("acceptance_pending_verification", []).append(
+                {"item": item, "note": note}
+            )
         # Any disposition answers the paused item, so it leaves pending; the
         # acceptance gate separately requires a *clearing* disposition before
         # a re-delivery carrying the same item may pass.
@@ -2709,7 +2977,11 @@ class Monitor:
             or data.get("node_contract_digest")
             != replacement.node_contract_digest
             or data.get("change_reason")
-            not in {"executable_contract_changed", "capability_contract_changed"}
+            not in {
+                "executable_contract_changed",
+                "capability_contract_changed",
+                "engine_attestation_renewed",
+            }
         ):
             raise ValueError("reauthorization replacement lineage is inconsistent")
         replacement_capability_digest = data.get("capability_contract_digest")
@@ -3456,6 +3728,27 @@ class Monitor:
         except (OSError, ValueError, TypeError, KeyError):
             return False
 
+    def _count_active_sessions(self, snapshot: RunSnapshot) -> int:
+        """Worker-session slots in use: the larger of snapshot and task registry."""
+        by_snapshot = sum(
+            1
+            for node_id, current in snapshot.nodes.items()
+            if current.get("status") not in {"stopped", "failed"}
+            and not current.get("pair_archived")
+            and (
+                int(current.get("developer_generation", 0)) > 0
+                or current.get("retryable_action") is not None
+                or isinstance(current.get("active_task"), dict)
+                or node_id in snapshot.handles
+            )
+        )
+        by_registry = len([
+            n for n in self._occupied_nodes(snapshot)[0]
+            if not snapshot.nodes.get(n, {}).get("pair_archived")
+            and snapshot.nodes.get(n, {}).get("status") not in {"stopped", "failed"}
+        ])
+        return max(by_snapshot, by_registry)
+
     def _schedule_ready(
         self,
         snapshot: RunSnapshot,
@@ -3482,18 +3775,12 @@ class Monitor:
         # candidates blocked_unknown, so the planned branch below never sees
         # them.
         self._refuse_path_ownership_conflicts(snapshot)
-        active_sessions = sum(
-            1
-            for node_id, current in snapshot.nodes.items()
-            if current.get("status") not in {"stopped", "failed"}
-            and not current.get("pair_archived")
-            and (
-                int(current.get("developer_generation", 0)) > 0
-                or current.get("retryable_action") is not None
-                or isinstance(current.get("active_task"), dict)
-                or node_id in snapshot.handles
-            )
-        )
+        active_sessions = self._count_active_sessions(snapshot)
+        # The task registry outranks the snapshot counters; an unreadable or
+        # contradictory registry holds new dispatch (blocked_unknown) rather
+        # than guessing how many slots are free.
+        self._reconcile_capacity(snapshot)
+        capacity_held = snapshot.run_id in self.__dict__.get("_capacity_hold", {})
         for node_id, node in self.nodes.items():
             current = snapshot.nodes[node_id]
             was_active_session = not current.get("pair_archived") and (
@@ -3740,7 +4027,7 @@ class Monitor:
                 continue
             if not self._brief_allows_first_write(snapshot, node_id, node):
                 continue
-            if active_sessions >= session_limit:
+            if capacity_held or active_sessions >= session_limit:
                 continue
             if not all(
                 snapshot.nodes[dependency].get("status") == "accepted"
@@ -3756,10 +4043,10 @@ class Monitor:
                     "writer lease is already owned by another run",
                 )
                 continue
-            if self._start_task(
-                snapshot, node_id, "developer", "develop", runner, False
-            ):
-                active_sessions += 1
+            self._start_task(snapshot, node_id, "developer", "develop", runner, False)
+            # A create left pending (retry marker, no handle yet) still holds
+            # its slot, so recount instead of trusting the start result.
+            active_sessions = self._count_active_sessions(snapshot)
 
     def _brief_allows_first_write(
         self, snapshot: RunSnapshot, node_id: str, node: DAGNode
@@ -5236,6 +5523,7 @@ class Monitor:
                         return
                     self._mark_blocked_unknown(snapshot, node_id, reason)
                     return
+                self._defer_structural_pending_items(snapshot, node_id, event, current)
                 undisposed = self._undisposed_blocked_unknowns(
                     current, event.data.get("in_session_review")
                 )
@@ -5914,6 +6202,58 @@ class Monitor:
             return False
         return True
 
+    def _defer_structural_pending_items(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        event: RunEvent,
+        current: Dict[str, Any],
+    ) -> None:
+        """Dispose structural pending-verification items without pausing.
+
+        Items only real devices, production or the acceptance period can verify
+        get a ``deferred_to_acceptance`` disposition (one audit event) and join
+        ``acceptance_pending_verification`` for the delivery/acceptance report.
+        An item already disposed, even in other words, is not disposed again.
+        Items that cannot be judged structural are left to the normal gate.
+        """
+        review = event.data.get("in_session_review")
+        items = review.get("blocked_unknowns") if isinstance(review, dict) else None
+        if not isinstance(items, list):
+            return
+        dispositions = current.setdefault("blocked_unknown_dispositions", [])
+        for item in items:
+            if not is_structural_pending_verification(item):
+                continue
+            if any(
+                entry.get("disposition") in BLOCKED_UNKNOWN_CLEARING_DISPOSITIONS
+                and (entry.get("item") == item
+                     or same_pending_verification(item, entry.get("item")))
+                for entry in dispositions
+            ):
+                continue
+            note = "结构性待验项：只能在真机、生产环境或验收期验证，随交付进入验收汇报"
+            dispositions.append(
+                {"item": item, "disposition": "deferred_to_acceptance", "note": note}
+            )
+            current.setdefault("acceptance_pending_verification", []).append(
+                {"item": item, "note": note}
+            )
+            current["blocked_unknowns_pending"] = [
+                pending for pending in current.get("blocked_unknowns_pending") or []
+                if pending != item
+            ]
+            self._record(
+                snapshot,
+                "blocked_unknown_disposition",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "disposition": "deferred_to_acceptance",
+                    "proof": {"item": item, "note": note},
+                },
+            )
+
     @staticmethod
     def _undisposed_blocked_unknowns(
         current: Dict[str, Any], review: Any
@@ -5954,7 +6294,13 @@ class Monitor:
                 cleared.add(entry.get("item"))
         undisposed = [item for item in pending if item not in answered]
         for item in payload_items:
-            if item not in cleared and item not in undisposed:
+            # A structural item re-reported in other words keeps the original
+            # clearing disposition instead of being disposed a second time.
+            if item in cleared or any(
+                same_pending_verification(item, done) for done in cleared
+            ):
+                continue
+            if item not in undisposed:
                 undisposed.append(item)
         return undisposed
 
@@ -7179,7 +7525,7 @@ class Monitor:
             data = record["data"]
             if data.get("run_id") != snapshot.run_id:
                 raise ValueError("unapplied event run lineage is inconsistent")
-            if record["event"] == "execution_topology_observed":
+            if record["event"] in {"execution_topology_observed", "monitor_entry_evidence_reconciled"}:
                 # System projection evidence is read-only metadata; legacy
                 # V3.9 replay must not interpret it as a node lifecycle event.
                 snapshot.event_sequence = record["sequence"]
@@ -7752,13 +8098,14 @@ class Monitor:
                     or disposition not in BLOCKED_UNKNOWN_DISPOSITION_KINDS
                 ):
                     raise ValueError("replayed blocked_unknown disposition is invalid")
+                replay_note = proof.get("note", "") if isinstance(proof.get("note", ""), str) else ""
                 current.setdefault("blocked_unknown_dispositions", []).append(
-                    {
-                        "item": item,
-                        "disposition": disposition,
-                        "note": proof.get("note", "") if isinstance(proof.get("note", ""), str) else "",
-                    }
+                    {"item": item, "disposition": disposition, "note": replay_note}
                 )
+                if disposition == "deferred_to_acceptance":
+                    current.setdefault("acceptance_pending_verification", []).append(
+                        {"item": item, "note": replay_note}
+                    )
                 # Mirror the live path: any disposition answers the pending
                 # item; only clearing kinds release the acceptance gate.
                 pending = current.get("blocked_unknowns_pending") or []

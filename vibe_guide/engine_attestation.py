@@ -150,3 +150,33 @@ def validate_engine_attestation(
         raise ValueError("engine attestation timestamp is in the future")
     if age > max_age_seconds:
         raise ValueError("engine attestation is expired")
+
+
+def needs_renewal(
+    attestation: Mapping[str, Any],
+    plan_id: str,
+    plan_revision: int,
+    recorded_ref: str,
+    now: Optional[str] = None,
+) -> bool:
+    """Return True when intact evidence is merely stale or superseded.
+
+    Renewal is only meaningful for evidence whose identity and content still
+    verify: the check runs at the evidence's own generation time, so age is the
+    one condition it ignores.  Evidence that is tampered, for another plan or
+    revision, or malformed raises ``ValueError`` instead -- that is not a
+    renewal case and must stay unverified.  Fresh evidence the card already
+    names needs nothing.
+    """
+    validate_engine_attestation(
+        attestation, plan_id, plan_revision, now=attestation.get("generated_at")
+    )
+    if attestation["evidence_ref"] != recorded_ref:
+        return True
+    try:
+        validate_engine_attestation(attestation, plan_id, plan_revision, now=now)
+    except ValueError as error:
+        if "expired" in str(error):
+            return True
+        raise
+    return False

@@ -1169,6 +1169,7 @@ def record_heartbeat_interval(paths, run_id, interval, *, clock=None):
     entry = {
         "minutes": interval["minutes"], "mode": interval["mode"],
         "reason": interval["reason"], "provider": interval.get("provider"),
+        "idle_streak": interval.get("idle_streak", 0),
         "since": since if since is not None else now, "updated_at": now,
     }
     _atomic_bytes(run_dir(paths, run_id) / _HEARTBEAT_INTERVAL_FILE, _json_bytes(entry))
