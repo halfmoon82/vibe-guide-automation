@@ -36,7 +36,11 @@ class RunnerTest(unittest.TestCase):
     def setUp(self):
         self.launcher = FakeLauncher()
         self.report = None
-        self.runner = ClaudeBgRunner(lambda c, w: self.launcher, delivery_reader=lambda claims: self.report)
+        # Session records persist under the project; keep them out of the cwd.
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.paths = ProjectPaths(Path(self.temporary.name))
+        self.runner = ClaudeBgRunner(lambda c, w: self.launcher, delivery_reader=lambda claims: self.report, paths=self.paths)
         self.contract = {"node_id": "n1", "role": "developer", "run_id": "r1", "generation": 1, "contract_path": "/c.md"}
 
     def start(self, **extra):
@@ -95,6 +99,7 @@ class RunnerTest(unittest.TestCase):
         runner = ClaudeBgRunner(
             lambda c, w: self.launcher,
             delivery_reader=lambda claims: reports.get(claims["generation"]),
+            paths=self.paths,
         )
         handle = runner.start(dict(self.contract), Path("/tmp"))
         reports[1] = {"payload": {"summary": "g1"}}

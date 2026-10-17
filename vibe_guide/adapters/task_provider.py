@@ -912,7 +912,34 @@ class ProviderActionStore:
                 and (latest is None or generation > latest)
             ):
                 latest = generation
+        if latest is None:
+            latest = self._background_generation(run_id, issue_id, role)
         return latest
+
+    def _background_generation(self, run_id, issue_id, role):
+        """Generation of a background-dispatched task from the run's tasks.json.
+
+        Background runners (``claude --bg``) start sessions directly and
+        write no ``requests/`` record; the monitor's task binding is then the
+        only dispatch evidence.  Visible bindings never qualify here: their
+        dispatch always leaves a request record.
+        """
+        from ..task_registry import load_task_binding
+
+        try:
+            binding = load_task_binding(self.paths, issue_id, role, run_id=run_id)
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return None
+        generation = binding.generation
+        if (
+            binding.mode != 'background'
+            or binding.run_id != run_id
+            or isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 1
+        ):
+            return None
+        return generation
 
     def _child_binding(self, run_id, issue_id, role, generation):
         """The monitor-written child binding for this exact generation."""
