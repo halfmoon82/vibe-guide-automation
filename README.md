@@ -86,7 +86,7 @@ vibe supervisor-address --run-id <run>             查询当前监工地址；�
 vibe worker-deliver --run-id <run> --node <id> --generation <n> --payload '<json>'   worker 在主项目目录自报交付（嵌套 delivery_evidence），格式错误当场返回
 ```
 
-新会话入口：agent 先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1——<=8 直接执行、9-15 轻规划，均不触碰 vibe，评分后输出一行 S1 评分与档位；>15 或拿不准时才 `vibe scan` + `vibe plan --request --s1` 进入正式路由。该协议完全自包含，不依赖任何外部技能。
+新会话入口：agent 先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1——<=8 直接执行、9-15 轻规划，均不触碰 vibe，评分后输出一行 S1 评分与档位；>15 且能拆出 3 个以上可并行节点、又需跨会话/跨中断续跑时才 `vibe scan` + `vibe plan --request --s1` 进入正式路由（不满足则按轻规划，评分行注明未满足的条件；拿不准按轻规划；产品经理显式要求或显式 `--s1` 升级仍进复杂模式）；「授权」「选A」这类确认/续接回复延续当前档位，不重新评分。该协议完全自包含，不依赖任何外部技能。
 
 产品经理的完整路径（自评确认为复杂之后）：agent 按 `.vibe/proposals/skills/prd-guide/SKILL.md` 的协议引导写 PRD 与节点拆分（业务字段），`vibe attest` 登记会话能力，`vibe plan --from-prd` 发布，`vibe authorize` 授权，`vibe monitor` 派发。旧的 `--node-spec` 手写路径仍可用。
 

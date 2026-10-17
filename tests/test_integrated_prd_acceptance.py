@@ -1280,8 +1280,12 @@ class ACH2CodexTopologyTests(unittest.TestCase):
 
 _TRIAGE_REQUESTS = {
     # request -> route fixed by the S1 rules (S1=5 / S1=17 on this branch).
+    # The 2026-10-17 entry-tightening PRD (A3/A5) supersedes "complex" here:
+    # S1=17 without proof of >=3 parallel nodes and cross-interrupt work is
+    # light_plan ("拿不准按轻规划"); complex now needs `--s1` facts or an
+    # explicit PM request.
     "修复 README 里的一个错别字": "simple",
-    "重构支付系统：迁移数据库、改造三个微服务接口、接入新的风控规则并上线到生产": "complex",
+    "重构支付系统：迁移数据库、改造三个微服务接口、接入新的风控规则并上线到生产": "light_plan",
 }
 _DEGRADED_MARKERS = ("degraded", "降级")
 _REASON_MARKERS = ("reason", "原因")

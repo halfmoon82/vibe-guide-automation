@@ -27,6 +27,15 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-17: narrower pending-verification whitelist + status listing.
+        "cb73d99b1241b4d05580be33a6bce4a2b8f62674e064b390d68a85ae8bc0db8f",
+        # 2026-10-17: structural pending-verification accepts only fixed sentence templates.
+        "14a0edcdd465c0d1e69d1a4719d2075aa3d9f6e0a3b8289981b4fbaf3984b1b9",
+        # 2026-10-17: §6.5 idle heartbeat back-off wired (pending-verification rework).
+        "4bd5a46dfefe563bc9b10b3165620cfab387447cf91bc27d4746bbd0a9543acf",
+        # 2026-10-17: pending-verification node — four human-interrupt cases,
+        # structural pending-verification items (§6.5/§7).
+        "114272b960006cddc98ac69ea105a6abfb3734e43314d244e8cc0b6fe5a43921",
         # 2026-10-16: run-9edb07bb integration merge (5 nodes on top of #210).
         "4bcee2236f297a664d8c8aa087590856298433546e1a7a61e56dc33b0418ceea",
         # intermediate text of that merge (main + heartbeat-contract only).
@@ -99,6 +108,10 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "5b7aa976a0f9b2ac20ca014a38a101635d274bad40d1a57bc4920b179ed5f38e",
     }),
     "vibe-entry": frozenset({
+        "315588896b6b69c069858aeaa2107146e6cbc3914f31b129e8057198842a0c38",
+        "ddf7b12525e99fc740b11557833cf7ef78c8b8c197dc96586a3c7bebbb555056",
+        # 2026-10-17: complex mode needs >=3 parallel nodes and cross-interrupt work; replies continue the tier.
+        "182f957ee264e44d4b3c9b70d053a74d9bb613d3610f4adc1d95be6415ebb7e5",
         "3ec0a771d482d92eba7f155f212dab97beb3a4a3b6712e16d7dc3d81394797eb",
         "a0d8ad6b24ed85982695214359b754a136315865ce76a4ccb36e03b9c4c9ef00",
         "08140f273188868532d5724d4fb199d1ee48ac46c80cbc2786f46fce91e4ddff",

@@ -42,7 +42,7 @@ class ProductManagerPathTests(unittest.TestCase):
         reject_engineering_fields(spec)
 
         # 1. Route: a complex request without a spec is a draft, not a dead end.
-        routed = self.cli("plan", "--request", REQUEST)
+        routed = self.cli("plan", "--request", REQUEST, "--s1", "5,5,5,5,5")
         self.assertEqual(routed.payload["route"], "complex", routed.payload)
         self.assertEqual(routed.payload["status"], "planned")
 
@@ -59,7 +59,7 @@ class ProductManagerPathTests(unittest.TestCase):
 
         # 3. Publish from the product spec: engineering fields are derived.
         shutil.copy(FIXTURE, self.root / "product-spec.json")
-        published = self.cli("plan", "--request", REQUEST, "--plan-id", "pm-plan", "--from-prd", "product-spec.json")
+        published = self.cli("plan", "--request", REQUEST, "--plan-id", "pm-plan", "--s1", "5,5,5,5,5", "--from-prd", "product-spec.json")
         self.assertEqual(published.payload["status"], "ok", published.payload)
         plan_dir = self.root / ".vibe" / "plans" / "pm-plan"
         plan = json.loads((plan_dir / "plan.json").read_text(encoding="utf-8"))

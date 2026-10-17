@@ -99,7 +99,7 @@ class ProtocolPathTests(_Project):
 
     def test_draft_then_same_id_publish_without_s1_reaches_authorization(self):
         # §1: route the request as-is, no --s1; keep the draft's plan_id.
-        routed = self.cli("plan", "--request", COMPLEX_REQUEST)
+        routed = self.cli("plan", "--request", COMPLEX_REQUEST, "--s1", "5,5,5,5,5")
         self.assertEqual(routed.payload["status"], "planned", routed.payload)
         plan_id = routed.payload["plan_id"]
         self.prepare_session()
@@ -107,7 +107,7 @@ class ProtocolPathTests(_Project):
         # the remote Git choice is written into it before publishing (§5.3).
         spec = self.write_spec(".vibe/plans/{}/product-spec.json".format(plan_id), "allow")
         # §5.3: publish with the draft's plan_id, still without --s1.
-        published = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+        published = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5", "--from-prd", spec)
         self.assert_complex_publish(published, plan_id, "allow")
         self.assertTrue((self.root / spec).is_file(), "publishing replaced the draft and lost the spec")
         authorized = self.cli("authorize", "--plan", plan_id, "--authorize", "AUTHORIZE")
@@ -115,11 +115,11 @@ class ProtocolPathTests(_Project):
 
     def test_draft_next_step_without_plan_id_publishes_over_the_draft(self):
         """The draft's own `next_step` omits --plan-id; the stable id applies."""
-        routed = self.cli("plan", "--request", COMPLEX_REQUEST)
+        routed = self.cli("plan", "--request", COMPLEX_REQUEST, "--s1", "5,5,5,5,5")
         plan_id = routed.payload["plan_id"]
         self.assertEqual(plan_id, stable_plan_id(COMPLEX_REQUEST))
         self.prepare_session()
-        published = self.cli("plan", "--request", COMPLEX_REQUEST, "--from-prd", self.write_spec("product-spec.json"))
+        published = self.cli("plan", "--request", COMPLEX_REQUEST, "--s1", "5,5,5,5,5", "--from-prd", self.write_spec("product-spec.json"))
         self.assert_complex_publish(published, plan_id, "deny")
 
     def test_publish_keeps_the_session_s1_of_its_draft(self):
@@ -227,13 +227,13 @@ class DraftReplacementBoundaryTests(_Project):
     """Only a draft that never reached publication may be replaced."""
 
     def draft(self):
-        plan_id = self.cli("plan", "--request", COMPLEX_REQUEST).payload["plan_id"]
+        plan_id = self.cli("plan", "--request", COMPLEX_REQUEST, "--s1", "5,5,5,5,5").payload["plan_id"]
         self.prepare_session()
         return plan_id
 
     def publish(self, plan_id):
         return self.cli(
-            "plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id,
+            "plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5",
             "--from-prd", self.write_spec("product-spec.json"),
         )
 
@@ -295,7 +295,7 @@ class DraftReplacementBoundaryTests(_Project):
             return real_replace(source, target)
 
         with mock.patch("vibe_guide.cli.os.replace", side_effect=failing_replace):
-            result = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+            result = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5", "--from-prd", spec)
         self.assertNotEqual(result.payload.get("status"), "ok", result.payload)
         self.assertEqual(sorted(p.name for p in self.plan_dir(plan_id).iterdir()), before)
         leftovers = [p.name for p in self.plan_dir(plan_id).parent.iterdir() if p.name.startswith(".")]
@@ -352,14 +352,14 @@ class DraftReplacementBoundaryTests(_Project):
 
         with mock.patch.object(cli_module.os, "rename", side_effect=interrupted_park):
             with self.assertRaises(KeyboardInterrupt):
-                self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+                self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5", "--from-prd", spec)
         self.assertFalse(self.plan_dir(plan_id).exists())
         # The protocol: .vibe/plans/.<plan_id>.draft.*/draft goes back to
         # .vibe/plans/<plan_id> when that does not exist.
         parked = list((self.root / ".vibe" / "plans").glob(".{}.draft.*/draft".format(plan_id)))
         self.assertEqual(len(parked), 1, parked)
         shutil.move(str(parked[0]), str(self.plan_dir(plan_id)))
-        published = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+        published = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5", "--from-prd", spec)
         self.assertEqual(published.payload.get("status"), "ok", published.payload)
         self.assertTrue((self.root / spec).is_file())
 
@@ -370,9 +370,9 @@ class DraftReplacementBoundaryTests(_Project):
         import vibe_guide.cli as cli_module
         with mock.patch.object(cli_module, "render_plan_artifacts", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
-                self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+                self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5", "--from-prd", spec)
         self.assertEqual(list((self.root / ".vibe" / "plans").glob(".{}.draft.*/draft".format(plan_id))), [])
-        published = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+        published = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5", "--from-prd", spec)
         self.assertEqual(published.payload.get("status"), "ok", published.payload)
 
     def test_a_parked_draft_behind_another_publication_republishes_under_a_new_id(self):
@@ -437,7 +437,7 @@ class DraftReplacementBoundaryTests(_Project):
 
         with mock.patch.object(cli_module.shutil, "rmtree", side_effect=interrupted_cleanup):
             with self.assertRaises(KeyboardInterrupt):
-                self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", spec)
+                self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5", "--from-prd", spec)
         # Branch ③: a parked draft, and the id is taken.
         parked = list((self.root / ".vibe" / "plans").glob(".{}.draft.*/draft".format(plan_id)))
         self.assertEqual(len(parked), 1, parked)
@@ -515,7 +515,7 @@ class DraftReplacementBoundaryTests(_Project):
         spec["decisions"][0]["status"] = "unresolved"
         spec["decisions"][0]["selected"] = None
         (self.root / "bad.json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
-        result = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", "bad.json")
+        result = self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5", "--from-prd", "bad.json")
         self.assertNotEqual(result.payload.get("status"), "ok", result.payload)
         self.assertEqual(sorted(p.name for p in self.plan_dir(plan_id).iterdir()), before)
         plan = json.loads((self.plan_dir(plan_id) / "plan.json").read_text(encoding="utf-8"))

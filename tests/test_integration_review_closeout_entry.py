@@ -411,7 +411,7 @@ class MailboxClosesTheRunTests(unittest.TestCase):
                  "--provenance", "closeout e2e: native visible-task tools observed",
                  "--project-id", "closeoutprobe")
         shutil.copy(FIXTURE, self.root / "product-spec.json")
-        self.cli("plan", "--request", REQUEST, "--plan-id", "closeout", "--from-prd", "product-spec.json")
+        self.cli("plan", "--request", REQUEST, "--plan-id", "closeout", "--s1", "5,5,5,5,5", "--from-prd", "product-spec.json")
         self.cli("authorize", "--plan", "closeout", "--authorize", "AUTHORIZE")
         result = self.cli("monitor", "--plan", "closeout", "--authorize", "AUTHORIZE")
         if tamper_plan is not None:

@@ -35,10 +35,11 @@ class V45SessionEntryTask2Tests(unittest.TestCase):
             context.failure_cost, context.toolchain,
         )))
 
-    def test_explicitly_complex_request_reaches_complex_without_s1(self):
+    def test_complex_looking_request_without_s1_is_light_plan_marked_uncertain(self):
         entry = build_session_entry("设计并实现支付系统，迁移数据、集成接口、编写测试并部署")
         self.assertGreater(entry.s1.total, 15)
-        self.assertEqual(entry.route.route, "complex")
+        self.assertEqual(entry.route.route, "light_plan")
+        self.assertIn("拿不准", entry.route.score_line)
 
     def test_empty_request_is_rejected(self):
         with self.assertRaises(ValueError):

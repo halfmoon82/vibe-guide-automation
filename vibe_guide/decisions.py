@@ -23,6 +23,12 @@ BOUNDARY_CATEGORIES = ("product_acceptance", "external_authorization")
 BOUNDARY_CATEGORY_ALIASES = {
     "product_design": "product_acceptance",
     "deploy": "external_authorization",
+    # The four human-interrupt cases: product scope/design change (above),
+    # deploy/release (above), credentials/system permission and irreversible
+    # actions outside the authorization card.
+    "credentials": "external_authorization",
+    "system_permission": "external_authorization",
+    "irreversible_action": "external_authorization",
 }
 #: Records written before categories existed read as this.
 LEGACY_BOUNDARY_CATEGORY = "product_acceptance"
@@ -34,8 +40,12 @@ def validate_boundary_category(category):
     value = BOUNDARY_CATEGORY_ALIASES.get(value, value)
     if value not in BOUNDARY_CATEGORIES:
         raise ValueError(
-            "category must be one of: {} (aliases: {}); engineering changes that "
-            "do not change PRD acceptance must be decided and recorded by the supervisor"
+            "category must be one of: {} (aliases: {}); only product scope/design "
+            "changes, deploy/release, credentials/system permissions and irreversible "
+            "actions outside the authorization card may hold or raise a decision. "
+            "Anything else is not a human decision: 自愈——the supervisor decides it, "
+            "records the correction and continues (engineering retries, cursor or "
+            "evidence mismatches, structural pending-verification items)"
             .format(
                 ", ".join(BOUNDARY_CATEGORIES),
                 ", ".join("{}→{}".format(old, new) for old, new in BOUNDARY_CATEGORY_ALIASES.items()),
