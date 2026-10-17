@@ -104,7 +104,18 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
   - `output`：交出什么。
   - `error_behavior`：出错时对用户的表现。
   - `acceptance_example`：一个具体的例子，验收者照着做就能判断通过与否。
-- `files`：这个节点会动的文件，项目相对路径。这是授权卡上的文件范围，宁可列全，不要漏。漏列的文件只有两类可由监工不问产品经理、自行补进该节点范围：`tests/` 下的测试文件，或项目 `.vibe/config.json` 的 `auto_scope_paths` 登记的机械附属文件；前提是在本仓库内、不涉及部署/凭据/外部系统配置、没有被其他未完成节点占用，并且补进去要留下纠偏记录（`scope_auto_expanded` 事件）。交付和验收汇报必须逐个节点列出 `scope_expansions`（`vibe status --json` 每个节点下的同名字段；为空也要写明无）。其他文件漏列仍必须请产品经理授权。
+- `files`：这个节点会动的文件，项目相对路径。这是**工程文件清单**，不是产品范围——它描述授权卡上的实现边界，扩展清单本身不等于产品设计变化。宁可列全，不要漏。漏列的文件可由监工不问产品经理、自行补进该节点范围，但必须同时满足：① 在本仓库内；② 不涉及部署、凭据、外部系统配置（`auto_scope_paths` 登记项由产品经理在登记时自行把关）；③ 没有被其他活跃节点的写范围（allowlist / owned_paths / 既往扩围）覆盖；④ 补进去要留下纠偏记录（`scope_auto_expanded` 事件）；⑤ 走通下面两类判据之一。
+
+  - **判据一（机械规则，始终有效）**：文件在 `tests/` 目录下，或项目 `.vibe/config.json` 的 `auto_scope_paths` 里登记过（逐条精确匹配，不支持通配符）。放在 `tests/` 下的依赖清单按本条放行。`auto_scope_paths` 是项目预先写好的白名单，登记本身即产品经理授权，因此这一支不再逐条检查依赖清单、敏感目录或外部配置根；配置文件缺失或非法时按空清单处理。
+  - **判据二（验收判定不变，需项目显式批准）**：每个已批准 PRD 验收例子的判定结果都不变，且文件属于低风险源码或文档（白名单与排除项见 `planner._approved_scope_rule`）。只在项目于 `.vibe/config.json` 写入 `acceptance_scope_rule_approved: true` 后生效，且该开关必须与项目 `AGENTS.md` §6 的同一规则成对出现；未开启的项目一律按判据一处理。
+
+  两类边界必须问产品经理：新增第三方依赖（发布/安全对外承诺）、执行模式从「可见可进入的任务」降级为「后台不可见」。判据二用 payload 的两个布尔字段自证这两条，任一为真即整条拒绝；判据一不逐条判这两条——`auto_scope_paths` 是产品经理预先登记的清单，登记本身即授权，所以不要往里登记依赖清单、部署脚本或凭据文件。验收判定改变同样必须单独授权。
+
+  判据二通过 `vibe scope-expand --run-id <run> --node <node> --payload '<json>'` 提出，且只对**已验收、当前没有活跃任务**的节点生效；节点开发中途的扩围走事件自报。payload 必须是对象，且**恰好五个键**：`files`、`acceptance_examples_unchanged`（必须为 `true`）、`adds_third_party_dependency`（必须为 `false`）、`visibility_downgrade`（必须为 `false`）、`reason`（去首尾空白后非空、≤200 字符、不含控制字符）。
+
+  `files` 至少一条、不重复、每条都是归一化后的仓库相对路径（不能带 `./` 前缀、尾斜杠或控制字符）。缺键、多键、任一取值不符或任一条路径不合法，整条请求被拒，**不做部分补入**：未开启判据二的项目里，只要有一个文件不满足判据一，整条请求都不补。事件自报（一致性缺口 `inconsistency.scope_expansion`、整合审查发现 `review_finding.scope_expansion`）仍允许直接给路径数组，那种旧形态只按判据一处理。
+
+  交付和验收汇报必须逐个节点列出 `scope_expansions`（`vibe status --json` 每个节点下的同名字段；为空也要写明无）。不在两类判据内的文件，按 §7 请产品经理单独授权；那一次授权的理由是文件越界，不是判据二没开。
 - 节点 `id` 用小写字母、数字、连字符。不要写 `integration-review`，vibe 会自动追加最终整合审查节点。
 
 拆完用产品语言复述一遍给产品经理："一共三件事，前两件可以同时做，第三件要等第一件做完。"
@@ -308,7 +319,7 @@ for action in store.pending():          # 先按当前 run/绑定证据收敛已
 ```
 
 - 全部清零就是 `findings: []`、`out_of_scope: []`。**只有 `resolved` 算清零**：`open`、`accepted`、`waived` 一律计入 `clearance`，报了会被判
-  `integration review acceptance still reports open P0-P2 findings`，节点落到 `blocked_unknown`。这一条是**格式约定，不是权限边界**：同一条 P0 写成 `resolved` 照样清零，vibe 不会去核对审查者此前报过的 `review_finding`。约定的作用是让自签豁免在证据包里留下痕迹——`waived` 过不去，想放行只能把它改写成 `resolved`，那就是一条明写在档案里的"我说修好了"。**所以放行仍然是人的决定，只是这道门不替人把关**：P0–P2 没修完就报 `review_finding` 事件让整合审查返工，别改字。
+  `integration review acceptance still reports open P0-P2 findings`，节点落到 `blocked_unknown`。这一条是**格式约定，不是权限边界**：同一条 P0 写成 `resolved` 照样清零，vibe 不会去核对审查者此前报过的 `review_finding`。约定的作用是让自签豁免在证据包里留下痕迹——`waived` 过不去，想放行只能把它改写成 `resolved`，那就是一条明写在档案里的"我说修好了"。**所以这里没有第二道人工审批门：放行取决于档案里写下的结论，这道门只记账、不替人把关**：P0–P2 没修完就报 `review_finding` 事件让整合审查返工，别改字。
 - 两个判断里的 `evidence` **必须是非空字符串**。给嵌套对象会被拒（`... needs a status and a non-empty evidence string`）：落盘时 `evidence` 整个字段会被打码，对象里"看起来像敏感信息"的键会被丢掉，于是写进去的包回读时不再合法——顶层会先报一次 `complete`，下一次读又退回去。所以这里只收一句话。
 
 - **只能给这四个键，多一个就是 schema 错误**。`run_id`、`plan_id`、`plan_revision`、四个 digest、`aggregated_scope`、`clearance`、`agentsmd_acceptance_refs`、`unverified_or_excluded` 全部由 vibe 从 run 自己和计划的整合合同派生。这不是省事：审查者不能改写它被追责的血缘，也不能缩小它被要求覆盖的范围。
@@ -472,7 +483,11 @@ vibe supervisor-preflight --run-id <run-id> --accept-decision --session-record <
 
 ## 7. 什么时候才能打断产品经理
 
-只有四类：产品范围或设计要变、部署或对外发布、涉及凭据或系统权限、授权卡外的不可撤销动作。`supervisor-hold` 与 `decision-raise` 只接受这四类（落盘仍是 `product_acceptance` / `external_authorization` 两个规范类别；`credentials`、`system_permission`、`irreversible_action` 是 `external_authorization` 的别名），其他类别（如 `engineering`）直接报错并提示走自愈。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知、按 §4 `files` 规则可自动补进范围的测试文件和机械附属文件）由 vibe 的 Monitor 自行分类恢复；结构性待验项**只认固定句式**：「[真机/生产环境/线上前缀]＋事项名词短语（中文 ≤8 字、英文 ≤5 词；不含否定、程度、谓语或“出现/发生/显示/返回/反馈/报错”类词，不含数字加单位，不以空白/模糊/低/慢/失灵/失效/延迟/late/delayed 等状态词结尾）＋[10/10]＋只能/仅能/需/须/待＋[在]验收期/上线后/真机上/生产环境＋验证/确认/完成」，英文同理（“<短名词> can only be verified in the acceptance period”），另认“验证脚本不入库/仅本地运行”；其余说法一律按未知处理、保持 `blocked_unknown`。符合句式、只能在真机、生产环境或验收期验证的事项，Monitor 自动记为 `deferred_to_acceptance` 处置、节点照常进入验收，并单列在交付与验收汇报的“验收期待验项”里（`vibe status` 人类可读与 `--json` 的 `acceptance_pending_verification` 按节点列出，有则必列、无则不显示），同一事项换措辞重报沿用原处置、不产生第二条处置事件；判断不了是否结构性的仍按普通未知项保持 `blocked_unknown`；恢复不了的会标 `blocked_unknown`，同时保留结构化 `recovery_action`，不伪装成成功也不静默丢掉入口。
+**已批准判据（产品经理 2026-10-05 确认）**：修改后，PRD 里每条验收例子的判定结果是否改变——不变就由监工自决并留痕，变了才问产品经理；另外两类无论如何都问：新增第三方依赖（发布/安全对外承诺）、执行模式从「可见可进入的任务」降级为「后台不可见」。
+
+这条判据的**落地条件**在 §4：判据一（`tests/` 与 `auto_scope_paths`）始终可用；判据二（验收判定不变）只在项目开启 `acceptance_scope_rule_approved` 后才可用，未开启的项目按判据一处理。判据二未开启**不等于产品范围变了**：落在判据一内的文件照常补；确实落在判据一之外的，仍走 §4 的单独授权——那会问产品经理，但理由是文件本身越界，不是判据二没开。
+
+只有四类：产品范围或设计要变、部署或对外发布、涉及凭据或系统权限、授权卡外的不可撤销动作。`supervisor-hold` 与 `decision-raise` 只接受这四类（落盘仍是 `product_acceptance` / `external_authorization` 两个规范类别；`credentials`、`system_permission`、`irreversible_action` 是 `external_authorization` 的别名），其他类别（如 `engineering`）直接报错并提示走自愈。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知、按 §4 `files` 判据一或判据二可自动补进范围的文件）由 vibe 的 Monitor 自行分类恢复；结构性待验项**只认固定句式**：「[真机/生产环境/线上前缀]＋事项名词短语（中文 ≤8 字、英文 ≤5 词；不含否定、程度、谓语或“出现/发生/显示/返回/反馈/报错”类词，不含数字加单位，不以空白/模糊/低/慢/失灵/失效/延迟/late/delayed 等状态词结尾）＋[10/10]＋只能/仅能/需/须/待＋[在]验收期/上线后/真机上/生产环境＋验证/确认/完成」，英文同理（“<短名词> can only be verified in the acceptance period”），另认“验证脚本不入库/仅本地运行”；其余说法一律按未知处理、保持 `blocked_unknown`。符合句式、只能在真机、生产环境或验收期验证的事项，Monitor 自动记为 `deferred_to_acceptance` 处置、节点照常进入验收，并单列在交付与验收汇报的“验收期待验项”里（`vibe status` 人类可读与 `--json` 的 `acceptance_pending_verification` 按节点列出，有则必列、无则不显示），同一事项换措辞重报沿用原处置、不产生第二条处置事件；判断不了是否结构性的仍按普通未知项保持 `blocked_unknown`；恢复不了的会标 `blocked_unknown`，同时保留结构化 `recovery_action`，不伪装成成功也不静默丢掉入口。
 
 `blocked_unknown` 的标准恢复动作按原因执行：
 
