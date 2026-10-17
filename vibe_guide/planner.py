@@ -120,6 +120,8 @@ class RouteResult:
         """The one-line S1 result the entry protocol asks the agent to print."""
         label = {"simple": "直接执行（不触碰 vibe）", "light_plan": "轻规划（不触碰 vibe）", "complex": "vibe 正式路由"}[self.route]
         line = "S1：{}→{}".format(self.score if self.score is not None else "?", label)
+        if EXPLICIT_COMPLEX_FLAG in self.force_upgrade_flags:
+            line += "；产品经理显式要求复杂流程"
         if self.unmet_conditions:
             line += "；未满足复杂模式条件：" + "、".join(self.unmet_conditions)
         return line
@@ -729,30 +731,44 @@ def required_workflow_nodes(route):
     raise ValueError("unrecognised route: {!r}".format(value))
 
 
-_CONFIRM_LEAD = re.compile(
-    r"^(?:全部)?(?:授权|同意|批准|接受|允许|确认|可以|好的?|行|是的?|对|没问题|ok|okay|继续|合并|就这样|就按)"
+# A reply continues the current tier only when it is made of nothing but these
+# words (plus option marks, version numbers and punctuation).  Any real task
+# content -- even after a leading "好的" -- makes it a new request.
+CONTINUATION_WORDS = (
+    "按你的推荐来", "按这个顺序", "按你说的", "git远端动作", "升级本机", "没问题", "就这样", "再次",
+    "授权", "同意", "批准", "接受", "允许", "确认", "可以", "好的", "是的", "继续", "合并", "发布",
+    "开始", "规划", "全部", "就按", "okay", "ok", "好", "行", "对", "是", "选", "吧", "了", "啊", "呢", "嗯", "并",
 )
-_OPTION_ONLY = re.compile(r"^(?:选\s*)?(?:[a-e]|[1-9]\d?)(?:[\s,，。.]|$)", re.IGNORECASE)
-_CONTINUE_PHRASES = ("按你的推荐", "按这个顺序", "按你说的", "再试一次", "你来接手", "接着做", "接着来")
+_WORD_RE = re.compile("|".join(re.escape(w) for w in CONTINUATION_WORDS))
+_OPTION_RE = re.compile(r"(?<![a-z0-9])[a-e](?![a-z0-9])|v?\d+(?:\.\d+)*")
+_PUNCT_RE = re.compile(r"[\s,，。.!！?？、;；:：~～]+")
 CONTINUATION_MAX_CHARS = 60
+
+# Fixed phrasings with which the product manager explicitly asks for the
+# complex flow.  Single source; the entry protocol text lists the same ones.
+EXPLICIT_COMPLEX_PHRASES = ("走复杂流程", "复杂流程", "复杂模式", "完整流程")
+EXPLICIT_COMPLEX_FLAG = "pm_explicit"
+
+
+def asks_for_complex(message: str) -> bool:
+    return isinstance(message, str) and any(p in message for p in EXPLICIT_COMPLEX_PHRASES)
 
 
 def is_continuation_message(message: str) -> bool:
-    """A reply that confirms/selects/continues existing work, not a new request.
+    """A reply that only confirms/selects/continues existing work.
 
     Such a message inherits the session's current tier; scoring it again made
     "授权" or "选A" look like a fresh complex task.
     """
     if not isinstance(message, str):
         return False
-    normalized = " ".join(message.strip().lower().split())
-    if not normalized or len(normalized) > CONTINUATION_MAX_CHARS or "\n" in message.strip():
+    text = " ".join(message.strip().lower().split())
+    if not text or len(text) > CONTINUATION_MAX_CHARS:
         return False
-    return bool(
-        _CONFIRM_LEAD.match(normalized)
-        or _OPTION_ONLY.match(normalized)
-        or any(phrase in normalized for phrase in _CONTINUE_PHRASES)
-    )
+    text = _OPTION_RE.sub("", text)
+    text = _WORD_RE.sub("", text)
+    text = _OPTION_RE.sub("", text)
+    return _PUNCT_RE.sub("", text) == ""
 
 
 def classify_s0(message: str) -> S0Result:

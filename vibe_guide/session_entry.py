@@ -5,7 +5,7 @@ It deliberately has no provider, writer, or monitor side effects; execution is
 handled by the later authorization boundary.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import os
@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .planner import RouteResult, S0Result, S1Score, TaskContext, classify_s0, is_continuation_message, parse_s1_context, route_task, score_s1
+from .planner import RouteResult, S0Result, S1Score, TaskContext, EXPLICIT_COMPLEX_FLAG, asks_for_complex, classify_s0, is_continuation_message, parse_s1_context, route_task, score_s1
 
 
 def _normalize_request(request: str) -> str:
@@ -302,6 +302,8 @@ def build_session_entry(request: str, s1: Any = None, plan_id: Optional[str] = N
         raise ValueError("--s1 must be five integers between 0 and 5, separated by commas")
     if context is None:
         context = default_s1_context(normalized)
+    if asks_for_complex(normalized) and EXPLICIT_COMPLEX_FLAG not in context.force_upgrade_flags:
+        context = replace(context, force_upgrade_flags=list(context.force_upgrade_flags) + [EXPLICIT_COMPLEX_FLAG])
     score = score_s1(context)
     route = route_task(context)
     resolved_plan_id = str(plan_id).strip() if isinstance(plan_id, str) and plan_id.strip() else stable_plan_id(normalized)

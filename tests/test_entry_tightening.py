@@ -15,8 +15,7 @@ from vibe_guide.session_entry import (
 FIXTURE = Path(__file__).parent / "fixtures" / "entry_route_complex_messages.json"
 MESSAGES = {row["id"]: row["message"] for row in json.loads(FIXTURE.read_text(encoding="utf-8"))}
 CONTINUATION_IDS = (
-    "vr-008", "vr-025", "vr-030", "vr-036", "vr-059", "vr-060", "vr-061", "vr-070",
-    "vr-071", "vr-094", "vr-096", "vr-097", "vr-098",
+    "vr-008", "vr-025", "vr-060", "vr-071", "vr-094", "vr-096", "vr-097", "vr-098",
 )
 
 
@@ -39,8 +38,20 @@ class ComplexMessageSetTests(unittest.TestCase):
                 self.assertNotEqual(entry_route(message)["route"], "complex")
 
     def test_real_new_requests_are_not_swallowed(self):
-        for text in ("设计并实现一个支付系统，迁移数据、集成接口、编写测试并部署", "帮我重构登录模块"):
+        for text in (
+            "设计并实现一个支付系统，迁移数据、集成接口、编写测试并部署", "帮我重构登录模块",
+            "好的，帮我重构整个支付模块", "可以帮我写一个登录页吗", "继续开发订单系统的退款功能",
+            "合并两个分支并解决冲突", "确认一下库存同步为什么失败", "行吧，那你重写整个后端",
+            "对了，还要加一个导出", "ok 那就开始做完整的复杂流程吧",
+        ):
             self.assertFalse(is_continuation_message(text), text)
+
+    def test_explicit_complex_request_enters_complex(self):
+        for text in ("请走复杂流程，帮我做支付系统", "用复杂模式做这个"):
+            result = entry_route(text)
+            self.assertEqual(result["route"], "complex", text)
+            self.assertIn("产品经理显式要求", result["score_line"])
+        self.assertEqual(entry_route("帮我做支付系统")["route"], "light_plan")
 
 
 class ComplexConditionTests(unittest.TestCase):
