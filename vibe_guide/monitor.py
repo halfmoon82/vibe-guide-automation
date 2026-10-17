@@ -3671,6 +3671,17 @@ class Monitor:
                 ):
                     if current.get("status") not in {"blocked_unknown", "retry_pending"}:
                         current["retryable_action"] = None
+                    if (
+                        str(retry.get("role")) == "reviewer"
+                        and current.get("reviewer_replacement_required")
+                        and current.get("status") == "review"
+                    ):
+                        # A scheduled successor review is now live: close the
+                        # replacement gate exactly like the delivery-time
+                        # successor dispatch does above.  Leaving it open
+                        # would force yet another fresh identity on the next
+                        # review round instead of continuing this reviewer.
+                        current["reviewer_replacement_required"] = False
                 continue
             if current.get("status") == "delivered" and not current.get("reviewer_started"):
                 if self._node_dispatch_topology(node) == TOPOLOGY_VISIBLE_SDD:
@@ -4103,6 +4114,13 @@ class Monitor:
         current[generation_key] = generation
         if role == "reviewer":
             current["reviewer_started"] = True
+            if successor:
+                # A fresh reviewer identity starts a fresh unconverged-loop
+                # budget: the three-finding limit exists to stop ping-pong
+                # under one reviewer, so replacing the reviewer must actually
+                # break the loop instead of parking on the successor's very
+                # first finding (#153).
+                current["review_loop_rounds"] = 0
 
         contract = dict(node.contract)
         contract.update(current.get("contract_overrides", {}))
@@ -4806,6 +4824,13 @@ class Monitor:
         # The registered binding must match the dispatch ruling.  A bridge
         # that cannot honor the ruled topology (e.g. no visible session for a
         # visible-sdd node) is fail-closed, never silently downgraded.
+        if continuation and previous_binding is not None and previous_binding.successor_of and not binding.successor_of:
+            # Immutable ancestry (task_registry.save_task_binding): resuming a
+            # successor task must keep its predecessor link.  Dropping it makes
+            # the registry refuse the continuation as "immutable successor
+            # ancestry drift" and strands the node in blocked_unknown after a
+            # replacement reviewer's next finding.
+            binding.successor_of = previous_binding.successor_of
         expected_topology = str(contract.get("topology") or TOPOLOGY_DUAL_VISIBLE)
         if binding.topology != expected_topology:
             raise ValueError(
@@ -5428,9 +5453,10 @@ class Monitor:
                     self._ensure_blocked_design_decision(snapshot, node_id)
                     return
                 try:
-                    review_round = int(current.get("review_generation", 0))
+                    review_round = int(current.get("review_loop_rounds", 0)) + 1
                 except (TypeError, ValueError):
-                    review_round = 0
+                    review_round = 1
+                current["review_loop_rounds"] = review_round
                 if review_round >= 3:
                     # Three unconverged rework rounds: the fix is a different
                     # reviewer (or a split node), never another automatic
@@ -5462,9 +5488,17 @@ class Monitor:
                             "run_id": snapshot.run_id,
                             "node_id": node_id,
                             "reason": current["reason"],
-                            "review_round": review_round,
-                            "reviewer_replacement_required": True,
                             "recovery_action": "change_reviewer_or_split_node",
+                            # The durable schema keeps structured values only
+                            # under pass-through keys, so the replay branch
+                            # restores the park from ``proof`` -- top-level
+                            # review_round / reviewer_replacement_required
+                            # would be dropped by _sanitize_event_data.
+                            "proof": {
+                                "review_loop_rounds": review_round,
+                                "reviewer_replacement_required": True,
+                                "reviewer_identity": current.get("reviewer_identity"),
+                            },
                         },
                         active,
                     )
@@ -7631,6 +7665,34 @@ class Monitor:
                     current["owner_layer"] = "product_acceptance"
                     current["recovery_action"] = None
                     current["user_interrupt"] = True
+                current["active_role"] = None
+                current["active_task"] = None
+                snapshot.handles.pop(node_id, None)
+                self._release_node_lease(snapshot, node_id)
+            elif record["event"] == "review_loop_limit_reached":
+                # Crash-window twin of the live three-round park: the event
+                # was appended but the snapshot save missed it.  Restore the
+                # same fail-closed park so the recovery entry stays executable
+                # instead of degrading to the generic manual-reconciliation
+                # state (the known cost of the older reviewer_write_violation
+                # event, which has no such branch).
+                proof = data.get("proof")
+                if (
+                    data.get("recovery_action") != "change_reviewer_or_split_node"
+                    or not isinstance(data.get("reason"), str)
+                    or not isinstance(proof, dict)
+                    or proof.get("reviewer_replacement_required") is not True
+                    or not isinstance(proof.get("reviewer_identity"), str)
+                    or not proof.get("reviewer_identity")
+                ):
+                    raise ValueError("replayed review loop limit evidence is invalid")
+                current["status"] = "blocked_unknown"
+                current["reason"] = data["reason"]
+                current["recovery_action"] = "change_reviewer_or_split_node"
+                current["reviewer_replacement_required"] = True
+                current["reviewer_started"] = False
+                current["review_loop_rounds"] = proof.get("review_loop_rounds", 3)
+                current["reviewer_identity"] = proof["reviewer_identity"]
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)

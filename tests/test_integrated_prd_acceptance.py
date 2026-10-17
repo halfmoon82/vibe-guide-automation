@@ -47,7 +47,7 @@ from vibe_guide.planner import resolve_scope_expansion
 from vibe_guide.runners.claude_bg import ClaudeBgRunner
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.runners.provider_action import ProviderActionRunner
-from vibe_guide.state import load_events, map_user_status
+from vibe_guide.state import load_events, load_snapshot, map_user_status
 
 from tests.support_v45_authorize import publish_complex_probe
 from tests.test_monitor import VisibleSddRunner, load_v46_dispatch_fixture
@@ -639,6 +639,91 @@ class ACB6ReworkLoopTests(_ProjectCase):
         self.assertFalse(
             {c.get("task_id") for c in new_reviews} & old_reviewer,
             "AC-B6: the replacement review must use a new reviewer identity",
+        )
+
+    def test_ac_b6_replacement_reviewer_keeps_identity_on_next_round(self):
+        """P2-1 of the PR #238 review: the replacement gate must close.
+
+        After the scheduled successor review starts, the next delivery must
+        continue that same replacement reviewer.  A gate left open forces a
+        third fresh identity on every round, so the review lineage the
+        visible-sdd protocol requires never forms.
+        """
+        monitor, runner, snapshot = self._three_rounds(
+            {"finding": "still wrong", "severity": "P1"}
+        )
+        old_reviewer = {
+            c["task_id"] for c in runner.start_calls if c["role"] == "reviewer"
+        }
+        monitor.repair_node("n1", snapshot.run_id)
+        # The successor gets a fresh three-finding budget: its first finding
+        # reworks instead of parking, and the re-review continues it.
+        runner.events[("n1", "reviewer")] = [
+            ("review_finding", {"finding": "still wrong", "severity": "P1"}),
+            ("accepted", {"evidence": "fresh review"}),
+        ]
+        runner.events[("n1", "developer")] = [("complete", {"evidence": "d"})] * 6
+        before = len(runner.start_calls)
+        with patch("time.time", return_value=time.time() + 3600):
+            snapshot = self._tick_until(
+                monitor, runner, snapshot, "n1",
+                {"accepted", "blocked_unknown", "blocked_design"}, limit=20,
+            )
+        new_reviews = [
+            c for c in runner.start_calls[before:] if c["role"] == "reviewer"
+        ]
+        self.assertEqual(
+            len(new_reviews), 2,
+            "PR #238 P2-1: expected exactly the successor review and its "
+            "continuation, got {}".format(
+                [(c["task_id"], bool(c.get("successor")), bool(c.get("continuation"))) for c in new_reviews]
+            ),
+        )
+        successor, again = new_reviews
+        self.assertTrue(successor["successor"])
+        self.assertFalse(successor["continuation"])
+        self.assertNotIn(successor["task_id"], old_reviewer)
+        self.assertEqual(again["task_id"], successor["task_id"])
+        self.assertTrue(again["continuation"])
+        self.assertEqual(snapshot.nodes["n1"]["status"], "accepted")
+
+    def test_ac_b6_review_loop_limit_survives_event_replay(self):
+        """P2-2 of the PR #238 review: the park must replay as itself.
+
+        A crash between appending ``review_loop_limit_reached`` and saving
+        the snapshot must not degrade the node to the generic
+        "unapplied event needs manual reconciliation" state: the recovery
+        entry has to stay executable.
+        """
+        monitor, runner, snapshot = self._three_rounds(
+            {"finding": "still wrong", "severity": "P1"}
+        )
+        events = load_events(self.paths, snapshot.run_id)
+        park = [r for r in events if r["event"] == "review_loop_limit_reached"][-1]
+        stale = load_snapshot(self.paths, snapshot.run_id)
+        stale.event_sequence = park["sequence"] - 1
+        node = stale.nodes["n1"]
+        # Stand in for the pre-park snapshot: drop every park marker the
+        # replay is supposed to restore from the event.
+        node.pop("reviewer_replacement_required", None)
+        node.pop("review_loop_rounds", None)
+        node["recovery_action"] = None
+        node["reviewer_identity"] = None
+        monitor._reconcile_unapplied_events(stale)
+        current = stale.nodes["n1"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        self.assertEqual(
+            current.get("recovery_action"), "change_reviewer_or_split_node"
+        )
+        self.assertIs(current.get("reviewer_replacement_required"), True)
+        self.assertIs(current.get("reviewer_started"), False)
+        self.assertEqual(
+            current.get("reviewer_identity"),
+            park["data"]["proof"]["reviewer_identity"],
+        )
+        self.assertEqual(
+            current.get("review_loop_rounds"),
+            park["data"]["proof"]["review_loop_rounds"],
         )
 
     def test_ac_b6_three_rounds_escalate_only_when_acceptance_changes(self):
