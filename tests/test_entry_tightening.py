@@ -53,6 +53,10 @@ class ComplexMessageSetTests(unittest.TestCase):
             self.assertIn("产品经理显式要求", result["score_line"])
         self.assertEqual(entry_route("帮我做支付系统")["route"], "light_plan")
 
+    def test_negated_or_incidental_mentions_are_not_explicit(self):
+        for text in ("不要走复杂流程，直接改", "别用复杂模式", "这个复杂流程太麻烦，帮我简化", "跑一遍完整流程测试"):
+            self.assertNotEqual(entry_route(text)["route"], "complex", text)
+
 
 class ComplexConditionTests(unittest.TestCase):
     def test_17_points_with_two_parallel_nodes_is_light_plan(self):

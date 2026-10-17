@@ -744,14 +744,18 @@ _OPTION_RE = re.compile(r"(?<![a-z0-9])[a-e](?![a-z0-9])|v?\d+(?:\.\d+)*")
 _PUNCT_RE = re.compile(r"[\s,，。.!！?？、;；:：~～]+")
 CONTINUATION_MAX_CHARS = 60
 
-# Fixed phrasings with which the product manager explicitly asks for the
-# complex flow.  Single source; the entry protocol text lists the same ones.
-EXPLICIT_COMPLEX_PHRASES = ("走复杂流程", "复杂流程", "复杂模式", "完整流程")
+# The product manager explicitly asks for the complex flow only with a request
+# verb in front of the flow name ("走复杂流程", "用复杂模式"), and not when a
+# negation sits right before it.  Single source; the entry protocol text lists
+# the same phrasings.
 EXPLICIT_COMPLEX_FLAG = "pm_explicit"
+_EXPLICIT_COMPLEX_RE = re.compile(r"(?P<neg>不要|不用|无需|没必要|不|别)?(?:请|要|就)?(?:走|用|按|进入)(?:复杂流程|复杂模式|正式流程)")
 
 
 def asks_for_complex(message: str) -> bool:
-    return isinstance(message, str) and any(p in message for p in EXPLICIT_COMPLEX_PHRASES)
+    if not isinstance(message, str):
+        return False
+    return any(not m.group("neg") for m in _EXPLICIT_COMPLEX_RE.finditer(message))
 
 
 def is_continuation_message(message: str) -> bool:
