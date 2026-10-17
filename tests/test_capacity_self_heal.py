@@ -179,3 +179,55 @@ class UnreadableRegistryTests(CapacityFixture):
         tasks.write_text(json.dumps(payload), encoding="utf-8")
         occupied, unknown = monitor._occupied_nodes(snapshot)
         self.assertIsNotNone(unknown)
+
+
+class ReplayAndRetryTests(CapacityFixture):
+    def test_unsaved_correction_event_does_not_wedge_resume(self):
+        monitor, record = self.monitor()
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        stored = load_snapshot(self.paths, snapshot.run_id)
+        stored.active_concurrency = 6
+        save_snapshot(self.paths, stored)
+        # An entry point records the correction, then the snapshot is not saved.
+        lost = load_snapshot(self.paths, snapshot.run_id)
+        monitor._reconcile_capacity(lost)
+        self.assertEqual(len(self.events(snapshot, "capacity_counter_corrected")), 1)
+        resumed = monitor.resume(snapshot.run_id, runner)
+        self.assertEqual(resumed.active_concurrency, 5)
+        self.assertEqual(len(runner.start_calls), 5)
+
+    def test_unsaved_registry_unknown_event_does_not_wedge_resume(self):
+        monitor, record = self.monitor()
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        tasks = self.paths.root / ".vibe" / "runs" / snapshot.run_id / "tasks.json"
+        tasks.write_text("{not json", encoding="utf-8")
+        lost = load_snapshot(self.paths, snapshot.run_id)
+        monitor._reconcile_capacity(lost)
+        self.assertEqual(len(self.events(snapshot, "capacity_registry_unknown")), 1)
+        resumed = monitor.resume(snapshot.run_id, runner)
+        self.assertEqual(resumed.status, "blocked_unknown")
+
+    def test_pending_schedule_retry_respects_capacity_hold(self):
+        monitor, record = self.monitor()
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        stored = load_snapshot(self.paths, snapshot.run_id)
+        current = stored.nodes["n6"]
+        current["status"] = "blocked_unknown"
+        current["retryable_action"] = {
+            "role": "developer", "phase": "develop", "continuation": False,
+            "successor": False, "same_task": False, "pending_schedule": True,
+            "missing_binding_recovery": True, "next_retry_at": 0,
+        }
+        save_snapshot(self.paths, stored)
+        (self.paths.root / ".vibe" / "runs" / snapshot.run_id / "tasks.json").write_text(
+            "{not json", encoding="utf-8"
+        )
+        monitor._reset_binding_cache()
+        before = len(runner.start_calls)
+        after = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(len(runner.start_calls), before)
+        # The retry marker is untouched: no start was even attempted.
+        self.assertIsNotNone(after.nodes["n6"]["retryable_action"])

@@ -3926,6 +3926,10 @@ class Monitor:
                     retry["defer_once"] = False
                     current["retryable_action"] = retry
                     continue
+                if pending_schedule and capacity_held:
+                    # Unknown registry: no new session, not even a reviewer
+                    # replacement.
+                    continue
                 if pending_schedule and (
                     active_sessions >= session_limit
                     or not all(
@@ -7525,7 +7529,12 @@ class Monitor:
             data = record["data"]
             if data.get("run_id") != snapshot.run_id:
                 raise ValueError("unapplied event run lineage is inconsistent")
-            if record["event"] in {"execution_topology_observed", "monitor_entry_evidence_reconciled"}:
+            if record["event"] in {
+                "execution_topology_observed",
+                "monitor_entry_evidence_reconciled",
+                "capacity_counter_corrected",
+                "capacity_registry_unknown",
+            }:
                 # System projection evidence is read-only metadata; legacy
                 # V3.9 replay must not interpret it as a node lifecycle event.
                 snapshot.event_sequence = record["sequence"]
