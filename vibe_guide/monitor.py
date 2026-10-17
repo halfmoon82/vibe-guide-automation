@@ -256,6 +256,14 @@ _PV_ENVIRONMENT_MARKERS = (
     "真机", "实机", "真实设备", "生产环境", "生产数据", "线上", "微信", "真实环境",
     "real device", "production", "on-device", "live environment",
 )
+#: An item that reports an already observed defect is never structural: it is a
+#: finding, not something that merely cannot be checked yet.  One list, used by
+#: both the classifier and the same-item comparison.
+_PV_DEFECT_MARKERS = (
+    "崩溃", "失败", "报错", "错误", "异常", "丢失", "算错", "不一致", "损坏", "回归",
+    "出错", "故障", "缺陷", "不对", "有误",
+    "crash", "fail", "error", "corrupt", "lost", "wrong", "regress", "broken", "bug",
+)
 _PV_DEFERRAL_MARKERS = ("验收期", "acceptance period", "acceptance phase")
 _PV_FILLER = (
     "验收期", "只能", "需要", "才能", "完成", "验证", "真实设备", "生产环境",
@@ -268,6 +276,8 @@ def is_structural_pending_verification(item: Any) -> bool:
     if not isinstance(item, str) or not item.strip():
         return False
     text = item.lower()
+    if any(marker in text for marker in _PV_DEFECT_MARKERS):
+        return False
     if "验证脚本" in text and "不入库" in text:
         return True
     if not any(marker in text for marker in _PV_ENVIRONMENT_MARKERS):
@@ -300,7 +310,14 @@ def same_pending_verification(first: Any, second: Any) -> bool:
     if first.strip() == second.strip():
         return True
     left, right = _pv_core_tokens(first), _pv_core_tokens(second)
-    return bool(left) and bool(right) and (left <= right or right <= left)
+    if not left or not right:
+        return False
+    # Extra words on one side must only name the environment; any other extra
+    # word (e.g. a different feature) makes it a different matter.
+    extras = (left ^ right)
+    return (left <= right or right <= left) and all(
+        any(token in marker for marker in _PV_ENVIRONMENT_MARKERS) for token in extras
+    )
 
 #: Disclosure recorded when a node is dispatched without a visible bridge.
 BACKGROUND_TOPOLOGY_DISCLOSURE = (

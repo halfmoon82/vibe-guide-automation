@@ -36,6 +36,10 @@ class ClassifierTests(unittest.TestCase):
         for text in (
             UNJUDGEABLE,
             "B1 scope: whether manifests count as new dependency needs PM ruling",
+            "生产环境日志显示崩溃，需验收期确认",
+            "生产环境订单金额算错，只能线上验证",
+            "线上数据丢失，验收期再看",
+            "production database corrupted; verify in acceptance period",
             "实机扫码失败，需要修复",  # a defect report, no acceptance-period deferral
             "",
             None,
@@ -46,6 +50,12 @@ class ClassifierTests(unittest.TestCase):
     def test_reworded_same_item_matches_but_other_item_does_not(self):
         self.assertTrue(same_pending_verification(ITEM, REWORDED))
         self.assertFalse(same_pending_verification(ITEM, "生产环境支付回调只能验收期验证"))
+
+    def test_extra_substantive_words_make_a_different_item(self):
+        base = "微信实机扫码 只能验收期验证"
+        self.assertFalse(same_pending_verification(base, "微信实机扫码失败崩溃 只能验收期验证"))
+        self.assertFalse(same_pending_verification(base, "微信实机分享 只能验收期验证"))
+        self.assertFalse(same_pending_verification("微信实机扫码 只能验收期验证", "微信 只能验收期验证"))
 
     def test_disposition_kind_is_registered_and_clearing(self):
         self.assertIn("deferred_to_acceptance", BLOCKED_UNKNOWN_DISPOSITION_KINDS)
@@ -102,6 +112,14 @@ class DeliveryTests(unittest.TestCase):
             r["event"] == "blocked_unknown_disposition_required"
             for r in load_events(self.paths, snapshot.run_id)
         ))
+
+    def test_observed_defect_never_reaches_accepted(self):
+        for text in ("生产环境日志显示崩溃，需验收期确认", "线上数据丢失，验收期再看"):
+            monitor, snapshot, runner = self._start([text])
+            snapshot = monitor.tick(snapshot.run_id, runner)
+            self.assertEqual(snapshot.nodes["sdd-a"]["status"], "blocked_unknown", text)
+            self.tearDown()
+            self.setUp()
 
     def test_unjudgeable_item_stays_blocked_unknown(self):
         monitor, snapshot, runner = self._start([UNJUDGEABLE])
