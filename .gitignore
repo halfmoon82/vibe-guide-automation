@@ -26,3 +26,8 @@ dist/
 # vibe session state: proposals/plans are generated per session by the vibe
 # protocol and must not be tracked.
 /.vibe/
+
+# 决策网关评测集（issue #128）：真实用户请求；本仓库是公开的，不入库。
+# 用 eval/decision/build_from_history.py 在本机重新生成。
+/eval/decision/route.jsonl
+/eval/decision/route.report.json
