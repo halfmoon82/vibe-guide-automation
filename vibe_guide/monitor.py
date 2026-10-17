@@ -261,8 +261,18 @@ _PV_ENVIRONMENT_MARKERS = (
 #: both the classifier and the same-item comparison.
 _PV_DEFECT_MARKERS = (
     "崩溃", "失败", "报错", "错误", "异常", "丢失", "算错", "不一致", "损坏", "回归",
-    "出错", "故障", "缺陷", "不对", "有误",
+    "出错", "故障", "缺陷", "不对", "有误", "闪退", "卡死", "卡住", "无响应", "白屏",
+    "黑屏", "超时", "重复", "漏", "偶发",
     "crash", "fail", "error", "corrupt", "lost", "wrong", "regress", "broken", "bug",
+    "hang", "hung", "freeze", "frozen", "timeout", "timed out", "duplicate", "flaky",
+    "leak",
+)
+#: Wording that describes something already seen happen ("出现/发生/报/显示/发现
+#: + noun").  Deliberately broad: a false hit only keeps the item blocked_unknown.
+_PV_OBSERVED_MARKERS = (
+    "出现", "发生", "显示", "发现", "看到", "观察到", "抛出", "报",
+    "observed", "occur", "shows", "showed", "found", "reported", "throws", "saw",
+    "appears",
 )
 _PV_DEFERRAL_MARKERS = ("验收期", "acceptance period", "acceptance phase")
 _PV_FILLER = (
@@ -271,12 +281,23 @@ _PV_FILLER = (
 )
 
 
+def _pv_reports_defect(text: str) -> bool:
+    """Defect or already-observed wording; ASCII words match at word starts only."""
+    for marker in _PV_DEFECT_MARKERS + _PV_OBSERVED_MARKERS:
+        if marker[0].isascii():
+            if re.search(r"\b" + re.escape(marker), text):
+                return True
+        elif marker in text:
+            return True
+    return False
+
+
 def is_structural_pending_verification(item: Any) -> bool:
     """True when ``item`` can only be verified on real devices/production/acceptance."""
     if not isinstance(item, str) or not item.strip():
         return False
     text = item.lower()
-    if any(marker in text for marker in _PV_DEFECT_MARKERS):
+    if _pv_reports_defect(text):
         return False
     if "验证脚本" in text and "不入库" in text:
         return True

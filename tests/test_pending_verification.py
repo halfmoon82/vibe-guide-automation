@@ -40,6 +40,12 @@ class ClassifierTests(unittest.TestCase):
             "生产环境订单金额算错，只能线上验证",
             "线上数据丢失，验收期再看",
             "production database corrupted; verify in acceptance period",
+            "真机上app闪退，只能验收期验证",
+            "真机卡死，只能验收期验证",
+            "真机 hang 住，只能验收期验证",
+            "线上支付出现重复扣款，验收期确认",
+            "生产环境偶发超时，需验收期确认",
+            "真机发现白屏，只能验收期验证",
             "实机扫码失败，需要修复",  # a defect report, no acceptance-period deferral
             "",
             None,
