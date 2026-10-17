@@ -18,6 +18,7 @@ from .authorization import (
     AuthorizationCard,
     AuthorizationRecord,
     authorize,
+    is_authorization_valid,
     build_authorization_card,
     INTEGRATION_REVIEW_NODE_ID,
     dispatch_topology_for_node,
@@ -94,7 +95,7 @@ from .state import RunSnapshot
 from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
 from .prd_profiles import evaluate_prd_checkpoints, validate_skill_profile
-from .engine_attestation import create_engine_attestation
+from .engine_attestation import create_engine_attestation, needs_renewal
 from .evidence import evaluate_v41_closeout
 from .installation import run_install, run_upgrade, migrate_state
 from .skills import SkillSpec, install_project_skill
@@ -1068,6 +1069,95 @@ def _card_field_diff(before: Any, after: Any) -> Dict[str, Any]:
     }
 
 
+def _renew_engine_attestation_if_stale(
+    paths: ProjectPaths,
+    directory: Path,
+    plan: Plan,
+    nodes: List[DAGNode],
+    card: AuthorizationCard,
+    run_id: str,
+    runner: Optional[Any],
+) -> Optional[RunSnapshot]:
+    """Continue the original authorization when only engine evidence went stale.
+
+    Engine evidence expires after 72 hours.  When the PRD, Spec, node
+    contracts, capability contract, authorization scope and allowed-action
+    fingerprint are all unchanged, the expiry is bookkeeping: the evidence is
+    re-observed, the same-run authorization is re-signed against it and the
+    event stream records ``authorization_reauthorized`` with
+    ``change_reason=engine_attestation_renewed``.  Any real contract change
+    returns ``None`` untouched so the ordinary gates invalidate the
+    authorization and name the changed item.  Evidence that cannot be read or
+    compared raises, and the caller reports ``blocked_unknown`` with the
+    reason -- unknown is never treated as unchanged.
+    """
+    if not _engine_evidence_required(plan):
+        return None
+    attestation_path = directory / "engine-attestation.json"
+    if attestation_path.is_symlink() or not attestation_path.is_file():
+        return None
+    record = AuthorizationRecord.from_dict(_read_json(directory / "authorization.json"))
+    try:
+        stale = needs_renewal(
+            _read_json(attestation_path), plan.plan_id, plan.version,
+            record.engine_evidence_ref,
+            now=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+    except ValueError:
+        return None  # not intact evidence: leave it to the engine gate
+    if not stale:
+        return None
+    snapshot = load_snapshot(paths, run_id)
+    monitor = Monitor(
+        paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card)
+    )
+    current_prd, current_spec = monitor._current_plan_digests()
+    contract_unchanged = (
+        is_authorization_valid(record, plan, nodes)
+        and snapshot.authorization_digest == record.digest
+        and snapshot.node_contract_digest == record.node_contract_digest
+        and snapshot.prd_digest == current_prd
+        and snapshot.spec_digest == current_spec
+        and snapshot.capability_contract_digest
+        == require_capability_contract(paths).contract_digest
+    )
+    if not contract_unchanged:
+        return None
+    fresh = _observed_engine_attestation(paths, plan)
+    refreshed = refresh_authorization_card(
+        plan, nodes, card, workflow=snapshot.workflow,
+        topology_rulings=_observed_topology_rulings(paths, card),
+        engine_attestation=fresh,
+    )
+    if set(_card_field_diff(card, refreshed)) - _VOLATILE_CARD_FIELDS:
+        return None
+    new_record = authorize(refreshed, "AUTHORIZE")
+    if runner is None:
+        runner = _public_runner(paths, refreshed, nodes)
+    with _staged_engine_attestation(attestation_path, fresh):
+        renewed = Monitor(
+            paths, plan, nodes,
+            topology_rulings=_observed_topology_rulings(paths, refreshed),
+        ).reauthorize(run_id, new_record, runner, "engine_attestation_renewed")
+        _atomic_json(directory / "authorization-card.json", refreshed.to_dict())
+    _atomic_json(directory / "authorization.json", new_record.to_dict())
+    _atomic_json(
+        directory / "plan-confirmation.json",
+        {
+            "status": "confirmed",
+            "plan_id": plan.plan_id,
+            "plan_revision": str(plan.version),
+            "authorization_digest": new_record.digest,
+            "authorization_required": True,
+            "run_id": renewed.run_id,
+            "event_sequence": renewed.event_sequence,
+            "publication": "same_run_reauthorization",
+        },
+    )
+    materialize_workflow_evidence(paths, plan.plan_id, "AUTHORIZE")
+    return renewed
+
+
 def _short_card_value(value: Any, limit: int = 40) -> str:
     """Render one card field for a human line without flooding it."""
     if isinstance(value, (list, tuple, dict)):
@@ -1442,6 +1532,31 @@ def _invalidation_path(directory: Path) -> Path:
     return directory / "authorization-invalidated.json"
 
 
+#: Marker -> the contract item it reports, so the invalidation says which
+#: fingerprint actually changed instead of a generic "executable contract".
+_DRIFT_ITEMS = (
+    ("a valid executable-contract authorization is required", "node_contract_or_scope"),
+    ("authorization node scope does not match", "authorization_scope"),
+    ("snapshot plan no longer matches", "plan_revision"),
+    ("snapshot authorization digest is inconsistent", "authorization_digest"),
+    ("snapshot contract digest is inconsistent", "node_contract_digest"),
+    ("prd/spec source drift", "prd_or_spec"),
+    ("workflow_evidence_stale", "workflow_evidence"),
+    ("required_workflow_blocked", "workflow_evidence"),
+    ("monitor entry evidence drift", "monitor_entry_evidence"),
+    ("blocked_by_execution_topology_mismatch", "execution_topology"),
+    ("execution_engine_unverified", "execution_engine"),
+)
+
+
+def _drift_item(reason: str) -> str:
+    lowered = reason.casefold()
+    for marker, item in _DRIFT_ITEMS:
+        if marker in lowered:
+            return item
+    return "unclassified"
+
+
 def _persist_invalidation(directory: Optional[Path], reason: str) -> None:
     if directory is not None:
         _atomic_json(
@@ -1450,6 +1565,7 @@ def _persist_invalidation(directory: Optional[Path], reason: str) -> None:
                 "status": "blocked_design",
                 "reason": reason,
                 "change_reason": "executable_contract_changed",
+                "changed_item": _drift_item(reason),
             },
         )
 
@@ -3056,6 +3172,15 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     paths, directory, plan, nodes, _card
                 )
             invalidation = _invalidation_path(directory)
+            if (
+                args.command == "resume"
+                and not invalidation.exists()
+                and _current_run_path(directory).is_file()
+            ):
+                _renew_engine_attestation_if_stale(
+                    paths, directory, plan, nodes, _card, run_id, runner
+                )
+                directory, plan, nodes, _card = _load_plan(paths, args.plan)
             if invalidation.exists():
                 persisted = _read_json(invalidation)
                 reason = (

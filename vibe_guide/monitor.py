@@ -912,7 +912,55 @@ class Monitor:
             if latest.get(key) != value:
                 raise PermissionError("blocked_by_execution_topology_mismatch: topology evidence drift")
         if latest.get("monitor_entry_evidence") != snapshot.monitor_entry_evidence:
-            raise PermissionError("blocked_by_execution_topology_mismatch: monitor entry evidence drift")
+            raise PermissionError(
+                "blocked_by_execution_topology_mismatch: monitor entry evidence drift "
+                "(snapshot={!r}, events={!r})".format(
+                    snapshot.monitor_entry_evidence, latest.get("monitor_entry_evidence")
+                )
+            )
+
+    def _heal_entry_evidence(self, snapshot: RunSnapshot) -> None:
+        """Re-record the entry evidence projection from the event stream.
+
+        The snapshot's ``monitor_entry_evidence`` is bookkeeping written by the
+        last monitor entry point; the event stream is the source of truth for
+        which entry ran last.  When only that one field disagrees (a recovery
+        entry such as ``monitor.reconcile_adopted_dispatch`` saved the snapshot
+        after the stream's last observation), the stream wins: the projection
+        is re-recorded and the correction is logged with both actual values.
+        Any other topology disagreement is left for the normal check to reject.
+        """
+        if getattr(self.plan, "complexity_band", "") != "complex":
+            return
+        observed = [
+            e for e in load_events(self.paths, snapshot.run_id)
+            if e.get("event") == "execution_topology_observed"
+        ]
+        if not observed:
+            return
+        latest = observed[-1].get("data", {})
+        stream_entry = latest.get("monitor_entry_evidence")
+        if (
+            not isinstance(stream_entry, str)
+            or not stream_entry.startswith("monitor.")
+            or stream_entry == snapshot.monitor_entry_evidence
+        ):
+            return
+        expected = {
+            "run_id": snapshot.run_id, "plan_revision": snapshot.plan_version,
+            "node_ids": sorted(self.nodes), "started_nodes": snapshot.started_nodes,
+            "active_concurrency": snapshot.active_concurrency,
+            "capacity": snapshot.capacity, "parallel_groups": snapshot.parallel_groups,
+        }
+        if any(latest.get(key) != value for key, value in expected.items()):
+            return
+        self._record(snapshot, "monitor_entry_evidence_reconciled", {
+            "run_id": snapshot.run_id,
+            "previous_monitor_entry_evidence": snapshot.monitor_entry_evidence,
+            "monitor_entry_evidence": stream_entry,
+            "change_reason": "event_stream_is_source_of_truth",
+        })
+        snapshot.monitor_entry_evidence = stream_entry
 
     def __init__(
         self,
@@ -1640,6 +1688,7 @@ class Monitor:
             raise PermissionError("capability_contract_unknown: run binding mismatch")
         self._require_snapshot_authorization(snapshot)
         self._reconcile_unapplied_events(snapshot)
+        self._heal_entry_evidence(snapshot)
         self._route_undecided_blocked_design(snapshot)
         for node_id, current in snapshot.nodes.items():
             if current.get("status") == "start_pending":
@@ -2709,7 +2758,11 @@ class Monitor:
             or data.get("node_contract_digest")
             != replacement.node_contract_digest
             or data.get("change_reason")
-            not in {"executable_contract_changed", "capability_contract_changed"}
+            not in {
+                "executable_contract_changed",
+                "capability_contract_changed",
+                "engine_attestation_renewed",
+            }
         ):
             raise ValueError("reauthorization replacement lineage is inconsistent")
         replacement_capability_digest = data.get("capability_contract_digest")
@@ -7026,7 +7079,7 @@ class Monitor:
             data = record["data"]
             if data.get("run_id") != snapshot.run_id:
                 raise ValueError("unapplied event run lineage is inconsistent")
-            if record["event"] == "execution_topology_observed":
+            if record["event"] in {"execution_topology_observed", "monitor_entry_evidence_reconciled"}:
                 # System projection evidence is read-only metadata; legacy
                 # V3.9 replay must not interpret it as a node lifecycle event.
                 snapshot.event_sequence = record["sequence"]
