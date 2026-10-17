@@ -296,7 +296,7 @@ def _pv_reports_defect(text: str) -> bool:
 #: documented in prd-guide.md); anything else is "unknown" and stays
 #: blocked_unknown.  Shape: [env prefix] <short noun phrase> [10/10]
 #: <only/need modal> [在] <acceptance-time word> <verify verb>, nothing else.
-_PV_ZH_NOUN = r"[A-Za-z\u4e00-\u9fff]{1,12}?"
+_PV_ZH_NOUN = r"[A-Za-z\u4e00-\u9fff]{1,8}?"
 _PV_ZH_TEMPLATE = re.compile(
     r"^(?:(?:真机|实机|生产环境|线上|真实设备|生产)(?:上|中)?)?"
     r"(?P<noun>" + _PV_ZH_NOUN + r")"
@@ -306,7 +306,7 @@ _PV_ZH_TEMPLATE = re.compile(
     r"(?:验证|确认|完成|验收)$"
 )
 _PV_EN_TEMPLATE = re.compile(
-    r"^(?P<noun>[a-z]+(?: [a-z]+){0,3}?)(?: \d+/\d+)? "
+    r"^(?P<noun>[a-z]+(?: [a-z]+){0,4}?)(?: \d+/\d+)? "
     r"(?:can only be|must be|needs to be|to be|only) "
     r"(?:verified|confirmed|validated|completed) "
     r"(?:in|during|on|after) (?:the )?"
@@ -323,9 +323,18 @@ _PV_NOUN_EXCLUDED_ZH = (
     "返回", "出现", "发生", "显示", "发现", "报", "慢", "差", "卡", "闪", "热",
     "收不", "打不", "登录不", "错", "坏", "挂", "断", "丢", "漏", "死",
 )
+#: A phrase that ENDS in a state/degree word reports a condition, not a thing.
+_PV_NOUN_STATE_SUFFIX_ZH = (
+    "空白", "模糊", "低", "高", "慢", "快", "失灵", "失效", "延迟", "多扣", "少扣",
+    "爆音", "错位", "偏", "乱", "跳", "了", "多", "少", "大", "小", "长", "短",
+    "弱", "强", "卡", "闪", "抖",
+)
+#: Digits with a unit/number word inside the phrase ("十分钟", "3 秒") never pass.
+_PV_NUMBER_ZH = re.compile(r"[零一二两三四五六七八九十百千万几半]+(?:分钟|秒|小时|天|次|个|条|倍|%|元|块)")
 _PV_NOUN_EXCLUDED_EN = re.compile(
     r"\b(?:not|no|cannot|never|without|very|too|slow|sometimes|intermittent|"
-    r"returns?|shows?|reports?|working|stuck|missing)\b"
+    r"returns?|shows?|reports?|working|stuck|missing|late|delayed|delay|slow|"
+    r"blurry|blank|wrong|broken|low|high|fast|laggy|jittery|failing|failed)\b"
 )
 
 
@@ -344,7 +353,12 @@ def is_structural_pending_verification(item: Any) -> bool:
         return True
     zh = _PV_ZH_TEMPLATE.fullmatch(text)
     if zh:
-        return not any(word in zh.group("noun") for word in _PV_NOUN_EXCLUDED_ZH)
+        noun = zh.group("noun")
+        return not (
+            any(word in noun for word in _PV_NOUN_EXCLUDED_ZH)
+            or noun.endswith(_PV_NOUN_STATE_SUFFIX_ZH)
+            or _PV_NUMBER_ZH.search(noun)
+        )
     en = _PV_EN_TEMPLATE.fullmatch(text)
     if en:
         return not _PV_NOUN_EXCLUDED_EN.search(en.group("noun"))

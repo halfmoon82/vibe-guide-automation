@@ -32,6 +32,8 @@ class ClassifierTests(unittest.TestCase):
             "真机支付流程只能验收期验证",
             "生产环境推送到达率只能上线后验证",
             "真机蓝牙配对只能验收期验证",
+            "真机蓝牙配对仅能在验收期确认",
+            "生产环境性能指标需验收期确认",
         ):
             self.assertTrue(is_structural_pending_verification(text), text)
 
@@ -44,6 +46,16 @@ class ClassifierTests(unittest.TestCase):
             "线上数据丢失，验收期再看",
             "production database corrupted; verify in acceptance period",
             "真机偶尔收不到推送，验收期确认",
+            "真机推送延迟十分钟只能验收期验证",
+            "线上金额多扣了只能验收期验证",
+            "真机登录失灵只能验收期验证",
+            "真机扫码识别率低只能验收期验证",
+            "真机支付页空白只能验收期验证",
+            "真机音频爆音只能验收期验证",
+            "真机图片模糊只能验收期验证",
+            "线上支付回调失效只能验收期验证",
+            "real device push late can only be verified in the acceptance period",
+            "push notification delayed can only be verified in the acceptance period",
             "真机登录不上，只能验收期验证",
             "生产环境接口返回500，需验收期确认",
             "真机无法打开页面，验收期验证",
@@ -172,6 +184,34 @@ class DeliveryTests(unittest.TestCase):
             if r["data"]["disposition"] == "deferred_to_acceptance"
         ]
         self.assertEqual(len(deferred), 1)
+
+
+class StatusListingTests(unittest.TestCase):
+    def snapshot(self, nodes):
+        from vibe_guide.state import RunSnapshot
+        return RunSnapshot("run-1", "plan-1", 1, "running", nodes, {})
+
+    def test_status_lists_auto_deferred_items_per_node(self):
+        from vibe_guide.cli import _snapshot_result
+        snap = self.snapshot({
+            "n1": {"status": "accepted",
+                   "acceptance_pending_verification": [{"item": ITEM, "note": "x"}]},
+            "n2": {"status": "accepted"},
+        })
+        for as_json in (False, True):
+            result = _snapshot_result("status", snap, as_json)
+            self.assertEqual(
+                result.payload["acceptance_pending_verification"], {"n1": [ITEM]})
+            self.assertIn("验收期待验项（自动放行，需产品经理验收时核对）", result.text)
+            self.assertIn("n1", result.text)
+            self.assertIn(ITEM, result.text)
+            self.assertNotIn("n2：", result.text)
+
+    def test_status_hides_section_when_none(self):
+        from vibe_guide.cli import _snapshot_result
+        result = _snapshot_result("status", self.snapshot({"n1": {"status": "accepted"}}), False)
+        self.assertNotIn("acceptance_pending_verification", result.payload)
+        self.assertNotIn("验收期待验项", result.text)
 
 
 class BoundaryTests(unittest.TestCase):

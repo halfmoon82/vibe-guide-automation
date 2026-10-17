@@ -27,6 +27,8 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-17: narrower pending-verification whitelist + status listing.
+        "cb73d99b1241b4d05580be33a6bce4a2b8f62674e064b390d68a85ae8bc0db8f",
         # 2026-10-17: structural pending-verification accepts only fixed sentence templates.
         "14a0edcdd465c0d1e69d1a4719d2075aa3d9f6e0a3b8289981b4fbaf3984b1b9",
         # 2026-10-17: §6.5 idle heartbeat back-off wired (pending-verification rework).

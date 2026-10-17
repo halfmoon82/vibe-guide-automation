@@ -1399,6 +1399,28 @@ def _render_card_preview(payload: Dict[str, Any], card: AuthorizationCard) -> st
     return "\n".join(lines)
 
 
+def _pending_verification_by_node(snapshot: Any) -> Dict[str, List[str]]:
+    """Items the monitor auto-released as structural pending verification, per node."""
+    result: Dict[str, List[str]] = {}
+    for node_id, node in (getattr(snapshot, "nodes", None) or {}).items():
+        entries = node.get("acceptance_pending_verification") if isinstance(node, dict) else None
+        items = [
+            entry["item"] for entry in entries or []
+            if isinstance(entry, dict) and isinstance(entry.get("item"), str)
+        ]
+        if items:
+            result[node_id] = items
+    return result
+
+
+def _render_pending_verification(by_node: Dict[str, List[str]]) -> str:
+    lines = ["验收期待验项（自动放行，需产品经理验收时核对）："]
+    for node_id, items in sorted(by_node.items()):
+        lines.append("  {}：".format(node_id))
+        lines.extend("    - " + item for item in items)
+    return "\n".join(lines)
+
+
 def _snapshot_result(
     command: str,
     snapshot: Any,
@@ -1425,6 +1447,9 @@ def _snapshot_result(
         "closeout_status": render_v41_closeout_status(snapshot),
         "continuation": continuation,
     }
+    pending_verification = _pending_verification_by_node(snapshot)
+    if pending_verification:
+        payload["acceptance_pending_verification"] = pending_verification
     if handoff:
         payload["handoff"] = handoff
     if retry_pending or snapshot.status == "blocked_unknown":
@@ -1440,6 +1465,8 @@ def _snapshot_result(
         if retry_pending
         else render_v41_closeout_status(snapshot)
     )
+    if pending_verification:
+        text += "\n" + _render_pending_verification(pending_verification)
     return _result(
         code,
         payload,
