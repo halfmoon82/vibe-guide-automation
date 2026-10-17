@@ -158,6 +158,33 @@ class BuildFromHistoryTest(unittest.TestCase):
         self.assertIn("[REDACTED:phone]", state)
         self.assertEqual(stats["rows_redacted"], 1)
 
+    def test_credential_only_difference_dedups_after_redaction(self):
+        # P2-1: redaction runs before dedup, so two requests differing only in
+        # credentials are recognised as the same request — not two rows with
+        # identical states.
+        rows, stats = self._build([
+            _user("核账。手机号 13800000001，host=rm-aaa.mysql.rds.aliyuncs.com:3306 user=employ pass=Secret111"),
+            _assistant("S1：10→轻规划（不触碰 vibe）"),
+            _user("核账。手机号 13800000002，host=rm-bbb.mysql.rds.aliyuncs.com:3306 user=employ pass=Secret222"),
+            _assistant("S1：11→轻规划（不触碰 vibe）"),
+        ])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(stats["duplicate_pairs"], 1)
+        self.assertIn("[REDACTED:phone]", rows[0]["state"])
+
+    def test_credential_only_difference_conflict_drops_both_sides(self):
+        # P2-1: conflict detection must see the redacted text; otherwise the
+        # same redacted state enters the set twice with contradictory labels.
+        rows, stats = self._build([
+            _user("核账。手机号 13800000001，host=rm-aaa.mysql.rds.aliyuncs.com:3306 user=employ pass=Secret111"),
+            _assistant("S1：10→轻规划（不触碰 vibe）"),
+            _user("核账。手机号 13800000002，host=rm-bbb.mysql.rds.aliyuncs.com:3306 user=employ pass=Secret222"),
+            _assistant("S1：17→vibe 正式路由（不触碰 vibe）"),
+        ])
+        self.assertEqual(rows, [])
+        self.assertEqual(stats["conflicting_labels"], 1)
+        self.assertEqual(stats["rows_dropped_conflict"], 2)
+
     def test_orphan_decision_without_any_user_message_is_counted(self):
         rows, stats = self._build([
             _assistant("S1：11→轻规划（不触碰 vibe）"),
@@ -170,7 +197,18 @@ class BuildFromHistoryTest(unittest.TestCase):
             _user("合并 #211"),
             _assistant("S1：3→直接执行（不触碰 vibe）"),
         ])
-        self.assertEqual(rows[0]["question"], build_from_history.CANONICAL_QUESTION)
+        # issue #128: 问法逐字定稿后改动必须重新评测——预期值硬编码在本测试里，
+        # 不再与模块活常量自比较（那是同义反复：改常量测试照样绿，已变异实证）。
+        self.assertEqual(rows[0]["question"], {
+            "key": "route",
+            "type": "choice",
+            "instructions": "这个请求应该走哪条处理路径？",
+            "criteria": {
+                "simple": "直接执行（S1 总分 <= 8，不触碰 vibe，不需要规划）",
+                "light_plan": "轻规划（S1 总分 9-15，列出步骤要点后执行，不触碰 vibe）",
+                "complex": "vibe 正式路由（S1 总分 > 15，或带强制升级标记，走完整规划流程）",
+            },
+        })
         self.assertEqual(sorted(rows[0]["question"]["criteria"]), ["complex", "light_plan", "simple"])
 
 

@@ -24,7 +24,7 @@
 1. 卡片/可验证行：`S1：11→轻规划（不触碰 vibe）`（协议 §2 规定的形状，
    常并入 `[对齐门]` 卡片的 `S1：` 字段）。
 2. 评分明细结论行：`S1 评估: 步骤(5) + 范围(3) + … = 15 → 轻规划执行`
-   —— 分数与档位在同一行里齐全，同样自洽可验。实测 55 行，与形状 1
+   —— 分数与档位在同一行里齐全，同样自洽可验。实测 55 行（2026-10-16 快照数），与形状 1
    零共现，是独立漏收的一池。
 
 ## 配对规则（v2，2026-10-16 修正）
@@ -33,8 +33,9 @@
 消息」——被拒的消息（心跳、短消息、宿主注入）不更新锚点，于是**心跳回合
 自己的判定会错配到上一条真实用户请求上**。v1 漏斗实测：217 个配对判定里
 只有 87 个干净，130 个在请求与判定行之间插过机器/注入/短消息；v1 报的
-11 组「冲突标签」在改为紧邻配对后**全部消失**——冲突本身就是错配的
-artifact，不是真实标签噪声。v1 数据集里有 9 行带错配标签。
+11 组「冲突标签」里 10 组在改为紧邻配对后消失（错配的 artifact），同时
+暴露出 1 组真实标签噪声（同一请求在不同会话被打了不同分，已按冲突规则
+双剔）——冲突不全是错配，但大部分是。v1 数据集里有 9 行带错配标签。
 
 判定行紧前的消息若是机器生成（心跳 `vibe supervisor-beat`、跨会话投递、
 Stop hook 反馈、`<system-reminder>`/`<task-notification>` 宿主注入、
@@ -287,8 +288,18 @@ def pairs(source_glob: str):
 
 def build(source_glob: str):
     found, stats = pairs(source_glob)
-    seen, rows = set(), []
+    # Redact BEFORE dedup/conflict detection: two requests that differ only in
+    # credentials (e.g. a rotated password) are the same request once redacted.
+    # Deduplicating on raw text let identical states enter the set twice, and
+    # saw them as unrelated states for conflict purposes — the same redacted
+    # state with contradictory expected labels, exactly what the conflict rule
+    # exists to prevent.
+    prepared = []
     for request, score, band in found:
+        clean = redact(request)
+        prepared.append((clean, score, band, clean != request))
+    seen, rows, redacted_flags = set(), [], []
+    for request, score, band, was_redacted in prepared:
         key = (request, band)
         if key in seen:
             continue
@@ -299,6 +310,7 @@ def build(source_glob: str):
             "question": CANONICAL_QUESTION,
             "expected": band,
         })
+        redacted_flags.append(was_redacted)
     # The same request scored differently at two points in time leaves rows a
     # model cannot both get right, which caps accuracy for no reason the eval is
     # meant to measure.  Drop both sides of the conflict rather than keep the
@@ -307,14 +319,14 @@ def build(source_glob: str):
     for row in rows:
         labels.setdefault(row["state"], set()).add(row["expected"])
     conflicting = {state for state, bands in labels.items() if len(bands) > 1}
-    kept = [row for row in rows if row["state"] not in conflicting]
-    redacted = 0
-    for index, row in enumerate(kept, 1):
-        row["id"] = "vr-%03d" % index
-        clean = redact(row["state"])
-        if clean != row["state"]:
+    kept, redacted = [], 0
+    for row, was_redacted in zip(rows, redacted_flags):
+        if row["state"] in conflicting:
+            continue
+        row["id"] = "vr-%03d" % (len(kept) + 1)
+        kept.append(row)
+        if was_redacted:
             redacted += 1
-            row["state"] = clean
     return kept, {
         **stats,
         "paired_decisions": len(found),

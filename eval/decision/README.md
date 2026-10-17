@@ -29,6 +29,11 @@ python3 calibrate/temperature.py /Users/macmini/Desktop/vibeguide/eval/decision/
 
 > ⚠️ 第 1 步会**整集重写**。用 `decision-gateway` 的 `eval/append_case.py` 手工回填的
 > 行不在转录里，会被 `--force` 冲掉——回填过就要先备份再重建，或重建后重新回填。
+>
+> ⚠️ 本页所有漏斗与实测数字对应 **2026-10-16 冻结快照**（118 行）。历史语料是增长的
+> 目标：在任何其它日期重建都会得到不同分布的数据集（2026-10-17 实测 `--dry-run`
+> 127 行），重建后必须**重跑全部评测**才能引用数字——与 issue #128「问法冻结后改动
+> 必须重新评测」同口径。
 
 ## 评测集怎么建的（详见脚本 docstring）
 
@@ -44,16 +49,17 @@ python3 calibrate/temperature.py /Users/macmini/Desktop/vibeguide/eval/decision/
    造标签。有回归测试钉住（`tests/test_decision_dataset_build.py`）。
 2. **受认两种判定行书写**：① 协议规定的可验证行 `S1：11→轻规划（…）`（常并入
    `[对齐门]` 卡片的 `S1：` 字段）；② 评分明细结论行 `S1 评估: 步骤(5)+范围(3)+…= 15
-   → 轻规划执行`——分数与档位同行齐全、同样自洽可验，实测 55 行、与形状 ① 零共现，
-   v1 完全漏收。
+   → 轻规划执行`——分数与档位同行齐全、同样自洽可验，实测 55 行（2026-10-16 快照数）、
+   与形状 ① 零共现，v1 完全漏收。
 3. **紧邻配对**：判定行与它**紧邻上一条用户消息**配对。v1 用「最近一条被接受的用户
    消息」做锚点，被拒的消息（心跳、宿主注入、短消息）不更新锚点——于是**心跳回合
    自己的判定被错配到上一条真实用户请求上**。v1 漏斗实测：217 个配对判定只有 87 个
-   干净，130 个在请求与判定行之间插过机器/注入/短消息；v1 报的 11 组「冲突标签」
-   在改为紧邻配对后**全部消失**（冲突是错配的 artifact，不是真实标签噪声）；v1 数据集
-   有 9 行带错配标签。判定行紧前的消息是机器生成（`vibe supervisor-beat` 心跳、跨会话
-   投递、Stop hook 反馈、`<system-reminder>`/`<task-notification>` 注入、OpenClaw
-   Guardian 定时指令等）时，整条丢弃并计数。
+   干净，130 个在请求与判定行之间插过机器/注入/短消息；v1 报的 11 组「冲突标签」里
+   10 组在改为紧邻配对后消失（错配的 artifact），同时暴露出 1 组真实标签噪声（同一
+   请求在不同会话被打了不同分，即下方漏斗的 `conflicting_labels 1`，已双剔）——冲突
+   不全是错配，但大部分是；v1 数据集有 9 行带错配标签。判定行紧前的消息是机器生成
+   （`vibe supervisor-beat` 心跳、跨会话投递、Stop hook 反馈、`<system-reminder>`/
+   `<task-notification>` 注入、OpenClaw Guardian 定时指令等）时，整条丢弃并计数。
 4. **短消息不过滤长度**。v1 的 `--min-chars 8` 把「跑完了，继续」「同意续授权」这类
    真实判定丢了，还制造错配锚点；短消息也是生产真实打分的请求，退化样本交给去重和
    冲突规则处理。
@@ -63,7 +69,8 @@ python3 calibrate/temperature.py /Users/macmini/Desktop/vibeguide/eval/decision/
    模型不可能全对的样本，白白压低准确率。
 7. **脱敏后入集**：`state` 逐字保留用户请求，但凭据/PII 形状机械替换（11 位手机号、
    `pass=…`、`host=rm-…` RDS 地址 → `[REDACTED:…]`），路由判定不依赖这些值。替换处
-   有占位符，行数计入构建报告（`rows_redacted`）。
+   有占位符，行数计入构建报告（`rows_redacted`）。脱敏在去重/冲突检测**之前**执行
+   （两条仅凭据不同的请求脱敏后即同一请求，回归测试钉住）。
 
 档位词表用**代码实际档位名** `simple` / `light_plan` / `complex`，与
 `vibe_guide/planner.py` 的 `ROUTE_SIMPLE_MAX_SCORE`（8）/ `ROUTE_LIGHT_PLAN_MAX_SCORE`（15）
@@ -103,6 +110,10 @@ latency p95         136.5 ms              88.3 ms
 NLL                1.1259 → 1.0979      1.0623 → 1.0621
 ECE（max prob）     0.1151 → 0.0375      0.036 → 0.053
 ```
+
+> 注：`route.report.json` 行内 probabilities 为**校准前**概率（由 NLL 复算值与上表
+> 「校准前」一列一致确认）；校准后数字（ECE 0.053 / NLL 1.0621）出自
+> `decision-gateway` 仓 `calibrate/temperature.py` 的输出。
 
 ### v2 的逐个类分解（比总分更重要）
 
