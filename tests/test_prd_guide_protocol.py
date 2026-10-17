@@ -652,7 +652,7 @@ class _ProjectCase(unittest.TestCase):
     def plan_from_prd(self, spec, plan_id="pm-plan"):
         (self.root / "product-spec.json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
         return run_cli(
-            ["plan", "--json", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--from-prd", "product-spec.json"],
+            ["plan", "--json", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5", "--from-prd", "product-spec.json"],
             self.root,
         )
 

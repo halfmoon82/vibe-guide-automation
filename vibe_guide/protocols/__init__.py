@@ -99,6 +99,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "5b7aa976a0f9b2ac20ca014a38a101635d274bad40d1a57bc4920b179ed5f38e",
     }),
     "vibe-entry": frozenset({
+        # 2026-10-17: complex mode needs >=3 parallel nodes and cross-interrupt work; replies continue the tier.
+        "182f957ee264e44d4b3c9b70d053a74d9bb613d3610f4adc1d95be6415ebb7e5",
         "3ec0a771d482d92eba7f155f212dab97beb3a4a3b6712e16d7dc3d81394797eb",
         "a0d8ad6b24ed85982695214359b754a136315865ce76a4ccb36e03b9c4c9ef00",
         "08140f273188868532d5724d4fb199d1ee48ac46c80cbc2786f46fce91e4ddff",

@@ -86,7 +86,7 @@ class AttestWritesTheBridgeTests(_Case):
         self.attest(project_id="pmpathprobe")
         shutil.copy(FIXTURE, self.root / "product-spec.json")
         planned = run_cli(
-            ["plan", "--json", "--request", COMPLEX_REQUEST, "--plan-id", "pm-plan", "--from-prd", "product-spec.json"],
+            ["plan", "--json", "--request", COMPLEX_REQUEST, "--plan-id", "pm-plan", "--s1", "5,5,5,5,5", "--from-prd", "product-spec.json"],
             self.root,
         )
         self.assertEqual(planned.payload.get("status"), "ok", planned.payload)

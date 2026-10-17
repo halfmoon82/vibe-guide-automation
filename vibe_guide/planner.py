@@ -38,8 +38,16 @@ class TaskContext:
     toolchain: int
     rationale: Dict[str, str] = field(default_factory=dict)
     force_upgrade_flags: List[str] = field(default_factory=list)
+    # Complex mode needs both: >=3 nodes that can start together, and work that
+    # spans sessions/interruptions.  None means "not assessed".
+    parallel_nodes: Optional[int] = None
+    cross_interrupt: Optional[bool] = None
 
     def __post_init__(self):
+        if self.parallel_nodes is not None and (not isinstance(self.parallel_nodes, int) or isinstance(self.parallel_nodes, bool) or self.parallel_nodes < 0):
+            raise ValueError("parallel_nodes must be a non-negative integer")
+        if self.cross_interrupt is not None and not isinstance(self.cross_interrupt, bool):
+            raise TypeError("cross_interrupt must be a boolean")
         for name in ("steps", "domains", "uncertainty", "failure_cost", "toolchain"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 5:
@@ -72,15 +80,21 @@ class RouteResult:
     dimensions: Dict[str, int] = field(default_factory=dict)
     force_upgrade_flags: List[str] = field(default_factory=list)
     evidence_ref: str = "planner:s0-s1"
+    # S1 > 15 that stays light_plan: the complex-mode conditions it failed.
+    unmet_conditions: List[str] = field(default_factory=list)
 
     def __post_init__(self):
+        if not isinstance(self.unmet_conditions, list) or not all(isinstance(item, str) and item.strip() for item in self.unmet_conditions):
+            raise TypeError("unmet_conditions must be a list of strings")
         if self.route not in {"simple", "light_plan", "complex"} or self.complexity_band != self.route:
             raise ValueError("unsupported route result")
         if self.screen not in {"s0", "s1"}:
             raise ValueError("unsupported routing screen")
         if self.score is not None and (isinstance(self.score, bool) or not isinstance(self.score, int) or self.score < 0):
             raise ValueError("route score must be a non-negative integer")
-        if self.score is not None and not self.force_upgrade_flags:
+        if self.unmet_conditions and (self.route != "light_plan" or self.force_upgrade_flags or self.score is None or self.score <= ROUTE_LIGHT_PLAN_MAX_SCORE):
+            raise ValueError("unmet conditions only apply to a light_plan route scored above the light-plan ceiling")
+        if self.score is not None and not self.force_upgrade_flags and not self.unmet_conditions:
             expected = "simple" if self.score <= ROUTE_SIMPLE_MAX_SCORE else "light_plan" if self.score <= ROUTE_LIGHT_PLAN_MAX_SCORE else "complex"
             if self.route != expected:
                 raise ValueError("route score does not match route")
@@ -96,7 +110,19 @@ class RouteResult:
             raise ValueError("evidence_ref must be non-empty")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"route": self.route, "complexity_band": self.complexity_band, "screen": self.screen, "score": self.score, "dimensions": dict(self.dimensions), "force_upgrade_flags": list(self.force_upgrade_flags), "evidence_ref": self.evidence_ref}
+        data = {"route": self.route, "complexity_band": self.complexity_band, "screen": self.screen, "score": self.score, "dimensions": dict(self.dimensions), "force_upgrade_flags": list(self.force_upgrade_flags), "evidence_ref": self.evidence_ref}
+        if self.unmet_conditions:
+            data["unmet_conditions"] = list(self.unmet_conditions)
+        return data
+
+    @property
+    def score_line(self) -> str:
+        """The one-line S1 result the entry protocol asks the agent to print."""
+        label = {"simple": "直接执行（不触碰 vibe）", "light_plan": "轻规划（不触碰 vibe）", "complex": "vibe 正式路由"}[self.route]
+        line = "S1：{}→{}".format(self.score if self.score is not None else "?", label)
+        if self.unmet_conditions:
+            line += "；未满足复杂模式条件：" + "、".join(self.unmet_conditions)
+        return line
 
     @property
     def band(self) -> str:
@@ -703,6 +729,32 @@ def required_workflow_nodes(route):
     raise ValueError("unrecognised route: {!r}".format(value))
 
 
+_CONFIRM_LEAD = re.compile(
+    r"^(?:全部)?(?:授权|同意|批准|接受|允许|确认|可以|好的?|行|是的?|对|没问题|ok|okay|继续|合并|就这样|就按)"
+)
+_OPTION_ONLY = re.compile(r"^(?:选\s*)?(?:[a-e]|[1-9]\d?)(?:[\s,，。.]|$)", re.IGNORECASE)
+_CONTINUE_PHRASES = ("按你的推荐", "按这个顺序", "按你说的", "再试一次", "你来接手", "接着做", "接着来")
+CONTINUATION_MAX_CHARS = 60
+
+
+def is_continuation_message(message: str) -> bool:
+    """A reply that confirms/selects/continues existing work, not a new request.
+
+    Such a message inherits the session's current tier; scoring it again made
+    "授权" or "选A" look like a fresh complex task.
+    """
+    if not isinstance(message, str):
+        return False
+    normalized = " ".join(message.strip().lower().split())
+    if not normalized or len(normalized) > CONTINUATION_MAX_CHARS or "\n" in message.strip():
+        return False
+    return bool(
+        _CONFIRM_LEAD.match(normalized)
+        or _OPTION_ONLY.match(normalized)
+        or any(phrase in normalized for phrase in _CONTINUE_PHRASES)
+    )
+
+
 def classify_s0(message: str) -> S0Result:
     """Apply a cheap rule screen; uncertain or multi-step text proceeds to S1."""
     normalized = " ".join(message.strip().lower().split())
@@ -739,33 +791,84 @@ def parse_s1_context(value: Any) -> Optional[TaskContext]:
         )
     if not isinstance(value, str) or not value.strip():
         return None
+    # Optional complex-mode facts: "5,3,3,3,3;parallel=2;resume=no".
+    head, *extras = [part.strip() for part in value.split(";")]
+    parallel: Optional[int] = None
+    interrupt: Optional[bool] = None
+    for extra in extras:
+        key, _, raw = extra.partition("=")
+        key, raw = key.strip().lower(), raw.strip().lower()
+        if key == "parallel" and raw.isdigit():
+            parallel = int(raw)
+        elif key == "resume" and raw in ("yes", "no"):
+            interrupt = raw == "yes"
+        else:
+            return None
     try:
-        values = [int(item.strip()) for item in value.split(",")]
+        values = [int(item.strip()) for item in head.split(",")]
     except (TypeError, ValueError):
         return None
     if len(values) != 5 or any(item < 0 or item > 5 for item in values):
         return None
-    return TaskContext(*values, rationale={"source": "explicit"})
+    return TaskContext(*values, rationale={"source": "explicit"}, parallel_nodes=parallel, cross_interrupt=interrupt)
 
 
-def _route_result_from_score(score: S1Score, force_upgrade_flags: Optional[List[str]] = None) -> RouteResult:
+COMPLEX_MIN_PARALLEL_NODES = 3
+UNMET_PARALLEL = "可并行节点不足 3"
+UNMET_INTERRUPT = "无需跨会话/跨中断续跑"
+UNCERTAIN_MARK = "拿不准"
+
+
+def _complex_conditions_unmet(context: Optional[TaskContext]) -> List[str]:
+    """Why an S1>15 request is not (yet) entitled to complex mode.
+
+    Complex mode costs a supervisor plus a developer/reviewer pair per node, so
+    it must be earned: >=3 nodes that can run at once AND work that outlives one
+    session.  An explicit ``--s1`` that says nothing about either is the
+    caller's own upgrade and is taken at its word (so is a TaskContext built
+    directly in code); a score guessed from request text is not, and once either
+    fact is given an unknown condition counts as unmet.
+    """
+    if context is None:
+        return []
+    if context.parallel_nodes is None and context.cross_interrupt is None:
+        return [UNCERTAIN_MARK] if context.rationale.get("source") == "stable_default" else []
+    unmet = []
+    if context.parallel_nodes is None:
+        unmet.append("可并行节点数未知（{}）".format(UNCERTAIN_MARK))
+    elif context.parallel_nodes < COMPLEX_MIN_PARALLEL_NODES:
+        unmet.append(UNMET_PARALLEL)
+    if context.cross_interrupt is None:
+        unmet.append("是否跨中断未知（{}）".format(UNCERTAIN_MARK))
+    elif not context.cross_interrupt:
+        unmet.append(UNMET_INTERRUPT)
+    return unmet
+
+
+def _route_result_from_score(score: S1Score, force_upgrade_flags: Optional[List[str]] = None, context: Optional[TaskContext] = None) -> RouteResult:
     if score.total < 0:
         raise ValueError("S1 total cannot be negative")
     flags = list(dict.fromkeys(force_upgrade_flags or []))
     route = "complex" if flags else ("simple" if score.total <= ROUTE_SIMPLE_MAX_SCORE else "light_plan" if score.total <= ROUTE_LIGHT_PLAN_MAX_SCORE else "complex")
+    unmet: List[str] = []
+    if route == "complex" and not flags:
+        unmet = _complex_conditions_unmet(context)
+        if unmet:
+            route = "light_plan"
     return RouteResult(
         route=route,
         complexity_band=route,
         score=score.total,
         dimensions={"steps": score.steps, "domains": score.domains, "uncertainty": score.uncertainty, "failure_cost": score.failure_cost, "toolchain": score.toolchain},
         force_upgrade_flags=flags,
+        unmet_conditions=unmet,
     )
 
 
 def route_task(context: Any):
     """Route a TaskContext to a persisted result; retain legacy S1Score API."""
     if isinstance(context, TaskContext):
-        return _route_result_from_score(score_s1(context), context.force_upgrade_flags)
+        return _route_result_from_score(score_s1(context), context.force_upgrade_flags, context)
     if isinstance(context, S1Score):
         # Existing CLI/V2 callers consume the string route.
         return _route_result_from_score(context).route
