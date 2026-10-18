@@ -64,10 +64,11 @@ class RunnerTest(unittest.TestCase):
 
     def test_delivery_is_delivered_once(self):
         handle = self.start()
-        self.report = {"payload": {"event": "delivered", "summary": "ok"}}
+        self.report = {"payload": {"event": "delivered", "evidence": "ok"}}
         events = self.runner.poll(handle)
         self.assertEqual([e.event for e in events], ["delivered"])
-        self.assertEqual(events[0].data["payload"]["summary"], "ok")
+        # Projected to the top level, where the monitor reads a report.
+        self.assertEqual(events[0].data["evidence"], "ok")
         self.assertEqual(self.runner.poll(handle), [])
 
     def test_state_mapping(self):
@@ -102,16 +103,16 @@ class RunnerTest(unittest.TestCase):
             paths=self.paths,
         )
         handle = runner.start(dict(self.contract), Path("/tmp"))
-        reports[1] = {"payload": {"summary": "g1"}}
+        reports[1] = {"payload": {"evidence": "g1"}}
         self.assertEqual([e.event for e in runner.poll(handle)], ["delivered"])
         runner.resume(handle, "rework", 2)
         self.launcher.state = "working"
         self.assertEqual(runner.poll(handle), [])
-        reports[2] = {"payload": {"summary": "g2"}}
+        reports[2] = {"payload": {"evidence": "g2"}}
         events = runner.poll(handle)
         self.assertEqual(events[0].event, "delivered")
         self.assertEqual(events[0].data["generation"], 2)
-        self.assertEqual(events[0].data["payload"]["summary"], "g2")
+        self.assertEqual(events[0].data["evidence"], "g2")
 
     def test_resume_generation_must_increase_and_be_int(self):
         handle = self.start()
@@ -166,8 +167,15 @@ class RunnerTest(unittest.TestCase):
             handle = runner.start(dict(self.contract), root)
             self.assertEqual(runner.poll(handle), [])
             target = root / ".vibe/provider-actions/deliveries/r1-n1-developer-g1.json"
-            target.write_text(json.dumps({"payload": {"summary": "s"}}), encoding="utf-8")
+            archive = {"run_id": "r1", "issue_id": "n1", "role": "developer", "generation": 1,
+                       "payload": {"evidence": "s"}, "consumed_by": None}
+            target.write_text(json.dumps(dict(archive, issue_id="n2")), encoding="utf-8")
+            self.assertEqual(runner.poll(handle), [])  # another node's report
+            target.write_text(json.dumps(archive), encoding="utf-8")
             self.assertEqual(runner.poll(handle)[0].event, "delivered")
+            # Taken once, by this task, as a visible wait would take it.
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["consumed_by"],
+                             "background:{}:g1".format(UUID))
 
     def test_default_reader_rejects_symlink_inside_deliveries(self):
         with tempfile.TemporaryDirectory() as tmp:
