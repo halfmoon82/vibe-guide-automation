@@ -7165,6 +7165,10 @@ class Monitor:
         if cause == "integration_scope_review":
             if isinstance(current.get("blocked_design_target"), str):
                 evidence["target_node_id"] = current["blocked_design_target"]
+            # Answering approves exactly these files, so the PM must see them.
+            files = current.get("blocked_design_files")
+            if isinstance(files, list):
+                evidence["files"] = [item for item in files if isinstance(item, str)]
         elif cause == "out_of_contract_finding":
             evidence["role"] = "reviewer"
             if isinstance(current.get("review_generation"), int):

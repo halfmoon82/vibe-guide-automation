@@ -93,6 +93,11 @@ class AnsweredDecisionResumeTests(_Base):
                 self.assertNotIn(forbidden, live.nodes["n1"].get("scope_expansions") or [])
                 self.assertEqual(self.answered_events(snapshot.run_id), [])
 
+    def test_scope_decision_shows_the_pm_which_files(self):
+        monitor, runner, snapshot = self.blocked_integration()
+        record = DecisionMailbox(self.paths)._load_request(snapshot.nodes[IR]["decision_ids"][0])
+        self.assertEqual(record["evidence"]["files"], [EXTRA])
+
     def test_keep_scope_answer_reaches_the_next_reviewer(self):
         monitor, runner, snapshot = self.blocked_integration()
         self.answer_pending(snapshot.nodes[IR]["decision_ids"][0], "keep_scope")
