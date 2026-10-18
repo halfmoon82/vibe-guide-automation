@@ -49,6 +49,7 @@ from .path_ownership import validate_path_ownership
 from .binding_lifecycle import VisibleSddAcceptance
 from .planner import (
     ScopeExpansionResolution,
+    _scope_compare_key,
     auto_scope_rule,
     resolve_consistency,
     resolve_scope_expansion,
@@ -171,6 +172,26 @@ _BLOCKED_DESIGN_DECISIONS = {
         ],
     },
 }
+
+#: Event written once per consumed answer set; replay re-applies the same
+#: transition from the event alone (see ``_apply_decision_answer_state``).
+DECISION_ANSWER_APPLIED = "decision_answer_applied"
+
+_ANSWER_ACTIONS = {
+    ("integration_scope_review", "approve_scope_expansion"): "scope_expanded",
+    ("integration_scope_review", "keep_scope"): "scope_kept",
+    ("out_of_contract_finding", "accept_as_contract_change"): "contract_changed",
+    ("out_of_contract_finding", "defer_finding"): "finding_deferred",
+}
+
+
+def _requested_scope_files(scope_request: Any) -> List[str]:
+    """File paths named by a provider scope-expansion request (strings only)."""
+    files = scope_request.get("files") if isinstance(scope_request, dict) else scope_request
+    if not isinstance(files, list):
+        return []
+    return [item for item in files if isinstance(item, str)]
+
 
 #: Compile/build command prefixes that can never prove a *behavioral*
 #: invariant (they only prove the code compiles).  Built-in and not reducible
@@ -1902,6 +1923,7 @@ class Monitor:
         self._require_snapshot_authorization(snapshot)
         self._reconcile_unapplied_events(snapshot)
         self._heal_entry_evidence(snapshot)
+        self._consume_answered_decisions(snapshot)
         self._route_undecided_blocked_design(snapshot)
         for node_id, current in snapshot.nodes.items():
             if current.get("status") == "start_pending":
@@ -2166,6 +2188,7 @@ class Monitor:
         self._require_snapshot_authorization(snapshot)
         self._validate_execution_topology(snapshot)
         self._reconcile_unapplied_events(snapshot)
+        self._consume_answered_decisions(snapshot)
         self._route_undecided_blocked_design(snapshot)
         self._poll_active_handles(snapshot, runner)
         self._record_topology_projection(snapshot, "monitor.tick")
@@ -5660,9 +5683,11 @@ class Monitor:
                         snapshot, target_node_id, scope_request
                     )
                     if resolution is None or not resolution.files:
+                        requested_files = _requested_scope_files(scope_request)
                         current["status"] = "blocked_design"
                         current["blocked_design_cause"] = "integration_scope_review"
                         current["blocked_design_target"] = target_node_id
+                        current["blocked_design_files"] = requested_files
                         current["reason"] = redact_provider_text(
                             "integration scope expansion requires product-manager review"
                         )
@@ -5680,6 +5705,7 @@ class Monitor:
                                 "old_task_reconciled": True,
                                 "blocked_design_cause": "integration_scope_review",
                                 "blocked_design_target": target_node_id,
+                                "blocked_design_files": requested_files,
                             },
                         )
                         self._ensure_blocked_design_decision(snapshot, node_id)
@@ -7139,6 +7165,10 @@ class Monitor:
         if cause == "integration_scope_review":
             if isinstance(current.get("blocked_design_target"), str):
                 evidence["target_node_id"] = current["blocked_design_target"]
+            # Answering approves exactly these files, so the PM must see them.
+            files = current.get("blocked_design_files")
+            if isinstance(files, list):
+                evidence["files"] = [item for item in files if isinstance(item, str)]
         elif cause == "out_of_contract_finding":
             evidence["role"] = "reviewer"
             if isinstance(current.get("review_generation"), int):
@@ -7191,6 +7221,154 @@ class Monitor:
         current["recovery_action"] = None
         current["quarantine"] = None
         return True
+
+    def _consume_answered_decisions(self, snapshot: RunSnapshot) -> None:
+        """Advance blocked_design nodes whose decisions are all answered.
+
+        A node moves only when every one of its decisions has a valid answer;
+        an answer voided by changed options reads as still pending.  Nodes in
+        any other state are left alone.
+        """
+        mailbox: Optional[DecisionMailbox] = None
+        for node_id, current in list(snapshot.nodes.items()):
+            ids = current.get("decision_ids")
+            if current.get("status") != "blocked_design" or not isinstance(ids, list) or not ids:
+                continue
+            if mailbox is None:
+                mailbox = DecisionMailbox(self.paths)
+            answers: List[Dict[str, Any]] = []
+            for decision_id in ids:
+                try:
+                    result = mailbox.result(str(decision_id))
+                except (OSError, TypeError, ValueError):
+                    result = None
+                if result is None:
+                    break
+                answer = {"decision_id": str(decision_id), "choice": result["choice"]}
+                if isinstance(result.get("note"), str) and result["note"]:
+                    answer["note"] = result["note"]
+                answers.append(answer)
+            if len(answers) != len(ids):
+                continue
+            guard = getattr(self, "_guard_lease", None)
+            if guard is not None:
+                guard(snapshot.run_id)
+            data, problem = self._decision_answer_transition(snapshot, node_id, current, answers)
+            if data is None:
+                self._mark_blocked_unknown(snapshot, node_id, problem, quarantine_lease=False)
+                continue
+            self._record(snapshot, DECISION_ANSWER_APPLIED, data)
+            self._apply_decision_answer_state(snapshot, node_id, data)
+
+    def _decision_answer_transition(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        current: Dict[str, Any],
+        answers: List[Dict[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Event data for the answered node, or (None, reason) if undecidable."""
+        data: Dict[str, Any] = {
+            "run_id": snapshot.run_id,
+            "node_id": node_id,
+            "decision_ids": [item["decision_id"] for item in answers],
+            "decision_answers": answers,
+        }
+        cause = current.get("blocked_design_cause")
+        if cause is None:
+            data["answer_action"] = "developer_resume"
+            return data, ""
+        choices = {item["choice"] for item in answers}
+        action = _ANSWER_ACTIONS.get((cause, next(iter(choices)))) if len(choices) == 1 else None
+        if action is None:
+            return None, "answered decision cannot be mapped to a node transition"
+        data["answer_action"] = action
+        if action != "scope_expanded":
+            return data, ""
+        target = current.get("blocked_design_target")
+        target_node = snapshot.nodes.get(target) if isinstance(target, str) else None
+        if (
+            target == node_id
+            or not isinstance(target_node, dict)
+            or target_node.get("status") != "accepted"
+        ):
+            return None, "scope expansion target is no longer an accepted node"
+        requested = current.get("blocked_design_files")
+        if not isinstance(requested, list) or not requested or len(set(requested)) != len(requested):
+            return None, "scope expansion request has no usable file list"
+        held = [_scope_compare_key(item) for item in self._files_held_by_other_active_nodes(snapshot, target)]
+        own = set(self._node_scope_files(target, target_node))
+        files = []
+        for item in requested:
+            key = _scope_compare_key(item)
+            if key == ".":
+                return None, "scope expansion request names an unverifiable path"
+            # The PM's answer may widen scope past the automatic rules, never
+            # past their hard floor: listing the path as configured is the
+            # only way auto_scope_rule still refuses it (credentials, .git,
+            # colon/format characters, paths leaving the repository).
+            if auto_scope_rule(item, (item,)) is None:
+                return None, "scope expansion request names a protected path"
+            if any(_dag_module._write_paths_overlap(key, other) for other in held):
+                return None, "scope expansion file is held by another active node"
+            if item not in own:
+                files.append(item)
+        data["blocked_design_target"] = target
+        data["files"] = files
+        return data, ""
+
+    def _apply_decision_answer_state(
+        self, snapshot: RunSnapshot, node_id: str, data: Dict[str, Any]
+    ) -> None:
+        """State change of one consumed answer; shared by live run and replay."""
+        current = snapshot.nodes[node_id]
+        action = data.get("answer_action")
+        answers = [dict(item) for item in data.get("decision_answers") or [] if isinstance(item, dict)]
+        for key in (
+            "decision_ids", "blocked_design_cause", "blocked_design_target",
+            "blocked_design_files", "owner_layer", "recovery_action",
+        ):
+            current.pop(key, None)
+        current["user_interrupt"] = False
+        current["reason"] = None
+        current["quarantine"] = None
+        current.setdefault("decision_answers", []).extend(answers)
+        reviewer_retry = {
+            "role": "reviewer", "phase": "review", "continuation": True,
+            "pending_schedule": True, "successor": False, "successor_candidate": False,
+        }
+        if action == "scope_expanded":
+            target = snapshot.nodes[data["blocked_design_target"]]
+            expansions = target.setdefault("scope_expansions", [])
+            for item in data.get("files", []):
+                if item not in expansions:
+                    expansions.append(item)
+            self._queue_scope_rework(target)
+            current["status"] = "rework"
+            self._queue_integration_review_rework(snapshot)
+        elif action == "scope_kept" or action == "finding_deferred":
+            # The next reviewer must see what was decided, or it re-raises it.
+            current.setdefault("contract_overrides", {})["decision_answers"] = list(current["decision_answers"])
+            if action == "finding_deferred":
+                deferred = current.setdefault("deferred_findings", [])
+                deferred.extend(item["decision_id"] for item in answers if item["decision_id"] not in deferred)
+            current["status"] = "rework"
+            current["active_role"] = None
+            current["active_task"] = None
+            current["pair_archived"] = True
+            current["retryable_action"] = dict(reviewer_retry)
+            snapshot.handles.pop(node_id, None)
+            self._release_node_lease(snapshot, node_id)
+        else:
+            overrides = current.setdefault("contract_overrides", {})
+            if action == "contract_changed":
+                accepted = overrides.setdefault("contract_change_accepted", [])
+                accepted.extend(item["decision_id"] for item in answers if item["decision_id"] not in accepted)
+                overrides["decision_answers"] = list(current["decision_answers"])
+            else:
+                overrides["decision_answers"] = answers
+            snapshot.handles.pop(node_id, None)
+            self._queue_scope_rework(current)
 
     def _route_undecided_blocked_design(self, snapshot: RunSnapshot) -> None:
         """Turn a decision-less blocked_design into a lifecycle recovery state."""
@@ -8000,10 +8178,16 @@ class Monitor:
                     current["blocked_design_cause"] = data["blocked_design_cause"]
                 if data.get("blocked_design_target"):
                     current["blocked_design_target"] = data["blocked_design_target"]
+                if isinstance(data.get("blocked_design_files"), list):
+                    current["blocked_design_files"] = list(data["blocked_design_files"])
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
                 self._release_node_lease(snapshot, node_id)
+            elif record["event"] == DECISION_ANSWER_APPLIED:
+                if provenance.get("role") != "system":
+                    raise ValueError("decision answer replay lacks system provenance")
+                self._apply_decision_answer_state(snapshot, node_id, data)
             elif record["event"] == "decision_raised":
                 reason = data.get("reason", "decision pending")
                 notification_unknown = reason == DECISION_NOTIFICATION_UNKNOWN_REASON
