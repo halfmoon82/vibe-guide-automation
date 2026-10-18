@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 from ..adapters.claude_bg import ClaudeBgLauncher, ClaudeBgUnknown
 from ..contracts import RunEvent, RunHandle, Runner
 from ..paths import ProjectPaths
+from ..state import validate_run_id
 from .provider_action import RESULT_EVENT_KEYS
 
 
@@ -147,7 +148,18 @@ class ClaudeBgRunner(Runner):
             session_id = claims["session_id"]
             if claims.get("handle_id") != handle_id or not _UUID.fullmatch(session_id):
                 return None
-            contract = dict(record["contract"], task_id=claims["task_id"],
+            stored = record["contract"]
+            # The record must describe the session its name and its own
+            # contract say it does; the handle name embeds the node.
+            if (claims.get("role") not in ("developer", "reviewer")
+                    or not _valid_generation(claims.get("generation"))
+                    or not isinstance(claims.get("node_id"), str)
+                    or not handle_id.startswith("claude-bg-{}-".format(claims["node_id"]))
+                    or any(stored.get(key) != claims.get(key)
+                           for key in ("node_id", "role", "run_id"))):
+                return None
+            validate_run_id(claims.get("run_id"))
+            contract = dict(stored, task_id=claims["task_id"],
                             generation=claims.get("generation"))
             worktree = Path(record["worktree"])
             if not worktree.is_absolute():
@@ -171,6 +183,23 @@ class ClaudeBgRunner(Runner):
         else:
             contract_path = contract.get("contract_path") or self._write_prompt(contract)
             task_id = launcher.launch(role, node_id, Path(contract_path))["task_id"]
+            try:
+                return self._register(launcher, contract, task_id, Path(worktree))
+            except (OSError, ValueError, TypeError) as error:
+                # No record means no restart can find this session, and the
+                # monitor retries a failed start: stop it so a retry never
+                # runs a second writer beside it.
+                try:
+                    launcher.stop(task_id)
+                except Exception as stop_error:
+                    # A ValueError is a contract error to the monitor, never
+                    # retried; the session may still be writing.
+                    raise ValueError(
+                        "background session {} started but its record could not be "
+                        "written and stopping it failed ({}); stop it before "
+                        "dispatching this node again".format(task_id, type(stop_error).__name__)
+                    ) from error
+                raise
         return self._register(launcher, contract, task_id, Path(worktree))
 
     def _write_prompt(self, contract: dict) -> Path:
