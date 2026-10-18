@@ -7299,6 +7299,12 @@ class Monitor:
             key = _scope_compare_key(item)
             if key == ".":
                 return None, "scope expansion request names an unverifiable path"
+            # The PM's answer may widen scope past the automatic rules, never
+            # past their hard floor: listing the path as configured is the
+            # only way auto_scope_rule still refuses it (credentials, .git,
+            # colon/format characters, paths leaving the repository).
+            if auto_scope_rule(item, (item,)) is None:
+                return None, "scope expansion request names a protected path"
             if any(_dag_module._write_paths_overlap(key, other) for other in held):
                 return None, "scope expansion file is held by another active node"
             if item not in own:
@@ -7337,6 +7343,8 @@ class Monitor:
             current["status"] = "rework"
             self._queue_integration_review_rework(snapshot)
         elif action == "scope_kept" or action == "finding_deferred":
+            # The next reviewer must see what was decided, or it re-raises it.
+            current.setdefault("contract_overrides", {})["decision_answers"] = list(current["decision_answers"])
             if action == "finding_deferred":
                 deferred = current.setdefault("deferred_findings", [])
                 deferred.extend(item["decision_id"] for item in answers if item["decision_id"] not in deferred)
@@ -7352,6 +7360,7 @@ class Monitor:
             if action == "contract_changed":
                 accepted = overrides.setdefault("contract_change_accepted", [])
                 accepted.extend(item["decision_id"] for item in answers if item["decision_id"] not in accepted)
+                overrides["decision_answers"] = list(current["decision_answers"])
             else:
                 overrides["decision_answers"] = answers
             snapshot.handles.pop(node_id, None)

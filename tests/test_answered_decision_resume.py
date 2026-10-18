@@ -78,6 +78,29 @@ class AnsweredDecisionResumeTests(_Base):
         self.assertFalse(live.nodes["n1"].get("scope_expansions"))
         self.assertEqual(live.nodes["n1"]["status"], "accepted")
 
+    def test_approve_expansion_never_admits_credential_or_git_paths(self):
+        for forbidden in (".env", ".git/config", "deploy/id_rsa"):
+            with self.subTest(path=forbidden):
+                self.setUp()
+                monitor, runner, snapshot = self.blocked_integration()
+                live = load_snapshot(self.paths, snapshot.run_id)
+                live.nodes[IR]["blocked_design_files"] = [forbidden]
+                save_snapshot(self.paths, live)
+                self.answer_pending(live.nodes[IR]["decision_ids"][0], "approve_scope_expansion")
+                live = load_snapshot(self.paths, snapshot.run_id)
+                monitor._consume_answered_decisions(live)
+                self.assertEqual(live.nodes[IR]["status"], "blocked_unknown")
+                self.assertNotIn(forbidden, live.nodes["n1"].get("scope_expansions") or [])
+                self.assertEqual(self.answered_events(snapshot.run_id), [])
+
+    def test_keep_scope_answer_reaches_the_next_reviewer(self):
+        monitor, runner, snapshot = self.blocked_integration()
+        self.answer_pending(snapshot.nodes[IR]["decision_ids"][0], "keep_scope")
+        live = load_snapshot(self.paths, snapshot.run_id)
+        monitor._consume_answered_decisions(live)
+        answers = live.nodes[IR]["contract_overrides"]["decision_answers"]
+        self.assertEqual([item["choice"] for item in answers], ["keep_scope"])
+
     def undecided_with(self, cause):
         monitor, runner, snapshot = self.undecided(blocked_design_cause=cause)
         live = monitor.tick(snapshot.run_id, runner)
@@ -94,6 +117,8 @@ class AnsweredDecisionResumeTests(_Base):
                 monitor._consume_answered_decisions(live)
                 node = live.nodes["n1"]
                 self.assertNotEqual(node["status"], "blocked_design")
+                # Whichever way it went, the next worker sees the answer itself.
+                self.assertEqual(node["contract_overrides"]["decision_answers"][0]["choice"], choice)
                 if marker:
                     self.assertTrue(node["contract_overrides"][marker])
                     self.assertEqual(node["status"], "rework")
