@@ -5288,8 +5288,7 @@ class Monitor:
 
     def _background_receipt(self, snapshot, node_id, role, active, binding, delivery):
         """The archived self-report of the active background task, or None."""
-        if not isinstance(active, dict) or binding.mode != "background" \
-                or binding.task_id != active.get("task_id") \
+        if not isinstance(active, dict) or binding.task_id != active.get("task_id") \
                 or binding.generation != active.get("generation"):
             return None
         return ProviderActionStore(self.paths).background_delivery_receipt(

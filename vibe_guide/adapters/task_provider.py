@@ -1372,7 +1372,6 @@ class ProviderActionStore:
         if (binding.mode != 'background' or binding.run_id != run_id
                 or binding.issue_id != issue_id or binding.role != role
                 or binding.generation != generation or binding.task_id != task_id
-                or self._background_generation(run_id, issue_id, role) != generation
                 or not isinstance(archived, dict)
                 or archived.get('run_id') != run_id or archived.get('issue_id') != issue_id
                 or archived.get('role') != role or archived.get('generation') != generation

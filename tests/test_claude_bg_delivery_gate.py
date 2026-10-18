@@ -226,9 +226,8 @@ class BackgroundDeliveryGateTests(unittest.TestCase):
     def test_visible_binding_keeps_host_and_cursor_requirements(self):
         snapshot = self.start()
         generation = self.generation(snapshot)
-        ProviderActionStore(self.paths).record_worker_delivery(
-            snapshot.run_id, "bg", "developer", dict(GOOD), generation
-        )
+        store = ProviderActionStore(self.paths)
+        store.record_worker_delivery(snapshot.run_id, "bg", "developer", dict(GOOD), generation)
         # The registry now says visible (a loadable binding needs a host; it
         # has no cursor): the background receipt must not stand in for it.
         registry = self.paths.vibe / "runs" / snapshot.run_id / "tasks.json"
@@ -238,12 +237,55 @@ class BackgroundDeliveryGateTests(unittest.TestCase):
                 binding.update(mode="visible", topology="dual-visible", visible=True,
                                threadId="thread-1", hostId="local", limitations=[])
         registry.write_text(json.dumps(data), encoding="utf-8")
+        # Same task identity as the visible binding, so only the mode refuses.
+        self.assertIsNone(store.background_delivery_receipt(
+            snapshot.run_id, "bg", "developer", generation, "thread-1",
+            GOOD["delivery_evidence"]))
 
         snapshot = self.monitor().resume(snapshot.run_id, self.runner())
 
         node = snapshot.nodes["bg"]
         self.assertEqual(node["status"], "blocked_unknown")
         self.assertIn("current cursor is missing", node["reason"])
+
+    def forge_archive(self, snapshot, **fields):
+        """Record bg's own report, then rewrite identity fields in the archive."""
+        generation = self.generation(snapshot)
+        ProviderActionStore(self.paths).record_worker_delivery(
+            snapshot.run_id, "bg", "developer", dict(GOOD), generation)
+        path = self.archive_path(snapshot.run_id, "bg", generation)
+        archive = json.loads(path.read_text(encoding="utf-8"))
+        archive.update(fields)
+        path.write_text(json.dumps(archive), encoding="utf-8")
+        return generation
+
+    def test_each_layer_refuses_a_foreign_archive(self):
+        # The runner's reader and the store's receipt both check the archive
+        # identity; neither may rely on the other.
+        snapshot = self.start()
+        for fields in ({"issue_id": "bg2"}, {"run_id": "run-other"}, {"role": "reviewer"},
+                       {"generation": 99}):
+            generation = self.forge_archive(snapshot, **fields)
+            claims = {"run_id": snapshot.run_id, "node_id": "bg", "role": "developer",
+                      "generation": generation}
+            self.assertIsNone(self.runner()._read_delivery(claims), fields)
+            self.assertIsNone(ProviderActionStore(self.paths).background_delivery_receipt(
+                snapshot.run_id, "bg", "developer", generation, "developer:bg",
+                GOOD["delivery_evidence"]), fields)
+            self.archive_path(snapshot.run_id, "bg", generation).unlink()
+
+    def test_receipt_refuses_another_task_or_consumer(self):
+        snapshot = self.start()
+        store = ProviderActionStore(self.paths)
+        generation = self.forge_archive(snapshot)
+        receipt = lambda task: store.background_delivery_receipt(
+            snapshot.run_id, "bg", "developer", generation, task, GOOD["delivery_evidence"])
+        self.assertIsNotNone(receipt("developer:bg"))
+        self.assertIsNone(receipt("developer:other"))
+        self.forge_archive(snapshot, consumed_by="action-123")
+        self.assertIsNone(receipt("developer:bg"))
+        self.assertFalse(store.consume_background_delivery(
+            snapshot.run_id, "bg", "developer", generation, "developer:bg"))
 
     def test_session_done_without_report_stays_blocked_unknown(self):
         snapshot = self.start()
