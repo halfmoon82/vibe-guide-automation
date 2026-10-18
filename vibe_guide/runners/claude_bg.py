@@ -7,6 +7,7 @@ reaches ``done`` without one is ``blocked_unknown``, never success.
 import json
 import os
 import re
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -14,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 from ..adapters.claude_bg import ClaudeBgLauncher, ClaudeBgUnknown
 from ..contracts import RunEvent, RunHandle, Runner
 from ..paths import ProjectPaths
+from ..task_registry import TaskBinding, load_task_binding, save_task_binding
 
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -21,6 +23,11 @@ _HANDLE = re.compile(r"claude-bg-[A-Za-z0-9._-]+")
 # What a restarted runner needs to rebuild the launcher for a session.
 _LAUNCHER_KEYS = ("node_id", "role", "run_id", "generation", "host", "branch",
                   "status_file", "handoff_file", "child_binding")
+# Report fields the monitor reads from the event itself, as the visible
+# provider runner forwards them; claims always win over worker text.
+_DELIVERY_KEYS = ("evidence", "finding", "in_contract", "consistency",
+                  "delivery_evidence", "completion_marker", "delivery_path",
+                  "thread_status", "in_session_review")
 
 
 def _valid_generation(value):
@@ -28,6 +35,9 @@ def _valid_generation(value):
 
 
 class ClaudeBgRunner(Runner):
+    # start() writes the session cursor into the task binding (_record_cursor).
+    binding_updated_on_start = True
+
     def __init__(
         self,
         launcher_factory: Callable[[dict, Path], ClaudeBgLauncher],
@@ -141,9 +151,96 @@ class ClaudeBgRunner(Runner):
             launcher.resume(resume_id, str(contract.get("rework_message") or ""))
             task_id = resume_id
         else:
+            self._ensure_worktree(contract, Path(worktree))
             contract_path = contract.get("contract_path") or self._write_prompt(contract)
             task_id = launcher.launch(role, node_id, Path(contract_path))["task_id"]
+            self._record_cursor(contract, task_id)
         return self._register(launcher, contract, task_id, Path(worktree))
+
+    def _project(self) -> ProjectPaths:
+        return self._paths or ProjectPaths.from_cwd(Path.cwd())
+
+    def _ensure_worktree(self, contract: dict, worktree: Path) -> None:
+        """Create a missing node worktree on the contract branch.
+
+        No host app creates it for a background session, and ``claude --bg``
+        cannot start in a directory that does not exist.  Only a direct
+        child of the project's ``.worktrees/`` is ever created.
+        """
+        if worktree.exists():
+            return
+        root = self._project().root.resolve()
+        target = worktree if worktree.is_absolute() else root / worktree
+        target = target.parent.resolve() / target.name
+        if target.parent != root / ".worktrees":
+            raise ClaudeBgUnknown("refusing to create a worktree outside .worktrees/: %s" % worktree)
+        branch = contract.get("branch")
+        if not isinstance(branch, str) or not branch.strip():
+            raise ClaudeBgUnknown("cannot create worktree %s: contract has no branch" % worktree)
+
+        def git(*args):
+            try:
+                return subprocess.run(["git", "-C", str(root)] + list(args),
+                                      capture_output=True, text=True, timeout=60)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise ClaudeBgUnknown("cannot create worktree %s: %s" % (worktree, type(error).__name__))
+
+        if git("rev-parse", "--verify", "-q", "refs/heads/" + branch).returncode == 0:
+            done = git("worktree", "add", str(target), branch)
+        else:
+            base = contract.get("base_sha") or "HEAD"
+            done = git("worktree", "add", "-b", branch, str(target), str(base))
+        if done.returncode != 0:
+            raise ClaudeBgUnknown("cannot create worktree %s: %s"
+                                  % (worktree, (done.stderr or done.stdout).strip()[-200:]))
+
+    def _record_cursor(self, contract: dict, session_id: str) -> None:
+        """Bind the launched session to the monitor's task binding.
+
+        The session UUID is the continuation cursor (``claude --resume``)
+        the delivery gate requires.  Only the binding for this exact task and
+        generation is touched.
+        """
+        run_id = contract.get("run_id")
+        if not run_id:
+            return
+        paths = self._project()
+        try:
+            binding = load_task_binding(paths, contract["node_id"],
+                                        contract.get("role", "developer"), run_id=run_id)
+        except FileNotFoundError:
+            return
+        if binding.task_id != contract.get("task_id") or binding.generation != contract.get("generation"):
+            return
+        binding.cursor = session_id
+        save_task_binding(paths, binding)
+
+    def task_binding(self, contract: dict, worktree: Path, run_id: str, status: str) -> TaskBinding:
+        """The binding the monitor registers before launch.
+
+        Same fields as the monitor's generic runner binding, plus the session
+        host: it is part of the immutable task identity, so it cannot be
+        added after launch the way the cursor is.
+        """
+        return TaskBinding(
+            provider="runner",
+            mode="background",
+            issue_id=str(contract["node_id"]),
+            role=str(contract.get("role", "developer")),
+            task_id=contract.get("task_id"),
+            host=str(contract.get("host") or "local"),
+            worktree=str(contract.get("worktree") or worktree),
+            branch=str(contract.get("branch") or ""),
+            status_file=str(contract.get("status_file") or ""),
+            handoff_file=str(contract.get("handoff_file") or ""),
+            run_id=run_id,
+            status=status,
+            generation=int(contract["generation"]),
+            allowlist=list(contract.get("files", [])),
+            capability_contract_digest=contract.get("capability_contract_digest"),
+            topology=str(contract.get("topology") or "background"),
+            limitations=list(contract.get("dispatch_limitations", [])),
+        )
 
     def _write_prompt(self, contract: dict) -> Path:
         """Materialize the worker prompt for a monitor payload.
@@ -200,7 +297,10 @@ class ClaudeBgRunner(Runner):
         report = self.delivery_reader(dict(claims))
         if report:
             session["delivered"] = True
-            return [RunEvent("delivered", dict(claims, payload=report["payload"]))]
+            payload = report["payload"]
+            data = {key: payload[key] for key in _DELIVERY_KEYS if key in payload}
+            data.update(claims, payload=payload)
+            return [RunEvent("delivered", data)]
         try:
             state = session["launcher"].status(claims["session_id"])
         except ClaudeBgUnknown as error:

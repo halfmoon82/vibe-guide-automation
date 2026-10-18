@@ -201,6 +201,7 @@ class RunnerTest(unittest.TestCase):
             root = Path(tmp).resolve()
             (root / ".vibe").mkdir()
             (root / "home").mkdir()
+            (root / ".worktrees" / "n1").mkdir(parents=True)
             runner = ClaudeBgRunner(lambda c, w: self.launcher, paths=ProjectPaths(root, vibe_home=root / "home"))
             contract = {
                 "node_id": "n1", "role": "developer", "run_id": "r1", "generation": 3,

@@ -132,6 +132,7 @@ class RunnerReconnectTests(unittest.TestCase):
 
     def test_record_keeps_project_paths_relative(self):
         worktree = self.paths.root / ".worktrees" / "n1"
+        worktree.mkdir(parents=True)
         handle = self.runner(FakeLauncher()).start(dict(self.contract), worktree)
         record = self.paths.resolve_vibe_path(
             "provider-actions/claude-bg-sessions/{}.json".format(handle.run_id)
@@ -182,6 +183,8 @@ class MonitorBackgroundTests(unittest.TestCase):
         with patch("vibe_guide.dag._write_scope_conflict_errors", return_value={}):
             card = build_authorization_card(self.plan, self.nodes, self.capabilities)
         runner = ClaudeBgRunner(lambda c, w: launcher, paths=self.paths)
+        # The node worktree already exists, so start never tries to create it.
+        (self.paths.root / ".worktrees" / "bg").mkdir(parents=True, exist_ok=True)
         snapshot = self.monitor().start(authorize(card, "AUTHORIZE"), runner)
         self.assertEqual(snapshot.nodes["bg"]["status"], "running")
         return snapshot

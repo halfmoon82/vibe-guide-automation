@@ -803,6 +803,13 @@ class Monitor:
             if not worktree.is_absolute() and isinstance(project_root, str) and project_root:
                 worktree = Path(project_root) / worktree
             handle = runner.start(payload, worktree)
+            if getattr(runner, "binding_updated_on_start", False):
+                # The runner completed the binding during start (claude-bg
+                # records the session cursor); drop the cached copy so the
+                # next status write does not overwrite it.
+                self._binding_cache.pop(
+                    (payload.get("run_id"), payload.get("node_id"), payload.get("role")), None
+                )
         except ProviderUnavailable as error:
             # Preserve the provider's actual request-shape diagnosis.  A
             # broad catch here used to erase it as ``ProviderUnavailable``;
