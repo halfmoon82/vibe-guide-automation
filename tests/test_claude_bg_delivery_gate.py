@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from vibe_guide.adapters.task_provider import ProviderActionStore
+from vibe_guide.contracts import RunHandle
 from vibe_guide.authorization import _canonical_digest, authorize, build_authorization_card
 from vibe_guide.capability_contract import build_contract, save_contract
 from vibe_guide.dag import append_integration_review_node
@@ -174,6 +175,28 @@ class BackgroundDeliveryGateTests(unittest.TestCase):
         # Re-reporting the identical payload is a duplicate, not a second result.
         again = store.record_worker_delivery(snapshot.run_id, "bg", "developer", dict(GOOD), generation)
         self.assertEqual((again["duplicate"], again["consumed"]), (True, False))
+
+    def test_corrected_rereport_reaches_the_same_runner(self):
+        # Review of PR 246: once a report was handed over, a corrected one
+        # (different content, archive rewritten unconsumed) must still reach
+        # the monitor through the same in-process runner, as a visible wait would.
+        snapshot = self.start()
+        generation = self.generation(snapshot)
+        store = ProviderActionStore(self.paths)
+        store.record_worker_delivery(snapshot.run_id, "bg", "developer", dict(GOOD), generation)
+        runner = self.runner()
+        handle = RunHandle(snapshot.handles["bg"])
+        self.assertEqual([e.event for e in runner.poll(handle)], ["delivered"])
+        self.assertEqual(runner.poll(handle), [])
+
+        corrected = {"delivery_evidence": dict(GOOD["delivery_evidence"], delivery_path="fixed.md")}
+        store.record_worker_delivery(snapshot.run_id, "bg", "developer", corrected, generation)
+        events = runner.poll(handle)
+
+        self.assertEqual([e.event for e in events], ["delivered"])
+        self.assertEqual(events[0].data["delivery_evidence"]["delivery_path"], "fixed.md")
+        self.assertEqual(store.unconsumed_deliveries(snapshot.run_id), [])
+        self.assertEqual(runner.poll(handle), [])
 
     def test_archive_for_another_node_does_not_vouch(self):
         snapshot = self.start()

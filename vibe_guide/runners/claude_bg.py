@@ -251,10 +251,14 @@ class ClaudeBgRunner(Runner):
                     },
                 )
             ]
-        if session["delivered"]:
-            return []
         claims = session["claims"]
         report = self.delivery_reader(dict(claims))
+        if session["delivered"] and not (
+            # A corrected re-report rewrites the archive unconsumed; take it
+            # like the next visible wait would, never the one already handed.
+            self._consumes_archive and report and report.get("consumed_by") is None
+        ):
+            return []
         if report:
             if not self._take_delivery(claims):
                 return [RunEvent("blocked_unknown", dict(
