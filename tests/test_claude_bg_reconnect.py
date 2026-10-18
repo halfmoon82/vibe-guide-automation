@@ -218,7 +218,9 @@ class MonitorBackgroundTests(unittest.TestCase):
         restarted = ClaudeBgRunner(lambda c, w: FakeLauncher(), paths=self.paths)
         events = restarted.poll(RunHandle(snapshot.handles["bg"]))
         self.assertEqual([event.event for event in events], ["delivered"])
-        self.assertEqual(events[0].data["payload"], GOOD)
+        # Projected to the top level, where the monitor's delivery gate reads it.
+        self.assertEqual(events[0].data["delivery_evidence"], GOOD["delivery_evidence"])
+        self.assertNotIn("payload", events[0].data)
 
     def test_background_self_report_rejects_other_generations(self):
         snapshot = self.start(FakeLauncher())

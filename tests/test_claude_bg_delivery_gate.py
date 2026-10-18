@@ -26,6 +26,7 @@ from vibe_guide.authorization import _canonical_digest, authorize, build_authori
 from vibe_guide.capability_contract import build_contract, save_contract
 from vibe_guide.dag import append_integration_review_node
 from vibe_guide.engine_attestation import create_engine_attestation
+from vibe_guide.evidence import evaluate_delivery_evidence
 from vibe_guide.models import AgentCapabilities, Plan
 from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
@@ -204,10 +205,69 @@ class BackgroundDeliveryGateTests(unittest.TestCase):
 
         self.assertNotIn(snapshot.nodes["bg"]["status"], {"review", "delivered"})
 
+    def test_background_reviewer_acceptance_reaches_accepted(self):
+        # The report's own event decides the transition, as for a visible
+        # wait result; a reviewer's acceptance is never read as a delivery.
+        snapshot = self.start()
+        store = ProviderActionStore(self.paths)
+        store.record_worker_delivery(snapshot.run_id, "bg", "developer", dict(GOOD), self.generation(snapshot))
+        snapshot = self.monitor().resume(snapshot.run_id, self.runner())
+        self.assertEqual(snapshot.nodes["bg"]["status"], "review")
+        reviewer = load_task_binding(self.paths, "bg", "reviewer", run_id=snapshot.run_id)
+        self.assertEqual(reviewer.mode, "background")
+
+        store.record_worker_delivery(snapshot.run_id, "bg", "reviewer",
+                                     dict(GOOD, event="accepted", evidence="P0-P2 clear"), reviewer.generation)
+        snapshot = self.monitor().resume(snapshot.run_id, self.runner())
+
+        self.assertEqual(snapshot.nodes["bg"]["status"], "accepted", snapshot.nodes["bg"].get("reason"))
+        self.assertEqual(store.unconsumed_deliveries(snapshot.run_id), [])
+
+    def test_visible_binding_keeps_host_and_cursor_requirements(self):
+        snapshot = self.start()
+        generation = self.generation(snapshot)
+        ProviderActionStore(self.paths).record_worker_delivery(
+            snapshot.run_id, "bg", "developer", dict(GOOD), generation
+        )
+        # The registry now says visible (a loadable binding needs a host; it
+        # has no cursor): the background receipt must not stand in for it.
+        registry = self.paths.vibe / "runs" / snapshot.run_id / "tasks.json"
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        for binding in data["bindings"]:
+            if binding.get("issue_id") == "bg":
+                binding.update(mode="visible", topology="dual-visible", visible=True,
+                               threadId="thread-1", hostId="local", limitations=[])
+        registry.write_text(json.dumps(data), encoding="utf-8")
+
+        snapshot = self.monitor().resume(snapshot.run_id, self.runner())
+
+        node = snapshot.nodes["bg"]
+        self.assertEqual(node["status"], "blocked_unknown")
+        self.assertIn("current cursor is missing", node["reason"])
+
     def test_session_done_without_report_stays_blocked_unknown(self):
         snapshot = self.start()
         snapshot = self.monitor().resume(snapshot.run_id, self.runner("done"))
         self.assertEqual(snapshot.nodes["bg"]["status"], "blocked_unknown")
+
+
+class BackgroundReceiptGateUnitTests(unittest.TestCase):
+    ARTIFACTS = dict(GOOD["delivery_evidence"])
+
+    def binding(self, mode):
+        return {"mode": mode, "task_id": "developer:bg", "host": None, "hostId": None,
+                "cursor": None, "worktree": ".worktrees/bg", "branch": "branch-bg"}
+
+    def test_background_receipt_replaces_host_and_cursor_for_background_only(self):
+        node = {"status": "DELIVERED"}
+        self.assertTrue(evaluate_delivery_evidence(
+            node, self.binding("background"), self.ARTIFACTS, background_receipt=True).complete)
+        visible = evaluate_delivery_evidence(
+            node, self.binding("visible"), self.ARTIFACTS, background_receipt=True)
+        self.assertEqual(visible.reasons, ["host identity is missing", "current cursor is missing"])
+        self.assertEqual(visible.classification, "blocked_unknown")
+        without = evaluate_delivery_evidence(node, self.binding("background"), self.ARTIFACTS)
+        self.assertEqual(without.reasons, ["host identity is missing", "current cursor is missing"])
 
 
 if __name__ == "__main__":

@@ -80,6 +80,17 @@ NATIVE_TOOL_MAP: Dict[str, Dict[str, str]] = {
 }
 
 
+#: Result keys a worker report hands to the monitor as event data.
+#: ``in_session_review`` carries the visible-sdd worker session's review
+#: clearance (protocol/evidence_ref/p0-p2) that Monitor needs to accept a
+#: single-session node (ISSUE-04).
+RESULT_EVENT_KEYS = (
+    "evidence", "finding", "in_contract", "consistency",
+    "delivery_evidence", "completion_marker", "delivery_path",
+    "thread_status", "in_session_review",
+)
+
+
 class ProviderActionRunner(Runner):
     """Expose a public CLI runner while the App owns native tool execution."""
 
@@ -1411,12 +1422,7 @@ class ProviderActionRunner(Runner):
                 error = result.get("error")
                 data["reason"] = (error.get("message", event_name) if isinstance(error, dict)
                                   else str(error or event_name))
-        # ``in_session_review`` carries the visible-sdd worker session's
-        # review clearance (protocol/evidence_ref/p0-p2) that Monitor needs
-        # to accept a single-session node (ISSUE-04).
-        for key in ("evidence", "finding", "in_contract", "consistency",
-                    "delivery_evidence", "completion_marker", "delivery_path",
-                    "thread_status", "in_session_review"):
+        for key in RESULT_EVENT_KEYS:
             if key in result:
                 data[key] = result[key]
         return [RunEvent(str(event_name), data)]
