@@ -1356,6 +1356,7 @@ class ProviderActionStore:
             raise ValueError('only a wait request can be retired')
         if self.result(action_id) is not None:
             raise ValueError('an answered wait cannot be retired')
+        hanging = self._hanging_handle(action)
         self._atomic(self._directory('stale') / (action_id + '.json'), {
             'schema_version': self.schema_version,
             'status': 'stale',
@@ -1363,6 +1364,39 @@ class ProviderActionStore:
             'action_id': action_id,
             'request_digest': action['request_digest'],
         })
+        if hanging is not None:
+            path, metadata = hanging
+            metadata['pending_action'] = None
+            metadata['pending_operation'] = None
+            self._atomic(path, metadata)
+
+    def _hanging_handle(self, action):
+        """The handle of the retired wait's task, when it still points at it.
+
+        Returns ``(path, metadata)`` for a handle whose ``pending_action`` is
+        this wait, ``None`` when no handle waits on it.  A handle of the same
+        task that waits on something else is refused: retiring must not hide
+        or leave behind a different in-flight action.
+        """
+        handles = self.root / 'handles'
+        if not handles.is_dir():
+            return None
+        for path in sorted(handles.glob('*.json')):
+            metadata = self._read(path)
+            if (metadata.get('run_id') != action.get('run_id')
+                    or metadata.get('node_id') != action.get('issue_id')
+                    or metadata.get('role') != action.get('role')
+                    or metadata.get('generation') != action.get('generation')):
+                continue
+            pending = metadata.get('pending_action')
+            if pending == action['action_id']:
+                return path, metadata
+            if pending:
+                raise ValueError(
+                    'handle {} of {}/{} is waiting on {} ({}), not on the wait being retired'.format(
+                        metadata.get('handle_id', path.stem), action.get('issue_id'),
+                        action.get('role'), pending, metadata.get('pending_operation')))
+        return None
 
     def unpolled_results(self, run_id):
         """Read-only list of nodes whose pending action already has a result.
