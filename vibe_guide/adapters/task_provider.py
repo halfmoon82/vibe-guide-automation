@@ -1344,6 +1344,66 @@ class ProviderActionStore:
             return None
         return action
 
+    @staticmethod
+    def background_consumer(task_id, generation):
+        """``consumed_by`` marker of a background self-report the monitor took."""
+        return 'background:{}:g{}'.format(task_id, generation)
+
+    def background_delivery_receipt(self, run_id, issue_id, role, generation, task_id,
+                                    delivery_evidence):
+        """The archived self-report of a background task, or None.
+
+        Background dispatch (``claude --bg``) never pages the session, so no
+        ``wait`` request ever consumes the archive and :meth:`self_report_receipt`
+        cannot exist.  This receipt instead requires the run's registered
+        binding to be a ``mode=background`` task of exactly this
+        run/node/role/generation/task, and this generation's archive to carry
+        the same identity and the same delivery evidence, unconsumed or taken
+        only by this task.  It stands in for the host and cursor a background
+        session never has; it never vouches for a visible binding.
+        """
+        from ..task_registry import load_task_binding
+
+        try:
+            binding = load_task_binding(self.paths, issue_id, role, run_id=run_id)
+            archived = self._read(self._delivery_path(run_id, issue_id, role, generation))
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return None
+        if (binding.mode != 'background' or binding.run_id != run_id
+                or binding.issue_id != issue_id or binding.role != role
+                or binding.generation != generation or binding.task_id != task_id
+                or not isinstance(archived, dict)
+                or archived.get('run_id') != run_id or archived.get('issue_id') != issue_id
+                or archived.get('role') != role or archived.get('generation') != generation
+                or not isinstance(archived.get('payload'), dict)
+                or not isinstance(delivery_evidence, dict)
+                or archived['payload'].get('delivery_evidence') != delivery_evidence
+                or archived.get('consumed_by') not in (
+                    None, self.background_consumer(task_id, generation))):
+            return None
+        return archived
+
+    def consume_background_delivery(self, run_id, issue_id, role, generation, task_id):
+        """Mark a background self-report handed to the monitor; True once owned.
+
+        Same lock as the wait hand-off, so a report is consumed exactly once:
+        a later identical ``worker-deliver`` is then a duplicate, and the
+        heartbeat stops counting it as pending work.  Re-taking a report this
+        task already owns stays True so a restarted runner can re-emit it.
+        """
+        from ..state import interprocess_lock
+
+        marker = self.background_consumer(task_id, generation)
+        identity = _canonical_digest([run_id, issue_id, role])
+        with interprocess_lock(self._directory('locks') / ('delivery-' + identity + '.lock')):
+            path = self._delivery_path(run_id, issue_id, role, generation)
+            report = self._read(path)
+            if not isinstance(report, dict) or report.get('consumed_by') not in (None, marker):
+                return False
+            if report.get('consumed_by') is None:
+                self._atomic(path, dict(report, consumed_by=marker))
+            return True
+
     def retire_wait(self, action_id, reason):
         """Hide one unanswered ``wait`` with an audit marker; never a result.
 

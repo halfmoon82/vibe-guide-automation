@@ -5309,6 +5309,16 @@ class Monitor:
             binding.task_id, binding.host or binding.hostId, delivery,
         )
 
+    def _background_receipt(self, snapshot, node_id, role, active, binding, delivery):
+        """The archived self-report of the active background task, or None."""
+        if not isinstance(active, dict) or binding.task_id != active.get("task_id") \
+                or binding.generation != active.get("generation"):
+            return None
+        return ProviderActionStore(self.paths).background_delivery_receipt(
+            snapshot.run_id, node_id, role, active.get("generation"),
+            binding.task_id, delivery,
+        )
+
     def _reject_acceptance_format(
         self,
         snapshot: RunSnapshot,
@@ -5497,6 +5507,9 @@ class Monitor:
             delivery = event.data.get("delivery_evidence")
             if snapshot.execution_engine == "vibeguide_monitor":
                 binding = self._load_task_binding(snapshot, node_id, role)
+                background_receipt = self._background_receipt(
+                    snapshot, node_id, role, active, binding, delivery
+                )
                 gate = evaluate_delivery_evidence(
                     {**current, "status": "DELIVERED"},
                     binding,
@@ -5504,6 +5517,7 @@ class Monitor:
                     self_report_receipt=self._self_report_receipt(
                         snapshot, node_id, role, active, binding, delivery
                     ) is not None,
+                    background_receipt=background_receipt is not None,
                 )
                 if not gate.complete:
                     if gate.classification == "acceptance_rejected":

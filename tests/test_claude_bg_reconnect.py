@@ -130,6 +130,22 @@ class RunnerReconnectTests(unittest.TestCase):
         restarted = ClaudeBgRunner(lambda c, w: FakeLauncher(), delivery_reader=lambda claims: report, paths=self.paths)
         self.assertEqual([event.event for event in restarted.poll(handle)], ["delivered"])
 
+    def test_session_is_stopped_when_its_record_cannot_be_written(self):
+        launcher = FakeLauncher()
+        runner = self.runner(launcher)
+        with patch.object(ClaudeBgRunner, "_persist", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                runner.start(dict(self.contract), Path("/tmp"))
+        self.assertIn(("stop", UUID), launcher.calls)
+
+    def test_unstoppable_orphan_is_a_non_retryable_error(self):
+        launcher = FakeLauncher()
+        launcher.stop = lambda task_id: (_ for _ in ()).throw(RuntimeError("cli gone"))
+        runner = self.runner(launcher)
+        with patch.object(ClaudeBgRunner, "_persist", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(ValueError, UUID):
+                runner.start(dict(self.contract), Path("/tmp"))
+
     def test_record_keeps_project_paths_relative(self):
         worktree = self.paths.root / ".worktrees" / "n1"
         handle = self.runner(FakeLauncher()).start(dict(self.contract), worktree)
@@ -155,6 +171,35 @@ class RunnerReconnectTests(unittest.TestCase):
         )
         events = self.runner(FakeLauncher()).poll(RunHandle(forged))
         self.assertEqual([event.event for event in events], ["blocked_unknown"])
+
+    def test_record_with_inconsistent_identity_is_not_adopted(self):
+        handle = self.runner(FakeLauncher()).start(dict(self.contract), Path("/tmp"))
+        path = self.paths.resolve_vibe_path(
+            "provider-actions/claude-bg-sessions/{}.json".format(handle.run_id))
+        original = path.read_text(encoding="utf-8")
+        # Claims that disagree with the stored contract, and records that
+        # agree with themselves but not with the handle name or the rules.
+        tampered = (
+            (("claims",), "node_id", "other"),
+            (("claims",), "run_id", "run-2"),
+            (("claims",), "generation", "3"),
+            (("contract",), "role", "reviewer"),
+            (("claims", "contract"), "node_id", "other"),
+            (("claims", "contract"), "role", "writer"),
+            (("claims", "contract"), "run_id", "../x"),
+        )
+        for sections, key, value in tampered:
+            record = json.loads(original)
+            for section in sections:
+                record[section][key] = value
+            path.write_text(json.dumps(record), encoding="utf-8")
+            launcher = FakeLauncher("blocked")
+            events = self.runner(launcher).poll(RunHandle(handle.run_id))
+            self.assertEqual([event.event for event in events], ["blocked_unknown"], (sections, key))
+            self.assertEqual(launcher.calls, [], (sections, key))
+        path.write_text(original, encoding="utf-8")
+        self.assertEqual([e.event for e in self.runner(FakeLauncher("blocked")).poll(handle)],
+                         ["needs_attention"])
 
     def test_unknown_handle_without_record_stays_blocked_unknown(self):
         events = self.runner(FakeLauncher()).poll(RunHandle("claude-bg-n1-ghost"))
@@ -218,7 +263,9 @@ class MonitorBackgroundTests(unittest.TestCase):
         restarted = ClaudeBgRunner(lambda c, w: FakeLauncher(), paths=self.paths)
         events = restarted.poll(RunHandle(snapshot.handles["bg"]))
         self.assertEqual([event.event for event in events], ["delivered"])
-        self.assertEqual(events[0].data["payload"], GOOD)
+        # Projected to the top level, where the monitor's delivery gate reads it.
+        self.assertEqual(events[0].data["delivery_evidence"], GOOD["delivery_evidence"])
+        self.assertNotIn("payload", events[0].data)
 
     def test_background_self_report_rejects_other_generations(self):
         snapshot = self.start(FakeLauncher())

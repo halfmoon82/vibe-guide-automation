@@ -14,6 +14,8 @@ from typing import Any, Callable, Dict, List, Optional
 from ..adapters.claude_bg import ClaudeBgLauncher, ClaudeBgUnknown
 from ..contracts import RunEvent, RunHandle, Runner
 from ..paths import ProjectPaths
+from ..state import validate_run_id
+from .provider_action import RESULT_EVENT_KEYS
 
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -36,6 +38,8 @@ class ClaudeBgRunner(Runner):
     ):
         self.launcher_factory = launcher_factory
         self._paths = paths
+        # An injected reader is a test seam with no archive behind it.
+        self._consumes_archive = delivery_reader is None
         self.delivery_reader = delivery_reader or self._read_delivery
         self._count = 0
         self._sessions: Dict[str, Dict[str, Any]] = {}
@@ -52,7 +56,32 @@ class ClaudeBgRunner(Runner):
             value = json.loads(path.read_text(encoding="utf-8"))
         except (ValueError, OSError, UnicodeDecodeError):
             return None
-        return value if isinstance(value, dict) and isinstance(value.get("payload"), dict) else None
+        if not isinstance(value, dict) or not isinstance(value.get("payload"), dict) or any(
+            value.get(field) != claims.get(key)
+            for field, key in (("run_id", "run_id"), ("issue_id", "node_id"),
+                               ("role", "role"), ("generation", "generation"))
+        ):
+            return None
+        return value
+
+    def _take_delivery(self, claims: dict) -> bool:
+        """Mark the archive handed to the monitor, as a visible ``wait`` does.
+
+        A later identical ``worker-deliver`` is then a duplicate and the
+        heartbeat stops counting the report; an archive another consumer
+        already took is not this session's to deliver.
+        """
+        if not self._consumes_archive:
+            return True
+        from ..adapters.task_provider import ProviderActionStore
+
+        try:
+            return ProviderActionStore(self._paths or ProjectPaths.from_cwd(Path.cwd())) \
+                .consume_background_delivery(claims.get("run_id"), claims["node_id"],
+                                             claims["role"], claims.get("generation"),
+                                             claims.get("task_id"))
+        except (OSError, ValueError):
+            return False
 
     def _register(self, launcher, contract: dict, session_id: str,
                   worktree: Path, handle_id: Optional[str] = None) -> RunHandle:
@@ -119,7 +148,18 @@ class ClaudeBgRunner(Runner):
             session_id = claims["session_id"]
             if claims.get("handle_id") != handle_id or not _UUID.fullmatch(session_id):
                 return None
-            contract = dict(record["contract"], task_id=claims["task_id"],
+            stored = record["contract"]
+            # The record must describe the session its name and its own
+            # contract say it does; the handle name embeds the node.
+            if (claims.get("role") not in ("developer", "reviewer")
+                    or not _valid_generation(claims.get("generation"))
+                    or not isinstance(claims.get("node_id"), str)
+                    or not handle_id.startswith("claude-bg-{}-".format(claims["node_id"]))
+                    or any(stored.get(key) != claims.get(key)
+                           for key in ("node_id", "role", "run_id"))):
+                return None
+            validate_run_id(claims.get("run_id"))
+            contract = dict(stored, task_id=claims["task_id"],
                             generation=claims.get("generation"))
             worktree = Path(record["worktree"])
             if not worktree.is_absolute():
@@ -143,6 +183,23 @@ class ClaudeBgRunner(Runner):
         else:
             contract_path = contract.get("contract_path") or self._write_prompt(contract)
             task_id = launcher.launch(role, node_id, Path(contract_path))["task_id"]
+            try:
+                return self._register(launcher, contract, task_id, Path(worktree))
+            except (OSError, ValueError, TypeError) as error:
+                # No record means no restart can find this session, and the
+                # monitor retries a failed start: stop it so a retry never
+                # runs a second writer beside it.
+                try:
+                    launcher.stop(task_id)
+                except Exception as stop_error:
+                    # A ValueError is a contract error to the monitor, never
+                    # retried; the session may still be writing.
+                    raise ValueError(
+                        "background session {} started but its record could not be "
+                        "written and stopping it failed ({}); stop it before "
+                        "dispatching this node again".format(task_id, type(stop_error).__name__)
+                    ) from error
+                raise
         return self._register(launcher, contract, task_id, Path(worktree))
 
     def _write_prompt(self, contract: dict) -> Path:
@@ -194,13 +251,26 @@ class ClaudeBgRunner(Runner):
                     },
                 )
             ]
-        if session["delivered"]:
-            return []
         claims = session["claims"]
         report = self.delivery_reader(dict(claims))
+        if session["delivered"] and not (
+            # A corrected re-report rewrites the archive unconsumed; take it
+            # like the next visible wait would, never the one already handed.
+            self._consumes_archive and report and report.get("consumed_by") is None
+        ):
+            return []
         if report:
+            if not self._take_delivery(claims):
+                return [RunEvent("blocked_unknown", dict(
+                    claims, reason="worker delivery archive was taken by another consumer"))]
             session["delivered"] = True
-            return [RunEvent("delivered", dict(claims, payload=report["payload"]))]
+            # Same projection as a visible wait result: the monitor reads the
+            # report's fields at the top level, and the runner's claims always
+            # win over anything the worker wrote.
+            payload = report["payload"]
+            data = {key: payload[key] for key in RESULT_EVENT_KEYS if key in payload}
+            data.update(claims)
+            return [RunEvent(str(payload.get("event") or "delivered"), data)]
         try:
             state = session["launcher"].status(claims["session_id"])
         except ClaudeBgUnknown as error:

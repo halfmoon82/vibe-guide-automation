@@ -34,7 +34,8 @@ _DELIVERY_FORMAT_REASONS = (
 
 
 def evaluate_delivery_evidence(
-    node: Any, binding: Any, artifacts: Any, self_report_receipt: bool = False
+    node: Any, binding: Any, artifacts: Any, self_report_receipt: bool = False,
+    background_receipt: bool = False,
 ) -> DeliveryEvidence:
     """Require complete, current delivery evidence before dependency unlock.
 
@@ -43,6 +44,12 @@ def evaluate_delivery_evidence(
     (``ProviderActionStore.self_report_receipt``).  It replaces only the
     cursor -- a self-report never pages the session, so it has none -- and
     every identity, host and worktree requirement still applies.
+
+    ``background_receipt`` is the proof for a ``mode=background`` binding
+    (``ProviderActionStore.background_delivery_receipt``).  A background
+    session has neither host nor cursor, so it replaces both -- and only
+    when the binding itself is background; a visible binding keeps both
+    requirements whatever the caller claims.
     """
     get = lambda value, key, default=None: value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
     reasons: List[str] = []
@@ -50,11 +57,13 @@ def evaluate_delivery_evidence(
         reasons.append("canonical delivered state is missing")
     if get(binding, "task_id") in (None, "") and get(binding, "threadId") in (None, ""):
         reasons.append("task identity is missing")
-    if get(binding, "host") in (None, "") and get(binding, "hostId") in (None, ""):
+    background = background_receipt and get(binding, "mode") == "background"
+    if get(binding, "host") in (None, "") and get(binding, "hostId") in (None, "") \
+            and not background:
         reasons.append("host identity is missing")
     if get(binding, "worktree") in (None, "") or get(binding, "branch") in (None, ""):
         reasons.append("worktree or branch is missing")
-    if get(binding, "cursor") in (None, "") and not self_report_receipt:
+    if get(binding, "cursor") in (None, "") and not (self_report_receipt or background):
         reasons.append("current cursor is missing")
     if not isinstance(artifacts, dict) or not artifacts.get("completion_marker"):
         reasons.append("completion marker is missing")
