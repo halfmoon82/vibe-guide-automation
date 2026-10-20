@@ -102,10 +102,31 @@ class Issue249AcceptedReverseBlockTests(unittest.TestCase):
         self.capabilities = AgentCapabilities("fake", True, True, True, True, True, "full")
 
     def _monitor(self):
+        return self._fresh_monitor()
+
+    def _fresh_monitor(self):
+        """Build an isolated monitor environment.
+
+        Loop-driven guard cases must never share a project root: the
+        previous run's durable residue (leases, registry entries) changes
+        how the next run dispatches.
+        """
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        paths = ProjectPaths(Path(temporary.name))
+        (paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (paths.vibe / "state.json").write_text(
+            '{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8"
+        )
+        save_contract(
+            paths,
+            build_contract(paths.root, provider="fake", host_id="local"),
+        )
+        self.paths = paths
         nodes = [node("n1")]
         plan = Plan("plan-1", 1, "docs/prd.md", [item.id for item in nodes], "draft")
         card = build_authorization_card(plan, nodes, self.capabilities)
-        return Monitor(self.paths, plan, nodes), authorize(card, "AUTHORIZE")
+        return Monitor(paths, plan, nodes), authorize(card, "AUTHORIZE")
 
     def _events(self, run_id, name=None):
         records = load_events(self.paths, run_id)
@@ -269,6 +290,11 @@ class Issue249AcceptedReverseBlockTests(unittest.TestCase):
         self.assertEqual(current["status"], "blocked_unknown")
         self.assertEqual(current["reason"], REVERSE_BLOCK_REASON)
         self.assertIsInstance(current.get("acceptance"), dict)
+        # The reverse-block's own residue is stamped by _mark_blocked_unknown
+        # and must not veto the rescue: reconcile_binding plus a quarantine
+        # whose handle was already retired (handle_id null).
+        self.assertEqual(current["recovery_action"], "reconcile_binding")
+        self.assertIsNone(current["quarantine"].get("handle_id"))
 
         resumed = monitor.resume(snapshot.run_id, FakeRunner())
 
@@ -304,6 +330,189 @@ class Issue249AcceptedReverseBlockTests(unittest.TestCase):
         self.assertFalse(resumed.nodes["n1"].get("pair_archived"))
         self.assertIsNone(resumed.nodes["n1"].get("review_clearance"))
         self.assertEqual(self._node_events(snapshot.run_id, "acceptance_recovered"), [])
+
+    # ------------------------------------------------------------------
+    # 4. Signature fail-closed: drift and live work veto the rescue.
+    # ------------------------------------------------------------------
+    def _corrupt_reverse_block(
+        self, monitor, snapshot, reviewer_active, epoch=None, digest=None, marker=None
+    ):
+        """Hand-build the #249 corrupted snapshot, optionally drifted."""
+        current = snapshot.nodes["n1"]
+        monitor._record_runner_event(
+            snapshot,
+            "n1",
+            RunEvent(
+                "accepted",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": "n1",
+                    "role": "reviewer",
+                    "task_id": reviewer_active["task_id"],
+                    "handle_id": reviewer_active["handle_id"],
+                    "generation": reviewer_active["generation"],
+                    "contract_digest": current["contract_digest"],
+                    "authorization_epoch": snapshot.authorization_digest,
+                },
+            ),
+            reviewer_active,
+        )
+        monitor._set_binding_status(snapshot, "n1", "reviewer", "accepted")
+        current["status"] = "accepted"
+        current["acceptance"] = {
+            "contract_digest": current["contract_digest"],
+            "authorization_epoch": snapshot.authorization_digest,
+        }
+        if epoch is not None:
+            current["acceptance"]["authorization_epoch"] = epoch
+        if digest is not None:
+            current["acceptance"]["contract_digest"] = digest
+        current["reason"] = None
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = None
+        snapshot.handles.pop("n1", None)
+        monitor._mark_blocked_unknown(snapshot, "n1", REVERSE_BLOCK_REASON)
+        # Live-work markers ride on top of the faithful corruption: the
+        # reverse-block's own reconcile_binding/quarantine stamps are part of
+        # the rescued signature, so veto markers must be applied after it.
+        if marker is not None:
+            key, value = marker
+            if key == "handle":
+                snapshot.handles["n1"] = reviewer_active["handle_id"]
+            else:
+                current[key] = value
+        monitor._save_snapshot(snapshot)
+        return snapshot
+
+    def test_rescue_signature_rejects_epoch_and_digest_drift(self):
+        drifts = [
+            ("epoch", {"epoch": "epoch-from-another-authorization"}),
+            ("digest", {"digest": "0" * 64}),
+        ]
+        for label, kwargs in drifts:
+            with self.subTest(drift=label):
+                monitor, record = self._fresh_monitor()
+                snapshot, _runner, reviewer_active = self._drive_to_reviewer(
+                    monitor, record
+                )
+                self._corrupt_reverse_block(monitor, snapshot, reviewer_active, **kwargs)
+
+                resumed = monitor.resume(snapshot.run_id, FakeRunner())
+
+                self.assertEqual(resumed.nodes["n1"]["status"], "blocked_unknown")
+                self.assertIsNone(resumed.nodes["n1"].get("review_clearance"))
+                self.assertFalse(resumed.nodes["n1"].get("pair_archived"))
+                self.assertEqual(
+                    self._node_events(snapshot.run_id, "acceptance_recovered"), []
+                )
+
+    def test_rescue_signature_rejects_live_work_markers(self):
+        markers = [
+            ("active_task", {"role": "reviewer", "task_id": "t", "generation": 1}),
+            ("active_role", "reviewer"),
+            ("start_intent", {"role": "reviewer", "phase": "review"}),
+            ("retryable_action", {"role": "reviewer", "phase": "review"}),
+            # A recovery action other than the reverse-block's own
+            # reconcile_binding stamp means somebody else is mid-recovery.
+            ("recovery_action", "retry_same_task"),
+            # A quarantine still bound to a live handle is live work; the
+            # reverse-block's own stamp always carries handle_id null.
+            ("quarantine", {"handle_id": "live-handle-1", "reason": "provider stall"}),
+            ("handle", None),
+        ]
+        for key, value in markers:
+            with self.subTest(marker=key):
+                monitor, record = self._fresh_monitor()
+                snapshot, _runner, reviewer_active = self._drive_to_reviewer(
+                    monitor, record
+                )
+                self._corrupt_reverse_block(
+                    monitor, snapshot, reviewer_active, marker=(key, value)
+                )
+
+                resumed = monitor.resume(snapshot.run_id, FakeRunner())
+
+                # Live work vetoes the rescue: the node stays blocked, the
+                # closeout never runs, and no audit event claims otherwise.
+                self.assertEqual(resumed.nodes["n1"]["status"], "blocked_unknown")
+                self.assertIsNone(resumed.nodes["n1"].get("review_clearance"))
+                self.assertFalse(resumed.nodes["n1"].get("pair_archived"))
+                self.assertEqual(
+                    self._node_events(snapshot.run_id, "acceptance_recovered"), []
+                )
+
+    def test_rescue_write_failure_restores_every_field_and_retries_next_resume(self):
+        monitor, record = self._monitor()
+        snapshot, _runner, reviewer_active = self._drive_to_reviewer(monitor, record)
+        current = snapshot.nodes["n1"]
+        current["quarantine"] = None
+        current["recovery_action"] = None
+        self._corrupt_reverse_block(monitor, snapshot, reviewer_active)
+        original_record = monitor._record
+
+        def flaky_record(snap, event, data):
+            if event == "acceptance_recovered":
+                raise OSError("simulated append failure")
+            return original_record(snap, event, data)
+
+        monitor._record = flaky_record
+        try:
+            resumed = monitor.resume(snapshot.run_id, FakeRunner())
+        finally:
+            monitor._record = original_record
+
+        # Fail closed with zero half-done residue: the node is still
+        # blocked_unknown with its original reason, the pair is NOT
+        # archived, and the reviewer binding was never flipped to archived
+        # -- the very residue that would mint a new deadlock.
+        blocked = resumed.nodes["n1"]
+        self.assertEqual(blocked["status"], "blocked_unknown")
+        self.assertFalse(blocked.get("pair_archived"))
+        self.assertIsNone(blocked.get("review_clearance"))
+        binding = load_task_binding(self.paths, "n1", "reviewer", run_id=resumed.run_id)
+        self.assertEqual(binding.status, "accepted")
+        self.assertEqual(
+            self._node_events(snapshot.run_id, "acceptance_recovered"), []
+        )
+
+        # The next pass retries cleanly from the restored state.
+        resumed = monitor.resume(resumed.run_id, FakeRunner())
+        recovered = resumed.nodes["n1"]
+        self.assertEqual(recovered["status"], "accepted")
+        self.assertTrue(recovered.get("pair_archived"))
+        binding = load_task_binding(self.paths, "n1", "reviewer", run_id=resumed.run_id)
+        self.assertEqual(binding.status, "archived")
+        self.assertEqual(
+            len(self._node_events(resumed.run_id, "acceptance_recovered")), 1
+        )
+
+    def test_rescue_lease_failure_before_mutation_is_a_clean_noop(self):
+        monitor, record = self._monitor()
+        snapshot, _runner, reviewer_active = self._drive_to_reviewer(monitor, record)
+        self._corrupt_reverse_block(monitor, snapshot, reviewer_active)
+        original_release = monitor._release_node_lease
+
+        def boom(snap, node_id):
+            raise OSError("simulated lease unlink failure")
+
+        monitor._release_node_lease = boom
+        try:
+            resumed = monitor.resume(snapshot.run_id, FakeRunner())
+        finally:
+            monitor._release_node_lease = original_release
+
+        # The lease release runs before any mutation, so the failed pass
+        # leaves the signature intact for the next resume.
+        blocked = resumed.nodes["n1"]
+        self.assertEqual(blocked["status"], "blocked_unknown")
+        self.assertFalse(blocked.get("pair_archived"))
+        binding = load_task_binding(self.paths, "n1", "reviewer", run_id=resumed.run_id)
+        self.assertEqual(binding.status, "accepted")
+
+        resumed = monitor.resume(resumed.run_id, FakeRunner())
+        self.assertEqual(resumed.nodes["n1"]["status"], "accepted")
+        self.assertTrue(resumed.nodes["n1"].get("pair_archived"))
 
 
 if __name__ == "__main__":

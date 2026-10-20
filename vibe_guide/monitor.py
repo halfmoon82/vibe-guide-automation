@@ -4251,9 +4251,14 @@ class Monitor:
 
         Fail-closed: anything short of the full signature -- a different
         block cause, no written acceptance, epoch or digest drift, a live
-        task/handle/intent/retry, an unreadable or stale reviewer binding,
-        or an unreadable live node contract -- leaves the node blocked for
-        the human.  Integration-review is excluded: its closeout needs the
+        task/handle/intent/retry, a recovery action other than the
+        reverse-block's own ``reconcile_binding`` stamp, a quarantine still
+        bound to a live handle, an unreadable or stale reviewer binding, or
+        an unreadable live node contract -- leaves the node blocked for the
+        human.  A write failure mid-closeout restores every inspected field
+        to its captured value (the lease is released before any mutation),
+        so the next pass retries cleanly and no gate can ever observe a
+        half-done rescue.  Integration-review is excluded: its closeout needs the
         derived run-level package, which an evidence-less record cannot
         rebuild.
         """
@@ -4289,6 +4294,18 @@ class Monitor:
             or node_id in snapshot.handles
         ):
             return False
+        # The reverse-block residue itself: ``_mark_blocked_unknown`` stamps
+        # ``reconcile_binding`` and a quarantine whose handle was already
+        # retired (handle_id null) -- that is the bug's own fingerprint, not
+        # live work.  Any other recovery action, or a quarantine still bound
+        # to a live handle, vetoes the rescue fail-closed.
+        if current.get("recovery_action") not in (None, "reconcile_binding"):
+            return False
+        quarantine = current.get("quarantine")
+        if isinstance(quarantine, dict) and quarantine.get("handle_id") is not None:
+            return False
+        if quarantine is not None and not isinstance(quarantine, dict):
+            return False
         try:
             registered = self._load_task_binding(snapshot, node_id, "reviewer")
         except (FileNotFoundError, OSError, TypeError, ValueError):
@@ -4313,7 +4330,20 @@ class Monitor:
             return False
         if not live_digest_matches:
             return False
+        previous_status = current.get("status")
         previous_clearance = current.get("review_clearance")
+        previous_reason = current.get("reason")
+        previous_recovery_action = current.get("recovery_action")
+        previous_quarantine = current.get("quarantine")
+        # Release the lease *before* any lifecycle mutation: the unlink is
+        # the one step that routinely raises OSError, and an exception after
+        # the bindings were archived could never re-flip them to accepted,
+        # which would mint a fresh mutually-exclusive deadlock.  Ordering it
+        # first keeps every failure below a pure no-op.
+        try:
+            self._release_node_lease(snapshot, node_id)
+        except (OSError, TypeError, ValueError):
+            return False
         try:
             current["status"] = "accepted"
             current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
@@ -4335,15 +4365,19 @@ class Monitor:
                 },
             )
             self._archive_pair(snapshot, node_id)
-            self._release_node_lease(snapshot, node_id)
         except (OSError, TypeError, ValueError):
             # Fail closed: a partial closeout must never leave the node
-            # accepted with an unarchived pair.  Restore the blocked state
-            # exactly as found so the next scheduling pass retries the
-            # rescue; the audit event above stays as the attempt trail.
-            current["status"] = "blocked_unknown"
+            # accepted with an unarchived pair.  Restore every field the
+            # signature inspected -- status, clearance, reason,
+            # recovery_action and quarantine -- to the captured values, so
+            # the next scheduling pass retries the rescue from a state no
+            # other gate can ever see as half-done.  The audit event above
+            # stays as the attempt trail.
+            current["status"] = previous_status
             current["review_clearance"] = previous_clearance
-            current["reason"] = REVERSE_BLOCK_REASON
+            current["reason"] = previous_reason
+            current["recovery_action"] = previous_recovery_action
+            current["quarantine"] = previous_quarantine
             return False
         return True
 
