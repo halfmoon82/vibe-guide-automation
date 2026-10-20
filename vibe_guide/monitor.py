@@ -4255,10 +4255,12 @@ class Monitor:
         reverse-block's own ``reconcile_binding`` stamp, a quarantine still
         bound to a live handle, an unreadable or stale reviewer binding, or
         an unreadable live node contract -- leaves the node blocked for the
-        human.  A write failure mid-closeout restores every inspected field
-        to its captured value (the lease is released before any mutation),
-        so the next pass retries cleanly and no gate can ever observe a
-        half-done rescue.  Integration-review is excluded: its closeout needs the
+        human.  The closeout itself orders durable state before audit: a
+        failure anywhere before the pair is fully archived restores every
+        inspected field (bindings rolled back best-effort) for a clean
+        retry; a failure of the final audit append alone keeps the durable
+        acceptance, because re-blocking an archived pair is the very
+        mutually-exclusive deadlock this pass exists to clear.  Integration-review is excluded: its closeout needs the
         derived run-level package, which an evidence-less record cannot
         rebuild.
         """
@@ -4317,11 +4319,17 @@ class Monitor:
         ):
             return False
         try:
-            self._load_task_binding(snapshot, node_id, "developer")
+            developer_binding = self._load_task_binding(snapshot, node_id, "developer")
         except (FileNotFoundError, OSError, TypeError, ValueError):
             # ``_archive_pair`` archives both bindings; without the
             # developer binding the closeout cannot be written durably.
             return False
+        # Capture the binding statuses as plain strings *now*: the binding
+        # objects are shared/cached, and ``_archive_pair`` flips their
+        # status in place, so reading them in the rollback path would only
+        # ever see the post-archive value.
+        previous_reviewer_status = registered.status
+        previous_developer_status = developer_binding.status
         try:
             live_digest_matches = self._live_node_contract_digest_matches(
                 node_id, current.get("contract_digest")
@@ -4335,6 +4343,7 @@ class Monitor:
         previous_reason = current.get("reason")
         previous_recovery_action = current.get("recovery_action")
         previous_quarantine = current.get("quarantine")
+        previous_pair_archived = bool(current.get("pair_archived"))
         # Release the lease *before* any lifecycle mutation: the unlink is
         # the one step that routinely raises OSError, and an exception after
         # the bindings were archived could never re-flip them to accepted,
@@ -4344,40 +4353,67 @@ class Monitor:
             self._release_node_lease(snapshot, node_id)
         except (OSError, TypeError, ValueError):
             return False
+        audit_payload = {
+            "run_id": snapshot.run_id,
+            "node_id": node_id,
+            "proof": {
+                "reverse_block_reason": REVERSE_BLOCK_REASON,
+                "reviewer_task_id": registered.task_id,
+                "reviewer_generation": registered.generation,
+                "contract_digest": contract_digest,
+            },
+        }
+        archived = False
         try:
             current["status"] = "accepted"
             current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
             current["reason"] = None
             current["recovery_action"] = None
             current["quarantine"] = None
-            self._record(
-                snapshot,
-                "acceptance_recovered",
-                {
-                    "run_id": snapshot.run_id,
-                    "node_id": node_id,
-                    "proof": {
-                        "reverse_block_reason": REVERSE_BLOCK_REASON,
-                        "reviewer_task_id": registered.task_id,
-                        "reviewer_generation": registered.generation,
-                        "contract_digest": contract_digest,
-                    },
-                },
-            )
+            # Durable closeout first, audit trail second: once the pair is
+            # archived the acceptance is a fact on disk, and a failing audit
+            # append must never re-block a node whose lifecycle already
+            # closed.  ``archived`` therefore only flips after _archive_pair
+            # -- including its own event -- fully succeeded.
             self._archive_pair(snapshot, node_id)
+            archived = True
+            self._record(snapshot, "acceptance_recovered", audit_payload)
         except (OSError, TypeError, ValueError):
-            # Fail closed: a partial closeout must never leave the node
-            # accepted with an unarchived pair.  Restore every field the
-            # signature inspected -- status, clearance, reason,
-            # recovery_action and quarantine -- to the captured values, so
-            # the next scheduling pass retries the rescue from a state no
-            # other gate can ever see as half-done.  The audit event above
-            # stays as the attempt trail.
+            if archived:
+                # Only the audit append can fail here.  Retry it once
+                # best-effort and keep the durable closeout: resurrecting
+                # blocked_unknown over an archived pair is exactly the
+                # mutually-exclusive deadlock this pass exists to clear.
+                try:
+                    self._record(snapshot, "acceptance_recovered", audit_payload)
+                except (OSError, TypeError, ValueError):
+                    pass
+                return True
+            # Fail closed with zero half-done residue: restore every field
+            # the signature inspected -- status, clearance, reason,
+            # recovery_action, quarantine and pair_archived -- to the
+            # captured values, and roll both bindings back to their
+            # pre-closeout statuses best-effort (``_archive_pair`` may have
+            # archived one or both before failing).  Without the rollback
+            # an archived reviewer binding would never match the signature
+            # again and the node would stay blocked forever -- the residue
+            # this rework exists to prevent.  The next scheduling pass then
+            # retries the rescue from a state no other gate can ever see as
+            # half-done.
             current["status"] = previous_status
             current["review_clearance"] = previous_clearance
             current["reason"] = previous_reason
             current["recovery_action"] = previous_recovery_action
             current["quarantine"] = previous_quarantine
+            current["pair_archived"] = previous_pair_archived
+            for role, status in (
+                ("developer", previous_developer_status),
+                ("reviewer", previous_reviewer_status),
+            ):
+                try:
+                    self._set_binding_status(snapshot, node_id, role, status)
+                except (FileNotFoundError, OSError, TypeError, ValueError):
+                    pass
             return False
         return True
 

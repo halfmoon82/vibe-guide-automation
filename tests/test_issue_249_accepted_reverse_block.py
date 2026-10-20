@@ -442,16 +442,69 @@ class Issue249AcceptedReverseBlockTests(unittest.TestCase):
                     self._node_events(snapshot.run_id, "acceptance_recovered"), []
                 )
 
-    def test_rescue_write_failure_restores_every_field_and_retries_next_resume(self):
+    def test_rescue_pair_archived_event_failure_rolls_back_and_retries(self):
         monitor, record = self._monitor()
         snapshot, _runner, reviewer_active = self._drive_to_reviewer(monitor, record)
-        current = snapshot.nodes["n1"]
-        current["quarantine"] = None
-        current["recovery_action"] = None
         self._corrupt_reverse_block(monitor, snapshot, reviewer_active)
         original_record = monitor._record
 
         def flaky_record(snap, event, data):
+            # The pair_archived append inside _archive_pair fails *after*
+            # both bindings were already written to archived.
+            if event == "pair_archived":
+                raise OSError("simulated append failure")
+            return original_record(snap, event, data)
+
+        monitor._record = flaky_record
+        try:
+            resumed = monitor.resume(snapshot.run_id, FakeRunner())
+        finally:
+            monitor._record = original_record
+
+        # The closeout must roll all the way back: node blocked again, the
+        # pair un-archived, and -- the whole point -- both bindings flipped
+        # back off archived so the signature can still match next pass.
+        blocked = resumed.nodes["n1"]
+        self.assertEqual(blocked["status"], "blocked_unknown")
+        self.assertFalse(blocked.get("pair_archived"))
+        self.assertIsNone(blocked.get("review_clearance"))
+        for role in ("developer", "reviewer"):
+            binding = load_task_binding(
+                self.paths, "n1", role, run_id=resumed.run_id
+            )
+            self.assertNotEqual(binding.status, "archived", role)
+        reviewer_binding = load_task_binding(
+            self.paths, "n1", "reviewer", run_id=resumed.run_id
+        )
+        self.assertEqual(reviewer_binding.status, "accepted")
+        self.assertEqual(
+            self._node_events(snapshot.run_id, "acceptance_recovered"), []
+        )
+
+        # The next pass retries cleanly from the rolled-back state.
+        resumed = monitor.resume(resumed.run_id, FakeRunner())
+        recovered = resumed.nodes["n1"]
+        self.assertEqual(recovered["status"], "accepted")
+        self.assertTrue(recovered.get("pair_archived"))
+        for role in ("developer", "reviewer"):
+            binding = load_task_binding(
+                self.paths, "n1", role, run_id=resumed.run_id
+            )
+            self.assertEqual(binding.status, "archived", role)
+        self.assertEqual(
+            len(self._node_events(resumed.run_id, "acceptance_recovered")), 1
+        )
+
+    def test_rescue_audit_failure_after_archive_keeps_durable_closeout(self):
+        monitor, record = self._monitor()
+        snapshot, _runner, reviewer_active = self._drive_to_reviewer(monitor, record)
+        self._corrupt_reverse_block(monitor, snapshot, reviewer_active)
+        original_record = monitor._record
+
+        def flaky_record(snap, event, data):
+            # The final audit append fails after the pair is archived: the
+            # durable acceptance stands, an audit trail must not resurrect
+            # blocked_unknown over an archived pair.
             if event == "acceptance_recovered":
                 raise OSError("simulated append failure")
             return original_record(snap, event, data)
@@ -462,30 +515,25 @@ class Issue249AcceptedReverseBlockTests(unittest.TestCase):
         finally:
             monitor._record = original_record
 
-        # Fail closed with zero half-done residue: the node is still
-        # blocked_unknown with its original reason, the pair is NOT
-        # archived, and the reviewer binding was never flipped to archived
-        # -- the very residue that would mint a new deadlock.
-        blocked = resumed.nodes["n1"]
-        self.assertEqual(blocked["status"], "blocked_unknown")
-        self.assertFalse(blocked.get("pair_archived"))
-        self.assertIsNone(blocked.get("review_clearance"))
-        binding = load_task_binding(self.paths, "n1", "reviewer", run_id=resumed.run_id)
-        self.assertEqual(binding.status, "accepted")
+        closed = resumed.nodes["n1"]
+        self.assertEqual(closed["status"], "accepted")
+        self.assertEqual(closed["review_clearance"], {"p0": 0, "p1": 0, "p2": 0})
+        self.assertTrue(closed.get("pair_archived"))
+        for role in ("developer", "reviewer"):
+            binding = load_task_binding(
+                self.paths, "n1", role, run_id=resumed.run_id
+            )
+            self.assertEqual(binding.status, "archived", role)
+        # The audit append is lost (the best-effort retry fails too), but
+        # the durable state is the truth.
         self.assertEqual(
             self._node_events(snapshot.run_id, "acceptance_recovered"), []
         )
 
-        # The next pass retries cleanly from the restored state.
+        # A later pass must not resurrect or double-close anything.
         resumed = monitor.resume(resumed.run_id, FakeRunner())
-        recovered = resumed.nodes["n1"]
-        self.assertEqual(recovered["status"], "accepted")
-        self.assertTrue(recovered.get("pair_archived"))
-        binding = load_task_binding(self.paths, "n1", "reviewer", run_id=resumed.run_id)
-        self.assertEqual(binding.status, "archived")
-        self.assertEqual(
-            len(self._node_events(resumed.run_id, "acceptance_recovered")), 1
-        )
+        self.assertEqual(resumed.nodes["n1"]["status"], "accepted")
+        self.assertTrue(resumed.nodes["n1"].get("pair_archived"))
 
     def test_rescue_lease_failure_before_mutation_is_a_clean_noop(self):
         monitor, record = self._monitor()
