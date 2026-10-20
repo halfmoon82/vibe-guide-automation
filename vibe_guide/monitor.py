@@ -4260,9 +4260,9 @@ class Monitor:
         inspected field (bindings rolled back best-effort) for a clean
         retry; a failure of the final audit append alone keeps the durable
         acceptance, because re-blocking an archived pair is the very
-        mutually-exclusive deadlock this pass exists to clear.  Integration-review is excluded: its closeout needs the
-        derived run-level package, which an evidence-less record cannot
-        rebuild.
+        mutually-exclusive deadlock this pass exists to clear.
+        Integration-review is excluded: its closeout needs the derived
+        run-level package, which an evidence-less record cannot rebuild.
         """
         current = snapshot.nodes[node_id]
         if self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
