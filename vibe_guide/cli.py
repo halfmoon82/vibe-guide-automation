@@ -187,7 +187,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--release", action="store_true", dest="hold_release")
     parser.add_argument("--node", dest="node_id")
     parser.add_argument("--role", dest="role", default="developer")
-    parser.add_argument("--payload", dest="worker_payload")
+    parser.add_argument(
+        "--payload",
+        dest="worker_payload",
+        help=(
+            "交付 JSON：嵌套 delivery_evidence（completion_marker/delivery_path/thread_status）"
+            "加顶层 event（developer 用 delivered/complete）；reviewer 全部清理 P0-P2 后验收必须带 "
+            "顶层 event=accepted 与顶层 evidence 对象，仍有未清发现时用 event=review_finding"
+        ),
+    )
     parser.add_argument("--generation", dest="worker_generation", type=int, default=None)
     parser.add_argument("--id", dest="decision_id")
     parser.add_argument("--choice", dest="decision_choice")

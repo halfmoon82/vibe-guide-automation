@@ -145,6 +145,16 @@ class ProviderActionRunner(Runner):
         business = {key: contract[key] for key in ("input", "output", "error_behavior", "acceptance_example") if key in contract}
         purpose = ("业务 review：只审查当前 developer 交付，独立记录发现及验收，禁止代改业务代码。"
                    if reviewer else "开发：继续已有实现、测试与返工，完成本代交付。")
+        # ISSUE-249: pin the reviewer's acceptance event value and the
+        # top-level evidence carrier on continuations as well; the same
+        # payload-shape gap bricked a node when the event value was left
+        # to the model.
+        acceptance_pin = (
+            "验收交付约定：payload 必须带顶层 \"event\": \"accepted\" 与顶层 \"evidence\" 对象"
+            "（记录本轮 P0-P2 清理结论），缺任一字段 monitor 会按格式错误退回本会话重报；"
+            "仍有未清 P0-P2 发现时用顶层 \"event\": \"review_finding\" 携带 finding 上报，不得用 accepted。"
+            if reviewer else ""
+        )
         return (
             "执行请求：继续 Issue {node} 的{purpose}本轮 generation {generation}。\n"
             "目标：{objective}；业务合同：{business}。"
@@ -152,6 +162,7 @@ class ProviderActionRunner(Runner):
             "合同：{spec}；writer worktree：{worktree}；branch：{branch}；允许路径：{files}。\n"
             "当前 developer 交付：{delivery}；状态文件：{status}；交付文件：{handoff}；完成 marker：{marker}。"
             "完成后必须写入本代状态/交付；在主项目目录执行 `vibe worker-deliver --run-id {run} --node {node} --role {role} --generation {generation} --payload '<交付 JSON>'`。"
+            "{acceptance_pin}"
             "随后执行 `vibe supervisor-address --run-id {run} --node {node} --role {role} --generation {generation} --json`；"
             "`wake.channel` 非空时用该工具向 `wake.target` 原样发送 `wake.signal`，唤醒登记主监工；为 null 或地址 unknown 时不发，由心跳领取。"
             "自报时把你本会话的工作目录原样写进交付 JSON 的 `delivery_evidence.session_cwd`：监工用它核对本会话是否真的挂载了 project，不填就无法核对。"
@@ -167,7 +178,8 @@ class ProviderActionRunner(Runner):
                  delivery=contract.get("delivery_path", "原开发交付"),
                  status=contract.get("status_file", "原状态文件"),
                  handoff=contract.get("handoff_file") or contract.get("delivery_path", "原交付文件"),
-                 marker=contract.get("completion_marker", "原交付 marker"))
+                 marker=contract.get("completion_marker", "原交付 marker"),
+                 acceptance_pin=acceptance_pin)
 
     def _validate_v39_create_binding(
         self, contract: Dict[str, Any], runtime_worktree: Path
@@ -551,8 +563,23 @@ class ProviderActionRunner(Runner):
             # worktree the CLI would resolve that worktree's own .vibe and
             # the report would never reach the supervisor.
             root = shlex.quote(str(self.paths.root))
-            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须在主项目目录执行，不要在 worktree 里执行）：0) 先把**你本会话的工作目录**（会话环境给出的 cwd；project 挂载的会话在项目树或 worktree 内，projectless 会话在宿主生成的临时目录）原样写进交付 JSON 的 `delivery_evidence.session_cwd`——监工用它核对本会话是否真的挂载了 project，不填就无法核对；1) 先执行 `cd {} && vibe worker-deliver --run-id {} --node {} --role {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；格式错误会当场返回）；2) `cd {} && vibe supervisor-address --run-id {} --node {} --role {} --generation {} --json` 查询监工地址与唤醒方式；3) 返回的 `wake.channel` 非空时，用该工具向 `wake.target` 原样发送 `wake.signal` 一行（Codex 为 `send_message_to_thread`）；`wake.channel` 为 null 或地址为 unknown 时不发，到此为止，监工心跳兜底拉取（Claude Code 目前没有已验证的推送通道）。唤醒信号内容不影响验收。运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。".format(
+            if role == "reviewer":
+                # ISSUE-249: pin the acceptance event value and the
+                # top-level evidence carrier.  A generic "deliver JSON"
+                # left the event value to the model, and an accepted
+                # payload without the top-level evidence object used to
+                # brick the node with no recoverable handling.
+                event_pin = (
+                    "你是 reviewer：全部 P0-P2 清零后的验收交付，payload 必须带顶层 "
+                    "\"event\": \"accepted\" 与顶层 \"evidence\" 对象（记录本轮验收结论，"
+                    "如 findings、覆盖情况、越界观察），缺任一字段 monitor 会按格式错误退回本会话重报；"
+                    "仍有未清 P0-P2 发现时用顶层 \"event\": \"review_finding\" 携带 finding 上报，不得用 accepted。"
+                )
+            else:
+                event_pin = ""
+            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须在主项目目录执行，不要在 worktree 里执行）：0) 先把**你本会话的工作目录**（会话环境给出的 cwd；project 挂载的会话在项目树或 worktree 内，projectless 会话在宿主生成的临时目录）原样写进交付 JSON 的 `delivery_evidence.session_cwd`——监工用它核对本会话是否真的挂载了 project，不填就无法核对；1) 先执行 `cd {} && vibe worker-deliver --run-id {} --node {} --role {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；{}格式错误会当场返回）；2) `cd {} && vibe supervisor-address --run-id {} --node {} --role {} --generation {} --json` 查询监工地址与唤醒方式；3) 返回的 `wake.channel` 非空时，用该工具向 `wake.target` 原样发送 `wake.signal` 一行（Codex 为 `send_message_to_thread`）；`wake.channel` 为 null 或地址为 unknown 时不发，到此为止，监工心跳兜底拉取（Claude Code 目前没有已验证的推送通道）。唤醒信号内容不影响验收。运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。".format(
                 role, node_id, root, run_id, node_id, role, generation,
+                event_pin,
                 root, run_id, node_id, role, generation,
             )
         else:

@@ -242,6 +242,17 @@ TOPOLOGY_VISIBLE_SDD = WORKER_TOPOLOGY_VISIBLE_SDD
 TOPOLOGY_DUAL_VISIBLE = WORKER_TOPOLOGY_DUAL_VISIBLE
 TOPOLOGY_BACKGROUND = WORKER_TOPOLOGY_BACKGROUND
 
+#: ISSUE-249: the reason the legacy acceptance ordering wrote when an
+#: ``accepted`` event was recorded and the reviewer binding flipped before
+#: the payload's top-level P0-P2 clearance evidence was checked.  The
+#: snapshot persists every node ``reason`` redacted, so recovery never
+#: matches this text; the durable signature is the written acceptance plus
+#: the accepted reviewer binding.  Kept for the audit trail and for tests
+#: that exercise the in-memory live path.
+REVERSE_BLOCK_REASON = (
+    "review acceptance has no registered P0-P2 clearance evidence"
+)
+
 #: Protocol pointer carried by every visible-sdd create request so the worker
 #: session can resolve the in-session SDD protocol from the installed package.
 VISIBLE_SDD_PROTOCOL_REF = "vibe_guide/protocols/visible-sdd-worker.md"
@@ -3810,6 +3821,14 @@ class Monitor:
                 int(current.get("developer_generation", 0)) > 0
                 or current.get("retryable_action") is not None
             )
+            # ISSUE-249 runs before every other recovery gate: the legacy
+            # acceptance ordering left blocked_unknown + a written acceptance
+            # + an accepted reviewer binding at once, and each legacy gate
+            # below is mutually exclusive with that state.
+            if self._recover_reverse_blocked_acceptance(snapshot, node_id):
+                if was_active_session:
+                    active_sessions -= 1
+                continue
             if self._recover_quarantined_delivered_developer(snapshot, node_id):
                 if was_active_session:
                     active_sessions -= 1
@@ -4204,6 +4223,129 @@ class Monitor:
             "predecessor_task_id": predecessor,
         }
         current["reason"] = "reviewer successor queued after missing binding recovery"
+
+    def _recover_reverse_blocked_acceptance(
+        self, snapshot: RunSnapshot, node_id: str
+    ) -> bool:
+        """Complete an acceptance the legacy ordering reverse-blocked (#249).
+
+        The pre-5.1.1 acceptance handler recorded the ``accepted`` event and
+        flipped the reviewer binding *before* checking the payload's
+        top-level P0-P2 clearance evidence, so an evidence-less acceptance
+        left the node simultaneously accepted (reviewer binding + written
+        ``acceptance`` fields) and ``blocked_unknown`` (snapshot status).
+        Every legacy recovery gate is mutually exclusive with that state:
+        the successor recoverer demands a *missing* reviewer binding,
+        ``repair`` only re-stamps ``binding_unknown``, and ``reconcile``
+        demands a package covering every unaccepted node.  This pass
+        recognizes the exact durable signature and completes the acceptance
+        the event log already asserts, mirroring the live path's
+        zero-clearance closeout for non-integration nodes.
+
+        The signature is structural, not textual: node reasons are persisted
+        redacted, so the reverse-block text cannot be matched on disk.  A
+        written acceptance with the current contract digest and
+        authorization epoch can only have been produced by the accepted
+        path itself, and the accepted reviewer binding of the recorded
+        generation proves the same reviewer round the acceptance belongs to.
+
+        Fail-closed: anything short of the full signature -- a different
+        block cause, no written acceptance, epoch or digest drift, a live
+        task/handle/intent/retry, an unreadable or stale reviewer binding,
+        or an unreadable live node contract -- leaves the node blocked for
+        the human.  Integration-review is excluded: its closeout needs the
+        derived run-level package, which an evidence-less record cannot
+        rebuild.
+        """
+        current = snapshot.nodes[node_id]
+        if self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
+            # A visible-sdd node binds a single worker session; its
+            # acceptance never passed through the reviewer binding path.
+            return False
+        if node_id == "integration-review":
+            return False
+        if current.get("status") != "blocked_unknown":
+            return False
+        acceptance = current.get("acceptance")
+        if not isinstance(acceptance, dict):
+            return False
+        contract_digest = acceptance.get("contract_digest")
+        if (
+            not isinstance(contract_digest, str)
+            or len(contract_digest) != 64
+            or any(character not in "0123456789abcdef" for character in contract_digest)
+            or contract_digest != current.get("contract_digest")
+            or acceptance.get("authorization_epoch") != snapshot.authorization_digest
+        ):
+            return False
+        if current.get("review_clearance"):
+            # The closeout already ran; nothing left to rescue.
+            return False
+        if (
+            current.get("active_task") is not None
+            or current.get("active_role") is not None
+            or current.get("start_intent") is not None
+            or current.get("retryable_action") is not None
+            or node_id in snapshot.handles
+        ):
+            return False
+        try:
+            registered = self._load_task_binding(snapshot, node_id, "reviewer")
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return False
+        if (
+            registered.status != "accepted"
+            or registered.task_id != current.get("reviewer_identity")
+            or registered.generation != current.get("review_generation")
+        ):
+            return False
+        try:
+            self._load_task_binding(snapshot, node_id, "developer")
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            # ``_archive_pair`` archives both bindings; without the
+            # developer binding the closeout cannot be written durably.
+            return False
+        try:
+            live_digest_matches = self._live_node_contract_digest_matches(
+                node_id, current.get("contract_digest")
+            )
+        except ValueError:
+            return False
+        if not live_digest_matches:
+            return False
+        previous_clearance = current.get("review_clearance")
+        try:
+            current["status"] = "accepted"
+            current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
+            current["reason"] = None
+            current["recovery_action"] = None
+            current["quarantine"] = None
+            self._record(
+                snapshot,
+                "acceptance_recovered",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "proof": {
+                        "reverse_block_reason": REVERSE_BLOCK_REASON,
+                        "reviewer_task_id": registered.task_id,
+                        "reviewer_generation": registered.generation,
+                        "contract_digest": contract_digest,
+                    },
+                },
+            )
+            self._archive_pair(snapshot, node_id)
+            self._release_node_lease(snapshot, node_id)
+        except (OSError, TypeError, ValueError):
+            # Fail closed: a partial closeout must never leave the node
+            # accepted with an unarchived pair.  Restore the blocked state
+            # exactly as found so the next scheduling pass retries the
+            # rescue; the audit event above stays as the attempt trail.
+            current["status"] = "blocked_unknown"
+            current["review_clearance"] = previous_clearance
+            current["reason"] = REVERSE_BLOCK_REASON
+            return False
+        return True
 
     def _prepare_worker_profile(
         self, node: DAGNode, contract: Dict[str, Any], current: Dict[str, Any], role: str
@@ -6042,6 +6184,23 @@ class Monitor:
                     "contract test execution failed: {}".format(contract_test_failure),
                 )
                 return
+            # Validate first (ISSUE-249): an acceptance payload that carries
+            # no registered P0-P2 clearance evidence is a format error the
+            # same reviewer session can correct and re-report on its live
+            # handle.  The legacy ordering recorded the event and flipped
+            # the binding first and only then noticed the gap, leaving the
+            # node accepted (binding + ``acceptance``) and blocked_unknown
+            # (snapshot) at once -- a state every recovery gate is mutually
+            # exclusive with.  Nothing below runs until the payload shape
+            # is complete.
+            if evidence is None:
+                self._reject_acceptance_format(
+                    snapshot,
+                    node_id,
+                    active,
+                    REVERSE_BLOCK_REASON,
+                )
+                return
             acceptance_event = RunEvent(
                 event.event,
                 {
@@ -6073,13 +6232,6 @@ class Monitor:
             current["active_task"] = None
             current["quarantine"] = None
             snapshot.handles.pop(node_id, None)
-            if evidence is None:
-                self._mark_blocked_unknown(
-                    snapshot,
-                    node_id,
-                    "review acceptance has no registered P0-P2 clearance evidence",
-                )
-                return
             if node_id == "integration-review":
                 # The acceptance of this node is the run-level closeout, so the
                 # clearance is whatever the derived package says rather than an
@@ -8035,12 +8187,7 @@ class Monitor:
                 current["active_task"] = None
                 current["quarantine"] = None
                 snapshot.handles.pop(node_id, None)
-                if not data.get("evidence"):
-                    current["status"] = "blocked_unknown"
-                    current["reason"] = (
-                        "review acceptance has no registered P0-P2 clearance evidence"
-                    )
-                elif node_id == "integration-review":
+                if node_id == "integration-review":
                     # The appended event keeps only redacted provider text, so the
                     # reviewer's structured claim cannot be rebuilt here.  Rather
                     # than close the run out on a package we would have to invent,
@@ -8051,6 +8198,14 @@ class Monitor:
                         "integration review acceptance must be reported again after recovery"
                     )
                 else:
+                    # A durable acceptance record is proof the review round
+                    # closed: reviewer identity, generation and the live
+                    # contract digest were all validated before the event was
+                    # recorded.  Re-blocking a recorded acceptance because its
+                    # payload lacked the top-level evidence object (the
+                    # ISSUE-249 ordering defect) re-created the unrecoverable
+                    # reverse-block on every replay, so replay completes the
+                    # acceptance the record asserts.
                     current["review_clearance"] = {
                         "p0": 0,
                         "p1": 0,
@@ -8268,6 +8423,19 @@ class Monitor:
                 # and node status were all left for the same task's corrected
                 # re-report -- so replay must mutate nothing either.
                 pass
+            elif record["event"] == "acceptance_recovered":
+                # ISSUE-249 rescue audit: a scheduling pass completed an
+                # acceptance the legacy ordering had reverse-blocked.  The
+                # crash-window snapshot saved before that pass is restored to
+                # the same completed state; the rescue pass re-verifies the
+                # signature on the next schedule either way.
+                current["status"] = "accepted"
+                current["reason"] = None
+                current["recovery_action"] = None
+                current["quarantine"] = None
+                if not isinstance(current.get("review_clearance"), dict):
+                    current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
+                current["pair_archived"] = True
             elif record["event"] == "contract_test_execution":
                 # Pure audit like acceptance_rejected: the live pass only
                 # gates acceptance (or the expected_red observation) and
