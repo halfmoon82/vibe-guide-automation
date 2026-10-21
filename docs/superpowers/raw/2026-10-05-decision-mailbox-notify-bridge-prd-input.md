@@ -1,5 +1,7 @@
 # 决策信箱 + 通知桥：PRD 输入（需求讨论共识稿）
 
+> **历史文档（存档于 2026-10-05）**：#141 已实现并关闭（`decisions.py`、`decision_boundary.py`、CLI `decision-raise/list/answer`），下文「待进正式流程」「没有外部通知通道」的表述已过期；坐标以 10-05 的 main 为准。
+
 - 日期：2026-10-05
 - 状态：**需求讨论已闭合，待 `vibe plan --request` 进正式复杂流程**；本文是 PRD 输入，不是已批准 PRD
 - 触发事故：issue #140 run 中 contract-env-facts 的 A/B 决策（digest 登记授权）跨第 3→7 班未获回答，靠换班交接文本口口相传，第 7 班被静默心跳刷没，用户第 8 班才拍到

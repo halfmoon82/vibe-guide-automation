@@ -1,5 +1,7 @@
 # 授权卡（产品语言版）· 监工整合 PRD 落地补齐
 
+> **已执行完毕，仅存档**：这张卡对应的 run 已收口，本文不是待执行指令。如需再次授权，按当前 `vibe plan` 重新出卡，不要照本文执行。
+
 计划编号：`session-496b0af6bf727889`（第 1 版）　授权摘要：`a412ffd5…`
 原始授权卡：`.vibe/plans/session-496b0af6bf727889/authorization-card.json`
 
