@@ -1,6 +1,6 @@
 # 决策信箱 + 通知桥：PRD 输入（需求讨论共识稿）
 
-> **历史文档（存档于 2026-10-05）**：#141 已实现并关闭（`decisions.py`、`decision_boundary.py`、CLI `decision-raise/list/answer`），下文「待进正式流程」「没有外部通知通道」的表述已过期；坐标以 10-05 的 main 为准。
+> **历史文档（存档于 2026-10-05）**：#141 已实现并关闭（`decisions.py`、`decision_boundary.py`、CLI `decision-raise/list/answer`），下文「待进正式流程」已过期；§1.2 的「代码里唯一 notify 相关物」也已过期——main 已有 `notify_bridge` 出站 hook，但**至今仍无任何 IM 通道**，`.vibe/config.json` 无通道配置这一条仍成立。坐标以 10-05 的 main 为准。
 
 - 日期：2026-10-05
 - 状态：**需求讨论已闭合，待 `vibe plan --request` 进正式复杂流程**；本文是 PRD 输入，不是已批准 PRD
