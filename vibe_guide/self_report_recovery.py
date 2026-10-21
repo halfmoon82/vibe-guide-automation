@@ -24,6 +24,12 @@ tests) judges it again.  It only applies when, from structured evidence:
 Anything else raises ``ValueError`` before the first write.  A newer wait the
 monitor issued afterwards (same handle, no result) is retired with an audit
 marker; one that already has a result refuses the recovery.
+
+Hybrid state: when that wait was already retired (as answered by the
+self-report receipt) but the handle still names it as ``pending_action`` and
+the binding holds a cursor, the same proof applies and recovery clears the
+dangling action instead of refusing for the cursor.  A cursor with a live wait
+or a wait retired for another reason is still refused.
 """
 from typing import Any, Dict
 
@@ -35,11 +41,29 @@ from .supervisor import SupervisorLease
 
 SELF_REPORT_DELIVERY_RECONCILED = "self_report_delivery_reconciled"
 SELF_REPORTED_DELIVERY_PACKAGE = frozenset({"kind", "node_id"})
+_RETIRE_REASON = "answered_by_self_report_receipt"
 _ROLE = "developer"
 _ENTRY = "monitor.reconcile_self_reported_delivery"
 #: The only node events the cursor refusal and its re-polls leave behind.
 _STUCK_PATTERN = frozenset({"blocked_unknown", "retry_scheduled", "unknown", "timeout",
                             "acceptance_rejected"})
+
+
+def _retired_reason(store, action_id: str, run_id: str):
+    """The reason of a valid stale marker beside this wait, else None."""
+    action = store.action(action_id)
+    path = store.root / "stale" / (action_id + ".json")
+    if path.is_symlink() or not path.is_file() or action.get("run_id") != run_id:
+        return None
+    try:
+        marker = store._read(path)
+    except (OSError, ValueError):
+        return None
+    if (isinstance(marker, dict) and marker.get("status") == "stale"
+            and marker.get("action_id") == action_id
+            and marker.get("request_digest") == action.get("request_digest")):
+        return marker.get("reason")
+    return None
 
 
 def _require(condition: bool, reason: str) -> None:
@@ -86,8 +110,6 @@ def _collect(monitor, snapshot, node_id: str, runner) -> Dict[str, Any]:
     binding = monitor._load_task_binding(snapshot, node_id, _ROLE)
     _require(binding.task_id == task_id and binding.generation == generation,
              "task binding is not the active task")
-    _require(binding.cursor in (None, ""),
-             "binding has a cursor; the normal wait path applies")
 
     store = ProviderActionStore(monitor.paths)
     archive = store._read(store._delivery_path(snapshot.run_id, node_id, _ROLE, generation))
@@ -146,9 +168,17 @@ def _collect(monitor, snapshot, node_id: str, runner) -> Dict[str, Any]:
                  "pending wait is not a later wait of this task")
         _require(store.result(later) is None,
                  "a later wait was already answered; run resume instead")
+    # A cursor means the normal wait path applies, except in the hybrid state:
+    # the handle's pending wait was already retired as answered by this
+    # self-report, but the handle still points at it.
+    retired = bool(later) and _retired_reason(store, later, snapshot.run_id) is not None
+    if binding.cursor not in (None, ""):
+        _require(retired, "binding has a cursor; the normal wait path applies")
+        _require(_retired_reason(store, later, snapshot.run_id) == _RETIRE_REASON,
+                 "pending wait was retired for another reason")
     return {"active": active, "handle_id": handle_id, "generation": generation,
             "task_id": task_id, "receipt": receipt, "result": result,
-            "metadata": metadata, "later": later, "store": store}
+            "metadata": metadata, "later": later, "retired": retired, "store": store}
 
 
 def _reconcile_locked(monitor, run_id: str, node_id: str, runner):
@@ -163,7 +193,8 @@ def _reconcile_locked(monitor, run_id: str, node_id: str, runner):
     store = proof["store"]
     metadata = proof["metadata"]
     if proof["later"]:
-        store.retire_wait(proof["later"], "answered_by_self_report_receipt")
+        if not proof["retired"]:
+            store.retire_wait(proof["later"], _RETIRE_REASON)
         metadata["pending_action"] = None
         metadata["pending_operation"] = None
 
@@ -179,6 +210,7 @@ def _reconcile_locked(monitor, run_id: str, node_id: str, runner):
         "task_id": proof["task_id"], "generation": proof["generation"],
         "handle_id": proof["handle_id"],
         "action_id": receipt["action_id"], "request_digest": receipt["request_digest"],
+        **({"source": "retired_wait_with_cursor"} if proof["retired"] else {}),
     })
     handle = RunHandle(proof["handle_id"])
     claims = {"node_id": node_id, "role": _ROLE, "task_id": proof["task_id"],
