@@ -374,6 +374,89 @@ class AcceptanceRejectionMonitorTests(unittest.TestCase):
             len(self._node_events(recovered.run_id, "accepted")), 1
         )
 
+    # ------------------------------------------------------------------
+    # 2b. Escalation only writes a terminal binding over a proven stop.
+    # ------------------------------------------------------------------
+    def _escalate_reviewer(self, runner):
+        monitor, record = self._monitor()
+        snapshot, runner = self._drive_to_reviewer(
+            monitor,
+            record,
+            reviewer_events=[
+                ("accepted", {"delivery_evidence": {"thread_status": "complete"}}),
+            ]
+            * ACCEPTANCE_FORMAT_REJECTION_LIMIT,
+        ) if runner is None else self._drive_with(monitor, record, runner)
+        handle_id = snapshot.handles["n1"]
+        for _ in range(ACCEPTANCE_FORMAT_REJECTION_LIMIT):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+        return snapshot, runner, handle_id
+
+    def _drive_with(self, monitor, record, runner):
+        snapshot = monitor.start(record, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "review")
+        return snapshot, runner
+
+    def test_escalation_stops_the_reviewer_before_marking_it_stopped(self):
+        snapshot, runner, handle_id = self._escalate_reviewer(None)
+
+        self.assertIn(handle_id, runner.stop_calls)
+        reviewer = load_task_binding(self.paths, "n1", "reviewer", run_id=snapshot.run_id)
+        self.assertEqual(reviewer.status, "stopped")
+        self.assertTrue(snapshot.nodes["n1"].get("reviewer_replacement_required"))
+
+    def test_unprovable_reviewer_stop_never_writes_a_terminal_binding(self):
+        class StopUnproven(FakeRunner):
+            def stop(self, handle):
+                self.stop_calls.append(handle.run_id)
+                raise RuntimeError("provider terminal wait did not prove a stop")
+
+        runner = StopUnproven(
+            events={
+                ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+                ("n1", "reviewer"): [
+                    ("accepted", {"delivery_evidence": {"thread_status": "complete"}}),
+                ]
+                * ACCEPTANCE_FORMAT_REJECTION_LIMIT,
+            }
+        )
+        snapshot, runner, handle_id = self._escalate_reviewer(runner)
+
+        self.assertIn(handle_id, runner.stop_calls)
+        reviewer = load_task_binding(self.paths, "n1", "reviewer", run_id=snapshot.run_id)
+        # No stop proof: the identity must not pass the successor gate, and
+        # no replacement may be armed over a session that may still write.
+        self.assertNotIn(reviewer.status, {"stopped", "failed", "archived"})
+        current = snapshot.nodes["n1"]
+        self.assertFalse(current.get("reviewer_replacement_required"))
+        self.assertEqual(
+            current.get("recovery_action"), ACCEPTANCE_FORMAT_ESCALATION_RECOVERY
+        )
+
+    def test_developer_escalation_never_writes_a_terminal_binding(self):
+        monitor, record = self._monitor()
+        snapshot, runner = self._drive_to_reviewer(monitor, record, reviewer_events=[])
+        developer_before = load_task_binding(
+            self.paths, "n1", "developer", run_id=snapshot.run_id
+        ).status
+        active = dict(snapshot.nodes["n1"]["active_task"], role="developer")
+
+        monitor._escalate_acceptance_format_rejection(
+            snapshot, "n1", active, "delivery evidence incomplete",
+            "delivery_evidence:missing_thread_status",
+            ACCEPTANCE_FORMAT_REJECTION_LIMIT, runner, snapshot.handles["n1"],
+        )
+
+        developer = load_task_binding(self.paths, "n1", "developer", run_id=snapshot.run_id)
+        # A developer has no successor path; repeated format rejections do not
+        # prove its session ended, so its identity must stay non-terminal.
+        self.assertNotIn(developer.status, {"stopped", "failed", "archived"})
+        self.assertIn(developer.status, {developer_before, "blocked_unknown"})
+        self.assertEqual(runner.stop_calls, [])
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+
     def _reconcile_package(self, monitor, run_id):
         """The provider-free same-run recovery package for the parked node.
 

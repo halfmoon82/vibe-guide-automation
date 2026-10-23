@@ -5590,6 +5590,8 @@ class Monitor:
         reason: str,
         rejection_code: Optional[str] = None,
         extra_event_data: Optional[Dict[str, Any]] = None,
+        runner: Optional[Runner] = None,
+        handle_id: Optional[str] = None,
     ) -> None:
         """Record a validate-first rejection as pure audit and keep the handle.
 
@@ -5630,7 +5632,8 @@ class Monitor:
         )
         if count >= ACCEPTANCE_FORMAT_REJECTION_LIMIT:
             self._escalate_acceptance_format_rejection(
-                snapshot, node_id, active, reason, rejection_code, count
+                snapshot, node_id, active, reason, rejection_code, count,
+                runner, handle_id,
             )
             return
         current["reason"] = (
@@ -5697,6 +5700,8 @@ class Monitor:
         reason: str,
         rejection_code: Optional[str],
         count: int,
+        runner: Optional[Runner] = None,
+        handle_id: Optional[str] = None,
     ) -> None:
         """Stop the rejection replay loop and make the stall visible (#255).
 
@@ -5736,28 +5741,37 @@ class Monitor:
         if isinstance(record, dict):
             record["escalated"] = True
         role = active.get("role") if isinstance(active, dict) else None
-        if role in {"developer", "reviewer"}:
-            # The retired task's binding must reach a *terminal* status, not
-            # ``blocked_unknown``: a visible successor may only be registered
-            # over a stopped/failed/archived predecessor (both
-            # ``provider_action.task_binding`` and ``save_task_binding``
-            # enforce it), and the reviewer-replacement recovery armed below
-            # dispatches exactly such a successor.  ``blocked_unknown`` is not
-            # terminal, so the successor create used to fail with "visible
-            # successor requires a stopped predecessor", roll back, and park
-            # the node again with no retry marker -- a new deadlock.  The node
-            # itself still parks ``blocked_unknown``; this status is about the
-            # task identity, whose (malformed) report is final.
-            # ``_stop_active_for_transition`` is deliberately not used here:
-            # the session already delivered its last report, so its terminal
-            # wait proves a *completed* event, never a stop, and routing
-            # through it would fail closed with "old task stop cannot be
-            # proven" -- re-creating the stall this escalation exists to end.
+        stopped = False
+        if role == "reviewer":
+            # Only a *proven* stop may make the retired reviewer terminal: a
+            # visible successor is registered over a stopped/failed/archived
+            # predecessor (``provider_action.task_binding`` and
+            # ``save_task_binding`` enforce it), so a terminal status written
+            # without proof would let a second writer in beside a session
+            # that may still be alive.  Repeated format rejections do not
+            # prove the session ended.  ``runner.stop`` does: claude-bg stops
+            # the session for real, and provider_action returns at once for a
+            # handle whose terminal wait it already confirmed (the delivered
+            # report).  Without that proof the binding stays non-terminal and
+            # no replacement is armed; the human entry is ``vibe reconcile``.
+            # ``_stop_active_for_transition`` is not reused: on failure it
+            # re-parks the node with a different reason and recovery action,
+            # while this escalation already parked it as documented.
+            if runner is not None and isinstance(handle_id, str) and handle_id:
+                try:
+                    runner.stop(RunHandle(handle_id))
+                    self._set_binding_status(snapshot, node_id, "reviewer", "stopped")
+                    stopped = True
+                except Exception:
+                    stopped = False
+        if role in {"developer", "reviewer"} and not stopped:
+            # Same non-terminal status ``_mark_blocked_unknown`` writes: the
+            # identity is parked, never released to a successor.
             try:
-                self._set_binding_status(snapshot, node_id, str(role), "stopped")
+                self._set_binding_status(snapshot, node_id, str(role), "blocked_unknown")
             except (FileNotFoundError, OSError, TypeError, ValueError):
                 pass
-        if role == "reviewer":
+        if role == "reviewer" and stopped:
             # Arm the reviewer-replacement recovery (same markers #153 stamps):
             # `vibe repair` then re-dispatches the review under a fresh
             # reviewer identity instead of resuming the session that could not
@@ -5958,6 +5972,8 @@ class Monitor:
                                 "disposition": gate.classification,
                                 "finding": list(gate.reasons),
                             },
+                            runner=runner,
+                            handle_id=handle_id,
                         )
                         self._save_snapshot(snapshot)
                         return
@@ -5981,7 +5997,8 @@ class Monitor:
                     reason, recoverable, code = review_failure
                     if recoverable:
                         self._reject_acceptance_format(
-                            snapshot, node_id, active, reason, code
+                            snapshot, node_id, active, reason, code,
+                            runner=runner, handle_id=handle_id,
                         )
                         return
                     self._mark_blocked_unknown(snapshot, node_id, reason)
@@ -6448,7 +6465,8 @@ class Monitor:
                 if rejection is not None:
                     if recoverable:
                         self._reject_acceptance_format(
-                            snapshot, node_id, active, rejection, rejection_code
+                            snapshot, node_id, active, rejection, rejection_code,
+                            runner=runner, handle_id=handle_id,
                         )
                         return
                     self._mark_blocked_unknown(snapshot, node_id, rejection)
@@ -6482,6 +6500,8 @@ class Monitor:
                     active,
                     REVERSE_BLOCK_REASON,
                     "acceptance_evidence:missing",
+                    runner=runner,
+                    handle_id=handle_id,
                 )
                 return
             acceptance_event = RunEvent(
