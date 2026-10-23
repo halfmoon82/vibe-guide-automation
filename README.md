@@ -59,6 +59,34 @@ python3 -m venv .venv
 python3 -m vibe_guide --help
 ```
 
+### 发版验收：三条会报假红的陷阱
+
+发版自检时最容易踩的三个坑，按下面的写法抄命令，不要凭记忆简化：
+
+1. **版本断言必须在干净目录跑**。在仓库根执行会 import 到仓库里的源码树而不是 pipx 安装版，实测仓库根报 5.0.16、干净 cwd 报 5.1.1：
+
+   ```bash
+   cd /tmp && python3 -c "import vibe_guide; print(vibe_guide.__version__)"
+   ```
+
+   `vibe doctor --json` 的 `facts.install` 会给出当前解释器实际加载的包路径、是否落在 cwd 源码树（`in_cwd`）、是否在 site-packages 内（`in_site_packages`）、是否算安装版（`installed`）；不成立时 `hint` 带修复提示。这项只是信息项，不影响 `status`。
+
+2. **pipx 装 wheel 必须用构建出来的原文件名**，改名后的副本（如 `cli-162b481.whl`）会被拒：
+
+   ```bash
+   pipx install --force dist/vibe_guide-5.1.1-py3-none-any.whl
+   ```
+
+3. **沙箱内 `pip install <sdist>` 会报 `EEXIST: mkdir pip-req-build-*`**（换 `TMPDIR` 仍复现），改成解包后按目录安装，新 venv 先装 setuptools / wheel：
+
+   ```bash
+   tar xzf dist/vibe_guide-5.1.1.tar.gz -C /tmp
+   python3 -m venv /tmp/vibe-sdist-check
+   /tmp/vibe-sdist-check/bin/pip install setuptools wheel
+   /tmp/vibe-sdist-check/bin/pip install --no-build-isolation --no-deps /tmp/vibe_guide-5.1.1
+   /tmp/vibe-sdist-check/bin/vibe --help
+   ```
+
 ## 核心命令
 
 ```text

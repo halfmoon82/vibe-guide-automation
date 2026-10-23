@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import sys
+import sysconfig
 from . import host_rules
 from .diagnostics import diagnose_skill, build_skill_reference_proposal, build_agentsmd_proposal, check_agents_contract
 from .scanner import WORKBUDDY_ORIGIN, legacy_entry_rule_lines
@@ -34,6 +36,72 @@ def _host_rules_facts(report):
         return host_rules.status(Path(report.root), Path.home())
     except Exception as error:  # noqa: BLE001 - diagnostics stay best-effort
         return {'decision': 'unknown', 'files': {}, 'reason': error.__class__.__name__}
+
+
+def _site_packages_paths():
+    """Installed locations of the running interpreter, as sysconfig knows them."""
+    try:
+        scheme = sysconfig.get_paths()
+    except (KeyError, OSError, ValueError):  # pragma: no cover - exotic hosts
+        scheme = {}
+    found = set()
+    for key in ('purelib', 'platlib'):
+        value = scheme.get(key)
+        if value:
+            found.add(Path(value))
+    for entry in getattr(sys, 'path', ()):
+        if entry and Path(entry).name in ('site-packages', 'dist-packages'):
+            found.add(Path(entry))
+    return sorted(found)
+
+
+def _is_within(path, root):
+    return path == root or root in path.parents
+
+
+def install_source_facts(cwd=None, package_file=None, site_packages=None):
+    """Which copy of `vibe_guide` the current interpreter imported (#257).
+
+    `package_file` defaults to this module's own file, which sits beside
+    `vibe_guide/__init__.py` — the same directory `vibe_guide.__file__`
+    reports, without re-importing the package to ask.
+
+    The verdict rides in `facts`, not `issues`: developers run doctor inside
+    the source tree by design, so this must never turn the check red — it only
+    means a version assertion made from here proves nothing about the
+    installed release.  `hint` carries the wording for that case.
+    """
+    working_dir = Path(cwd if cwd is not None else Path.cwd()).resolve()
+    package_path = Path(
+        package_file if package_file is not None else __file__
+    ).resolve()
+    if site_packages is None:
+        site_packages = _site_packages_paths()
+    roots = [Path(root).resolve() for root in site_packages]
+    in_cwd = _is_within(package_path, working_dir)
+    in_site_packages = any(_is_within(package_path, root) for root in roots)
+    hint = None
+    # site-packages wins: a pipx venv under $HOME or a project's own .venv is
+    # still an installed copy even though it sits below the working directory.
+    if in_site_packages:
+        pass
+    elif in_cwd:
+        hint = (
+            'vibe_guide 从当前目录的源码树加载（' + str(package_path) + '），'
+            '此处断言版本测的是源码树而不是安装版；请在干净目录（如 /tmp）重跑'
+        )
+    else:
+        hint = (
+            'vibe_guide 不在当前解释器的 site-packages 内（'
+            + str(package_path) + '），不能代表安装版；请在干净目录（如 /tmp）重跑'
+        )
+    return {
+        'package_path': str(package_path),
+        'in_cwd': in_cwd,
+        'in_site_packages': in_site_packages,
+        'installed': in_site_packages,
+        'hint': hint,
+    }
 
 
 def doctor(report):
@@ -139,6 +207,9 @@ def doctor(report):
         },
         'agents': {'available': available_agents},
         'host_rules': _host_rules_facts(report),
+        # Advisory only: whether a version assertion run from here would prove
+        # anything about the installed release (#257).
+        'install': install_source_facts(),
     }
     warnings = []
     for label, state in sorted(facts['host_rules'].get('files', {}).items()):
