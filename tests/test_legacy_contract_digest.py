@@ -32,6 +32,7 @@ from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.state import (
+    scope_only_expansion_binds,
     _decode_snapshot,
     load_events,
     load_snapshot,
@@ -369,6 +370,17 @@ class LegacyVisibleSddReplayTests(unittest.TestCase):
         self.assertEqual(recovered.nodes["sdd-a"]["status"], "accepted")
         self.assertEqual(
             recovered.nodes["sdd-a"]["acceptance"]["contract_digest"], legacy
+        )
+
+
+class ScopeOnlyExpansionPredicateTests(unittest.TestCase):
+    def test_unhashable_scope_entries_are_unprovable_not_errors(self):
+        node = LegacyContractDigestTests._nodes()[1]
+        node.contract["worker_profile"]["allowlist"].append({"bad": 1})
+        self.assertFalse(
+            scope_only_expansion_binds(
+                node, legacy_executable_contract_digest([node]), ["x"], ["x", "y"]
+            )
         )
 
 

@@ -77,6 +77,8 @@ def scope_only_expansion_binds(
     """
     if not isinstance(previous_digest, str) or not _DIGEST.fullmatch(previous_digest):
         return False
+    if isinstance(new_scope, str) or isinstance(previous_scope, str):
+        return False
     try:
         increment = frozenset(new_scope) - frozenset(previous_scope)
     except TypeError:
@@ -84,11 +86,11 @@ def scope_only_expansion_binds(
     contract = getattr(node, "contract", None)
     if not increment or not isinstance(contract, dict) or not contract:
         return False
-    stripped = copy.copy(node)
-    stripped.contract = _strip_scope_increment(copy.deepcopy(contract), increment)
     try:
+        stripped = copy.copy(node)
+        stripped.contract = _strip_scope_increment(copy.deepcopy(contract), increment)
         return legacy_executable_contract_digest([stripped]) == previous_digest
-    except ValueError:
+    except (TypeError, ValueError):
         return False
 
 
