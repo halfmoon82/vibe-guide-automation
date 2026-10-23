@@ -78,6 +78,7 @@ from .state import (
     release_writer_lease,
     run_dir,
     save_snapshot,
+    scope_only_expansion_binds,
     interprocess_lock,
     validate_run_id,
 )
@@ -2067,12 +2068,23 @@ class Monitor:
         # A node is unchanged when its previous digest still binds the new
         # contract.  Runs from 5.0.7 hold the scope-inclusive form, which a
         # plain comparison with the new digest would always call changed.
+        # A 5.0.7 digest also binds file scope, so a scope-only expansion
+        # would always look changed.  scope_only_expansion_binds proves
+        # "only file scope changed" by stripping the union increment (known
+        # ceiling: A adds and B drops the same file cancel out in the union,
+        # nothing is provable, and both are redispatched).  state.py replay
+        # applies the same predicate.
+        def unchanged(node_id, digest):
+            return executable_contract_digest_matches(
+                [self.nodes[node_id]], digest
+            ) or scope_only_expansion_binds(
+                self.nodes[node_id], digest, previous.file_scope, record.file_scope
+            )
+
         changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if not executable_contract_digest_matches(
-                [self.nodes[node_id]], previous_node_contract_digests[node_id]
-            )
+            if not unchanged(node_id, previous_node_contract_digests[node_id])
         )
         affected_nodes = affected_node_closure(
             list(self.nodes.values()), changed_nodes
@@ -2105,9 +2117,7 @@ class Monitor:
             }
             if (
                 node_id not in affected_nodes
-                and executable_contract_digest_matches(
-                    [self.nodes[node_id]], previous_node_contract_digests.get(node_id)
-                )
+                and unchanged(node_id, previous_node_contract_digests.get(node_id))
                 and evidence["contract_digest"]
                 == previous_node_contract_digests[node_id]
             ):
@@ -3136,8 +3146,16 @@ class Monitor:
         expected_changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if not executable_contract_digest_matches(
-                [self.nodes[node_id]], previous_node_contract_digests[node_id]
+            if not (
+                executable_contract_digest_matches(
+                    [self.nodes[node_id]], previous_node_contract_digests[node_id]
+                )
+                or scope_only_expansion_binds(
+                    self.nodes[node_id],
+                    previous_node_contract_digests[node_id],
+                    previous.file_scope,
+                    replacement.file_scope,
+                )
             )
         )
         if changed_nodes != expected_changed_nodes:
@@ -3180,8 +3198,16 @@ class Monitor:
                 or set(evidence) != {"contract_digest", "authorization_epoch"}
                 or evidence["contract_digest"]
                 != previous_node_contract_digests[node_id]
-                or not executable_contract_digest_matches(
-                    [self.nodes[node_id]], evidence["contract_digest"]
+                or not (
+                    executable_contract_digest_matches(
+                        [self.nodes[node_id]], evidence["contract_digest"]
+                    )
+                    or scope_only_expansion_binds(
+                        self.nodes[node_id],
+                        evidence["contract_digest"],
+                        previous.file_scope,
+                        replacement.file_scope,
+                    )
                 )
                 or evidence["authorization_epoch"] != previous.digest
             ):

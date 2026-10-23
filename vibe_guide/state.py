@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 import errno
 from ._wincompat import flock_exclusive, flock_release, IS_WINDOWS as _IS_WINDOWS
 import hashlib
+import copy
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,80 @@ from .models import (
 )
 from .binding_contract import BindingIntent as V44BindingIntent, BindingProof as V44BindingProof
 from .paths import ProjectPaths
+
+
+_SCOPE_KEYS = frozenset(("files", "allowlist"))
+
+
+def _strip_scope_increment(value: Any, increment: frozenset) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (
+                [item for item in item_value if item not in increment]
+                if isinstance(key, str)
+                and key.casefold().replace("-", "_") in _SCOPE_KEYS
+                and isinstance(item_value, list)
+                else _strip_scope_increment(item_value, increment)
+            )
+            for key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_strip_scope_increment(item, increment) for item in value]
+    return value
+
+
+def scope_only_expansion_binds(
+    node: DAGNode,
+    previous_digest: Any,
+    previous_scope: Any,
+    new_scope: Any,
+) -> bool:
+    """Whether ``previous_digest`` proves ``node`` changed only by file scope.
+
+    5.0.7 digests bound file scope, and the snapshot keeps no copy of the old
+    scope, so the old contract cannot be recomputed.  Instead the union
+    increment (files authorized now but not before) is removed from the new
+    contract's ``files``/``allowlist`` and the result is digested with the old
+    algorithm: a match proves nothing else differs.  Known ceiling: when one
+    node adds a file and another drops that same file the union is unchanged,
+    the increment is empty, nothing can be proven, and the node is redispatched.
+    Anything unprovable answers False (redispatch), never a false retain.
+    """
+    if not isinstance(previous_digest, str) or not _DIGEST.fullmatch(previous_digest):
+        return False
+    if isinstance(new_scope, str) or isinstance(previous_scope, str):
+        return False
+    try:
+        increment = frozenset(new_scope) - frozenset(previous_scope)
+    except TypeError:
+        return False
+    contract = getattr(node, "contract", None)
+    if not increment or not isinstance(contract, dict) or not contract:
+        return False
+    try:
+        stripped = copy.copy(node)
+        stripped.contract = _strip_scope_increment(copy.deepcopy(contract), increment)
+        return legacy_executable_contract_digest([stripped]) == previous_digest
+    except (TypeError, ValueError):
+        return False
+
+
+def _previous_digest_binds(
+    node: DAGNode,
+    digest: Any,
+    previous: AuthorizationRecord,
+    replacement: AuthorizationRecord,
+) -> bool:
+    """Unchanged contract, or a 5.0.7 digest whose only delta is file scope.
+
+    Must stay isomorphic with ``Monitor.reauthorize``: replay rejects any
+    reauthorization whose recorded disposition this predicate disagrees with.
+    """
+    return executable_contract_digest_matches([node], digest) or (
+        scope_only_expansion_binds(
+            node, digest, previous.file_scope, replacement.file_scope
+        )
+    )
 
 
 STATE_SCHEMA_VERSION = 1
@@ -1179,8 +1254,11 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         expected_changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if not executable_contract_digest_matches(
-                [authorized_by_id[node_id]], previous_node_contract_digests[node_id]
+            if not _previous_digest_binds(
+                authorized_by_id[node_id],
+                previous_node_contract_digests[node_id],
+                previous,
+                replacement,
             )
         )
         retained_ids = set(retained_acceptances)
@@ -1202,8 +1280,11 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 or not isinstance(evidence, dict)
                 or set(evidence) != {"contract_digest", "authorization_epoch"}
                 or evidence["contract_digest"] != previous_node_contract_digests[node_id]
-                or not executable_contract_digest_matches(
-                    [authorized_by_id[node_id]], evidence["contract_digest"]
+                or not _previous_digest_binds(
+                    authorized_by_id[node_id],
+                    evidence["contract_digest"],
+                    previous,
+                    replacement,
                 )
                 or evidence["authorization_epoch"] != previous.digest
             ):

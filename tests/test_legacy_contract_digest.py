@@ -32,6 +32,7 @@ from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.state import (
+    scope_only_expansion_binds,
     _decode_snapshot,
     load_events,
     load_snapshot,
@@ -165,22 +166,53 @@ class LegacyContractDigestTests(unittest.TestCase):
         Monitor(self.paths, self.plan, nodes).tick(rebound.run_id, FakeRunner())
         return rebound
 
-    def test_new_code_reauthorization_keeps_unchanged_507_acceptances(self):
+    def test_new_code_reauthorization_keeps_scope_only_expanded_507_nodes(self):
+        """#224: a 5.0.7 run whose node only gained files keeps its acceptance."""
         snapshot = self._accepted_507_run()
         changed = self._nodes()
         changed[1].contract["files"].append("tests/test_b.py")
         changed[1].contract["worker_profile"]["allowlist"].append("tests/test_b.py")
         rebound = self._reauthorize_under_new_code(snapshot, changed)
-        # a is untouched and keeps its acceptance, rebound to the new digest.
-        # b's 5.0.7 digest bound its old file scope, so it cannot prove the
-        # edit was scope-only and is reworked exactly as 5.0.7 would.
+        for index, node_id in enumerate(("a", "b")):
+            self.assertEqual(rebound.nodes[node_id]["status"], "accepted")
+            self.assertEqual(
+                rebound.nodes[node_id]["acceptance"]["contract_digest"],
+                executable_contract_digest([changed[index]]),
+            )
+        # Replay of the recorded disposition accepts it too.
+        load_snapshot(self.paths, rebound.run_id)
+
+    def test_scope_expansion_with_a_semantic_change_is_still_invalidated(self):
+        snapshot = self._accepted_507_run()
+        changed = self._nodes()
+        changed[1].contract["files"].append("tests/test_b.py")
+        changed[1].contract["worker_profile"]["allowlist"].append("tests/test_b.py")
+        changed[1].contract["acceptance_example"] = "verified_fact: changed"
+        rebound = self._reauthorize_under_new_code(snapshot, changed)
         self.assertEqual(rebound.nodes["a"]["status"], "accepted")
-        self.assertEqual(
-            rebound.nodes["a"]["acceptance"]["contract_digest"],
-            executable_contract_digest([changed[0]]),
-        )
         self.assertNotEqual(rebound.nodes["b"]["status"], "accepted")
         self.assertIsNone(rebound.nodes["b"]["acceptance"])
+
+    def test_union_increment_cancelling_between_nodes_redispatches(self):
+        """Known ceiling: A adds and B drops the same file, so nothing is provable."""
+        nodes = self._nodes()
+        nodes[1].contract["files"].append("shared.py")
+        nodes[1].contract["worker_profile"]["allowlist"].append("shared.py")
+        runner = self._accepting_runner()
+        with _as_written_by_507():
+            snapshot = Monitor(self.paths, self.plan, nodes).start(
+                self._record(nodes), runner
+            )
+            monitor = Monitor(self.paths, self.plan, nodes)
+            for _ in range(10):
+                snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["a"]["status"], "accepted")
+        changed = self._nodes()
+        changed[0].contract["files"].append("shared.py")
+        changed[0].contract["worker_profile"]["allowlist"].append("shared.py")
+        rebound = self._reauthorize_under_new_code(snapshot, changed)
+        self.assertNotEqual(rebound.nodes["a"]["status"], "accepted")
+        self.assertNotEqual(rebound.nodes["b"]["status"], "accepted")
 
     def test_new_code_reauthorization_of_unchanged_507_dag_keeps_everything(self):
         snapshot = self._accepted_507_run()
@@ -338,6 +370,17 @@ class LegacyVisibleSddReplayTests(unittest.TestCase):
         self.assertEqual(recovered.nodes["sdd-a"]["status"], "accepted")
         self.assertEqual(
             recovered.nodes["sdd-a"]["acceptance"]["contract_digest"], legacy
+        )
+
+
+class ScopeOnlyExpansionPredicateTests(unittest.TestCase):
+    def test_unhashable_scope_entries_are_unprovable_not_errors(self):
+        node = LegacyContractDigestTests._nodes()[1]
+        node.contract["worker_profile"]["allowlist"].append({"bad": 1})
+        self.assertFalse(
+            scope_only_expansion_binds(
+                node, legacy_executable_contract_digest([node]), ["x"], ["x", "y"]
+            )
         )
 
 
