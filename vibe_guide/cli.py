@@ -44,6 +44,7 @@ from .supervisor_output import supervisor_output_batch
 from .supervisor_wakeup import idle_heartbeat_minutes, preflight_with_checkpoint
 from .supervisor import (
     Supervisor,
+    contract_drift as supervisor_contract_drift,
     current_supervisor_address,
     register_supervisor_address,
     release_supervisor_hold,
@@ -2113,9 +2114,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     if payload["state"] != "rotate":
                         payload["state"] = "unknown"
             return payload
-        payload = preflight_with_checkpoint(paths, args.run_id, args.session_record,
-            compute_preflight, command_prefix=supervisor_command_prefix,
-            accept_decision=args.accept_decision, **kwargs)
+        # Contract drift is checked before any cached receipt can answer (#220).
+        payload = supervisor_contract_drift(paths, args.run_id)
+        if payload is None:
+            payload = preflight_with_checkpoint(paths, args.run_id, args.session_record,
+                compute_preflight, command_prefix=supervisor_command_prefix,
+                accept_decision=args.accept_decision, **kwargs)
         interval = _beat_interval(paths, args.run_id, payload, persist=False)
         payload = {**payload, "heartbeat_interval": interval}
         code = SUCCESS if payload["state"] in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN

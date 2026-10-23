@@ -1488,21 +1488,13 @@ def authorization_choices(paths, run_id):
         # to prevent, so anything outside the offered tiers reads as absent.
         if type(value) is int and value in allowed:
             choices[key] = value
-    # A forced 30-minute choice is marked on the published card (the record
-    # keeps only the choice): honour it only where the card stated its cost.
-    chosen = choices.get("heartbeat_interval_minutes")
-    if chosen is not None:
-        try:
-            card = json.loads(Path(path).with_name("authorization-card.json")
-                              .read_text(encoding="utf-8"))
-            options = card.get("heartbeat_interval_options") or []
-        except (OSError, TypeError, ValueError, AttributeError):
-            options = []
-        if any(isinstance(item, dict) and item.get("minutes") == chosen
-               and item.get("forced") is True and item.get("available") is True
-               and isinstance(item.get("cost"), str) and item["cost"].strip()
-               for item in options):
-            choices["heartbeat_interval_forced"] = True
+    # A forced 30-minute choice is written into the signed authorization record
+    # itself (with its stated price); honour it only for that exact tier.
+    if (choices.get("heartbeat_interval_minutes") is not None
+            and data.get("heartbeat_interval_forced") is True
+            and isinstance(data.get("heartbeat_interval_forced_cost"), str)
+            and data["heartbeat_interval_forced_cost"].strip()):
+        choices["heartbeat_interval_forced"] = True
     return choices
 
 

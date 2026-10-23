@@ -66,6 +66,28 @@ class ContractDriftBeatTests(unittest.TestCase):
         self.assertIn("重新授权", text)
         self.assertNotIn("idle", text.split("contract_drift")[0])
 
+    def test_cached_receipt_cannot_hide_the_drift(self):
+        from vibe_guide.cli import run_cli
+
+        self._rewrite_contract()
+        cached = {"state": "work", "reason": "cached receipt"}
+        with self._snapshot(self.digest), patch(
+                "vibe_guide.cli.preflight_with_checkpoint", return_value=cached) as checkpoint:
+            out = run_cli(["supervisor-preflight", "--run-id", "run-1",
+                           "--session-record", str(self.record)], self.root)
+        self.assertIn("contract_drift", str(out))
+        checkpoint.assert_not_called()
+
+    def test_unchanged_contract_still_reaches_the_checkpoint(self):
+        from vibe_guide.cli import run_cli
+
+        cached = {"state": "work", "reason": "cached receipt"}
+        with self._snapshot(self.digest), patch(
+                "vibe_guide.cli.preflight_with_checkpoint", return_value=cached) as checkpoint:
+            run_cli(["supervisor-preflight", "--run-id", "run-1",
+                     "--session-record", str(self.record)], self.root)
+        checkpoint.assert_called_once()
+
     def test_missing_contract_is_unknown_not_consistent(self):
         (self.root / ".vibe/session-contract.json").unlink()
         with self._snapshot(self.digest):

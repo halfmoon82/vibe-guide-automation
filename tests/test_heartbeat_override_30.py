@@ -9,7 +9,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vibe_guide.authorization import build_authorization_card
+from vibe_guide.authorization import (
+    AuthorizationRecord, authorize, build_authorization_card, is_authorization_integrity_valid,
+)
 from vibe_guide.cli import _render_card_options
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan
 from vibe_guide.paths import ProjectPaths
@@ -88,7 +90,7 @@ class ForcedThirtyTests(unittest.TestCase):
         directory = self.paths.vibe / "plans" / "p1"
         directory.mkdir(parents=True, exist_ok=True)
         (directory / "authorization.json").write_text(json.dumps(
-            {"schema_version": 2, "plan_id": "p1", "heartbeat_interval_minutes": minutes}))
+            authorize(card, "AUTHORIZE").to_dict()))
         (directory / "authorization-card.json").write_text(json.dumps(card.to_dict()))
         from unittest.mock import patch
         from types import SimpleNamespace
@@ -104,6 +106,32 @@ class ForcedThirtyTests(unittest.TestCase):
         self.assertEqual(interval["minutes"], 30)
         self.assertEqual(interval["mode"], "forced")
         self.assertIn("30 分钟", interval["reason"])
+
+    def test_forced_choice_is_in_the_signed_record(self):
+        record = authorize(self._card(30), "AUTHORIZE")
+        data = record.to_dict()
+        self.assertIs(data["heartbeat_interval_forced"], True)
+        self.assertEqual(data["heartbeat_interval_forced_cost"], FORCED_INTERVAL_COST)
+        self.assertTrue(is_authorization_integrity_valid(record))
+        # The marker is under the digest: stripping it breaks the record.
+        stripped = {k: v for k, v in data.items() if not k.startswith("heartbeat_interval_forced")}
+        self.assertFalse(is_authorization_integrity_valid(AuthorizationRecord.from_dict(stripped)))
+        self.assertEqual(AuthorizationRecord.from_dict(data), record)
+
+    def test_unforced_records_carry_no_marker_and_old_records_load(self):
+        for minutes in (10, None):
+            data = authorize(self._card(minutes), "AUTHORIZE").to_dict()
+            self.assertNotIn("heartbeat_interval_forced", data)
+            self.assertNotIn("heartbeat_interval_forced_cost", data)
+            self.assertTrue(is_authorization_integrity_valid(AuthorizationRecord.from_dict(data)))
+
+    def test_verified_push_makes_30_unforced_in_the_record(self):
+        (self.root / ".vibe/push-wake-verification.json").write_text(json.dumps(
+            {"platforms": {"claude-code": {"success": [{"evidence_ref": "s"}],
+                                           "failure": [{"evidence_ref": "f"}]}}}))
+        data = authorize(self._card(30), "AUTHORIZE").to_dict()
+        self.assertEqual(data["heartbeat_interval_minutes"], 30)
+        self.assertNotIn("heartbeat_interval_forced", data)
 
     def test_a_30_without_a_forced_card_still_falls_back(self):
         register_supervisor_address(
