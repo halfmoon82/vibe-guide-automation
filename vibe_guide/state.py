@@ -385,6 +385,38 @@ _PROVIDER_TEXT_KEYS = {
 }
 _REDACTED = "[REDACTED]"
 _REDACTED_PROVIDER_TEXT = "[REDACTED_PROVIDER_TEXT]"
+#: Node-level structural facts a recovery or rollback gate is allowed to
+#: decide on (#256).  Every entry is program-authored structure -- a status
+#: enum, a hex digest, an epoch, an identity/generation pair, a marker object
+#: -- so persistence keeps it verbatim.  Provider text is deliberately absent:
+#: the free-text ``reason`` that sits next to these keys is redacted on write,
+#: so a gate that compares it can only ever compare against
+#: ``[REDACTED_PROVIDER_TEXT]`` and silently miss (the #249/#256 failure).
+#: This set and ``_PROVIDER_TEXT_KEYS`` are disjoint by contract
+#: (tests/test_recovery_fidelity_256.py pins it): a key in both would make
+#: every recovery comparison read a placeholder.
+#:
+#: Binding status / identity / generation are not here because bindings live
+#: in the task registry, which persists them unredacted; gates still copy them
+#: into a read-only snapshot before mutating (``monitor.BindingFacts``).
+RECOVERY_SIGNATURE_KEYS = frozenset({
+    "acceptance",
+    "active_role",
+    "active_task",
+    "contract_digest",
+    "developer_generation",
+    "developer_identity",
+    "handle_id",
+    "pair_archived",
+    "quarantine",
+    "recovery_action",
+    "review_clearance",
+    "review_generation",
+    "reviewer_identity",
+    "retryable_action",
+    "start_intent",
+    "status",
+})
 # Keys of these maps are identifiers — node ids, "<node>:<role>" task keys,
 # parallel-group names — not field names, so they are never candidate secret
 # names.  Node ids come straight from the product spec and only have to match
@@ -417,6 +449,19 @@ def _is_sensitive_data_key(key: str) -> bool:
     if normalized.endswith("_digest") or normalized.endswith("_ref"):
         return False
     return any(name in normalized for name in _SENSITIVE_DATA_NAMES)
+
+
+def is_redacted_value(value: Any) -> bool:
+    """Whether persistence replaced ``value`` with one of its placeholders.
+
+    A recovery gate that reads such a value is deciding on a placeholder, not
+    on a fact; the #256 contract is that such a gate fails closed instead of
+    comparing (see ``RECOVERY_SIGNATURE_KEYS``).
+    """
+    return isinstance(value, str) and value in (
+        _REDACTED,
+        _REDACTED_PROVIDER_TEXT,
+    )
 
 
 def redact_provider_text(value: Any) -> Any:
