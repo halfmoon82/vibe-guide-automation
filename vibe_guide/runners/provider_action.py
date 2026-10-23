@@ -25,7 +25,7 @@ from ..models import (
 )
 from ..model_router import provider_thinking_for
 from ..paths import ProjectPaths
-from ..protocols import load_protocol
+from ..protocols import load_protocol, protocol_path, published_protocol_digest
 from ..task_registry import (
     DEFAULT_TOPOLOGY,
     _TOPOLOGIES,
@@ -89,6 +89,30 @@ RESULT_EVENT_KEYS = (
     "delivery_evidence", "completion_marker", "delivery_path",
     "thread_status", "in_session_review",
 )
+
+
+#: ``.vibe/config.json`` field choosing how the visible-sdd protocol reaches
+#: the worker prompt: ``inline`` (default, full text) or ``ref`` (path + sha256).
+FIELD_SDD_PROTOCOL_DELIVERY = "sdd_protocol_delivery"
+
+
+def _sdd_protocol_delivery(root: Path) -> str:
+    """Return the project's delivery mode; an explicit illegal value fails closed."""
+    path = Path(root) / ".vibe" / "config.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return "inline"
+    except (OSError, ValueError) as exc:
+        raise ValueError("project config is unreadable: {}".format(exc))
+    if not isinstance(data, dict) or FIELD_SDD_PROTOCOL_DELIVERY not in data:
+        return "inline"
+    value = data[FIELD_SDD_PROTOCOL_DELIVERY]
+    if value not in ("inline", "ref"):
+        raise ValueError(
+            "{} must be 'inline' or 'ref'".format(FIELD_SDD_PROTOCOL_DELIVERY)
+        )
+    return value
 
 
 class ProviderActionRunner(Runner):
@@ -640,16 +664,28 @@ class ProviderActionRunner(Runner):
             # into the worker prompt so the session does not need the
             # repository to obey it.  A missing packaged protocol fails
             # closed here, before the create request leaves the mailbox.
-            protocol_text = load_protocol(Path(sdd_protocol).stem)
+            protocol_name = Path(sdd_protocol).stem
+            if _sdd_protocol_delivery(self.paths.root) == "ref":
+                # Ref mode: pin path + published sha256 instead of the full
+                # text.  An unpublished/edited file raises here, before the
+                # create request leaves the mailbox.
+                digest = published_protocol_digest(protocol_name)
+                protocol_block = (
+                    "## 会话必须遵循的协议（按引用交付）\n\n"
+                    "协议文件：{path}\nsha256：{digest}\n\n"
+                    "开工前先读取该文件并计算 sha256（如 `shasum -a 256 <路径>`）；"
+                    "与上面的 sha256 逐字相同才可遵守其全文。文件不存在、读取失败或摘要不符时，"
+                    "不得按该协议工作、不得写任何文件，立即停止并向监工报告协议摘要校验失败。"
+                ).format(path=protocol_path(protocol_name), digest=digest)
+            else:
+                protocol_block = (
+                    "## 会话必须遵循的协议（随包全文，逐字执行）\n\n"
+                    + load_protocol(protocol_name)
+                )
             create_request["topology"] = topology
             create_request["sdd_protocol"] = sdd_protocol
             create_request["prompt"] = (
-                head
-                + "\n\n"
-                + "## 会话必须遵循的协议（随包全文，逐字执行）\n\n"
-                + protocol_text
-                + "\n\n"
-                + consistency
+                head + "\n\n" + protocol_block + "\n\n" + consistency
             )
         if v39:
             # Keep the provider request bound to the same supervisor target
