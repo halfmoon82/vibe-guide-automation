@@ -4716,6 +4716,46 @@ class ContractTestExecutionTests(unittest.TestCase):
         )
         self.assertIsNone(read_writer_lease(self.paths, "n1", current["worktree"]))
 
+    def test_replayed_worker_decision_keeps_notification_unknown(self):
+        # #256 D1: the event `reason` is redacted on disk, so replay must not
+        # re-derive "notification unknown" from it.  Crash after the event is
+        # appended but before the snapshot is saved, then replay from disk.
+        config_path = self.paths.vibe / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            json.dumps({
+                "notify_bridge": {"enabled": True, "command": "/definitely/missing"}
+            }),
+            encoding="utf-8",
+        )
+        monitor, record = self.authorized_monitor([node("n1")])
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        active = dict(snapshot.nodes["n1"]["active_task"])
+        event = RunEvent(
+            "delivered",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": "n1",
+                "role": active["role"],
+                "task_id": active["task_id"],
+                "handle_id": active["handle_id"],
+                "generation": active["generation"],
+                "decision_requests": [{"question": "Pick", "options": ["A", "B"]}],
+            },
+        )
+        monitor._apply_event(snapshot, "n1", active["handle_id"], event, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "blocked_unknown")
+
+        stale = load_snapshot(self.paths, snapshot.run_id)
+        self.assertLess(stale.event_sequence, snapshot.event_sequence)
+        monitor._reconcile_unapplied_events(stale)
+
+        self.assertEqual(stale.nodes["n1"]["status"], "blocked_unknown")
+        self.assertEqual(
+            stale.nodes["n1"]["reason"], "decision notification bridge status unknown"
+        )
+
 
 class CoverageDenominatorTests(unittest.TestCase):
     """Branch coverage for the coverage-denominator gate.

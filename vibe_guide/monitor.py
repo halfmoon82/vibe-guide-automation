@@ -5917,6 +5917,8 @@ class Monitor:
                     "decision_ids": [item["decision_id"] for item in decisions],
                     "source": "worker_delivery",
                     "reason": decision_reason,
+                    # `reason` is redacted on disk; replay reads this (#256).
+                    "notification_status": "unknown" if notification_unknown else "sent",
                 },
                 active,
             )
@@ -8689,7 +8691,17 @@ class Monitor:
                 self._apply_decision_answer_state(snapshot, node_id, data)
             elif record["event"] == "decision_raised":
                 reason = data.get("reason", "decision pending")
-                notification_unknown = reason == DECISION_NOTIFICATION_UNKNOWN_REASON
+                # The persisted `reason` is always redacted, so a worker
+                # delivery's unknown notification rides in the structured
+                # `notification_status` (#256).  Only that source parks as
+                # blocked_unknown live; the reason comparison stays for
+                # events built in memory.
+                notification_unknown = reason == DECISION_NOTIFICATION_UNKNOWN_REASON or (
+                    data.get("source") == "worker_delivery"
+                    and data.get("notification_status") == "unknown"
+                )
+                if notification_unknown:
+                    reason = DECISION_NOTIFICATION_UNKNOWN_REASON
                 current["status"] = "blocked_unknown" if notification_unknown else "blocked_design"
                 current["reason"] = reason
                 current["decision_ids"] = list(data.get("decision_ids") or [])
