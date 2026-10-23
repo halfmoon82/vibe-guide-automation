@@ -137,6 +137,11 @@ SHIPPED_PROTOCOL_DIGESTS = {
         # 2026-10-14: heartbeat --accept-decision + N1 intervals.
         "cfff1ae864a712bb1d110e82c95bfac801f313b9f19470c37843bd3c78dae5b1",
     }),
+    # Worker protocol delivered by reference (#216): a ref-mode dispatch pins
+    # the file's sha256 and only accepts a digest published here.
+    "visible-sdd-worker": frozenset({
+        "30b226ff0a6711a91779785c28a993679e0a33c3aeb89e836cfd427194750945",
+    }),
 }
 
 _HERE = Path(__file__).resolve().parent
@@ -151,6 +156,26 @@ def load_protocol(name: str) -> str:
     if not path.is_file():
         raise FileNotFoundError("unknown protocol: {}".format(name))
     return path.read_text(encoding="utf-8")
+
+
+def protocol_path(name: str) -> Path:
+    """Absolute path of the shipped protocol file; the name is a simple identifier."""
+    load_protocol(name)  # validates the name and that the file exists
+    return _HERE / (name + ".md")
+
+
+def published_protocol_digest(name: str) -> str:
+    """sha256 of the shipped file's bytes, only if the published table lists it.
+
+    Fail-closed: an edited protocol file whose digest is not in
+    ``SHIPPED_PROTOCOL_DIGESTS`` raises instead of being pinned.
+    """
+    digest = hashlib.sha256(protocol_path(name).read_bytes()).hexdigest()
+    if digest not in SHIPPED_PROTOCOL_DIGESTS.get(name, frozenset()):
+        raise ValueError(
+            "protocol {} does not match any published digest".format(name)
+        )
+    return digest
 
 
 def is_shipped_protocol(name: str, text: str) -> bool:
