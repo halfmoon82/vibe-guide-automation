@@ -224,6 +224,17 @@ def _canonical_digest(value: Any) -> str:
 
 _PROJECT_MOUNT_NONE = 'none'
 
+#: Result key that carries advisory observations *beside* a delivery (issue
+#: #240).  It is recomputed at hand-off from the report itself and is never
+#: copied out of the worker payload: a delivery must not be able to smuggle a
+#: warning into the monitor's event data, and the payload digest that forms
+#: ``idempotent_key`` must stay bit-for-bit what it was before this field
+#: existed.  The runner imports this name, so the two sides of the hand-off
+#: cannot drift apart.
+WARNINGS_KEY = 'warnings'
+
+_ADVISORY_RESULT_KEYS = (WARNINGS_KEY,)
+
 
 def _requested_project_mount(request: Any, operation: str) -> Optional[str]:
     """Mount to record for a dispatch request, or ``None`` to inherit one.
@@ -810,10 +821,38 @@ class ProviderActionStore:
     def _delivery_warnings(self, run_id, issue_id, role, generation, payload):
         """Advisory notes that must reach the worker without blocking delivery."""
         warnings = [
-            self._project_mount_warning(run_id, issue_id, role, generation),
-            self._session_root_warning(run_id, issue_id, role, generation, payload),
+            self._safe_warning(
+                self._project_mount_warning, run_id, issue_id, role, generation
+            ),
+            self._safe_warning(
+                self._session_root_warning, run_id, issue_id, role, generation, payload
+            ),
         ]
         return [warning for warning in warnings if warning]
+
+    @staticmethod
+    def _safe_warning(check, *args):
+        """One advisory note, or ``None`` -- never an exception.
+
+        Both warnings are observations, so a record this process cannot read
+        is "not reported", the same as a missing field (#219 boundary).  The
+        two hand-off paths -- the worker's own report and the monitor's wait
+        result -- go through this one wrapper so neither can turn a torn
+        mailbox record into a failed delivery or a failed wait.
+        """
+        # Each caught type has a real source: ``OSError`` for path/permission/
+        # ``unlink`` failures, ``RuntimeError`` when ``Path.expanduser()``
+        # cannot expand ``~``, ``ValueError`` when ``_read`` parses a torn or
+        # half-written mailbox record.  ``TypeError`` is deliberately not
+        # caught: both checks are isinstance-guarded and take only str/dict,
+        # so it can only signal a programming error (a changed signature or a
+        # wrong argument type), and silencing it would leave the warning
+        # permanently blind -- the very defect this node removes.  For the
+        # same reason ``KeyboardInterrupt`` and friends must keep bubbling.
+        try:
+            return check(*args)
+        except (OSError, RuntimeError, ValueError):
+            return None
 
     def _project_mount_warning(self, run_id, issue_id, role, generation):
         """Warn when the create that started this session asked for no mount.
@@ -1294,9 +1333,27 @@ class ProviderActionStore:
                 # The cursor is the servicer's read position in the session,
                 # never the worker's claim: a self-report carries none, and
                 # the delivery gate accepts the receipt below instead.
-                result = {key: value for key, value in payload.items() if key != 'cursor'}
+                result = {
+                    key: value for key, value in payload.items()
+                    if key != 'cursor' and key not in _ADVISORY_RESULT_KEYS
+                }
                 result['event'] = payload.get('event', 'delivered')
                 result['status'] = 'completed'
+                # ISSUE-240: the session-root advisory rides beside the
+                # delivery instead of inside it.  It is recomputed here from
+                # the same payload the worker reported, so it never enters the
+                # payload copy above and never feeds the digest below: the
+                # result of a delivery is unchanged when there is nothing to
+                # say, and ``idempotent_key`` stays exactly the payload digest
+                # it was before this field existed.  The runner forwards it as
+                # event data; the delivery gate above has already decided, and
+                # this field can never change that decision.
+                warning = self._safe_warning(
+                    self._session_root_warning,
+                    run_id, issue_id, role, generation, payload,
+                )
+                if warning:
+                    result[WARNINGS_KEY] = [warning]
                 result['idempotent_key'] = _canonical_digest(payload)
                 if not self.complete(action['action_id'], result,
                                      request_digest=action['request_digest'], native=False):

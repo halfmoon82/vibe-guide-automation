@@ -9,6 +9,7 @@ import subprocess
 from typing import Any, Dict, Optional
 
 from ..adapters.task_provider import (
+    WARNINGS_KEY,
     ProviderActionStore,
     ProviderPending,
     ProviderUnavailable,
@@ -89,6 +90,34 @@ RESULT_EVENT_KEYS = (
     "delivery_evidence", "completion_marker", "delivery_path",
     "thread_status", "in_session_review",
 )
+
+#: Advisory observations a wait result may carry *beside* the delivery payload
+#: (issue #240).  The provider store recomputes them from the report at
+#: hand-off, so they describe the delivery itself and never anything the worker
+#: claims; they are recorded as event data for the supervisor's next
+#: preflight/resume and are read by no gate.  Kept out of
+#: :data:`RESULT_EVENT_KEYS` because that tuple is a payload projection -- these
+#: keys never come from the payload.  The key name is imported from the store
+#: that writes it, so the two ends of the hand-off cannot drift.
+ADVISORY_EVENT_KEYS = (WARNINGS_KEY,)
+
+#: One advisory note is a diagnostic line, not a channel.
+_ADVISORY_NOTE_LIMIT = 2000
+_ADVISORY_NOTES_LIMIT = 5
+
+
+def _advisory_notes(value):
+    """Sanitized advisory notes from a provider result, or None.
+
+    Anything malformed is "nothing to say": this field is observational, so it
+    must never be able to turn a delivery result into a rejection.
+    """
+    if not isinstance(value, (list, tuple)):
+        return None
+    notes = [note.strip() for note in value if isinstance(note, str) and note.strip()]
+    if not notes:
+        return None
+    return [note[:_ADVISORY_NOTE_LIMIT] for note in notes[:_ADVISORY_NOTES_LIMIT]]
 
 
 class ProviderActionRunner(Runner):
@@ -1452,6 +1481,10 @@ class ProviderActionRunner(Runner):
         for key in RESULT_EVENT_KEYS:
             if key in result:
                 data[key] = result[key]
+        for key in ADVISORY_EVENT_KEYS:
+            notes = _advisory_notes(result.get(key))
+            if notes is not None:
+                data[key] = notes
         return [RunEvent(str(event_name), data)]
 
     def stop(self, handle: RunHandle) -> None:
