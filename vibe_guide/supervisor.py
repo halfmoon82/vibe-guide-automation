@@ -1890,3 +1890,60 @@ def bounded_supervisor_output(paths, run_id, payload, rendered):
         short["reason"] = str(payload["reason"])[:200]
     short.update({"truncated": True, "output_evidence": _artifact_ref(path)})
     return json.dumps(short, ensure_ascii=False, sort_keys=True)
+
+
+_CARD_SUMMARY_KEYS = ("plan_id", "plan_version", "digest", "node_contract_digest", "active_pair_limit",
+                      "remote_git_actions", "engine_evidence_ref", "execution_engine", "engine_mode")
+
+
+def authorization_card_summary(paths, plan_id, card=None):
+    """Screen-sized card view; the on-disk card stays the full authority.
+
+    ``card`` may be None (authorize has only the plan id).  A card file that
+    cannot be read reports ``unknown`` rather than an empty summary.
+    """
+    path = paths.resolve_vibe_path(Path("plans") / plan_id / "authorization-card.json")
+    try:
+        raw = path.read_bytes()
+        if card is None:
+            card = json.loads(raw.decode("utf-8"))
+        if not isinstance(card, dict):
+            raise ValueError("authorization card must be an object")
+    except (OSError, ValueError) as error:
+        return {"status": "unknown", "path": str(path), "reason": "authorization card unreadable: {}".format(str(error)[:120])}
+    summary = {k: card[k] for k in _CARD_SUMMARY_KEYS if k in card}
+    summary.update({
+        "status": "ok", "path": str(path.resolve()),
+        "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+        "node_ids": list(card.get("node_ids") or []),
+    })
+    return summary
+
+
+_MAILBOX_KEYS = ("action_id", "operation", "native_tool", "issue_id", "role", "generation", "sequence", "request_digest")
+
+
+def supervisor_mailbox_view(paths, run_id):
+    """Pending provider requests with prompt bodies replaced by {sha256, bytes, path}."""
+    from .adapters.task_provider import ProviderActionStore
+    try:
+        pending = ProviderActionStore(paths).pending(run_id)
+    except (OSError, ValueError) as error:
+        return {"command": "supervisor-mailbox", "status": "unknown", "run_id": run_id,
+                "reason": "provider mailbox unreadable: {}".format(str(error)[:160])}
+    items = []
+    for action in pending:
+        item = {k: action[k] for k in _MAILBOX_KEYS if k in action}
+        path = paths.vibe / "provider-actions/requests" / (str(action.get("action_id")) + ".json")
+        request = action.get("request")
+        if isinstance(request, dict):
+            if isinstance(request.get("child_binding"), dict):
+                item["child_binding"] = request["child_binding"]
+            if "prompt" in request:
+                prompt = request["prompt"]
+                body = prompt.encode("utf-8") if isinstance(prompt, str) else _json_bytes(prompt)
+                item["prompt"] = {"sha256": hashlib.sha256(body).hexdigest(), "bytes": len(body),
+                                  "path": str(path.resolve())}
+        items.append(item)
+    return {"command": "supervisor-mailbox", "status": "ok", "run_id": run_id,
+            "pending_count": len(items), "pending": items}
