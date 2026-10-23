@@ -3,6 +3,14 @@
 > 本文件随 vibe 包发布，由 `vibe init --confirm` 物化到 `.vibe/proposals/skills/prd-guide/SKILL.md`，也可用 `vibe plan --print-protocol` 直接打印。
 > 面向 Claude Code / Codex 等宿主 agent。产品经理不需要读它。
 
+## 阅读地图（按角色读，不必全量前置）
+
+- **PRD 引导会话**（和产品经理谈需求、拆节点、写产品 spec）：读 §0–§5；其中 §2.1 方法论引用按话题取用，§4 的扩范围判据细节到拆节点时再细读。
+- **首班监工**：读 §0 + §6。开工先做 §6.0 的两件接电动作，每轮按 §6.1–§6.3 服务信箱、§6.5 执行心跳纪律；§1–§5 只在要重新发布或改卡时回头读。
+- **§6.4 平台差异表只读本宿主一行**；其他平台的行到需要对比时再读。
+- **§6.2 整合审查节点的 `accepted` evidence 结构化格式**：到整合审查节点派发或回写时再读，首班不必前置。
+- **§7 打断边界**：监工准备挂起或建决策时读；PRD 会话在要抛出 `needs_confirmation` 问题时读。
+
 ## 0. 分工
 
 - **agent 出内容**：和产品经理对话、只读分析代码、写 PRD、拆节点、记录产品决策。
@@ -184,7 +192,7 @@ vibe plan --request "<产品经理的原话>" --plan-id <plan_id> --from-prd <pr
 
 发布前还要问产品经理两个运行参数，答案写进产品 spec 顶层，缺省值由发布补齐：
 
-- `heartbeat_interval_minutes`：空闲基准心跳间隔，`10` 或 `30`，缺省 `10`。`30` 只在当前平台的推送唤醒已验证、且该平台有已登记的推送通道时可用；不可用时卡上照样列出并写明原因，硬选它会被拒绝发布。等答 60 分钟仍由 vibe 推导，不进卡。
+- `heartbeat_interval_minutes`：空闲基准心跳间隔，`10` 或 `30`，缺省 `10`。当前平台的推送唤醒已验证（`.vibe/push-wake-verification.json` 里该平台成功、失败证据各至少一条）时，`30` 正常可选。平台已知但推送未验证时，`30` 仍列出为**强制选择**：卡上标 `forced` 并写明代价（worker 完工后监工最长 30 分钟才会发现）；产品经理仍选它时，授权记录里写入 `heartbeat_interval_forced` 与代价原文，运行按 30 分钟出下一拍。平台未知或推送状态判不出来时该档不可用，卡上照样列出并写明原因。等答 60 分钟仍由 vibe 推导，不进卡。
 - `rotate_hard_cap`：换班硬上限，`150000` / `200000` / `300000`，缺省 `200000`。`300000` 只在宿主报告的上下文窗口不小于 30 万时可用：Codex 把窗口写在会话记录里，发布时加 `--session-record <本会话记录路径>` 传入该记录；Claude Code 不报窗口，因此恒不可用。依据是宿主在 30 万之前就会自动压缩，换班不会触发，选 30 万等于悄悄变成「永不换班」。
 
 两项都计入授权摘要，改任一项要用新的 `plan_id` 重新发布、重新授权，与改 `remote_git_actions` 同规则。运行时以授权记录里的值为准：条件不再满足时（推送登记被撤、接班会话窗口更小）退回默认值，并在预检 `reason` 里写明，不静默。没有这两项的旧计划保持改动前的行为不变：空闲间隔仍按推送唤醒是否已验证在 10/30 之间自动选，硬上限 200000。
@@ -194,7 +202,7 @@ vibe plan --request "<产品经理的原话>" --plan-id <plan_id> --from-prd <pr
 替换中途被打断（如 Ctrl-C）或 reason 含 `draft could not be restored` 时，先确认草案有没有被挪开：位置以 reason 里给出的路径为准，没给路径就找 `.vibe/plans/.<plan_id>.draft.*/draft`（命中多个时别猜：把每个目录的修改时间和其中 `plan.json` 的状态列给产品经理，请他选）。①找不到：草案没被挪动，直接按原命令重新发布；②找到了且 `.vibe/plans/<plan_id>` 不存在：把它整个挪回这个位置，再按原命令重新发布；③找到了且 `.vibe/plans/<plan_id>` 已存在就不要覆盖，也不要当成本次发布成功（那里可能是别的会话的发布，有授权卡也证明不了是你的）：从挪开的草案里取回产品 spec 放到 `.vibe/plans` 之外（见 §5.1），告诉产品经理这个编号已被占用，再换一个新的 `plan_id` 重新发布，`--s1` 照挪开草案 `plan.json` 里 `route_result.dimensions` 的 `steps,domains,uncertainty,failure_cost,toolchain` 依次填。旧编号下那份计划原样留着：不念它的卡、不对它 `vibe authorize` 或 `vibe monitor`，授权和开工只用新编号；把它的编号和 `plan.json` 的状态列给产品经理，说明它可能是本次被打断的发布，也可能是别的会话的，清不清理由产品经理决定。处理完后，挪开的草案移到废纸篓，剩下的空隐藏目录可以删掉。
 
 - `status: ok`：vibe 已生成 PRD、Spec、Issue、DAG 审计、授权卡、planning-brief。把 `authorization_card` 用产品语言念给产品经理：要做哪几件事、哪些同时开工、每件事一个开发任务加一个独立审查任务、发布前选定的远端 Git 开关（卡上的 `remote_git_actions`）、永远不含部署/发布/生产写入/凭据/对外通信。
-- 念卡时把两个运行参数一起念：卡上的 `heartbeat_interval_minutes` 与 `rotate_hard_cap`，以及 `heartbeat_interval_options` / `rotate_hard_cap_options` 里标着不可用的档位和原因。不可用的档位是产品经理该知道的选项，不是内部细节——别只念能用的那些，也别替他决定。
+- 念卡时把两个运行参数一起念：卡上的 `heartbeat_interval_minutes` 与 `rotate_hard_cap`，以及 `heartbeat_interval_options` / `rotate_hard_cap_options` 里标着不可用的档位和原因；标 `forced` 的档位一并念出 `cost` 原文（选了它就按那个代价跑），不可用与强制档位都是产品经理该知道的选项，不是内部细节——别只念能用的那些，也别替他决定。
 - 念卡时分开说两件事，别让 `allow` 听起来像"允许了又排除了"：`excluded_actions` 里的推送/合并是说开发任务自己永远不推送；`allowed_actions` 里的推送/合并是说产品经理允许后，这些动作进入授权范围；vibe 只在独立终审通过后校验并记录，不代为执行。选 `deny` 时 `allowed_actions` 不含任何远端 Git 动作，`excluded_actions` 照样列着推送/合并。
 - 产品经理此时想改远端 Git 开关或上面两个运行参数：`vibe authorize` 改不了它们。把产品 spec 复制到 `.vibe/plans` 之外（见 §5.1），改其中的 `remote_git_actions` / `heartbeat_interval_minutes` / `rotate_hard_cap`，用一个新的 `plan_id` 重新发布（`--plan-id <新编号> --s1 <s1>`，`<s1>` 照抄首次发布结果里的 `s1`：草案已被替换，新编号没有评分可沿用），再念新卡。想选 30 万档时，这次发布还要带 `--session-record`，否则窗口未知、该档仍不可用。
 - `status: blocked` 且 reason 以 `product_spec_requires_complex_route` 开头：请求被评成了非复杂路径，vibe 拒绝丢掉产品 spec。用 §1 草案的 `plan_id` 发布，或按 §1 用 `--s1` 显式升级。
@@ -270,7 +278,15 @@ for action in store.pending():          # 先按当前 run/绑定证据收敛已
 `accepted`/更新代次证据全部匹配时，才可调用 `reconcile_stale()` 写入审计标记；原请求保留，
 不调用 native tool、不写伪造结果。任一证据缺失或冲突都继续保持 pending/unknown。
 
-也可以直接读 `.vibe/provider-actions/requests/*.json`。回写建议走 `complete()`：结果文件必须恰好含 `schema_version` / `action_id` / `request_digest` / `payload` 四个键，且前三个与请求逐字对应，错一个就会被判"未绑定到请求"而拒收——`complete()` 替你填对。手写也能被接受，但没有理由自己去对 digest。
+也可以直接读 `.vibe/provider-actions/requests/*.json`。只想先知道信箱里有什么、不读派发全文时，用摘要视图：
+
+```bash
+vibe supervisor-mailbox --run-id <run-id> --json
+```
+
+它逐条返回 pending 请求的摘要（`action_id`、`operation`、`native_tool`、`issue_id`、`role`、`generation`、`child_binding`），派发 prompt 正文换成 `{sha256, bytes, path}`；需要全文时按 `path` 读那份请求文件。它是只读摘要，不是消费——消费仍是按 `action["native_tool"]` 调用并 `complete()` 回写。
+
+回写建议走 `complete()`：结果文件必须恰好含 `schema_version` / `action_id` / `request_digest` / `payload` 四个键，且前三个与请求逐字对应，错一个就会被判"未绑定到请求"而拒收——`complete()` 替你填对。手写也能被接受，但没有理由自己去对 digest。
 
 每份请求里你要看的字段：
 
@@ -473,7 +489,9 @@ worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），
 
 - **WorkBuddy**：`workbuddy_job__*` 五个工具名已登记，对应 WorkBuddy 官方 Jobs API，但**还没有在真实会话里跑通过**。在本机实测之前，不要把它当成已验证的派发路径，也不要据此承诺授权后不用人看。
 
-### 6.5 监工心跳纪律（预检 → idle/work/decision/rotate/unknown）
+**推送唤醒通道**（§6.5 里 `vibe supervisor-address` 返回的 `wake.channel`）按平台登记，不按派发路径分：Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`（2026-10-23 登记；在 `.vibe/push-wake-verification.json` 补齐成功、失败证据各一条之前，30 分钟档仍只能强制选择，见 §5.3），WorkBuddy 没有登记通道（`channel` 为 null，由心跳拉取）。
+
+### 6.5 监工心跳纪律（预检 → idle/work/decision/rotate/unknown/contract_drift）
 
 每次心跳的第一步只跑本地预检，只读磁盘：
 
@@ -482,6 +500,7 @@ vibe supervisor-preflight --run-id <run-id> --accept-decision --session-record <
 ```
 
 - 每拍只运行生成命令一次，工具返回、重连和上下文恢复续接当前阶段。
+- 输出 `contract_drift`：**能力合同与运行快照的 digest 不一致**——典型诱因是别的会话的 git 写操作（checkout/stash/reset/merge）改写了 `.vibe` 运行态文件。它先于 idle/work/decision/rotate 判定返回；这一拍**停止推进、不当 idle 或 work 处理**，按输出提示走同一运行的重新授权流程（`vibe authorize` 同一 plan/run），不要继续派发或消费信箱。能力合同文件本身读不出时输出 `unknown`（见下），按 `work` 处理照旧。
 - 输出 `decision`：只有带 `--accept-decision` 才会输出（只剩未答决策、无其他可服务事项时）；旧版指令同一情形收到 `work`，按 `work` 走 resume，由 resume 渲染决策卡片。从 `.vibe/decisions/` 读取并渲染未答卡片；心跳降频到 60 分钟但不暂停，答案消费后恢复；降频状态写在 `.vibe/runs/<run-id>/heartbeat-interval.json`，接班时 `vibe supervisor-handoff` 会打印。
 - 输出 `idle`：所有节点都在运行、已完成或等人拍板，且无新请求。只回一字结束本轮，不做任何写。连续第二拍起仍是 `idle`（无可服务事项），下一拍间隔在当前档位（默认 10、推送验证 30）基础上放大到 3 倍、上限 60 分钟，`heartbeat-interval.json` 记 `mode=idle_backoff` 与 `idle_streak`，`vibe supervisor-handoff` 同步打印；出现新交付或唤醒（预检变为 `work` 等非 `idle`）的那一拍立即恢复基础间隔；只剩未答决策时仍是 §上条的 60 分钟。
 - **等人拍板必须登记**：监工决定把某个节点挂起等用户回答时，先跑 `vibe supervisor-hold --run-id <run-id> --node <节点> --category <product_acceptance|external_authorization> --decision <决策ID>|--authorization-gap <缺口> --reason <一句话原因>`（必须引用一条决策 ID 或一个授权缺口，二选一；`product_design`/`deploy` 仍可作别名，落盘存规范名；没有 category 的旧挂起按 `product_acceptance` 读取，下次刷新须补上 category 和引用；`decision-answer` 必须带决策卡 `answer_cli` 里的 `--digest`，选项一变旧答案作废、决策重新待答）；用户用 `decision-answer` 回答后由运行自动消费：预检对「已回答、节点仍在 `blocked_design`」的决策报 `work`（理由写明已回答待处理），监工照常 resume 即可，不必口头转达，也不必手工释放挂起；决策已答的挂起不再引起反复 `work`；不经决策的挂起（授权缺口）仍用 `vibe supervisor-hold --run-id <run-id> --node <节点> --release` 手工释放。回答命令会提示「想马上续跑，去监工会话说继续；否则最晚下一次心跳自动接上」。只有 §7 的四类情况才能挂起或建决策，其余类别（如 `engineering`）会被拒绝，应走自愈路径。不登记，挂起的请求每次心跳都被当成 `work`，空闲心跳的成本是设计值的数倍（2026-10-05 run 140 实测：60 次预检 46 次误判）。挂起的节点上有 worker 交付或结果时仍然是 `work`。挂起会记下当时全盘节点状态：此后任何节点状态变化，或挂起满 6 小时，预检报 `work`（`hold needs recheck`），复核后仍在等人就对每个挂起节点再跑一次同一条挂起命令刷新。挂起节点的待服务请求在用户答复并解除挂起之前不执行，换班后的新班次同样遵守。`review`/`rework` 状态的节点不能挂起（它们只靠监工推进）。
@@ -489,7 +508,7 @@ vibe supervisor-preflight --run-id <run-id> --accept-decision --session-record <
 - 输出 `rotate`：当前上下文达到 10 万且自接班以来增长至少 8 万 token（可配 `--token-threshold`），或达到 20 万的绝对上限（默认；用户明确临时覆盖时使用 `--context-hard-cap <tokens>`，增长阈值也需同步显式设置，不能只用 `--token-threshold` 冒充绝对上限已改变）；登记时没给 `--session-record` 的班次没有接班起点，按绝对值计算。项目 `.vibe/config.json` 设了 `"supervisor_single_shift": true` 时，同一监工会话服务整个运行，不再按增长换班，只在达到绝对上限时输出 `rotate`（预检输出带 `single_shift: true`）；默认不设，行为同上。执行换班：新开会话，让它跑 `vibe supervisor-handoff --run-id <run-id>`——这一条打印接班需要的全部内容（进度、等人拍板事项、填好的同一段心跳指令、接班步骤），新会话照做即可，不必再翻本协议、授权卡或完整状态：用 `vibe supervisor-register --session-record` 登记、自建心跳、置顶、改标题；删除旧心跳，旧会话归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。
 - 输出 `unknown`：会话记录读不到或解析失败。**不得当成 idle**，按 `work` 处理。
 
-监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> --session-record <日志>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run> [--node <n> --role <r> --generation <g>]` 查询；未登记返回 `unknown` 而非空成功。登记后的回答带 `wake`：Codex 为 `channel=send_message_to_thread`、`target`（监工会话 id）与填好的一行 `signal`（`vibe-wake run=… node=… role=… generation=…`），worker 用该工具原样发送；Claude Code 等没有已验证推送通道的平台 `channel` 为 null 并写明原因，worker 不发，由心跳领取。监工不信任信号内容。登记内容只允许 provider/会话 id/host，不得含凭据。
+监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> --session-record <日志>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run> [--node <n> --role <r> --generation <g>]` 查询；未登记返回 `unknown` 而非空成功。登记后的回答带 `wake`：`channel`（推送通道）、`target`（监工会话 id）与填好的一行 `signal`（`vibe-wake run=… node=… role=… generation=…`），worker 用该通道原样发送——Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`（通道已登记，见 §6.4）；WorkBuddy 等没有登记推送通道的平台 `channel` 为 null 并写明原因，worker 不发，由心跳领取。监工不信任信号内容。登记内容只允许 provider/会话 id/host，不得含凭据。
 
 ## 7. 什么时候才能打断产品经理
 

@@ -27,6 +27,10 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-23: top-of-file reading map; §5.3 forced 30-minute choice with
+        # cost; §6.1 supervisor-mailbox summary view; §6.4/§6.5 Claude Code
+        # SendMessage wake channel + contract_drift heartbeat branch (#216④).
+        "54423a04770c2cd3fa34f9e2cbf320d2c0230460a8ebec5e8dd0264686d2e15b",
         # 2026-10-17: §5.3 documents the two card choices (idle heartbeat base,
         # rotation hard cap), their availability rules and the republish rule;
         # §6 reads the cadence from the card instead of promising an automatic 30 (#209).
