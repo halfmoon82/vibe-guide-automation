@@ -42,14 +42,18 @@ class WakeInstructionTests(unittest.TestCase):
                     wake["signal"], "vibe-wake run=run-1 node=n1 role=developer generation=2"
                 )
 
-    def test_claude_code_has_no_channel_and_says_why(self):
+    def test_claude_code_wakes_through_send_message(self):
         for provider in ("claude-code", "claude-code-visible"):
             with self.subTest(provider=provider):
                 self._register(provider)
-                wake = current_supervisor_address(self.paths, "run-1")["wake"]
-                self.assertIsNone(wake["channel"])
-                self.assertIn("心跳", wake["reason"])
-                self.assertNotIn("signal", wake)
+                wake = current_supervisor_address(
+                    self.paths, "run-1", node_id="n1", role="developer", generation=2
+                )["wake"]
+                self.assertEqual(wake["channel"], "SendMessage")
+                self.assertEqual(wake["target"], "S")
+                self.assertEqual(
+                    wake["signal"], "vibe-wake run=run-1 node=n1 role=developer generation=2"
+                )
 
     def test_unknown_provider_has_no_channel(self):
         self._register("someday-host")

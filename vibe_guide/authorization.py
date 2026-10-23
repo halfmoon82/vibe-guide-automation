@@ -1310,7 +1310,7 @@ def _normalized_option_entries(
     for item in options:
         if not isinstance(item, dict):
             raise ValueError(label + " option must be an object")
-        unknown = set(item) - {key, "available", "reason"}
+        unknown = set(item) - {key, "available", "reason", "forced", "cost"}
         if unknown:
             raise ValueError(
                 label + " option has unknown keys: "
@@ -1330,7 +1330,20 @@ def _normalized_option_entries(
             raise ValueError(label + " option reason must be a string")
         if not available and not reason.strip():
             raise ValueError(label + " option is unavailable without a reason")
-        entries.append({key: value, "available": available, "reason": reason})
+        entry = {key: value, "available": available, "reason": reason}
+        # A forced tier is usable only by an explicit product choice and must
+        # state its price on the card: a missing cost refuses publication.
+        # Absent for ordinary tiers, so existing cards stay byte-identical.
+        if "forced" in item or "cost" in item:
+            forced = item.get("forced")
+            cost = item.get("cost")
+            if forced is not True or not available:
+                raise ValueError(label + " option forced marker must be true on an available tier")
+            if not isinstance(cost, str) or not cost.strip():
+                raise ValueError(label + " forced option has no cost statement")
+            entry["forced"] = True
+            entry["cost"] = cost
+        entries.append(entry)
     return tuple(entries)
 
 

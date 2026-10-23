@@ -78,6 +78,10 @@ def preflight_with_checkpoint(paths, run_id, session_record, compute, *,
     turn = _host_turn(session_record)
     if turn is None:
         return compute()
+    drift = supervisor.contract_drift(paths, run_id)
+    if drift is not None:
+        # Never served from a cached receipt: the drift must show on this beat.
+        return drift
     if context_hard_cap is None:
         context_hard_cap, _reason = supervisor.rotate_hard_cap_for_run(
             paths, run_id, session_record

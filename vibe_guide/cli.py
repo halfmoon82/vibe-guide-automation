@@ -1388,7 +1388,9 @@ def _render_card_options(options: Any, key: str, unit: str) -> str:
     parts = []
     for item in entries:
         label = "{:,} {}".format(item.get(key), unit)
-        if item.get("available"):
+        if item.get("available") and item.get("forced"):
+            parts.append("{}（强制选择：{}）".format(label, item.get("cost") or "未记录代价"))
+        elif item.get("available"):
             parts.append(label)
         else:
             parts.append("{}（不可用：{}）".format(label, item.get("reason") or "未记录原因"))
@@ -2015,6 +2017,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             text = "work：按 prd-guide §6.1 服务信箱一轮，推进用 {} resume --plan {} --run-id {}".format(
                 supervisor_command_prefix, plan_id, args.run_id
             ) + tail
+        elif state == "contract_drift":
+            text = "contract_drift：能力合同与运行快照不一致，停止推进，立即走同一运行的重新授权流程；{}".format(
+                payload.get("hint", "")) + tail
         elif state == "rotate":
             text = "rotate：新开一个会话，让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(
                 supervisor_command_prefix, args.run_id
