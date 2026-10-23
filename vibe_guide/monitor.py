@@ -253,6 +253,28 @@ REVERSE_BLOCK_REASON = (
     "review acceptance has no registered P0-P2 clearance evidence"
 )
 
+#: ISSUE-254/255: how many consecutive validate-first format rejections the
+#: same session (same handle + generation) may accumulate before the monitor
+#: stops re-reading the same delivery.  Rejection stays recoverable by design
+#: (#249/#83: the same session corrects and re-reports), so the first
+#: rejection must never escalate; a live session corrects within one or two
+#: re-reads.  Past this limit the delivery is assumed un-reportable -- the
+#: observed incident (run-1ebcb792) had the reviewer session exit right after
+#: delivering, so every ``vibe resume`` tick re-read the same payload and
+#: re-rejected it forever while the node sat in ``review`` -- and the node is
+#: escalated to a visible ``blocked_unknown`` with a human recovery action
+#: instead of looping.
+ACCEPTANCE_FORMAT_REJECTION_LIMIT = 3
+
+#: The node ``recovery_action`` stamped by the escalation above.  It names the
+#: human recovery entries, both of which exist in the CLI: reshape the
+#: delivery per the pinned schema and re-deliver through ``vibe reconcile``
+#: (``Monitor.reconcile_evidence`` reuses the original bindings and replays
+#: ordinary delivered/accepted events), or ``vibe requeue``/``repair`` to put
+#: the node back into the scheduler.  For the integration reviewer specifically
+#: the reshaped claim is recorded through ``Monitor.record_integration_review``.
+ACCEPTANCE_FORMAT_ESCALATION_RECOVERY = "reshape_delivery_and_reconcile"
+
 #: Protocol pointer carried by every visible-sdd create request so the worker
 #: session can resolve the in-session SDD protocol from the installed package.
 VISIBLE_SDD_PROTOCOL_REF = "vibe_guide/protocols/visible-sdd-worker.md"
@@ -3486,8 +3508,12 @@ class Monitor:
             "authorization_epoch": authorization_epoch,
         }
         # Match the live path: a replayed acceptance must not resurrect the
-        # rejection text the lost snapshot still carried.
+        # rejection text the lost snapshot still carried -- nor the #255
+        # consecutive-rejection counter or the escalation recovery action the
+        # parked node carried into the reconciliation.
         current["reason"] = None
+        current.pop("acceptance_format_rejections", None)
+        current["recovery_action"] = None
         current["reviewer_identity"] = provenance["task_id"]
         current["review_generation"] = generation
         current["active_role"] = None
@@ -5481,20 +5507,29 @@ class Monitor:
     ):
         """Derive the run-level package without writing anything.
 
-        Returns ``(package, None, False)`` on success and
-        ``(None, reason, recoverable)`` otherwise.  Splitting derivation from
-        the write is what lets the live acceptance path validate first: a
-        malformed claim (recoverable) is a format error the same reviewer can
-        correct and re-report on its still-live handle, while a contract
-        digest mismatch or open P0-P2 findings stay fail-closed.  Only a
-        schema/derivation failure is recoverable -- everything else is an
+        Returns ``(package, None, False, None)`` on success and
+        ``(None, reason, recoverable, code)`` otherwise.  ``code`` (#254) is the
+        machine-readable rejection class the free-text ``reason`` cannot
+        survive persistence with: it is built only from program constants (the
+        claim key names and expected types), so it stays readable after the
+        provider-text redaction the ``reason`` goes through.  Splitting
+        derivation from the write is what lets the live acceptance path
+        validate first: a malformed claim (recoverable) is a format error the
+        same reviewer can correct and re-report on its still-live handle, while
+        a contract digest mismatch or open P0-P2 findings stay fail-closed.
+        Only a schema/derivation failure is recoverable -- everything else is an
         evidence or scope problem a re-report cannot fix.
         """
         if contract is None or refs is None or excluded is None:
             contract = integration_contract_projection(self.plan, list(self.nodes.values()))
             record = self._snapshot_record(snapshot)
             if digest_integration_contract(contract) != record.integration_contract_digest:
-                return None, "integration contract no longer matches the authorized digest", False
+                return (
+                    None,
+                    "integration contract no longer matches the authorized digest",
+                    False,
+                    "integration_derivation:contract_digest_drift",
+                )
             if contract:
                 refs = contract.get("agentsmd_acceptance_refs") or []
                 excluded = contract.get("unverified_or_excluded") or []
@@ -5506,10 +5541,26 @@ class Monitor:
                 snapshot, claim, list(refs or []), list(excluded or [])
             )
         except (TypeError, ValueError) as error:
-            return None, "integration review evidence cannot be derived ({})".format(error), True
+            # A typed claim error carries its stable code; anything else that
+            # fails derivation (lineage, digest, scope) is run state rather
+            # than claim shape and gets the shared fallback code.
+            code = getattr(error, "code", None)
+            if not isinstance(code, str) or not code:
+                code = "integration_derivation:unclassified"
+            return (
+                None,
+                "integration review evidence cannot be derived ({})".format(error),
+                True,
+                code,
+            )
         if any(package["clearance"][severity] for severity in ("p0", "p1", "p2")):
-            return None, "integration review acceptance still reports open P0-P2 findings", False
-        return package, None, False
+            return (
+                None,
+                "integration review acceptance still reports open P0-P2 findings",
+                False,
+                "integration_derivation:open_p0_p2_findings",
+            )
+        return package, None, False, None
 
     def _self_report_receipt(self, snapshot, node_id, role, active, binding, delivery):
         """The consumed ``worker-deliver`` wait for the active task, or None."""
@@ -5537,6 +5588,10 @@ class Monitor:
         node_id: str,
         active: Dict[str, Any],
         reason: str,
+        rejection_code: Optional[str] = None,
+        extra_event_data: Optional[Dict[str, Any]] = None,
+        runner: Optional[Runner] = None,
+        handle_id: Optional[str] = None,
     ) -> None:
         """Record a validate-first rejection as pure audit and keep the handle.
 
@@ -5556,23 +5611,192 @@ class Monitor:
         the process dies after this event is appended but before the
         snapshot is saved, the replayed no-op restores neither the evidence
         entry nor this reason -- the durable trail is the audit event alone.
+
+        #254: besides that redacted free text the event also carries
+        ``rejection_code`` -- a stable, assertable machine-readable class
+        (error kind plus the involved key names / expected types, all program
+        constants) under a non-provider-text event key, so an auditor can tell
+        a wrong key set from a wrong type from an empty value without
+        un-redacting anything.  #255: consecutive rejections of the same
+        session (same handle + generation) are counted durably on the node
+        (``acceptance_format_rejections``); when no live entity can re-report
+        -- the incident case where the reviewer session exited right after
+        delivering and every tick re-read the same payload -- the count hits
+        ``ACCEPTANCE_FORMAT_REJECTION_LIMIT`` and the rejection escalates to a
+        visible ``blocked_unknown`` with ``recovery_action`` instead of
+        replaying forever.
         """
         current = snapshot.nodes[node_id]
+        count = self._note_acceptance_format_rejection(
+            snapshot, node_id, active, rejection_code
+        )
+        if count >= ACCEPTANCE_FORMAT_REJECTION_LIMIT:
+            self._escalate_acceptance_format_rejection(
+                snapshot, node_id, active, reason, rejection_code, count,
+                runner, handle_id,
+            )
+            return
         current["reason"] = (
             "acceptance report format error; "
             "the same session can correct and re-report"
         )
-        self._record(
-            snapshot,
-            "acceptance_rejected",
-            {
-                "run_id": snapshot.run_id,
-                "node_id": node_id,
-                "reason": redact_provider_text(reason),
-                "recoverable": True,
-            },
-            active,
+        event_data = {
+            "run_id": snapshot.run_id,
+            "node_id": node_id,
+            "reason": redact_provider_text(reason),
+            "recoverable": True,
+        }
+        if isinstance(rejection_code, str) and rejection_code:
+            event_data["rejection_code"] = rejection_code
+        event_data["rejection_count"] = count
+        if extra_event_data:
+            event_data.update(extra_event_data)
+        self._record(snapshot, "acceptance_rejected", event_data, active)
+
+    def _note_acceptance_format_rejection(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        active: Optional[Dict[str, Any]],
+        rejection_code: Optional[str],
+    ) -> int:
+        """Count one consecutive format rejection for the same session.
+
+        The count is keyed by the active task's handle and generation, both of
+        which survive a crash because the counter lives on the durable node
+        record (not in memory): a corrected re-report reaches acceptance and
+        clears it, a new dispatch generation starts a fresh count, and the same
+        unchanged delivery re-read on every tick keeps raising it -- exactly the
+        signal that distinguishes "the session will fix this" from "nobody can
+        re-report this" (#255).  Returns the new count.
+        """
+        current = snapshot.nodes[node_id]
+        task = active if isinstance(active, dict) else {}
+        record = current.get("acceptance_format_rejections")
+        count = 1
+        if (
+            isinstance(record, dict)
+            and record.get("handle_id") == task.get("handle_id")
+            and record.get("generation") == task.get("generation")
+        ):
+            try:
+                count = int(record.get("count", 0)) + 1
+            except (TypeError, ValueError):
+                count = 1
+        current["acceptance_format_rejections"] = {
+            "role": task.get("role"),
+            "handle_id": task.get("handle_id"),
+            "generation": task.get("generation"),
+            "count": count,
+            "last_code": rejection_code,
+        }
+        return count
+
+    def _escalate_acceptance_format_rejection(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        active: Optional[Dict[str, Any]],
+        reason: str,
+        rejection_code: Optional[str],
+        count: int,
+        runner: Optional[Runner] = None,
+        handle_id: Optional[str] = None,
+    ) -> None:
+        """Stop the rejection replay loop and make the stall visible (#255).
+
+        Retiring the re-report channel is deliberate, not a new brick: the
+        session that produced the payload has already spent
+        ``ACCEPTANCE_FORMAT_REJECTION_LIMIT`` re-reads unable to correct it, so
+        continuing to poll it can only replay the same delivery.  The node is
+        parked as ``blocked_unknown`` (user-visible, run-level status follows),
+        the durable counter keeps ``count``/``last_code`` for the audit trail,
+        and ``recovery_action`` names the human entries: reshape the delivery
+        per the pinned schema and re-deliver through ``vibe reconcile``
+        (``Monitor.reconcile_evidence`` replays ordinary delivered/accepted
+        events on the original bindings), or ``vibe requeue`` to re-dispatch.
+        The integration reviewer's reshaped claim closes through
+        ``Monitor.record_integration_review``.
+        """
+        current = snapshot.nodes[node_id]
+        current["status"] = "blocked_unknown"
+        current["reason"] = (
+            "acceptance report format rejected {} times; "
+            "no live session can correct and re-report".format(count)
         )
+        current["recovery_action"] = ACCEPTANCE_FORMAT_ESCALATION_RECOVERY
+        current["active_role"] = None
+        current["active_task"] = None
+        # The retry marker is what could re-activate this same session on the
+        # next resume; an un-reportable delivery must not consume it.
+        current["retryable_action"] = None
+        # A quarantine means "the same task may still be resumed"; the
+        # escalated rejection is the opposite claim -- nobody alive can
+        # re-report.  Leaving it would let the delivered-developer
+        # continuation recovery re-dispatch the node on the same tick and
+        # silently overwrite the parked state.
+        current["quarantine"] = None
+        snapshot.handles.pop(node_id, None)
+        record = current.get("acceptance_format_rejections")
+        if isinstance(record, dict):
+            record["escalated"] = True
+        role = active.get("role") if isinstance(active, dict) else None
+        stopped = False
+        if role == "reviewer":
+            # Only a *proven* stop may make the retired reviewer terminal: a
+            # visible successor is registered over a stopped/failed/archived
+            # predecessor (``provider_action.task_binding`` and
+            # ``save_task_binding`` enforce it), so a terminal status written
+            # without proof would let a second writer in beside a session
+            # that may still be alive.  Repeated format rejections do not
+            # prove the session ended.  ``runner.stop`` does: claude-bg stops
+            # the session for real, and provider_action returns at once for a
+            # handle whose terminal wait it already confirmed (the delivered
+            # report).  Without that proof the binding stays non-terminal and
+            # no replacement is armed; the human entry is ``vibe reconcile``.
+            # ``_stop_active_for_transition`` is not reused: on failure it
+            # re-parks the node with a different reason and recovery action,
+            # while this escalation already parked it as documented.
+            if runner is not None and isinstance(handle_id, str) and handle_id:
+                try:
+                    runner.stop(RunHandle(handle_id))
+                    self._set_binding_status(snapshot, node_id, "reviewer", "stopped")
+                    stopped = True
+                except Exception:
+                    stopped = False
+        if role in {"developer", "reviewer"} and not stopped:
+            # Same non-terminal status ``_mark_blocked_unknown`` writes: the
+            # identity is parked, never released to a successor.
+            try:
+                self._set_binding_status(snapshot, node_id, str(role), "blocked_unknown")
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                pass
+        if role == "reviewer" and stopped:
+            # Arm the reviewer-replacement recovery (same markers #153 stamps):
+            # `vibe repair` then re-dispatches the review under a fresh
+            # reviewer identity instead of resuming the session that could not
+            # produce a well-formed report.
+            current["reviewer_replacement_required"] = True
+            current["reviewer_started"] = False
+            current["pair_archived"] = True
+            # Keep the stopped identity as the successor predecessor, the same
+            # marker #153 and the reviewer-write-violation path stamp, so the
+            # replacement review cannot accidentally reuse it.
+            current["reviewer_identity"] = (
+                active.get("task_id") if isinstance(active, dict) else None
+            )
+        event_data = {
+            "run_id": snapshot.run_id,
+            "node_id": node_id,
+            "reason": redact_provider_text(reason),
+            # Escalated rejections are no longer same-session recoverable; the
+            # recovery path is the human one named in recovery_action.
+            "recoverable": False,
+            "rejection_count": count,
+        }
+        if isinstance(rejection_code, str) and rejection_code:
+            event_data["rejection_code"] = rejection_code
+        self._record(snapshot, "acceptance_rejected", event_data, active)
 
     def _apply_event(
         self,
@@ -5735,19 +5959,21 @@ class Monitor:
                     if gate.classification == "acceptance_rejected":
                         # Pure artifact-format gap: audit the rejection, keep
                         # the handle and binding so the same task can
-                        # re-report a corrected delivery in this session.
-                        self._record(
+                        # re-report a corrected delivery in this session.  The
+                        # structured code names the missing artifact fields;
+                        # the free-text reasons stay redacted beside it.
+                        self._reject_acceptance_format(
                             snapshot,
-                            "acceptance_rejected",
+                            node_id,
+                            active,
+                            "; ".join(gate.reasons),
+                            gate.code,
                             {
-                                "run_id": snapshot.run_id,
-                                "node_id": node_id,
-                                "reason": "; ".join(gate.reasons),
                                 "disposition": gate.classification,
                                 "finding": list(gate.reasons),
-                                "recoverable": True,
                             },
-                            active,
+                            runner=runner,
+                            handle_id=handle_id,
                         )
                         self._save_snapshot(snapshot)
                         return
@@ -5768,10 +5994,11 @@ class Monitor:
                     snapshot, node_id, event, current
                 )
                 if review_failure is not None:
-                    reason, recoverable = review_failure
+                    reason, recoverable, code = review_failure
                     if recoverable:
                         self._reject_acceptance_format(
-                            snapshot, node_id, active, reason
+                            snapshot, node_id, active, reason, code,
+                            runner=runner, handle_id=handle_id,
                         )
                         return
                     self._mark_blocked_unknown(snapshot, node_id, reason)
@@ -6230,13 +6457,16 @@ class Monitor:
                 # the handle is popped.  A malformed claim is a format error
                 # the same reviewer can correct and re-report on its live
                 # handle; bricking here destroyed every recovery path first.
-                integration_package, rejection, recoverable = (
+                # The rejection rides with its structured code (#254) so the
+                # redacted free text never loses the failure class.
+                integration_package, rejection, recoverable, rejection_code = (
                     self._derive_integration_acceptance(snapshot, evidence)
                 )
                 if rejection is not None:
                     if recoverable:
                         self._reject_acceptance_format(
-                            snapshot, node_id, active, rejection
+                            snapshot, node_id, active, rejection, rejection_code,
+                            runner=runner, handle_id=handle_id,
                         )
                         return
                     self._mark_blocked_unknown(snapshot, node_id, rejection)
@@ -6269,6 +6499,9 @@ class Monitor:
                     node_id,
                     active,
                     REVERSE_BLOCK_REASON,
+                    "acceptance_evidence:missing",
+                    runner=runner,
+                    handle_id=handle_id,
                 )
                 return
             acceptance_event = RunEvent(
@@ -6296,8 +6529,10 @@ class Monitor:
                 "contract_digest": current["contract_digest"],
                 "authorization_epoch": snapshot.authorization_digest,
             }
-            # A corrected re-report must not keep the rejection text.
+            # A corrected re-report must not keep the rejection text -- nor the
+            # #255 consecutive-rejection counter the same session raised.
             current["reason"] = None
+            current.pop("acceptance_format_rejections", None)
             current["active_role"] = None
             current["active_task"] = None
             current["quarantine"] = None
@@ -6627,11 +6862,13 @@ class Monitor:
         """Pure validation of the in-session review evidence; no writes.
 
         Returns ``None`` when the delivery may be accepted, otherwise
-        ``(reason, recoverable)``.  Missing or malformed evidence and a
-        foreign protocol pointer are format errors (recoverable -- the same
-        worker session can correct and re-report on its live handle, per
-        ISSUE-83); an unreadable or drifted node contract is an evidence
-        problem and stays fail-closed.
+        ``(reason, recoverable, code)``.  ``code`` (#254) is the stable
+        machine-readable rejection class that survives the provider-text
+        redaction the free-text ``reason`` goes through on persistence.
+        Missing or malformed evidence and a foreign protocol pointer are
+        format errors (recoverable -- the same worker session can correct and
+        re-report on its live handle, per ISSUE-83); an unreadable or drifted
+        node contract is an evidence problem and stays fail-closed.
         """
         review = event.data.get("in_session_review")
         clearance = review.get("clearance") if isinstance(review, dict) else None
@@ -6649,7 +6886,11 @@ class Monitor:
             and bool(evidence_ref.strip())
         )
         if not valid:
-            return "visible-sdd delivery lacks verifiable in-session review evidence", True
+            return (
+                "visible-sdd delivery lacks verifiable in-session review evidence",
+                True,
+                "sdd_review:missing_evidence",
+            )
         blocked_unknowns = review.get("blocked_unknowns", [])
         if not isinstance(blocked_unknowns, list) or any(
             not isinstance(item, str) or not item.strip() for item in blocked_unknowns
@@ -6660,12 +6901,17 @@ class Monitor:
             return (
                 "visible-sdd in-session review blocked_unknowns must be a list of non-empty strings",
                 True,
+                "sdd_review:blocked_unknowns_shape",
             )
         if review.get("protocol") != VISIBLE_SDD_PROTOCOL_REF:
             # The session must have followed the protocol shipped with this
             # package; a different or missing pointer is not the visible-sdd
             # review this acceptance certifies.
-            return "visible-sdd delivery cites an unknown in-session review protocol", True
+            return (
+                "visible-sdd delivery cites an unknown in-session review protocol",
+                True,
+                "sdd_review:unknown_protocol",
+            )
         environment_facts_ref = review.get("environment_facts_ref")
         if not isinstance(environment_facts_ref, str) or not environment_facts_ref.strip():
             # The shipped protocol (visible-sdd-worker.md section 3) makes
@@ -6677,6 +6923,7 @@ class Monitor:
             return (
                 "visible-sdd in-session review environment_facts_ref must be a non-empty string",
                 True,
+                "sdd_review:environment_facts_ref_missing",
             )
         # Coverage denominator (protocol section 2.5 step 0): the review must
         # state how many of the reviewable files it actually covered.  Without
@@ -6691,7 +6938,7 @@ class Monitor:
             review.get("coverage") if isinstance(review, dict) else None
         )
         if coverage_failure is not None:
-            return coverage_failure, True
+            return coverage_failure, True, "sdd_review:coverage_invalid"
         # ISSUE-02: the acceptance evidence is bound to the node contract it
         # reviewed.  The carried digest is the dispatch-time node digest and
         # must still equal the digest recomputed from the live contract; an
@@ -6702,11 +6949,16 @@ class Monitor:
                 node_id, current.get("contract_digest")
             )
         except ValueError as error:
-            return "visible-sdd acceptance refused: {}".format(error), False
+            return (
+                "visible-sdd acceptance refused: {}".format(error),
+                False,
+                "sdd_review:contract_unreadable",
+            )
         if not live_digest_matches:
             return (
                 "visible-sdd acceptance refused: contract digest does not match the live node contract",
                 False,
+                "sdd_review:contract_digest_drift",
             )
         return None
 
@@ -6827,7 +7079,7 @@ class Monitor:
         evidence_ref = review.get("evidence_ref") if isinstance(review, dict) else None
         failure = self._validate_visible_sdd_review(snapshot, node_id, event, current)
         if failure is not None:
-            reason, _recoverable = failure
+            reason, _recoverable, _code = failure
             self._mark_blocked_unknown(snapshot, node_id, reason)
             return
         if self._undisposed_blocked_unknowns(
@@ -6914,8 +7166,10 @@ class Monitor:
             "contract_digest": current["contract_digest"],
             "authorization_epoch": snapshot.authorization_digest,
         }
-        # A corrected re-report must not keep the rejection text.
+        # A corrected re-report must not keep the rejection text -- nor the
+        # #255 consecutive-rejection counter the same session raised.
         current["reason"] = None
+        current.pop("acceptance_format_rejections", None)
         current["review_clearance"] = {"p0": 0, "p1": 0, "p2": 0}
         current["blocked_unknowns_pending"] = []
         current["quarantine"] = None
@@ -7179,12 +7433,14 @@ class Monitor:
         before = {key: current.get(key) for key in ("task_id", "generation", "writer", "lease", "cursor", "intent_digest", "contract_digest")}
         reason = str(current.get("reason") or "repair requested")
         if (
-            current.get("recovery_action") == "change_reviewer_or_split_node"
+            current.get("recovery_action")
+            in {"change_reviewer_or_split_node", ACCEPTANCE_FORMAT_ESCALATION_RECOVERY}
             and current.get("reviewer_replacement_required")
         ):
-            # A three-round unconverged review loop (#153) is repaired by
-            # replacing the reviewer identity, not by re-polling the stopped
-            # task.  Every identity field stays untouched (so
+            # A three-round unconverged review loop (#153) -- or an acceptance
+            # whose format was rejected past the escalation limit (#255) -- is
+            # repaired by replacing the reviewer identity, not by re-polling
+            # the stopped task.  Every identity field stays untouched (so
             # ``preserved_identity`` remains true); only the live handle is
             # retired and a retry marker queues the successor review for the
             # scheduler, which dispatches it with a fresh reviewer task id.
@@ -8251,8 +8507,12 @@ class Monitor:
                     "authorization_epoch": authorization_epoch,
                 }
                 # Match the live path: a replayed acceptance must not
-                # resurrect the rejection text the lost snapshot carried.
+                # resurrect the rejection text the lost snapshot carried -- nor
+                # the #255 consecutive-rejection counter it raised, nor the
+                # escalation recovery action the parked node carried.
                 current["reason"] = None
+                current.pop("acceptance_format_rejections", None)
+                current["recovery_action"] = None
                 current["active_role"] = None
                 current["active_task"] = None
                 current["quarantine"] = None

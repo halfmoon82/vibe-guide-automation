@@ -206,6 +206,16 @@ _EVENT_DATA_KEYS = {
     "retryable_same_task",
     "recoverable",
     "same_task_required",
+    # rejection_code / rejection_count (#254/#255): the machine-readable
+    # acceptance-format rejection code (built only from program constants --
+    # error class plus claim key names / expected types) and the consecutive
+    # rejection count for the same session.  Both live on non-provider-text
+    # keys on purpose: the free-text `reason` next to them is redacted on
+    # write, and without the code an auditor could not tell a wrong key set
+    # from a wrong type from an empty value, nor see the replay loop the
+    # count makes visible.
+    "rejection_code",
+    "rejection_count",
     "attempt",
     "reason_class",
     "next_retry_at",

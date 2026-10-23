@@ -511,28 +511,49 @@ class MailboxClosesTheRunTests(unittest.TestCase):
         recorded, the binding flipped and the handle popped before the schema
         said no, leaving no recovery path.  Validate-first rejects it as pure
         audit: no lifecycle event, live handle, same session may re-report.
+
+        ISSUE-255: when the same session re-reports the same malformed claim
+        past ``ACCEPTANCE_FORMAT_REJECTION_LIMIT`` re-reads there is nobody
+        left to correct it, so the rejection escalates instead of replaying
+        forever: the handle retires, the node parks ``blocked_unknown`` with
+        the recovery action naming the human entry, and the durable counter
+        keeps the count for the audit trail.  Still never accepted, still no
+        closeout, and the escalation leaves the re-delivery path open.
         """
         result, snapshot = self.serve("P0-P2 cleared")
         self.assertNotEqual(result.payload["status"], "complete", result.payload)
         node = snapshot.nodes["integration-review"]
         self.assertNotEqual(node["status"], "accepted")
         self.assertEqual(snapshot.integration_review_evidence, {})
-        # The stable signals of a live re-report channel: the reviewer handle
-        # and its active task were never consumed, and every malformed report
-        # landed as a recoverable audit event rather than a lifecycle
-        # transition.  (Node `status` itself is not a stable signal here --
-        # the pre-existing "provider wait is pending" visibility flicker
-        # rewrites it between polls and the next poll repairs it.)
-        self.assertIn("integration-review", snapshot.handles)
-        self.assertIsInstance(node.get("active_task"), dict)
         events = load_events(self.paths, snapshot.run_id)
         rejections = [
             record for record in events
             if record["event"] == "acceptance_rejected"
             and record["data"].get("node_id") == "integration-review"
         ]
-        self.assertTrue(rejections, events)
-        self.assertTrue(rejections[0]["data"].get("recoverable"))
+        self.assertEqual(len(rejections), monitor.ACCEPTANCE_FORMAT_REJECTION_LIMIT, rejections)
+        # Every rejection below the limit stayed same-session recoverable.
+        for record in rejections[:-1]:
+            self.assertTrue(record["data"].get("recoverable"))
+        escalated = rejections[-1]
+        self.assertFalse(escalated["data"].get("recoverable"))
+        self.assertEqual(
+            escalated["data"].get("rejection_code"), "claim_shape:not_an_object"
+        )
+        self.assertEqual(
+            escalated["data"].get("rejection_count"),
+            monitor.ACCEPTANCE_FORMAT_REJECTION_LIMIT,
+        )
+        self.assertNotIn("integration-review", snapshot.handles)
+        self.assertEqual(node["status"], "blocked_unknown")
+        self.assertEqual(
+            node.get("recovery_action"),
+            monitor.ACCEPTANCE_FORMAT_ESCALATION_RECOVERY,
+        )
+        self.assertEqual(
+            node["acceptance_format_rejections"]["count"],
+            monitor.ACCEPTANCE_FORMAT_REJECTION_LIMIT,
+        )
         self.assertEqual(
             [r for r in events if r["event"] == "accepted"
              and r["data"].get("node_id") == "integration-review"],
@@ -591,7 +612,15 @@ class MailboxClosesTheRunTests(unittest.TestCase):
         # ISSUE-83: a malformed verdict is rejected for re-report on the live
         # handle; it no longer bricks the run, and it never reported complete.
         self.assertNotEqual(node["status"], "accepted")
-        self.assertIn("integration-review", snapshot.handles)
+        # ISSUE-255: the same verdict keeps coming back un-corrected, so past
+        # the escalation limit the re-report channel retires and the stall
+        # parks visible with a human recovery action instead of replaying.
+        self.assertNotIn("integration-review", snapshot.handles)
+        self.assertEqual(node["status"], "blocked_unknown")
+        self.assertEqual(
+            node.get("recovery_action"),
+            monitor.ACCEPTANCE_FORMAT_ESCALATION_RECOVERY,
+        )
         self.assertEqual(snapshot.integration_review_evidence, {})
 
     def test_the_scope_the_reviewer_is_held_to_comes_from_the_plan(self):

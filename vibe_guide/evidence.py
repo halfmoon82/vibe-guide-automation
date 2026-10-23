@@ -5,7 +5,7 @@ from enum import Enum
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 from copy import deepcopy
 
 from .paths import ProjectPaths
@@ -22,6 +22,23 @@ class DeliveryEvidence:
     def complete(self) -> bool:
         return self.status == "DELIVERED"
 
+    @property
+    def code(self) -> Optional[str]:
+        """Stable machine-readable class for a format gap, else ``None``.
+
+        The ``reasons`` are persisted as provider text and redact to a single
+        placeholder, so an auditor cannot tell which artifact field was
+        missing.  This code (#254) is built only from the fixed reason
+        literals -- e.g. ``delivery_evidence:missing_completion_marker`` --
+        and survives redaction.
+        """
+        if self.classification != "acceptance_rejected":
+            return None
+        slugs = [_DELIVERY_FORMAT_REASON_CODES.get(reason) for reason in self.reasons]
+        if any(slug is None for slug in slugs):
+            return None
+        return "delivery_evidence:" + "+".join(sorted(slugs))
+
     def to_dict(self) -> Dict[str, Any]:
         return {"status": self.status, "reasons": list(self.reasons), "classification": self.classification}
 
@@ -31,6 +48,15 @@ _DELIVERY_FORMAT_REASONS = (
     "delivery path is missing",
     "terminal thread status is missing",
 )
+
+# Fixed slugs for the delivery-artifact format reasons above.  Keyed by the
+# literal so a new reason without a slug fails closed (``code`` is ``None``)
+# instead of inventing a spelling at runtime.
+_DELIVERY_FORMAT_REASON_CODES = {
+    "completion marker is missing": "missing_completion_marker",
+    "delivery path is missing": "missing_delivery_path",
+    "terminal thread status is missing": "missing_thread_status",
+}
 
 
 def evaluate_delivery_evidence(
@@ -157,6 +183,33 @@ INTEGRATION_REVIEW_CLAIM_KEYS = frozenset({
 })
 
 
+class IntegrationClaimFormatError(ValueError):
+    """A malformed integration reviewer claim, with a machine-readable code.
+
+    The free-text message stays provider text (persistence redacts it), so an
+    auditor cannot tell a wrong key set from a wrong type from an empty value
+    once the reason lands on disk.  ``code`` closes that gap (#254): it is
+    built exclusively from program constants -- the claim key names and the
+    expected types -- never from reviewer-supplied text, so it survives the
+    provider-text redaction and can be pinned by tests.
+
+    Shapes (stable, assertable):
+      ``claim_shape:not_an_object``
+      ``claim_shape:unexpected_keys:missing_<sorted constant keys>``
+      ``claim_shape:unexpected_keys:extra_only``
+      ``claim_shape:type:<key>:list`` / ``claim_shape:type:<key>:object``
+      ``claim_shape:<verdict key>:empty_evidence``
+      ``claim_findings:invalid_entry`` / ``:invalid_severity`` / ``:invalid_status``
+
+    It stays a ``ValueError`` subclass so every existing ``except ValueError``
+    caller (including ``_derive_integration_acceptance``) keeps working.
+    """
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def _snapshot_value(snapshot: Any, key: str, default: Any = None) -> Any:
     if isinstance(snapshot, dict):
         return snapshot.get(key, default)
@@ -226,13 +279,19 @@ def _open_finding_counts(findings: Any) -> Dict[str, int]:
     observation_severities = {"p3", "p4"}
     for finding in findings:
         if not isinstance(finding, dict):
-            raise ValueError("integration finding schema is invalid")
+            raise IntegrationClaimFormatError(
+                "integration finding schema is invalid", "claim_findings:invalid_entry"
+            )
         severity = str(finding.get("severity", "")).lower()
         if severity not in open_counts and severity not in observation_severities:
-            raise ValueError("integration finding schema is invalid")
+            raise IntegrationClaimFormatError(
+                "integration finding schema is invalid", "claim_findings:invalid_severity"
+            )
         status = str(finding.get("status", finding.get("resolution", ""))).lower()
         if status not in {"open", "resolved", "accepted", "waived"}:
-            raise ValueError("integration finding status is invalid")
+            raise IntegrationClaimFormatError(
+                "integration finding status is invalid", "claim_findings:invalid_status"
+            )
         if severity in open_counts and status != "resolved":
             open_counts[severity] += 1
     return open_counts
@@ -313,12 +372,34 @@ def build_integration_review_evidence(
     held to.
     """
     if not isinstance(claim, dict) or set(claim) != INTEGRATION_REVIEW_CLAIM_KEYS:
-        raise ValueError(
+        # One message for every key-set deviation (the shipped schema must
+        # stay namable from the reason alone), but a distinct stable code per
+        # shape so the persisted audit trail keeps the distinction (#254).
+        # Missing keys are program constants, so they are named in the code;
+        # unexpected keys are reviewer-supplied text, so only their absence of
+        # pattern ("extra_only") is recorded -- never the key names.
+        missing = (
+            sorted(INTEGRATION_REVIEW_CLAIM_KEYS - set(claim))
+            if isinstance(claim, dict)
+            else sorted(INTEGRATION_REVIEW_CLAIM_KEYS)
+        )
+        code = (
+            "claim_shape:unexpected_keys:missing_" + "_".join(missing)
+            if missing
+            else "claim_shape:unexpected_keys:extra_only"
+        )
+        raise IntegrationClaimFormatError(
             "integration review claim must be an object with exactly these keys: "
-            + ", ".join(sorted(INTEGRATION_REVIEW_CLAIM_KEYS))
+            + ", ".join(sorted(INTEGRATION_REVIEW_CLAIM_KEYS)),
+            code if isinstance(claim, dict) else "claim_shape:not_an_object",
         )
     if not isinstance(claim["findings"], list) or not isinstance(claim["out_of_scope"], list):
-        raise ValueError("integration review claim findings and out_of_scope must be lists")
+        raise IntegrationClaimFormatError(
+            "integration review claim findings and out_of_scope must be lists",
+            "claim_shape:type:{}:list".format(
+                "findings" if not isinstance(claim["findings"], list) else "out_of_scope"
+            ),
+        )
     for key in ("iteration_compatibility", "test_runtime_delivery"):
         verdict = claim[key]
         # The justification has to be text: persistence redacts any value under
@@ -326,8 +407,11 @@ def build_integration_review_evidence(
         # sensitive -- so `{"secret_scan": "clean"}` was written as `{}` and the
         # reload-time validator then rejected the whole completed run.
         if not isinstance(verdict, dict) or not isinstance(verdict.get("evidence"), str) or not verdict["evidence"].strip():
-            raise ValueError(
-                "integration review claim {} needs a status and a non-empty evidence string".format(key)
+            raise IntegrationClaimFormatError(
+                "integration review claim {} needs a status and a non-empty evidence string".format(key),
+                "claim_shape:type:{}:object".format(key)
+                if not isinstance(verdict, dict)
+                else "claim_shape:{}:empty_evidence".format(key),
             )
     nodes = _snapshot_value(snapshot, "nodes", {})
     package = {
