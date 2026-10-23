@@ -45,7 +45,9 @@ from .supervisor_wakeup import idle_heartbeat_minutes, preflight_with_checkpoint
 from .supervisor import (
     Supervisor,
     contract_drift as supervisor_contract_drift,
+    authorization_card_summary,
     current_supervisor_address,
+    supervisor_mailbox_view,
     register_supervisor_address,
     release_supervisor_hold,
     set_supervisor_hold,
@@ -141,7 +143,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue'),
+        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue'),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
@@ -1983,6 +1985,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         except (OSError, TypeError, ValueError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)[:200]}, "输出批次已阻塞", args.as_json)
 
+    if args.command == "supervisor-mailbox":
+        if not args.run_id:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        payload = supervisor_mailbox_view(paths, args.run_id)
+        return _result(SUCCESS if payload["status"] == "ok" else UNKNOWN, payload, json.dumps(payload, ensure_ascii=False), args.as_json)
+
     if args.command == "supervisor-beat":
         if not args.run_id:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
@@ -2833,9 +2841,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             # The draft is gone once published; republishing under a new id
             # passes this back as --s1 to keep the same route.
             "s1": _s1_arg(entry),
-            "plan": plan.to_dict(),
+            # Screen output is slim; plan.json, nodes.json and the full card
+            # stay on disk as the authority (issue #216).
+            "plan": {"plan_id": plan.plan_id, "version": plan.version,
+                     "path": str(_plan_root(paths, plan.plan_id).resolve() / "plan.json")},
             "nodes": [node.id for node in nodes],
-            "authorization_card": card.to_dict(),
+            "authorization_card": authorization_card_summary(paths, plan.plan_id, card.to_dict()),
             "authorization_digest": card.digest,
         }
         approved_handoff = build_stage_handoff(
@@ -2916,6 +2927,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 "plan_id": args.plan,
                 "route": workflow.get("route"),
                 "recorded_nodes": list(workflow.get("nodes") or []),
+                "authorization_card": authorization_card_summary(paths, args.plan),
                 "authorization_granted": bool(workflow.get("authorization_granted")),
             },
             "十节点门禁证据已记录，可以启动监工",
