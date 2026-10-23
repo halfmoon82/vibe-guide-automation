@@ -179,6 +179,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", dest="supervisor_provider")
     parser.add_argument("--session-id", dest="session_id")
     parser.add_argument("--host", dest="supervisor_host")
+    parser.add_argument("--wake-target", dest="wake_target",
+                        help="supervisor-register: 工人唤醒本监工时 SendMessage 用的会话名（缺省用 --session-id）")
     parser.add_argument("--context-hard-cap", dest="context_hard_cap", type=int, default=None)
     parser.add_argument("--token-threshold", dest="token_threshold", type=int, default=None)
     parser.add_argument("--reason", dest="hold_reason")
@@ -2133,6 +2135,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 "provider": args.supervisor_provider,
                 "session_id": args.session_id,
                 "host": args.supervisor_host,
+                "wake_target": args.wake_target,
             }, session_record=args.session_record)
         except (TypeError, ValueError, OSError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "登记失败：" + str(error), args.as_json)

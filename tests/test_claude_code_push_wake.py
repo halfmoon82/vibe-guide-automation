@@ -40,6 +40,14 @@ class ClaudeCodePushWakeTests(unittest.TestCase):
         self.assertEqual(
             wake["signal"], "vibe-wake run=run-1 node=n1 role=developer generation=5")
 
+    def test_registered_session_name_is_the_wake_target(self):
+        # A UUID session id is not addressable by SendMessage; the name is.
+        register_supervisor_address(self.paths, "run-1", {
+            "provider": "claude-code", "session_id": "60b33567-uuid", "host": "mac",
+            "wake_target": " 担任监工 "})
+        wake = current_supervisor_address(self.paths, "run-1")["wake"]
+        self.assertEqual(wake["target"], "担任监工")
+
     def _register(self, **platforms):
         (self.root / ".vibe/push-wake-verification.json").write_text(
             json.dumps({"platforms": {"claude-code": platforms}}))

@@ -1164,6 +1164,11 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
             "registered_at": time.time(),
             "lease_epoch": epoch,
         }
+        # SendMessage reaches a session by its name, not its id (real-machine
+        # trial 2026-10-23: the id was "not reachable", the name delivered).
+        wake_target = address.get("wake_target")
+        if isinstance(wake_target, str) and wake_target.strip():
+            entry["wake_target"] = wake_target.strip()
         if session_record is not None and Path(str(session_record)).expanduser().is_absolute():
             record = _read_json_file(session_record)
             baseline = _session_tokens(record) if record is not None else None
@@ -1242,7 +1247,7 @@ def wake_instruction(address, run_id, node_id=None, role=None, generation=None):
         return {"channel": None, "reason": reason}
     return {
         "channel": channel,
-        "target": address.get("session_id"),
+        "target": address.get("wake_target") or address.get("session_id"),
         "signal": wake_signal(run_id, node_id, role, generation),
     }
 
