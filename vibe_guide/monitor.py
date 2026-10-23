@@ -3,7 +3,7 @@
 import hashlib
 import json
 import re
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from datetime import datetime, timezone
 import subprocess
@@ -65,10 +65,12 @@ from .dag import (
 from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
+    RECOVERY_SIGNATURE_KEYS,
     RunSnapshot,
     _atomic_bytes,
     acquire_writer_lease,
     append_event,
+    is_redacted_value,
     load_events,
     load_snapshot,
     map_user_status,
@@ -703,6 +705,315 @@ def recovery_action_for_failure(observation: Any) -> str:
     if kind == "external_decision":
         return "await_external_decision"
     return "reconcile_binding"
+
+
+#: #256 ③: the ``recovery_action`` values a rescue may treat as the defect's
+#: own residue.  ``_mark_blocked_unknown`` derives the action from the failure
+#: reason's keywords, so a block that is *not* a defect also lands on
+#: ``reconcile_binding`` (reverse-block text is one such case) -- but any other
+#: action names a live recovery route somebody is already walking, and must
+#: keep vetoing.
+DEFECT_ADJACENT_RECOVERY_ACTIONS = frozenset({None, "reconcile_binding"})
+
+
+def defect_adjacent_marker_allows_rescue(recovery_action: Any, quarantine: Any) -> bool:
+    """Whether the #256 defect-adjacent markers permit a rescue.
+
+    ``_mark_blocked_unknown`` always stamps ``recovery_action`` plus a
+    ``quarantine`` object holding the handle the block retired.  For the
+    reverse-block residue that pair is ``reconcile_binding`` and
+    ``{"handle_id": None}``: it is the bug's fingerprint, not live work.
+    Treating either field as "somebody is still working on this" vetoes every
+    rescue of a genuinely stuck node, so the criterion is narrow:
+
+    * ``recovery_action`` must be absent or the block's own
+      ``reconcile_binding``;
+    * a ``quarantine`` still bound to a non-null ``handle_id`` is live work;
+    * a ``quarantine`` that is neither absent nor a mapping is malformed.
+
+    Fail-closed by construction: only the program-authored shapes above pass.
+    """
+    if recovery_action not in DEFECT_ADJACENT_RECOVERY_ACTIONS:
+        return False
+    if quarantine is None:
+        return True
+    if not isinstance(quarantine, dict):
+        return False
+    return quarantine.get("handle_id") is None
+
+
+@dataclass(frozen=True)
+class BindingFacts:
+    """A read-only copy of one binding's identity, taken at capture time.
+
+    ``_load_task_binding`` returns a shared/cached ``TaskBinding`` and both
+    ``_set_binding_status`` and ``_archive_pair`` mutate its ``status`` in
+    place.  A rollback that re-reads the object therefore sees the
+    post-mutation value and turns itself into a no-op -- exactly the #249
+    ``019a619`` trace.  Gates capture this copy before the first mutation and
+    roll back from it (#256 ①).
+    """
+
+    role: str
+    status: Optional[str]
+    task_id: Optional[str]
+    generation: Optional[int]
+
+    def __post_init__(self) -> None:
+        # ``frozen=True`` blocks attribute rebinding but not a field that holds
+        # a mutable list/dict, which would make "read-only copy" a convention
+        # instead of a property.  Pinning the field types keeps it executable.
+        for name in ("status", "task_id", "generation"):
+            value = getattr(self, name)
+            if not isinstance(value, (str, int, type(None))):
+                raise TypeError(
+                    "binding fact {} must be a scalar, not {}".format(
+                        name, type(value).__name__
+                    )
+                )
+
+    @classmethod
+    def capture(cls, role: str, binding: Any) -> "BindingFacts":
+        return cls(
+            role=role,
+            status=getattr(binding, "status", None),
+            task_id=getattr(binding, "task_id", None),
+            generation=getattr(binding, "generation", None),
+        )
+
+
+@dataclass(frozen=True)
+class RecoveryFacts:
+    """The facts a recovery or rollback gate may decide on (#256 ①).
+
+    Two rules make the decision reproducible:
+
+    1. **Structural fields only.**  Every field is read from the snapshot node
+       and deep-copied at capture time, so a later mutation of the live node
+       mapping cannot change what the gate decided on.  The provider-text
+       ``reason`` is carried solely so a rollback can put it back -- no gate
+       may compare it, because persistence redacts it (``RECOVERY_SIGNATURE_KEYS``).
+    2. **Unreadable facts fail closed.**  If a signature fact reads back as a
+       redaction placeholder, ``unreadable`` names it and the gate refuses:
+       comparing against ``[REDACTED_PROVIDER_TEXT]`` can only produce the
+       silent miss this contract exists to prevent.
+
+    Bindings are captured separately (``BindingFacts``) because they live in
+    the task registry and are shared mutable objects.
+    """
+
+    node_id: str
+    status: Optional[str]
+    contract_digest: Optional[str]
+    acceptance: Optional[Dict[str, Any]]
+    review_clearance: Optional[Dict[str, Any]]
+    recovery_action: Any
+    quarantine: Any
+    pair_archived: bool
+    active_task: Any
+    active_role: Any
+    start_intent: Any
+    retryable_action: Any
+    handle_registered: bool
+    reviewer_identity: Optional[str]
+    review_generation: Any
+    reason: Any
+
+    #: ``(field, snapshot key)`` for every fact the gate decides on.  Each key
+    #: must be declared structural in ``state.RECOVERY_SIGNATURE_KEYS``;
+    #: ``__post_init__`` refuses a capture that would decide on a key
+    #: persistence may redact.  ``reason`` is deliberately absent: it is
+    #: provider text carried only so a rollback can restore it, never compared.
+    SIGNATURE_FIELDS = (
+        ("status", "status"),
+        ("contract_digest", "contract_digest"),
+        ("acceptance", "acceptance"),
+        ("review_clearance", "review_clearance"),
+        ("recovery_action", "recovery_action"),
+        ("quarantine", "quarantine"),
+        ("pair_archived", "pair_archived"),
+        ("active_task", "active_task"),
+        ("active_role", "active_role"),
+        ("start_intent", "start_intent"),
+        ("retryable_action", "retryable_action"),
+        ("reviewer_identity", "reviewer_identity"),
+        ("review_generation", "review_generation"),
+    )
+
+    def __post_init__(self) -> None:
+        stray = [
+            key
+            for _field, key in self.SIGNATURE_FIELDS
+            if key not in RECOVERY_SIGNATURE_KEYS
+        ]
+        if stray:
+            raise ValueError(
+                "recovery facts must be structural: " + ", ".join(sorted(stray))
+            )
+
+    @classmethod
+    def capture(
+        cls, node_id: str, node: Dict[str, Any], handle_registered: bool = False
+    ) -> "RecoveryFacts":
+        values = {
+            field: copy.deepcopy(node.get(key)) for field, key in cls.SIGNATURE_FIELDS
+        }
+        values["pair_archived"] = bool(values["pair_archived"])
+        return cls(
+            node_id=node_id,
+            handle_registered=bool(handle_registered),
+            reason=copy.deepcopy(node.get("reason")),
+            **values,
+        )
+
+    @property
+    def acceptance_contract_digest(self) -> Any:
+        acceptance = self.acceptance if isinstance(self.acceptance, dict) else {}
+        return acceptance.get("contract_digest")
+
+    @property
+    def authorization_epoch(self) -> Any:
+        acceptance = self.acceptance if isinstance(self.acceptance, dict) else {}
+        return acceptance.get("authorization_epoch")
+
+    @property
+    def unreadable(self) -> Tuple[str, ...]:
+        """Signature facts that read back as a redaction placeholder."""
+        candidates = (
+            ("status", self.status),
+            ("contract_digest", self.contract_digest),
+            ("acceptance.contract_digest", self.acceptance_contract_digest),
+            ("acceptance.authorization_epoch", self.authorization_epoch),
+            ("recovery_action", self.recovery_action),
+            ("reviewer_identity", self.reviewer_identity),
+        )
+        return tuple(name for name, value in candidates if is_redacted_value(value))
+
+
+#: #256 ④: same-type audit of the three call surfaces issue #256 names.  Each
+#: entry records the callers inspected and one of two verdicts:
+#: ``same_type_fixed`` -- the caller had the distortion and now decides on
+#: captured facts, or ``different_type`` -- the caller cannot reach the
+#: distortion, for the stated reason.  Kept as data (not prose in three
+#: docstrings) so tests/test_recovery_fidelity_256.py can pin coverage: every
+#: named site must be present with a verdict and a rationale, and
+#: ``call_sites`` -- the number of ``<receiver>.<site>(`` call expressions in
+#: this module, counted by AST in that test -- must match the real call count.
+#: Call sites inside ``except`` branches are counted too.
+RECOVERY_FIDELITY_AUDIT = (
+    {
+        "site": "_archive_pair",
+        "call_sites": 3,
+        "callers": (
+            {
+                "caller": "_recover_reverse_blocked_acceptance",
+                "verdict": "same_type_fixed",
+                "rationale": (
+                    "The only caller with a rollback.  _archive_pair flips the "
+                    "shared binding objects to archived in place, so the pass "
+                    "captures BindingFacts before the first mutation and rolls "
+                    "back from those copies instead of re-reading .status."
+                ),
+            },
+            {
+                "caller": "_apply_event",
+                "verdict": "different_type",
+                "rationale": (
+                    "No rollback reads binding state: the durable accepted "
+                    "event is recorded before any mutation and "
+                    "_reconcile_unapplied_events re-archives both bindings "
+                    "from it, so a crash between them is repaired by replay."
+                ),
+            },
+            {
+                "caller": "_accept_visible_sdd_delivery",
+                "verdict": "different_type",
+                "rationale": (
+                    "Same ordering as _apply_event (accepted event first, then "
+                    "archive) and the visible-sdd replay archives the developer "
+                    "binding itself; nothing reads a mutated status back."
+                ),
+            },
+        ),
+    },
+    {
+        "site": "_release_node_lease",
+        "call_sites": 22,
+        "callers": (
+            {
+                "caller": "_recover_reverse_blocked_acceptance",
+                "verdict": "same_type_fixed",
+                "rationale": (
+                    "Released before any lifecycle mutation inside the guarded "
+                    "block, so a failure leaves the signature intact and the "
+                    "next pass retries; no state is read after the unlink."
+                ),
+            },
+            {
+                "caller": (
+                    "_apply_event, _start_task, reauthorize, _schedule_ready "
+                    "helpers, _reconcile_unapplied_events and the remaining "
+                    "terminal-transition callers (the other 21 sites)"
+                ),
+                "verdict": "different_type",
+                "rationale": (
+                    "_release_node_lease itself reads only the node worktree "
+                    "and run id (structural), and every caller uses it as a "
+                    "terminal side effect: none wraps it in a rollback that "
+                    "then reads a binding status or a reason."
+                ),
+            },
+        ),
+    },
+    {
+        "site": "_mark_blocked_unknown",
+        "call_sites": 49,
+        "callers": (
+            {
+                "caller": (
+                    "_apply_event, _start_task, _schedule_ready, "
+                    "_accept_visible_sdd_delivery and the remaining block "
+                    "sites (the other 46 sites)"
+                ),
+                "verdict": "different_type",
+                "rationale": (
+                    "Callers pass a reason and never read the stamps back as "
+                    "evidence; the block is fail-closed by construction."
+                ),
+            },
+            {
+                "caller": "_recover_quarantined_delivered_developer",
+                "verdict": "different_type",
+                "rationale": (
+                    "Requires a quarantine mapping, but only as a precondition "
+                    "corroborated by a delivered developer binding with matching "
+                    "identity and generation -- the marker alone never unlocks "
+                    "recovery."
+                ),
+            },
+            {
+                "caller": "_schedule_ready (quarantined no-binding branch)",
+                "verdict": "different_type",
+                "rationale": (
+                    "Reads the quarantine marker to park the node for manual "
+                    "repair -- a fail-closed direction, and the #249 rescue "
+                    "that must tolerate the marker runs before it."
+                ),
+            },
+            {
+                "caller": "repair_node (reads the stamp, not a caller)",
+                "verdict": "different_type",
+                "rationale": (
+                    "Not a caller: it re-classifies from the persisted "
+                    "(redacted) reason at monitor.py repair_node, so after a "
+                    "restart it always lands on the binding_unknown branch. "
+                    "Fail-closed and pre-existing; recorded as out-of-scope "
+                    "residual for #256 follow-up, not changed here."
+                ),
+            },
+        ),
+    },
+)
 
 
 def self_heal_binding(snapshot: Any, node_id: str, observation: Any) -> HealingResult:
@@ -4275,6 +4586,12 @@ class Monitor:
         path itself, and the accepted reviewer binding of the recorded
         generation proves the same reviewer round the acceptance belongs to.
 
+        Every fact the pass decides on is captured into ``RecoveryFacts`` /
+        ``BindingFacts`` *before* the first mutation (#256 ①), and a signature
+        fact that reads back as a redaction placeholder aborts the pass
+        instead of being compared (#256 ②).  The defect-adjacent markers are
+        judged by ``defect_adjacent_marker_allows_rescue`` (#256 ③).
+
         Fail-closed: anything short of the full signature -- a different
         block cause, no written acceptance, epoch or digest drift, a live
         task/handle/intent/retry, a recovery action other than the
@@ -4283,10 +4600,11 @@ class Monitor:
         an unreadable live node contract -- leaves the node blocked for the
         human.  The closeout itself orders durable state before audit: a
         failure anywhere before the pair is fully archived restores every
-        inspected field (bindings rolled back best-effort) for a clean
-        retry; a failure of the final audit append alone keeps the durable
-        acceptance, because re-blocking an archived pair is the very
-        mutually-exclusive deadlock this pass exists to clear.
+        inspected field from the captured facts (bindings rolled back
+        best-effort) for a clean retry; a failure of the final audit append
+        alone keeps the durable acceptance, because re-blocking an archived
+        pair is the very mutually-exclusive deadlock this pass exists to
+        clear.
         Integration-review is excluded: its closeout needs the derived
         run-level package, which an evidence-less record cannot rebuild.
         """
@@ -4297,84 +4615,94 @@ class Monitor:
             return False
         if node_id == "integration-review":
             return False
-        if current.get("status") != "blocked_unknown":
+        # #256 ①: every decision below reads facts captured *now*.  The node
+        # mapping and the shared binding objects are mutated in place further
+        # down, so re-reading them (especially from the rollback) can only see
+        # post-mutation values -- the #249 no-op rollback.
+        facts = RecoveryFacts.capture(
+            node_id, current, handle_registered=node_id in snapshot.handles
+        )
+        if facts.unreadable:
+            # A signature fact persisted as a redaction placeholder cannot be
+            # compared; fail closed instead of silently missing (#256 ②).
             return False
-        acceptance = current.get("acceptance")
-        if not isinstance(acceptance, dict):
+        if facts.status != "blocked_unknown":
             return False
-        contract_digest = acceptance.get("contract_digest")
+        if not isinstance(facts.acceptance, dict):
+            return False
+        contract_digest = facts.acceptance_contract_digest
         if (
             not isinstance(contract_digest, str)
             or len(contract_digest) != 64
             or any(character not in "0123456789abcdef" for character in contract_digest)
-            or contract_digest != current.get("contract_digest")
-            or acceptance.get("authorization_epoch") != snapshot.authorization_digest
+            or contract_digest != facts.contract_digest
+            or facts.authorization_epoch != snapshot.authorization_digest
         ):
             return False
-        if current.get("review_clearance"):
+        if facts.review_clearance:
             # The closeout already ran; nothing left to rescue.
             return False
         if (
-            current.get("active_task") is not None
-            or current.get("active_role") is not None
-            or current.get("start_intent") is not None
-            or current.get("retryable_action") is not None
-            or node_id in snapshot.handles
+            facts.active_task is not None
+            or facts.active_role is not None
+            or facts.start_intent is not None
+            or facts.retryable_action is not None
+            or facts.handle_registered
         ):
             return False
-        # The reverse-block residue itself: ``_mark_blocked_unknown`` stamps
-        # ``reconcile_binding`` and a quarantine whose handle was already
-        # retired (handle_id null) -- that is the bug's own fingerprint, not
-        # live work.  Any other recovery action, or a quarantine still bound
-        # to a live handle, vetoes the rescue fail-closed.
-        if current.get("recovery_action") not in (None, "reconcile_binding"):
-            return False
-        quarantine = current.get("quarantine")
-        if isinstance(quarantine, dict) and quarantine.get("handle_id") is not None:
-            return False
-        if quarantine is not None and not isinstance(quarantine, dict):
+        # The reverse-block residue itself (#256 ③): ``_mark_blocked_unknown``
+        # stamps ``reconcile_binding`` and a quarantine whose handle was
+        # already retired (handle_id null) -- that is the bug's own
+        # fingerprint, not live work.  Any other recovery action, or a
+        # quarantine still bound to a live handle, vetoes the rescue
+        # fail-closed.
+        if not defect_adjacent_marker_allows_rescue(
+            facts.recovery_action, facts.quarantine
+        ):
             return False
         try:
-            registered = self._load_task_binding(snapshot, node_id, "reviewer")
+            registered = BindingFacts.capture(
+                "reviewer", self._load_task_binding(snapshot, node_id, "reviewer")
+            )
         except (FileNotFoundError, OSError, TypeError, ValueError):
             return False
         if (
             registered.status != "accepted"
-            or registered.task_id != current.get("reviewer_identity")
-            or registered.generation != current.get("review_generation")
+            or registered.task_id != facts.reviewer_identity
+            or registered.generation != facts.review_generation
         ):
             return False
         try:
-            developer_binding = self._load_task_binding(snapshot, node_id, "developer")
+            developer_binding = BindingFacts.capture(
+                "developer", self._load_task_binding(snapshot, node_id, "developer")
+            )
         except (FileNotFoundError, OSError, TypeError, ValueError):
             # ``_archive_pair`` archives both bindings; without the
             # developer binding the closeout cannot be written durably.
             return False
-        # Capture the binding statuses as plain strings *now*: the binding
-        # objects are shared/cached, and ``_archive_pair`` flips their
-        # status in place, so reading them in the rollback path would only
-        # ever see the post-archive value.
-        previous_reviewer_status = registered.status
-        previous_developer_status = developer_binding.status
         try:
             live_digest_matches = self._live_node_contract_digest_matches(
-                node_id, current.get("contract_digest")
+                node_id, facts.contract_digest
             )
         except ValueError:
             return False
         if not live_digest_matches:
             return False
-        previous_status = current.get("status")
-        previous_clearance = current.get("review_clearance")
-        previous_reason = current.get("reason")
-        previous_recovery_action = current.get("recovery_action")
-        previous_quarantine = current.get("quarantine")
-        previous_pair_archived = bool(current.get("pair_archived"))
         # Release the lease *before* any lifecycle mutation: the unlink is
         # the one step that routinely raises OSError, and an exception after
         # the bindings were archived could never re-flip them to accepted,
         # which would mint a fresh mutually-exclusive deadlock.  Ordering it
         # first keeps every failure below a pure no-op.
+        #
+        # The caught tuple is deliberately narrow and is a plain tuple of
+        # exception *classes* (a set literal would raise TypeError at runtime,
+        # and a frozenset constant could not be used in an except clause at
+        # all): OSError is the unlink failure this ordering exists for,
+        # TypeError/ValueError are what the registry validators raise.  Every
+        # other exception -- including RuntimeError and BaseException
+        # subclasses such as KeyboardInterrupt -- must propagate so the run
+        # fails loudly instead of parking the node; widening this tuple would
+        # turn a programming error into a silent "rescue declined".
         try:
             self._release_node_lease(snapshot, node_id)
         except (OSError, TypeError, ValueError):
@@ -4417,27 +4745,27 @@ class Monitor:
                 return True
             # Fail closed with zero half-done residue: restore every field
             # the signature inspected -- status, clearance, reason,
-            # recovery_action, quarantine and pair_archived -- to the
-            # captured values, and roll both bindings back to their
-            # pre-closeout statuses best-effort (``_archive_pair`` may have
-            # archived one or both before failing).  Without the rollback
-            # an archived reviewer binding would never match the signature
-            # again and the node would stay blocked forever -- the residue
-            # this rework exists to prevent.  The next scheduling pass then
-            # retries the rescue from a state no other gate can ever see as
-            # half-done.
-            current["status"] = previous_status
-            current["review_clearance"] = previous_clearance
-            current["reason"] = previous_reason
-            current["recovery_action"] = previous_recovery_action
-            current["quarantine"] = previous_quarantine
-            current["pair_archived"] = previous_pair_archived
-            for role, status in (
-                ("developer", previous_developer_status),
-                ("reviewer", previous_reviewer_status),
-            ):
+            # recovery_action, quarantine and pair_archived -- from the
+            # captured ``facts`` copy, and roll both bindings back to the
+            # statuses captured in their ``BindingFacts`` copies
+            # best-effort (``_archive_pair`` may have archived one or both
+            # before failing).  Reading either back from the live objects
+            # here would only ever see the post-mutation value and turn the
+            # rollback into a no-op (#249 ``019a619``), leaving an archived
+            # binding that never matches the signature again.  The next
+            # scheduling pass then retries the rescue from a state no other
+            # gate can ever see as half-done.
+            current["status"] = facts.status
+            current["review_clearance"] = facts.review_clearance
+            current["reason"] = facts.reason
+            current["recovery_action"] = facts.recovery_action
+            current["quarantine"] = facts.quarantine
+            current["pair_archived"] = facts.pair_archived
+            for binding in (developer_binding, registered):
                 try:
-                    self._set_binding_status(snapshot, node_id, role, status)
+                    self._set_binding_status(
+                        snapshot, node_id, binding.role, binding.status
+                    )
                 except (FileNotFoundError, OSError, TypeError, ValueError):
                     pass
             return False
@@ -7179,6 +7507,16 @@ class Monitor:
         self._release_node_lease(snapshot, node_id)
 
     def _archive_pair(self, snapshot: RunSnapshot, node_id: str) -> None:
+        """Archive both bindings of a closed node and record the audit event.
+
+        ``_set_binding_status`` mutates the shared/cached ``TaskBinding``
+        object in place, so this call destroys the pre-archive status of both
+        bindings.  A caller that may need to roll the pair back must capture
+        ``BindingFacts`` (or the plain status strings) *before* calling here;
+        reading ``.status`` afterwards only ever returns ``archived`` (#256 ①).
+        Callers without a rollback rely on the durable ``accepted`` event and
+        its replay instead; see ``RECOVERY_FIDELITY_AUDIT``.
+        """
         current = snapshot.nodes[node_id]
         roles = ("developer", "reviewer")
         if self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
@@ -7545,6 +7883,20 @@ class Monitor:
         retryable_same_task: bool = False,
         extra_event_data: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """Park a node as blocked_unknown and stamp its recovery markers.
+
+        The stamps are structural (``recovery_action``, ``quarantine`` with
+        the handle this block retires) while ``reason`` is provider text that
+        persistence redacts.  Two consequences for anything that reads them
+        back (#256):
+
+        * never match on ``reason`` -- after a restart it is
+          ``[REDACTED_PROVIDER_TEXT]``;
+        * the ``recovery_action`` / ``quarantine`` pair is the block's own
+          fingerprint, not proof of live work.  Rescue gates judge it with
+          ``defect_adjacent_marker_allows_rescue``; see
+          ``RECOVERY_FIDELITY_AUDIT`` for the call-site verdicts.
+        """
         current = snapshot.nodes[node_id]
         active = current.get("active_task")
         handle_id = snapshot.handles.get(node_id)
@@ -8837,6 +9189,13 @@ class Monitor:
             snapshot.event_sequence = record["sequence"]
 
     def _release_node_lease(self, snapshot: RunSnapshot, node_id: str) -> None:
+        """Drop the node's writer lease.
+
+        Reads only structural node fields (worktree) and the run id, so it
+        carries none of the #256 distortions; callers use it as a terminal
+        side effect and must not wrap it in a rollback that reads a binding
+        status afterwards (see ``RECOVERY_FIDELITY_AUDIT``).
+        """
         current = snapshot.nodes[node_id]
         release_writer_lease(
             self.paths,
