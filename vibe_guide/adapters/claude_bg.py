@@ -421,7 +421,20 @@ class ClaudeBgLauncher:
 
     def stop(self, task_id: str) -> None:
         short = self._short(task_id)
-        self._require_ok(self._run(self._claude("stop", short), self._worktree()), "claude stop")
+        result = self._run(self._claude("stop", short), self._worktree())
+        if result.returncode != 0:
+            # `claude stop` can fail for a session that already exited after
+            # delivering.  Its listed end state proves it is not running --
+            # the fallback `resume` uses, but stricter: `resume` only refuses
+            # `working`, while a stop must prove nothing will write again, so
+            # `blocked` (alive, waiting) and an unknown state stay failures.
+            try:
+                state = self.status(task_id)
+            except ClaudeBgUnknown:
+                state = None
+            if state in {"done", "stopped", "failed"}:
+                return
+        self._require_ok(result, "claude stop")
 
     def resume(self, task_id: str, message: str) -> None:
         # A short id would copy the session instead of continuing it.

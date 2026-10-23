@@ -279,6 +279,30 @@ class ResumeSafetyTest(LauncherCase):
         self.launcher().resume(UUID, "x")
         self.assertTrue([a for a in self.argvs() if "--resume" in a])
 
+    def test_stop_of_an_already_ended_session_is_a_proven_stop(self):
+        # `claude stop` may fail for a session that already exited after
+        # delivering (#262 follow-up); its listed end state proves the stop.
+        for state in ("done", "stopped", "failed"):
+            with self.subTest(state=state):
+                self.fake.returncodes["stop"] = 1
+                self.fake.state = state
+                self.launcher().stop(UUID)
+
+    def test_stop_failed_and_session_not_ended_still_raises(self):
+        # `blocked` waits for input: alive, and could write again.
+        for state in ("working", "blocked"):
+            with self.subTest(state=state):
+                self.fake.returncodes["stop"] = 1
+                self.fake.state = state
+                with self.assertRaises(ClaudeBgUnknown):
+                    self.launcher().stop(UUID)
+
+    def test_stop_failed_and_status_unknown_still_raises(self):
+        self.fake.returncodes["stop"] = 1
+        self.fake.agents_out = "[]"
+        with self.assertRaises(ClaudeBgUnknown):
+            self.launcher().stop(UUID)
+
     def test_copy_message_in_stderr_detected_and_copy_stopped(self):
         self.fake.resume_out = "backgrounded · %s · node\n" % COPY
         self.fake.resume_err = "started a copy of the session"
