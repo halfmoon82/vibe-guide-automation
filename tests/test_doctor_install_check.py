@@ -89,6 +89,23 @@ def test_cwd_beats_site_packages_when_both_match():
         assert '源码树' in facts['hint']
 
 
+def test_site_packages_under_cwd_is_still_installed():
+    """在 $HOME 下跑 doctor，pipx venv 也在 $HOME 下：仍是安装版。"""
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        site = home / '.local' / 'pipx' / 'venvs' / 'vibe-guide' / 'lib' / 'site-packages'
+        package = _package_file(site)
+
+        facts = install_source_facts(
+            cwd=home, package_file=package, site_packages=[site]
+        )
+
+        assert facts['in_cwd'] is True
+        assert facts['in_site_packages'] is True
+        assert facts['installed'] is True
+        assert facts['hint'] is None
+
+
 def test_default_package_file_follows_module_file(monkeypatch):
     """默认取本模块文件（与 vibe_guide/__init__.py 同目录），可 monkeypatch 替换。"""
     with tempfile.TemporaryDirectory() as d:

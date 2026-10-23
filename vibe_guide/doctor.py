@@ -81,12 +81,16 @@ def install_source_facts(cwd=None, package_file=None, site_packages=None):
     in_cwd = _is_within(package_path, working_dir)
     in_site_packages = any(_is_within(package_path, root) for root in roots)
     hint = None
-    if in_cwd:
+    # site-packages wins: a pipx venv under $HOME or a project's own .venv is
+    # still an installed copy even though it sits below the working directory.
+    if in_site_packages:
+        pass
+    elif in_cwd:
         hint = (
             'vibe_guide 从当前目录的源码树加载（' + str(package_path) + '），'
             '此处断言版本测的是源码树而不是安装版；请在干净目录（如 /tmp）重跑'
         )
-    elif not in_site_packages:
+    else:
         hint = (
             'vibe_guide 不在当前解释器的 site-packages 内（'
             + str(package_path) + '），不能代表安装版；请在干净目录（如 /tmp）重跑'
@@ -95,7 +99,7 @@ def install_source_facts(cwd=None, package_file=None, site_packages=None):
         'package_path': str(package_path),
         'in_cwd': in_cwd,
         'in_site_packages': in_site_packages,
-        'installed': in_site_packages and not in_cwd,
+        'installed': in_site_packages,
         'hint': hint,
     }
 
