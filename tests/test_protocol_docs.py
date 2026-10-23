@@ -107,6 +107,37 @@ class PrdGuideBackgroundTests(unittest.TestCase):
         self.assertIn(digest, SHIPPED_PROTOCOL_DIGESTS["prd-guide"])
 
 
+class ReadingMapTests(unittest.TestCase):
+    """#216④: the map at the top steers each role to its sections.
+
+    Every section reference the map prints must resolve to a real heading, so
+    a renumber or a dropped section cannot leave the map pointing at nothing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = PRD_GUIDE.read_text(encoding="utf-8")
+        start = cls.text.index("## 阅读地图")
+        cls.map_ = cls.text[start:cls.text.index("\n## 0. ", start)]
+
+    def test_map_sits_before_the_numbered_sections(self):
+        self.assertLess(self.text.index("## 阅读地图"), self.text.index("## 0. "))
+
+    def test_map_names_each_audience(self):
+        for needle in ("PRD 引导", "监工", "§6.4", "整合审查", "§7"):
+            self.assertIn(needle, self.map_, needle)
+
+    def test_every_section_reference_resolves_to_a_heading(self):
+        headings = set(
+            re.match(r"^(#{2,3})\s*(\S+)", line).group(2).rstrip(".")
+            for line in self.text.splitlines()
+            if re.match(r"^#{2,3} ", line)
+        )
+        for ref in re.findall(r"§([\d.]+)", self.map_):
+            self.assertIn(ref.rstrip("."), headings,
+                          "map references missing section {}".format(ref))
+
+
 class ReadmeBackgroundTests(unittest.TestCase):
     CASES = (
         ("README.md", "### Claude Code 后台派发"),
