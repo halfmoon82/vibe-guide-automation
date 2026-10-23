@@ -38,6 +38,11 @@ class SddProtocolRefTests(unittest.TestCase):
         self.assertEqual(default, inline)
         self.assertIn(INLINE_HEADER + load_protocol(NAME) + "\n\n", default)
 
+    def test_current_protocol_digest_is_published(self):
+        digest = hashlib.sha256(protocol_path(NAME).read_bytes()).hexdigest()
+        self.assertIn(digest, SHIPPED_PROTOCOL_DIGESTS[NAME],
+                      "protocol changed: append its new sha256 to SHIPPED_PROTOCOL_DIGESTS")
+
     def test_ref_prompt_has_path_and_published_sha_without_full_text(self):
         with tempfile.TemporaryDirectory() as d:
             _, prompt = _prompt(d, {"sdd_protocol_delivery": "ref"})
