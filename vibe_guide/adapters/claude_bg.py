@@ -424,9 +424,10 @@ class ClaudeBgLauncher:
         result = self._run(self._claude("stop", short), self._worktree())
         if result.returncode != 0:
             # `claude stop` can fail for a session that already exited after
-            # delivering.  Its listed end state proves it is not running, the
-            # same check `resume` makes; `blocked` is alive and waiting, and an
-            # unknown state stays a failure.
+            # delivering.  Its listed end state proves it is not running --
+            # the fallback `resume` uses, but stricter: `resume` only refuses
+            # `working`, while a stop must prove nothing will write again, so
+            # `blocked` (alive, waiting) and an unknown state stay failures.
             try:
                 state = self.status(task_id)
             except ClaudeBgUnknown:
