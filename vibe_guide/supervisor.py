@@ -491,6 +491,49 @@ def _with_cap_reason(result, cap_reason):
     return result
 
 
+#: Common cause of a drifted capability contract, named so the supervisor can
+#: act instead of guessing (#220): a git write operation (checkout, stash,
+#: reset, merge) rewriting tracked ``.vibe`` run-state files mid-run.
+CONTRACT_DRIFT_HINT = (
+    "常见诱因：git 写操作（checkout/stash/reset/merge）改写了 .vibe 运行态文件，"
+    "请检查 .vibe/session-contract.json 的改动来源"
+)
+
+
+def contract_drift(paths, run_id):
+    """Compare the live capability contract with the run snapshot's digest.
+
+    Returns ``None`` when they agree or the run never recorded a contract
+    digest (nothing to compare), a ``contract_drift`` payload when they differ,
+    and an ``unknown`` payload when the contract cannot be read -- an
+    unreadable file is never taken as "consistent".  Read-only (#220).
+    """
+    try:
+        snapshot = load_snapshot(paths, run_id)
+    except (OSError, TypeError, ValueError):
+        return None
+    recorded = getattr(snapshot, "capability_contract_digest", "")
+    if not isinstance(recorded, str) or not recorded:
+        return None
+    from .capability_contract import load_contract
+
+    try:
+        current = load_contract(paths).contract_digest
+    except (OSError, TypeError, ValueError) as error:
+        return {"state": "unknown",
+                "reason": "capability contract unreadable: {}".format(str(error)[:160])}
+    if current == recorded:
+        return None
+    return {
+        "state": "contract_drift",
+        "reason": "capability contract digest differs from the run snapshot",
+        "recorded_digest": recorded,
+        "current_digest": current,
+        "action": "走同一运行的重新授权流程（vibe authorize 同一 plan/run），不要继续推进",
+        "hint": CONTRACT_DRIFT_HINT,
+    }
+
+
 def supervisor_preflight(
     paths,
     run_id,
@@ -528,6 +571,9 @@ def supervisor_preflight(
     record = _read_json_file(session_record)
     if record is None:
         return {"state": "unknown", "reason": "session record unreadable"}
+    drift = contract_drift(paths, run_id)
+    if drift is not None:
+        return drift
     # Resolved before any state branch so a downgrade is named on every exit
     # path, including "unknown": a beat that cannot tell why its cap changed is
     # how a smaller takeover window turns into an unexplained late rotation.
@@ -1118,6 +1164,11 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
             "registered_at": time.time(),
             "lease_epoch": epoch,
         }
+        # SendMessage reaches a session by its name, not its id (real-machine
+        # trial 2026-10-23: the id was "not reachable", the name delivered).
+        wake_target = address.get("wake_target")
+        if isinstance(wake_target, str) and wake_target.strip():
+            entry["wake_target"] = wake_target.strip()
         if session_record is not None and Path(str(session_record)).expanduser().is_absolute():
             record = _read_json_file(session_record)
             baseline = _session_tokens(record) if record is not None else None
@@ -1147,6 +1198,10 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
 #: plainly that there is no channel and the heartbeat collects the delivery.
 WAKE_CHANNELS = {
     "codex": "send_message_to_thread",
+    # Registered as a channel (#220 follow-up, 2026-10-23); it still counts as
+    # *verified* only once .vibe/push-wake-verification.json carries both a
+    # success and a failure evidence for claude-code.
+    "claude": "SendMessage",
 }
 WAKE_NO_CHANNEL_REASON = {
     "claude": "Claude Code 没有已验证的推送通道（#154 实测 unverified），等监工心跳拉取",
@@ -1192,7 +1247,7 @@ def wake_instruction(address, run_id, node_id=None, role=None, generation=None):
         return {"channel": None, "reason": reason}
     return {
         "channel": channel,
-        "target": address.get("session_id"),
+        "target": address.get("wake_target") or address.get("session_id"),
         "signal": wake_signal(run_id, node_id, role, generation),
     }
 
@@ -1344,6 +1399,10 @@ def _push_wake_available(paths, provider):
     return True, reason
 
 
+#: What choosing 30 minutes costs when push wake-up is not verified.
+FORCED_INTERVAL_COST = "worker 完工后监工最长 30 分钟才会发现"
+
+
 def heartbeat_interval_options(paths, provider):
     """Every idle base a card may offer, with availability and the reason.
 
@@ -1358,6 +1417,13 @@ def heartbeat_interval_options(paths, provider):
             entries.append({"minutes": minutes, "available": True, "reason": ""})
             continue
         available, reason = _push_wake_available(paths, provider)
+        if not available and isinstance(provider, str) and provider:
+            # No verified push wake-up: 30 stays selectable as a forced choice
+            # (product decision 2026-10-23) with its price on the card.  An
+            # unknown provider cannot be judged, so it stays unavailable.
+            entries.append({"minutes": minutes, "available": True, "reason": reason,
+                            "forced": True, "cost": FORCED_INTERVAL_COST})
+            continue
         entries.append({"minutes": minutes, "available": available, "reason": reason})
     return entries
 
@@ -1427,6 +1493,13 @@ def authorization_choices(paths, run_id):
         # to prevent, so anything outside the offered tiers reads as absent.
         if type(value) is int and value in allowed:
             choices[key] = value
+    # A forced 30-minute choice is written into the signed authorization record
+    # itself (with its stated price); honour it only for that exact tier.
+    if (choices.get("heartbeat_interval_minutes") is not None
+            and data.get("heartbeat_interval_forced") is True
+            and isinstance(data.get("heartbeat_interval_forced_cost"), str)
+            and data["heartbeat_interval_forced_cost"].strip()):
+        choices["heartbeat_interval_forced"] = True
     return choices
 
 
@@ -1479,7 +1552,8 @@ def heartbeat_interval(paths, run_id, *, decision_only):
                 "reason": "supervisor provider unknown: " + str(address.get("reason", "no provider")),
                 "provider": None}
     verified, reason = _push_wake_available(paths, provider)
-    chosen = authorization_choices(paths, run_id).get("heartbeat_interval_minutes")
+    choices = authorization_choices(paths, run_id)
+    chosen = choices.get("heartbeat_interval_minutes")
     if chosen == HEARTBEAT_INTERVAL_DEFAULT_MINUTES:
         # The product manager chose the default, so a verified push wake-up does
         # not quietly upgrade the cadence behind their back.
@@ -1490,6 +1564,13 @@ def heartbeat_interval(paths, run_id, *, decision_only):
         if verified:
             return {"minutes": chosen, "mode": "push_verified",
                     "reason": reason, "provider": provider}
+        if choices.get("heartbeat_interval_forced"):
+            # The card marked this 30 as a forced choice and stated its price:
+            # honour the authorization instead of silently returning to 10.
+            return {"minutes": chosen, "mode": "forced",
+                    "reason": "authorization forced {} minutes ({}); {}".format(
+                        chosen, reason, FORCED_INTERVAL_COST),
+                    "provider": provider}
         return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
                 "reason": "authorization selected {} minutes but {}".format(chosen, reason),
                 "provider": provider}

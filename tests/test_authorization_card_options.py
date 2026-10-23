@@ -98,12 +98,16 @@ class CardOptionAvailabilityTests(unittest.TestCase):
         options = heartbeat_interval_options(self.paths, "codex")
         self.assertEqual([item["minutes"] for item in options], [10, 30])
         self.assertTrue(options[0]["available"])
-        self.assertFalse(options[1]["available"])
+        # Not verified: selectable only as a forced choice with its price.
+        self.assertTrue(options[1]["available"])
+        self.assertTrue(options[1]["forced"])
+        self.assertIn("30 分钟", options[1]["cost"])
         self.assertIn("no push wake verification registered", options[1]["reason"])
 
         self._verify()
         verified = heartbeat_interval_options(self.paths, "codex")
         self.assertTrue(verified[1]["available"], verified)
+        self.assertNotIn("forced", verified[1])
 
     def test_the_adapter_id_and_the_registered_provider_name_one_platform(self):
         # The card is built from the adapter id (``codex``) while the runtime
@@ -123,17 +127,23 @@ class CardOptionAvailabilityTests(unittest.TestCase):
         # whose wake-up was never verified.
         self._verify(provider="codex-background")
         options = heartbeat_interval_options(self.paths, "codex-app-visible")
-        self.assertFalse(options[1]["available"])
+        self.assertTrue(options[1]["forced"])
         self.assertIn("not registered", options[1]["reason"])
 
-    def test_a_platform_without_a_wake_channel_never_offers_thirty(self):
-        # Claude Code's wake-up is verified here on purpose: verification alone
-        # is not enough, because the platform has no registered push channel, so
-        # the longer cadence would delay every beat with nothing to wake it.
+    def test_claude_code_has_a_channel_so_verification_alone_clears_the_force(self):
+        # SendMessage is registered as Claude Code's channel; once both
+        # evidences are on file, 30 is an ordinary tier, not a forced one.
+        options = heartbeat_interval_options(self.paths, "claude-code")
+        self.assertTrue(options[1]["forced"])
         self._verify(provider="claude-code")
         options = heartbeat_interval_options(self.paths, "claude-code")
+        self.assertTrue(options[1]["available"])
+        self.assertNotIn("forced", options[1])
+
+    def test_an_unknown_provider_cannot_be_forced(self):
+        options = heartbeat_interval_options(self.paths, None)
         self.assertFalse(options[1]["available"])
-        self.assertIn("推送通道", options[1]["reason"])
+        self.assertNotIn("forced", options[1])
 
     def test_three_hundred_thousand_needs_a_reported_window(self):
         unknown = rotate_hard_cap_options(None)
@@ -183,7 +193,8 @@ class CardChoiceTests(unittest.TestCase):
             (self.root / ".vibe/push-wake-verification.json").write_text(
                 json.dumps(_verified_payload()), encoding="utf-8"
             )
-        return (heartbeat_interval_options(self.paths, "codex"),
+        return (heartbeat_interval_options(
+                    self.paths, "codex" if verified else None),
                 rotate_hard_cap_options(window))
 
     def test_a_choice_the_host_cannot_support_is_refused_at_publication(self):
@@ -478,7 +489,7 @@ class RuntimeChoiceTests(unittest.TestCase):
 
     def test_a_revoked_verification_falls_back_and_names_the_choice(self):
         self._verify()
-        self._authorization(heartbeat_interval_minutes=30)
+        self._authorization(heartbeat_interval_minutes=30)  # card carries no force
         (self.root / ".vibe/push-wake-verification.json").unlink()
         interval = heartbeat_interval(self.paths, "run-1", decision_only=False)
         self.assertEqual(interval["minutes"], 10)

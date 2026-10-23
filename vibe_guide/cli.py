@@ -44,6 +44,7 @@ from .supervisor_output import supervisor_output_batch
 from .supervisor_wakeup import idle_heartbeat_minutes, preflight_with_checkpoint
 from .supervisor import (
     Supervisor,
+    contract_drift as supervisor_contract_drift,
     current_supervisor_address,
     register_supervisor_address,
     release_supervisor_hold,
@@ -178,6 +179,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", dest="supervisor_provider")
     parser.add_argument("--session-id", dest="session_id")
     parser.add_argument("--host", dest="supervisor_host")
+    parser.add_argument("--wake-target", dest="wake_target",
+                        help="supervisor-register: 工人唤醒本监工时 SendMessage 用的会话名（缺省用 --session-id）")
     parser.add_argument("--context-hard-cap", dest="context_hard_cap", type=int, default=None)
     parser.add_argument("--token-threshold", dest="token_threshold", type=int, default=None)
     parser.add_argument("--reason", dest="hold_reason")
@@ -1388,7 +1391,9 @@ def _render_card_options(options: Any, key: str, unit: str) -> str:
     parts = []
     for item in entries:
         label = "{:,} {}".format(item.get(key), unit)
-        if item.get("available"):
+        if item.get("available") and item.get("forced"):
+            parts.append("{}（强制选择：{}）".format(label, item.get("cost") or "未记录代价"))
+        elif item.get("available"):
             parts.append(label)
         else:
             parts.append("{}（不可用：{}）".format(label, item.get("reason") or "未记录原因"))
@@ -2015,6 +2020,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             text = "work：按 prd-guide §6.1 服务信箱一轮，推进用 {} resume --plan {} --run-id {}".format(
                 supervisor_command_prefix, plan_id, args.run_id
             ) + tail
+        elif state == "contract_drift":
+            text = "contract_drift：能力合同与运行快照不一致，停止推进，立即走同一运行的重新授权流程；{}".format(
+                payload.get("hint", "")) + tail
         elif state == "rotate":
             text = "rotate：新开一个会话，让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(
                 supervisor_command_prefix, args.run_id
@@ -2108,9 +2116,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     if payload["state"] != "rotate":
                         payload["state"] = "unknown"
             return payload
-        payload = preflight_with_checkpoint(paths, args.run_id, args.session_record,
-            compute_preflight, command_prefix=supervisor_command_prefix,
-            accept_decision=args.accept_decision, **kwargs)
+        # Contract drift is checked before any cached receipt can answer (#220).
+        payload = supervisor_contract_drift(paths, args.run_id)
+        if payload is None:
+            payload = preflight_with_checkpoint(paths, args.run_id, args.session_record,
+                compute_preflight, command_prefix=supervisor_command_prefix,
+                accept_decision=args.accept_decision, **kwargs)
         interval = _beat_interval(paths, args.run_id, payload, persist=False)
         payload = {**payload, "heartbeat_interval": interval}
         code = SUCCESS if payload["state"] in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
@@ -2124,6 +2135,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 "provider": args.supervisor_provider,
                 "session_id": args.session_id,
                 "host": args.supervisor_host,
+                "wake_target": args.wake_target,
             }, session_record=args.session_record)
         except (TypeError, ValueError, OSError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "登记失败：" + str(error), args.as_json)

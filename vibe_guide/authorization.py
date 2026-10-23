@@ -929,6 +929,8 @@ def _authorization_payload(
     contract_test_commands: Optional[Dict[str, Any]] = None,
     heartbeat_interval_minutes: Optional[int] = None,
     rotate_hard_cap: Optional[int] = None,
+    heartbeat_interval_forced: Optional[bool] = None,
+    heartbeat_interval_forced_cost: Optional[str] = None,
 ) -> Dict[str, Any]:
     payload = {
         "schema_version": AUTHORIZATION_SCHEMA_VERSION,
@@ -986,6 +988,11 @@ def _authorization_payload(
         payload["heartbeat_interval_minutes"] = heartbeat_interval_minutes
     if rotate_hard_cap is not None:
         payload["rotate_hard_cap"] = rotate_hard_cap
+    # A forced 30-minute choice is part of what was approved, so it is signed;
+    # absent otherwise, which keeps every earlier record digest unchanged.
+    if heartbeat_interval_forced:
+        payload["heartbeat_interval_forced"] = True
+        payload["heartbeat_interval_forced_cost"] = heartbeat_interval_forced_cost or ""
     return payload
 
 
@@ -1026,6 +1033,8 @@ class AuthorizationCard:
     # approved, so they never enter the digest.
     heartbeat_interval_minutes: Optional[int] = None
     rotate_hard_cap: Optional[int] = None
+    heartbeat_interval_forced: Optional[bool] = None
+    heartbeat_interval_forced_cost: Optional[str] = None
     heartbeat_interval_options: Tuple[Dict[str, Any], ...] = ()
     rotate_hard_cap_options: Tuple[Dict[str, Any], ...] = ()
 
@@ -1089,6 +1098,8 @@ class AuthorizationRecord:
     # keeps carrying exactly the keys it carried before.
     heartbeat_interval_minutes: Optional[int] = None
     rotate_hard_cap: Optional[int] = None
+    heartbeat_interval_forced: Optional[bool] = None
+    heartbeat_interval_forced_cost: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -1118,7 +1129,7 @@ class AuthorizationRecord:
             "digest",
             "agent_id",
         }
-        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "heartbeat_interval_options", "rotate_hard_cap_options"}
+        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "heartbeat_interval_forced", "heartbeat_interval_forced_cost", "heartbeat_interval_options", "rotate_hard_cap_options"}
         if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
             raise ValueError("authorization record schema is invalid")
         if data["schema_version"] != AUTHORIZATION_SCHEMA_VERSION:
@@ -1130,6 +1141,8 @@ class AuthorizationRecord:
         converted.setdefault("remote_git_actions", "deny")
         converted.setdefault("heartbeat_interval_minutes", None)
         converted.setdefault("rotate_hard_cap", None)
+        converted.setdefault("heartbeat_interval_forced", None)
+        converted.setdefault("heartbeat_interval_forced_cost", None)
         _validate_card_choice(
             converted["heartbeat_interval_minutes"], HEARTBEAT_INTERVAL_CHOICES,
             "heartbeat interval minutes",
@@ -1310,7 +1323,7 @@ def _normalized_option_entries(
     for item in options:
         if not isinstance(item, dict):
             raise ValueError(label + " option must be an object")
-        unknown = set(item) - {key, "available", "reason"}
+        unknown = set(item) - {key, "available", "reason", "forced", "cost"}
         if unknown:
             raise ValueError(
                 label + " option has unknown keys: "
@@ -1330,7 +1343,20 @@ def _normalized_option_entries(
             raise ValueError(label + " option reason must be a string")
         if not available and not reason.strip():
             raise ValueError(label + " option is unavailable without a reason")
-        entries.append({key: value, "available": available, "reason": reason})
+        entry = {key: value, "available": available, "reason": reason}
+        # A forced tier is usable only by an explicit product choice and must
+        # state its price on the card: a missing cost refuses publication.
+        # Absent for ordinary tiers, so existing cards stay byte-identical.
+        if "forced" in item or "cost" in item:
+            forced = item.get("forced")
+            cost = item.get("cost")
+            if forced is not True or not available:
+                raise ValueError(label + " option forced marker must be true on an available tier")
+            if not isinstance(cost, str) or not cost.strip():
+                raise ValueError(label + " forced option has no cost statement")
+            entry["forced"] = True
+            entry["cost"] = cost
+        entries.append(entry)
     return tuple(entries)
 
 
@@ -1363,7 +1389,8 @@ def _drop_unset_card_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     what a pre-209 card did -- must be byte-identical to the ones issued before
     the option existed, so their stored digests keep verifying.
     """
-    for key in ("heartbeat_interval_minutes", "rotate_hard_cap"):
+    for key in ("heartbeat_interval_minutes", "rotate_hard_cap",
+                "heartbeat_interval_forced", "heartbeat_interval_forced_cost"):
         if result.get(key) is None:
             result.pop(key, None)
     for key in ("heartbeat_interval_options", "rotate_hard_cap_options"):
@@ -1395,6 +1422,8 @@ def build_authorization_card(
     topology_rulings: Optional[Dict[str, str]] = None,
     heartbeat_interval_minutes: Optional[int] = None,
     rotate_hard_cap: Optional[int] = None,
+    heartbeat_interval_forced: Optional[bool] = None,
+    heartbeat_interval_forced_cost: Optional[str] = None,
     heartbeat_interval_options: Optional[Any] = None,
     rotate_hard_cap_options: Optional[Any] = None,
     enforce_choice_availability: bool = True,
@@ -1565,6 +1594,14 @@ def build_authorization_card(
         rotate_hard_cap_options, "tokens", ROTATE_HARD_CAP_CHOICES,
         "rotation hard cap",
     )
+    # The card marks a forced tier; choosing it writes that fact and its price
+    # into the authorization itself.  Options not observed (a carry-forward)
+    # keep whatever the caller passed.
+    if heartbeat_interval_options is not None:
+        heartbeat_interval_forced, heartbeat_interval_forced_cost = None, None
+        for item in heartbeat_options:
+            if item.get("forced") and item["minutes"] == heartbeat_interval_minutes:
+                heartbeat_interval_forced, heartbeat_interval_forced_cost = True, item["cost"]
     # Only a freshly requested choice is checked against observed availability;
     # a carried-forward one (options not observed) is left to the runtime.
     if enforce_choice_availability and heartbeat_interval_options is not None:
@@ -1605,6 +1642,8 @@ def build_authorization_card(
         contract_test_commands=contract_test_commands,
         heartbeat_interval_minutes=heartbeat_interval_minutes,
         rotate_hard_cap=rotate_hard_cap,
+        heartbeat_interval_forced=heartbeat_interval_forced,
+        heartbeat_interval_forced_cost=heartbeat_interval_forced_cost,
     )
     digest = _canonical_digest(canonical)
     canonical["engine_authorization_digest"] = digest
@@ -1694,6 +1733,8 @@ def refresh_authorization_card(
         workers=workers,
         heartbeat_interval_minutes=previous.heartbeat_interval_minutes,
         rotate_hard_cap=previous.rotate_hard_cap,
+        heartbeat_interval_forced=previous.heartbeat_interval_forced,
+        heartbeat_interval_forced_cost=previous.heartbeat_interval_forced_cost,
         # A caller that observed nothing keeps the availability the approved
         # card recorded: the alternative -- emitting an empty list -- would
         # erase the reason a tier was unavailable from the refreshed card.
@@ -1757,6 +1798,8 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         contract_test_commands=card.contract_test_commands,
         heartbeat_interval_minutes=card.heartbeat_interval_minutes,
         rotate_hard_cap=card.rotate_hard_cap,
+        heartbeat_interval_forced=card.heartbeat_interval_forced,
+        heartbeat_interval_forced_cost=card.heartbeat_interval_forced_cost,
     )
     if card.schema_version != AUTHORIZATION_SCHEMA_VERSION:
         raise ValueError("unsupported authorization card schema")
@@ -1796,6 +1839,8 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         contract_test_commands=card.contract_test_commands,
         heartbeat_interval_minutes=card.heartbeat_interval_minutes,
         rotate_hard_cap=card.rotate_hard_cap,
+        heartbeat_interval_forced=card.heartbeat_interval_forced,
+        heartbeat_interval_forced_cost=card.heartbeat_interval_forced_cost,
     )
 
 
@@ -1863,6 +1908,8 @@ def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
         contract_test_commands=record.contract_test_commands,
         heartbeat_interval_minutes=record.heartbeat_interval_minutes,
         rotate_hard_cap=record.rotate_hard_cap,
+        heartbeat_interval_forced=record.heartbeat_interval_forced,
+        heartbeat_interval_forced_cost=record.heartbeat_interval_forced_cost,
     )
     if not secrets.compare_digest(record.digest, _canonical_digest(canonical)):
         # V3/V4 records pre-dating execution-engine binding remain readable
