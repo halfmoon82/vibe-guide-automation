@@ -37,6 +37,19 @@ class HybridStateRecoveryTests(unittest.TestCase):
         self.stuck(extra_resumes=2)
         later, = self.pending_waits()
         self.store.retire_wait(later['action_id'], reason)
+        # The pre-#251 retire left the handle's pending_action in place, so the
+        # recovery still had to clear a dangling pointer.  retire_wait now
+        # clears the handle itself (#251, pinned by test_retire_wait_pending.py),
+        # which means the current API can no longer produce the legacy shape
+        # this case exists to exercise.  Build that disk state directly: the
+        # stale marker is already written by retire_wait above, only the handle
+        # still has to name the retired wait.
+        self.handle()
+        path = self.store.root / 'handles' / (self.handle_id + '.json')
+        metadata = json.loads(path.read_text())
+        metadata['pending_action'] = later['action_id']
+        metadata['pending_operation'] = 'wait'
+        path.write_text(json.dumps(metadata))
         binding = load_task_binding(self.paths, NODE, 'developer', run_id=self.run_id)
         binding.cursor = TASK + ':9'
         save_task_binding(self.paths, binding)
