@@ -158,7 +158,7 @@ def verify_required_workflow_state(workflow):
 # exposing a small, stable vocabulary to end users.  This mapping is pure so
 # callers (CLI, desktop bridges and tests) can derive the same label without
 # mutating the snapshot or interpreting provider details themselves.
-USER_VISIBLE_STATES = ("准备中", "自动修复中", "已启动", "需要你决定")
+USER_VISIBLE_STATES = ("准备中", "自动修复中", "已启动", "需要你决定", "需要监工建工作树")
 _USER_DECISION_STATUSES = {"blocked_design", "blocked_deploy"}
 _USER_PREPARING_STATUSES = {"initialized", "planned", "brief_pending", "start_pending"}
 _USER_ACTIVE_STATUSES = {
@@ -168,16 +168,64 @@ _USER_RECOVERY_STATUSES = {
     "retry_pending", "binding_probe_pending", "binding_repair_pending",
     "binding_repairing", "blocked_unknown", "unknown", "timeout", "failed", "stopped",
 }
+
+#: Node marker the supervisor persists when a dispatch was blocked by a node
+#: worktree it must not build itself (#235).  ``reason_code`` is a fixed enum
+#: -- the same vocabulary ``adapters.claude_bg.WORKTREE_REASON_CODES`` uses --
+#: so the label can name the required action without reading provider text.
+WORKTREE_PREFLIGHT_KEY = "worktree_preflight"
+WORKTREE_REASON_CODES = ("worktree_missing", "worktree_mismatch", "worktree_create_failed")
+WORKTREE_ACTION_STATUS = "需要监工建工作树"
+
+
+def worktree_reason_code(record: Any) -> Optional[str]:
+    """The persisted worktree-blocking code of a node record, or None."""
+    if not isinstance(record, dict):
+        return None
+    marker = record.get(WORKTREE_PREFLIGHT_KEY)
+    code = marker.get("reason_code") if isinstance(marker, dict) else None
+    return code if code in WORKTREE_REASON_CODES else None
+
+
+def worktree_action(record: Any) -> Optional[str]:
+    """The concrete command a supervisor has to run for this node, or None."""
+    if not isinstance(record, dict):
+        return None
+    marker = record.get(WORKTREE_PREFLIGHT_KEY)
+    if not isinstance(marker, dict):
+        return None
+    command = marker.get("worktree_command")
+    return command if isinstance(command, str) and command.strip() else None
+
+
 def map_user_status(status: Any, reason: Any = "") -> str:
-    """Map internal V3.9 state to one of the four user-facing statuses.
+    """Map internal V3.9 state to one of the user-facing statuses.
 
     A mapping/dict is accepted as a convenience for snapshot node records;
     technical fields remain untouched and reason text is not interpreted as a
     decision boundary.  Unknown states fail safe to the recoverable
-    ``自动修复中`` label.
+    ``自动修复中`` label.  ``需要监工建工作树`` is the one label that is not
+    derived from a status enum: it names an action only a supervisor can
+    take (#235), so it is keyed on the persisted worktree marker.
     """
     if isinstance(status, dict):
         record = status
+        # #235: nothing in vibe builds a missing worktree on a retry, so a
+        # node blocked on one is not self-healing and must not read as
+        # 自动修复中.  Checked before the binding/retry branches (a blocked
+        # dispatch carries both markers), and only while no session is bound
+        # and the node has not moved on: a delivered or accepted node keeps
+        # its real status even if an old marker is still in its record.
+        if (
+            not record.get("active_task")
+            and record.get("status") not in _USER_ACTIVE_STATUSES
+            # #235: a decision-state node must read 需要你决定 even if an
+            # old worktree marker survives in its record; the supervisor
+            # cannot act on a worktree while the user still owes a decision.
+            and record.get("status") not in _USER_DECISION_STATUSES
+            and worktree_reason_code(record)
+        ):
+            return WORKTREE_ACTION_STATUS
         if record.get("binding_phase") in _USER_RECOVERY_STATUSES:
             return "自动修复中"
         # A running node with no active handle but a durable retry marker is
@@ -291,6 +339,18 @@ _EVENT_DATA_KEYS = {
     # count makes visible.
     "rejection_code",
     "rejection_count",
+    # worktree preflight (#235): what the background launcher had to do about
+    # a node worktree before it could dispatch.  ``reason_code`` is a fixed
+    # enum, ``worktree``/``branch``/``worktree_base`` are paths and git
+    # identifiers, and ``worktree_command`` is a command vibe itself
+    # composed -- none of it is provider text, so all of it survives
+    # sanitization on purpose: the whole defect was that the one readable
+    # fact ("this directory is not there") was replaced by a placeholder.
+    "reason_code",
+    "worktree",
+    "branch",
+    "worktree_base",
+    "worktree_command",
     "attempt",
     "reason_class",
     "next_retry_at",

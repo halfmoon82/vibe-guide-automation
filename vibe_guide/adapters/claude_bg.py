@@ -22,6 +22,16 @@ from .task_provider import BackgroundTaskRouting, ProviderUnavailable, Visibilit
 
 CLAUDE_BG_PROVIDER = "claude-code-background"
 
+#: Worktree preflight vocabulary (#235).  The codes are fixed enums a caller
+#: may persist as-is; the events are what the supervisor's event stream
+#: records when a dispatch had to build a node worktree or was blocked by one.
+WORKTREE_MISSING = "worktree_missing"
+WORKTREE_MISMATCH = "worktree_mismatch"
+WORKTREE_CREATE_FAILED = "worktree_create_failed"
+WORKTREE_REASON_CODES = (WORKTREE_MISSING, WORKTREE_MISMATCH, WORKTREE_CREATE_FAILED)
+WORKTREE_CREATED_EVENT = "worktree_created"
+WORKTREE_BLOCKED_EVENT = "worktree_preflight_blocked"
+
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _BACKGROUNDED = re.compile(r"backgrounded\s*[·•.]\s*([0-9a-f]{8})\b")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -35,6 +45,46 @@ class ClaudeBgUnknown(ProviderUnavailable):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+class ClaudeBgWorktreeBlocked(ClaudeBgUnknown):
+    """A worktree precondition this launcher will not repair on its own.
+
+    ``reason_code`` is a fixed enum, never provider text, so a caller can
+    persist it verbatim (#235): "the directory is not there" is a fact about
+    this machine, and hiding it behind a redacted ``reason`` is what left the
+    node waiting for an action nobody knew it needed.
+    """
+
+    def __init__(
+        self,
+        reason_code: str,
+        reason: str,
+        worktree: str,
+        branch: str,
+        command: Optional[str] = None,
+    ):
+        super().__init__(reason)
+        self.reason_code = reason_code
+        self.worktree = worktree
+        self.branch = branch
+        self.command = command
+        # A structured observation without any provider-text key, so failure
+        # classification still fails closed instead of parsing free text.
+        self.observation = {
+            "reason_code": reason_code,
+            "worktree": worktree,
+            "branch": branch,
+            "worktree_command": command,
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "reason_code": self.reason_code,
+            "worktree": self.worktree,
+            "branch": self.branch,
+            "worktree_command": self.command,
+        }
 
 
 class ClaudeBgConfigRefused(ValueError):
@@ -193,6 +243,12 @@ class ClaudeBgLauncher:
         self.prompt_builder = prompt_builder
         self.model = model or config.model
         self.transcript_locator = transcript_locator
+        #: What ``launch`` had to do about the node worktree (#235), read back
+        #: by the CLI after the dispatch returns: ``{"event": ...,
+        #: "worktree": ..., "branch": ..., "worktree_base": ..., ...}``.
+        #: ``None`` until a launch ran, so a caller never mistakes "no launch
+        #: yet" for "the worktree was already there".
+        self.worktree_preflight: Optional[Dict[str, Any]] = None
 
     # -- helpers -----------------------------------------------------------
     def _run(self, argv: List[str], cwd: Path) -> CommandResult:
@@ -206,6 +262,199 @@ class ClaudeBgLauncher:
         if not path.is_dir():
             raise ClaudeBgUnknown("worktree is not an existing directory: %s" % path)
         return path
+
+    # -- worktree preflight (#235) ----------------------------------------
+    def _blocked(
+        self, reason_code: str, reason: str, command: Optional[str] = None
+    ) -> ClaudeBgWorktreeBlocked:
+        self.worktree_preflight = {
+            "event": WORKTREE_BLOCKED_EVENT,
+            "reason_code": reason_code,
+            "worktree": self.routing.worktree,
+            "branch": self.routing.branch,
+            "worktree_command": command,
+        }
+        return ClaudeBgWorktreeBlocked(
+            reason_code, reason, self.routing.worktree, self.routing.branch, command
+        )
+
+    def _prepare_worktree(self) -> Path:
+        """The dispatch worktree, built only when nothing contradicts it.
+
+        ``launch`` is the only caller: every other operation must observe the
+        worktree as it is.  A directory that is already there is never
+        switched, reset or overwritten -- a contradiction is reported, not
+        repaired, because the other side of that directory may be live work.
+        """
+        path = Path(self.routing.worktree)
+        if path.is_dir():
+            return self._verify_worktree(path)
+        return self._create_worktree(path)
+
+    def _verify_worktree(self, path: Path) -> Path:
+        if not (path / ".git").exists():
+            # Not a worktree root of its own: there is no branch claim to
+            # contradict, and the launcher has never owned this directory.
+            return path
+        try:
+            branch = self._git_branch(path)
+            head = self._git_text(["rev-parse", "HEAD"], path)
+        except ClaudeBgUnknown as error:
+            raise self._blocked(
+                WORKTREE_MISMATCH,
+                "cannot read the git state of worktree %s (%s); refusing to dispatch into it"
+                % (path, error.reason),
+                "git -C %s rev-parse --abbrev-ref HEAD" % path,
+            )
+        if branch != self.routing.branch:
+            raise self._blocked(
+                WORKTREE_MISMATCH,
+                "worktree %s is on %s, not the contract branch %s; vibe does not switch or "
+                "overwrite an existing worktree"
+                % (path, branch or "a detached HEAD", self.routing.branch),
+                "git -C %s rev-parse --abbrev-ref HEAD" % path,
+            )
+        self.worktree_preflight = {
+            "event": None,
+            "worktree": str(path),
+            "branch": branch,
+            "worktree_base": head,
+        }
+        return path
+
+    def _manual_command(
+        self, path: Path, branch: str, base: Optional[str], why: str = ""
+    ) -> str:
+        """The command a supervisor has to run for this node (#235).
+
+        A literal ``<base>`` placeholder used to stand in for the run
+        baseline: the string looked paste-able but failed with a git error,
+        and the supervisor had to guess which commit vibe meant.  With the
+        baseline read the command names the real commit; without one it says
+        the baseline is unavailable -- and why -- instead of faking a command.
+        """
+        if base:
+            return "git worktree add %s -b %s %s" % (path, branch, base)
+        return "base 不可用（%s）：无可直接执行的 git worktree add 命令" % (
+            why or "尚未读取仓库基线",
+        )
+
+    def _create_worktree(self, path: Path) -> Path:
+        repo = self._repository_root(path)
+        branch = self.routing.branch
+        # No baseline has been read yet here, so the command must not pretend
+        # one exists.
+        manual = self._manual_command(
+            path, branch, None, "分支名无法传给 git，且基线尚未读取"
+        )
+        if branch.startswith("-"):
+            raise self._blocked(
+                WORKTREE_MISSING,
+                "worktree %s does not exist and branch %r cannot be passed to git" % (path, branch),
+                manual,
+            )
+        if repo is None:
+            raise self._blocked(
+                WORKTREE_MISSING,
+                "worktree %s does not exist and no git repository contains it; create it "
+                "inside a repository before dispatch" % path,
+                self._manual_command(path, branch, None, "%s 不在任何 git 仓库内" % path),
+            )
+        try:
+            base = self._git_text(["rev-parse", "HEAD"], repo)
+        except ClaudeBgUnknown as error:
+            raise self._blocked(
+                WORKTREE_CREATE_FAILED,
+                "cannot read the run baseline from %s (%s); worktree %s was not created"
+                % (repo, error.reason, path),
+                self._manual_command(path, branch, None, "无法从 %s 读取基线" % repo),
+            )
+        # The baseline is known from here on, so every command below names the
+        # real commit instead of a placeholder.
+        manual = self._manual_command(path, branch, base)
+        if self._branch_exists(repo, branch):
+            raise self._blocked(
+                WORKTREE_MISSING,
+                "worktree %s does not exist and branch %s already exists; vibe does not "
+                "reuse or overwrite an existing branch: git worktree add %s %s"
+                % (path, branch, path, branch),
+                "git worktree add %s %s" % (path, branch),
+            )
+        result = self._run(["git", "worktree", "add", str(path), "-b", branch, base], repo)
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "").strip()[-200:]
+            raise self._blocked(
+                WORKTREE_CREATE_FAILED,
+                "git worktree add for %s failed (exit %s): %s" % (path, result.returncode, tail),
+                manual,
+            )
+        try:
+            head = self._git_text(["rev-parse", "HEAD"], path)
+            created_branch = self._git_branch(path)
+        except ClaudeBgUnknown as error:
+            raise self._blocked(
+                WORKTREE_MISMATCH,
+                "worktree %s was created but its git state is unreadable (%s)"
+                % (path, error.reason),
+                manual,
+            )
+        if head.lower() != base.lower() or created_branch != branch:
+            raise self._blocked(
+                WORKTREE_MISMATCH,
+                "worktree %s was created at %s on %s, not %s on %s"
+                % (path, head, created_branch or "a detached HEAD", base, branch),
+                manual,
+            )
+        self.worktree_preflight = {
+            "event": WORKTREE_CREATED_EVENT,
+            "worktree": str(path),
+            "branch": branch,
+            "worktree_base": base,
+        }
+        return path
+
+    def _repository_root(self, path: Path) -> Optional[Path]:
+        """The nearest ancestor that holds a repository, or None."""
+        try:
+            current = Path(path).resolve()
+        except OSError:
+            return None
+        for candidate in [current, *current.parents]:
+            if (candidate / ".git").exists():
+                return candidate
+        return None
+
+    def _git_text(self, args: List[str], cwd: Path) -> str:
+        result = self._run(["git"] + list(args), cwd)
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or "").strip()[-200:]
+            raise ClaudeBgUnknown("git %s failed (exit %s): %s" % (" ".join(args), result.returncode, tail))
+        return _ANSI.sub("", result.stdout or "").strip()
+
+    def _git_branch(self, cwd: Path) -> str:
+        """The checked-out branch; "" when HEAD is detached (a real answer)."""
+        result = self._run(["git", "symbolic-ref", "--short", "-q", "HEAD"], cwd)
+        if result.returncode not in (0, 1):
+            tail = (result.stderr or result.stdout or "").strip()[-200:]
+            raise ClaudeBgUnknown(
+                "git symbolic-ref failed (exit %s): %s" % (result.returncode, tail)
+            )
+        return _ANSI.sub("", result.stdout or "").strip()
+
+    def _branch_exists(self, repo: Path, branch: str) -> bool:
+        for ref in ("refs/heads/" + branch, "refs/remotes/origin/" + branch):
+            result = self._run(["git", "show-ref", "--verify", "--quiet", ref], repo)
+            if result.returncode == 0:
+                return True
+            if result.returncode not in (1, 128):
+                # Not "absent": the launcher cannot tell, so it must not create.
+                tail = (result.stderr or result.stdout or "").strip()[-200:]
+                raise self._blocked(
+                    WORKTREE_CREATE_FAILED,
+                    "cannot verify whether branch %s exists (exit %s): %s"
+                    % (branch, result.returncode, tail),
+                )
+        return False
 
     def _require_ok(self, result: CommandResult, what: str) -> str:
         if result.returncode != 0:
@@ -253,7 +502,10 @@ class ClaudeBgLauncher:
 
     # -- operations --------------------------------------------------------
     def launch(self, role: str, issue_id: str, contract_path: Path) -> Dict[str, Any]:
-        worktree = self._worktree()
+        # #235: a dispatch whose node worktree was never built used to die here
+        # as an unreadable "unknown"; build it when nothing contradicts it, and
+        # report a readable reason when something does.
+        worktree = self._prepare_worktree()
         if self.prompt_builder:
             prompt = self.prompt_builder(role, issue_id, Path(contract_path))
         else:

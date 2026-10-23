@@ -105,6 +105,14 @@ from .attest import record_session_capabilities
 from .protocols import PRD_GUIDE_NAME, load_protocol
 from .state import _atomic_bytes, load_events, load_snapshot, validate_run_id
 from .state import RunSnapshot
+from .state import (
+    WORKTREE_ACTION_STATUS,
+    WORKTREE_PREFLIGHT_KEY,
+    map_user_status,
+    save_snapshot,
+    worktree_action,
+    worktree_reason_code,
+)
 from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
 from .prd_profiles import evaluate_prd_checkpoints, validate_skill_profile
@@ -602,10 +610,13 @@ def _observed_adapter(paths: ProjectPaths, adapter_id: str):
     return result
 
 
-def _claude_bg_launcher_factory(paths: ProjectPaths):
+def _claude_bg_launcher_factory(paths: ProjectPaths, launchers: Optional[List[Any]] = None):
     """Return ``factory(contract, worktree) -> ClaudeBgLauncher`` for the runner.
 
     The launcher module is imported lazily when the factory is called.
+    ``launchers``, when given, collects ``(node_id, launcher)`` so the caller
+    can read back what the dispatch had to do about a node worktree (#235);
+    the launcher has no run identity of its own and cannot record events.
     """
 
     def factory(contract: dict, worktree: Path):
@@ -631,33 +642,46 @@ def _claude_bg_launcher_factory(paths: ProjectPaths):
             status_file=str(contract.get("status_file") or fallback),
             handoff_file=str(contract.get("handoff_file") or fallback),
         )
-        return claude_bg.ClaudeBgLauncher(
+        launcher = claude_bg.ClaudeBgLauncher(
             routing, claude_bg.load_claude_bg_config(paths), model=model
         )
+        if launchers is not None:
+            launchers.append((str(contract.get("node_id") or ""), launcher))
+        return launcher
 
     return factory
 
 
-def _background_runner(paths: ProjectPaths, adapter_id: str, provider: str):
+def _background_runner(
+    paths: ProjectPaths,
+    adapter_id: str,
+    provider: str,
+    launchers: Optional[List[Any]] = None,
+):
     """Build the background-session runner (``vibe_guide.runners.claude_bg``)."""
     try:
         from .runners.claude_bg import ClaudeBgRunner
     except ImportError as error:
         raise ValueError("后台运行器未安装：vibe_guide.runners.claude_bg") from error
-    return ClaudeBgRunner(_claude_bg_launcher_factory(paths), paths=paths)
+    return ClaudeBgRunner(
+        _claude_bg_launcher_factory(paths, launchers), paths=paths
+    )
 
 
 def _public_runner(
     paths: ProjectPaths,
     card: AuthorizationCard,
     nodes: List[DAGNode],
+    launchers: Optional[List[Any]] = None,
 ) -> ProviderActionRunner:
     if any(node.contract.get("adapter_id") != card.agent_id for node in nodes):
         raise ValueError("node adapter routing does not match authorization")
     observed = _observed_adapter(paths, card.agent_id)
     if observed.capabilities.mode == "background":
         if _card_discloses_background(card):
-            return _background_runner(paths, observed.adapter_id, observed.capabilities.provider)
+            return _background_runner(
+                paths, observed.adapter_id, observed.capabilities.provider, launchers
+            )
         # The approved card never disclosed a background downgrade: keep the
         # visible / in-session path it was authorized for.
         if not (
@@ -673,6 +697,86 @@ def _public_runner(
         paths,
         observed.adapter_id,
         observed.capabilities.provider,
+    )
+
+
+#: Launcher report fields worth persisting: the worktree it built or refused,
+#: the branch and baseline it used, and the command a supervisor must run.
+_WORKTREE_REPORT_KEYS = ("reason_code", "worktree", "branch", "worktree_base", "worktree_command")
+
+
+def _record_worktree_preflight(
+    paths: ProjectPaths,
+    monitor: Monitor,
+    snapshot: RunSnapshot,
+    launchers: Optional[List[Any]],
+) -> bool:
+    """Persist what a background dispatch did about node worktrees (#235).
+
+    The launcher cannot record events -- it has no run identity -- so the CLI,
+    which owns both the factory and the snapshot, writes the report each
+    launcher left behind.  A creation is history only.  A block is also a node
+    marker, because ``vibe status`` has to name the action long after the
+    dispatch returned: the retry marker beside it says ``binding_unknown`` and
+    its free-text reason is redacted on write, so without this marker the
+    node would keep reading as 自动修复中 forever.
+    """
+    # Lazily, like the factory: the launcher module is optional at import time.
+    from .adapters.claude_bg import WORKTREE_BLOCKED_EVENT, WORKTREE_CREATED_EVENT
+
+    changed = False
+    for node_id, launcher in launchers or ():
+        report = getattr(launcher, "worktree_preflight", None)
+        if not isinstance(report, dict) or node_id not in snapshot.nodes:
+            continue
+        current = snapshot.nodes[node_id]
+        event = report.get("event")
+        if event == WORKTREE_BLOCKED_EVENT:
+            data = {"run_id": snapshot.run_id, "node_id": node_id}
+            for key in _WORKTREE_REPORT_KEYS:
+                if report.get(key):
+                    data[key] = report[key]
+            monitor._record(snapshot, event, data)
+            current["worktree_preflight"] = {
+                key: value for key, value in data.items()
+                if key not in ("run_id", "node_id")
+            }
+        elif event == WORKTREE_CREATED_EVENT:
+            data = {"run_id": snapshot.run_id, "node_id": node_id}
+            for key in _WORKTREE_REPORT_KEYS:
+                if report.get(key):
+                    data[key] = report[key]
+            monitor._record(snapshot, event, data)
+            current.pop("worktree_preflight", None)
+        elif WORKTREE_PREFLIGHT_KEY in current:
+            # The directory is there and matches the contract now (the report
+            # says nothing happened): the action a supervisor was asked to
+            # take is done, so the marker must stop claiming it.
+            current.pop(WORKTREE_PREFLIGHT_KEY, None)
+        else:
+            continue
+        current["user_status"] = map_user_status(current)
+        changed = True
+    if changed:
+        save_snapshot(paths, snapshot)
+    return changed
+
+
+def _render_worktree_actions(snapshot: Any) -> str:
+    """Name the worktree action a supervisor has to take, per blocked node."""
+    lines = []
+    for node_id, node in sorted((getattr(snapshot, "nodes", None) or {}).items()):
+        # The label is the single authority on whether the action applies.
+        if not isinstance(node, dict) or map_user_status(node) != WORKTREE_ACTION_STATUS:
+            continue
+        code = worktree_reason_code(node)
+        action = worktree_action(node) or "见事件流 worktree_preflight_blocked"
+        lines.append("  节点 {}：{}，需要监工执行：{}".format(node_id, code, action))
+    if not lines:
+        return ""
+    return (
+        "工作树未就绪（vibe 只补建缺失的目录，绝不覆盖已有目录/分支）："
+        + "\n" + "\n".join(lines)
     )
 
 
@@ -1199,13 +1303,23 @@ def _renew_engine_attestation_if_stale(
     if set(_card_field_diff(card, refreshed)) - _VOLATILE_CARD_FIELDS:
         return None
     new_record = authorize(refreshed, "AUTHORIZE")
+    # Background launchers this renewal builds, so the worktree preflight
+    # report can be persisted once the dispatch returns (#235).
+    launchers: List[Any] = []
     if runner is None:
-        runner = _public_runner(paths, refreshed, nodes)
+        runner = _public_runner(paths, refreshed, nodes, launchers)
     with _staged_engine_attestation(attestation_path, fresh):
-        renewed = Monitor(
+        renewal = Monitor(
             paths, plan, nodes,
             topology_rulings=_observed_topology_rulings(paths, refreshed),
-        ).reauthorize(run_id, new_record, runner, "engine_attestation_renewed")
+        )
+        renewed = renewal.reauthorize(
+            run_id, new_record, runner, "engine_attestation_renewed"
+        )
+        # A same-run reauthorization dispatches through the runner exactly
+        # like the invalidation path does: a node worktree that had to be
+        # built, or refused, leaves its report on the launcher.
+        _record_worktree_preflight(paths, renewal, renewed, launchers)
         _atomic_json(directory / "authorization-card.json", refreshed.to_dict())
     _atomic_json(directory / "authorization.json", new_record.to_dict())
     _atomic_json(
@@ -1553,6 +1667,9 @@ def _snapshot_result(
         if retry_pending
         else render_v41_closeout_status(snapshot)
     )
+    worktree_actions = _render_worktree_actions(snapshot)
+    if worktree_actions:
+        text += "\n" + worktree_actions
     if pending_verification:
         text += "\n" + _render_pending_verification(pending_verification)
     return _result(
@@ -2998,6 +3115,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             invalidation_path = _invalidation_path(directory)
             invalidation_to_clear = None
             reauthorizing_current_run = _current_run_path(directory).exists()
+            # Background launchers this dispatch builds, so the worktree
+            # preflight report can be persisted once the dispatch returns.
+            launchers: List[Any] = []
             if invalidation_path.exists():
                 invalidation = _read_json(invalidation_path)
                 if not isinstance(invalidation, dict):
@@ -3016,11 +3136,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     )
                     record = authorize(card, args.authorize)
                     if runner is None:
-                        runner = _public_runner(paths, card, nodes)
-                    snapshot = Monitor(
+                        runner = _public_runner(paths, card, nodes, launchers)
+                    monitor = Monitor(
                         paths, plan, nodes,
                         topology_rulings=_observed_topology_rulings(paths, card),
-                    ).reauthorize(
+                    )
+                    snapshot = monitor.reauthorize(
                         _run_id(directory, None),
                         record,
                         runner,
@@ -3030,6 +3151,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                             )
                         ),
                     )
+                    _record_worktree_preflight(paths, monitor, snapshot, launchers)
                     # Publish the refreshed card inside the staged window, and
                     # only once the reauthorization actually succeeded.  Writing
                     # it before `reauthorize` left the card, the authorization
@@ -3063,27 +3185,31 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     )
                     record = authorize(card, args.authorize)
                     if runner is None:
-                        runner = _public_runner(paths, card, nodes)
-                    snapshot = Monitor(
+                        runner = _public_runner(paths, card, nodes, launchers)
+                    monitor = Monitor(
                         paths, plan, nodes,
                         topology_rulings=_observed_topology_rulings(paths, card),
-                    ).reauthorize(
+                    )
+                    snapshot = monitor.reauthorize(
                         _run_id(directory, None),
                         record,
                         runner,
                         "capability_contract_changed",
                     )
+                    _record_worktree_preflight(paths, monitor, snapshot, launchers)
                     # See the invalidation branch above for why the card is
                     # published here and not one line further out.
                     _atomic_json(directory / "authorization-card.json", card.to_dict())
             else:
                 record = authorize(card, args.authorize)
                 if runner is None:
-                    runner = _public_runner(paths, card, nodes)
-                snapshot = Monitor(
+                    runner = _public_runner(paths, card, nodes, launchers)
+                monitor = Monitor(
                     paths, plan, nodes,
                     topology_rulings=_observed_topology_rulings(paths, card),
-                ).start(record, runner)
+                )
+                snapshot = monitor.start(record, runner)
+                _record_worktree_preflight(paths, monitor, snapshot, launchers)
             # Publishing a plan records confirmation, not execution
             # authorization.  Once the user supplies the exact authorization
             # token, persist the lifecycle transition so the public execution
@@ -3369,8 +3495,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             if args.command == "status":
                 snapshot = load_snapshot(paths, run_id)
             else:
+                launchers = []
                 if runner is None:
-                    runner = _public_runner(paths, _card, nodes)
+                    runner = _public_runner(paths, _card, nodes, launchers)
                 AuthorizationRecord.from_dict(
                     _read_json(directory / "authorization.json")
                 )
@@ -3413,6 +3540,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 # reattachment; let that tick own the single provider poll.
                 snapshot = monitor.resume(run_id, runner, poll_handles=False)
                 snapshot = monitor.tick(run_id, runner)
+                # A dispatch that had to build a node worktree, or refused to,
+                # leaves its report on the launcher; persist it before the
+                # status projection reads the node markers (#235).
+                _record_worktree_preflight(paths, monitor, snapshot, launchers)
         except PermissionError as error:
             if _is_capability_contract_unknown(error):
                 return _result(
