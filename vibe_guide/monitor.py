@@ -83,6 +83,9 @@ from .state import (
     scope_only_expansion_binds,
     interprocess_lock,
     validate_run_id,
+    WORKTREE_PREFLIGHT_KEY,
+    WORKTREE_PREFLIGHT_KEYS,
+    WORKTREE_REASON_CODES,
 )
 from .task_registry import (
     REGISTRY_SCHEMA_VERSION,
@@ -9209,6 +9212,36 @@ class Monitor:
                     for pending_item in pending
                     if pending_item != item
                 ]
+            elif record["event"] in {"worktree_created", "worktree_preflight_blocked"}:
+                # #235 crash window.  The CLI appends one of these events and
+                # only then saves the snapshot, so a crash in between leaves
+                # the event unapplied.  Without a twin the fall-through else
+                # parks the node as blocked_unknown "needs manual
+                # reconciliation" -- which is the silent 自动修复中 the #235
+                # marker exists to replace, resurrected by the very crash the
+                # marker was meant to survive.
+                if provenance.get("role") != "system":
+                    raise ValueError("worktree preflight replay lacks system provenance")
+                marker = {
+                    key: data[key]
+                    for key in WORKTREE_PREFLIGHT_KEYS
+                    if isinstance(data.get(key), str) and data[key].strip()
+                }
+                if record["event"] == "worktree_created":
+                    # The launcher built the worktree: the action a supervisor
+                    # was asked to take is done, so the marker must go.
+                    current.pop(WORKTREE_PREFLIGHT_KEY, None)
+                else:
+                    # A block without its fixed-enum code is a malformed
+                    # record, not a block: the label is derived from the code,
+                    # so an empty marker would render nothing while the node
+                    # still refuses to dispatch.  Fail closed instead.
+                    if marker.get("reason_code") not in WORKTREE_REASON_CODES:
+                        raise ValueError("worktree preflight replay lacks a reason code")
+                    current[WORKTREE_PREFLIGHT_KEY] = marker
+                # The label is derived from the marker, never stored beside
+                # it twice: recomputing keeps replay and the live path equal.
+                current["user_status"] = map_user_status(current)
             else:
                 current["status"] = "blocked_unknown"
                 current["reason"] = "unapplied event needs manual reconciliation"
