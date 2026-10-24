@@ -2885,7 +2885,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     raise ValueError("node spec must be a JSON object")
             # The session route settles the band only on the product path;
             # a hand-written node spec keeps declaring its own band.
-            source = normalize_node_spec(source, entry, paths, route_governs_band=bool(args.from_prd))
+            source = normalize_node_spec(source, entry, paths, route_governs_band=bool(args.from_prd), adapter_id=args.adapter)
             # Evaluate the PRD checkpoints before _publish_plan().  This gate
             # is deliberately side-effect free: unresolved product choices,
             # missing/unverified evidence, and invalid Skill references must

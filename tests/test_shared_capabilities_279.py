@@ -53,14 +53,14 @@ class _Case(unittest.TestCase):
         result = run_cli(["init", "--confirm", "--json"], self.root)
         self.assertEqual(result.payload.get("status"), "ok", result.payload)
 
-    def attest(self, adapter, facts, provenance="test session"):
-        facts_path = self.root / "facts.json"
+    def attest(self, adapter, facts, provenance="test session", project_id=None):
+        facts_path = self.root / ("facts-{}.json".format(adapter))
         facts_path.write_text(json.dumps(facts), encoding="utf-8")
-        return run_cli(
-            ["attest", "--json", "--adapter", adapter, "--facts", "facts.json",
-             "--provenance", provenance],
-            self.root,
-        )
+        argv = ["attest", "--json", "--adapter", adapter,
+                "--facts", facts_path.name, "--provenance", provenance]
+        if project_id is not None:
+            argv += ["--project-id", project_id]
+        return run_cli(argv, self.root)
 
 
 class PerAdapterStorageTests(_Case):
@@ -145,6 +145,95 @@ class AmbiguityTests(_Case):
             self.store.capabilities()
         with self.assertRaises(ProviderPending):
             observe_capabilities(self.paths)
+
+
+SPEC_FIXTURE = Path(__file__).parent / "fixtures" / "pm-path" / "product-spec.json"
+COMPLEX_REQUEST = "设计并实现支付系统，迁移数据、集成接口、编写测试并部署"
+
+
+class MultiAdapterPublishTests(_Case):
+    """A complex ``--from-prd`` publish must name its adapter among several.
+
+    The product spec cannot carry adapter_id (engineering field), so the
+    calling session declares itself with ``vibe plan --adapter``; without it
+    several attested adapters leave the publish unambiguously blocked.
+    """
+
+    def _plan(self, plan_id, *extra):
+        shutil.copy(SPEC_FIXTURE, self.root / "product-spec.json")
+        return run_cli(
+            ["plan", "--json", "--request", COMPLEX_REQUEST, "--plan-id", plan_id,
+             "--s1", "5,5,5,5,5", "--from-prd", "product-spec.json", *extra],
+            self.root,
+        )
+
+    def _attest_both(self):
+        self.attest("claude-code", CLAUDE_FACTS, project_id="pmpathprobe")
+        self.attest("workbuddy", WORKBUDDY_FACTS, project_id="pmpathprobe")
+
+    def test_adapterless_publish_is_blocked_with_an_adapter_hint(self):
+        self.init()
+        self._attest_both()
+        result = self._plan("pm-plan")
+        self.assertEqual(result.payload.get("status"), "blocked", result.payload)
+        reason = result.payload.get("reason", "")
+        self.assertIn("engine_attestation_unavailable", reason)
+        self.assertIn("--adapter", reason)
+        self.assertIn("claude-code", reason)
+        self.assertIn("workbuddy", reason)
+
+    def test_publish_with_adapter_binds_that_adapters_record(self):
+        self.init()
+        self._attest_both()
+        result = self._plan("pm-plan", "--adapter", "claude-code")
+        self.assertEqual(result.payload.get("status"), "ok", result.payload)
+        plan_dir = self.root / ".vibe" / "plans" / "pm-plan"
+        nodes = json.loads((plan_dir / "nodes.json").read_text(encoding="utf-8"))
+        business = [node for node in nodes if node["id"] != "integration-review"]
+        self.assertTrue(business)
+        for node in business:
+            self.assertEqual(node["contract"]["adapter_id"], "claude-code", node["id"])
+        attestation = json.loads(
+            (plan_dir / "engine-attestation.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(attestation["provider"], "claude-code")
+
+    def test_publish_with_the_other_adapter_uses_its_record(self):
+        self.init()
+        self._attest_both()
+        result = self._plan("pm-plan", "--adapter", "workbuddy")
+        self.assertEqual(result.payload.get("status"), "ok", result.payload)
+        attestation = json.loads(
+            (self.root / ".vibe" / "plans" / "pm-plan" / "engine-attestation.json")
+            .read_text(encoding="utf-8")
+        )
+        self.assertEqual(attestation["provider"], "workbuddy")
+
+    def test_unregistered_adapter_never_borrows_anothers_record(self):
+        self.init()
+        self._attest_both()
+        result = self._plan("pm-plan", "--adapter", "cursor")
+        self.assertEqual(result.payload.get("status"), "blocked", result.payload)
+        self.assertIn("engine_attestation_unavailable", result.payload.get("reason", ""))
+        self.assertIn("cursor", result.payload.get("reason", ""))
+        self.assertFalse((self.root / ".vibe" / "plans" / "pm-plan").exists())
+
+
+class SymlinkPolicyTests(_Case):
+    def test_symlinked_record_reads_as_unregistered_like_capabilities_all(self):
+        self.init()
+        self.attest("workbuddy", WORKBUDDY_FACTS)
+        store_dir = self.paths.vibe / "provider-actions"
+        (store_dir / "real-claude.json").write_text(json.dumps({
+            "schema_version": 1,
+            "adapter_id": "claude-code",
+            "facts": CLAUDE_FACTS,
+            "provenance": "planted outside the bridge",
+        }), encoding="utf-8")
+        (store_dir / "capabilities-claude-code.json").symlink_to("real-claude.json")
+        with self.assertRaises(FileNotFoundError):
+            self.store.capabilities("claude-code")
+        self.assertNotIn("claude-code", self.store.capabilities_all())
 
 
 if __name__ == "__main__":

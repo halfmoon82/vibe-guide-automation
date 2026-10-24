@@ -416,13 +416,15 @@ class ProviderActionStore:
                 raise ValueError("adapter id must be a simple identifier")
             adapter_id = adapter_id.strip()
             per_adapter = self.root / ("capabilities-" + adapter_id + ".json")
-            if per_adapter.is_file() or per_adapter.is_symlink():
+            # Same symlink posture as capabilities_all: a symlinked record is
+            # untrusted evidence and reads as "not registered", never borrowed.
+            if per_adapter.is_file() and not per_adapter.is_symlink():
                 record = self._validate_capability(self._read(per_adapter))
                 if record["adapter_id"] != adapter_id:
                     raise ValueError("provider capability record names a different adapter")
                 return record
             legacy = self.root / "capabilities.json"
-            if legacy.is_file() or legacy.is_symlink():
+            if legacy.is_file() and not legacy.is_symlink():
                 record = self._validate_capability(self._read(legacy))
                 if record["adapter_id"] == adapter_id:
                     return record

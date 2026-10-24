@@ -266,7 +266,7 @@ def derive_integration_contract(spec: Dict[str, Any], entry: Any, paths: Any) ->
     return contract
 
 
-def normalize_node_spec(spec: Any, entry: Any, paths: Any, route_governs_band: bool = True) -> Dict[str, Any]:
+def normalize_node_spec(spec: Any, entry: Any, paths: Any, route_governs_band: bool = True, adapter_id: Optional[str] = None) -> Dict[str, Any]:
     """Return a publish-ready node spec: fills what is missing, never overwrites.
 
     ``entry`` is the ``SessionEntry`` the request routed through.  On the
@@ -298,15 +298,35 @@ def normalize_node_spec(spec: Any, entry: Any, paths: Any, route_governs_band: b
     out.setdefault("plan_id", entry.plan_id)
 
     observed: Optional[ObservedCapabilities] = None
+    pending_reason = "engine_attestation_unavailable: verified Monitor engine evidence is required"
     try:
-        observed = observe_capabilities(paths)
+        # ``adapter_id`` is the calling session's own adapter (``vibe plan
+        # --adapter``).  Without it the bridge resolves only when exactly one
+        # adapter has attested; several records fail closed rather than
+        # guessing which session owns this publish (#279).
+        observed = observe_capabilities(paths, adapter_id)
     except ProviderPending:
         observed = None
+        try:
+            records = ProviderActionStore(paths).capabilities_all()
+        except (OSError, TypeError, ValueError):
+            # The diagnostic listing must not mask the original pending state.
+            records = {}
+        if adapter_id:
+            pending_reason += (
+                "：adapter {} 未登记会话能力，先 vibe attest --adapter {} 登记"
+                .format(adapter_id, adapter_id)
+            )
+        elif len(records) > 1:
+            pending_reason += (
+                "：项目已登记多个 adapter 的能力（{}），发布时需用 --adapter 声明本会话所属 adapter"
+                .format(", ".join(sorted(records)))
+            )
     if "capabilities" not in out:
         if observed is not None:
             out["capabilities"] = dict(observed.capabilities)
         elif band == "complex":
-            raise PermissionError("engine_attestation_unavailable: verified Monitor engine evidence is required")
+            raise PermissionError(pending_reason)
         else:
             out["capabilities"] = dict(_GUIDE_CAPABILITIES)
     capabilities = out["capabilities"]
