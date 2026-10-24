@@ -13,9 +13,15 @@ import unittest
 from pathlib import Path
 
 from vibe_guide.adapters.claude_bg import ClaudeBgUnknown
-from vibe_guide.contracts import RunHandle
+from vibe_guide.authorization import authorize, build_authorization_card
+from vibe_guide.capability_contract import build_contract, save_contract
+from vibe_guide.contracts import RunEvent, RunHandle
+from vibe_guide.models import AgentCapabilities, DAGNode, Plan
+from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.claude_bg import ClaudeBgRunner
+from vibe_guide.runners.fake import FakeRunner
+from vibe_guide.state import load_events, save_snapshot
 
 # Match the fake's generated session ids (first and second launch).
 UUID_A = "00000001-1111-4222-8333-000000000001"
@@ -256,6 +262,91 @@ class RetirePriorSessionsTests(unittest.TestCase):
         self.assertEqual(
             [event.event for event in self.runner.poll(foreign)], ["needs_attention"]
         )
+
+
+def monitor_node(node_id, worker=None):
+    # Same minimal node shape tests/test_monitor.py authorizes.
+    return DAGNode(
+        node_id,
+        node_id,
+        [],
+        [],
+        "g1",
+        {
+            "files": [node_id + ".py"],
+            "worker": worker or "worker-" + node_id,
+            "worktree": ".worktrees/" + node_id,
+            "worker_profile": {"worker": "codex", "model": "test", "reasoning": "normal", "fallbacks": [], "selection_basis": {"issue_complexity_ref": node_id, "complexity_band": "standard", "risk_tags": [], "availability_evidence": "test"}, "writer": "writer", "worktree": ".worktrees/" + node_id, "branch": "branch-" + node_id, "allowlist": [node_id + ".py"]},
+        },
+        "ready",
+    )
+
+
+class StaleHandleMonitorTests(unittest.TestCase):
+    """The monitor must treat a superseded handle as dead weight, not unknown."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.paths = ProjectPaths(Path(self.temporary.name))
+        (self.paths.vibe / "state.json").parent.mkdir(parents=True, exist_ok=True)
+        (self.paths.vibe / "state.json").write_text(
+            '{"workflow_version": 2, "session_gate": "s0_required"}\n', encoding="utf-8"
+        )
+        save_contract(
+            self.paths,
+            build_contract(self.paths.root, provider="fake", host_id="local"),
+        )
+        self.capabilities = AgentCapabilities("fake", True, True, True, True, True, "full")
+
+    def authorized_monitor(self, nodes):
+        plan = Plan("plan-1", 1, "docs/prd.md", [item.id for item in nodes], "draft")
+        card = build_authorization_card(plan, nodes, self.capabilities)
+        return Monitor(self.paths, plan, nodes), authorize(card, "AUTHORIZE")
+
+    def _redispatch_snapshot(self):
+        """The incident shape: a second developer dispatch while the first
+        handle is still registered (heartbeat-wake re-dispatch)."""
+        monitor, record = self.authorized_monitor([monitor_node("n1")])
+        runner = FakeRunner()
+        snapshot = monitor.start(record, runner)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "running")
+        old_handle = snapshot.handles["n1"]
+        self.assertTrue(
+            monitor._start_task(
+                snapshot, "n1", "developer", "rework", runner, continuation=True
+            )
+        )
+        return monitor, runner, snapshot, old_handle
+
+    def test_redispatch_marks_the_replaced_handle_stale(self):
+        monitor, runner, snapshot, old_handle = self._redispatch_snapshot()
+
+        self.assertNotEqual(snapshot.handles["n1"], old_handle)
+        self.assertIn(old_handle, snapshot.nodes["n1"]["stale_handles"])
+
+    def test_event_from_a_stale_handle_is_ignored_not_blocked(self):
+        monitor, runner, snapshot, old_handle = self._redispatch_snapshot()
+
+        monitor._apply_event(snapshot, "n1", old_handle, RunEvent("delivered", {}), runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+        names = [event["event"] for event in load_events(self.paths, snapshot.run_id)]
+        self.assertIn("stale_handle_event_ignored", names)
+        self.assertNotIn("blocked_unknown", names)
+
+    def test_stale_handle_is_not_polled_again(self):
+        monitor, runner, snapshot, old_handle = self._redispatch_snapshot()
+        # A replayed snapshot can still carry the superseded handle in the
+        # handle map; the stale list must keep it out of polling.
+        snapshot.handles["n1"] = old_handle
+        runner.events[old_handle] = [("delivered", {"evidence": "stale"})]
+
+        monitor._poll_active_handles(snapshot, runner)
+
+        self.assertEqual(snapshot.nodes["n1"]["status"], "rework")
+        names = [event["event"] for event in load_events(self.paths, snapshot.run_id)]
+        self.assertNotIn("blocked_unknown", names)
 
 
 if __name__ == "__main__":
