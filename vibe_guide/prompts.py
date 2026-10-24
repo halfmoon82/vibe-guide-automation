@@ -14,13 +14,18 @@ from typing import Any, Dict, List, Optional
 
 from .state import durable_projection
 
-#: Severities that never send a node back to the developer.  Everything a
-#: reviewer reports under ``review_finding`` with severity P0-P2 -- and any
-#: missing or malformed severity, which ``Monitor._review_finding_disposition``
-#: treats as corrective feedback -- is rework-worthy and must ride along.
-_NON_REWORK_SEVERITIES = {"P3", "P4", "P5"}
+#: Severities that never send a node back to the developer.  This mirrors
+#: ``Monitor._review_finding_disposition``: only P3 is an observation; P0-P2,
+#: P4/P5 and any missing or malformed severity all return to the developer,
+#: so every one of them must ride along in the rework prompt.
+_NON_REWORK_SEVERITIES = {"P3"}
 
 _REVIEWER_DELIVERY = re.compile(r"-reviewer-g(\d+)\.json$")
+
+#: Carriers ``Monitor._review_finding_severity`` inspects for a finding:
+#: ``finding`` and ``review_finding`` at payload level, each optionally
+#: holding a one-level nested ``finding``.
+_FINDING_CARRIERS = ("finding", "review_finding")
 
 
 def _finding_severity(finding: Any) -> Optional[str]:
@@ -31,12 +36,53 @@ def _finding_severity(finding: Any) -> Optional[str]:
     return None
 
 
+def _payload_severity(payload: Dict[str, Any]) -> Optional[str]:
+    """Extract the round severity the way ``Monitor`` does."""
+    values: List[Any] = [payload.get("severity")]
+    for key in _FINDING_CARRIERS:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            values.append(value.get("severity"))
+            nested = value.get("finding")
+            if isinstance(nested, dict):
+                values.append(nested.get("severity"))
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip().upper()
+    return None
+
+
+def _string_finding_entry(text: str, severity: Optional[str]) -> Dict[str, Any]:
+    """Wrap a free-text finding so it reaches the reworked session.
+
+    ``finding`` itself is a provider-text key and would be masked by the
+    durable projection, so the verbatim text lives under ``summary``.
+    """
+    entry: Dict[str, Any] = {"summary": text}
+    if severity is not None:
+        entry["severity"] = severity
+    return entry
+
+
 def _payload_findings(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Collect this round's reviewer findings from the supported carriers."""
+    round_severity = _payload_severity(payload)
     findings: List[Dict[str, Any]] = []
-    finding = payload.get("finding")
-    if isinstance(finding, dict):
-        findings.append(finding)
+    for key in _FINDING_CARRIERS:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            findings.append(value)
+            nested = value.get("finding")
+            if isinstance(nested, dict):
+                findings.append(nested)
+            elif isinstance(nested, str) and nested.strip():
+                findings.append(
+                    _string_finding_entry(
+                        nested, _finding_severity(value) or round_severity
+                    )
+                )
+        elif isinstance(value, str) and value.strip():
+            findings.append(_string_finding_entry(value, round_severity))
     extra = payload.get("extra_findings")
     if isinstance(extra, list):
         findings.extend(item for item in extra if isinstance(item, dict))
@@ -45,11 +91,17 @@ def _payload_findings(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         nested = evidence.get("findings")
         if isinstance(nested, list):
             findings.extend(item for item in nested if isinstance(item, dict))
-    return [
-        item
-        for item in findings
-        if _finding_severity(item) not in _NON_REWORK_SEVERITIES
-    ]
+    seen = set()
+    kept: List[Dict[str, Any]] = []
+    for item in findings:
+        if _finding_severity(item) in _NON_REWORK_SEVERITIES:
+            continue
+        marker = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        kept.append(item)
+    return kept
 
 
 def _latest_reviewer_findings(contract: Dict[str, Any]) -> List[Dict[str, Any]]:

@@ -146,6 +146,87 @@ class ReworkFindingsSectionTests(unittest.TestCase):
                     ProviderActionRunner._continuation_prompt(contract),
                 )
 
+    def test_string_finding_is_carried_with_round_severity(self):
+        # Monitor._review_finding_disposition sends {"event": "review_finding",
+        # "finding": "fix test"} back as an implementation finding; the rework
+        # prompt must not drop it just because the carrier is a string.
+        with tempfile.TemporaryDirectory() as root:
+            _write_delivery(
+                root,
+                1,
+                {
+                    "event": "review_finding",
+                    "severity": "P1",
+                    "finding": "fix test",
+                },
+            )
+            section = rework_findings_section(_contract(root))
+        self.assertIn("fix test", section)
+        self.assertIn('"severity": "P1"', section)
+        # The synthesized entry must not reuse the ``finding`` key: it is a
+        # provider-text key and the durable projection would mask the text.
+        self.assertIn('"summary": "fix test"', section)
+
+    def test_top_level_review_finding_and_nested_carriers_are_recognized(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_delivery(
+                root,
+                1,
+                {
+                    "event": "review_finding",
+                    "review_finding": {
+                        "severity": "P1",
+                        "title": "顶层载体",
+                        "fix": "对齐 monitor 口径",
+                    },
+                },
+            )
+            _write_delivery(
+                root,
+                2,
+                {
+                    "event": "review_finding",
+                    "finding": {
+                        "severity": "P2",
+                        "finding": {
+                            "severity": "P2",
+                            "title": "嵌套 finding.finding",
+                        },
+                    },
+                },
+            )
+            section = rework_findings_section(_contract(root))
+        self.assertIn("嵌套 finding.finding", section)
+        self.assertNotIn("顶层载体", section)  # newer generation wins
+
+    def test_p4_p5_findings_ride_along_like_monitor_disposition(self):
+        with tempfile.TemporaryDirectory() as root:
+            _write_delivery(
+                root,
+                1,
+                {
+                    "event": "review_finding",
+                    "finding": {"severity": "P4", "summary": "低危返工项"},
+                },
+            )
+            section = rework_findings_section(_contract(root))
+        self.assertIn("低危返工项", section)
+
+    def test_duplicate_finding_across_carriers_is_deduped(self):
+        shared = {"severity": "P1", "title": "同一条 finding"}
+        with tempfile.TemporaryDirectory() as root:
+            _write_delivery(
+                root,
+                1,
+                {
+                    "event": "review_finding",
+                    "finding": dict(shared),
+                    "evidence": {"findings": [dict(shared)]},
+                },
+            )
+            section = rework_findings_section(_contract(root))
+        self.assertEqual(1, section.count("同一条 finding"))
+
     def test_sensitive_keys_are_dropped_from_findings(self):
         with tempfile.TemporaryDirectory() as root:
             _write_delivery(
