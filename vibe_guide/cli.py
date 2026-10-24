@@ -108,6 +108,7 @@ from .state import RunSnapshot
 from .state import (
     WORKTREE_ACTION_STATUS,
     WORKTREE_PREFLIGHT_KEY,
+    WORKTREE_PREFLIGHT_KEYS,
     map_user_status,
     save_snapshot,
     worktree_action,
@@ -702,7 +703,7 @@ def _public_runner(
 
 #: Launcher report fields worth persisting: the worktree it built or refused,
 #: the branch and baseline it used, and the command a supervisor must run.
-_WORKTREE_REPORT_KEYS = ("reason_code", "worktree", "branch", "worktree_base", "worktree_command")
+_WORKTREE_REPORT_KEYS = WORKTREE_PREFLIGHT_KEYS
 
 
 def _record_worktree_preflight(

@@ -176,6 +176,18 @@ _USER_RECOVERY_STATUSES = {
 WORKTREE_PREFLIGHT_KEY = "worktree_preflight"
 WORKTREE_REASON_CODES = ("worktree_missing", "worktree_mismatch", "worktree_create_failed")
 WORKTREE_ACTION_STATUS = "需要监工建工作树"
+#: The marker's own keys, in one place because two writers need them: the CLI
+#: records what the launcher left behind (#235), and the monitor's replay of
+#: that event rebuilds the same marker after a crash between the event append
+#: and the snapshot save.  Two copies of this list is how a replay silently
+#: drops a field the live path wrote.
+WORKTREE_PREFLIGHT_KEYS = (
+    "reason_code",
+    "worktree",
+    "branch",
+    "worktree_base",
+    "worktree_command",
+)
 
 
 def worktree_reason_code(record: Any) -> Optional[str]:

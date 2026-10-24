@@ -890,5 +890,202 @@ class CliBackgroundDispatchTest(unittest.TestCase):
         return git(path, "rev-parse", "HEAD").stdout.strip()
 
 
+class CrashWindowReplayTest(unittest.TestCase):
+    """A crash between the event append and the snapshot save (#235 P2).
+
+    The CLI appends ``worktree_created`` / ``worktree_preflight_blocked`` and
+    only then saves the snapshot.  A crash in between leaves the event
+    unapplied, and before this twin the fall-through ``else`` parked the node
+    as ``blocked_unknown`` "unapplied event needs manual reconciliation" --
+    the silent 自动修复中 the #235 marker exists to replace, resurrected by
+    the very crash the marker was meant to survive.
+
+    The replay is driven through the real ``Monitor`` method with a stub
+    ``self``: the branch under test touches no monitor state, and building a
+    whole authorized plan to reach it would test the plan, not the branch.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        (self.root / ".vibe").mkdir()
+        self.paths = ProjectPaths(self.root)
+        self.run_id = "run-235"
+        self.authorization_digest = "a" * 64
+        self.node_contract_digest = "b" * 64
+
+    def _node(self):
+        return {
+            "status": "blocked_unknown",
+            "reason": "[REDACTED_PROVIDER_TEXT]",
+            "active_task": None,
+        }
+
+    def _snapshot(self):
+        class _Snap:
+            pass
+
+        snap = _Snap()
+        snap.run_id = self.run_id
+        snap.authorization_digest = self.authorization_digest
+        snap.node_contract_digest = self.node_contract_digest
+        snap.event_sequence = 0
+        snap.nodes = {"node-n1": self._node()}
+        snap.handles = {}
+        return snap
+
+    class _Stub:
+        """Only ``paths`` is read on the path under test."""
+
+        def __init__(self, paths):
+            self.paths = paths
+
+    def _replay(self, event, data):
+        from vibe_guide.monitor import Monitor
+
+        append_event(
+            self.paths,
+            RunEvent(event, dict(data, run_id=self.run_id)),
+            provenance={
+                "role": "system",
+                "authorization_digest": self.authorization_digest,
+                "node_contract_digest": self.node_contract_digest,
+            },
+        )
+        snapshot = self._snapshot()
+        Monitor._reconcile_unapplied_events(self._Stub(self.paths), snapshot)
+        return snapshot.nodes["node-n1"]
+
+    def test_blocked_event_restores_the_marker_and_the_label(self):
+        node = self._replay(WORKTREE_BLOCKED_EVENT, {
+            "node_id": "node-n1",
+            "reason_code": WORKTREE_MISSING,
+            "worktree": "/repo/.worktrees/node-n1",
+            "branch": "node/n1",
+            "worktree_base": "a" * 40,
+            "worktree_command": "git worktree add /repo/.worktrees/node-n1 -b node/n1 " + "a" * 40,
+        })
+        # The marker comes back whole ...
+        self.assertEqual(node[WORKTREE_PREFLIGHT_KEY]["reason_code"], WORKTREE_MISSING)
+        self.assertEqual(node[WORKTREE_PREFLIGHT_KEY]["worktree"], "/repo/.worktrees/node-n1")
+        self.assertEqual(node[WORKTREE_PREFLIGHT_KEY]["branch"], "node/n1")
+        self.assertEqual(node[WORKTREE_PREFLIGHT_KEY]["worktree_base"], "a" * 40)
+        self.assertIn("git worktree add", node[WORKTREE_PREFLIGHT_KEY]["worktree_command"])
+        # ... the label is recomputed from it, not stored twice ...
+        self.assertEqual(node["user_status"], WORKTREE_ACTION_STATUS)
+        # ... and the node is NOT parked as "needs manual reconciliation",
+        # which is the whole defect: the supervisor would read 自动修复中 and
+        # wait for an external action that never comes.
+        self.assertNotEqual(
+            node.get("reason"), "unapplied event needs manual reconciliation"
+        )
+        self.assertEqual(worktree_reason_code(node), WORKTREE_MISSING)
+
+    def test_created_event_clears_the_marker(self):
+        node = self._replay(WORKTREE_CREATED_EVENT, {
+            "node_id": "node-n1",
+            "worktree": "/repo/.worktrees/node-n1",
+            "branch": "node/n1",
+            "worktree_base": "a" * 40,
+        })
+        self.assertNotIn(WORKTREE_PREFLIGHT_KEY, node)
+        self.assertNotEqual(node["user_status"], WORKTREE_ACTION_STATUS)
+        self.assertIsNone(worktree_reason_code(node))
+
+    def test_replay_is_idempotent(self):
+        # Two crash windows from the same durable event: the second replay
+        # starts from the same sequence position, so the marker it rebuilds
+        # must be byte-identical to the first one's.
+        data = {
+            "node_id": "node-n1",
+            "reason_code": WORKTREE_MISSING,
+            "worktree": "/repo/.worktrees/node-n1",
+            "branch": "node/n1",
+        }
+        append_event(
+            self.paths,
+            RunEvent(WORKTREE_BLOCKED_EVENT, dict(data, run_id=self.run_id)),
+            provenance={
+                "role": "system",
+                "authorization_digest": self.authorization_digest,
+                "node_contract_digest": self.node_contract_digest,
+            },
+        )
+        from vibe_guide.monitor import Monitor
+
+        first = self._snapshot()
+        Monitor._reconcile_unapplied_events(self._Stub(self.paths), first)
+        again = self._snapshot()
+        Monitor._reconcile_unapplied_events(self._Stub(self.paths), again)
+        self.assertEqual(
+            first.nodes["node-n1"][WORKTREE_PREFLIGHT_KEY],
+            again.nodes["node-n1"][WORKTREE_PREFLIGHT_KEY],
+        )
+        self.assertEqual(
+            first.nodes["node-n1"]["user_status"],
+            again.nodes["node-n1"]["user_status"],
+        )
+
+    def test_a_consumed_event_is_not_replayed_twice(self):
+        # Advancing the sequence is what makes replay safe to re-run: once the
+        # event is applied, the next pass must see an empty pending set.
+        data = {"node_id": "node-n1", "reason_code": WORKTREE_MISSING}
+        append_event(
+            self.paths,
+            RunEvent(WORKTREE_BLOCKED_EVENT, dict(data, run_id=self.run_id)),
+            provenance={
+                "role": "system",
+                "authorization_digest": self.authorization_digest,
+                "node_contract_digest": self.node_contract_digest,
+            },
+        )
+        from vibe_guide.monitor import Monitor
+
+        first = self._snapshot()
+        Monitor._reconcile_unapplied_events(self._Stub(self.paths), first)
+        second = self._snapshot()
+        second.event_sequence = first.event_sequence
+        Monitor._reconcile_unapplied_events(self._Stub(self.paths), second)
+        self.assertEqual(second.event_sequence, first.event_sequence)
+        self.assertNotIn(WORKTREE_PREFLIGHT_KEY, second.nodes["node-n1"])
+
+    def test_malformed_event_data_fails_closed(self):
+        from vibe_guide.monitor import Monitor
+
+        append_event(
+            self.paths,
+            RunEvent(WORKTREE_BLOCKED_EVENT, {"run_id": self.run_id, "node_id": "node-n1"}),
+            provenance={
+                "role": "system",
+                "authorization_digest": self.authorization_digest,
+                "node_contract_digest": self.node_contract_digest,
+            },
+        )
+        snapshot = self._snapshot()
+        with self.assertRaises(ValueError):
+            Monitor._reconcile_unapplied_events(self._Stub(self.paths), snapshot)
+
+    def test_non_system_provenance_is_refused(self):
+        from vibe_guide.monitor import Monitor
+
+        append_event(
+            self.paths,
+            RunEvent(WORKTREE_BLOCKED_EVENT, {
+                "run_id": self.run_id, "node_id": "node-n1",
+                "reason_code": WORKTREE_MISSING,
+            }),
+            provenance={
+                "role": "developer",
+                "authorization_digest": self.authorization_digest,
+                "node_contract_digest": self.node_contract_digest,
+            },
+        )
+        snapshot = self._snapshot()
+        with self.assertRaises(ValueError):
+            Monitor._reconcile_unapplied_events(self._Stub(self.paths), snapshot)
+
+
+
 if __name__ == "__main__":
     unittest.main()
