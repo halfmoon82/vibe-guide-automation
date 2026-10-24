@@ -27,6 +27,11 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-24: §6.5 rotate requires the new session be created inside the
+        # project (Codex Desktop: create_thread project target; projectless
+        # cwd lands outside the sandbox profile and every .vibe/ access prompts,
+        # #231); supervisor-register now warns on such a cwd.
+        "35277bfc6da0d71088b05a15c29e9041360cde5d9e3916121f6e94761e0ac1d7",
         # 2026-10-23: top-of-file reading map; §5.3 forced 30-minute choice with
         # cost; §6.1 supervisor-mailbox summary view; §6.4/§6.5 Claude Code
         # SendMessage wake channel + contract_drift heartbeat branch (#216④).

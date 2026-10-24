@@ -49,6 +49,7 @@ from .supervisor import (
     current_supervisor_address,
     supervisor_mailbox_view,
     register_supervisor_address,
+    session_cwd_warning,
     release_supervisor_hold,
     set_supervisor_hold,
     supervisor_handoff,
@@ -2150,7 +2151,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             text = "contract_drift：能力合同与运行快照不一致，停止推进，立即走同一运行的重新授权流程；{}".format(
                 payload.get("hint", "")) + tail
         elif state == "rotate":
-            text = "rotate：新开一个会话，让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(
+            text = "rotate：新开一个会话（必须建在本项目里：Codex 桌面用 create_thread 的 project 目标，禁止 projectless，否则读写 .vibe/ 逐条弹审批，#231），让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(
                 supervisor_command_prefix, args.run_id
             ) + tail
         else:
@@ -2278,7 +2279,13 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             else:
                 why = "记录里还没有上下文用量"
             text += "；未记下接班起点（{}），换班按绝对阈值计算".format(why)
-        return _result(SUCCESS, {"command": args.command, "status": "ok", "current": entry}, text, args.as_json)
+        cwd_warning = session_cwd_warning(paths, args.session_record)
+        if cwd_warning:
+            text += "；警告：" + cwd_warning
+        payload = {"command": args.command, "status": "ok", "current": entry}
+        if cwd_warning:
+            payload["session_cwd_warning"] = cwd_warning
+        return _result(SUCCESS, payload, text, args.as_json)
 
     if args.command == "supervisor-hold":
         if not (args.run_id and args.node_id):
