@@ -33,7 +33,7 @@ permissions:
 jobs:
   gate:
     # ubuntu 专用：本门禁的断言与平台无关，macOS runner 计费 ×10。
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     if: github.repository == 'halfmoon82/vibe-guide-automation'
     steps:
