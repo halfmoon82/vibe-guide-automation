@@ -2976,6 +2976,11 @@ class Monitor:
         for node_id, handle_id in list(snapshot.handles.items()):
             self._require_snapshot_authorization(snapshot)
             current = snapshot.nodes.get(node_id, {})
+            if handle_id in (current.get("stale_handles") or ()):
+                # A newer dispatch for this node superseded the handle; a
+                # dead handle is never polled and can never emit the
+                # unregistered-handle blocked_unknown again.
+                continue
             try:
                 events = runner.poll(RunHandle(handle_id))
             except Exception as error:
@@ -5597,6 +5602,13 @@ class Monitor:
         current["active_task"]["handle_id"] = handle.run_id
         current["start_intent"] = None
         current["quarantine"] = None
+        previous_handle = snapshot.handles.get(node_id)
+        if previous_handle and previous_handle != handle.run_id:
+            # The replaced handle is dead weight: keep it out of polling and
+            # out of the unregistered-handle fail-closed path.
+            stale_handles = current.setdefault("stale_handles", [])
+            if previous_handle not in stale_handles:
+                stale_handles.append(previous_handle)
         snapshot.handles[node_id] = handle.run_id
         self._record(
             snapshot,
@@ -6167,6 +6179,21 @@ class Monitor:
         current = snapshot.nodes[node_id]
         active = current.get("active_task")
         if not isinstance(active, dict) or active.get("handle_id") != handle_id:
+            if handle_id in (current.get("stale_handles") or ()):
+                # A superseded session still emitted something; the event is
+                # evidence-free for the new dispatch, so record that it was
+                # ignored instead of parking the node as blocked_unknown.
+                self._record(
+                    snapshot,
+                    "stale_handle_event_ignored",
+                    {
+                        "run_id": snapshot.run_id,
+                        "node_id": node_id,
+                        "handle_id": handle_id,
+                        "reason": "event from a superseded session ignored",
+                    },
+                )
+                return
             self._mark_blocked_unknown(
                 snapshot, node_id, "event arrived from an unregistered handle"
             )

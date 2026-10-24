@@ -7,6 +7,7 @@ reaches ``done`` without one is ``blocked_unknown``, never success.
 import json
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -23,6 +24,14 @@ _HANDLE = re.compile(r"claude-bg-[A-Za-z0-9._-]+")
 # What a restarted runner needs to rebuild the launcher for a session.
 _LAUNCHER_KEYS = ("node_id", "role", "run_id", "generation", "host", "branch",
                   "status_file", "handoff_file", "child_binding")
+#: States a superseded session may already rest in; none of them writes.
+#: ``blocked`` is alive but waiting, so it cannot be writing either -- the
+#: same set ``ClaudeBgLauncher.stop`` accepts as proof the session ended.
+_RETIRED_STATES = frozenset({"stopped", "done", "failed", "blocked"})
+#: ``claude stop`` returns before ``claude agents`` shows the session down;
+#: resuming or launching inside that window starts a copy (live).  Wait
+#: through these delays, then refuse to add a second writer.
+_RETIRE_SETTLE_SECONDS = (1, 2, 3, 5, 8)
 
 
 def _valid_generation(value):
@@ -35,9 +44,11 @@ class ClaudeBgRunner(Runner):
         launcher_factory: Callable[[dict, Path], ClaudeBgLauncher],
         delivery_reader: Optional[Callable[[dict], Optional[dict]]] = None,
         paths: Optional[ProjectPaths] = None,
+        sleeper: Callable[[float], None] = time.sleep,
     ):
         self.launcher_factory = launcher_factory
         self._paths = paths
+        self._sleeper = sleeper
         # An injected reader is a test seam with no archive behind it.
         self._consumes_archive = delivery_reader is None
         self.delivery_reader = delivery_reader or self._read_delivery
@@ -84,7 +95,8 @@ class ClaudeBgRunner(Runner):
             return False
 
     def _register(self, launcher, contract: dict, session_id: str,
-                  worktree: Path, handle_id: Optional[str] = None) -> RunHandle:
+                  worktree: Path, handle_id: Optional[str] = None,
+                  stale: bool = False) -> RunHandle:
         if handle_id is None:
             # Unique across processes: a restarted runner must never reissue
             # a handle a persisted session record already owns.
@@ -99,6 +111,10 @@ class ClaudeBgRunner(Runner):
             # ``delivered``, so a handle still polled after a restart means
             # that event was lost and must be emitted again.
             "delivered": False,
+            # Set when a newer dispatch for the same node replaced this
+            # session: a superseded handle must never emit an event again
+            # (the monitor would read it as an unregistered handle).
+            "stale": stale,
             "contract": {key: contract[key] for key in _LAUNCHER_KEYS if key in contract},
             "worktree": str(worktree),
             "claims": {
@@ -126,7 +142,7 @@ class ClaudeBgRunner(Runner):
         """Write the session record a restarted runner adopts from."""
         session = self._sessions[handle_id]
         path = self._record_path(handle_id)
-        record = {key: session[key] for key in ("contract", "worktree", "claims")}
+        record = {key: session[key] for key in ("contract", "worktree", "claims", "stale")}
         # .vibe never stores absolute user paths: keep project worktrees relative.
         root = (self._paths or ProjectPaths.from_cwd(Path.cwd())).root
         try:
@@ -167,8 +183,99 @@ class ClaudeBgRunner(Runner):
         except (ValueError, OSError, UnicodeDecodeError, KeyError, TypeError):
             return None
         launcher = self.launcher_factory(contract, worktree)
-        self._register(launcher, contract, session_id, worktree, handle_id=handle_id)
+        self._register(launcher, contract, session_id, worktree,
+                       handle_id=handle_id, stale=bool(record.get("stale")))
         return self._sessions[handle_id]
+
+    def _prior_session_handles(self, node_id: str) -> List[str]:
+        """Persisted session records that claim this node.
+
+        A restarted runner's memory is empty, so the durable records under
+        ``claude-bg-sessions/`` are the only list of sessions a previous
+        dispatch created; the in-process case scans the same place.
+        """
+        paths = self._paths or ProjectPaths.from_cwd(Path.cwd())
+        directory = paths.resolve_vibe_path("provider-actions/claude-bg-sessions")
+        try:
+            names = sorted(item.name for item in directory.iterdir())
+        except OSError:
+            return []
+        prefix = "claude-bg-{}-".format(node_id)
+        found = []
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            handle_id = name[:-len(".json")]
+            if not _HANDLE.fullmatch(handle_id):
+                continue
+            if handle_id.startswith(prefix):
+                found.append(handle_id)
+                continue
+            # A record whose handle embeds another node belongs to us only if
+            # its claims say so; adoption re-validates either way.
+            try:
+                record = json.loads((directory / name).read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            claims = record.get("claims") if isinstance(record, dict) else None
+            if isinstance(claims, dict) and claims.get("node_id") == node_id:
+                found.append(handle_id)
+        return found
+
+    def _retire_session(self, session: Dict[str, Any], handle_id: str) -> None:
+        """Prove one prior session can no longer write before it is replaced.
+
+        A session already resting needs no repeated stop; a ``working`` one
+        is stopped and re-observed until it lands in a resting state.  A stop
+        that fails, a session that cannot be reached, or one that is still
+        ``working`` after the settle window raises ``ClaudeBgUnknown`` so the
+        dispatch falls back to a retry instead of adding a second writer to
+        the same worktree (run-64c826b5 ended with three).
+        """
+        session_id = session["claims"]["session_id"]
+        launcher = session["launcher"]
+        if launcher.status(session_id) in _RETIRED_STATES:
+            return
+        launcher.stop(session_id)
+        for delay in _RETIRE_SETTLE_SECONDS:
+            self._sleeper(delay)
+            state = launcher.status(session_id)
+            if state in _RETIRED_STATES:
+                return
+        raise ClaudeBgUnknown(
+            "prior session %s did not reach a resting state after stop "
+            "(last seen %s); not dispatching a second writer beside it"
+            % (session_id, state)
+        )
+
+    def _retire_prior_sessions(self, contract: dict,
+                               keep_session_id: Optional[str] = None) -> None:
+        """Retire every earlier session of this node before a new dispatch.
+
+        The session being resumed (``keep_session_id``) is not stopped here --
+        ``launcher.resume`` runs its own verified stop -- but its old handle
+        is still marked stale so it is never polled or reported again.
+        """
+        node_id = contract["node_id"]
+        retired = []
+        for handle_id in self._prior_session_handles(node_id):
+            session = self._adopt_persisted(handle_id)
+            if session is None or session["claims"]["node_id"] != node_id:
+                # A record that names this node but cannot be validated
+                # cannot prove its session ended; dispatching beside it may
+                # add a second writer, so the start must wait and retry.
+                raise ClaudeBgUnknown(
+                    "prior session record %s for node %s cannot be verified; "
+                    "not dispatching another writer" % (handle_id, node_id)
+                )
+            if session["stale"]:
+                continue
+            if session["claims"]["session_id"] != keep_session_id:
+                self._retire_session(session, handle_id)
+            retired.append(handle_id)
+        for handle_id in retired:
+            self._sessions[handle_id]["stale"] = True
+            self._persist(handle_id)
 
     def start(self, contract: dict, worktree: Path) -> RunHandle:
         node_id = contract["node_id"]
@@ -178,9 +285,18 @@ class ClaudeBgRunner(Runner):
             raise ValueError("resuming a session requires an integer generation")
         launcher = self.launcher_factory(contract, Path(worktree))
         if resume_id:
+            # Resume runs its own verified stop on the target session; every
+            # other session this node left behind must be proven retired
+            # first so the continuation never writes beside it.
+            self._retire_prior_sessions(contract, keep_session_id=resume_id)
             launcher.resume(resume_id, str(contract.get("rework_message") or ""))
             task_id = resume_id
         else:
+            if contract.get("continuation") or str(contract.get("phase")) == "rework":
+                # A rework/continuation dispatch starts a fresh session in
+                # the same node worktree; any earlier session still working
+                # there would be a second live writer.
+                self._retire_prior_sessions(contract)
             contract_path = contract.get("contract_path") or self._write_prompt(contract)
             task_id = launcher.launch(role, node_id, Path(contract_path))["task_id"]
             try:
@@ -252,6 +368,11 @@ class ClaudeBgRunner(Runner):
                 )
             ]
         claims = session["claims"]
+        if session["stale"]:
+            # A superseded handle is never polled for events again: whatever
+            # it could still report belongs to a session a newer dispatch
+            # already replaced.
+            return []
         report = self.delivery_reader(dict(claims))
         if session["delivered"] and not (
             # A corrected re-report rewrites the archive unconsumed; take it
