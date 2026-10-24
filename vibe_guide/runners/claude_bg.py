@@ -25,9 +25,11 @@ _HANDLE = re.compile(r"claude-bg-[A-Za-z0-9._-]+")
 _LAUNCHER_KEYS = ("node_id", "role", "run_id", "generation", "host", "branch",
                   "status_file", "handoff_file", "child_binding")
 #: States a superseded session may already rest in; none of them writes.
-#: ``blocked`` is alive but waiting, so it cannot be writing either -- the
-#: same set ``ClaudeBgLauncher.stop`` accepts as proof the session ended.
-_RETIRED_STATES = frozenset({"stopped", "done", "failed", "blocked"})
+#: ``blocked`` is NOT retired: it is alive and waiting, and an answer or a
+#: heartbeat wake puts it back to ``working`` -- the exact double-writer
+#: this issue exists to kill.  It matches the set ``ClaudeBgLauncher.stop``
+#: accepts as proof the session ended.
+_RETIRED_STATES = frozenset({"stopped", "done", "failed"})
 #: ``claude stop`` returns before ``claude agents`` shows the session down;
 #: resuming or launching inside that window starts a copy (live).  Wait
 #: through these delays, then refuse to add a second writer.
@@ -248,16 +250,25 @@ class ClaudeBgRunner(Runner):
             % (session_id, state)
         )
 
+    def _mark_stale(self, handle_ids: List[str]) -> None:
+        for handle_id in handle_ids:
+            self._sessions[handle_id]["stale"] = True
+            self._persist(handle_id)
+
     def _retire_prior_sessions(self, contract: dict,
-                               keep_session_id: Optional[str] = None) -> None:
+                               keep_session_id: Optional[str] = None) -> List[str]:
         """Retire every earlier session of this node before a new dispatch.
 
         The session being resumed (``keep_session_id``) is not stopped here --
-        ``launcher.resume`` runs its own verified stop -- but its old handle
-        is still marked stale so it is never polled or reported again.
+        ``launcher.resume`` runs its own verified stop -- and its old handle
+        is NOT marked stale yet: if the resume then fails, that handle is the
+        node's only one and marking it stale would silence the live session
+        forever instead of surfacing ``blocked_unknown``.  The caller marks
+        the returned handles stale only after the resume has succeeded.
         """
         node_id = contract["node_id"]
         retired = []
+        kept = []
         for handle_id in self._prior_session_handles(node_id):
             session = self._adopt_persisted(handle_id)
             if session is None or session["claims"]["node_id"] != node_id:
@@ -270,12 +281,13 @@ class ClaudeBgRunner(Runner):
                 )
             if session["stale"]:
                 continue
-            if session["claims"]["session_id"] != keep_session_id:
-                self._retire_session(session, handle_id)
+            if session["claims"]["session_id"] == keep_session_id:
+                kept.append(handle_id)
+                continue
+            self._retire_session(session, handle_id)
             retired.append(handle_id)
-        for handle_id in retired:
-            self._sessions[handle_id]["stale"] = True
-            self._persist(handle_id)
+        self._mark_stale(retired)
+        return kept
 
     def start(self, contract: dict, worktree: Path) -> RunHandle:
         node_id = contract["node_id"]
@@ -287,9 +299,13 @@ class ClaudeBgRunner(Runner):
         if resume_id:
             # Resume runs its own verified stop on the target session; every
             # other session this node left behind must be proven retired
-            # first so the continuation never writes beside it.
-            self._retire_prior_sessions(contract, keep_session_id=resume_id)
+            # first so the continuation never writes beside it.  The resumed
+            # session's old handle goes stale only after the resume proves
+            # the continuation exists -- a failed resume must leave it live
+            # so the node surfaces its state instead of going silent.
+            kept = self._retire_prior_sessions(contract, keep_session_id=resume_id)
             launcher.resume(resume_id, str(contract.get("rework_message") or ""))
+            self._mark_stale(kept)
             task_id = resume_id
         else:
             if contract.get("continuation") or str(contract.get("phase")) == "rework":

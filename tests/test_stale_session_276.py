@@ -46,7 +46,7 @@ class FakeLauncher:
 
     def stop(self, task_id):
         self.calls.append(("stop", task_id))
-        if self.states.get(task_id) == "working":
+        if self.states.get(task_id) in ("working", "blocked"):
             self.states[task_id] = "stopped"
 
     def resume(self, task_id, message):
@@ -87,7 +87,9 @@ class RetirePriorSessionsTests(unittest.TestCase):
         )
 
     def test_resting_prior_session_is_not_stopped_again(self):
-        for state in ("done", "stopped", "blocked", "failed"):
+        # ``blocked`` is deliberately absent: a waiting session can wake back
+        # to ``working``, so it must be stopped like a live one.
+        for state in ("done", "stopped", "failed"):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as root:
                 paths = ProjectPaths(Path(root))
                 launcher = FakeLauncher()
@@ -102,6 +104,57 @@ class RetirePriorSessionsTests(unittest.TestCase):
                 runner.start(dict(self.contract, continuation=True, generation=2), Path("/tmp"))
                 self.assertIn(("status", UUID_A), launcher.calls)
                 self.assertNotIn(("stop", UUID_A), launcher.calls)
+
+    def test_blocked_prior_session_is_stopped_before_redispatch(self):
+        # The incident shape: a blocked session is alive and can be woken
+        # back to ``working`` by an answer or a heartbeat, so retiring it
+        # must run a real stop, not skip it as resting.
+        self.start()
+        self.launcher.states[UUID_A] = "blocked"
+
+        self.start(continuation=True, generation=2)
+
+        self.assertIn(("stop", UUID_A), self.launcher.calls)
+        self.assertEqual(self.launcher.states[UUID_A], "stopped")
+
+    def test_blocked_session_that_survives_stop_blocks_the_new_writer(self):
+        self.start()
+        self.launcher.states[UUID_A] = "blocked"
+        # `claude stop` answered but the session stays ``blocked``.
+        self.launcher.stop = lambda task_id: self.launcher.calls.append(("stop", task_id))
+
+        with self.assertRaises(ClaudeBgUnknown):
+            self.start(continuation=True, generation=2)
+
+        self.assertIn(("stop", UUID_A), self.launcher.calls)
+        self.assertEqual(
+            [call for call in self.launcher.calls if call[0] == "launch"],
+            [("launch", "developer", "n1")],
+        )
+
+    def test_failed_resume_leaves_the_prior_handle_live(self):
+        first = self.start()
+        self.launcher.states[UUID_A] = "blocked"
+
+        def failing_resume(task_id, message):
+            self.launcher.calls.append(("resume", task_id, message))
+            raise ClaudeBgUnknown("claude --bg --resume failed (exit 1): boom")
+
+        self.launcher.resume = failing_resume
+        with self.assertRaises(ClaudeBgUnknown):
+            self.start(resume_task_id=UUID_A, rework_message="fix P1", generation=2)
+
+        # The node's only handle must not be stale: the still-alive session
+        # keeps reporting its state instead of the node going silent.
+        self.assertEqual(
+            [event.event for event in self.runner.poll(first)], ["needs_attention"]
+        )
+        record = json.loads(
+            self.paths.resolve_vibe_path(
+                "provider-actions/claude-bg-sessions/{}.json".format(first.run_id)
+            ).read_text(encoding="utf-8")
+        )
+        self.assertIs(record["stale"], False)
 
     def test_unstoppable_prior_session_blocks_the_new_writer(self):
         self.start()
