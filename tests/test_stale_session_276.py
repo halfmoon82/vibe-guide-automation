@@ -263,6 +263,27 @@ class RetirePriorSessionsTests(unittest.TestCase):
             [event.event for event in self.runner.poll(foreign)], ["needs_attention"]
         )
 
+    def test_prefix_sharing_nodes_sessions_do_not_block_dispatch(self):
+        # "claude-bg-n1-" is a prefix of "claude-bg-n1-other-...": the foreign
+        # record must be recognized as another node's and skipped, not read
+        # as an unverifiable claim that fail-closes every n1 rework.
+        foreign = self.runner.start(dict(self.contract, node_id="n1-other"), Path("/tmp"))
+        self.start()  # n1's live session: UUID_B
+        self.start(continuation=True, generation=2)
+
+        self.assertIn(("stop", UUID_B), self.launcher.calls)
+        self.assertNotIn(("stop", UUID_A), self.launcher.calls)
+        self.assertEqual(
+            [call for call in self.launcher.calls if call[0] == "launch"],
+            [("launch", "developer", "n1-other"),
+             ("launch", "developer", "n1"),
+             ("launch", "developer", "n1")],
+        )
+        self.launcher.states[UUID_A] = "blocked"
+        self.assertEqual(
+            [event.event for event in self.runner.poll(foreign)], ["needs_attention"]
+        )
+
 
 def monitor_node(node_id, worker=None):
     # Same minimal node shape tests/test_monitor.py authorizes.

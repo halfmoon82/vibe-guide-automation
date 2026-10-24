@@ -210,17 +210,24 @@ class ClaudeBgRunner(Runner):
             handle_id = name[:-len(".json")]
             if not _HANDLE.fullmatch(handle_id):
                 continue
-            if handle_id.startswith(prefix):
-                found.append(handle_id)
-                continue
-            # A record whose handle embeds another node belongs to us only if
-            # its claims say so; adoption re-validates either way.
+            # A record belongs to us only if its claims say so; the handle
+            # name alone is not proof because node ids share prefixes
+            # ("claude-bg-api-" also matches "claude-bg-api-docs-...").
             try:
                 record = json.loads((directory / name).read_text(encoding="utf-8"))
             except (OSError, ValueError, UnicodeDecodeError):
-                continue
+                record = None
             claims = record.get("claims") if isinstance(record, dict) else None
-            if isinstance(claims, dict) and claims.get("node_id") == node_id:
+            if isinstance(claims, dict) and isinstance(claims.get("node_id"), str):
+                if claims["node_id"] == node_id:
+                    found.append(handle_id)
+                # A readable record that claims another node is a prefix
+                # collision, not ours -- never surface it to the caller.
+                continue
+            if handle_id.startswith(prefix):
+                # Named for this node but its claims cannot be read at all:
+                # it cannot prove its session ended, so surface it for the
+                # fail-closed check rather than silently skipping it.
                 found.append(handle_id)
         return found
 
