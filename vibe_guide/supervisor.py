@@ -660,7 +660,34 @@ def _valid_holds(holds, statuses, now):
     return valid, sorted(stale)
 
 
+def _delivery_warnings(paths, run_id):
+    """Advisory notes attached to this run's already-answered wait requests.
+
+    Anything unreadable is skipped: an observation must never be the reason
+    the mailbox state becomes unknown.
+    """
+    try:
+        from .adapters.task_provider import ProviderActionStore
+
+        return ProviderActionStore(paths).answered_wait_warnings(run_id)
+    except Exception:
+        return []
+
+
 def _mailbox_state(paths, run_id, holds):
+    state = _mailbox_state_inner(paths, run_id, holds)
+    if isinstance(state, dict) and state.get("state") == "work":
+        warnings = _delivery_warnings(paths, run_id)
+        if warnings:
+            # #240: the session-root warning is the only observation of the
+            # sandbox a worker actually ran in.  Surfacing it here is what
+            # makes it visible to the supervisor's next preflight; without it
+            # the warning exists on disk and nobody reads it.
+            state["warnings"] = warnings
+    return state
+
+
+def _mailbox_state_inner(paths, run_id, holds):
     try:
         from .adapters.task_provider import ProviderActionStore
 
