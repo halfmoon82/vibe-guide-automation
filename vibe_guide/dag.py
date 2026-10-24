@@ -736,8 +736,11 @@ def _parallel_group_errors(nodes: List[DAGNode]) -> Dict[str, List[str]]:
     Two nodes may share a parallel group only when their write scopes are
     verifiably disjoint and neither contract consumes a path the other
     produces.  Overlap, artifact references, or unverifiable metadata refuse
-    the grouping: the plan must relabel the relation as ``integration_after``
-    or split the group.
+    the grouping.  Write-scope overlap cannot be lifted inside the group at
+    all — ``depends_on`` only serializes nodes dispatched independently, and
+    ``integration_after`` never serializes — so the plan must split the
+    paths, merge the nodes, or move one out of the group (a real dependency
+    then becomes ``depends_on``).
 
     Membership covers every status that holds or will hold a writer
     (``planned``/``ready``/``running``/``rework``/``review``/``brief_pending``):
@@ -802,7 +805,8 @@ def _parallel_group_errors(nodes: List[DAGNode]) -> Dict[str, List[str]]:
                 if overlaps:
                     message = (
                         "parallel_group '{}': nodes {} and {} have overlapping write scope "
-                        "({}); relabel integration_after or split the group".format(
+                        "({}); depends_on does not lift a group overlap — split the paths "
+                        "or move a node out of the group".format(
                             group, left.id, right.id, ", ".join(overlaps[:3])
                         )
                     )
@@ -823,7 +827,8 @@ def _parallel_group_errors(nodes: List[DAGNode]) -> Dict[str, List[str]]:
                     for path in referenced[:3]:
                         message = (
                             "parallel_group '{}': node {} contract references {}'s produced "
-                            "path {}; relabel integration_after or split the group".format(
+                            "path {}; serialize with depends_on or move a node out of the "
+                            "group".format(
                                 group, consumer.id, producer.id, path
                             )
                         )
@@ -933,7 +938,7 @@ def _write_scope_conflict_errors(nodes: List[DAGNode]) -> Dict[str, List[str]]:
             if overlaps:
                 message = (
                     "nodes {} and {} have overlapping write scope ({}); "
-                    "add depends_on, relabel integration_after, or split the paths".format(
+                    "serialize with depends_on or split the paths".format(
                         left.id, right.id, ", ".join(overlaps[:3])
                     )
                 )

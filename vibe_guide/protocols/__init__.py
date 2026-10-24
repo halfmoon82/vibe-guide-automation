@@ -27,6 +27,9 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-24: §4 write-scope overlap rule — depends_on serializes;
+        # integration_after and parallel_group cannot lift an overlap (#265).
+        "5e262e2c569f89b0838ce29bc2fb6b790f78cd15f6cdd52ff834cfc249509d44",
         # 2026-10-24: §6.5 rotate requires the new session be created inside the
         # project (Codex Desktop: create_thread project target; projectless
         # cwd lands outside the sandbox profile and every .vibe/ access prompts,

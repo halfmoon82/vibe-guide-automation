@@ -107,6 +107,7 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
 - `depends_on`：没有它完成就**无法开始**的节点。
 - `integration_after`：可以先各自开发、最后要联调的关系。不阻塞启动。
 - `parallel_group`：可以同时开工的一组，用同一个组名；不需要分组就写 `null`。
+- **写范围重叠的节点必须用 `depends_on` 串行。**两个节点的 `files`（写范围）有重叠时，`integration_after` 和 `parallel_group` 都不能解除冲突——它们不阻塞启动，两个 writer 会同时写同一批文件被审计拒绝。拆节点时先把同文件工作归到同一节点；确实要拆成两个节点时，用 `depends_on` 把它们串起来。同一 `parallel_group` 内的重叠连 `depends_on` 也救不了，只能拆开路径或把其中一个移出该组。
 - 每个节点 `contract` 四个字段用验收语言写，不写实现细节：
   - `input`：拿到什么。
   - `output`：交出什么。

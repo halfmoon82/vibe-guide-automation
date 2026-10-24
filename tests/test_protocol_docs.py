@@ -107,6 +107,36 @@ class PrdGuideBackgroundTests(unittest.TestCase):
         self.assertIn(digest, SHIPPED_PROTOCOL_DIGESTS["prd-guide"])
 
 
+class PrdGuideWriteScopeRuleTests(unittest.TestCase):
+    """#265: §4 must tell the planner that overlapping write scopes need
+    depends_on, and must not offer integration_after as a fix."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = PRD_GUIDE.read_text(encoding="utf-8")
+        start = cls.text.index("## 4. ")
+        cls.section = cls.text[start:cls.text.index("\n## 5.", start)]
+
+    def test_rule_states_depends_on_serializes_overlaps(self):
+        bullet_start = self.section.index("写范围重叠的节点")
+        bullet = self.section[bullet_start:self.section.index("\n", bullet_start)]
+        self.assertIn("depends_on", bullet)
+        self.assertIn("串行", bullet)
+
+    def test_rule_does_not_offer_integration_after_as_fix(self):
+        bullet_start = self.section.index("写范围重叠的节点")
+        bullet = self.section[bullet_start:self.section.index("\n", bullet_start)]
+        self.assertIn("不能解除", bullet)
+        # "integration_after …不能解除冲突" names it only to forbid it.
+        self.assertNotIn("relabel", bullet)
+
+    def test_rule_covers_same_group_overlap(self):
+        bullet_start = self.section.index("写范围重叠的节点")
+        bullet = self.section[bullet_start:self.section.index("\n", bullet_start)]
+        self.assertIn("parallel_group", bullet)
+        self.assertIn("也救不了", bullet)
+
+
 class ReadingMapTests(unittest.TestCase):
     """#216④: the map at the top steers each role to its sections.
 
