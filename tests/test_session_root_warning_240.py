@@ -47,8 +47,13 @@ def _payload(session_cwd=_ABSENT, **extra):
     return payload
 
 
-class SessionRootWarningWaitTests(unittest.TestCase):
-    """A real git repo + worktree: the landing check reads git facts."""
+class _WaitFixture(unittest.TestCase):
+    """A real git repo + worktree: the landing check reads git facts.
+
+    Kept as a fixture base so both the wait-result tests and the supervisor
+    visibility tests build the same sandbox without one inheriting (and
+    silently re-running) the other's cases.
+    """
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -118,6 +123,10 @@ class SessionRootWarningWaitTests(unittest.TestCase):
 
     def _archived(self):
         return list((self.root / ".vibe" / "provider-actions" / "deliveries").glob("*.json"))
+
+
+class SessionRootWarningWaitTests(_WaitFixture):
+    """The warning rides beside the delivery, never inside it."""
 
     # --- the warning rides beside the delivery -----------------------------
 
@@ -326,6 +335,67 @@ class WaitResultForwardingTests(unittest.TestCase):
         notes = self._events(result)[0].data["warnings"]
         self.assertEqual(len(notes), 5)
         self.assertTrue(all(len(note) <= 2000 for note in notes))
+
+
+class WarningPersistenceTests(unittest.TestCase):
+    """The warning must survive the event boundary, not just the wait result.
+
+    #240's first hop attached the advisory to ``RunEvent.data`` and stopped
+    there.  ``state._sanitize_event_data`` keeps only whitelisted keys, so the
+    warning was dropped on the way to events.jsonl: the supervisor's next
+    preflight read a run in which the delivery looked completely normal.  The
+    integration review caught it because no test asserted the round trip.
+    """
+
+    def test_warning_is_whitelisted_for_durable_event_data(self):
+        from vibe_guide.state import _EVENT_DATA_KEYS, _sanitize_event_data
+
+        self.assertIn("warnings", _EVENT_DATA_KEYS)
+
+    def test_warning_survives_sanitization_verbatim(self):
+        from vibe_guide.state import _sanitize_event_data
+
+        warning = "会话根 /tmp/Codex/2026-10-15/m-en-00 不在项目树内，very likely projectless"
+        data = _sanitize_event_data({
+            "run_id": "run-1", "node_id": "n1", "warnings": [warning],
+        })
+        # The observation survives bit for bit ...
+        self.assertEqual(data["warnings"], [warning])
+        # ... while provider free text next to it stays redacted.
+        self.assertEqual(
+            _sanitize_event_data({"run_id": "r", "reason": "boom"})["reason"],
+            "[REDACTED_PROVIDER_TEXT]",
+        )
+
+
+class SupervisorVisibilityTests(_WaitFixture):
+    """The supervisor's own view of the warning (the contract's output ②)."""
+
+    def test_mailbox_state_surfaces_the_warning_to_the_supervisor(self):
+        from vibe_guide.supervisor import _mailbox_state
+
+        action = self._wait()
+        payload = _payload(session_cwd=str(self._stray_root()))
+        self.assertTrue(self._deliver(payload)["consumed"])
+        result = self.store.result(action["action_id"])
+        self.assertTrue(result["warnings"])
+        state = _mailbox_state(ProjectPaths(self.root), "run-1", {})
+        self.assertEqual(state["state"], "work")
+        self.assertIn("warnings", state)
+        self.assertEqual(
+            state["warnings"],
+            [{"node_id": "n1", "warnings": result["warnings"]}],
+        )
+
+    def test_mailbox_state_without_a_warning_says_nothing_about_it(self):
+        from vibe_guide.supervisor import _mailbox_state
+
+        action = self._wait()
+        self._deliver(_payload(session_cwd=str(self.root / ".worktrees" / "n1")))
+        result = self.store.result(action["action_id"])
+        self.assertNotIn("warnings", result)
+        state = _mailbox_state(ProjectPaths(self.root), "run-1", {})
+        self.assertNotIn("warnings", state)
 
 
 if __name__ == "__main__":
