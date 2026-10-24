@@ -351,6 +351,13 @@ _EVENT_DATA_KEYS = {
     "branch",
     "worktree_base",
     "worktree_command",
+    # session-root delivery warning (#240): the one observation that can see
+    # which sandbox a worker actually ran in.  It is advisory structure vibe
+    # itself composed from ``delivery_evidence.session_cwd``, never provider
+    # text, so it survives sanitization on purpose: the whole defect was that
+    # the warning reached ``RunEvent.data`` and then vanished at the event
+    # boundary, leaving the supervisor with a delivery that looked normal.
+    "warnings",
     "attempt",
     "reason_class",
     "next_retry_at",

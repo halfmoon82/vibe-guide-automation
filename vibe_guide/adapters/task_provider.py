@@ -1515,6 +1515,42 @@ class ProviderActionStore:
                         action.get('role'), pending, metadata.get('pending_operation')))
         return None
 
+    def answered_wait_warnings(self, run_id):
+        """Read-only advisory notes carried by this run's answered waits.
+
+        ``pending()`` drops a request the moment it has a result, so the
+        warning written beside a completed wait is unreachable from there.
+        Scanning the requests against the results is the only way to read it
+        back (#240): the note has to reach the supervisor's preflight, not
+        just sit next to a result nobody opens.
+        """
+        notes = []
+        request_dir = self._directory("requests")
+        result_dir = self._directory("results")
+        if not request_dir.is_dir():
+            return notes
+        for path in sorted(request_dir.glob("action-*.json")):
+            if not (result_dir / path.name).exists():
+                continue
+            try:
+                action = self._read(path)
+            except (OSError, ValueError):
+                continue
+            if not isinstance(action, dict):
+                continue
+            if action.get("run_id") != run_id or action.get("operation") != "wait":
+                continue
+            result = self.result(action.get("action_id"))
+            if not isinstance(result, dict):
+                continue
+            warnings = result.get("warnings")
+            if not isinstance(warnings, list):
+                continue
+            collected = [text for text in warnings if isinstance(text, str) and text.strip()]
+            if collected:
+                notes.append({"node_id": action.get("issue_id"), "warnings": collected})
+        return notes
+
     def unpolled_results(self, run_id):
         """Read-only list of nodes whose pending action already has a result.
 
