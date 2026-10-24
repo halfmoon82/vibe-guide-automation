@@ -1081,6 +1081,82 @@ def _write_registry(path, registry):
             os.unlink(temporary)
 
 
+def _session_cwd_from_record(session_record):
+    """Best-effort extraction of the session's own working directory.
+
+    Codex Desktop writes it once as ``session_meta.payload.cwd``; Claude Code
+    repeats a top-level ``cwd`` on its entries.  ``_read_json_file`` is not
+    reused here: it returns the newest *usage*-bearing line, which need not
+    carry the cwd, while the line that does usually sits at the top.  Advisory
+    only -- anything unreadable or missing returns None.
+    """
+    try:
+        text = Path(session_record).expanduser().read_text(encoding="utf-8")
+    except (OSError, TypeError, UnicodeDecodeError, ValueError):
+        return None
+    try:
+        entries = [json.loads(text)]
+    except ValueError:
+        entries = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                continue  # a line still being written
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        payload = entry.get("payload")
+        if entry.get("type") == "session_meta" and isinstance(payload, dict):
+            cwd = payload.get("cwd")
+            if isinstance(cwd, str) and cwd.strip():
+                return cwd.strip()
+        cwd = entry.get("cwd")
+        if isinstance(cwd, str) and cwd.strip():
+            return cwd.strip()
+    return None
+
+
+def session_cwd_warning(paths, session_record):
+    """Advisory: the registering session lives outside the project root.
+
+    Issue #231: a projectless Codex Desktop session starts in a host-generated
+    directory whose creation-time sandbox profile lacks the project root, so
+    every read or write of ``.vibe/`` raises its own approval prompt, and
+    re-filing the thread into the project afterwards does not backfill the
+    profile.  The session record is the only ground truth for the session's
+    own cwd -- the CLI process cannot see it, since each command may be
+    prefixed with ``cd <project root>``.  Missing or unreadable records stay
+    silent: absence of the field is not evidence of a bad session, and this
+    warning must never be the reason a registration fails.
+    """
+    if session_record is None:
+        return None
+    raw = _session_cwd_from_record(session_record)
+    if raw is None:
+        return None
+    try:
+        session = Path(raw).expanduser()
+        if not session.is_absolute():
+            return None
+        session = session.resolve()
+        root = Path(paths.root).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if session == root or root in session.parents:
+        return None
+    return (
+        "登记会话的 cwd（{}）不在项目根（{}）内：该会话很可能是 projectless 创建，"
+        "创建时的沙箱权限档案不含项目根，读写 .vibe/ 的命令会逐条弹审批，"
+        "且事后把会话归入项目不回溯（#231 实测）。登记仍然生效；"
+        "建议改在本项目下重建会话（Codex 桌面用 create_thread 的 project 目标）再接班。"
+        .format(session, root)
+    )
+
+
 def register_supervisor_address(paths, run_id, address, *, session_record=None, expected_epoch=None):
     """Atomically record the current supervisor address; keeps history.
 
@@ -1745,7 +1821,10 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
                 ", ".join(option.get("id", "") for option in decision.get("options", [])),
             ))
     lines += [
-        "接班步骤：",
+        "接班步骤（新会话必须建在本项目里，禁止 projectless：否则 cwd 落在宿主自动生成目录，"
+        "创建时的沙箱权限档案不含项目根，每条读写 .vibe/ 的命令都逐条弹审批，"
+        "事后把会话归入项目不回溯——#231 实测；"
+        "Codex 桌面用 create_thread 的 project 目标，Claude Code 在仓库根目录启动新会话）：",
         "  1) 登记：vibe supervisor-register --run-id {} --provider <平台> "
         "--session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>".format(run_id),
         "     " + SESSION_RECORD_HINT,
