@@ -782,6 +782,34 @@ def _render_worktree_actions(snapshot: Any) -> str:
     )
 
 
+def _render_node_error_classes(snapshot: Any) -> str:
+    """Name the structured failure class of each blocked node (#277).
+
+    The free-text ``reason`` is provider text persistence redacts, so the
+    readable line is built from the program-authored stamps
+    ``reason_class`` / ``reason_code`` / ``error_type`` that
+    ``_mark_blocked_unknown`` now persists verbatim.
+    """
+    lines = []
+    for node_id, node in sorted((getattr(snapshot, "nodes", None) or {}).items()):
+        if not isinstance(node, dict) or node.get("status") != "blocked_unknown":
+            continue
+        reason_class = node.get("reason_class")
+        if not isinstance(reason_class, str) or not reason_class:
+            continue
+        parts = [reason_class]
+        reason_code = node.get("reason_code")
+        if isinstance(reason_code, str) and reason_code:
+            parts.append("code={}".format(reason_code))
+        error_type = node.get("error_type")
+        if isinstance(error_type, str) and error_type:
+            parts.append("异常={}".format(error_type))
+        lines.append("  节点 {}：错误类别 {}".format(node_id, "，".join(parts)))
+    if not lines:
+        return ""
+    return "阻塞节点错误分类（reason 原文已按规则打码）：\n" + "\n".join(lines)
+
+
 def _s1_arg(entry: Any) -> str:
     score = entry.s1
     return ",".join(str(value) for value in (score.steps, score.domains, score.uncertainty, score.failure_cost, score.toolchain))
@@ -1672,6 +1700,9 @@ def _snapshot_result(
     worktree_actions = _render_worktree_actions(snapshot)
     if worktree_actions:
         text += "\n" + worktree_actions
+    error_classes = _render_node_error_classes(snapshot)
+    if error_classes:
+        text += "\n" + error_classes
     if pending_verification:
         text += "\n" + _render_pending_verification(pending_verification)
     return _result(
