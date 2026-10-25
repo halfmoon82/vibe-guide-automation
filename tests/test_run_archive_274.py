@@ -8,6 +8,7 @@ recorded in the moved event log.
 """
 import json
 import unittest
+from unittest import mock
 
 from tests import support_v45_authorize as support
 from vibe_guide.adapters.task_provider import ProviderActionStore
@@ -221,6 +222,67 @@ class RunArchiveTests(RunArchiveFixture):
         )
         # The archived state.json was not overwritten by the stub's version.
         self.assertIn('"status": "complete"', (archive / "state.json").read_text())
+
+    def test_failed_archive_records_reason_not_false_success(self):
+        # A mid-move failure must leave run_archive_failed evidence with its
+        # reason class and must not leave a false run_archived record; the
+        # run directory stays in place untouched (contract error behavior).
+        with mock.patch(
+            "vibe_guide.monitor._archive_run_artifacts",
+            side_effect=ValueError("archive lease destination already exists: x.json"),
+        ):
+            with self.assertRaises(ValueError):
+                self.monitor.archive_run(self.run_id)
+        primary = self.paths.vibe / "runs" / self.run_id
+        self.assertTrue(primary.is_dir())
+        self.assertTrue((primary / "state.json").is_file())
+        records = load_events(self.paths, self.run_id)
+        self.assertEqual(records[-1]["event"], "run_archive_failed")
+        self.assertEqual(records[-1]["data"]["reason_class"], "ValueError")
+        self.assertFalse(
+            any(record["event"] == "run_archived" for record in records)
+        )
+
+    def test_failed_archive_records_partial_move_in_archive(self):
+        # When the run directory already moved before the failure, the
+        # failure event still lands on disk -- inside the archive leg via
+        # run_dir's redirect -- so the partial state stays auditable.
+        def _move_then_fail(paths, run_id):
+            import os
+            destination = runs_archive_dir(paths, run_id)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(str(paths.vibe / "runs" / run_id), str(destination))
+            raise OSError("simulated mid-move failure")
+
+        with mock.patch(
+            "vibe_guide.monitor._archive_run_artifacts",
+            side_effect=_move_then_fail,
+        ):
+            with self.assertRaises(OSError):
+                self.monitor.archive_run(self.run_id)
+        records = [
+            json.loads(line)
+            for line in (runs_archive_dir(self.paths, self.run_id)
+                         / "events.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(records[-1]["event"], "run_archive_failed")
+        self.assertEqual(records[-1]["data"]["reason_class"], "OSError")
+
+    def test_sweep_failure_dedupes_failure_events(self):
+        with mock.patch(
+            "vibe_guide.monitor._archive_run_artifacts",
+            side_effect=TypeError("boom"),
+        ):
+            self.monitor._archive_finished_runs()
+            self.monitor._archive_finished_runs()
+        records = load_events(self.paths, self.run_id)
+        failures = [r for r in records if r["event"] == "run_archive_failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["data"]["reason_class"], "TypeError")
+        # A later successful archive still gets its run_archived record.
+        self.monitor.archive_run(self.run_id)
+        records = load_events(self.paths, self.run_id)
+        self.assertEqual(records[-1]["event"], "run_archived")
 
     def test_reconcile_package_routes_to_archive(self):
         payload = {"kind": "run_archive", "run_id": self.run_id}

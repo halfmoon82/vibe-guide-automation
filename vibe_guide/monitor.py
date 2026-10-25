@@ -1837,14 +1837,20 @@ class Monitor:
             # Only ``complete`` archives automatically: a failed or
             # blocked_unknown run may still hold a quarantined writer lease
             # that is exactly what keeps a possibly-live session from being
-            # redispatched.  Those statuses need the human-facing
-            # ``vibe reconcile`` run_archive package (with force for
-            # non-terminal or stateless runs).
+            # redispatched.  Those statuses archive through the human-facing
+            # ``vibe reconcile`` run_archive package (they are terminal, so
+            # no force is needed; force is only for live or stateless runs).
             if status not in terminal:
                 continue
             try:
                 self.archive_run(child.name)
-            except (OSError, ValueError, TypeError):
+            except (OSError, ValueError, TypeError) as error:
+                # Archiving is best-effort at monitor entry, but a failure
+                # must still leave on-disk evidence with its reason class:
+                # a partially archived run (directory moved, mailbox
+                # requests still pending, lease unreleased) is otherwise
+                # invisible until someone notices the stuck run.
+                self._record_archive_failed(child.name, error)
                 continue
 
     def _save_task_binding(self, binding: TaskBinding) -> None:
@@ -2760,12 +2766,24 @@ class Monitor:
                 )
             except (OSError, ValueError):
                 already_recorded = False
-        if primary.is_dir() and not already_recorded:
-            # The archive event rides with the moved directory, so it must be
-            # appended while the run still lives under .vibe/runs/.  Its
-            # provenance carries the run's current authorization/contract
-            # digests (read from state.json, or supplied by the snapshot the
-            # caller just saved) so event-lineage validation keeps passing.
+        try:
+            manifest = _archive_run_artifacts(self.paths, run_id)
+        except (OSError, ValueError, TypeError) as error:
+            # Leave the failure on disk with its reason class: an archive
+            # that died mid-move (directory gone but mailbox requests still
+            # pending, lease unreleased) is otherwise indistinguishable from
+            # a clean archive, and the auto-sweep would keep retrying a run
+            # nobody can see is stuck.
+            self._record_archive_failed(run_id, error)
+            raise
+        if not already_recorded:
+            # The archive event is appended only after the move succeeded so
+            # a failed archive never leaves a false ``run_archived`` record;
+            # run_dir() resolves into .vibe/runs-archive/ at this point, so
+            # the event still lands inside the archived directory.  Its
+            # provenance carries the run's authorization/contract digests
+            # (read from state.json, or supplied by the snapshot the caller
+            # just saved) so event-lineage validation keeps passing.
             if snapshot is not None:
                 for key in ("authorization_digest", "node_contract_digest"):
                     value = getattr(snapshot, key, None)
@@ -2780,7 +2798,49 @@ class Monitor:
                 }),
                 provenance=provenance or None,
             )
-        return _archive_run_artifacts(self.paths, run_id)
+        return manifest
+
+    def _record_archive_failed(self, run_id: str, error: BaseException) -> None:
+        """Append a ``run_archive_failed`` event with the failure reason class.
+
+        Best-effort: recording must never mask or replace the original
+        failure, so any error here is swallowed.  Duplicate failure events
+        for the same reason class are suppressed so the auto-sweep does not
+        flood the log on every monitor entry.  When the run directory is
+        already gone from ``.vibe/runs/`` the event lands inside
+        ``.vibe/runs-archive/<run_id>/`` via :func:`run_dir`'s redirect.
+        """
+        try:
+            directory = run_dir(self.paths, run_id)
+        except (OSError, ValueError):
+            return
+        if not directory.is_dir():
+            # No evidence directory exists anywhere (e.g. a stateless run
+            # whose artifacts failed before the archive root was created);
+            # appending here would resurrect a stub under .vibe/runs/.
+            return
+        reason_class = type(error).__name__
+        try:
+            records = load_events(self.paths, run_id)
+        except (OSError, ValueError):
+            records = []
+        if records:
+            last = records[-1]
+            if (
+                last.get("event") == "run_archive_failed"
+                and last.get("data", {}).get("reason_class") == reason_class
+            ):
+                return
+        try:
+            append_event(
+                self.paths,
+                RunEvent("run_archive_failed", {
+                    "run_id": run_id,
+                    "reason_class": reason_class,
+                }),
+            )
+        except (OSError, ValueError, TypeError):
+            pass
 
     def reconcile_evidence(self, run_id: str, package: Dict[str, Any]) -> RunSnapshot:
         """Promote a verified, same-run evidence package through normal events.
