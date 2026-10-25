@@ -334,6 +334,19 @@ _EVENT_DATA_KEYS = {
     "prd_digest",
     "spec_digest",
     "reason",
+    # node_repaired (#278): the repair class ("stuck_session" /
+    # "reviewer_replacement" / failure classification kind), the action it
+    # queued, and whether identity survived.  All are program constants or
+    # booleans; ``reconciliation`` is the structured git/provider probe block
+    # the repair already computes from repo-local facts.
+    "kind",
+    "repair_action",
+    "preserved_identity",
+    "reconciliation",
+    "same_task",
+    # The binding status observed before a stuck_session repair normalizes it
+    # to failed; without it the fold would erase why the writer was dead.
+    "previous_binding_status",
     "retained_acceptances",
     "invalidated_acceptances",
     "role",

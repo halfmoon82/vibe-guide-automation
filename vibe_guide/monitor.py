@@ -8095,6 +8095,236 @@ class Monitor:
                     "repair_action": "change_reviewer_or_split_node",
                     "recovery_action": current.get("recovery_action"),
                     "run_id": snapshot.run_id, "reconciliation": reconciliation}
+        # Stuck-session repair (#278): when the node still carries the marks of
+        # a live session (active task, run handle, or a quarantined lease) but
+        # the task binding is already terminal -- the session was stopped
+        # externally or a previous recovery retired it -- a same-task retry can
+        # never work: the identity is dead.  repair_node then folds the whole
+        # manual checklist into one call: mark the binding failed, release the
+        # writer lease, retire the dead handle, clear the quarantine and queue
+        # a successor for the next ``vibe resume``.  Every piece tolerates
+        # absence so a partially cleaned state still converges instead of
+        # reporting a false success.  A binding that is still live means the
+        # session may be working; it falls through to the same-task path below
+        # rather than being parked by a repair.
+        role = str(
+            current.get("active_role")
+            or (current.get("active_task") or {}).get("role")
+            or "developer"
+        )
+        binding = None
+        binding_unreadable = False
+        try:
+            # Deliberately bypass ``_binding_cache``: the session may have been
+            # stopped by hand (or by a previous supervisor in another process)
+            # after the in-memory binding was cached, and a stale live status
+            # would skip the very cleanup this path exists for.
+            binding = load_task_binding(
+                self.paths, node_id, role, run_id=snapshot.run_id
+            )
+        except FileNotFoundError:
+            binding = None
+        except (OSError, TypeError, ValueError):
+            # The registry exists but cannot be read (corrupt JSON, schema
+            # drift, recursive ancestry).  "Unreadable" is not "dead": the
+            # binding may still describe a live writer, so cleanup and any
+            # successor would risk two writers.  Fail closed by parking the
+            # node for reconcile_binding without touching lease, handle or
+            # quarantine.
+            binding_unreadable = True
+        stuck_marks = (
+            isinstance(current.get("active_task"), dict)
+            or node_id in snapshot.handles
+            or isinstance(current.get("quarantine"), dict)
+        )
+        if stuck_marks and binding_unreadable:
+            current["status"] = "blocked_unknown"
+            current["recovery_action"] = "reconcile_binding"
+            current["reason"] = redact_provider_text(reason)
+            current["retryable_action"] = {
+                "action": "reconcile_binding",
+                "manual_repair_required": True,
+                "same_task": False,
+                "same_task_required": True,
+                "successor": False,
+                "reason": (
+                    "stuck-session repair could not read the task binding registry"
+                ),
+            }
+            reconciliation = {
+                "git": {"observed": False},
+                "provider": {"observed": False, "status": "unavailable"},
+            }
+            self._record(snapshot, "node_repaired", {"run_id": snapshot.run_id,
+                "node_id": node_id,
+                "kind": "stuck_session", "preserved_identity": False,
+                "repair_action": "stuck_session_cleanup", "same_task": False,
+                "successor": False, "role": role,
+                "reconciliation": reconciliation,
+                "task_id": None,
+                "generation": current.get(
+                    "review_generation" if role == "reviewer" else "developer_generation"
+                )})
+            self._save_snapshot(snapshot)
+            return {"node_id": node_id, "kind": "stuck_session",
+                    "preserved_identity": False,
+                    "status": current["status"],
+                    "task_id": None,
+                    "generation": current.get(
+                        "review_generation" if role == "reviewer" else "developer_generation"
+                    ),
+                    "repair_action": "stuck_session_cleanup",
+                    "recovery_action": current["recovery_action"],
+                    "steps": {
+                        "binding_failed": False,
+                        "lease_released": False,
+                        "handle_retired": False,
+                        "quarantine_cleared": False,
+                    },
+                    "run_id": snapshot.run_id,
+                    "reconciliation": reconciliation}
+        # Dead means the binding itself is finished: the provider/registry
+        # terminal set (stopped/failed/archived/blocked_design) plus
+        # blocked_unknown (the binding gate parked it before a verified start)
+        # and delivered/accepted (a completed handoff -- the contract's "done"
+        # and "blocked" shapes).  A missing binding is dead by absence.  Live
+        # statuses (created/start_pending/running/review/rework) are the only
+        # ones that still fall through to the same-task path.
+        binding_dead = binding is None or binding.status in {
+            "stopped", "failed", "archived",
+            "blocked_design", "blocked_unknown",
+            "delivered", "accepted",
+        }
+        if stuck_marks and binding_dead:
+            steps = {
+                "binding_failed": False,
+                "lease_released": False,
+                "handle_retired": False,
+                "quarantine_cleared": False,
+            }
+            predecessor = binding.task_id if binding is not None else None
+            previous_binding_status = (
+                binding.status if binding is not None else None
+            )
+            # Every dead binding is normalized to ``failed`` -- the canonical
+            # "no live writer" stamp the manual checklist used.  The registry
+            # requires all same-role historical bindings to be
+            # stopped/failed/archived before a successor may be registered, so
+            # leaving ``delivered``/``blocked_unknown`` in place would block
+            # the very dispatch this repair queues.  The pre-repair status is
+            # preserved on the event below via ``previous_binding_status`` so
+            # the fold does not erase history.
+            if binding is not None and binding.status != "failed":
+                try:
+                    binding = self._set_binding_status(
+                        snapshot, node_id, role, "failed"
+                    )
+                except (FileNotFoundError, OSError, TypeError, ValueError):
+                    # A binding we cannot retire cannot be proven dead; a
+                    # successor beside it would risk two live writers.  Fail
+                    # closed instead of queueing the dispatch.
+                    binding = None
+                    predecessor = None
+            steps["binding_failed"] = (
+                binding is not None and binding.status == "failed"
+            )
+            if binding is None and predecessor is not None:
+                # Reached only via the failed-to-retire branch above.
+                binding_unretired = True
+            else:
+                binding_unretired = False
+            lease_released = release_writer_lease(
+                self.paths,
+                node_id,
+                str(current.get("worktree", "")),
+                snapshot.run_id,
+            )
+            observed_lease = read_writer_lease(
+                self.paths, node_id, str(current.get("worktree", ""))
+            )
+            steps["lease_released"] = lease_released or observed_lease is None or not observed_lease.active
+            retired_handle = snapshot.handles.pop(node_id, None)
+            steps["handle_retired"] = (
+                retired_handle is not None or node_id not in snapshot.handles
+            )
+            steps["quarantine_cleared"] = isinstance(
+                current.get("quarantine"), dict
+            )
+            current["quarantine"] = None
+            current["active_role"] = None
+            current["active_task"] = None
+            # Free the pair slot so the scheduler's pending_schedule retry can
+            # dispatch the successor inside the concurrency budget.
+            current["pair_archived"] = True
+            if role == "reviewer":
+                current["status"] = "rework"
+                current["reviewer_started"] = False
+            else:
+                current["status"] = "retry_pending"
+            current["reason"] = redact_provider_text(reason)
+            if binding_unretired:
+                # No terminal binding could be produced or proven; a successor
+                # is unsafe, so the node stays parked for reconcile_binding.
+                current["status"] = "blocked_unknown"
+                current["recovery_action"] = "reconcile_binding"
+                current["retryable_action"] = {
+                    "action": "reconcile_binding",
+                    "manual_repair_required": True,
+                    "same_task": False,
+                    "same_task_required": True,
+                    "successor": False,
+                    "reason": (
+                        "stuck-session repair could not retire the old binding"
+                    ),
+                }
+            else:
+                current["recovery_action"] = "repair_node"
+                current["retryable_action"] = {
+                    "role": role,
+                    "phase": "review" if role == "reviewer" else "develop",
+                    "continuation": False,
+                    "pending_schedule": True,
+                    "successor": True,
+                    "same_task": False,
+                    "same_task_required": False,
+                    "old_task_reconciled": True,
+                    "predecessor_task_id": predecessor,
+                    "reason": redact_provider_text(reason),
+                }
+            after = {key: current.get(key) for key in before}
+            preserved = before == after
+            reconciliation = {
+                "git": {"observed": False},
+                "provider": {"observed": False, "status": "unavailable"},
+            }
+            self._record(snapshot, "node_repaired", {"run_id": snapshot.run_id,
+                "node_id": node_id,
+                "kind": "stuck_session", "preserved_identity": preserved,
+                "repair_action": "stuck_session_cleanup", "same_task": False,
+                "successor": current["retryable_action"].get("successor") is True,
+                "role": role,
+                "phase": current["retryable_action"].get("phase"),
+                "predecessor_task_id": predecessor,
+                "previous_binding_status": previous_binding_status,
+                "handle_id": retired_handle,
+                "reconciliation": reconciliation,
+                "task_id": predecessor,
+                "generation": current.get(
+                    "review_generation" if role == "reviewer" else "developer_generation"
+                )})
+            self._save_snapshot(snapshot)
+            return {"node_id": node_id, "kind": "stuck_session",
+                    "preserved_identity": preserved,
+                    "status": current.get("status"),
+                    "task_id": predecessor,
+                    "generation": current.get(
+                        "review_generation" if role == "reviewer" else "developer_generation"
+                    ),
+                    "repair_action": "stuck_session_cleanup",
+                    "recovery_action": current.get("recovery_action"),
+                    "steps": steps,
+                    "run_id": snapshot.run_id,
+                    "reconciliation": reconciliation}
         classification = classify_provider_failure({"reason": reason})
         if classification["kind"] == "binding_unknown":
             current["status"] = "blocked_unknown"
