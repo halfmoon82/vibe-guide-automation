@@ -37,6 +37,7 @@ from ..task_registry import (
     save_task_binding,
 )
 from ..workflow_gate import session_contract_prompt
+from ..prompts import rework_findings_section
 from ..state import read_writer_lease
 from ..providers import (
     CLAUDE_CODE_PROVIDER,
@@ -220,6 +221,7 @@ class ProviderActionRunner(Runner):
             "`wake.channel` 非空时用该工具向 `wake.target` 原样发送 `wake.signal`，唤醒登记主监工；为 null 或地址 unknown 时不发，由心跳领取。"
             "自报时把你本会话的工作目录原样写进交付 JSON 的 `delivery_evidence.session_cwd`：监工用它核对本会话是否真的挂载了 project，不填就无法核对。"
             "运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。\n"
+            "{rework_findings}"
         ).format(node=node_id, generation=generation, purpose=purpose, objective=objective,
                  role=contract.get('role', 'developer'),
                  run=contract.get('run_id', '<原 run-id>'),
@@ -232,7 +234,8 @@ class ProviderActionRunner(Runner):
                  status=contract.get("status_file", "原状态文件"),
                  handoff=contract.get("handoff_file") or contract.get("delivery_path", "原交付文件"),
                  marker=contract.get("completion_marker", "原交付 marker"),
-                 acceptance_pin=acceptance_pin)
+                 acceptance_pin=acceptance_pin,
+                 rework_findings=rework_findings_section(contract))
 
     def _validate_v39_create_binding(
         self, contract: Dict[str, Any], runtime_worktree: Path
