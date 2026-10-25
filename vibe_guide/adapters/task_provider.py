@@ -333,6 +333,8 @@ class ProviderActionStore:
     ) -> None:
         if not isinstance(adapter_id, str) or not adapter_id:
             raise ValueError("adapter id is required")
+        if not _SAFE_ID.fullmatch(adapter_id):
+            raise ValueError("adapter id must be a simple identifier")
         if (
             not isinstance(facts, Mapping)
             or not facts
@@ -359,16 +361,84 @@ class ProviderActionStore:
                 raise ValueError("provider capability project_id must be a non-empty string")
             payload["project_id"] = project_id.strip()
         self.root.mkdir(parents=True, exist_ok=True)
+        # The per-adapter file is authoritative (issue #279): each adapter's
+        # session attests its own record and no later attest of *another*
+        # adapter can overwrite it.  The legacy single-file bridge is kept as
+        # a mirror of the latest record so pre-split readers still work.
+        self._atomic(self.root / ("capabilities-" + adapter_id + ".json"), payload)
         self._atomic(self.root / "capabilities.json", payload)
 
-    def capabilities(self) -> Dict[str, Any]:
-        value = self._read(self.root / "capabilities.json")
+    def _validate_capability(self, value: Dict[str, Any]) -> Dict[str, Any]:
         required = {"schema_version", "adapter_id", "facts", "provenance"}
         if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - {"project_id"}:
             raise ValueError("provider capability schema is invalid")
         if value["schema_version"] != self.schema_version:
             raise ValueError("provider capability schema is unsupported")
         return value
+
+    def capabilities_all(self) -> Dict[str, Dict[str, Any]]:
+        """Every recorded adapter capability, keyed by its own ``adapter_id``.
+
+        The per-adapter files win; the legacy ``capabilities.json`` record
+        joins only for adapters that predate the split and never got a
+        per-adapter file.  No record is ever attributed to another adapter.
+        """
+        records: Dict[str, Dict[str, Any]] = {}
+        if not self.root.is_dir():
+            return records
+        if self.root.is_symlink():
+            raise ValueError("provider action path may not be a symlink")
+        for path in sorted(self.root.glob("capabilities-*.json")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            record = self._validate_capability(self._read(path))
+            records[str(record["adapter_id"])] = record
+        legacy = self.root / "capabilities.json"
+        if legacy.is_file() and not legacy.is_symlink():
+            record = self._validate_capability(self._read(legacy))
+            records.setdefault(str(record["adapter_id"]), record)
+        return records
+
+    def capabilities(self, adapter_id: Optional[str] = None) -> Dict[str, Any]:
+        """The recorded capability bridge for one adapter.
+
+        With ``adapter_id`` the call reads exactly that adapter's record: a
+        per-adapter file when it exists, else the legacy single file only when
+        it names this adapter.  A missing record raises ``FileNotFoundError``;
+        another adapter's record is never borrowed in its place.
+
+        Without an adapter the call is the legacy convenience view: it needs
+        exactly one recorded adapter, and refuses rather than guessing when
+        several adapters have attested.
+        """
+        if adapter_id is not None:
+            if not isinstance(adapter_id, str) or not _SAFE_ID.fullmatch(adapter_id.strip()):
+                raise ValueError("adapter id must be a simple identifier")
+            adapter_id = adapter_id.strip()
+            per_adapter = self.root / ("capabilities-" + adapter_id + ".json")
+            # Same symlink posture as capabilities_all: a symlinked record is
+            # untrusted evidence and reads as "not registered", never borrowed.
+            if per_adapter.is_file() and not per_adapter.is_symlink():
+                record = self._validate_capability(self._read(per_adapter))
+                if record["adapter_id"] != adapter_id:
+                    raise ValueError("provider capability record names a different adapter")
+                return record
+            legacy = self.root / "capabilities.json"
+            if legacy.is_file() and not legacy.is_symlink():
+                record = self._validate_capability(self._read(legacy))
+                if record["adapter_id"] == adapter_id:
+                    return record
+            raise FileNotFoundError(
+                "no capability record for adapter: {}".format(adapter_id)
+            )
+        records = self.capabilities_all()
+        if not records:
+            raise FileNotFoundError("provider capability record is missing")
+        if len(records) > 1:
+            raise ValueError(
+                "multiple adapters have capability records; specify the adapter"
+            )
+        return next(iter(records.values()))
 
     def request(
         self,

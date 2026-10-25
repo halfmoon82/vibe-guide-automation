@@ -87,6 +87,7 @@ from .session_entry import build_session_entry, draft_s1, materialize_session_en
 from .node_spec import (
     complete_node_contracts,
     normalize_node_spec,
+    observe_all_capabilities,
     observe_capabilities,
     reject_engineering_fields,
     render_planning_brief_markdown,
@@ -393,10 +394,12 @@ def _card_discloses_background(card: Optional[AuthorizationCard]) -> bool:
 def _observed_topology_rulings(
     paths: ProjectPaths, card: Optional[AuthorizationCard] = None
 ) -> dict:
-    """Return ``{adapter_id: dispatch ruling}`` from the recorded bridge.
+    """Return ``{adapter_id: dispatch ruling}`` from the recorded bridges.
 
     The ruling re-derives the ISSUE-07 topology decision from the capability
-    facts and provenance the desktop session published.  Any missing or
+    facts and provenance each desktop session published (#279: every adapter
+    keeps its own record, so a run gets rulings for the adapters that
+    actually attested, not for whichever wrote last).  Any missing or
     invalid evidence yields an empty mapping, and the monitor then keeps its
     conservative dual-visible default: UNKNOWN never upgrades to visible-sdd.
 
@@ -406,44 +409,47 @@ def _observed_topology_rulings(
     not diverge; the first-publication card (``card=None``) is not walked back.
     """
     try:
-        observed = observe_capabilities(paths)
+        observed = observe_all_capabilities(paths)
     except (ProviderPending, OSError, TypeError, ValueError):
         return {}
-    probes = [observed.adapter_id + ".in_session_sdd", observed.adapter_id + ".subprocess"]
-    try:
-        adapter = AdapterRegistry().get(observed.adapter_id)
-    except KeyError:
-        return {}
-    background_probe = adapter.manifest.get("background_probe")
-    if background_probe:
-        probes.append(background_probe)
-    evidence = observed.detection.evidence
-    provenance = observed.detection.capabilities.provenance
+    rulings = {}
+    for adapter_id, record in observed.items():
+        probes = [record.adapter_id + ".in_session_sdd", record.adapter_id + ".subprocess"]
+        try:
+            adapter = AdapterRegistry().get(record.adapter_id)
+        except KeyError:
+            continue
+        background_probe = adapter.manifest.get("background_probe")
+        if background_probe:
+            probes.append(background_probe)
+        evidence = record.detection.evidence
+        provenance = record.detection.capabilities.provenance
 
-    def ruling(names):
-        facts = {}
-        provenance_map = {}
-        for name in names:
-            if name in evidence:
-                facts[name] = bool(evidence[name])
-                source = provenance.get(name)
-                if isinstance(source, str) and source:
-                    provenance_map[name] = source
-        return adapter.topology_decision(
-            AdapterEnvironment(facts=facts, provenance=provenance_map)
-        ).topology
+        def ruling(names):
+            facts = {}
+            provenance_map = {}
+            for name in names:
+                if name in evidence:
+                    facts[name] = bool(evidence[name])
+                    source = provenance.get(name)
+                    if isinstance(source, str) and source:
+                        provenance_map[name] = source
+            return adapter.topology_decision(
+                AdapterEnvironment(facts=facts, provenance=provenance_map)
+            ).topology
 
-    try:
-        topology = ruling(probes)
-        if (
-            topology == TOPOLOGY_BACKGROUND
-            and card is not None
-            and not _card_discloses_background(card)
-        ):
-            topology = ruling(probes[:-1] if background_probe else probes)
-    except (KeyError, TypeError, ValueError):
-        return {}
-    return {observed.adapter_id: topology}
+        try:
+            topology = ruling(probes)
+            if (
+                topology == TOPOLOGY_BACKGROUND
+                and card is not None
+                and not _card_discloses_background(card)
+            ):
+                topology = ruling(probes[:-1] if background_probe else probes)
+        except (KeyError, TypeError, ValueError):
+            continue
+        rulings[record.adapter_id] = topology
+    return rulings
 
 
 def _background_launcher_problem(paths: ProjectPaths) -> Optional[str]:
@@ -525,11 +531,24 @@ def _observed_engine_attestation(paths: ProjectPaths, plan: Plan) -> Dict[str, A
 
     The observation is taken the way publication takes it, from the live
     ``ProviderActionStore``, so the re-signed card rests on freshly observed
-    facts rather than on a re-typed copy of the old ones.  Raising is the
+    facts rather than on a re-typed copy of the old ones.  The record is the
+    adapter the published attestation names: other adapters' attests cannot
+    rewrite it (#279).  Raising is the
     correct outcome when the store cannot be read: an unverifiable engine
     binding must not be re-signed.
     """
-    observed = ProviderActionStore(paths).capabilities()
+    attestation_path = paths.resolve_vibe_path(
+        Path("plans") / plan.plan_id / "engine-attestation.json"
+    )
+    provider = None
+    try:
+        if attestation_path.is_file() and not attestation_path.is_symlink():
+            provider = json.loads(
+                attestation_path.read_text(encoding="utf-8")
+            ).get("provider")
+    except (OSError, TypeError, ValueError):
+        provider = None
+    observed = ProviderActionStore(paths).capabilities(provider)
     return create_engine_attestation(
         plan.plan_id,
         plan.version,
@@ -587,7 +606,7 @@ def _observed_adapter(paths: ProjectPaths, adapter_id: str):
     last_error = None
     for attempt in range(3):
         try:
-            observed = observe_capabilities(paths)
+            observed = observe_capabilities(paths, adapter_id)
             break
         except ProviderPending as error:
             last_error = error
@@ -918,7 +937,9 @@ def _publish_plan(
     engine_attestation = None
     try:
         if is_complex_spec:
-            observed_store = ProviderActionStore(paths).capabilities()
+            observed_store = ProviderActionStore(paths).capabilities(
+                capabilities.agent_id
+            )
             engine_attestation = create_engine_attestation(
                 plan.plan_id,
                 plan.version,
@@ -2595,11 +2616,14 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         report = doctor(scan_project(paths))
         bridge_payload = None
         try:
-            bridge = ProviderActionStore(paths).capabilities()
-            bridge_payload = _observed_adapter(
-                paths, bridge["adapter_id"]
-            ).to_dict()
-        except (FileNotFoundError, OSError, TypeError, ValueError):
+            # Several adapters may have attested (#279): report the first in
+            # name order; the sort keeps the diagnostic deterministic.
+            bridge = sorted(ProviderActionStore(paths).capabilities_all().items())
+            if bridge:
+                bridge_payload = _observed_adapter(
+                    paths, bridge[0][1]["adapter_id"]
+                ).to_dict()
+        except (FileNotFoundError, OSError, TypeError, ValueError, ProviderPending):
             pass
         issues = list(report.issues)
         if bridge_payload is not None:
@@ -2892,7 +2916,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     raise ValueError("node spec must be a JSON object")
             # The session route settles the band only on the product path;
             # a hand-written node spec keeps declaring its own band.
-            source = normalize_node_spec(source, entry, paths, route_governs_band=bool(args.from_prd))
+            source = normalize_node_spec(source, entry, paths, route_governs_band=bool(args.from_prd), adapter_id=args.adapter)
             # Evaluate the PRD checkpoints before _publish_plan().  This gate
             # is deliberately side-effect free: unresolved product choices,
             # missing/unverified evidence, and invalid Skill references must
