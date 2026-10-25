@@ -372,6 +372,11 @@ _EVENT_DATA_KEYS = {
     "warnings",
     "attempt",
     "reason_class",
+    # #277: the exception class behind a block (e.g. "ConnectionError").
+    # Program-authored type name, never provider text; without it the
+    # blocked_unknown event loses half of the structured classification the
+    # issue requires persistence to keep.
+    "error_type",
     "next_retry_at",
     "binding_digest",
     "last_observation_ref",
@@ -464,6 +469,19 @@ _PROVIDER_TEXT_KEYS = {
 }
 _REDACTED = "[REDACTED]"
 _REDACTED_PROVIDER_TEXT = "[REDACTED_PROVIDER_TEXT]"
+#: #277: structured error-classification fields are vibe/provider-authored
+#: fixed enums and type names, never free text, so they are exempted from
+#: provider-text redaction even when they sit inside an otherwise-redacted
+#: provider payload.  The defect was that a failure dict like
+#: ``{"reason": <text>, "reason_class": "binding_unknown"}`` persisted as
+#: ``{"reason": "[REDACTED_PROVIDER_TEXT]", "reason_class":
+#: "[REDACTED_PROVIDER_TEXT]"}`` -- the one fact a supervisor or auditor can
+#: act on ("which error class") was replaced by a placeholder.
+STRUCTURED_REASON_KEYS = frozenset({
+    "error_type",
+    "reason_class",
+    "reason_code",
+})
 #: Node-level structural facts a recovery or rollback gate is allowed to
 #: decide on (#256).  Every entry is program-authored structure -- a status
 #: enum, a hex digest, an epoch, an identity/generation pair, a marker object
@@ -543,7 +561,22 @@ def is_redacted_value(value: Any) -> bool:
     )
 
 
+def _provider_text_verbose() -> bool:
+    """#277 opt-in debug switch: ``VIBE_VERBOSE=1`` keeps provider free text.
+
+    Off by default.  Field-name-based secret masking (``token``/``secret``/
+    ``credential``/...) stays on even under verbose -- the flag is for
+    debugging a live failure, not for persisting credentials.
+    """
+    return os.environ.get("VIBE_VERBOSE") == "1"
+
+
 def redact_provider_text(value: Any) -> Any:
+    if _provider_text_verbose():
+        # Verbose keeps the original text verbatim; routing through the normal
+        # sanitizer still masks dict entries whose *keys* name secrets and
+        # keeps nested provider-text keys treated uniformly.
+        return _sanitize_durable_value(value)
     if value is None:
         return None
     if isinstance(value, list):
@@ -551,11 +584,20 @@ def redact_provider_text(value: Any) -> Any:
     if isinstance(value, tuple):
         return [redact_provider_text(item) for item in value]
     if isinstance(value, dict):
-        return {
-            str(key): redact_provider_text(item)
-            for key, item in value.items()
-            if not _is_sensitive_data_key(str(key))
-        }
+        result: Dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            if _is_sensitive_data_key(name):
+                continue
+            if _normalize_data_key(name) in STRUCTURED_REASON_KEYS and isinstance(
+                item, (str, int, float, bool)
+            ):
+                # Fixed-enum/type-name fields (#277).  Scalars only: a dict or
+                # list under a structured name is still provider payload.
+                result[name] = item
+                continue
+            result[name] = redact_provider_text(item)
+        return result
     return _REDACTED_PROVIDER_TEXT
 
 

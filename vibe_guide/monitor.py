@@ -2992,6 +2992,7 @@ class Monitor:
                         snapshot, node_id, reason,
                         quarantine_lease=False,
                         retryable_same_task=True,
+                        cause=error,
                     )
                 continue
             for event in events:
@@ -5263,7 +5264,7 @@ class Monitor:
             current["active_role"] = None
             # Preserve the write-ahead intent for same-task retry.
             if successor:
-                self._mark_blocked_unknown(snapshot, node_id, str(error), quarantine_lease=False)
+                self._mark_blocked_unknown(snapshot, node_id, error, quarantine_lease=False)
                 if pending_successor:
                     self._record(snapshot, "successor_binding_pending", {
                         "run_id": snapshot.run_id, "node_id": node_id,
@@ -5310,7 +5311,7 @@ class Monitor:
             if failure["kind"] == "external_decision":
                 self._mark_external_authorization_required(snapshot, node_id, str(error))
             elif failure["kind"] not in {"retryable", "capacity_wait", "repairable"}:
-                self._mark_blocked_unknown(snapshot, node_id, str(error))
+                self._mark_blocked_unknown(snapshot, node_id, error)
                 # A pre-write binding observation has no provider handle yet,
                 # but it is still a recoverable same-generation action. Keep
                 # the retry marker after the fail-closed user status so the
@@ -5349,6 +5350,7 @@ class Monitor:
                     snapshot, node_id,
                     "task binding rejected before start ({})".format(type(error).__name__),
                     quarantine_lease=False,
+                    cause=error,
                 )
                 return False
             return self._preflight_contract_failure(
@@ -5574,6 +5576,7 @@ class Monitor:
                 "worker start outcome is unknown ({})".format(
                     type(error).__name__
                 ),
+                cause=error,
             )
             self._save_snapshot(snapshot)
             return False
@@ -5623,6 +5626,7 @@ class Monitor:
                 "confirmed task binding cannot be updated ({})".format(
                     type(error).__name__
                 ),
+                cause=error,
             )
             self._save_snapshot(snapshot)
             return False
@@ -6226,6 +6230,7 @@ class Monitor:
                     "reviewer violation could not return to developer ({})".format(
                         type(error).__name__
                     ),
+                    cause=error,
                 )
             return
         if event.event not in {
@@ -6253,7 +6258,8 @@ class Monitor:
                 )
             except (OSError, TypeError, ValueError) as error:
                 self._mark_blocked_unknown(
-                    snapshot, node_id, "decision request could not be persisted ({})".format(type(error).__name__)
+                    snapshot, node_id, "decision request could not be persisted ({})".format(type(error).__name__),
+                    cause=error,
                 )
                 return
             notification_unknown = any(
@@ -6396,6 +6402,7 @@ class Monitor:
                         "task binding cannot record review state ({})".format(
                             type(error).__name__
                         ),
+                        cause=error,
                     )
                     return
                 current["status"] = "review"
@@ -6409,6 +6416,7 @@ class Monitor:
                     "task binding cannot record delivery ({})".format(
                         type(error).__name__
                     ),
+                    cause=error,
                 )
                 return
             current["status"] = "delivered"
@@ -6440,6 +6448,7 @@ class Monitor:
                         "reviewer task binding cannot be verified ({})".format(
                             type(error).__name__
                         ),
+                        cause=error,
                     )
                     return
                 else:
@@ -6775,6 +6784,7 @@ class Monitor:
                     "reviewer binding cannot be verified ({})".format(
                         type(error).__name__
                     ),
+                    cause=error,
                 )
                 return
             if (
@@ -6800,6 +6810,7 @@ class Monitor:
                     "dual-visible acceptance refused: node contract is unreadable ({})".format(
                         error
                     ),
+                    cause=error,
                 )
                 return
             if not live_digest_matches:
@@ -6881,6 +6892,7 @@ class Monitor:
                     "task binding cannot record acceptance ({})".format(
                         type(error).__name__
                     ),
+                    cause=error,
                 )
                 return
             current["status"] = "accepted"
@@ -6963,6 +6975,7 @@ class Monitor:
                     "task binding cannot record terminal state ({})".format(
                         type(error).__name__
                     ),
+                    cause=error,
                 )
                 return
             current["status"] = terminal_status
@@ -7774,6 +7787,7 @@ class Monitor:
         if classification["kind"] == "external_decision":
             current["status"] = "blocked_design"
             current["reason"] = redact_provider_text(reason)
+            current["reason_class"] = "external_decision"
             current["retryable_action"] = None
             current["recovery_action"] = "await_external_decision"
             current["owner_layer"] = "external_authorization"
@@ -7790,6 +7804,7 @@ class Monitor:
             current["retryable_action"] = retry
             current["status"] = "retry_pending" if classification["kind"] in {"retryable", "capacity_wait", "repairable"} else "blocked_unknown"
             current["reason"] = redact_provider_text(reason)
+            current["reason_class"] = str(classification["kind"])
         self._record(snapshot, "retry_scheduled", {"run_id": snapshot.run_id, "node_id": node_id,
             "reason_class": classification["kind"], "reason": reason,
             "same_task_required": True, "next_retry_at": current.get("retryable_action", {}).get("next_retry_at") if isinstance(current.get("retryable_action"), dict) else None})
@@ -7907,10 +7922,12 @@ class Monitor:
         self,
         snapshot: RunSnapshot,
         node_id: str,
-        reason: str,
+        reason: Any,
         quarantine_lease: bool = True,
         retryable_same_task: bool = False,
         extra_event_data: Optional[Dict[str, Any]] = None,
+        reason_code: Optional[str] = None,
+        cause: Optional[BaseException] = None,
     ) -> None:
         """Park a node as blocked_unknown and stamp its recovery markers.
 
@@ -7925,18 +7942,46 @@ class Monitor:
           fingerprint, not proof of live work.  Rescue gates judge it with
           ``defect_adjacent_marker_allows_rescue``; see
           ``RECOVERY_FIDELITY_AUDIT`` for the call-site verdicts.
+
+        #277: alongside the redacted free text the block now stamps the
+        structured classification on the node and the event --
+        ``reason_class`` (the classifier's fixed-enum kind),
+        ``error_type`` (the exception class when the block came from one --
+        pass the exception itself as ``reason`` or separately as ``cause``)
+        and an optional ``reason_code``.  All three are program-authored
+        enums/names, so persistence keeps them verbatim and ``vibe status``
+        can name the failure class without the provider text.
         """
+        if cause is None and isinstance(reason, BaseException):
+            cause = reason
+        reason_text = str(reason)
+        error_type = type(cause).__name__ if cause is not None else None
+        classification = classify_provider_failure(
+            cause if cause is not None else {"reason": reason_text}
+        )
+        reason_class = str(classification["kind"])
         current = snapshot.nodes[node_id]
         active = current.get("active_task")
         handle_id = snapshot.handles.get(node_id)
         current["status"] = "blocked_unknown"
-        current["reason"] = reason
+        current["reason"] = reason_text
+        current["reason_class"] = reason_class
+        if error_type is not None:
+            current["error_type"] = error_type
+        else:
+            current.pop("error_type", None)
+        if reason_code is not None:
+            current["reason_code"] = reason_code
+        else:
+            current.pop("reason_code", None)
         current["quarantine"] = {
             "run_id": snapshot.run_id,
             "handle_id": handle_id,
-            "reason": reason,
+            "reason": reason_text,
         }
-        action = recovery_action_for_failure({"reason": reason})
+        action = recovery_action_for_failure(
+            cause if cause is not None else {"reason": reason_text}
+        )
         current["recovery_action"] = action
         if isinstance(active, dict) and active.get("role") in {"developer", "reviewer"}:
             try:
@@ -7951,13 +7996,18 @@ class Monitor:
                 node_id,
                 str(current.get("worktree", "")),
                 snapshot.run_id,
-                reason,
+                reason_text,
             )
         event_data = {
             "run_id": snapshot.run_id,
             "node_id": node_id,
-            "reason": reason,
+            "reason": reason_text,
+            "reason_class": reason_class,
         }
+        if error_type is not None:
+            event_data["error_type"] = error_type
+        if reason_code is not None:
+            event_data["reason_code"] = reason_code
         if retryable_same_task:
             event_data["retryable_same_task"] = True
         if extra_event_data:
@@ -7996,6 +8046,9 @@ class Monitor:
         redacted = redact_provider_text(reason)
         current["status"] = "blocked_design"
         current["reason"] = redacted
+        # #277: external authorization is a fixed routing class -- keep the
+        # structured class readable beside the redacted free text.
+        current["reason_class"] = "external_decision"
         current["retryable_action"] = None
         current["recovery_action"] = "await_external_decision"
         current["owner_layer"] = "external_authorization"
@@ -8010,6 +8063,7 @@ class Monitor:
             "run_id": snapshot.run_id,
             "node_id": node_id,
             "reason": redacted,
+            "reason_class": "external_decision",
             "old_task_reconciled": True,
             "owner_layer": "external_authorization",
             "recovery_action": "await_external_decision",
