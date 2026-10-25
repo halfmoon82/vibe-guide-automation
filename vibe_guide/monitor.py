@@ -7867,6 +7867,7 @@ class Monitor:
             or "developer"
         )
         binding = None
+        binding_unreadable = False
         try:
             # Deliberately bypass ``_binding_cache``: the session may have been
             # stopped by hand (or by a previous supervisor in another process)
@@ -7875,16 +7876,80 @@ class Monitor:
             binding = load_task_binding(
                 self.paths, node_id, role, run_id=snapshot.run_id
             )
-        except (FileNotFoundError, OSError, TypeError, ValueError):
+        except FileNotFoundError:
             binding = None
+        except (OSError, TypeError, ValueError):
+            # The registry exists but cannot be read (corrupt JSON, schema
+            # drift, recursive ancestry).  "Unreadable" is not "dead": the
+            # binding may still describe a live writer, so cleanup and any
+            # successor would risk two writers.  Fail closed by parking the
+            # node for reconcile_binding without touching lease, handle or
+            # quarantine.
+            binding_unreadable = True
         stuck_marks = (
             isinstance(current.get("active_task"), dict)
             or node_id in snapshot.handles
             or isinstance(current.get("quarantine"), dict)
         )
-        if stuck_marks and (
-            binding is None or binding.status in {"stopped", "failed", "archived"}
-        ):
+        if stuck_marks and binding_unreadable:
+            current["status"] = "blocked_unknown"
+            current["recovery_action"] = "reconcile_binding"
+            current["reason"] = redact_provider_text(reason)
+            current["retryable_action"] = {
+                "action": "reconcile_binding",
+                "manual_repair_required": True,
+                "same_task": False,
+                "same_task_required": True,
+                "successor": False,
+                "reason": (
+                    "stuck-session repair could not read the task binding registry"
+                ),
+            }
+            reconciliation = {
+                "git": {"observed": False},
+                "provider": {"observed": False, "status": "unavailable"},
+            }
+            self._record(snapshot, "node_repaired", {"run_id": snapshot.run_id,
+                "node_id": node_id,
+                "kind": "stuck_session", "preserved_identity": False,
+                "repair_action": "stuck_session_cleanup", "same_task": False,
+                "successor": False, "role": role,
+                "reconciliation": reconciliation,
+                "task_id": None,
+                "generation": current.get(
+                    "review_generation" if role == "reviewer" else "developer_generation"
+                )})
+            self._save_snapshot(snapshot)
+            return {"node_id": node_id, "kind": "stuck_session",
+                    "preserved_identity": False,
+                    "status": current["status"],
+                    "task_id": None,
+                    "generation": current.get(
+                        "review_generation" if role == "reviewer" else "developer_generation"
+                    ),
+                    "repair_action": "stuck_session_cleanup",
+                    "recovery_action": current["recovery_action"],
+                    "steps": {
+                        "binding_failed": False,
+                        "lease_released": False,
+                        "handle_retired": False,
+                        "quarantine_cleared": False,
+                    },
+                    "run_id": snapshot.run_id,
+                    "reconciliation": reconciliation}
+        # Dead means the binding itself is finished: the provider/registry
+        # terminal set (stopped/failed/archived/blocked_design) plus
+        # blocked_unknown (the binding gate parked it before a verified start)
+        # and delivered/accepted (a completed handoff -- the contract's "done"
+        # and "blocked" shapes).  A missing binding is dead by absence.  Live
+        # statuses (created/start_pending/running/review/rework) are the only
+        # ones that still fall through to the same-task path.
+        binding_dead = binding is None or binding.status in {
+            "stopped", "failed", "archived",
+            "blocked_design", "blocked_unknown",
+            "delivered", "accepted",
+        }
+        if stuck_marks and binding_dead:
             steps = {
                 "binding_failed": False,
                 "lease_released": False,
@@ -7892,6 +7957,17 @@ class Monitor:
                 "quarantine_cleared": False,
             }
             predecessor = binding.task_id if binding is not None else None
+            previous_binding_status = (
+                binding.status if binding is not None else None
+            )
+            # Every dead binding is normalized to ``failed`` -- the canonical
+            # "no live writer" stamp the manual checklist used.  The registry
+            # requires all same-role historical bindings to be
+            # stopped/failed/archived before a successor may be registered, so
+            # leaving ``delivered``/``blocked_unknown`` in place would block
+            # the very dispatch this repair queues.  The pre-repair status is
+            # preserved on the event below via ``previous_binding_status`` so
+            # the fold does not erase history.
             if binding is not None and binding.status != "failed":
                 try:
                     binding = self._set_binding_status(
@@ -7983,6 +8059,7 @@ class Monitor:
                 "role": role,
                 "phase": current["retryable_action"].get("phase"),
                 "predecessor_task_id": predecessor,
+                "previous_binding_status": previous_binding_status,
                 "handle_id": retired_handle,
                 "reconciliation": reconciliation,
                 "task_id": predecessor,

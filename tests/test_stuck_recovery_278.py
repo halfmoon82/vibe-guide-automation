@@ -216,6 +216,69 @@ class StuckRecoveryTests(unittest.TestCase):
             persisted.tasks["n1:developer"]["status"], "failed"
         )
 
+    def test_corrupt_registry_parks_instead_of_fail_open(self):
+        """P1: an unreadable tasks.json is not "dead" -- repair must fail
+        closed (blocked_unknown / reconcile_binding) without touching the
+        lease, handle, quarantine, or queueing a successor beside a possibly
+        live writer."""
+        monitor, runner, snapshot = self._running_snapshot()
+        tasks_path = (
+            self.paths.vibe / "runs" / snapshot.run_id / "tasks.json"
+        )
+        self.assertTrue(tasks_path.exists())
+        # Corrupt the registry after the session started.
+        tasks_path.write_text("{not json", encoding="utf-8")
+
+        result = monitor.repair_node("n1", snapshot.run_id)
+
+        self.assertEqual(result["kind"], "stuck_session")
+        self.assertEqual(result["status"], "blocked_unknown")
+        self.assertEqual(result["recovery_action"], "reconcile_binding")
+        self.assertFalse(result["steps"]["binding_failed"])
+        self.assertFalse(result["steps"]["lease_released"])
+        self.assertFalse(result["steps"]["handle_retired"])
+        persisted = load_snapshot(self.paths, snapshot.run_id)
+        current = persisted.nodes["n1"]
+        self.assertEqual(current["status"], "blocked_unknown")
+        retry = current["retryable_action"]
+        self.assertTrue(retry["manual_repair_required"])
+        self.assertFalse(retry["successor"])
+        # Nothing was cleaned: the handle and active task survive so a human
+        # reconcile still sees the real marks.
+        self.assertIn("n1", persisted.handles)
+        self.assertIsInstance(current.get("active_task"), dict)
+        self.assertIsNotNone(
+            read_writer_lease(self.paths, "n1", ".worktrees/n1")
+        )
+
+    def test_blocked_binding_folds_cleanup_and_successor(self):
+        """P2: a binding parked at blocked_unknown (the contract's "blocked"
+        shape) is dead too -- repair folds the checklist instead of bouncing
+        back to manual_repair_required, and the normalized failed binding
+        lets the successor register."""
+        monitor, runner, snapshot = self._running_snapshot()
+        binding = self._stop_binding(snapshot, "blocked_unknown")
+
+        result = monitor.repair_node("n1", snapshot.run_id)
+
+        self.assertEqual(result["kind"], "stuck_session")
+        self.assertTrue(result["steps"]["binding_failed"])
+        persisted = load_snapshot(self.paths, snapshot.run_id)
+        self.assertEqual(
+            persisted.tasks["n1:developer"]["status"], "failed"
+        )
+        self.assertNotIn("n1", persisted.handles)
+        self.assertTrue(
+            persisted.nodes["n1"]["retryable_action"]["pending_schedule"]
+        )
+        with patch("vibe_guide.monitor.require_entry", return_value=None):
+            resumed = monitor.resume(snapshot.run_id, runner)
+        self.assertEqual(resumed.nodes["n1"]["status"], "running")
+        successor = load_task_binding(
+            self.paths, "n1", "developer", run_id=snapshot.run_id
+        )
+        self.assertEqual(successor.successor_of, binding.task_id)
+
 
 if __name__ == "__main__":
     unittest.main()

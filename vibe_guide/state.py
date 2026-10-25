@@ -344,6 +344,9 @@ _EVENT_DATA_KEYS = {
     "preserved_identity",
     "reconciliation",
     "same_task",
+    # The binding status observed before a stuck_session repair normalizes it
+    # to failed; without it the fold would erase why the writer was dead.
+    "previous_binding_status",
     "retained_acceptances",
     "invalidated_acceptances",
     "role",
