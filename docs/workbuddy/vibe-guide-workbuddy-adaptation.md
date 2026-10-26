@@ -230,7 +230,7 @@ D 单独删除 `workbuddy.yaml` 里的 `native_control_plane` 键。
 ### 8.3 `NATIVE_TOOL_MAP` 的能力映射（关键）
 
 `provider_action.py` 要为 provider 提供 **create / enter / resume / wait / events**。
-WorkBuddy Jobs API **逐条都有对应**，且是官方公开 REST：
+WorkBuddy Jobs API **逐条都有对应**，且是官方公开 REST：（⚠️ 2026-10-26 定案：接口对应关系成立，但 agent job 在本宿主拿不到模型凭据，见下文「2026-10-26 定案」与 root-cause 文档 §0.1）
 
 | vibe 原生动作（Codex 侧工具名） | WorkBuddy 对应端点 |
 |---|---|
@@ -366,4 +366,4 @@ bridge 为 null。**这不阻塞规划/发布/授权**，只影响自动派发�
 |---|---|
 | 引擎 / doctor / 规则文件 / skill 供给 | **全绿**（`issues: []`，exit 0） |
 | 复杂任务规划 → 发布 → 授权 | **可用**（十节点门禁实测通过） |
-| 自动派发并行会话 | **执行体已补**（v5.0.2 随包 `workbuddy_job` MCP server；2026-10-03 macOS 实测五工具可用）。待宿主信任 + 解决 safe-delete 500，见 [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md) |
+| 自动派发并行会话 | **执行体已补**（v5.0.2 随包 `workbuddy_job` MCP server；2026-10-03 macOS 实测五工具可用）。待宿主信任 + 解决 safe-delete 500，见 [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md)。**2026-10-26 更正**：agent job 不可用，仅 `session_id` 窗口会话路径可用；无自动换班 |

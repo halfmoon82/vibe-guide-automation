@@ -26,7 +26,7 @@ job broker spawn 出来的 CLI 进程**拿不到模型凭据**——这是凭据
 5. **broker control socket 不管登录**。只有 `ping/attach/resize/detach/request-reclaim`，reclaim 要 reclaim token + pid + generation + sessionId + createdAt 全匹配。
 6. **复核探针（5.8.4）**：`POST /api/v1/jobs` 的 agent job 仍 `starting→failed`、日志 0 字节、transcript 空（探针 `6cc7c770`/`71d4c26c`），bash 对照作业 `9d86514a` 正常写日志——网关与 spawn 链路健康，失败精确在模型凭证自举。
 
-**对换班的含义**：WorkBuddy 上不存在「无焦点、独立 runtime、自带模型身份」的公开创建入口；`vibe supervisor-preflight` 输出 `rotate` 时只能由用户在 UI 新开会话接班（`vibe supervisor-handoff`）。不得用 GUI 点击模拟换班（与用户窗口操作冲突），也不得把 ACP `session/new` 当隔离 runtime（同 gateway 上共享 `sessionSubject`）。完整证据追加在 `outputs/workbuddy-handoff-native-verification-2026-10-26.txt`。
+**对换班的含义**：WorkBuddy 上不存在「无焦点、独立 runtime、自带模型身份」的公开创建入口；`vibe supervisor-preflight` 输出 `rotate` 时只能由用户在 UI 新开会话接班（`vibe supervisor-handoff`）。不得用 GUI 点击模拟换班（与用户窗口操作冲突），也不得把 ACP `session/new` 当隔离 runtime（同 gateway 上共享 `sessionSubject`）。完整原始探针记录保存在维护者本机（未脱敏，不随仓库发布）。
 
 ---
 
