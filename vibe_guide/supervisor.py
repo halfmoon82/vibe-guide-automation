@@ -1154,6 +1154,49 @@ def _session_cwd_from_record(session_record):
     return None
 
 
+def _session_meta(session_record):
+    """The Codex ``session_meta`` payload, or None when absent or unreadable."""
+    try:
+        with Path(session_record).expanduser().open(encoding="utf-8") as stream:
+            for line in stream:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get("type") == "session_meta":
+                    payload = entry.get("payload")
+                    return payload if isinstance(payload, dict) else None
+    except (OSError, TypeError, UnicodeDecodeError, ValueError):
+        return None
+    return None
+
+
+def _successor_refusal(session_record):
+    """Why a successor shift must not take over, or None.
+
+    run-63e7cfc2 (2026-10-26): the successor was a Codex ``fork_thread`` copy
+    of the outgoing supervisor and started at ~297k tokens, so rotating moved
+    the whole history along and the next rotation came one growth step later.
+    A successor exists to start light; one that does not is refused before the
+    lease moves, and the outgoing shift stays in charge.  Without a readable
+    record there is no evidence either way and registration proceeds.
+    """
+    if session_record is None or not Path(str(session_record)).expanduser().is_absolute():
+        return None
+    meta = _session_meta(session_record)
+    forked = meta.get("forked_from_id") if meta else None
+    if isinstance(forked, str) and forked:
+        return ("successor session is a fork of {} and carries its full history; "
+                "create a fresh session in the project instead of fork_thread".format(forked))
+    record = _read_json_file(session_record)
+    tokens = _session_tokens(record) if record is not None else None
+    if tokens is not None and tokens >= DEFAULT_ROTATE_SOFT_CAP:
+        return ("successor session already holds {:,} tokens (limit {:,}); "
+                "take over from a fresh session that only runs supervisor-handoff".format(
+                    tokens, DEFAULT_ROTATE_SOFT_CAP))
+    return None
+
+
 def session_cwd_warning(paths, session_record):
     """Advisory: the registering session lives outside the project root.
 
@@ -1188,6 +1231,43 @@ def session_cwd_warning(paths, session_record):
         "且事后把会话归入项目不回溯（#231 实测）。登记仍然生效；"
         "建议改在本项目下重建会话（Codex 桌面用 create_thread 的 project 目标）再接班。"
         .format(session, root)
+    )
+
+
+def project_root_worktree_warning(paths):
+    """Advisory: the project root is a linked git worktree, not the main checkout.
+
+    run-63e7cfc2 (2026-10-26): the run lived in a Codex Desktop host worktree
+    (``~/.codex/worktrees/...``) while the host granted new sessions write
+    access to the main checkout only, so no successor -- however it was
+    created -- could write ``.vibe``.  A ``.git`` *file* pointing into another
+    repository's ``worktrees/`` directory is the structural sign; anything
+    else stays silent.
+    """
+    marker = Path(paths.root) / ".git"
+    try:
+        if not marker.is_file():
+            return None
+        text = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    gitdir = Path(text[len("gitdir:"):].strip())
+    if not gitdir.is_absolute():
+        gitdir = Path(paths.root) / gitdir
+    if gitdir.parent.name != "worktrees":
+        return None
+    main = gitdir.parent.parent.parent
+    try:
+        main = main.resolve()
+    except (OSError, RuntimeError):
+        pass
+    return (
+        "项目根 {} 是 git 工作副本，不是主仓库 {}：宿主为新会话授予的可写目录"
+        "通常是主仓库，接班会话可能写不了这里的 .vibe/，换班会中断。"
+        "建议在主仓库运行 vibe，或确认新会话对本目录有写权限（run-63e7cfc2 实测）。"
+        .format(Path(paths.root).resolve(), main)
     )
 
 
@@ -1272,6 +1352,10 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
                 reject("supervisor lease is owned by another session")
             epoch = on_disk
         else:
+            if isinstance(current, dict):
+                refusal = _successor_refusal(session_record)
+                if refusal:
+                    reject(refusal)
             try:
                 epoch = lease.cas_locked(
                     run_id, expected_epoch,
@@ -1860,7 +1944,11 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "接班步骤（新会话必须建在本项目里，禁止 projectless：否则 cwd 落在宿主自动生成目录，"
         "创建时的沙箱权限档案不含项目根，每条读写 .vibe/ 的命令都逐条弹审批，"
         "事后把会话归入项目不回溯——#231 实测；"
-        "Codex 桌面用 create_thread 的 project 目标，Claude Code 在仓库根目录启动新会话）：",
+        "Codex 桌面用 create_thread 的 project 目标，Claude Code 在仓库根目录启动新会话）。"
+        "必须是全新会话：不要用 fork_thread 或复制上一班会话——fork 会带上整段历史，"
+        "登记会被拒绝（run-63e7cfc2 实测接班即 29.7 万）。"
+        "接班会话写不了 .vibe/ 时（session_gate_blocked: no write access）不要重试、不要反复申请审批，"
+        "停下把目录报给用户：",
         "  1) 登记：vibe supervisor-register --run-id {} --provider <平台> "
         "--session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>".format(run_id),
         "     " + SESSION_RECORD_HINT,

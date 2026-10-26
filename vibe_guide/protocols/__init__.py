@@ -27,6 +27,10 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-26: §6.5 single shift is the default; successors must be fresh
+        # sessions (fork / >=100k start refused at register); unwritable .vibe
+        # stops instead of retrying (run-63e7cfc2).
+        "0cbbd0e63a258cb0592e5f001b8d0dee0a0639752a2a762e463eddac98249307",
         # 2026-10-26: §6.4/§6.5 WorkBuddy 定案——Jobs detached agent 拿不到
         # 模型 run identity（凭证边界为宿主设计），派发只能走窗口会话；
         # 无自动换班入口，rotate 只能由用户在本项目 UI 新开会话接班。

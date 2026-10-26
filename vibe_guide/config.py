@@ -41,7 +41,9 @@ FIELD_AUTO_SCOPE_PATHS = 'auto_scope_paths'
 
 #: Boolean field: when true one supervisor session serves the whole run and
 #: the preflight only rotates at the absolute context hard cap (PRD #177 D1).
-#: Default false keeps the shipped growth-based rotation unchanged.
+#: Default true since 2026-10-26 (PRD #181 N3): the card's rotation hard cap is
+#: then the only rotation rule.  An explicit false opts back into growth-based
+#: rotation, which rotated an 800k-cap run at 291k (run-63e7cfc2).
 FIELD_SUPERVISOR_SINGLE_SHIFT = 'supervisor_single_shift'
 
 #: Boolean field: true only after the product manager has approved and
@@ -68,7 +70,7 @@ class ProjectConfig:
     #: Defaults to an empty tuple so two-argument construction keeps working.
     behavioral_command_blacklist_extra: tuple = ()
     auto_scope_paths: tuple = ()
-    supervisor_single_shift: bool = False
+    supervisor_single_shift: bool = True
     acceptance_scope_rule_approved: bool = False
 
 
@@ -108,7 +110,7 @@ def _auto_scope_paths(data):
 
 def _single_shift(data):
     if FIELD_SUPERVISOR_SINGLE_SHIFT not in data:
-        return False
+        return True
     value = data[FIELD_SUPERVISOR_SINGLE_SHIFT]
     if not isinstance(value, bool):
         raise ValueError(f'{FIELD_SUPERVISOR_SINGLE_SHIFT} must be true or false')
@@ -153,19 +155,19 @@ def load_supervisor_single_shift(root):
 
     The heartbeat preflight must not be blocked by an unrelated bad field, so
     this does not validate the rest of the file.  Returns ``(value, warning)``:
-    a missing or unreadable file falls back to ``False`` (the shipped
-    behaviour) with a warning string; a present non-boolean switch still
+    a missing or unreadable file falls back to ``True`` (the shipped
+    default) with a warning string; a present non-boolean switch still
     raises ValueError naming the field.
     """
     path = _config_path(root)
     if not path.exists():
-        return False, None
+        return True, None
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, UnicodeDecodeError, ValueError):
-        return False, '.vibe/config.json unreadable; single shift off'
+        return True, '.vibe/config.json unreadable; single shift on (default)'
     if not isinstance(data, dict):
-        return False, '.vibe/config.json is not an object; single shift off'
+        return True, '.vibe/config.json is not an object; single shift on (default)'
     return _single_shift(data), None
 
 

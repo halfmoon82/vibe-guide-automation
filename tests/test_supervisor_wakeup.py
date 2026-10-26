@@ -103,7 +103,7 @@ class WakeupTests(unittest.TestCase):
 
     def test_live_hard_cap_overrides_reused_work(self):
         self.preflight()
-        self.usage(150001)
+        self.usage(200001)
         result = self.preflight()
         self.assertEqual(result['state'], 'rotate')
         self.assertFalse(result.get('wakeup', {}).get('reused', True))

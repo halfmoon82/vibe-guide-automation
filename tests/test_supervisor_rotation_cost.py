@@ -155,7 +155,7 @@ class RelativeThresholdTests(_Case):
         path = _codex_rollout(self.tmp.name, [30000, 50000])
         self.register(session_record=path)
         _codex_rollout(self.tmp.name, [30000, 50000, 130001])
-        result = supervisor_preflight(self.paths, "run-1", path)
+        result = supervisor_preflight(self.paths, "run-1", path, single_shift=False)
         self.assertEqual(result["state"], "rotate")
         self.assertEqual(result["reason"], "context grew past threshold since takeover")
 
@@ -163,7 +163,8 @@ class RelativeThresholdTests(_Case):
         path = _codex_rollout(self.tmp.name, [50000])
         self.register(session_record=path)
         _codex_rollout(self.tmp.name, [50000, 100000])
-        result = supervisor_preflight(self.paths, "run-1", path, token_threshold=20000)
+        result = supervisor_preflight(self.paths, "run-1", path, token_threshold=20000,
+                                      single_shift=False)
         self.assertEqual(result["state"], "rotate")
 
     def test_hard_cap_rotates_whatever_the_baseline(self):

@@ -279,6 +279,15 @@ def screen_session(paths, session_id: str, request: str, origin: str = "user_ent
         finally:
             if os.path.exists(temporary_name): os.unlink(temporary_name)
         flock_release(lock_handle.fileno()); lock_handle.close()
+    except PermissionError as error:
+        if error.errno is None:
+            raise PermissionError("session gate persistence failed") from error
+        # The host sandbox, not vibe, denied the write (run-63e7cfc2: a
+        # successor created as workspace-write without the project root).
+        # Name the directory so the session reports it instead of retrying.
+        raise PermissionError(
+            "session gate persistence failed: no write access to {}".format(paths.vibe_dir)
+        ) from error
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise PermissionError("session gate persistence failed") from error
     return gate
