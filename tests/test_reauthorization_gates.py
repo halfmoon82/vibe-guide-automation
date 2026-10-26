@@ -494,6 +494,216 @@ class ScopeOnlyReauthorizationTests(unittest.TestCase):
         self.assertIsNone(rebound.nodes["b"]["acceptance"])
 
 
+class PlatformHandoffReworkTests(unittest.TestCase):
+    """#289 section 3 (PM ruling 2026-10-26): successor only after a handoff.
+
+    Rework of a node whose task was bound before a recorded platform_handoff
+    goes to a successor developer on the new platform (the old task cannot be
+    resumed there).  Without a handoff -- or for tasks created after it -- the
+    ordinary rule stays: Review findings return to the same worker.
+    """
+
+    # Reuse the fixture without re-running the parent class's tests.
+    setUp = ScopeOnlyReauthorizationTests.setUp
+    tearDown = ScopeOnlyReauthorizationTests.tearDown
+    _nodes = staticmethod(ScopeOnlyReauthorizationTests._nodes)
+    _handoff_nodes = ScopeOnlyReauthorizationTests._handoff_nodes
+    _switch_platform = ScopeOnlyReauthorizationTests._switch_platform
+    _handoff = ScopeOnlyReauthorizationTests._handoff
+    _accepted_run = ScopeOnlyReauthorizationTests._accepted_run
+
+    def _in_review_run(self, b_reviewer_events=()):
+        nodes = self._nodes()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        runner = FakeRunner(events={
+            ("a", "developer"): [("complete", {"evidence": "a"})],
+            ("a", "reviewer"): [("accepted", {"evidence": "a"})],
+            ("b", "developer"): [("complete", {"evidence": "b"})],
+            ("b", "reviewer"): list(b_reviewer_events),
+        })
+        monitor = Monitor(self.paths, plan, nodes)
+        snapshot = monitor.start(record, runner)
+        for _ in range(8):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+            if snapshot.nodes["b"]["status"] == "review" and not b_reviewer_events:
+                break
+        return monitor, snapshot, runner
+
+    def _starts(self, runner, node_id, role):
+        return [call for call in runner.start_calls
+                if call["node_id"] == node_id and call["role"] == role]
+
+    def test_same_platform_finding_returns_to_the_same_developer(self):
+        _monitor, snapshot, runner = self._in_review_run(
+            [("review_finding", {"finding": "fix it", "in_contract": True})]
+        )
+        developer = self._starts(runner, "b", "developer")
+        self.assertGreaterEqual(len(developer), 2)
+        self.assertTrue(developer[-1]["continuation"])
+        self.assertFalse(developer[-1]["successor"])
+        self.assertEqual(developer[-1]["task_id"], developer[0]["task_id"])
+
+    def test_in_flight_node_is_redispatched_as_a_successor_after_handoff(self):
+        _monitor, snapshot, runner = self._in_review_run()
+        self.assertEqual(snapshot.nodes["b"]["status"], "review")
+        old_developer = snapshot.nodes["b"]["developer_identity"]
+        old_reviewer = snapshot.nodes["b"]["reviewer_identity"]
+        self._switch_platform()
+        handoff_runner = FakeRunner(events={
+            ("b", "developer"): [("complete", {"evidence": "b2"})],
+            ("b", "reviewer"): [("accepted", {"evidence": "b2"})],
+        })
+        monitor, _record, rebound = self._handoff(
+            snapshot, self._handoff_nodes(), handoff_runner
+        )
+        # The accepted upstream node keeps its acceptance.
+        self.assertEqual(rebound.nodes["a"]["status"], "accepted")
+        developer = self._starts(handoff_runner, "b", "developer")
+        self.assertEqual(len(developer), 1)
+        self.assertTrue(developer[0]["successor"])
+        self.assertFalse(developer[0]["continuation"])
+        self.assertEqual(developer[0]["predecessor_task_id"], old_developer)
+        self.assertNotEqual(developer[0]["task_id"], old_developer)
+        old = [item for item in json.loads(
+            (self.paths.vibe / "runs" / snapshot.run_id / "tasks.json").read_text()
+        )["bindings"] if item["task_id"] == old_developer]
+        self.assertEqual([item["status"] for item in old], ["archived"])
+        new = load_task_binding(self.paths, "b", "developer", run_id=snapshot.run_id)
+        self.assertEqual(new.successor_of, old_developer)
+        self.assertEqual(new.handoff_from_provider, "runner")
+        events = load_events(self.paths, snapshot.run_id)
+        reconciled = [event["data"] for event in events
+                      if event["event"] == "handoff_predecessor_reconciled"]
+        self.assertEqual(reconciled[-1]["predecessor_task_id"], old_developer)
+        self.assertEqual(reconciled[-1]["proof"], "platform_handoff")
+
+        # The re-review after the successor delivers also needs a new-platform
+        # reviewer: the old reviewer task cannot be resumed either.
+        for _ in range(6):
+            rebound = monitor.tick(snapshot.run_id, handoff_runner)
+        reviewer = self._starts(handoff_runner, "b", "reviewer")
+        self.assertEqual(len(reviewer), 1)
+        self.assertTrue(reviewer[0]["successor"])
+        self.assertEqual(reviewer[0]["predecessor_task_id"], old_reviewer)
+        self.assertEqual(rebound.nodes["b"]["status"], "accepted")
+
+    def test_post_handoff_task_finding_returns_to_the_successor_itself(self):
+        _monitor, snapshot, _runner = self._in_review_run()
+        self._switch_platform()
+        handoff_runner = FakeRunner(events={
+            ("b", "developer"): [("complete", {"evidence": "b2"}),
+                                 ("complete", {"evidence": "b3"})],
+            ("b", "reviewer"): [
+                ("review_finding", {"finding": "again", "in_contract": True}),
+                ("accepted", {"evidence": "b3"}),
+            ],
+        })
+        monitor, _record, rebound = self._handoff(
+            snapshot, self._handoff_nodes(), handoff_runner
+        )
+        for _ in range(10):
+            rebound = monitor.tick(snapshot.run_id, handoff_runner)
+        developer = self._starts(handoff_runner, "b", "developer")
+        self.assertEqual(len(developer), 2)
+        self.assertTrue(developer[0]["successor"])
+        # Same platform from here on: back to the successor, not another one.
+        self.assertTrue(developer[1]["continuation"])
+        self.assertFalse(developer[1]["successor"])
+        self.assertEqual(developer[1]["task_id"], developer[0]["task_id"])
+        self.assertEqual(rebound.nodes["b"]["status"], "accepted")
+
+    def _foreign_successor_create(self, snapshot, lineage, generation=1):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+
+        request = {"successor": True, "predecessor_task_id": "reviewer:b",
+                   "authorization_digest": "0" * 64}
+        if lineage:
+            request["handoff_from_provider"] = lineage
+        with patch("vibe_guide.adapters.task_provider.require_entry"):
+            return ProviderActionStore(self.paths).request(
+                operation="create", provider="workbuddy", run_id=snapshot.run_id,
+                issue_id="b", role="reviewer", generation=generation, native_tool="native",
+                request=request,
+            )
+
+    def _reconcile_foreign(self, monitor, snapshot, action):
+        from types import SimpleNamespace
+
+        # The recovery only serves visible reviewers; FakeRunner registers a
+        # generic background-mode row, so make the archived predecessor the
+        # visible row the real bridge would have written.
+        path = next(self.paths.vibe.glob("runs*/" + snapshot.run_id + "/tasks.json"))
+        registry = json.loads(path.read_text())
+        for row in registry["bindings"]:
+            if row["task_id"] == "reviewer:b":
+                row["mode"] = "visible"
+                row["visible"] = True
+                row["host"] = "old-host"
+        path.write_text(json.dumps(registry))
+        monitor._reset_binding_cache()
+
+        return monitor.reconcile_created_successor(
+            snapshot.run_id, "b", SimpleNamespace(provider="workbuddy"),
+            action_id=action["action_id"], request_digest=action["request_digest"],
+            predecessor_archive={"threadId": "reviewer:b", "archived": True},
+            preservation_path="unused", preservation_digest="unused",
+        )
+
+    def test_created_successor_recovery_keeps_the_provider_gate_without_handoff(self):
+        snapshot, nodes, _cursors = self._accepted_run()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        action = self._foreign_successor_create(snapshot, "runner")
+        with self.assertRaisesRegex(ValueError, "predecessor archive is unverified"):
+            self._reconcile_foreign(Monitor(self.paths, plan, nodes), snapshot, action)
+
+    def test_created_successor_recovery_opens_the_provider_gate_after_handoff(self):
+        snapshot, _nodes, _cursors = self._accepted_run()
+        self._switch_platform()
+        monitor, _record, rebound = self._handoff(snapshot, self._handoff_nodes())
+        missing = self._foreign_successor_create(rebound, None)
+        with self.assertRaisesRegex(ValueError, "predecessor archive is unverified"):
+            self._reconcile_foreign(monitor, rebound, missing)
+        # With the recorded lineage the provider gate passes; the next proof
+        # (create lineage under the current authorization) still applies.
+        recorded = self._foreign_successor_create(rebound, "runner", generation=2)
+        with self.assertRaisesRegex(ValueError, "create lineage is invalid"):
+            self._reconcile_foreign(monitor, rebound, recorded)
+
+    def test_live_predecessor_blocks_the_handoff_successor(self):
+        _monitor, snapshot, _runner = self._in_review_run()
+        old_developer = snapshot.nodes["b"]["developer_identity"]
+        self._switch_platform()
+        nodes = self._handoff_nodes()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        monitor = Monitor(self.paths, plan, nodes)
+        handoff_runner = FakeRunner()
+        # Simulate an old-platform developer that is still running (no
+        # terminal proof): the successor must not be created.
+        original = monitor._schedule_ready
+
+        def schedule_after_reviving(snapshot_, runner_, *args, **kwargs):
+            binding = load_task_binding(self.paths, "b", "developer", run_id=snapshot.run_id)
+            if binding.task_id == old_developer and binding.status != "running":
+                binding.status = "running"
+                save_task_binding(self.paths, binding)
+                monitor._reset_binding_cache()
+            return original(snapshot_, runner_, *args, **kwargs)
+
+        with patch.object(monitor, "_schedule_ready", schedule_after_reviving):
+            rebound = monitor.reauthorize(
+                snapshot.run_id, record, handoff_runner, "platform_handoff"
+            )
+        self.assertEqual(self._starts(handoff_runner, "b", "developer"), [])
+        self.assertEqual(rebound.nodes["b"]["status"], "blocked_unknown")
+        self.assertIn("handoff", rebound.nodes["b"]["reason"])
+
+
 class TemporaryReadFailureTests(unittest.TestCase):
     def test_resume_read_failure_stays_unknown_without_invalidation_marker(self):
         root = Path(tempfile.mkdtemp(prefix="vg-temporary-read-"))

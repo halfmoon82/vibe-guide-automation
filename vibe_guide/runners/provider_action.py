@@ -553,7 +553,18 @@ class ProviderActionRunner(Runner):
         except FileNotFoundError:
             existing = None
         successor = bool(contract.get("successor"))
-        if existing is not None and existing.provider != self.provider:
+        # #289: a successor created on this platform after a recorded
+        # platform_handoff may follow a predecessor bound by another provider.
+        # The monitor sets the flag only after proving the old task terminal;
+        # the lineage must name that predecessor's provider exactly, and the
+        # stopped-predecessor gate below still applies.
+        handoff_lineage = (
+            successor
+            and contract.get("platform_handoff_successor") is True
+            and existing is not None
+            and contract.get("handoff_from_provider") == existing.provider
+        )
+        if existing is not None and existing.provider != self.provider and not handoff_lineage:
             raise ValueError("task binding provider mismatch: explicit handoff required")
         v39 = binding_contract_enabled(contract)
         live_intent = contract.get("binding_intent")
@@ -751,6 +762,10 @@ class ProviderActionRunner(Runner):
         if successor:
             create_request["successor"] = True
             create_request["predecessor_task_id"] = predecessor
+            if handoff_lineage:
+                # Durable lineage on the create action itself, so a later
+                # false-start recovery can verify it without trusting state.
+                create_request["handoff_from_provider"] = existing.provider
         contract = self._parameter_recovery_contract(contract, run_id, create_request)
         created = self._require_result(
             contract, run_id, "create", create_request
@@ -859,6 +874,7 @@ class ProviderActionRunner(Runner):
             allowlist=list(contract.get("files", [])),
             capability_contract_digest=contract.get("capability_contract_digest"),
             successor_of=predecessor if successor else None,
+            handoff_from_provider=existing.provider if handoff_lineage else None,
         )
         if profile is not None:
             binding.route_digest = profile.route_digest

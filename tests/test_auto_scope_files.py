@@ -31,7 +31,7 @@ from vibe_guide.engine_attestation import create_engine_attestation
 from vibe_guide.planner import REQUIRED_COMPLEX_WORKFLOW, TaskContext
 from vibe_guide.task_registry import TaskBinding
 from vibe_guide.workflow_gate import create_task_workflow, record_workflow_node
-from vibe_guide.state import durable_projection, load_events, load_snapshot
+from vibe_guide.state import durable_projection, load_events, load_snapshot, save_snapshot
 
 
 BINDING = {
@@ -1250,6 +1250,61 @@ class MonitorAutoScopeTests(unittest.TestCase):
         self.assertNotIn(INTEGRATION_REVIEW_NODE_ID, recovered.handles)
         self.assertEqual(integration["retryable_action"]["role"], "reviewer")
         self.assertTrue(integration["retryable_action"]["continuation"])
+
+    def _integration_finding_run(self, inject_handoff):
+        class _GenerationBoundRunner(_BoundBindingRunner):
+            # A successor needs a task id that differs from its predecessor.
+            def task_binding(self, contract, worktree, run_id, status):
+                binding = super().task_binding(contract, worktree, run_id, status)
+                if contract.get("successor"):
+                    binding.task_id = binding.platform_task_id = (
+                        binding.task_id + "-g{}".format(contract["generation"])
+                    )
+                return binding
+
+        plan, nodes, card, monitor, delivered = self._build_complex_plan(
+            [_node("n1")]
+        )
+        runner = _GenerationBoundRunner(events={
+            ("n1", "developer"): [delivered, delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+            (INTEGRATION_REVIEW_NODE_ID, "reviewer"): [(
+                "review_finding",
+                {
+                    "finding": "integration fixture required",
+                    "severity": "P1",
+                    "target_node_id": "n1",
+                    "scope_expansion": _scope_claim(["tests/test_integration.py"]),
+                },
+            )],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        for _ in range(2):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["status"], "review")
+        old = snapshot.nodes["n1"]["developer_identity"]
+        if inject_handoff:
+            snapshot.nodes["n1"]["handoff_superseded"] = {"developer": old}
+            save_snapshot(self.paths, snapshot)
+        for _ in range(3):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        starts = [c for c in runner.start_calls
+                  if c["node_id"] == "n1" and c["role"] == "developer"]
+        return snapshot, starts, old
+
+    def test_integration_finding_rework_returns_to_original_developer_without_handoff(self):
+        _snapshot, starts, old = self._integration_finding_run(False)
+        self.assertGreaterEqual(len(starts), 2)
+        self.assertTrue(starts[-1]["continuation"])
+        self.assertFalse(starts[-1]["successor"])
+        self.assertEqual(starts[-1]["task_id"], old)
+
+    def test_integration_finding_rework_goes_to_a_successor_after_platform_handoff(self):
+        _snapshot, starts, old = self._integration_finding_run(True)
+        self.assertGreaterEqual(len(starts), 2)
+        self.assertTrue(starts[-1]["successor"])
+        self.assertEqual(starts[-1]["predecessor_task_id"], old)
+        self.assertNotEqual(starts[-1]["task_id"], old)
 
     def test_scope_expand_cli_registers_accepted_patch(self):
         self._approve_acceptance_rule()

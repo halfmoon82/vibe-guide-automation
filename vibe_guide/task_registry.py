@@ -99,6 +99,10 @@ class TaskBinding:
     reasoning: Optional[str] = None
     capability_contract_digest: Optional[str] = None
     successor_of: Optional[str] = None
+    # #289: provider of the predecessor task when this successor was created
+    # on a new platform after a platform_handoff reauthorization.  Absent on
+    # every same-platform binding, so legacy rows keep their exact shape.
+    handoff_from_provider: Optional[str] = None
     binding_intent: Optional[Dict[str, Any]] = None
     binding_observation: Optional[Dict[str, Any]] = None
     binding_state: str = "blocked_unknown"
@@ -175,6 +179,12 @@ class TaskBinding:
             not isinstance(self.successor_of, str) or not self.successor_of
         ):
             raise ValueError("task binding successor predecessor is invalid")
+        if self.handoff_from_provider is not None and (
+            not isinstance(self.handoff_from_provider, str)
+            or not self.handoff_from_provider
+            or self.successor_of is None
+        ):
+            raise ValueError("task binding handoff lineage is invalid")
         for name in ("binding_intent", "binding_observation"):
             value = getattr(self, name)
             if value is not None:
@@ -331,6 +341,8 @@ class TaskBinding:
             "reasoning": self.reasoning,
             "legacy": dict(self.legacy),
         }
+        if self.handoff_from_provider is not None:
+            result["handoff_from_provider"] = self.handoff_from_provider
         if self.binding_intent is not None:
             result["binding_intent"] = (
                 self.binding_intent.to_dict()
@@ -374,7 +386,7 @@ class TaskBinding:
             "generation",
         }
         optional = {"binding_intent", "binding_observation", "binding_state", "business_write_allowed", "legacy", "topology"}
-        allowed = expected | {"allowlist", "capability_contract_digest", "successor_of", "route_digest", "model", "reasoning"} | optional
+        allowed = expected | {"allowlist", "capability_contract_digest", "successor_of", "handoff_from_provider", "route_digest", "model", "reasoning"} | optional
         if not isinstance(data, dict) or not set(data).issubset(allowed) or not expected.issubset(data):
             raise ValueError("task binding record schema is invalid")
         normalized = dict(data)
@@ -554,7 +566,10 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding, *,
         ):
             raise ValueError("task binding changed during conditional update")
         successor = False
-        if matched is not None and matched.successor_of != persistent.successor_of:
+        if matched is not None and (
+            matched.successor_of != persistent.successor_of
+            or matched.handoff_from_provider != persistent.handoff_from_provider
+        ):
             raise ValueError("immutable successor ancestry drift")
         if matched is not None and persistent.generation < matched.generation:
             raise ValueError("task generation cannot regress")
@@ -563,16 +578,30 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding, *,
                 raise ValueError("historical predecessor generation is immutable")
         if matched is None and same_role:
             latest = sorted(same_role, key=lambda item: item.generation)[-1]
+            # #289: a successor created on a new platform after a recorded
+            # platform_handoff names the predecessor's provider as lineage.
+            # Only then may provider, host and capability contract differ;
+            # writer root, branch, topology/mode and allowlist stay fixed.
+            handoff = (
+                persistent.handoff_from_provider is not None
+                and persistent.handoff_from_provider == latest.provider
+            )
+            pinned = (
+                ("mode", "worktree", "branch", "topology")
+                if handoff else
+                ("provider", "mode", "host", "worktree", "branch", "topology",
+                 "allowlist", "capability_contract_digest")
+            )
             successor = (
                 persistent.successor_of == latest.task_id
                 and persistent.task_id != latest.task_id
                 and not any(item.task_id == persistent.task_id for item in same_role)
                 and persistent.generation > latest.generation
                 and all(item.status in {"stopped", "failed", "archived"} for item in same_role)
-                and all(getattr(latest, key) == getattr(persistent, key) for key in (
-                    "provider", "mode", "host", "worktree", "branch", "topology",
-                    "allowlist", "capability_contract_digest",
-                ))
+                and all(getattr(latest, key) == getattr(persistent, key) for key in pinned)
+                # A handoff successor may carry a rework scope expansion, so
+                # its allowlist may grow but never shrink.
+                and (not handoff or set(latest.allowlist) <= set(persistent.allowlist))
             )
             if not successor:
                 raise ValueError("immutable task identity drift")
@@ -654,8 +683,17 @@ def reconcile_shadowed_successor(
     new = TaskBinding.from_dict(successor.to_dict())
     action = store.action(action_id)
     request = action['request']
+    # #289: a successor created on a new platform after a platform_handoff is
+    # created by the new provider.  Accept that only when the create request
+    # itself and the successor row both name the predecessor's provider.
+    handoff = (
+        new.handoff_from_provider is not None
+        and new.handoff_from_provider == old.provider
+        and request.get('handoff_from_provider') == old.provider
+    )
+    creator = new.provider if handoff else old.provider
     if (action.get('request_digest') != request_digest or action.get('operation') != 'create'
-            or action.get('provider') != old.provider or action.get('run_id') != old.run_id
+            or action.get('provider') != creator or action.get('run_id') != old.run_id
             or action.get('issue_id') != old.issue_id or action.get('role') != old.role
             or action.get('generation') != old.generation
             or request.get('authorization_digest') != authorization_digest
@@ -672,8 +710,10 @@ def reconcile_shadowed_successor(
             or new.successor_of != old.task_id or new.mode != 'visible'
             or new.status != 'created' or new.business_write_allowed is not False
             or any(getattr(old, key) != getattr(new, key) for key in (
-                'provider', 'mode', 'issue_id', 'role', 'run_id', 'generation',
-                'worktree', 'branch', 'topology', 'allowlist', 'capability_contract_digest'))):
+                ('mode', 'issue_id', 'role', 'run_id', 'generation',
+                 'worktree', 'branch', 'topology', 'allowlist') if handoff else
+                ('provider', 'mode', 'issue_id', 'role', 'run_id', 'generation',
+                 'worktree', 'branch', 'topology', 'allowlist', 'capability_contract_digest')))):
         raise ValueError('shadowed successor scope or identity is invalid')
     for operation in ('locate', 'visibility'):
         observation = store.related_action(action, operation)
