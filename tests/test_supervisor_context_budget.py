@@ -52,7 +52,7 @@ class ContextBudgetTests(unittest.TestCase):
         result = self.preflight(99999, token_threshold=1)
         self.assertEqual(result['state'], 'work')
         self.assertFalse(result['prepare_handoff'])
-        self.assertEqual(self.preflight(134339)['state'], 'rotate')
+        self.assertEqual(self.preflight(134339, single_shift=False)['state'], 'rotate')
 
     def test_compact_handoff_contains_bindings_and_verifiable_evidence(self):
         from vibe_guide.state import run_dir

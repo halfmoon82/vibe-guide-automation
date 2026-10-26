@@ -114,9 +114,13 @@ def preflight_with_checkpoint(paths, run_id, session_record, compute, *,
             tokens = supervisor._session_tokens(supervisor._read_json_file(session_record))
             baseline = address.get('baseline_context')
             warning = tokens is not None and tokens >= supervisor.DEFAULT_ROTATE_SOFT_CAP
+            try:
+                single_shift, _ = supervisor.load_supervisor_single_shift(paths.root)
+            except ValueError:
+                return compute()
             rotate = tokens is not None and (
-                tokens >= context_hard_cap or (warning and type(baseline) is int
-                    and tokens - baseline >= token_threshold))
+                tokens >= context_hard_cap or (not single_shift and warning
+                    and type(baseline) is int and tokens - baseline >= token_threshold))
             if (isinstance(previous, dict) and previous.get('binding') == binding
                     and isinstance(cached, dict) and cached.get('state') in {'work', 'rotate'}
                     and previous.get('phase') == {'work': 'service_mailbox', 'rotate': 'handoff'}[cached['state']]

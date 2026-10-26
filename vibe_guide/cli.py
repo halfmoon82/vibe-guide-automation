@@ -33,7 +33,7 @@ from .adapters.base import (
 )
 from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
-from .config import load_project_config
+from .config import load_project_config, load_supervisor_single_shift
 from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import doctor
 from .initializer import _rules_target, apply_agentsmd_proposal, init_project, refresh_protocol_copies
@@ -50,6 +50,7 @@ from .supervisor import (
     supervisor_mailbox_view,
     register_supervisor_address,
     session_cwd_warning,
+    project_root_worktree_warning,
     release_supervisor_hold,
     set_supervisor_hold,
     supervisor_handoff,
@@ -65,6 +66,9 @@ from .supervisor import (
     HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
     HEARTBEAT_INTERVAL_DECISION_MINUTES,
     DEFAULT_ROTATE_HARD_CAP,
+    DEFAULT_ROTATE_SOFT_CAP,
+    DEFAULT_ROTATE_TOKEN_THRESHOLD,
+    rotate_hard_cap_for_run,
     supervisor_holds,
     supervisor_preflight,
     HOST_SHIFT_DIFFERENCES,
@@ -2056,7 +2060,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             # CLI persistence binds the route, not raw user/provider text.
             screen_session(paths, str(session_id), args.command)
         except (OSError, ValueError, PermissionError) as error:
-            return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": str(error)}, "会话筛选已阻塞：" + str(error), args.as_json)
+            text = "会话筛选已阻塞：" + str(error)
+            if "host sandbox denied access" in str(error):
+                text += ("。本会话的宿主沙箱不允许读写这个目录，重试不会变；不要重试，"
+                         "也不要反复申请审批：停下，把这个目录告诉用户，"
+                         "由用户把会话切到可写该目录的权限，或在能写它的会话里继续")
+            return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": str(error)}, text, args.as_json)
     if args.command in {"attest", "authorize", "monitor", "reconcile", "resume", "status", "scan"} and paths.vibe.exists() and not state_probe.exists():
         return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": "V2 state.json is missing"}, "会话筛选已阻塞：V2 state.json 缺失", args.as_json)
     if args.command == "scan" and paths.vibe.exists():
@@ -2205,7 +2214,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             text = "contract_drift：能力合同与运行快照不一致，停止推进，立即走同一运行的重新授权流程；{}".format(
                 payload.get("hint", "")) + tail
         elif state == "rotate":
-            text = "rotate：新开一个会话（必须建在本项目里：Codex 桌面用 create_thread 的 project 目标，禁止 projectless，否则读写 .vibe/ 逐条弹审批，#231），让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(
+            text = "rotate：新开一个会话（必须建在本项目里：Codex 桌面用 create_thread 的 project 目标，禁止 projectless，否则读写 .vibe/ 逐条弹审批，#231；必须是全新会话，不要 fork_thread，fork 带整段历史会被登记拒绝），让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(
                 supervisor_command_prefix, args.run_id
             ) + tail
         else:
@@ -2322,7 +2331,19 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "登记失败：" + str(error), args.as_json)
         text = "监工地址已登记"
         if "baseline_context" in entry:
-            text += "；接班起点 {} token；100k 准备交接，200k 硬换班，增长阈值辅助判断".format(entry["baseline_context"])
+            cap, _cap_reason = rotate_hard_cap_for_run(paths, args.run_id, args.session_record)
+            try:
+                single, _ = load_supervisor_single_shift(paths.root)
+            except ValueError:
+                single = None
+            if single:
+                rule = "单班：只在达到硬上限 {:,} 时换班".format(cap)
+            elif single is False:
+                rule = "增长换班（supervisor_single_shift=false）：达到硬上限 {:,}，或过 {:,} 后自接班增长 {:,} 时换班".format(
+                    cap, DEFAULT_ROTATE_SOFT_CAP, DEFAULT_ROTATE_TOKEN_THRESHOLD)
+            else:
+                rule = "supervisor_single_shift 配置无效，预检将报 unknown"
+            text += "；接班起点 {} token；{}".format(entry["baseline_context"], rule)
         else:
             if not args.session_record:
                 why = "没给 --session-record"
@@ -2336,9 +2357,14 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         cwd_warning = session_cwd_warning(paths, args.session_record)
         if cwd_warning:
             text += "；警告：" + cwd_warning
+        worktree_warning = project_root_worktree_warning(paths)
+        if worktree_warning:
+            text += "；警告：" + worktree_warning
         payload = {"command": args.command, "status": "ok", "current": entry}
         if cwd_warning:
             payload["session_cwd_warning"] = cwd_warning
+        if worktree_warning:
+            payload["project_root_worktree_warning"] = worktree_warning
         return _result(SUCCESS, payload, text, args.as_json)
 
     if args.command == "supervisor-hold":

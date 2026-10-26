@@ -207,7 +207,7 @@ V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 
 
 并发上限：`.vibe/config.json` 的 `max_active_worker_sessions` 控制同时活跃的 worker 会话数，默认 5（合法范围 1–64），与授权卡快照取较小者生效；显式但非法的值是配置错误，不会静默回落默认值。节点验收、P0–P2 清零且证据登记后归档会话，名额释放给后续 ready 节点。
 
-单班监工：`.vibe/config.json` 设 `"supervisor_single_shift": true` 后，同一监工会话服务整个运行，预检不再按上下文增长换班，只在达到 20 万绝对上限（或 `--context-hard-cap` 临时值）时输出 `rotate`。默认 false，沿用增长换班。非布尔值是配置错误，预检报 `unknown`；配置文件整体读不了时按默认处理并带 `config_warning`；绝对上限换班不受配置影响。
+单班监工（默认）：同一监工会话服务整个运行，预检只在达到授权卡选定的换班硬上限（缺省 20 万，或 `--context-hard-cap` 临时值）时输出 `rotate`。`.vibe/config.json` 显式设 `"supervisor_single_shift": false` 才恢复「过 10 万后自接班增长 8 万即换班」。非布尔值是配置错误，预检报 `unknown`；配置文件整体读不了时按默认（单班）处理并带 `config_warning`；绝对上限换班不受配置影响。接班会话必须是全新会话：fork 出来的会话、或起步就不低于 10 万 token 的会话，`supervisor-register` 会拒绝登记。
 
 按验收结果扩范围：`.vibe/config.json` 的 `acceptance_scope_rule_approved` 默认 false，此时监工自动扩范围只限 `tests/` 与 `auto_scope_paths`；只有产品经理批准并写入 `AGENTS.md` §6 的对应补丁后才设为 true，届时「所有 PRD 验收例子判定不变」的低风险文件也可自扩。
 

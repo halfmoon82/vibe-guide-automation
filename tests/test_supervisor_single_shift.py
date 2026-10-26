@@ -1,8 +1,8 @@
 """PRD #177 D1: `supervisor_single_shift` turns off growth-based rotation.
 
 With the switch on, one supervisor session serves the whole run and the
-preflight rotates only at the absolute hard cap.  With the switch absent the
-shipped growth rule is unchanged (covered by the existing rotation tests).
+preflight rotates only at the absolute hard cap.  Since 2026-10-26 (PRD #181
+N3) an absent switch means on; an explicit false keeps the growth rule.
 """
 import json
 import tempfile
@@ -41,10 +41,10 @@ class SingleShiftTests(unittest.TestCase):
         with patch('vibe_guide.supervisor._mailbox_state', return_value={'state': 'work'}):
             return supervisor_preflight(self.paths, 'run-1', self.record, **kwargs)
 
-    def test_default_keeps_growth_rotation(self):
+    def test_default_is_single_shift(self):
         result = self.preflight(130000)
-        self.assertEqual(result['state'], 'rotate')
-        self.assertEqual(result['reason'], 'context grew past threshold since takeover')
+        self.assertEqual(result['state'], 'work')
+        self.assertTrue(result['single_shift'])
 
     def test_explicit_false_keeps_growth_rotation(self):
         self.write_config({FIELD_SUPERVISOR_SINGLE_SHIFT: False})
@@ -63,6 +63,7 @@ class SingleShiftTests(unittest.TestCase):
         self.assertEqual(self.preflight(199999)['state'], 'work')
 
     def test_switch_off_rotates_below_hard_cap_on_growth(self):
+        self.write_config({FIELD_SUPERVISOR_SINGLE_SHIFT: False})
         self.assertEqual(self.preflight(199999)['state'], 'rotate')
 
     def test_switch_on_still_rotates_at_hard_cap(self):
@@ -98,15 +99,15 @@ class SingleShiftTests(unittest.TestCase):
         self.assertEqual(result['state'], 'work')
         self.assertTrue(result['single_shift'])
 
-    def test_unreadable_config_keeps_shipped_rotation_with_warning(self):
+    def test_unreadable_config_keeps_shipped_default_with_warning(self):
         (self.root / '.vibe').mkdir(exist_ok=True)
         (self.root / '.vibe' / 'config.json').write_text('{broken', encoding='utf-8')
         result = self.preflight(130000)
-        self.assertEqual(result['state'], 'rotate')
+        self.assertEqual(result['state'], 'work')
         self.assertEqual(self.preflight(200000)['state'], 'rotate')
         low = self.preflight(60000)
         self.assertEqual(low['state'], 'work')
-        self.assertFalse(low['single_shift'])
+        self.assertTrue(low['single_shift'])
         self.assertIn('unreadable', low['config_warning'])
 
     def test_cli_preflight_reads_switch(self):
@@ -122,7 +123,7 @@ class SingleShiftTests(unittest.TestCase):
 
     def test_protocol_documents_switch_and_keeps_rotate_branch(self):
         text = load_protocol('prd-guide')
-        self.assertIn('"supervisor_single_shift": true', text)
+        self.assertIn('"supervisor_single_shift": false', text)
         self.assertIn('输出 `rotate`', text)
 
 
