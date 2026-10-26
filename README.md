@@ -63,7 +63,7 @@ python3 -m vibe_guide --help
 
 发版自检时最容易踩的三个坑，按下面的写法抄命令，不要凭记忆简化：
 
-1. **版本断言必须在干净目录跑**。在仓库根执行会 import 到仓库里的源码树而不是 pipx 安装版，实测仓库根报 5.0.16、干净 cwd 报 5.1.3：
+1. **版本断言必须在干净目录跑**。在仓库根执行会 import 到仓库里的源码树而不是 pipx 安装版，仓库根可能导入本地源码；干净 cwd 应显示实际安装版本：
 
    ```bash
    cd /tmp && python3 -c "import vibe_guide; print(vibe_guide.__version__)"
