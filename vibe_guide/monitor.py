@@ -3773,7 +3773,9 @@ class Monitor:
         if set(retained_acceptances) & set(invalidated_acceptances):
             raise ValueError("reauthorization acceptance lineage overlaps")
         if data.get("change_reason") == "platform_handoff" and (
-            changed_nodes or invalidated_acceptances
+            changed_nodes
+            or invalidated_acceptances
+            or previous.file_scope != replacement.file_scope
         ):
             # Replay twin of the reauthorize gate: a handoff never moves the
             # acceptance contract, so it can neither change nor invalidate.
@@ -4110,6 +4112,11 @@ class Monitor:
             return str(identity)
         return None
 
+    #: Termination basis for a handoff predecessor: "already delivered".  After
+    #: a platform switch the old platform cannot be queried, so there is no
+    #: stop confirmation to ask for; the local registry saying the task handed
+    #: over its work is the only proof.  Any other state, or a missing or
+    #: mismatched binding, is unproven and the node goes to blocked_unknown.
     #: Binding states that are already a terminal handoff of the old task: a
     #: delivered developer, a reviewer that returned its review, an accepted
     #: pair.  After a platform handoff no rework or re-review can ever return

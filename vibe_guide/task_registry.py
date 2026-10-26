@@ -600,7 +600,9 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding, *,
                 and all(item.status in {"stopped", "failed", "archived"} for item in same_role)
                 and all(getattr(latest, key) == getattr(persistent, key) for key in pinned)
                 # A handoff successor may carry a rework scope expansion, so
-                # its allowlist may grow but never shrink.
+                # its allowlist may grow but never shrink.  Whether the growth
+                # is authorized is the caller's job: the monitor derives it
+                # from contract.files of the authorized DAG, never from here.
                 and (not handoff or set(latest.allowlist) <= set(persistent.allowlist))
             )
             if not successor:

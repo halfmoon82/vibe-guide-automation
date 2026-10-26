@@ -121,6 +121,18 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
                         )
                     action.assert_not_called()
 
+    def test_provider_mismatch_error_points_at_the_successor_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = ProviderActionRunner(paths, "workbuddy-visible", "workbuddy")
+            with patch("vibe_guide.runners.provider_action.load_task_binding",
+                       return_value=self._foreign_predecessor(directory, "archived")):
+                with self.assertRaisesRegex(ValueError, "successor task on the new platform"):
+                    runner.task_binding(
+                        self._handoff_contract(successor=False), Path(directory),
+                        "run-a", "running",
+                    )
+
     def _evidence(self, paths):
         node = "BUG-V3-005"
         worktree = str(paths.root / "worker")

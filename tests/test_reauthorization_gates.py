@@ -448,6 +448,59 @@ class ScopeOnlyReauthorizationTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "contract_drift"):
             self._handoff(snapshot, nodes)
 
+    def _scope_expansion_transition(self):
+        """A genuine scope-only expansion reauthorization, plus the pre-state.
+
+        The ordinary reason accepts it (scope-only expansion keeps acceptance).
+        Relabelled as ``platform_handoff`` it must be refused on replay: a
+        handoff never moves the write scope, and the write-side gate that
+        enforces that does not run on replay.
+        """
+        import copy
+
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        before = copy.deepcopy(load_snapshot(self.paths, snapshot.run_id))
+        nodes = self._nodes(a_files=["a.py", "tests/test_a.py"])
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        monitor = Monitor(self.paths, plan, nodes)
+        monitor.reauthorize(
+            snapshot.run_id, record, FakeRunner(), "executable_contract_changed"
+        )
+        events = load_events(self.paths, snapshot.run_id)
+        transition = [e for e in events if e["event"] == "authorization_reauthorized"][-1]
+        self.assertEqual(transition["data"]["changed_nodes"], [])
+        return monitor, before, snapshot.run_id, events
+
+    def test_state_replay_rejects_a_handoff_that_widens_the_file_scope(self):
+        import copy
+        from vibe_guide.state import _decode_snapshot, run_dir
+
+        _monitor, _before, run_id, events = self._scope_expansion_transition()
+        records = copy.deepcopy(events)
+        for record in records:
+            if record["event"] == "authorization_reauthorized":
+                record["data"]["change_reason"] = "platform_handoff"
+        state = (run_dir(self.paths, run_id) / "state.json").read_bytes()
+        with self.assertRaisesRegex(ValueError, "platform handoff transition changed"):
+            _decode_snapshot(state, records)
+        # The same log with the genuine reason still decodes.
+        _decode_snapshot(state, copy.deepcopy(events))
+
+    def test_monitor_replay_rejects_a_handoff_that_widens_the_file_scope(self):
+        import copy
+
+        monitor, before, _run_id, events = self._scope_expansion_transition()
+        data = copy.deepcopy(
+            [e for e in events if e["event"] == "authorization_reauthorized"][-1]["data"]
+        )
+        monitor._apply_reauthorization_transition(copy.deepcopy(before), copy.deepcopy(data))
+        data["change_reason"] = "platform_handoff"
+        with self.assertRaisesRegex(ValueError, "platform handoff transition changed"):
+            monitor._apply_reauthorization_transition(copy.deepcopy(before), data)
+
     def test_unknown_reason_still_cannot_absorb_a_capability_change(self):
         snapshot, _old_nodes, _cursors = self._accepted_run()
         self._switch_platform()
@@ -703,6 +756,40 @@ class PlatformHandoffReworkTests(unittest.TestCase):
         self.assertEqual(rebound.nodes["b"]["status"], "blocked_unknown")
         self.assertIn("handoff", rebound.nodes["b"]["reason"])
 
+
+    def test_handoff_predecessor_is_terminal_only_when_delivered_else_unproven(self):
+        # Termination basis after a handoff: the old platform cannot be
+        # queried, so the only proof is "already delivered" in the local
+        # registry.  Any other state, or a missing/mismatched binding, is
+        # unproven (the caller turns that into blocked_unknown).
+        monitor, snapshot, _runner = self._in_review_run()
+        developer = load_task_binding(self.paths, "b", "developer", run_id=snapshot.run_id)
+        self.assertEqual(developer.status, "delivered")
+        for status in ("running", "created", "blocked_unknown"):
+            with self.subTest(status=status):
+                developer.status = status
+                save_task_binding(self.paths, developer)
+                monitor._reset_binding_cache()
+                self.assertIsNone(
+                    monitor._prove_handoff_predecessor_terminal(snapshot, "b", "developer")
+                )
+        developer.status = "delivered"
+        save_task_binding(self.paths, developer)
+        monitor._reset_binding_cache()
+        # reauthorize drops every live handle before redispatching.
+        snapshot.handles.clear()
+        snapshot.nodes["b"]["active_role"] = None
+        snapshot.nodes["b"]["active_task"] = None
+        with self.subTest(case="identity mismatch"):
+            ghost = json.loads(json.dumps(snapshot.nodes["b"]))
+            snapshot.nodes["b"]["developer_identity"] = "ghost-task"
+            self.assertIsNone(
+                monitor._prove_handoff_predecessor_terminal(snapshot, "b", "developer")
+            )
+            snapshot.nodes["b"].update(ghost)
+        with self.subTest(case="delivered"):
+            proven = monitor._prove_handoff_predecessor_terminal(snapshot, "b", "developer")
+            self.assertEqual(proven[0], developer.task_id)
 
 class TemporaryReadFailureTests(unittest.TestCase):
     def test_resume_read_failure_stays_unknown_without_invalidation_marker(self):

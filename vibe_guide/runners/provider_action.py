@@ -565,7 +565,11 @@ class ProviderActionRunner(Runner):
             and contract.get("handoff_from_provider") == existing.provider
         )
         if existing is not None and existing.provider != self.provider and not handoff_lineage:
-            raise ValueError("task binding provider mismatch: explicit handoff required")
+            raise ValueError(
+                "task binding provider mismatch: explicit handoff required "
+                "(after a platform handoff, resume through a successor task "
+                "on the new platform instead of the old binding)"
+            )
         v39 = binding_contract_enabled(contract)
         live_intent = contract.get("binding_intent")
         live_observation = contract.get("binding_observation")
@@ -953,7 +957,11 @@ class ProviderActionRunner(Runner):
         a wrong base remain blocked; no reset/clean/stash/checkout is used.
         """
         if binding.provider != self.provider:
-            raise ValueError("task binding provider mismatch: explicit handoff required")
+            raise ValueError(
+                "task binding provider mismatch: explicit handoff required "
+                "(after a platform handoff, resume through a successor task "
+                "on the new platform instead of the old binding)"
+            )
         if not binding_contract_enabled(contract):
             return self.binding_gate(contract, binding)
 
@@ -1271,7 +1279,11 @@ class ProviderActionRunner(Runner):
             run_id=run_id,
         )
         if binding.provider != self.provider:
-            raise ValueError("task binding provider mismatch: explicit handoff required")
+            raise ValueError(
+                "task binding provider mismatch: explicit handoff required "
+                "(after a platform handoff, resume through a successor task "
+                "on the new platform instead of the old binding)"
+            )
         expected_capability_digest = contract.get("capability_contract_digest")
         if expected_capability_digest and binding.capability_contract_digest != expected_capability_digest:
             raise ValueError("task binding capability contract digest is stale")
