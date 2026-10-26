@@ -230,7 +230,7 @@ D 单独删除 `workbuddy.yaml` 里的 `native_control_plane` 键。
 ### 8.3 `NATIVE_TOOL_MAP` 的能力映射（关键）
 
 `provider_action.py` 要为 provider 提供 **create / enter / resume / wait / events**。
-WorkBuddy Jobs API **逐条都有对应**，且是官方公开 REST：
+WorkBuddy Jobs API **逐条都有对应**，且是官方公开 REST：（⚠️ 2026-10-26 定案：接口对应关系成立，但 agent job 在本宿主拿不到模型凭据，见下文「2026-10-26 定案」与 root-cause 文档 §0.1）
 
 | vibe 原生动作（Codex 侧工具名） | WorkBuddy 对应端点 |
 |---|---|
@@ -310,6 +310,14 @@ daemon stop → Daemon stopped.
 > `safe-delete-bulk-guard.cjs` 按**回合**计的删除额度（本机阈值 50）被打满——跑全量测试
 > 是主要消耗方，换回合即归零。完整机制见
 > [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md) §5。
+>
+> **2026-10-26 定案（推翻本节"Jobs API 是可用派发路径"的预期）**：
+> Jobs agent 路径经源码层闭合证实**永远拿不到模型凭据**（detached 子进程继承不到宿主
+> session 的 run identity，broker 内层还主动删 `CODEBUDDY_GATEWAY_AUTH`）。窗口会话派发
+> （`POST /api/v1/sessions/{sid}/reply`）仍是唯一实测可用的可见路径，已落地为
+> `workbuddy_job__create` 的 `session_id` 分支；Jobs API 在本宿主上只能跑 `bash:true`
+> 作业。同时定案：WorkBuddy **没有自动换班入口**，rotate 只能靠用户在 UI 新开会话。
+> 详见 [workbuddy-dispatch-root-cause-and-fix.md](workbuddy-dispatch-root-cause-and-fix.md) §0.1。
 
 ---
 
@@ -358,4 +366,4 @@ bridge 为 null。**这不阻塞规划/发布/授权**，只影响自动派发�
 |---|---|
 | 引擎 / doctor / 规则文件 / skill 供给 | **全绿**（`issues: []`，exit 0） |
 | 复杂任务规划 → 发布 → 授权 | **可用**（十节点门禁实测通过） |
-| 自动派发并行会话 | **执行体已补**（v5.0.2 随包 `workbuddy_job` MCP server；2026-10-03 macOS 实测五工具可用）。待宿主信任 + 解决 safe-delete 500，见 [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md) |
+| 自动派发并行会话 | **执行体已补**（v5.0.2 随包 `workbuddy_job` MCP server；2026-10-03 macOS 实测五工具可用）。待宿主信任 + 解决 safe-delete 500，见 [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md)。**2026-10-26 更正**：agent job 不可用，仅 `session_id` 窗口会话路径可用；无自动换班 |

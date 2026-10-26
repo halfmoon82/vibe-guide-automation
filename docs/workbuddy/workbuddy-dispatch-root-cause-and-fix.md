@@ -1,7 +1,7 @@
 # WorkBuddy 派发：根因定案与确切修法
 
-日期：2026-10-08
-环境：macOS arm64 / WorkBuddy 5.6.2 / CLI 2.147.0 / gatewayMode=local
+日期：2026-10-08（根因）；2026-10-26（证据链闭合到源码层，见 §0.1）
+环境：macOS arm64 / WorkBuddy 5.6.2 / CLI 2.147.0（初测）；WorkBuddy 5.8.4 / CLI 2.161.0（复核）
 结论性质：**实测定案**，不是推断。每条结论附可复现命令。
 
 ---
@@ -14,6 +14,19 @@ job broker spawn 出来的 CLI 进程**拿不到模型凭据**——这是凭据
 
 **修法不是修作业，而是换派发目标**：把任务投递到**真实 WorkBuddy 窗口会话**
 （`POST /api/v1/sessions/{id}/reply`），该路径已实测能真实驱动 agent。
+
+## 0.1 2026-10-26 源码级闭合（换班不可用定案）
+
+本轮在 5.8.4 / CLI 2.161.0 上把根因从「环境差分实测定案」推进到「bundle 源码层闭合」，并顺带判定了**自动换班不可用**：
+
+1. **模型认证的落点不是网关密码**。模型请求走 `resolveRunIdentity()`（module 80039）取当前 session 的进程内 run identity，再用其 `auth.accessToken` 组 `runIdentityHeaders()`。这个 identity 存在 session 对象的 WeakMap 里，**detached 子进程继承不到内存**。
+2. **broker 内层主动再清洗一遍**。`forkBgSession` 只复制 `process.env` + 注入 job id/dir；`JobBrokerRuntime.spawnInner` 在 PTY spawn 内层 CLI 前显式 `delete CODEBUDDY_GATEWAY_AUTH`/`SERVER__PORT`/`SERVER__HOST`/broker 标志，只注入 job reclaim token。gateway auth 都不进内层，更别说 run identity。
+3. **credential bootstrap socket 是一次性私门**。接收端仅在进程启动时监听 `CODEBUDDY_SIDECAR_CREDENTIAL_BOOTSTRAP_SOCKET`，payload 必须同时匹配 `version/sessionId/token/pid`，收到即删 socket。外部 spawn 没有合法 payload。
+4. **prewarm `activate` 不是公开入口**。协议确有 `ping/status/activate`（cwd/args/sessionId/env/`credentialProtectionBootstrap`），但 bootstrap 材料由宿主协调器生成，且只对 `--prewarm` 待命进程成立；Jobs 路径不带该参数。
+5. **broker control socket 不管登录**。只有 `ping/attach/resize/detach/request-reclaim`，reclaim 要 reclaim token + pid + generation + sessionId + createdAt 全匹配。
+6. **复核探针（5.8.4）**：`POST /api/v1/jobs` 的 agent job 仍 `starting→failed`、日志 0 字节、transcript 空（探针 `6cc7c770`/`71d4c26c`），bash 对照作业 `9d86514a` 正常写日志——网关与 spawn 链路健康，失败精确在模型凭证自举。
+
+**对换班的含义**：WorkBuddy 上不存在「无焦点、独立 runtime、自带模型身份」的公开创建入口；`vibe supervisor-preflight` 输出 `rotate` 时只能由用户在 UI 新开会话接班（`vibe supervisor-handoff`）。不得用 GUI 点击模拟换班（与用户窗口操作冲突），也不得把 ACP `session/new` 当隔离 runtime（同 gateway 上共享 `sessionSubject`）。完整原始探针记录保存在维护者本机（未脱敏，不随仓库发布）。
 
 ---
 

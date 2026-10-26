@@ -245,7 +245,7 @@ Codex（`codex_app__create_thread` / `navigate_to_codex_page` / `wait_threads` /
 |---|---|---|---|
 | 发布门禁 | `cli.py:308-313` → `base.py:252-255` | `native_control_plane` | **已解**（D 组） |
 | 派发门禁 | `provider_action.py:48` `NATIVE_TOOL_MAP` | provider 是否在表内 | **已解**（E 组） |
-| 执行门禁 | 桌面会话里有没有这个工具 | MCP server 是否装并信任 | **已提供**（v5.0.2 随包 `vibe_guide/mcp_servers/workbuddy_jobs.py`，见 [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md)）；待宿主"信任"+解决 safe-delete 阻断 |
+| 执行门禁 | 桌面会话里有没有这个工具 | MCP server 是否装并信任 | **已提供**（v5.0.2 随包 `vibe_guide/mcp_servers/workbuddy_jobs.py`，见 [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md)）；待宿主"信任"+解决 safe-delete 阻断。**2026-10-26 更正**：Jobs agent job 拿不到模型凭据，仅 `session_id` 窗口会话路径可用，详见 [workbuddy-dispatch-root-cause-and-fix.md](workbuddy-dispatch-root-cause-and-fix.md) §0.1 |
 
 失败模式是干净的：明确报错 + 隔离节点，不会伪装成功、不会傻等。
 E 组之后变成"请求已入信箱、等待被取走"，同样不会伪装成功。

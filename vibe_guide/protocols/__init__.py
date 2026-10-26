@@ -27,6 +27,10 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-26: §6.4/§6.5 WorkBuddy 定案——Jobs detached agent 拿不到
+        # 模型 run identity（凭证边界为宿主设计），派发只能走窗口会话；
+        # 无自动换班入口，rotate 只能由用户在本项目 UI 新开会话接班。
+        "58e05735b62294ab619c005ae56dc0e40622a374c3f0fb9861d7fdc57b570938",
         # 2026-10-26: #265 write-scope overlap rule merged onto V5.1.3's
         # 500k/800k rotate hard-cap options (run-43e778 integration, #292).
         "5e43f257106a86cfebb5c097656a39cbbe216ae717c807d9ce85a5777ec90384",

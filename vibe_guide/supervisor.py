@@ -1421,7 +1421,9 @@ SESSION_RECORD_HINT = (
 HOST_SHIFT_DIFFERENCES = (
     "宿主差异：Codex 桌面两条都能自动建；"
     "Claude Code 没有换班原语，心跳降级为兜底机制；"
-    "WorkBuddy 两条都得在本会话里手动做（登记地址、建心跳），不会自己发生。"
+    "WorkBuddy 两条都得在本会话里手动做（登记地址、建心跳），不会自己发生，"
+    "且没有合法的无焦点自动换班入口——rotate 只能由用户在本项目新开会话接班"
+    "（Jobs detached 子进程拿不到模型 run identity，凭证边界为宿主设计使然）。"
 )
 
 
@@ -1861,7 +1863,8 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "  2) 自建心跳，指令逐字用下面这段，只替换 <本会话记录路径>：",
         heartbeat_command(run_id, command_prefix=command_prefix),
         "  3) 置顶、改标题；删掉上一班的心跳，归档上一班会话"
-        "（Claude Code 没有换班原语：上一班结束会话即可）。",
+        "（Claude Code 没有换班原语：上一班结束会话即可；"
+        "WorkBuddy 无自动换班入口，新会话由用户在本项目 UI 里手动开启）。",
         "  4) 跑一次心跳指令第 1 步的预检，按输出走。",
         HOST_SHIFT_DIFFERENCES,
         "监工挂起某个节点等用户拍板时，先登记：vibe supervisor-hold --run-id {} "
