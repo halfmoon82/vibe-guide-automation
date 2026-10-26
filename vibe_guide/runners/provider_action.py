@@ -553,6 +553,23 @@ class ProviderActionRunner(Runner):
         except FileNotFoundError:
             existing = None
         successor = bool(contract.get("successor"))
+        # #289: a successor created on this platform after a recorded
+        # platform_handoff may follow a predecessor bound by another provider.
+        # The monitor sets the flag only after proving the old task terminal;
+        # the lineage must name that predecessor's provider exactly, and the
+        # stopped-predecessor gate below still applies.
+        handoff_lineage = (
+            successor
+            and contract.get("platform_handoff_successor") is True
+            and existing is not None
+            and contract.get("handoff_from_provider") == existing.provider
+        )
+        if existing is not None and existing.provider != self.provider and not handoff_lineage:
+            raise ValueError(
+                "task binding provider mismatch: explicit handoff required "
+                "(after a platform handoff, resume through a successor task "
+                "on the new platform instead of the old binding)"
+            )
         v39 = binding_contract_enabled(contract)
         live_intent = contract.get("binding_intent")
         live_observation = contract.get("binding_observation")
@@ -749,6 +766,10 @@ class ProviderActionRunner(Runner):
         if successor:
             create_request["successor"] = True
             create_request["predecessor_task_id"] = predecessor
+            if handoff_lineage:
+                # Durable lineage on the create action itself, so a later
+                # false-start recovery can verify it without trusting state.
+                create_request["handoff_from_provider"] = existing.provider
         contract = self._parameter_recovery_contract(contract, run_id, create_request)
         created = self._require_result(
             contract, run_id, "create", create_request
@@ -857,6 +878,7 @@ class ProviderActionRunner(Runner):
             allowlist=list(contract.get("files", [])),
             capability_contract_digest=contract.get("capability_contract_digest"),
             successor_of=predecessor if successor else None,
+            handoff_from_provider=existing.provider if handoff_lineage else None,
         )
         if profile is not None:
             binding.route_digest = profile.route_digest
@@ -934,6 +956,12 @@ class ProviderActionRunner(Runner):
         node branch.  Existing branch occupancy, path drift, dirty content or
         a wrong base remain blocked; no reset/clean/stash/checkout is used.
         """
+        if binding.provider != self.provider:
+            raise ValueError(
+                "task binding provider mismatch: explicit handoff required "
+                "(after a platform handoff, resume through a successor task "
+                "on the new platform instead of the old binding)"
+            )
         if not binding_contract_enabled(contract):
             return self.binding_gate(contract, binding)
 
@@ -1250,6 +1278,12 @@ class ProviderActionRunner(Runner):
             str(contract["role"]),
             run_id=run_id,
         )
+        if binding.provider != self.provider:
+            raise ValueError(
+                "task binding provider mismatch: explicit handoff required "
+                "(after a platform handoff, resume through a successor task "
+                "on the new platform instead of the old binding)"
+            )
         expected_capability_digest = contract.get("capability_contract_digest")
         if expected_capability_digest and binding.capability_contract_digest != expected_capability_digest:
             raise ValueError("task binding capability contract digest is stale")

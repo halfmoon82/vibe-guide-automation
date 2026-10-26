@@ -365,27 +365,22 @@ def dispatch_topology_for_node(
     4. the conservative ``dual-visible`` default.  UNKNOWN evidence never
        yields ``visible-sdd``.
 
-    Rule 2 is load-bearing, not redundant with rule 3.  Removing it does not
-    change the role the closeout node is *first* dispatched with -- that is
-    ``developer`` either way.  It changes the *topology*: rule 3 then rules
-    the node ``visible-sdd``, and a ``visible-sdd`` delivery returns early
-    through ``Monitor._accept_visible_sdd_delivery`` (the
-    ``TOPOLOGY_VISIBLE_SDD`` branch taken after a node reports delivered),
-    which never dispatches a reviewer.  The run-level
-    ``integration_review_evidence`` package is only ever derived from a
-    *reviewer* acceptance claim in the normal dispatch flow
-    (``Monitor._derive_integration_acceptance``; the write itself is the
-    module-level ``monitor._record_integration_review`` alias of
-    ``evidence.record_integration_review``), so it stays empty.
-    Measured on the real fixture (2026-10-07): the closeout node still ends
-    up ``accepted``, but the run can never reach ``complete`` -- it stalls on
-    ``integration review evidence is missing``.  With rule 2 in place the node
-    is ruled ``dual-visible``, delivered, and then dispatched a second time as
-    a reviewer, and that second dispatch is what closes the run out.
+    Integration closeout dispatches only a reviewer.  Keep it off the
+    developer-only visible-sdd path: integration acceptance must come from
+    a reviewer claim, never from a synthetic developer delivery.  The
+    existing topology vocabulary is retained for old authorization records;
+    the worker entry's reviewer role describes its single closeout session.
     """
     contract = node.contract if isinstance(node.contract, dict) else {}
     persisted = contract.get("dispatch_topology")
     if isinstance(persisted, str) and persisted in _WORKER_TOPOLOGIES:
+        if (
+            getattr(node, "id", "") == INTEGRATION_REVIEW_NODE_ID
+            and persisted == WORKER_TOPOLOGY_VISIBLE_SDD
+        ):
+            raise ValueError(
+                "integration review requires reviewer dispatch, not visible-sdd"
+            )
         return persisted
     if getattr(node, "id", "") == INTEGRATION_REVIEW_NODE_ID:
         return WORKER_TOPOLOGY_DUAL_VISIBLE
@@ -445,7 +440,9 @@ def _rerule_workers(
         updated["mode"] = (
             "background" if topology == WORKER_TOPOLOGY_BACKGROUND else "visible"
         )
-        if topology == WORKER_TOPOLOGY_VISIBLE_SDD:
+        if node.id == INTEGRATION_REVIEW_NODE_ID:
+            updated["role"] = "reviewer"
+        elif topology == WORKER_TOPOLOGY_VISIBLE_SDD:
             updated["role"] = "developer"
         reruled.append(updated)
     return tuple(reruled)
@@ -728,6 +725,67 @@ def executable_contract_digest_matches(nodes: List[DAGNode], digest: Any) -> boo
     )
 
 
+def verified_authorized_nodes(
+    encoded_nodes: Any, digests: Any, record: "AuthorizationRecord", scope_digests: Any = None
+) -> Dict[str, DAGNode]:
+    """Decode an epoch's DAG only when aggregate and per-node commitments bind it."""
+    if not isinstance(encoded_nodes, dict) or not isinstance(digests, dict):
+        return {}
+    if set(encoded_nodes) != set(record.node_ids) or set(digests) != set(record.node_ids):
+        return {}
+    try:
+        nodes = {key: DAGNode.from_dict(json.loads(value)) for key, value in encoded_nodes.items()}
+        if any(node.id != key for key, node in nodes.items()):
+            return {}
+        if scope_digests != record.node_scope_digests:
+            return {}
+        if not isinstance(scope_digests, dict) or set(scope_digests) != set(nodes) or any(
+            legacy_executable_contract_digest([node]) != scope_digests[key]
+            for key, node in nodes.items()
+        ):
+            return {}
+        for algorithm in (executable_contract_digest, legacy_executable_contract_digest):
+            if algorithm(list(nodes.values())) == record.node_contract_digest and all(
+                algorithm([node]) == digests[key] for key, node in nodes.items()
+            ):
+                return nodes
+    except (TypeError, ValueError, KeyError):
+        pass
+    return {}
+
+
+def acceptance_contract_projection(node: DAGNode) -> Dict[str, Any]:
+    """Remove only known routing leaves; retain scope and all unknown semantics.
+
+    This is NOT an execution authorization digest.  It can only retain an
+    acceptance after a separately verified old epoch and a new authorization.
+    """
+    projected = canonical_node_contracts([node])[0]
+    contract = dict(projected["contract"])
+    for key in ("adapter_id", "worker", "reviewer_worker", "model", "reasoning", "route_digest"):
+        contract.pop(key, None)
+    profile = contract.get("worker_profile")
+    if isinstance(profile, dict):
+        profile = dict(profile)
+        for key in ("worker", "model", "reasoning", "route_digest"):
+            profile.pop(key, None)
+        # selection_basis/fallbacks may carry permissions or business facts;
+        # unknown fields are never classified as harmless routing changes.
+        contract["worker_profile"] = profile
+    return dict(projected, contract=contract)
+
+
+def route_only_acceptance_binds(
+    node: DAGNode, previous_node: Optional[DAGNode], digest: Any
+) -> bool:
+    """The caller must obtain previous_node from the verified preceding epoch."""
+    return (
+        previous_node is not None
+        and executable_contract_digest_matches([previous_node], digest)
+        and acceptance_contract_projection(previous_node) == acceptance_contract_projection(node)
+    )
+
+
 def integration_contract_projection(plan: Plan, nodes: List[DAGNode]) -> Dict[str, Any]:
     """The integration contract the card freezes, from its two sources.
 
@@ -931,6 +989,7 @@ def _authorization_payload(
     rotate_hard_cap: Optional[int] = None,
     heartbeat_interval_forced: Optional[bool] = None,
     heartbeat_interval_forced_cost: Optional[str] = None,
+    node_scope_digests: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     payload = {
         "schema_version": AUTHORIZATION_SCHEMA_VERSION,
@@ -964,6 +1023,8 @@ def _authorization_payload(
     # Workers semantics are bound into the digest whenever present.  Records
     # pre-dating ISSUE-02 carry no workers at all; keeping the keys absent for
     # empty declarations preserves their digests bit-for-bit.
+    if node_scope_digests:
+        payload["node_scope_digests"] = dict(node_scope_digests)
     if workers:
         payload["workers"] = workers
         payload["topology_summary"] = (
@@ -1035,6 +1096,7 @@ class AuthorizationCard:
     rotate_hard_cap: Optional[int] = None
     heartbeat_interval_forced: Optional[bool] = None
     heartbeat_interval_forced_cost: Optional[str] = None
+    node_scope_digests: Optional[Dict[str, str]] = None
     heartbeat_interval_options: Tuple[Dict[str, Any], ...] = ()
     rotate_hard_cap_options: Tuple[Dict[str, Any], ...] = ()
 
@@ -1100,6 +1162,7 @@ class AuthorizationRecord:
     rotate_hard_cap: Optional[int] = None
     heartbeat_interval_forced: Optional[bool] = None
     heartbeat_interval_forced_cost: Optional[str] = None
+    node_scope_digests: Optional[Dict[str, str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -1129,7 +1192,7 @@ class AuthorizationRecord:
             "digest",
             "agent_id",
         }
-        allowed = required | {"remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "heartbeat_interval_forced", "heartbeat_interval_forced_cost", "heartbeat_interval_options", "rotate_hard_cap_options"}
+        allowed = required | {"node_scope_digests", "remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "heartbeat_interval_forced", "heartbeat_interval_forced_cost", "heartbeat_interval_options", "rotate_hard_cap_options"}
         if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
             raise ValueError("authorization record schema is invalid")
         if data["schema_version"] != AUTHORIZATION_SCHEMA_VERSION:
@@ -1389,7 +1452,7 @@ def _drop_unset_card_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     what a pre-209 card did -- must be byte-identical to the ones issued before
     the option existed, so their stored digests keep verifying.
     """
-    for key in ("heartbeat_interval_minutes", "rotate_hard_cap",
+    for key in ("node_scope_digests", "heartbeat_interval_minutes", "rotate_hard_cap",
                 "heartbeat_interval_forced", "heartbeat_interval_forced_cost"):
         if result.get(key) is None:
             result.pop(key, None)
@@ -1464,6 +1527,11 @@ def build_authorization_card(
         worker_identities[node.id] = raw_worker
     normalized_workers = _normalize_workers_schema(
         workers, node_ids, worker_identities
+    )
+    normalized_workers = tuple(
+        dict(entry, role="reviewer")
+        if entry["node_id"] == INTEGRATION_REVIEW_NODE_ID else entry
+        for entry in normalized_workers
     )
     if topology_rulings is not None:
         # The card has to describe the dispatch the supervisor will actually
@@ -1644,6 +1712,7 @@ def build_authorization_card(
         rotate_hard_cap=rotate_hard_cap,
         heartbeat_interval_forced=heartbeat_interval_forced,
         heartbeat_interval_forced_cost=heartbeat_interval_forced_cost,
+        node_scope_digests={node.id: legacy_executable_contract_digest([node]) for node in nodes},
     )
     digest = _canonical_digest(canonical)
     canonical["engine_authorization_digest"] = digest
@@ -1800,6 +1869,7 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         rotate_hard_cap=card.rotate_hard_cap,
         heartbeat_interval_forced=card.heartbeat_interval_forced,
         heartbeat_interval_forced_cost=card.heartbeat_interval_forced_cost,
+        node_scope_digests=card.node_scope_digests,
     )
     if card.schema_version != AUTHORIZATION_SCHEMA_VERSION:
         raise ValueError("unsupported authorization card schema")
@@ -1841,6 +1911,7 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         rotate_hard_cap=card.rotate_hard_cap,
         heartbeat_interval_forced=card.heartbeat_interval_forced,
         heartbeat_interval_forced_cost=card.heartbeat_interval_forced_cost,
+        node_scope_digests=card.node_scope_digests,
     )
 
 
@@ -1872,6 +1943,10 @@ def is_authorization_valid(
         except (TypeError, ValueError):
             return False
         if not digest_matches:
+            return False
+        if record.node_scope_digests is not None and record.node_scope_digests != {
+            node.id: legacy_executable_contract_digest([node]) for node in nodes
+        }:
             return False
         if record.file_scope != live_file_scope:
             return False
@@ -1910,6 +1985,7 @@ def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
         rotate_hard_cap=record.rotate_hard_cap,
         heartbeat_interval_forced=record.heartbeat_interval_forced,
         heartbeat_interval_forced_cost=record.heartbeat_interval_forced_cost,
+        node_scope_digests=record.node_scope_digests,
     )
     if not secrets.compare_digest(record.digest, _canonical_digest(canonical)):
         # V3/V4 records pre-dating execution-engine binding remain readable

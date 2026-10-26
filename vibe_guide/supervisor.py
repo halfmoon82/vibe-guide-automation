@@ -559,7 +559,11 @@ def contract_drift(paths, run_id):
         "reason": "capability contract digest differs from the run snapshot",
         "recorded_digest": recorded,
         "current_digest": current,
-        "action": "走同一运行的重新授权流程（vibe authorize 同一 plan/run），不要继续推进",
+        "action": (
+            "走同一运行的重新授权流程（vibe authorize 同一 plan/run），不要继续推进；"
+            "若是换平台交接，用 `vibe monitor --plan <plan> --authorize AUTHORIZE "
+            "--platform-handoff` 重新授权：已验收节点保留验收，验收契约有变化时仍按 contract_drift 拒绝"
+        ),
         "hint": CONTRACT_DRIFT_HINT,
     }
 

@@ -182,6 +182,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--observations")
     parser.add_argument("--watch", action="store_true", dest="watch")
     parser.add_argument("--preview-card", action="store_true", dest="preview_card")
+    parser.add_argument("--platform-handoff", action="store_true", dest="platform_handoff",
+                        help="monitor: 换平台交接时重新授权同一运行（只允许派发绑定与能力合同变化）")
     parser.add_argument("--mode", choices=("layered", "bundled"), default="layered")
     parser.add_argument("--source", dest="skill_source")
     parser.add_argument("--sha", dest="skill_sha")
@@ -3208,7 +3210,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                         _run_id(directory, None),
                         record,
                         runner,
-                        str(
+                        "platform_handoff" if args.platform_handoff else str(
                             invalidation.get(
                                 "change_reason", "executable_contract_changed"
                             )
@@ -3257,13 +3259,18 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                         _run_id(directory, None),
                         record,
                         runner,
-                        "capability_contract_changed",
+                        "platform_handoff" if args.platform_handoff
+                        else "capability_contract_changed",
                     )
                     _record_worktree_preflight(paths, monitor, snapshot, launchers)
                     # See the invalidation branch above for why the card is
                     # published here and not one line further out.
                     _atomic_json(directory / "authorization-card.json", card.to_dict())
             else:
+                if args.platform_handoff:
+                    # A handoff continues an existing run; never let the flag
+                    # silently start a fresh one.
+                    raise ValueError("platform handoff requires an existing run")
                 record = authorize(card, args.authorize)
                 if runner is None:
                     runner = _public_runner(paths, card, nodes, launchers)

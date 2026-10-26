@@ -470,6 +470,8 @@ def evaluate_v41_closeout(snapshot: Any) -> CloseoutDecision:
     nodes = _snapshot_value(snapshot, "nodes", {})
     if not isinstance(nodes, dict) or not nodes:
         return CloseoutDecision(False, "blocked_unknown", ["snapshot nodes are unavailable"])
+    if any(isinstance(node, dict) and node.get("workspace_reconciliation_required") is True for node in nodes.values()):
+        return CloseoutDecision(False, "blocked_unknown", ["workspace reconciliation required"])
     integration_id, integration = _integration_node(snapshot)
     if integration_id is None:
         accepted = all(isinstance(node, dict) and node.get("status") == "accepted" for node in nodes.values())

@@ -19,6 +19,9 @@ from .authorization import (
     AuthorizationRecord,
     affected_node_closure,
     canonical_node_contracts,
+    legacy_executable_contract_digest,
+    verified_authorized_nodes,
+    route_only_acceptance_binds,
     contract_invariant_entries,
     digest_integration_contract,
     dispatch_topology_for_node,
@@ -137,6 +140,7 @@ from .evidence import (
 from .engine_attestation import validate_engine_attestation
 from .decision_boundary import NotificationBridge, ingest_worker_decisions
 from .orphan_recovery import ORPHAN_DISPATCH_ADOPTED, replay_orphan_adoption
+from .providers import CODEX_PROVIDER
 from .self_report_recovery import SELF_REPORT_DELIVERY_RECONCILED
 from .decisions import DecisionMailbox
 
@@ -944,7 +948,7 @@ RECOVERY_FIDELITY_AUDIT = (
     },
     {
         "site": "_release_node_lease",
-        "call_sites": 22,
+        "call_sites": 23,
         "callers": (
             {
                 "caller": "_recover_reverse_blocked_acceptance",
@@ -959,7 +963,7 @@ RECOVERY_FIDELITY_AUDIT = (
                 "caller": (
                     "_apply_event, _start_task, reauthorize, _schedule_ready "
                     "helpers, _reconcile_unapplied_events and the remaining "
-                    "terminal-transition callers (the other 21 sites)"
+                    "terminal-transition callers (the other 22 sites, including the #290 contract_error replay that re-plans an integration-review node)"
                 ),
                 "verdict": "different_type",
                 "rationale": (
@@ -973,7 +977,7 @@ RECOVERY_FIDELITY_AUDIT = (
     },
     {
         "site": "_mark_blocked_unknown",
-        "call_sites": 49,
+        "call_sites": 53,
         "callers": (
             {
                 "caller": (
@@ -985,6 +989,20 @@ RECOVERY_FIDELITY_AUDIT = (
                 "rationale": (
                     "Callers pass a reason and never read the stamps back as "
                     "evidence; the block is fail-closed by construction."
+                ),
+            },
+            {
+                "caller": (
+                    "_start_task (workspace reconciliation / platform handoff "
+                    "predecessor unproven), _apply_event (same guard "
+                    "and the integration reviewer write violation)"
+                ),
+                "verdict": "different_type",
+                "rationale": (
+                    "#289/#290 new sites: each only parks the node fail-closed "
+                    "on a structural flag or an unproven predecessor and "
+                    "returns; none reads the stamps back as evidence or "
+                    "rolls anything back from them."
                 ),
             },
             {
@@ -2260,6 +2278,15 @@ class Monitor:
                 "node_contract_digest": record.node_contract_digest,
                 "capability_contract_digest": capability_contract_digest,
                 "node_ids": sorted(self.nodes),
+                "prd_digest": snapshot.prd_digest,
+                "spec_digest": snapshot.spec_digest,
+                "authorized_node_contracts": self._encoded_node_contracts(),
+                "node_contract_digests": {
+                    key: current["contract_digest"] for key, current in snapshot.nodes.items()
+                },
+                "node_scope_digests": {
+                    key: legacy_executable_contract_digest([node]) for key, node in self.nodes.items()
+                },
                 "legacy_evidence_digest": snapshot.legacy_evidence_digest,
             },
         )
@@ -2363,6 +2390,24 @@ class Monitor:
         self._save_snapshot(snapshot)
         return snapshot
 
+    def _encoded_node_contracts(self) -> Dict[str, str]:
+        return {
+            item["id"]: json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            for item in canonical_node_contracts(list(self.nodes.values()))
+        }
+
+    def _previous_authorized_nodes(
+        self, snapshot: RunSnapshot, previous: AuthorizationRecord
+    ) -> Dict[str, DAGNode]:
+        for event in reversed(load_events(self.paths, snapshot.run_id)[:snapshot.event_sequence]):
+            data = event["data"]
+            if event["event"] in {"run_started", "authorization_reauthorized"} and data.get("authorization_digest") == previous.digest:
+                return verified_authorized_nodes(
+                    data.get("authorized_node_contracts"), data.get("node_contract_digests"),
+                    previous, data.get("node_scope_digests"),
+                )
+        return {}
+
     def reauthorize(
         self,
         run_id: str,
@@ -2391,6 +2436,10 @@ class Monitor:
             if capability_contract_changed and change_reason not in {
                 "capability_contract_changed",
                 "executable_contract_changed",
+                # #289: switching platforms changes the capability contract
+                # by construction; the handoff gate below still refuses any
+                # acceptance-contract change under this reason.
+                "platform_handoff",
             }:
                 raise PermissionError(
                     "capability_contract_unknown: explicit recovery reason required"
@@ -2412,7 +2461,15 @@ class Monitor:
             or set(snapshot.nodes) != set(self.nodes)
         ):
             raise PermissionError("reauthorization must remain on the same plan revision")
-        if snapshot.authorization_digest == record.digest and not capability_contract_changed:
+        if any(current.get("workspace_reconciliation_required") is True for current in snapshot.nodes.values()):
+            raise PermissionError("workspace reconciliation required before reauthorization")
+        live_prd, live_spec = self._current_plan_digests()
+        if (snapshot.prd_digest and not live_prd) or (snapshot.spec_digest and not live_spec):
+            raise PermissionError("reauthorization source lineage is unreadable")
+        source_changed = (
+            bool(live_prd) and live_prd != snapshot.prd_digest
+        ) or (bool(live_spec) and live_spec != snapshot.spec_digest)
+        if snapshot.authorization_digest == record.digest and not capability_contract_changed and not source_changed:
             self._require_snapshot_authorization(snapshot)
             # A replay of an interrupted reauthorization lands here with the
             # transition already applied but its projection never recorded,
@@ -2426,6 +2483,12 @@ class Monitor:
             return snapshot
 
         previous = self._snapshot_record(snapshot)
+        current_prd_digest, current_spec_digest = live_prd, live_spec
+        integration_changed = (
+            previous.integration_contract_digest != record.integration_contract_digest
+            or current_prd_digest != snapshot.prd_digest
+            or current_spec_digest != snapshot.spec_digest
+        )
         previous_node_contract_digests = {
             node_id: snapshot.nodes[node_id].get("contract_digest")
             for node_id in snapshot.nodes
@@ -2443,8 +2506,12 @@ class Monitor:
         # ceiling: A adds and B drops the same file cancel out in the union,
         # nothing is provable, and both are redispatched).  state.py replay
         # applies the same predicate.
+        previous_authorized_nodes = self._previous_authorized_nodes(snapshot, previous)
+
         def unchanged(node_id, digest):
-            return executable_contract_digest_matches(
+            return route_only_acceptance_binds(
+                self.nodes[node_id], previous_authorized_nodes.get(node_id), digest
+            ) or executable_contract_digest_matches(
                 [self.nodes[node_id]], digest
             ) or scope_only_expansion_binds(
                 self.nodes[node_id], digest, previous.file_scope, record.file_scope
@@ -2453,8 +2520,40 @@ class Monitor:
         changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if not unchanged(node_id, previous_node_contract_digests[node_id])
+            if (node_id == "integration-review" and integration_changed)
+            or not unchanged(node_id, previous_node_contract_digests[node_id])
         )
+        if change_reason == "platform_handoff":
+            # #289 draft section 2: a platform handoff may move only the
+            # dispatch binding (adapter/worker/model routing) and the
+            # capability contract.  The scope-only-expansion allowance of an
+            # ordinary reauthorization does not apply: file scope is part of
+            # the acceptance contract.  Refuse before any side effect (task
+            # stop, event append) so a mislabelled change leaves the run as
+            # it was.
+            drifted = sorted(
+                node_id
+                for node_id in snapshot.nodes
+                if not (
+                    route_only_acceptance_binds(
+                        self.nodes[node_id],
+                        previous_authorized_nodes.get(node_id),
+                        previous_node_contract_digests[node_id],
+                    )
+                    or executable_contract_digest_matches(
+                        [self.nodes[node_id]], previous_node_contract_digests[node_id]
+                    )
+                )
+            )
+            if drifted or integration_changed or record.file_scope != previous.file_scope:
+                raise PermissionError(
+                    "contract_drift: platform_handoff may only change dispatch "
+                    "binding and capability contract (acceptance contract "
+                    "changed: {})".format(
+                        ", ".join(drifted)
+                        or ("integration contract" if integration_changed else "file scope")
+                    )
+                )
         affected_nodes = affected_node_closure(
             list(self.nodes.values()), changed_nodes
         )
@@ -2548,11 +2647,6 @@ class Monitor:
         # its strict lineage check: only an explicit reauthorization may move
         # the pinned source digests, and the move is recorded old -> new in
         # the transition so the audit chain shows what was re-bound.
-        current_prd_digest, current_spec_digest = self._current_plan_digests()
-        if not current_prd_digest:
-            current_prd_digest = snapshot.prd_digest
-        if not current_spec_digest:
-            current_spec_digest = snapshot.spec_digest
         transition = {
             "run_id": snapshot.run_id,
             "previous_authorization": previous.to_dict(),
@@ -2570,6 +2664,9 @@ class Monitor:
             "previous_node_contract_digests": previous_node_contract_digests,
             "node_contract_digests": new_node_contract_digests,
             "authorized_node_contracts": authorized_node_contracts,
+            "node_scope_digests": {
+                key: legacy_executable_contract_digest([node]) for key, node in self.nodes.items()
+            },
             "changed_nodes": changed_nodes,
             "affected_nodes": affected_nodes,
             "accepted_nodes": accepted_nodes,
@@ -2578,6 +2675,9 @@ class Monitor:
             "change_reason": change_reason,
             "continuation": continuation,
         }
+        # Validate the complete transition before publishing its durable event.
+        # A rejected proof must not poison replay with an unappliable event.
+        self._apply_reauthorization_transition(copy.deepcopy(snapshot), transition)
         self._record(snapshot, "authorization_reauthorized", transition)
         self._apply_reauthorization_transition(snapshot, transition)
         # The transition resets every never-started node back to ``planned``,
@@ -2619,6 +2719,8 @@ class Monitor:
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
         self._validate_execution_topology(snapshot)
+        if any(node.get("workspace_reconciliation_required") is True for node in snapshot.nodes.values()):
+            raise PermissionError("workspace reconciliation required before integration evidence")
         _record_integration_review(snapshot, evidence)
         self._record(snapshot, "integration_review_recorded", {
             "run_id": snapshot.run_id,
@@ -2867,6 +2969,8 @@ class Monitor:
         self._reset_binding_cache()
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
+        if any(node.get("workspace_reconciliation_required") is True for node in snapshot.nodes.values()):
+            raise PermissionError("workspace reconciliation required before evidence recovery")
         self._validate_reconciliation_package(snapshot, package)
         if all(node.get("status") == "accepted" for node in snapshot.nodes.values()):
             return snapshot
@@ -3571,6 +3675,7 @@ class Monitor:
                 "executable_contract_changed",
                 "capability_contract_changed",
                 "engine_attestation_renewed",
+                "platform_handoff",
             }
         ):
             raise ValueError("reauthorization replacement lineage is inconsistent")
@@ -3667,11 +3772,30 @@ class Monitor:
             raise ValueError("reauthorization acceptance lineage is invalid")
         if set(retained_acceptances) & set(invalidated_acceptances):
             raise ValueError("reauthorization acceptance lineage overlaps")
+        if data.get("change_reason") == "platform_handoff" and (
+            changed_nodes
+            or invalidated_acceptances
+            or previous.file_scope != replacement.file_scope
+        ):
+            # Replay twin of the reauthorize gate: a handoff never moves the
+            # acceptance contract, so it can neither change nor invalidate.
+            raise ValueError("platform handoff transition changed the acceptance contract")
+        previous_authorized_nodes = self._previous_authorized_nodes(snapshot, previous)
         expected_changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if not (
-                executable_contract_digest_matches(
+            if (
+                node_id == "integration-review" and (
+                    previous.integration_contract_digest != replacement.integration_contract_digest
+                    or replacement_prd_digest != snapshot.prd_digest
+                    or replacement_spec_digest != snapshot.spec_digest
+                )
+            ) or not (
+                route_only_acceptance_binds(
+                    self.nodes[node_id], previous_authorized_nodes.get(node_id),
+                    previous_node_contract_digests[node_id],
+                )
+                or executable_contract_digest_matches(
                     [self.nodes[node_id]], previous_node_contract_digests[node_id]
                 )
                 or scope_only_expansion_binds(
@@ -3695,6 +3819,10 @@ class Monitor:
         }
         if authorized_node_contracts != expected_authorized_node_contracts:
             raise ValueError("reauthorization authorized DAG proof is invalid")
+        if "node_scope_digests" in data and data["node_scope_digests"] != {
+            key: legacy_executable_contract_digest([node]) for key, node in self.nodes.items()
+        }:
+            raise ValueError("reauthorization per-node scope proof is invalid")
         if affected_nodes != affected_node_closure(
             list(self.nodes.values()), changed_nodes
         ):
@@ -3723,7 +3851,11 @@ class Monitor:
                 or evidence["contract_digest"]
                 != previous_node_contract_digests[node_id]
                 or not (
-                    executable_contract_digest_matches(
+                    route_only_acceptance_binds(
+                        self.nodes[node_id], previous_authorized_nodes.get(node_id),
+                        evidence["contract_digest"],
+                    )
+                    or executable_contract_digest_matches(
                         [self.nodes[node_id]], evidence["contract_digest"]
                     )
                     or scope_only_expansion_binds(
@@ -3746,20 +3878,57 @@ class Monitor:
             ):
                 raise ValueError("invalidated acceptance evidence is invalid")
 
+        retained_integration_package = None
+        if "integration-review" in retained_acceptances and snapshot.integration_review_evidence:
+            from .evidence import validate_integration_review_evidence
+            retained_integration_package = copy.deepcopy(snapshot.integration_review_evidence)
+            validate_integration_review_evidence(
+                snapshot, {key: value for key, value in retained_integration_package.items() if key != "history"}
+            )
+            if replacement_prd_digest != snapshot.prd_digest or replacement_spec_digest != snapshot.spec_digest:
+                raise ValueError("retained integration review cannot change PRD/Spec lineage")
         snapshot.authorization = replacement.to_dict()
         snapshot.authorization_digest = replacement.digest
         snapshot.node_contract_digest = replacement.node_contract_digest
         snapshot.capability_contract_digest = replacement_capability_digest or ""
         snapshot.prd_digest = replacement_prd_digest
         snapshot.spec_digest = replacement_spec_digest
+        if retained_integration_package is not None:
+            history = list(retained_integration_package.pop("history", []))
+            history.append(copy.deepcopy(retained_integration_package))
+            retained_integration_package.update(
+                authorization_digest=replacement.digest,
+                node_contract_digest=replacement.node_contract_digest,
+            )
+            validate_integration_review_evidence(snapshot, retained_integration_package)
+            retained_integration_package["history"] = history
+            snapshot.integration_review_evidence = retained_integration_package
         snapshot.status = "running"
         snapshot.handles.clear()
+        platform_handoff = data.get("change_reason") == "platform_handoff"
         for node_id, current in snapshot.nodes.items():
             current["contract_digest"] = node_contract_digests[node_id]
+            if platform_handoff:
+                # #289 section 3: every task bound before the handoff lives
+                # on the old platform and cannot be resumed from the new one.
+                # Record which identities are superseded; _start_task turns
+                # a later resume of exactly these into a successor.  Tasks
+                # created after the handoff are not listed, so their rework
+                # keeps returning to the same worker.
+                superseded = {
+                    role: current[role + "_identity"]
+                    for role in ("developer", "reviewer")
+                    if current.get(role + "_identity")
+                }
+                if superseded:
+                    current["handoff_superseded"] = superseded
             current["active_role"] = None
             current["active_task"] = None
             current["start_intent"] = None
             current["quarantine"] = None
+            continuation_role = (
+                "reviewer" if is_integration_review_node(self.nodes[node_id]) else "developer"
+            )
             if current.get("status") == "accepted":
                 if node_id in retained_acceptances:
                     # The retained acceptance now binds the replacement digest,
@@ -3774,17 +3943,22 @@ class Monitor:
                     self._queue_reauthorization_continuation(
                         current,
                         self._continuation_requires_successor(
-                            snapshot, node_id, "developer"
+                            snapshot, node_id, continuation_role
                         ),
+                        continuation_role,
                     )
                     continue
                 raise ValueError("accepted node lacks reauthorization disposition")
-            if int(current.get("developer_generation", 0)) > 0:
+            generation_key = (
+                "review_generation" if continuation_role == "reviewer" else "developer_generation"
+            )
+            if int(current.get(generation_key, 0)) > 0:
                 self._queue_reauthorization_continuation(
                     current,
                     self._continuation_requires_successor(
-                        snapshot, node_id, "developer"
+                        snapshot, node_id, continuation_role
                     ),
+                    continuation_role,
                 )
             else:
                 current["status"] = "planned"
@@ -3817,13 +3991,13 @@ class Monitor:
 
     @staticmethod
     def _queue_reauthorization_continuation(
-        current: Dict[str, Any], successor_candidate: bool
+        current: Dict[str, Any], successor_candidate: bool, role: str = "developer"
     ) -> None:
         current["pair_archived"] = True
         current["status"] = "blocked_unknown"
         current["retryable_action"] = {
-            "role": "developer",
-            "phase": "rework",
+            "role": role,
+            "phase": "review" if role == "reviewer" else "rework",
             "continuation": True,
             "pending_schedule": True,
             "successor_candidate": successor_candidate,
@@ -3918,6 +4092,82 @@ class Monitor:
                 if node.contract.get(key):
                     return str(node.contract[key])
         return None
+
+    def _run_has_platform_handoff(self, snapshot: RunSnapshot) -> bool:
+        """Whether this run recorded a platform_handoff reauthorization."""
+        return any(
+            event.get("event") == "authorization_reauthorized"
+            and event.get("data", {}).get("change_reason") == "platform_handoff"
+            for event in load_events(self.paths, snapshot.run_id)[: snapshot.event_sequence]
+        )
+
+    @staticmethod
+    def _handoff_superseded_identity(
+        current: Dict[str, Any], role: str
+    ) -> Optional[str]:
+        """The role's current task identity when a platform_handoff superseded it."""
+        superseded = current.get("handoff_superseded")
+        identity = current.get(role + "_identity")
+        if isinstance(superseded, dict) and identity and superseded.get(role) == identity:
+            return str(identity)
+        return None
+
+    #: Termination basis for a handoff predecessor: "already delivered".  After
+    #: a platform switch the old platform cannot be queried, so there is no
+    #: stop confirmation to ask for; the local registry saying the task handed
+    #: over its work is the only proof.  Any other state, or a missing or
+    #: mismatched binding, is unproven and the node goes to blocked_unknown.
+    #: Binding states that are already a terminal handoff of the old task: a
+    #: delivered developer, a reviewer that returned its review, an accepted
+    #: pair.  After a platform handoff no rework or re-review can ever return
+    #: to such a task, so archiving it is the "original task lands terminal"
+    #: step of #289 section 3.  Live or unknown states are never archived.
+    _HANDOFF_ARCHIVABLE_STATUSES = {
+        "developer": frozenset({"delivered", "accepted"}),
+        "reviewer": frozenset({"review", "delivered", "accepted"}),
+    }
+
+    def _prove_handoff_predecessor_terminal(
+        self, snapshot: RunSnapshot, node_id: str, role: str
+    ) -> Optional[Tuple[str, str]]:
+        """Archive a terminal pre-handoff task, then prove it stopped.
+
+        Returns ``(predecessor task id, predecessor provider)``, or ``None`` when the old task cannot
+        be proven terminal (missing/stale binding, live state); the caller
+        then fails closed instead of creating a second writer.  The proof
+        itself is the ordinary ``_prove_old_task_stopped_or_absent``.
+        """
+        current = snapshot.nodes[node_id]
+        try:
+            binding = self._load_task_binding(snapshot, node_id, role)
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return None
+        if not binding.task_id or binding.task_id != current.get(role + "_identity"):
+            return None
+        previous_status = binding.status
+        if previous_status in self._HANDOFF_ARCHIVABLE_STATUSES[role]:
+            try:
+                self._set_binding_status(snapshot, node_id, role, "archived")
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                return None
+        predecessor = self._prove_old_task_stopped_or_absent(
+            snapshot, node_id, {"successor_candidate": True, "role": role}
+        )
+        if not predecessor:
+            return None
+        self._record(
+            snapshot,
+            "handoff_predecessor_reconciled",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": role,
+                "predecessor_task_id": predecessor,
+                "previous_binding_status": previous_status,
+                "proof": "platform_handoff",
+            },
+        )
+        return predecessor, binding.provider
 
     def _prove_old_task_stopped_or_absent(
         self,
@@ -4202,14 +4452,26 @@ class Monitor:
         action = store.action(action_id)
         old = load_historical_task_binding(self.paths, run_id, node_id, 'reviewer',
                                           action['request'].get('predecessor_task_id'))
-        if (old.mode != 'visible' or old.provider != getattr(runner, 'provider', None)
+        runner_provider = getattr(runner, 'provider', None)
+        # #289: only a run with a recorded platform_handoff may recover a
+        # successor whose predecessor was bound by another provider, and only
+        # when the create request itself carries that provider as lineage.
+        # The archived-predecessor proof below is unchanged.
+        handoff = (
+            old.provider != runner_provider
+            and self._run_has_platform_handoff(snapshot)
+            and action['request'].get('handoff_from_provider') == old.provider
+            and action.get('provider') == runner_provider
+        )
+        if (old.mode != 'visible' or (old.provider != runner_provider and not handoff)
                 or old.status not in {'stopped', 'failed', 'archived'}
                 or not isinstance(predecessor_archive, dict)
                 or predecessor_archive.get('threadId') != old.task_id
                 or predecessor_archive.get('archived') is not True):
             raise ValueError('successor predecessor archive is unverified')
         if not self._proven_successor_action(snapshot, node_id, old.role, old.generation,
-            old.provider, action_id, request_digest, old.task_id, record.digest):
+            runner_provider if handoff else old.provider, action_id, request_digest,
+            old.task_id, record.digest):
             raise ValueError('successor reconciliation create lineage is invalid')
         profile = action['request'].get('worker_profile')
         if not isinstance(profile, dict):
@@ -4269,6 +4531,11 @@ class Monitor:
                    binding_intent=None, binding_observation=None,
                    binding_state='blocked_unknown', business_write_allowed=False,
                    model=profile.model, reasoning=profile.reasoning, route_digest=profile.route_digest)
+        if handoff:
+            raw.update(provider=runner_provider, handoff_from_provider=old.provider,
+                       threadId=task_id if runner_provider == CODEX_PROVIDER else None,
+                       hostId=host if runner_provider == CODEX_PROVIDER else None,
+                       capability_contract_digest=snapshot.capability_contract_digest or None)
         new = TaskBinding.from_dict(raw)
         reconcile_shadowed_successor(self.paths, old, new, action_id=action_id,
                                     request_digest=request_digest, authorization_digest=record.digest)
@@ -4656,16 +4923,23 @@ class Monitor:
                 for dependency in node.depends_on
             ):
                 continue
-            developer_generation = int(current.get("developer_generation", 0)) + 1
-            developer_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, "developer", developer_generation, current))
-            if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, developer_digest, "developer", developer_generation):
+            # Review-only closeout waits for the same dependency/capacity gates,
+            # but never creates a developer merely to unlock a reviewer.
+            first_role = "reviewer" if is_integration_review_node(node) else "developer"
+            generation_key = "review_generation" if first_role == "reviewer" else "developer_generation"
+            first_generation = int(current.get(generation_key, 0)) + 1
+            first_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, first_role, first_generation, current))
+            if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, first_digest, first_role, first_generation):
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
                     "writer lease is already owned by another run",
                 )
                 continue
-            self._start_task(snapshot, node_id, "developer", "develop", runner, False)
+            self._start_task(
+                snapshot, node_id, first_role,
+                "review" if first_role == "reviewer" else "develop", runner, False,
+            )
             # A create left pending (retry marker, no handle yet) still holds
             # its slot, so recount instead of trusting the start result.
             active_sessions = self._count_active_sessions(snapshot)
@@ -5125,7 +5399,17 @@ class Monitor:
         ).hexdigest()[:24]
         current["status"] = "blocked_unknown"
         current["reason"] = "task binding rejected before start ({})".format(type(error).__name__)
-        if successor:
+        if (
+            is_integration_review_node(self.nodes[node_id])
+            and role == "reviewer" and generation == 1
+            and not continuation and not current.get("reviewer_identity")
+        ):
+            # No start intent or provider action exists at this local preflight
+            # boundary. Retry normal readiness, not legacy developer recovery.
+            current["status"] = "planned"
+            current["reviewer_started"] = False
+            current["retryable_action"] = None
+        elif successor:
             # A missing historical reviewer binding is a successor recovery
             # path. Preserve its lineage marker so the scheduler can create
             # the successor on the next cycle; it is not a same-task retry.
@@ -5162,7 +5446,10 @@ class Monitor:
                 "node_id": node_id,
                 "role": role,
                 "phase": failure_phase,
-                "reason_code": "dispatch_contract_invalid",
+                "reason_code": (
+                    "integration_initial_preflight_retry"
+                    if current["status"] == "planned" else "dispatch_contract_invalid"
+                ),
                 "action_ref": action_ref,
             },
         )
@@ -5182,6 +5469,9 @@ class Monitor:
         record = self._require_snapshot_authorization(snapshot)
         node = self.nodes[node_id]
         current = snapshot.nodes[node_id]
+        if current.get("workspace_reconciliation_required") is True:
+            self._mark_blocked_unknown(snapshot, node_id, "workspace reconciliation required before dispatch")
+            return False
         topology = self._node_dispatch_topology(node)
         supervisor_rejection = self._supervisor_writer_rejection(node, current)
         if supervisor_rejection is not None:
@@ -5219,6 +5509,31 @@ class Monitor:
             identity = str(prior_intent.get("task_id") or identity)
         else:
             generation = int(current.get(generation_key, 0)) + 1
+        # #289 section 3 (PM ruling): only after a recorded platform_handoff
+        # does rework/re-review of a pre-handoff task go to a successor on
+        # the new platform; the old task must first land terminal.  Every
+        # other resume keeps returning to the same worker.  A pending start
+        # intent of this role is the in-flight successor itself.
+        handoff_predecessor = None
+        if (
+            not successor
+            and self._handoff_superseded_identity(current, role) is not None
+            and not (isinstance(prior_intent, dict) and prior_intent.get("role") == role)
+        ):
+            handoff_predecessor = self._prove_handoff_predecessor_terminal(
+                snapshot, node_id, role
+            )
+            if handoff_predecessor is None:
+                self._mark_blocked_unknown(
+                    snapshot,
+                    node_id,
+                    "platform handoff predecessor cannot be proven terminal for successor",
+                    reason_code="platform_handoff_predecessor_unproven",
+                )
+                return False
+            continuation = False
+            successor = True
+            current["old_task_reconciled"] = True
         # A first reviewer binding has no prior reviewer identity. If local
         # validation fails, preserve the historical recovery marker so the
         # next cycle can create the successor task.
@@ -5301,6 +5616,13 @@ class Monitor:
                 predecessor_task_id = retry.get("predecessor_task_id")
             if not predecessor_task_id:
                 predecessor_task_id = current.get(identity_key)
+            if handoff_predecessor is not None:
+                predecessor_task_id, contract["handoff_from_provider"] = handoff_predecessor
+                # Lets the provider runner and the task registry accept a
+                # predecessor bound by another provider (lineage recorded as
+                # ``handoff_from_provider``).  Only set after the terminal
+                # proof above.
+                contract["platform_handoff_successor"] = True
             contract["predecessor_task_id"] = predecessor_task_id
         contract.setdefault("worktree", str(current["worktree"]))
         contract.setdefault("branch", str(current["branch"]))
@@ -5947,6 +6269,11 @@ class Monitor:
                 allowlist=list(contract.get("files", [])),
                 capability_contract_digest=contract.get("capability_contract_digest"),
                 successor_of=contract.get("predecessor_task_id") if successor else None,
+                handoff_from_provider=(
+                    contract.get("handoff_from_provider")
+                    if successor and contract.get("platform_handoff_successor") is True
+                    else None
+                ),
                 topology=str(contract.get("topology") or TOPOLOGY_DUAL_VISIBLE),
                 limitations=list(contract.get("dispatch_limitations", [])),
             )
@@ -5960,6 +6287,13 @@ class Monitor:
             # ancestry drift" and strands the node in blocked_unknown after a
             # replacement reviewer's next finding.
             binding.successor_of = previous_binding.successor_of
+        if (
+            continuation and previous_binding is not None
+            and previous_binding.handoff_from_provider
+            and not binding.handoff_from_provider
+        ):
+            # Same immutability for the #289 handoff lineage.
+            binding.handoff_from_provider = previous_binding.handoff_from_provider
         expected_topology = str(contract.get("topology") or TOPOLOGY_DUAL_VISIBLE)
         if binding.topology != expected_topology:
             raise ValueError(
@@ -5973,6 +6307,11 @@ class Monitor:
                 raise ValueError("successor task predecessor does not match contract")
             if binding.successor_of is None:
                 binding.successor_of = predecessor
+            if contract.get("platform_handoff_successor") is True:
+                lineage = contract.get("handoff_from_provider")
+                if binding.handoff_from_provider not in {None, lineage}:
+                    raise ValueError("successor handoff lineage does not match contract")
+                binding.handoff_from_provider = lineage
         expected_capability_digest = contract.get("capability_contract_digest")
         if expected_capability_digest:
             if binding.capability_contract_digest not in {
@@ -6412,11 +6751,24 @@ class Monitor:
             )
             return
 
+        if current.get("workspace_reconciliation_required") is True:
+            self._mark_blocked_unknown(snapshot, node_id, "workspace reconciliation required before acceptance")
+            return
         evidence = event.data.get("evidence") or event.data.get("finding")
         if evidence is not None:
             current.setdefault("evidence", []).append(redact_provider_text(evidence))
         role = active["role"]
         if role == "reviewer" and self._reviewer_write_violation(event.data):
+            if is_integration_review_node(self.nodes[node_id]):
+                # The pollution fact precedes stop: a failed stop must never
+                # make a reported write eligible for acceptance again.
+                self._record(snapshot, "integration_workspace_quarantined", {
+                    "run_id": snapshot.run_id, "node_id": node_id,
+                }, active)
+                current["workspace_reconciliation_required"] = True
+                current["acceptance"] = None
+                current["reviewer_replacement_required"] = True
+                self._save_snapshot(snapshot)
             # A reviewer that touched business files invalidates the whole
             # review round.  Stop that task, preserve the developer identity,
             # and force the next review to use a fresh reviewer identity.
@@ -6450,6 +6802,17 @@ class Monitor:
                 },
                 active,
             )
+            if is_integration_review_node(self.nodes[node_id]):
+                # A read-only closeout has no developer to receive rework.
+                # Preserve the stopped reviewer and quarantine the reported
+                # writes; a fresh reviewer cannot certify unverified pollution.
+                current["acceptance"] = None
+                current["workspace_reconciliation_required"] = True
+                current["recovery_action"] = "reconcile_binding"
+                self._mark_blocked_unknown(
+                    snapshot, node_id, "integration reviewer write violation; workspace reconciliation required"
+                )
+                return
             try:
                 self._start_task(
                     snapshot, node_id, "developer", "rework", runner, True, False
@@ -7792,7 +8155,12 @@ class Monitor:
         """
         current = snapshot.nodes[node_id]
         roles = ("developer", "reviewer")
-        if self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
+        if is_integration_review_node(self.nodes[node_id]):
+            # New closeout runs have only a reviewer; legacy runs may also
+            # carry a developer binding, which must still be archived.
+            roles = (("developer", "reviewer") if current.get("developer_identity")
+                     else ("reviewer",))
+        elif self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
             # A visible-sdd node holds exactly one worker-session binding.
             roles = ("developer",)
         for role in roles:
@@ -9787,6 +10155,33 @@ class Monitor:
                     for pending_item in pending
                     if pending_item != item
                 ]
+            elif record["event"] == "handoff_predecessor_reconciled":
+                # Evidence only: the registry already holds the archived
+                # predecessor, and the successor's own start events replay
+                # through their branches.
+                if provenance.get("role") != "system" or data.get("proof") != "platform_handoff":
+                    raise ValueError("handoff predecessor replay provenance is invalid")
+            elif record["event"] == "integration_workspace_quarantined":
+                if not is_integration_review_node(self.nodes[node_id]) or provenance.get("role") != "reviewer":
+                    raise ValueError("integration quarantine provenance is invalid")
+                current["workspace_reconciliation_required"] = True
+                current["reviewer_replacement_required"] = True
+                current["acceptance"] = None
+                current["status"] = "blocked_unknown"
+            elif (
+                record["event"] == "contract_error"
+                and data.get("reason_code") == "integration_initial_preflight_retry"
+                and is_integration_review_node(self.nodes[node_id])
+                and not current.get("reviewer_identity")
+                and not current.get("active_task")
+                and not current.get("start_intent")
+                and node_id not in snapshot.handles
+            ):
+                current["status"] = "planned"
+                current["review_generation"] = 0
+                current["reviewer_started"] = False
+                current["retryable_action"] = None
+                self._release_node_lease(snapshot, node_id)
             elif record["event"] in {"worktree_created", "worktree_preflight_blocked"}:
                 # #235 crash window.  The CLI appends one of these events and
                 # only then saves the snapshot, so a crash in between leaves

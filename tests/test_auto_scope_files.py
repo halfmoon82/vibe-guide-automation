@@ -31,7 +31,7 @@ from vibe_guide.engine_attestation import create_engine_attestation
 from vibe_guide.planner import REQUIRED_COMPLEX_WORKFLOW, TaskContext
 from vibe_guide.task_registry import TaskBinding
 from vibe_guide.workflow_gate import create_task_workflow, record_workflow_node
-from vibe_guide.state import durable_projection, load_events, load_snapshot
+from vibe_guide.state import durable_projection, load_events, load_snapshot, save_snapshot
 
 
 BINDING = {
@@ -935,6 +935,10 @@ class MonitorAutoScopeTests(unittest.TestCase):
         for _ in range(4):
             snapshot = monitor.tick(snapshot.run_id, runner)
         self.assertEqual(snapshot.status, "complete")
+        integration_calls = [call for call in runner.start_calls
+                             if call["node_id"] == INTEGRATION_REVIEW_NODE_ID]
+        self.assertEqual([call["role"] for call in integration_calls], ["reviewer"])
+        self.assertTrue(snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["pair_archived"])
 
         snapshot = monitor.request_scope_expansion(
             snapshot.run_id,
@@ -1013,6 +1017,159 @@ class MonitorAutoScopeTests(unittest.TestCase):
         self.assertEqual(current["retryable_action"]["role"], "developer")
         self.assertTrue(current["retryable_action"]["pending_schedule"])
 
+    def test_integration_review_starts_only_a_reviewer_after_dependencies_accept(self):
+        plan, nodes, card, monitor, delivered = self._build_complex_plan([_node("n1")])
+        integration_worker = next(entry for entry in card.workers
+                                  if entry["node_id"] == INTEGRATION_REVIEW_NODE_ID)
+        self.assertEqual(integration_worker["role"], "reviewer")
+        runner = _BoundBindingRunner(events={
+            ("n1", "developer"): [delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        self.assertFalse(any(call["node_id"] == INTEGRATION_REVIEW_NODE_ID
+                             for call in runner.start_calls))
+        for _ in range(2):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        calls = [call for call in runner.start_calls
+                 if call["node_id"] == INTEGRATION_REVIEW_NODE_ID]
+        self.assertEqual([call["role"] for call in calls], ["reviewer"])
+        self.assertTrue(calls[0]["read_only"])
+        self.assertEqual(calls[0]["allowlist"], [])
+        self.assertEqual(snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["developer_generation"], 0)
+        self.assertIsNone(snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["developer_identity"])
+
+    def test_completed_integration_evidence_rebinds_after_route_only_reauthorization(self):
+        import copy
+        plan, nodes, card, monitor, delivered = self._build_complex_plan([_node("n1")])
+        runner = _BoundBindingRunner(events={
+            ("n1", "developer"): [delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+            (INTEGRATION_REVIEW_NODE_ID, "reviewer"): [
+                ("accepted", {"evidence": dict(CLEARED_INTEGRATION_CLAIM)})],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        for _ in range(4):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.status, "complete")
+        old_epoch = snapshot.authorization_digest
+        changed_nodes = copy.deepcopy(nodes)
+        for node in changed_nodes:
+            node.contract["adapter_id"] = "cursor"
+        record = authorize(build_authorization_card(
+            plan, changed_nodes, self.capabilities, engine_evidence_ref=card.engine_evidence_ref
+        ), "AUTHORIZE")
+        rebound = Monitor(self.paths, plan, changed_nodes).reauthorize(
+            snapshot.run_id, record, runner, "executable_contract_changed")
+        self.assertNotEqual(old_epoch, rebound.authorization_digest)
+        self.assertEqual(rebound.status, "complete")
+        self.assertEqual(rebound.integration_review_evidence["authorization_digest"], record.digest)
+        self.assertEqual(load_snapshot(self.paths, snapshot.run_id).status, "complete")
+
+    def test_same_authorization_with_changed_prd_invalidates_integration(self):
+        plan, nodes, card, monitor, delivered = self._build_complex_plan([_node("n1")])
+        runner = _BoundBindingRunner(events={
+            ("n1", "developer"): [delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+            (INTEGRATION_REVIEW_NODE_ID, "reviewer"): [
+                ("accepted", {"evidence": dict(CLEARED_INTEGRATION_CLAIM)})],
+        })
+        record = authorize(card, "AUTHORIZE")
+        snapshot = monitor.start(record, runner)
+        for _ in range(4):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.status, "complete")
+        (self.paths.root / "docs" / "prd.md").write_text("new approved requirements\n", encoding="utf-8")
+        rebound = monitor.reauthorize(snapshot.run_id, record, runner, "executable_contract_changed")
+        self.assertEqual(rebound.nodes["n1"]["status"], "accepted")
+        self.assertIsNone(rebound.nodes[INTEGRATION_REVIEW_NODE_ID]["acceptance"])
+        self.assertNotEqual(rebound.status, "complete")
+        transition = next(event for event in reversed(load_events(self.paths, snapshot.run_id))
+                          if event["event"] == "authorization_reauthorized")
+        self.assertEqual(transition["data"]["changed_nodes"], [INTEGRATION_REVIEW_NODE_ID])
+        self.assertEqual(load_snapshot(self.paths, snapshot.run_id).prd_digest, rebound.prd_digest)
+
+    def test_integration_reviewer_write_violation_never_dispatches_developer(self):
+        plan, _nodes, card, monitor, delivered = self._build_complex_plan([_node("n1")])
+        runner = _BoundBindingRunner(events={
+            ("n1", "developer"): [delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+            (INTEGRATION_REVIEW_NODE_ID, "reviewer"): [
+                ("complete", {"reviewer_write_violation": True,
+                              "reviewer_modified_files": ["n1.py"]})],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        for _ in range(2):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        with patch.object(monitor, "_start_task", wraps=monitor._start_task) as start:
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertFalse(any(call.args[1:3] == (INTEGRATION_REVIEW_NODE_ID, "developer")
+                             for call in start.call_args_list))
+        self.assertEqual(snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["status"], "blocked_unknown")
+        self.assertIsNone(snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["acceptance"])
+
+    def test_integration_preflight_failure_returns_to_planned_without_developer(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        _plan, _nodes, _card, monitor, _delivered = self._build_complex_plan([_node("n1")])
+        current = {"review_generation": 1, "reviewer_identity": None, "reviewer_started": True}
+        snapshot = SimpleNamespace(nodes={INTEGRATION_REVIEW_NODE_ID: current}, run_id="run-test")
+        with patch.object(monitor, "_release_node_lease"), patch.object(monitor, "_record"), patch.object(monitor, "_save_snapshot"):
+            monitor._preflight_contract_failure(
+                snapshot, INTEGRATION_REVIEW_NODE_ID, "reviewer", "review", False,
+                1, "review_generation", ValueError("temporary"), "profile", True,
+            )
+        self.assertEqual(current["status"], "planned")
+        self.assertEqual(current["review_generation"], 0)
+        self.assertFalse(current["reviewer_started"])
+        self.assertIsNone(current["retryable_action"])
+
+    def test_integration_write_quarantine_cannot_be_cleared_by_reauthorization(self):
+        from vibe_guide.state import save_snapshot
+        plan, nodes, card, monitor, delivered = self._build_complex_plan([_node("n1")])
+        runner = _BoundBindingRunner(events={
+            ("n1", "developer"): [delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["workspace_reconciliation_required"] = True
+        save_snapshot(self.paths, snapshot)
+        before = len(load_events(self.paths, snapshot.run_id))
+        with self.assertRaisesRegex(PermissionError, "workspace reconciliation"):
+            monitor.reauthorize(snapshot.run_id, authorize(card, "AUTHORIZE"), runner,
+                                "executable_contract_changed")
+        self.assertEqual(len(load_events(self.paths, snapshot.run_id)), before)
+
+    def test_integration_reauthorization_queues_reviewer_not_developer(self):
+        current = {"review_generation": 1}
+        Monitor._queue_reauthorization_continuation(current, False, "reviewer")
+        self.assertEqual(current["retryable_action"]["role"], "reviewer")
+        self.assertEqual(current["retryable_action"]["phase"], "review")
+        self.assertTrue(current["retryable_action"]["continuation"])
+
+    def test_legacy_delivered_integration_starts_reviewer_without_new_developer(self):
+        from vibe_guide.state import save_snapshot
+        plan, nodes, card, monitor, delivered = self._build_complex_plan([_node("n1")])
+        runner = _BoundBindingRunner(events={
+            ("n1", "developer"): [delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        original_start = monitor._start_task
+        def defer_integration(snapshot, node_id, *args, **kwargs):
+            if node_id == INTEGRATION_REVIEW_NODE_ID:
+                return False
+            return original_start(snapshot, node_id, *args, **kwargs)
+        with patch.object(monitor, "_start_task", side_effect=defer_integration):
+            for _ in range(2):
+                snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["status"] = "delivered"
+        save_snapshot(self.paths, snapshot)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        calls = [call for call in runner.start_calls
+                 if call["node_id"] == INTEGRATION_REVIEW_NODE_ID]
+        self.assertEqual([call["role"] for call in calls], ["reviewer"])
+
     def test_integration_review_finding_expands_target_and_queues_rework(self):
         files = ["tests/test_first.py", "tests/test_second.py"]
         plan, nodes, card, monitor, delivered = self._build_complex_plan(
@@ -1070,7 +1227,9 @@ class MonitorAutoScopeTests(unittest.TestCase):
             )],
         })
         snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
-        for _ in range(3):
+        # Reviewer-only closeout starts one tick earlier: there is no dummy
+        # developer delivery to consume before the real review begins.
+        for _ in range(2):
             snapshot = monitor.tick(snapshot.run_id, runner)
         self.assertEqual(
             snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["status"], "review"
@@ -1091,6 +1250,61 @@ class MonitorAutoScopeTests(unittest.TestCase):
         self.assertNotIn(INTEGRATION_REVIEW_NODE_ID, recovered.handles)
         self.assertEqual(integration["retryable_action"]["role"], "reviewer")
         self.assertTrue(integration["retryable_action"]["continuation"])
+
+    def _integration_finding_run(self, inject_handoff):
+        class _GenerationBoundRunner(_BoundBindingRunner):
+            # A successor needs a task id that differs from its predecessor.
+            def task_binding(self, contract, worktree, run_id, status):
+                binding = super().task_binding(contract, worktree, run_id, status)
+                if contract.get("successor"):
+                    binding.task_id = binding.platform_task_id = (
+                        binding.task_id + "-g{}".format(contract["generation"])
+                    )
+                return binding
+
+        plan, nodes, card, monitor, delivered = self._build_complex_plan(
+            [_node("n1")]
+        )
+        runner = _GenerationBoundRunner(events={
+            ("n1", "developer"): [delivered, delivered],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+            (INTEGRATION_REVIEW_NODE_ID, "reviewer"): [(
+                "review_finding",
+                {
+                    "finding": "integration fixture required",
+                    "severity": "P1",
+                    "target_node_id": "n1",
+                    "scope_expansion": _scope_claim(["tests/test_integration.py"]),
+                },
+            )],
+        })
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        for _ in range(2):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes[INTEGRATION_REVIEW_NODE_ID]["status"], "review")
+        old = snapshot.nodes["n1"]["developer_identity"]
+        if inject_handoff:
+            snapshot.nodes["n1"]["handoff_superseded"] = {"developer": old}
+            save_snapshot(self.paths, snapshot)
+        for _ in range(3):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        starts = [c for c in runner.start_calls
+                  if c["node_id"] == "n1" and c["role"] == "developer"]
+        return snapshot, starts, old
+
+    def test_integration_finding_rework_returns_to_original_developer_without_handoff(self):
+        _snapshot, starts, old = self._integration_finding_run(False)
+        self.assertGreaterEqual(len(starts), 2)
+        self.assertTrue(starts[-1]["continuation"])
+        self.assertFalse(starts[-1]["successor"])
+        self.assertEqual(starts[-1]["task_id"], old)
+
+    def test_integration_finding_rework_goes_to_a_successor_after_platform_handoff(self):
+        _snapshot, starts, old = self._integration_finding_run(True)
+        self.assertGreaterEqual(len(starts), 2)
+        self.assertTrue(starts[-1]["successor"])
+        self.assertEqual(starts[-1]["predecessor_task_id"], old)
+        self.assertNotEqual(starts[-1]["task_id"], old)
 
     def test_scope_expand_cli_registers_accepted_patch(self):
         self._approve_acceptance_rule()

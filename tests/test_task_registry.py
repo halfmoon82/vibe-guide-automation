@@ -151,6 +151,69 @@ class TaskRegistryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     save_task_binding(paths, new)
 
+    def _handoff_pair(self, root):
+        paths = ProjectPaths(Path(root))
+        old = self.binding()
+        old.generation = 2
+        old.status = 'archived'
+        old.capability_contract_digest = 'a' * 64
+        old.allowlist = ['a.py']
+        new = self.binding(task_id='thread-new')
+        new.allowlist = ['a.py']
+        new.provider = 'workbuddy'
+        new.host = 'other-host'
+        new.hostId = None
+        new.threadId = None
+        new.generation = 3
+        new.successor_of = old.task_id
+        new.capability_contract_digest = 'b' * 64
+        new.handoff_from_provider = 'codex'
+        return paths, old, new
+
+    def test_platform_handoff_successor_may_change_provider_host_and_capability(self):
+        # #289 section 3: the predecessor's provider is the recorded lineage.
+        with tempfile.TemporaryDirectory() as root:
+            paths, old, new = self._handoff_pair(root)
+            save_task_binding(paths, old)
+            save_task_binding(paths, new)
+            loaded = load_task_binding(paths, 'N3', 'developer', run_id='run-1')
+            self.assertEqual(loaded.provider, 'workbuddy')
+            self.assertEqual(loaded.successor_of, 'thread-dev')
+            self.assertEqual(loaded.handoff_from_provider, 'codex')
+
+    def test_platform_handoff_successor_may_grow_but_not_shrink_the_allowlist(self):
+        # A rework scope expansion (e.g. from an integration finding) lands in
+        # the successor's allowlist; dropping a predecessor file never may.
+        with tempfile.TemporaryDirectory() as root:
+            paths, old, new = self._handoff_pair(root)
+            new.allowlist = ['a.py', 'tests/test_new.py']
+            save_task_binding(paths, old)
+            save_task_binding(paths, new)
+        with tempfile.TemporaryDirectory() as root:
+            paths, old, new = self._handoff_pair(root)
+            new.allowlist = []
+            save_task_binding(paths, old)
+            with self.assertRaises(ValueError):
+                save_task_binding(paths, new)
+
+    def test_cross_provider_successor_without_handoff_lineage_is_rejected(self):
+        for field, value in [('handoff_from_provider', None),
+                             ('handoff_from_provider', 'cursor'),
+                             ('worktree', '.worktrees/other'), ('branch', 'other'),
+                             ('allowlist', ['extra.py']), ('topology', 'background')]:
+            with self.subTest(field=field, value=value), tempfile.TemporaryDirectory() as root:
+                paths, old, new = self._handoff_pair(root)
+                setattr(new, field, value)
+                if field == 'topology':
+                    new.mode = 'background'
+                    new.limitations = ['background']
+                save_task_binding(paths, old)
+                with self.assertRaises(ValueError):
+                    save_task_binding(paths, new)
+
+    def test_handoff_lineage_field_is_absent_from_legacy_rows(self):
+        self.assertNotIn('handoff_from_provider', self.binding().to_dict())
+
     def test_bound_created_successor_can_reconcile_false_same_generation_projection(self):
         from vibe_guide.adapters.task_provider import ProviderActionStore
         from unittest.mock import patch
@@ -187,6 +250,64 @@ class TaskRegistryTests(unittest.TestCase):
         old.status = 'running'
         with self.assertRaises(ValueError):
             save_task_binding(self.paths, old)
+
+    def _shadowed_handoff(self, request_lineage):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        from unittest.mock import patch
+        old = self.binding()
+        old.generation = 3
+        old.status = 'archived'
+        save_task_binding(self.paths, old)
+        store = ProviderActionStore(self.paths)
+        (self.paths.vibe / 'state.json').write_text('{}')
+        basis = dict(provider='workbuddy', run_id='run-1', issue_id='N3', role='developer',
+                     generation=3, native_tool='native')
+        request = {'successor': True, 'predecessor_task_id': old.task_id,
+                   'authorization_digest': 'a' * 64}
+        if request_lineage:
+            request['handoff_from_provider'] = request_lineage
+        with patch('vibe_guide.adapters.task_provider.require_entry'):
+            create = store.request(operation='create', request=request, **basis)
+            store.complete(create['action_id'], {'binding': {'task_id': 'new', 'host': 'wb-host'}})
+            for operation, payload, result in [
+                ('locate', {'threadId': 'new'}, {'located': True}),
+                ('visibility', {'targets': [{'threadId': 'new', 'hostId': 'wb-host'}]},
+                 {'visible': True, 'direct_enter': True}),
+            ]:
+                action = store.request(operation=operation,
+                    request=dict(payload, authorization_digest='a' * 64), **basis)
+                store.complete(action['action_id'], result)
+        new = self.binding(task_id='new')
+        new.provider = 'workbuddy'
+        new.host = 'wb-host'
+        new.hostId = None
+        new.threadId = None
+        new.generation = 3
+        new.successor_of = old.task_id
+        new.handoff_from_provider = 'codex'
+        new.capability_contract_digest = 'b' * 64
+        new.cursor = None
+        return old, new, create
+
+    def test_shadowed_successor_recovery_accepts_a_recorded_handoff_creator(self):
+        old, new, create = self._shadowed_handoff('codex')
+        reconcile_shadowed_successor(self.paths, old, new, action_id=create['action_id'],
+                                    request_digest=create['request_digest'],
+                                    authorization_digest='a' * 64)
+        loaded = load_task_binding(self.paths, 'N3', 'developer', run_id='run-1')
+        self.assertEqual((loaded.task_id, loaded.provider, loaded.handoff_from_provider),
+                         ('new', 'workbuddy', 'codex'))
+
+    def test_shadowed_successor_recovery_refuses_a_foreign_creator_without_lineage(self):
+        for lineage in (None, 'cursor'):
+            with self.subTest(lineage=lineage), tempfile.TemporaryDirectory() as root:
+                self.paths = ProjectPaths(Path(root))
+                old, new, create = self._shadowed_handoff(lineage)
+                with self.assertRaises(ValueError):
+                    reconcile_shadowed_successor(
+                        self.paths, old, new, action_id=create['action_id'],
+                        request_digest=create['request_digest'],
+                        authorization_digest='a' * 64)
 
     def test_developer_and_reviewer_must_be_distinct_tasks(self):
         save_task_binding(self.paths, self.binding())

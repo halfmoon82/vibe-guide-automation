@@ -38,6 +38,10 @@ from vibe_guide.authorization import (
     authorize,
     build_authorization_card,
     dispatch_topology_for_node,
+    acceptance_contract_projection,
+    verified_authorized_nodes,
+    canonical_node_contracts,
+    legacy_executable_contract_digest,
     executable_contract_digest,
     is_authorization_valid,
     refresh_authorization_card,
@@ -292,6 +296,236 @@ class ScopeOnlyReauthorizationTests(unittest.TestCase):
                 cursor,
             )
 
+    def test_acceptance_projection_preserves_protected_and_unknown_fields(self):
+        import copy
+        original = self._nodes()[0]
+        protected = (
+            ("worktree", "outside"), ("files", ["outside.py"]),
+            ("actions", ["test"]), ("required_capabilities", ["new"]),
+            ("unknown_business_rule", "changed"),
+        )
+        for key, value in protected:
+            with self.subTest(key=key):
+                changed = copy.deepcopy(original)
+                changed.contract[key] = value
+                self.assertNotEqual(acceptance_contract_projection(original),
+                                    acceptance_contract_projection(changed))
+        for key, value in (("writer", "new-writer"), ("branch", "new-branch"),
+                           ("allowlist", ["outside.py"]), ("fallbacks", ["new"]),
+                           ("selection_basis", {"risk_tags": ["changed"]})):
+            with self.subTest(profile_key=key):
+                changed = copy.deepcopy(original)
+                changed.contract["worker_profile"][key] = value
+                self.assertNotEqual(acceptance_contract_projection(original),
+                                    acceptance_contract_projection(changed))
+
+    def test_old_dag_proof_requires_per_node_scope_and_matching_commitments(self):
+        nodes = self._nodes()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE")
+        encoded = {item["id"]: json.dumps(item) for item in canonical_node_contracts(nodes)}
+        digests = {node.id: executable_contract_digest([node]) for node in nodes}
+        scopes = {node.id: legacy_executable_contract_digest([node]) for node in nodes}
+        self.assertEqual(set(verified_authorized_nodes(encoded, digests, record, scopes)), {"a", "b"})
+        self.assertEqual(verified_authorized_nodes(encoded, digests, record), {})
+        altered = json.loads(encoded["a"])
+        altered["contract"]["files"] = ["b.py"]
+        altered_encoded = dict(encoded, a=json.dumps(altered))
+        self.assertEqual(verified_authorized_nodes(altered_encoded, digests, record, scopes), {})
+        forged_scopes = dict(scopes, a=legacy_executable_contract_digest([DAGNode.from_dict(altered)]))
+        self.assertEqual(verified_authorized_nodes(altered_encoded, digests, record, forged_scopes), {})
+        self.assertEqual(verified_authorized_nodes(encoded, dict(digests, a="0" * 64), record, scopes), {})
+
+    def test_route_only_change_retains_acceptances_under_the_new_epoch(self):
+        snapshot, old_nodes, _cursors = self._accepted_run()
+        old_epoch = snapshot.authorization_digest
+        changed_nodes = self._nodes()
+        for node in changed_nodes:
+            node.contract["adapter_id"] = "cursor"
+            node.contract["worker_profile"]["model"] = "new-model"
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(build_authorization_card(plan, changed_nodes, self.capabilities), "AUTHORIZE")
+        self.assertNotEqual(record.node_contract_digest, executable_contract_digest(old_nodes))
+        rebound = Monitor(self.paths, plan, changed_nodes).reauthorize(
+            snapshot.run_id, record, FakeRunner(), "executable_contract_changed"
+        )
+        self.assertNotEqual(old_epoch, record.digest)
+        for node in changed_nodes:
+            self.assertEqual(rebound.nodes[node.id]["status"], "accepted")
+            self.assertEqual(rebound.nodes[node.id]["acceptance"], {
+                "contract_digest": executable_contract_digest([node]),
+                "authorization_epoch": record.digest,
+            })
+        loaded = load_snapshot(self.paths, snapshot.run_id)
+        self.assertEqual(loaded.authorization_digest, record.digest)
+
+    def test_route_change_with_scope_redistribution_does_not_retain_acceptance(self):
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        changed_nodes = self._nodes()
+        for node, scope in zip(changed_nodes, (["b.py"], ["a.py"])):
+            node.contract["adapter_id"] = "cursor"
+            node.contract["files"] = list(scope)
+            node.contract["worker_profile"]["allowlist"] = list(scope)
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(build_authorization_card(plan, changed_nodes, self.capabilities), "AUTHORIZE")
+        rebound = Monitor(self.paths, plan, changed_nodes).reauthorize(
+            snapshot.run_id, record, FakeRunner(), "executable_contract_changed"
+        )
+        self.assertIsNone(rebound.nodes["a"]["acceptance"])
+        self.assertIsNone(rebound.nodes["b"]["acceptance"])
+        transition = next(event for event in reversed(load_events(self.paths, snapshot.run_id))
+                          if event["event"] == "authorization_reauthorized")
+        self.assertEqual(transition["data"]["retained_acceptances"], {})
+
+    # -- #289 draft section 2: platform_handoff is a first-class reason ------
+
+    def _handoff_nodes(self, **kwargs):
+        nodes = self._nodes(**kwargs)
+        for node in nodes:
+            node.contract["adapter_id"] = "cursor"
+            node.contract["worker_profile"]["worker"] = "cursor"
+            node.contract["worker_profile"]["model"] = "cursor-model"
+        return nodes
+
+    def _switch_platform(self):
+        save_contract(
+            self.paths, build_contract(self.root, provider="cursor", host_id="local")
+        )
+
+    def _handoff(self, snapshot, nodes, runner=None):
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        monitor = Monitor(self.paths, plan, nodes)
+        return monitor, record, monitor.reauthorize(
+            snapshot.run_id, record, runner or FakeRunner(), "platform_handoff"
+        )
+
+    def test_platform_handoff_retains_acceptances_across_capability_change(self):
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        previous_capability = snapshot.capability_contract_digest
+        self._switch_platform()
+        nodes = self._handoff_nodes()
+        _monitor, record, rebound = self._handoff(snapshot, nodes)
+
+        self.assertNotEqual(rebound.capability_contract_digest, previous_capability)
+        for node in nodes:
+            self.assertEqual(rebound.nodes[node.id]["status"], "accepted")
+            self.assertEqual(rebound.nodes[node.id]["acceptance"], {
+                "contract_digest": executable_contract_digest([node]),
+                "authorization_epoch": record.digest,
+            })
+        transition = [event for event in load_events(self.paths, snapshot.run_id)
+                      if event["event"] == "authorization_reauthorized"][-1]["data"]
+        self.assertEqual(transition["change_reason"], "platform_handoff")
+        self.assertEqual(transition["changed_nodes"], [])
+        self.assertEqual(sorted(transition["retained_acceptances"]), ["a", "b"])
+        # Replay validation accepts the persisted handoff lineage.
+        self.assertEqual(
+            load_snapshot(self.paths, snapshot.run_id).authorization_digest, record.digest
+        )
+
+    def test_platform_handoff_with_acceptance_change_is_contract_drift(self):
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        self._switch_platform()
+        nodes = self._handoff_nodes(a_acceptance="verified_fact: changed")
+        before = len(load_events(self.paths, snapshot.run_id))
+        with self.assertRaisesRegex(PermissionError, "contract_drift"):
+            self._handoff(snapshot, nodes)
+        self.assertEqual(len(load_events(self.paths, snapshot.run_id)), before)
+        self.assertEqual(
+            load_snapshot(self.paths, snapshot.run_id).authorization_digest,
+            snapshot.authorization_digest,
+        )
+
+    def test_platform_handoff_with_scope_change_is_contract_drift(self):
+        # A file-scope change is an acceptance-contract change even when the
+        # ordinary reauthorization would keep it as a scope-only expansion.
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        self._switch_platform()
+        nodes = self._handoff_nodes(a_files=["a.py", "tests/test_a.py"])
+        with self.assertRaisesRegex(PermissionError, "contract_drift"):
+            self._handoff(snapshot, nodes)
+
+    def _scope_expansion_transition(self):
+        """A genuine scope-only expansion reauthorization, plus the pre-state.
+
+        The ordinary reason accepts it (scope-only expansion keeps acceptance).
+        Relabelled as ``platform_handoff`` it must be refused on replay: a
+        handoff never moves the write scope, and the write-side gate that
+        enforces that does not run on replay.
+        """
+        import copy
+
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        before = copy.deepcopy(load_snapshot(self.paths, snapshot.run_id))
+        nodes = self._nodes(a_files=["a.py", "tests/test_a.py"])
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        monitor = Monitor(self.paths, plan, nodes)
+        monitor.reauthorize(
+            snapshot.run_id, record, FakeRunner(), "executable_contract_changed"
+        )
+        events = load_events(self.paths, snapshot.run_id)
+        transition = [e for e in events if e["event"] == "authorization_reauthorized"][-1]
+        self.assertEqual(transition["data"]["changed_nodes"], [])
+        return monitor, before, snapshot.run_id, events
+
+    def test_state_replay_rejects_a_handoff_that_widens_the_file_scope(self):
+        import copy
+        from vibe_guide.state import _decode_snapshot, run_dir
+
+        _monitor, _before, run_id, events = self._scope_expansion_transition()
+        records = copy.deepcopy(events)
+        for record in records:
+            if record["event"] == "authorization_reauthorized":
+                record["data"]["change_reason"] = "platform_handoff"
+        state = (run_dir(self.paths, run_id) / "state.json").read_bytes()
+        with self.assertRaisesRegex(ValueError, "platform handoff transition changed"):
+            _decode_snapshot(state, records)
+        # The same log with the genuine reason still decodes.
+        _decode_snapshot(state, copy.deepcopy(events))
+
+    def test_monitor_replay_rejects_a_handoff_that_widens_the_file_scope(self):
+        import copy
+
+        monitor, before, _run_id, events = self._scope_expansion_transition()
+        data = copy.deepcopy(
+            [e for e in events if e["event"] == "authorization_reauthorized"][-1]["data"]
+        )
+        monitor._apply_reauthorization_transition(copy.deepcopy(before), copy.deepcopy(data))
+        data["change_reason"] = "platform_handoff"
+        with self.assertRaisesRegex(ValueError, "platform handoff transition changed"):
+            monitor._apply_reauthorization_transition(copy.deepcopy(before), data)
+
+    def test_unknown_reason_still_cannot_absorb_a_capability_change(self):
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        self._switch_platform()
+        nodes = self._handoff_nodes()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        with self.assertRaisesRegex(PermissionError, "capability_contract_unknown"):
+            Monitor(self.paths, plan, nodes).reauthorize(
+                snapshot.run_id, record, FakeRunner(), "platform_switch"
+            )
+
+    def test_platform_handoff_clears_the_supervisor_contract_drift_gate(self):
+        from vibe_guide.supervisor import contract_drift
+
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        self._switch_platform()
+        drift = contract_drift(self.paths, snapshot.run_id)
+        self.assertEqual(drift["state"], "contract_drift")
+        # The gate names the legal exit for a platform switch.
+        self.assertIn("--platform-handoff", drift["action"])
+        self._handoff(snapshot, self._handoff_nodes())
+        self.assertIsNone(contract_drift(self.paths, snapshot.run_id))
+
     def test_acceptance_semantic_change_invalidates_downstream_b(self):
         snapshot, _old_nodes, _cursors = self._accepted_run()
         changed_nodes = self._nodes(a_acceptance="verified_fact: changed")
@@ -312,6 +546,250 @@ class ScopeOnlyReauthorizationTests(unittest.TestCase):
         self.assertEqual(rebound.nodes["b"]["status"], "blocked_unknown")
         self.assertIsNone(rebound.nodes["b"]["acceptance"])
 
+
+class PlatformHandoffReworkTests(unittest.TestCase):
+    """#289 section 3 (PM ruling 2026-10-26): successor only after a handoff.
+
+    Rework of a node whose task was bound before a recorded platform_handoff
+    goes to a successor developer on the new platform (the old task cannot be
+    resumed there).  Without a handoff -- or for tasks created after it -- the
+    ordinary rule stays: Review findings return to the same worker.
+    """
+
+    # Reuse the fixture without re-running the parent class's tests.
+    setUp = ScopeOnlyReauthorizationTests.setUp
+    tearDown = ScopeOnlyReauthorizationTests.tearDown
+    _nodes = staticmethod(ScopeOnlyReauthorizationTests._nodes)
+    _handoff_nodes = ScopeOnlyReauthorizationTests._handoff_nodes
+    _switch_platform = ScopeOnlyReauthorizationTests._switch_platform
+    _handoff = ScopeOnlyReauthorizationTests._handoff
+    _accepted_run = ScopeOnlyReauthorizationTests._accepted_run
+
+    def _in_review_run(self, b_reviewer_events=()):
+        nodes = self._nodes()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        runner = FakeRunner(events={
+            ("a", "developer"): [("complete", {"evidence": "a"})],
+            ("a", "reviewer"): [("accepted", {"evidence": "a"})],
+            ("b", "developer"): [("complete", {"evidence": "b"})],
+            ("b", "reviewer"): list(b_reviewer_events),
+        })
+        monitor = Monitor(self.paths, plan, nodes)
+        snapshot = monitor.start(record, runner)
+        for _ in range(8):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+            if snapshot.nodes["b"]["status"] == "review" and not b_reviewer_events:
+                break
+        return monitor, snapshot, runner
+
+    def _starts(self, runner, node_id, role):
+        return [call for call in runner.start_calls
+                if call["node_id"] == node_id and call["role"] == role]
+
+    def test_same_platform_finding_returns_to_the_same_developer(self):
+        _monitor, snapshot, runner = self._in_review_run(
+            [("review_finding", {"finding": "fix it", "in_contract": True})]
+        )
+        developer = self._starts(runner, "b", "developer")
+        self.assertGreaterEqual(len(developer), 2)
+        self.assertTrue(developer[-1]["continuation"])
+        self.assertFalse(developer[-1]["successor"])
+        self.assertEqual(developer[-1]["task_id"], developer[0]["task_id"])
+
+    def test_in_flight_node_is_redispatched_as_a_successor_after_handoff(self):
+        _monitor, snapshot, runner = self._in_review_run()
+        self.assertEqual(snapshot.nodes["b"]["status"], "review")
+        old_developer = snapshot.nodes["b"]["developer_identity"]
+        old_reviewer = snapshot.nodes["b"]["reviewer_identity"]
+        self._switch_platform()
+        handoff_runner = FakeRunner(events={
+            ("b", "developer"): [("complete", {"evidence": "b2"})],
+            ("b", "reviewer"): [("accepted", {"evidence": "b2"})],
+        })
+        monitor, _record, rebound = self._handoff(
+            snapshot, self._handoff_nodes(), handoff_runner
+        )
+        # The accepted upstream node keeps its acceptance.
+        self.assertEqual(rebound.nodes["a"]["status"], "accepted")
+        developer = self._starts(handoff_runner, "b", "developer")
+        self.assertEqual(len(developer), 1)
+        self.assertTrue(developer[0]["successor"])
+        self.assertFalse(developer[0]["continuation"])
+        self.assertEqual(developer[0]["predecessor_task_id"], old_developer)
+        self.assertNotEqual(developer[0]["task_id"], old_developer)
+        old = [item for item in json.loads(
+            (self.paths.vibe / "runs" / snapshot.run_id / "tasks.json").read_text()
+        )["bindings"] if item["task_id"] == old_developer]
+        self.assertEqual([item["status"] for item in old], ["archived"])
+        new = load_task_binding(self.paths, "b", "developer", run_id=snapshot.run_id)
+        self.assertEqual(new.successor_of, old_developer)
+        self.assertEqual(new.handoff_from_provider, "runner")
+        events = load_events(self.paths, snapshot.run_id)
+        reconciled = [event["data"] for event in events
+                      if event["event"] == "handoff_predecessor_reconciled"]
+        self.assertEqual(reconciled[-1]["predecessor_task_id"], old_developer)
+        self.assertEqual(reconciled[-1]["proof"], "platform_handoff")
+
+        # The re-review after the successor delivers also needs a new-platform
+        # reviewer: the old reviewer task cannot be resumed either.
+        for _ in range(6):
+            rebound = monitor.tick(snapshot.run_id, handoff_runner)
+        reviewer = self._starts(handoff_runner, "b", "reviewer")
+        self.assertEqual(len(reviewer), 1)
+        self.assertTrue(reviewer[0]["successor"])
+        self.assertEqual(reviewer[0]["predecessor_task_id"], old_reviewer)
+        self.assertEqual(rebound.nodes["b"]["status"], "accepted")
+
+    def test_post_handoff_task_finding_returns_to_the_successor_itself(self):
+        _monitor, snapshot, _runner = self._in_review_run()
+        self._switch_platform()
+        handoff_runner = FakeRunner(events={
+            ("b", "developer"): [("complete", {"evidence": "b2"}),
+                                 ("complete", {"evidence": "b3"})],
+            ("b", "reviewer"): [
+                ("review_finding", {"finding": "again", "in_contract": True}),
+                ("accepted", {"evidence": "b3"}),
+            ],
+        })
+        monitor, _record, rebound = self._handoff(
+            snapshot, self._handoff_nodes(), handoff_runner
+        )
+        for _ in range(10):
+            rebound = monitor.tick(snapshot.run_id, handoff_runner)
+        developer = self._starts(handoff_runner, "b", "developer")
+        self.assertEqual(len(developer), 2)
+        self.assertTrue(developer[0]["successor"])
+        # Same platform from here on: back to the successor, not another one.
+        self.assertTrue(developer[1]["continuation"])
+        self.assertFalse(developer[1]["successor"])
+        self.assertEqual(developer[1]["task_id"], developer[0]["task_id"])
+        self.assertEqual(rebound.nodes["b"]["status"], "accepted")
+
+    def _foreign_successor_create(self, snapshot, lineage, generation=1):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+
+        request = {"successor": True, "predecessor_task_id": "reviewer:b",
+                   "authorization_digest": "0" * 64}
+        if lineage:
+            request["handoff_from_provider"] = lineage
+        with patch("vibe_guide.adapters.task_provider.require_entry"):
+            return ProviderActionStore(self.paths).request(
+                operation="create", provider="workbuddy", run_id=snapshot.run_id,
+                issue_id="b", role="reviewer", generation=generation, native_tool="native",
+                request=request,
+            )
+
+    def _reconcile_foreign(self, monitor, snapshot, action):
+        from types import SimpleNamespace
+
+        # The recovery only serves visible reviewers; FakeRunner registers a
+        # generic background-mode row, so make the archived predecessor the
+        # visible row the real bridge would have written.
+        path = next(self.paths.vibe.glob("runs*/" + snapshot.run_id + "/tasks.json"))
+        registry = json.loads(path.read_text())
+        for row in registry["bindings"]:
+            if row["task_id"] == "reviewer:b":
+                row["mode"] = "visible"
+                row["visible"] = True
+                row["host"] = "old-host"
+        path.write_text(json.dumps(registry))
+        monitor._reset_binding_cache()
+
+        return monitor.reconcile_created_successor(
+            snapshot.run_id, "b", SimpleNamespace(provider="workbuddy"),
+            action_id=action["action_id"], request_digest=action["request_digest"],
+            predecessor_archive={"threadId": "reviewer:b", "archived": True},
+            preservation_path="unused", preservation_digest="unused",
+        )
+
+    def test_created_successor_recovery_keeps_the_provider_gate_without_handoff(self):
+        snapshot, nodes, _cursors = self._accepted_run()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        action = self._foreign_successor_create(snapshot, "runner")
+        with self.assertRaisesRegex(ValueError, "predecessor archive is unverified"):
+            self._reconcile_foreign(Monitor(self.paths, plan, nodes), snapshot, action)
+
+    def test_created_successor_recovery_opens_the_provider_gate_after_handoff(self):
+        snapshot, _nodes, _cursors = self._accepted_run()
+        self._switch_platform()
+        monitor, _record, rebound = self._handoff(snapshot, self._handoff_nodes())
+        missing = self._foreign_successor_create(rebound, None)
+        with self.assertRaisesRegex(ValueError, "predecessor archive is unverified"):
+            self._reconcile_foreign(monitor, rebound, missing)
+        # With the recorded lineage the provider gate passes; the next proof
+        # (create lineage under the current authorization) still applies.
+        recorded = self._foreign_successor_create(rebound, "runner", generation=2)
+        with self.assertRaisesRegex(ValueError, "create lineage is invalid"):
+            self._reconcile_foreign(monitor, rebound, recorded)
+
+    def test_live_predecessor_blocks_the_handoff_successor(self):
+        _monitor, snapshot, _runner = self._in_review_run()
+        old_developer = snapshot.nodes["b"]["developer_identity"]
+        self._switch_platform()
+        nodes = self._handoff_nodes()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        monitor = Monitor(self.paths, plan, nodes)
+        handoff_runner = FakeRunner()
+        # Simulate an old-platform developer that is still running (no
+        # terminal proof): the successor must not be created.
+        original = monitor._schedule_ready
+
+        def schedule_after_reviving(snapshot_, runner_, *args, **kwargs):
+            binding = load_task_binding(self.paths, "b", "developer", run_id=snapshot.run_id)
+            if binding.task_id == old_developer and binding.status != "running":
+                binding.status = "running"
+                save_task_binding(self.paths, binding)
+                monitor._reset_binding_cache()
+            return original(snapshot_, runner_, *args, **kwargs)
+
+        with patch.object(monitor, "_schedule_ready", schedule_after_reviving):
+            rebound = monitor.reauthorize(
+                snapshot.run_id, record, handoff_runner, "platform_handoff"
+            )
+        self.assertEqual(self._starts(handoff_runner, "b", "developer"), [])
+        self.assertEqual(rebound.nodes["b"]["status"], "blocked_unknown")
+        self.assertIn("handoff", rebound.nodes["b"]["reason"])
+
+
+    def test_handoff_predecessor_is_terminal_only_when_delivered_else_unproven(self):
+        # Termination basis after a handoff: the old platform cannot be
+        # queried, so the only proof is "already delivered" in the local
+        # registry.  Any other state, or a missing/mismatched binding, is
+        # unproven (the caller turns that into blocked_unknown).
+        monitor, snapshot, _runner = self._in_review_run()
+        developer = load_task_binding(self.paths, "b", "developer", run_id=snapshot.run_id)
+        self.assertEqual(developer.status, "delivered")
+        for status in ("running", "created", "blocked_unknown"):
+            with self.subTest(status=status):
+                developer.status = status
+                save_task_binding(self.paths, developer)
+                monitor._reset_binding_cache()
+                self.assertIsNone(
+                    monitor._prove_handoff_predecessor_terminal(snapshot, "b", "developer")
+                )
+        developer.status = "delivered"
+        save_task_binding(self.paths, developer)
+        monitor._reset_binding_cache()
+        # reauthorize drops every live handle before redispatching.
+        snapshot.handles.clear()
+        snapshot.nodes["b"]["active_role"] = None
+        snapshot.nodes["b"]["active_task"] = None
+        with self.subTest(case="identity mismatch"):
+            ghost = json.loads(json.dumps(snapshot.nodes["b"]))
+            snapshot.nodes["b"]["developer_identity"] = "ghost-task"
+            self.assertIsNone(
+                monitor._prove_handoff_predecessor_terminal(snapshot, "b", "developer")
+            )
+            snapshot.nodes["b"].update(ghost)
+        with self.subTest(case="delivered"):
+            proven = monitor._prove_handoff_predecessor_terminal(snapshot, "b", "developer")
+            self.assertEqual(proven[0], developer.task_id)
 
 class TemporaryReadFailureTests(unittest.TestCase):
     def test_resume_read_failure_stays_unknown_without_invalidation_marker(self):
@@ -568,6 +1046,15 @@ class DispatchTopologyRulingTests(unittest.TestCase):
             ),
             "dual-visible",
         )
+
+    def test_integration_review_rejects_developer_only_persisted_topology(self):
+        node = _business_node("integration-review", dispatch_topology="visible-sdd")
+        with self.assertRaisesRegex(ValueError, "integration.*reviewer"):
+            dispatch_topology_for_node(node, {"workbuddy": "in_session_sdd"})
+
+    def test_integration_review_keeps_explicit_background_topology(self):
+        node = _business_node("integration-review", dispatch_topology="background")
+        self.assertEqual(dispatch_topology_for_node(node), "background")
 
     def test_persisted_contract_ruling_wins_over_the_live_ruling(self):
         node = _business_node("alpha", dispatch_topology="dual-visible")

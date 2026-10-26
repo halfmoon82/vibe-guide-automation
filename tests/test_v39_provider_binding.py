@@ -23,6 +23,116 @@ from vibe_guide.monitor import Monitor
 
 
 class V39ProviderBindingEntryPointTests(unittest.TestCase):
+    def test_foreign_provider_binding_is_rejected_before_resume_or_mutation(self):
+        for entrypoint in ("task_binding", "start", "binding_bootstrap", "successor"):
+            with self.subTest(entrypoint=entrypoint), tempfile.TemporaryDirectory() as directory:
+                paths = ProjectPaths(Path(directory))
+                binding = TaskBinding(
+                    provider="codex-app-visible", mode="visible", issue_id="node-a",
+                    role="developer", task_id="old-task", host="old-host",
+                    worktree=directory, branch="node/a", run_id="run-a", generation=1,
+                    status="archived", cursor="old-cursor", allowlist=["a.py"],
+                )
+                runner = ProviderActionRunner(paths, "workbuddy-visible", "workbuddy")
+                contract = {
+                    "run_id": "run-a", "node_id": "node-a", "role": "developer",
+                    "generation": 2, "continuation": True, "files": ["a.py"],
+                }
+                with patch("vibe_guide.runners.provider_action.load_task_binding", return_value=binding), \
+                     patch.object(runner, "_action") as action, \
+                     patch.object(runner.store, "_atomic") as atomic:
+                    with self.assertRaisesRegex(ValueError, "provider.*mismatch"):
+                        if entrypoint == "start":
+                            runner.start(contract, Path(directory))
+                        elif entrypoint == "binding_bootstrap":
+                            runner.binding_bootstrap(contract, binding, Path(directory))
+                        else:
+                            if entrypoint == "successor":
+                                contract["successor"] = True
+                            runner.task_binding(contract, Path(directory), "run-a", "running")
+                    action.assert_not_called()
+                    atomic.assert_not_called()
+                self.assertEqual(binding.status, "archived")
+                self.assertEqual(binding.generation, 1)
+                self.assertEqual(binding.cursor, "old-cursor")
+
+    def _foreign_predecessor(self, directory, status="archived"):
+        return TaskBinding(
+            provider="codex-app-visible", mode="visible", issue_id="node-a",
+            role="developer", task_id="old-task", host="old-host",
+            worktree=directory, branch="node/a", run_id="run-a", generation=1,
+            status=status, cursor="old-cursor", allowlist=["a.py"],
+        )
+
+    def _handoff_contract(self, **overrides):
+        contract = {
+            "run_id": "run-a", "node_id": "node-a", "role": "developer",
+            "generation": 2, "files": ["a.py"], "successor": True,
+            "predecessor_task_id": "old-task", "project_id": "project-a",
+            "worktree": "w", "branch": "node/a",
+            "platform_handoff_successor": True,
+            "handoff_from_provider": "codex-app-visible",
+        }
+        contract.update(overrides)
+        return contract
+
+    def test_platform_handoff_successor_accepts_a_foreign_terminal_predecessor(self):
+        # #289 section 3: the monitor only sets the handoff flag after the
+        # terminal proof; the new-platform runner then records the lineage.
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = ProviderActionRunner(paths, "workbuddy-visible", "workbuddy")
+
+            def fake(contract, run_id, operation, request):
+                return {
+                    "create": {"binding": {"task_id": "new-task", "host": "new-host"}},
+                    "locate": {"located": True},
+                    "visibility": {"visible": True, "direct_enter": True},
+                }[operation]
+
+            runner._require_result = fake
+            with patch("vibe_guide.runners.provider_action.load_task_binding",
+                       return_value=self._foreign_predecessor(directory)):
+                binding = runner.task_binding(
+                    self._handoff_contract(), Path(directory), "run-a", "running"
+                )
+            self.assertEqual(binding.provider, "workbuddy")
+            self.assertEqual(binding.successor_of, "old-task")
+            self.assertEqual(binding.handoff_from_provider, "codex-app-visible")
+
+    def test_platform_handoff_successor_still_refuses_unproven_lineage(self):
+        cases = (
+            ("live predecessor", {}, "running", "stopped predecessor"),
+            ("lineage names another provider",
+             {"handoff_from_provider": "cursor"}, "archived", "provider.*mismatch"),
+            ("flag without successor", {"successor": False}, "archived", "provider.*mismatch"),
+        )
+        for label, overrides, status, message in cases:
+            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+                paths = ProjectPaths(Path(directory))
+                runner = ProviderActionRunner(paths, "workbuddy-visible", "workbuddy")
+                with patch("vibe_guide.runners.provider_action.load_task_binding",
+                           return_value=self._foreign_predecessor(directory, status)), \
+                        patch.object(runner, "_action") as action:
+                    with self.assertRaisesRegex(ValueError, message):
+                        runner.task_binding(
+                            self._handoff_contract(**overrides), Path(directory),
+                            "run-a", "running",
+                        )
+                    action.assert_not_called()
+
+    def test_provider_mismatch_error_points_at_the_successor_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = ProjectPaths(Path(directory))
+            runner = ProviderActionRunner(paths, "workbuddy-visible", "workbuddy")
+            with patch("vibe_guide.runners.provider_action.load_task_binding",
+                       return_value=self._foreign_predecessor(directory, "archived")):
+                with self.assertRaisesRegex(ValueError, "successor task on the new platform"):
+                    runner.task_binding(
+                        self._handoff_contract(successor=False), Path(directory),
+                        "run-a", "running",
+                    )
+
     def _evidence(self, paths):
         node = "BUG-V3-005"
         worktree = str(paths.root / "worker")
