@@ -1503,6 +1503,8 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
             or retained_ids | invalidated_ids != set(accepted_nodes)
         ):
             raise ValueError("reauthorization affected suffix disposition is invalid")
+        if data.get("change_reason") == "platform_handoff" and (changed_nodes or invalidated_ids):
+            raise ValueError("platform handoff transition changed the acceptance contract")
         for node_id, evidence in retained_acceptances.items():
             if (
                 node_id not in snapshot.nodes

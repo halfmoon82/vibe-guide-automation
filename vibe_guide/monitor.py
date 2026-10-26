@@ -2421,6 +2421,10 @@ class Monitor:
             if capability_contract_changed and change_reason not in {
                 "capability_contract_changed",
                 "executable_contract_changed",
+                # #289: switching platforms changes the capability contract
+                # by construction; the handoff gate below still refuses any
+                # acceptance-contract change under this reason.
+                "platform_handoff",
             }:
                 raise PermissionError(
                     "capability_contract_unknown: explicit recovery reason required"
@@ -2504,6 +2508,37 @@ class Monitor:
             if (node_id == "integration-review" and integration_changed)
             or not unchanged(node_id, previous_node_contract_digests[node_id])
         )
+        if change_reason == "platform_handoff":
+            # #289 draft section 2: a platform handoff may move only the
+            # dispatch binding (adapter/worker/model routing) and the
+            # capability contract.  The scope-only-expansion allowance of an
+            # ordinary reauthorization does not apply: file scope is part of
+            # the acceptance contract.  Refuse before any side effect (task
+            # stop, event append) so a mislabelled change leaves the run as
+            # it was.
+            drifted = sorted(
+                node_id
+                for node_id in snapshot.nodes
+                if not (
+                    route_only_acceptance_binds(
+                        self.nodes[node_id],
+                        previous_authorized_nodes.get(node_id),
+                        previous_node_contract_digests[node_id],
+                    )
+                    or executable_contract_digest_matches(
+                        [self.nodes[node_id]], previous_node_contract_digests[node_id]
+                    )
+                )
+            )
+            if drifted or integration_changed or record.file_scope != previous.file_scope:
+                raise PermissionError(
+                    "contract_drift: platform_handoff may only change dispatch "
+                    "binding and capability contract (acceptance contract "
+                    "changed: {})".format(
+                        ", ".join(drifted)
+                        or ("integration contract" if integration_changed else "file scope")
+                    )
+                )
         affected_nodes = affected_node_closure(
             list(self.nodes.values()), changed_nodes
         )
@@ -3625,6 +3660,7 @@ class Monitor:
                 "executable_contract_changed",
                 "capability_contract_changed",
                 "engine_attestation_renewed",
+                "platform_handoff",
             }
         ):
             raise ValueError("reauthorization replacement lineage is inconsistent")
@@ -3721,6 +3757,12 @@ class Monitor:
             raise ValueError("reauthorization acceptance lineage is invalid")
         if set(retained_acceptances) & set(invalidated_acceptances):
             raise ValueError("reauthorization acceptance lineage overlaps")
+        if data.get("change_reason") == "platform_handoff" and (
+            changed_nodes or invalidated_acceptances
+        ):
+            # Replay twin of the reauthorize gate: a handoff never moves the
+            # acceptance contract, so it can neither change nor invalidate.
+            raise ValueError("platform handoff transition changed the acceptance contract")
         previous_authorized_nodes = self._previous_authorized_nodes(snapshot, previous)
         expected_changed_nodes = sorted(
             node_id

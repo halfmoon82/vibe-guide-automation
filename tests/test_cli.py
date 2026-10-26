@@ -403,6 +403,52 @@ class CliContractTests(unittest.TestCase):
                 (root / ".vibe/plans/cap-route/authorization-invalidated.json").exists()
             )
 
+    def test_platform_handoff_flag_reauthorizes_with_the_handoff_reason(self):
+        # #289: the supervisor's contract_drift gate names this exit; the
+        # flag must reach Monitor.reauthorize as change_reason=platform_handoff.
+        from vibe_guide.cli import run_cli
+
+        fixture = Path(__file__).parent / "fixtures" / "e2e-project"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".project-root").write_text("fixture\n", encoding="utf-8")
+            shutil.copyfile(fixture / "plan-source.json", root / "plan-source.json")
+            self.assertEqual(run_cli(["init", "--confirm", "--json"], root).exit_code, 0)
+            planned = run_cli(
+                [
+                    "plan", "--request", "设计并实现两个契约兼容的并行节点并完成独立审查",
+                    "--plan-id", "handoff", "--s1", "4,4,4,4,4",
+                    "--node-spec", "plan-source.json", "--json",
+                ],
+                root,
+            )
+            self.assertEqual(planned.exit_code, 0, planned.text)
+            runner = FakeRunner()
+            started = run_cli(
+                ["monitor", "--plan", "handoff", "--authorize", "AUTHORIZE", "--json"],
+                root,
+                runner=runner,
+            )
+            self.assertEqual(started.exit_code, 0, started.text)
+            run_id = started.payload["run_id"]
+            save_contract(
+                ProjectPaths(root),
+                build_contract(root, provider="cursor", host_id="local"),
+            )
+            handed_off = run_cli(
+                ["monitor", "--plan", "handoff", "--authorize", "AUTHORIZE",
+                 "--platform-handoff", "--json"],
+                root,
+                runner=runner,
+            )
+            self.assertEqual(handed_off.payload.get("run_id"), run_id, handed_off.text)
+            reasons = [
+                event["data"]["change_reason"]
+                for event in load_events(ProjectPaths(root), run_id)
+                if event["event"] == "authorization_reauthorized"
+            ]
+            self.assertEqual(reasons, ["platform_handoff"])
+
     def test_legacy_setup_metadata_exposes_real_name_version_and_console_entry(self):
         root = Path(__file__).resolve().parents[1]
         name = subprocess.run(

@@ -377,6 +377,102 @@ class ScopeOnlyReauthorizationTests(unittest.TestCase):
                           if event["event"] == "authorization_reauthorized")
         self.assertEqual(transition["data"]["retained_acceptances"], {})
 
+    # -- #289 draft section 2: platform_handoff is a first-class reason ------
+
+    def _handoff_nodes(self, **kwargs):
+        nodes = self._nodes(**kwargs)
+        for node in nodes:
+            node.contract["adapter_id"] = "cursor"
+            node.contract["worker_profile"]["worker"] = "cursor"
+            node.contract["worker_profile"]["model"] = "cursor-model"
+        return nodes
+
+    def _switch_platform(self):
+        save_contract(
+            self.paths, build_contract(self.root, provider="cursor", host_id="local")
+        )
+
+    def _handoff(self, snapshot, nodes, runner=None):
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        monitor = Monitor(self.paths, plan, nodes)
+        return monitor, record, monitor.reauthorize(
+            snapshot.run_id, record, runner or FakeRunner(), "platform_handoff"
+        )
+
+    def test_platform_handoff_retains_acceptances_across_capability_change(self):
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        previous_capability = snapshot.capability_contract_digest
+        self._switch_platform()
+        nodes = self._handoff_nodes()
+        _monitor, record, rebound = self._handoff(snapshot, nodes)
+
+        self.assertNotEqual(rebound.capability_contract_digest, previous_capability)
+        for node in nodes:
+            self.assertEqual(rebound.nodes[node.id]["status"], "accepted")
+            self.assertEqual(rebound.nodes[node.id]["acceptance"], {
+                "contract_digest": executable_contract_digest([node]),
+                "authorization_epoch": record.digest,
+            })
+        transition = [event for event in load_events(self.paths, snapshot.run_id)
+                      if event["event"] == "authorization_reauthorized"][-1]["data"]
+        self.assertEqual(transition["change_reason"], "platform_handoff")
+        self.assertEqual(transition["changed_nodes"], [])
+        self.assertEqual(sorted(transition["retained_acceptances"]), ["a", "b"])
+        # Replay validation accepts the persisted handoff lineage.
+        self.assertEqual(
+            load_snapshot(self.paths, snapshot.run_id).authorization_digest, record.digest
+        )
+
+    def test_platform_handoff_with_acceptance_change_is_contract_drift(self):
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        self._switch_platform()
+        nodes = self._handoff_nodes(a_acceptance="verified_fact: changed")
+        before = len(load_events(self.paths, snapshot.run_id))
+        with self.assertRaisesRegex(PermissionError, "contract_drift"):
+            self._handoff(snapshot, nodes)
+        self.assertEqual(len(load_events(self.paths, snapshot.run_id)), before)
+        self.assertEqual(
+            load_snapshot(self.paths, snapshot.run_id).authorization_digest,
+            snapshot.authorization_digest,
+        )
+
+    def test_platform_handoff_with_scope_change_is_contract_drift(self):
+        # A file-scope change is an acceptance-contract change even when the
+        # ordinary reauthorization would keep it as a scope-only expansion.
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        self._switch_platform()
+        nodes = self._handoff_nodes(a_files=["a.py", "tests/test_a.py"])
+        with self.assertRaisesRegex(PermissionError, "contract_drift"):
+            self._handoff(snapshot, nodes)
+
+    def test_unknown_reason_still_cannot_absorb_a_capability_change(self):
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        self._switch_platform()
+        nodes = self._handoff_nodes()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        with self.assertRaisesRegex(PermissionError, "capability_contract_unknown"):
+            Monitor(self.paths, plan, nodes).reauthorize(
+                snapshot.run_id, record, FakeRunner(), "platform_switch"
+            )
+
+    def test_platform_handoff_clears_the_supervisor_contract_drift_gate(self):
+        from vibe_guide.supervisor import contract_drift
+
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        self._switch_platform()
+        drift = contract_drift(self.paths, snapshot.run_id)
+        self.assertEqual(drift["state"], "contract_drift")
+        # The gate names the legal exit for a platform switch.
+        self.assertIn("--platform-handoff", drift["action"])
+        self._handoff(snapshot, self._handoff_nodes())
+        self.assertIsNone(contract_drift(self.paths, snapshot.run_id))
+
     def test_acceptance_semantic_change_invalidates_downstream_b(self):
         snapshot, _old_nodes, _cursors = self._accepted_run()
         changed_nodes = self._nodes(a_acceptance="verified_fact: changed")
