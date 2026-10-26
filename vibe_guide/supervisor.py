@@ -341,9 +341,28 @@ def _read_json_file(path):
             entry = json.loads(line)
         except ValueError:
             continue  # a line still being written
+        if _usage_present_but_invalid(entry):
+            return None  # read as unknown, never as an older line's count
         if _session_tokens(entry) is not None:
             return entry
     return None
+
+
+def _usage_present_but_invalid(entry):
+    """The entry carries a WorkBuddy usage block with no readable input.
+
+    Such a line means "usage was reported but malformed"; skipping it would
+    fall back to an older line and report a stale count as current.
+    """
+    if not isinstance(entry, dict) or entry.get("type") != "function_call":
+        return False
+    message = entry.get("message")
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        return False
+    value = usage.get("input_tokens")
+    return not (isinstance(value, int) and not isinstance(value, bool)
+                and value >= 0)
 
 
 def _session_tokens(record):
@@ -369,6 +388,17 @@ def _session_tokens(record):
         if isinstance(value, (int, float)) and value >= 0:
             return int(value)
     usage = record.get("usage")
+    message = record.get("message")
+    if (not isinstance(usage, dict) and record.get("type") == "function_call"
+            and isinstance(message, dict) and isinstance(message.get("usage"), dict)):
+        # WorkBuddy function_call usage already counts cached tokens inside
+        # input_tokens, whatever its total says; adding the cache fields again
+        # double-counts the context.  A non-integer input is unknown, never
+        # a reason to fall back to the additive Anthropic reading.
+        value = message["usage"].get("input_tokens")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None
     if isinstance(usage, dict):
         nested = _session_tokens(usage)
         if nested is not None:
