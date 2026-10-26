@@ -553,6 +553,8 @@ class ProviderActionRunner(Runner):
         except FileNotFoundError:
             existing = None
         successor = bool(contract.get("successor"))
+        if existing is not None and existing.provider != self.provider:
+            raise ValueError("task binding provider mismatch: explicit handoff required")
         v39 = binding_contract_enabled(contract)
         live_intent = contract.get("binding_intent")
         live_observation = contract.get("binding_observation")
@@ -934,6 +936,8 @@ class ProviderActionRunner(Runner):
         node branch.  Existing branch occupancy, path drift, dirty content or
         a wrong base remain blocked; no reset/clean/stash/checkout is used.
         """
+        if binding.provider != self.provider:
+            raise ValueError("task binding provider mismatch: explicit handoff required")
         if not binding_contract_enabled(contract):
             return self.binding_gate(contract, binding)
 
@@ -1250,6 +1254,8 @@ class ProviderActionRunner(Runner):
             str(contract["role"]),
             run_id=run_id,
         )
+        if binding.provider != self.provider:
+            raise ValueError("task binding provider mismatch: explicit handoff required")
         expected_capability_digest = contract.get("capability_contract_digest")
         if expected_capability_digest and binding.capability_contract_digest != expected_capability_digest:
             raise ValueError("task binding capability contract digest is stale")

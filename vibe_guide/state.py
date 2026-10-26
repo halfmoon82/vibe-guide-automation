@@ -23,6 +23,8 @@ from .authorization import (
     executable_contract_digest_matches,
     is_authorization_integrity_valid,
     legacy_executable_contract_digest,
+    verified_authorized_nodes,
+    route_only_acceptance_binds,
 )
 from .contracts import RunEvent
 from .models import (
@@ -99,13 +101,14 @@ def _previous_digest_binds(
     digest: Any,
     previous: AuthorizationRecord,
     replacement: AuthorizationRecord,
+    previous_node: Optional[DAGNode] = None,
 ) -> bool:
     """Unchanged contract, or a 5.0.7 digest whose only delta is file scope.
 
     Must stay isomorphic with ``Monitor.reauthorize``: replay rejects any
     reauthorization whose recorded disposition this predicate disagrees with.
     """
-    return executable_contract_digest_matches([node], digest) or (
+    return route_only_acceptance_binds(node, previous_node, digest) or executable_contract_digest_matches([node], digest) or (
         scope_only_expansion_binds(
             node, digest, previous.file_scope, replacement.file_scope
         )
@@ -314,6 +317,7 @@ _EVENT_DATA_KEYS = {
     "in_contract",
     "intent_id",
     "node_contract_digest",
+    "node_scope_digests",
     "node_contract_digests",
     "node_id",
     "node_ids",
@@ -541,6 +545,7 @@ _IDENTIFIER_KEYED_FIELDS = frozenset({
     "continuation",
     "handles",
     "invalidated_acceptances",
+    "node_scope_digests",
     "node_contract_digests",
     "nodes",
     "parallel_groups",
@@ -1281,6 +1286,10 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
     for node_id, node in snapshot.nodes.items():
         if not isinstance(node, dict) or node.get("status") not in _NODE_STATUSES:
             raise ValueError("snapshot node state is invalid for " + node_id)
+    if snapshot.status == "complete" and any(
+        node.get("workspace_reconciliation_required") is True for node in snapshot.nodes.values()
+    ):
+        raise ValueError("complete run has unresolved workspace quarantine")
     if snapshot.status == "complete":
         if not all(node.get("status") == "accepted" for node in snapshot.nodes.values()):
             raise ValueError("complete run contains unaccepted nodes")
@@ -1316,6 +1325,8 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         first_capability_contract_digest
     ):
         raise ValueError("run-start capability contract lineage is inconsistent")
+    current_prd_digest = first["data"].get("prd_digest")
+    current_spec_digest = first["data"].get("spec_digest")
     current_capability_contract_digest = first_capability_contract_digest
     if sorted(first["data"].get("node_ids", [])) != sorted(snapshot.nodes):
         raise ValueError("run-start node lineage is inconsistent")
@@ -1323,6 +1334,9 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         raise ValueError("legacy evidence lineage is inconsistent")
     retained_acceptance_proofs = []
     latest_node_contract_digests = None
+    epoch_contracts = first["data"].get("authorized_node_contracts")
+    epoch_digests = first["data"].get("node_contract_digests")
+    epoch_scope_digests = first["data"].get("node_scope_digests")
     for record in records[: snapshot.event_sequence]:
         provenance = record["provenance"]
         if provenance["authorization_digest"] != current_authorization_digest:
@@ -1354,6 +1368,14 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
             )
         ):
             raise ValueError("reauthorization capability contract lineage is inconsistent")
+        source_fields = {"previous_prd_digest", "previous_spec_digest", "prd_digest", "spec_digest"}
+        if source_fields & set(data) and not source_fields.issubset(data):
+            raise ValueError("reauthorization source lineage is incomplete")
+        for source, pinned in (("prd", current_prd_digest), ("spec", current_spec_digest)):
+            if pinned is not None and data.get("previous_" + source + "_digest", pinned) != pinned:
+                raise ValueError("reauthorization source lineage is inconsistent")
+        current_prd_digest = data.get("prd_digest", current_prd_digest)
+        current_spec_digest = data.get("spec_digest", current_spec_digest)
         previous = AuthorizationRecord.from_dict(data.get("previous_authorization"))
         replacement = AuthorizationRecord.from_dict(data.get("new_authorization"))
         if (
@@ -1439,17 +1461,33 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
             for node in authorized_nodes
         ):
             raise ValueError("reauthorization authorized DAG proof is invalid")
+        if replacement.node_scope_digests is not None and data.get("node_scope_digests") != replacement.node_scope_digests:
+            raise ValueError("reauthorization signed scope proof is inconsistent")
+        if "node_scope_digests" in data and data["node_scope_digests"] != {
+            node.id: legacy_executable_contract_digest([node]) for node in authorized_nodes
+        }:
+            raise ValueError("reauthorization per-node scope proof is invalid")
+        previous_by_id = verified_authorized_nodes(
+            epoch_contracts, epoch_digests, previous, epoch_scope_digests
+        )
         authorized_by_id = {node.id: node for node in authorized_nodes}
         # The previous digest may be the 5.0.7 form; a node is unchanged when
         # either form of it still binds the authorized contract.
         expected_changed_nodes = sorted(
             node_id
             for node_id in snapshot.nodes
-            if not _previous_digest_binds(
+            if (
+                node_id == "integration-review" and (
+                    previous.integration_contract_digest != replacement.integration_contract_digest
+                    or data.get("prd_digest", snapshot.prd_digest) != data.get("previous_prd_digest", snapshot.prd_digest)
+                    or data.get("spec_digest", snapshot.spec_digest) != data.get("previous_spec_digest", snapshot.spec_digest)
+                )
+            ) or not _previous_digest_binds(
                 authorized_by_id[node_id],
                 previous_node_contract_digests[node_id],
                 previous,
                 replacement,
+                previous_by_id.get(node_id),
             )
         )
         retained_ids = set(retained_acceptances)
@@ -1476,6 +1514,7 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                     evidence["contract_digest"],
                     previous,
                     replacement,
+                    previous_by_id.get(node_id),
                 )
                 or evidence["authorization_epoch"] != previous.digest
             ):
@@ -1492,10 +1531,17 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 or evidence["authorization_epoch"] != previous.digest
             ):
                 raise ValueError("invalidated acceptance proof is invalid")
+        epoch_contracts = authorized_node_contracts
+        epoch_digests = node_contract_digests
+        epoch_scope_digests = data.get("node_scope_digests")
         latest_node_contract_digests = node_contract_digests
         current_authorization_digest = replacement.digest
         current_node_contract_digest = replacement.node_contract_digest
         current_capability_contract_digest = replacement_capability_contract_digest
+    if (current_prd_digest is not None and current_prd_digest != snapshot.prd_digest) or (
+        current_spec_digest is not None and current_spec_digest != snapshot.spec_digest
+    ):
+        raise ValueError("snapshot final source lineage is inconsistent")
     if current_authorization_digest != snapshot.authorization_digest:
         raise ValueError("snapshot final authorization lineage is inconsistent")
     if current_node_contract_digest != snapshot.node_contract_digest:

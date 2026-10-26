@@ -38,6 +38,10 @@ from vibe_guide.authorization import (
     authorize,
     build_authorization_card,
     dispatch_topology_for_node,
+    acceptance_contract_projection,
+    verified_authorized_nodes,
+    canonical_node_contracts,
+    legacy_executable_contract_digest,
     executable_contract_digest,
     is_authorization_valid,
     refresh_authorization_card,
@@ -291,6 +295,87 @@ class ScopeOnlyReauthorizationTests(unittest.TestCase):
                 load_task_binding(self.paths, "b", role, run_id=snapshot.run_id).cursor,
                 cursor,
             )
+
+    def test_acceptance_projection_preserves_protected_and_unknown_fields(self):
+        import copy
+        original = self._nodes()[0]
+        protected = (
+            ("worktree", "outside"), ("files", ["outside.py"]),
+            ("actions", ["test"]), ("required_capabilities", ["new"]),
+            ("unknown_business_rule", "changed"),
+        )
+        for key, value in protected:
+            with self.subTest(key=key):
+                changed = copy.deepcopy(original)
+                changed.contract[key] = value
+                self.assertNotEqual(acceptance_contract_projection(original),
+                                    acceptance_contract_projection(changed))
+        for key, value in (("writer", "new-writer"), ("branch", "new-branch"),
+                           ("allowlist", ["outside.py"]), ("fallbacks", ["new"]),
+                           ("selection_basis", {"risk_tags": ["changed"]})):
+            with self.subTest(profile_key=key):
+                changed = copy.deepcopy(original)
+                changed.contract["worker_profile"][key] = value
+                self.assertNotEqual(acceptance_contract_projection(original),
+                                    acceptance_contract_projection(changed))
+
+    def test_old_dag_proof_requires_per_node_scope_and_matching_commitments(self):
+        nodes = self._nodes()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE")
+        encoded = {item["id"]: json.dumps(item) for item in canonical_node_contracts(nodes)}
+        digests = {node.id: executable_contract_digest([node]) for node in nodes}
+        scopes = {node.id: legacy_executable_contract_digest([node]) for node in nodes}
+        self.assertEqual(set(verified_authorized_nodes(encoded, digests, record, scopes)), {"a", "b"})
+        self.assertEqual(verified_authorized_nodes(encoded, digests, record), {})
+        altered = json.loads(encoded["a"])
+        altered["contract"]["files"] = ["b.py"]
+        altered_encoded = dict(encoded, a=json.dumps(altered))
+        self.assertEqual(verified_authorized_nodes(altered_encoded, digests, record, scopes), {})
+        forged_scopes = dict(scopes, a=legacy_executable_contract_digest([DAGNode.from_dict(altered)]))
+        self.assertEqual(verified_authorized_nodes(altered_encoded, digests, record, forged_scopes), {})
+        self.assertEqual(verified_authorized_nodes(encoded, dict(digests, a="0" * 64), record, scopes), {})
+
+    def test_route_only_change_retains_acceptances_under_the_new_epoch(self):
+        snapshot, old_nodes, _cursors = self._accepted_run()
+        old_epoch = snapshot.authorization_digest
+        changed_nodes = self._nodes()
+        for node in changed_nodes:
+            node.contract["adapter_id"] = "cursor"
+            node.contract["worker_profile"]["model"] = "new-model"
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(build_authorization_card(plan, changed_nodes, self.capabilities), "AUTHORIZE")
+        self.assertNotEqual(record.node_contract_digest, executable_contract_digest(old_nodes))
+        rebound = Monitor(self.paths, plan, changed_nodes).reauthorize(
+            snapshot.run_id, record, FakeRunner(), "executable_contract_changed"
+        )
+        self.assertNotEqual(old_epoch, record.digest)
+        for node in changed_nodes:
+            self.assertEqual(rebound.nodes[node.id]["status"], "accepted")
+            self.assertEqual(rebound.nodes[node.id]["acceptance"], {
+                "contract_digest": executable_contract_digest([node]),
+                "authorization_epoch": record.digest,
+            })
+        loaded = load_snapshot(self.paths, snapshot.run_id)
+        self.assertEqual(loaded.authorization_digest, record.digest)
+
+    def test_route_change_with_scope_redistribution_does_not_retain_acceptance(self):
+        snapshot, _old_nodes, _cursors = self._accepted_run()
+        changed_nodes = self._nodes()
+        for node, scope in zip(changed_nodes, (["b.py"], ["a.py"])):
+            node.contract["adapter_id"] = "cursor"
+            node.contract["files"] = list(scope)
+            node.contract["worker_profile"]["allowlist"] = list(scope)
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(build_authorization_card(plan, changed_nodes, self.capabilities), "AUTHORIZE")
+        rebound = Monitor(self.paths, plan, changed_nodes).reauthorize(
+            snapshot.run_id, record, FakeRunner(), "executable_contract_changed"
+        )
+        self.assertIsNone(rebound.nodes["a"]["acceptance"])
+        self.assertIsNone(rebound.nodes["b"]["acceptance"])
+        transition = next(event for event in reversed(load_events(self.paths, snapshot.run_id))
+                          if event["event"] == "authorization_reauthorized")
+        self.assertEqual(transition["data"]["retained_acceptances"], {})
 
     def test_acceptance_semantic_change_invalidates_downstream_b(self):
         snapshot, _old_nodes, _cursors = self._accepted_run()
@@ -568,6 +653,15 @@ class DispatchTopologyRulingTests(unittest.TestCase):
             ),
             "dual-visible",
         )
+
+    def test_integration_review_rejects_developer_only_persisted_topology(self):
+        node = _business_node("integration-review", dispatch_topology="visible-sdd")
+        with self.assertRaisesRegex(ValueError, "integration.*reviewer"):
+            dispatch_topology_for_node(node, {"workbuddy": "in_session_sdd"})
+
+    def test_integration_review_keeps_explicit_background_topology(self):
+        node = _business_node("integration-review", dispatch_topology="background")
+        self.assertEqual(dispatch_topology_for_node(node), "background")
 
     def test_persisted_contract_ruling_wins_over_the_live_ruling(self):
         node = _business_node("alpha", dispatch_topology="dual-visible")
