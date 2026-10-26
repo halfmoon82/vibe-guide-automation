@@ -1101,7 +1101,10 @@ class DispatchPromptTests(unittest.TestCase):
 
             runner._action = fake_action
             runner.binding_gate = lambda contract, binding: SimpleNamespace(verified=True)
+            # A real TaskBinding always names its provider (required field);
+            # the stand-in mirrors the binding this runner created.
             binding = SimpleNamespace(
+                provider="codex-app-visible",
                 task_id="t", host="mac", cursor=None, capability_contract_digest=None,
                 model="default", reasoning="normal", route_digest=_profile().route_digest,
             )
