@@ -341,9 +341,28 @@ def _read_json_file(path):
             entry = json.loads(line)
         except ValueError:
             continue  # a line still being written
+        if _usage_present_but_invalid(entry):
+            return None  # read as unknown, never as an older line's count
         if _session_tokens(entry) is not None:
             return entry
     return None
+
+
+def _usage_present_but_invalid(entry):
+    """The entry carries a WorkBuddy usage block with no readable input.
+
+    Such a line means "usage was reported but malformed"; skipping it would
+    fall back to an older line and report a stale count as current.
+    """
+    if not isinstance(entry, dict) or entry.get("type") != "function_call":
+        return False
+    message = entry.get("message")
+    usage = message.get("usage") if isinstance(message, dict) else None
+    if not isinstance(usage, dict):
+        return False
+    value = usage.get("input_tokens")
+    return not (isinstance(value, int) and not isinstance(value, bool)
+                and value >= 0)
 
 
 def _session_tokens(record):

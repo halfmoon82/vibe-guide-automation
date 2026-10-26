@@ -222,6 +222,22 @@ class PreflightTests(unittest.TestCase):
             result = supervisor_preflight(self.paths, "run-1", str(path))
         self.assertEqual(result["state"], "unknown")
 
+    def test_invalid_latest_usage_line_does_not_fall_back_to_stale_line(self):
+        # Review P3: a malformed newest usage line must yield "unknown",
+        # never an older line's stale count.
+        path = Path(self.tmp.name) / "workbuddy-stale.jsonl"
+        path.write_text(
+            json.dumps({"type": "function_call", "message": {"usage": {
+                "input_tokens": 30000, "output_tokens": 100,
+            }}}) + "\n"
+            + json.dumps({"type": "function_call", "message": {"usage": {
+                "input_tokens": "bad", "cache_read_input_tokens": 144338,
+            }}}) + "\n",
+            encoding="utf-8")
+        with _patch_snapshot({"n1": "blocked_unknown"}):
+            result = supervisor_preflight(self.paths, "run-1", str(path))
+        self.assertEqual(result["state"], "unknown")
+
     def test_missing_record_is_unknown_not_idle(self):
         result = supervisor_preflight(self.paths, "run-1", "/nonexistent.json")
         self.assertEqual(result["state"], "unknown")
