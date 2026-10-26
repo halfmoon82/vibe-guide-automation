@@ -82,6 +82,7 @@ from .state import (
     read_writer_lease,
     redact_provider_text,
     release_writer_lease,
+    rebind_writer_lease,
     run_dir,
     save_snapshot,
     scope_only_expansion_binds,
@@ -4826,7 +4827,7 @@ class Monitor:
                 retry_role = str(retry["role"])
                 retry_generation = int(current.get("review_generation" if retry_role == "reviewer" else "developer_generation", 0)) + 1
                 retry_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, retry_role, retry_generation, current))
-                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation):
+                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, retry_role, retry_generation, retry_digest):
                     self._mark_blocked_unknown(
                         snapshot,
                         node_id,
@@ -4877,7 +4878,7 @@ class Monitor:
                 retry_role = "reviewer"
                 retry_generation = int(current.get("review_generation", 0)) + 1
                 retry_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, retry_role, retry_generation, current))
-                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation):
+                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, retry_role, retry_generation, retry_digest):
                     self._mark_blocked_unknown(
                         snapshot,
                         node_id,
@@ -4929,7 +4930,7 @@ class Monitor:
             generation_key = "review_generation" if first_role == "reviewer" else "developer_generation"
             first_generation = int(current.get(generation_key, 0)) + 1
             first_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, first_role, first_generation, current))
-            if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, first_digest, first_role, first_generation):
+            if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, first_digest, first_role, first_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, first_role, first_generation, first_digest):
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
@@ -4943,6 +4944,66 @@ class Monitor:
             # A create left pending (retry marker, no handle yet) still holds
             # its slot, so recount instead of trusting the start result.
             active_sessions = self._count_active_sessions(snapshot)
+
+    def _adopt_unserved_handoff_lease(
+        self, snapshot: RunSnapshot, node_id: str, role: str, generation: int, digest: str
+    ) -> bool:
+        """Re-key this run's own unclaimed lease after a platform_handoff.
+
+        The intent digest binds the authorization, so the handoff's new
+        authorization makes the lease registered before it look foreign.  The
+        lease may move to the new digest only when this run recorded a
+        platform_handoff and nothing ever claimed the node: no binding, no
+        task identity, no handle, no ``start_confirmed``, no provider result.
+        Anything unprovable returns False and the caller keeps blocked_unknown.
+        """
+        current = snapshot.nodes[node_id]
+        try:
+            if not self._run_has_platform_handoff(snapshot):
+                return False
+            if (
+                current.get("developer_identity") or current.get("reviewer_identity")
+                or current.get("active_task") or node_id in snapshot.handles
+            ):
+                return False
+            for other in ("developer", "reviewer"):
+                try:
+                    self._load_task_binding(snapshot, node_id, other)
+                except FileNotFoundError:
+                    continue
+                return False
+            if any(
+                event.get("event") == "start_confirmed"
+                and event.get("data", {}).get("node_id") == node_id
+                for event in load_events(self.paths, snapshot.run_id)[: snapshot.event_sequence]
+            ):
+                return False
+            store = ProviderActionStore(self.paths)
+            if store.has_result_for(snapshot.run_id, node_id):
+                return False
+            if not rebind_writer_lease(
+                self.paths, node_id, str(current["worktree"]), snapshot.run_id,
+                role, generation, None, digest, previous_status="active",
+            ):
+                return False
+            superseded = store.supersede_unclaimed_creates(
+                snapshot.run_id, node_id, role, generation, snapshot.authorization_digest
+            )
+        except (OSError, TypeError, ValueError):
+            return False
+        self._record(
+            snapshot,
+            "handoff_lease_rebound",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": role,
+                "generation": generation,
+                "intent_digest": digest,
+                "superseded_creates": superseded,
+            },
+        )
+        return True
 
     def _brief_allows_first_write(
         self, snapshot: RunSnapshot, node_id: str, node: DAGNode
@@ -10155,6 +10216,10 @@ class Monitor:
                     for pending_item in pending
                     if pending_item != item
                 ]
+            elif record["event"] == "handoff_lease_rebound":
+                # Evidence only: the lease file was re-keyed before the event.
+                if provenance.get("role") != "system" or not self._run_has_platform_handoff(snapshot):
+                    raise ValueError("handoff lease rebound replay provenance is invalid")
             elif record["event"] == "handoff_predecessor_reconciled":
                 # Evidence only: the registry already holds the archived
                 # predecessor, and the successor's own start events replay

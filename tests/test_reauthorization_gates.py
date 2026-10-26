@@ -66,7 +66,7 @@ from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.state import load_events, load_snapshot
-from vibe_guide.task_registry import load_task_binding, save_task_binding
+from vibe_guide.task_registry import TaskBinding, load_task_binding, save_task_binding
 
 from tests.support_v45_authorize import publish_complex_probe
 
@@ -2133,3 +2133,188 @@ class ObservedAdapterAdmissionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _PendingForBRunner(FakeRunner):
+    """The desktop bridge has not answered node b's create yet."""
+
+    def task_binding(self, contract, worktree, run_id, status):
+        from vibe_guide.adapters.task_provider import ProviderPending
+
+        from vibe_guide.task_registry import TaskBinding
+
+        if contract.get("node_id") == "b":
+            raise ProviderPending("provider capability bridge is pending")
+        return TaskBinding(
+            provider="runner", mode="background", issue_id=contract["node_id"],
+            role=contract["role"], task_id=contract["task_id"], host=None,
+            worktree=str(worktree), branch=str(contract.get("branch", "")),
+            status_file="", handoff_file="", run_id=run_id, status=status,
+            generation=contract["generation"],
+            allowlist=list(contract.get("files", [])),
+            capability_contract_digest=contract.get("capability_contract_digest"),
+            topology=str(contract.get("topology")),
+            limitations=list(contract.get("dispatch_limitations", [])),
+        )
+
+
+class PlatformHandoffUnservedLeaseTests(unittest.TestCase):
+    """A just-ready node whose create nobody claimed must survive a handoff."""
+
+    setUp = ScopeOnlyReauthorizationTests.setUp
+    tearDown = ScopeOnlyReauthorizationTests.tearDown
+    _nodes = staticmethod(ScopeOnlyReauthorizationTests._nodes)
+    _handoff_nodes = ScopeOnlyReauthorizationTests._handoff_nodes
+    _switch_platform = ScopeOnlyReauthorizationTests._switch_platform
+    _handoff = ScopeOnlyReauthorizationTests._handoff
+
+    def _a_accepted_b_unclaimed(self):
+        nodes = self._nodes()
+        plan = Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft")
+        record = authorize(
+            build_authorization_card(plan, nodes, self.capabilities), "AUTHORIZE"
+        )
+        runner = _PendingForBRunner(events={
+            ("a", "developer"): [("complete", {"evidence": "a"})],
+            ("a", "reviewer"): [("accepted", {"evidence": "a"})],
+        })
+        monitor = Monitor(self.paths, plan, nodes)
+        snapshot = monitor.start(record, runner)
+        for _ in range(6):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        return snapshot
+
+    def _b_leases(self):
+        return [(path, json.loads(path.read_text()))
+                for path in sorted((self.paths.vibe / "leases").glob("*.json"))
+                if json.loads(path.read_text())["node_id"] == "b"]
+
+    def _handoff_with(self, snapshot, runner=None):
+        self._switch_platform()
+        return self._handoff(snapshot, self._handoff_nodes(), runner or FakeRunner())
+
+    def _old_create(self, snapshot):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+
+        with patch("vibe_guide.adapters.task_provider.require_entry"):
+            return ProviderActionStore(self.paths).request(
+                operation="create", provider="workbuddy", run_id=snapshot.run_id,
+                issue_id="b", role="developer", generation=1, native_tool="native",
+                request={"authorization_digest": snapshot.authorization_digest},
+            )
+
+    def test_fixture_leaves_b_leased_but_unclaimed(self):
+        snapshot = self._a_accepted_b_unclaimed()
+        self.assertEqual(snapshot.nodes["a"]["status"], "accepted")
+        self.assertEqual(len(self._b_leases()), 1)
+        self.assertFalse(snapshot.nodes["b"].get("developer_identity"))
+        self.assertNotIn("b", snapshot.handles)
+        with self.assertRaises(FileNotFoundError):
+            load_task_binding(self.paths, "b", "developer", run_id=snapshot.run_id)
+
+    def test_handoff_rebinds_the_unclaimed_lease_and_the_new_platform_claims_b(self):
+        snapshot = self._a_accepted_b_unclaimed()
+        old_digest = self._b_leases()[0][1]["intent_digest"]
+        runner = FakeRunner(events={("b", "developer"): [("complete", {"evidence": "b"})],
+                                    ("b", "reviewer"): [("accepted", {"evidence": "b"})]})
+        monitor, _record, rebound = self._handoff_with(snapshot, runner)
+        self.assertNotEqual(rebound.nodes["b"]["status"], "blocked_unknown")
+        for _ in range(6):
+            rebound = monitor.tick(snapshot.run_id, runner)
+        self.assertEqual(rebound.nodes["b"]["status"], "accepted")
+        self.assertEqual(len([c for c in runner.start_calls if c["node_id"] == "b" and c["role"] == "developer"]), 1)
+        event = [e for e in load_events(self.paths, snapshot.run_id) if e["event"] == "handoff_lease_rebound"]
+        self.assertEqual(len(event), 1)
+        data = event[0]["data"]
+        self.assertEqual((data["node_id"], data["role"], data["generation"]), ("b", "developer", 1))
+        self.assertNotEqual(data["intent_digest"], old_digest)
+        self.assertIn("superseded_creates", data)
+
+    def test_rebind_keeps_exactly_one_active_lease(self):
+        snapshot = self._a_accepted_b_unclaimed()
+        old_path = self._b_leases()[0][0]
+        self._handoff_with(snapshot)
+        leases = self._b_leases()
+        self.assertEqual(len(leases), 1)
+        self.assertNotEqual(leases[0][0], old_path)
+        self.assertEqual(leases[0][1]["status"], "active")
+        self.assertEqual(leases[0][1]["run_id"], snapshot.run_id)
+
+    def test_old_platform_create_is_superseded_and_not_pending(self):
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+
+        snapshot = self._a_accepted_b_unclaimed()
+        old = self._old_create(snapshot)
+        self.assertEqual([a["action_id"] for a in ProviderActionStore(self.paths).pending(snapshot.run_id)],
+                         [old["action_id"]])
+        self._handoff_with(snapshot)
+        self.assertEqual(ProviderActionStore(self.paths).pending(snapshot.run_id), [])
+        marker = json.loads((self.paths.vibe / "provider-actions" / "stale" / (old["action_id"] + ".json")).read_text())
+        self.assertEqual(marker["reason"], "platform_handoff_superseded")
+        self.assertEqual(marker["request_digest"], old["request_digest"])
+        # Immutable request stays, and no provider result was forged.
+        self.assertTrue((self.paths.vibe / "provider-actions" / "requests" / (old["action_id"] + ".json")).exists())
+        self.assertFalse((self.paths.vibe / "provider-actions" / "results" / (old["action_id"] + ".json")).exists())
+
+    def test_a_claimed_create_is_never_superseded(self):
+        snapshot = self._a_accepted_b_unclaimed()
+        old = self._old_create(snapshot)
+        results = self.paths.vibe / "provider-actions" / "results"
+        results.mkdir(parents=True, exist_ok=True)
+        (results / (old["action_id"] + ".json")).write_text("{}")
+        _monitor, _record, rebound = self._handoff_with(snapshot)
+        self.assertEqual(rebound.nodes["b"]["status"], "blocked_unknown")
+        self.assertFalse((self.paths.vibe / "provider-actions" / "stale" / (old["action_id"] + ".json")).exists())
+
+    def _assert_still_blocked(self, snapshot):
+        _monitor, _record, rebound = self._handoff_with(snapshot)
+        self.assertEqual(rebound.nodes["b"]["status"], "blocked_unknown")
+        self.assertIn("another run", rebound.nodes["b"]["reason"])
+        self.assertFalse([e for e in load_events(self.paths, snapshot.run_id)
+                          if e["event"] == "handoff_lease_rebound"])
+
+    def _edit_b_lease(self, **changes):
+        path, payload = self._b_leases()[0]
+        payload.update(changes)
+        path.write_text(json.dumps(payload, sort_keys=True))
+
+    def test_a_lease_of_another_run_still_blocks(self):
+        snapshot = self._a_accepted_b_unclaimed()
+        self._edit_b_lease(run_id="run-someone-else")
+        self._assert_still_blocked(snapshot)
+
+    def test_a_lease_of_another_generation_is_never_rebound(self):
+        # The acquire rule never treated a different generation as a clash;
+        # the rebind must not touch such a lease either.
+        snapshot = self._a_accepted_b_unclaimed()
+        self._edit_b_lease(generation=7)
+        before = self._b_leases()
+        self._handoff_with(snapshot)
+        self.assertIn(before[0], self._b_leases())
+        self.assertFalse([e for e in load_events(self.paths, snapshot.run_id)
+                          if e["event"] == "handoff_lease_rebound"])
+
+    def test_a_node_with_a_task_binding_still_blocks(self):
+        snapshot = self._a_accepted_b_unclaimed()
+        save_task_binding(self.paths, TaskBinding(
+            provider="runner", mode="background", issue_id="b", role="developer",
+            task_id="developer:b", host=None, worktree=".worktrees/b", branch="branch-b",
+            status_file="", handoff_file="", run_id=snapshot.run_id, status="running",
+            generation=1, allowlist=["b.py"],
+        ))
+        self._assert_still_blocked(snapshot)
+
+    def test_a_node_with_a_start_confirmed_event_still_blocks(self):
+        snapshot = self._a_accepted_b_unclaimed()
+        monitor = Monitor(self.paths, Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft"), self._nodes())
+        live = load_snapshot(self.paths, snapshot.run_id)
+        monitor._record(live, "start_confirmed", {"run_id": live.run_id, "node_id": "b", "role": "developer"})
+        monitor._save_snapshot(live)
+        self._assert_still_blocked(live)
+
+    def test_without_a_platform_handoff_the_lease_is_never_rebound(self):
+        snapshot = self._a_accepted_b_unclaimed()
+        monitor = Monitor(self.paths, Plan("plan-1", 1, "docs/prd.md", ["a", "b"], "draft"), self._nodes())
+        live = load_snapshot(self.paths, snapshot.run_id)
+        self.assertFalse(monitor._adopt_unserved_handoff_lease(live, "b", "developer", 1, "f" * 64))
+        self.assertEqual(self._b_leases()[0][1]["intent_digest"] != "f" * 64, True)
