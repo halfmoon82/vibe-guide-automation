@@ -369,7 +369,20 @@ def _session_tokens(record):
         if isinstance(value, (int, float)) and value >= 0:
             return int(value)
     usage = record.get("usage")
+    message = record.get("message")
+    if (not isinstance(usage, dict) and record.get("type") == "function_call"
+            and isinstance(message, dict)):
+        usage = message.get("usage")
     if isinstance(usage, dict):
+        # WorkBuddy normalized usage includes cached tokens in input_tokens.
+        # ponytail: recognize only the observed top-level normalized shape;
+        # native Anthropic message.usage retains its additive cache semantics.
+        normalized = [usage.get(key) for key in
+                      ("input_tokens", "output_tokens", "total_tokens")]
+        if (all(isinstance(value, int) and not isinstance(value, bool)
+                and value >= 0 for value in normalized)
+                and normalized[2] == normalized[0] + normalized[1]):
+            return normalized[0]
         nested = _session_tokens(usage)
         if nested is not None:
             return nested

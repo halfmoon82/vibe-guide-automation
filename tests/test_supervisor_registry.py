@@ -186,6 +186,17 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(result["state"], "rotate")
         self.assertEqual(result["tokens"], 200105)
 
+    def test_workbuddy_normalized_usage_does_not_add_cached_subset(self):
+        path = Path(self.tmp.name) / "workbuddy.jsonl"
+        path.write_text(json.dumps({"type": "function_call", "message": {"usage": {
+            "input_tokens": 145819, "output_tokens": 169,
+            "total_tokens": 145988, "cache_read_input_tokens": 144338,
+        }}}) + '\n{"partial', encoding="utf-8")
+        with _patch_snapshot({"n1": "blocked_unknown"}):
+            result = supervisor_preflight(self.paths, "run-1", str(path))
+        self.assertEqual(result["tokens"], 145819)
+        self.assertEqual(result["state"], "work")
+
     def test_missing_record_is_unknown_not_idle(self):
         result = supervisor_preflight(self.paths, "run-1", "/nonexistent.json")
         self.assertEqual(result["state"], "unknown")
