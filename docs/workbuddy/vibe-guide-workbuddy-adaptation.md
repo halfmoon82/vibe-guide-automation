@@ -310,6 +310,14 @@ daemon stop → Daemon stopped.
 > `safe-delete-bulk-guard.cjs` 按**回合**计的删除额度（本机阈值 50）被打满——跑全量测试
 > 是主要消耗方，换回合即归零。完整机制见
 > [workbuddy-job-mcp-server.md](workbuddy-job-mcp-server.md) §5。
+>
+> **2026-10-26 定案（推翻本节"Jobs API 是可用派发路径"的预期）**：
+> Jobs agent 路径经源码层闭合证实**永远拿不到模型凭据**（detached 子进程继承不到宿主
+> session 的 run identity，broker 内层还主动删 `CODEBUDDY_GATEWAY_AUTH`）。窗口会话派发
+> （`POST /api/v1/sessions/{sid}/reply`）仍是唯一实测可用的可见路径，已落地为
+> `workbuddy_job__create` 的 `session_id` 分支；Jobs API 在本宿主上只能跑 `bash:true`
+> 作业。同时定案：WorkBuddy **没有自动换班入口**，rotate 只能靠用户在 UI 新开会话。
+> 详见 [workbuddy-dispatch-root-cause-and-fix.md](workbuddy-dispatch-root-cause-and-fix.md) §0.1。
 
 ---
 
