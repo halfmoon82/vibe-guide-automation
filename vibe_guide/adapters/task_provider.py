@@ -377,7 +377,8 @@ class ProviderActionStore:
             if previous is not None:
                 previous_id = str(previous["adapter_id"])
                 migrated = self.root / ("capabilities-" + previous_id + ".json")
-                if previous_id != adapter_id and not migrated.exists():
+                if (_SAFE_ID.fullmatch(previous_id) and previous_id != adapter_id
+                        and not migrated.exists()):
                     self._atomic(migrated, previous)
         self._atomic(self.root / ("capabilities-" + adapter_id + ".json"), payload)
         self._atomic(legacy, payload)

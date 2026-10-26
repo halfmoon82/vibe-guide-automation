@@ -157,6 +157,40 @@ class MissingAndLegacyRecordTests(_Case):
             sorted(self.store.capabilities_all()), ["claude-code", "workbuddy"]
         )
 
+    def _write_legacy(self, adapter_id, facts):
+        legacy = self.paths.vibe / "provider-actions" / "capabilities.json"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({
+            "schema_version": 1,
+            "adapter_id": adapter_id,
+            "facts": facts,
+            "provenance": "recorded by an older vibe",
+        }), encoding="utf-8")
+
+    def test_legacy_migration_never_overwrites_an_existing_per_adapter_file(self):
+        self.init()
+        self.attest("claude-code", CLAUDE_FACTS, provenance="current session")
+        stale = dict(CLAUDE_FACTS, **{"claude-code.shell": False})
+        self._write_legacy("claude-code", stale)
+        self.attest("workbuddy", WORKBUDDY_FACTS)
+        record = self.store.capabilities("claude-code")
+        self.assertEqual(record["facts"], CLAUDE_FACTS)
+        self.assertEqual(record["provenance"], "current session")
+
+    def test_legacy_migration_skips_an_unsafe_adapter_id(self):
+        self.init()
+        self._write_legacy("../escaped", CLAUDE_FACTS)
+        self.assertEqual(
+            self.attest("workbuddy", WORKBUDDY_FACTS).payload.get("status"), "ok"
+        )
+        self.assertFalse((self.paths.vibe / "capabilities-..").exists())
+        self.assertEqual(
+            sorted(p.name for p in (self.paths.vibe / "provider-actions").iterdir()
+                   if p.name.startswith("capabilities")),
+            ["capabilities-workbuddy.json", "capabilities.json"],
+        )
+        self.assertFalse(any(self.paths.vibe.glob("escaped*")))
+
 
 class AmbiguityTests(_Case):
     def test_adapterless_read_refuses_to_guess_among_several_records(self):
