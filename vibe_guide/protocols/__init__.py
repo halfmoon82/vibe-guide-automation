@@ -30,6 +30,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         # 2026-10-26: §6.5 single shift is the default; successors must be fresh
         # sessions (fork / >=100k start refused at register); unwritable .vibe
         # stops instead of retrying (run-63e7cfc2).
+        "01ca786432c5079da2685787986c342a551393208f79ff470814ca5b69f5d8a3",
+        # same day, first wording of the above (committed in 2a31b1b).
         "0cbbd0e63a258cb0592e5f001b8d0dee0a0639752a2a762e463eddac98249307",
         # 2026-10-26: §6.4/§6.5 WorkBuddy 定案——Jobs detached agent 拿不到
         # 模型 run identity（凭证边界为宿主设计），派发只能走窗口会话；

@@ -1947,7 +1947,7 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "Codex 桌面用 create_thread 的 project 目标，Claude Code 在仓库根目录启动新会话）。"
         "必须是全新会话：不要用 fork_thread 或复制上一班会话——fork 会带上整段历史，"
         "登记会被拒绝（run-63e7cfc2 实测接班即 29.7 万）。"
-        "接班会话写不了 .vibe/ 时（session_gate_blocked: no write access）不要重试、不要反复申请审批，"
+        "接班会话写不了 .vibe/ 时（session_gate_blocked: host sandbox denied access）不要重试、不要反复申请审批，"
         "停下把目录报给用户：",
         "  1) 登记：vibe supervisor-register --run-id {} --provider <平台> "
         "--session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>".format(run_id),

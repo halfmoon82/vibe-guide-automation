@@ -286,7 +286,7 @@ def screen_session(paths, session_id: str, request: str, origin: str = "user_ent
         # successor created as workspace-write without the project root).
         # Name the directory so the session reports it instead of retrying.
         raise PermissionError(
-            "session gate persistence failed: no write access to {}".format(paths.vibe_dir)
+            "session gate persistence failed: host sandbox denied access to {}".format(paths.vibe_dir)
         ) from error
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise PermissionError("session gate persistence failed") from error

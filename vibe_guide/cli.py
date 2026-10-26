@@ -2061,8 +2061,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             screen_session(paths, str(session_id), args.command)
         except (OSError, ValueError, PermissionError) as error:
             text = "会话筛选已阻塞：" + str(error)
-            if "no write access" in str(error):
-                text += ("。本会话的宿主沙箱不允许写这个目录，重试不会变；不要重试，"
+            if "host sandbox denied access" in str(error):
+                text += ("。本会话的宿主沙箱不允许读写这个目录，重试不会变；不要重试，"
                          "也不要反复申请审批：停下，把这个目录告诉用户，"
                          "由用户把会话切到可写该目录的权限，或在能写它的会话里继续")
             return _result(BLOCKED, {"command": args.command, "status": "session_gate_blocked", "reason": str(error)}, text, args.as_json)
