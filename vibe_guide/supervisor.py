@@ -371,18 +371,16 @@ def _session_tokens(record):
     usage = record.get("usage")
     message = record.get("message")
     if (not isinstance(usage, dict) and record.get("type") == "function_call"
-            and isinstance(message, dict)):
-        usage = message.get("usage")
+            and isinstance(message, dict) and isinstance(message.get("usage"), dict)):
+        # WorkBuddy function_call usage already counts cached tokens inside
+        # input_tokens, whatever its total says; adding the cache fields again
+        # double-counts the context.  A non-integer input is unknown, never
+        # a reason to fall back to the additive Anthropic reading.
+        value = message["usage"].get("input_tokens")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None
     if isinstance(usage, dict):
-        # WorkBuddy normalized usage includes cached tokens in input_tokens.
-        # ponytail: recognize only the observed top-level normalized shape;
-        # native Anthropic message.usage retains its additive cache semantics.
-        normalized = [usage.get(key) for key in
-                      ("input_tokens", "output_tokens", "total_tokens")]
-        if (all(isinstance(value, int) and not isinstance(value, bool)
-                and value >= 0 for value in normalized)
-                and normalized[2] == normalized[0] + normalized[1]):
-            return normalized[0]
         nested = _session_tokens(usage)
         if nested is not None:
             return nested

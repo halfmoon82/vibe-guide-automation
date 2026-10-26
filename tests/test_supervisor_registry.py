@@ -197,6 +197,31 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(result["tokens"], 145819)
         self.assertEqual(result["state"], "work")
 
+    def test_workbuddy_usage_without_matching_total_still_skips_cached_subset(self):
+        # Review P2: a WorkBuddy record whose total is missing or computed
+        # differently must not fall back to adding the cached subset again.
+        for extra in ({}, {"total_tokens": 999999}):
+            with self.subTest(extra=extra):
+                path = Path(self.tmp.name) / "workbuddy-shape.jsonl"
+                usage = {"input_tokens": 145819, "output_tokens": 169,
+                         "cache_read_input_tokens": 144338}
+                usage.update(extra)
+                path.write_text(json.dumps({"type": "function_call",
+                                            "message": {"usage": usage}}) + "\n",
+                                encoding="utf-8")
+                with _patch_snapshot({"n1": "blocked_unknown"}):
+                    result = supervisor_preflight(self.paths, "run-1", str(path))
+                self.assertEqual(result["tokens"], 145819)
+
+    def test_workbuddy_usage_without_integer_input_is_unknown(self):
+        path = Path(self.tmp.name) / "workbuddy-bad.jsonl"
+        path.write_text(json.dumps({"type": "function_call", "message": {"usage": {
+            "input_tokens": "145819", "cache_read_input_tokens": 144338,
+        }}}) + "\n", encoding="utf-8")
+        with _patch_snapshot({"n1": "blocked_unknown"}):
+            result = supervisor_preflight(self.paths, "run-1", str(path))
+        self.assertEqual(result["state"], "unknown")
+
     def test_missing_record_is_unknown_not_idle(self):
         result = supervisor_preflight(self.paths, "run-1", "/nonexistent.json")
         self.assertEqual(result["state"], "unknown")
