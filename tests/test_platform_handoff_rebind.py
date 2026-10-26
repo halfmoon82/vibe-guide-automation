@@ -228,6 +228,26 @@ class PlatformHandoffRebindTests(HandoffCase):
         self.assertEqual(len([e for e in load_events(self.paths, self.run_id)
                               if e["event"] == "authorization_reauthorized"]), 0)
 
+    def test_an_acceptance_change_alongside_the_handoff_is_refused_and_nothing_moves(self):
+        self.ready_unclaimed()
+        path = self.root / ".vibe" / "plans" / PLAN / "nodes.json"
+        items = _read(path)
+        for item in items:
+            if item["id"] == SECOND:
+                item["contract"]["acceptance_example"] = "verified_fact: 改过的验收例子"
+        path.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+        card_before = _read(self.root / ".vibe" / "plans" / PLAN / "authorization-card.json")
+        self.switch_platform("claude-code")
+        result = self.handoff()
+        self.assertEqual(result.payload["status"], "blocked_design", result.payload)
+        self.assertIn("contract_drift", result.payload["reason"])
+        self.assertIn(SECOND, result.payload["reason"])
+        self.assertEqual(self.plan_card().agent_id, "workbuddy")
+        self.assertEqual(_read(self.root / ".vibe" / "plans" / PLAN / "authorization-card.json"), card_before)
+        self.assertEqual(len([e for e in load_events(self.paths, self.run_id)
+                              if e["event"] == "authorization_reauthorized"]), 0)
+        self.assertEqual(self.snapshot().authorization["agent_id"], "workbuddy")
+
     def test_a_platform_without_a_dispatch_lifecycle_is_refused_the_same_way(self):
         self.ready_unclaimed()
         nodes_before = self.node_file()
