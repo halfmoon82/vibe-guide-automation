@@ -296,6 +296,7 @@ _EVENT_DATA_KEYS = {
     *CONSISTENCY_CORRECTION_KEYS,
     "authorization_digest",
     "authorization_epoch",
+    "superseded_creates",
     "capability_contract_digest",
     "checkpoint_sha",
     "last_event_seq",
@@ -1940,9 +1941,13 @@ def release_writer_lease(
 
 def rebind_writer_lease(
     paths: ProjectPaths, node_id: str, worktree: str, run_id: str,
-    role: str, generation: int, previous_intent_digest: str, intent_digest: str,
+    role: str, generation: int, previous_intent_digest: Optional[str], intent_digest: str,
+    *, previous_status: str = "quarantined",
 ) -> bool:
-    """Move one same-run, same-generation quarantined lease to a new intent.
+    """Move one same-run, same-generation lease (quarantined by default) to a new intent.
+
+    ``previous_intent_digest=None`` accepts the one lease that differs from
+    ``intent_digest`` (platform_handoff: the old digest is not recomputable).
 
     Only the orphan-adoption recovery uses this: the writer is unchanged, the
     authorization that names it was re-issued.  Any other active/quarantined
@@ -1980,8 +1985,10 @@ def rebind_writer_lease(
             if (probe.get("node_id") == node_id and probe.get("worktree") == worktree
                     and probe.get("run_id") == run_id and probe.get("role") == role
                     and probe.get("generation") == generation
-                    and probe.get("intent_digest") == previous_intent_digest
-                    and probe.get("status") == "quarantined"):
+                    and (probe.get("intent_digest") == previous_intent_digest
+                         or (previous_intent_digest is None
+                             and probe.get("intent_digest") != intent_digest))
+                    and probe.get("status") == previous_status):
                 previous.append(candidate)
                 continue
             return False

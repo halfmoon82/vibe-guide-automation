@@ -794,6 +794,67 @@ class ProviderActionStore:
             changed.append(str(action.get("action_id")))
         return changed
 
+    def has_result_for(self, run_id: str, issue_id: str) -> bool:
+        """Whether any request of this node already has a provider result."""
+        request_dir = self.root / "requests"
+        if not request_dir.is_dir():
+            return False
+        for path in sorted(request_dir.glob("action-*.json")):
+            action = self._read(path)
+            if (
+                action.get("run_id") == run_id and action.get("issue_id") == issue_id
+                and (self.root / "results" / path.name).exists()
+            ):
+                return True
+        return False
+
+    def supersede_unclaimed_creates(
+        self, run_id: str, issue_id: str, role: str, generation: int,
+        authorization_digest: str,
+    ) -> List[str]:
+        """Hide this role's unclaimed create requests from before a handoff.
+
+        platform_handoff re-keys the dispatch under a new authorization, and
+        the action id embeds the provider, so the new platform emits a second
+        create beside the old one.  A create with no result, written under
+        another authorization digest, was never claimed: mark it stale (an
+        audit marker beside the immutable request; the native tool is never
+        invoked) so only one create stays pending.  A request without a
+        readable authorization digest, or with a result, is left alone.
+        """
+        if not all(isinstance(value, str) and value for value in (run_id, issue_id, role, authorization_digest)):
+            raise ValueError("provider request identity is required")
+        changed = []
+        request_dir = self._directory("requests")
+        stale_dir = self._directory("stale")
+        for path in sorted(request_dir.glob("action-*.json")):
+            if (self.root / "results" / path.name).exists() or (stale_dir / path.name).exists():
+                continue
+            action = self._read(path)
+            envelope = action.get("request")
+            digest = envelope.get("authorization_digest") if isinstance(envelope, Mapping) else None
+            if (
+                action.get("run_id") != run_id or action.get("issue_id") != issue_id
+                or action.get("role") != role or action.get("operation") != "create"
+                or action.get("generation") != generation
+                or not isinstance(digest, str) or digest == authorization_digest
+            ):
+                continue
+            self._atomic(stale_dir / path.name, {
+                "schema_version": self.schema_version,
+                "status": "stale",
+                "reason": "platform_handoff_superseded",
+                "action_id": action.get("action_id"),
+                "request_digest": action.get("request_digest"),
+                "run_id": run_id,
+                "issue_id": issue_id,
+                "role": role,
+                "generation": generation,
+                "authorization_digest": digest,
+            })
+            changed.append(str(action.get("action_id")))
+        return changed
+
     def record_worker_delivery(self, run_id, issue_id, role, payload, generation):
         """Worker self-reported delivery, idempotent and format-gated.
 
