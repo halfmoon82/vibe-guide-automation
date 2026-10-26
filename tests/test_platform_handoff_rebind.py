@@ -17,7 +17,7 @@ from pathlib import Path
 from vibe_guide.adapters.task_provider import ProviderActionStore
 from unittest.mock import patch
 
-from vibe_guide.authorization import acceptance_contract_projection
+from vibe_guide.authorization import acceptance_contract_projection, rebind_dispatch_contract
 from vibe_guide.capability_contract import build_contract, save_contract
 from vibe_guide.cli import _load_plan, run_cli
 from vibe_guide.handoff_rebind import (
@@ -345,6 +345,189 @@ class PlatformHandoffRebindTests(HandoffCase):
         leases = [json.loads(p.read_text()) for p in sorted((self.root / ".vibe" / "leases").glob("*.json"))
                   if json.loads(p.read_text())["node_id"] == SECOND]
         self.assertEqual([lease["status"] for lease in leases], ["active"])
+
+
+class ReuseCurrentAttestationTests(HandoffCase):
+    """`reuse_current` keeps evidence only while it still says what is observed."""
+
+    def setUp(self):
+        super().setUp()
+        self.published_on("workbuddy")
+        self.path = self.root / ".vibe" / "plans" / PLAN / "engine-attestation.json"
+        self.published = _read(self.path)
+        self.plan = _load_plan(self.paths, PLAN)[1]
+        self.observed = ProviderActionStore(self.paths).capabilities("workbuddy")
+
+    def observe(self):
+        from vibe_guide import cli as cli_module
+
+        return cli_module._observed_engine_attestation(self.paths, self.plan, "workbuddy", True)
+
+    def write(self, *, provider=None, facts=None, provenance=None, now=None):
+        from vibe_guide.engine_attestation import create_engine_attestation
+
+        evidence = create_engine_attestation(
+            self.plan.plan_id, self.plan.version, "vibeguide_monitor", "dag",
+            provider or self.observed["adapter_id"],
+            self.observed["facts"] if facts is None else facts,
+            provenance or self.observed["provenance"],
+            now or self.published["generated_at"],
+        )
+        self.path.write_text(json.dumps(evidence), encoding="utf-8")
+        return evidence
+
+    def test_matching_current_evidence_is_reused_verbatim(self):
+        self.assertEqual(self.observe(), self.published)
+
+    def test_a_different_provider_is_not_reused(self):
+        written = self.write(provider="cursor")
+        result = self.observe()
+        self.assertNotEqual(result, written)
+        self.assertEqual(result["provider"], "workbuddy")
+
+    def test_expired_evidence_is_not_reused(self):
+        from datetime import datetime, timedelta, timezone
+
+        old = (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat().replace("+00:00", "Z")
+        written = self.write(now=old)
+        result = self.observe()
+        self.assertNotEqual(result, written)
+        self.assertNotEqual(result["generated_at"], old)
+
+    def test_different_capability_facts_are_not_reused(self):
+        facts = dict(self.observed["facts"])
+        facts["workbuddy.visible_task.wait"] = not facts["workbuddy.visible_task.wait"]
+        written = self.write(facts=facts)
+        result = self.observe()
+        self.assertNotEqual(result, written)
+        self.assertEqual(result["capability_facts"], self.observed["facts"])
+
+    def test_different_provenance_is_not_reused(self):
+        written = self.write(provenance="someone else observed this")
+        result = self.observe()
+        self.assertNotEqual(result, written)
+        self.assertEqual(result["provenance"], self.observed["provenance"])
+
+    def test_without_reuse_every_call_stamps_fresh_evidence(self):
+        from vibe_guide import cli as cli_module
+
+        fresh = cli_module._observed_engine_attestation(self.paths, self.plan, None, False)
+        self.assertNotEqual(fresh["digest"], self.published["digest"])
+
+
+class RebindDispatchContractTests(unittest.TestCase):
+    PROFILE = {"worker": "old", "model": "m", "reasoning": "r", "fallbacks": [{"model": "f"}],
+               "selection_basis": {"k": "v"}, "route_digest": "", "writer": "w",
+               "worktree": ".worktrees/n", "branch": "b", "allowlist": ["n.py"]}
+
+    def contract(self, worker):
+        from vibe_guide.models import WorkerProfile
+
+        profile = WorkerProfile.from_dict(dict(self.PROFILE, worker=worker)).to_dict()
+        return {"adapter_id": "old", "worker": worker, "reviewer_worker": "reviewer",
+                "worker_profile": profile, "files": ["n.py"]}
+
+    def test_profile_worker_equal_to_the_old_platform_is_renamed(self):
+        result = rebind_dispatch_contract(self.contract("old"), "new")
+        self.assertEqual(result["worker_profile"]["worker"], "new")
+
+    def test_profile_worker_not_equal_to_the_old_platform_is_untouched(self):
+        result = rebind_dispatch_contract(self.contract("worker-x"), "new")
+        self.assertEqual(result["worker_profile"]["worker"], "worker-x")
+        self.assertEqual(result["adapter_id"], "new")
+
+    def test_every_other_profile_leaf_is_byte_identical(self):
+        before = self.contract("old")
+        result = rebind_dispatch_contract(before, "new")
+        for key in ("model", "reasoning", "route_digest", "selection_basis", "fallbacks",
+                    "writer", "worktree", "branch", "allowlist"):
+            self.assertEqual(result["worker_profile"][key], before["worker_profile"][key], key)
+        self.assertEqual(result["files"], before["files"])
+        self.assertEqual(before["adapter_id"], "old")
+        self.assertEqual(before["worker_profile"]["worker"], "old")
+
+
+class HandoffCrashWindowTests(HandoffCase):
+    def ready(self):
+        self.published_on("workbuddy")
+        self.switch_platform("claude-code")
+
+    def leases(self):
+        return [json.loads(p.read_text()) for p in sorted((self.root / ".vibe" / "leases").glob("*.json"))
+                if json.loads(p.read_text())["node_id"] == SECOND]
+
+    def assert_converged(self):
+        self.assertEqual(self.plan_nodes()[SECOND].contract["adapter_id"], "claude-code")
+        self.assertEqual(self.plan_card().agent_id, "claude-code")
+        self.assertEqual([lease["status"] for lease in self.leases()], ["active"])
+        attestation = _read(self.root / ".vibe" / "plans" / PLAN / "engine-attestation.json")
+        self.assertEqual(attestation["provider"], "claude-code")
+        self.assertEqual(self.plan_card().engine_evidence_ref, attestation["evidence_ref"])
+        self.serve(SECOND)
+        self.assertEqual(self.snapshot().nodes[SECOND]["status"], "accepted")
+
+    def test_nodes_written_but_card_not_converges_on_rerun(self):
+        from vibe_guide import cli as cli_module
+
+        self.ready()
+        real = cli_module._atomic_json
+
+        def crash(path, payload):
+            if Path(path).name == "authorization-card.json":
+                raise OSError("injected crash before the card")
+            return real(path, payload)
+
+        with patch.object(cli_module, "_atomic_json", crash):
+            self.handoff()
+        self.assertEqual(self.plan_nodes()[SECOND].contract["adapter_id"], "claude-code")
+        self.assertEqual(self.plan_card().agent_id, "workbuddy")
+        rerun = self.handoff()
+        self.assertNotEqual(rerun.payload["status"], "blocked_unknown", rerun.payload)
+        self.assert_converged()
+
+    def _crash_on_reauthorized_event(self):
+        from vibe_guide.monitor import Monitor
+
+        real = Monitor._record
+
+        def crash(self_, snapshot, event_name, *args, **kwargs):
+            if event_name == "authorization_reauthorized":
+                raise RuntimeError("injected crash before the event")
+            return real(self_, snapshot, event_name, *args, **kwargs)
+
+        return patch.object(Monitor, "_record", crash)
+
+    def test_evidence_swapped_but_event_not_written_rolls_back_and_converges(self):
+        self.ready()
+        path = self.root / ".vibe" / "plans" / PLAN / "engine-attestation.json"
+        before = path.read_bytes()
+        with self._crash_on_reauthorized_event():
+            interrupted = self.handoff()
+        self.assertEqual(interrupted.payload["status"], "unknown", interrupted.payload)
+        # A failure that still runs Python rolls the evidence back with the run.
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.snapshot().authorization["agent_id"], "workbuddy")
+        rerun = self.handoff()
+        self.assertNotEqual(rerun.payload["status"], "blocked_unknown", rerun.payload)
+        self.assert_converged()
+
+    def test_hard_kill_leaving_new_evidence_without_the_event_converges(self):
+        """The rollback itself cannot run in a real kill: keep the new file."""
+        from vibe_guide import cli as cli_module
+
+        self.ready()
+        path = self.root / ".vibe" / "plans" / PLAN / "engine-attestation.json"
+        before = path.read_bytes()
+        with self._crash_on_reauthorized_event(), patch.object(
+            cli_module, "_atomic_bytes", side_effect=OSError("killed before rollback")
+        ):
+            interrupted = self.handoff()
+        self.assertEqual(interrupted.payload["status"], "unknown", interrupted.payload)
+        self.assertNotEqual(path.read_bytes(), before)
+        self.assertEqual(self.snapshot().authorization["agent_id"], "workbuddy")
+        rerun = self.handoff()
+        self.assertNotEqual(rerun.payload["status"], "blocked_unknown", rerun.payload)
+        self.assert_converged()
 
 
 class ResolveHandoffTargetTests(unittest.TestCase):
