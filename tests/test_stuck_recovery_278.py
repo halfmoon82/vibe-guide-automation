@@ -1,8 +1,8 @@
 """Issue #278: stuck-session repair folds the manual recovery checklist into
 ``vibe repair`` / ``vibe requeue`` (``Monitor.repair_node``).
 
-Business contract: after a developer session is stopped externally
-(stopped/done/blocked) one ``vibe repair --node <id>`` must mark the task
+Business contract: after a developer session is proven stopped externally
+(stopped/failed/archived binding) one ``vibe repair --node <id>`` must mark the task
 binding failed, release the (possibly quarantined) writer lease, retire the
 dead handle, clear the quarantine and queue a same-issue successor dispatch;
 ``vibe resume`` then starts the successor without manual state.json edits.
@@ -180,8 +180,24 @@ class StuckRecoveryTests(unittest.TestCase):
             self.paths, "n1", "developer", run_id=snapshot.run_id
         )
 
-        result = monitor.repair_node("n1", snapshot.run_id)
+        # Persistence redacts provider text; inject the observed reason in
+        # memory as the supervisor does when requesting a same-task retry.
+        original = monitor._recovery_snapshot
 
+        def with_raw_reason(node_id, run_id=None):
+            loaded = original(node_id, run_id)
+            loaded.nodes[node_id]["reason"] = "connection timed out"
+            return loaded
+
+        with patch.object(monitor, "_recovery_snapshot", side_effect=with_raw_reason):
+            result = monitor.repair_node("n1", snapshot.run_id)
+
+        persisted = load_snapshot(self.paths, snapshot.run_id)
+        self.assertEqual(persisted.nodes["n1"]["status"], "retry_pending")
+        retry = persisted.nodes["n1"]["retryable_action"]
+        self.assertTrue(retry["same_task_required"])
+        self.assertFalse(retry["successor"])
+        self.assertNotIn("manual_repair_required", retry)
         self.assertNotEqual(result["kind"], "stuck_session")
         after = load_task_binding(
             self.paths, "n1", "developer", run_id=snapshot.run_id
@@ -251,33 +267,99 @@ class StuckRecoveryTests(unittest.TestCase):
             read_writer_lease(self.paths, "n1", ".worktrees/n1")
         )
 
-    def test_blocked_binding_folds_cleanup_and_successor(self):
-        """P2: a binding parked at blocked_unknown (the contract's "blocked"
-        shape) is dead too -- repair folds the checklist instead of bouncing
-        back to manual_repair_required, and the normalized failed binding
-        lets the successor register."""
+    def test_nonterminal_binding_never_authorizes_successor_cleanup(self):
         monitor, runner, snapshot = self._running_snapshot()
-        binding = self._stop_binding(snapshot, "blocked_unknown")
+        for status in ("blocked_unknown", "blocked_design", "delivered", "accepted"):
+            with self.subTest(status=status):
+                binding = self._stop_binding(snapshot, status)
+                handle = snapshot.handles["n1"]
+                monitor.repair_node("n1", snapshot.run_id)
+                persisted = load_snapshot(self.paths, snapshot.run_id)
+                self.assertEqual(persisted.handles.get("n1"), handle)
+                self.assertIsNotNone(persisted.nodes["n1"].get("active_task"))
+                self.assertIsNotNone(read_writer_lease(self.paths, "n1", ".worktrees/n1"))
+                after = load_task_binding(self.paths, "n1", "developer", run_id=snapshot.run_id)
+                self.assertNotIn(after.status, ("stopped", "failed", "archived"))
+                self.assertEqual(after.task_id, binding.task_id)
+                self.assertFalse((persisted.nodes["n1"].get("retryable_action") or {}).get("successor"))
+
+    def test_repair_preserves_delivered_same_task_recovery(self):
+        monitor, runner, snapshot = self._running_snapshot()
+        binding = self._stop_binding(snapshot, "delivered")
+        current = snapshot.nodes["n1"]
+        handle = snapshot.handles.pop("n1")
+        current.update(
+            status="blocked_unknown", active_role=None, active_task=None,
+            start_intent=None, retryable_action=None, reviewer_started=False,
+            quarantine={"run_id": snapshot.run_id, "handle_id": handle,
+                        "reason": "interrupted authorized continuation"},
+        )
+        save_snapshot(self.paths, snapshot)
+        monitor.repair_node("n1", snapshot.run_id)
+        with patch("vibe_guide.monitor.require_entry", return_value=None):
+            resumed = monitor.resume(snapshot.run_id, runner)
+        self.assertEqual(resumed.nodes["n1"]["status"], "rework")
+        self.assertEqual(len(runner.start_calls), 2)
+        self.assertTrue(runner.start_calls[-1]["continuation"])
+        self.assertFalse(runner.start_calls[-1]["successor"])
+        after = load_task_binding(self.paths, "n1", "developer", run_id=snapshot.run_id)
+        self.assertEqual(after.task_id, binding.task_id)
+
+    def test_repair_preserves_existing_delivered_continuation(self):
+        monitor, runner, snapshot = self._running_snapshot()
+        binding = self._stop_binding(snapshot, "delivered")
+        current = snapshot.nodes["n1"]
+        snapshot.handles.pop("n1")
+        retry = {"role": "developer", "phase": "rework", "continuation": True,
+                 "pending_schedule": True, "successor": False}
+        current.update(status="blocked_unknown", active_role=None, active_task=None,
+                       start_intent=None, retryable_action=retry, reviewer_started=False,
+                       pair_archived=True,
+                       quarantine={"run_id": snapshot.run_id, "handle_id": None,
+                                   "reason": "interrupted authorized continuation"})
+        save_snapshot(self.paths, snapshot)
+        monitor.repair_node("n1", snapshot.run_id)
+        persisted = load_snapshot(self.paths, snapshot.run_id)
+        self.assertEqual(persisted.nodes["n1"]["retryable_action"], retry)
+        with patch("vibe_guide.monitor.require_entry", return_value=None):
+            resumed = monitor.resume(snapshot.run_id, runner)
+        self.assertEqual(resumed.nodes["n1"]["status"], "rework")
+        self.assertTrue(runner.start_calls[-1]["continuation"])
+        self.assertFalse(runner.start_calls[-1]["successor"])
+        self.assertEqual(load_task_binding(self.paths, "n1", "developer",
+                                          run_id=snapshot.run_id).task_id, binding.task_id)
+
+    def test_stale_failed_binding_cannot_retire_current_writer(self):
+        monitor, runner, snapshot = self._running_snapshot()
+        self._stop_binding(snapshot, "failed")
+        current = snapshot.nodes["n1"]
+        current["developer_generation"] += 1
+        current["active_task"]["generation"] = current["developer_generation"]
+        save_snapshot(self.paths, snapshot)
+        handle = snapshot.handles["n1"]
 
         result = monitor.repair_node("n1", snapshot.run_id)
 
-        self.assertEqual(result["kind"], "stuck_session")
-        self.assertTrue(result["steps"]["binding_failed"])
         persisted = load_snapshot(self.paths, snapshot.run_id)
-        self.assertEqual(
-            persisted.tasks["n1:developer"]["status"], "failed"
-        )
-        self.assertNotIn("n1", persisted.handles)
-        self.assertTrue(
-            persisted.nodes["n1"]["retryable_action"]["pending_schedule"]
-        )
-        with patch("vibe_guide.monitor.require_entry", return_value=None):
-            resumed = monitor.resume(snapshot.run_id, runner)
-        self.assertEqual(resumed.nodes["n1"]["status"], "running")
-        successor = load_task_binding(
-            self.paths, "n1", "developer", run_id=snapshot.run_id
-        )
-        self.assertEqual(successor.successor_of, binding.task_id)
+        self.assertEqual(result["status"], "blocked_unknown")
+        self.assertEqual(persisted.handles.get("n1"), handle)
+        self.assertEqual(persisted.nodes["n1"]["active_task"], current["active_task"])
+        self.assertIsNotNone(read_writer_lease(self.paths, "n1", ".worktrees/n1"))
+        self.assertFalse(persisted.nodes["n1"]["retryable_action"].get("successor"))
+
+    def test_binding_retirement_failure_preserves_all_writer_marks(self):
+        monitor, runner, snapshot = self._running_snapshot()
+        self._stop_binding(snapshot, "stopped")
+        active = dict(snapshot.nodes["n1"]["active_task"])
+        handle = snapshot.handles["n1"]
+        with patch.object(monitor, "_set_binding_status", side_effect=OSError("registry unavailable")):
+            result = monitor.repair_node("n1", snapshot.run_id)
+        persisted = load_snapshot(self.paths, snapshot.run_id)
+        self.assertEqual(result["status"], "blocked_unknown")
+        self.assertEqual(persisted.handles.get("n1"), handle)
+        self.assertEqual(persisted.nodes["n1"]["active_task"], active)
+        self.assertIsNotNone(read_writer_lease(self.paths, "n1", ".worktrees/n1"))
+        self.assertFalse(persisted.nodes["n1"]["retryable_action"].get("successor"))
 
 
 if __name__ == "__main__":
