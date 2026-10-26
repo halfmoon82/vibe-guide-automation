@@ -82,6 +82,7 @@ from .state import (
     read_writer_lease,
     redact_provider_text,
     release_writer_lease,
+    rebind_writer_lease,
     run_dir,
     save_snapshot,
     scope_only_expansion_binds,
@@ -4826,7 +4827,7 @@ class Monitor:
                 retry_role = str(retry["role"])
                 retry_generation = int(current.get("review_generation" if retry_role == "reviewer" else "developer_generation", 0)) + 1
                 retry_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, retry_role, retry_generation, current))
-                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation):
+                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, retry_role, retry_generation, retry_digest):
                     self._mark_blocked_unknown(
                         snapshot,
                         node_id,
@@ -4877,7 +4878,7 @@ class Monitor:
                 retry_role = "reviewer"
                 retry_generation = int(current.get("review_generation", 0)) + 1
                 retry_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, retry_role, retry_generation, current))
-                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation):
+                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, retry_role, retry_generation, retry_digest):
                     self._mark_blocked_unknown(
                         snapshot,
                         node_id,
@@ -4929,7 +4930,7 @@ class Monitor:
             generation_key = "review_generation" if first_role == "reviewer" else "developer_generation"
             first_generation = int(current.get(generation_key, 0)) + 1
             first_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, first_role, first_generation, current))
-            if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, first_digest, first_role, first_generation):
+            if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, first_digest, first_role, first_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, first_role, first_generation, first_digest):
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
@@ -4943,6 +4944,96 @@ class Monitor:
             # A create left pending (retry marker, no handle yet) still holds
             # its slot, so recount instead of trusting the start result.
             active_sessions = self._count_active_sessions(snapshot)
+
+    def _handoff_replaced_authorization(self, snapshot: RunSnapshot) -> Optional[str]:
+        """The authorization digest the latest reauthorization replaced, when
+        that reauthorization was a platform_handoff into the current one.
+
+        Only the most recent reauthorization counts: a later ordinary
+        reauthorization moves the digest again, and then nothing recorded
+        proves which requests predate the handoff, so this returns None.
+        """
+        latest = None
+        for event in load_events(self.paths, snapshot.run_id)[: snapshot.event_sequence]:
+            if event.get("event") == "authorization_reauthorized":
+                latest = event.get("data", {})
+        if (
+            not isinstance(latest, dict)
+            or latest.get("change_reason") != "platform_handoff"
+            or latest.get("authorization_digest") != snapshot.authorization_digest
+        ):
+            return None
+        previous = latest.get("previous_authorization_digest")
+        if not isinstance(previous, str) or len(previous) != 64:
+            return None
+        return previous
+
+    def _adopt_unserved_handoff_lease(
+        self, snapshot: RunSnapshot, node_id: str, role: str, generation: int, digest: str
+    ) -> bool:
+        """Re-key this run's own unclaimed lease after a platform_handoff.
+
+        The intent digest binds the authorization, so the handoff's new
+        authorization makes the lease registered before it look foreign.  The
+        lease may move to the new digest only when the run's latest
+        reauthorization is a platform_handoff and nothing ever claimed the
+        node: no binding, no task identity, no handle, no ``start_confirmed``,
+        no mailbox claim mark (``ProviderActionStore.claim_evidence``).
+        Anything unprovable returns False and the caller keeps blocked_unknown.
+
+        Order matters for crash recovery: hide the old create first (an
+        idempotent step), then move the lease, then record the event.  A crash
+        before the move leaves the old lease, so the next attempt re-enters
+        here and converges; a crash after it leaves nothing to clean up.
+        """
+        current = snapshot.nodes[node_id]
+        try:
+            replaced = self._handoff_replaced_authorization(snapshot)
+            if replaced is None:
+                return False
+            if (
+                current.get("developer_identity") or current.get("reviewer_identity")
+                or current.get("active_task") or node_id in snapshot.handles
+            ):
+                return False
+            for other in ("developer", "reviewer"):
+                try:
+                    self._load_task_binding(snapshot, node_id, other)
+                except FileNotFoundError:
+                    continue
+                return False
+            if any(
+                event.get("event") == "start_confirmed"
+                and event.get("data", {}).get("node_id") == node_id
+                for event in load_events(self.paths, snapshot.run_id)[: snapshot.event_sequence]
+            ):
+                return False
+            store = ProviderActionStore(self.paths)
+            if store.claim_evidence(snapshot.run_id, node_id) is not None:
+                return False
+            superseded = store.supersede_unclaimed_creates(
+                snapshot.run_id, node_id, role, generation, replaced
+            )
+            if not rebind_writer_lease(
+                self.paths, node_id, str(current["worktree"]), snapshot.run_id,
+                role, generation, None, digest, previous_status="active",
+            ):
+                return False
+        except (OSError, TypeError, ValueError):
+            return False
+        self._record(
+            snapshot,
+            "handoff_lease_rebound",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": role,
+                "generation": generation,
+                "intent_digest": digest,
+                "superseded_creates": superseded,
+            },
+        )
+        return True
 
     def _brief_allows_first_write(
         self, snapshot: RunSnapshot, node_id: str, node: DAGNode
@@ -10155,6 +10246,10 @@ class Monitor:
                     for pending_item in pending
                     if pending_item != item
                 ]
+            elif record["event"] == "handoff_lease_rebound":
+                # Evidence only: the lease file was re-keyed before the event.
+                if provenance.get("role") != "system" or not self._run_has_platform_handoff(snapshot):
+                    raise ValueError("handoff lease rebound replay provenance is invalid")
             elif record["event"] == "handoff_predecessor_reconciled":
                 # Evidence only: the registry already holds the archived
                 # predecessor, and the successor's own start events replay
