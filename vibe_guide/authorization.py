@@ -786,6 +786,30 @@ def route_only_acceptance_binds(
     )
 
 
+def rebind_dispatch_contract(contract: Dict[str, Any], to_adapter: str) -> Dict[str, Any]:
+    """The contract with only its platform-naming dispatch fields moved.
+
+    ``acceptance_contract_projection`` is the one definition of which leaves
+    are routing: this function may only write those, so whatever it returns
+    projects identically to its input.  ``adapter_id`` always moves; a worker
+    label moves only when it was literally the old platform's id (an adapter
+    name used as a worker name).  Model and reasoning are never touched: what
+    the new platform calls them is not derivable, and guessing would be
+    inventing a route nobody verified.
+    """
+    old = contract.get("adapter_id")
+    rebound = dict(contract)
+    rebound["adapter_id"] = to_adapter
+    if isinstance(old, str) and old.strip():
+        for key in ("worker", "reviewer_worker"):
+            if rebound.get(key) == old:
+                rebound[key] = to_adapter
+        profile = rebound.get("worker_profile")
+        if isinstance(profile, dict) and profile.get("worker") == old:
+            rebound["worker_profile"] = dict(profile, worker=to_adapter)
+    return rebound
+
+
 def integration_contract_projection(plan: Plan, nodes: List[DAGNode]) -> Dict[str, Any]:
     """The integration contract the card freezes, from its two sources.
 
@@ -1737,8 +1761,12 @@ def refresh_authorization_card(
     engine_attestation: Optional[Dict[str, Any]] = None,
     heartbeat_interval_options: Optional[Any] = None,
     rotate_hard_cap_options: Optional[Any] = None,
+    agent_id: Optional[str] = None,
 ) -> AuthorizationCard:
     """Rebuild a same-plan card while retaining its approved agent/capacity scope.
+
+    ``agent_id`` is for a platform handoff only: it names the platform the
+    run moves to.  Left ``None`` the approved agent is carried forward.
 
     The agent/capacity envelope is retained from ``previous`` because it was
     already approved; the per-node worker topology is *not*.  It is re-derived
@@ -1766,7 +1794,7 @@ def refresh_authorization_card(
     ):
         raise ValueError("reauthorization must remain on the same plan revision")
     capabilities = AgentCapabilities(
-        previous.agent_id,
+        agent_id or previous.agent_id,
         False,
         False,
         False,
