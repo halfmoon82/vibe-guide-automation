@@ -148,7 +148,7 @@ class CardOptionAvailabilityTests(unittest.TestCase):
     def test_three_hundred_thousand_needs_a_reported_window(self):
         unknown = rotate_hard_cap_options(None)
         self.assertEqual([item["tokens"] for item in unknown],
-                         [150000, 200000, 300000])
+                         [150000, 200000, 300000, 500000, 800000])
         self.assertTrue(unknown[0]["available"])
         self.assertTrue(unknown[1]["available"])
         self.assertFalse(unknown[2]["available"])
@@ -160,6 +160,17 @@ class CardOptionAvailabilityTests(unittest.TestCase):
 
         large = rotate_hard_cap_options(1000000)
         self.assertTrue(large[2]["available"], large)
+
+    def test_large_caps_require_sufficient_reported_windows(self):
+        for cap in (500000, 800000):
+            for window in (None, cap - 1, cap, 1000000):
+                with self.subTest(cap=cap, window=window):
+                    option = next(item for item in rotate_hard_cap_options(window)
+                                  if item["tokens"] == cap)
+                    self.assertEqual(option["available"],
+                                     window is not None and window >= cap)
+                    if not option["available"]:
+                        self.assertTrue(option["reason"])
 
     def test_the_window_is_read_from_wherever_the_host_writes_it(self):
         path = Path(self.tmp.name) / "rollout.jsonl"
@@ -273,6 +284,25 @@ class CardChoiceTests(unittest.TestCase):
         self.assertEqual(restored.rotate_hard_cap, 300000)
         self.assertTrue(is_authorization_integrity_valid(restored))
 
+    def test_large_caps_are_signed_and_round_trip_without_changing_default(self):
+        plan, nodes = _plan()
+        heartbeat, rotate = self._options(window=1000000)
+        digests = set()
+        for cap in (500000, 800000):
+            with self.subTest(cap=cap):
+                card = build_authorization_card(
+                    plan, nodes, CAPS, rotate_hard_cap=cap,
+                    heartbeat_interval_options=heartbeat,
+                    rotate_hard_cap_options=rotate,
+                )
+                restored = AuthorizationRecord.from_dict(
+                    authorize(card, "AUTHORIZE").to_dict())
+                self.assertEqual(restored.rotate_hard_cap, cap)
+                self.assertTrue(is_authorization_integrity_valid(restored))
+                digests.add(card.digest)
+        self.assertEqual(len(digests), 2)
+        self.assertEqual(DEFAULT_ROTATE_HARD_CAP_TOKENS, 200000)
+
     def test_a_record_without_the_choices_serializes_exactly_as_before(self):
         plan, nodes = _plan()
         card = build_authorization_card(plan, nodes, CAPS)
@@ -345,13 +375,13 @@ class PublishedCardTests(unittest.TestCase):
         self.assertEqual([item["minutes"] for item in card.heartbeat_interval_options],
                          [10, 30])
         self.assertEqual([item["tokens"] for item in card.rotate_hard_cap_options],
-                         [150000, 200000, 300000])
+                         [150000, 200000, 300000, 500000, 800000])
         # The unusable tier is on the card, with its reason.
         self.assertFalse(card.rotate_hard_cap_options[2]["available"])
         self.assertTrue(card.rotate_hard_cap_options[2]["reason"])
         stored = card.to_dict()
         self.assertEqual(len(stored["heartbeat_interval_options"]), 2)
-        self.assertEqual(len(stored["rotate_hard_cap_options"]), 3)
+        self.assertEqual(len(stored["rotate_hard_cap_options"]), 5)
 
     def test_publication_refuses_a_tier_the_host_cannot_reach(self):
         # The check lives in the card builder, but publication is the only
@@ -362,6 +392,24 @@ class PublishedCardTests(unittest.TestCase):
                 ProjectPaths(self.root), "bad-plan", self._spec(rotate_hard_cap=300000)
             )
         self.assertIn("rotation hard cap is unavailable", str(raised.exception))
+
+    def test_large_caps_publish_with_window_evidence_and_refuse_without_it(self):
+        for cap in (500000, 800000):
+            with self.subTest(cap=cap):
+                with self.assertRaisesRegex(ValueError, "rotation hard cap is unavailable"):
+                    _publish_plan(
+                        ProjectPaths(self.root), "unknown-{}".format(cap),
+                        self._spec(rotate_hard_cap=cap))
+                record = self.root / "large-window.jsonl"
+                _session_record(record, 1000, window=1000000)
+                _, _, card = _publish_plan(
+                    ProjectPaths(self.root), "large-{}".format(cap),
+                    self._spec(rotate_hard_cap=cap), session_record=str(record))
+                self.assertEqual(card.rotate_hard_cap, cap)
+                stored = json.loads((self.root / ".vibe/plans" /
+                                     "large-{}".format(cap) /
+                                     "authorization-card.json").read_text())
+                self.assertEqual(stored["rotate_hard_cap"], cap)
 
     def test_a_published_choice_is_read_back_from_the_plan(self):
         self.root.joinpath(".vibe").mkdir(exist_ok=True)
@@ -438,6 +486,21 @@ class RuntimeChoiceTests(unittest.TestCase):
         payload = supervisor_preflight(self.paths, "run-1", str(self.record))
         self.assertEqual(payload["context_hard_cap"], 300000)
         self.assertNotIn("rotate_hard_cap_downgrade", payload)
+
+    def test_large_caps_apply_and_downgrade_for_a_smaller_takeover_window(self):
+        for cap in (500000, 800000):
+            for window in (1000000, cap, cap - 1, None):
+                with self.subTest(cap=cap, window=window):
+                    _session_record(self.record, 250000, window=window)
+                    self._authorization(rotate_hard_cap=cap)
+                    actual, reason = rotate_hard_cap_for_run(
+                        self.paths, "run-1", str(self.record))
+                    sufficient = window is not None and window >= cap
+                    self.assertEqual(actual, cap if sufficient else 200000)
+                    if sufficient:
+                        self.assertIsNone(reason)
+                    else:
+                        self.assertIn("{:,}".format(cap), reason)
 
     def test_a_smaller_takeover_window_falls_back_and_says_so(self):
         _session_record(self.record, 250000, window=249036)
