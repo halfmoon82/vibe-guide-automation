@@ -794,35 +794,76 @@ class ProviderActionStore:
             changed.append(str(action.get("action_id")))
         return changed
 
-    def has_result_for(self, run_id: str, issue_id: str) -> bool:
-        """Whether any request of this node already has a provider result."""
-        request_dir = self.root / "requests"
-        if not request_dir.is_dir():
-            return False
-        for path in sorted(request_dir.glob("action-*.json")):
-            action = self._read(path)
-            if (
-                action.get("run_id") == run_id and action.get("issue_id") == issue_id
-                and (self.root / "results" / path.name).exists()
-            ):
-                return True
-        return False
+    def claim_evidence(self, run_id: str, issue_id: str) -> Optional[str]:
+        """Name the first durable mark that this node's dispatch was claimed.
+
+        The mailbox has no explicit ack when a desktop session reads a
+        request, so "unclaimed" can only mean "no durable mark of progress":
+        a result, a completion lock or conflicting observation for any of the
+        node's requests, a bridge handle or claude-bg session record of the
+        node, or a delivery/prompt file of the node.  ``dispatch-heads`` is
+        deliberately not a mark: ``request()`` writes it before the request
+        is visible.  Unreadable evidence counts as claimed (fail closed).
+        A session that is mid-creation and has written nothing yet cannot be
+        seen here; that window is inherent and is reported, not guessed at.
+        """
+        if not all(isinstance(value, str) and value for value in (run_id, issue_id)):
+            raise ValueError("provider request identity is required")
+        try:
+            action_ids = set()
+            request_dir = self.root / "requests"
+            if request_dir.is_dir():
+                for path in sorted(request_dir.glob("action-*.json")):
+                    action = self._read(path)
+                    if action.get("run_id") == run_id and action.get("issue_id") == issue_id:
+                        action_ids.add(path.stem)
+            for action_id in sorted(action_ids):
+                if (self.root / "results" / (action_id + ".json")).exists():
+                    return "result"
+                if (self.root / "locks" / (action_id + ".lock")).exists():
+                    return "lock"
+                observations = self.root / "observations"
+                if observations.is_dir() and any(observations.glob(action_id + "-*.json")):
+                    return "observation"
+            handles = self.root / "handles"
+            if handles.is_dir():
+                for path in sorted(handles.glob("*.json")):
+                    meta = self._read(path)
+                    if meta.get("run_id") == run_id and meta.get("node_id") == issue_id:
+                        return "handle"
+            sessions = self.root / "claude-bg-sessions"
+            if sessions.is_dir():
+                for path in sorted(sessions.glob("*.json")):
+                    claims = self._read(path).get("claims")
+                    if (isinstance(claims, Mapping) and claims.get("run_id") == run_id
+                            and claims.get("node_id") == issue_id):
+                        return "session"
+            name = re.compile(
+                "^" + re.escape(run_id) + "-" + re.escape(issue_id) + r"-(developer|reviewer)-g\d+\.(json|md)$"
+            )
+            for directory in ("deliveries", "prompts"):
+                folder = self.root / directory
+                if folder.is_dir() and any(name.match(item.name) for item in folder.iterdir()):
+                    return directory
+        except (OSError, ValueError, TypeError, AttributeError):
+            return "unreadable"
+        return None
 
     def supersede_unclaimed_creates(
         self, run_id: str, issue_id: str, role: str, generation: int,
-        authorization_digest: str,
+        previous_authorization_digest: str,
     ) -> List[str]:
         """Hide this role's unclaimed create requests from before a handoff.
 
         platform_handoff re-keys the dispatch under a new authorization, and
         the action id embeds the provider, so the new platform emits a second
         create beside the old one.  A create with no result, written under
-        another authorization digest, was never claimed: mark it stale (an
-        audit marker beside the immutable request; the native tool is never
-        invoked) so only one create stays pending.  A request without a
-        readable authorization digest, or with a result, is left alone.
+        exactly the authorization the handoff replaced (never a later one),
+        was never claimed: mark it stale (an audit marker beside the
+        immutable request; the native tool is never invoked) so only one
+        create stays pending.  Every other request is left alone.
         """
-        if not all(isinstance(value, str) and value for value in (run_id, issue_id, role, authorization_digest)):
+        if not all(isinstance(value, str) and value for value in (run_id, issue_id, role, previous_authorization_digest)):
             raise ValueError("provider request identity is required")
         changed = []
         request_dir = self._directory("requests")
@@ -837,7 +878,7 @@ class ProviderActionStore:
                 action.get("run_id") != run_id or action.get("issue_id") != issue_id
                 or action.get("role") != role or action.get("operation") != "create"
                 or action.get("generation") != generation
-                or not isinstance(digest, str) or digest == authorization_digest
+                or digest != previous_authorization_digest
             ):
                 continue
             self._atomic(stale_dir / path.name, {

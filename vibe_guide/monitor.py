@@ -4945,6 +4945,29 @@ class Monitor:
             # its slot, so recount instead of trusting the start result.
             active_sessions = self._count_active_sessions(snapshot)
 
+    def _handoff_replaced_authorization(self, snapshot: RunSnapshot) -> Optional[str]:
+        """The authorization digest the latest reauthorization replaced, when
+        that reauthorization was a platform_handoff into the current one.
+
+        Only the most recent reauthorization counts: a later ordinary
+        reauthorization moves the digest again, and then nothing recorded
+        proves which requests predate the handoff, so this returns None.
+        """
+        latest = None
+        for event in load_events(self.paths, snapshot.run_id)[: snapshot.event_sequence]:
+            if event.get("event") == "authorization_reauthorized":
+                latest = event.get("data", {})
+        if (
+            not isinstance(latest, dict)
+            or latest.get("change_reason") != "platform_handoff"
+            or latest.get("authorization_digest") != snapshot.authorization_digest
+        ):
+            return None
+        previous = latest.get("previous_authorization_digest")
+        if not isinstance(previous, str) or len(previous) != 64:
+            return None
+        return previous
+
     def _adopt_unserved_handoff_lease(
         self, snapshot: RunSnapshot, node_id: str, role: str, generation: int, digest: str
     ) -> bool:
@@ -4952,14 +4975,21 @@ class Monitor:
 
         The intent digest binds the authorization, so the handoff's new
         authorization makes the lease registered before it look foreign.  The
-        lease may move to the new digest only when this run recorded a
-        platform_handoff and nothing ever claimed the node: no binding, no
-        task identity, no handle, no ``start_confirmed``, no provider result.
+        lease may move to the new digest only when the run's latest
+        reauthorization is a platform_handoff and nothing ever claimed the
+        node: no binding, no task identity, no handle, no ``start_confirmed``,
+        no mailbox claim mark (``ProviderActionStore.claim_evidence``).
         Anything unprovable returns False and the caller keeps blocked_unknown.
+
+        Order matters for crash recovery: hide the old create first (an
+        idempotent step), then move the lease, then record the event.  A crash
+        before the move leaves the old lease, so the next attempt re-enters
+        here and converges; a crash after it leaves nothing to clean up.
         """
         current = snapshot.nodes[node_id]
         try:
-            if not self._run_has_platform_handoff(snapshot):
+            replaced = self._handoff_replaced_authorization(snapshot)
+            if replaced is None:
                 return False
             if (
                 current.get("developer_identity") or current.get("reviewer_identity")
@@ -4979,16 +5009,16 @@ class Monitor:
             ):
                 return False
             store = ProviderActionStore(self.paths)
-            if store.has_result_for(snapshot.run_id, node_id):
+            if store.claim_evidence(snapshot.run_id, node_id) is not None:
                 return False
+            superseded = store.supersede_unclaimed_creates(
+                snapshot.run_id, node_id, role, generation, replaced
+            )
             if not rebind_writer_lease(
                 self.paths, node_id, str(current["worktree"]), snapshot.run_id,
                 role, generation, None, digest, previous_status="active",
             ):
                 return False
-            superseded = store.supersede_unclaimed_creates(
-                snapshot.run_id, node_id, role, generation, snapshot.authorization_digest
-            )
         except (OSError, TypeError, ValueError):
             return False
         self._record(
