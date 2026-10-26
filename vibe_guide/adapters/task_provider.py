@@ -365,8 +365,22 @@ class ProviderActionStore:
         # session attests its own record and no later attest of *another*
         # adapter can overwrite it.  The legacy single-file bridge is kept as
         # a mirror of the latest record so pre-split readers still work.
+        # Before the mirror is overwritten, a pre-split record that belongs to
+        # another adapter and has no per-adapter file yet is migrated into its
+        # own file, so the first attest after an upgrade loses nothing.
+        legacy = self.root / "capabilities.json"
+        if legacy.is_file() and not legacy.is_symlink():
+            try:
+                previous = self._validate_capability(self._read(legacy))
+            except (OSError, ValueError):
+                previous = None
+            if previous is not None:
+                previous_id = str(previous["adapter_id"])
+                migrated = self.root / ("capabilities-" + previous_id + ".json")
+                if previous_id != adapter_id and not migrated.exists():
+                    self._atomic(migrated, previous)
         self._atomic(self.root / ("capabilities-" + adapter_id + ".json"), payload)
-        self._atomic(self.root / "capabilities.json", payload)
+        self._atomic(legacy, payload)
 
     def _validate_capability(self, value: Dict[str, Any]) -> Dict[str, Any]:
         required = {"schema_version", "adapter_id", "facts", "provenance"}

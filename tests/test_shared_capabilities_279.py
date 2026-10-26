@@ -135,6 +135,28 @@ class MissingAndLegacyRecordTests(_Case):
         with self.assertRaises(ProviderPending):
             observe_capabilities(self.paths, "claude-code")
 
+    def test_legacy_record_survives_another_adapters_first_attest(self):
+        # An upgraded project holds only the pre-split file for claude-code;
+        # the first attest by another adapter must not erase that record.
+        self.init()
+        legacy = self.paths.vibe / "provider-actions" / "capabilities.json"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({
+            "schema_version": 1,
+            "adapter_id": "claude-code",
+            "facts": CLAUDE_FACTS,
+            "provenance": "recorded by an older vibe",
+        }), encoding="utf-8")
+        self.assertEqual(
+            self.attest("workbuddy", WORKBUDDY_FACTS).payload.get("status"), "ok"
+        )
+        self.assertEqual(
+            self.store.capabilities("claude-code")["facts"], CLAUDE_FACTS
+        )
+        self.assertEqual(
+            sorted(self.store.capabilities_all()), ["claude-code", "workbuddy"]
+        )
+
 
 class AmbiguityTests(_Case):
     def test_adapterless_read_refuses_to_guess_among_several_records(self):
