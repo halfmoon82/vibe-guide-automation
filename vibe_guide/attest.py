@@ -74,7 +74,8 @@ def record_session_capabilities(paths: Any, adapter_id: str, facts: Any, provena
     ProviderActionStore(paths).publish_capabilities(
         adapter_id, validated, provenance.strip(), project_id.strip() if project_id else None,
     )
-    observed = observe_capabilities(paths)
+    # Read back this adapter's own record, not whatever adapter attested last.
+    observed = observe_capabilities(paths, adapter_id)
     caps = observed.detection.capabilities
     return {
         "adapter_id": observed.adapter_id,

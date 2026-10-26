@@ -70,6 +70,7 @@ from .state import (
     _atomic_bytes,
     acquire_writer_lease,
     append_event,
+    archive_run as _archive_run_artifacts,
     is_redacted_value,
     load_events,
     load_snapshot,
@@ -82,6 +83,7 @@ from .state import (
     save_snapshot,
     scope_only_expansion_binds,
     interprocess_lock,
+    unarchive_run,
     validate_run_id,
     WORKTREE_PREFLIGHT_KEY,
     WORKTREE_PREFLIGHT_KEYS,
@@ -1803,6 +1805,54 @@ class Monitor:
         self._guard_lease(getattr(snapshot, "run_id", None))
         save_snapshot(self.paths, snapshot)
 
+    def _archive_finished_runs(self) -> None:
+        """Sweep terminal runs out of ``.vibe/runs/`` (issue #274).
+
+        Runs archive at monitor entry rather than inside the save path: the
+        run that just reached ``complete`` may still be reopened by an
+        accepted patch (``reauthorize`` restores it), and post-command writers
+        like bounded supervisor output must not resurrect a stub.  Archiving
+        is best-effort per run -- a failure stays on disk for the manual
+        ``vibe reconcile --evidence {"kind": "run_archive"}`` path instead of
+        breaking the command that triggered the sweep.
+        """
+        runs_root = self.paths.vibe / "runs"
+        if runs_root.is_symlink() or not runs_root.is_dir():
+            return
+        terminal = {"complete"}
+        for child in sorted(runs_root.iterdir(), key=lambda item: item.name):
+            if child.is_symlink() or not child.is_dir():
+                continue
+            try:
+                validate_run_id(child.name)
+            except ValueError:
+                continue
+            state_file = child / "state.json"
+            if not state_file.is_file() or state_file.is_symlink():
+                continue
+            try:
+                status = json.loads(state_file.read_text(encoding="utf-8")).get("status")
+            except (OSError, ValueError, UnicodeDecodeError):
+                continue
+            # Only ``complete`` archives automatically: a failed or
+            # blocked_unknown run may still hold a quarantined writer lease
+            # that is exactly what keeps a possibly-live session from being
+            # redispatched.  Those statuses archive through the human-facing
+            # ``vibe reconcile`` run_archive package (they are terminal, so
+            # no force is needed; force is only for live or stateless runs).
+            if status not in terminal:
+                continue
+            try:
+                self.archive_run(child.name)
+            except (OSError, ValueError, TypeError) as error:
+                # Archiving is best-effort at monitor entry, but a failure
+                # must still leave on-disk evidence with its reason class:
+                # a partially archived run (directory moved, mailbox
+                # requests still pending, lease unreleased) is otherwise
+                # invisible until someone notices the stuck run.
+                self._record_archive_failed(child.name, error)
+                continue
+
     def _save_task_binding(self, binding: TaskBinding) -> None:
         self._guard_lease(binding.run_id)
         save_task_binding(self.paths, binding)
@@ -2107,6 +2157,7 @@ class Monitor:
         self, record: Optional[AuthorizationRecord], runner: Runner
     ) -> RunSnapshot:
         self._reset_binding_cache()
+        self._archive_finished_runs()
         self._require_record(record)
         state = self.paths.vibe / "state.json"
         capability_contract_digest = ""
@@ -2232,6 +2283,7 @@ class Monitor:
 
     def resume(self, run_id: str, runner: Runner, poll_handles: bool = True) -> RunSnapshot:
         self._reset_binding_cache()
+        self._archive_finished_runs()
         require_entry(self.paths, "resume:" + str(run_id), "resume")
         snapshot = load_snapshot(self.paths, run_id)
         if isinstance(snapshot.workflow, dict):
@@ -2322,6 +2374,9 @@ class Monitor:
 
         self._reset_binding_cache()
         self._require_record(record)
+        # A completed run is archived out of .vibe/runs/ (issue #274);
+        # reauthorization reopens it, so its evidence moves back first.
+        unarchive_run(self.paths, run_id)
         snapshot = load_snapshot(self.paths, run_id)
         state = self.paths.vibe / "state.json"
         current_capability_contract_digest = snapshot.capability_contract_digest
@@ -2541,6 +2596,7 @@ class Monitor:
 
     def tick(self, run_id: str, runner: Runner) -> RunSnapshot:
         self._reset_binding_cache()
+        self._archive_finished_runs()
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
         self._validate_execution_topology(snapshot)
@@ -2652,6 +2708,140 @@ class Monitor:
         self._save_snapshot(snapshot)
         return snapshot
 
+    def archive_run(
+        self, run_id: str, *, force: bool = False, snapshot: Any = None
+    ) -> Dict[str, Any]:
+        """Archive a finished run's evidence out of ``.vibe/runs/`` (issue #274).
+
+        Moves the run directory, its provider-action mailbox artifacts, and
+        its writer leases into ``.vibe/runs-archive/<run_id>/`` (plans-archive
+        shape).  Without ``force`` only runs whose persisted state reached a
+        terminal status (``complete``/``failed``/``blocked_unknown``/
+        ``blocked_design``/``stopped``) archive; live or stateless runs need
+        the explicit ``force`` flag from a human reconciliation package.  The
+        operation is idempotent and resumable; already-archived runs return
+        the existing manifest.
+        """
+        validate_run_id(run_id)
+        from .state import _safe_project_path, runs_archive_dir
+
+        primary = _safe_project_path(self.paths, ".vibe", "runs", run_id)
+        destination = runs_archive_dir(self.paths, run_id)
+        if primary.is_symlink() or destination.is_symlink():
+            raise ValueError("run archive paths may not be symlinks")
+
+        status: Optional[str] = None
+        provenance: Dict[str, Any] = {}
+        for candidate in (primary / "state.json", destination / "state.json"):
+            if candidate.is_file() and not candidate.is_symlink():
+                try:
+                    raw = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, ValueError, UnicodeDecodeError):
+                    raw = None
+                if isinstance(raw, dict):
+                    if isinstance(raw.get("status"), str):
+                        status = raw["status"]
+                    provenance = {
+                        key: raw[key]
+                        for key in ("authorization_digest", "node_contract_digest")
+                        if isinstance(raw.get(key), str)
+                    }
+                    break
+        terminal = {"complete", "failed", "blocked_unknown", "blocked_design",
+                    "stopped"}
+        if status not in terminal and not force:
+            raise ValueError(
+                "run {} is not in a terminal state (status={}); archiving a "
+                "live or unverifiable run requires an explicit force"
+                .format(run_id, status if status is not None else "missing")
+            )
+
+        events_path = primary / "events.jsonl"
+        already_recorded = False
+        if events_path.is_file() and not events_path.is_symlink():
+            try:
+                already_recorded = any(
+                    record.get("event") == "run_archived"
+                    for record in load_events(self.paths, run_id)
+                )
+            except (OSError, ValueError):
+                already_recorded = False
+        try:
+            manifest = _archive_run_artifacts(self.paths, run_id)
+        except (OSError, ValueError, TypeError) as error:
+            # Leave the failure on disk with its reason class: an archive
+            # that died mid-move (directory gone but mailbox requests still
+            # pending, lease unreleased) is otherwise indistinguishable from
+            # a clean archive, and the auto-sweep would keep retrying a run
+            # nobody can see is stuck.
+            self._record_archive_failed(run_id, error)
+            raise
+        if not already_recorded:
+            # The archive event is appended only after the move succeeded so
+            # a failed archive never leaves a false ``run_archived`` record;
+            # run_dir() resolves into .vibe/runs-archive/ at this point, so
+            # the event still lands inside the archived directory.  Its
+            # provenance carries the run's authorization/contract digests
+            # (read from state.json, or supplied by the snapshot the caller
+            # just saved) so event-lineage validation keeps passing.
+            if snapshot is not None:
+                for key in ("authorization_digest", "node_contract_digest"):
+                    value = getattr(snapshot, key, None)
+                    if isinstance(value, str) and value:
+                        provenance[key] = value
+            append_event(
+                self.paths,
+                RunEvent("run_archived", {
+                    "run_id": run_id,
+                    "status": status,
+                    "source": "manual" if force else "terminal",
+                }),
+                provenance=provenance or None,
+            )
+        return manifest
+
+    def _record_archive_failed(self, run_id: str, error: BaseException) -> None:
+        """Append a ``run_archive_failed`` event with the failure reason class.
+
+        Best-effort: recording must never mask or replace the original
+        failure, so any error here is swallowed.  Duplicate failure events
+        for the same reason class are suppressed so the auto-sweep does not
+        flood the log on every monitor entry.  When the run directory is
+        already gone from ``.vibe/runs/`` the event lands inside
+        ``.vibe/runs-archive/<run_id>/`` via :func:`run_dir`'s redirect.
+        """
+        try:
+            directory = run_dir(self.paths, run_id)
+        except (OSError, ValueError):
+            return
+        if not directory.is_dir():
+            # No evidence directory exists anywhere (e.g. a stateless run
+            # whose artifacts failed before the archive root was created);
+            # appending here would resurrect a stub under .vibe/runs/.
+            return
+        reason_class = type(error).__name__
+        try:
+            records = load_events(self.paths, run_id)
+        except (OSError, ValueError):
+            records = []
+        if records:
+            last = records[-1]
+            if (
+                last.get("event") == "run_archive_failed"
+                and last.get("data", {}).get("reason_class") == reason_class
+            ):
+                return
+        try:
+            append_event(
+                self.paths,
+                RunEvent("run_archive_failed", {
+                    "run_id": run_id,
+                    "reason_class": reason_class,
+                }),
+            )
+        except (OSError, ValueError, TypeError):
+            pass
+
     def reconcile_evidence(self, run_id: str, package: Dict[str, Any]) -> RunSnapshot:
         """Promote a verified, same-run evidence package through normal events.
 
@@ -2660,6 +2850,20 @@ class Monitor:
         Any malformed, stale, mixed, or unverifiable package is rejected before
         the first event is appended.
         """
+        if isinstance(package, dict) and package.get("kind") == "run_archive":
+            # Manual archive of a dead run (issue #274): works even when the
+            # run has no loadable snapshot, because the archive contract is
+            # plan-independent filesystem evidence.
+            if package.get("run_id") not in (None, run_id):
+                raise ValueError("run_archive package run_id does not match --run-id")
+            self.archive_run(run_id, force=package.get("force") is True)
+            try:
+                return load_snapshot(self.paths, run_id)
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    "run {} is archived but has no loadable snapshot: {}"
+                    .format(run_id, error)
+                )
         self._reset_binding_cache()
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
@@ -2976,6 +3180,11 @@ class Monitor:
         for node_id, handle_id in list(snapshot.handles.items()):
             self._require_snapshot_authorization(snapshot)
             current = snapshot.nodes.get(node_id, {})
+            if handle_id in (current.get("stale_handles") or ()):
+                # A newer dispatch for this node superseded the handle; a
+                # dead handle is never polled and can never emit the
+                # unregistered-handle blocked_unknown again.
+                continue
             try:
                 events = runner.poll(RunHandle(handle_id))
             except Exception as error:
@@ -2992,6 +3201,7 @@ class Monitor:
                         snapshot, node_id, reason,
                         quarantine_lease=False,
                         retryable_same_task=True,
+                        cause=error,
                     )
                 continue
             for event in events:
@@ -5263,7 +5473,7 @@ class Monitor:
             current["active_role"] = None
             # Preserve the write-ahead intent for same-task retry.
             if successor:
-                self._mark_blocked_unknown(snapshot, node_id, str(error), quarantine_lease=False)
+                self._mark_blocked_unknown(snapshot, node_id, error, quarantine_lease=False)
                 if pending_successor:
                     self._record(snapshot, "successor_binding_pending", {
                         "run_id": snapshot.run_id, "node_id": node_id,
@@ -5310,7 +5520,7 @@ class Monitor:
             if failure["kind"] == "external_decision":
                 self._mark_external_authorization_required(snapshot, node_id, str(error))
             elif failure["kind"] not in {"retryable", "capacity_wait", "repairable"}:
-                self._mark_blocked_unknown(snapshot, node_id, str(error))
+                self._mark_blocked_unknown(snapshot, node_id, error)
                 # A pre-write binding observation has no provider handle yet,
                 # but it is still a recoverable same-generation action. Keep
                 # the retry marker after the fail-closed user status so the
@@ -5349,6 +5559,7 @@ class Monitor:
                     snapshot, node_id,
                     "task binding rejected before start ({})".format(type(error).__name__),
                     quarantine_lease=False,
+                    cause=error,
                 )
                 return False
             return self._preflight_contract_failure(
@@ -5574,6 +5785,7 @@ class Monitor:
                 "worker start outcome is unknown ({})".format(
                     type(error).__name__
                 ),
+                cause=error,
             )
             self._save_snapshot(snapshot)
             return False
@@ -5597,6 +5809,13 @@ class Monitor:
         current["active_task"]["handle_id"] = handle.run_id
         current["start_intent"] = None
         current["quarantine"] = None
+        previous_handle = snapshot.handles.get(node_id)
+        if previous_handle and previous_handle != handle.run_id:
+            # The replaced handle is dead weight: keep it out of polling and
+            # out of the unregistered-handle fail-closed path.
+            stale_handles = current.setdefault("stale_handles", [])
+            if previous_handle not in stale_handles:
+                stale_handles.append(previous_handle)
         snapshot.handles[node_id] = handle.run_id
         self._record(
             snapshot,
@@ -5623,6 +5842,7 @@ class Monitor:
                 "confirmed task binding cannot be updated ({})".format(
                     type(error).__name__
                 ),
+                cause=error,
             )
             self._save_snapshot(snapshot)
             return False
@@ -6167,6 +6387,21 @@ class Monitor:
         current = snapshot.nodes[node_id]
         active = current.get("active_task")
         if not isinstance(active, dict) or active.get("handle_id") != handle_id:
+            if handle_id in (current.get("stale_handles") or ()):
+                # A superseded session still emitted something; the event is
+                # evidence-free for the new dispatch, so record that it was
+                # ignored instead of parking the node as blocked_unknown.
+                self._record(
+                    snapshot,
+                    "stale_handle_event_ignored",
+                    {
+                        "run_id": snapshot.run_id,
+                        "node_id": node_id,
+                        "handle_id": handle_id,
+                        "reason": "event from a superseded session ignored",
+                    },
+                )
+                return
             self._mark_blocked_unknown(
                 snapshot, node_id, "event arrived from an unregistered handle"
             )
@@ -6226,6 +6461,7 @@ class Monitor:
                     "reviewer violation could not return to developer ({})".format(
                         type(error).__name__
                     ),
+                    cause=error,
                 )
             return
         if event.event not in {
@@ -6253,7 +6489,8 @@ class Monitor:
                 )
             except (OSError, TypeError, ValueError) as error:
                 self._mark_blocked_unknown(
-                    snapshot, node_id, "decision request could not be persisted ({})".format(type(error).__name__)
+                    snapshot, node_id, "decision request could not be persisted ({})".format(type(error).__name__),
+                    cause=error,
                 )
                 return
             notification_unknown = any(
@@ -6396,6 +6633,7 @@ class Monitor:
                         "task binding cannot record review state ({})".format(
                             type(error).__name__
                         ),
+                        cause=error,
                     )
                     return
                 current["status"] = "review"
@@ -6409,6 +6647,7 @@ class Monitor:
                     "task binding cannot record delivery ({})".format(
                         type(error).__name__
                     ),
+                    cause=error,
                 )
                 return
             current["status"] = "delivered"
@@ -6440,6 +6679,7 @@ class Monitor:
                         "reviewer task binding cannot be verified ({})".format(
                             type(error).__name__
                         ),
+                        cause=error,
                     )
                     return
                 else:
@@ -6775,6 +7015,7 @@ class Monitor:
                     "reviewer binding cannot be verified ({})".format(
                         type(error).__name__
                     ),
+                    cause=error,
                 )
                 return
             if (
@@ -6800,6 +7041,7 @@ class Monitor:
                     "dual-visible acceptance refused: node contract is unreadable ({})".format(
                         error
                     ),
+                    cause=error,
                 )
                 return
             if not live_digest_matches:
@@ -6881,6 +7123,7 @@ class Monitor:
                     "task binding cannot record acceptance ({})".format(
                         type(error).__name__
                     ),
+                    cause=error,
                 )
                 return
             current["status"] = "accepted"
@@ -6963,6 +7206,7 @@ class Monitor:
                     "task binding cannot record terminal state ({})".format(
                         type(error).__name__
                     ),
+                    cause=error,
                 )
                 return
             current["status"] = terminal_status
@@ -7774,6 +8018,7 @@ class Monitor:
         if classification["kind"] == "external_decision":
             current["status"] = "blocked_design"
             current["reason"] = redact_provider_text(reason)
+            current["reason_class"] = "external_decision"
             current["retryable_action"] = None
             current["recovery_action"] = "await_external_decision"
             current["owner_layer"] = "external_authorization"
@@ -7790,6 +8035,7 @@ class Monitor:
             current["retryable_action"] = retry
             current["status"] = "retry_pending" if classification["kind"] in {"retryable", "capacity_wait", "repairable"} else "blocked_unknown"
             current["reason"] = redact_provider_text(reason)
+            current["reason_class"] = str(classification["kind"])
         self._record(snapshot, "retry_scheduled", {"run_id": snapshot.run_id, "node_id": node_id,
             "reason_class": classification["kind"], "reason": reason,
             "same_task_required": True, "next_retry_at": current.get("retryable_action", {}).get("next_retry_at") if isinstance(current.get("retryable_action"), dict) else None})
@@ -7797,6 +8043,7 @@ class Monitor:
 
     def repair_node(self, node_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
         """Repair a node in place; identity fields are immutable across repair."""
+        self._reset_binding_cache()
         snapshot = self._recovery_snapshot(node_id, run_id)
         current = snapshot.nodes[node_id]
         before = {key: current.get(key) for key in ("task_id", "generation", "writer", "lease", "cursor", "intent_digest", "contract_digest")}
@@ -7849,6 +8096,288 @@ class Monitor:
                     "repair_action": "change_reviewer_or_split_node",
                     "recovery_action": current.get("recovery_action"),
                     "run_id": snapshot.run_id, "reconciliation": reconciliation}
+        # Stuck-session repair (#278): when the node still carries the marks of
+        # a live session (active task, run handle, or a quarantined lease) but
+        # the task binding is already terminal -- the session was stopped
+        # externally or a previous recovery retired it -- a same-task retry can
+        # never work: the identity is dead.  repair_node then folds the whole
+        # manual checklist into one call: mark the binding failed, release the
+        # writer lease, retire the dead handle, clear the quarantine and queue
+        # a successor for the next ``vibe resume``.  Every piece tolerates
+        # absence so a partially cleaned state still converges instead of
+        # reporting a false success.  A binding that is still live means the
+        # session may be working; it falls through to the same-task path below
+        # rather than being parked by a repair.
+        role = str(
+            current.get("active_role")
+            or (current.get("active_task") or {}).get("role")
+            or "developer"
+        )
+        binding = None
+        binding_unreadable = False
+        try:
+            # Deliberately bypass ``_binding_cache``: the session may have been
+            # stopped by hand (or by a previous supervisor in another process)
+            # after the in-memory binding was cached, and a stale live status
+            # would skip the very cleanup this path exists for.
+            binding = load_task_binding(
+                self.paths, node_id, role, run_id=snapshot.run_id
+            )
+        except FileNotFoundError:
+            binding = None
+        except (OSError, TypeError, ValueError):
+            # The registry exists but cannot be read (corrupt JSON, schema
+            # drift, recursive ancestry).  "Unreadable" is not "dead": the
+            # binding may still describe a live writer, so cleanup and any
+            # successor would risk two writers.  Fail closed by parking the
+            # node for reconcile_binding without touching lease, handle or
+            # quarantine.
+            binding_unreadable = True
+        stuck_marks = (
+            isinstance(current.get("active_task"), dict)
+            or node_id in snapshot.handles
+            or isinstance(current.get("quarantine"), dict)
+        )
+        if stuck_marks and binding_unreadable:
+            current["status"] = "blocked_unknown"
+            current["recovery_action"] = "reconcile_binding"
+            current["reason"] = redact_provider_text(reason)
+            current["retryable_action"] = {
+                "action": "reconcile_binding",
+                "manual_repair_required": True,
+                "same_task": False,
+                "same_task_required": True,
+                "successor": False,
+                "reason": (
+                    "stuck-session repair could not read the task binding registry"
+                ),
+            }
+            reconciliation = {
+                "git": {"observed": False},
+                "provider": {"observed": False, "status": "unavailable"},
+            }
+            self._record(snapshot, "node_repaired", {"run_id": snapshot.run_id,
+                "node_id": node_id,
+                "kind": "stuck_session", "preserved_identity": False,
+                "repair_action": "stuck_session_cleanup", "same_task": False,
+                "successor": False, "role": role,
+                "reconciliation": reconciliation,
+                "task_id": None,
+                "generation": current.get(
+                    "review_generation" if role == "reviewer" else "developer_generation"
+                )})
+            self._save_snapshot(snapshot)
+            return {"node_id": node_id, "kind": "stuck_session",
+                    "preserved_identity": False,
+                    "status": current["status"],
+                    "task_id": None,
+                    "generation": current.get(
+                        "review_generation" if role == "reviewer" else "developer_generation"
+                    ),
+                    "repair_action": "stuck_session_cleanup",
+                    "recovery_action": current["recovery_action"],
+                    "steps": {
+                        "binding_failed": False,
+                        "lease_released": False,
+                        "handle_retired": False,
+                        "quarantine_cleared": False,
+                    },
+                    "run_id": snapshot.run_id,
+                    "reconciliation": reconciliation}
+        # A parked or missing registry entry cannot prove provider termination.
+        # Only registry terminal states prove that another task may replace
+        # this binding. Unknown/blocked/delivered are not termination evidence.
+        active = current.get("active_task")
+        generation_key = "review_generation" if role == "reviewer" else "developer_generation"
+        binding_matches = binding is not None and (
+            binding.task_id == current.get(role + "_identity")
+            and binding.generation == current.get(generation_key)
+            and (not isinstance(active, dict) or (
+                binding.task_id == active.get("task_id")
+                and binding.generation == active.get("generation")
+                and role == active.get("role")
+                and snapshot.handles.get(node_id) == active.get("handle_id")
+            ))
+        )
+        binding_dead = binding_matches and binding.status in {
+            "stopped", "failed", "archived",
+        }
+        retry = current.get("retryable_action")
+        delivered_continuation = (
+            binding_matches and binding.status == "delivered" and role == "developer"
+            and self._node_dispatch_topology(self.nodes[node_id]) != TOPOLOGY_VISIBLE_SDD
+            and current.get("active_task") is None
+            and current.get("active_role") is None
+            and current.get("start_intent") is None
+            and node_id not in snapshot.handles
+            and current.get("reviewer_started") is not True
+            and current.get("pair_archived") is True
+            and isinstance(retry, dict)
+            and retry.get("role") == "developer" and retry.get("phase") == "rework"
+            and retry.get("continuation") is True
+            and retry.get("pending_schedule") is True
+            and retry.get("successor") is not True
+            and retry.get("successor_candidate") is not True
+            and not retry.get("manual_repair_required")
+        )
+        if delivered_continuation or (
+            stuck_marks and binding_matches and binding.status == "delivered"
+            and self._recover_quarantined_delivered_developer(snapshot, node_id)
+        ):
+            self._save_snapshot(snapshot)
+            return {"node_id": node_id, "kind": "same_task_retry",
+                    "preserved_identity": True, "status": current["status"],
+                    "task_id": binding.task_id, "run_id": snapshot.run_id}
+        if stuck_marks and (
+            not binding_matches or (not binding_dead and binding.status not in {
+                "created", "start_pending", "running", "review", "rework",
+            })
+        ):
+            current["status"] = "blocked_unknown"
+            current["recovery_action"] = "reconcile_binding"
+            current["retryable_action"] = {
+                "action": "reconcile_binding", "manual_repair_required": True,
+                "same_task": True, "same_task_required": True,
+                "successor": False,
+                "reason": "old task termination is not proven",
+            }
+            self._record(snapshot, "node_repaired", {
+                "run_id": snapshot.run_id, "node_id": node_id,
+                "kind": "binding_unknown", "preserved_identity": True,
+                "repair_action": "reconcile_binding", "same_task": True,
+                "successor": False, "role": role,
+                "task_id": binding.task_id if binding is not None else None,
+            })
+            self._save_snapshot(snapshot)
+            return {"node_id": node_id, "kind": "binding_unknown",
+                    "preserved_identity": True,
+                    "status": current["status"],
+                    "recovery_action": "reconcile_binding",
+                    "run_id": snapshot.run_id}
+        if stuck_marks and binding_dead:
+            steps = {
+                "binding_failed": False,
+                "lease_released": False,
+                "handle_retired": False,
+                "quarantine_cleared": False,
+            }
+            predecessor = binding.task_id if binding is not None else None
+            previous_binding_status = (
+                binding.status if binding is not None else None
+            )
+            # Normalize only proven terminal bindings to ``failed``.  The
+            # pre-repair status remains in the event below so this cleanup
+            # does not erase history or promote unknown states to terminal.
+            if binding is not None and binding.status != "failed":
+                try:
+                    binding = self._set_binding_status(
+                        snapshot, node_id, role, "failed"
+                    )
+                except (FileNotFoundError, OSError, TypeError, ValueError):
+                    # A binding we cannot retire cannot be proven dead; a
+                    # successor beside it would risk two live writers.  Fail
+                    # closed instead of queueing the dispatch.
+                    current["status"] = "blocked_unknown"
+                    current["recovery_action"] = "reconcile_binding"
+                    current["retryable_action"] = {
+                        "action": "reconcile_binding",
+                        "manual_repair_required": True,
+                        "same_task": False,
+                        "same_task_required": True,
+                        "successor": False,
+                        "reason": "stuck-session repair could not retire the old binding",
+                    }
+                    self._record(snapshot, "node_repaired", {
+                        "run_id": snapshot.run_id, "node_id": node_id,
+                        "kind": "binding_unknown", "preserved_identity": True,
+                        "repair_action": "reconcile_binding", "successor": False,
+                        "predecessor_task_id": predecessor,
+                        "previous_binding_status": previous_binding_status,
+                    })
+                    self._save_snapshot(snapshot)
+                    return {"node_id": node_id, "kind": "binding_unknown",
+                            "status": current["status"],
+                            "recovery_action": "reconcile_binding",
+                            "steps": steps, "run_id": snapshot.run_id}
+            steps["binding_failed"] = (
+                binding is not None and binding.status == "failed"
+            )
+            lease_released = release_writer_lease(
+                self.paths,
+                node_id,
+                str(current.get("worktree", "")),
+                snapshot.run_id,
+            )
+            observed_lease = read_writer_lease(
+                self.paths, node_id, str(current.get("worktree", ""))
+            )
+            steps["lease_released"] = lease_released or observed_lease is None or not observed_lease.active
+            retired_handle = snapshot.handles.pop(node_id, None)
+            steps["handle_retired"] = (
+                retired_handle is not None or node_id not in snapshot.handles
+            )
+            steps["quarantine_cleared"] = isinstance(
+                current.get("quarantine"), dict
+            )
+            current["quarantine"] = None
+            current["active_role"] = None
+            current["active_task"] = None
+            # Free the pair slot so the scheduler's pending_schedule retry can
+            # dispatch the successor inside the concurrency budget.
+            current["pair_archived"] = True
+            if role == "reviewer":
+                current["status"] = "rework"
+                current["reviewer_started"] = False
+            else:
+                current["status"] = "retry_pending"
+            current["reason"] = redact_provider_text(reason)
+            current["recovery_action"] = "repair_node"
+            current["retryable_action"] = {
+                "role": role,
+                "phase": "review" if role == "reviewer" else "develop",
+                "continuation": False,
+                "pending_schedule": True,
+                "successor": True,
+                "same_task": False,
+                "same_task_required": False,
+                "old_task_reconciled": True,
+                "predecessor_task_id": predecessor,
+                "reason": redact_provider_text(reason),
+            }
+            after = {key: current.get(key) for key in before}
+            preserved = before == after
+            reconciliation = {
+                "git": {"observed": False},
+                "provider": {"observed": False, "status": "unavailable"},
+            }
+            self._record(snapshot, "node_repaired", {"run_id": snapshot.run_id,
+                "node_id": node_id,
+                "kind": "stuck_session", "preserved_identity": preserved,
+                "repair_action": "stuck_session_cleanup", "same_task": False,
+                "successor": current["retryable_action"].get("successor") is True,
+                "role": role,
+                "phase": current["retryable_action"].get("phase"),
+                "predecessor_task_id": predecessor,
+                "previous_binding_status": previous_binding_status,
+                "handle_id": retired_handle,
+                "reconciliation": reconciliation,
+                "task_id": predecessor,
+                "generation": current.get(
+                    "review_generation" if role == "reviewer" else "developer_generation"
+                )})
+            self._save_snapshot(snapshot)
+            return {"node_id": node_id, "kind": "stuck_session",
+                    "preserved_identity": preserved,
+                    "status": current.get("status"),
+                    "task_id": predecessor,
+                    "generation": current.get(
+                        "review_generation" if role == "reviewer" else "developer_generation"
+                    ),
+                    "repair_action": "stuck_session_cleanup",
+                    "recovery_action": current.get("recovery_action"),
+                    "steps": steps,
+                    "run_id": snapshot.run_id,
+                    "reconciliation": reconciliation}
         classification = classify_provider_failure({"reason": reason})
         if classification["kind"] == "binding_unknown":
             current["status"] = "blocked_unknown"
@@ -7907,10 +8436,12 @@ class Monitor:
         self,
         snapshot: RunSnapshot,
         node_id: str,
-        reason: str,
+        reason: Any,
         quarantine_lease: bool = True,
         retryable_same_task: bool = False,
         extra_event_data: Optional[Dict[str, Any]] = None,
+        reason_code: Optional[str] = None,
+        cause: Optional[BaseException] = None,
     ) -> None:
         """Park a node as blocked_unknown and stamp its recovery markers.
 
@@ -7925,18 +8456,46 @@ class Monitor:
           fingerprint, not proof of live work.  Rescue gates judge it with
           ``defect_adjacent_marker_allows_rescue``; see
           ``RECOVERY_FIDELITY_AUDIT`` for the call-site verdicts.
+
+        #277: alongside the redacted free text the block now stamps the
+        structured classification on the node and the event --
+        ``reason_class`` (the classifier's fixed-enum kind),
+        ``error_type`` (the exception class when the block came from one --
+        pass the exception itself as ``reason`` or separately as ``cause``)
+        and an optional ``reason_code``.  All three are program-authored
+        enums/names, so persistence keeps them verbatim and ``vibe status``
+        can name the failure class without the provider text.
         """
+        if cause is None and isinstance(reason, BaseException):
+            cause = reason
+        reason_text = str(reason)
+        error_type = type(cause).__name__ if cause is not None else None
+        classification = classify_provider_failure(
+            cause if cause is not None else {"reason": reason_text}
+        )
+        reason_class = str(classification["kind"])
         current = snapshot.nodes[node_id]
         active = current.get("active_task")
         handle_id = snapshot.handles.get(node_id)
         current["status"] = "blocked_unknown"
-        current["reason"] = reason
+        current["reason"] = reason_text
+        current["reason_class"] = reason_class
+        if error_type is not None:
+            current["error_type"] = error_type
+        else:
+            current.pop("error_type", None)
+        if reason_code is not None:
+            current["reason_code"] = reason_code
+        else:
+            current.pop("reason_code", None)
         current["quarantine"] = {
             "run_id": snapshot.run_id,
             "handle_id": handle_id,
-            "reason": reason,
+            "reason": reason_text,
         }
-        action = recovery_action_for_failure({"reason": reason})
+        action = recovery_action_for_failure(
+            cause if cause is not None else {"reason": reason_text}
+        )
         current["recovery_action"] = action
         if isinstance(active, dict) and active.get("role") in {"developer", "reviewer"}:
             try:
@@ -7951,13 +8510,18 @@ class Monitor:
                 node_id,
                 str(current.get("worktree", "")),
                 snapshot.run_id,
-                reason,
+                reason_text,
             )
         event_data = {
             "run_id": snapshot.run_id,
             "node_id": node_id,
-            "reason": reason,
+            "reason": reason_text,
+            "reason_class": reason_class,
         }
+        if error_type is not None:
+            event_data["error_type"] = error_type
+        if reason_code is not None:
+            event_data["reason_code"] = reason_code
         if retryable_same_task:
             event_data["retryable_same_task"] = True
         if extra_event_data:
@@ -7996,6 +8560,9 @@ class Monitor:
         redacted = redact_provider_text(reason)
         current["status"] = "blocked_design"
         current["reason"] = redacted
+        # #277: external authorization is a fixed routing class -- keep the
+        # structured class readable beside the redacted free text.
+        current["reason_class"] = "external_decision"
         current["retryable_action"] = None
         current["recovery_action"] = "await_external_decision"
         current["owner_layer"] = "external_authorization"
@@ -8010,6 +8577,7 @@ class Monitor:
             "run_id": snapshot.run_id,
             "node_id": node_id,
             "reason": redacted,
+            "reason_class": "external_decision",
             "old_task_reconciled": True,
             "owner_layer": "external_authorization",
             "recovery_action": "await_external_decision",
@@ -8567,10 +9135,17 @@ class Monitor:
         records = load_events(self.paths, snapshot.run_id)
         pending = records[snapshot.event_sequence :]
         for record in pending:
-            if record.get("event") == "supervisor_heartbeat":
-                # Heartbeats are supervisor lease telemetry, not node
-                # lifecycle events.  They may be appended between snapshot
-                # writes and must be consumed before provider polling.
+            if record.get("event") in {
+                "supervisor_heartbeat",
+                "run_archived",
+                "run_archive_failed",
+            }:
+                # Heartbeats are supervisor lease telemetry and archive
+                # records are filesystem evidence, not node lifecycle events.
+                # They may be appended between snapshot writes and must be
+                # consumed before provider polling; a completed run can still
+                # be reopened by an accepted patch, at which point its reads
+                # transparently land inside .vibe/runs-archive/.
                 snapshot.event_sequence = record["sequence"]
                 continue
             provenance = record["provenance"]

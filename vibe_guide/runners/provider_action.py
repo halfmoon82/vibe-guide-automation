@@ -3,6 +3,7 @@
 from dataclasses import replace
 import hashlib
 import json
+import os
 import shlex
 from pathlib import Path
 import subprocess
@@ -37,6 +38,7 @@ from ..task_registry import (
     save_task_binding,
 )
 from ..workflow_gate import session_contract_prompt
+from ..prompts import rework_findings_section
 from ..state import read_writer_lease
 from ..providers import (
     CLAUDE_CODE_PROVIDER,
@@ -220,6 +222,7 @@ class ProviderActionRunner(Runner):
             "`wake.channel` 非空时用该工具向 `wake.target` 原样发送 `wake.signal`，唤醒登记主监工；为 null 或地址 unknown 时不发，由心跳领取。"
             "自报时把你本会话的工作目录原样写进交付 JSON 的 `delivery_evidence.session_cwd`：监工用它核对本会话是否真的挂载了 project，不填就无法核对。"
             "运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。\n"
+            "{rework_findings}"
         ).format(node=node_id, generation=generation, purpose=purpose, objective=objective,
                  role=contract.get('role', 'developer'),
                  run=contract.get('run_id', '<原 run-id>'),
@@ -232,7 +235,8 @@ class ProviderActionRunner(Runner):
                  status=contract.get("status_file", "原状态文件"),
                  handoff=contract.get("handoff_file") or contract.get("delivery_path", "原交付文件"),
                  marker=contract.get("completion_marker", "原交付 marker"),
-                 acceptance_pin=acceptance_pin)
+                 acceptance_pin=acceptance_pin,
+                 rework_findings=rework_findings_section(contract))
 
     def _validate_v39_create_binding(
         self, contract: Dict[str, Any], runtime_worktree: Path
@@ -1561,3 +1565,104 @@ class ProviderActionRunner(Runner):
         events = self._wait_result(handle, metadata, claims, result)
         if len(events) != 1 or events[0].event != "stopped":
             raise ProviderPending("provider terminal wait did not prove a stop")
+
+
+def archive_run_provider_actions(
+    paths: ProjectPaths, run_id: str, target_root: Path
+) -> list:
+    """Sweep one run's provider-action artifacts into ``target_root``.
+
+    Every mailbox file the run owns (requests, results, stale markers,
+    observations, deliveries, dispatch heads, prompts, handles and
+    claude-bg session records) is moved under
+    ``<target_root>/provider-actions/<subdir>/`` so a dead run's requests no
+    longer surface in :meth:`ProviderActionStore.pending`.  Advisory lock
+    files stay in place -- they are crash leftovers, not evidence.  Idempotent:
+    files already archived are matched again through the archived requests.
+    Returns the list of archived-relative paths moved this call.
+    """
+    from ..state import validate_run_id
+
+    validate_run_id(run_id)
+    if target_root.is_symlink():
+        raise ValueError("run archive target may not be a symlink")
+    store = ProviderActionStore(paths)
+    root = store.root
+    if root.is_symlink() or (root.exists() and not root.is_dir()):
+        raise ValueError("provider action path may not be a symlink")
+
+    def _payload(path: Path) -> Optional[Dict[str, Any]]:
+        if path.is_symlink() or not path.is_file():
+            return None
+        try:
+            return store._read(path)
+        except (OSError, ValueError):
+            return None
+
+    action_ids = set()
+    moved = []
+
+    def _collect_requests(directory: Path) -> None:
+        if not directory.is_dir() or directory.is_symlink():
+            return
+        for path in sorted(directory.glob("action-*.json")):
+            payload = _payload(path)
+            if payload is None:
+                continue
+            if payload.get("run_id") != run_id:
+                continue
+            action_id = payload.get("action_id") or path.stem
+            if isinstance(action_id, str) and action_id:
+                action_ids.add(action_id)
+            action_ids.add(path.stem)
+            destination = target_root / "provider-actions" / "requests" / path.name
+            if destination.exists():
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(str(path), str(destination))
+            moved.append("provider-actions/requests/" + path.name)
+
+    # Requests already archived by an earlier crashed sweep still name this
+    # run's action ids for the result/observation match below.
+    _collect_requests(target_root / "provider-actions" / "requests")
+    _collect_requests(root / "requests")
+
+    def _owns(path: Path, payload: Optional[Dict[str, Any]]) -> bool:
+        if payload is not None:
+            if payload.get("run_id") == run_id:
+                return True
+            action_id = payload.get("action_id")
+            if isinstance(action_id, str) and action_id in action_ids:
+                return True
+            claims = payload.get("claims")
+            if isinstance(claims, dict) and claims.get("run_id") == run_id:
+                return True
+        stem = path.name
+        if stem.startswith(run_id + "-"):
+            return True
+        return any(stem == item or stem.startswith(item + "-")
+                   for item in action_ids)
+
+    for name in ("results", "stale", "observations", "deliveries",
+                 "dispatch-heads", "prompts", "handles", "claude-bg-sessions"):
+        directory = root / name
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        for path in sorted(directory.iterdir()):
+            if not path.is_file() or path.is_symlink():
+                continue
+            payload = _payload(path)
+            if not _owns(path, payload):
+                continue
+            destination = target_root / "provider-actions" / name / path.name
+            if destination.exists():
+                if destination.is_file() and destination.read_bytes() == path.read_bytes():
+                    path.unlink()
+                    continue
+                raise ValueError(
+                    "archive provider action destination already exists: " + path.name
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(str(path), str(destination))
+            moved.append("provider-actions/" + name + "/" + path.name)
+    return moved

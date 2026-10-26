@@ -334,6 +334,19 @@ _EVENT_DATA_KEYS = {
     "prd_digest",
     "spec_digest",
     "reason",
+    # node_repaired (#278): the repair class ("stuck_session" /
+    # "reviewer_replacement" / failure classification kind), the action it
+    # queued, and whether identity survived.  All are program constants or
+    # booleans; ``reconciliation`` is the structured git/provider probe block
+    # the repair already computes from repo-local facts.
+    "kind",
+    "repair_action",
+    "preserved_identity",
+    "reconciliation",
+    "same_task",
+    # The binding status observed before a stuck_session repair normalizes it
+    # to failed; without it the fold would erase why the writer was dead.
+    "previous_binding_status",
     "retained_acceptances",
     "invalidated_acceptances",
     "role",
@@ -372,6 +385,11 @@ _EVENT_DATA_KEYS = {
     "warnings",
     "attempt",
     "reason_class",
+    # #277: the exception class behind a block (e.g. "ConnectionError").
+    # Program-authored type name, never provider text; without it the
+    # blocked_unknown event loses half of the structured classification the
+    # issue requires persistence to keep.
+    "error_type",
     "next_retry_at",
     "binding_digest",
     "last_observation_ref",
@@ -464,6 +482,19 @@ _PROVIDER_TEXT_KEYS = {
 }
 _REDACTED = "[REDACTED]"
 _REDACTED_PROVIDER_TEXT = "[REDACTED_PROVIDER_TEXT]"
+#: #277: structured error-classification fields are vibe/provider-authored
+#: fixed enums and type names, never free text, so they are exempted from
+#: provider-text redaction even when they sit inside an otherwise-redacted
+#: provider payload.  The defect was that a failure dict like
+#: ``{"reason": <text>, "reason_class": "binding_unknown"}`` persisted as
+#: ``{"reason": "[REDACTED_PROVIDER_TEXT]", "reason_class":
+#: "[REDACTED_PROVIDER_TEXT]"}`` -- the one fact a supervisor or auditor can
+#: act on ("which error class") was replaced by a placeholder.
+STRUCTURED_REASON_KEYS = frozenset({
+    "error_type",
+    "reason_class",
+    "reason_code",
+})
 #: Node-level structural facts a recovery or rollback gate is allowed to
 #: decide on (#256).  Every entry is program-authored structure -- a status
 #: enum, a hex digest, an epoch, an identity/generation pair, a marker object
@@ -543,7 +574,22 @@ def is_redacted_value(value: Any) -> bool:
     )
 
 
+def _provider_text_verbose() -> bool:
+    """#277 opt-in debug switch: ``VIBE_VERBOSE=1`` keeps provider free text.
+
+    Off by default.  Field-name-based secret masking (``token``/``secret``/
+    ``credential``/...) stays on even under verbose -- the flag is for
+    debugging a live failure, not for persisting credentials.
+    """
+    return os.environ.get("VIBE_VERBOSE") == "1"
+
+
 def redact_provider_text(value: Any) -> Any:
+    if _provider_text_verbose():
+        # Verbose keeps the original text verbatim; routing through the normal
+        # sanitizer still masks dict entries whose *keys* name secrets and
+        # keeps nested provider-text keys treated uniformly.
+        return _sanitize_durable_value(value)
     if value is None:
         return None
     if isinstance(value, list):
@@ -551,11 +597,20 @@ def redact_provider_text(value: Any) -> Any:
     if isinstance(value, tuple):
         return [redact_provider_text(item) for item in value]
     if isinstance(value, dict):
-        return {
-            str(key): redact_provider_text(item)
-            for key, item in value.items()
-            if not _is_sensitive_data_key(str(key))
-        }
+        result: Dict[str, Any] = {}
+        for key, item in value.items():
+            name = str(key)
+            if _is_sensitive_data_key(name):
+                continue
+            if _normalize_data_key(name) in STRUCTURED_REASON_KEYS and isinstance(
+                item, (str, int, float, bool)
+            ):
+                # Fixed-enum/type-name fields (#277).  Scalars only: a dict or
+                # list under a structured name is still provider payload.
+                result[name] = item
+                continue
+            result[name] = redact_provider_text(item)
+        return result
     return _REDACTED_PROVIDER_TEXT
 
 
@@ -861,9 +916,21 @@ def _safe_project_path(paths: ProjectPaths, *parts: str) -> Path:
     return candidate
 
 
+def runs_archive_dir(paths: ProjectPaths, run_id: str) -> Path:
+    """Archive location for a finished run, mirroring ``plans-archive``."""
+    return _safe_project_path(paths, ".vibe", "runs-archive", run_id)
+
+
 def run_dir(paths: ProjectPaths, run_id: str, create: bool = False) -> Path:
     validate_run_id(run_id)
     directory = _safe_project_path(paths, ".vibe", "runs", run_id)
+    if not directory.exists():
+        # An archived run's evidence stays addressable read-side: any later
+        # run-scoped read or write lands inside the archive instead of
+        # resurrecting a stub directory under .vibe/runs/.
+        archived = runs_archive_dir(paths, run_id)
+        if archived.is_dir() and not archived.is_symlink():
+            return archived
     if create:
         directory.mkdir(parents=True, exist_ok=True)
         # Revalidate after mkdir to catch a concurrently inserted symlink.
@@ -1874,3 +1941,245 @@ def rebind_writer_lease(
             if candidate != new_path:
                 candidate.unlink()
         return True
+
+
+def _archive_merge_directory(source: Path, destination: Path, archive_root: Path,
+                             moved: List[str], conflicts: List[str]) -> None:
+    """Merge ``source`` into ``destination`` without overwriting evidence.
+
+    Identical files are deduplicated; a conflicting file is kept beside the
+    original under a ``.conflict-<digest>`` suffix so neither side is lost.
+    """
+    for child in sorted(source.iterdir(), key=lambda item: item.name):
+        target = destination / child.name
+        if child.is_symlink():
+            conflicts.append(str(child.relative_to(archive_root.parent.parent)))
+            continue
+        if child.is_dir():
+            if target.exists() and not target.is_dir():
+                conflicts.append(str(child.relative_to(archive_root.parent.parent)))
+                continue
+            target.mkdir(exist_ok=True)
+            _archive_merge_directory(child, target, archive_root, moved, conflicts)
+            try:
+                child.rmdir()
+            except OSError:
+                pass
+            continue
+        relative = target.relative_to(archive_root).as_posix()
+        if target.exists() and not target.is_symlink() and target.is_file():
+            if target.read_bytes() == child.read_bytes():
+                child.unlink()
+                continue
+            digest = hashlib.sha256(child.read_bytes()).hexdigest()[:8]
+            conflict_target = destination / (child.name + ".conflict-" + digest)
+            if not conflict_target.exists():
+                os.replace(str(child), str(conflict_target))
+                moved.append(conflict_target.relative_to(archive_root).as_posix())
+            else:
+                child.unlink()
+            continue
+        if target.exists() or target.is_symlink():
+            conflicts.append(str(child.relative_to(archive_root.parent.parent)))
+            continue
+        os.replace(str(child), str(target))
+        moved.append(relative)
+
+
+def archive_run_leases(paths: ProjectPaths, run_id: str,
+                       target_root: Path) -> List[str]:
+    """Move writer leases carrying ``run_id`` into ``target_root/leases/``.
+
+    Removing the lease file is what frees a node/worktree pair for a later
+    dispatch; unreadable or foreign leases are left in place.
+    """
+    validate_run_id(run_id)
+    lease_dir = _safe_project_path(paths, ".vibe", "leases")
+    if lease_dir.is_symlink():
+        raise ValueError("lease directory may not be a symlink")
+    moved: List[str] = []
+    if not lease_dir.is_dir():
+        return moved
+    for candidate in sorted(lease_dir.glob("*.json")):
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("run_id") != run_id:
+            continue
+        destination = target_root / "leases" / candidate.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            if destination.is_file() and destination.read_bytes() == candidate.read_bytes():
+                candidate.unlink()
+                continue
+            raise ValueError("archive lease destination already exists: " + candidate.name)
+        os.replace(str(candidate), str(destination))
+        moved.append("leases/" + candidate.name)
+    return moved
+
+
+def archive_run(paths: ProjectPaths, run_id: str) -> Dict[str, Any]:
+    """Move one run's directory, provider artifacts and leases to the archive.
+
+    Idempotent and crash-resumable: every partial state (run dir moved but
+    manifest missing, artifacts half-swept, residual stub recreated by a late
+    writer) converges on the next call.  Existing archive content is never
+    overwritten; conflicting residual files are kept as ``.conflict-*``.
+    """
+    validate_run_id(run_id)
+    primary = _safe_project_path(paths, ".vibe", "runs", run_id)
+    destination = runs_archive_dir(paths, run_id)
+    if destination.is_symlink() or (primary.is_symlink()):
+        raise ValueError("run archive paths may not be symlinks")
+    if primary.exists() and not primary.is_dir():
+        raise ValueError("run archive source is not a directory")
+    lock = _safe_project_path(paths, ".vibe", "runs-archive", ".archive.lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    moved: List[str] = []
+    conflicts: List[str] = []
+    with interprocess_lock(lock):
+        destination.mkdir(parents=True, exist_ok=True)
+        manifest_path = destination / "archive-manifest.json"
+        if manifest_path.exists() and not manifest_path.is_symlink():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                manifest = None
+            if not isinstance(manifest, dict) or manifest.get("run_id") != run_id:
+                manifest = None
+        else:
+            manifest = None
+        if manifest is None:
+            manifest = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "moved": [],
+                "conflicts": [],
+            }
+        if primary.is_dir():
+            try:
+                # Single rename when the archive slot is still empty; a
+                # pre-existing archive (rerun after a crash, or a stub
+                # recreated by a late writer) falls through to a merge that
+                # never overwrites.
+                os.rename(str(primary), str(destination))
+                moved.append(".")
+            except OSError:
+                _archive_merge_directory(
+                    primary, destination, destination, moved, conflicts
+                )
+                try:
+                    primary.rmdir()
+                except OSError:
+                    # Residual conflict files keep the source legible.
+                    conflicts.append(str(primary))
+        from .runners.provider_action import archive_run_provider_actions
+
+        moved.extend(archive_run_provider_actions(paths, run_id, destination))
+        moved.extend(archive_run_leases(paths, run_id, destination))
+        seen = set(manifest["moved"])
+        for item in moved:
+            if item not in seen:
+                manifest["moved"].append(item)
+                seen.add(item)
+        seen_conflicts = set(manifest["conflicts"])
+        for item in conflicts:
+            if item not in seen_conflicts:
+                manifest["conflicts"].append(item)
+                seen_conflicts.add(item)
+        manifest["archived"] = True
+        _atomic_bytes(
+            manifest_path,
+            (
+                json.dumps(manifest, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"))
+                + "\n"
+            ).encode("utf-8"),
+        )
+    return manifest
+
+
+def _restore_tree(source_dir: Path, target_dir: Path,
+                  conflicts_root: Path, moved: List[str]) -> None:
+    """Move ``source_dir`` contents back into ``target_dir`` (unarchive).
+
+    Never overwrites: identical files are deduplicated, divergent files are
+    kept under ``conflicts_root`` so neither side is lost.
+    """
+    if not source_dir.is_dir() or source_dir.is_symlink():
+        return
+    for path in sorted(source_dir.iterdir(), key=lambda item: item.name):
+        if path.is_symlink() or not path.is_file():
+            continue
+        destination = target_dir / path.name
+        if destination.exists():
+            if destination.is_file() and destination.read_bytes() == path.read_bytes():
+                path.unlink()
+                continue
+            conflict = conflicts_root / path.name
+            conflict.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(str(path), str(conflict))
+            moved.append(str(conflict))
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(str(path), str(destination))
+        moved.append(str(destination))
+    try:
+        source_dir.rmdir()
+    except OSError:
+        pass
+
+
+def unarchive_run(paths: ProjectPaths, run_id: str) -> bool:
+    """Restore an archived run under ``.vibe/runs/`` (issue #274).
+
+    Inverse of :func:`archive_run`: a completed run reopened by
+    reauthorization must write under ``.vibe/runs/`` again.  The run
+    directory, its provider-action artifacts and its writer leases move back;
+    ``restore-conflicts/`` keeps any divergent file that could not be restored
+    without overwriting newer evidence.  Idempotent; returns True when the
+    run directory is live under ``.vibe/runs/`` afterwards.
+    """
+    validate_run_id(run_id)
+    primary = _safe_project_path(paths, ".vibe", "runs", run_id)
+    archive = runs_archive_dir(paths, run_id)
+    if primary.is_symlink() or archive.is_symlink():
+        raise ValueError("run archive paths may not be symlinks")
+    if primary.exists():
+        if not primary.is_dir():
+            raise ValueError("run restore destination is not a directory")
+        return True
+    if not archive.is_dir():
+        return False
+    lock = _safe_project_path(paths, ".vibe", "runs-archive", ".archive.lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with interprocess_lock(lock):
+        if primary.exists() or not archive.is_dir():
+            return primary.is_dir()
+        # Bring the whole archive back first; the provider-actions/leases
+        # subtrees inside it are then dispersed to their live homes so a
+        # reopened run regains its mailbox requests and writer leases.
+        os.rename(str(archive), str(primary))
+        conflicts_root = primary / "restore-conflicts"
+        provider_root = primary / "provider-actions"
+        store_root = _safe_project_path(paths, ".vibe", "provider-actions")
+        if provider_root.is_dir() and not provider_root.is_symlink():
+            for sub in sorted(provider_root.iterdir(), key=lambda item: item.name):
+                if sub.is_dir() and not sub.is_symlink():
+                    _restore_tree(
+                        sub, store_root / sub.name,
+                        conflicts_root / "provider-actions" / sub.name, [],
+                    )
+            try:
+                provider_root.rmdir()
+            except OSError:
+                pass
+        _restore_tree(
+            primary / "leases",
+            _safe_project_path(paths, ".vibe", "leases"),
+            conflicts_root / "leases", [],
+        )
+    return True

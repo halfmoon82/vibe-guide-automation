@@ -378,9 +378,13 @@ class ParallelGroupAuditTests(unittest.TestCase):
                 result.reasons[node_id],
             )
             self.assertTrue(
-                any("integration_after" in reason for reason in result.reasons[node_id]),
+                any("depends_on" in reason for reason in result.reasons[node_id]),
                 result.reasons[node_id],
             )
+            # The fix list must not suggest integration_after: it never
+            # serializes writers, so it cannot lift a write-scope overlap.
+            for reason in result.reasons[node_id]:
+                self.assertNotIn("integration_after", reason)
 
     def test_overlapping_owned_paths_are_refused_from_parallel_group(self):
         nodes = [
@@ -420,9 +424,10 @@ class ParallelGroupAuditTests(unittest.TestCase):
                 result.reasons[node_id],
                 [
                     "parallel_group 'g': nodes a and b have overlapping write scope "
-                    "(vibe_guide/shared.py); relabel integration_after or split the group",
+                    "(vibe_guide/shared.py); depends_on does not lift a group overlap — "
+                    "split the paths or move a node out of the group",
                     "nodes a and b have overlapping write scope (vibe_guide/shared.py); "
-                    "add depends_on, relabel integration_after, or split the paths",
+                    "serialize with depends_on or split the paths",
                 ],
             )
 
@@ -457,9 +462,11 @@ class ParallelGroupAuditTests(unittest.TestCase):
         for node_id in ("producer", "consumer"):
             self.assertTrue(
                 any("produced path docs/specs/shared-protocol.md" in reason
-                    and "integration_after" in reason for reason in result.reasons[node_id]),
+                    and "depends_on" in reason for reason in result.reasons[node_id]),
                 result.reasons[node_id],
             )
+            for reason in result.reasons[node_id]:
+                self.assertNotIn("integration_after", reason)
 
     def test_disjoint_nodes_remain_in_parallel_group(self):
         nodes = [self._group_node("a"), self._group_node("b")]

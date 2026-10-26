@@ -1995,6 +1995,24 @@ def bounded_supervisor_output(paths, run_id, payload, rendered):
     if "reason" in payload:
         short["reason"] = str(payload["reason"])[:200]
     short.update({"truncated": True, "output_evidence": _artifact_ref(path)})
+    # ISSUE-280: ``vibe status --json`` readers rely on ``nodes`` being a
+    # stable top-level object keyed by node id.  The byte budget may truncate
+    # per-node detail, but it must never silently change the top-level shape;
+    # the full object is always recoverable through ``output_evidence``.
+    nodes = payload.get("nodes")
+    if isinstance(nodes, dict):
+        for project in (
+                lambda node: {
+                    key: str(node.get(key, ""))[:200]
+                    for key in ("status", "user_status") if node.get(key)},
+                lambda node: {},
+        ):
+            short["nodes"] = {
+                str(node_id): project(node) if isinstance(node, dict) else {}
+                for node_id, node in nodes.items()
+            }
+            if len(json.dumps(short, ensure_ascii=False).encode("utf-8")) <= SUPERVISOR_OUTPUT_LIMIT:
+                break
     return json.dumps(short, ensure_ascii=False, sort_keys=True)
 
 

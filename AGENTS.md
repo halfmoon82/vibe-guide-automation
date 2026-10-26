@@ -62,6 +62,8 @@
 - `contract`：占位实现必须满足的输入、输出、错误行为和验收示例；
 - `parallel_group`：可以同时启动的节点组。
 
+写范围重叠的节点必须用 `depends_on` 串行；`integration_after` 不阻塞启动，不能解除写范围冲突。拆节点时先把同文件工作归到同一节点，再考虑用 `depends_on` 串行两个节点。
+
 可用 stub、fixture 或 fake service 时，应先并行开发，再做适配联调。共享文件或潜在冲突不是天然串行理由，优先使用隔离 worktree。
 
 ## 6. 监工与授权
