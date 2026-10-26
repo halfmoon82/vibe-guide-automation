@@ -2533,6 +2533,23 @@ class PlatformHandoffUnservedLeaseTests(unittest.TestCase):
         monitor, live, digest = self._post_handoff_probe()
         self.assertTrue(monitor._adopt_unserved_handoff_lease(live, "b", "developer", 1, digest))
 
+    def test_the_helper_refuses_when_the_snapshot_left_the_handoffs_authorization(self):
+        # Defence in depth beside "the latest reauthorization must be the
+        # handoff": the digest the handoff produced must still be the run's.
+        monitor, live, digest = self._post_handoff_probe()
+        live.authorization_digest = "d" * 64
+        self.assertFalse(monitor._adopt_unserved_handoff_lease(live, "b", "developer", 1, digest))
+
+    def test_the_helper_refuses_when_a_later_reauthorization_followed_the_handoff(self):
+        monitor, live, digest = self._post_handoff_probe()
+        events = load_events(self.paths, live.run_id)
+        later = json.loads(json.dumps(next(
+            e for e in reversed(events) if e["event"] == "authorization_reauthorized")))
+        later["data"]["change_reason"] = "executable_contract_changed"
+        with patch.object(monitor_module, "load_events", lambda *a, **k: events + [later]):
+            live.event_sequence = len(events) + 1
+            self.assertFalse(monitor._adopt_unserved_handoff_lease(live, "b", "developer", 1, digest))
+
     def test_the_helper_refuses_a_node_with_a_task_identity(self):
         # Defence in depth: identity is normally set together with a binding.
         monitor, live, digest = self._post_handoff_probe()
