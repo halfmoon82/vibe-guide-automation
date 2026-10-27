@@ -122,6 +122,58 @@ def _advisory_notes(value):
     return [note[:_ADVISORY_NOTE_LIMIT] for note in notes[:_ADVISORY_NOTES_LIMIT]]
 
 
+#: Receipt shapes this runner reads.  ``poll``/``_wait_result`` and
+#: ``heal_pack`` share these definitions, so the shape a heal pack reports as
+#: expected is the one the reader enforces.
+RESUME_RECEIPT_FIELD = "resumed"
+WAIT_EVENT_NAMES = (
+    "complete", "delivered", "accepted", "review_finding", "failed", "stopped",
+)
+WAIT_TERMINAL_STATUSES = ("complete", "completed", "failed", "stopped")
+WAIT_TRANSIENT_STATUSES = ("timeout", "unknown", "error")
+WAIT_STATUS_AS_EVENT = ("failed", "stopped")
+WAIT_CURSOR_MAX_LENGTH = 4096
+_MISSING = object()
+
+
+def cursor_is_valid(cursor: Any) -> bool:
+    return (
+        isinstance(cursor, str)
+        and bool(cursor)
+        and len(cursor) <= WAIT_CURSOR_MAX_LENGTH
+        and "\x00" not in cursor
+    )
+
+
+def resume_receipt_differences(payload: Dict[str, Any]) -> list:
+    """Why the reader would refuse a resume receipt; empty when it accepts."""
+    value = payload.get(RESUME_RECEIPT_FIELD, _MISSING)
+    if value is _MISSING:
+        return ["missing field: %s" % RESUME_RECEIPT_FIELD]
+    if value is not True:
+        return [
+            "field %s must be true (got type %s)"
+            % (RESUME_RECEIPT_FIELD, type(value).__name__)
+        ]
+    return []
+
+
+def wait_cursor_differences(payload: Dict[str, Any]) -> list:
+    """The one wait-result defect ``_wait_result`` keeps pending.
+
+    A bad cursor returns before the pending action is cleared, so the same
+    result is read again on every poll.  Every other shape problem is read
+    once, consumed, and answered by a fresh wait -- nothing left to repair.
+    """
+    cursor = payload.get("cursor")
+    if cursor is not None and not cursor_is_valid(cursor):
+        return [
+            "field cursor is invalid (needs a non-empty string, at most %d "
+            "characters, no NUL)" % WAIT_CURSOR_MAX_LENGTH
+        ]
+    return []
+
+
 #: ``.vibe/config.json`` field choosing how the visible-sdd protocol reaches
 #: the worker prompt: ``inline`` (default, full text) or ``ref`` (path + sha256).
 FIELD_SDD_PROTOCOL_DELIVERY = "sdd_protocol_delivery"
@@ -1488,12 +1540,7 @@ class ProviderActionRunner(Runner):
     ):
         status = result.get("status")
         cursor = result.get("cursor")
-        if cursor is not None and (
-            not isinstance(cursor, str)
-            or not cursor
-            or len(cursor) > 4096
-            or "\x00" in cursor
-        ):
+        if cursor is not None and not cursor_is_valid(cursor):
             return [
                 RunEvent(
                     "visibility_unknown",
@@ -1513,26 +1560,19 @@ class ProviderActionRunner(Runner):
         metadata["pending_action"] = None
         metadata["pending_operation"] = None
         self.store._atomic(self._handle_path(handle.run_id), metadata)
-        if status in {"timeout", "unknown", "error"}:
+        if status in WAIT_TRANSIENT_STATUSES:
             return [RunEvent("visibility_unknown", {**claims, "reason": str(status)})]
         event_name = result.get("event")
-        if event_name is None and status in {"failed", "stopped"}:
+        if event_name is None and status in WAIT_STATUS_AS_EVENT:
             event_name = status
-        if event_name not in {
-            "complete",
-            "delivered",
-            "accepted",
-            "review_finding",
-            "failed",
-            "stopped",
-        }:
+        if event_name not in WAIT_EVENT_NAMES:
             return [
                 RunEvent(
                     "visibility_unknown",
                     {**claims, "reason": "provider event is unsupported"},
                 )
             ]
-        if status not in {"complete", "completed", "failed", "stopped"}:
+        if status not in WAIT_TERMINAL_STATUSES:
             return [
                 RunEvent(
                     "visibility_unknown",
@@ -1582,12 +1622,7 @@ class ProviderActionRunner(Runner):
         ) != "stopped":
             raise ProviderPending("provider terminal wait did not prove a stop")
         cursor = result.get("cursor")
-        if cursor is not None and (
-            not isinstance(cursor, str)
-            or not cursor
-            or len(cursor) > 4096
-            or "\x00" in cursor
-        ):
+        if cursor is not None and not cursor_is_valid(cursor):
             raise ProviderPending("provider terminal wait cursor is invalid")
         claims = {
             "node_id": metadata["node_id"],
