@@ -845,7 +845,14 @@ def _platform_handoff_rebind(
         dispatchable_others=dispatchable,
     )
     if target is None:
-        stranded = stranded_nodes(nodes, unfinished, contract.provider)
+        # Only a contract naming a platform that is attested and dispatchable
+        # is an actionable disagreement; one naming something nobody attested
+        # (a bare label) gives the operator no target to add.
+        stranded = (
+            stranded_nodes(nodes, unfinished, contract.provider)
+            if contract.provider in dispatchable
+            else []
+        )
         if stranded:
             # Nothing is written before this point: say so instead of
             # re-authorizing into a no-op that looks like a handoff.

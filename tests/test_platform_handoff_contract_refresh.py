@@ -116,6 +116,15 @@ class RealUserHandoffTests(HandoffCase):
         self.assertEqual(load_contract(self.paths).provider, "claude-code")
         self.assert_moved_and_finishes(before)
 
+    def test_a_contract_naming_an_unattested_label_is_not_a_stranded_stop(self):
+        """CONSTRUCTED STATE: a bare label has no target to tell the operator to add."""
+        from vibe_guide.capability_contract import build_contract, save_contract
+
+        self.ready()
+        save_contract(self.paths, build_contract(self.root, provider="cursor", host_id="local"))
+        result = self.handoff()
+        self.assertNotIn("--adapter", str(result.payload.get("reason", "")), result.payload)
+
     def test_an_unstated_contract_with_no_other_platform_is_not_a_stranded_run(self):
         self.ready()
         result = self.handoff()
@@ -133,8 +142,13 @@ class RealUserHandoffTests(HandoffCase):
         """
         from vibe_guide.capability_contract import build_contract, save_contract
 
-        self.ready()
+        # The run starts under a contract that already names claude-code while
+        # its nodes sit on workbuddy, and claude-code is attested afterwards:
+        # the digest never changes, so no rule can name a target.
+        self.assertEqual(self.cli("init", "--confirm").payload["status"], "ok")
         save_contract(self.paths, build_contract(self.root, provider="claude-code", host_id="local"))
+        self.ready()
+        self.attest("claude-code")
         plan = self.root / ".vibe" / "plans" / PLAN
         files = {name: (plan / name).read_bytes() for name in ("nodes.json", "authorization-card.json", "authorization.json")}
         contract = self.contract_text()
