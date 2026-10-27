@@ -2477,6 +2477,8 @@ class Monitor:
             # so refresh the projection before dispatching for the same
             # reason as the full path below.
             self._record_topology_projection(snapshot, "monitor.reauthorize")
+            if change_reason == "platform_handoff":
+                self._hide_stale_handoff_creates(snapshot)
             self._schedule_ready(snapshot, runner)
             self._refresh_run_status(snapshot)
             self._record_topology_projection(snapshot, "monitor.reauthorize")
@@ -2689,6 +2691,8 @@ class Monitor:
         # fail closed with ``ready-set drift`` — the same double-record
         # ordering ``tick`` already uses.
         self._record_topology_projection(snapshot, "monitor.reauthorize")
+        if change_reason == "platform_handoff":
+            self._hide_stale_handoff_creates(snapshot)
         self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
         self._record_topology_projection(snapshot, "monitor.reauthorize")
@@ -4968,6 +4972,73 @@ class Monitor:
             return None
         return previous
 
+    def _node_never_claimed(
+        self, snapshot: RunSnapshot, node_id: str, store: ProviderActionStore
+    ) -> bool:
+        """Whether nothing durable shows anyone started this node: no task
+        identity, active task, handle, binding, ``start_confirmed`` or mailbox
+        claim mark.  Anything unprovable is False."""
+        current = snapshot.nodes[node_id]
+        if (
+            current.get("developer_identity") or current.get("reviewer_identity")
+            or current.get("active_task") or node_id in snapshot.handles
+        ):
+            return False
+        for other in ("developer", "reviewer"):
+            try:
+                self._load_task_binding(snapshot, node_id, other)
+            except FileNotFoundError:
+                continue
+            return False
+        if any(
+            event.get("event") == "start_confirmed"
+            and event.get("data", {}).get("node_id") == node_id
+            for event in load_events(self.paths, snapshot.run_id)[: snapshot.event_sequence]
+        ):
+            return False
+        return store.claim_evidence(snapshot.run_id, node_id) is None
+
+    def _hide_stale_handoff_creates(self, snapshot: RunSnapshot) -> None:
+        """Hide the old platform's unclaimed creates of every unfinished node.
+
+        Independent of the node's lease: a dispatch that failed once released
+        its lease, so the lease-rebind path never runs for it, yet its old
+        create is still pending beside the new platform's.  Only requests
+        written under the authorization the latest platform_handoff replaced
+        and that nothing claimed are hidden; the new platform's own create
+        carries the current digest and is never matched.  Idempotent, so a
+        re-run of the handoff heals a mailbox an earlier version left with two.
+        """
+        replaced = self._handoff_replaced_authorization(snapshot)
+        if replaced is None:
+            return
+        store = ProviderActionStore(self.paths)
+        for node_id in sorted(snapshot.nodes):
+            if snapshot.nodes[node_id].get("status") == "accepted":
+                continue
+            try:
+                slots = store.unresolved_create_slots(snapshot.run_id, node_id, replaced)
+                if not slots or not self._node_never_claimed(snapshot, node_id, store):
+                    continue
+                for role, generation in slots:
+                    superseded = store.supersede_unclaimed_creates(
+                        snapshot.run_id, node_id, role, generation, replaced
+                    )
+                    if superseded:
+                        self._record(
+                            snapshot,
+                            "handoff_stale_creates_hidden",
+                            {
+                                "run_id": snapshot.run_id,
+                                "node_id": node_id,
+                                "role": role,
+                                "generation": generation,
+                                "superseded_creates": superseded,
+                            },
+                        )
+            except (OSError, TypeError, ValueError):
+                continue
+
     def _adopt_unserved_handoff_lease(
         self, snapshot: RunSnapshot, node_id: str, role: str, generation: int, digest: str
     ) -> bool:
@@ -4991,25 +5062,8 @@ class Monitor:
             replaced = self._handoff_replaced_authorization(snapshot)
             if replaced is None:
                 return False
-            if (
-                current.get("developer_identity") or current.get("reviewer_identity")
-                or current.get("active_task") or node_id in snapshot.handles
-            ):
-                return False
-            for other in ("developer", "reviewer"):
-                try:
-                    self._load_task_binding(snapshot, node_id, other)
-                except FileNotFoundError:
-                    continue
-                return False
-            if any(
-                event.get("event") == "start_confirmed"
-                and event.get("data", {}).get("node_id") == node_id
-                for event in load_events(self.paths, snapshot.run_id)[: snapshot.event_sequence]
-            ):
-                return False
             store = ProviderActionStore(self.paths)
-            if store.claim_evidence(snapshot.run_id, node_id) is not None:
+            if not self._node_never_claimed(snapshot, node_id, store):
                 return False
             superseded = store.supersede_unclaimed_creates(
                 snapshot.run_id, node_id, role, generation, replaced
@@ -10250,6 +10304,10 @@ class Monitor:
                 # Evidence only: the lease file was re-keyed before the event.
                 if provenance.get("role") != "system" or not self._run_has_platform_handoff(snapshot):
                     raise ValueError("handoff lease rebound replay provenance is invalid")
+            elif record["event"] == "handoff_stale_creates_hidden":
+                # Evidence only: the stale markers were written before the event.
+                if provenance.get("role") != "system" or not self._run_has_platform_handoff(snapshot):
+                    raise ValueError("handoff stale creates replay provenance is invalid")
             elif record["event"] == "handoff_predecessor_reconciled":
                 # Evidence only: the registry already holds the archived
                 # predecessor, and the successor's own start events replay

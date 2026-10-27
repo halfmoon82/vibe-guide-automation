@@ -917,6 +917,32 @@ class ProviderActionStore:
             return "unreadable"
         return None
 
+    def unresolved_create_slots(
+        self, run_id: str, issue_id: str, authorization_digest: str,
+    ) -> List[Tuple[str, int]]:
+        """(role, generation) of this node's create requests that have no
+        result and no stale marker and were written under exactly
+        ``authorization_digest``; the candidates a handoff may hide."""
+        if not all(isinstance(value, str) and value for value in (run_id, issue_id, authorization_digest)):
+            raise ValueError("provider request identity is required")
+        slots = set()
+        stale_dir = self._directory("stale")
+        for path in sorted(self._directory("requests").glob("action-*.json")):
+            if (self.root / "results" / path.name).exists() or (stale_dir / path.name).exists():
+                continue
+            action = self._read(path)
+            envelope = action.get("request")
+            if (
+                action.get("run_id") == run_id and action.get("issue_id") == issue_id
+                and action.get("operation") == "create"
+                and isinstance(action.get("role"), str)
+                and isinstance(action.get("generation"), int)
+                and isinstance(envelope, Mapping)
+                and envelope.get("authorization_digest") == authorization_digest
+            ):
+                slots.add((action["role"], action["generation"]))
+        return sorted(slots)
+
     def supersede_unclaimed_creates(
         self, run_id: str, issue_id: str, role: str, generation: int,
         previous_authorization_digest: str,
