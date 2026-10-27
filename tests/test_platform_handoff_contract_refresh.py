@@ -179,6 +179,43 @@ class ContractRefreshCrashWindowTests(HandoffCase):
         self.assertNotEqual(rerun.payload["status"], "blocked_unknown", rerun.payload)
         self.assert_moved_and_finishes(before)
 
+    def test_a_rerun_through_the_invalidation_marker_branch_refreshes_the_contract(self):
+        """The marker branch is reachable by commands alone.
+
+        A handoff killed after the reauthorization committed but before
+        nodes.json was written leaves the card naming a platform the files
+        do not; the user's next plain ``resume`` then writes
+        ``authorization-invalidated.json``.  Re-running the handoff takes the
+        other card-refresh branch, and it must refresh the contract too.
+        """
+        from vibe_guide import cli as cli_module
+
+        before = self.ready()
+        self.attest("claude-code")
+        real = cli_module._atomic_json
+
+        def crash(path, payload):
+            if Path(path).name == "nodes.json":
+                raise OSError("injected kill before nodes.json")
+            return real(path, payload)
+
+        with patch.object(cli_module, "_atomic_json", crash), patch.object(
+            cli_module, "_atomic_bytes", side_effect=OSError("killed before rollback")
+        ):
+            self.handoff("--adapter", "claude-code")
+        marker = self.root / ".vibe" / "plans" / PLAN / "authorization-invalidated.json"
+        self.assertFalse(marker.exists())
+        self.cli("resume", "--plan", PLAN)
+        self.assertTrue(marker.exists(), "the plain resume after the kill must leave the marker")
+        # The killed run had already committed the contract; the re-run goes
+        # through the marker branch and must leave it consistent.
+        self.assertEqual(load_contract(self.paths).provider, "claude-code")
+        rerun = self.handoff("--adapter", "claude-code")
+        self.assertNotEqual(rerun.payload["status"], "blocked_unknown", rerun.payload)
+        self.assertFalse(marker.exists())
+        self.assertEqual(load_contract(self.paths).provider, "claude-code")
+        self.assert_moved_and_finishes(before)
+
     def test_an_acceptance_change_alongside_the_handoff_leaves_the_contract_untouched(self):
         self.ready()
         self.attest("claude-code")

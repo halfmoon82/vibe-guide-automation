@@ -690,6 +690,33 @@ def _staged_session_contract(
         raise
 
 
+@contextlib.contextmanager
+def _staged_reauthorization(
+    paths: ProjectPaths,
+    plan: Plan,
+    directory: Path,
+    handoff_agent: Optional[str],
+    committed: List[bool],
+    observation: Tuple[Any, ...],
+):
+    """Everything a same-run reauthorization stages before ``reauthorize`` runs.
+
+    One place for both card-refresh branches of ``monitor`` (with and without an
+    invalidation marker), so neither can drift from the other: the session
+    contract refresh of a platform handoff, then the engine evidence.  Yields
+    the engine attestation (``None`` when the plan has no engine binding).
+    """
+    with _staged_session_contract(paths, handoff_agent, committed), \
+        _staged_engine_attestation(
+            directory / "engine-attestation.json",
+            _observed_engine_attestation(paths, plan, *observation)
+            if _engine_evidence_required(plan)
+            else None,
+            committed,
+        ) as engine_attestation:
+        yield engine_attestation
+
+
 def _observed_adapter(paths: ProjectPaths, adapter_id: str):
     observed = None
     last_error = None
@@ -3408,16 +3435,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 invalidation = _read_json(invalidation_path)
                 if not isinstance(invalidation, dict):
                     raise ValueError("authorization invalidation record is invalid")
-                with _staged_session_contract(
-                    paths, handoff_agent, handoff_committed
-                ), _staged_engine_attestation(
-                    directory / "engine-attestation.json",
-                    _observed_engine_attestation(
-                        paths, plan, *handoff_observation
-                    )
-                    if _engine_evidence_required(plan)
-                    else None,
-                    handoff_committed,
+                with _staged_reauthorization(
+                    paths, plan, directory, handoff_agent,
+                    handoff_committed, handoff_observation,
                 ) as engine_attestation:
                     card = refresh_authorization_card(
                         plan, nodes, card,
@@ -3475,16 +3495,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 # Refresh the card as well: a delivered contract correction
                 # may have changed the executable node digest without writing
                 # an invalidation marker yet.
-                with _staged_session_contract(
-                    paths, handoff_agent, handoff_committed
-                ), _staged_engine_attestation(
-                    directory / "engine-attestation.json",
-                    _observed_engine_attestation(
-                        paths, plan, *handoff_observation
-                    )
-                    if _engine_evidence_required(plan)
-                    else None,
-                    handoff_committed,
+                with _staged_reauthorization(
+                    paths, plan, directory, handoff_agent,
+                    handoff_committed, handoff_observation,
                 ) as engine_attestation:
                     card = refresh_authorization_card(
                         plan, nodes, card,
