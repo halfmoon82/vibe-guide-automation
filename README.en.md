@@ -137,6 +137,15 @@ Accepted on real sessions (2026-10-14, Claude Code 2.1.260): background dispatch
 
 Unverified, do not treat as available: pre-assigning a session id with `--session-id`, combining `-w` with `--bg`, recovery after a long task / sleep / daemon exit, and `--bg` under the desktop-bundled CLI.
 
+### Platform handoff (`--platform-handoff`)
+
+To move the rest of a running plan to another platform (for example from WorkBuddy to Claude Code):
+
+1. In a session on the **new** platform, register its capabilities first: `vibe attest --adapter <new-platform> --facts <project-relative path> --provenance <where observed>`. `attest` only records capabilities; it never changes the session capability contract.
+2. Then run `vibe monitor --plan <plan> --authorize AUTHORIZE --platform-handoff [--adapter <new-platform>]`. The handoff refreshes the contract's platform to the new one (`host_id` is kept), keeps accepted nodes accepted as they were, rebinds the unfinished nodes and the authorization card to the new platform, and reauthorizes the same run.
+3. `--adapter` may be omitted only when exactly one other dispatchable platform exists and the contract has never named a platform. With several candidates, or in a project that was already handed off (the contract names a platform), `--adapter` is required; otherwise the command stops at `blocked_unknown` with a message and never picks for you.
+4. No command without `--platform-handoff` rewrites the session capability contract. A handoff that also changes an acceptance contract is refused as `contract_drift` and changes nothing.
+
 ## Governance boundaries
 
 - `scan` is read-only.

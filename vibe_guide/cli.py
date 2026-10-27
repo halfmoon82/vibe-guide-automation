@@ -89,10 +89,13 @@ from .planner import (
     build_stage_handoff,
 )
 from .session_entry import build_session_entry, draft_s1, materialize_session_entry, replaceable_draft_extras
+from .capability_contract import contract_path, save_contract
 from .handoff_rebind import (
     HandoffRebindError,
+    contract_for_platform,
     rebind_nodes,
     resolve_handoff_target,
+    stranded_nodes,
     unfinished_node_ids,
 )
 from .node_spec import (
@@ -652,6 +655,69 @@ def _staged_engine_attestation(
         raise
 
 
+@contextlib.contextmanager
+def _staged_session_contract(
+    paths: ProjectPaths,
+    target: Optional[str],
+    committed: Optional[List[bool]] = None,
+):
+    """Point the session capability contract at the platform a handoff moves to.
+
+    Nothing a user can run refreshes ``.vibe/session-contract.json`` (``init``
+    writes it once as ``provider=unknown``; ``attest`` only writes the provider
+    mailbox), so a handoff that waited for the contract to change never moved
+    anything.  The handoff is the explicit act that says the session platform
+    changed, so it owns this write; no other command reaches here.  Staged like
+    the engine evidence: restored if the reauthorization fails before it commits,
+    and a re-run after a crash sees the new contract and converges.
+    """
+    if target is None:
+        yield
+        return
+    refreshed = contract_for_platform(
+        require_capability_contract(paths), paths.root, target
+    )
+    if refreshed is None:
+        yield
+        return
+    path = contract_path(paths)
+    previous = path.read_bytes()
+    save_contract(paths, refreshed)
+    try:
+        yield
+    except BaseException:
+        if not (committed and committed[0]):
+            _atomic_bytes(path, previous)
+        raise
+
+
+@contextlib.contextmanager
+def _staged_reauthorization(
+    paths: ProjectPaths,
+    plan: Plan,
+    directory: Path,
+    handoff_agent: Optional[str],
+    committed: List[bool],
+    observation: Tuple[Any, ...],
+):
+    """Everything a same-run reauthorization stages before ``reauthorize`` runs.
+
+    One place for both card-refresh branches of ``monitor`` (with and without an
+    invalidation marker), so neither can drift from the other: the session
+    contract refresh of a platform handoff, then the engine evidence.  Yields
+    the engine attestation (``None`` when the plan has no engine binding).
+    """
+    with _staged_session_contract(paths, handoff_agent, committed), \
+        _staged_engine_attestation(
+            directory / "engine-attestation.json",
+            _observed_engine_attestation(paths, plan, *observation)
+            if _engine_evidence_required(plan)
+            else None,
+            committed,
+        ) as engine_attestation:
+        yield engine_attestation
+
+
 def _observed_adapter(paths: ProjectPaths, adapter_id: str):
     observed = None
     last_error = None
@@ -779,6 +845,23 @@ def _platform_handoff_rebind(
         dispatchable_others=dispatchable,
     )
     if target is None:
+        # Only a contract naming a platform that is attested and dispatchable
+        # is an actionable disagreement; one naming something nobody attested
+        # (a bare label) gives the operator no target to add.
+        stranded = (
+            stranded_nodes(nodes, unfinished, contract.provider)
+            if contract.provider in dispatchable
+            else []
+        )
+        if stranded:
+            # Nothing is written before this point: say so instead of
+            # re-authorizing into a no-op that looks like a handoff.
+            raise HandoffRebindError(
+                "platform handoff: 会话能力合同写的是 {}，但未完成节点（{}）仍绑在别的平台，"
+                "无法判断交接到哪个；请加 --adapter <新平台> 指定".format(
+                    contract.provider, ", ".join(stranded)
+                )
+            )
         return nodes, None
     try:
         _observed_adapter(paths, target)
@@ -3370,14 +3453,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 invalidation = _read_json(invalidation_path)
                 if not isinstance(invalidation, dict):
                     raise ValueError("authorization invalidation record is invalid")
-                with _staged_engine_attestation(
-                    directory / "engine-attestation.json",
-                    _observed_engine_attestation(
-                        paths, plan, *handoff_observation
-                    )
-                    if _engine_evidence_required(plan)
-                    else None,
-                    handoff_committed,
+                with _staged_reauthorization(
+                    paths, plan, directory, handoff_agent,
+                    handoff_committed, handoff_observation,
                 ) as engine_attestation:
                     card = refresh_authorization_card(
                         plan, nodes, card,
@@ -3435,14 +3513,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 # Refresh the card as well: a delivered contract correction
                 # may have changed the executable node digest without writing
                 # an invalidation marker yet.
-                with _staged_engine_attestation(
-                    directory / "engine-attestation.json",
-                    _observed_engine_attestation(
-                        paths, plan, *handoff_observation
-                    )
-                    if _engine_evidence_required(plan)
-                    else None,
-                    handoff_committed,
+                with _staged_reauthorization(
+                    paths, plan, directory, handoff_agent,
+                    handoff_committed, handoff_observation,
                 ) as engine_attestation:
                     card = refresh_authorization_card(
                         plan, nodes, card,

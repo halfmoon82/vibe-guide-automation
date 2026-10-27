@@ -523,10 +523,12 @@ def _with_cap_reason(result, cap_reason):
 
 #: Common cause of a drifted capability contract, named so the supervisor can
 #: act instead of guessing (#220): a git write operation (checkout, stash,
-#: reset, merge) rewriting tracked ``.vibe`` run-state files mid-run.
+#: reset, merge) rewriting tracked ``.vibe`` run-state files mid-run; or a
+#: platform handoff, which refreshes the contract on purpose.
 CONTRACT_DRIFT_HINT = (
     "常见诱因：git 写操作（checkout/stash/reset/merge）改写了 .vibe 运行态文件，"
-    "请检查 .vibe/session-contract.json 的改动来源"
+    "请检查 .vibe/session-contract.json 的改动来源；"
+    "也可能是换平台交接刷新了合同（vibe monitor ... --platform-handoff [--adapter 平台]）"
 )
 
 

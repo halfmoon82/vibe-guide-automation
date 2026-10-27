@@ -13,8 +13,14 @@ reauthorization.
 """
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+from pathlib import Path
+
 from .authorization import node_adapter_id, rebind_dispatch_contract
+from .capability_contract import CapabilityContract, build_contract
 from .models import DAGNode
+
+# What ``vibe init`` writes into a contract nobody has ever stated a platform for.
+UNSTATED_PROVIDER = "unknown"
 
 
 class HandoffRebindError(Exception):
@@ -45,14 +51,20 @@ def resolve_handoff_target(
        than the card's, or exactly one such platform exists.  Several
        candidates is ambiguity, which is an error, never a pick.
 
-    Otherwise nothing moves.  Re-running a finished handoff therefore cannot
-    flip the run back to the platform it left.
+    4. The contract never named a platform at all (``unknown``, which is all
+       ``init`` ever writes and nothing but a handoff refreshes): then the
+       capability digest cannot change by itself, so absence of change is no
+       evidence, and the one other dispatchable platform is the target.
+
+    Otherwise nothing moves.  A contract that already names a platform keeps
+    rule 4 off, so re-running a finished handoff cannot flip the run back to
+    the platform it left.
     """
     if explicit:
         return explicit
     if run_agent and (run_agent != card_agent or run_drift):
         return run_agent
-    if not capability_changed:
+    if not capability_changed and contract_provider != UNSTATED_PROVIDER:
         return None
     others = sorted(set(dispatchable_others) - {card_agent})
     if contract_provider and contract_provider in others:
@@ -63,6 +75,49 @@ def resolve_handoff_target(
             "请加 --adapter <新平台> 指定".format(", ".join(others))
         )
     return others[0] if others else None
+
+
+def contract_for_platform(
+    contract: CapabilityContract, project_root: Path, target: str
+) -> Optional[CapabilityContract]:
+    """The session contract after a handoff to ``target``, or ``None`` if it already names it.
+
+    Only ``provider`` changes.  The contract-level ``expires_at`` is renewed
+    (now + TTL, so ``contract_digest`` is recomputed): the refreshed contract is
+    a new observation made by the handoff, and handing a run a contract that is
+    about to lapse would only schedule the next failure.  Each fact keeps its own
+    ``checked_at``/``expires_at`` as it was: the handoff observed no capability,
+    so it must not make an old observation look fresh.  ``host_id`` has no source in this code base
+    other than the contract itself (``attest`` states facts, never a host), so
+    it is kept rather than invented; every stated fact is kept as it was.
+    """
+    if contract.provider == target:
+        return None
+    return build_contract(
+        Path(project_root),
+        provider=target,
+        host_id=contract.host_id,
+        facts=dict(contract.capabilities),
+    )
+
+
+def stranded_nodes(
+    nodes: Iterable[DAGNode], unfinished: Iterable[str], contract_provider: Optional[str]
+) -> List[str]:
+    """Unfinished nodes bound to a platform other than the one the contract names.
+
+    Only meaningful when no handoff target could be named: a contract that
+    states a platform while unfinished nodes sit on another means the user
+    believes the run moved and it did not.  A contract that states nothing
+    (``unknown``) has no platform to disagree with.
+    """
+    if not contract_provider or contract_provider == UNSTATED_PROVIDER:
+        return []
+    pending = set(unfinished)
+    return sorted(
+        node.id for node in nodes
+        if node.id in pending and node_adapter_id(node) != contract_provider
+    )
 
 
 def unfinished_node_ids(
