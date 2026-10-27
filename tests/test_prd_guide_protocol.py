@@ -1523,3 +1523,93 @@ class CardOptionProtocolTests(unittest.TestCase):
             PRODUCT_SPEC_FIELDS["rotate_hard_cap?"],
             "|".join(str(item) for item in ROTATE_HARD_CAP_CHOICES),
         )
+
+
+class StallSelfHealSectionTests(unittest.TestCase):
+    """§6.5 must tell the supervisor what to do when a node is stalled.
+
+    The vocabulary below is the contract between this text and the code that
+    prints it (status label, tier names, review command, event type).  The
+    text-side checks always run; the code-side check turns on as soon as any
+    module in ``vibe_guide`` carries any of these tokens, so a wiring change that
+    renames the command or a label fails here instead of leaving the protocol
+    pointing at something that no longer exists.
+    """
+
+    STALL_LABEL = "需要监工排查"
+    ESCALATE_LABEL = "需要人处理"
+    REVIEW_COMMAND = "vibe heal-verify"
+    TIERS = ("supervisor_investigate", "escalate_to_pm")
+    ATTEMPT_EVENT = "self_heal_attempt"
+    RETIRED_LABELS = ("自动修复中", "自动推进中")
+
+    def _branch(self):
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("prd-guide")
+        start = text.index("### 6.5 ")
+        end = text.find("\n## ", start)
+        section = text[start:end if end != -1 else len(text)]
+        lines = [line for line in section.splitlines() if self.STALL_LABEL in line
+                 and line.lstrip().startswith("- ")]
+        self.assertEqual(len(lines), 1, "§6.5 needs exactly one stall branch bullet")
+        return lines[0]
+
+    def test_stall_branch_exists_in_the_heartbeat_section(self):
+        self._branch()
+
+    def test_stall_branch_names_the_commands_labels_and_tiers_verbatim(self):
+        line = self._branch()
+        for token in (self.STALL_LABEL, self.ESCALATE_LABEL, self.REVIEW_COMMAND,
+                      self.ATTEMPT_EVENT, *self.TIERS):
+            self.assertIn(token, line, token)
+
+    def test_stall_branch_orders_the_ladder_investigate_fix_verify_escalate(self):
+        line = self._branch()
+        steps = ("排查包", "修复", self.REVIEW_COMMAND, "2 次", "停下")
+        positions = [line.index(step) for step in steps]
+        self.assertEqual(positions, sorted(positions), "ladder steps out of order")
+
+    def test_stall_branch_states_the_edit_boundary(self):
+        line = self._branch()
+        self.assertIn("运行时文件", line)
+        self.assertIn("state.json", line)
+        self.assertIn("events.jsonl", line)
+        self.assertIn("不得直接改", line)
+
+    def test_stall_branch_keeps_the_product_and_authorization_boundary(self):
+        line = self._branch()
+        for phrase in ("产品", "授权", "deploy"):
+            self.assertIn(phrase, line, phrase)
+
+    def test_stall_branch_does_not_present_a_stall_as_progress(self):
+        line = self._branch()
+        for label in self.RETIRED_LABELS:
+            self.assertNotIn(label, line, label)
+        self.assertIn("优先于 `idle`", line)
+
+    def test_each_tier_is_paired_with_its_own_label(self):
+        line = self._branch()
+        investigate, escalate = (line.index(tier) for tier in self.TIERS)
+        self.assertLess(line.index(self.STALL_LABEL), investigate)
+        self.assertLess(investigate, escalate)
+        between = line[escalate:line.index(self.ESCALATE_LABEL)]
+        self.assertNotIn(self.TIERS[0], between)
+        self.assertNotIn(self.STALL_LABEL, between)
+
+    def test_readme_explains_the_stall_flow_in_user_terms(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for token in (self.STALL_LABEL, self.ESCALATE_LABEL, self.REVIEW_COMMAND):
+            self.assertIn(token, readme, token)
+        self.assertIn("不再显示“" + "”或“".join(self.RETIRED_LABELS) + "”", readme)
+
+    def test_once_code_prints_the_stall_label_it_carries_every_other_token(self):
+        sources = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted((ROOT / "vibe_guide").rglob("*.py"))
+        )
+        tokens = (self.STALL_LABEL, self.ESCALATE_LABEL, "heal-verify",
+                  self.ATTEMPT_EVENT, *self.TIERS)
+        if not any(token in sources for token in tokens):
+            self.skipTest("stall wiring has not landed in vibe_guide yet")
+        for token in tokens:
+            self.assertIn(token, sources, token)
