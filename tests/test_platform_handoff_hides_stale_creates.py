@@ -120,12 +120,31 @@ class StaleCreateTests(HandoffCase):
         self.assertEqual([a["provider"] for a in self.store.pending()], ["workbuddy-visible"])
 
     def test_a_claimed_old_create_is_never_hidden(self):
+        """CONSTRUCTED STATE: a completion lock marks the old create as claimed.
+
+        That lock is what a session that picked the request up leaves behind
+        (``ProviderActionStore.claim_evidence``); only a live desktop session
+        writes it, so the test writes the file itself.
+        """
         self.published_on("workbuddy")
         old = self.store.pending()[0]
-        self.store.complete(old["action_id"], {"status": "unknown"})  # a claim mark: a result exists
+        lock = self.root / ".vibe" / "provider-actions" / "locks" / (old["action_id"] + ".lock")
+        lock.write_text("claimed", encoding="utf-8")
         self.attest("claude-code")
         self.handoff("--adapter", "claude-code")
         self.assertNotIn(old["action_id"], self.stale_ids())
+
+    def test_a_plain_rerun_after_a_handoff_hides_nothing(self):
+        """CONSTRUCTED STATE: the 5.1.11 two-pending mailbox, then no flag."""
+        self.published_on("workbuddy")
+        self.attest("claude-code")
+        self.handoff("--adapter", "claude-code")
+        for name in self.stale_ids():
+            (self.stale_dir() / (name + ".json")).unlink()
+        self.cli("monitor", "--plan", PLAN, "--authorize", "AUTHORIZE")
+        self.cli("resume", "--plan", PLAN)
+        self.assertEqual(self.stale_ids(), [])
+        self.assertEqual(len(self.store.pending()), 2)
 
     def test_the_hide_is_audited_and_survives_the_event_filter(self):
         self.published_on("workbuddy")
