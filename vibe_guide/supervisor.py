@@ -2254,21 +2254,38 @@ def _build_pack(paths, run_id, node_id, snapshot, events, role):
     )
 
 
-def _persist_pack(paths, run_id, node_id, pack):
-    """Keep a recognized pack: once the receipt is fixed the reader no longer refuses
-    it, so the pack that names what was wrong cannot be rebuilt for the re-check."""
+def _node_fingerprint(snapshot, node_id):
+    from . import stall
+    return stall.node_fingerprint(snapshot.nodes[node_id], snapshot.tasks, node_id)
+
+
+def _persist_pack(paths, run_id, node_id, pack, fingerprint):
+    """Keep a recognized pack, tagged with the node state it diagnosed: once the
+    receipt is fixed the reader no longer refuses it, so the pack that names what
+    was wrong cannot be rebuilt for the re-check."""
     from .state import _atomic_bytes
     if pack.get("recognized"):
-        data = json.dumps(pack, sort_keys=True, ensure_ascii=False, indent=2)
+        data = json.dumps({**pack, "stall_fingerprint": fingerprint},
+                          sort_keys=True, ensure_ascii=False, indent=2)
         _atomic_bytes(_heal_pack_path(paths, run_id, node_id), data.encode("utf-8") + b"\n")
 
 
-def _load_pack(paths, run_id, node_id):
+def _load_pack(paths, run_id, node_id, fingerprint):
+    """The persisted pack, only while the node is still in the state it diagnosed."""
     try:
         pack = json.loads(_heal_pack_path(paths, run_id, node_id).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return pack if isinstance(pack, dict) else None
+    if not isinstance(pack, dict) or pack.get("stall_fingerprint") != fingerprint:
+        return None
+    return pack
+
+
+def _discard_pack(paths, run_id, node_id):
+    try:
+        _heal_pack_path(paths, run_id, node_id).unlink()
+    except OSError:
+        pass
 
 
 def _node_stall_state(paths, run_id, snapshot, events, node_id):
@@ -2307,6 +2324,10 @@ def beat_stall_report(paths, run_id):
     try:
         snapshot = load_snapshot(paths, run_id)
         events = load_events(paths, run_id)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        return {"status": "unknown", "nodes": {}, "run_readable": False,
+                "reason": "run unreadable: " + type(error).__name__}
+    try:
         outcome = stall.record_beat(
             paths, run_id, _stall_candidates(snapshot), snapshot.tasks, events
         )
@@ -2315,7 +2336,7 @@ def beat_stall_report(paths, run_id):
             if result["tier"] not in _STALL_REPORT_TIERS:
                 continue
             pack = _build_pack(paths, run_id, node_id, snapshot, events, "developer")
-            _persist_pack(paths, run_id, node_id, pack)
+            _persist_pack(paths, run_id, node_id, pack, result["fingerprint"])
             nodes[node_id] = {
                 "tier": result["tier"],
                 "unchanged_beats": result["unchanged_beats"],
@@ -2323,9 +2344,9 @@ def beat_stall_report(paths, run_id):
                 "pack": pack,
             }
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
-        return {"status": "unknown", "nodes": {},
+        return {"status": "unknown", "nodes": {}, "run_readable": True,
                 "reason": "stall assessment unavailable: " + type(error).__name__}
-    return {"status": "ok", "unknown_previous": outcome["unknown_previous"], "nodes": nodes}
+    return {"status": "ok", "run_readable": True, "unknown_previous": outcome["unknown_previous"], "nodes": nodes}
 
 
 def _pack_summary(pack):
@@ -2338,6 +2359,11 @@ def _pack_summary(pack):
 def render_stall_beat_text(report, run_id, command_prefix="vibe"):
     """Beat lines for stalled nodes: product-manager escalations first, then investigations."""
     escalate, investigate = [], []
+    unknown = []
+    if report.get("status") == "unknown" and report.get("run_readable"):
+        # An unreadable run already degrades the whole beat; a readable run whose
+        # stall assessment failed must not read as "nothing stalled".
+        unknown.append("空转评估未知：{}".format(report.get("reason", "")))
     for node_id, entry in sorted(report.get("nodes", {}).items()):
         command = "{} stall-check --run-id {} --node {}".format(command_prefix, run_id, node_id)
         if entry["tier"] == "escalate_to_pm":
@@ -2349,7 +2375,7 @@ def render_stall_beat_text(report, run_id, command_prefix="vibe"):
             investigate.append(
                 "需要监工排查：节点 {} 连续 {} 拍进展不变；排查包：{}；修复后复核：{} --recheck".format(
                     node_id, entry["unchanged_beats"], command, command))
-    return "\n".join(escalate + investigate)
+    return "\n".join(escalate + investigate + unknown)
 
 
 def stall_check(paths, run_id, node_id, *, recheck=False, role="developer"):
@@ -2370,10 +2396,11 @@ def stall_check(paths, run_id, node_id, *, recheck=False, role="developer"):
     if node_id not in snapshot.nodes:
         return {**base, "status": "blocked_invalid", "reason": "node is not part of this run"}
     pack = _build_pack(paths, run_id, node_id, snapshot, events, role)
+    fingerprint = _node_fingerprint(snapshot, node_id)
     if not recheck:
-        _persist_pack(paths, run_id, node_id, pack)
+        _persist_pack(paths, run_id, node_id, pack, fingerprint)
         return {**base, "status": "pack", "pack": pack}
-    subject = pack if pack["recognized"] else (_load_pack(paths, run_id, node_id) or pack)
+    subject = pack if pack["recognized"] else (_load_pack(paths, run_id, node_id, fingerprint) or pack)
     verdict = recheck_heal_pack(paths, subject)
     unchanged, tier = _node_stall_state(paths, run_id, snapshot, events, node_id)
     data = {
@@ -2392,6 +2419,7 @@ def stall_check(paths, run_id, node_id, *, recheck=False, role="developer"):
     })
     if not verdict["passed"]:
         return {**base, "status": "recheck_failed", "differences": verdict["differences"], "pack": subject}
+    _discard_pack(paths, run_id, node_id)
     record = stall.load_progress(paths, run_id)
     entry = record["nodes"].get(node_id) if record else None
     if entry and unchanged:

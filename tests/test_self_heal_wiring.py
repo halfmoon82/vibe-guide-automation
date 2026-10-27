@@ -188,6 +188,13 @@ class BeatTests(IncidentFixture):
         self.assertNotIn("需要监工排查：", out.text)
         self.assertEqual(out.payload["stall"]["nodes"], {})
 
+    def test_failed_assessment_on_a_readable_run_is_visible_in_the_text(self):
+        with patch.object(stall, "record_beat", side_effect=OSError("disk")):
+            out = self.beat()
+        self.assertEqual(out.payload["stall"]["status"], "unknown")
+        self.assertIn("空转评估未知", out.text)
+        self.assertIn("OSError", out.text)
+
     def test_unreadable_run_is_reported_unknown_not_clean(self):
         out = run_cli(["supervisor-beat", "--run-id", "run-missing",
                        "--session-record", str(self.record)], self.root)
@@ -234,6 +241,24 @@ class StallCheckTests(IncidentFixture):
         self.assertEqual(data["tier"], "supervisor_investigate")
         self.assertEqual(data["unchanged_beats"], 3)
         self.assertEqual(data["differences"], [])
+
+    def test_a_consumed_fix_cannot_pass_a_later_unrelated_stall(self):
+        for _ in range(3):
+            self.beat()
+        self.fix_receipt()
+        self.assertEqual(self.stall_check("--recheck").payload["status"], "recheck_passed")
+        again = self.stall_check("--recheck")
+        self.assertEqual(again.payload["status"], "recheck_failed")
+
+    def test_a_pack_from_an_earlier_stall_state_is_not_reused(self):
+        for _ in range(3):
+            self.beat()
+        self.fix_receipt()
+        snapshot = load_snapshot(self.paths, self.run_id)
+        snapshot.nodes[NODE]["handoff_file"] = ".vibe/handoff.md"
+        save_snapshot(self.paths, snapshot)
+        out = self.stall_check("--recheck")
+        self.assertEqual(out.payload["status"], "recheck_failed")
 
     def test_recheck_without_any_refused_receipt_does_not_pass(self):
         snapshot = load_snapshot(self.paths, self.run_id)
