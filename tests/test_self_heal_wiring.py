@@ -32,7 +32,13 @@ RESUMING_TEXT = "监工已启动并自动推进中"
 
 
 class IncidentFixture(unittest.TestCase):
-    """A run whose only node is retry_pending behind a resume receipt the reader refuses."""
+    """A run whose only node is retry_pending behind a resume receipt the reader refuses.
+
+    ``ROLE`` is the role of the stuck session; the retry marker has the shape the
+    monitor really writes (role/reason_class, no ``action`` key, no active_task).
+    """
+
+    ROLE = "developer"
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -57,14 +63,22 @@ class IncidentFixture(unittest.TestCase):
         node = snapshot.nodes[NODE]
         node["status"] = "retry_pending"
         node["active_task"] = None
-        node["retryable_action"] = {"action": "resume", "attempt": 1}
+        node["retryable_action"] = {
+            "role": self.ROLE, "phase": "develop" if self.ROLE == "developer" else "review",
+            "continuation": "resume", "successor": False,
+            "same_task": True, "same_task_required": True,
+            "attempt": 1, "reason_class": "retryable",
+            "next_retry_at": 1793087998.0,
+            "binding_digest": node.get("contract_digest", ""),
+            "last_observation_ref": "provider-pending",
+        }
         snapshot.handles.pop(NODE, None)
         node["user_status"] = map_user_status(node)
         save_snapshot(self.paths, snapshot)
         self.store = ProviderActionStore(self.paths)
         self.action = self.store.request(
             operation="resume", provider="claude-code", run_id=self.run_id,
-            issue_id=NODE, role="developer", generation=1, sequence=1,
+            issue_id=NODE, role=self.ROLE, generation=1, sequence=1,
             native_tool="ccd_session_mgmt__send_message", request={"threadId": "t1"},
         )
         self.store.complete(self.action["action_id"], {"threadId": "t1"}, native=False)

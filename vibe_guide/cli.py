@@ -2336,7 +2336,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
     if args.command == "heal-verify":
         if not (args.run_id and args.node_id):
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id and --node are required"}, "缺少 --run-id 或 --node", args.as_json)
-        payload = heal_verify(paths, args.run_id, args.node_id, role=args.role)
+        explicit_role = args.role if any(
+            item == "--role" or item.startswith("--role=") for item in argv) else None
+        payload = heal_verify(paths, args.run_id, args.node_id, role=explicit_role)
         status = payload["status"]
         if status == "verify_passed":
             text = "复核通过：节点 {} 的回执已被读取方接受，空转计数已清零，下一拍起继续推进".format(args.node_id)

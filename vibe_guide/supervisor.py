@@ -2238,18 +2238,41 @@ def _heal_pack_path(paths, run_id, node_id):
     return run_dir(paths, run_id) / _HEAL_PACK_FILE.format(node_id)
 
 
+_PACK_ROLES = ("developer", "reviewer")
+
+
+def _node_role(node, fallback="developer"):
+    """Role of the stuck session: the live task, else the pending retry marker.
+
+    A retry-pending node has no ``active_task``; the monitor records the role in
+    ``retryable_action["role"]``.
+    """
+    active = node.get("active_task")
+    retry = node.get("retryable_action")
+    for source in (active, retry):
+        role = source.get("role") if isinstance(source, dict) else None
+        if role in _PACK_ROLES:
+            return role
+    return fallback
+
+
+def _node_blocker(node):
+    """Fixed-enum class of what the retry is waiting on (``reason_class``, else ``action``)."""
+    retry = node.get("retryable_action")
+    if isinstance(retry, dict):
+        for key in ("reason_class", "action"):
+            if isinstance(retry.get(key), str):
+                return retry[key]
+    return ""
+
+
 def _build_pack(paths, run_id, node_id, snapshot, events, role):
     from .heal_pack import build_heal_pack
     node = snapshot.nodes[node_id]
-    active = node.get("active_task")
-    active_role = active.get("role") if isinstance(active, dict) else None
-    retry = node.get("retryable_action")
-    blocker = retry.get("action") if isinstance(retry, dict) else ""
     return build_heal_pack(
-        paths, run_id, node_id,
-        active_role if active_role in ("developer", "reviewer") else role,
+        paths, run_id, node_id, role,
         node_status=str(node.get("status") or ""),
-        blocker=blocker if isinstance(blocker, str) else "",
+        blocker=_node_blocker(node),
         recent_events=[event.get("event") for event in events[-20:]],
     )
 
@@ -2345,7 +2368,8 @@ def beat_stall_report(paths, run_id):
         for node_id, result in outcome["nodes"].items():
             if result["tier"] not in _STALL_REPORT_TIERS:
                 continue
-            pack = _build_pack(paths, run_id, node_id, snapshot, events, "developer")
+            pack = _build_pack(paths, run_id, node_id, snapshot, events,
+                               _node_role(snapshot.nodes[node_id]))
             _persist_pack(paths, run_id, node_id, pack, result["fingerprint"])
             nodes[node_id] = {
                 "tier": result["tier"],
@@ -2392,22 +2416,25 @@ def render_stall_beat_text(report, run_id, command_prefix="vibe"):
                     node_id, entry["unchanged_beats"], entry["attempts_since_change"], tried,
                     _pack_summary(entry["pack"])))
         else:
+            pack_role = entry["pack"].get("role")
+            role_flag = " --role " + pack_role if pack_role in _PACK_ROLES and pack_role != "developer" else ""
             investigate.append(
                 "需要监工排查：节点 {} 连续 {} 拍进展不变；排查包：{}；"
-                "修完运行时文件后复核：{} heal-verify --run-id {} --node {}".format(
+                "修完运行时文件后复核：{} heal-verify --run-id {} --node {}{}".format(
                     node_id, entry["unchanged_beats"], _pack_text(entry["pack"]),
-                    command_prefix, run_id, node_id))
+                    command_prefix, run_id, node_id, role_flag))
     return "\n".join(escalate + investigate + unknown)
 
 
-def heal_verify(paths, run_id, node_id, *, role="developer"):
+def heal_verify(paths, run_id, node_id, *, role=None):
     """``vibe heal-verify``: the supervisor's re-check after repairing runtime files.
 
     The run evidence (event hash chain and the current state.json) is verified
     first; a chain that no longer verifies refuses the check and writes nothing.
     Then the reader's own validation is re-run: a pass records a self_heal_attempt
     and clears the node's idle count; a failure leaves the node as it was and
-    records a failed attempt.
+    records a failed attempt.  The role to check is the explicit ``role``, else
+    the role of the pack the beat handed out, else the stuck session's own.
     """
     from .contracts import RunEvent
     from .heal_pack import recheck_heal_pack
@@ -2420,9 +2447,13 @@ def heal_verify(paths, run_id, node_id, *, role="developer"):
         return {**base, "status": "blocked_integrity", "reason": str(error)[:200]}
     if node_id not in snapshot.nodes:
         return {**base, "status": "blocked_invalid", "reason": "node is not part of this run"}
-    pack = _build_pack(paths, run_id, node_id, snapshot, events, role)
     fingerprint = _node_fingerprint(snapshot, node_id)
-    subject = pack if pack["recognized"] else (_load_pack(paths, run_id, node_id, fingerprint) or pack)
+    persisted = _load_pack(paths, run_id, node_id, fingerprint)
+    role = role or (persisted or {}).get("role") or _node_role(snapshot.nodes[node_id])
+    pack = _build_pack(paths, run_id, node_id, snapshot, events, role)
+    # A pack from another role is not a fallback for an explicitly chosen role.
+    kept = persisted if persisted and persisted.get("role") == role else None
+    subject = pack if pack["recognized"] else (kept or pack)
     verdict = recheck_heal_pack(paths, subject)
     unchanged, tier = _node_stall_state(paths, run_id, snapshot, events, node_id)
     data = {
