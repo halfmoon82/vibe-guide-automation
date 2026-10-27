@@ -163,6 +163,27 @@ class StaleCreateTests(HandoffCase):
         self.handoff("--adapter", "claude-code")
         self.assertNotIn(old["action_id"], self.stale_ids())
 
+    def test_an_old_platform_create_under_an_unrelated_authorization_is_not_hidden(self):
+        """CONSTRUCTED STATE: one more unclaimed old-platform create, written under a digest no handoff replaced.
+
+        Nothing a user types produces such a request; it is written through
+        the mailbox API the way ``tests/test_reauthorization_gates.py`` does.
+        The handoff must hide only what its own chain replaced.
+        """
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+
+        self.published_on("workbuddy")
+        with patch("vibe_guide.adapters.task_provider.require_entry"):
+            stranger = ProviderActionStore(self.paths).request(
+                operation="create", provider="workbuddy-visible", run_id=self.run_id,
+                issue_id=SECOND, role="reviewer", generation=1, native_tool="native",
+                request={"authorization_digest": "e" * 64},
+            )
+        self.attest("claude-code")
+        self.handoff("--adapter", "claude-code")
+        self.assertNotIn(stranger["action_id"], self.stale_ids())
+        self.assertIn(stranger["action_id"], [a["action_id"] for a in self.store.pending()])
+
     def test_an_ordinary_reauthorization_after_a_handoff_hides_nothing(self):
         """CONSTRUCTED STATE: the 5.1.11 two-pending mailbox, then a flagless reauthorization.
 
