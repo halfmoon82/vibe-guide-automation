@@ -156,6 +156,26 @@ class ForkedSuccessorTests(_Case):
         entry = self.register("first", record)
         self.assertEqual(entry["session_id"], "first")
 
+    def test_successor_without_record_is_refused(self):
+        # Without the session's own record a fork cannot be detected at all.
+        with self.assertRaises(SupervisorLeaseConflict) as caught:
+            self.register("blind")
+        self.assertIn("--session-record", str(caught.exception))
+
+    def test_successor_with_relative_or_missing_record_is_refused(self):
+        with self.assertRaises(SupervisorLeaseConflict):
+            self.register("relative", "rollout.jsonl")
+        with self.assertRaises(SupervisorLeaseConflict):
+            self.register("missing", Path(self.tmp.name) / "absent.jsonl")
+
+    def test_first_supervisor_and_same_shift_need_no_record(self):
+        self.assertEqual(self.register("first")["session_id"], "first")
+        (Path(self.tmp.name) / "solo").mkdir()
+        solo = ProjectPaths(Path(self.tmp.name) / "solo")
+        entry = register_supervisor_address(
+            solo, "run-1", {"provider": "codex", "session_id": "only", "host": "local"})
+        self.assertEqual(entry["session_id"], "only")
+
     def test_cli_reports_refusal_as_blocked(self):
         forked = _record(self.tmp.name, "fork.jsonl", 40000, forked_from="first")
         result = run_cli([

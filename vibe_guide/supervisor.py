@@ -1178,11 +1178,18 @@ def _successor_refusal(session_record):
     of the outgoing supervisor and started at ~297k tokens, so rotating moved
     the whole history along and the next rotation came one growth step later.
     A successor exists to start light; one that does not is refused before the
-    lease moves, and the outgoing shift stays in charge.  Without a readable
-    record there is no evidence either way and registration proceeds.
+    lease moves, and the outgoing shift stays in charge.  The session's own
+    record is the only evidence of how it was created, so a successor that
+    does not supply a readable one is refused too: otherwise leaving the flag
+    off would be the way around the fork check.
     """
-    if session_record is None or not Path(str(session_record)).expanduser().is_absolute():
-        return None
+    if session_record is None:
+        return ("successor registration requires --session-record <this session's own log>; "
+                "without it a forked session cannot be told apart from a fresh one")
+    path = Path(str(session_record)).expanduser()
+    if not path.is_absolute() or not path.is_file():
+        return ("successor --session-record must be the absolute path of this session's "
+                "existing log, got {}".format(session_record))
     meta = _session_meta(session_record)
     forked = meta.get("forked_from_id") if meta else None
     if isinstance(forked, str) and forked:
