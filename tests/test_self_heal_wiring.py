@@ -1,5 +1,5 @@
 """Self-heal wiring: stall detection and the heal pack reach the heartbeat,
-the status label, the resume text and the ``vibe stall-check`` command."""
+the status label, the resume text and the ``vibe heal-verify`` command."""
 
 import json
 import tempfile
@@ -27,7 +27,7 @@ from vibe_guide.state import (
 
 NODE = "n1"
 INVESTIGATE_LABEL = "需要监工排查"
-ESCALATE_LABEL = "需要产品经理："
+ESCALATE_LABEL = "需要人处理"
 RESUMING_TEXT = "监工已启动并自动推进中"
 
 
@@ -76,8 +76,8 @@ class IncidentFixture(unittest.TestCase):
         return run_cli(["supervisor-beat", "--run-id", self.run_id,
                         "--session-record", str(self.record)], self.root)
 
-    def stall_check(self, *extra):
-        return run_cli(["stall-check", "--run-id", self.run_id, "--node", NODE, "--json", *extra],
+    def verify(self):
+        return run_cli(["heal-verify", "--run-id", self.run_id, "--node", NODE, "--json"],
                        self.root)
 
     def fix_receipt(self):
@@ -102,9 +102,10 @@ class StateLabelTests(unittest.TestCase):
         marked = dict(self.retrying, stall_tier="supervisor_investigate")
         self.assertEqual(map_user_status(marked), INVESTIGATE_LABEL)
 
-    def test_escalated_node_reads_the_existing_decision_label(self):
+    def test_escalated_node_reads_the_need_human_label_not_the_decision_label(self):
         marked = dict(self.retrying, stall_tier="escalate_to_pm")
-        self.assertEqual(map_user_status(marked), "需要你决定")
+        self.assertEqual(map_user_status(marked), ESCALATE_LABEL)
+        self.assertNotEqual(map_user_status(marked), "需要你决定")
 
     def test_auto_retry_tier_keeps_the_auto_repair_label(self):
         self.assertEqual(map_user_status(dict(self.retrying, stall_tier="auto_retry")), "自动修复中")
@@ -119,6 +120,7 @@ class StateLabelTests(unittest.TestCase):
     def test_new_label_is_in_the_public_vocabulary(self):
         from vibe_guide.state import USER_VISIBLE_STATES
         self.assertIn(INVESTIGATE_LABEL, USER_VISIBLE_STATES)
+        self.assertIn(ESCALATE_LABEL, USER_VISIBLE_STATES)
 
 
 class EventKeyTests(unittest.TestCase):
@@ -133,13 +135,21 @@ class BeatTests(IncidentFixture):
         for _ in range(2):
             out = self.beat()
             self.assertNotIn("需要监工排查：", out.text)
-            self.assertNotIn("stall-check", out.text)
+            self.assertNotIn("heal-verify", out.text)
         out = self.beat()
         self.assertTrue(out.text.startswith("需要监工排查："), out.text)
         self.assertIn(NODE, out.text)
         self.assertIn("3", out.text)
-        self.assertIn("vibe stall-check --run-id {} --node {}".format(self.run_id, NODE), out.text)
-        self.assertIn("vibe stall-check --run-id {} --node {} --recheck".format(self.run_id, NODE), out.text)
+        self.assertIn("vibe heal-verify --run-id {} --node {}".format(self.run_id, NODE), out.text)
+        self.assertNotIn("--recheck", out.text)
+        self.assertNotIn("stall-check", out.text)
+
+    def test_investigate_branch_carries_the_pack_in_the_output_itself(self):
+        for _ in range(3):
+            out = self.beat()
+        for fragment in ("missing field: resumed", "resumed", "threadId", "results", "requests",
+                         "repair_entries"):
+            self.assertIn(fragment, out.text)
 
     def test_beat_payload_carries_the_pack_and_never_the_receipt_value(self):
         for _ in range(3):
@@ -161,12 +171,14 @@ class BeatTests(IncidentFixture):
     def test_escalation_after_two_attempts_addresses_the_product_manager(self):
         for _ in range(3):
             self.beat()
-        self.stall_check("--recheck")
-        self.stall_check("--recheck")
+        self.verify()
+        self.verify()
         out = self.beat()
-        self.assertTrue(out.text.startswith(ESCALATE_LABEL), out.text)
+        self.assertTrue(out.text.startswith("需要人处理："), out.text)
         self.assertEqual(out.payload["stall"]["nodes"][NODE]["tier"], "escalate_to_pm")
         self.assertIn("missing field: resumed", out.text)
+        self.assertEqual(out.text.count("self_heal_attempt"), 2)
+        self.assertNotIn("需要产品经理", out.text)
 
     def test_progress_resets_the_count_and_the_branch_disappears(self):
         for _ in range(3):
@@ -201,22 +213,21 @@ class BeatTests(IncidentFixture):
         self.assertEqual(out.payload["stall"]["status"], "unknown")
 
 
-class StallCheckTests(IncidentFixture):
-    def test_pack_mode_prints_the_pack_and_writes_no_event(self):
-        out = self.stall_check()
-        self.assertEqual(out.payload["status"], "pack")
-        pack = out.payload["pack"]
-        self.assertTrue(pack["recognized"])
-        self.assertEqual(pack["differences"], ["missing field: resumed"])
-        self.assertEqual(self.attempts(), [])
-        self.assertIn("missing field: resumed", out.text)
+class HealVerifyTests(IncidentFixture):
+    def test_there_is_no_separate_pack_command_or_recheck_flag(self):
+        for argv in (["stall-check", "--run-id", self.run_id, "--node", NODE],
+                     ["heal-verify", "--run-id", self.run_id, "--node", NODE, "--recheck"]):
+            with self.subTest(argv=argv):
+                out = run_cli(argv, self.root)
+                self.assertNotEqual(out.exit_code, 0)
+                self.assertEqual(self.attempts(), [])
 
-    def test_failed_recheck_keeps_state_and_records_a_failed_attempt(self):
+    def test_failed_verify_keeps_state_and_records_a_failed_attempt(self):
         for _ in range(3):
             self.beat()
         before = self.progress_entry()
-        out = self.stall_check("--recheck")
-        self.assertEqual(out.payload["status"], "recheck_failed")
+        out = self.verify()
+        self.assertEqual(out.payload["status"], "verify_failed")
         self.assertNotEqual(out.exit_code, 0)
         self.assertEqual(out.payload["differences"], ["missing field: resumed"])
         self.assertEqual(self.progress_entry(), before)
@@ -224,12 +235,12 @@ class StallCheckTests(IncidentFixture):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["data"]["outcome"], "failed")
 
-    def test_passed_recheck_records_the_attempt_and_clears_the_stall_count(self):
+    def test_passed_verify_records_the_attempt_and_clears_the_stall_count(self):
         for _ in range(3):
             self.beat()
         self.fix_receipt()
-        out = self.stall_check("--recheck")
-        self.assertEqual(out.payload["status"], "recheck_passed")
+        out = self.verify()
+        self.assertEqual(out.payload["status"], "verify_passed")
         self.assertEqual(out.exit_code, 0)
         self.assertEqual(self.progress_entry()["unchanged_beats"], 0)
         data = self.attempts()[0]["data"]
@@ -246,9 +257,9 @@ class StallCheckTests(IncidentFixture):
         for _ in range(3):
             self.beat()
         self.fix_receipt()
-        self.assertEqual(self.stall_check("--recheck").payload["status"], "recheck_passed")
-        again = self.stall_check("--recheck")
-        self.assertEqual(again.payload["status"], "recheck_failed")
+        self.assertEqual(self.verify().payload["status"], "verify_passed")
+        again = self.verify()
+        self.assertEqual(again.payload["status"], "verify_failed")
 
     def test_a_pack_from_an_earlier_stall_state_is_not_reused(self):
         for _ in range(3):
@@ -257,21 +268,21 @@ class StallCheckTests(IncidentFixture):
         snapshot = load_snapshot(self.paths, self.run_id)
         snapshot.nodes[NODE]["handoff_file"] = ".vibe/handoff.md"
         save_snapshot(self.paths, snapshot)
-        out = self.stall_check("--recheck")
-        self.assertEqual(out.payload["status"], "recheck_failed")
+        out = self.verify()
+        self.assertEqual(out.payload["status"], "verify_failed")
 
-    def test_recheck_without_any_refused_receipt_does_not_pass(self):
+    def test_verify_without_any_refused_receipt_does_not_pass(self):
         snapshot = load_snapshot(self.paths, self.run_id)
-        out = self.stall_check("--recheck")
-        self.assertEqual(out.payload["status"], "recheck_failed")
+        out = self.verify()
+        self.assertEqual(out.payload["status"], "verify_failed")
         self.assertEqual(snapshot.nodes[NODE]["status"], "retry_pending")
 
     def test_unknown_node_is_refused(self):
-        out = run_cli(["stall-check", "--run-id", self.run_id, "--node", "ghost", "--json"], self.root)
+        out = run_cli(["heal-verify", "--run-id", self.run_id, "--node", "ghost", "--json"], self.root)
         self.assertEqual(out.payload["status"], "blocked_invalid")
 
     def test_missing_arguments_are_refused(self):
-        out = run_cli(["stall-check", "--run-id", self.run_id, "--json"], self.root)
+        out = run_cli(["heal-verify", "--run-id", self.run_id, "--json"], self.root)
         self.assertEqual(out.payload["status"], "blocked_invalid")
 
 
@@ -305,7 +316,7 @@ class ResumeTextTests(IncidentFixture):
 
 
 class IntegrityTests(IncidentFixture):
-    def test_tampered_event_log_blocks_the_recheck_and_writes_nothing(self):
+    def test_tampered_event_log_blocks_the_verify_and_writes_nothing(self):
         for _ in range(3):
             self.beat()
         self.fix_receipt()
@@ -316,7 +327,7 @@ class IntegrityTests(IncidentFixture):
         lines[0] = json.dumps(record, sort_keys=True, separators=(",", ":"))
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         size = path.stat().st_size
-        out = self.stall_check("--recheck")
+        out = self.verify()
         self.assertEqual(out.payload["status"], "blocked_integrity")
         self.assertNotEqual(out.exit_code, 0)
         self.assertEqual(path.stat().st_size, size)
@@ -330,15 +341,15 @@ class IntegrityTests(IncidentFixture):
         state = json.loads(path.read_text(encoding="utf-8"))
         state["authorization_digest"] = "0" * 64
         path.write_text(json.dumps(state), encoding="utf-8")
-        out = self.stall_check("--recheck")
+        out = self.verify()
         self.assertEqual(out.payload["status"], "blocked_integrity")
         self.assertEqual(self.attempts(), [])
 
-    def test_pack_mode_also_reports_a_broken_chain(self):
+    def test_a_broken_chain_is_reported_even_before_any_fix(self):
         path = self.paths.vibe / "runs" / self.run_id / "events.jsonl"
         path.write_text(path.read_text(encoding="utf-8").replace('"event"', '"evnt"', 1),
                         encoding="utf-8")
-        out = self.stall_check()
+        out = self.verify()
         self.assertEqual(out.payload["status"], "blocked_integrity")
 
 

@@ -51,7 +51,7 @@ from .supervisor import (
     supervisor_mailbox_view,
     beat_stall_report,
     render_stall_beat_text,
-    stall_check,
+    heal_verify,
     stall_peek,
     register_supervisor_address,
     session_cwd_warning,
@@ -174,11 +174,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'stall-check'),
+        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify'),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
-    parser.add_argument("--recheck", action="store_true", dest="recheck",
-                        help="stall-check: 修复回执后让读取方重新校验；通过才记录自愈并清零空转计数")
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--host-rules", dest="host_rules", choices=("skip", "apply", "rollback"),
                         help="init: 回答「是否在用户级规则中加入 vibe 监工会话例外」")
@@ -2335,20 +2333,18 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         payload = supervisor_mailbox_view(paths, args.run_id)
         return _result(SUCCESS if payload["status"] == "ok" else UNKNOWN, payload, json.dumps(payload, ensure_ascii=False), args.as_json)
 
-    if args.command == "stall-check":
+    if args.command == "heal-verify":
         if not (args.run_id and args.node_id):
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id and --node are required"}, "缺少 --run-id 或 --node", args.as_json)
-        payload = stall_check(paths, args.run_id, args.node_id, recheck=args.recheck, role=args.role)
+        payload = heal_verify(paths, args.run_id, args.node_id, role=args.role)
         status = payload["status"]
-        if status == "pack":
-            text = "排查包（节点 {}）：{}".format(args.node_id, json.dumps(payload["pack"], ensure_ascii=False))
-        elif status == "recheck_passed":
+        if status == "verify_passed":
             text = "复核通过：节点 {} 的回执已被读取方接受，空转计数已清零，下一拍起继续推进".format(args.node_id)
-        elif status == "recheck_failed":
-            text = "复核未通过（已记失败尝试）：{}".format("；".join(payload["differences"]))
+        elif status == "verify_failed":
+            text = "复核未通过（已记失败尝试，节点保持原状）：{}".format("；".join(payload["differences"]))
         else:
-            text = "排查被拒绝（{}）：{}".format(status, payload.get("reason", ""))
-        return _result(SUCCESS if status in {"pack", "recheck_passed"} else BLOCKED, payload, text, args.as_json)
+            text = "复核被拒绝（{}）：{}".format(status, payload.get("reason", ""))
+        return _result(SUCCESS if status == "verify_passed" else BLOCKED, payload, text, args.as_json)
 
     if args.command == "supervisor-beat":
         if not args.run_id:

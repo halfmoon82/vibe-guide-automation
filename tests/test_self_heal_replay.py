@@ -1,4 +1,4 @@
-"""Replay of the stuck-receipt incident through the real beat / stall-check / reader path.
+"""Replay of the stuck-receipt incident through the real beat / heal-verify / reader path.
 
 A resume receipt written as ``{"threadId": ...}`` (no ``resumed: true``) is
 refused by the reader forever.  The run must stop reading as self-healing,
@@ -58,13 +58,13 @@ class IncidentReplayTests(IncidentFixture):
         self.assertEqual(stalled.payload["nodes"][NODE]["user_status"], INVESTIGATE_LABEL)
         self.assertNotEqual(stalled.payload["nodes"][NODE]["user_status"], "自动修复中")
 
-        before_fix = self.stall_check("--recheck")
-        self.assertEqual(before_fix.payload["status"], "recheck_failed")
+        before_fix = self.verify()
+        self.assertEqual(before_fix.payload["status"], "verify_failed")
         self.assertTrue(self.reader_refuses_receipt())
 
         self.fix_receipt()
-        after_fix = self.stall_check("--recheck")
-        self.assertEqual(after_fix.payload["status"], "recheck_passed")
+        after_fix = self.verify()
+        self.assertEqual(after_fix.payload["status"], "verify_passed")
         self.assertFalse(self.reader_refuses_receipt())
 
         outcomes = [e["data"]["outcome"] for e in self.attempts()]
@@ -87,11 +87,11 @@ class IncidentReplayTests(IncidentFixture):
     def test_a_fix_that_keeps_failing_ends_with_the_product_manager(self):
         for _ in range(3):
             self.beat()
-        self.stall_check("--recheck")
-        self.stall_check("--recheck")
+        self.verify()
+        self.verify()
         out = self.beat()
-        self.assertTrue(out.text.startswith(ESCALATE_LABEL), out.text)
-        self.assertEqual(self.status().payload["nodes"][NODE]["user_status"], "需要你决定")
+        self.assertTrue(out.text.startswith("需要人处理："), out.text)
+        self.assertEqual(self.status().payload["nodes"][NODE]["user_status"], "需要人处理")
 
     def test_broken_digest_chain_refuses_to_advance_and_reports(self):
         for _ in range(3):
@@ -103,7 +103,7 @@ class IncidentReplayTests(IncidentFixture):
         record["data"]["injected"] = "by hand"
         lines[1] = json.dumps(record, sort_keys=True, separators=(",", ":"))
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        out = self.stall_check("--recheck")
+        out = self.verify()
         self.assertEqual(out.payload["status"], "blocked_integrity")
         self.assertIn("digest", out.payload["reason"])
         self.assertNotEqual(out.exit_code, 0)

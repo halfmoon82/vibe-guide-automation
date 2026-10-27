@@ -2318,6 +2318,16 @@ def stall_peek(paths, run_id, snapshot):
         return {}
 
 
+def _attempt_records(events, node_id, count):
+    """The last ``count`` self_heal_attempt outcomes recorded for this node."""
+    attempts = [
+        {"outcome": event["data"].get("outcome"), "differences": event["data"].get("differences", [])}
+        for event in events
+        if event.get("event") == "self_heal_attempt" and event["data"].get("node_id") == node_id
+    ]
+    return attempts[-count:] if count else []
+
+
 def beat_stall_report(paths, run_id):
     """Assess one beat (exactly one ``stall.record_beat``) and describe stalled nodes."""
     from . import stall
@@ -2341,6 +2351,7 @@ def beat_stall_report(paths, run_id):
                 "tier": result["tier"],
                 "unchanged_beats": result["unchanged_beats"],
                 "attempts_since_change": result["attempts_since_change"],
+                "attempts": _attempt_records(events, node_id, result["attempts_since_change"]),
                 "pack": pack,
             }
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
@@ -2356,8 +2367,12 @@ def _pack_summary(pack):
     return str(pack.get("note") or "未识别具体格式")
 
 
+def _pack_text(pack):
+    return json.dumps(pack, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def render_stall_beat_text(report, run_id, command_prefix="vibe"):
-    """Beat lines for stalled nodes: product-manager escalations first, then investigations."""
+    """Beat lines for stalled nodes: 需要人处理 first, then 需要监工排查 (pack inline)."""
     escalate, investigate = [], []
     unknown = []
     if report.get("status") == "unknown" and report.get("run_readable"):
@@ -2365,29 +2380,39 @@ def render_stall_beat_text(report, run_id, command_prefix="vibe"):
         # stall assessment failed must not read as "nothing stalled".
         unknown.append("空转评估未知：{}".format(report.get("reason", "")))
     for node_id, entry in sorted(report.get("nodes", {}).items()):
-        command = "{} stall-check --run-id {} --node {}".format(command_prefix, run_id, node_id)
         if entry["tier"] == "escalate_to_pm":
+            tried = "；".join(
+                "self_heal_attempt {}：{}".format(
+                    "通过" if item["outcome"] == "passed" else "失败",
+                    "、".join(item["differences"]) or "无差异记录")
+                for item in entry.get("attempts", [])
+            ) or "无记录"
             escalate.append(
-                "需要产品经理：节点 {} 连续 {} 拍进展不变，监工自愈 {} 次仍未恢复；排查包摘要：{}".format(
-                    node_id, entry["unchanged_beats"], entry["attempts_since_change"],
+                "需要人处理：节点 {} 连续 {} 拍进展不变，监工自愈 {} 次仍未恢复；已试过：{}；排查包摘要：{}".format(
+                    node_id, entry["unchanged_beats"], entry["attempts_since_change"], tried,
                     _pack_summary(entry["pack"])))
         else:
             investigate.append(
-                "需要监工排查：节点 {} 连续 {} 拍进展不变；排查包：{}；修复后复核：{} --recheck".format(
-                    node_id, entry["unchanged_beats"], command, command))
+                "需要监工排查：节点 {} 连续 {} 拍进展不变；排查包：{}；"
+                "修完运行时文件后复核：{} heal-verify --run-id {} --node {}".format(
+                    node_id, entry["unchanged_beats"], _pack_text(entry["pack"]),
+                    command_prefix, run_id, node_id))
     return "\n".join(escalate + investigate + unknown)
 
 
-def stall_check(paths, run_id, node_id, *, recheck=False, role="developer"):
-    """``vibe stall-check``: the node's heal pack, or (``recheck``) the reader's verdict on the fix.
+def heal_verify(paths, run_id, node_id, *, role="developer"):
+    """``vibe heal-verify``: the supervisor's re-check after repairing runtime files.
 
     The run evidence (event hash chain and the current state.json) is verified
     first; a chain that no longer verifies refuses the check and writes nothing.
+    Then the reader's own validation is re-run: a pass records a self_heal_attempt
+    and clears the node's idle count; a failure leaves the node as it was and
+    records a failed attempt.
     """
     from .contracts import RunEvent
     from .heal_pack import recheck_heal_pack
     from . import stall
-    base = {"command": "stall-check", "run_id": run_id, "node_id": node_id}
+    base = {"command": "heal-verify", "run_id": run_id, "node_id": node_id}
     try:
         snapshot = verify_run_evidence(paths, run_id)
         events = load_events(paths, run_id)
@@ -2397,9 +2422,6 @@ def stall_check(paths, run_id, node_id, *, recheck=False, role="developer"):
         return {**base, "status": "blocked_invalid", "reason": "node is not part of this run"}
     pack = _build_pack(paths, run_id, node_id, snapshot, events, role)
     fingerprint = _node_fingerprint(snapshot, node_id)
-    if not recheck:
-        _persist_pack(paths, run_id, node_id, pack, fingerprint)
-        return {**base, "status": "pack", "pack": pack}
     subject = pack if pack["recognized"] else (_load_pack(paths, run_id, node_id, fingerprint) or pack)
     verdict = recheck_heal_pack(paths, subject)
     unchanged, tier = _node_stall_state(paths, run_id, snapshot, events, node_id)
@@ -2418,11 +2440,11 @@ def stall_check(paths, run_id, node_id, *, recheck=False, role="developer"):
         "node_contract_digest": snapshot.node_contract_digest,
     })
     if not verdict["passed"]:
-        return {**base, "status": "recheck_failed", "differences": verdict["differences"], "pack": subject}
+        return {**base, "status": "verify_failed", "differences": verdict["differences"]}
     _discard_pack(paths, run_id, node_id)
     record = stall.load_progress(paths, run_id)
     entry = record["nodes"].get(node_id) if record else None
     if entry and unchanged:
         entry["unchanged_beats"] = 0
         stall.save_progress(paths, run_id, record)
-    return {**base, "status": "recheck_passed", "differences": []}
+    return {**base, "status": "verify_passed", "differences": []}

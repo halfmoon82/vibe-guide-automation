@@ -161,17 +161,19 @@ def verify_required_workflow_state(workflow):
 # exposing a small, stable vocabulary to end users.  This mapping is pure so
 # callers (CLI, desktop bridges and tests) can derive the same label without
 # mutating the snapshot or interpreting provider details themselves.
-USER_VISIBLE_STATES = ("准备中", "自动修复中", "已启动", "需要你决定", "需要监工建工作树", "需要监工排查")
+USER_VISIBLE_STATES = ("准备中", "自动修复中", "已启动", "需要你决定", "需要监工建工作树", "需要监工排查", "需要人处理")
 #: A node that would read 自动修复中 but whose progress fingerprint has not moved
 #: for several beats is not self-healing: the supervisor has to investigate
-#: (``supervisor_investigate``) or hand the node to the product manager
-#: (``escalate_to_pm``).  The tier is a transient display marker (``stall_tier``)
+#: (``supervisor_investigate``) or stop and report to a human
+#: (``escalate_to_pm``, 需要人处理 -- deliberately not 需要你决定, which is the
+#: product-decision label).  The tier is a transient display marker (``stall_tier``)
 #: injected by output code from the stall record; it is never persisted.
 STALL_INVESTIGATE_STATUS = "需要监工排查"
+STALL_ESCALATE_STATUS = "需要人处理"
 STALL_TIER_KEY = "stall_tier"
 _STALL_TIER_STATUS = {
     "supervisor_investigate": STALL_INVESTIGATE_STATUS,
-    "escalate_to_pm": "需要你决定",
+    "escalate_to_pm": STALL_ESCALATE_STATUS,
 }
 _USER_DECISION_STATUSES = {"blocked_design", "blocked_deploy"}
 _USER_PREPARING_STATUSES = {"initialized", "planned", "brief_pending", "start_pending"}
