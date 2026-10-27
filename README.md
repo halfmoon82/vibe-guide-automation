@@ -113,6 +113,7 @@ vibe supervisor-hold --run-id <run> --node <id> --release   解除"节点等人�
 vibe supervisor-handoff --run-id <run>             打印接班所需的全部内容（进度、等人事项、心跳指令、步骤），换班时新会话只跑这一条
 vibe supervisor-address --run-id <run>             查询当前监工地址；未登记返回 unknown；带 --node/--role/--generation 时 wake 字段给出推送工具与填好的唤醒信号
 vibe worker-deliver --run-id <run> --node <id> --generation <n> --payload '<json>'   worker 在主项目目录自报交付（嵌套 delivery_evidence），格式错误当场返回
+vibe heal-verify --run-id <run> --node <id>   监工按排查包修完运行时文件后的复核：重跑同一读取校验，通过才推进并写入 `self_heal_attempt` 事件，不通过则节点保持原状并记一次失败尝试
 ```
 
 新会话入口：agent 先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1——<=8 直接执行、9-15 轻规划，均不触碰 vibe，评分后输出一行 S1 评分与档位；>15 且能拆出 3 个以上可并行节点、又需跨会话/跨中断续跑时才 `vibe scan` + `vibe plan --request --s1` 进入正式路由（不满足则按轻规划，评分行注明未满足的条件；拿不准按轻规划；产品经理显式要求或显式 `--s1` 升级仍进复杂模式）；「授权」「选A」这类确认/续接回复延续当前档位，不重新评分。该协议完全自包含，不依赖任何外部技能。
@@ -190,6 +191,10 @@ V4.4 将工程故障限定在节点范围内，并保留同一任务身份。五
 测试通过、worker 自报、timeout、分支名或本地 fixture 都不能单独证明真实 provider 能力、任务可见性、merge、发布或 deploy。当前执行必须以匹配的 plan、授权、BindingIntent/BindingProof、lease、provider 返回和验收证据为准；缺失或冲突证据保持 `unknown`，不得转成成功。
 
 ## 授权、监工和恢复
+
+### 节点卡住时：空转、排查与自愈
+
+节点连续几拍心跳都没有任何进展（状态、代数、活跃任务、最新交付都不变）时，状态标签显示“需要监工排查”，不再显示“自动修复中”或“自动推进中”。监工此时不能只回“等待”，而是按顺序：读 vibe 给出的排查包（读取方期望什么格式、实际收到什么、差在哪、涉及哪些运行时文件）；在授权范围内自己修，可以改运行时文件，但不得直接改 `state.json` 和 `events.jsonl`；修完跑 `vibe heal-verify` 复核，通过才继续推进，并留下一条 `self_heal_attempt` 自愈记录。同一问题修了 2 次仍没进展，或需要越过产品范围、授权卡、deploy、凭据和系统权限边界时，状态变为“需要人处理”：监工带着排查包和已试过的尝试停下报告，等你决定。产品经理回来看到的是“已继续推进加一条自愈记录”，或“卡在哪、试过什么”的报告。
 
 ### DAG 运行时约束
 
