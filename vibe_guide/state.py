@@ -161,7 +161,20 @@ def verify_required_workflow_state(workflow):
 # exposing a small, stable vocabulary to end users.  This mapping is pure so
 # callers (CLI, desktop bridges and tests) can derive the same label without
 # mutating the snapshot or interpreting provider details themselves.
-USER_VISIBLE_STATES = ("准备中", "自动修复中", "已启动", "需要你决定", "需要监工建工作树")
+USER_VISIBLE_STATES = ("准备中", "自动修复中", "已启动", "需要你决定", "需要监工建工作树", "需要监工排查", "需要人处理")
+#: A node that would read 自动修复中 but whose progress fingerprint has not moved
+#: for several beats is not self-healing: the supervisor has to investigate
+#: (``supervisor_investigate``) or stop and report to a human
+#: (``escalate_to_pm``, 需要人处理 -- deliberately not 需要你决定, which is the
+#: product-decision label).  The tier is a transient display marker (``stall_tier``)
+#: injected by output code from the stall record; it is never persisted.
+STALL_INVESTIGATE_STATUS = "需要监工排查"
+STALL_ESCALATE_STATUS = "需要人处理"
+STALL_TIER_KEY = "stall_tier"
+_STALL_TIER_STATUS = {
+    "supervisor_investigate": STALL_INVESTIGATE_STATUS,
+    "escalate_to_pm": STALL_ESCALATE_STATUS,
+}
 _USER_DECISION_STATUSES = {"blocked_design", "blocked_deploy"}
 _USER_PREPARING_STATUSES = {"initialized", "planned", "brief_pending", "start_pending"}
 _USER_ACTIVE_STATUSES = {
@@ -214,6 +227,18 @@ def worktree_action(record: Any) -> Optional[str]:
 
 
 def map_user_status(status: Any, reason: Any = "") -> str:
+    """User-facing status, with a stalled auto-repair node relabelled.
+
+    Only a node that would otherwise read ``自动修复中`` is relabelled by its
+    ``stall_tier`` marker; every other label keeps its own authority.
+    """
+    label = _derived_user_status(status, reason)
+    if isinstance(status, dict) and label == "自动修复中":
+        return _STALL_TIER_STATUS.get(status.get(STALL_TIER_KEY), label)
+    return label
+
+
+def _derived_user_status(status: Any, reason: Any = "") -> str:
     """Map internal V3.9 state to one of the user-facing statuses.
 
     A mapping/dict is accepted as a convenience for snapshot node records;
@@ -462,6 +487,15 @@ _EVENT_DATA_KEYS = {
     "owner_layer",
     "recovery_action",
     "user_interrupt",
+    # self_heal_attempt: one supervisor re-check of a refused provider receipt.
+    # ``operation``/``outcome``/``tier`` are fixed enums, ``differences`` are the
+    # reader's own constant messages (field names and type names, never receipt
+    # values), ``unchanged_beats`` is a counter.
+    "operation",
+    "outcome",
+    "differences",
+    "tier",
+    "unchanged_beats",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",
@@ -1648,6 +1682,24 @@ def save_snapshot(paths: ProjectPaths, snapshot: RunSnapshot) -> None:
                     ).encode("utf-8"),
                 )
         _atomic_bytes(state_path, serialized)
+
+
+def verify_run_evidence(paths: ProjectPaths, run_id: str) -> RunSnapshot:
+    """Strict read of a run's evidence: event hash chain plus the current state.json.
+
+    Unlike ``load_snapshot`` this never falls back to ``state.previous.json``
+    and never rewrites ``state.json``; a hand-edited or corrupt file raises
+    ``ValueError`` instead of being silently replaced by an older snapshot.
+    """
+    try:
+        directory = run_dir(paths, run_id, create=False)
+        records = load_events(paths, run_id)
+        snapshot = _decode_snapshot((directory / "state.json").read_bytes(), records)
+    except (OSError, TypeError) as error:
+        raise ValueError("run evidence is unreadable: " + type(error).__name__) from error
+    if snapshot.run_id != run_id:
+        raise ValueError("snapshot run id does not match its path")
+    return snapshot
 
 
 def load_snapshot(paths: ProjectPaths, run_id: str) -> RunSnapshot:

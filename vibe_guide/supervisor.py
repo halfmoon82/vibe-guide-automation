@@ -19,7 +19,16 @@ from .config import load_supervisor_single_shift
 from .contracts import RunEvent
 from .decision_boundary import LEGACY_BOUNDARY_CATEGORY, validate_boundary_category
 from .providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER, WORKBUDDY_VISIBLE_PROVIDER
-from .state import append_event, interprocess_lock, run_dir, save_snapshot, load_snapshot
+from .state import (
+    append_event,
+    interprocess_lock,
+    load_events,
+    load_snapshot,
+    map_user_status,
+    run_dir,
+    save_snapshot,
+    verify_run_evidence,
+)
 
 
 class SupervisorLeaseConflict(ValueError):
@@ -2259,3 +2268,270 @@ def supervisor_mailbox_view(paths, run_id):
         items.append(item)
     return {"command": "supervisor-mailbox", "status": "ok", "run_id": run_id,
             "pending_count": len(items), "pending": items}
+
+
+# --- self-heal wiring: stall detection and heal pack reach the heartbeat -------
+
+_STALL_BASE_LABEL = "自动修复中"
+_STALL_REPORT_TIERS = ("supervisor_investigate", "escalate_to_pm")
+_HEAL_PACK_FILE = "heal-pack-{}.json"
+
+
+def _stall_candidates(snapshot):
+    """Nodes that would read 自动修复中 -- the only ones a stall may relabel.
+
+    A node waiting on its dependencies (准备中) or running under a live worker
+    (已启动) legitimately keeps one fingerprint for many beats.
+    """
+    return {
+        node_id: node
+        for node_id, node in (snapshot.nodes or {}).items()
+        if isinstance(node, dict) and map_user_status(node) == _STALL_BASE_LABEL
+    }
+
+
+def _heal_pack_path(paths, run_id, node_id):
+    return run_dir(paths, run_id) / _HEAL_PACK_FILE.format(node_id)
+
+
+_PACK_ROLES = ("developer", "reviewer")
+
+
+def _node_role(node, fallback="developer"):
+    """Role of the stuck session: the live task, else the pending retry marker.
+
+    A retry-pending node has no ``active_task``; the monitor records the role in
+    ``retryable_action["role"]``.
+    """
+    active = node.get("active_task")
+    retry = node.get("retryable_action")
+    for source in (active, retry):
+        role = source.get("role") if isinstance(source, dict) else None
+        if role in _PACK_ROLES:
+            return role
+    return fallback
+
+
+def _node_blocker(node):
+    """Fixed-enum class of what the retry is waiting on (``reason_class``, else ``action``)."""
+    retry = node.get("retryable_action")
+    if isinstance(retry, dict):
+        for key in ("reason_class", "action"):
+            if isinstance(retry.get(key), str):
+                return retry[key]
+    return ""
+
+
+def _build_pack(paths, run_id, node_id, snapshot, events, role):
+    from .heal_pack import build_heal_pack
+    node = snapshot.nodes[node_id]
+    return build_heal_pack(
+        paths, run_id, node_id, role,
+        node_status=str(node.get("status") or ""),
+        blocker=_node_blocker(node),
+        recent_events=[event.get("event") for event in events[-20:]],
+    )
+
+
+def _node_fingerprint(snapshot, node_id):
+    from . import stall
+    return stall.node_fingerprint(snapshot.nodes[node_id], snapshot.tasks, node_id)
+
+
+def _persist_pack(paths, run_id, node_id, pack, fingerprint):
+    """Keep a recognized pack, tagged with the node state it diagnosed: once the
+    receipt is fixed the reader no longer refuses it, so the pack that names what
+    was wrong cannot be rebuilt for the re-check."""
+    from .state import _atomic_bytes
+    if pack.get("recognized"):
+        data = json.dumps({**pack, "stall_fingerprint": fingerprint},
+                          sort_keys=True, ensure_ascii=False, indent=2)
+        _atomic_bytes(_heal_pack_path(paths, run_id, node_id), data.encode("utf-8") + b"\n")
+
+
+def _load_pack(paths, run_id, node_id, fingerprint):
+    """The persisted pack, only while the node is still in the state it diagnosed."""
+    try:
+        pack = json.loads(_heal_pack_path(paths, run_id, node_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(pack, dict) or pack.get("stall_fingerprint") != fingerprint:
+        return None
+    return pack
+
+
+def _discard_pack(paths, run_id, node_id):
+    try:
+        _heal_pack_path(paths, run_id, node_id).unlink()
+    except OSError:
+        pass
+
+
+def _node_stall_state(paths, run_id, snapshot, events, node_id):
+    """(unchanged_beats, tier) the last persisted beat recorded for this exact node state."""
+    from . import stall
+    record = stall.load_progress(paths, run_id)
+    entry = record["nodes"].get(node_id) if record else None
+    node = snapshot.nodes.get(node_id)
+    if (
+        not entry
+        or not isinstance(node, dict)
+        or entry["fingerprint"] != stall.node_fingerprint(node, snapshot.tasks, node_id)
+    ):
+        return 0, stall.TIER_AUTO_RETRY
+    since = max(0, stall.count_self_heal_attempts(events).get(node_id, 0) - entry["attempts_baseline"])
+    return entry["unchanged_beats"], stall._tier(entry["unchanged_beats"], since)
+
+
+def stall_peek(paths, run_id, snapshot):
+    """{node_id: tier} of nodes stalled per the last persisted beat; read-only."""
+    try:
+        events = load_events(paths, run_id)
+        return {
+            node_id: tier
+            for node_id in _stall_candidates(snapshot)
+            for unchanged, tier in [_node_stall_state(paths, run_id, snapshot, events, node_id)]
+            if tier in _STALL_REPORT_TIERS and unchanged
+        }
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {}
+
+
+def _attempt_records(events, node_id, count):
+    """The last ``count`` self_heal_attempt outcomes recorded for this node."""
+    attempts = [
+        {"outcome": event["data"].get("outcome"), "differences": event["data"].get("differences", [])}
+        for event in events
+        if event.get("event") == "self_heal_attempt" and event["data"].get("node_id") == node_id
+    ]
+    return attempts[-count:] if count else []
+
+
+def beat_stall_report(paths, run_id):
+    """Assess one beat (exactly one ``stall.record_beat``) and describe stalled nodes."""
+    from . import stall
+    try:
+        snapshot = load_snapshot(paths, run_id)
+        events = load_events(paths, run_id)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        return {"status": "unknown", "nodes": {}, "run_readable": False,
+                "reason": "run unreadable: " + type(error).__name__}
+    try:
+        outcome = stall.record_beat(
+            paths, run_id, _stall_candidates(snapshot), snapshot.tasks, events
+        )
+        nodes = {}
+        for node_id, result in outcome["nodes"].items():
+            if result["tier"] not in _STALL_REPORT_TIERS:
+                continue
+            pack = _build_pack(paths, run_id, node_id, snapshot, events,
+                               _node_role(snapshot.nodes[node_id]))
+            _persist_pack(paths, run_id, node_id, pack, result["fingerprint"])
+            nodes[node_id] = {
+                "tier": result["tier"],
+                "unchanged_beats": result["unchanged_beats"],
+                "attempts_since_change": result["attempts_since_change"],
+                "attempts": _attempt_records(events, node_id, result["attempts_since_change"]),
+                "pack": pack,
+            }
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        return {"status": "unknown", "nodes": {}, "run_readable": True,
+                "reason": "stall assessment unavailable: " + type(error).__name__}
+    return {"status": "ok", "run_readable": True, "unknown_previous": outcome["unknown_previous"], "nodes": nodes}
+
+
+def _pack_summary(pack):
+    if pack.get("recognized"):
+        return "差异：{}；涉及文件：{}".format(
+            "；".join(pack.get("differences") or []), "、".join(pack.get("files") or []))
+    return str(pack.get("note") or "未识别具体格式")
+
+
+def _pack_text(pack):
+    return json.dumps(pack, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def render_stall_beat_text(report, run_id, command_prefix="vibe"):
+    """Beat lines for stalled nodes: 需要人处理 first, then 需要监工排查 (pack inline)."""
+    escalate, investigate = [], []
+    unknown = []
+    if report.get("status") == "unknown" and report.get("run_readable"):
+        # An unreadable run already degrades the whole beat; a readable run whose
+        # stall assessment failed must not read as "nothing stalled".
+        unknown.append("空转评估未知：{}".format(report.get("reason", "")))
+    for node_id, entry in sorted(report.get("nodes", {}).items()):
+        if entry["tier"] == "escalate_to_pm":
+            tried = "；".join(
+                "self_heal_attempt {}：{}".format(
+                    "通过" if item["outcome"] == "passed" else "失败",
+                    "、".join(item["differences"]) or "无差异记录")
+                for item in entry.get("attempts", [])
+            ) or "无记录"
+            escalate.append(
+                "需要人处理：节点 {} 连续 {} 拍进展不变，监工自愈 {} 次仍未恢复；已试过：{}；排查包摘要：{}".format(
+                    node_id, entry["unchanged_beats"], entry["attempts_since_change"], tried,
+                    _pack_summary(entry["pack"])))
+        else:
+            pack_role = entry["pack"].get("role")
+            role_flag = " --role " + pack_role if pack_role in _PACK_ROLES and pack_role != "developer" else ""
+            investigate.append(
+                "需要监工排查：节点 {} 连续 {} 拍进展不变；排查包：{}；"
+                "修完运行时文件后复核：{} heal-verify --run-id {} --node {}{}".format(
+                    node_id, entry["unchanged_beats"], _pack_text(entry["pack"]),
+                    command_prefix, run_id, node_id, role_flag))
+    return "\n".join(escalate + investigate + unknown)
+
+
+def heal_verify(paths, run_id, node_id, *, role=None):
+    """``vibe heal-verify``: the supervisor's re-check after repairing runtime files.
+
+    The run evidence (event hash chain and the current state.json) is verified
+    first; a chain that no longer verifies refuses the check and writes nothing.
+    Then the reader's own validation is re-run: a pass records a self_heal_attempt
+    and clears the node's idle count; a failure leaves the node as it was and
+    records a failed attempt.  The role to check is the explicit ``role``, else
+    the role of the pack the beat handed out, else the stuck session's own.
+    """
+    from .contracts import RunEvent
+    from .heal_pack import recheck_heal_pack
+    from . import stall
+    base = {"command": "heal-verify", "run_id": run_id, "node_id": node_id}
+    try:
+        snapshot = verify_run_evidence(paths, run_id)
+        events = load_events(paths, run_id)
+    except ValueError as error:
+        return {**base, "status": "blocked_integrity", "reason": str(error)[:200]}
+    if node_id not in snapshot.nodes:
+        return {**base, "status": "blocked_invalid", "reason": "node is not part of this run"}
+    fingerprint = _node_fingerprint(snapshot, node_id)
+    persisted = _load_pack(paths, run_id, node_id, fingerprint)
+    role = role or (persisted or {}).get("role") or _node_role(snapshot.nodes[node_id])
+    pack = _build_pack(paths, run_id, node_id, snapshot, events, role)
+    # A pack from another role is not a fallback for an explicitly chosen role.
+    kept = persisted if persisted and persisted.get("role") == role else None
+    subject = pack if pack["recognized"] else (kept or pack)
+    verdict = recheck_heal_pack(paths, subject)
+    unchanged, tier = _node_stall_state(paths, run_id, snapshot, events, node_id)
+    data = {
+        "run_id": run_id, "node_id": node_id,
+        "outcome": "passed" if verdict["passed"] else "failed",
+        "differences": list(verdict["differences"]),
+        "tier": tier, "unchanged_beats": unchanged,
+    }
+    for key in ("operation", "action_id"):
+        if isinstance(subject.get(key), str):
+            data[key] = subject[key]
+    append_event(paths, RunEvent("self_heal_attempt", data), {
+        "role": "system", "task_id": None, "handle_id": None, "generation": 0,
+        "authorization_digest": snapshot.authorization_digest,
+        "node_contract_digest": snapshot.node_contract_digest,
+    })
+    if not verdict["passed"]:
+        return {**base, "status": "verify_failed", "differences": verdict["differences"]}
+    _discard_pack(paths, run_id, node_id)
+    record = stall.load_progress(paths, run_id)
+    entry = record["nodes"].get(node_id) if record else None
+    if entry and unchanged:
+        entry["unchanged_beats"] = 0
+        stall.save_progress(paths, run_id, record)
+    return {**base, "status": "verify_passed", "differences": []}
