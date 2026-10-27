@@ -52,6 +52,11 @@ class PreflightTests(unittest.TestCase):
         self.root = Path(self.tmp.name) / "project"
         self.root.mkdir()
         self.paths = ProjectPaths(self.root)
+        # Lease/registry semantics only; the successor fork/record policy has its
+        # own tests in test_supervisor_rotation_hardening.
+        _policy = patch('vibe_guide.supervisor._successor_refusal', return_value=None)
+        _policy.start()
+        self.addCleanup(_policy.stop)
 
     def test_over_threshold_rotates(self):
         rec = _record(self.tmp.name, 200001)
@@ -256,6 +261,11 @@ class RegistryTests(unittest.TestCase):
         self.root = Path(self.tmp.name) / "project"
         self.root.mkdir()
         self.paths = ProjectPaths(self.root)
+        # Lease/registry semantics only; the successor fork/record policy has its
+        # own tests in test_supervisor_rotation_hardening.
+        _policy = patch('vibe_guide.supervisor._successor_refusal', return_value=None)
+        _policy.start()
+        self.addCleanup(_policy.stop)
 
     def _entry(self, session):
         return {"provider": "codex", "session_id": session, "host": "mac"}
@@ -288,6 +298,11 @@ class SupervisorCliTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name) / "project"
         self.root.mkdir()
+        # Lease/registry semantics only; the successor fork/record policy has its
+        # own tests in test_supervisor_rotation_hardening.
+        _policy = patch('vibe_guide.supervisor._successor_refusal', return_value=None)
+        _policy.start()
+        self.addCleanup(_policy.stop)
 
     def cli(self, argv):
         return run_cli(argv + ["--json"], self.root)
@@ -342,6 +357,11 @@ class LeaseEpochTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.paths = ProjectPaths(Path(self._tmp.name))
+        # Lease/registry semantics only; the successor fork/record policy has its
+        # own tests in test_supervisor_rotation_hardening.
+        _policy = patch('vibe_guide.supervisor._successor_refusal', return_value=None)
+        _policy.start()
+        self.addCleanup(_policy.stop)
 
     def _race(self, calls):
         import threading

@@ -7,6 +7,7 @@ of an unnamed "authorized channel".
 """
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from vibe_guide.cli import run_cli
@@ -23,6 +24,11 @@ class WakeInstructionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.paths = ProjectPaths(Path(self.tmp.name))
+        # Lease/registry semantics only; the successor fork/record policy has its
+        # own tests in test_supervisor_rotation_hardening.
+        _policy = patch('vibe_guide.supervisor._successor_refusal', return_value=None)
+        _policy.start()
+        self.addCleanup(_policy.stop)
 
     def _register(self, provider):
         register_supervisor_address(

@@ -32,6 +32,11 @@ class CallerGuardTests(unittest.TestCase):
         self.monitor = Monitor.__new__(Monitor)
         self.monitor.paths = self.paths
         self.monitor.lease_guard = None
+        # Lease/registry semantics only; the successor fork/record policy has its
+        # own tests in test_supervisor_rotation_hardening.
+        _policy = patch('vibe_guide.supervisor._successor_refusal', return_value=None)
+        _policy.start()
+        self.addCleanup(_policy.stop)
 
     def _register(self, *names):
         for name in names:
