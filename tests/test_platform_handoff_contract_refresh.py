@@ -90,8 +90,55 @@ class RealUserHandoffTests(HandoffCase):
         result = self.handoff()
         self.assertEqual(result.payload["status"], "blocked_unknown", result.payload)
         self.assertIn("--adapter", result.payload["reason"])
+        self.assertIn("claude-code", result.payload["reason"])
+        self.assertIn("codex", result.payload["reason"])
         self.assertEqual(self.contract_text(), before)
         self.assertEqual((self.root / ".vibe" / "plans" / PLAN / "nodes.json").read_text(encoding="utf-8"), nodes)
+        self.assertEqual(len([e for e in load_events(self.paths, self.run_id)
+                              if e["event"] == "authorization_reauthorized"]), 0)
+
+    def test_an_attested_platform_with_no_dispatch_lifecycle_is_not_a_candidate(self):
+        """grok attests but never becomes dispatchable: it must not make a tie."""
+        before = self.ready()
+        self.attest("claude-code")
+        self.attest("grok")
+        result = self.handoff()
+        self.assertNotEqual(result.payload["status"], "blocked_unknown", result.payload)
+        self.assertEqual(load_contract(self.paths).provider, "claude-code")
+        self.assert_moved_and_finishes(before)
+
+    def test_a_finished_handoff_rerun_without_adapter_is_a_quiet_no_op(self):
+        before = self.ready()
+        self.attest("claude-code")
+        self.handoff("--adapter", "claude-code")
+        again = self.handoff()
+        self.assertNotEqual(again.payload["status"], "blocked_unknown", again.payload)
+        self.assertEqual(load_contract(self.paths).provider, "claude-code")
+        self.assert_moved_and_finishes(before)
+
+    def test_a_contract_naming_another_platform_than_the_nodes_is_a_readable_stop(self):
+        """CONSTRUCTED STATE (users cannot reach it with 5.1.10 commands).
+
+        Only a contract written by hand, as 5.1.9-era supervisors did, names a
+        platform while unfinished nodes still sit on another and nothing can
+        name the target.  The handoff must say so instead of re-authorizing
+        into a silent no-op.  The contract is written with build/save here on
+        purpose and this test claims nothing about a real user path.
+        """
+        from vibe_guide.capability_contract import build_contract, save_contract
+
+        self.ready()
+        save_contract(self.paths, build_contract(self.root, provider="claude-code", host_id="local"))
+        plan = self.root / ".vibe" / "plans" / PLAN
+        files = {name: (plan / name).read_bytes() for name in ("nodes.json", "authorization-card.json", "authorization.json")}
+        contract = self.contract_text()
+        result = self.handoff()
+        self.assertEqual(result.payload["status"], "blocked_unknown", result.payload)
+        self.assertIn("--adapter", result.payload["reason"])
+        self.assertIn("claude-code", result.payload["reason"])
+        for name, content in files.items():
+            self.assertEqual((plan / name).read_bytes(), content, name)
+        self.assertEqual(self.contract_text(), contract)
         self.assertEqual(len([e for e in load_events(self.paths, self.run_id)
                               if e["event"] == "authorization_reauthorized"]), 0)
 
@@ -249,6 +296,26 @@ class PureRuleTests(unittest.TestCase):
     def test_a_stated_contract_provider_and_no_change_means_nothing_moves(self):
         self.assertIsNone(self.resolve(contract_provider="b", dispatchable_others=("a", "b")))
 
+    def test_the_contract_validity_is_renewed_but_each_fact_keeps_its_own_clock(self):
+        import tempfile
+        from datetime import datetime, timedelta, timezone
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        past = datetime.now(timezone.utc) - timedelta(minutes=30)
+        old = build_contract(root, host_id="h1", now=past, facts={
+            "x": {"status": "verified_available", "scope": "task", "route": "r",
+                  "evidence_ref": "e", "checked_at": "2020-01-01T00:00:00Z",
+                  "expires_at": "2020-01-02T00:00:00Z"}})
+        new = contract_for_platform(old, root, "claude-code")
+        self.assertGreater(new.expires_at, old.expires_at)
+        self.assertNotEqual(new.contract_digest, old.contract_digest)
+        self.assertTrue(old.capabilities["x"].checked_at.startswith("2020-01-01T00:00:00"))
+        self.assertEqual(new.capabilities["x"].checked_at, old.capabilities["x"].checked_at)
+        self.assertEqual(new.capabilities["x"].expires_at, old.capabilities["x"].expires_at)
+        for field in ("schema_version", "project_digest", "host_id", "scope"):
+            self.assertEqual(getattr(new, field), getattr(old, field), field)
+
     def test_contract_for_platform_changes_only_the_provider(self):
         import tempfile
 
@@ -259,6 +326,28 @@ class PureRuleTests(unittest.TestCase):
         self.assertEqual((new.provider, new.host_id), ("claude-code", "h1"))
         self.assertEqual(new.capabilities, old.capabilities)
         self.assertIsNone(contract_for_platform(new, root, "claude-code"))
+
+
+class HandoffDocumentationTests(unittest.TestCase):
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def section(self, name, heading):
+        text = (self.ROOT / name).read_text(encoding="utf-8")
+        start = text.index(heading)
+        end = text.find("\n## ", start)
+        return text[start: end if end != -1 else len(text)]
+
+    def test_both_readmes_document_the_handoff_in_its_own_section(self):
+        for name, heading in (("README.md", "### 换平台交接"),
+                              ("README.en.md", "### Platform handoff")):
+            body = self.section(name, heading)
+            for needle in ("vibe attest --adapter", "--platform-handoff", "--adapter"):
+                self.assertIn(needle, body, (name, needle))
+
+    def test_the_drift_hint_names_the_handoff(self):
+        from vibe_guide.supervisor import CONTRACT_DRIFT_HINT
+
+        self.assertIn("--platform-handoff", CONTRACT_DRIFT_HINT)
 
 
 if __name__ == "__main__":

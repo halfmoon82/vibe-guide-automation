@@ -82,7 +82,12 @@ def contract_for_platform(
 ) -> Optional[CapabilityContract]:
     """The session contract after a handoff to ``target``, or ``None`` if it already names it.
 
-    Only ``provider`` changes.  ``host_id`` has no source in this code base
+    Only ``provider`` changes.  The contract-level ``expires_at`` is renewed
+    (now + TTL, so ``contract_digest`` is recomputed): the refreshed contract is
+    a new observation made by the handoff, and handing a run a contract that is
+    about to lapse would only schedule the next failure.  Each fact keeps its own
+    ``checked_at``/``expires_at`` as it was: the handoff observed no capability,
+    so it must not make an old observation look fresh.  ``host_id`` has no source in this code base
     other than the contract itself (``attest`` states facts, never a host), so
     it is kept rather than invented; every stated fact is kept as it was.
     """
@@ -93,6 +98,25 @@ def contract_for_platform(
         provider=target,
         host_id=contract.host_id,
         facts=dict(contract.capabilities),
+    )
+
+
+def stranded_nodes(
+    nodes: Iterable[DAGNode], unfinished: Iterable[str], contract_provider: Optional[str]
+) -> List[str]:
+    """Unfinished nodes bound to a platform other than the one the contract names.
+
+    Only meaningful when no handoff target could be named: a contract that
+    states a platform while unfinished nodes sit on another means the user
+    believes the run moved and it did not.  A contract that states nothing
+    (``unknown``) has no platform to disagree with.
+    """
+    if not contract_provider or contract_provider == UNSTATED_PROVIDER:
+        return []
+    pending = set(unfinished)
+    return sorted(
+        node.id for node in nodes
+        if node.id in pending and node_adapter_id(node) != contract_provider
     )
 
 

@@ -95,6 +95,7 @@ from .handoff_rebind import (
     contract_for_platform,
     rebind_nodes,
     resolve_handoff_target,
+    stranded_nodes,
     unfinished_node_ids,
 )
 from .node_spec import (
@@ -844,6 +845,16 @@ def _platform_handoff_rebind(
         dispatchable_others=dispatchable,
     )
     if target is None:
+        stranded = stranded_nodes(nodes, unfinished, contract.provider)
+        if stranded:
+            # Nothing is written before this point: say so instead of
+            # re-authorizing into a no-op that looks like a handoff.
+            raise HandoffRebindError(
+                "platform handoff: 会话能力合同写的是 {}，但未完成节点（{}）仍绑在别的平台，"
+                "无法判断交接到哪个；请加 --adapter <新平台> 指定".format(
+                    contract.provider, ", ".join(stranded)
+                )
+            )
         return nodes, None
     try:
         _observed_adapter(paths, target)

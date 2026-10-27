@@ -51,6 +51,7 @@ class ContractDriftBeatTests(unittest.TestCase):
         self.assertIn("重新授权", payload["action"])
         self.assertEqual(payload["hint"], CONTRACT_DRIFT_HINT)
         self.assertIn("git", payload["hint"])
+        self.assertIn("--platform-handoff", payload["hint"])
         self.assertEqual(payload["recorded_digest"], self.digest)
         self.assertNotEqual(payload["current_digest"], self.digest)
 

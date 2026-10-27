@@ -290,6 +290,15 @@ worker 用 `vibe worker-deliver` 自报的交付不带游标（游标只来自�
 
 授权 action 是 closed allowlist；未列明、deploy-like、外部安装和系统权限动作一律拒绝。`files` 必须是规范化的项目内相对路径列表，并与授权卡的 file scope 精确绑定。授权卡还绑定同时活跃的 developer/reviewer pair 上限；只有 reviewer 接受、P0–P2 清零且证据登记后才归档 pair 并释放容量。
 
+### 换平台交接（`--platform-handoff`）
+
+运行中想把剩下的工作换到另一个平台（例如从 WorkBuddy 换到 Claude Code）：
+
+1. 在**新平台**的会话里先登记能力：`vibe attest --adapter <新平台> --facts <项目内相对路径> --provenance <来源>`。`attest` 只登记能力，不改会话能力合同。
+2. 再执行 `vibe monitor --plan <计划> --authorize AUTHORIZE --platform-handoff [--adapter <新平台>]`。交接这一步会把会话能力合同的平台刷新为新平台（`host_id` 保持原值），已验收节点原样保留验收，未完成节点和授权卡改绑到新平台，并在同一运行上重新授权。
+3. 只有一个其他可派发平台、且合同还没写过平台时可以省略 `--adapter`；有多个候选、或项目已交接过（合同已写了平台）时必须带 `--adapter`，否则会停在 `blocked_unknown` 并提示，不会替你挑。
+4. 不带 `--platform-handoff` 的任何命令都不会改写会话能力合同；交接同时改了验收契约会按 `contract_drift` 拒绝，什么都不改动。
+
 ## LocalRunner 边界
 
 `LocalRunner` 只能执行构造时由适配层登记的精确命令；adapter ID 或任一命令参数不一致都会在启动前拒绝。它不使用 shell 字符串，不持久化命令参数、stdout、stderr、token、credential 或 provider 原文，只保存有界的 PID、退出状态、命令名称、安全事件引用和确认命令来源。
