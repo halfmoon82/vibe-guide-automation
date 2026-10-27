@@ -49,6 +49,10 @@ from .supervisor import (
     authorization_card_summary,
     current_supervisor_address,
     supervisor_mailbox_view,
+    beat_stall_report,
+    render_stall_beat_text,
+    stall_check,
+    stall_peek,
     register_supervisor_address,
     session_cwd_warning,
     project_root_worktree_warning,
@@ -121,6 +125,7 @@ from .state import RunSnapshot
 from .state import (
     WORKTREE_ACTION_STATUS,
     WORKTREE_PREFLIGHT_KEY,
+    STALL_TIER_KEY,
     WORKTREE_PREFLIGHT_KEYS,
     map_user_status,
     save_snapshot,
@@ -169,9 +174,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue'),
+        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'stall-check'),
     )
     parser.add_argument("--json", action="store_true", dest="as_json")
+    parser.add_argument("--recheck", action="store_true", dest="recheck",
+                        help="stall-check: 修复回执后让读取方重新校验；通过才记录自愈并清零空转计数")
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--host-rules", dest="host_rules", choices=("skip", "apply", "rollback"),
                         help="init: 回答「是否在用户级规则中加入 vibe 监工会话例外」")
@@ -1814,13 +1821,32 @@ def _render_pending_verification(by_node: Dict[str, List[str]]) -> str:
     return "\n".join(lines)
 
 
+def _stalled_nodes_view(
+    paths: Optional[ProjectPaths], snapshot: Any
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Display copy of the nodes with stalled ones relabelled, and {node_id: tier}.
+
+    The ``stall_tier`` marker lives only on this copy; the snapshot is never
+    written back with it.
+    """
+    tiers = stall_peek(paths, snapshot.run_id, snapshot) if paths is not None else {}
+    nodes = dict(snapshot.nodes)
+    for node_id, tier in tiers.items():
+        marked = dict(nodes[node_id], **{STALL_TIER_KEY: tier})
+        marked["user_status"] = map_user_status(marked)
+        nodes[node_id] = marked
+    return nodes, tiers
+
+
 def _snapshot_result(
     command: str,
     snapshot: Any,
     as_json: bool,
     continuation: str = "manual",
     handoff: str = "",
+    paths: Optional[ProjectPaths] = None,
 ) -> CLIResult:
+    display_nodes, stalled = _stalled_nodes_view(paths, snapshot)
     retry_pending = any(
         node.get("status") == "retry_pending"
         or (
@@ -1836,7 +1862,7 @@ def _snapshot_result(
         "dispatcher": "monitor" if command in {"monitor", "resume", "reconcile"} else None,
         "status": result_status,
         "run_id": snapshot.run_id,
-        "nodes": snapshot.nodes,
+        "nodes": display_nodes,
         "closeout_status": render_v41_closeout_status(snapshot),
         "continuation": continuation,
     }
@@ -1853,11 +1879,13 @@ def _snapshot_result(
         code = UNKNOWN
     else:
         code = SUCCESS
-    text = (
-        "监工已启动并自动推进中：运行 {}".format(snapshot.run_id)
-        if retry_pending
-        else render_v41_closeout_status(snapshot)
-    )
+    if retry_pending and not stalled:
+        text = "监工已启动并自动推进中：运行 {}".format(snapshot.run_id)
+    else:
+        text = render_v41_closeout_status(snapshot)
+    for node_id in sorted(stalled):
+        text += "\n{}：节点 {} 连续多拍进展不变，没有在自动推进".format(
+            display_nodes[node_id]["user_status"], node_id)
     worktree_actions = _render_worktree_actions(snapshot)
     if worktree_actions:
         text += "\n" + worktree_actions
@@ -2307,6 +2335,21 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         payload = supervisor_mailbox_view(paths, args.run_id)
         return _result(SUCCESS if payload["status"] == "ok" else UNKNOWN, payload, json.dumps(payload, ensure_ascii=False), args.as_json)
 
+    if args.command == "stall-check":
+        if not (args.run_id and args.node_id):
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id and --node are required"}, "缺少 --run-id 或 --node", args.as_json)
+        payload = stall_check(paths, args.run_id, args.node_id, recheck=args.recheck, role=args.role)
+        status = payload["status"]
+        if status == "pack":
+            text = "排查包（节点 {}）：{}".format(args.node_id, json.dumps(payload["pack"], ensure_ascii=False))
+        elif status == "recheck_passed":
+            text = "复核通过：节点 {} 的回执已被读取方接受，空转计数已清零，下一拍起继续推进".format(args.node_id)
+        elif status == "recheck_failed":
+            text = "复核未通过（已记失败尝试）：{}".format("；".join(payload["differences"]))
+        else:
+            text = "排查被拒绝（{}）：{}".format(status, payload.get("reason", ""))
+        return _result(SUCCESS if status in {"pack", "recheck_passed"} else BLOCKED, payload, text, args.as_json)
+
     if args.command == "supervisor-beat":
         if not args.run_id:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
@@ -2355,6 +2398,13 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             text = "unknown：按 work 处理，推进用 {} resume --plan {} --run-id {}；原因：{}".format(
                 supervisor_command_prefix, plan_id, args.run_id, payload.get("reason", "状态未知")
             ) + tail
+        stall_report = beat_stall_report(paths, args.run_id)
+        payload["stall"] = stall_report
+        stall_text = render_stall_beat_text(stall_report, args.run_id, supervisor_command_prefix)
+        if stall_text:
+            # The stall line leads so the supervisor cannot read "idle"/"work"
+            # past it; rotate and contract_drift stay first (they stop the beat).
+            text = text + "\n" + stall_text if state in {"rotate", "contract_drift"} else stall_text + "\n" + text
         code = SUCCESS if state in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
         return _result(
             code,
@@ -3618,8 +3668,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             handoff = _first_shift_handoff(
                 paths, args.plan, snapshot.run_id, getattr(snapshot, "status", None)
             )
-            return _snapshot_result("monitor", snapshot, args.as_json, "supervisor", handoff)
-        return _snapshot_result("monitor", snapshot, args.as_json, "manual", handoff)
+            return _snapshot_result("monitor", snapshot, args.as_json, "supervisor", handoff, paths=paths)
+        return _snapshot_result("monitor", snapshot, args.as_json, "manual", handoff, paths=paths)
 
     if args.command == "reconcile":
         try:
@@ -3689,7 +3739,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                                                             package['node_id'], target_runner)
             else:
                 snapshot = monitor.reconcile_evidence(args.run_id, package)
-            return _snapshot_result("reconcile", snapshot, args.as_json)
+            return _snapshot_result("reconcile", snapshot, args.as_json, paths=paths)
         except (FileNotFoundError, OSError, TypeError, ValueError, PermissionError) as error:
             return _result(
                 UNKNOWN,
@@ -3709,7 +3759,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             )
             payload = monitor.repair_node(args.node_id, args.run_id)
             snapshot = load_snapshot(paths, args.run_id)
-            result = _snapshot_result(args.command, snapshot, args.as_json)
+            result = _snapshot_result(args.command, snapshot, args.as_json, paths=paths)
             result.payload["repair"] = payload
             return result
         except (FileNotFoundError, OSError, TypeError, ValueError, PermissionError) as error:
@@ -3922,7 +3972,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             if args.command == "resume"
             else ""
         )
-        return _snapshot_result(args.command, snapshot, args.as_json, handoff=handoff)
+        return _snapshot_result(args.command, snapshot, args.as_json, handoff=handoff, paths=paths)
 
     return _result(
         USAGE_ERROR, {"status": "usage_error"}, "参数错误", args.as_json
