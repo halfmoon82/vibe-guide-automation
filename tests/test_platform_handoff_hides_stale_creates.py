@@ -110,6 +110,35 @@ class StaleCreateTests(HandoffCase):
         self.assert_one_pending_on("claude-code-visible")
         self.finish_on_new_platform(before)
 
+    def test_a_rerun_that_reauthorizes_again_does_not_hide_the_new_platforms_create(self):
+        """CONSTRUCTED STATE: the 5.1.11 two-pending mailbox, healed by a rerun that re-keys again.
+
+        The real project's rerun did not take the no-op path: it wrote a second
+        platform_handoff reauthorization, so the digest the *latest* handoff
+        replaced is the one the new platform's own create carries.  Hiding by
+        that digest alone hid the new create and kept the old one.  The
+        marker removal reproduces the two-pending mailbox; attesting the target
+        again with another provenance first makes the rerun a real second reauthorization.
+        """
+        before = self.published_on("workbuddy")
+        old = [a["action_id"] for a in self.store.pending()]
+        self.attest("claude-code")
+        self.handoff("--adapter", "claude-code")
+        for name in self.stale_ids():
+            (self.stale_dir() / (name + ".json")).unlink()
+        self.assertEqual(self.cli("attest", "--adapter", "claude-code", "--facts", "claude-code-facts.json",
+                                  "--provenance", "a later attestation", "--project-id", "h5probe").payload["status"], "ok")
+        self.handoff("--adapter", "claude-code")
+        handoffs = [e for e in self.events("authorization_reauthorized")
+                    if e["data"]["change_reason"] == "platform_handoff"]
+        self.assertEqual(len(handoffs), 2, "the rerun must be a second real reauthorization")
+        self.assert_one_pending_on("claude-code-visible")
+        self.assertEqual(self.stale_ids(), sorted(old))
+        # Not asserted here: whether the node then finishes.  A second
+        # re-keying handoff leaves the create under the previous digest and the
+        # next dispatch of that node stops with ``contract_error`` on main too
+        # (an open, separate gap reported with this change).
+
     def test_without_the_flag_nothing_is_hidden(self):
         self.published_on("workbuddy")
         self.fail_the_dispatch_once()

@@ -919,6 +919,7 @@ class ProviderActionStore:
 
     def unresolved_create_slots(
         self, run_id: str, issue_id: str, authorization_digest: str,
+        except_provider: Optional[str] = None,
     ) -> List[Tuple[str, int]]:
         """(role, generation) of this node's create requests that have no
         result and no stale marker and were written under exactly
@@ -935,6 +936,7 @@ class ProviderActionStore:
             if (
                 action.get("run_id") == run_id and action.get("issue_id") == issue_id
                 and action.get("operation") == "create"
+                and action.get("provider") != except_provider
                 and isinstance(action.get("role"), str)
                 and isinstance(action.get("generation"), int)
                 and isinstance(envelope, Mapping)
@@ -945,7 +947,7 @@ class ProviderActionStore:
 
     def supersede_unclaimed_creates(
         self, run_id: str, issue_id: str, role: str, generation: int,
-        previous_authorization_digest: str,
+        previous_authorization_digest: str, except_provider: Optional[str] = None,
     ) -> List[str]:
         """Hide this role's unclaimed create requests from before a handoff.
 
@@ -955,7 +957,8 @@ class ProviderActionStore:
         exactly the authorization the handoff replaced (never a later one),
         was never claimed: mark it stale (an audit marker beside the
         immutable request; the native tool is never invoked) so only one
-        create stays pending.  Every other request is left alone.
+        create stays pending.  Every other request is left alone.  A request
+        of ``except_provider`` (the platform now dispatching) is never hidden.
         """
         if not all(isinstance(value, str) and value for value in (run_id, issue_id, role, previous_authorization_digest)):
             raise ValueError("provider request identity is required")
@@ -973,6 +976,7 @@ class ProviderActionStore:
                 or action.get("role") != role or action.get("operation") != "create"
                 or action.get("generation") != generation
                 or digest != previous_authorization_digest
+                or action.get("provider") == except_provider
             ):
                 continue
             self._atomic(stale_dir / path.name, {

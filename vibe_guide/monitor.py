@@ -2478,7 +2478,7 @@ class Monitor:
             # reason as the full path below.
             self._record_topology_projection(snapshot, "monitor.reauthorize")
             if change_reason == "platform_handoff":
-                self._hide_stale_handoff_creates(snapshot)
+                self._hide_stale_handoff_creates(snapshot, runner)
             self._schedule_ready(snapshot, runner)
             self._refresh_run_status(snapshot)
             self._record_topology_projection(snapshot, "monitor.reauthorize")
@@ -2692,7 +2692,7 @@ class Monitor:
         # ordering ``tick`` already uses.
         self._record_topology_projection(snapshot, "monitor.reauthorize")
         if change_reason == "platform_handoff":
-            self._hide_stale_handoff_creates(snapshot)
+            self._hide_stale_handoff_creates(snapshot, runner)
         self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
         self._record_topology_projection(snapshot, "monitor.reauthorize")
@@ -4831,7 +4831,7 @@ class Monitor:
                 retry_role = str(retry["role"])
                 retry_generation = int(current.get("review_generation" if retry_role == "reviewer" else "developer_generation", 0)) + 1
                 retry_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, retry_role, retry_generation, current))
-                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, retry_role, retry_generation, retry_digest):
+                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, retry_role, retry_generation, retry_digest, runner):
                     self._mark_blocked_unknown(
                         snapshot,
                         node_id,
@@ -4882,7 +4882,7 @@ class Monitor:
                 retry_role = "reviewer"
                 retry_generation = int(current.get("review_generation", 0)) + 1
                 retry_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, retry_role, retry_generation, current))
-                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, retry_role, retry_generation, retry_digest):
+                if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, retry_role, retry_generation, retry_digest, runner):
                     self._mark_blocked_unknown(
                         snapshot,
                         node_id,
@@ -4934,7 +4934,7 @@ class Monitor:
             generation_key = "review_generation" if first_role == "reviewer" else "developer_generation"
             first_generation = int(current.get(generation_key, 0)) + 1
             first_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, first_role, first_generation, current))
-            if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, first_digest, first_role, first_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, first_role, first_generation, first_digest):
+            if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, first_digest, first_role, first_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, first_role, first_generation, first_digest, runner):
                 self._mark_blocked_unknown(
                     snapshot,
                     node_id,
@@ -4998,31 +4998,68 @@ class Monitor:
             return False
         return store.claim_evidence(snapshot.run_id, node_id) is None
 
-    def _hide_stale_handoff_creates(self, snapshot: RunSnapshot) -> None:
+    def _handoff_replaced_authorizations(self, snapshot: RunSnapshot) -> List[str]:
+        """Every authorization digest an unbroken chain of platform_handoff
+        reauthorizations ending at the current one replaced, newest first.
+
+        Re-running a finished handoff reauthorizes again, so the latest event
+        alone names the digest the *new* platform's create carries; the old
+        platform's create sits one link further back.  The walk stops at the
+        first event that is not a handoff or does not link to the digest
+        after it.
+        """
+        expected = snapshot.authorization_digest
+        chain: List[str] = []
+        events = [
+            event for event in load_events(self.paths, snapshot.run_id)[: snapshot.event_sequence]
+            if event.get("event") == "authorization_reauthorized"
+        ]
+        for event in reversed(events):
+            data = event.get("data", {})
+            previous = data.get("previous_authorization_digest")
+            if (
+                data.get("change_reason") != "platform_handoff"
+                or data.get("authorization_digest") != expected
+                or not isinstance(previous, str) or len(previous) != 64
+            ):
+                break
+            chain.append(previous)
+            expected = previous
+        return chain
+
+    def _hide_stale_handoff_creates(self, snapshot: RunSnapshot, runner: Runner) -> None:
         """Hide the old platform's unclaimed creates of every unfinished node.
 
         Independent of the node's lease: a dispatch that failed once released
         its lease, so the lease-rebind path never runs for it, yet its old
         create is still pending beside the new platform's.  Only requests
-        written under the authorization the latest platform_handoff replaced
-        and that nothing claimed are hidden; the new platform's own create
-        carries the current digest and is never matched.  Idempotent, so a
+        written under an authorization a platform_handoff replaced, by a
+        provider other than the one now dispatching, and that nothing claimed
+        are hidden; the new platform's own create is never matched (its
+        provider is the runner's).  Idempotent, so a
         re-run of the handoff heals a mailbox an earlier version left with two.
         """
-        replaced = self._handoff_replaced_authorization(snapshot)
-        if replaced is None:
+        provider = getattr(runner, "provider", None)
+        replaced = self._handoff_replaced_authorizations(snapshot)
+        if not isinstance(provider, str) or not provider or not replaced:
             return
         store = ProviderActionStore(self.paths)
         for node_id in sorted(snapshot.nodes):
             if snapshot.nodes[node_id].get("status") == "accepted":
                 continue
             try:
-                slots = store.unresolved_create_slots(snapshot.run_id, node_id, replaced)
+                slots = [
+                    (digest, role, generation)
+                    for digest in replaced
+                    for role, generation in store.unresolved_create_slots(
+                        snapshot.run_id, node_id, digest, provider
+                    )
+                ]
                 if not slots or not self._node_never_claimed(snapshot, node_id, store):
                     continue
-                for role, generation in slots:
+                for digest, role, generation in slots:
                     superseded = store.supersede_unclaimed_creates(
-                        snapshot.run_id, node_id, role, generation, replaced
+                        snapshot.run_id, node_id, role, generation, digest, provider
                     )
                     if superseded:
                         self._record(
@@ -5040,7 +5077,8 @@ class Monitor:
                 continue
 
     def _adopt_unserved_handoff_lease(
-        self, snapshot: RunSnapshot, node_id: str, role: str, generation: int, digest: str
+        self, snapshot: RunSnapshot, node_id: str, role: str, generation: int, digest: str,
+        runner: Optional[Runner] = None,
     ) -> bool:
         """Re-key this run's own unclaimed lease after a platform_handoff.
 
@@ -5065,8 +5103,14 @@ class Monitor:
             store = ProviderActionStore(self.paths)
             if not self._node_never_claimed(snapshot, node_id, store):
                 return False
+            # A rerun of the handoff re-keys again, and then the digest the
+            # latest handoff replaced is the one the new platform's own create
+            # carries: never hide a request of the provider now dispatching
+            # (a runner without a provider keeps the digest-only rule).
+            provider = getattr(runner, "provider", None)
             superseded = store.supersede_unclaimed_creates(
-                snapshot.run_id, node_id, role, generation, replaced
+                snapshot.run_id, node_id, role, generation, replaced,
+                provider if isinstance(provider, str) and provider else None,
             )
             if not rebind_writer_lease(
                 self.paths, node_id, str(current["worktree"]), snapshot.run_id,
