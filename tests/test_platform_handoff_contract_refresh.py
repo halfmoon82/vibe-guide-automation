@@ -116,6 +116,12 @@ class RealUserHandoffTests(HandoffCase):
         self.assertEqual(load_contract(self.paths).provider, "claude-code")
         self.assert_moved_and_finishes(before)
 
+    def test_an_unstated_contract_with_no_other_platform_is_not_a_stranded_run(self):
+        self.ready()
+        result = self.handoff()
+        self.assertNotEqual(result.payload["status"], "blocked_unknown", result.payload)
+        self.assertEqual(load_contract(self.paths).provider, "unknown")
+
     def test_a_contract_naming_another_platform_than_the_nodes_is_a_readable_stop(self):
         """CONSTRUCTED STATE (users cannot reach it with 5.1.10 commands).
 
@@ -338,10 +344,12 @@ class HandoffDocumentationTests(unittest.TestCase):
         return text[start: end if end != -1 else len(text)]
 
     def test_both_readmes_document_the_handoff_in_its_own_section(self):
-        for name, heading in (("README.md", "### 换平台交接"),
-                              ("README.en.md", "### Platform handoff")):
+        for name, heading, plan in (("README.md", "### 换平台交接", "<计划>"),
+                                    ("README.en.md", "### Platform handoff", "<plan>")):
             body = self.section(name, heading)
-            for needle in ("vibe attest --adapter", "--platform-handoff", "--adapter"):
+            new = "<新平台>" if name == "README.md" else "<new-platform>"
+            for needle in ("vibe attest --adapter " + new,
+                           "vibe monitor --plan {} --authorize AUTHORIZE --platform-handoff [--adapter {}]".format(plan, new)):
                 self.assertIn(needle, body, (name, needle))
 
     def test_the_drift_hint_names_the_handoff(self):
