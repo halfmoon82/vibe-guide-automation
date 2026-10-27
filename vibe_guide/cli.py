@@ -23,6 +23,7 @@ from .authorization import (
     INTEGRATION_REVIEW_NODE_ID,
     dispatch_topology_for_node,
     node_adapter_id,
+    rebind_dispatch_contract,
     refresh_authorization_card,
 )
 from .adapters.base import (
@@ -88,6 +89,12 @@ from .planner import (
     build_stage_handoff,
 )
 from .session_entry import build_session_entry, draft_s1, materialize_session_entry, replaceable_draft_extras
+from .handoff_rebind import (
+    HandoffRebindError,
+    rebind_nodes,
+    resolve_handoff_target,
+    unfinished_node_ids,
+)
 from .node_spec import (
     complete_node_contracts,
     normalize_node_spec,
@@ -123,7 +130,11 @@ from .state import (
 from .runners.provider_action import ProviderActionRunner
 from .preflight import PreflightBlockedError, PreflightContext, assert_authorizable, run_preflight
 from .prd_profiles import evaluate_prd_checkpoints, validate_skill_profile
-from .engine_attestation import create_engine_attestation, needs_renewal
+from .engine_attestation import (
+    create_engine_attestation,
+    needs_renewal,
+    validate_engine_attestation,
+)
 from .evidence import evaluate_v41_closeout
 from .installation import run_install, run_upgrade, migrate_state
 from .skills import SkillSpec, install_project_skill
@@ -523,7 +534,12 @@ def _background_worker_entries(
     return entries
 
 
-def _observed_engine_attestation(paths: ProjectPaths, plan: Plan) -> Dict[str, Any]:
+def _observed_engine_attestation(
+    paths: ProjectPaths,
+    plan: Plan,
+    provider: Optional[str] = None,
+    reuse_current: bool = False,
+) -> Dict[str, Any]:
     """Re-observe the engine evidence a same-plan reauthorization has to name.
 
     Publication stamps the plan's ``engine-attestation.json`` once, and
@@ -546,15 +562,37 @@ def _observed_engine_attestation(paths: ProjectPaths, plan: Plan) -> Dict[str, A
     attestation_path = paths.resolve_vibe_path(
         Path("plans") / plan.plan_id / "engine-attestation.json"
     )
-    provider = None
+    # A platform handoff names the platform the run is moving to; the
+    # published attestation still names the one it is leaving.
     try:
-        if attestation_path.is_file() and not attestation_path.is_symlink():
+        if (
+            provider is None
+            and attestation_path.is_file()
+            and not attestation_path.is_symlink()
+        ):
             provider = json.loads(
                 attestation_path.read_text(encoding="utf-8")
             ).get("provider")
     except (OSError, TypeError, ValueError):
         provider = None
     observed = ProviderActionStore(paths).capabilities(provider)
+    if reuse_current:
+        # ``generated_at`` is part of the digest, so a fresh stamp on every
+        # call gives every re-run a new authorization digest -- and a create
+        # request already written under the previous one then reads as an
+        # identity drift.  Evidence that still describes exactly what is
+        # observed now is therefore kept as it is.
+        try:
+            existing = json.loads(attestation_path.read_text(encoding="utf-8"))
+            validate_engine_attestation(existing, plan.plan_id, plan.version)
+            if (
+                existing.get("provider") == observed["adapter_id"]
+                and existing.get("capability_facts") == observed["facts"]
+                and existing.get("provenance") == observed["provenance"]
+            ):
+                return existing
+        except (OSError, TypeError, ValueError):
+            pass
     return create_engine_attestation(
         plan.plan_id,
         plan.version,
@@ -569,7 +607,9 @@ def _observed_engine_attestation(paths: ProjectPaths, plan: Plan) -> Dict[str, A
 
 @contextlib.contextmanager
 def _staged_engine_attestation(
-    path: Path, attestation: Optional[Dict[str, Any]]
+    path: Path,
+    attestation: Optional[Dict[str, Any]],
+    committed: Optional[List[bool]] = None,
 ):
     """Publish ``attestation`` for the duration of one reauthorization call.
 
@@ -599,6 +639,11 @@ def _staged_engine_attestation(
     try:
         yield attestation
     except BaseException:
+        if committed and committed[0]:
+            # The run already durably moved onto this evidence (a platform
+            # handoff past its reauthorization): putting the old file back
+            # would leave the run naming evidence nobody can find.
+            raise
         if previous is None:
             if path.exists():
                 path.unlink()
@@ -695,13 +740,102 @@ def _background_runner(
     )
 
 
+def _platform_handoff_rebind(
+    paths: ProjectPaths,
+    directory: Path,
+    nodes: List[DAGNode],
+    card: AuthorizationCard,
+    explicit: Optional[str],
+) -> Tuple[List[DAGNode], Optional[str]]:
+    """Nodes and target platform of a ``--platform-handoff``.
+
+    Returns ``(nodes, None)`` unchanged when no platform can be named,
+    which is exactly the behaviour before this existed.  A named platform that is
+    not attested and dispatchable raises ``HandoffRebindError``: the run is
+    never pointed at a platform nobody verified.
+    """
+    snapshot = load_snapshot(paths, _run_id(directory, None))
+    authorization = snapshot.authorization if isinstance(snapshot.authorization, dict) else {}
+    run_agent = str(authorization.get("agent_id") or "")
+    unfinished = unfinished_node_ids(nodes, snapshot.nodes)
+    run_drift = bool(run_agent) and any(
+        node_adapter_id(node) != run_agent for node in nodes if node.id in unfinished
+    )
+    contract = require_capability_contract(paths)
+    dispatchable: List[str] = []
+    for adapter_id in sorted(observe_all_capabilities(paths)):
+        try:
+            _observed_adapter(paths, adapter_id)
+        except (ProviderPending, ValueError):
+            continue
+        dispatchable.append(adapter_id)
+    target = resolve_handoff_target(
+        explicit=explicit,
+        card_agent=card.agent_id,
+        run_agent=run_agent,
+        run_drift=run_drift,
+        capability_changed=snapshot.capability_contract_digest != contract.contract_digest,
+        contract_provider=contract.provider,
+        dispatchable_others=dispatchable,
+    )
+    if target is None:
+        return nodes, None
+    try:
+        _observed_adapter(paths, target)
+    except (ProviderPending, ValueError) as error:
+        raise HandoffRebindError(
+            "platform handoff: 新平台 {} 未登记能力或没有可验证的派发通道（先在新平台会话里 "
+            "vibe attest --adapter {}）：{}".format(target, target, error)
+        ) from error
+    rebound, _moved = rebind_nodes(nodes, unfinished, target)
+    return rebound, target
+
+
+def _handed_off_accepted_nodes(paths: ProjectPaths, card: AuthorizationCard) -> frozenset:
+    """Accepted nodes of a run that recorded a platform_handoff.
+
+    Their dispatch binding is history: they were accepted on the platform the
+    run left, and the handoff never rewrites that.  A run with no recorded
+    handoff exempts nothing, so the routing check stays exactly as strict as
+    before for every ordinary run.  Any read problem exempts nothing.
+    """
+    try:
+        directory = _plan_root(paths, card.plan_id)
+        run_id = _run_id(directory, None)
+        events = load_events(paths, run_id)
+        if not any(
+            event.get("event") == "authorization_reauthorized"
+            and event.get("data", {}).get("change_reason") == "platform_handoff"
+            for event in events
+        ):
+            return frozenset()
+        snapshot = load_snapshot(paths, run_id)
+        return frozenset(
+            node_id for node_id, current in snapshot.nodes.items()
+            if current.get("status") == "accepted"
+        )
+    except (OSError, TypeError, ValueError, KeyError):
+        return frozenset()
+
+
 def _public_runner(
     paths: ProjectPaths,
     card: AuthorizationCard,
     nodes: List[DAGNode],
     launchers: Optional[List[Any]] = None,
+    exempt_nodes: Optional[frozenset] = None,
 ) -> ProviderActionRunner:
-    if any(node.contract.get("adapter_id") != card.agent_id for node in nodes):
+    # The handoff call names its accepted nodes itself (no handoff event is
+    # recorded yet when its runner is built); every other call derives them
+    # from a recorded handoff.
+    exempt = (
+        exempt_nodes if exempt_nodes is not None
+        else _handed_off_accepted_nodes(paths, card)
+    )
+    if any(
+        node.contract.get("adapter_id") != card.agent_id
+        for node in nodes if node.id not in exempt
+    ):
         raise ValueError("node adapter routing does not match authorization")
     observed = _observed_adapter(paths, card.agent_id)
     if observed.capabilities.mode == "background":
@@ -3206,6 +3340,29 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             invalidation_path = _invalidation_path(directory)
             invalidation_to_clear = None
             reauthorizing_current_run = _current_run_path(directory).exists()
+            # A platform handoff moves the unfinished nodes and the card's
+            # agent to the new platform; everything else is untouched, and an
+            # ordinary reauthorization never reaches this.
+            handoff_agent: Optional[str] = None
+            handoff_nodes: Optional[List[DAGNode]] = None
+            handoff_accepted: Optional[frozenset] = None
+            handoff_committed: List[bool] = [False]
+            handoff_observation: Tuple[Any, ...] = ()
+            if args.platform_handoff and reauthorizing_current_run:
+                nodes, handoff_agent = _platform_handoff_rebind(
+                    paths, directory, nodes, card, args.adapter
+                )
+                # Only a handoff observes against the target platform and
+                # keeps still-current evidence; any other reauthorization
+                # observes exactly as it always did.
+                handoff_observation = (handoff_agent, True)
+                if handoff_agent is not None:
+                    handoff_nodes = nodes
+                    handoff_accepted = frozenset(
+                        node_id for node_id, current in load_snapshot(
+                            paths, _run_id(directory, None)
+                        ).nodes.items() if current.get("status") == "accepted"
+                    )
             # Background launchers this dispatch builds, so the worktree
             # preflight report can be persisted once the dispatch returns.
             launchers: List[Any] = []
@@ -3215,19 +3372,26 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     raise ValueError("authorization invalidation record is invalid")
                 with _staged_engine_attestation(
                     directory / "engine-attestation.json",
-                    _observed_engine_attestation(paths, plan)
+                    _observed_engine_attestation(
+                        paths, plan, *handoff_observation
+                    )
                     if _engine_evidence_required(plan)
                     else None,
+                    handoff_committed,
                 ) as engine_attestation:
                     card = refresh_authorization_card(
                         plan, nodes, card,
                         workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
                         topology_rulings=_observed_topology_rulings(paths, card),
                         engine_attestation=engine_attestation,
+                        agent_id=handoff_agent,
                     )
                     record = authorize(card, args.authorize)
                     if runner is None:
-                        runner = _public_runner(paths, card, nodes, launchers)
+                        runner = _public_runner(
+                            paths, card, nodes, launchers,
+                            exempt_nodes=handoff_accepted,
+                        )
                     monitor = Monitor(
                         paths, plan, nodes,
                         topology_rulings=_observed_topology_rulings(paths, card),
@@ -3242,7 +3406,16 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                             )
                         ),
                     )
+                    handoff_committed[0] = handoff_nodes is not None
                     _record_worktree_preflight(paths, monitor, snapshot, launchers)
+                    if handoff_nodes is not None:
+                        # Without this the next resume reads the old platform
+                        # back out of nodes.json.  Nodes first, then the card:
+                        # either half-written state is re-derived by a re-run.
+                        _atomic_json(
+                            directory / "nodes.json",
+                            [node.to_dict() for node in handoff_nodes],
+                        )
                     # Publish the refreshed card inside the staged window, and
                     # only once the reauthorization actually succeeded.  Writing
                     # it before `reauthorize` left the card, the authorization
@@ -3264,19 +3437,26 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 # an invalidation marker yet.
                 with _staged_engine_attestation(
                     directory / "engine-attestation.json",
-                    _observed_engine_attestation(paths, plan)
+                    _observed_engine_attestation(
+                        paths, plan, *handoff_observation
+                    )
                     if _engine_evidence_required(plan)
                     else None,
+                    handoff_committed,
                 ) as engine_attestation:
                     card = refresh_authorization_card(
                         plan, nodes, card,
                         workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
                         topology_rulings=_observed_topology_rulings(paths, card),
                         engine_attestation=engine_attestation,
+                        agent_id=handoff_agent,
                     )
                     record = authorize(card, args.authorize)
                     if runner is None:
-                        runner = _public_runner(paths, card, nodes, launchers)
+                        runner = _public_runner(
+                            paths, card, nodes, launchers,
+                            exempt_nodes=handoff_accepted,
+                        )
                     monitor = Monitor(
                         paths, plan, nodes,
                         topology_rulings=_observed_topology_rulings(paths, card),
@@ -3288,7 +3468,13 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                         "platform_handoff" if args.platform_handoff
                         else "capability_contract_changed",
                     )
+                    handoff_committed[0] = handoff_nodes is not None
                     _record_worktree_preflight(paths, monitor, snapshot, launchers)
+                    if handoff_nodes is not None:
+                        _atomic_json(
+                            directory / "nodes.json",
+                            [node.to_dict() for node in handoff_nodes],
+                        )
                     # See the invalidation branch above for why the card is
                     # published here and not one line further out.
                     _atomic_json(directory / "authorization-card.json", card.to_dict())
@@ -3344,6 +3530,13 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 BLOCKED,
                 {"command": "monitor", "status": "preflight_blocked", "check_ids": list(error.check_ids), "reason": str(error)},
                 "预检已阻塞：" + ", ".join(error.check_ids),
+                args.as_json,
+            )
+        except HandoffRebindError as error:
+            return _result(
+                UNKNOWN,
+                {"command": "monitor", "dispatcher": "monitor", "status": "blocked_unknown", "reason": str(error)},
+                "平台交接未完成：" + str(error),
                 args.as_json,
             )
         except PermissionError as error:
