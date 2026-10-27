@@ -134,17 +134,29 @@ class StaleCreateTests(HandoffCase):
         self.handoff("--adapter", "claude-code")
         self.assertNotIn(old["action_id"], self.stale_ids())
 
-    def test_a_plain_rerun_after_a_handoff_hides_nothing(self):
-        """CONSTRUCTED STATE: the 5.1.11 two-pending mailbox, then no flag."""
+    def test_an_ordinary_reauthorization_after_a_handoff_hides_nothing(self):
+        """CONSTRUCTED STATE: the 5.1.11 two-pending mailbox, then a flagless reauthorization.
+
+        The user edits prd.md and restores it; the plain ``resume`` leaves the
+        invalidation marker and ``monitor --authorize`` (no handoff flag)
+        reauthorizes the run.  The marker is the only command-reachable way to
+        run a flagless reauthorization against this run.
+        """
         self.published_on("workbuddy")
         self.attest("claude-code")
         self.handoff("--adapter", "claude-code")
         for name in self.stale_ids():
             (self.stale_dir() / (name + ".json")).unlink()
-        self.cli("monitor", "--plan", PLAN, "--authorize", "AUTHORIZE")
+        prd = self.root / ".vibe" / "plans" / PLAN / "prd.md"
+        original = prd.read_bytes()
+        prd.write_bytes(original + "\n补充一行。\n".encode("utf-8"))
         self.cli("resume", "--plan", PLAN)
-        self.assertEqual(self.stale_ids(), [])
-        self.assertEqual(len(self.store.pending()), 2)
+        prd.write_bytes(original)
+        self.assertTrue((self.root / ".vibe" / "plans" / PLAN / "authorization-invalidated.json").exists())
+        self.cli("monitor", "--plan", PLAN, "--authorize", "AUTHORIZE")
+        reasons = [e["data"]["change_reason"] for e in self.events("authorization_reauthorized")]
+        self.assertEqual(self.stale_ids(), [], reasons)
+        self.assertEqual(len(self.store.pending()), 2, reasons)
 
     def test_the_hide_is_audited_and_survives_the_event_filter(self):
         self.published_on("workbuddy")
