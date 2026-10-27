@@ -162,6 +162,16 @@ class CLIResult:
     as_json: bool = False
 
 
+def _explicit_role(argv: Sequence[str]) -> Optional[str]:
+    """``--role`` as typed (abbreviations included), or None when it was left to its default."""
+    probe = argparse.ArgumentParser(add_help=False)
+    probe.add_argument("--role", dest="role", default=None)
+    try:
+        return probe.parse_known_args(list(argv))[0].role
+    except SystemExit:
+        return None
+
+
 def _result(
     code: int, payload: Dict[str, Any], text: str, as_json: bool
 ) -> CLIResult:
@@ -2336,8 +2346,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
     if args.command == "heal-verify":
         if not (args.run_id and args.node_id):
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id and --node are required"}, "缺少 --run-id 或 --node", args.as_json)
-        explicit_role = args.role if any(
-            item == "--role" or item.startswith("--role=") for item in argv) else None
+        explicit_role = _explicit_role(argv)
         payload = heal_verify(paths, args.run_id, args.node_id, role=explicit_role)
         status = payload["status"]
         if status == "verify_passed":

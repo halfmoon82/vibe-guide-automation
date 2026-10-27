@@ -93,6 +93,15 @@ class ReviewerVerifyTests(ReviewerStallFixture):
         self.assertEqual(out.payload["status"], "verify_failed")
         self.assertNotEqual(out.payload["differences"], ["missing field: resumed"])
 
+    def test_every_spelling_of_an_explicit_role_is_honored(self):
+        self.stalled_beat()
+        for spelling in (["--role=developer"], ["--rol", "developer"]):
+            with self.subTest(spelling=spelling):
+                out = self.verify_as(*spelling)
+                self.assertNotEqual(out.payload["differences"], ["missing field: resumed"])
+        out = self.verify_as("--role=reviewer")
+        self.assertEqual(out.payload["differences"], ["missing field: resumed"])
+
     def test_no_escalation_before_two_real_failed_attempts(self):
         out = self.stalled_beat()
         self.assertTrue(out.text.startswith("需要监工排查："))
