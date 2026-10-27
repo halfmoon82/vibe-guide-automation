@@ -283,6 +283,32 @@ class ContractRefreshCrashWindowTests(HandoffCase):
         self.assertEqual(load_contract(self.paths).provider, "claude-code")
         self.assert_moved_and_finishes(before)
 
+    def test_a_marker_left_by_a_plain_resume_does_not_stop_the_handoff_refreshing_the_contract(self):
+        """Marker branch with the contract still unrefreshed.
+
+        The user edits prd.md, a plain ``resume`` writes
+        ``authorization-invalidated.json``, the user puts prd.md back (text
+        editing only) and then hands the run off.  The handoff takes the marker
+        branch and has to refresh the contract itself.
+        """
+        before = self.ready()
+        self.attest("claude-code")
+        plan = self.root / ".vibe" / "plans" / PLAN
+        prd = plan / "prd.md"
+        original = prd.read_bytes()
+        prd.write_bytes(original + "\n补充一行说明。\n".encode("utf-8"))
+        resumed = self.cli("resume", "--plan", PLAN)
+        marker = plan / "authorization-invalidated.json"
+        self.assertEqual(resumed.payload["status"], "blocked_design", resumed.payload)
+        self.assertTrue(marker.exists())
+        prd.write_bytes(original)
+        self.assertEqual(load_contract(self.paths).provider, "unknown")
+        result = self.handoff("--adapter", "claude-code")
+        self.assertNotEqual(result.payload["status"], "blocked_unknown", result.payload)
+        self.assertEqual(load_contract(self.paths).provider, "claude-code")
+        self.assertFalse(marker.exists())
+        self.assert_moved_and_finishes(before)
+
     def test_an_acceptance_change_alongside_the_handoff_leaves_the_contract_untouched(self):
         self.ready()
         self.attest("claude-code")
