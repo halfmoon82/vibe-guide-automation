@@ -1234,12 +1234,15 @@ def session_cwd_warning(paths, session_record):
         return None
     if session == root or root in session.parents:
         return None
-    # A cwd in another checkout of the same repository (the main checkout of a
-    # linked-worktree root, or a sibling worktree) is a project session, not a
-    # projectless one: run-63e7cfc2's successor ran from the main checkout and
-    # wrote .vibe without a prompt (2026-10-27).
+    # A cwd in the *main checkout* of the repository the root is a linked
+    # worktree of is a project session, not a projectless one: run-63e7cfc2's
+    # successor ran from the main checkout and wrote .vibe without a prompt
+    # (2026-10-27).  A cwd in some other linked worktree of the same repository
+    # -- e.g. a host-generated ~/.codex/worktrees/<id>/<repo> -- is exactly the
+    # case #231 warns about, so it keeps the warning.
     common = _git_common_dir(root)
-    if common is not None and _git_common_dir(session) == common:
+    if (common is not None and _git_common_dir(session) == common
+            and _in_main_checkout(session)):
         return None
     return (
         "登记会话的 cwd（{}）不在项目根（{}）内：该会话很可能是 projectless 创建，"
@@ -1288,6 +1291,21 @@ def _git_common_dir(path):
             except (OSError, RuntimeError):
                 return None
     return None
+
+
+def _in_main_checkout(path):
+    """True when the nearest ``.git`` above ``path`` is a directory."""
+    current = Path(path)
+    for candidate in (current, *current.parents):
+        marker = candidate / ".git"
+        try:
+            if marker.is_dir():
+                return True
+            if marker.exists():
+                return False
+        except OSError:
+            return False
+    return False
 
 
 def project_root_worktree_warning(paths):

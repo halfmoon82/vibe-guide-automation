@@ -104,14 +104,24 @@ class SessionCwdWarningTests(unittest.TestCase):
         (main / "sub").mkdir()
         self.assertIsNone(session_cwd_warning(self.paths, record))
 
-    def test_session_in_sibling_worktree_of_same_repo_is_silent(self):
+    def test_session_in_sibling_worktree_of_same_repo_still_warns(self):
+        # A host-generated linked worktree is the projectless case #231 is for.
         main = self._linked_worktree_root()
         sibling = Path(self.tmp.name) / "sibling"
         sibling.mkdir()
         (main / ".git" / "worktrees" / "sibling").mkdir()
         (sibling / ".git").write_text(
             "gitdir: {}\n".format(main / ".git" / "worktrees" / "sibling"), encoding="utf-8")
-        self.assertIsNone(session_cwd_warning(self.paths, _codex_record(self.tmp.name, str(sibling))))
+        self.assertIsNotNone(session_cwd_warning(self.paths, _codex_record(self.tmp.name, str(sibling))))
+
+    def test_root_in_main_checkout_session_in_worktree_still_warns(self):
+        # Reverse layout: project in the main checkout, session in a worktree.
+        (self.root / ".git" / "worktrees" / "host").mkdir(parents=True)
+        host = Path(self.tmp.name) / "codex-host"
+        host.mkdir()
+        (host / ".git").write_text(
+            "gitdir: {}\n".format(self.root / ".git" / "worktrees" / "host"), encoding="utf-8")
+        self.assertIsNotNone(session_cwd_warning(self.paths, _codex_record(self.tmp.name, str(host))))
 
     def test_session_in_another_repo_still_warns(self):
         self._linked_worktree_root()
