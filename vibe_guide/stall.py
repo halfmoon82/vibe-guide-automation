@@ -37,18 +37,26 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def node_fingerprint(node: Mapping[str, Any], tasks: Optional[Mapping[str, Any]] = None) -> str:
-    """Digest of a node's progress-bearing fields only."""
+def node_fingerprint(
+    node: Mapping[str, Any],
+    tasks: Optional[Mapping[str, Any]] = None,
+    node_id: Optional[str] = None,
+) -> str:
+    """Digest of a node's progress-bearing fields only.
+
+    Snapshot ``tasks`` are keyed ``"<node_id>:<role>"``, so the binding of the
+    active task can only be found when the caller supplies ``node_id``.
+    """
     active = node.get("active_task")
-    active_id = active.get("task_id") if isinstance(active, Mapping) else active
+    role = active.get("role") if isinstance(active, Mapping) else None
     evidence = node.get("evidence")
     latest_evidence = evidence[-1] if isinstance(evidence, list) and evidence else None
     action = node.get("retryable_action")
     observation = action.get("last_observation_ref") if isinstance(action, Mapping) else None
     task_state = None
-    if tasks and active_id and isinstance(tasks.get(active_id), Mapping):
-        task = tasks[active_id]
-        task_state = [task.get("status"), task.get("generation"), task.get("cursor")]
+    binding = tasks.get("{}:{}".format(node_id, role)) if tasks and node_id and role else None
+    if isinstance(binding, Mapping):
+        task_state = [binding.get("status"), binding.get("generation"), binding.get("cursor")]
     return _digest({
         "status": node.get("status"),
         "developer_generation": node.get("developer_generation"),
@@ -113,7 +121,7 @@ def assess_stalls(
     for node_id, node in (nodes or {}).items():
         if not isinstance(node, Mapping) or node.get("status") in TERMINAL_STATUSES:
             continue
-        fingerprint = node_fingerprint(node, tasks)
+        fingerprint = node_fingerprint(node, tasks, node_id)
         total = attempts.get(node_id, 0)
         old = prior.get(node_id)
         if old and old["fingerprint"] == fingerprint:

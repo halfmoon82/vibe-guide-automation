@@ -73,11 +73,34 @@ class FingerprintTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertNotEqual(base, node_fingerprint(node))
 
-    def test_task_cursor_change_counts_as_progress(self):
-        node = make_node(active_task="t1")
-        first = node_fingerprint(node, {"t1": {"status": "running", "generation": 1, "cursor": "a"}})
-        second = node_fingerprint(node, {"t1": {"status": "running", "generation": 1, "cursor": "b"}})
-        self.assertNotEqual(first, second)
+    def test_task_binding_change_counts_as_progress_in_the_real_snapshot_shape(self):
+        active = {"task_id": "developer:n", "role": "developer", "generation": 1, "handle_id": "h1"}
+        node = make_node(active_task=active)
+
+        def tasks(**binding):
+            return {"n:developer": {"status": "running", "generation": 1, "cursor": "a", **binding}}
+
+        base = node_fingerprint(node, tasks(), node_id="n")
+        self.assertEqual(base, node_fingerprint(node, tasks(), node_id="n"))
+        for binding in ({"cursor": "b"}, {"status": "delivered"}, {"generation": 2}):
+            with self.subTest(binding=binding):
+                self.assertNotEqual(base, node_fingerprint(node, tasks(**binding), node_id="n"))
+
+    def test_binding_of_another_node_or_role_does_not_count(self):
+        active = {"task_id": "developer:n", "role": "developer", "generation": 1}
+        node = make_node(active_task=active)
+        base = node_fingerprint(node, {"n:developer": {"cursor": "a"}}, node_id="n")
+        other = {"n:developer": {"cursor": "a"}, "m:developer": {"cursor": "z"}, "n:reviewer": {"cursor": "z"}}
+        self.assertEqual(base, node_fingerprint(node, other, node_id="n"))
+
+    def test_assess_stalls_feeds_the_node_id_so_cursor_progress_resets_the_count(self):
+        active = {"task_id": "developer:n", "role": "developer", "generation": 1}
+        nodes = {"n": make_node(active_task=active)}
+        first = assess_stalls(nodes, {"n:developer": {"cursor": "a"}}, [], None)
+        second = assess_stalls(nodes, {"n:developer": {"cursor": "a"}}, [], first["record"])
+        moved = assess_stalls(nodes, {"n:developer": {"cursor": "b"}}, [], second["record"])
+        self.assertEqual(second["nodes"]["n"]["unchanged_beats"], 2)
+        self.assertEqual(moved["nodes"]["n"]["unchanged_beats"], 1)
 
     def test_node_without_retryable_action_is_fingerprinted(self):
         node = make_node()
@@ -241,8 +264,18 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(outcome["nodes"][NODE]["tier"], TIER_AUTO_RETRY)
         self.assertEqual(load_progress(self.paths, RUN_ID)["nodes"][NODE]["unchanged_beats"], 1)
 
-    def test_progress_file_is_not_a_state_or_event_file(self):
-        self.assertNotIn(stall.PROGRESS_FILE, {"state.json", "events.jsonl", "state.previous.json"})
+    def test_beat_leaves_other_run_files_untouched(self):
+        directory = progress_path(self.paths, RUN_ID).parent
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in ("state.json", "events.jsonl"):
+            (directory / name).write_text("keep", encoding="utf-8")
+        record_beat(self.paths, RUN_ID, {NODE: make_node()}, {}, [])
+        self.assertEqual(
+            sorted(item.name for item in directory.iterdir()),
+            ["events.jsonl", "progress.json", "state.json"],
+        )
+        for name in ("state.json", "events.jsonl"):
+            self.assertEqual((directory / name).read_text(encoding="utf-8"), "keep")
 
 
 if __name__ == "__main__":
