@@ -87,6 +87,38 @@ class SessionCwdWarningTests(unittest.TestCase):
         record = _codex_record(self.tmp.name, "relative/dir")
         self.assertIsNone(session_cwd_warning(self.paths, record))
 
+    def _linked_worktree_root(self):
+        """Project root as a linked worktree of ``main`` (run-63e7cfc2 layout)."""
+        main = Path(self.tmp.name) / "main"
+        (main / ".git" / "worktrees" / "project").mkdir(parents=True)
+        (self.root / ".git").write_text(
+            "gitdir: {}\n".format(main / ".git" / "worktrees" / "project"), encoding="utf-8")
+        return main
+
+    def test_session_in_main_checkout_of_same_repo_is_silent(self):
+        # 2026-10-27 14:26: the successor ran from the main checkout while the
+        # run lived in the host worktree; it wrote .vibe fine, so the
+        # "projectless" warning was a false alarm.
+        main = self._linked_worktree_root()
+        record = _codex_record(self.tmp.name, str(main / "sub"))
+        (main / "sub").mkdir()
+        self.assertIsNone(session_cwd_warning(self.paths, record))
+
+    def test_session_in_sibling_worktree_of_same_repo_is_silent(self):
+        main = self._linked_worktree_root()
+        sibling = Path(self.tmp.name) / "sibling"
+        sibling.mkdir()
+        (main / ".git" / "worktrees" / "sibling").mkdir()
+        (sibling / ".git").write_text(
+            "gitdir: {}\n".format(main / ".git" / "worktrees" / "sibling"), encoding="utf-8")
+        self.assertIsNone(session_cwd_warning(self.paths, _codex_record(self.tmp.name, str(sibling))))
+
+    def test_session_in_another_repo_still_warns(self):
+        self._linked_worktree_root()
+        other = Path(self.tmp.name) / "other-repo"
+        (other / ".git").mkdir(parents=True)
+        self.assertIsNotNone(session_cwd_warning(self.paths, _codex_record(self.tmp.name, str(other))))
+
     def test_register_cli_warns_but_still_succeeds(self):
         record = _codex_record(self.tmp.name, str(self.outside))
         result = run_cli([
