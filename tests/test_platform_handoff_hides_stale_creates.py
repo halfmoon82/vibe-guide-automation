@@ -113,12 +113,16 @@ class StaleCreateTests(HandoffCase):
     def test_a_rerun_that_reauthorizes_again_does_not_hide_the_new_platforms_create(self):
         """CONSTRUCTED STATE: the 5.1.11 two-pending mailbox, healed by a rerun that re-keys again.
 
-        The real project's rerun did not take the no-op path: it wrote a second
-        platform_handoff reauthorization, so the digest the *latest* handoff
-        replaced is the one the new platform's own create carries.  Hiding by
-        that digest alone hid the new create and kept the old one.  The
-        marker removal reproduces the two-pending mailbox; attesting the target
-        again with another provenance first makes the rerun a real second reauthorization.
+        A rerun that writes a second platform_handoff reauthorization makes the
+        digest the *latest* handoff replaced the one the new platform's own
+        create carries.  Hiding by that digest alone hid the new create and
+        kept the old one.  This path is NOT what happens when the real project
+        reruns the handoff unchanged: that rerun takes the no-op path and writes
+        no second reauthorization (measured on the real project, digest and
+        event count unchanged).  A second reauthorization only appears when the
+        user's actions change the authorization in between, e.g. attesting the
+        target again with another provenance, which is what this test does after
+        removing the stale marker to reproduce the two-pending mailbox.
         """
         before = self.published_on("workbuddy")
         old = [a["action_id"] for a in self.store.pending()]
