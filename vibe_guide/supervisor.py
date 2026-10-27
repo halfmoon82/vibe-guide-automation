@@ -1234,6 +1234,16 @@ def session_cwd_warning(paths, session_record):
         return None
     if session == root or root in session.parents:
         return None
+    # A cwd in the *main checkout* of the repository the root is a linked
+    # worktree of is a project session, not a projectless one: run-63e7cfc2's
+    # successor ran from the main checkout and wrote .vibe without a prompt
+    # (2026-10-27).  A cwd in some other linked worktree of the same repository
+    # -- e.g. a host-generated ~/.codex/worktrees/<id>/<repo> -- is exactly the
+    # case #231 warns about, so it keeps the warning.
+    common = _git_common_dir(root)
+    if (common is not None and _git_common_dir(session) == common
+            and _in_main_checkout(session)):
+        return None
     return (
         "登记会话的 cwd（{}）不在项目根（{}）内：该会话很可能是 projectless 创建，"
         "创建时的沙箱权限档案不含项目根，读写 .vibe/ 的命令会逐条弹审批，"
@@ -1241,6 +1251,61 @@ def session_cwd_warning(paths, session_record):
         "建议改在本项目下重建会话（Codex 桌面用 create_thread 的 project 目标）再接班。"
         .format(session, root)
     )
+
+
+def _gitdir_file_target(directory):
+    """Where ``<directory>/.git`` points when it is a ``gitdir:`` file, else None."""
+    marker = Path(directory) / ".git"
+    try:
+        if not marker.is_file():
+            return None
+        text = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    gitdir = Path(text[len("gitdir:"):].strip())
+    return gitdir if gitdir.is_absolute() else Path(directory) / gitdir
+
+
+def _git_common_dir(path):
+    """The repository's shared ``.git`` directory for ``path``, or None.
+
+    Walks up to the nearest ``.git``; a linked worktree's ``gitdir:`` file is
+    followed to ``<common>/worktrees/<name>`` and mapped back to ``<common>``.
+    """
+    current = Path(path)
+    for candidate in (current, *current.parents):
+        marker = candidate / ".git"
+        try:
+            if marker.is_dir():
+                return marker.resolve()
+        except OSError:
+            return None
+        gitdir = _gitdir_file_target(candidate)
+        if gitdir is not None:
+            if gitdir.parent.name == "worktrees":
+                gitdir = gitdir.parent.parent
+            try:
+                return gitdir.resolve()
+            except (OSError, RuntimeError):
+                return None
+    return None
+
+
+def _in_main_checkout(path):
+    """True when the nearest ``.git`` above ``path`` is a directory."""
+    current = Path(path)
+    for candidate in (current, *current.parents):
+        marker = candidate / ".git"
+        try:
+            if marker.is_dir():
+                return True
+            if marker.exists():
+                return False
+        except OSError:
+            return False
+    return False
 
 
 def project_root_worktree_warning(paths):
@@ -1253,19 +1318,8 @@ def project_root_worktree_warning(paths):
     repository's ``worktrees/`` directory is the structural sign; anything
     else stays silent.
     """
-    marker = Path(paths.root) / ".git"
-    try:
-        if not marker.is_file():
-            return None
-        text = marker.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeDecodeError):
-        return None
-    if not text.startswith("gitdir:"):
-        return None
-    gitdir = Path(text[len("gitdir:"):].strip())
-    if not gitdir.is_absolute():
-        gitdir = Path(paths.root) / gitdir
-    if gitdir.parent.name != "worktrees":
+    gitdir = _gitdir_file_target(Path(paths.root))
+    if gitdir is None or gitdir.parent.name != "worktrees":
         return None
     main = gitdir.parent.parent.parent
     try:
