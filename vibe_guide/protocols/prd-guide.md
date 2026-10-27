@@ -478,7 +478,7 @@ worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），
 | `resume` | `codex_app__send_message_to_thread` | `ccd_session_mgmt__send_message` | `workbuddy_job__reply` | `claude stop` + `claude --bg --resume <完整会话 id>` |
 | `wait` | `codex_app__wait_threads` | `ccd_session_mgmt__list_events` | `workbuddy_job__wait` | 轮询 `claude agents --json --all` 的 `state` + `vibe worker-deliver` 自报 |
 
-- **Codex 本地桌面**：`create_thread` 没有审批门，`create` 直接返回会话身份。这是目前唯一能以**可见会话**做到**无人值守**派发的路径——产品经理授权一次之后，agent 可以把整批节点派完，不需要人再看屏幕。Claude Code 只有配置了后台启动器、改走降级后台（`claude-code-background`）才能同样无人值守，代价是桌面看不到（见下方「Claude Code 后台」一条）。
+- **Codex 本地桌面**：`create_thread` 没有审批门，`create` 直接返回会话身份。`create` 只用 `create_thread` 的 project 目标（`target: {type: project, projectId, environment}`，vibe 请求里已填好，原样传）；**不得用 `fork_thread` 代替**——fork 带上监工整段历史（run-63e7cfc2 实测工作会话起步约 65 万 token），回写时 `complete()` 会查 Codex 会话记录里的 `forked_from_id` 拒收并抛 `ForkedProviderSession`，请求保持待处理。`create_thread` 的 worktree 目标宿主不接受（返回 invalid arguments），不要改参数形态硬试；新会话写不了节点工作副本时停下报告宿主权限，不要改用 fork 绕过（项目可在 `.codex/config.toml` 设 `sandbox_mode`，由用户决定）。这是目前唯一能以**可见会话**做到**无人值守**派发的路径——产品经理授权一次之后，agent 可以把整批节点派完，不需要人再看屏幕。Claude Code 只有配置了后台启动器、改走降级后台（`claude-code-background`）才能同样无人值守，代价是桌面看不到（见下方「Claude Code 后台」一条）。
 - **Claude Code 桌面**（未配置后台启动器时）：`ccd_session__spawn_task` 只是**提议**一个任务。它返回一个 `task_id` 并在界面上显示一张卡片，**需要用户点一下**才真正创建会话；调用方拿不到 `sessionId`。所以每个节点都有一个人工确认点，拿到 `task_id` 之后还要再查一次（`ccd_session_mgmt__list_sessions`）才能取到真实会话 id 去回写 `create`。
 
 在 Claude Code 上把这条流程当成"全自动"会一直卡住：卡片没人点，`create` 永远拿不到身份，run 停在 `retry_pending`。要么守着确认每个节点，要么用 Codex 本地桌面跑派发，要么配置后台启动器改走降级后台（见下）。

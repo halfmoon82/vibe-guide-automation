@@ -6,7 +6,7 @@ Vibe Guide is a local CLI for scanning a project, planning work, and running a r
 
 ## Installation
 
-The current release is **5.1.9**. Treat the matching `v5.1.9` tag, commit, and Release assets as the version source of truth; `dist/` is only a local build cache, not a download entry point. Release validation covers the wheel, source distribution, and source installation separately. Local builds only produce verification artifacts; they do not create tags or releases, push, merge, or deploy.
+The current release is **5.1.14**. Treat the matching `v5.1.14` tag, commit, and Release assets as the version source of truth; `dist/` is only a local build cache, not a download entry point. Release validation covers the wheel, source distribution, and source installation separately. Local builds only produce verification artifacts; they do not create tags or releases, push, merge, or deploy.
 
 ### Installation and initialization prerequisites
 
@@ -22,7 +22,7 @@ When a user asks to install or upgrade, the Agent must:
 
 1. Query the newest tag instead of trusting README text, `dist/` filenames, or memory:
    `git ls-remote --tags --sort='-v:refname' https://github.com/halfmoon82/vibe-guide-automation.git 'refs/tags/v*'`
-2. Select the newest stable tag (currently `v5.1.9`) and verify that the tag, commit, and downloadable Release assets agree. If that cannot be verified, keep the result `unknown`.
+2. Select the newest stable tag (currently `v5.1.14`) and verify that the tag, commit, and downloadable Release assets agree. If that cannot be verified, keep the result `unknown`.
 3. Install that version and verify both:
    `python3 -c "import vibe_guide; print(vibe_guide.__version__)"`
    `vibe --help`
@@ -34,7 +34,7 @@ An Agent must not assume that downloading or installing the package automaticall
 Install the published wheel:
 
 ```bash
-python3 -m pip install --user --upgrade vibe_guide-5.1.9-py3-none-any.whl
+python3 -m pip install --user --upgrade vibe_guide-5.1.14-py3-none-any.whl
 vibe --help
 ```
 
@@ -136,6 +136,15 @@ Permissions and commit identity: workers run with `bypassPermissions`; the safet
 Accepted on real sessions (2026-10-14, Claude Code 2.1.260): background dispatch → delivery → review finds a defect → rework continues the same session → re-review passes, with no clicks, in about 30 seconds. Re-run locally with `VIBE_LIVE_CLAUDE_BG=1 python3 -m unittest tests.test_claude_bg_live -v` (skipped by default; it starts real background sessions and spends usage). Workers must run in a linked worktree (`.worktrees/<node>`): in the main checkout, newer Claude Code background sessions open their own worktree and write there, so deliveries do not land where expected.
 
 Unverified, do not treat as available: pre-assigning a session id with `--session-id`, combining `-w` with `--bg`, recovery after a long task / sleep / daemon exit, and `--bg` under the desktop-bundled CLI.
+
+### Platform handoff (`--platform-handoff`)
+
+To move the rest of a running plan to another platform (for example from WorkBuddy to Claude Code):
+
+1. In a session on the **new** platform, register its capabilities first: `vibe attest --adapter <new-platform> --facts <project-relative path> --provenance <where observed>`. `attest` only records capabilities; it never changes the session capability contract.
+2. Then run `vibe monitor --plan <plan> --authorize AUTHORIZE --platform-handoff [--adapter <new-platform>]`. The handoff refreshes the contract's platform to the new one (`host_id` is kept), keeps accepted nodes accepted as they were, rebinds the unfinished nodes and the authorization card to the new platform, and reauthorizes the same run.
+3. `--adapter` may be omitted only when exactly one other dispatchable platform exists and the contract has never named a platform. With several candidates, or in a project that was already handed off (the contract names a platform), `--adapter` is required; otherwise the command stops at `blocked_unknown` with a message and never picks for you.
+4. No command without `--platform-handoff` rewrites the session capability contract. A handoff that also changes an acceptance contract is refused as `contract_drift` and changes nothing.
 
 ## Governance boundaries
 

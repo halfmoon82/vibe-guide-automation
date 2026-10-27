@@ -53,6 +53,62 @@ class UnresolvedNativeTool(RuntimeError):
                 called_tool, expected_tool, action_id, attempts, advice))
 
 
+class ForkedProviderSession(ValueError):
+    """A ``create`` result names a Codex thread that was forked, not created.
+
+    run-63e7cfc2 (2026-10-26): ``fork_thread`` copies the caller's whole
+    history into the new thread, so a worker "created" that way started at the
+    supervisor's ~650k tokens.  The request stays pending.
+    """
+
+    def __init__(self, action_id: str, thread_id: str, forked_from: str):
+        self.action_id = action_id
+        self.thread_id = thread_id
+        self.forked_from = forked_from
+        super().__init__(
+            "thread {} for {} was made by fork_thread from {} and carries that session's "
+            "full history; archive it and call create_thread with the project target "
+            "instead (the request stays pending). If a created thread cannot write the "
+            "worktree, stop and report the sandbox to the user rather than forking".format(
+                thread_id, action_id, forked_from))
+
+
+def _codex_forked_from(thread_id: str) -> Optional[str]:
+    """``forked_from_id`` from the thread's Codex session record, or None.
+
+    Codex Desktop keeps one ``rollout-<time>-<thread id>.jsonl`` per thread
+    under ``$CODEX_HOME/sessions/<y>/<m>/<d>/`` (or ``archived_sessions/``),
+    whose first line is ``session_meta``.  A missing or unreadable record is
+    no evidence either way.
+    """
+    if not isinstance(thread_id, str) or not _SAFE_ID.fullmatch(thread_id):
+        return None
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    pattern = "rollout-*-{}.jsonl".format(thread_id)
+    candidates = list(home.glob("sessions/*/*/*/" + pattern)) + list(
+        home.glob("archived_sessions/" + pattern))
+    for path in candidates:
+        try:
+            with path.open(encoding="utf-8") as stream:
+                first = json.loads(stream.readline())
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        meta = first.get("payload") if isinstance(first, dict) else None
+        if isinstance(first, dict) and first.get("type") == "session_meta" and isinstance(meta, dict):
+            forked = meta.get("forked_from_id")
+            return forked if isinstance(forked, str) and forked else None
+    return None
+
+
+def _result_thread_id(payload: Dict[str, Any]) -> Optional[str]:
+    binding = payload.get("binding")
+    for source in (binding if isinstance(binding, dict) else {}, payload):
+        value = source.get("threadId") or source.get("thread_id")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 _UNRESOLVED_TOOL = re.compile(
     r"\s*(?:<tool_use_error>)?\s*(?:Error:\s*)?No such tool available:\s*`?([\w.-]+)", re.IGNORECASE)
 
@@ -640,6 +696,18 @@ class ProviderActionStore:
         called_tool = _unresolved_tool_name(payload) if native else None
         if called_tool is not None:
             self._record_unresolved_tool(request, called_tool, payload)
+        if native and request.get("native_tool") == "codex_app__create_thread":
+            thread_id = _result_thread_id(payload)
+            forked_from = _codex_forked_from(thread_id) if thread_id else None
+            if forked_from:
+                self._atomic(
+                    self._directory("observations") / "{}-forked-{}.json".format(
+                        action_id, _canonical_digest(payload)[:16]),
+                    {"schema_version": self.schema_version, "kind": "forked_provider_session",
+                     "action_id": action_id, "request_digest": request["request_digest"],
+                     "thread_id": thread_id, "forked_from": forked_from,
+                     "observed_at": time.time(), "payload": payload})
+                raise ForkedProviderSession(action_id, thread_id, forked_from)
         record = {
             "schema_version": self.schema_version,
             "action_id": action_id,
@@ -849,9 +917,37 @@ class ProviderActionStore:
             return "unreadable"
         return None
 
+    def unresolved_create_slots(
+        self, run_id: str, issue_id: str, authorization_digest: str,
+        except_provider: Optional[str] = None,
+    ) -> List[Tuple[str, int]]:
+        """(role, generation) of this node's create requests that have no
+        result and no stale marker and were written under exactly
+        ``authorization_digest``; the candidates a handoff may hide."""
+        if not all(isinstance(value, str) and value for value in (run_id, issue_id, authorization_digest)):
+            raise ValueError("provider request identity is required")
+        slots = set()
+        stale_dir = self._directory("stale")
+        for path in sorted(self._directory("requests").glob("action-*.json")):
+            if (self.root / "results" / path.name).exists() or (stale_dir / path.name).exists():
+                continue
+            action = self._read(path)
+            envelope = action.get("request")
+            if (
+                action.get("run_id") == run_id and action.get("issue_id") == issue_id
+                and action.get("operation") == "create"
+                and action.get("provider") != except_provider
+                and isinstance(action.get("role"), str)
+                and isinstance(action.get("generation"), int)
+                and isinstance(envelope, Mapping)
+                and envelope.get("authorization_digest") == authorization_digest
+            ):
+                slots.add((action["role"], action["generation"]))
+        return sorted(slots)
+
     def supersede_unclaimed_creates(
         self, run_id: str, issue_id: str, role: str, generation: int,
-        previous_authorization_digest: str,
+        previous_authorization_digest: str, except_provider: Optional[str] = None,
     ) -> List[str]:
         """Hide this role's unclaimed create requests from before a handoff.
 
@@ -861,7 +957,8 @@ class ProviderActionStore:
         exactly the authorization the handoff replaced (never a later one),
         was never claimed: mark it stale (an audit marker beside the
         immutable request; the native tool is never invoked) so only one
-        create stays pending.  Every other request is left alone.
+        create stays pending.  Every other request is left alone.  A request
+        of ``except_provider`` (the platform now dispatching) is never hidden.
         """
         if not all(isinstance(value, str) and value for value in (run_id, issue_id, role, previous_authorization_digest)):
             raise ValueError("provider request identity is required")
@@ -879,6 +976,7 @@ class ProviderActionStore:
                 or action.get("role") != role or action.get("operation") != "create"
                 or action.get("generation") != generation
                 or digest != previous_authorization_digest
+                or action.get("provider") == except_provider
             ):
                 continue
             self._atomic(stale_dir / path.name, {

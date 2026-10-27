@@ -532,10 +532,12 @@ def _with_cap_reason(result, cap_reason):
 
 #: Common cause of a drifted capability contract, named so the supervisor can
 #: act instead of guessing (#220): a git write operation (checkout, stash,
-#: reset, merge) rewriting tracked ``.vibe`` run-state files mid-run.
+#: reset, merge) rewriting tracked ``.vibe`` run-state files mid-run; or a
+#: platform handoff, which refreshes the contract on purpose.
 CONTRACT_DRIFT_HINT = (
     "常见诱因：git 写操作（checkout/stash/reset/merge）改写了 .vibe 运行态文件，"
-    "请检查 .vibe/session-contract.json 的改动来源"
+    "请检查 .vibe/session-contract.json 的改动来源；"
+    "也可能是换平台交接刷新了合同（vibe monitor ... --platform-handoff [--adapter 平台]）"
 )
 
 
@@ -1241,6 +1243,16 @@ def session_cwd_warning(paths, session_record):
         return None
     if session == root or root in session.parents:
         return None
+    # A cwd in the *main checkout* of the repository the root is a linked
+    # worktree of is a project session, not a projectless one: run-63e7cfc2's
+    # successor ran from the main checkout and wrote .vibe without a prompt
+    # (2026-10-27).  A cwd in some other linked worktree of the same repository
+    # -- e.g. a host-generated ~/.codex/worktrees/<id>/<repo> -- is exactly the
+    # case #231 warns about, so it keeps the warning.
+    common = _git_common_dir(root)
+    if (common is not None and _git_common_dir(session) == common
+            and _in_main_checkout(session)):
+        return None
     return (
         "登记会话的 cwd（{}）不在项目根（{}）内：该会话很可能是 projectless 创建，"
         "创建时的沙箱权限档案不含项目根，读写 .vibe/ 的命令会逐条弹审批，"
@@ -1248,6 +1260,61 @@ def session_cwd_warning(paths, session_record):
         "建议改在本项目下重建会话（Codex 桌面用 create_thread 的 project 目标）再接班。"
         .format(session, root)
     )
+
+
+def _gitdir_file_target(directory):
+    """Where ``<directory>/.git`` points when it is a ``gitdir:`` file, else None."""
+    marker = Path(directory) / ".git"
+    try:
+        if not marker.is_file():
+            return None
+        text = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    gitdir = Path(text[len("gitdir:"):].strip())
+    return gitdir if gitdir.is_absolute() else Path(directory) / gitdir
+
+
+def _git_common_dir(path):
+    """The repository's shared ``.git`` directory for ``path``, or None.
+
+    Walks up to the nearest ``.git``; a linked worktree's ``gitdir:`` file is
+    followed to ``<common>/worktrees/<name>`` and mapped back to ``<common>``.
+    """
+    current = Path(path)
+    for candidate in (current, *current.parents):
+        marker = candidate / ".git"
+        try:
+            if marker.is_dir():
+                return marker.resolve()
+        except OSError:
+            return None
+        gitdir = _gitdir_file_target(candidate)
+        if gitdir is not None:
+            if gitdir.parent.name == "worktrees":
+                gitdir = gitdir.parent.parent
+            try:
+                return gitdir.resolve()
+            except (OSError, RuntimeError):
+                return None
+    return None
+
+
+def _in_main_checkout(path):
+    """True when the nearest ``.git`` above ``path`` is a directory."""
+    current = Path(path)
+    for candidate in (current, *current.parents):
+        marker = candidate / ".git"
+        try:
+            if marker.is_dir():
+                return True
+            if marker.exists():
+                return False
+        except OSError:
+            return False
+    return False
 
 
 def project_root_worktree_warning(paths):
@@ -1260,19 +1327,8 @@ def project_root_worktree_warning(paths):
     repository's ``worktrees/`` directory is the structural sign; anything
     else stays silent.
     """
-    marker = Path(paths.root) / ".git"
-    try:
-        if not marker.is_file():
-            return None
-        text = marker.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeDecodeError):
-        return None
-    if not text.startswith("gitdir:"):
-        return None
-    gitdir = Path(text[len("gitdir:"):].strip())
-    if not gitdir.is_absolute():
-        gitdir = Path(paths.root) / gitdir
-    if gitdir.parent.name != "worktrees":
+    gitdir = _gitdir_file_target(Path(paths.root))
+    if gitdir is None or gitdir.parent.name != "worktrees":
         return None
     main = gitdir.parent.parent.parent
     try:
@@ -2079,7 +2135,7 @@ def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_p
             "按 native_tool 执行真实调用，保留完整原始结果；调用 ProviderActionStore.complete"
             "(action_id, payload, request_digest=原请求摘要)，再执行 resume 并核验状态/cursor/交付变化。"
             "已完成动作不重复调用；新观测使用新 sequence。宿主报 No such tool available 时 complete() 拒收并抛 UnresolvedNativeTool："
-            "按工具清单里的全名重试一次，仍失败即停止服务信箱、向用户报告工具名路由故障，不交班、不开新会话。工程失败按现有恢复协议继续，"
+            "按工具清单里的全名重试一次，仍失败即停止服务信箱、向用户报告工具名路由故障，不交班、不开新会话。Codex 的 create 只用 create_thread（project 目标原样传），不得用 fork_thread 代替：fork 会带上本会话整段历史，complete() 查到 forked_from_id 即拒收并抛 ForkedProviderSession；新会话写不了工作副本时停下报告宿主权限，不要改用 fork。工程失败按现有恢复协议继续，"
             "不得用重复 preflight/resume 代替 native 调用；产品变化、外部授权或 deploy 才请求用户。"
         ),
         "pending_count": len(pending), "evidence": evidence,

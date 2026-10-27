@@ -8,7 +8,7 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 ## 安装
 
-当前发行版本为 `5.1.9`。版本真相以仓库中匹配的 `v5.1.9` tag、对应提交和 Release 资产为准；版本引用的写法约定：反引号 v 形式（如本句的 tag）只用于当前 release tag，历史版本写作 V4.5.0 这样大写、无反引号的形式，否则 release-tag-gate 会判为旧 tag 残留。`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
+当前发行版本为 `5.1.14`。版本真相以仓库中匹配的 `v5.1.14` tag、对应提交和 Release 资产为准；版本引用的写法约定：反引号 v 形式（如本句的 tag）只用于当前 release tag，历史版本写作 V4.5.0 这样大写、无反引号的形式，否则 release-tag-gate 会判为旧 tag 残留。`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
 
 ### 安装与初始化前提
 
@@ -24,7 +24,7 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 1. 先查询最新 tag，不根据 README、`dist/` 文件名或历史记忆判断版本：
    `git ls-remote --tags --sort='-v:refname' https://github.com/halfmoon82/vibe-guide-automation.git 'refs/tags/v*'`
-2. 选择最新稳定 tag（当前应为 `v5.1.9`），核对 tag、提交和可下载 Release 资产版本一致；无法核对时保持 `unknown`，不要猜测。
+2. 选择最新稳定 tag（当前应为 `v5.1.14`），核对 tag、提交和可下载 Release 资产版本一致；无法核对时保持 `unknown`，不要猜测。
 3. 在目标环境安装该版本，并验证：
    `python3 -c "import vibe_guide; print(vibe_guide.__version__)"`
    `vibe --help`
@@ -74,16 +74,16 @@ python3 -m vibe_guide --help
 2. **pipx 装 wheel 必须用构建出来的原文件名**，改名后的副本（如 `cli-162b481.whl`）会被拒：
 
    ```bash
-   pipx install --force dist/vibe_guide-5.1.9-py3-none-any.whl
+   pipx install --force dist/vibe_guide-5.1.14-py3-none-any.whl
    ```
 
 3. **沙箱内 `pip install <sdist>` 会报 `EEXIST: mkdir pip-req-build-*`**（换 `TMPDIR` 仍复现），改成解包后按目录安装，新 venv 先装 setuptools / wheel：
 
    ```bash
-   tar xzf dist/vibe_guide-5.1.9.tar.gz -C /tmp
+   tar xzf dist/vibe_guide-5.1.14.tar.gz -C /tmp
    python3 -m venv /tmp/vibe-sdist-check
    /tmp/vibe-sdist-check/bin/pip install setuptools wheel
-   /tmp/vibe-sdist-check/bin/pip install --no-build-isolation --no-deps /tmp/vibe_guide-5.1.9
+   /tmp/vibe-sdist-check/bin/pip install --no-build-isolation --no-deps /tmp/vibe_guide-5.1.14
    /tmp/vibe-sdist-check/bin/vibe --help
    ```
 
@@ -294,6 +294,15 @@ worker 用 `vibe worker-deliver` 自报的交付不带游标（游标只来自�
 桌面 App 原生能力不能由 Python 直接调用时，public CLI 使用 `.vibe/provider-actions/` 的 provider-neutral request/result bridge。`monitor/resume` 会写入有界、digest 绑定的 `create/locate/visibility/resume/wait` 请求；App 会话按 `native_tool` 调用公开能力并回写绑定结果。Codex 映射到 `create_thread`、`navigate_to_codex_page`、`send_message_to_thread` 和 `wait_threads`；其他 provider 必须先接入并验证自己的等价桌面控制面。未完成原生探针时不允许 background fallback；在真实 task ID、host、定位和可见性全部核验前，状态保持 `blocked_unknown`；node-spec 中的 provider/mode/thread/host 自声明不会成为证据。
 
 授权 action 是 closed allowlist；未列明、deploy-like、外部安装和系统权限动作一律拒绝。`files` 必须是规范化的项目内相对路径列表，并与授权卡的 file scope 精确绑定。授权卡还绑定同时活跃的 developer/reviewer pair 上限；只有 reviewer 接受、P0–P2 清零且证据登记后才归档 pair 并释放容量。
+
+### 换平台交接（`--platform-handoff`）
+
+运行中想把剩下的工作换到另一个平台（例如从 WorkBuddy 换到 Claude Code）：
+
+1. 在**新平台**的会话里先登记能力：`vibe attest --adapter <新平台> --facts <项目内相对路径> --provenance <来源>`。`attest` 只登记能力，不改会话能力合同。
+2. 再执行 `vibe monitor --plan <计划> --authorize AUTHORIZE --platform-handoff [--adapter <新平台>]`。交接这一步会把会话能力合同的平台刷新为新平台（`host_id` 保持原值），已验收节点原样保留验收，未完成节点和授权卡改绑到新平台，并在同一运行上重新授权。
+3. 只有一个其他可派发平台、且合同还没写过平台时可以省略 `--adapter`；有多个候选、或项目已交接过（合同已写了平台）时必须带 `--adapter`，否则会停在 `blocked_unknown` 并提示，不会替你挑。
+4. 不带 `--platform-handoff` 的任何命令都不会改写会话能力合同；交接同时改了验收契约会按 `contract_drift` 拒绝，什么都不改动。
 
 ## LocalRunner 边界
 

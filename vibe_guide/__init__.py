@@ -1,3 +1,3 @@
 """Shared contracts for the Vibe Coding development guide."""
 
-__version__ = "5.1.9"
+__version__ = "5.1.14"
