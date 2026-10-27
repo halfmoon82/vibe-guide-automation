@@ -27,6 +27,9 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-27: §6.4 Codex create must not be replaced by fork_thread;
+        # complete() refuses forked threads (run-63e7cfc2).
+        "a57224cd615fe68d46a0316a4240b939d677f338dc5604af8fe9485a01e61f7b",
         # 2026-10-26: §6.5 successor registration must carry its own session record.
         "c27735328c843eb65d3c9ccf1d6d7d1d7872d0d778d3ce4135921710a822e224",
         # 2026-10-26: §6.5 single shift is the default; successors must be fresh

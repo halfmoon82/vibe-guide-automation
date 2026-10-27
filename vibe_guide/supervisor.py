@@ -2072,7 +2072,7 @@ def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_p
             "按 native_tool 执行真实调用，保留完整原始结果；调用 ProviderActionStore.complete"
             "(action_id, payload, request_digest=原请求摘要)，再执行 resume 并核验状态/cursor/交付变化。"
             "已完成动作不重复调用；新观测使用新 sequence。宿主报 No such tool available 时 complete() 拒收并抛 UnresolvedNativeTool："
-            "按工具清单里的全名重试一次，仍失败即停止服务信箱、向用户报告工具名路由故障，不交班、不开新会话。工程失败按现有恢复协议继续，"
+            "按工具清单里的全名重试一次，仍失败即停止服务信箱、向用户报告工具名路由故障，不交班、不开新会话。Codex 的 create 只用 create_thread（project 目标原样传），不得用 fork_thread 代替：fork 会带上本会话整段历史，complete() 查到 forked_from_id 即拒收并抛 ForkedProviderSession；新会话写不了工作副本时停下报告宿主权限，不要改用 fork。工程失败按现有恢复协议继续，"
             "不得用重复 preflight/resume 代替 native 调用；产品变化、外部授权或 deploy 才请求用户。"
         ),
         "pending_count": len(pending), "evidence": evidence,
