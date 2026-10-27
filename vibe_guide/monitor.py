@@ -1495,7 +1495,10 @@ class Monitor:
         if list(snapshot.ready_set) != ready:
             raise PermissionError("blocked_by_execution_topology_mismatch: ready-set drift")
         started = [n for n, c in snapshot.nodes.items() if c.get("active_task") or n in snapshot.handles]
-        if list(snapshot.started_nodes) != started:
+        # Order-insensitive: save_snapshot sorts node keys, so a reloaded
+        # snapshot lists nodes alphabetically while started_nodes keeps
+        # dispatch order.
+        if sorted(snapshot.started_nodes) != sorted(started):
             raise PermissionError("blocked_by_execution_topology_mismatch: started-set drift")
         self._reconcile_capacity(snapshot)
         expected_groups = {n: ([self.nodes[n].parallel_group] if self.nodes[n].parallel_group else []) for n in started}
