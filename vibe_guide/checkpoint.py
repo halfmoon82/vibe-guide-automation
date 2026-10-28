@@ -6,7 +6,6 @@ complete source of history.
 """
 
 from dataclasses import dataclass, field, asdict
-import hashlib
 import json
 import math
 import os
@@ -16,6 +15,7 @@ import shutil
 import tempfile
 from typing import Any, Dict, List, Optional, Union
 
+from .digests import canonical_json_digest
 from .paths import ProjectPaths
 from .state import RunSnapshot, load_snapshot
 
@@ -200,8 +200,7 @@ class MonitorCheckpoint:
         return payload
 
     def _computed_sha(self) -> str:
-        raw = json.dumps(self._payload(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return hashlib.sha256(raw).hexdigest()
+        return canonical_json_digest(self._payload())
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not self.run_id:

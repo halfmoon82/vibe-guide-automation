@@ -1,9 +1,9 @@
 """V2 non-blocking diagnostics and execution boundary contracts."""
 from dataclasses import dataclass, asdict
 import json
-import hashlib
 import os
 import tempfile
+from .digests import sha256_bytes
 from ._wincompat import flock_exclusive, flock_release
 from pathlib import Path
 from typing import Any, Dict, List
@@ -262,7 +262,7 @@ def screen_session(paths, session_id: str, request: str, origin: str = "user_ent
                 raise PermissionError("session gate path is symlinked")
             data = json.loads(target.read_text(encoding="utf-8"))
         old = data.get(session_id)
-        digest = hashlib.sha256(request.encode("utf-8")).hexdigest()
+        digest = sha256_bytes(request.encode("utf-8"))
         if old:
             if old.get("request_digest") != digest or old.get("origin") != origin:
                 flock_release(lock_handle.fileno()); lock_handle.close()

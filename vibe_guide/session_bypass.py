@@ -8,14 +8,14 @@ for the entry session until expiry; the challenge itself cannot be replayed.
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
+from .digests import sha256_bytes
+from .fsio import atomic_write_bytes
 from ._wincompat import flock_exclusive, flock_release
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import secrets
-import tempfile
 from typing import Any, Dict, Optional, Tuple
 
 
@@ -63,7 +63,7 @@ def _validate_session(session_id: str) -> str:
 
 
 def _digest(challenge: str) -> str:
-    return hashlib.sha256(challenge.encode("utf-8")).hexdigest()
+    return sha256_bytes(challenge.encode("utf-8"))
 
 
 def _event_identity(event: Dict[str, Any]) -> str:
@@ -242,17 +242,8 @@ def _store_path(paths: Any) -> Path:
 
 
 def _write_json(path: Path, data: Dict[str, Any]) -> None:
-    descriptor, temporary = tempfile.mkstemp(prefix=".session-bypass.", dir=str(path.parent))
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(data, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    encoded = (json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    atomic_write_bytes(path, encoded)
 
 
 def _read_store(path: Path) -> Dict[str, Any]:
