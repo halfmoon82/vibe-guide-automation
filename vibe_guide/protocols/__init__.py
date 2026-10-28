@@ -187,6 +187,11 @@ SHIPPED_PROTOCOL_DIGESTS = {
     "supervisor-card": frozenset({
         "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
     }),
+    # Second-level self-heal short session (daemon): the prompt the daemon feeds
+    # a one-shot repair session.
+    "heal-session": frozenset({
+        "f0338725e0669a5cc0fdee9b4189e7fd550f37c7e91bc922df68cfbc56dfe139",
+    }),
 }
 
 _HERE = Path(__file__).resolve().parent
