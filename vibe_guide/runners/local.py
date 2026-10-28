@@ -8,7 +8,6 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import uuid
@@ -16,6 +15,7 @@ import uuid
 from ..authorization import validate_runtime_contract
 from ..adapters.task_provider import require_complex_monitor_dispatch
 from ..contracts import RunEvent, RunHandle, Runner
+from ..fsio import atomic_write_bytes
 from .._wincompat import (
     IS_WINDOWS as _IS_WINDOWS,
     process_start_token as _process_start_token,
@@ -35,20 +35,8 @@ def _digest(value: Any) -> str:
 def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
     if path.parent.is_symlink() or path.is_symlink():
         raise ValueError("local runner metadata path may not be a symlink")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix="." + path.name + ".", dir=str(path.parent)
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(str(temporary), str(path))
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    atomic_write_bytes(path, encoded)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:

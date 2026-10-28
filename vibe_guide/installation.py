@@ -7,6 +7,7 @@ import tempfile
 from typing import Any, Callable, Dict, Optional
 
 from . import __version__
+from .digests import sha256_bytes
 from .models import InstallRequest, InstallResult
 
 PHASES = ("preflight", "probe", "authorize", "backup", "migrate", "finalize")
@@ -253,7 +254,7 @@ def migration_preview(project_root):
 def migrate_state(project_root, *, preview=False):
     result = migration_preview(project_root)
     if preview: return result
-    import hashlib, shutil
+    import shutil
     root = Path(project_root).expanduser().resolve(strict=False); vibe = root/".vibe"; source = vibe/"state.json"
     if not source.exists(): return {**result, "status":"complete", "migrated":False, "evidence":"no legacy state"}
     namespace = vibe/"namespaces"/MIGRATION_NAMESPACE; namespace.mkdir(parents=True, exist_ok=True)
@@ -266,12 +267,12 @@ def migrate_state(project_root, *, preview=False):
         if not target.exists():
             if item.is_dir(): shutil.copytree(item,target)
             else: shutil.copy2(item,target)
-        copied.append({"source":str(item),"target":str(target),"sha256":hashlib.sha256(item.read_bytes()).hexdigest() if item.is_file() else None})
+        copied.append({"source":str(item),"target":str(target),"sha256":sha256_bytes(item.read_bytes()) if item.is_file() else None})
     target=namespace/"state.json"
     if not target.exists(): shutil.copy2(source,target)
     manifest={"status":"historical_read_only","namespace":str(history),"artifacts":copied,"source_preserved":True}
     _atomic_json(vibe/"history_manifest.json",manifest)
-    digest=hashlib.sha256(source.read_bytes()).hexdigest()
+    digest=sha256_bytes(source.read_bytes())
     rollback=vibe/"rollback_evidence.json"; _atomic_json(rollback,{"source":str(source),"source_sha256":digest,"restore_path":str(source),"verified":True})
     evidence=vibe/"migration_evidence.json"; _atomic_json(evidence,{"status":"migrated","source":str(source),"source_sha256":digest,"target":str(target),"target_namespace":namespace.name,"history_manifest":str(vibe/"history_manifest.json"),"rollback_evidence":str(rollback),"source_preserved":True})
     return {**result,"status":"complete","migrated":True,"evidence":str(evidence),"target":str(target),"history_manifest":str(vibe/"history_manifest.json"),"rollback_evidence":str(rollback)}
@@ -280,7 +281,7 @@ def _tree_hash(path):
     import hashlib
     if not path.exists(): return None
     h=hashlib.sha256()
-    if path.is_file(): return hashlib.sha256(path.read_bytes()).hexdigest()
+    if path.is_file(): return sha256_bytes(path.read_bytes())
     for item in sorted(path.rglob("*")):
         if item.is_file():
             h.update(str(item.relative_to(path)).encode()); h.update(item.read_bytes())
@@ -288,10 +289,10 @@ def _tree_hash(path):
 
 def rollback_state(project_root):
     """Restore legacy history recursively with fail-closed conflict checks."""
-    import hashlib, shutil
+    import shutil
     root=Path(project_root).expanduser().resolve(strict=False); vibe=root/".vibe"; evidence_path=vibe/"rollback_evidence.json"
     history=vibe/"namespaces"/MIGRATION_NAMESPACE/"history"; current=vibe/"namespaces"/MIGRATION_NAMESPACE
-    source=vibe/"state.json"; before_source=hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else None
+    source=vibe/"state.json"; before_source=sha256_bytes(source.read_bytes()) if source.is_file() else None
     current_before=_tree_hash(current); rollback=vibe/"rollback"; target_before=_tree_hash(rollback); restored=[]; conflicts=[]
     if not history.is_dir():
         payload={"status":"blocked_unknown","reason":"history manifest unavailable","original_source_path":str(source),"original_source_hash":before_source}
@@ -299,12 +300,12 @@ def rollback_state(project_root):
     for item in sorted(history.rglob("*")):
         rel=item.relative_to(history); target=rollback/rel
         if item.is_dir(): target.mkdir(parents=True,exist_ok=True); continue
-        src_hash=hashlib.sha256(item.read_bytes()).hexdigest(); before=_tree_hash(target)
+        src_hash=sha256_bytes(item.read_bytes()); before=_tree_hash(target)
         if target.exists() and before != src_hash: conflicts.append({"path":str(target),"expected":src_hash,"actual":before}); continue
         target.parent.mkdir(parents=True,exist_ok=True)
         if not target.exists(): shutil.copy2(item,target)
-        restored.append({"path":str(target),"hash":hashlib.sha256(target.read_bytes()).hexdigest()})
-    current_after=_tree_hash(current); source_after=hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else None
+        restored.append({"path":str(target),"hash":sha256_bytes(target.read_bytes())})
+    current_after=_tree_hash(current); source_after=sha256_bytes(source.read_bytes()) if source.is_file() else None
     target_hash=_tree_hash(rollback)
     payload={"status":"blocked_invalid" if conflicts else ("complete" if source_after==before_source and current_after==current_before else "blocked_invalid"),"original_source_path":str(source),"original_source_hash":before_source,"target_before_hash":target_before,"target_after_hash":target_hash,"current_namespace_path":str(current),"current_namespace_hash_before":current_before,"current_namespace_hash_after":current_after,"restored_files":restored,"restored_directories":sorted(str(x) for x in rollback.rglob("*") if x.is_dir()),"conflicts":conflicts,"source_unchanged":source_after==before_source,"current_namespace_preserved":current_after==current_before}
     _atomic_json(evidence_path,payload); return payload

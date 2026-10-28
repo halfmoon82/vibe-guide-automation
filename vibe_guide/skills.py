@@ -12,6 +12,8 @@ import subprocess
 import tarfile
 import tempfile
 
+from .digests import sha256_bytes
+
 
 _FULL_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -153,7 +155,7 @@ def repository_vendor_dir(vibe_home, source):
     GitHub URL so two installs from the same repo reuse one vendor copy.
     """
     canonical = normalize_github_source(source)
-    digest = hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:16]
+    digest = sha256_bytes(canonical.encode('utf-8'))[:16]
     parts = canonical.rsplit('/', 2)
     slug = '{}-{}'.format(parts[-2], parts[-1])
     return Path(vibe_home).resolve() / 'vendor' / '{}-{}'.format(slug, digest)

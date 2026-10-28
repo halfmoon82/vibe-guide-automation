@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
 from pathlib import Path
-import tempfile
 import time
 import re
 from typing import Any, Dict, Iterable, Mapping, Optional
+
+from .digests import canonical_json_digest
+from .fsio import atomic_write_bytes
 
 
 SCHEMA_VERSION = 1
@@ -55,9 +56,7 @@ def validate_boundary_category(category):
 
 
 def canonical_digest(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    return canonical_json_digest(value)
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -67,17 +66,7 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     encoded = (json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     if len(encoded) > _MAX_RECORD_BYTES:
         raise ValueError("decision record exceeds the size bound")
-    descriptor, temporary_name = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(str(temporary), str(path))
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    atomic_write_bytes(path, encoded)
 
 
 def _read_json(path: Path) -> Dict[str, Any]:

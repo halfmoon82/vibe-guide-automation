@@ -1,12 +1,12 @@
 """JSON-safe shared data models for the guide contracts."""
 
 from dataclasses import asdict, dataclass, field
-import hashlib
-import json
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Dict, List, Optional
 import re
+
+from .digests import canonical_json_digest, sha256_bytes
 
 
 @dataclass(frozen=True)
@@ -203,7 +203,7 @@ def node_slug(node_id: Any) -> str:
     notices.
     """
     raw = str(node_id or "")
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    digest = sha256_bytes(raw.encode("utf-8"))[:8]
     # Dots are legal in a ref but ".." and a ".lock" suffix are not, and a lone
     # "." is not a usable directory name; drop them rather than special-case.
     stem = _SLUG_UNSAFE.sub("-", raw.strip()).strip("-")[:_SLUG_MAX].strip("-")
@@ -585,9 +585,6 @@ class TargetContract:
 
     @property
     def digest(self) -> str:
-        import hashlib
-        import json
-
         payload = {
             "provider": self.provider,
             "repository": self.repository,
@@ -598,7 +595,7 @@ class TargetContract:
             "file_scope": list(self.file_scope),
             "merge_method": self.merge_method,
         }
-        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return canonical_json_digest(payload)
 
     def to_dict(self) -> Dict[str, Any]:
         data = _json_dict(self)
@@ -710,7 +707,7 @@ class IntegrationAcceptanceContract:
 
     def digest(self, *, prd_ref: str = "", spec_ref: str = "", plan_revision: int = 1) -> str:
         payload = {"prd_ref": prd_ref, "spec_ref": spec_ref, "plan_revision": plan_revision, "contract": self.to_dict()}
-        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return canonical_json_digest(payload)
 
 
 @dataclass
@@ -836,14 +833,7 @@ class WorkerProfile:
             raise ValueError("fallbacks must be a list of dictionaries")
         if not isinstance(self.selection_basis, dict):
             raise ValueError("selection_basis must be a dictionary")
-        digest = hashlib.sha256(
-            json.dumps(
-                self.selection_basis,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        digest = canonical_json_digest(self.selection_basis)
         if self.route_digest:
             if (
                 not isinstance(self.route_digest, str)
@@ -904,9 +894,9 @@ class SupervisorLeaseObservation:
             raise TypeError("lease evidence types are invalid")
         for name in ("node_id", "worktree", "run_id", "lease_id", "status", "source", "proof"):
             object.__setattr__(self, name, _binding_text(getattr(self, name), name))
-        expected = hashlib.sha256(
+        expected = sha256_bytes(
             (self.node_id + "\0" + self.worktree + "\0" + self.run_id).encode("utf-8")
-        ).hexdigest()
+        )
         if self.lease_id != expected:
             raise ValueError("lease evidence id is invalid")
         if self.status != "active" or self.source != "supervisor.read_writer_lease" or self.proof != "read_writer_lease":
@@ -1370,11 +1360,7 @@ class DeployManifest:
 
     @property
     def digest(self) -> str:
-        import hashlib
-        import json
-
-        payload = json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return canonical_json_digest(self.to_dict())
 
     def to_dict(self) -> Dict[str, Any]:
         return _json_dict(self)
