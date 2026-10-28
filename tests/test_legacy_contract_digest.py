@@ -110,34 +110,6 @@ class LegacyContractDigestTests(unittest.TestCase):
             )
         return snapshot, changed
 
-    def test_dual_visible_replay_accepts_a_507_acceptance(self):
-        """A 5.0.7 acceptance event left unapplied replays under new code."""
-        nodes = self._nodes()
-        runner = self._accepting_runner()
-        with _as_written_by_507():
-            snapshot = Monitor(self.paths, self.plan, nodes).start(
-                self._record(nodes), runner
-            )
-            monitor = Monitor(self.paths, self.plan, nodes)
-            preserved = None
-            for _ in range(10):
-                if snapshot.nodes["b"]["status"] == "review":
-                    preserved = copy.deepcopy(snapshot)
-                snapshot = monitor.tick(snapshot.run_id, runner)
-        self.assertIsNotNone(preserved)
-        self.assertEqual(snapshot.nodes["b"]["status"], "accepted")
-        save_snapshot(self.paths, preserved)
-
-        recovered = Monitor(self.paths, self.plan, nodes).tick(
-            snapshot.run_id, runner
-        )
-
-        self.assertEqual(recovered.nodes["b"]["status"], "accepted")
-        self.assertEqual(
-            recovered.nodes["b"]["acceptance"]["contract_digest"],
-            _digest_as_507([nodes[1]]),
-        )
-
     def _accepted_507_run(self):
         """Both nodes accepted under 5.0.7, so every stored digest is the old form."""
         nodes = self._nodes()
@@ -246,11 +218,6 @@ class LegacyContractDigestTests(unittest.TestCase):
         self.assertNotEqual(executable_contract_digest(changed), _digest_as_507(changed))
         self.assertEqual(snapshot.node_contract_digest, _digest_as_507(changed))
 
-    def test_reauthorized_507_run_loads(self):
-        snapshot, _changed = self._reauthorized_507_run()
-        loaded = load_snapshot(self.paths, snapshot.run_id)
-        self.assertEqual(loaded.authorization_digest, snapshot.authorization_digest)
-
     def test_507_authorization_record_stays_valid_against_live_nodes(self):
         nodes = self._nodes()
         with _as_written_by_507():
@@ -277,43 +244,6 @@ class LegacyContractDigestTests(unittest.TestCase):
                 for node_id in ("a", "b")
             }
         )
-
-    def test_507_dispatched_nodes_reach_acceptance_under_new_code(self):
-        nodes = self._nodes()
-        runner = self._accepting_runner()
-        with _as_written_by_507():
-            snapshot = Monitor(self.paths, self.plan, nodes).start(
-                self._record(nodes), runner
-            )
-        self.assertEqual(
-            snapshot.nodes["a"]["contract_digest"], _digest_as_507([nodes[0]])
-        )
-        monitor = Monitor(self.paths, self.plan, nodes)
-        for _ in range(10):
-            snapshot = monitor.tick(snapshot.run_id, runner)
-        self.assertEqual(
-            {node_id: current["status"] for node_id, current in snapshot.nodes.items()},
-            {"a": "accepted", "b": "accepted"},
-        )
-        self.assertEqual(
-            load_snapshot(self.paths, snapshot.run_id).nodes["b"]["status"], "accepted"
-        )
-
-    def test_reauthorized_507_run_ticks_like_507(self):
-        snapshot, changed = self._reauthorized_507_run()
-        monitor = Monitor(self.paths, self.plan, changed)
-        for _ in range(3):
-            snapshot = monitor.tick(snapshot.run_id, self._accepting_runner())
-        # 5.0.7 itself leaves a scope-expanded node waiting for its continuation.
-        self.assertEqual(
-            {node_id: current["status"] for node_id, current in snapshot.nodes.items()},
-            {"a": "rework", "b": "planned"},
-        )
-        load_snapshot(self.paths, snapshot.run_id)
-
-    def test_untouched_proof_decodes(self):
-        snapshot, _changed = self._reauthorized_507_run()
-        self._decode_with(snapshot.run_id)
 
     def test_tampered_507_proof_is_rejected(self):
         snapshot, _changed = self._reauthorized_507_run()
@@ -352,26 +282,6 @@ class LegacyVisibleSddReplayTests(unittest.TestCase):
     tearDown = _visible_sdd_contract.VisibleSddAcceptanceMonitorTests.tearDown
     _monitor = _visible_sdd_contract.VisibleSddAcceptanceMonitorTests._monitor
     _runner = staticmethod(_visible_sdd_contract.VisibleSddAcceptanceMonitorTests._runner)
-
-    def test_visible_sdd_replay_accepts_a_507_acceptance(self):
-        with _as_written_by_507():
-            monitor, record = self._monitor()
-            runner = self._runner()
-            snapshot = monitor.start(record, runner)
-            preserved = copy.deepcopy(snapshot)
-            snapshot = monitor.tick(snapshot.run_id, runner)
-        self.assertEqual(snapshot.nodes["sdd-a"]["status"], "accepted")
-        legacy = _digest_as_507([monitor.nodes["sdd-a"]])
-        self.assertEqual(snapshot.nodes["sdd-a"]["contract_digest"], legacy)
-        save_snapshot(self.paths, preserved)
-
-        recovered = monitor.tick(snapshot.run_id, runner)
-
-        self.assertEqual(recovered.nodes["sdd-a"]["status"], "accepted")
-        self.assertEqual(
-            recovered.nodes["sdd-a"]["acceptance"]["contract_digest"], legacy
-        )
-
 
 class ScopeOnlyExpansionPredicateTests(unittest.TestCase):
     def test_unhashable_scope_entries_are_unprovable_not_errors(self):

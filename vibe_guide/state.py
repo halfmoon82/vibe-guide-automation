@@ -20,7 +20,6 @@ from .authorization import (
     AuthorizationRecord,
     affected_node_closure,
     executable_contract_digest,
-    executable_contract_digest_matches,
     is_authorization_integrity_valid,
     legacy_executable_contract_digest,
     verified_authorized_nodes,
@@ -108,7 +107,7 @@ def _previous_digest_binds(
     Must stay isomorphic with ``Monitor.reauthorize``: replay rejects any
     reauthorization whose recorded disposition this predicate disagrees with.
     """
-    return route_only_acceptance_binds(node, previous_node, digest) or executable_contract_digest_matches([node], digest) or (
+    return route_only_acceptance_binds(node, previous_node, digest) or executable_contract_digest([node]) == digest or (
         scope_only_expansion_binds(
             node, digest, previous.file_scope, replacement.file_scope
         )
@@ -447,7 +446,6 @@ _EVENT_DATA_KEYS = {
     "isolated",
     "repaired",
     "binding",
-    "legacy_evidence_digest",
     # Execution-topology observation fields.  _validate_execution_topology()
     # compares the persisted `execution_topology_observed` event field by field
     # against the live snapshot, so omitting them here silently dropped them on
@@ -743,9 +741,6 @@ class RunSnapshot:
     workflow: Optional[Dict[str, Any]] = None
     prd_digest: str = ""
     spec_digest: str = ""
-    legacy_run: bool = False
-    legacy_evidence: Optional[Dict[str, Any]] = None
-    legacy_evidence_digest: str = ""
     execution_engine: str = ""
     engine_mode: str = ""
     engine_evidence_ref: str = ""
@@ -853,7 +848,10 @@ class RunSnapshot:
             "binding_state",
             "business_write_allowed",
         }
-        allowed = with_capability | binding_fields | {"integration_review_evidence", "workflow", "prd_digest", "spec_digest", "legacy_run", "legacy_evidence", "legacy_evidence_digest", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "ready_set", "topology_digest", "started_nodes", "active_concurrency", "capacity", "monitor_entry_evidence", "parallel_groups", "v44_binding_intent", "v44_binding_proof"}
+        allowed = with_capability | binding_fields | {"integration_review_evidence", "workflow", "prd_digest", "spec_digest", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "ready_set", "topology_digest", "started_nodes", "active_concurrency", "capacity", "monitor_entry_evidence", "parallel_groups", "v44_binding_intent", "v44_binding_proof"}
+        if isinstance(data, dict):
+            # Pre-5.2 snapshots: read them (status/closeout) but drop the keys.
+            data = {key: value for key, value in data.items() if key not in LEGACY_RUN_KEYS}
         if not isinstance(data, dict) or not set(data).issubset(allowed) or not expected.issubset(data):
             raise ValueError("snapshot schema is invalid")
         normalized = dict(data)
@@ -865,9 +863,6 @@ class RunSnapshot:
         normalized.setdefault("integration_review_evidence", {})
         normalized.setdefault("prd_digest", "")
         normalized.setdefault("spec_digest", "")
-        normalized.setdefault("legacy_run", False)
-        normalized.setdefault("legacy_evidence", None)
-        normalized.setdefault("legacy_evidence_digest", "")
         normalized.setdefault("execution_engine", "")
         normalized.setdefault("engine_mode", "")
         normalized.setdefault("engine_evidence_ref", "")
@@ -896,19 +891,6 @@ class RunSnapshot:
         for key in ("prd_digest", "spec_digest"):
             if not isinstance(normalized.get(key, ""), str):
                 raise ValueError("snapshot {} is invalid".format(key))
-        if type(normalized.get("legacy_run")) is not bool:
-            raise ValueError("snapshot legacy_run is invalid")
-        if normalized.get("legacy_evidence") is not None and not isinstance(normalized["legacy_evidence"], dict):
-            raise ValueError("snapshot legacy evidence is invalid")
-        if normalized.get("legacy_run") is True:
-            evidence = normalized.get("legacy_evidence")
-            if (not isinstance(evidence, dict) or not isinstance(evidence.get("source"), str)
-                    or not evidence.get("source", "").strip() or not isinstance(evidence.get("run_id"), str)
-                    or not evidence.get("run_id", "").strip()):
-                raise ValueError("legacy snapshot evidence is missing")
-            validate_run_id(evidence["run_id"])
-            if not isinstance(normalized.get("legacy_evidence_digest"), str) or not _DIGEST.fullmatch(normalized["legacy_evidence_digest"]):
-                raise ValueError("legacy snapshot evidence digest is invalid")
         if normalized["binding_state"] == "binding_verified":
             normalized["binding_state"] = "blocked_unknown"
             normalized["business_write_allowed"] = False
@@ -1375,8 +1357,6 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
     current_capability_contract_digest = first_capability_contract_digest
     if sorted(first["data"].get("node_ids", [])) != sorted(snapshot.nodes):
         raise ValueError("run-start node lineage is inconsistent")
-    if snapshot.legacy_run and first["data"].get("legacy_evidence_digest") != snapshot.legacy_evidence_digest:
-        raise ValueError("legacy evidence lineage is inconsistent")
     retained_acceptance_proofs = []
     latest_node_contract_digests = None
     epoch_contracts = first["data"].get("authorized_node_contracts")
@@ -1487,22 +1467,8 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 authorized_nodes.append(authorized_node)
         except (json.JSONDecodeError, TypeError, ValueError) as error:
             raise ValueError("reauthorization authorized DAG proof is invalid") from error
-        # 5.0.7 wrote these digests with file scope included.  The aggregate
-        # selects the algorithm and every per-node digest must use the same
-        # one, so a proof mixing the two is rejected.
-        digest_algorithm = next(
-            (
-                algorithm
-                for algorithm in (
-                    executable_contract_digest,
-                    legacy_executable_contract_digest,
-                )
-                if algorithm(authorized_nodes) == replacement.node_contract_digest
-            ),
-            None,
-        )
-        if digest_algorithm is None or any(
-            digest_algorithm([node]) != node_contract_digests[node.id]
+        if executable_contract_digest(authorized_nodes) != replacement.node_contract_digest or any(
+            executable_contract_digest([node]) != node_contract_digests[node.id]
             for node in authorized_nodes
         ):
             raise ValueError("reauthorization authorized DAG proof is invalid")
@@ -1710,6 +1676,32 @@ def verify_run_evidence(paths: ProjectPaths, run_id: str) -> RunSnapshot:
     if snapshot.run_id != run_id:
         raise ValueError("snapshot run id does not match its path")
     return snapshot
+
+
+LEGACY_RUN_KEYS = ("legacy_run", "legacy_evidence", "legacy_evidence_digest")
+LEGACY_RUN_BLOCK = "legacy_run_in_flight"
+LEGACY_RUN_GUIDANCE = "请用 vibe 5.1.16 或更早版本收口该运行后再升级"
+
+
+def legacy_run_in_flight(paths: ProjectPaths, run_id: str) -> bool:
+    """True for an unfinished run saved in the pre-5.2 snapshot format.
+
+    Those snapshots carry the `legacy_run` keys that the current format no
+    longer writes.  A finished (`complete`) one stays readable through
+    `load_snapshot`; an unfinished one must be closed with the old version.
+    Unreadable state answers False so the normal load error is reported.
+    """
+    try:
+        raw = json.loads((run_dir(paths, run_id, create=False) / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (isinstance(raw, dict) and any(key in raw for key in LEGACY_RUN_KEYS)
+            and raw.get("status") != "complete")
+
+
+def require_not_legacy_run(paths: ProjectPaths, run_id: str) -> None:
+    if legacy_run_in_flight(paths, run_id):
+        raise PermissionError(LEGACY_RUN_BLOCK + ": " + LEGACY_RUN_GUIDANCE)
 
 
 def load_snapshot(paths: ProjectPaths, run_id: str) -> RunSnapshot:

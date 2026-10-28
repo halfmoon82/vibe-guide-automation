@@ -32,7 +32,7 @@ from .protocols import (
     load_protocol,
 )
 from .capability_contract import build_contract, contract_path, load_contract, save_contract
-from .migration import migrate_v2_to_v310, migrate_v2_to_v42, _backup, _payload_is_complete
+from .migration import _backup, _payload_is_complete
 from .workflow_gate import V42_STATE, is_v42_sdd_first_state
 from .config import (
     DEFAULT_MAX_ACTIVE_WORKER_SESSIONS,
@@ -63,11 +63,6 @@ class InitResult:
     #: a state file that could not be read.  Kept out of `paths`, which lists
     #: what was written.
     notes: list = field(default_factory=list)
-
-
-def migrate_project(source, destination):
-    """Initializer-facing entry point for explicit, backup-first upgrades."""
-    return migrate_v2_to_v42(source, destination)
 
 
 def _is_within(root, path):

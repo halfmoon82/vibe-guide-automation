@@ -54,7 +54,7 @@ class V42ClosedLoopContractTests(unittest.TestCase):
         # state file, so rejecting those keys deadlocks every integration-review
         # plan: with the evidence the session gate fails, without it the run is
         # blocked as required_workflow_blocked.
-        for evidence_key in ("task_workflow", "workflow", "legacy_run", "legacy_evidence"):
+        for evidence_key in ("task_workflow", "workflow"):
             with self.subTest(evidence_key=evidence_key), tempfile.TemporaryDirectory() as root:
                 paths = ProjectPaths(Path(root))
                 paths.vibe.mkdir()

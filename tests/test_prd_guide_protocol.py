@@ -743,8 +743,8 @@ class PublishSectionTests(unittest.TestCase):
         # remote Git actions as not performed, and the only merge gate needs
         # merge_local/merge_remote, which the published card never carries.
         import inspect
-        from vibe_guide import authorization, monitor
-        self.assertIn('"external_execution": "not_performed"', inspect.getsource(monitor))
+        from vibe_guide import authorization, change_requests
+        self.assertIn('"external_execution": "not_performed"', inspect.getsource(change_requests))
         self.assertIn('{"merge_local", "merge_remote"}', inspect.getsource(authorization.can_auto_merge))
         # The worker envelope is fixed, so it lists push/merge under deny too.
         from vibe_guide.authorization import _EXCLUDED_ACTIONS, _REMOTE_GIT_ACTIONS_SCOPE
