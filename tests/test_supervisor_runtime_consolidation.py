@@ -218,3 +218,50 @@ class ProtocolRefDefaultTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _cli_calls_beat_entry():
+    from vibe_guide import cli
+    return "supervisor_beat(" in Path(cli.__file__).read_text(encoding="utf-8")
+
+
+@unittest.skipUnless(_cli_calls_beat_entry(),
+                     "cli.py supervisor-beat 尚未接入 supervisor.supervisor_beat（待 scope-expand）")
+class BeatEntryWiringTests(_Case):
+    """The beat features must be reachable from ``vibe supervisor-beat``."""
+
+    def beat(self, record):
+        from vibe_guide.cli import run_cli
+        return run_cli(["supervisor-beat", "--run-id", RUN, "--session-record", str(record)], self.root)
+
+    def test_cli_idle_ends_turn_and_repeat_stops(self):
+        record = self.record("shift.jsonl", 1000)
+        self.register("codex-app-visible", record=record)
+        with patch("vibe_guide.supervisor._mailbox_state",
+                   return_value={"state": "idle", "reason": "nothing pending"}):
+            first = self.beat(record).payload
+            second = self.beat(record).payload
+        self.assertEqual(first["state"], "idle")
+        self.assertTrue(first["end_turn"])
+        self.assertEqual(second["state"], "stop")
+        self.assertTrue(second["end_turn"])
+
+    def test_cli_new_delivery_runs_normally(self):
+        record = self.record("shift.jsonl", 1000)
+        self.register("codex-app-visible", record=record)
+        with patch("vibe_guide.supervisor._mailbox_state",
+                   return_value={"state": "idle", "reason": "nothing pending"}):
+            self.beat(record)
+            self.request("wait")
+            self.assertNotEqual(self.beat(record).payload["state"], "stop")
+
+    def test_cli_work_prints_card_then_reference(self):
+        record = self.record("shift.jsonl", 1000)
+        self.register("codex-app-visible", record=record)
+        with patch("vibe_guide.supervisor._mailbox_state",
+                   return_value={"state": "work", "reason": "pending"}):
+            first = self.beat(record).text
+            self.request("wait")
+            second = self.beat(record).text
+        self.assertIn("监工卡（每班一次", first)
+        self.assertNotIn("监工卡（每班一次", second)

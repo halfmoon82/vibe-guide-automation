@@ -2724,8 +2724,8 @@ _BEAT_LAST_FILE = "beat-last.json"
 _CARD_SHOWN_FILE = "supervisor-card-shown.json"
 _BEAT_WATCHED_FILES = (
     "state.json", "events.jsonl", "tasks.json", "supervisor-registry.json",
-    "supervisor-holds.json", _HEARTBEAT_INTERVAL_FILE,
-)
+    "supervisor-holds.json",
+)  # the interval file is the beat's own output, so it is not an input
 
 
 def _stat_entry(path):
@@ -2866,3 +2866,48 @@ def render_beat_text(paths, run_id, payload, *, plan_id, command_prefix="vibe",
         return "work：服务信箱一轮，推进用 {}{}\n{}".format(resume, tail, block) + context
     return "unknown：按 work 处理，推进用 {}；原因：{}".format(
         resume, payload.get("reason", "状态未知")) + tail
+
+
+def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
+                    command_prefix="vibe", interval_for=None, preflight_kwargs=None, now=None):
+    """The one beat entry the CLI calls: ``(payload, text, ok)``.
+
+    A repeat inside the window returns ``stop`` without recomputing.  Otherwise
+    run the preflight (and handoff prep), pick the interval via ``interval_for``
+    (the CLI owns cadence persistence), render the text, then remember the
+    fingerprint.  ``ok`` is False when the beat's state is unknown.
+    """
+    stop, fingerprint = beat_repeat_check(paths, run_id, now=now)
+    if stop:
+        text = render_beat_text(paths, run_id, stop, plan_id="")
+        return {**stop, "heartbeat_command": heartbeat_command(run_id, command_prefix=command_prefix)}, text, True
+    payload = supervisor_preflight(paths, run_id, session_record,
+                                   accept_decision=accept_decision, **(preflight_kwargs or {}))
+    if payload.get("prepare_handoff"):
+        try:
+            handoff, _ = supervisor_handoff(paths, run_id, command_prefix=command_prefix)
+            payload["handoff_summary"] = handoff["handoff_summary"]
+        except (FileNotFoundError, TypeError, ValueError, OSError) as error:
+            payload = {**payload, "handoff_status": "unknown",
+                       "handoff_error": "handoff preparation failed: " + str(error)}
+            if payload["state"] != "rotate":
+                payload["state"] = "unknown"
+    try:
+        plan_id = load_snapshot(paths, run_id).plan_id
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        plan_id = "<plan_id>"
+    interval = interval_for(payload) if interval_for else None
+    if interval:
+        payload["heartbeat_interval"] = interval
+    text = render_beat_text(paths, run_id, payload, plan_id=plan_id, command_prefix=command_prefix,
+                            interval_minutes=interval["minutes"] if interval else None)
+    state = payload.get("state")
+    report = beat_stall_report(paths, run_id)
+    payload["stall"] = report
+    stall_text = render_stall_beat_text(report, run_id, command_prefix)
+    if stall_text:
+        text = text + "\n" + stall_text if state in {"rotate", "contract_drift"} else stall_text + "\n" + text
+    ok = state in {"idle", "work", "decision", "rotate", "stop"} and payload.get("handoff_status") != "unknown"
+    beat_repeat_commit(paths, run_id, fingerprint, payload, now=now)
+    payload = {"heartbeat_command": heartbeat_command(run_id, command_prefix=command_prefix), **payload}
+    return payload, text, ok
