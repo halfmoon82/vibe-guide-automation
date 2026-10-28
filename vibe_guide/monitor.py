@@ -115,6 +115,7 @@ from .authorize_entry import load_live_workflow, select_plan_workflow, verify_wo
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
 from .model_router import ModelRouter
+from . import model_catalog
 from .change_requests import (
     ChangeRequest,
     ChangeRequestEvidence,
@@ -5476,6 +5477,104 @@ class Monitor:
             return False
         return True
 
+    def _effective_model_tier(self, node: DAGNode, current: Dict[str, Any], role: str) -> str:
+        """Derived tier plus the run's recorded ±1 adjustments (never below ``light``)."""
+        tier = model_catalog.node_tier(node, role=role)
+        try:
+            delta = int(current.get("model_tier_adjustment", 0))
+        except (TypeError, ValueError):
+            delta = 0
+        index = max(0, min(len(model_catalog.TIERS) - 1, model_catalog.TIERS.index(tier) + delta))
+        tier = model_catalog.TIERS[index]
+        if role == "reviewer":
+            tier = model_catalog.max_tier(tier, "standard")
+        return tier
+
+    def _apply_model_tier(
+        self, snapshot: RunSnapshot, node: DAGNode, contract: Dict[str, Any],
+        current: Dict[str, Any], role: str,
+    ) -> None:
+        """Turn the node's tier into this platform's model on the dispatch copy.
+
+        Only a profile that still carries the planner's placeholder model is
+        touched: an explicitly routed node keeps the route it was given.  The
+        concrete model lives on the dispatch contract only, never in the signed
+        node contract, so it cannot affect the authorization digest.
+        """
+        raw = contract.get("worker_profile")
+        if not isinstance(raw, dict) or raw.get("model") not in (None, "", "default"):
+            return
+        if contract.get("routing_required") is True:
+            return
+        try:
+            tier = self._effective_model_tier(node, current, role)
+            choice = model_catalog.resolve(
+                str(contract.get("adapter_id") or node.contract.get("adapter_id") or ""),
+                tier,
+                vibe_home=model_catalog.vibe_home_path(),
+            )
+        except (model_catalog.TierError, ValueError, TypeError):
+            return
+        if choice.status != "ok":
+            # Unknown probe: keep the platform default, but say so once.
+            if not current.get("model_tier_unknown_recorded"):
+                current["model_tier_unknown_recorded"] = True
+                self._record(
+                    snapshot,
+                    "model_tier_unresolved",
+                    {
+                        "run_id": snapshot.run_id,
+                        "node_id": node.id,
+                        "role": role,
+                        "reason_code": "model_probe_unknown",
+                        "proof": {"tier": tier, "platform": choice.platform, "note": choice.note},
+                    },
+                )
+            return
+        basis = dict(raw.get("selection_basis") or {})
+        basis.update({"model_tier": tier, "model_tier_source": choice.source})
+        try:
+            profile = WorkerProfile(**dict(
+                raw, model=choice.model, reasoning=choice.reasoning,
+                selection_basis=basis, route_digest="",
+            ))
+        except (TypeError, ValueError):
+            return
+        contract["worker_profile"] = profile.to_dict()
+
+    def adjust_model_tier(
+        self, run_id: str, node_id: str, delta: int, reason: str
+    ) -> RunSnapshot:
+        """Supervisor/repair session moves a node's tier by exactly one level.
+
+        Refused (with the allowed range) when the move leaves light..deep, and
+        when no reason is given.
+        """
+        snapshot = load_snapshot(self.paths, run_id)
+        if node_id not in snapshot.nodes:
+            raise ValueError("model tier adjustment targets an unknown node")
+        current = snapshot.nodes[node_id]
+        before = self._effective_model_tier(self.nodes[node_id], current, "developer")
+        after = model_catalog.adjust_tier(before, delta, reason)
+        self._commit_model_tier_adjustment(snapshot, node_id, current, delta, before, after, reason, "supervisor")
+        self._save_snapshot(snapshot)
+        return snapshot
+
+    def _commit_model_tier_adjustment(
+        self, snapshot: RunSnapshot, node_id: str, current: Dict[str, Any],
+        delta: int, before: str, after: str, reason: str, actor: str,
+    ) -> None:
+        current["model_tier_adjustment"] = int(current.get("model_tier_adjustment", 0)) + delta
+        self._record(
+            snapshot,
+            "model_tier_adjusted",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "proof": {"from": before, "to": after, "reason": reason, "by": actor},
+            },
+        )
+
     def _prepare_worker_profile(
         self, node: DAGNode, contract: Dict[str, Any], current: Dict[str, Any], role: str
     ) -> Optional[WorkerProfile]:
@@ -5852,6 +5951,7 @@ class Monitor:
             contract["files"] = list(profile.allowlist)
             if routing_requested:
                 contract["routing_required"] = True
+        self._apply_model_tier(snapshot, node, contract, current, role)
         if binding_contract_enabled(contract):
             has_live_evidence = isinstance(contract.get("binding_intent"), BindingIntent) and isinstance(
                 contract.get("binding_observation"), BindingObservation
@@ -7382,6 +7482,14 @@ class Monitor:
                 except (TypeError, ValueError):
                     review_round = 1
                 current["review_loop_rounds"] = review_round
+                if review_round == 2:
+                    before = self._effective_model_tier(self.nodes[node_id], current, "developer")
+                    if before != model_catalog.TIERS[-1]:
+                        self._commit_model_tier_adjustment(
+                            snapshot, node_id, current, 1, before,
+                            model_catalog.adjust_tier(before, 1, "review rejected twice"),
+                            "review rejected twice", "monitor",
+                        )
                 if review_round >= 3:
                     # Three unconverged rework rounds: the fix is a different
                     # reviewer (or a split node), never another automatic

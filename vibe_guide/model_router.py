@@ -32,7 +32,7 @@ _CONTEXT_REQUIREMENTS = {
 
 def provider_thinking_for(reasoning: str) -> str:
     """Map the internal reasoning contract to the Codex provider enum."""
-    mapping = {"normal": "medium", "deep": "high"}
+    mapping = {"light": "low", "normal": "medium", "deep": "high"}
     if not isinstance(reasoning, str) or reasoning not in mapping:
         raise ValueError("unsupported reasoning level: %s" % reasoning)
     return mapping[reasoning]
