@@ -237,7 +237,11 @@ def validate_result_shape(operation, payload, *, role=None):
     errors = []
     if operation == "wait":
         status = payload.get("status")
-        required = ["status"] + ([] if status in WAIT_STATUS_AS_EVENT else ["event"])
+        # failed/stopped carry their event in the status; timeout/unknown/error
+        # are transient (the reader only records visibility_unknown), so they
+        # need neither event nor delivery_evidence.
+        no_event = status in WAIT_STATUS_AS_EVENT or status in WAIT_TRANSIENT_STATUSES
+        required = ["status"] + ([] if no_event else ["event"])
         if role == "developer" and payload.get("event") in ("delivered", "complete"):
             required.append("delivery_evidence")
         errors = _shape_errors(required, _WAIT_RESULT_FIELDS, payload)

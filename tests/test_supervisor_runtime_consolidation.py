@@ -156,6 +156,15 @@ class SupervisorCardTests(_Case):
 
 
 class MailboxWriteBackTests(_Case):
+    def test_transient_wait_statuses_need_only_status(self):
+        for status in ("timeout", "unknown", "error"):
+            validate_result_shape("wait", {"status": status}, role="developer")
+            validate_result_shape("wait", {"status": status, "cursor": "c1"}, role="developer")
+            with self.assertRaises(ValueError) as caught:
+                validate_result_shape("wait", {"status": status, "bogus": 1}, role="developer")
+            self.assertIn("bogus", str(caught.exception))
+            self.assertNotIn("event", str(caught.exception).replace("unexpected", ""))
+
     def test_developer_wait_without_delivery_evidence_is_rejected_unconsumed(self):
         action = self.request("wait")
         with self.assertRaises(ValueError) as caught:

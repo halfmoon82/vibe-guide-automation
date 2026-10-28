@@ -76,6 +76,7 @@ from .supervisor import (
     rotate_hard_cap_for_run,
     supervisor_holds,
     supervisor_preflight,
+    supervisor_beat,
     HOST_SHIFT_DIFFERENCES,
     SESSION_RECORD_HINT,
 )
@@ -2448,60 +2449,13 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             kwargs["token_threshold"] = args.token_threshold
         if args.context_hard_cap is not None:
             kwargs["context_hard_cap"] = args.context_hard_cap
-        payload = supervisor_preflight(paths, args.run_id, args.session_record,
-                                       accept_decision=args.accept_decision, **kwargs)
-        if payload.get("prepare_handoff"):
-            try:
-                handoff, _ = supervisor_handoff(paths, args.run_id, command_prefix=supervisor_command_prefix)
-                payload["handoff_summary"] = handoff["handoff_summary"]
-            except (FileNotFoundError, TypeError, ValueError, OSError) as error:
-                payload = {**payload, "handoff_status": "unknown",
-                           "handoff_error": "handoff preparation failed: " + str(error)}
-                if payload["state"] != "rotate":
-                    payload["state"] = "unknown"
-        state = payload.get("state")
-        try:
-            plan_id = load_snapshot(paths, args.run_id).plan_id
-        except (FileNotFoundError, OSError, TypeError, ValueError):
-            plan_id = "<plan_id>"
-        interval = _beat_interval(paths, args.run_id, payload, persist=True)
-        payload["heartbeat_interval"] = interval
-        tail = "；下一拍间隔 {} 分钟".format(interval["minutes"])
-        if state == "idle":
-            # 保持输出恰为 "idle"（既有测试与"只回一个字"的约定）；间隔见 JSON 的 heartbeat_interval。
-            text = "idle"
-        elif state == "decision":
-            text = "decision：读取决策信箱并向用户呈现未答卡片；心跳降频到 {} 分钟但不暂停，答案写回后恢复{}".format(
-                HEARTBEAT_INTERVAL_DECISION_MINUTES, tail)
-        elif state == "work":
-            text = "work：按 prd-guide §6.1 服务信箱一轮，推进用 {} resume --plan {} --run-id {}".format(
-                supervisor_command_prefix, plan_id, args.run_id
-            ) + tail
-        elif state == "contract_drift":
-            text = "contract_drift：能力合同与运行快照不一致，停止推进，立即走同一运行的重新授权流程；{}".format(
-                payload.get("hint", "")) + tail
-        elif state == "rotate":
-            text = "rotate：新开一个会话（必须建在本项目里：Codex 桌面用 create_thread 的 project 目标，禁止 projectless，否则读写 .vibe/ 逐条弹审批，#231；必须是全新会话，不要 fork_thread，fork 带整段历史会被登记拒绝），让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(
-                supervisor_command_prefix, args.run_id
-            ) + tail
-        else:
-            text = "unknown：按 work 处理，推进用 {} resume --plan {} --run-id {}；原因：{}".format(
-                supervisor_command_prefix, plan_id, args.run_id, payload.get("reason", "状态未知")
-            ) + tail
-        stall_report = beat_stall_report(paths, args.run_id)
-        payload["stall"] = stall_report
-        stall_text = render_stall_beat_text(stall_report, args.run_id, supervisor_command_prefix)
-        if stall_text:
-            # The stall line leads so the supervisor cannot read "idle"/"work"
-            # past it; rotate and contract_drift stay first (they stop the beat).
-            text = text + "\n" + stall_text if state in {"rotate", "contract_drift"} else stall_text + "\n" + text
-        code = SUCCESS if state in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
-        return _result(
-            code,
-            {"command": args.command, "heartbeat_command": heartbeat_command(args.run_id, command_prefix=supervisor_command_prefix), **payload},
-            text,
-            args.as_json,
+        payload, text, ok = supervisor_beat(
+            paths, args.run_id, args.session_record,
+            accept_decision=args.accept_decision, command_prefix=supervisor_command_prefix,
+            interval_for=lambda beat_payload: _beat_interval(paths, args.run_id, beat_payload, persist=True),
+            preflight_kwargs=kwargs,
         )
+        return _result(SUCCESS if ok else UNKNOWN, {"command": args.command, **payload}, text, args.as_json)
 
     if args.command == "decision-raise":
         if not (args.run_id and args.node_id and args.decision_question):
