@@ -227,14 +227,18 @@ def worktree_action(record: Any) -> Optional[str]:
 
 
 def map_user_status(status: Any, reason: Any = "") -> str:
-    """User-facing status, with a stalled auto-repair node relabelled.
+    """User-facing status, with a stalled node relabelled.
 
-    Only a node that would otherwise read ``自动修复中`` is relabelled by its
-    ``stall_tier`` marker; every other label keeps its own authority.
+    A node that would otherwise read ``自动修复中`` is relabelled by its
+    ``stall_tier`` marker, and so is a ``running`` node with a bound worker
+    session (its silent session is what the marker reports); every other label
+    keeps its own authority.
     """
     label = _derived_user_status(status, reason)
-    if isinstance(status, dict) and label == "自动修复中":
-        return _STALL_TIER_STATUS.get(status.get(STALL_TIER_KEY), label)
+    if isinstance(status, dict):
+        session_node = status.get("status") == "running" and isinstance(status.get("active_task"), dict)
+        if label == "自动修复中" or session_node:
+            return _STALL_TIER_STATUS.get(status.get(STALL_TIER_KEY), label)
     return label
 
 
