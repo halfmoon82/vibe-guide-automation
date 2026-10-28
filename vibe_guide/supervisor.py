@@ -19,6 +19,7 @@ from .config import load_supervisor_single_shift
 from .contracts import RunEvent
 from .decision_boundary import LEGACY_BOUNDARY_CATEGORY, validate_boundary_category
 from .providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER, WORKBUDDY_VISIBLE_PROVIDER
+from . import worker_liveness
 from .state import (
     append_event,
     interprocess_lock,
@@ -2274,19 +2275,49 @@ def supervisor_mailbox_view(paths, run_id):
 
 _STALL_BASE_LABEL = "自动修复中"
 _STALL_REPORT_TIERS = ("supervisor_investigate", "escalate_to_pm")
+
+
+def _silent_tier(attempts_since_change, silent_minutes):
+    """A silent worker session is already past its 15-minute threshold: investigate
+    at once.  It escalates to a person only after self-heal was tried as often as
+    for any other stall AND the silence outlasted twice the threshold, so a single
+    long command never reaches a person just because the supervisor re-checked."""
+    from . import stall
+    long_enough = silent_minutes * 60 >= worker_liveness.ESCALATE_SILENCE_SECONDS
+    if attempts_since_change >= stall.ESCALATE_ATTEMPTS and long_enough:
+        return stall.TIER_ESCALATE
+    return stall.TIER_INVESTIGATE
+
+
 _HEAL_PACK_FILE = "heal-pack-{}.json"
 
 
-def _stall_candidates(snapshot):
-    """Nodes that would read 自动修复中 -- the only ones a stall may relabel.
+def _is_session_node(node):
+    """A node with a bound worker session at work: its health is the session's, not its fingerprint."""
+    return (
+        isinstance(node, dict)
+        and node.get("status") in worker_liveness.SESSION_STATUSES
+        and isinstance(node.get("active_task"), dict)
+    )
 
-    A node waiting on its dependencies (准备中) or running under a live worker
-    (已启动) legitimately keeps one fingerprint for many beats.
+
+def _stall_candidates(snapshot, session_nodes=None):
+    """Nodes a stall may relabel: those that would read 自动修复中, plus running
+    nodes whose worker session went silent.
+
+    A node waiting on its dependencies (准备中) keeps one fingerprint for many
+    beats legitimately, and so does a running node under a working session: the
+    latter is only a candidate when ``session_nodes`` (the silent ones the beat
+    just probed) names it, or -- for the read-only peek -- always, since the
+    persisted record only holds entries for nodes that were silent.
     """
     return {
         node_id: node
         for node_id, node in (snapshot.nodes or {}).items()
-        if isinstance(node, dict) and map_user_status(node) == _STALL_BASE_LABEL
+        if isinstance(node, dict) and (
+            map_user_status(node) == _STALL_BASE_LABEL
+            or (_is_session_node(node) and (session_nodes is None or node_id in session_nodes))
+        )
     }
 
 
@@ -2320,6 +2351,25 @@ def _node_blocker(node):
             if isinstance(retry.get(key), str):
                 return retry[key]
     return ""
+
+
+def _probe_session_nodes(paths, run_id, snapshot):
+    """({node_id: probe} for silent workers, {node_id: session} whose liveness is unknown).
+
+    Read-only: it only stats transcript files, so the preflight and the status
+    peek may call it too.  A node whose session cannot be identified at all
+    (another provider, a legacy id) is in neither: nothing can be claimed.
+    """
+    silent, unknown = {}, {}
+    for node_id, node in (snapshot.nodes or {}).items():
+        if not _is_session_node(node):
+            continue
+        result = worker_liveness.probe(paths, run_id, node_id, node)
+        if result["state"] == "silent":
+            silent[node_id] = result
+        elif result["state"] == "unknown":
+            unknown[node_id] = result["session"]
+    return silent, unknown
 
 
 def _build_pack(paths, run_id, node_id, snapshot, events, role):
@@ -2380,6 +2430,9 @@ def _node_stall_state(paths, run_id, snapshot, events, node_id):
     ):
         return 0, stall.TIER_AUTO_RETRY
     since = max(0, stall.count_self_heal_attempts(events).get(node_id, 0) - entry["attempts_baseline"])
+    if _is_session_node(node):
+        silent = worker_liveness.probe(paths, run_id, node_id, node).get("silent_minutes", 0)
+        return entry["unchanged_beats"], _silent_tier(since, silent)
     return entry["unchanged_beats"], stall._tier(entry["unchanged_beats"], since)
 
 
@@ -2387,9 +2440,11 @@ def stall_peek(paths, run_id, snapshot):
     """{node_id: tier} of nodes stalled per the last persisted beat; read-only."""
     try:
         events = load_events(paths, run_id)
+        silent, _ = _probe_session_nodes(paths, run_id, snapshot)
         return {
             node_id: tier
-            for node_id in _stall_candidates(snapshot)
+            for node_id, node in _stall_candidates(snapshot).items()
+            if not _is_session_node(node) or node_id in silent
             for unchanged, tier in [_node_stall_state(paths, run_id, snapshot, events, node_id)]
             if tier in _STALL_REPORT_TIERS and unchanged
         }
@@ -2407,6 +2462,35 @@ def _attempt_records(events, node_id, count):
     return attempts[-count:] if count else []
 
 
+def _silent_pack(run_id, node_id, node, probe):
+    """Pack for a worker session that stopped writing: no refused receipt to diff,
+    so the evidence is the transcript's age and where to read the real cause."""
+    from .heal_pack import PACK_SCHEMA
+    minutes = probe["silent_minutes"]
+    return {
+        "schema": PACK_SCHEMA,
+        "recognized": True,
+        "kind": "silent_worker",
+        "run_id": run_id,
+        "node_id": node_id,
+        "role": _node_role(node),
+        "node_status": "running",
+        "blocker_class": "worker_silent",
+        "files": [probe["transcript"]],
+        "expected": [{"field": "transcript_age_minutes", "type": "int",
+                      "requirement": "below %d" % (worker_liveness.SILENCE_SECONDS // 60)}],
+        "actual": [{"field": "transcript_age_minutes", "type": "int"}],
+        "differences": ["worker session silent for %d minutes" % minutes],
+        "repair_entries": [
+            "read the last lines of the transcript in `files`: the real cause (an API error, "
+            "a permission prompt waiting for the person, a dead process) is written there",
+            "then restart or nudge that session through the host's own session tools, "
+            "and run heal-verify: it passes once the transcript is written again",
+        ],
+        "note": "worker 会话已静默 %d 分钟" % minutes,
+    }
+
+
 def beat_stall_report(paths, run_id):
     """Assess one beat (exactly one ``stall.record_beat``) and describe stalled nodes."""
     from . import stall
@@ -2417,27 +2501,39 @@ def beat_stall_report(paths, run_id):
         return {"status": "unknown", "nodes": {}, "run_readable": False,
                 "reason": "run unreadable: " + type(error).__name__}
     try:
+        silent, unknown_liveness = _probe_session_nodes(paths, run_id, snapshot)
         outcome = stall.record_beat(
-            paths, run_id, _stall_candidates(snapshot), snapshot.tasks, events
+            paths, run_id, _stall_candidates(snapshot, silent), snapshot.tasks, events
         )
         nodes = {}
         for node_id, result in outcome["nodes"].items():
-            if result["tier"] not in _STALL_REPORT_TIERS:
+            node = snapshot.nodes[node_id]
+            if node_id in silent:
+                tier = _silent_tier(result["attempts_since_change"], silent[node_id]["silent_minutes"])
+                pack = _silent_pack(run_id, node_id, node, silent[node_id])
+            else:
+                tier = result["tier"]
+                pack = None
+            if tier not in _STALL_REPORT_TIERS:
                 continue
-            pack = _build_pack(paths, run_id, node_id, snapshot, events,
-                               _node_role(snapshot.nodes[node_id]))
-            _persist_pack(paths, run_id, node_id, pack, result["fingerprint"])
+            if pack is None:
+                pack = _build_pack(paths, run_id, node_id, snapshot, events, _node_role(node))
+                _persist_pack(paths, run_id, node_id, pack, result["fingerprint"])
             nodes[node_id] = {
-                "tier": result["tier"],
+                "tier": tier,
                 "unchanged_beats": result["unchanged_beats"],
                 "attempts_since_change": result["attempts_since_change"],
                 "attempts": _attempt_records(events, node_id, result["attempts_since_change"]),
                 "pack": pack,
             }
+            if node_id in silent:
+                nodes[node_id]["silent_minutes"] = silent[node_id]["silent_minutes"]
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
         return {"status": "unknown", "nodes": {}, "run_readable": True,
                 "reason": "stall assessment unavailable: " + type(error).__name__}
-    return {"status": "ok", "run_readable": True, "unknown_previous": outcome["unknown_previous"], "nodes": nodes}
+    return {"status": "ok", "run_readable": True, "unknown_previous": outcome["unknown_previous"],
+            "unknown_liveness": sorted(unknown_liveness), "unknown_sessions": unknown_liveness,
+            "nodes": nodes}
 
 
 def _pack_summary(pack):
@@ -2459,7 +2555,15 @@ def render_stall_beat_text(report, run_id, command_prefix="vibe"):
         # An unreadable run already degrades the whole beat; a readable run whose
         # stall assessment failed must not read as "nothing stalled".
         unknown.append("空转评估未知：{}".format(report.get("reason", "")))
+    for node_id, session in sorted((report.get("unknown_sessions") or {}).items()):
+        # The session is identified but leaves no transcript to read: the beat must
+        # not read as plain "idle" -- the supervisor looks at that session itself.
+        unknown.append("空转评估未知：节点 {} 的 worker 会话 {} 读不到会话记录，无法判断是否仍在工作".format(
+            node_id, session))
     for node_id, entry in sorted(report.get("nodes", {}).items()):
+        silent = entry.get("silent_minutes")
+        since = "worker 会话静默 {} 分钟".format(silent) if silent is not None else "连续 {} 拍进展不变".format(
+            entry["unchanged_beats"])
         if entry["tier"] == "escalate_to_pm":
             tried = "；".join(
                 "self_heal_attempt {}：{}".format(
@@ -2468,18 +2572,54 @@ def render_stall_beat_text(report, run_id, command_prefix="vibe"):
                 for item in entry.get("attempts", [])
             ) or "无记录"
             escalate.append(
-                "需要人处理：节点 {} 连续 {} 拍进展不变，监工自愈 {} 次仍未恢复；已试过：{}；排查包摘要：{}".format(
-                    node_id, entry["unchanged_beats"], entry["attempts_since_change"], tried,
+                "需要人处理：节点 {} {}，监工自愈 {} 次仍未恢复；已试过：{}；排查包摘要：{}".format(
+                    node_id, since, entry["attempts_since_change"], tried,
                     _pack_summary(entry["pack"])))
         else:
             pack_role = entry["pack"].get("role")
             role_flag = " --role " + pack_role if pack_role in _PACK_ROLES and pack_role != "developer" else ""
             investigate.append(
-                "需要监工排查：节点 {} 连续 {} 拍进展不变；排查包：{}；"
+                "需要监工排查：节点 {} {}；排查包：{}；"
                 "修完运行时文件后复核：{} heal-verify --run-id {} --node {}{}".format(
-                    node_id, entry["unchanged_beats"], _pack_text(entry["pack"]),
+                    node_id, since, _pack_text(entry["pack"]),
                     command_prefix, run_id, node_id, role_flag))
     return "\n".join(escalate + investigate + unknown)
+
+
+def _heal_verify_worker(paths, run_id, node_id, snapshot, events, base):
+    """Re-check a running node by its worker session: passes once the transcript moves."""
+    from .contracts import RunEvent
+    from . import stall
+    node = snapshot.nodes[node_id]
+    result = worker_liveness.probe(paths, run_id, node_id, node)
+    if result["state"] == "unresolved":
+        # No session id to look at: there is no evidence either way, so nothing is
+        # re-checked and nothing is recorded -- a pass here would be invented.
+        return {**base, "status": "blocked_unknown",
+                "reason": "cannot identify this node's worker session; nothing to re-check"}
+    if result["state"] == "silent":
+        differences = ["worker session silent for %d minutes" % result["silent_minutes"]]
+    elif result["state"] == "unknown":
+        differences = ["worker liveness unknown: " + result["reason"]]
+    else:
+        differences = []
+    passed = not differences
+    unchanged, tier = _node_stall_state(paths, run_id, snapshot, events, node_id)
+    append_event(paths, RunEvent("self_heal_attempt", {
+        "run_id": run_id, "node_id": node_id, "outcome": "passed" if passed else "failed",
+        "differences": differences, "tier": tier, "unchanged_beats": unchanged,
+    }), {
+        "role": "system", "task_id": None, "handle_id": None, "generation": 0,
+        "authorization_digest": snapshot.authorization_digest,
+        "node_contract_digest": snapshot.node_contract_digest,
+    })
+    if not passed:
+        return {**base, "status": "verify_failed", "differences": differences}
+    record = stall.load_progress(paths, run_id)
+    if record and node_id in record["nodes"]:
+        del record["nodes"][node_id]
+        stall.save_progress(paths, run_id, record)
+    return {**base, "status": "verify_passed", "differences": []}
 
 
 def heal_verify(paths, run_id, node_id, *, role=None):
@@ -2503,6 +2643,8 @@ def heal_verify(paths, run_id, node_id, *, role=None):
         return {**base, "status": "blocked_integrity", "reason": str(error)[:200]}
     if node_id not in snapshot.nodes:
         return {**base, "status": "blocked_invalid", "reason": "node is not part of this run"}
+    if _is_session_node(snapshot.nodes[node_id]):
+        return _heal_verify_worker(paths, run_id, node_id, snapshot, events, base)
     fingerprint = _node_fingerprint(snapshot, node_id)
     persisted = _load_pack(paths, run_id, node_id, fingerprint)
     role = role or (persisted or {}).get("role") or _node_role(snapshot.nodes[node_id])
