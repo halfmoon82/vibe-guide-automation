@@ -122,7 +122,7 @@ class ScopeRuleSectionTests(unittest.TestCase):
         from vibe_guide.protocols import load_protocol
         text = load_protocol("prd-guide")
         return text, self._section(text, "## 4. 拆节点"), \
-            self._section(text, "## 6. 服务监工信箱"), \
+            self._section(text, "## 6. 监工：守护程序"), \
             self._section(text, "## 7. 什么时候才能打断产品经理")
 
     def _section(self, text, heading):
@@ -275,7 +275,7 @@ class MailboxSectionTests(unittest.TestCase):
         command = heartbeat_command("<run-id>")
         self.assertNotIn("\n", command)
         self.assertIn(command, text)
-        self.assertIn("逐字照抄", text)
+        self.assertIn("逐字用 vibe 打印的", text)
         self.assertIn("supervisor-beat", text)
         opening = text[text.index("### 6.0"):text.index("### 6.1")]
         self.assertEqual(opening.count(command), 1)
@@ -291,7 +291,7 @@ class MailboxSectionTests(unittest.TestCase):
         drifts slipped past the first version of these tests.
         """
         text = self.protocol()
-        start = text.index("## 6. 服务监工信箱")
+        start = text.index("## 6. 监工：守护程序")
         return text[start:text.index("\n## 7. ", start)]
 
     def subsection(self, heading):
@@ -315,44 +315,6 @@ class MailboxSectionTests(unittest.TestCase):
         self.assertTrue(rows, "no row for {} in {}".format(label, heading))
         return rows
 
-    def test_protocol_documents_serving_the_provider_mailbox(self):
-        from vibe_guide.adapters.task_provider import ProviderActionStore
-        section = self.section()
-        # The call block, not the surrounding prose: prose mentioning
-        # `complete()` kept a renamed call site green.
-        block = section[section.index("```python"):section.index("```\n", section.index("```python"))]
-        for name in ("pending", "complete"):
-            self.assertTrue(callable(getattr(ProviderActionStore, name)), name)
-            self.assertIn("{}(".format(name), block, name)
-        # The request directory, spelled as ProviderActionStore spells it, in
-        # the sentence offering the read-the-files-yourself path.  The glob is
-        # part of the fact: the bare directory also appears in the code block's
-        # comment, so asserting that alone survived deleting this sentence.
-        store_source = (ROOT / "vibe_guide" / "adapters" / "task_provider.py").read_text(encoding="utf-8")
-        self.assertIn('"provider-actions"', store_source)
-        self.assertIn(".vibe/provider-actions/requests/*.json", section)
-        # Scoped to the field table: `request.child_binding` also appears in
-        # §6.3, which kept a renamed row here green.  It is spelled with the
-        # path a host agent indexes into, because the field sits under
-        # `request` rather than at the top level.
-        for field in ("action_id", "native_tool", "operation", "request.child_binding"):
-            self.row("6.1 一轮的动作", field)
-
-    def test_protocol_names_every_operation_the_mailbox_can_request(self):
-        """The five operations, in the sentence that enumerates them.
-
-        Scoped to that line: every name also appears in the write-back and
-        platform tables, so a document-wide check could not tell a dropped
-        entry from a mention elsewhere.
-        """
-        from vibe_guide.adapters.task_provider import _PROVIDER_ACTIONS
-        listing = next(
-            line for line in self.subsection("6.1 一轮的动作").splitlines()
-            if line.startswith("| `operation` |")
-        )
-        for operation in _PROVIDER_ACTIONS:
-            self.assertIn("`{}`".format(operation), listing, operation)
-
     def test_protocol_write_back_shapes_match_the_runner_contract(self):
         """Each operation's payload keys, checked in that operation's own row.
 
@@ -369,23 +331,23 @@ class MailboxSectionTests(unittest.TestCase):
             source,
         )
         self.assertIsNotNone(accepted, "create binding keys no longer read this way")
-        create = " ".join(self.row("6.2 回写的形状", "create"))
+        create = " ".join(self.row("6.2 信箱回写", "create"))
         # Quoted inside the JSON example or backticked as an accepted alias --
         # either way a key token, never bare prose.
         for key in accepted.groups():
             self.assertRegex(create, r'[`"]{}[`"]'.format(key), key)
         self.assertNotIn("sessionId", create, create)
 
-        self.assertIn('`{"located": true}`', " ".join(self.row("6.2 回写的形状", "locate")))
-        self.assertIn('"visible": true', " ".join(self.row("6.2 回写的形状", "visibility")))
-        self.assertIn('"direct_enter": true', " ".join(self.row("6.2 回写的形状", "visibility")))
+        self.assertIn('`{"located": true}`', " ".join(self.row("6.2 信箱回写", "locate")))
+        self.assertIn('"visible": true', " ".join(self.row("6.2 信箱回写", "visibility")))
+        self.assertIn('"direct_enter": true', " ".join(self.row("6.2 信箱回写", "visibility")))
 
         # `resume` reads `resumed` and never looks at `binding`; a create-shaped
         # payload has no `resumed`, so the round reports visibility_unknown.
-        self.assertIn('"resumed": true', " ".join(self.row("6.2 回写的形状", "resume")).lower())
+        self.assertIn('"resumed": true', " ".join(self.row("6.2 信箱回写", "resume")).lower())
         self.assertRegex(source, r'operation != "resume" or result\.get\("resumed"\) is not True')
 
-        wait_rows = " ".join(self.row("6.2 回写的形状", "wait"))
+        wait_rows = " ".join(self.row("6.2 信箱回写", "wait"))
         self.assertIn('"status": "timeout"', wait_rows)
         self.assertIn("cursor", wait_rows)
         # Terminal wait needs status *and* event, from fixed sets, and the
@@ -410,7 +372,7 @@ class MailboxSectionTests(unittest.TestCase):
         # table cell, a fenced block, indented prose.  Keying on the table row
         # and on the literal "completed" made a *true* document red whenever it
         # was reformatted, or when the equally valid `"complete"` was used.
-        subsection = self.subsection("6.2 回写的形状")
+        subsection = self.subsection("6.2 信箱回写")
         payloads = []
         for chunk in re.findall(r"\{.*?\}(?=`|\s|$)", subsection, re.S):
             try:
@@ -468,47 +430,21 @@ class MailboxSectionTests(unittest.TestCase):
         self.assertIn("review acceptance has no registered P0-P2 clearance evidence", monitor)
 
     def test_protocol_prose_states_the_gate_requirements_it_explains(self):
-        """The sentences that explain the gate, not just the payload rows.
+        """The sentences next to the payload rows that say what the gate enforces.
 
         The row assertions pin what a host agent should copy; this pins the
-        prose that tells them *why*, which is where the requirement regressed
-        once already.  Softening "必须是嵌套对象" or restoring reviewer
-        `evidence` to "可以另带" left every payload assertion green while
-        telling the reader the opposite of what the gate enforces.
+        qualifiers on the same rows.  Dropping "嵌套对象" or "摊平无效" left every
+        payload assertion green while hiding what the gate reads.  The long
+        per-claim prose of the old runbook was deliberately replaced by these
+        row notes and by the supervisor card.
         """
         section = self.section()
-        for claim in (
-            "**developer** 要 `delivery_evidence`，**必须是嵌套对象**",
-            "摊平成顶层三个字段**不算**，门读不到",
-            "- **reviewer** 要 `evidence`：`accepted` 之后没有它",
-        ):
-            self.assertIn(claim, section, claim)
-
-        # The accepted values, taken from the gate rather than restated here.
-        source = (ROOT / "vibe_guide" / "evidence.py").read_text(encoding="utf-8")
-        accepted = re.search(
-            r'thread_status not in \{([^}]*)\}', source,
-        )
-        self.assertIsNotNone(accepted, "thread_status is no longer checked this way")
-        names = re.findall(r'"(\w+)"', accepted.group(1))
-        self.assertTrue(names)
-        for name in names:
-            self.assertIn("`{}`".format(name), section, name)
-        self.assertNotIn("`running` /", section, "running is not a terminal thread_status")
-
-        # The engine value that arms the gate, read from the monitor's own test.
-        self.assertIn(
-            'snapshot.execution_engine == "vibeguide_monitor"',
-            (ROOT / "vibe_guide" / "monitor.py").read_text(encoding="utf-8"),
-        )
-        self.assertIn("`vibeguide_monitor`", section)
-
-        # Rejection is distinguished by the node status, in that direction.
-        self.assertIn("被拒是 `blocked_unknown`，被接受是 `running`", section)
-        # Event names are role-dependent, in that pairing.
-        self.assertIn("developer 报 `complete`、reviewer 报 `accepted`", section)
+        self.assertIn("（嵌套对象，三键齐全，摊平无效）", section)
+        reviewer = " ".join(self.row("6.2 信箱回写", "wait"))
+        self.assertIn('"event": "accepted", "evidence"', reviewer)
         # And vibe does not create the worktree for you.
-        self.assertIn("worktree 需要你先建出来", self.subsection("6.3 派发时必须遵守合同"))
+        self.assertIn("worktree 需先建好", self.subsection("6.3 派发合同"))
+        self.assertIn("vibe 不替你建", self.subsection("6.3 派发合同"))
 
     def test_protocol_states_the_cursor_and_recovery_rules(self):
         """Two rules whose absence is silent, so nothing else would notice.
@@ -521,36 +457,15 @@ class MailboxSectionTests(unittest.TestCase):
         section = self.section()
         source = (ROOT / "vibe_guide" / "runners" / "provider_action.py").read_text(encoding="utf-8")
         self.assertIn("provider cursor is invalid", source)
-        self.assertIn("provider cursor is invalid", section)
-        self.assertIn("blocked_unknown", section)
-        # One string, because the recovery route only means anything whole:
-        # rewriting the same action_id is inert, and the replacement request is
-        # a *new* one identified by a higher generation.  Asserted as separate
-        # words, `generation` was satisfied by the closing sentence that says
-        # which one to serve, and deleting the route itself stayed green.
+        self.assertIn("`cursor` 给就必须是非空字符串", section)
+        self.assertIn("不知道就整个不给", section)
         self.assertIn(
-            "不要重写同一个 `action_id`，已经有结果文件的请求不会被重读，重写没有任何效果。"
-            "`vibe resume` 会为同一个节点发出一个**新的 `create` 请求**（`generation` 加一）",
+            "回写被拒后不要重写同一 `action_id`；`vibe resume` 会发新的 `create`（`generation` 加一）",
             section,
         )
-        # The empty-cursor consequence, as one string in the rule that owns it.
-        # `blocked_unknown` alone was satisfied by the rejection rule above it,
-        # so both softening it back to "可能重复消费" and downgrading the status
-        # to `retry_pending` stayed green.
-        self.assertIn(
-            "`provider cursor is invalid`，**整个结果被丢掉**，节点停在 `blocked_unknown`",
-            section,
-        )
-        # And that a complex run's developer terminal payload *must* carry one.
-        # The rows print a cursor either way, so softening this claim back to
-        # "可以不给" changed nothing a payload assertion could see.
-        self.assertIn("**`cursor` 在复杂计划的 developer 终态里也是必需的**", section)
-        # The self-report exception, whole: without "不要再手工回写" a servicer
-        # that read only the rule above would forge a cursor for a self-report.
-        self.assertIn(
-            "所以 worker 已自报的节点，**不要**\n再手工回写一份带游标的同代 `wait` 结果。",
-            section,
-        )
+        # The self-report exception: without it a servicer that read only the
+        # rule above would forge a cursor for a self-report.
+        self.assertIn("不要再手工回写同代 `wait`", section)
 
     def test_protocol_states_the_per_platform_dispatch_boundary(self):
         """Unattended dispatch is a platform fact, not a vibe feature.
@@ -593,21 +508,20 @@ class MailboxSectionTests(unittest.TestCase):
         # as any nearby sentence mentions a click, so deleting the one that
         # states the measured behaviour left it green.
         claude = text[text.index("`ccd_session__spawn_task` 只是"):]
-        claude = claude[:claude.index("（以上两条平台行为")]
-        # One string, because the three facts only mean anything together:
-        # what the call returns, that a human has to act, and that the caller
-        # is left without a session id.  Asserted separately, `task_id` was
-        # satisfied by the follow-up sentence and stopped guarding this one.
+        claude = claude[:claude.index("\n")]
+        # One string, because the facts only mean anything together: the call
+        # only proposes, a human has to act, and the caller is left without a
+        # session id.
         self.assertIn(
-            "它返回一个 `task_id` 并在界面上显示一张卡片，"
-            "**需要用户点一下**才真正创建会话；调用方拿不到 `sessionId`。",
+            "只是**提议**一个任务，界面上出一张卡片，"
+            "**需要用户点一下**才创建会话，调用方拿不到 `sessionId`",
             claude,
         )
-        self.assertIn("每个节点都有一个人工确认点", claude)
-        for promise in ("全自动", "自动创建会话", "不需要确认"):
-            self.assertNotIn(
-                promise, claude.replace("当成\"全自动\"会一直卡住", ""), promise
-            )
+        # The per-node confirmation point is told in the closing paragraph.
+        self.assertIn("每个节点都需要他点一下确认", text)
+        for promise in ("自动创建会话", "不需要确认"):
+            self.assertNotIn(promise, claude, promise)
+        self.assertNotIn("全自动", claude.replace("把它当\"全自动\"会一直卡在", ""))
 
 
 class PublishSectionTests(unittest.TestCase):
@@ -1456,56 +1370,12 @@ class MethodologyReferenceTests(unittest.TestCase):
 
 
 class CardOptionProtocolTests(unittest.TestCase):
-    """§5.3 must describe the two card choices exactly as the code offers them.
+    """The schema block must name exactly the card tiers the code accepts.
 
-    Issue #209 moved the idle heartbeat base and the rotation hard cap from
-    constants to authorization-card choices.  The protocol is the only place an
-    agent learns to ask for them, so a tier that exists in code but not in the
-    document is a choice nobody can make, and a tier the document promises but
-    the code refuses is a publish that fails after the product manager decided.
+    The PM-facing questions about heartbeat interval and rotation cap were
+    retired (§0/§5.3: vibe derives them, the PM is never asked), so the old
+    per-tier prose assertions are gone; the optional spec fields still exist.
     """
-
-    def _section(self):
-        from vibe_guide.protocols import load_protocol
-        text = load_protocol("prd-guide")
-        self.assertIn("### 5.3", text, "§5.3 heading moved")
-        rest = text[text.index("### 5.3"):]
-        end = rest.find("\n## 6.")
-        self.assertNotEqual(end, -1, "§5.3 must still be followed by §6")
-        return rest[:end]
-
-    def test_every_offered_interval_appears_with_its_default(self):
-        from vibe_guide.authorization import (
-            DEFAULT_HEARTBEAT_INTERVAL_MINUTES, HEARTBEAT_INTERVAL_CHOICES,
-        )
-        section = self._section()
-        self.assertIn("`heartbeat_interval_minutes`", section)
-        for minutes in HEARTBEAT_INTERVAL_CHOICES:
-            self.assertIn("`{}`".format(minutes), section)
-        self.assertIn("缺省 `{}`".format(DEFAULT_HEARTBEAT_INTERVAL_MINUTES), section)
-
-    def test_every_offered_cap_appears_with_its_default(self):
-        from vibe_guide.authorization import (
-            DEFAULT_ROTATE_HARD_CAP_TOKENS, ROTATE_HARD_CAP_CHOICES,
-        )
-        section = self._section()
-        self.assertIn("`rotate_hard_cap`", section)
-        for tokens in ROTATE_HARD_CAP_CHOICES:
-            self.assertIn("`{}`".format(tokens), section)
-        self.assertIn("缺省 `{}`".format(DEFAULT_ROTATE_HARD_CAP_TOKENS), section)
-
-    def test_both_availability_conditions_name_their_evidence(self):
-        section = self._section()
-        self.assertIn("推送唤醒已验证", section)
-        self.assertIn("30 万", section)
-        self.assertIn("--session-record", section)
-
-    def test_republish_fallback_and_legacy_rules_are_all_stated(self):
-        section = self._section()
-        self.assertIn("新的 `plan_id` 重新发布", section)
-        self.assertIn("预检 `reason`", section)
-        self.assertIn("没有这两项的旧计划", section)
-        self.assertIn("60 分钟", section)
 
     def test_the_schema_block_names_exactly_the_offered_tiers(self):
         # Both directions matter: a tier added to the schema but not to the code
@@ -1526,81 +1396,83 @@ class CardOptionProtocolTests(unittest.TestCase):
 
 
 class StallSelfHealSectionTests(unittest.TestCase):
-    """§6.5 must tell the supervisor what to do when a node is stalled.
+    """§6.1 must tell the supervisor what to do when a node is stalled.
 
     The vocabulary below is the contract between this text and the code that
-    prints it (status label, tier names, review command, event type).  The
-    text-side checks always run; the code-side check turns on as soon as any
-    module in ``vibe_guide`` carries any of these tokens, so a wiring change that
-    renames the command or a label fails here instead of leaving the protocol
-    pointing at something that no longer exists.
+    prints it (status label, review command, event type).  §6.1 now states the
+    ladder as three levels (daemon retry / repair short session / escalate); the
+    old tier identifiers and the preflight "优先于 `idle`" bullet were removed
+    with the heartbeat runbook, so they are no longer asserted here.
     """
 
     STALL_LABEL = "需要监工排查"
     ESCALATE_LABEL = "需要人处理"
     REVIEW_COMMAND = "vibe heal-verify"
-    TIERS = ("supervisor_investigate", "escalate_to_pm")
+    TIERS = ("supervisor_investigate", "escalate_to_pm")  # code-side identifiers
     ATTEMPT_EVENT = "self_heal_attempt"
     RETIRED_LABELS = ("自动修复中", "自动推进中")
 
-    def _branch(self):
+    def _levels(self):
         from vibe_guide.protocols import load_protocol
         text = load_protocol("prd-guide")
-        start = text.index("### 6.5 ")
-        end = text.find("\n## ", start)
+        start = text.index("### 6.1 ")
+        end = text.find("\n### ", start + 1)
         section = text[start:end if end != -1 else len(text)]
-        lines = [line for line in section.splitlines() if self.STALL_LABEL in line
-                 and line.lstrip().startswith("- ")]
-        self.assertEqual(len(lines), 1, "§6.5 needs exactly one stall branch bullet")
-        return lines[0]
+        items = {}
+        for line in section.splitlines():
+            for number in ("2", "3"):
+                if line.startswith(number + ". "):
+                    items[number] = line
+        self.assertEqual(sorted(items), ["2", "3"], "§6.1 needs level 2 and level 3 items")
+        return items["2"], items["3"], section
 
     def test_stall_branch_exists_in_the_heartbeat_section(self):
-        self._branch()
+        investigate, escalate, _section = self._levels()
+        self.assertIn(self.STALL_LABEL, investigate)
+        self.assertIn(self.ESCALATE_LABEL, escalate)
 
     def test_stall_branch_names_the_commands_labels_and_tiers_verbatim(self):
-        line = self._branch()
-        for token in (self.STALL_LABEL, self.ESCALATE_LABEL, self.REVIEW_COMMAND,
-                      self.ATTEMPT_EVENT, *self.TIERS):
-            self.assertIn(token, line, token)
+        investigate, escalate, _section = self._levels()
+        for token in (self.STALL_LABEL, self.REVIEW_COMMAND, self.ATTEMPT_EVENT):
+            self.assertIn(token, investigate, token)
+        self.assertIn(self.ESCALATE_LABEL, escalate)
 
     def test_stall_branch_orders_the_ladder_investigate_fix_verify_escalate(self):
-        line = self._branch()
-        steps = ("排查包", "修复", self.REVIEW_COMMAND, "2 次", "停下")
-        positions = [line.index(step) for step in steps]
+        investigate, escalate, _section = self._levels()
+        steps = ("排查包", "授权范围内修复", self.REVIEW_COMMAND)
+        positions = [investigate.index(step) for step in steps]
         self.assertEqual(positions, sorted(positions), "ladder steps out of order")
+        self.assertIn("两次修复无进展", escalate)
+        self.assertIn("停下报告", escalate)
 
     def test_stall_branch_states_the_edit_boundary(self):
-        line = self._branch()
-        self.assertIn("运行时文件", line)
-        self.assertIn("state.json", line)
-        self.assertIn("events.jsonl", line)
-        self.assertIn("不得直接改", line)
+        investigate, _escalate, _section = self._levels()
+        self.assertIn("运行时文件", investigate)
+        self.assertIn("state.json", investigate)
+        self.assertIn("events.jsonl", investigate)
+        self.assertIn("不得直接改", investigate)
 
     def test_stall_branch_keeps_the_product_and_authorization_boundary(self):
-        line = self._branch()
+        _investigate, escalate, _section = self._levels()
         for phrase in ("产品", "授权", "deploy"):
-            self.assertIn(phrase, line, phrase)
+            self.assertIn(phrase, escalate, phrase)
 
     def test_stall_branch_does_not_present_a_stall_as_progress(self):
-        line = self._branch()
+        _investigate, _escalate, section = self._levels()
         for label in self.RETIRED_LABELS:
-            self.assertNotIn(label, line, label)
-        self.assertIn("优先于 `idle`", line)
+            self.assertNotIn(label, section, label)
 
     def test_each_tier_is_paired_with_its_own_label(self):
-        line = self._branch()
-        investigate, escalate = (line.index(tier) for tier in self.TIERS)
-        self.assertLess(line.index(self.STALL_LABEL), investigate)
-        self.assertLess(investigate, escalate)
-        between = line[escalate:line.index(self.ESCALATE_LABEL)]
-        self.assertNotIn(self.TIERS[0], between)
-        self.assertNotIn(self.STALL_LABEL, between)
+        investigate, escalate, _section = self._levels()
+        self.assertNotIn(self.ESCALATE_LABEL, investigate)
+        self.assertNotIn(self.STALL_LABEL, escalate)
 
     def test_readme_explains_the_stall_flow_in_user_terms(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         for token in (self.STALL_LABEL, self.ESCALATE_LABEL, self.REVIEW_COMMAND):
             self.assertIn(token, readme, token)
-        self.assertIn("不再显示“" + "”或“".join(self.RETIRED_LABELS) + "”", readme)
+        for label in self.RETIRED_LABELS:
+            self.assertNotIn(label, readme, label)
 
     def test_once_code_prints_the_stall_label_it_carries_every_other_token(self):
         sources = "\n".join(

@@ -649,19 +649,14 @@ class DocumentationExampleTests(unittest.TestCase):
         for command in release:
             self.assertNotIn("--category", command)
 
+        # prd-guide 已压缩为一条创建命令示例；--release 的完整命令示例与「挂起命令刷新」
+        # 行随旧监工手册一并删除（release 示例由上面的 README 断言覆盖）。
         prd_commands = re.findall(r"`(vibe supervisor-hold[^`]+)`", prd_guide)
-        prd_create_or_refresh = [command for command in prd_commands if "--release" not in command]
-        prd_release = [command for command in prd_commands if "--release" in command]
-        self.assertTrue(prd_create_or_refresh)
-        self.assertTrue(prd_release)
-        for command in prd_create_or_refresh:
+        self.assertTrue(prd_commands)
+        for command in prd_commands:
+            self.assertNotIn("--release", command)
             self.assertRegex(command, self._CATEGORY_SYNTAX)
-        for command in prd_release:
-            self.assertNotIn("--category", command)
-
-        refresh_lines = [line for line in prd_guide.splitlines() if "挂起命令刷新" in line]
-        self.assertTrue(refresh_lines)
-        self.assertTrue(any(self._CATEGORY_SYNTAX.search(line) for line in refresh_lines))
+        self.assertRegex(prd_guide, r"`--release`\s*手工释放")
 
 
 if __name__ == "__main__":

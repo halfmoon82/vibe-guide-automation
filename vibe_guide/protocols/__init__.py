@@ -27,6 +27,8 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-28: tests re-pinned to the slim guide; <35KB; single-shift off switch.
+        "5aa107da27432d276ab913b86fa1749c756d16e564bcf41a0362ac782e5993e4",
         # 2026-10-28: §6 slimmed to daemon + short session + three-level self-heal,
         # pointing at supervisor-card.md; engine attestation 72h, merge rule, no
         # engineering questions to the product manager.
@@ -163,6 +165,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "a6d940da69d2e43664a37d44f0a9e28ad7f5ca2ecb8ebb03f46cf05752acd94b",
     }),
     "vibe-entry": frozenset({
+        # 2026-10-28: first-shift pointer §6.0.
+        "1f8ba7164902fd33df2db931d8a720458b21672500d299d568b7fbaf38e16b23",
         # 2026-10-28: first-shift supervisor does daemon start + 60-minute fallback check.
         "b3b201841310cec4de4d3e60cdef9773cb53cc5447317400b6543c481a7f344d",
         "315588896b6b69c069858aeaa2107146e6cbc3914f31b129e8057198842a0c38",
