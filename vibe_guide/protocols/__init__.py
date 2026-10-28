@@ -27,6 +27,8 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-28: integration merge — slim guide plus derived risk_tags rule (#321).
+        "a0b328bfbff4ccd5a9cd356be360df45b5fb3809afda8e898a7b6b65110f7914",
         # 2026-10-28: tests re-pinned to the slim guide; <35KB; single-shift off switch.
         "5aa107da27432d276ab913b86fa1749c756d16e564bcf41a0362ac782e5993e4",
         # 2026-10-28: §6 slimmed to daemon + short session + three-level self-heal,
@@ -35,6 +37,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "fd485222f9645667e76a203e4f4cda9dd226b2e9ec6a184f2c493b9f2d9e377b",
         # 2026-10-28: heartbeat tiers 10/60 (was 10/30); dispatch_mode field.
         "d529d1256141b67d1d3317a0b6de0c5a6e7599d36afd54813cc61019faeb13d6",
+        # 2026-10-28: derive execution risk_tags; reject product-side overrides.
+        "d84945dbabc656db5ceace7d6d54097f3eaf357512b9f675a7ec6600b5b5d54a",
         # 2026-10-27: §6.5 stalled-node branch merged onto the §6.4 fork_thread rule.
         "4720ebe75f624e66591e5faeea180936f9fa5cc53876d25ab6be04417bc6b5ba",
         # 2026-10-27: §6.5 stalled-node branch (investigate, self-heal, verify, escalate).

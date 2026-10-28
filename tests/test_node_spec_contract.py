@@ -89,6 +89,47 @@ class ProductSpecFieldBoundaryTests(unittest.TestCase):
 
 
 class ProductSpecPublishTests(_ProjectCase):
+    def test_product_only_publish_has_schedulable_roots_and_bound_risk_tags(self):
+        from vibe_guide.dag import audit_dag
+        from vibe_guide.models import Plan
+
+        self.write_capabilities()
+        result = self.plan_from_prd(self.write_spec(_product_spec()))
+        self.assertEqual(result.payload.get("status"), "ok", result.payload)
+        plan = Plan.from_dict(json.loads((self.plan_dir() / "plan.json").read_text(encoding="utf-8")))
+        audit = audit_dag(plan)
+        self.assertEqual(audit.status, "ready", audit.to_dict())
+        self.assertEqual(set(audit.ready_nodes), {"export-button", "date-range-filter"})
+        for node in plan.nodes:
+            if node.id != "integration-review":
+                self.assertTrue(node.contract["risk_tags"])
+                self.assertEqual(node.contract["risk_tags"], node.contract["worker_profile"]["selection_basis"]["risk_tags"])
+        for invalid in ([], None, "security", [""]):
+            with self.subTest(invalid=invalid):
+                changed = Plan.from_dict(plan.to_dict())
+                changed.nodes[0].contract["risk_tags"] = invalid
+                rejected = audit_dag(changed)
+                self.assertEqual(rejected.status, "blocked_dag", rejected.to_dict())
+                self.assertNotIn("export-button", rejected.ready_nodes)
+        changed = Plan.from_dict(plan.to_dict())
+        changed.nodes[0].risk_tags = ["security"]
+        rejected = audit_dag(changed)
+        self.assertEqual(rejected.status, "blocked_dag", rejected.to_dict())
+        self.assertTrue(any("risk_tags mismatch" in reason for reason in rejected.reasons["export-button"]))
+
+    def test_product_cannot_supply_risk_tags_at_either_metadata_location(self):
+        self.write_capabilities()
+        for location in ("node", "contract"):
+            with self.subTest(location=location):
+                spec = _product_spec()
+                target = spec["nodes"][0] if location == "node" else spec["nodes"][0]["contract"]
+                target["risk_tags"] = ["read-only"]
+                plan_id = "risk-smuggling-" + location
+                result = self.plan_from_prd(self.write_spec(spec), plan_id=plan_id)
+                self.assertNotEqual(result.payload.get("status"), "ok", result.payload)
+                self.assertIn("risk_tags", result.payload.get("reason", ""))
+                self.assertFalse(self.plan_dir(plan_id).exists())
+
     def test_entry_route_band_equals_published_plan_band(self):
         self.write_capabilities()
         result = self.plan_from_prd(self.write_spec(_product_spec()))

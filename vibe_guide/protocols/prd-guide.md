@@ -144,7 +144,9 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
 
 `heartbeat_interval_minutes`、`rotate_hard_cap`、`dispatch_mode` 由 vibe 按平台推导，缺省即可，**不向产品经理询问**（§5.3）。
 
-**黑名单（写了就被拒）**：顶层 `complexity_band` `route` `route_result` `capabilities` `project_id` `integration_contract` `spec_path` `plan_id`；节点 `status`；`contract` 内 `adapter_id` `project_id` `worker` `reviewer_worker` `worker_profile` `worktree` `branch` `writer` `reviewer`。`worktree` 与 `branch` 由 vibe 按节点 id 派生（`.worktrees/<节点>` 与 `node/<节点>`），写死会让并行节点撞进同一棵树。
+产品路径的 `risk_tags` 默认派生为 `write_scope`，表示节点写入合同文件范围的工程风险，不是业务风险评级或执行许可。旧 `--node-spec` 的显式标签保持原样；空值、错误类型和多处冲突仍由 DAG 审计拒绝。
+
+**黑名单（写了就被拒）**：顶层 `complexity_band` `route` `route_result` `capabilities` `project_id` `integration_contract` `spec_path` `plan_id`；节点 `status` `risk_tags`；`contract` 内 `adapter_id` `project_id` `worker` `reviewer_worker` `worker_profile` `worktree` `branch` `writer` `reviewer` `risk_tags`。`worktree` 与 `branch` 由 vibe 按节点 id 派生（`.worktrees/<节点>` 与 `node/<节点>`），写死会让并行节点撞进同一棵树。
 
 ### 5.2 登记本会话的能力（复杂计划发布前必做一次）
 
