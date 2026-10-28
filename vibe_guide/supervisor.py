@@ -13,6 +13,7 @@ from .authorization import (
     DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
     DEFAULT_ROTATE_HARD_CAP_TOKENS,
     HEARTBEAT_INTERVAL_CHOICES,
+    HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
     ROTATE_HARD_CAP_CHOICES,
 )
 from .config import load_supervisor_single_shift
@@ -598,7 +599,7 @@ def _registered_provider(paths, run_id):
     return provider if isinstance(provider, str) and provider else None
 
 
-def _provider_never_rotates(provider):
+def provider_never_rotates(provider):
     """Claude Code (any spelling) has no automatic shift change."""
     return _provider_family(provider) == "claude"
 
@@ -661,7 +662,7 @@ def supervisor_preflight(
         return {"state": "unknown", "reason": "growth threshold must be positive"}
     if type(context_hard_cap) is not int or context_hard_cap <= DEFAULT_ROTATE_SOFT_CAP:
         return {"state": "unknown", "reason": "context hard cap must exceed soft cap"}
-    no_rotate = _provider_never_rotates(_registered_provider(paths, run_id))
+    no_rotate = provider_never_rotates(_registered_provider(paths, run_id))
     pressure = None
     if tokens >= context_hard_cap:
         if not no_rotate:
@@ -1557,7 +1558,7 @@ def wake_channel(provider):
     """Return ``(channel, reason)`` for push wake-ups on ``provider``.
 
     One definition shared by :func:`wake_instruction` (which also needs the
-    target and the signal) and the authorization card's 30-minute availability:
+    target and the signal) and the authorization card's long-interval availability:
     a card must never offer a cadence the dispatch path could not wake.
     """
     family = _provider_family(provider)
@@ -1624,11 +1625,11 @@ HOST_SHIFT_DIFFERENCES = (
 )
 
 
-#: One source for the beat cadence.  Default 10 minutes; 30 once a platform's
-#: push wake-up is registered as verified (success and failure evidence both);
-#: 60 while the only open item is an unanswered human decision.
-HEARTBEAT_INTERVAL_DEFAULT_MINUTES = 10
-HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES = 30
+#: The tiers are defined once in ``authorization``.  Default 10 minutes; 60 once
+#: a platform's push wake-up is registered as verified (success and failure
+#: evidence both); 60 also while the only open item is an unanswered human
+#: decision.
+HEARTBEAT_INTERVAL_DEFAULT_MINUTES = DEFAULT_HEARTBEAT_INTERVAL_MINUTES
 HEARTBEAT_INTERVAL_DECISION_MINUTES = 60
 PUSH_WAKE_VERIFICATION_RELATIVE = ".vibe/push-wake-verification.json"
 _HEARTBEAT_INTERVAL_FILE = "heartbeat-interval.json"
@@ -1639,7 +1640,7 @@ _HEARTBEAT_INTERVAL_FILE = "heartbeat-interval.json"
 #: ids -- a manifest's ``id`` field, which has no constant of its own and is
 #: spelled the same way by ``supervisor_wakeup``.  ``-background`` is
 #: deliberately absent: it is a different wake path, and substituting its
-#: registration would offer 30 minutes on a visible task whose wake-up was never
+#: registration would offer the long interval on a visible task whose wake-up was never
 #: verified.
 _WAKE_PROVIDER_GROUPS = {
     "codex": ("codex", "codex-app", CODEX_PROVIDER),
@@ -1719,7 +1720,7 @@ def _push_wake_verified(paths, provider):
 
 
 def _push_wake_available(paths, provider):
-    """Return ``(available, reason)`` for the 30-minute idle base."""
+    """Return ``(available, reason)`` for the long idle base."""
     if not isinstance(provider, str) or not provider:
         return False, "supervisor provider unknown: the platform's push wake-up cannot be checked"
     verified, reason = _push_wake_verified(paths, provider)
@@ -1731,15 +1732,15 @@ def _push_wake_available(paths, provider):
     return True, reason
 
 
-#: What choosing 30 minutes costs when push wake-up is not verified.
-FORCED_INTERVAL_COST = "worker 完工后监工最长 30 分钟才会发现"
+#: What choosing the long interval costs when push wake-up is not verified.
+FORCED_INTERVAL_COST = "worker 完工后监工最长 {} 分钟才会发现".format(HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES)
 
 
 def heartbeat_interval_options(paths, provider):
     """Every idle base a card may offer, with availability and the reason.
 
     Unavailable tiers are listed, never hidden (product decision 2026-10-13):
-    the product manager should see that 30 minutes exists and why it cannot be
+    the product manager should see that the long interval exists and why it cannot be
     chosen yet, not silently get a two-option card on one platform and a
     one-option card on another.
     """
@@ -1750,7 +1751,7 @@ def heartbeat_interval_options(paths, provider):
             continue
         available, reason = _push_wake_available(paths, provider)
         if not available and isinstance(provider, str) and provider:
-            # No verified push wake-up: 30 stays selectable as a forced choice
+            # No verified push wake-up: the long tier stays selectable as a forced choice
             # (product decision 2026-10-23) with its price on the card.  An
             # unknown provider cannot be judged, so it stays unavailable.
             entries.append({"minutes": minutes, "available": True, "reason": reason,
@@ -1825,7 +1826,7 @@ def authorization_choices(paths, run_id):
         # to prevent, so anything outside the offered tiers reads as absent.
         if type(value) is int and value in allowed:
             choices[key] = value
-    # A forced 30-minute choice is written into the signed authorization record
+    # A forced long-interval choice is written into the signed authorization record
     # itself (with its stated price); honour it only for that exact tier.
     if (choices.get("heartbeat_interval_minutes") is not None
             and data.get("heartbeat_interval_forced") is True
@@ -1897,7 +1898,7 @@ def heartbeat_interval(paths, run_id, *, decision_only):
             return {"minutes": chosen, "mode": "push_verified",
                     "reason": reason, "provider": provider}
         if choices.get("heartbeat_interval_forced"):
-            # The card marked this 30 as a forced choice and stated its price:
+            # The card marked this long interval as a forced choice and stated its price:
             # honour the authorization instead of silently returning to 10.
             return {"minutes": chosen, "mode": "forced",
                     "reason": "authorization forced {} minutes ({}); {}".format(
@@ -2303,6 +2304,68 @@ def supervisor_mailbox_view(paths, run_id):
         items.append(item)
     return {"command": "supervisor-mailbox", "status": "ok", "run_id": run_id,
             "pending_count": len(items), "pending": items}
+
+
+_TEMPLATE_PLACEHOLDER = "<填写>"
+
+
+def _template_payload(operation, role):
+    """A result example for ``operation`` that passes ``validate_result_shape``.
+
+    Placeholder strings stand where the supervisor must put real values; the
+    shape check accepts them, so a template submitted unedited is stored --
+    the output tells the caller which values are placeholders.
+    """
+    if operation == "wait":
+        if role == "reviewer":
+            return {"status": "complete", "event": "accepted",
+                    "evidence": {"summary": _TEMPLATE_PLACEHOLDER}}
+        return {"status": "complete", "event": "delivered",
+                "delivery_evidence": {"completion_marker": _TEMPLATE_PLACEHOLDER,
+                                      "delivery_path": _TEMPLATE_PLACEHOLDER,
+                                      "thread_status": _TEMPLATE_PLACEHOLDER}}
+    if operation == "create":
+        return {"binding": {"threadId": _TEMPLATE_PLACEHOLDER}}
+    if operation == "resume":
+        return {"resumed": True}
+    return {"status": _TEMPLATE_PLACEHOLDER}
+
+
+def mailbox_result_template(paths, run_id, action_id):
+    """The example result for one mailbox request (read-only)."""
+    from .adapters.task_provider import ProviderActionStore
+
+    request = ProviderActionStore(paths).action(action_id)
+    if request.get("run_id") != run_id:
+        raise ValueError("provider action belongs to a different run")
+    operation = request.get("operation")
+    return {"command": "supervisor-mailbox", "status": "ok", "run_id": run_id,
+            "action_id": action_id, "operation": operation, "role": request.get("role"),
+            "placeholder": _TEMPLATE_PLACEHOLDER,
+            "template": _template_payload(operation, request.get("role"))}
+
+
+def mailbox_complete(paths, run_id, action_id, payload):
+    """Write one mailbox result; ``completed`` or ``already_completed``.
+
+    A request that already holds a result is reported as completed and nothing
+    is written: the first bound result wins, and a second answer must not leave
+    observation files behind.  A shape the reader would reject raises
+    ``ValueError`` before anything is stored.
+    """
+    from .adapters.task_provider import ProviderActionStore
+    from .runners.provider_action import complete_mailbox_action
+
+    store = ProviderActionStore(paths)
+    request = store.action(action_id)
+    if request.get("run_id") != run_id:
+        raise ValueError("provider action belongs to a different run")
+    if store.result(action_id) is not None:
+        return {"command": "supervisor-mailbox", "status": "already_completed",
+                "run_id": run_id, "action_id": action_id}
+    complete_mailbox_action(paths, run_id, action_id, payload)
+    return {"command": "supervisor-mailbox", "status": "completed",
+            "run_id": run_id, "action_id": action_id}
 
 
 # --- self-heal wiring: stall detection and heal pack reach the heartbeat -------

@@ -648,8 +648,8 @@ class PublishSectionTests(unittest.TestCase):
     def test_publish_step_tells_how_to_recover_a_parked_draft(self):
         """Where a draft is left when a swap is interrupted comes from the code."""
         import inspect
-        from vibe_guide import cli
-        source = inspect.getsource(cli._replace_draft)
+        from vibe_guide import publish
+        source = inspect.getsource(publish._replace_draft)
         self.assertIn('prefix="." + destination.name + ".draft."', source)
         self.assertIn('parked = holding / "draft"', source)
         self.assertIn("draft could not be restored", source)

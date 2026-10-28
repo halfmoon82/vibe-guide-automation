@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional
 from .adapters.base import Environment
 from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
+from .authorization import HEARTBEAT_INTERVAL_CHOICES, ROTATE_HARD_CAP_CHOICES
 from .models import IntegrationAcceptanceContract, node_branch, node_worktree
 from .prd_profiles import render_planning_brief
 from .scanner import resolve_rules_file
@@ -49,8 +50,10 @@ PRODUCT_SPEC_FIELDS: Dict[str, Any] = {
     "rationale?": {"framing|tradeoffs|flow|acceptance": "verified_fact: ..."},
     "remote_git_actions?": "allow|deny",
     # ISSUE-209 card choices; the protocol's §5.1 block must match this exactly.
-    "heartbeat_interval_minutes?": "10|30",
-    "rotate_hard_cap?": "150000|200000|300000|500000|800000",
+    "heartbeat_interval_minutes?": "|".join(str(item) for item in HEARTBEAT_INTERVAL_CHOICES),
+    "rotate_hard_cap?": "|".join(str(item) for item in ROTATE_HARD_CAP_CHOICES),
+    # Claude Code dispatches in the background by default; "visible" switches to cards.
+    "dispatch_mode?": "background|visible",
 }
 
 #: Fields vibe derives.  A product spec carrying any of them is rejected.

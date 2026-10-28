@@ -1117,7 +1117,7 @@ class ReauthorizeComplexProjectionTests(unittest.TestCase):
     """``(a)`` and ``(d)`` — observed on a real complex run."""
 
     def setUp(self):
-        self.root = publish_complex_probe(self)
+        self.root = publish_complex_probe(self, dispatch_mode="visible")
         self.paths = ProjectPaths(self.root)
         authorized = run_cli(
             ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
@@ -1302,7 +1302,7 @@ class FailedReauthorizationCardPublicationTests(unittest.TestCase):
     """``(b)`` — the card may only be published once reauthorize succeeded."""
 
     def setUp(self):
-        self.root = publish_complex_probe(self)
+        self.root = publish_complex_probe(self, dispatch_mode="visible")
         self.paths = ProjectPaths(self.root)
         authorized = run_cli(
             ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
@@ -1461,7 +1461,7 @@ class RefreshNamesFreshEngineEvidenceTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.root = publish_complex_probe(self)
+        self.root = publish_complex_probe(self, dispatch_mode="visible")
         self.paths = ProjectPaths(self.root)
         authorized = run_cli(
             ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
@@ -1567,7 +1567,7 @@ class ExpiredEngineEvidenceReauthorizationTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.root = publish_complex_probe(self)
+        self.root = publish_complex_probe(self, dispatch_mode="visible")
         self.paths = ProjectPaths(self.root)
         authorized = run_cli(
             ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
@@ -1828,7 +1828,7 @@ class CardPreviewTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.root = publish_complex_probe(self)
+        self.root = publish_complex_probe(self, dispatch_mode="visible")
         self.paths = ProjectPaths(self.root)
         authorized = run_cli(
             ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],
@@ -2031,7 +2031,7 @@ class FirstPublicationPreviewTests(unittest.TestCase):
     """
 
     def setUp(self):
-        self.root = publish_complex_probe(self)
+        self.root = publish_complex_probe(self, dispatch_mode="visible")
         self.paths = ProjectPaths(self.root)
         authorized = run_cli(
             ["authorize", "--plan", "probe-plan", "--authorize", "AUTHORIZE", "--json"],

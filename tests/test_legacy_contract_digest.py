@@ -27,7 +27,7 @@ from vibe_guide.authorization import (
     legacy_executable_contract_digest,
 )
 from vibe_guide.capability_contract import build_contract, save_contract
-from vibe_guide.models import AgentCapabilities, Plan
+from vibe_guide.models import AgentCapabilities, DAGNode, Plan
 from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.fake import FakeRunner
@@ -186,13 +186,12 @@ class LegacyContractDigestTests(unittest.TestCase):
         self.assertNotEqual(rebound.nodes["a"]["status"], "accepted")
         self.assertNotEqual(rebound.nodes["b"]["status"], "accepted")
 
-    def test_new_code_reauthorization_of_unchanged_507_dag_keeps_everything(self):
+    def test_new_code_reauthorization_no_longer_keeps_507_acceptance(self):
+        # 5.2.0 retired the 5.0.7 aggregate digest: such runs are closed on the
+        # old version, so nothing is carried over as accepted.
         snapshot = self._accepted_507_run()
         rebound = self._reauthorize_under_new_code(snapshot, self._nodes())
-        self.assertEqual(
-            {node_id: current["status"] for node_id, current in rebound.nodes.items()},
-            {"a": "accepted", "b": "accepted"},
-        )
+        self.assertNotIn("accepted", {current["status"] for current in rebound.nodes.values()})
 
     def test_new_code_reauthorization_still_invalidates_a_507_semantic_change(self):
         snapshot = self._accepted_507_run()
@@ -218,11 +217,11 @@ class LegacyContractDigestTests(unittest.TestCase):
         self.assertNotEqual(executable_contract_digest(changed), _digest_as_507(changed))
         self.assertEqual(snapshot.node_contract_digest, _digest_as_507(changed))
 
-    def test_507_authorization_record_stays_valid_against_live_nodes(self):
+    def test_507_authorization_record_is_no_longer_valid(self):
         nodes = self._nodes()
         with _as_written_by_507():
             record = self._record(nodes)
-        self.assertTrue(is_authorization_valid(record, self.plan, nodes))
+        self.assertFalse(is_authorization_valid(record, self.plan, nodes))
 
     def test_507_record_is_rejected_when_the_contract_drifted(self):
         nodes = self._nodes()
@@ -297,14 +296,13 @@ class ScopeOnlyExpansionPredicateTests(unittest.TestCase):
 class MalformedContractDigestTests(unittest.TestCase):
     """A corrupt persisted digest is a mismatch, never a crash."""
 
-    def test_both_algorithms_still_match(self):
+    def test_only_the_current_algorithm_matches(self):
         self.assertTrue(
             executable_contract_digest_matches([], executable_contract_digest([]))
         )
-        self.assertTrue(
-            executable_contract_digest_matches(
-                [], legacy_executable_contract_digest([])
-            )
+        nodes = [DAGNode("a", "a", [], [], None, {"files": ["x"], "input": "i"}, "planned")]
+        self.assertFalse(
+            executable_contract_digest_matches(nodes, legacy_executable_contract_digest(nodes))
         )
 
     def test_malformed_digests_are_mismatches_not_errors(self):
