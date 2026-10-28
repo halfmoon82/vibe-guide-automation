@@ -5,61 +5,62 @@
 
 ## 阅读地图（按角色读，不必全量前置）
 
-- **PRD 引导会话**（和产品经理谈需求、拆节点、写产品 spec）：读 §0–§5；其中 §2.1 方法论引用按话题取用，§4 的扩范围判据细节到拆节点时再细读。
-- **首班监工**：读 §0 + §6。开工先做 §6.0 的两件接电动作，每轮按 §6.1–§6.3 服务信箱、§6.5 执行心跳纪律；§1–§5 只在要重新发布或改卡时回头读。
+- **PRD 引导会话**（和产品经理谈需求、拆节点、写产品 spec）：读 §0–§5；§2.1 方法论按话题取用，§4 扩范围判据拆节点时再细读。
+- **首班监工**：读 §0 + §6，每一拍的动作以随包 `supervisor-card.md`（监工卡）为准；§1–§5 只在要重新发布或改卡时回头读。
 - **§6.4 平台差异表只读本宿主一行**；其他平台的行到需要对比时再读。
-- **§6.2 整合审查节点的 `accepted` evidence 结构化格式**：到整合审查节点派发或回写时再读，首班不必前置。
+- **§6.2 整合审查节点的 `accepted` evidence 结构化格式**：到整合审查节点回写时再读。
 - **§7 打断边界**：监工准备挂起或建决策时读；PRD 会话在要抛出 `needs_confirmation` 问题时读。
 
 ## 0. 分工
 
 - **agent 出内容**：和产品经理对话、只读分析代码、写 PRD、拆节点、记录产品决策。
-- **vibe 出协议 + 校验 + 脚手架**：路由分流、校验产品 spec、派生全部工程字段、发布计划、签授权卡、派发监工。
-- agent **不得**在产品 spec 里写任何工程字段（见 §5 的黑名单），vibe 会拒绝。
+- **vibe 出协议 + 校验 + 脚手架**：路由分流、校验产品 spec、派生全部工程字段（含每个节点的能力档位）、发布计划、签授权卡、派发监工。
+- agent **不得**在产品 spec 里写任何工程字段（见 §5.1 黑名单），vibe 会拒绝。
 - agent **不得**替产品经理做产品决策：`decisions[].status` 只有产品经理明确选定后才能写 `approved`。
+- **不向产品经理问工程问题**：心跳间隔、换班上限、模型、重试次数、拓扑、worktree 等一律由 vibe 按平台与证据推导，监工自定并留痕。
 
 ## 1. 入口判定
 
-**跳过条件**：如果当前会话已经通过 `vibe-entry` 协议做过 `--s1` 自评，跳过本节直接进入 §2，避免重复评分。
+**跳过条件**：当前会话已通过 `vibe-entry` 协议做过 `--s1` 自评，跳过本节直接进入 §2。
 
-收到一条新请求，先原样交给 vibe 分流，不要自己判断复杂度：
+收到新请求，先原样交给 vibe 分流，不要自己判断复杂度：
 
 ```bash
 vibe plan --request "<产品经理的原话>" --json
 ```
 
-- `route` 为 `simple` 或 `light_plan`：直接开始做，不进入本协议；但涉及图形界面时，动手前仍要先过 vibe-entry §4 的界面设计稿门（出稿、等产品经理明确确认）。
-- `route` 为 `complex`：vibe 会生成一个 draft（`status: planned`，`execution: deferred_until_authorize`），记下 `plan_id`，进入 §2。
-- 不要自己算 `--s1`：分数由 vibe 从文本推导并记进草案，发布时沿用草案的评分（§5.3 不必再传）；如果产品经理明确要求按复杂流程走，用 `--s1 5,5,5,5,5` 显式升级，绝不反向降级。
+- `route` 为 `simple` 或 `light_plan`：直接做，不进入本协议；涉及图形界面时，动手前仍要先过 vibe-entry §4 的界面设计稿门（出稿、等产品经理明确确认）。
+- `route` 为 `complex`：vibe 生成 draft（`status: planned`，`execution: deferred_until_authorize`），记下 `plan_id`，进入 §2。
+- 不要自己算 `--s1`：分数由 vibe 从文本推导并记进草案，发布时沿用；产品经理明确要求按复杂流程走，用 `--s1 5,5,5,5,5` 显式升级，绝不反向降级。
 
 ## 2. PRD 引导对话（只谈产品，不谈工程）
 
-按下面五个话题逐一确认，每条结论都带来源标记：
+按五个话题逐一确认，每条结论带来源标记：
 
 | 话题 | 要问清楚的 | 典型追问 |
 |---|---|---|
-| 问题 | 现在哪里不顺、谁遇到、多常见 | "现在没有这个功能时，你们是怎么绕过去的？" |
-| 目标 | 做完以后什么变了 | "上线一周后，你看哪个数字或反馈来判断成功？" |
-| 成功标准 | 可观察、可验收 | "验收那天，你会亲手点哪几步？期待看到什么？" |
+| 问题 | 现在哪里不顺、谁遇到、多常见 | "没有这个功能时怎么绕过去？" |
+| 目标 | 做完以后什么变了 | "上线一周后看什么判断成功？" |
+| 成功标准 | 可观察、可验收 | "验收那天你会点哪几步？" |
 | 非目标 | 明确不做的 | "有没有相关但这次不碰的？" |
-| 用户场景 | 谁、在什么情况下、做什么、得到什么 | "举一个最常见的例子。" |
+| 用户场景 | 谁、什么情况、做什么、得到什么 | "举一个最常见的例子。" |
 
-来源标记规则：
+来源标记：
 
-- `user_confirmed`：产品经理亲口说过或明确点头的。
-- `system_inferred`：agent 从上下文或代码合理推断、产品经理没有反对的。**不打断产品经理**，直接记下继续。
+- `user_confirmed`：产品经理亲口说过或明确点头。
+- `system_inferred`：agent 从上下文或代码合理推断、产品经理没有反对。**不打断**，直接记下继续。
 - `needs_confirmation`：会改变产品方向、授权边界或验收标准的取舍。**必须停下来问**，得到答案前不能进入 §4。
-- `unverified`：证据不足、暂时无法核实的（多见于代码现状）。
+- `unverified`：证据不足、暂时无法核实（多见于代码现状）。
 
-只在 `needs_confirmation` 时提问。每次只问一个问题，说清楚不同答案会怎样改变结果。普通的信息缺口记为 `system_inferred` 继续。
+只在 `needs_confirmation` 时提问，每次只问一个问题，说清楚不同答案会怎样改变结果。
 
-**涉及图形界面时，PRD 必须带设计稿**（vibe-entry §4 的界面设计稿门在这里落地）：本次新增和改动的每一个页面，都在 `prd.design_mockups` 小节写一条，`value` 形如 `订单列表页（改动）：<稿件路径或链接>`。稿件必须打开就能看到页面长什么样（图片、HTML 原型、Figma 等链接），纯文字描述不算。产品经理确认前这条的 `source` 写 `needs_confirmation`——vibe 会因此拒绝发布，这是正确行为；他明确确认后改成 `user_confirmed`；稿件改过，把这条改回 `needs_confirmation` 重新确认。**设计稿没确认，不得进入 §4，更不得动手写代码。**
+**涉及图形界面时，PRD 必须带设计稿**：本次新增和改动的每个页面，在 `prd.design_mockups` 小节写一条，`value` 形如 `订单列表页（改动）：<稿件路径或链接>`。稿件必须打开就能看到页面（图片、HTML 原型、Figma 等链接），纯文字描述不算。产品经理确认前 `source` 写 `needs_confirmation`——vibe 因此拒绝发布，这是正确行为；确认后改 `user_confirmed`；稿件改过则改回重新确认。**设计稿没确认，不得进入 §4，更不得写代码。**
 
-会改变产品方向、授权边界或验收标准的取舍，同时要写成 `decisions[]` 条目：`question` / `options`（至少两个、互不相同）/ `impact` / `recommendation`（必须是 options 之一）/ `field`（这个决定落在哪个契约字段上，如 `export.watermark`）。产品经理选定后，`selected` 逐字等于所选 option，`status` 写 `approved`。**没选定的决策保持 `unresolved`，vibe 会拒绝发布，这是正确行为。**
+会改变产品方向、授权边界或验收标准的取舍，同时写成 `decisions[]`：`question` / `options`（至少两个、互不相同）/ `impact` / `recommendation`（必须是 options 之一）/ `field`（落在哪个契约字段，如 `export.watermark`）。选定后 `selected` 逐字等于所选 option，`status` 写 `approved`；**没选定的保持 `unresolved`，vibe 会拒绝发布。**
 
 ### 2.1 方法论引用（可参考，不强制）
 
-讨论到对应话题时，可参考下列方法论 skill；它们位于项目 `.vibe/proposals/skills/<名>/SKILL.md`。未安装时用下面的命令按锁定版本装进项目（`<名>` 和 `<子目录>` 取自表格对应行）：
+对应话题可参考项目 `.vibe/proposals/skills/<名>/SKILL.md` 里的方法论 skill；未安装时按锁定版本装入（`<名>`、`<子目录>` 取自下表）：
 
 ```bash
 vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077817f89bf4a9b623246219734ac3be0 --subdir <子目录> --name <名> --confirm
@@ -77,67 +78,46 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
 | strategy-red-team | 风险与反例 | `pm-execution/skills/strategy-red-team` |
 | pre-mortem | 风险与反例 | `pm-execution/skills/pre-mortem` |
 
-使用规则：
-
-- 仅作参考、不强制逐字引用；对应 skill 未安装时提示安装命令后继续按本节规则推进，不得阻塞对话。
-- `$ARGUMENTS` 与主题从当前对话读取，不为方法论单独要求参数。
-- 输出仍为中文；不得把方法论产出另存为额外 markdown 文件。
-- 不得改变来源标记与停等门：`user_confirmed`/`system_inferred`/`needs_confirmation`/`unverified` 的语义与 `needs_confirmation` 停等规则保持不变。
+仅作参考、不强制，未安装时提示安装命令后继续，不得阻塞对话；输出仍为中文，不得把方法论产出另存为额外 markdown 文件；不得改变来源标记与停等门。
 
 ## 3. 只读代码分析
 
-对话结束后、拆节点之前，只读地看代码。禁止改任何文件。找出：
-
-- 入口点：用户操作从哪个文件/函数进来。
-- 涉及模块：会碰到哪些模块、它们之间怎么调用。
-- 现有行为：今天这条路径实际做什么，有没有已知问题。
-- 现有测试：哪些测试覆盖了这条路径。
-
-产出两种东西：
+对话结束后、拆节点之前，只读地看代码，禁止改任何文件。找出入口点、涉及模块、现有行为（含已知问题）、现有测试。产出：
 
 1. `prd.code_evidence[]`：每条一句话 + 项目相对路径（可带符号名），来源标 `unverified` 或 `system_inferred`。
-2. 每个 `goals[]` 条目的 `code_evidence` 字段（§5）。
+2. 每个 `goals[]` 条目的 `code_evidence` 字段（§5.1）。
 
-用产品经理能懂的话把结论说一遍："这个需求会碰到保单查看页和 PDF 工具两处，现有测试没有覆盖导出。"不要念文件路径。
+用产品经理能懂的话说结论，不念文件路径。
 
 ## 4. 拆节点
 
 原则：默认并行，只把真正阻塞启动的关系写成硬依赖。
 
 - `depends_on`：没有它完成就**无法开始**的节点。
-- `integration_after`：可以先各自开发、最后要联调的关系。不阻塞启动。
-- `parallel_group`：可以同时开工的一组，用同一个组名；不需要分组就写 `null`。
-- **写范围重叠的节点必须用 `depends_on` 串行。**两个节点的 `files`（写范围）有重叠时，`integration_after` 和 `parallel_group` 都不能解除冲突——它们不阻塞启动，两个 writer 会同时写同一批文件被审计拒绝。拆节点时先把同文件工作归到同一节点；确实要拆成两个节点时，用 `depends_on` 把它们串起来。同一 `parallel_group` 内的重叠连 `depends_on` 也救不了，只能拆开路径或把其中一个移出该组。
-- 每个节点 `contract` 四个字段用验收语言写，不写实现细节：
-  - `input`：拿到什么。
-  - `output`：交出什么。
-  - `error_behavior`：出错时对用户的表现。
-  - `acceptance_example`：一个具体的例子，验收者照着做就能判断通过与否。
-- `files`：这个节点会动的文件，项目相对路径。这是**工程文件清单**，不是产品范围——它描述授权卡上的实现边界，扩展清单本身不等于产品设计变化。宁可列全，不要漏。漏列的文件可由监工不问产品经理、自行补进该节点范围，但必须同时满足：① 在本仓库内；② 不涉及部署、凭据、外部系统配置（`auto_scope_paths` 登记项由产品经理在登记时自行把关）；③ 没有被其他活跃节点的写范围（allowlist / owned_paths / 既往扩围）覆盖；④ 补进去要留下纠偏记录（`scope_auto_expanded` 事件）；⑤ 走通下面两类判据之一。
+- `integration_after`：可以先各自开发、最后联调的关系，不阻塞启动。
+- `parallel_group`：可同时开工的一组，用同一个组名；不需要分组写 `null`。
+- **写范围重叠的节点必须用 `depends_on` 串行。**两个节点的 `files` 有重叠时，`integration_after` 和 `parallel_group` 都不能解除冲突——它们不阻塞启动，两个 writer 会同时写同一批文件被审计拒绝。先把同文件工作归到同一节点；确要拆开，用 `depends_on` 串起来。同一 `parallel_group` 内的重叠连 `depends_on` 也救不了，只能拆开路径或把其中一个移出该组。
+- 每个节点 `contract` 四个字段用验收语言写，不写实现细节：`input`（拿到什么）、`output`（交出什么）、`error_behavior`（出错时对用户的表现）、`acceptance_example`（验收者照着做就能判断通过与否的具体例子）。
+- `files`：节点会动的文件，项目相对路径。这是**工程文件清单**，不是产品范围，扩展清单本身不等于产品设计变化；宁可列全。漏列的文件可由监工不问产品经理、自行补进该节点范围，须同时满足：① 在本仓库内；② 不涉及部署、凭据、外部系统配置；③ 没有被其他活跃节点的写范围覆盖；④ 留下 `scope_auto_expanded` 纠偏记录；⑤ 走通下面两类判据之一。
 
-  - **判据一（机械规则，始终有效）**：文件在 `tests/` 目录下，或项目 `.vibe/config.json` 的 `auto_scope_paths` 里登记过（逐条精确匹配，不支持通配符）。放在 `tests/` 下的依赖清单按本条放行。`auto_scope_paths` 是项目预先写好的白名单，登记本身即产品经理授权，因此这一支不再逐条检查依赖清单、敏感目录或外部配置根；配置文件缺失或非法时按空清单处理。
-  - **判据二（验收判定不变，需项目显式批准）**：每个已批准 PRD 验收例子的判定结果都不变，且文件属于低风险源码或文档（白名单与排除项见 `planner._approved_scope_rule`）。只在项目于 `.vibe/config.json` 写入 `acceptance_scope_rule_approved: true` 后生效，且该开关必须与项目 `AGENTS.md` §6 的同一规则成对出现；未开启的项目一律按判据一处理。
+  - **判据一（机械规则，始终有效）**：文件在 `tests/` 下（含 `tests/` 下的依赖清单），或在 `.vibe/config.json` 的 `auto_scope_paths` 里登记过（逐条精确匹配，不支持通配符；登记本身即产品经理授权，所以不要登记依赖清单、部署脚本或凭据文件；配置缺失或非法按空清单处理）。
+  - **判据二（验收判定不变，需项目显式批准）**：每个已批准 PRD 验收例子的判定结果都不变，且文件属于低风险源码或文档（白名单与排除项见 `planner._approved_scope_rule`）。只在项目 `.vibe/config.json` 写入 `acceptance_scope_rule_approved: true` 后生效，且该开关必须与项目 `AGENTS.md` §6 的同一规则成对出现；未开启一律按判据一处理。
 
-  两类边界必须问产品经理：新增第三方依赖（发布/安全对外承诺）、执行模式从「可见可进入的任务」降级为「后台不可见」。判据二用 payload 的两个布尔字段自证这两条，任一为真即整条拒绝；判据一不逐条判这两条——`auto_scope_paths` 是产品经理预先登记的清单，登记本身即授权，所以不要往里登记依赖清单、部署脚本或凭据文件。验收判定改变同样必须单独授权。
+  两类边界必须问产品经理：新增第三方依赖（发布/安全对外承诺）、执行模式从「可见可进入的任务」降级为「后台不可见」；验收判定改变同样单独授权。
 
-  判据二通过 `vibe scope-expand --run-id <run> --node <node> --payload '<json>'` 提出，且只对**已验收、当前没有活跃任务**的节点生效；节点开发中途的扩围走事件自报。payload 必须是对象，且**恰好五个键**：`files`、`acceptance_examples_unchanged`（必须为 `true`）、`adds_third_party_dependency`（必须为 `false`）、`visibility_downgrade`（必须为 `false`）、`reason`（去首尾空白后非空、≤200 字符、不含控制字符）。
+  判据二用 `vibe scope-expand --run-id <run> --node <node> --payload '<json>'` 提出，只对**已验收、当前没有活跃任务**的节点生效（开发中途的扩围走事件自报，只按判据一）。payload 恰好五个键：`files`（至少一条、不重复、归一化仓库相对路径）、`acceptance_examples_unchanged`（必须 `true`）、`adds_third_party_dependency`（必须 `false`）、`visibility_downgrade`（必须 `false`）、`reason`（非空、≤200 字符、无控制字符）。缺键、多键、取值不符或路径不合法整条拒绝，不做部分补入。
 
-  `files` 至少一条、不重复、每条都是归一化后的仓库相对路径（不能带 `./` 前缀、尾斜杠或控制字符）。缺键、多键、任一取值不符或任一条路径不合法，整条请求被拒，**不做部分补入**：未开启判据二的项目里，只要有一个文件不满足判据一，整条请求都不补。事件自报（一致性缺口 `inconsistency.scope_expansion`、整合审查发现 `review_finding.scope_expansion`）仍允许直接给路径数组，那种旧形态只按判据一处理。
+  交付和验收汇报逐节点列出 `scope_expansions`（`vibe status --json` 同名字段，为空写明无）。不在两类判据内的文件按 §7 单独授权。
+- 节点 `id` 用小写字母、数字、连字符；不要写 `integration-review`，vibe 会自动追加最终整合审查节点。
+- **能力档位由 vibe 派生**：每个节点得到平台无关的 `light` / `standard` / `deep` 三档之一（纯文档→light；带 migration/security/cross_module 标签、改动文件 ≥8 或跨 3 个以上模块→deep；其余 standard；reviewer 至少 standard；整合审查 deep）。档位不写进产品 spec，写了会被拒。
 
-  交付和验收汇报必须逐个节点列出 `scope_expansions`（`vibe status --json` 每个节点下的同名字段；为空也要写明无）。不在两类判据内的文件，按 §7 请产品经理单独授权；那一次授权的理由是文件越界，不是判据二没开。
-- 节点 `id` 用小写字母、数字、连字符。不要写 `integration-review`，vibe 会自动追加最终整合审查节点。
-
-拆完用产品语言复述一遍给产品经理："一共三件事，前两件可以同时做，第三件要等第一件做完。"
+拆完用产品语言复述一遍。
 
 ## 5. 产出与提交
 
 ### 5.1 产品 spec 的形状
 
-写成一个 JSON 文件，放在哪里取决于发布用的 `plan_id` 有没有草案：
-
-- 用 §1 草案的同一个 `plan_id` 发布：建议放在 `.vibe/plans/<plan_id>/product-spec.json`，发布时随草案一起保留。
-- 用没有草案的新 `plan_id` 发布（§5.3 改远端 Git 开关、恢复分支③）：放在 `.vibe/plans` 之外，建议项目根目录的 `product-spec.json`。
-- 不要事先建 `.vibe/plans/<新编号>/`：vibe 只替换草案目录，新编号下已经存在的目录会让发布报 `plan already exists`。
+写成一个 JSON 文件：用 §1 草案的同一个 `plan_id` 发布，放 `.vibe/plans/<plan_id>/product-spec.json`；用没有草案的新 `plan_id` 发布，放 `.vibe/plans` 之外（如项目根 `product-spec.json`）。不要事先建 `.vibe/plans/<新编号>/`，否则发布报 `plan already exists`。
 
 结构以 `vibe_guide.node_spec.PRODUCT_SPEC_FIELDS` 为准，测试会断言本节与代码一致：
 
@@ -162,179 +142,90 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
   ],
   "rationale?": {"framing|tradeoffs|flow|acceptance": "verified_fact: ..."},
   "remote_git_actions?": "allow|deny",
-  "heartbeat_interval_minutes?": "10|30",
-  "rotate_hard_cap?": "150000|200000|300000|500000|800000"
+  "heartbeat_interval_minutes?": "10|60",
+  "rotate_hard_cap?": "150000|200000|300000|500000|800000",
+  "dispatch_mode?": "background|visible"
 }
 ```
 
-`prd` 的推荐 section：`problem`、`user_scenarios`、`success_criteria`、`non_goals`、`code_evidence`；涉及图形界面时必须有 `design_mockups`（见 §2）。
+`prd` 的推荐 section：`problem`、`user_scenarios`、`success_criteria`、`non_goals`、`code_evidence`；涉及图形界面时必须有 `design_mockups`（§2）。
 
-**黑名单（写了就被拒）**：顶层 `complexity_band` `route` `route_result` `capabilities` `project_id` `integration_contract` `spec_path` `plan_id`；节点 `status`；`contract` 内 `adapter_id` `project_id` `worker` `reviewer_worker` `worker_profile` `worktree` `branch` `writer` `reviewer`。这些全部由 vibe 派生。
+`heartbeat_interval_minutes`、`rotate_hard_cap`、`dispatch_mode` 是授权卡上由 vibe 按平台推导的运行参数，缺省即可，**不向产品经理询问**（见 §5.3）。
 
-其中 `worktree` 与 `branch` 由 vibe 按节点 id 派生成互不相同的一对（`.worktrees/<节点>` 与 `node/<节点>`），保证每个节点在自己的目录和分支上开发；agent 写死它们会让两个并行节点撞进同一棵树。
+**黑名单（写了就被拒）**：顶层 `complexity_band` `route` `route_result` `capabilities` `project_id` `integration_contract` `spec_path` `plan_id`；节点 `status`；`contract` 内 `adapter_id` `project_id` `worker` `reviewer_worker` `worker_profile` `worktree` `branch` `writer` `reviewer`。`worktree` 与 `branch` 由 vibe 按节点 id 派生成互不相同的一对（`.worktrees/<节点>` 与 `node/<节点>`），agent 写死会让并行节点撞进同一棵树。
 
 ### 5.2 登记本会话的能力（复杂计划发布前必做一次）
 
-vibe 不猜宿主平台有什么能力，由 agent 盘点自己**这次会话里实际看到的**工具后登记：
+vibe 不猜宿主平台有什么能力，由 agent 盘点**这次会话里实际看到的**工具后登记：
 
 ```bash
 vibe attest --adapter <claude-code|codex|...> --facts <facts.json> --provenance "<一句话说明依据>" [--project-id <id>]
 ```
 
-`facts.json` 的键名以 `vibe_guide/adapters/manifests/<adapter>.yaml` 的 probes 为准，值只能是 `true` / `false`，只有确实看到对应工具才写 `true`。`project_id` 是宿主平台里这个项目的标识（Codex 的 project id、Claude Code 的会话 cwd 标识），可见任务派发需要它。
+`facts.json` 的键名以 `vibe_guide/adapters/manifests/<adapter>.yaml` 的 probes 为准，值只能是 `true` / `false`，看到对应工具才写 `true`。`project_id` 是宿主平台里这个项目的标识，可见任务派发需要它。
 
 ### 5.3 发布、授权、开工
 
-发布前先问产品经理：允许还是禁止远端 Git 动作（提交、推送、开 PR、合并），把答案写进产品 spec 顶层的 `remote_git_actions`（`allow` / `deny`，缺省 `deny`）。这个开关在发布时就写进授权卡，要在发布前定。
+发布前只问产品经理一件事：允许还是禁止远端 Git 动作（提交、推送、开 PR、合并），写进产品 spec 的 `remote_git_actions`（`allow` / `deny`，缺省 `deny`）。**不问心跳间隔与换班上限**：授权卡上的 `heartbeat_interval_minutes` 等运行参数由 vibe 推导（推送唤醒已验证的平台兜底检查为 60 分钟，未验证为 10 分钟），产品经理要改时才改。
 
 ```bash
 vibe plan --request "<产品经理的原话>" --plan-id <plan_id> --from-prd <product-spec.json> --json
 ```
 
-发布前还要问产品经理两个运行参数，答案写进产品 spec 顶层，缺省值由发布补齐：
+用 §1 草案的同一个 `plan_id` 发布，vibe 替换这份草案；已发布或已授权的计划不会被覆盖，仍报 `plan already exists`。发布不必传 `--s1`。替换中途被打断或 reason 含 `draft could not be restored` 时，按 reason 给出的路径（没给就找 `.vibe/plans/.<plan_id>.draft.*/draft`，多个时请产品经理选）确认草案：①没被挪动，原命令重发；②被挪开且 `.vibe/plans/<plan_id>` 不存在，挪回再重发；③被挪开且该目录已存在，不覆盖、不当成本次成功，取回产品 spec 放到 `.vibe/plans` 之外，换新 `plan_id` 重发（`--s1` 照草案 `plan.json` 里 `route_result.dimensions` 依次填），旧编号原样留着由产品经理决定。
 
-- `heartbeat_interval_minutes`：空闲基准心跳间隔，`10` 或 `30`，缺省 `10`。当前平台的推送唤醒已验证（`.vibe/push-wake-verification.json` 里该平台成功、失败证据各至少一条）时，`30` 正常可选。平台已知但推送未验证时，`30` 仍列出为**强制选择**：卡上标 `forced` 并写明代价（worker 完工后监工最长 30 分钟才会发现）；产品经理仍选它时，授权记录里写入 `heartbeat_interval_forced` 与代价原文，运行按 30 分钟出下一拍。平台未知或推送状态判不出来时该档不可用，卡上照样列出并写明原因。等答 60 分钟仍由 vibe 推导，不进卡。
-- `rotate_hard_cap`：换班硬上限，`150000` / `200000` / `300000` / `500000` / `800000`，缺省 `200000`。超过 20 万的档位只在宿主报告的上下文窗口不小于所选上限时可用：30 万、50 万、80 万分别需要至少同等大小的窗口。Codex 把窗口写在会话记录里，发布时加 `--session-record <本会话记录路径>` 传入该记录；未报告窗口的宿主不能选这些档位。模型宣称支持大窗口不替代当前会话的宿主证据；避免宿主先压缩、所选换班上限无法到达。
-
-两项都计入授权摘要，改任一项要用新的 `plan_id` 重新发布、重新授权，与改 `remote_git_actions` 同规则。运行时以授权记录里的值为准：条件不再满足时（推送登记被撤、接班会话窗口更小）退回默认值，并在预检 `reason` 里写明，不静默。没有这两项的旧计划保持改动前的行为不变：空闲间隔仍按推送唤醒是否已验证在 10/30 之间自动选，硬上限 200000。
-
-用 §1 草案的同一个 `plan_id` 发布，vibe 会替换这份草案（草案从未持有授权）；已发布或已授权的计划不会被覆盖，仍报 `plan already exists`。发布同样不必传 `--s1`，vibe 沿用草案记下的评分，只升不降。
-
-替换中途被打断（如 Ctrl-C）或 reason 含 `draft could not be restored` 时，先确认草案有没有被挪开：位置以 reason 里给出的路径为准，没给路径就找 `.vibe/plans/.<plan_id>.draft.*/draft`（命中多个时别猜：把每个目录的修改时间和其中 `plan.json` 的状态列给产品经理，请他选）。①找不到：草案没被挪动，直接按原命令重新发布；②找到了且 `.vibe/plans/<plan_id>` 不存在：把它整个挪回这个位置，再按原命令重新发布；③找到了且 `.vibe/plans/<plan_id>` 已存在就不要覆盖，也不要当成本次发布成功（那里可能是别的会话的发布，有授权卡也证明不了是你的）：从挪开的草案里取回产品 spec 放到 `.vibe/plans` 之外（见 §5.1），告诉产品经理这个编号已被占用，再换一个新的 `plan_id` 重新发布，`--s1` 照挪开草案 `plan.json` 里 `route_result.dimensions` 的 `steps,domains,uncertainty,failure_cost,toolchain` 依次填。旧编号下那份计划原样留着：不念它的卡、不对它 `vibe authorize` 或 `vibe monitor`，授权和开工只用新编号；把它的编号和 `plan.json` 的状态列给产品经理，说明它可能是本次被打断的发布，也可能是别的会话的，清不清理由产品经理决定。处理完后，挪开的草案移到废纸篓，剩下的空隐藏目录可以删掉。
-
-- `status: ok`：vibe 已生成 PRD、Spec、Issue、DAG 审计、授权卡、planning-brief。把 `authorization_card` 用产品语言念给产品经理：要做哪几件事、哪些同时开工、每件事一个开发任务加一个独立审查任务、发布前选定的远端 Git 开关（卡上的 `remote_git_actions`）、永远不含部署/发布/生产写入/凭据/对外通信。
-- 念卡时把两个运行参数一起念：卡上的 `heartbeat_interval_minutes` 与 `rotate_hard_cap`，以及 `heartbeat_interval_options` / `rotate_hard_cap_options` 里标着不可用的档位和原因；标 `forced` 的档位一并念出 `cost` 原文（选了它就按那个代价跑），不可用与强制档位都是产品经理该知道的选项，不是内部细节——别只念能用的那些，也别替他决定。
-- 念卡时分开说两件事，别让 `allow` 听起来像"允许了又排除了"：`excluded_actions` 里的推送/合并是说开发任务自己永远不推送；`allowed_actions` 里的推送/合并是说产品经理允许后，这些动作进入授权范围；vibe 只在独立终审通过后校验并记录，不代为执行。选 `deny` 时 `allowed_actions` 不含任何远端 Git 动作，`excluded_actions` 照样列着推送/合并。
-- 产品经理此时想改远端 Git 开关或上面两个运行参数：`vibe authorize` 改不了它们。把产品 spec 复制到 `.vibe/plans` 之外（见 §5.1），改其中的 `remote_git_actions` / `heartbeat_interval_minutes` / `rotate_hard_cap`，用一个新的 `plan_id` 重新发布（`--plan-id <新编号> --s1 <s1>`，`<s1>` 照抄首次发布结果里的 `s1`：草案已被替换，新编号没有评分可沿用），再念新卡。想选 30 万档时，这次发布还要带 `--session-record`，否则窗口未知、该档仍不可用。
-- `status: blocked` 且 reason 以 `product_spec_requires_complex_route` 开头：请求被评成了非复杂路径，vibe 拒绝丢掉产品 spec。用 §1 草案的 `plan_id` 发布，或按 §1 用 `--s1` 显式升级。
-- `status: blocked` 且 reason 含 `product decisions remain unresolved`：回到 §2 把决策问清楚。
-- `status: blocked` 且 reason 含 `engine_attestation_unavailable`：先做 §5.2。
-- `status: blocked_design` 且带 `question`：这是 PRD 检查点发现的未决产品问题，原样问产品经理。
+- `status: ok`：vibe 已生成 PRD、Spec、Issue、DAG 审计、授权卡。把 `authorization_card` 用产品语言念给产品经理：做哪几件事、哪些同时开工、每件事一个开发任务加一个独立审查任务、每个节点的能力档位与当前平台换算出的模型、派发方式（Claude Code 默认后台、可改选可见卡片，见 §6.4）、远端 Git 开关、永远不含部署/发布/生产写入/凭据/对外通信。
+- 分开说两件事，别让 `allow` 听起来像"允许了又排除了"：`excluded_actions` 里的推送/合并是开发任务自己永远不推送；`allowed_actions` 里的推送/合并是产品经理允许后进入授权范围的动作。**合并规则**：独立终审通过、P0–P2 清零后，vibe 在授权范围内标记「可合并」，监工执行合并命令，vibe 再核实合并提交可达目标分支后才记为已合并；监工自报不算证据。选 `deny` 时 `allowed_actions` 不含远端 Git 动作，`excluded_actions` 照样列着。
+- 想改远端 Git 开关或运行参数：`vibe authorize` 改不了。复制产品 spec 到 `.vibe/plans` 之外改字段，用新 `plan_id` 重新发布（`--s1` 照抄首次结果里的 `s1`），再念新卡。
+- 引擎证明有效期 72 小时：同一 plan revision 超期后，`vibe authorize` 重新观测引擎凭证并自动续签，不需要重新发布计划；PRD、Spec、节点文件真有改动时不借续签放行。
+- `status: blocked`：reason 以 `product_spec_requires_complex_route` 开头→用草案 `plan_id` 发布或 `--s1` 显式升级；含 `product decisions remain unresolved`→回 §2；含 `engine_attestation_unavailable`→先做 §5.2。`blocked_design` 且带 `question`：未决产品问题，原样问产品经理。
 
 产品经理说"授权"后：
 
 ```bash
 vibe authorize --plan <plan_id> --authorize AUTHORIZE --json
 vibe monitor --plan <plan_id> --authorize AUTHORIZE --json
+vibe daemon start --run-id <run-id> --plan <plan_id>
 ```
 
-之后用 `vibe status --plan <plan_id>` 看进度，`vibe resume --plan <plan_id>` 从断点续接。
+之后 `vibe status --plan <plan_id>` 看进度，`vibe resume --plan <plan_id>` 从断点续接。
 
-## 6. 服务监工信箱（复杂计划开工后，每轮都要做）
+## 6. 监工：守护程序 + 短会话 + 三级自愈（复杂计划开工后）
 
-`vibe monitor` 自己不会创建开发会话。它把每个要派发的动作写成一份请求放进信箱，然后停下来等。**请求没人服务，run 就一直停在那里**——`status` 会显示 `retry_pending`，这不是失败，是在等你。
+完整每拍动作见随包 `vibe_guide/protocols/supervisor-card.md`（监工卡，≤3KB，`vibe supervisor-beat` 在 work 时按班次输出）；本节只写形态、边界和平台事实，不重复卡里的规则。
 
-包里没有任何代码能替你做这一步：创建会话需要宿主平台的桌面工具，只有当前这个会话持有它们。所以这是 agent 的职责。
+### 6.0 形态与开工
 
-### 6.0 开工准备（首班监工必做，做完才算开工）
+- **守护程序干机械活**：授权后 `vibe daemon start|status|stop --run-id <run-id>` 起一个分离的本地进程，持监工租约，每个 tick 确定性地 resume、收交付、派后台 worker、拉 reviewer、接受节点、一级自动重试；pid、心跳、最近错误写在运行目录，崩溃或租约丢失不产生第二个写入者。它不调用模型。
+- **产品经理会话只保留 60 分钟兜底检查**：会话登记地址（`vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>`；`vibe daemon register-pm --run-id <run-id> --provider <平台> --session-name <会话名>` 登记推送目标），心跳指令逐字用 vibe 打印的 `vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>`，每 60 分钟（推送唤醒未验证的平台为 10 分钟）一拍：先 `vibe daemon status`，失活则重启或上报，存活就按监工卡结束本轮。不要自写心跳，也不要把信箱服务写进心跳。
+- **推送优先**：worker 交付后用 `vibe supervisor-address --run-id <run> --node <n> --role <r> --generation <g>` 回答里的 `wake`（`channel`、`target`、`signal`）原样推送唤醒登记的会话；`channel` 为 null 或地址 unknown 时不发，由兜底检查领取。监工不信任信号内容。
+- 状态一律从磁盘读，不凭记忆；未知状态不当成功；宿主报 `No such tool available` 不是节点故障，重试一次后停下报告，不交班。
 
-首班监工在服务信箱之前先把自己接上电。两件事，各一条命令：
+### 6.1 三级自愈与升级
 
-**登记监工地址**：
+1. **一级（守护程序自动）**：节点空转（同一节点连续数拍状态、代数、活跃任务、最新交付都不变）时先自动重试，不耗模型。
+2. **二级（修复短会话）**：仍空转到「需要监工排查」档，守护程序按平台拉起**一次**一次性短会话（claude-code 用 `claude -p`，codex 用 `codex exec`，kimi-code 用 `kimi -p`；WorkBuddy 无命令行，写入信箱由其自动化每次新会话处理），模型按节点档位换算，输入排查包 + 监工卡 + 授权范围。会话在授权范围内修复（可改排查包列出的运行时文件，不得直接改 `state.json` 和 `events.jsonl`），**必须以 `vibe heal-verify --run-id <run-id> --node <节点>` 结束**，由守护程序复核；通过才推进并记 `self_heal_attempt`。每个运行同时最多一个短会话，次数与 token 有预算，用尽立即升级。
+3. **三级（升给产品经理）**：同一空转指纹两次修复无进展，或修复需要越过产品范围、授权卡、deploy、凭据与系统权限边界（§7），守护程序建决策卡并推送到登记的会话，标签变为「需要人处理」；带排查包和已试过的尝试停下报告，不第三次重试，不挂成 `engineering` 类决策。
 
-```bash
-vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>
-```
+短会话命令不可用或超时记为 unknown 并升级，不当成功；返回用量里缓存读取连续为零记 `cache_health` 告警。
 
-登记内容只允许 provider / 会话 id / host，不得含凭据。`<本会话记录路径>` 是本会话自己的日志文件（Codex 为 `~/.codex/sessions/<年>/<月>/<日>/rollout-…-<本会话 id>.jsonl`，Claude Code 为 `~/.claude/projects/<项目>/<本会话 id>.jsonl`），预检直接从里面读上下文大小，不要另写记录文件；登记时 vibe 顺带记下此刻的上下文作为接班起点，换班按此后的增长计算。worker 完工后的唤醒信号按这个地址发；没登记时 `vibe supervisor-address` 返回 `unknown`，唤醒信号无处可发，交付只能等监工被动 resume 才领取。
+### 6.2 信箱回写
 
-**自建心跳**：vibe 是 CLI，没有常驻进程，心跳只能由宿主 agent 会话承载。用宿主平台原语建一个周期任务（Codex 桌面用 heartbeat automation，可以全自动），心跳指令**逐字使用 vibe 生成的这一行**——未登记时 `vibe monitor` 和 `vibe resume` 都会把填好计划与运行编号的版本打印出来，照抄那份，只替换 `<本会话记录路径>`：
-
-```text
-vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>
-```
-
-逐字照抄这一行，不得另写；每拍只执行一次，按命令输出的分支继续。心跳周期按授权卡上的 `heartbeat_interval_minutes` 建（缺省 10 分钟）；命令输出末尾给出下一拍间隔：卡上选了 10 就是 10，选了 30 就是 30，只剩未答决策时为 60 分钟；与当前周期不一致时按输出调整。卡上没记这项的旧运行保持原规则：某平台的推送唤醒经真实验证（成功、失败各至少一次原始证据）登记在 `.vibe/push-wake-verification.json` 后为 30 分钟。
-
-不要自己另写心跳指令，也不要把信箱服务直接写进心跳：自写的心跳每次都跑一整轮 `vibe resume`，跳过预检、不登记、不换班，空闲心跳的成本是设计值的 5–15 倍（2026-10-03 实测）。
-
-心跳不建，`rotate` 的阈值检测就不会发生：token 涨过阈值也不会换班，一直涨到溢出。换班后的新会话同样要做这两件事（§6.5）。
-
-宿主差异：Codex 桌面两条都能自动建；Claude Code 没有换班原语，心跳降级为兜底机制，换班时是移交给新会话（§6.5）；WorkBuddy 两条都得在本会话里手动做（登记地址、建心跳），不会自己发生，且没有合法的无焦点自动换班入口（§6.4 的 WorkBuddy 条目）——rotate 时只能由用户在本项目新开会话接班。两件事做完再进 §6.1。
-
-### 6.1 一轮的动作
-
-```python
-from vibe_guide.paths import ProjectPaths
-from vibe_guide.adapters.task_provider import ProviderActionStore
-
-store = ProviderActionStore(ProjectPaths(<项目根>))
-for action in store.pending():          # 先按当前 run/绑定证据收敛已确认 stale，再读未完成请求
-    ...                                 # 按 action["native_tool"] 调对应桌面工具
-    store.complete(action["action_id"], <结果 payload>)
-```
-
-心跳是 native-action consumer：`pending()` 只负责发现请求，必须由监工会话逐条调用
-`action["native_tool"]`，再用同一 `action_id`、`request_digest` 通过 `complete()` 回写结果；
-只跑 `resume` 不算消费信箱。
-
-**宿主报"找不到工具"时不交班**：调用 `native_tool` 得到 `No such tool available: <短名>`，说明本会话这一轮的工具名被截短了（2026-10-14 实测：部分模型网关线路会去掉 `fn__<server>__` 前缀），不是任务或节点失败。把这条原样回复交给 `complete()`：它不入库，只存为证据，请求保持待处理，并抛出 `UnresolvedNativeTool`（带 `attempts` 次数）。第 1 次：按工具清单里的全名再调一次；第 2 次仍失败：停止服务信箱，向产品经理报告"工具名路由故障"，等线路修好。不要开交班会话——新会话走的是同一条线路，会重复失败。
-
-**整批输出门**：每次宿主工具编排的合并返回最多 8192 UTF-8 字节，不是每个子调用各有 8192 字节。shell/源码读取与原生工具结果统一保存为批次 JSON `[{"name":"wait_threads","output":<完整原生结果>}, ...]`，调用 `vibe supervisor-output --run-id <run-id> --payload <批次路径> --json`（runtime bridge 使用交接中的命令前缀）。只将该入口摘要送入会话；完整原生对象仍用于 provider 结果校验和回写，摘要不是成功证据。入口保留完整结果、SHA 和短状态，失败/unknown 不降级为成功；同一 SHA 再读只返回引用。需下钻时读取具体相关片段，已读的同 digest 协议/历史报告不重复全文载入；接班不重新调查已解决的故障。这个入口只限制通过它返回的结果，宿主不得另行打印原始批次绕过它。
-
-**续接目标不丢失**：收到明确开发、review 或接班请求后，后续 AGENTS/技能注入只补规则，不能把任务替换成“没有具体任务”。先按入口预检，再执行原请求；只有真正缺少会改变目标或授权的字段才提问。续接消息应包含目标、原合同、writer worktree/branch、白名单、本代状态/交付路径和 marker。原生 `active`/`resumed` 回执不证明实现推进；若只有规则确认而无执行/交付，在原任务明确重申未完成目标，保留 generation 与真实结果，不新建 writer。
-
-模型与监工独立：每个 developer/reviewer 按该 Issue 的难度、风险和已验证能力选择 WorkerProfile，派发和续接显式传模型及思考档位（deep→high、normal→medium）；不得因为监工使用某模型而默认继承。模型不可验证时保持 unknown，不以省略模型参数掩盖故障。
-旧 `create` 只有在当前 run、节点、角色、代次、授权摘要和
-`accepted`/更新代次证据全部匹配时，才可调用 `reconcile_stale()` 写入审计标记；原请求保留，
-不调用 native tool、不写伪造结果。任一证据缺失或冲突都继续保持 pending/unknown。
-
-也可以直接读 `.vibe/provider-actions/requests/*.json`。只想先知道信箱里有什么、不读派发全文时，用摘要视图：
-
-```bash
-vibe supervisor-mailbox --run-id <run-id> --json
-```
-
-它逐条返回 pending 请求的摘要（`action_id`、`operation`、`native_tool`、`issue_id`、`role`、`generation`、`child_binding`），派发 prompt 正文换成 `{sha256, bytes, path}`；需要全文时按 `path` 读那份请求文件。它是只读摘要，不是消费——消费仍是按 `action["native_tool"]` 调用并 `complete()` 回写。
-
-回写建议走 `complete()`：结果文件必须恰好含 `schema_version` / `action_id` / `request_digest` / `payload` 四个键，且前三个与请求逐字对应，错一个就会被判"未绑定到请求"而拒收——`complete()` 替你填对。手写也能被接受，但没有理由自己去对 digest。
-
-每份请求里你要看的字段：
-
-| 字段 | 用途 |
-|---|---|
-| `action_id` | 回写时的键，原样传给 `complete()` |
-| `operation` | 五个之一：`create` `locate` `visibility` `resume` `wait` |
-| `native_tool` | 这个平台上该调哪个工具，vibe 已经替你查好 |
-| `issue_id` / `role` | 哪个节点的哪个角色（`developer` / `reviewer`） |
-| `request.child_binding` | **合同**：`worktree` `branch` `allowlist`，见 §6.3 |
-| `request.prompt` | 原样交给被派发的会话，里面含它必须回绑的证据 |
-
-### 6.2 回写的形状
-
-`payload` 必须是一个对象，按操作给出 vibe 会读的字段：
+可见派发（卡片、窗口会话）的请求由监工服务；后台派发由守护程序直接执行，不经信箱。每份请求用 `vibe supervisor-mailbox --run-id <run-id> --json` 看摘要（正文换成 `{sha256, bytes, path}`），用 `vibe supervisor-mailbox --template <action_id>` 取回写示例，填好后 `vibe supervisor-mailbox --complete <action_id> --result <文件或 ->` 回写；形状不对在写入前被拒，错误列出缺少或多出的字段名，不产生 `blocked_unknown`。回写按操作给字段：
 
 | 操作 | payload |
 |---|---|
-| `create` | `{"binding": {"task_id": "<真实会话 id>", "host": "<本机标识>"}}`（`threadId` / `hostId` 同样接受） |
+| `create` | `{"binding": {"task_id": "<真实会话 id>", "host": "<本机标识>"}}`（`threadId`/`hostId` 同样接受；没有真实会话 id 就不回写） |
 | `locate` | `{"located": true}` |
 | `visibility` | `{"visible": true, "direct_enter": true}` |
-| `wait`（还没干完） | `{"status": "timeout", "cursor": "<最后一条事件的游标>"}` |
-| `wait`（干完了，developer） | `{"status": "completed", "cursor": "<游标>", "event": "complete", "delivery_evidence": {"completion_marker": "<完成标记>", "delivery_path": "<交付物路径>", "thread_status": "complete"}}` |
-| `wait`（干完了，reviewer） | `{"status": "completed", "cursor": "<游标>", "event": "accepted", "evidence": "<P0–P2 清零证据>"}`；**整合审查节点例外**，`evidence` 必须是结构化判断，见下 |
-| `resume` | `{"resumed": true}`（会话 id 沿用原来的，**不要**回写绑定） |
+| `wait`（未完） | `{"status": "timeout", "cursor": "<游标>"}` |
+| `wait`（developer 完） | `{"status": "completed", "cursor": "<游标>", "event": "complete", "delivery_evidence": {"completion_marker": "…", "delivery_path": "…", "thread_status": "complete"}}`（嵌套对象，三键齐全，摊平无效） |
+| `wait`（reviewer 完） | `{"status": "completed", "cursor": "<游标>", "event": "accepted", "evidence": "<P0–P2 清零证据>"}` |
+| `resume` | `{"resumed": true}`（沿用原会话 id，不回写绑定） |
 
-`wait` 的终态字段各有各的判定，缺一个就整轮作废：`status` 只认
-`complete` / `completed` / `failed` / `stopped`，`event` 只认
-`complete` / `delivered` / `accepted` / `review_finding` / `failed` / `stopped`，
-且**角色不同事件名不同**——developer 报 `complete`、reviewer 报 `accepted`，
-报错会被判 `provider event is unsupported`。
+`cursor` 给就必须是非空字符串（≤4096、无 NUL），不知道就整个不给。不确定就不回写，pending 比假成功便宜。回写被拒后不要重写同一 `action_id`；`vibe resume` 会发新的 `create`（`generation` 加一），认最大的那个。worker 自报（`vibe worker-deliver`）没有游标，交付门改认自报回执，不要再手工回写同代 `wait`。
 
-**复杂计划的终态还要过一道交付证据门，两个角色各要一样东西**（这道门只在
-复杂计划上生效：授权时 `complexity_band == "complex"` 会把引擎设成
-`vibeguide_monitor`，非复杂计划不走这里）：
-
-- **developer** 要 `delivery_evidence`，**必须是嵌套对象**，三个键齐全：
-  `completion_marker`、`delivery_path`、`thread_status`（只认 `complete` /
-  `completed` / `DELIVERED`）。摊平成顶层三个字段**不算**，门读不到。缺任何
-  一个，节点直接 `blocked_unknown`（理由如 `completion marker is missing`），
-  而顶层看起来只是还在等。
-- **reviewer** 要 `evidence`：`accepted` 之后没有它，节点被判
-  `review acceptance has no registered P0-P2 clearance evidence`。
-
-#### 整合审查节点的 accepted：`evidence` 必须是结构化判断
-
-最后那个 `integration-review` 节点的 `accepted` 不只是收下一个节点，它是**整个 run 的验收**：vibe 收到它才写 run 级的整合审查证据包，顶层才从 `running` 走到 `complete`。所以这一个节点的 `evidence` 不能是一句话，必须是一个对象，**恰好四个键**：
+**整合审查节点的 `accepted`**是整个 run 的验收，`evidence` 必须是对象，**恰好四个键**：
 
 ```json
 {
@@ -345,130 +236,28 @@ vibe supervisor-mailbox --run-id <run-id> --json
 }
 ```
 
-- 全部清零就是 `findings: []`、`out_of_scope: []`。**只有 `resolved` 算清零**：`open`、`accepted`、`waived` 一律计入 `clearance`，报了会被判
-  `integration review acceptance still reports open P0-P2 findings`，节点落到 `blocked_unknown`。这一条是**格式约定，不是权限边界**：同一条 P0 写成 `resolved` 照样清零，vibe 不会去核对审查者此前报过的 `review_finding`。约定的作用是让自签豁免在证据包里留下痕迹——`waived` 过不去，想放行只能把它改写成 `resolved`，那就是一条明写在档案里的"我说修好了"。**所以这里没有第二道人工审批门：放行取决于档案里写下的结论，这道门只记账、不替人把关**：P0–P2 没修完就报 `review_finding` 事件让整合审查返工，别改字。
-- 两个判断里的 `evidence` **必须是非空字符串**。给嵌套对象会被拒（`... needs a status and a non-empty evidence string`）：落盘时 `evidence` 整个字段会被打码，对象里"看起来像敏感信息"的键会被丢掉，于是写进去的包回读时不再合法——顶层会先报一次 `complete`，下一次读又退回去。所以这里只收一句话。
+- 全部清零就是 `findings: []`、`out_of_scope: []`。**只有 `resolved` 算清零**，`open`/`accepted`/`waived` 计入 `clearance` 落 `blocked_unknown`；`p3`/`p4` 是观察项不计入。没修完就报 `review_finding` 返工，别改字。
+- 两个判断的 `evidence` 必须是非空字符串；`out_of_scope` 非空即拒；`status`、`severity` 是封闭取值，同义词判不完整。
+- 只能给这四个键，其余由 vibe 派生。格式错误记 `acceptance_rejected`（可修正重报）；整合合同 digest 漂移和未清零 P0–P2 才 fail-closed 落 `blocked_unknown`。拒收原文落盘被打码，只能对照自己发出的 claim 查。
 
-- **只能给这四个键，多一个就是 schema 错误**。`run_id`、`plan_id`、`plan_revision`、四个 digest、`aggregated_scope`、`clearance`、`agentsmd_acceptance_refs`、`unverified_or_excluded` 全部由 vibe 从 run 自己和计划的整合合同派生。这不是省事：审查者不能改写它被追责的血缘，也不能缩小它被要求覆盖的范围。
-- 键名错、少键、或者给一个字符串，本次验收被记为 `acceptance_rejected`（纯审计事件，
-  代码里的判定是 `integration review evidence cannot be derived (...)`），**节点不砖化**：
-  reviewer 的会话 handle 保留，监工继续在同一会话上等待，修正 claim 后重报即可。
-  只有两类拒绝仍然 fail-closed 落 `blocked_unknown`：整合合同 digest 漂移（`plan.json` 在授权后
-  被改）和验收包里仍有未清零的 P0–P2——这两类不是格式错误，重报解决不了。
+### 6.3 派发合同
 
-**但拒绝的报错原文在盘上读不到。** 节点的 `reason` 落盘时会被打码成
-`[REDACTED_PROVIDER_TEXT]`——`vibe status --json`、事件日志、隔离记录里都一样，多种
-完全不同的拒收原因长得一模一样。所以别指望"看理由"定位，能读到的是两样东西：
-
-1. 事件日志里有这个节点的 `acceptance_rejected` 记录（`recoverable: true`），且 reviewer 的
-   会话 handle 还在（`snapshot.handles` 里能读到）——说明是格式拒绝、可以重报；
-   若节点落到 `blocked_unknown` 且 handle 已被隔离，则是 digest 漂移或未清零 P0–P2 那两类
-   fail-closed，得回到授权/返工流程。（顶层 `status` 会被还在重试的其他节点改写成
-   `retry_pending`，它不告诉你是哪个节点，所以按节点看。）
-2. 你回写的那份 claim 被记在这个节点的 `evidence` 列表里，**键名保留、值打码**。
-   **被拒的时候它是最后一条；清零那次最后一条是派生出来的证据包，不是 claim**——清零时
-   vibe 会在 claim 后面再追加那个包。
-   所以**形状读得出来**：整条是一个字符串而不是对象，说明你给的是一句话；
-   对象里少了 `out_of_scope`，就是少一个键；`iteration_compatibility.evidence` 是个对象而不是
-   字符串，说明你给了嵌套对象
-   （嵌套对象里"看起来像敏感信息"的键被逐个丢掉，**只有每个键都像时才会只剩 `{}`，混着写还剩几个键**）；
-   `out_of_scope` 是个非空列表，就是聚合范围之外有改动。
-   **但值读不出来**：`findings[].status` 也被打码，`resolved` 和 `waived` 长得一样，而且清零的
-   run 本来就可以带 `resolved` 的条目——所以 `findings` 非空**不代表**有没清零的项。
-
-形状合法却被拒，就是值的问题，而且盘上看不出来，只能对着你自己发出去的那份 claim 查这五条：
-
-- **`status` 写 `accepted` 或 `waived` 一样不算清零**，只有 `resolved` 清，其余全部计入 `clearance`。
-- **`out_of_scope` 非空就判 `integration aggregated scope contains out-of-scope changes`**，聚合范围之外改了东西必须先收回去，不能靠在这里列一笔了事。
-- **`evidence` 给空字符串、只有空格或换行、或者干脆不给这个键，和给嵌套对象一样被拒**，报的也是同一句
-  `... needs a status and a non-empty evidence string`。这条在盘上尤其看不出来：真话、`""`、`"   "`
-  打码后落盘完全一样，都是 `[REDACTED_PROVIDER_TEXT]`，所以只能回头查你发出去的原文。
-- **`findings[]` 的 `severity` 只收 `p0` / `p1` / `p2` / `p3` / `p4`，`status` 只收 `open` /
-  `resolved` / `accepted` / `waived`**。`p3` / `p4` 是观察项，登记进 `findings` 但**不计入**
-  `clearance`；白名单是按名字扩的，写 `critical`、`po`、`p5` 照样判
-  `integration finding schema is invalid`（打错字的 P0 不许被静默吞掉），写 `pending` 判
-  `integration finding status is invalid`——都不是"多报一条"，是整包作废（记
-  `acceptance_rejected`，可修正重报）。
-- **两个判断的 `status` 也是封闭取值**：`iteration_compatibility` 只收 `verified` /
-  `compatible` / `reviewed`，`test_runtime_delivery` 只收 `verified` / `reviewed`。写
-  `ok`、`passed` 这类同义词判 `... evidence is incomplete`，写 `unknown` / `expired` /
-  `stale` 判 `... evidence is unknown or expired`。
-
-**`cursor` 在复杂计划的 developer 终态里也是必需的**：绑定上的游标只有你回写时
-才会被写进去（`ProviderActionRunner._wait_result`），不给就等于绑定没有游标，交付证据门
-报 `current cursor is missing`。这道门只挂在 `delivered` / `complete` 上，所以
-reviewer 的 `accepted` 不受它约束——但每轮都回写游标本来就是对的（`wait` 靠它
-接着上一次的位置读），所以上表两行都给了。
-
-**唯一例外是 worker 自报（`vibe worker-deliver`）**：自报由 vibe 自己交给同代的
-`wait`，没有翻过会话，所以没有游标；vibe 也会丢掉 payload 里 worker 自带的
-`cursor`（游标是监工的读取位置，不是 worker 的说法）。交付证据门改认"自报回执"：
-该代存档已被一个指向本任务 task/host 的同代 `wait` 领走，且那份结果就是存档里的
-交付。身份、host、worktree、branch 照旧必须齐。所以 worker 已自报的节点，**不要**
-再手工回写一份带游标的同代 `wait` 结果。
-
-`resume` 只看 `resumed`，**完全不读 `binding`**。按 `create` 的形状回写它，
-`resumed` 就是缺的，这一轮会报 `visibility_unknown` 事件，节点落到
-`blocked_unknown` 或重试态，续接推不下去。
-
-三条硬规则：
-
-1. **`create` 的 `binding` 必须用上面那几个键名，并且含真实的会话 id**。vibe 只认 `task_id`/`threadId` 与 `host`/`hostId`；用别的名字（比如桌面工具自己叫的 `sessionId`）会被判"没有任务身份"而丢掉绑定。只有设置句柄、没有真实会话 id 时，不要回写——留着 pending，下一轮再来。
-
-   **顶层状态看不出被拒**：绑定被丢掉和"正在等下一个节点"，顶层 `status` 都是 `retry_pending`，`pending()` 的计数也都会少一个（它只数没有结果文件的请求，不管结果有没有被接受）。要分辨就看 `payload["nodes"]` 里那个节点的状态——被拒是 `blocked_unknown`，被接受是 `running`。顶层之所以掩盖它，是只要还有一个节点在重试，顶层就被改写成 `retry_pending`。
-
-   **发现回写被拒之后**：不要重写同一个 `action_id`，已经有结果文件的请求不会被重读，重写没有任何效果。`vibe resume` 会为同一个节点发出一个**新的 `create` 请求**（`generation` 加一），服务那个新请求才能恢复。所以同一个节点在信箱里可能先后有多份 `create`，认 `generation` 最大的那个。
-2. **给 `cursor` 就必须是非空字符串**（长度 ≤ 4096、不含 NUL）。空串会被判
-   `provider cursor is invalid`，**整个结果被丢掉**，节点停在 `blocked_unknown`——
-   不是"可能重复消费"这种可以容忍的风险。不知道游标就整个字段不给（终态允许省略）。
-3. **不确定就不回写**。pending 比假成功便宜得多；vibe 会一直等，不会把未知当成功。
-
-回写一个之后 `vibe resume --plan <plan_id>`，剩下的请求下一轮继续。`status` 变回 `retry_pending` 只是说还有没服务完的请求。
-
-### 6.3 派发时必须遵守合同
-
-`request.child_binding` 里的 `worktree` 和 `branch` 是 vibe 按节点 id 派生的、每个节点互不相同的一对。**创建会话时必须把它的工作目录设成合同里的 `worktree`**，并让它在合同的 `branch` 上开发。
-
-这不是形式要求：两个并行节点落进同一个目录同一个分支，就是两个 writer 改同一棵树，改动互相覆盖。`allowlist` 同理——被派发的会话只能碰这些文件。
-
-**这条要求各宿主能做到的程度不一样**：
+`request.child_binding` 的 `worktree`、`branch`、`allowlist` 由 vibe 按节点 id 派生，每个节点互不相同。**创建会话必须把工作目录设成合同里的 `worktree`**，让它在合同的 `branch` 上开发，只碰 `allowlist` 里的文件；worktree 需先建好（`git worktree add <worktree> -b <branch>`），vibe 不替你建。
 
 | 宿主 | 设定工作目录的方式 | 做不到时的后果 |
 |---|---|---|
 | Claude Code | 派发时传 `cwd` | 会话启动就落在 `worktree` 里 |
-| WorkBuddy | Agent 工具**没有 `cwd` 参数**，子代理默认继承派发方的目录 | 只能在派发提示里要求子代理**每条命令先 `cd <worktree>`**、写文件一律用绝对路径；**漏一条命令就落回主项目树** |
+| WorkBuddy | Agent 工具**没有 `cwd` 参数** | 派发提示里逐条要求**每条命令先 `cd <worktree>`**、写文件用绝对路径；串行节点也一样 |
 
-WorkBuddy 那一行的依据是 2026-10-09 本机实测：同一份提示下，写明 worktree 的子代理落在 worktree 内，
-不写的落在**主项目根**；且子代理的 shell 状态不跨命令保持，每条命令都得重新 `cd`。
-所以在 WorkBuddy 上派发提示必须逐条写死 worktree，**节点串行也一样**——串行只是去掉了
-「两个 writer 改同一棵树」的风险，不钉 worktree 的子代理仍会落在主项目根、在错误的分支上开发。
+**唯一例外是交付自报**：`vibe worker-deliver` 必须在**主项目目录**执行（在 worktree 里会写进 worktree 自己的 `.vibe`，监工看不到）。
 
-**唯一例外是交付自报**：`vibe worker-deliver` 必须回到**主项目目录**执行
-（visible-sdd-worker §5）——在 worktree 里执行会写进 worktree 自己的 `.vibe`，监工看不到。
-即：改文件、跑验证在 worktree 里，自报在主项目目录里。
+模型与监工独立：每个 developer/reviewer 的模型由节点档位按平台探针换算（探针失败回退平台默认并标注），派发和续接显式传模型与思考档位；同一节点审查打回两次自动升一档，监工或修复会话可 ±1 档但必须给理由。具体模型名不进授权指纹，换平台或换模型授权不失效。
 
-worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），vibe 不会替你建。
-
-#### 节点合同的环境事实（environment_facts）
-
-改动第三方 UI 组件用法的节点，IssueContract 必须携带 `environment_facts`，否则合同不闭环、不能开工——这是拦停，不是警告过渡。字段形状：
-
-```json
-"environment_facts": [
-  {"fact": "str", "source": "str", "verified_at": "str"}
-]
-```
-
-- **fact**：一句实测得到的环境事实（如"element-plus 实装 2.3.7 无 value prop"）；**source**：事实的出处；**verified_at**：核实日期。`fact` 与 `source` 必须是非空字符串，缺任一项闭环失败并列出 `environment_facts[i].fact` / `environment_facts[i].source` 缺口。
-- **何时必须声明**：节点的 goal、owned_paths 或 read_paths 文本命中内置第三方 UI 库清单（大小写不敏感匹配）而 `environment_facts` 缺失或为 `[]` 时，闭环直接失败并指出 `environment_facts`。清单是 `vibe_guide.contracts.THIRD_PARTY_UI_LIBRARY_MARKERS`，当前含 `element-plus` `element-ui` `antd` `ant-design` `vuetify` `quasar` `naive-ui` `arco` `material-ui` `mui` `primereact` `chakra`；项目用到清单外的库时，改该常量并补测试，不要绕过闭环。
-- **source 的路径判别**：含 `://` 的视为外部引用（URL），不要求文件存在；不含 `/` 且不以常见文件扩展名（`.json` `.md` `.py` `.js` `.jsx` `.ts` `.tsx` `.vue` `.yaml` `.yml` `.toml` `.lock` `.txt` `.html` `.css`）结尾的视为描述性文字（如"官方文档"），也不要求文件存在；其余一律按仓内相对路径处理，该文件必须存在于项目根下，绝对路径或含 `..` 判为越界缺口。
-- **向后兼容**：旧合同没有 `environment_facts` 字段照常通过 schema 校验与闭环；只有命中第三方 UI 库清单时缺失才被拦停。
-
-拆节点（§4）时如果需求涉及第三方 UI 组件用法，就在合同评审前把实测事实核好，避免派发时被闭环门拦下返工。
+**环境事实**：改动第三方 UI 组件用法的节点，IssueContract 必须带 `environment_facts`（`[{"fact": "str", "source": "str", "verified_at": "str"}]`），否则合同不闭环、不能开工。节点 goal、owned_paths 或 read_paths 命中 `vibe_guide.contracts.THIRD_PARTY_UI_LIBRARY_MARKERS`（大小写不敏感）而该字段缺失或为 `[]` 时拦停；`fact` 与 `source` 必须非空。`source` 含 `://` 视为外部引用，不含 `/` 且无常见文件扩展名视为描述性文字，其余按仓内相对路径、文件必须存在，绝对路径或含 `..` 越界。拆节点时就把实测事实核好。
 
 ### 6.4 平台差异：哪个平台能"授权一次、不用盯屏幕"
 
-五个操作在三个可见 provider 上都已登记，Claude Code 另有一个降级后台 provider `claude-code-background`；但**创建会话时要不要人工点一下，各平台不一样**。这是平台事实，不是 vibe 的功能差异：
+五个操作在三个可见 provider 上都已登记，Claude Code 另有降级后台 provider `claude-code-background`；创建会话时要不要人工点一下，各平台不一样：
 
 | 操作 | `codex-app-visible` | `claude-code-visible` | `workbuddy-visible` | `claude-code-background` |
 |---|---|---|---|---|
@@ -478,56 +267,35 @@ worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），
 | `resume` | `codex_app__send_message_to_thread` | `ccd_session_mgmt__send_message` | `workbuddy_job__reply` | `claude stop` + `claude --bg --resume <完整会话 id>` |
 | `wait` | `codex_app__wait_threads` | `ccd_session_mgmt__list_events` | `workbuddy_job__wait` | 轮询 `claude agents --json --all` 的 `state` + `vibe worker-deliver` 自报 |
 
-- **Codex 本地桌面**：`create_thread` 没有审批门，`create` 直接返回会话身份。`create` 只用 `create_thread` 的 project 目标（`target: {type: project, projectId, environment}`，vibe 请求里已填好，原样传）；**不得用 `fork_thread` 代替**——fork 带上监工整段历史（run-63e7cfc2 实测工作会话起步约 65 万 token），回写时 `complete()` 会查 Codex 会话记录里的 `forked_from_id` 拒收并抛 `ForkedProviderSession`，请求保持待处理。`create_thread` 的 worktree 目标宿主不接受（返回 invalid arguments），不要改参数形态硬试；新会话写不了节点工作副本时停下报告宿主权限，不要改用 fork 绕过（项目可在 `.codex/config.toml` 设 `sandbox_mode`，由用户决定）。这是目前唯一能以**可见会话**做到**无人值守**派发的路径——产品经理授权一次之后，agent 可以把整批节点派完，不需要人再看屏幕。Claude Code 只有配置了后台启动器、改走降级后台（`claude-code-background`）才能同样无人值守，代价是桌面看不到（见下方「Claude Code 后台」一条）。
-- **Claude Code 桌面**（未配置后台启动器时）：`ccd_session__spawn_task` 只是**提议**一个任务。它返回一个 `task_id` 并在界面上显示一张卡片，**需要用户点一下**才真正创建会话；调用方拿不到 `sessionId`。所以每个节点都有一个人工确认点，拿到 `task_id` 之后还要再查一次（`ccd_session_mgmt__list_sessions`）才能取到真实会话 id 去回写 `create`。
+- **Codex 本地桌面**：`codex_app__create_thread` 直接创建用户可见的 thread，无人值守即可全自动；Codex 的 `create` 不得用 `fork_thread` 替代（fork 出的会话被 `complete()` 拒收）。要在 Claude Code 上无人值守，改走 `claude-code-background`。
+- **Claude Code 桌面**（未配置后台启动器时）：`ccd_session__spawn_task` 只是**提议**一个任务，界面上出一张卡片，**需要用户点一下**才创建会话，调用方拿不到 `sessionId`，要再 `ccd_session_mgmt__list_sessions` 取真实会话 id 回写 `create`。把它当"全自动"会一直卡在 `retry_pending`，授权卡念完就要告诉产品经理这一点。
+- **Claude Code 后台（`claude-code-background`，降级后台）**：Claude Code 的默认派发方式，授权一次、不用盯屏幕，授权卡上可改选可见卡片。需要配置后台启动器（README「Claude Code 后台派发」节：在用户级 `$VIBE_HOME/config.json` 登记凭据设置文件与默认模型），且会话用 `vibe attest` 登记了 `claude-code.background_task.launch` 为真；未配置时仍走卡片路径。降级限制三条：① 桌面侧边栏看不到，`get_session` / `open_session_in` 也找不到；② 只能在真实终端 `claude attach <short-id>` 进入；③ 返工可续接同一会话——先 `claude stop`，再用**完整会话 id** 执行 `claude --bg --resume <完整会话 id> <返工消息>`，**除完整会话 id 和返工消息外不带任何其他参数**（如 `-n`、`--model`），否则会复制出新会话；vibe 发现复制会停掉副本并报未知。权限用 `bypassPermissions`（`acceptEdits` 第一条 Bash 就卡在 `blocked`，`dontAsk` 直接拒绝 Bash 却报 `done`）。每次派发显式带 `--model`（由节点档位换算）。`state=done` 只表示这一轮结束、不代表任务成功，完成依据是 worker 的 `vibe worker-deliver` 自报；`blocked` 需要处理，不能当进行中。vibe 不保存密钥，只记设置文件路径。未验证、不得当作可用：`--session-id` 预指定会话 id、`-w` 与 `--bg` 合用、长任务/休眠/daemon 退出后的恢复、桌面内置 CLI 下的 `--bg`。
+- **WorkBuddy**：`workbuddy_job__*` 五个工具已登记，但 Jobs API 派生的 detached agent 拿不到模型凭据（凭证边界为宿主设计，补 flag 或环境变量修不好），可用的派发目标是用户已在 UI 打开的窗口会话（`workbuddy_job__create` 带 `session_id`，一个窗口同时只承载一个任务）。没有自动换班入口，也不得用 GUI 点击代开窗口。
 
-在 Claude Code 上把这条流程当成"全自动"会一直卡住：卡片没人点，`create` 永远拿不到身份，run 停在 `retry_pending`。要么守着确认每个节点，要么用 Codex 本地桌面跑派发，要么配置后台启动器改走降级后台（见下）。
+**推送唤醒通道**（`vibe supervisor-address` 返回的 `wake.channel`）按平台登记：Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`（在 `.vibe/push-wake-verification.json` 补齐成功、失败证据各一条之前视为未验证，兜底检查保持 10 分钟），WorkBuddy 没有登记通道（`channel` 为 null，由兜底检查领取）。
 
-（以上两条平台行为为 2026-09-18 本机实测所得，非推断。仓库里另有一份完整实测记录，
-但它不随包发布，所以这里不给路径。）
+### 6.5 换班、预检分支与其他
 
-- **Claude Code 后台（`claude-code-background`，降级后台）**：2026-10-13 本机实测 `claude --bg` 零点击启动、会话落在指定目录、可续接同一会话、并行互不干扰（仓库另有实测记录，不随包发布，不给路径）。配置了后台启动器（README「Claude Code 后台派发」节：在用户级 `$VIBE_HOME/config.json` 登记凭据设置文件与默认模型），且会话用 `vibe attest` 登记了 `claude-code.background_task.launch` 为真）后，Claude Code 默认走这条，授权一次、不用盯屏幕；未配置时仍走上面的卡片路径，每个节点要点一下。降级限制三条：① 桌面侧边栏看不到，`get_session` / `open_session_in` 也找不到；② 只能在真实终端 `claude attach <short-id>` 进入；③ 返工可续接同一会话——先 `claude stop`，再用**完整会话 id** 执行 `claude --bg --resume <完整会话 id> <返工消息>`，**除完整会话 id 和返工消息外不带任何其他参数**（如 `-n`、`--model`），否则会复制出新会话；vibe 发现复制会停掉副本并报未知。权限用 `bypassPermissions`（`acceptEdits` 第一条 Bash 就卡在 `blocked`，`dontAsk` 直接拒绝 Bash 却报 `done`）。每次派发显式带 `--model`（默认 sonnet，由监工按节点决定）。`state=done` 只表示这一轮结束、不代表任务成功，完成依据是 worker 的 `vibe worker-deliver` 自报；`blocked` 需要处理，不能当进行中。vibe 不保存密钥，只记设置文件路径。未验证、不得当作可用：`--session-id` 预指定会话 id、`-w` 与 `--bg` 合用、长任务/休眠/daemon 退出后的恢复、桌面内置 CLI 下的 `--bg`。
-
-- **WorkBuddy**：`workbuddy_job__*` 五个工具名已登记，对应 WorkBuddy 官方 Jobs API。2026-10-26 本机（WorkBuddy 5.8.4 / CLI 2.161.0）定案：**Jobs API 派生的 detached agent 拿不到模型凭据，在产生任何输出前退出**——gateway 健康、spawn 正常、job 能建能跑（bash 对照作业成功），但模型请求用的是宿主进程内的会话级 run identity，CLI 启动时主动删除凭据引导变量、broker spawn 内层时再删 `CODEBUDDY_GATEWAY_AUTH`，任何不经 sidecar 亲自拉起的进程都拿不到凭证。这不是配置或沙箱问题，不能靠补 flag/补环境变量修好。可用的派发目标是**用户已在 UI 打开的窗口会话**（`POST /api/v1/sessions/{sid}/reply`），由 `workbuddy_job__create` 带 `session_id` 走会话侧路径；它要求项目目录里有开着的窗口、编排者自身窗口被排除，且一个窗口同时只承载一个任务。**WorkBuddy 上没有自动换班**：没有合法的"无焦点、独立、已登录模型会话"创建入口，`vibe supervisor-preflight` 报 `rotate` 时只能由用户在 UI 新开会话并运行 `vibe supervisor-handoff`（见 §6.5）。完整证据链见 `docs/workbuddy/workbuddy-dispatch-root-cause-and-fix.md`（同日补记的凭证边界一节）。
-
-**推送唤醒通道**（§6.5 里 `vibe supervisor-address` 返回的 `wake.channel`）按平台登记，不按派发路径分：Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`（2026-10-23 登记；在 `.vibe/push-wake-verification.json` 补齐成功、失败证据各一条之前，30 分钟档仍只能强制选择，见 §5.3），WorkBuddy 没有登记通道（`channel` 为 null，由心跳拉取）。
-
-### 6.5 监工心跳纪律（预检 → idle/work/decision/rotate/unknown/contract_drift）
-
-每次心跳的第一步只跑本地预检，只读磁盘：
-
-```bash
-vibe supervisor-preflight --run-id <run-id> --accept-decision --session-record <本会话记录路径>
-```
-
-- 每拍只运行生成命令一次，工具返回、重连和上下文恢复续接当前阶段。
-- 输出 `contract_drift`：**能力合同与运行快照的 digest 不一致**——典型诱因是别的会话的 git 写操作（checkout/stash/reset/merge）改写了 `.vibe` 运行态文件。它先于 idle/work/decision/rotate 判定返回；这一拍**停止推进、不当 idle 或 work 处理**，按输出提示走同一运行的重新授权流程（`vibe authorize` 同一 plan/run），不要继续派发或消费信箱。能力合同文件本身读不出时输出 `unknown`（见下），按 `work` 处理照旧。
-- 输出 `decision`：只有带 `--accept-decision` 才会输出（只剩未答决策、无其他可服务事项时）；旧版指令同一情形收到 `work`，按 `work` 走 resume，由 resume 渲染决策卡片。从 `.vibe/decisions/` 读取并渲染未答卡片；心跳降频到 60 分钟但不暂停，答案消费后恢复；降频状态写在 `.vibe/runs/<run-id>/heartbeat-interval.json`，接班时 `vibe supervisor-handoff` 会打印。
-- 输出 `idle`：所有节点都在运行、已完成或等人拍板，且无新请求。只回一字结束本轮，不做任何写。连续第二拍起仍是 `idle`（无可服务事项），下一拍间隔在当前档位（默认 10、推送验证 30）基础上放大到 3 倍、上限 60 分钟，`heartbeat-interval.json` 记 `mode=idle_backoff` 与 `idle_streak`，`vibe supervisor-handoff` 同步打印；出现新交付或唤醒（预检变为 `work` 等非 `idle`）的那一拍立即恢复基础间隔；只剩未答决策时仍是 §上条的 60 分钟。
-- **等人拍板必须登记**：监工决定把某个节点挂起等用户回答时，先跑 `vibe supervisor-hold --run-id <run-id> --node <节点> --category <product_acceptance|external_authorization> --decision <决策ID>|--authorization-gap <缺口> --reason <一句话原因>`（必须引用一条决策 ID 或一个授权缺口，二选一；`product_design`/`deploy` 仍可作别名，落盘存规范名；没有 category 的旧挂起按 `product_acceptance` 读取，下次刷新须补上 category 和引用；`decision-answer` 必须带决策卡 `answer_cli` 里的 `--digest`，选项一变旧答案作废、决策重新待答）；用户用 `decision-answer` 回答后由运行自动消费：预检对「已回答、节点仍在 `blocked_design`」的决策报 `work`（理由写明已回答待处理），监工照常 resume 即可，不必口头转达，也不必手工释放挂起；决策已答的挂起不再引起反复 `work`；不经决策的挂起（授权缺口）仍用 `vibe supervisor-hold --run-id <run-id> --node <节点> --release` 手工释放。回答命令会提示「想马上续跑，去监工会话说继续；否则最晚下一次心跳自动接上」。只有 §7 的四类情况才能挂起或建决策，其余类别（如 `engineering`）会被拒绝，应走自愈路径。不登记，挂起的请求每次心跳都被当成 `work`，空闲心跳的成本是设计值的数倍（2026-10-05 run 140 实测：60 次预检 46 次误判）。挂起的节点上有 worker 交付或结果时仍然是 `work`。挂起会记下当时全盘节点状态：此后任何节点状态变化，或挂起满 6 小时，预检报 `work`（`hold needs recheck`），复核后仍在等人就对每个挂起节点再跑一次同一条挂起命令刷新。挂起节点的待服务请求在用户答复并解除挂起之前不执行，换班后的新班次同样遵守。`review`/`rework` 状态的节点不能挂起（它们只靠监工推进）。
-- 输出 `work`：有待服务请求、worker 已完工（含已自报但监工还没领取的交付），或有节点处在就绪/重试/未知等需要推进的状态。按 §6.1 原流程服务信箱，状态一律只从磁盘读，不凭记忆。
-- 输出 `rotate`：当前上下文达到 10 万且自接班以来增长至少 8 万 token（可配 `--token-threshold`），或达到 20 万的绝对上限（默认；用户明确临时覆盖时使用 `--context-hard-cap <tokens>`，增长阈值也需同步显式设置，不能只用 `--token-threshold` 冒充绝对上限已改变）；登记时没给 `--session-record` 的班次没有接班起点，按绝对值计算。单班是默认（2026-10-26 起，`supervisor_single_shift` 缺省即 `true`，预检输出带 `single_shift: true`）：同一监工会话服务整个运行，只在达到授权卡的绝对上限时输出 `rotate`，上面的增长条件不生效；项目 `.vibe/config.json` 显式写 `"supervisor_single_shift": false` 才恢复增长换班。执行换班：新开会话（**必须建在本项目里，禁止 projectless**：Codex 桌面用 `create_thread` 的 project 目标，Claude Code 在仓库根目录启动新会话——否则 cwd 落在宿主自动生成目录，创建时的沙箱权限档案不含项目根，每条读写 `.vibe/` 的命令都逐条弹审批，事后把会话归入项目不回溯，2026-10-17 run-ee4575fa 六班实测；`supervisor-register` 会从会话记录里检出这种 cwd 并给出非阻断警告），新会话必须是**全新会话**：不要用 `fork_thread` 或任何复制上一班历史的方式——fork 带上整段历史，接班即超过 10 万，`supervisor-register` 会拒绝 fork 出来的会话、起步就不低于 10 万的接班会话，以及不带本会话记录（`--session-record` 绝对路径、文件存在）的接班登记，上一班继续在岗（2026-10-26 run-63e7cfc2 实测接班即 29.7 万）。接班会话写不了 `.vibe/`（`session_gate_blocked`，原因带 `host sandbox denied access`）时不要重试、不要反复申请审批，停下把目录报给用户；项目根是 git 工作副本（如 Codex 自动建的 `~/.codex/worktrees/...`）时，宿主给新会话的可写目录通常只有主仓库，`supervisor-register` 会对此给出非阻断警告。让它跑 `vibe supervisor-handoff --run-id <run-id>`——这一条打印接班需要的全部内容（进度、等人拍板事项、填好的同一段心跳指令、接班步骤），新会话照做即可，不必再翻本协议、授权卡或完整状态：用 `vibe supervisor-register --session-record` 登记、自建心跳、置顶、改标题；删除旧心跳，旧会话归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。**WorkBuddy 上没有自动换班原语**（2026-10-26 定案：Jobs detached 子进程拿不到模型 run identity，见 §6.4 的 WorkBuddy 条目），rotate 时报给用户的接班步骤是：用户在本项目目录的 WorkBuddy 里新开会话 → 新会话运行 `vibe supervisor-handoff --run-id <run-id>` 照做 → 旧会话删除自己的心跳并归档；不得承诺自动换班，也不得用 GUI 点击代开窗口（会和用户操作冲突）。
-- 输出 `unknown`：会话记录读不到或解析失败。**不得当成 idle**，按 `work` 处理。
-- 看到节点或心跳输出“需要监工排查”（空转：同一节点连续数拍状态、代数、活跃任务、最新交付都不变，档位 `supervisor_investigate`）：这不是进展，优先于 `idle` 的一字收尾，不要只回“等待”。按顺序做：① 先读输出附带的排查包（读取方期望的字段与类型、实际收到的字段名与类型、差异、涉及的运行时文件路径、允许的修复入口；无法识别的阻塞给通用排查包并标明“未识别具体格式”），不凭印象猜；② 在授权范围内自主修复——可以改排查包列出的运行时文件（如格式错误的回执），不得直接改 state.json 和 events.jsonl，这两个文件的摘要链断裂时 vibe 会拒绝推进；③ 修完立刻跑 `vibe heal-verify --run-id <run-id> --node <节点>` 复核：通过才推进，并写入一条 `self_heal_attempt` 事件，不通过则节点保持原状、记一次失败尝试，按新差异再修；④ 同一状态指纹已有 2 次 `self_heal_attempt` 仍无进展，或修复需要越过产品范围、授权卡、deploy、凭据与系统权限边界（见 §7）时，档位升为 `escalate_to_pm`，状态标签变为“需要人处理”：带着排查包和已试过的尝试记录停下报告，不再第三次重试，也不要挂成 `engineering` 类决策。
-
-监工地址登记与查询：`vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> --session-record <日志>` 原子登记当前地址（历史保留），`vibe supervisor-address --run-id <run> [--node <n> --role <r> --generation <g>]` 查询；未登记返回 `unknown` 而非空成功。登记后的回答带 `wake`：`channel`（推送通道）、`target`（监工会话 id）与填好的一行 `signal`（`vibe-wake run=… node=… role=… generation=…`），worker 用该通道原样发送——Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`（通道已登记，见 §6.4）；WorkBuddy 等没有登记推送通道的平台 `channel` 为 null 并写明原因，worker 不发，由心跳领取。监工不信任信号内容。登记内容只允许 provider/会话 id/host，不得含凭据。
+- **不换班（Claude Code）**：Claude Code 没有换班原语，预检永不输出 `rotate`，到上限改为 `work` 并附 `context_pressure` 提示，同会话继续。
+- **换班（其他平台）**：单班是默认（`supervisor_single_shift` 缺省 `true`），只在达到绝对上限（缺省 20 万，上限档位见授权卡）时输出 `rotate`。执行换班：新会话**必须建在本项目里**（Codex 用 `create_thread` 的 project 目标；projectless 的 cwd 落在宿主自动生成目录，每条读写 `.vibe/` 的命令逐条弹审批），必须是**全新会话**——禁止 `fork_thread`，`supervisor-register` 会拒绝 fork 出的会话、起步不低于 10 万的会话、以及不带 `--session-record`（绝对路径、文件存在）的接班登记。让它跑 `vibe supervisor-handoff --run-id <run-id>`，打印接班所需的全部内容，新会话照做：登记、建兜底检查、旧会话删除自己的检查并归档。接班会话写不了 `.vibe/`（`session_gate_blocked`，带 `host sandbox denied access`）时不要重试，停下把目录报给用户；WorkBuddy 的换班只能由用户在本项目新开会话接班。
+- **预检**：`vibe supervisor-preflight --run-id <run-id> --accept-decision --session-record <本会话记录路径>`（每拍只运行一次），输出分支以监工卡为准：`contract_drift`（能力合同与运行快照 digest 不一致，停止推进，走同一运行的重新授权）、`decision`（渲染 `.vibe/decisions/` 未答卡片，降频到 60 分钟不暂停）、`idle`（回一字结束，不做任何写）、`work`、`unknown`（读不到会话记录，不当 idle，按 `work` 处理）。
+- **等人拍板必须登记**：`vibe supervisor-hold --run-id <run-id> --node <节点> --category <product_acceptance|external_authorization> --decision <决策ID>|--authorization-gap <缺口> --reason <一句话>`；用户用 `decision-answer`（必须带决策卡 `--digest`）回答后由运行自动消费，不必手工释放；不经决策的授权缺口挂起用 `--release` 手工释放。挂起满 6 小时或任一节点状态变化，预检报 `work`（`hold needs recheck`），复核后仍在等人就刷新。`review`/`rework` 节点不能挂起。不登记，空闲心跳每拍被判 `work`，成本是设计值的数倍。
 
 ## 7. 什么时候才能打断产品经理
 
-**已批准判据（产品经理 2026-10-05 确认）**：修改后，PRD 里每条验收例子的判定结果是否改变——不变就由监工自决并留痕，变了才问产品经理；另外两类无论如何都问：新增第三方依赖（发布/安全对外承诺）、执行模式从「可见可进入的任务」降级为「后台不可见」。
+**已批准判据**：修改后，PRD 里每条验收例子的判定结果是否改变——不变由监工自决并留痕，变了才问；另外两类无论如何都问：新增第三方依赖、执行模式从「可见可进入的任务」降级为「后台不可见」。落地条件见 §4。
 
-这条判据的**落地条件**在 §4：判据一（`tests/` 与 `auto_scope_paths`）始终可用；判据二（验收判定不变）只在项目开启 `acceptance_scope_rule_approved` 后才可用，未开启的项目按判据一处理。判据二未开启**不等于产品范围变了**：落在判据一内的文件照常补；确实落在判据一之外的，仍走 §4 的单独授权——那会问产品经理，但理由是文件本身越界，不是判据二没开。
+只有四类：产品范围或设计要变、部署或对外发布、涉及凭据或系统权限、授权卡外的不可撤销动作。`supervisor-hold` 与 `decision-raise` 只接受这四类（落盘仍是 `product_acceptance` / `external_authorization` 两个规范类别；`credentials`、`system_permission`、`irreversible_action` 是后者的别名），其他类别（如 `engineering`）直接报错并提示走自愈。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知、可按 §4 自动补进范围的文件）由 vibe 自行分类恢复。
 
-只有四类：产品范围或设计要变、部署或对外发布、涉及凭据或系统权限、授权卡外的不可撤销动作。`supervisor-hold` 与 `decision-raise` 只接受这四类（落盘仍是 `product_acceptance` / `external_authorization` 两个规范类别；`credentials`、`system_permission`、`irreversible_action` 是 `external_authorization` 的别名），其他类别（如 `engineering`）直接报错并提示走自愈。其他工程问题（超时、任务创建失败、容量、分支漂移、能力未知、按 §4 `files` 判据一或判据二可自动补进范围的文件）由 vibe 的 Monitor 自行分类恢复；结构性待验项**只认固定句式**：「[真机/生产环境/线上前缀]＋事项名词短语（中文 ≤8 字、英文 ≤5 词；不含否定、程度、谓语或“出现/发生/显示/返回/反馈/报错”类词，不含数字加单位，不以空白/模糊/低/慢/失灵/失效/延迟/late/delayed 等状态词结尾）＋[10/10]＋只能/仅能/需/须/待＋[在]验收期/上线后/真机上/生产环境＋验证/确认/完成」，英文同理（“<短名词> can only be verified in the acceptance period”），另认“验证脚本不入库/仅本地运行”；其余说法一律按未知处理、保持 `blocked_unknown`。符合句式、只能在真机、生产环境或验收期验证的事项，Monitor 自动记为 `deferred_to_acceptance` 处置、节点照常进入验收，并单列在交付与验收汇报的“验收期待验项”里（`vibe status` 人类可读与 `--json` 的 `acceptance_pending_verification` 按节点列出，有则必列、无则不显示），同一事项换措辞重报沿用原处置、不产生第二条处置事件；判断不了是否结构性的仍按普通未知项保持 `blocked_unknown`；恢复不了的会标 `blocked_unknown`，同时保留结构化 `recovery_action`，不伪装成成功也不静默丢掉入口。
+**结构性待验项只认固定句式**：「[真机/生产环境/线上前缀]＋事项名词短语（中文 ≤8 字、英文 ≤5 词；不含否定、程度、谓语或“出现/发生/显示/返回/反馈/报错”类词，不含数字加单位，不以空白/模糊/低/慢/失灵/失效/延迟/late/delayed 等状态词结尾）＋[10/10]＋只能/仅能/需/须/待＋[在]验收期/上线后/真机上/生产环境＋验证/确认/完成」，英文同理（“<短名词> can only be verified in the acceptance period”），另认“验证脚本不入库/仅本地运行”；其余说法一律按未知处理、保持 `blocked_unknown`。符合句式的事项自动记为 `deferred_to_acceptance` 处置、节点照常进入验收，并单列在交付与验收汇报的“验收期待验项”（`vibe status` 的 `acceptance_pending_verification`，有则必列）；同一事项换措辞重报沿用原处置。
 
-`blocked_unknown` 的标准恢复动作按原因执行：
+`blocked_unknown` 的恢复动作按原因执行，处置用 `vibe blocked-unknown --run-id <run> --node <节点> --disposition <处置> --reason <原因>` 记录，节点状态在 `vibe status` 可见，并保留结构化 `recovery_action`：
 
 - `repair_node`：工作树、分支、合同测试或快照可由本地证据修复；保持原 task identity、generation、worktree 和 writer lease。
-- `requeue_same_task`：超时、断开、容量或 provider pending；只续接同一任务，按退避时间等待，不创建 successor。
-- 宿主报 `No such tool available`：不是节点故障，不进入上面任何一类，按 §6.1 重试一次后停下报告，不交班。
-- `reconcile_binding`：绑定、身份、租约或 cursor 无法证明；先核对 task binding、worktree、branch、run 和 cursor，再通过 `vibe repair --plan <plan> --run-id <run> --node <node>` 或同一 Monitor 的 repair/requeue 入口恢复；未证明前不得盲派。
-- `await_external_decision`：命中产品、外部授权或 deploy 边界；保持 blocked，等待对应授权。
+- `requeue_same_task`：超时、断开、容量或 provider pending；只续接同一任务，按退避等待，不创建 successor。
+- `reconcile_binding`：绑定、身份、租约或 cursor 无法证明；先核对 task binding、worktree、branch、run 和 cursor，再走 `vibe repair --plan <plan> --run-id <run> --node <node>` 或同一 Monitor 的 repair/requeue 入口；未证明前不得盲派。
+- `await_external_decision`：命中产品、外部授权或 deploy 边界；保持 blocked，等对应授权。
 
-可恢复动作都追加事件证据。三轮返工仍不收敛时，监工记录换 reviewer 或拆节点并保留唯一 writer；只有会改变 PRD 验收判定的分歧才升级产品决策。reviewer 代改业务文件时本轮作废，退回 developer，并更换 reviewer。agent 看到 `blocked_unknown` 或 `retry_pending` 时先按 §6 查信箱里有没有没服务完的请求，不要立刻报告失败。
+三轮返工仍不收敛时，监工记录换 reviewer 或拆节点并保留唯一 writer；只有会改变 PRD 验收判定的分歧才升级产品决策。reviewer 代改业务文件时本轮作废，退回 developer 并更换 reviewer。
 
-一个例外要告诉产品经理：在 Claude Code 桌面上派发，每个节点都需要他点一下确认卡片（§6.4）。这属于"需要新的外部授权"那一类，授权卡念完之后就要说清楚，不要让他以为授权一次就不用管了。
+一个例外要告诉产品经理：Claude Code 改选可见卡片派发时，每个节点都需要他点一下确认（§6.4）。授权卡念完就要说清楚，不要让他以为授权一次就不用管了。

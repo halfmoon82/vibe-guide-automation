@@ -27,6 +27,10 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-28: §6 slimmed to daemon + short session + three-level self-heal,
+        # pointing at supervisor-card.md; engine attestation 72h, merge rule, no
+        # engineering questions to the product manager.
+        "fd485222f9645667e76a203e4f4cda9dd226b2e9ec6a184f2c493b9f2d9e377b",
         # 2026-10-27: §6.5 stalled-node branch merged onto the §6.4 fork_thread rule.
         "4720ebe75f624e66591e5faeea180936f9fa5cc53876d25ab6be04417bc6b5ba",
         # 2026-10-27: §6.5 stalled-node branch (investigate, self-heal, verify, escalate).
@@ -157,6 +161,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "a6d940da69d2e43664a37d44f0a9e28ad7f5ca2ecb8ebb03f46cf05752acd94b",
     }),
     "vibe-entry": frozenset({
+        # 2026-10-28: first-shift supervisor does daemon start + 60-minute fallback check.
+        "b3b201841310cec4de4d3e60cdef9773cb53cc5447317400b6543c481a7f344d",
         "315588896b6b69c069858aeaa2107146e6cbc3914f31b129e8057198842a0c38",
         "ddf7b12525e99fc740b11557833cf7ef78c8b8c197dc96586a3c7bebbb555056",
         # 2026-10-17: complex mode needs >=3 parallel nodes and cross-interrupt work; replies continue the tier.
