@@ -1701,7 +1701,9 @@ def legacy_run_in_flight(paths: ProjectPaths, run_id: str) -> bool:
 
 def require_not_legacy_run(paths: ProjectPaths, run_id: str) -> None:
     if legacy_run_in_flight(paths, run_id):
-        raise PermissionError(LEGACY_RUN_BLOCK + ": " + LEGACY_RUN_GUIDANCE)
+        # The "blocked_design: " prefix is how the CLI maps a PermissionError to
+        # a BLOCKED result (exit 3) instead of an unknown one.
+        raise PermissionError("blocked_design: " + LEGACY_RUN_BLOCK + ": " + LEGACY_RUN_GUIDANCE)
 
 
 def load_snapshot(paths: ProjectPaths, run_id: str) -> RunSnapshot:

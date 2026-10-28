@@ -54,5 +54,40 @@ class LegacyRunGuardTests(unittest.TestCase):
         self.assertFalse(legacy_run_in_flight(self.paths, self.snapshot.run_id))
 
 
+class LegacyRunCliTests(unittest.TestCase):
+    """Through the public CLI: unfinished legacy run -> blocked, finished -> status works."""
+
+    def setUp(self):
+        from tests.test_end_to_end import EndToEndTests
+        self.host = EndToEndTests("setUp")
+        self.host.setUp()
+        self.addCleanup(self.host.tearDown)
+        self.host.initialize()
+        self.host.create_plan()
+        self.runner = self.host.local_runner()
+        started = self.host.run_cli(
+            ["monitor", "--plan", "e2e-plan", "--authorize", "AUTHORIZE", "--json"], runner=self.runner)
+        self.assertEqual(started.exit_code, 0, started.text)
+        self.run_id = started.payload["run_id"]
+        self.state = self.host.root / ".vibe" / "runs" / self.run_id / "state.json"
+
+    def _as_legacy(self, status):
+        raw = json.loads(self.state.read_text(encoding="utf-8"))
+        raw.update({"legacy_run": False, "legacy_evidence": None, "legacy_evidence_digest": "", "status": status})
+        self.state.write_text(json.dumps(raw), encoding="utf-8")
+
+    def test_resume_of_unfinished_legacy_run_is_blocked_not_unknown(self):
+        self._as_legacy("running")
+        result = self.host.run_cli(["resume", "--plan", "e2e-plan", "--json"], runner=self.runner)
+        self.assertEqual(result.exit_code, 3, result.text)
+        self.assertIn(LEGACY_RUN_BLOCK, result.payload["reason"])
+
+    def test_status_of_finished_legacy_run_still_works(self):
+        self._as_legacy("complete")
+        result = self.host.run_cli(["status", "--plan", "e2e-plan", "--json"], runner=self.runner)
+        self.assertEqual(result.exit_code, 0, result.text)
+        self.assertEqual(result.payload["run_id"], self.run_id)
+
+
 if __name__ == "__main__":
     unittest.main()
