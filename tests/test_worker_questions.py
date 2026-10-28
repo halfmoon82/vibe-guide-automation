@@ -248,6 +248,9 @@ class MonitorQuestionTests(unittest.TestCase):
         self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz0123", text)
         self.assertNotIn("sk-ABCDEFGHIJKLMNOPQRSTUV", text)
         self.assertIn("要不要换？", text)
+        quoted = worker_questions.excerpt('配置是 {"api_token": "abc123xyz"}，请求头 Authorization: Bearer abcdef123456')
+        self.assertNotIn("abc123xyz", quoted)
+        self.assertNotIn("abcdef123456", quoted)
 
     def test_cli_requeue_with_a_note_answers_the_question(self):
         from vibe_guide.cli import run_cli

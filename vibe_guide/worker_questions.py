@@ -45,6 +45,9 @@ _CREDENTIAL_PATTERNS = (
      "[REDACTED]"),
     (re.compile(r"(?i)\b(api[_-]?key|access[_-]?key|token|secret|password|passwd)(\s*[:=]\s*)\S+"),
      r"\1\2[REDACTED]"),
+    (re.compile(r'(?i)("[^"]*(?:key|token|secret|password)[^"]*"\s*:\s*)"[^"]*"'),
+     r'\1"[REDACTED]"'),
+    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+"), r"\1[REDACTED]"),
 )
 
 
