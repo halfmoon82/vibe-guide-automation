@@ -180,6 +180,11 @@ SHIPPED_PROTOCOL_DIGESTS = {
     "visible-sdd-worker": frozenset({
         "30b226ff0a6711a91779785c28a993679e0a33c3aeb89e836cfd427194750945",
     }),
+    # Short per-beat runbook; the beat prints it once per shift, then only
+    # its path and sha256.
+    "supervisor-card": frozenset({
+        "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
+    }),
 }
 
 _HERE = Path(__file__).resolve().parent

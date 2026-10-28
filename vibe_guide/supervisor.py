@@ -580,6 +580,29 @@ def contract_drift(paths, run_id):
     }
 
 
+#: Shown beside ``context_pressure``: the shift cannot be replaced on this host.
+CONTEXT_PRESSURE_HINT = (
+    "上下文已超过换班硬上限，但本平台没有换班原语：同会话继续，不要新开会话接班；"
+    "需要时先用 supervisor-handoff 留下紧凑交接摘要。"
+)
+
+
+def _registered_provider(paths, run_id):
+    """Provider of the registered supervisor address, or None when unknown."""
+    try:
+        registry = _read_json_file(run_dir(paths, run_id) / _REGISTRY_NAME)
+    except (OSError, ValueError):
+        return None
+    current = registry.get("current") if isinstance(registry, dict) else None
+    provider = current.get("provider") if isinstance(current, dict) else None
+    return provider if isinstance(provider, str) and provider else None
+
+
+def _provider_never_rotates(provider):
+    """Claude Code (any spelling) has no automatic shift change."""
+    return _provider_family(provider) == "claude"
+
+
 def supervisor_preflight(
     paths,
     run_id,
@@ -638,21 +661,26 @@ def supervisor_preflight(
         return {"state": "unknown", "reason": "growth threshold must be positive"}
     if type(context_hard_cap) is not int or context_hard_cap <= DEFAULT_ROTATE_SOFT_CAP:
         return {"state": "unknown", "reason": "context hard cap must exceed soft cap"}
+    no_rotate = _provider_never_rotates(_registered_provider(paths, run_id))
+    pressure = None
     if tokens >= context_hard_cap:
-        return _with_cap_reason(
-            {"state": "rotate", "reason": "context over hard cap",
-             "tokens": tokens, "baseline": baseline,
-             "context_hard_cap": context_hard_cap, "prepare_handoff": True},
-            cap_reason,
-        )
+        if not no_rotate:
+            return _with_cap_reason(
+                {"state": "rotate", "reason": "context over hard cap",
+                 "tokens": tokens, "baseline": baseline,
+                 "context_hard_cap": context_hard_cap, "prepare_handoff": True},
+                cap_reason,
+            )
+        pressure = {"tokens": tokens, "context_hard_cap": context_hard_cap,
+                    "hint": CONTEXT_PRESSURE_HINT}
     config_warning = None
     if single_shift is None:
         try:
             single_shift, config_warning = load_supervisor_single_shift(paths.root)
         except ValueError:
             return {"state": "unknown", "reason": "supervisor_single_shift invalid"}
-    if (not single_shift and tokens >= DEFAULT_ROTATE_SOFT_CAP and baseline is not None
-            and tokens - baseline >= token_threshold):
+    if (not no_rotate and not single_shift and tokens >= DEFAULT_ROTATE_SOFT_CAP
+            and baseline is not None and tokens - baseline >= token_threshold):
         return _with_cap_reason(
             {"state": "rotate", "reason": "context grew past threshold since takeover",
              "tokens": tokens, "baseline": baseline,
@@ -676,6 +704,14 @@ def supervisor_preflight(
     if cap_reason:
         result = _with_cap_reason(result, cap_reason)
     result["prepare_handoff"] = tokens >= DEFAULT_ROTATE_SOFT_CAP
+    if pressure is not None:
+        # Claude Code has no rotation primitive: over the cap the beat keeps
+        # the session working and only warns, instead of asking for a handoff
+        # nobody can perform.  A pending decision keeps its own state.
+        if result.get("state") == "idle":
+            result = {**result, "state": "work",
+                      "reason": "context over hard cap; {} never rotates".format(_registered_provider(paths, run_id))}
+        result["context_pressure"] = pressure
     result["single_shift"] = bool(single_shift)
     if config_warning:
         result["config_warning"] = config_warning
@@ -2027,9 +2063,7 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "     " + SESSION_RECORD_HINT,
         "  2) 自建心跳，指令逐字用下面这段，只替换 <本会话记录路径>：",
         heartbeat_command(run_id, command_prefix=command_prefix),
-        "  3) 置顶、改标题；删掉上一班的心跳，归档上一班会话"
-        "（Claude Code 没有换班原语：上一班结束会话即可；"
-        "WorkBuddy 无自动换班入口，新会话由用户在本项目 UI 里手动开启）。",
+        "  3) 置顶、改标题；删掉上一班的心跳，归档上一班会话（各宿主差异见下一行）。",
         "  4) 跑一次心跳指令第 1 步的预检，按输出走。",
         HOST_SHIFT_DIFFERENCES,
         "监工挂起某个节点等用户拍板时，先登记：vibe supervisor-hold --run-id {} "
@@ -2677,3 +2711,158 @@ def heal_verify(paths, run_id, node_id, *, role=None):
         entry["unchanged_beats"] = 0
         stall.save_progress(paths, run_id, record)
     return {**base, "status": "verify_passed", "differences": []}
+
+
+# ---------------------------------------------------------------------------
+# Beat output: idle ends the turn, a repeated beat stops, the card ships once.
+
+IDLE_BEAT_TEXT = "idle：本轮结束，不要再调用，等待下一次唤醒"
+BEAT_REPEAT_WINDOW_SECONDS = 120
+BEAT_REPEAT_TEXT = "与上次相同，立即结束本轮"
+SUPERVISOR_CARD_NAME = "supervisor-card"
+_BEAT_LAST_FILE = "beat-last.json"
+_CARD_SHOWN_FILE = "supervisor-card-shown.json"
+_BEAT_WATCHED_FILES = (
+    "state.json", "events.jsonl", "tasks.json", "supervisor-registry.json",
+    "supervisor-holds.json", _HEARTBEAT_INTERVAL_FILE,
+)
+
+
+def _stat_entry(path):
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return [path.name, info.st_size, info.st_mtime_ns]
+
+
+def _listing(directory):
+    try:
+        return sorted(entry for entry in (_stat_entry(p) for p in directory.iterdir()) if entry)
+    except OSError:
+        return []
+
+
+def beat_fingerprint(paths, run_id):
+    """Digest of everything a beat reads from disk, or None when unreadable.
+
+    Built from file names, sizes and mtimes only, so computing it is cheap and
+    never re-runs the preflight.  A new delivery, request, result, decision or
+    run event changes it; the session's own token growth does not.
+    """
+    from .adapters.task_provider import ProviderActionStore
+    from .decisions import DecisionMailbox
+
+    try:
+        directory = run_dir(paths, run_id)
+        parts = [[name, _stat_entry(directory / name)] for name in _BEAT_WATCHED_FILES]
+        store_root = ProviderActionStore(paths).root
+        for sub in ("requests", "results", "stale", "observations"):
+            parts.append(["provider-" + sub, _listing(store_root / sub)])
+        decision_root = DecisionMailbox(paths).root
+        for sub in ("requests", "results"):
+            parts.append(["decision-" + sub, _listing(decision_root / sub)])
+    except (OSError, TypeError, ValueError):
+        return None
+    raw = json.dumps(parts, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def beat_repeat_check(paths, run_id, *, now=None):
+    """``(stop_payload, fingerprint)``; the payload is set only for a repeat.
+
+    A repeat is the identical fingerprint within ``BEAT_REPEAT_WINDOW_SECONDS``
+    of the last committed beat.  Any change in state returns ``(None, fp)`` so
+    the beat runs normally.
+    """
+    now = time.time() if now is None else now
+    fingerprint = beat_fingerprint(paths, run_id)
+    if fingerprint is None:
+        return None, None
+    last = _read_json_file(run_dir(paths, run_id) / _BEAT_LAST_FILE)
+    if (isinstance(last, dict) and last.get("fingerprint") == fingerprint
+            and isinstance(last.get("at"), (int, float))
+            and 0 <= now - last["at"] < BEAT_REPEAT_WINDOW_SECONDS):
+        return {"state": "stop", "reason": BEAT_REPEAT_TEXT, "end_turn": True,
+                "repeat_of_seconds": round(now - last["at"], 1)}, fingerprint
+    return None, fingerprint
+
+
+def beat_repeat_commit(paths, run_id, fingerprint, payload, *, now=None):
+    """Remember a beat that answered; unknown results never suppress a retry."""
+    from .state import _atomic_bytes
+
+    if fingerprint is None or not isinstance(payload, dict):
+        return
+    if payload.get("state") not in {"idle", "work", "decision", "rotate"}:
+        return
+    now = time.time() if now is None else now
+    _atomic_bytes(run_dir(paths, run_id) / _BEAT_LAST_FILE,
+                  _json_bytes({"fingerprint": fingerprint, "at": now}))
+
+
+def _supervisor_card(paths, run_id):
+    """``(text, ref)`` of the shipped card; raises when missing or unpublished."""
+    from .protocols import load_protocol, protocol_path, published_protocol_digest
+
+    digest = published_protocol_digest(SUPERVISOR_CARD_NAME)
+    return load_protocol(SUPERVISOR_CARD_NAME), {
+        "path": str(protocol_path(SUPERVISOR_CARD_NAME)), "sha256": digest}
+
+
+def _card_block(paths, run_id):
+    """Full card on a shift's first work beat, path + sha256 afterwards."""
+    from .state import _atomic_bytes
+
+    text, ref = _supervisor_card(paths, run_id)
+    registry = _read_json_file(run_dir(paths, run_id) / _REGISTRY_NAME)
+    current = registry.get("current") if isinstance(registry, dict) else None
+    shift = json.dumps(current, sort_keys=True) if isinstance(current, dict) else "unregistered"
+    shift_key = hashlib.sha256(shift.encode("utf-8")).hexdigest()
+    marker = run_dir(paths, run_id) / _CARD_SHOWN_FILE
+    shown = _read_json_file(marker)
+    reference = "监工卡：{}（sha256 {}）".format(ref["path"], ref["sha256"])
+    if isinstance(shown, dict) and shown.get("shift") == shift_key and shown.get("sha256") == ref["sha256"]:
+        return reference, ref, False
+    _atomic_bytes(marker, _json_bytes({"shift": shift_key, "sha256": ref["sha256"]}))
+    return reference + "\n" + text, ref, True
+
+
+def render_beat_text(paths, run_id, payload, *, plan_id, command_prefix="vibe",
+                     interval_minutes=None):
+    """Text for one beat; sets ``end_turn`` and the card reference on ``payload``.
+
+    A card that cannot be read or does not match its published digest turns a
+    ``work`` beat into ``unknown`` with the reason instead of dropping the card.
+    """
+    state = payload.get("state")
+    tail = "；下一拍间隔 {} 分钟".format(interval_minutes) if interval_minutes else ""
+    resume = "{} resume --plan {} --run-id {}".format(command_prefix, plan_id, run_id)
+    payload["end_turn"] = state in ("idle", "stop")
+    if state == "idle":
+        return IDLE_BEAT_TEXT
+    if state == "stop":
+        return BEAT_REPEAT_TEXT
+    if state == "decision":
+        return ("decision：读取决策信箱并向用户呈现未答卡片；心跳降频到 {} 分钟但不暂停，答案写回后恢复"
+                .format(HEARTBEAT_INTERVAL_DECISION_MINUTES)) + tail
+    if state == "contract_drift":
+        return ("contract_drift：能力合同与运行快照不一致，停止推进，立即走同一运行的重新授权流程；{}"
+                .format(payload.get("hint", ""))) + tail
+    if state == "rotate":
+        return ("rotate：新开一个会话（必须建在本项目里、必须是全新会话，不要 fork_thread），"
+                "让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(command_prefix, run_id)) + tail
+    if state == "work":
+        try:
+            block, ref, first = _card_block(paths, run_id)
+        except (OSError, ValueError) as error:
+            payload["state"] = "unknown"
+            payload["reason"] = "supervisor card unavailable: {}".format(str(error)[:160])
+            return "unknown：监工卡不可用（{}）；推进用 {}".format(payload["reason"], resume) + tail
+        payload["supervisor_card"] = {**ref, "full_text": first}
+        context = ""
+        if payload.get("context_pressure"):
+            context = "\n" + payload["context_pressure"]["hint"]
+        return "work：服务信箱一轮，推进用 {}{}\n{}".format(resume, tail, block) + context
+    return "unknown：按 work 处理，推进用 {}；原因：{}".format(
+        resume, payload.get("reason", "状态未知")) + tail
