@@ -197,7 +197,9 @@ _USER_RECOVERY_STATUSES = {
 #: -- the same vocabulary ``adapters.claude_bg.WORKTREE_REASON_CODES`` uses --
 #: so the label can name the required action without reading provider text.
 WORKTREE_PREFLIGHT_KEY = "worktree_preflight"
-WORKTREE_REASON_CODES = ("worktree_missing", "worktree_mismatch", "worktree_create_failed")
+WORKTREE_REASON_CODES = (
+    "worktree_missing", "worktree_mismatch", "worktree_create_failed", "worktree_merge_conflict",
+)
 WORKTREE_ACTION_STATUS = "需要监工建工作树"
 #: The marker's own keys, in one place because two writers need them: the CLI
 #: records what the launcher left behind (#235), and the monitor's replay of
@@ -210,6 +212,9 @@ WORKTREE_PREFLIGHT_KEYS = (
     "branch",
     "worktree_base",
     "worktree_command",
+    # Repository-relative paths git itself reported as conflicting when the
+    # accepted upstream branches were merged into a downstream node's base.
+    "conflict_files",
 )
 
 
@@ -422,6 +427,7 @@ _EVENT_DATA_KEYS = {
     "branch",
     "worktree_base",
     "worktree_command",
+    "conflict_files",
     # session-root delivery warning (#240): the one observation that can see
     # which sandbox a worker actually ran in.  It is advisory structure vibe
     # itself composed from ``delivery_evidence.session_cwd``, never provider

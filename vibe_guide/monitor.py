@@ -109,6 +109,7 @@ from .task_registry import (
 )
 from .config import load_project_config
 from .worker_questions import WORKER_QUESTION_EVENT, park_question as park_worker_question
+from .worktree_base import upstream_branches
 from .workflow_gate import require_capability_contract, require_entry, verify_workflow
 from .authorize_entry import load_live_workflow, select_plan_workflow, verify_workflow_artifacts
 from .diagnostics import validate_child_session_binding
@@ -5597,6 +5598,7 @@ class Monitor:
             contract["predecessor_task_id"] = predecessor_task_id
         contract.setdefault("worktree", str(current["worktree"]))
         contract.setdefault("branch", str(current["branch"]))
+        contract["upstream_branches"] = upstream_branches(self.nodes, snapshot.nodes, node_id)
         if role == "reviewer" and continuation:
             # Resume prompts must carry the real developer delivery facts
             # observed by the monitor, bound to this snapshot generation.

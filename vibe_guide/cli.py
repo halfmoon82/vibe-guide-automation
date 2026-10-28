@@ -815,7 +815,8 @@ def _claude_bg_launcher_factory(paths: ProjectPaths, launchers: Optional[List[An
             handoff_file=str(contract.get("handoff_file") or fallback),
         )
         launcher = claude_bg.ClaudeBgLauncher(
-            routing, claude_bg.load_claude_bg_config(paths), model=model
+            routing, claude_bg.load_claude_bg_config(paths), model=model,
+            upstream_branches=contract.get("upstream_branches") or (),
         )
         if launchers is not None:
             launchers.append((str(contract.get("node_id") or ""), launcher))
@@ -1026,6 +1027,10 @@ def _record_worktree_preflight(
                     data[key] = report[key]
             record_event(monitor, snapshot, event, data)
             current.pop("worktree_preflight", None)
+            if report.get("worktree_base"):
+                # The base vibe built this worktree from (main plus accepted
+                # upstreams); delivery-time scope checks diff against it.
+                current["worktree_base"] = report["worktree_base"]
         elif WORKTREE_PREFLIGHT_KEY in current:
             # The directory is there and matches the contract now (the report
             # says nothing happened): the action a supervisor was asked to

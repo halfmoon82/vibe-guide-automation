@@ -28,7 +28,11 @@ CLAUDE_BG_PROVIDER = "claude-code-background"
 WORKTREE_MISSING = "worktree_missing"
 WORKTREE_MISMATCH = "worktree_mismatch"
 WORKTREE_CREATE_FAILED = "worktree_create_failed"
-WORKTREE_REASON_CODES = (WORKTREE_MISSING, WORKTREE_MISMATCH, WORKTREE_CREATE_FAILED)
+#: Accepted upstream branches of a downstream node do not merge cleanly.
+WORKTREE_MERGE_CONFLICT = "worktree_merge_conflict"
+WORKTREE_REASON_CODES = (
+    WORKTREE_MISSING, WORKTREE_MISMATCH, WORKTREE_CREATE_FAILED, WORKTREE_MERGE_CONFLICT,
+)
 WORKTREE_CREATED_EVENT = "worktree_created"
 WORKTREE_BLOCKED_EVENT = "worktree_preflight_blocked"
 
@@ -235,6 +239,7 @@ class ClaudeBgLauncher:
         model: Optional[str] = None,
         transcript_locator: Callable[[str], Optional[Path]] = _default_transcript_locator,
         sleeper: Callable[[float], None] = time.sleep,
+        upstream_branches: Optional[Sequence[str]] = None,
     ):
         self.routing = routing
         self.sleeper = sleeper
@@ -243,6 +248,9 @@ class ClaudeBgLauncher:
         self.prompt_builder = prompt_builder
         self.model = model or config.model
         self.transcript_locator = transcript_locator
+        #: Accepted upstream node branches, in topological order, merged into
+        #: the baseline of a worktree this launcher builds.
+        self.upstream_branches = [str(item) for item in (upstream_branches or ())]
         #: What ``launch`` had to do about the node worktree (#235), read back
         #: by the CLI after the dispatch returns: ``{"event": ...,
         #: "worktree": ..., "branch": ..., "worktree_base": ..., ...}``.
@@ -265,7 +273,8 @@ class ClaudeBgLauncher:
 
     # -- worktree preflight (#235) ----------------------------------------
     def _blocked(
-        self, reason_code: str, reason: str, command: Optional[str] = None
+        self, reason_code: str, reason: str, command: Optional[str] = None,
+        conflict_files: Optional[List[str]] = None,
     ) -> ClaudeBgWorktreeBlocked:
         self.worktree_preflight = {
             "event": WORKTREE_BLOCKED_EVENT,
@@ -274,6 +283,8 @@ class ClaudeBgLauncher:
             "branch": self.routing.branch,
             "worktree_command": command,
         }
+        if conflict_files:
+            self.worktree_preflight["conflict_files"] = list(conflict_files)
         return ClaudeBgWorktreeBlocked(
             reason_code, reason, self.routing.worktree, self.routing.branch, command
         )
@@ -380,6 +391,9 @@ class ClaudeBgLauncher:
                 % (path, branch, path, branch),
                 "git worktree add %s %s" % (path, branch),
             )
+        if self.upstream_branches:
+            base = self._compose_upstream_base(repo, path, branch, base)
+            manual = self._manual_command(path, branch, base)
         result = self._run(["git", "worktree", "add", str(path), "-b", branch, base], repo)
         if result.returncode != 0:
             tail = (result.stderr or result.stdout or "").strip()[-200:]
@@ -412,6 +426,34 @@ class ClaudeBgLauncher:
             "worktree_base": base,
         }
         return path
+
+    def _compose_upstream_base(self, repo: Path, path: Path, branch: str, base: str) -> str:
+        """Main plus every accepted upstream branch; nothing is built on failure."""
+        from ..worktree_base import (
+            UpstreamBaseUnavailable, UpstreamMergeConflict, compose_base,
+        )
+
+        try:
+            return compose_base(lambda args: self._run(["git"] + args, repo), base,
+                                self.upstream_branches)
+        except UpstreamMergeConflict as conflict:
+            files = "、".join(conflict.files) or "（git 未列出文件）"
+            raise self._blocked(
+                WORKTREE_MERGE_CONFLICT,
+                "accepted upstream branch %s does not merge cleanly into the baseline of %s; "
+                "conflicting files: %s; worktree %s was not created"
+                % (conflict.branch, branch, ", ".join(conflict.files), path),
+                "上游分支 %s 与已合入的基线冲突（冲突文件：%s）：先在上游分支解决冲突或调整依赖，"
+                "再重新派发本节点" % (conflict.branch, files),
+                conflict_files=conflict.files,
+            )
+        except UpstreamBaseUnavailable as error:
+            raise self._blocked(
+                WORKTREE_CREATE_FAILED,
+                "cannot compose the upstream baseline for %s (%s); worktree %s was not created"
+                % (branch, error, path),
+                self._manual_command(path, branch, None, str(error)),
+            )
 
     def _repository_root(self, path: Path) -> Optional[Path]:
         """The nearest ancestor that holds a repository, or None."""
