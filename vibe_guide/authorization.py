@@ -1121,6 +1121,10 @@ class AuthorizationCard:
     node_scope_digests: Optional[Dict[str, str]] = None
     heartbeat_interval_options: Tuple[Dict[str, Any], ...] = ()
     rotate_hard_cap_options: Tuple[Dict[str, Any], ...] = ()
+    # Per-node capability tier and what the current platform resolves it to.
+    # Unsigned display: the tier is derived from the signed node contract, and
+    # a concrete model name must never enter the digest.
+    model_tiers: Tuple[Dict[str, Any], ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -1478,10 +1482,32 @@ def _drop_unset_card_fields(result: Dict[str, Any]) -> Dict[str, Any]:
                 "heartbeat_interval_forced", "heartbeat_interval_forced_cost"):
         if result.get(key) is None:
             result.pop(key, None)
-    for key in ("heartbeat_interval_options", "rotate_hard_cap_options"):
+    for key in ("heartbeat_interval_options", "rotate_hard_cap_options", "model_tiers"):
         if not result.get(key):
             result.pop(key, None)
     return result
+
+
+def _model_tier_rows(nodes: List[DAGNode], platform: str) -> Tuple[Dict[str, Any], ...]:
+    """Each node's tier and its model on ``platform``; a failed probe is shown as unknown."""
+    from . import model_catalog
+
+    home = model_catalog.vibe_home_path()
+    rows = []
+    for node in sorted(nodes, key=lambda item: item.id):
+        tier = model_catalog.node_tier(node)
+        choice = model_catalog.resolve(platform, tier, vibe_home=home)
+        rows.append({
+            "node_id": node.id,
+            "tier": tier,
+            "reviewer_tier": model_catalog.node_tier(node, role="reviewer"),
+            "platform": choice.platform,
+            "resolved_model": choice.model,
+            "effort": choice.effort,
+            "resolution": choice.status,
+            "note": choice.note,
+        })
+    return tuple(rows)
 
 
 def build_authorization_card(
@@ -1743,6 +1769,7 @@ def build_authorization_card(
     # digest and the record schema unchanged for a caller that passes none.
     canonical["heartbeat_interval_options"] = heartbeat_options
     canonical["rotate_hard_cap_options"] = rotate_options
+    canonical["model_tiers"] = _model_tier_rows(nodes, capabilities.agent_id)
     card = AuthorizationCard(digest=digest, **canonical)
     # The issuing path checks its own output: a card the validator would
     # refuse must not be signed in the first place (ISSUE-08).
