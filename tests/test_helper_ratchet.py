@@ -34,7 +34,6 @@ ALLOWED_FILES = (
     "change_requests.py",
     "cli.py",
     "engine_attestation.py",
-    "history_migration.py",
     "host_rules.py",
     "initializer.py",
     "manifest.py",

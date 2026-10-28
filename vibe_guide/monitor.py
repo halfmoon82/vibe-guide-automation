@@ -1,6 +1,5 @@
 """Authorization-bound, write-ahead monitor for developer/reviewer DAG tasks."""
 
-import hashlib
 import json
 import re
 from dataclasses import dataclass, replace
@@ -48,6 +47,8 @@ from .models import (
 from .paths import ProjectPaths
 from .path_ownership import validate_path_ownership
 from .binding_lifecycle import VisibleSddAcceptance
+from . import digests, fsio, monitor_acceptance, monitor_contracts, monitor_handoff
+from .monitor_acceptance import VISIBLE_SDD_PROTOCOL_REF
 from .planner import (
     ScopeExpansionResolution,
     _scope_compare_key,
@@ -69,7 +70,6 @@ from .state import (
     RECOVERY_SIGNATURE_KEYS,
     RunSnapshot,
     require_not_legacy_run,
-    _atomic_bytes,
     acquire_writer_lease,
     append_event,
     archive_run as _archive_run_artifacts,
@@ -96,7 +96,6 @@ from .task_registry import (
     REGISTRY_SCHEMA_VERSION,
     TaskBinding,
     _all_bindings,
-    _atomic_json,
     _read_registry,
     _registry_lock,
     _run_tasks_path,
@@ -149,11 +148,6 @@ class ScopeDecisionRequired(PermissionError):
     """The requested expansion crosses a product-owned scope boundary."""
 
 
-# ISSUE-140 (design section 3.3): contract-declared invariant test commands
-# are executed by the monitor inside the node writer worktree.  Commands come
-# from the already-authorized node contract and execution never leaves the
-# contract writer worktree, so this introduces no new authorization surface.
-DEFAULT_CONTRACT_TEST_TIMEOUT_SECONDS = 120
 DECISION_NOTIFICATION_UNKNOWN_REASON = "decision notification bridge status unknown"
 # A node that reaches blocked_design with no decision record is a supervisor
 # lifecycle defect, not a wait-for-user.  Recovery: the supervisor either
@@ -205,37 +199,8 @@ def _requested_scope_files(scope_request: Any) -> List[str]:
     return [item for item in files if isinstance(item, str)]
 
 
-#: Compile/build command prefixes that can never prove a *behavioral*
-#: invariant (they only prove the code compiles).  Built-in and not reducible
-#: through configuration; projects may append entries via
-#: ``.vibe/config.json`` ``behavioral_command_blacklist_extra``.
-BEHAVIORAL_COMPILE_COMMAND_BLACKLIST = frozenset({
-    "tsc",
-    "vue-tsc",
-    "vite build",
-    "webpack",
-    "rollup",
-    "esbuild",
-    "npm run build",
-    "pnpm build",
-    "yarn build",
-    "next build",
-    "ng build",
-})
 
 
-def _command_matches_blacklist(command: str, blacklist) -> bool:
-    """Prefix match on whitespace-split tokens.
-
-    A command hits a blacklist entry when its first ``len(entry_tokens)``
-    tokens equal the entry's tokens exactly.
-    """
-    tokens = str(command).split()
-    for entry in blacklist:
-        entry_tokens = str(entry).split()
-        if entry_tokens and tokens[: len(entry_tokens)] == entry_tokens:
-            return True
-    return False
 
 
 
@@ -287,9 +252,6 @@ ACCEPTANCE_FORMAT_REJECTION_LIMIT = 3
 #: the reshaped claim is recorded through ``Monitor.record_integration_review``.
 ACCEPTANCE_FORMAT_ESCALATION_RECOVERY = "reshape_delivery_and_reconcile"
 
-#: Protocol pointer carried by every visible-sdd create request so the worker
-#: session can resolve the in-session SDD protocol from the installed package.
-VISIBLE_SDD_PROTOCOL_REF = "vibe_guide/protocols/visible-sdd-worker.md"
 
 #: Disposition kinds that close one ``blocked_unknowns`` item reported by an
 #: in-session review (issue #140 design draft section 3.6).  A non-empty
@@ -1108,12 +1070,12 @@ class Monitor:
     @staticmethod
     def _prospective_intent_digest(snapshot: RunSnapshot, node_id: str, role: str, generation: int, current: Dict[str, Any]) -> str:
         payload = {"run_id": snapshot.run_id, "node_id": node_id, "role": role, "generation": generation, "task_id": current.get(role + "_identity") or f"{role}:{node_id}", "writer": current.get("writer") or current.get("worker") or role, "worktree": current.get("worktree", ""), "branch": current.get("branch", ""), "authorization_digest": snapshot.authorization_digest, "node_contract_digest": current.get("contract_digest") or snapshot.node_contract_digest}
-        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return digests.sha256_bytes(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
 
     @staticmethod
     def _start_intent_digest(snapshot: RunSnapshot, node_id: str, role: str, task_id: str, generation: int, contract: Dict[str, Any], current: Dict[str, Any]) -> str:
         payload = {"run_id": snapshot.run_id, "node_id": node_id, "role": role, "task_id": task_id, "generation": generation, "writer": contract.get("writer") or current.get("worker"), "worktree": contract.get("worktree") or current.get("worktree"), "branch": contract.get("branch") or current.get("branch"), "authorization_digest": snapshot.authorization_digest, "node_contract_digest": current.get("contract_digest") or getattr(snapshot, "node_contract_digest", "")}
-        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return digests.sha256_bytes(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
 
     def _dispatch_with_intent(self, runner: Runner, contract: Dict[str, Any], intent: Any):
         """Dispatch one provider request and accept only a matching proof.
@@ -1153,9 +1115,9 @@ class Monitor:
                 action_basis = payload.get("binding_intent") or (
                     intent.to_dict() if hasattr(intent, "to_dict") else dict(intent)
                 )
-                action_ref = "dispatch-" + hashlib.sha256(
+                action_ref = "dispatch-" + digests.sha256_bytes(
                     json.dumps(action_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                ).hexdigest()[:24]
+                )[:24]
                 return {
                     "kind": "contract_error",
                     "reason": "provider dispatch contract rejected",
@@ -1187,9 +1149,9 @@ class Monitor:
             action_basis = payload.get("binding_intent") or (
                 intent.to_dict() if hasattr(intent, "to_dict") else dict(intent)
             )
-            action_ref = "dispatch-" + hashlib.sha256(
+            action_ref = "dispatch-" + digests.sha256_bytes(
                 json.dumps(action_basis, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            ).hexdigest()[:24]
+            )[:24]
             return {
                 "kind": "contract_error" if reason_code != "provider_unavailable" else "retryable",
                 "reason": "provider dispatch contract rejected",
@@ -1296,7 +1258,7 @@ class Monitor:
         expected = []
         for node in self.nodes.values():
             expected.append({"id": node.id, "depends_on": list(node.depends_on), "parallel_group": node.parallel_group, "allowlist": list(node.allowlist), "owned_paths": list(node.owned_paths), "writer": node.writer, "reviewer": node.reviewer, "worktree": node.worktree})
-        digest = hashlib.sha256(json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        digest = digests.sha256_bytes(json.dumps(expected, sort_keys=True, separators=(",", ":")).encode("utf-8"))
         blocked_ids = {
             node_id for node_id, current in snapshot.nodes.items()
             if current.get("status") in {"blocked_unknown", "blocked_design", "blocked_deploy"}
@@ -1654,7 +1616,7 @@ class Monitor:
             except (OSError, ValueError):
                 existing = []
         existing.append(audit)
-        _atomic_bytes(
+        fsio.atomic_write_bytes(
             audit_path,
             (json.dumps(existing, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"),
         )
@@ -1729,7 +1691,7 @@ class Monitor:
             if path_value and not path.is_absolute():
                 path = self.paths.root / path
             try:
-                values.append(hashlib.sha256(path.read_bytes()).hexdigest() if path_value else "")
+                values.append(digests.sha256_bytes(path.read_bytes()) if path_value else "")
             except (OSError, ValueError):
                 values.append("")
         return values[0], values[1]
@@ -2978,7 +2940,7 @@ class Monitor:
     @staticmethod
     def _scope_binding_digest(binding: Dict[str, Any]) -> str:
         values = {k: v for k, v in binding.items() if k != "allowlist"}
-        return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+        return digests.sha256_bytes(json.dumps(values, sort_keys=True).encode())
 
     def _validate_scope_correction(self, snapshot: RunSnapshot, node_id: str,
                                    proof: Dict[str, Any]):
@@ -3143,7 +3105,7 @@ class Monitor:
             raise ValueError("reconciliation evidence path escapes worktree") from error
         if candidate.is_symlink() or not candidate.is_file():
             raise ValueError("reconciliation evidence file is unavailable")
-        if hashlib.sha256(candidate.read_bytes()).hexdigest() != digest:
+        if digests.sha256_bytes(candidate.read_bytes()) != digest:
             raise ValueError("reconciliation evidence hash mismatch")
 
     def _validate_head(self, binding: TaskBinding, claimed: Any) -> None:
@@ -3517,7 +3479,7 @@ class Monitor:
         project_root = str(self.paths.root.resolve())
         return {
             "schema_version": 1,
-            "project_digest": hashlib.sha256(project_root.encode("utf-8")).hexdigest(),
+            "project_digest": digests.sha256_bytes(project_root.encode("utf-8")),
             "plan_id": self.plan.plan_id,
             "plan_version": self.plan.version,
             "decision_digest": record.decision_digest,
@@ -3955,25 +3917,7 @@ class Monitor:
 
     @staticmethod
     def _identity_from_contract(node: DAGNode, role: str) -> Optional[str]:
-        for key in (
-            role + "_task_id",
-            role + "_platform_task_id",
-            role + "_threadId",
-            role + "_thread_id",
-        ):
-            value = node.contract.get(key)
-            if value:
-                return str(value)
-        nested = node.contract.get(role + "_task")
-        if isinstance(nested, dict):
-            for key in ("task_id", "platform_task_id", "threadId", "thread_id"):
-                if nested.get(key):
-                    return str(nested[key])
-        if role == "developer":
-            for key in ("task_id", "platform_task_id", "threadId", "thread_id"):
-                if node.contract.get(key):
-                    return str(node.contract[key])
-        return None
+        return monitor_handoff._identity_from_contract(node, role)
 
     def _run_has_platform_handoff(self, snapshot: RunSnapshot) -> bool:
         """Whether this run recorded a platform_handoff reauthorization."""
@@ -3984,15 +3928,8 @@ class Monitor:
         )
 
     @staticmethod
-    def _handoff_superseded_identity(
-        current: Dict[str, Any], role: str
-    ) -> Optional[str]:
-        """The role's current task identity when a platform_handoff superseded it."""
-        superseded = current.get("handoff_superseded")
-        identity = current.get(role + "_identity")
-        if isinstance(superseded, dict) and identity and superseded.get(role) == identity:
-            return str(identity)
-        return None
+    def _handoff_superseded_identity(current: Dict[str, Any], role: str) -> Optional[str]:
+        return monitor_handoff._handoff_superseded_identity(current, role)
 
     #: Termination basis for a handoff predecessor: "already delivered".  After
     #: a platform switch the old platform cannot be queried, so there is no
@@ -4009,89 +3946,11 @@ class Monitor:
         "reviewer": frozenset({"review", "delivered", "accepted"}),
     }
 
-    def _prove_handoff_predecessor_terminal(
-        self, snapshot: RunSnapshot, node_id: str, role: str
-    ) -> Optional[Tuple[str, str]]:
-        """Archive a terminal pre-handoff task, then prove it stopped.
+    def _prove_handoff_predecessor_terminal(self, snapshot: RunSnapshot, node_id: str, role: str) -> Optional[Tuple[str, str]]:
+        return monitor_handoff._prove_handoff_predecessor_terminal(self, snapshot, node_id, role)
 
-        Returns ``(predecessor task id, predecessor provider)``, or ``None`` when the old task cannot
-        be proven terminal (missing/stale binding, live state); the caller
-        then fails closed instead of creating a second writer.  The proof
-        itself is the ordinary ``_prove_old_task_stopped_or_absent``.
-        """
-        current = snapshot.nodes[node_id]
-        try:
-            binding = self._load_task_binding(snapshot, node_id, role)
-        except (FileNotFoundError, OSError, TypeError, ValueError):
-            return None
-        if not binding.task_id or binding.task_id != current.get(role + "_identity"):
-            return None
-        previous_status = binding.status
-        if previous_status in self._HANDOFF_ARCHIVABLE_STATUSES[role]:
-            try:
-                self._set_binding_status(snapshot, node_id, role, "archived")
-            except (FileNotFoundError, OSError, TypeError, ValueError):
-                return None
-        predecessor = self._prove_old_task_stopped_or_absent(
-            snapshot, node_id, {"successor_candidate": True, "role": role}
-        )
-        if not predecessor:
-            return None
-        self._record(
-            snapshot,
-            "handoff_predecessor_reconciled",
-            {
-                "run_id": snapshot.run_id,
-                "node_id": node_id,
-                "role": role,
-                "predecessor_task_id": predecessor,
-                "previous_binding_status": previous_status,
-                "proof": "platform_handoff",
-            },
-        )
-        return predecessor, binding.provider
-
-    def _prove_old_task_stopped_or_absent(
-        self,
-        snapshot: RunSnapshot,
-        node_id: str,
-        retry: Dict[str, Any],
-    ) -> Optional[str]:
-        """Return the predecessor identity only when a successor is safe.
-
-        ``None`` means the old task remains ambiguous.  An empty string is a
-        durable absence proof: there is no current-run registry binding and
-        no provider request that could have created a task.  A terminal
-        binding is accepted only for an already provider-confirmed terminal
-        state; running/blocked bindings never authorize a new writer.
-        """
-        current = snapshot.nodes[node_id]
-        if retry.get("successor_candidate") is not True:
-            return None
-        if (
-            current.get("active_task") is not None
-            or node_id in snapshot.handles
-            or current.get("start_intent") is not None
-        ):
-            return None
-        role = retry.get("role")
-        if role not in {"developer", "reviewer"}:
-            return None
-        try:
-            binding = self._load_task_binding(snapshot, node_id, str(role))
-        except FileNotFoundError:
-            try:
-                requested = ProviderActionStore(self.paths).has_request(
-                    snapshot.run_id, node_id, str(role)
-                )
-            except (OSError, TypeError, ValueError):
-                return None
-            return None if requested else ""
-        except (OSError, TypeError, ValueError):
-            return None
-        if binding.status in {"stopped", "failed", "archived"}:
-            return binding.task_id or ""
-        return None
+    def _prove_old_task_stopped_or_absent(self, snapshot: RunSnapshot, node_id: str, retry: Dict[str, Any]) -> Optional[str]:
+        return monitor_handoff._prove_old_task_stopped_or_absent(self, snapshot, node_id, retry)
 
     def _live_node_contract_digest(self, node_id: str) -> str:
         """Recompute the node contract digest from the live node contract.
@@ -4214,20 +4073,8 @@ class Monitor:
             current["pair_archived"] = True
         self._release_node_lease(snapshot, node_id)
 
-    def _reject_replayed_old_task_reconciliation(
-        self, snapshot: RunSnapshot, node_id: str, data: Dict[str, Any]
-    ) -> None:
-        """Consume an untrusted reconciliation event without starting a writer."""
-        current = snapshot.nodes[node_id]
-        current["status"] = "blocked_unknown"
-        current["reason"] = "replayed old task reconciliation proof is invalid"
-        current["quarantine"] = {
-            "run_id": snapshot.run_id,
-            "handle_id": snapshot.handles.get(node_id),
-            "reason": current["reason"],
-        }
-        current["old_task_reconciled"] = False
-        current["retryable_action"] = None
+    def _reject_replayed_old_task_reconciliation(self, snapshot: RunSnapshot, node_id: str, data: Dict[str, Any]) -> None:
+        return monitor_acceptance._reject_replayed_old_task_reconciliation(self, snapshot, node_id, data)
 
     def _recover_developer_delivery_projection(self, snapshot, node_id, *, require_receipt=False,
                                                replay_sequence=None):
@@ -4312,7 +4159,12 @@ class Monitor:
         if not artifact.resolve().is_relative_to(root) or not artifact.is_file():
             raise ValueError('successor reconciliation developer delivery artifact is unverified')
         return delivery, {'action_id':action['action_id'], 'request_digest':action['request_digest'],
-            'archive_path':str(path), 'archive_digest':hashlib.sha256(path.read_bytes()).hexdigest()}
+            'archive_path':str(path), 'archive_digest':digests.sha256_bytes(path.read_bytes())}
+
+    def reconcile_package(self, run_id, package, *, runner_factory, invalidation_path, authorization_digest):
+        return monitor_handoff.reconcile_package(
+            self, run_id, package, runner_factory=runner_factory,
+            invalidation_path=invalidation_path, authorization_digest=authorization_digest)
 
     def reconcile_created_successor(self, run_id, node_id, runner, *, action_id,
                                     request_digest, predecessor_archive, preservation_path,
@@ -4376,7 +4228,7 @@ class Monitor:
         delivery, delivery_recovery = self._recover_developer_delivery_projection(snapshot, node_id)
         path = Path(preservation_path)
         raw_preservation = path.read_bytes()
-        if hashlib.sha256(raw_preservation).hexdigest() != preservation_digest:
+        if digests.sha256_bytes(raw_preservation) != preservation_digest:
             raise ValueError('successor reconciliation preservation digest mismatch')
         preserved = json.loads(raw_preservation)
         if (not isinstance(preserved, dict)
@@ -4391,7 +4243,7 @@ class Monitor:
                 or preserved.get('cumulative_diff', {}).get('stdout') != git('diff', '--binary', 'HEAD')):
             raise ValueError('successor reconciliation preserved content changed')
         untracked = git('ls-files', '--others', '--exclude-standard').splitlines()
-        hashes = {name: hashlib.sha256((root/name).read_bytes()).hexdigest() for name in untracked}
+        hashes = {name: digests.sha256_bytes((root/name).read_bytes()) for name in untracked}
         if hashes != preserved.get('untracked_hashes'):
             raise ValueError('successor reconciliation untracked content changed')
         # Other nodes may not hold the same writer root. The original
@@ -4905,53 +4757,7 @@ class Monitor:
         return chain
 
     def _hide_stale_handoff_creates(self, snapshot: RunSnapshot, runner: Runner) -> None:
-        """Hide the old platform's unclaimed creates of every unfinished node.
-
-        Independent of the node's lease: a dispatch that failed once released
-        its lease, so the lease-rebind path never runs for it, yet its old
-        create is still pending beside the new platform's.  Only requests
-        written under an authorization a platform_handoff replaced, by a
-        provider other than the one now dispatching, and that nothing claimed
-        are hidden; the new platform's own create is never matched (its
-        provider is the runner's).  Idempotent, so a
-        re-run of the handoff heals a mailbox an earlier version left with two.
-        """
-        provider = getattr(runner, "provider", None)
-        replaced = self._handoff_replaced_authorizations(snapshot)
-        if not isinstance(provider, str) or not provider or not replaced:
-            return
-        store = ProviderActionStore(self.paths)
-        for node_id in sorted(snapshot.nodes):
-            if snapshot.nodes[node_id].get("status") == "accepted":
-                continue
-            try:
-                slots = [
-                    (digest, role, generation)
-                    for digest in replaced
-                    for role, generation in store.unresolved_create_slots(
-                        snapshot.run_id, node_id, digest, provider
-                    )
-                ]
-                if not slots or not self._node_never_claimed(snapshot, node_id, store):
-                    continue
-                for digest, role, generation in slots:
-                    superseded = store.supersede_unclaimed_creates(
-                        snapshot.run_id, node_id, role, generation, digest, provider
-                    )
-                    if superseded:
-                        self._record(
-                            snapshot,
-                            "handoff_stale_creates_hidden",
-                            {
-                                "run_id": snapshot.run_id,
-                                "node_id": node_id,
-                                "role": role,
-                                "generation": generation,
-                                "superseded_creates": superseded,
-                            },
-                        )
-            except (OSError, TypeError, ValueError):
-                continue
+        return monitor_handoff._hide_stale_handoff_creates(self, snapshot, runner)
 
     def _adopt_unserved_handoff_lease(
         self, snapshot: RunSnapshot, node_id: str, role: str, generation: int, digest: str,
@@ -5558,9 +5364,9 @@ class Monitor:
         current["active_task"] = None
         current["active_role"] = None
         current["start_intent"] = None
-        action_ref = "dispatch-" + hashlib.sha256(
+        action_ref = "dispatch-" + digests.sha256_bytes(
             (snapshot.run_id + "\0" + node_id + "\0" + role + "\0" + str(generation) + "\0" + failure_phase + "\0" + type(error).__name__).encode("utf-8")
-        ).hexdigest()[:24]
+        )[:24]
         current["status"] = "blocked_unknown"
         current["reason"] = "task binding rejected before start ({})".format(type(error).__name__)
         if (
@@ -5988,7 +5794,7 @@ class Monitor:
                     "reason_class": failure["kind"],
                     "next_retry_at": time.time(),
                     "binding_digest": current.get("contract_digest", ""),
-                    "last_observation_ref": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
+                    "last_observation_ref": digests.sha256_bytes(str(error).encode("utf-8")),
                 }
                 current["status"] = self._v42_retry_status()
                 current["reason"] = redact_provider_text(str(error))
@@ -6025,7 +5831,7 @@ class Monitor:
                         "reason_class": "binding_unknown",
                         "next_retry_at": time.time(),
                         "binding_digest": current.get("contract_digest", ""),
-                        "last_observation_ref": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
+                        "last_observation_ref": digests.sha256_bytes(str(error).encode("utf-8")),
                     }
             if binding_contract_enabled(contract) and failure["kind"] != "external_decision":
                 current["binding_phase"] = "binding_repair_pending"
@@ -6144,7 +5950,7 @@ class Monitor:
                         "attempt": max(1, previous_attempt + 1), "reason_class": failure["kind"],
                         "next_retry_at": time.time(),
                         "binding_digest": current.get("contract_digest", ""),
-                        "last_observation_ref": handle.get("action_ref") or hashlib.sha256(str(reason).encode("utf-8")).hexdigest(),
+                        "last_observation_ref": handle.get("action_ref") or digests.sha256_bytes(str(reason).encode("utf-8")),
                     }
                     current["status"] = self._v42_retry_status()
                     current["reason"] = redact_provider_text(str(reason))
@@ -6228,7 +6034,7 @@ class Monitor:
                     "reason_class": failure["kind"],
                     "next_retry_at": time.time() + min(60.0, float(2 ** min(attempt - 1, 5))),
                     "binding_digest": current.get("contract_digest", ""),
-                    "last_observation_ref": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
+                    "last_observation_ref": digests.sha256_bytes(str(error).encode("utf-8")),
                 }
                 current["retryable_action"] = retry
                 current["status"] = self._v42_retry_status()
@@ -7991,211 +7797,12 @@ class Monitor:
             active if isinstance(active, dict) else None,
         )
 
-    def _validate_visible_sdd_review(
-        self,
-        snapshot: RunSnapshot,
-        node_id: str,
-        event: RunEvent,
-        current: Dict[str, Any],
-    ):
-        """Pure validation of the in-session review evidence; no writes.
-
-        Returns ``None`` when the delivery may be accepted, otherwise
-        ``(reason, recoverable, code)``.  ``code`` (#254) is the stable
-        machine-readable rejection class that survives the provider-text
-        redaction the free-text ``reason`` goes through on persistence.
-        Missing or malformed evidence and a foreign protocol pointer are
-        format errors (recoverable -- the same worker session can correct and
-        re-report on its live handle, per ISSUE-83); an unreadable or drifted
-        node contract is an evidence problem and stays fail-closed.
-        """
-        review = event.data.get("in_session_review")
-        clearance = review.get("clearance") if isinstance(review, dict) else None
-        evidence_ref = review.get("evidence_ref") if isinstance(review, dict) else None
-        valid = (
-            isinstance(review, dict)
-            and isinstance(clearance, dict)
-            and all(
-                isinstance(clearance.get(severity), int)
-                and not isinstance(clearance.get(severity), bool)
-                and clearance.get(severity) == 0
-                for severity in ("p0", "p1", "p2")
-            )
-            and isinstance(evidence_ref, str)
-            and bool(evidence_ref.strip())
-        )
-        if not valid:
-            return (
-                "visible-sdd delivery lacks verifiable in-session review evidence",
-                True,
-                "sdd_review:missing_evidence",
-            )
-        blocked_unknowns = review.get("blocked_unknowns", [])
-        if not isinstance(blocked_unknowns, list) or any(
-            not isinstance(item, str) or not item.strip() for item in blocked_unknowns
-        ):
-            # Shape errors stay on the recoverable acceptance_rejected
-            # channel; only a well-formed non-empty list reaches the
-            # disposition gate in _apply_event.
-            return (
-                "visible-sdd in-session review blocked_unknowns must be a list of non-empty strings",
-                True,
-                "sdd_review:blocked_unknowns_shape",
-            )
-        if review.get("protocol") != VISIBLE_SDD_PROTOCOL_REF:
-            # The session must have followed the protocol shipped with this
-            # package; a different or missing pointer is not the visible-sdd
-            # review this acceptance certifies.
-            return (
-                "visible-sdd delivery cites an unknown in-session review protocol",
-                True,
-                "sdd_review:unknown_protocol",
-            )
-        environment_facts_ref = review.get("environment_facts_ref")
-        if not isinstance(environment_facts_ref, str) or not environment_facts_ref.strip():
-            # The shipped protocol (visible-sdd-worker.md section 3) makes
-            # this field mandatory so the acceptance stays traceable to the
-            # environment facts the in-session review was dispatched with
-            # ("none" when the contract declares no environment_facts).  A
-            # missing or blank value is a format error the same session can
-            # correct and re-report on its live handle.
-            return (
-                "visible-sdd in-session review environment_facts_ref must be a non-empty string",
-                True,
-                "sdd_review:environment_facts_ref_missing",
-            )
-        # Coverage denominator (protocol section 2.5 step 0): the review must
-        # state how many of the reviewable files it actually covered.  Without
-        # a denominator a review that silently skipped half the changeset is
-        # indistinguishable from an exhaustive one -- the clearance numbers
-        # only count findings, never coverage.  The field is therefore
-        # mandatory and its arithmetic is checked here instead of being
-        # trusted from prose.  ``mode: "none"`` is the explicit waiver path:
-        # it must carry a reason, so "did not obtain the list" is an auditable
-        # fact rather than a missing key.
-        coverage_failure = self._validate_visible_sdd_coverage(
-            review.get("coverage") if isinstance(review, dict) else None
-        )
-        if coverage_failure is not None:
-            return coverage_failure, True, "sdd_review:coverage_invalid"
-        # ISSUE-02: the acceptance evidence is bound to the node contract it
-        # reviewed.  The carried digest is the dispatch-time node digest and
-        # must still equal the digest recomputed from the live contract; an
-        # unreadable contract or a drifted one refuses the acceptance instead
-        # of writing an empty, placeholder or stale digest.
-        try:
-            live_digest_matches = self._live_node_contract_digest_matches(
-                node_id, current.get("contract_digest")
-            )
-        except ValueError as error:
-            return (
-                "visible-sdd acceptance refused: {}".format(error),
-                False,
-                "sdd_review:contract_unreadable",
-            )
-        if not live_digest_matches:
-            return (
-                "visible-sdd acceptance refused: contract digest does not match the live node contract",
-                False,
-                "sdd_review:contract_digest_drift",
-            )
-        return None
+    def _validate_visible_sdd_review(self, snapshot: RunSnapshot, node_id: str, event: RunEvent, current: Dict[str, Any]):
+        return monitor_acceptance._validate_visible_sdd_review(self, snapshot, node_id, event, current)
 
     @staticmethod
     def _validate_visible_sdd_coverage(coverage: Any) -> Optional[str]:
-        """Validate the review's coverage denominator; ``None`` when acceptable.
-
-        The shipped protocol (visible-sdd-worker.md section 2.5 step 0)
-        requires the reviewer to obtain the deterministic reviewable-file list
-        (``ocr delegate preview``) and to account for every entry -- reviewed,
-        or skipped with a stated reason.  A review that never states its
-        denominator cannot be told apart from one that silently skipped files,
-        so ``coverage`` is a required field and its arithmetic must add up.
-
-        ``mode: "none"`` is the waiver path: it makes "no deterministic list
-        was obtained" a visible, reasoned fact instead of an absent key.  The
-        waiver covers the *tool*, never the obligation to account for scope.
-
-        Every branch returns a recoverable format error: the same worker
-        session can correct the payload and re-report on its live handle.
-
-        Known ceiling: ``coverage`` is self-reported.  This validator checks
-        types and internal arithmetic only -- it never cross-checks ``listed``
-        against the real changeset or against the ``ocr delegate preview``
-        output, so a reviewer can still pass by declaring a *smaller*
-        changeset.  The protocol names that as fabrication (section 5); closing
-        it mechanically would need a ground truth this layer does not have.
-        ``CoverageDenominatorTests`` pins the accepted case, so adding the
-        cross-check later has to be a conscious change rather than a silent one.
-        """
-        # ponytail: coverage 是自报字段，这里只校验类型与算术自洽
-        # （listed == reviewed + len(skipped)），不核对真实 git 变更集或
-        # preview 输出；需要机械证伪时，改为要求 coverage 附带 preview 输出的
-        # 确定性摘要（文件数/内容哈希）并与监工侧可复算的量比对。
-        if not isinstance(coverage, dict):
-            return (
-                "visible-sdd in-session review coverage must be an object "
-                '({"mode": "ocr", "listed": N, "reviewed": M, "skipped": [...]} '
-                'or {"mode": "none", "reason": "..."})'
-            )
-        mode = coverage.get("mode")
-        if mode == "none":
-            reason = coverage.get("reason")
-            if not isinstance(reason, str) or not reason.strip():
-                return (
-                    'visible-sdd in-session review coverage mode "none" requires '
-                    "a non-empty reason"
-                )
-            return None
-        if mode != "ocr":
-            return (
-                'visible-sdd in-session review coverage mode must be "ocr" or "none"'
-            )
-        listed = coverage.get("listed")
-        reviewed = coverage.get("reviewed")
-        for field_name, value in (("listed", listed), ("reviewed", reviewed)):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                return (
-                    "visible-sdd in-session review coverage {} must be a "
-                    "non-negative integer".format(field_name)
-                )
-        skipped = coverage.get("skipped")
-        if not isinstance(skipped, list):
-            return (
-                "visible-sdd in-session review coverage skipped must be a list "
-                'of {"file", "reason"} objects'
-            )
-        seen_files = set()
-        for item in skipped:
-            if (
-                not isinstance(item, dict)
-                or not isinstance(item.get("file"), str)
-                or not item.get("file", "").strip()
-                or not isinstance(item.get("reason"), str)
-                or not item.get("reason", "").strip()
-            ):
-                return (
-                    "visible-sdd in-session review coverage skipped entries must "
-                    'each carry non-empty "file" and "reason" strings'
-                )
-            # ``len(skipped)`` is an addend of the denominator, so duplicate
-            # entries would inflate it for free and turn "per-file
-            # disposition" back into "count the entries".
-            name = item["file"].strip()
-            if name in seen_files:
-                return (
-                    "visible-sdd in-session review coverage skipped lists {} "
-                    "more than once; account for each file once".format(name)
-                )
-            seen_files.add(name)
-        if listed != reviewed + len(skipped):
-            return (
-                "visible-sdd in-session review coverage does not add up: "
-                "listed {} != reviewed {} + skipped {}".format(
-                    listed, reviewed, len(skipped)
-                )
-            )
-        return None
+        return monitor_acceptance._validate_visible_sdd_coverage(coverage)
 
     def _accept_visible_sdd_delivery(
         self,
@@ -8350,87 +7957,24 @@ class Monitor:
         )
 
     @staticmethod
-    def _event_claims_match(
-        event: RunEvent, node_id: str, active: Dict[str, Any]
-    ) -> bool:
-        claims = {
-            "node_id": node_id,
-            "role": active.get("role"),
-            "task_id": active.get("task_id"),
-            "handle_id": active.get("handle_id"),
-            "generation": active.get("generation"),
-        }
-        return all(event.data.get(key) == value for key, value in claims.items())
+    def _event_claims_match(event: RunEvent, node_id: str, active: Dict[str, Any]) -> bool:
+        return monitor_acceptance._event_claims_match(event, node_id, active)
 
     @staticmethod
     def _review_finding_severity(data: Dict[str, Any]):
-        """Extract a reviewer severity from the supported finding shapes."""
-        values = []
-        if isinstance(data, dict):
-            values.append(data.get("severity"))
-            for key in ("finding", "review_finding"):
-                value = data.get(key)
-                if isinstance(value, dict):
-                    values.append(value.get("severity"))
-                    nested = value.get("finding")
-                    if isinstance(nested, dict):
-                        values.append(nested.get("severity"))
-        for value in values:
-            if isinstance(value, str) and value.strip():
-                return value.strip().upper()
-        return None
+        return monitor_acceptance._review_finding_severity(data)
 
     @classmethod
     def _review_finding_disposition(cls, data: Dict[str, Any]) -> str:
-        """Classify a reviewer finding before applying product-boundary logic.
-
-        P3 is an observation and cannot block a run.  Missing or non-standard
-        severities are malformed engineering feedback, so the same developer
-        gets a corrective pass instead of the node being escalated as a
-        product decision.  P0-P2 are implementation findings and likewise
-        return to the original developer.
-        """
-        severity = cls._review_finding_severity(data)
-        if severity == "P3":
-            return "observation"
-        if severity in {"P0", "P1", "P2"}:
-            return "implementation"
-        # A malformed severity with a consistency payload still goes through
-        # the approved-decision resolver: it may be a genuine product
-        # boundary disagreement.  When the consistency payload is absent,
-        # there is no product choice to resolve, so retry the same developer.
-        if isinstance(data, dict) and data.get("consistency"):
-            return "defer_to_consistency"
-        return "implementation"
+        return monitor_acceptance._review_finding_disposition(cls, data)
 
     @staticmethod
     def _reviewer_write_violation(data: Dict[str, Any]) -> bool:
-        """Recognize an explicit reviewer write violation from provider data."""
-        if not isinstance(data, dict):
-            return False
-        if data.get("reviewer_write_violation") is True:
-            return True
-        if data.get("reviewer_modified_files"):
-            return True
-        if data.get("business_code_edited") is True:
-            return True
-        kind = str(data.get("kind") or data.get("type") or "").casefold()
-        return kind in {"reviewer_write_violation", "reviewer_modified_business_code"}
+        return monitor_acceptance._reviewer_write_violation(data)
 
     @staticmethod
     def _finding_changes_prd_acceptance(data: Dict[str, Any]) -> bool:
-        """Return whether an unresolved finding changes the product contract."""
-        if not isinstance(data, dict):
-            return False
-        return any(
-            data.get(key) is True
-            for key in (
-                "changes_prd_acceptance",
-                "changes_acceptance",
-                "product_scope_change",
-                "product_design_change",
-            )
-        )
+        return monitor_acceptance._finding_changes_prd_acceptance(data)
 
     def _record_runner_event(
         self,
@@ -8478,7 +8022,7 @@ class Monitor:
                 attempt = int(previous.get("attempt", 0)) + 1
             except (TypeError, ValueError):
                 attempt = 1
-        observation_ref = hashlib.sha256(str(reason).encode("utf-8")).hexdigest()
+        observation_ref = digests.sha256_bytes(str(reason).encode("utf-8"))
         cursor = None
         try:
             binding = self._load_task_binding(snapshot, node_id, str(role))
@@ -10410,183 +9954,13 @@ class Monitor:
         )
 
     def _contract_test_entries(self, node_id: str):
-        """Collect executable invariant entries from the node contract.
+        return monitor_contracts._contract_test_entries(self, node_id)
 
-        Missing/non-list/empty ``invariants`` yields an empty list, which is
-        what keeps contracts without invariants completely behavior-neutral.
-        An invalid ``timeout_seconds`` is a contract error and is reported
-        through the returned error string instead of being guessed at.
-        """
-        node = self.nodes[node_id]
-        contract = node.contract if isinstance(node.contract, dict) else {}
-        entries = []
-        for index, item in contract_invariant_entries(contract):
-            invariant_id = item.get("id")
-            if not isinstance(invariant_id, str) or not invariant_id.strip():
-                invariant_id = "invariants[{}]".format(index)
-            kind = item.get("kind")
-            kind = kind.strip() if isinstance(kind, str) and kind.strip() else None
-            timeout_seconds = item.get(
-                "timeout_seconds", DEFAULT_CONTRACT_TEST_TIMEOUT_SECONDS
-            )
-            if (
-                isinstance(timeout_seconds, bool)
-                or not isinstance(timeout_seconds, int)
-                or timeout_seconds < 1
-            ):
-                return None, (
-                    "invariant {} has an invalid timeout_seconds value "
-                    "(contract error)".format(invariant_id.strip())
-                )
-            entries.append(
-                {
-                    "invariant_id": invariant_id.strip(),
-                    "command": item["test_command"],
-                    "kind": kind,
-                    "timeout_seconds": timeout_seconds,
-                }
-            )
-        return entries, None
+    def _record_contract_test_execution(self, snapshot: RunSnapshot, node_id: str, phase: str, entry: Dict[str, Any], exit_code: Optional[int], output_tail: str, worktree: Path, active: Optional[Dict[str, Any]]=None) -> None:
+        return monitor_contracts._record_contract_test_execution(self, snapshot, node_id, phase, entry, exit_code, output_tail, worktree, active)
 
-    def _record_contract_test_execution(
-        self,
-        snapshot: RunSnapshot,
-        node_id: str,
-        phase: str,
-        entry: Dict[str, Any],
-        exit_code: Optional[int],
-        output_tail: str,
-        worktree: Path,
-        active: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        # The execution detail rides under ``proof``: it is a structured
-        # result (identifiers, exit code, bounded output tail), and the
-        # durable event schema only preserves structured values under
-        # pass-through keys.  run_id/node_id/phase stay top-level.
-        self._record(
-            snapshot,
-            "contract_test_execution",
-            {
-                "run_id": snapshot.run_id,
-                "node_id": node_id,
-                "phase": phase,
-                "proof": {
-                    "invariant_id": entry["invariant_id"],
-                    "command": entry["command"],
-                    "exit_code": exit_code,
-                    "output_tail": output_tail,
-                    "executed_at": datetime.now(timezone.utc).isoformat(),
-                    "worktree": str(worktree),
-                },
-            },
-            active,
-        )
-
-    def _execute_contract_test_commands(
-        self,
-        snapshot: RunSnapshot,
-        node_id: str,
-        phase: str,
-        active: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
-        """Run contract-declared invariant test commands for one node.
-
-        No new authorization surface: every command comes from the
-        already-authorized node contract and execution is confined to the
-        contract writer worktree.  ``phase`` is ``"acceptance"`` (commands
-        must pass) or ``"expected_red"`` (commands must fail before the
-        implementation exists).  Returns ``None`` on success, otherwise a
-        failure reason; every executed (or refused) command is recorded as a
-        ``contract_test_execution`` event first, so a rejection can never be
-        forged into a pass.
-        """
-        entries, contract_error = self._contract_test_entries(node_id)
-        if contract_error is not None:
-            return contract_error
-        if not entries:
-            return None
-        current = snapshot.nodes[node_id]
-        worktree = self._worktree_path(current)
-        if not worktree.is_dir():
-            return (
-                "writer worktree {} does not exist; contract test execution "
-                "is confined to it".format(worktree)
-            )
-        blacklist = frozenset()
-        if any(entry["kind"] == "behavioral" for entry in entries):
-            # Fail closed: an unreadable project config means the effective
-            # blacklist is unknown, so behavioral invariants cannot run.
-            try:
-                project_config = load_project_config(self.paths.root)
-            except ValueError as error:
-                return (
-                    "behavioral command blacklist cannot be resolved from "
-                    "the project config: {}".format(error)
-                )
-            blacklist = BEHAVIORAL_COMPILE_COMMAND_BLACKLIST | set(
-                project_config.behavioral_command_blacklist_extra
-            )
-        for entry in entries:
-            if entry["kind"] == "behavioral" and _command_matches_blacklist(
-                entry["command"], blacklist
-            ):
-                note = (
-                    "behavioral invariant test_command matches the compile "
-                    "command blacklist"
-                )
-                self._record_contract_test_execution(
-                    snapshot, node_id, phase, entry, None,
-                    "not executed: " + note, worktree, active,
-                )
-                return "invariant {}: {} ({!r})".format(
-                    entry["invariant_id"], note, entry["command"]
-                )
-            try:
-                completed = subprocess.run(
-                    entry["command"],
-                    shell=True,
-                    cwd=str(worktree),
-                    capture_output=True,
-                    text=True,
-                    timeout=entry["timeout_seconds"],
-                )
-                exit_code: Optional[int] = completed.returncode
-                output_tail = (
-                    (completed.stdout or "") + "\n" + (completed.stderr or "")
-                )[-2000:]
-            except subprocess.TimeoutExpired as error:
-                exit_code = None
-                partial = error.stdout or ""
-                if isinstance(partial, bytes):
-                    partial = partial.decode("utf-8", "replace")
-                output_tail = (
-                    "timeout after {}s\n".format(entry["timeout_seconds"])
-                    + str(partial)
-                )[-2000:]
-            self._record_contract_test_execution(
-                snapshot, node_id, phase, entry, exit_code, output_tail,
-                worktree, active,
-            )
-            if phase == "expected_red":
-                # Red means any non-zero outcome (failure, timeout, missing
-                # command); only a clean pass violates the TDD contract.
-                if exit_code == 0:
-                    return (
-                        "invariant {} expected red before implementation, "
-                        "command passed ({!r})".format(
-                            entry["invariant_id"], entry["command"]
-                        )
-                    )
-                continue
-            if exit_code is None:
-                return "invariant {} command {!r} timed out after {}s".format(
-                    entry["invariant_id"], entry["command"], entry["timeout_seconds"]
-                )
-            if exit_code != 0:
-                return "invariant {} command {!r} exited with code {}".format(
-                    entry["invariant_id"], entry["command"], exit_code
-                )
-        return None
+    def _execute_contract_test_commands(self, snapshot: RunSnapshot, node_id: str, phase: str, active: Optional[Dict[str, Any]]=None) -> Optional[str]:
+        return monitor_contracts._execute_contract_test_commands(self, snapshot, node_id, phase, active)
 
     def _worktree_path(self, current: Dict[str, Any]) -> Path:
         worktree_path = Path(str(current.get("worktree", ".")))

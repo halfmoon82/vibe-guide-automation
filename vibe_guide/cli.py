@@ -42,6 +42,7 @@ from .initializer import _rules_target, apply_agentsmd_proposal, init_project, r
 from . import host_rules
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import BLOCKED_UNKNOWN_DISPOSITION_KINDS, Monitor, ScopeDecisionRequired
+from .monitor_handoff import current_plan_digests, record_event
 from .supervisor_output import supervisor_output_batch
 from .supervisor_wakeup import idle_heartbeat_minutes, preflight_with_checkpoint
 from .supervisor import (
@@ -1012,7 +1013,7 @@ def _record_worktree_preflight(
             for key in _WORKTREE_REPORT_KEYS:
                 if report.get(key):
                     data[key] = report[key]
-            monitor._record(snapshot, event, data)
+            record_event(monitor, snapshot, event, data)
             current["worktree_preflight"] = {
                 key: value for key, value in data.items()
                 if key not in ("run_id", "node_id")
@@ -1022,7 +1023,7 @@ def _record_worktree_preflight(
             for key in _WORKTREE_REPORT_KEYS:
                 if report.get(key):
                     data[key] = report[key]
-            monitor._record(snapshot, event, data)
+            record_event(monitor, snapshot, event, data)
             current.pop("worktree_preflight", None)
         elif WORKTREE_PREFLIGHT_KEY in current:
             # The directory is there and matches the contract now (the report
@@ -1422,7 +1423,7 @@ def _renew_engine_attestation_if_stale(
     monitor = Monitor(
         paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card)
     )
-    current_prd, current_spec = monitor._current_plan_digests()
+    current_prd, current_spec = current_plan_digests(monitor)
     contract_unchanged = (
         is_authorization_valid(record, plan, nodes)
         and snapshot.authorization_digest == record.digest
@@ -3586,63 +3587,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 paths, plan, nodes,
                 topology_rulings=_observed_topology_rulings(paths, _card),
             )
-            if isinstance(package, dict) and package.get('kind') == 'scope_correction':
-                snapshot = monitor.reconcile_scope(args.run_id, package)
-            elif isinstance(package, dict) and package.get('kind') == 'created_successor':
-                required = {'kind', 'node_id', 'action_id', 'request_digest',
-                            'predecessor_archive', 'preservation_path', 'preservation_digest'}
-                if set(package) != required or package['node_id'] not in monitor.nodes:
-                    raise ValueError('created successor reconciliation package is invalid')
-                target_runner = runner if runner is not None else _public_runner(paths, _card, nodes)
-                snapshot = monitor.reconcile_created_successor(args.run_id, package['node_id'],
-                    target_runner, **{key: package[key] for key in required - {'kind', 'node_id'}})
-                invalidation = _invalidation_path(directory)
-                if invalidation.exists():
-                    # Recheck the unchanged authorization and corrected runtime
-                    # projection; the old marker's prose is never permission.
-                    monitor._require_snapshot_authorization(snapshot)
-                    monitor._validate_execution_topology(snapshot)
-                    if invalidation.is_symlink() or _card.digest != snapshot.authorization_digest:
-                        raise ValueError('reconciled authorization does not match the current card')
-                    raw_invalidation = invalidation.read_bytes()
-                    marker = json.loads(raw_invalidation)
-                    if (not isinstance(marker, dict) or marker.get('status') != 'blocked_design'
-                            or marker.get('change_reason') != 'executable_contract_changed'):
-                        raise ValueError('invalidation requires a separate authorization decision')
-                    from .state import _atomic_bytes, run_dir, save_snapshot
-                    digest = hashlib.sha256(raw_invalidation).hexdigest()
-                    archive = run_dir(paths, args.run_id) / 'recovery' / ('invalidation-' + digest + '.json')
-                    if archive.parent.is_symlink() or archive.is_symlink():
-                        raise ValueError('invalidation archive may not traverse a symlink')
-                    _atomic_bytes(archive, raw_invalidation)
-                    monitor._record_topology_projection(snapshot, 'monitor.reconcile_successor',
-                        recovery_evidence={'invalidation_path': str(archive),
-                            'invalidation_digest': digest, 'authorization_digest': snapshot.authorization_digest})
-                    save_snapshot(paths, snapshot)
-                    if invalidation.read_bytes() != raw_invalidation:
-                        raise ValueError('invalidation changed during reconciliation')
-                    invalidation.unlink()
-            elif isinstance(package, dict) and package.get('kind') == 'adopted_dispatch':
-                from .orphan_recovery import ADOPTED_DISPATCH_PACKAGE, adopt_orphan_dispatch
-                if set(package) != ADOPTED_DISPATCH_PACKAGE or package['node_id'] not in monitor.nodes:
-                    raise ValueError('adopted dispatch reconciliation package is invalid')
-                if _invalidation_path(directory).exists() or _invalidation_path(directory).is_symlink():
-                    raise ValueError('authorization is invalidated; reauthorize before adopting')
-                target_runner = runner if runner is not None else _public_runner(paths, _card, nodes)
-                snapshot = adopt_orphan_dispatch(monitor, args.run_id, package['node_id'],
-                                                 package['action_id'], target_runner)
-            elif isinstance(package, dict) and package.get('kind') == 'self_reported_delivery':
-                from .self_report_recovery import (
-                    SELF_REPORTED_DELIVERY_PACKAGE, reconcile_self_reported_delivery)
-                if set(package) != SELF_REPORTED_DELIVERY_PACKAGE or package['node_id'] not in monitor.nodes:
-                    raise ValueError('self-reported delivery reconciliation package is invalid')
-                if _invalidation_path(directory).exists() or _invalidation_path(directory).is_symlink():
-                    raise ValueError('authorization is invalidated; reauthorize before reconciling')
-                target_runner = runner if runner is not None else _public_runner(paths, _card, nodes)
-                snapshot = reconcile_self_reported_delivery(monitor, args.run_id,
-                                                            package['node_id'], target_runner)
-            else:
-                snapshot = monitor.reconcile_evidence(args.run_id, package)
+            snapshot = monitor.reconcile_package(
+                args.run_id, package,
+                runner_factory=lambda: runner if runner is not None else _public_runner(paths, _card, nodes),
+                invalidation_path=_invalidation_path(directory),
+                authorization_digest=_card.digest,
+            )
             return _snapshot_result("reconcile", snapshot, args.as_json, paths=paths)
         except (FileNotFoundError, OSError, TypeError, ValueError, PermissionError) as error:
             return _result(
