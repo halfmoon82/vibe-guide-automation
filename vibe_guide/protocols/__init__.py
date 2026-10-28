@@ -31,6 +31,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         # pointing at supervisor-card.md; engine attestation 72h, merge rule, no
         # engineering questions to the product manager.
         "fd485222f9645667e76a203e4f4cda9dd226b2e9ec6a184f2c493b9f2d9e377b",
+        # 2026-10-28: heartbeat tiers 10/60 (was 10/30); dispatch_mode field.
+        "d529d1256141b67d1d3317a0b6de0c5a6e7599d36afd54813cc61019faeb13d6",
         # 2026-10-27: §6.5 stalled-node branch merged onto the §6.4 fork_thread rule.
         "4720ebe75f624e66591e5faeea180936f9fa5cc53876d25ab6be04417bc6b5ba",
         # 2026-10-27: §6.5 stalled-node branch (investigate, self-heal, verify, escalate).
@@ -185,6 +187,16 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # the file's sha256 and only accepts a digest published here.
     "visible-sdd-worker": frozenset({
         "30b226ff0a6711a91779785c28a993679e0a33c3aeb89e836cfd427194750945",
+    }),
+    # Short per-beat runbook; the beat prints it once per shift, then only
+    # its path and sha256.
+    "supervisor-card": frozenset({
+        "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
+    }),
+    # Second-level self-heal short session (daemon): the prompt the daemon feeds
+    # a one-shot repair session.
+    "heal-session": frozenset({
+        "f0338725e0669a5cc0fdee9b4189e7fd550f37c7e91bc922df68cfbc56dfe139",
     }),
 }
 

@@ -132,3 +132,32 @@ class ProjectPaths:
         if value.is_absolute():
             raise ValueError("relative path required")
         return self._contained(self.vibe_home / value, self.vibe_home)
+
+
+class RunFiles:
+    """File and directory names inside ``.vibe/runs/<run-id>/``."""
+
+    STATE = "state.json"
+    STATE_PREVIOUS = "state.previous.json"
+    EVENTS = "events.jsonl"
+    TASKS = "tasks.json"
+    PLAN = "plan.json"
+    PLAN_CONFIRMATION = "plan-confirmation.json"
+    AUTHORIZATION = "authorization.json"
+    AUTHORIZATION_CARD = "authorization-card.json"
+    AUTHORIZATION_INVALIDATED = "authorization-invalidated.json"
+    NODES = "nodes.json"
+    PRD = "prd.md"
+    DAG_AUDIT = "dag-audit.json"
+    ENGINE_ATTESTATION = "engine-attestation.json"
+    BASELINE_HEALTH = "baseline-health.json"
+    SESSION_GATES = "session-gates.json"
+    SESSION_CONTRACT = "session-contract.json"
+    RUN_MANIFEST = "run-manifest.json"
+    HANDOFF_SUMMARY = "handoff-summary.json"
+    SUPERVISOR_LEASE = "supervisor.lease"
+    ADOPT_LOCK = "adopt.lock"
+    STATE_LOCK = ".state.lock"
+    EVENTS_LOCK = ".events.lock"
+    EVIDENCE_DIR = "evidence"
+    TOOL_OUTPUT_DIR = "tool-output"

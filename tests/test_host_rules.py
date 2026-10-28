@@ -13,7 +13,6 @@ from pathlib import Path
 from unittest import mock
 
 from vibe_guide import host_rules
-from vibe_guide.capability_wizard import build_capability_catalog
 from vibe_guide.cli import run_cli
 from vibe_guide.doctor import doctor
 from vibe_guide.paths import ProjectPaths
@@ -141,12 +140,6 @@ class DecisionItemTests(HostRulesTestBase):
         again = self.init()
         self.assertEqual(again.payload["host_rules"]["decision"], "skip")
         self.assertNotEqual(again.payload["host_rules"]["status"], "decision_required")
-
-    def test_catalog_marks_host_rules_sensitive(self):
-        items = build_capability_catalog(
-            {"capabilities": [{"name": host_rules.HOST_RULES_ID}]}
-        )
-        self.assertEqual(items[0].layer, "sensitive_external")
 
 
 class ApplyTests(HostRulesTestBase):

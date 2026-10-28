@@ -26,10 +26,8 @@ from .authorization import (
     digest_integration_contract,
     dispatch_topology_for_node,
     executable_contract_digest,
-    executable_contract_digest_matches,
     integration_contract_projection,
     is_authorization_valid,
-    node_adapter_id,
     validate_runtime_contract,
     _scoped_values,
 )
@@ -70,6 +68,7 @@ from .state import (
     CONSISTENCY_CORRECTION_KEYS,
     RECOVERY_SIGNATURE_KEYS,
     RunSnapshot,
+    require_not_legacy_run,
     _atomic_bytes,
     acquire_writer_lease,
     append_event,
@@ -115,6 +114,7 @@ from .authorize_entry import load_live_workflow, select_plan_workflow, verify_wo
 from .diagnostics import validate_child_session_binding
 from .models import WorkerProfile
 from .model_router import ModelRouter
+from . import model_catalog
 from .change_requests import (
     ChangeRequest,
     ChangeRequestEvidence,
@@ -122,7 +122,6 @@ from .change_requests import (
     execute_change_request,
     merge_local,
 )
-from .authorization import can_create_change_request, can_auto_merge
 from .checkpoint import (
     ContextBudgetEstimator,
     ContextBudgetPolicy,
@@ -1116,41 +1115,6 @@ class Monitor:
         payload = {"run_id": snapshot.run_id, "node_id": node_id, "role": role, "task_id": task_id, "generation": generation, "writer": contract.get("writer") or current.get("worker"), "worktree": contract.get("worktree") or current.get("worktree"), "branch": contract.get("branch") or current.get("branch"), "authorization_digest": snapshot.authorization_digest, "node_contract_digest": current.get("contract_digest") or getattr(snapshot, "node_contract_digest", "")}
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
-    def _build_binding_intent(self, snapshot: RunSnapshot, node_id: str, role: str,
-                               generation: int, contract: Optional[Dict[str, Any]] = None):
-        """Build (or reuse) the immutable pre-dispatch identity envelope.
-
-        This helper deliberately contains no provider lease or cursor.  It is
-        safe to call repeatedly after an interrupted start and therefore keeps
-        the original task/generation stable during retries.
-        """
-        current = snapshot.nodes[node_id]
-        contract = dict(contract or {})
-        task_id = current.get(role + "_identity") or contract.get("task_id") or f"{role}:{node_id}"
-        payload = {
-            "run_id": snapshot.run_id,
-            "plan_id": getattr(self.plan, "plan_id", snapshot.plan_id),
-            "plan_revision": getattr(self.plan, "version", snapshot.plan_version),
-            "node_id": node_id,
-            "task_id": task_id,
-            "role": role,
-            "generation": int(generation),
-            "writer": contract.get("writer") or current.get("writer") or current.get("worker") or role,
-            "worktree": str(contract.get("worktree") or current.get("worktree", "")),
-            "branch": str(contract.get("branch") or current.get("branch", "")),
-            "base_sha": str(contract.get("base_sha") or current.get("base_sha", "")),
-            "authorization_digest": snapshot.authorization_digest,
-            "node_contract_digest": current.get("contract_digest") or snapshot.node_contract_digest,
-        }
-        existing = current.get("binding_intent") or current.get("start_intent")
-        if isinstance(existing, dict) and all(existing.get(k) == payload.get(k) for k in payload):
-            payload = existing
-        try:
-            from .binding_contract import BindingIntent as V44BindingIntent
-            return V44BindingIntent.from_dict(payload)
-        except (ImportError, TypeError, ValueError):
-            return payload
-
     def _dispatch_with_intent(self, runner: Runner, contract: Dict[str, Any], intent: Any):
         """Dispatch one provider request and accept only a matching proof.
 
@@ -1279,33 +1243,6 @@ class Monitor:
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
         return "blocked_unknown"
-
-    @staticmethod
-    def _legacy_run_allowed(state_data: Dict[str, Any]) -> bool:
-        """Accept only an explicitly evidenced historical-run marker."""
-        if not isinstance(state_data, dict) or state_data.get("legacy_run") is not True:
-            return False
-        evidence = state_data.get("legacy_evidence")
-        if not isinstance(evidence, dict):
-            return False
-        source = evidence.get("source")
-        run_id = evidence.get("run_id")
-        if not isinstance(source, str) or not source.strip() or not isinstance(run_id, str) or not run_id.strip():
-            return False
-        try:
-            validate_run_id(run_id)
-        except ValueError:
-            return False
-        return True
-
-    @staticmethod
-    def _legacy_evidence_digest(evidence: Dict[str, Any]) -> str:
-        payload = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    @classmethod
-    def _legacy_binding_valid(cls, legacy_run: Any, evidence: Any, digest: Any) -> bool:
-        return legacy_run is True and cls._legacy_run_allowed({"legacy_run": legacy_run, "legacy_evidence": evidence}) and digest == cls._legacy_evidence_digest(evidence)
 
     @staticmethod
     def _lineage_matches_snapshot(snapshot: RunSnapshot, prd_digest: str, spec_digest: str) -> bool:
@@ -1599,10 +1536,6 @@ class Monitor:
 
     def _reset_binding_cache(self) -> None:
         self._binding_cache.clear()
-
-    def _node_adapter_id(self, node: DAGNode) -> str:
-        """Return the platform adapter id a node is ruled under, or ""."""
-        return node_adapter_id(node)
 
     def _node_dispatch_topology(self, node: DAGNode) -> str:
         """Rule the dispatch topology for one node.
@@ -2128,53 +2061,6 @@ class Monitor:
     # Short alias for callers that already operate in the Monitor boundary.
     merge_local = merge_change_request_local
 
-    def record_change_request_action(
-        self,
-        run_id: str,
-        action: str,
-        target_contract: Any,
-        evidence: Optional[Dict[str, Any]] = None,
-        node_id: Optional[str] = None,
-    ) -> ChangeRequestEvidence:
-        """Record a target-bound PR/MR or merge action without calling a provider.
-
-        A failed precondition quarantines only this external action.  When a
-        node observation is supplied, callers may invoke ``self_heal_binding``
-        first; this method never widens the frozen contract or authorization.
-        """
-        snapshot = load_snapshot(self.paths, run_id)
-        record = self._require_snapshot_authorization(snapshot)
-        prepared = execute_change_request(action, target_contract)
-        payload = dict(evidence or {})
-        payload.setdefault("action", action)
-        payload.setdefault("target_contract", prepared.target_contract)
-        allowed = (
-            can_create_change_request(payload, record)
-            if str(action).casefold() in {"create_pr", "create_mr"}
-            else can_auto_merge(payload, record)
-            if str(action).casefold() in {"merge_local", "merge_remote"}
-            else False
-        )
-        status = "authorized" if allowed and prepared.status == "prepared" else "blocked_unknown"
-        if not allowed:
-            prepared = ChangeRequestEvidence(
-                prepared.action, status, prepared.target_contract,
-                prepared.target_digest, prepared.provider,
-                remote_mutated=False,
-                details={"reason": "authorization or evidence precondition failed"},
-            )
-            if node_id:
-                self.isolate_affected_action(snapshot, node_id, "change request action evidence is incomplete")
-        self._record(snapshot, "change_request_" + prepared.status, {
-            "run_id": run_id, "action": prepared.action,
-            "target_contract": prepared.target_contract,
-            "target_digest": prepared.target_digest,
-            "evidence": prepared.to_dict(),
-            "external_execution": "not_performed",
-        })
-        self._save_snapshot(snapshot)
-        return prepared
-
     def start(
         self, record: Optional[AuthorizationRecord], runner: Runner
     ) -> RunSnapshot:
@@ -2213,8 +2099,7 @@ class Monitor:
             raise PermissionError("session_gate_blocked: V2 state.json is missing")
         assert record is not None
         integration_run = any(node.id == "integration-review" for node in self.nodes.values())
-        legacy_run = self._legacy_run_allowed(state_data)
-        if integration_run and task_workflow is None and not legacy_run:
+        if integration_run and task_workflow is None:
             raise PermissionError("required_workflow_blocked: workflow")
         prd_digest, spec_digest = self._current_plan_digests()
         if integration_run and (not prd_digest or not spec_digest):
@@ -2264,9 +2149,6 @@ class Monitor:
             workflow=task_workflow,
             prd_digest=prd_digest,
             spec_digest=spec_digest,
-            legacy_run=legacy_run,
-            legacy_evidence=state_data.get("legacy_evidence") if legacy_run else None,
-            legacy_evidence_digest=self._legacy_evidence_digest(state_data.get("legacy_evidence")) if legacy_run else "",
             execution_engine=record.execution_engine,
             engine_mode=record.engine_mode,
             engine_evidence_ref=record.engine_evidence_ref,
@@ -2291,7 +2173,6 @@ class Monitor:
                 "node_scope_digests": {
                     key: legacy_executable_contract_digest([node]) for key, node in self.nodes.items()
                 },
-                "legacy_evidence_digest": snapshot.legacy_evidence_digest,
             },
         )
         # _schedule_ready() validates the execution topology, and that check
@@ -2316,6 +2197,7 @@ class Monitor:
         self._reset_binding_cache()
         self._archive_finished_runs()
         require_entry(self.paths, "resume:" + str(run_id), "resume")
+        require_not_legacy_run(self.paths, run_id)
         snapshot = load_snapshot(self.paths, run_id)
         if isinstance(snapshot.workflow, dict):
             result = verify_workflow(snapshot.workflow)
@@ -2333,10 +2215,9 @@ class Monitor:
             if live_workflow is None:
                 raise PermissionError("required_workflow_blocked: authorizing evidence is no longer present")
             verify_workflow_artifacts(self.paths, live_workflow, run_started=True)
-        legacy_allowed = self._legacy_binding_valid(snapshot.legacy_run, snapshot.legacy_evidence, snapshot.legacy_evidence_digest)
-        if "integration-review" in snapshot.nodes and snapshot.workflow is None and not legacy_allowed:
+        if "integration-review" in snapshot.nodes and snapshot.workflow is None:
             raise PermissionError("required_workflow_blocked: workflow")
-        if "integration-review" in snapshot.nodes and not legacy_allowed:
+        if "integration-review" in snapshot.nodes:
             current_prd, current_spec = self._current_plan_digests()
             if not self._lineage_matches_snapshot(snapshot, current_prd, current_spec):
                 raise PermissionError("integration lineage blocked_unknown: PRD/Spec source drift")
@@ -2517,9 +2398,7 @@ class Monitor:
         def unchanged(node_id, digest):
             return route_only_acceptance_binds(
                 self.nodes[node_id], previous_authorized_nodes.get(node_id), digest
-            ) or executable_contract_digest_matches(
-                [self.nodes[node_id]], digest
-            ) or scope_only_expansion_binds(
+            ) or executable_contract_digest([self.nodes[node_id]]) == digest or scope_only_expansion_binds(
                 self.nodes[node_id], digest, previous.file_scope, record.file_scope
             )
 
@@ -2546,9 +2425,7 @@ class Monitor:
                         previous_authorized_nodes.get(node_id),
                         previous_node_contract_digests[node_id],
                     )
-                    or executable_contract_digest_matches(
-                        [self.nodes[node_id]], previous_node_contract_digests[node_id]
-                    )
+                    or executable_contract_digest([self.nodes[node_id]]) == previous_node_contract_digests[node_id]
                 )
             )
             if drifted or integration_changed or record.file_scope != previous.file_scope:
@@ -2705,6 +2582,7 @@ class Monitor:
     def tick(self, run_id: str, runner: Runner) -> RunSnapshot:
         self._reset_binding_cache()
         self._archive_finished_runs()
+        require_not_legacy_run(self.paths, run_id)
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
         self._validate_execution_topology(snapshot)
@@ -3803,9 +3681,7 @@ class Monitor:
                     self.nodes[node_id], previous_authorized_nodes.get(node_id),
                     previous_node_contract_digests[node_id],
                 )
-                or executable_contract_digest_matches(
-                    [self.nodes[node_id]], previous_node_contract_digests[node_id]
-                )
+                or executable_contract_digest([self.nodes[node_id]]) == previous_node_contract_digests[node_id]
                 or scope_only_expansion_binds(
                     self.nodes[node_id],
                     previous_node_contract_digests[node_id],
@@ -3863,9 +3739,7 @@ class Monitor:
                         self.nodes[node_id], previous_authorized_nodes.get(node_id),
                         evidence["contract_digest"],
                     )
-                    or executable_contract_digest_matches(
-                        [self.nodes[node_id]], evidence["contract_digest"]
-                    )
+                    or executable_contract_digest([self.nodes[node_id]]) == evidence["contract_digest"]
                     or scope_only_expansion_binds(
                         self.nodes[node_id],
                         evidence["contract_digest"],
@@ -4243,7 +4117,7 @@ class Monitor:
         ``_live_node_contract_digest`` when the contract is unreadable.
         """
         self._live_node_contract_digest(node_id)
-        return executable_contract_digest_matches([self.nodes[node_id]], digest)
+        return executable_contract_digest([self.nodes[node_id]]) == digest
 
     def _replay_visible_sdd_acceptance(
         self,
@@ -5476,6 +5350,104 @@ class Monitor:
             return False
         return True
 
+    def _effective_model_tier(self, node: DAGNode, current: Dict[str, Any], role: str) -> str:
+        """Derived tier plus the run's recorded ±1 adjustments (never below ``light``)."""
+        tier = model_catalog.node_tier(node, role=role)
+        try:
+            delta = int(current.get("model_tier_adjustment", 0))
+        except (TypeError, ValueError):
+            delta = 0
+        index = max(0, min(len(model_catalog.TIERS) - 1, model_catalog.TIERS.index(tier) + delta))
+        tier = model_catalog.TIERS[index]
+        if role == "reviewer":
+            tier = model_catalog.max_tier(tier, "standard")
+        return tier
+
+    def _apply_model_tier(
+        self, snapshot: RunSnapshot, node: DAGNode, contract: Dict[str, Any],
+        current: Dict[str, Any], role: str,
+    ) -> None:
+        """Turn the node's tier into this platform's model on the dispatch copy.
+
+        Only a profile that still carries the planner's placeholder model is
+        touched: an explicitly routed node keeps the route it was given.  The
+        concrete model lives on the dispatch contract only, never in the signed
+        node contract, so it cannot affect the authorization digest.
+        """
+        raw = contract.get("worker_profile")
+        if not isinstance(raw, dict) or raw.get("model") not in (None, "", "default"):
+            return
+        if contract.get("routing_required") is True:
+            return
+        try:
+            tier = self._effective_model_tier(node, current, role)
+            choice = model_catalog.resolve(
+                str(contract.get("adapter_id") or node.contract.get("adapter_id") or ""),
+                tier,
+                vibe_home=model_catalog.vibe_home_path(),
+            )
+        except (model_catalog.TierError, ValueError, TypeError):
+            return
+        if choice.status != "ok":
+            # Unknown probe: keep the platform default, but say so once.
+            if not current.get("model_tier_unknown_recorded"):
+                current["model_tier_unknown_recorded"] = True
+                self._record(
+                    snapshot,
+                    "model_tier_unresolved",
+                    {
+                        "run_id": snapshot.run_id,
+                        "node_id": node.id,
+                        "role": role,
+                        "reason_code": "model_probe_unknown",
+                        "proof": {"tier": tier, "platform": choice.platform, "note": choice.note},
+                    },
+                )
+            return
+        basis = dict(raw.get("selection_basis") or {})
+        basis.update({"model_tier": tier, "model_tier_source": choice.source})
+        try:
+            profile = WorkerProfile(**dict(
+                raw, model=choice.model, reasoning=choice.reasoning,
+                selection_basis=basis, route_digest="",
+            ))
+        except (TypeError, ValueError):
+            return
+        contract["worker_profile"] = profile.to_dict()
+
+    def adjust_model_tier(
+        self, run_id: str, node_id: str, delta: int, reason: str
+    ) -> RunSnapshot:
+        """Supervisor/repair session moves a node's tier by exactly one level.
+
+        Refused (with the allowed range) when the move leaves light..deep, and
+        when no reason is given.
+        """
+        snapshot = load_snapshot(self.paths, run_id)
+        if node_id not in snapshot.nodes:
+            raise ValueError("model tier adjustment targets an unknown node")
+        current = snapshot.nodes[node_id]
+        before = self._effective_model_tier(self.nodes[node_id], current, "developer")
+        after = model_catalog.adjust_tier(before, delta, reason)
+        self._commit_model_tier_adjustment(snapshot, node_id, current, delta, before, after, reason, "supervisor")
+        self._save_snapshot(snapshot)
+        return snapshot
+
+    def _commit_model_tier_adjustment(
+        self, snapshot: RunSnapshot, node_id: str, current: Dict[str, Any],
+        delta: int, before: str, after: str, reason: str, actor: str,
+    ) -> None:
+        current["model_tier_adjustment"] = int(current.get("model_tier_adjustment", 0)) + delta
+        self._record(
+            snapshot,
+            "model_tier_adjusted",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "proof": {"from": before, "to": after, "reason": reason, "by": actor},
+            },
+        )
+
     def _prepare_worker_profile(
         self, node: DAGNode, contract: Dict[str, Any], current: Dict[str, Any], role: str
     ) -> Optional[WorkerProfile]:
@@ -5852,6 +5824,7 @@ class Monitor:
             contract["files"] = list(profile.allowlist)
             if routing_requested:
                 contract["routing_required"] = True
+        self._apply_model_tier(snapshot, node, contract, current, role)
         if binding_contract_enabled(contract):
             has_live_evidence = isinstance(contract.get("binding_intent"), BindingIntent) and isinstance(
                 contract.get("binding_observation"), BindingObservation
@@ -7382,6 +7355,14 @@ class Monitor:
                 except (TypeError, ValueError):
                     review_round = 1
                 current["review_loop_rounds"] = review_round
+                if review_round == 2:
+                    before = self._effective_model_tier(self.nodes[node_id], current, "developer")
+                    if before != model_catalog.TIERS[-1]:
+                        self._commit_model_tier_adjustment(
+                            snapshot, node_id, current, 1, before,
+                            model_catalog.adjust_tier(before, 1, "review rejected twice"),
+                            "review rejected twice", "monitor",
+                        )
                 if review_round >= 3:
                     # Three unconverged rework rounds: the fix is a different
                     # reviewer (or a split node), never another automatic
@@ -8421,11 +8402,6 @@ class Monitor:
         if isinstance(data, dict) and data.get("consistency"):
             return "defer_to_consistency"
         return "implementation"
-
-    @classmethod
-    def _is_implementation_finding(cls, data: Dict[str, Any]) -> bool:
-        """Recognize a finding that must return to the original developer."""
-        return cls._review_finding_disposition(data) == "implementation"
 
     @staticmethod
     def _reviewer_write_violation(data: Dict[str, Any]) -> bool:

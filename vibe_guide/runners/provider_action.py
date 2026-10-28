@@ -175,7 +175,8 @@ def wait_cursor_differences(payload: Dict[str, Any]) -> list:
 
 
 #: ``.vibe/config.json`` field choosing how the visible-sdd protocol reaches
-#: the worker prompt: ``inline`` (default, full text) or ``ref`` (path + sha256).
+#: the worker prompt: ``ref`` (default, path + sha256) or ``inline`` (full text,
+#: explicit opt-in).
 FIELD_SDD_PROTOCOL_DELIVERY = "sdd_protocol_delivery"
 
 
@@ -185,17 +186,104 @@ def _sdd_protocol_delivery(root: Path) -> str:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return "inline"
+        return "ref"
     except (OSError, ValueError) as exc:
         raise ValueError("project config is unreadable: {}".format(exc))
     if not isinstance(data, dict) or FIELD_SDD_PROTOCOL_DELIVERY not in data:
-        return "inline"
+        return "ref"
     value = data[FIELD_SDD_PROTOCOL_DELIVERY]
     if value not in ("inline", "ref"):
         raise ValueError(
             "{} must be 'inline' or 'ref'".format(FIELD_SDD_PROTOCOL_DELIVERY)
         )
     return value
+
+
+#: Fields a ``wait`` result may carry; the rest of the reader's rules live in
+#: ``ProviderActionRunner._wait_result`` and are mirrored below.
+_WAIT_RESULT_FIELDS = frozenset(
+    ("status", "event", "cursor", "error", "reason", "reason_class",
+     "credential_required", "login_required", "permission_required",
+     WARNINGS_KEY) + RESULT_EVENT_KEYS
+)
+_CREATE_RESULT_FIELDS = frozenset(("binding", "threadId", "thread_id", "status", "cursor"))
+_BINDING_IDENTITY_FIELDS = ("threadId", "thread_id", "task_id", "clientThreadId")
+_RESUME_RESULT_FIELDS = frozenset((RESUME_RECEIPT_FIELD, "status"))
+
+
+def _shape_errors(required, allowed, payload):
+    errors = []
+    missing = sorted(key for key in required if key not in payload)
+    extra = sorted(key for key in payload if key not in allowed)
+    if missing:
+        errors.append("missing fields: " + ", ".join(missing))
+    if extra:
+        errors.append("unexpected fields: " + ", ".join(extra))
+    return errors
+
+
+def validate_result_shape(operation, payload, *, role=None):
+    """Reject a mailbox result the reader would not accept, naming the fields.
+
+    Mirrors the rules the runner applies when it consumes the result, so a
+    wrong shape fails here, before the write, instead of becoming a
+    ``blocked_unknown`` after it.  Operations without a reader-side shape
+    (locate, visibility, ...) are only required to be objects.  ``role`` is the
+    request's role: a developer's ``delivered``/``complete`` wait result must
+    carry ``delivery_evidence``.  Raises ``ValueError``; returns None.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("provider action result payload must be an object")
+    errors = []
+    if operation == "wait":
+        status = payload.get("status")
+        # failed/stopped carry their event in the status; timeout/unknown/error
+        # are transient (the reader only records visibility_unknown), so they
+        # need neither event nor delivery_evidence.
+        no_event = status in WAIT_STATUS_AS_EVENT or status in WAIT_TRANSIENT_STATUSES
+        required = ["status"] + ([] if no_event else ["event"])
+        if role == "developer" and payload.get("event") in ("delivered", "complete"):
+            required.append("delivery_evidence")
+        errors = _shape_errors(required, _WAIT_RESULT_FIELDS, payload)
+        if "status" in payload and not isinstance(status, str):
+            errors.append("field status must be a string")
+        event = payload.get("event")
+        if event is not None and event not in WAIT_EVENT_NAMES:
+            errors.append("field event must be one of: " + ", ".join(WAIT_EVENT_NAMES))
+        if payload.get("cursor") is not None and not cursor_is_valid(payload["cursor"]):
+            errors.append("field cursor is invalid")
+        if "delivery_evidence" in payload and not isinstance(payload["delivery_evidence"], dict):
+            errors.append("field delivery_evidence must be an object")
+    elif operation == "create":
+        errors = _shape_errors(["binding"], _CREATE_RESULT_FIELDS, payload)
+        binding = payload.get("binding")
+        if "binding" in payload and (
+            not isinstance(binding, dict)
+            or not any(isinstance(binding.get(key), str) and binding[key]
+                       for key in _BINDING_IDENTITY_FIELDS)
+        ):
+            errors.append("field binding needs a task identity: " + " or ".join(_BINDING_IDENTITY_FIELDS))
+    elif operation == "resume":
+        errors = _shape_errors([RESUME_RECEIPT_FIELD], _RESUME_RESULT_FIELDS, payload)
+        if RESUME_RECEIPT_FIELD in payload and payload[RESUME_RECEIPT_FIELD] is not True:
+            errors.append("field {} must be true".format(RESUME_RECEIPT_FIELD))
+    if errors:
+        raise ValueError("{} result shape invalid: {}".format(operation, "; ".join(errors)))
+
+
+def complete_mailbox_action(paths, run_id, action_id, payload, *, native=True):
+    """Validate a mailbox result against its request, then store it.
+
+    The shape is checked before anything is written, so a rejected result
+    leaves the request pending (not consumed) and creates no observation.
+    Storage is ``ProviderActionStore.complete``: the first bound result wins.
+    """
+    store = ProviderActionStore(paths)
+    request = store.action(action_id)
+    if request.get("run_id") != run_id:
+        raise ValueError("provider action belongs to a different run")
+    validate_result_shape(request.get("operation"), payload, role=request.get("role"))
+    return store.complete(action_id, payload, native=native)
 
 
 class ProviderActionRunner(Runner):

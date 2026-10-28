@@ -53,9 +53,16 @@ class VisibleSddPromptCarriesProtocolTests(unittest.TestCase):
     def _runner(self, root):
         return _RecordingRunner(ProjectPaths(Path(root)))
 
+    def _inline_runner(self, root):
+        # Ref is the default delivery; these tests pin the explicit inline mode.
+        (Path(root) / ".vibe").mkdir(exist_ok=True)
+        (Path(root) / ".vibe" / "config.json").write_text(
+            '{"sdd_protocol_delivery": "inline"}', encoding="utf-8")
+        return self._runner(root)
+
     def test_create_prompt_contains_full_protocol_text(self):
         with tempfile.TemporaryDirectory() as directory:
-            runner = self._runner(directory)
+            runner = self._inline_runner(directory)
             runner.task_binding(dict(CONTRACT), Path(directory), "run-93", "running")
             creates = [req for op, req in runner.requests if op == "create"]
             self.assertEqual(len(creates), 1, "exactly one create request")
@@ -83,7 +90,7 @@ class VisibleSddPromptCarriesProtocolTests(unittest.TestCase):
 
     def test_missing_protocol_fails_closed_before_create(self):
         with tempfile.TemporaryDirectory() as directory:
-            runner = self._runner(directory)
+            runner = self._inline_runner(directory)
             with patch(
                 "vibe_guide.runners.provider_action.load_protocol",
                 side_effect=FileNotFoundError("missing protocol"),

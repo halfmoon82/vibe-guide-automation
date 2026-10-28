@@ -1,4 +1,4 @@
-"""30 minutes on a platform without verified push wake-up is a forced choice.
+"""60 minutes on a platform without verified push wake-up is a forced choice.
 
 The card lists it as selectable with its price; only an explicit product
 choice records it; the runtime honours that choice instead of silently
@@ -53,12 +53,12 @@ class ForcedThirtyTests(unittest.TestCase):
             heartbeat_interval_options=options)
 
     def test_publishing_30_without_verification_succeeds_and_marks_the_force(self):
-        card = self._card(30)
-        self.assertEqual(card.heartbeat_interval_minutes, 30)
+        card = self._card(60)
+        self.assertEqual(card.heartbeat_interval_minutes, 60)
         entry = card.heartbeat_interval_options[1]
         self.assertTrue(entry["forced"])
         self.assertEqual(entry["cost"], FORCED_INTERVAL_COST)
-        self.assertIn("最长 30 分钟", entry["cost"])
+        self.assertIn("最长 60 分钟", entry["cost"])
         rendered = _render_card_options(card.heartbeat_interval_options, "minutes", "分钟")
         self.assertIn("强制选择", rendered)
         self.assertIn(entry["cost"], rendered)
@@ -71,13 +71,13 @@ class ForcedThirtyTests(unittest.TestCase):
 
     def test_a_forced_tier_without_a_cost_refuses_publication(self):
         options = [{"minutes": 10, "available": True, "reason": ""},
-                   {"minutes": 30, "available": True, "reason": "x", "forced": True}]
+                   {"minutes": 60, "available": True, "reason": "x", "forced": True}]
         with self.assertRaises(ValueError) as raised:
-            self._card(30, options)
+            self._card(60, options)
         self.assertIn("cost", str(raised.exception))
         options[1]["cost"] = "  "
         with self.assertRaises(ValueError):
-            self._card(30, options)
+            self._card(60, options)
 
     def test_no_choice_is_never_30_by_default(self):
         # Offering the forced tier does not select it: the runtime stays at 10.
@@ -100,15 +100,15 @@ class ForcedThirtyTests(unittest.TestCase):
     def test_runtime_honours_the_forced_choice(self):
         register_supervisor_address(
             self.paths, "run-1", {"provider": "claude-code", "session_id": "S", "host": "mac"})
-        with self._authorize(30, self._card(30)):
+        with self._authorize(60, self._card(60)):
             self.assertTrue(authorization_choices(self.paths, "run-1")["heartbeat_interval_forced"])
             interval = heartbeat_interval(self.paths, "run-1", decision_only=False)
-        self.assertEqual(interval["minutes"], 30)
+        self.assertEqual(interval["minutes"], 60)
         self.assertEqual(interval["mode"], "forced")
-        self.assertIn("30 分钟", interval["reason"])
+        self.assertIn("60 分钟", interval["reason"])
 
     def test_forced_choice_is_in_the_signed_record(self):
-        record = authorize(self._card(30), "AUTHORIZE")
+        record = authorize(self._card(60), "AUTHORIZE")
         data = record.to_dict()
         self.assertIs(data["heartbeat_interval_forced"], True)
         self.assertEqual(data["heartbeat_interval_forced_cost"], FORCED_INTERVAL_COST)
@@ -129,16 +129,16 @@ class ForcedThirtyTests(unittest.TestCase):
         (self.root / ".vibe/push-wake-verification.json").write_text(json.dumps(
             {"platforms": {"claude-code": {"success": [{"evidence_ref": "s"}],
                                            "failure": [{"evidence_ref": "f"}]}}}))
-        data = authorize(self._card(30), "AUTHORIZE").to_dict()
-        self.assertEqual(data["heartbeat_interval_minutes"], 30)
+        data = authorize(self._card(60), "AUTHORIZE").to_dict()
+        self.assertEqual(data["heartbeat_interval_minutes"], 60)
         self.assertNotIn("heartbeat_interval_forced", data)
 
     def test_a_30_without_a_forced_card_still_falls_back(self):
         register_supervisor_address(
             self.paths, "run-1", {"provider": "claude-code", "session_id": "S", "host": "mac"})
         plain = [{"minutes": 10, "available": True, "reason": ""},
-                 {"minutes": 30, "available": True, "reason": ""}]
-        with self._authorize(30, self._card(30, plain)):
+                 {"minutes": 60, "available": True, "reason": ""}]
+        with self._authorize(60, self._card(60, plain)):
             interval = heartbeat_interval(self.paths, "run-1", decision_only=False)
         self.assertEqual(interval["minutes"], 10)
 
@@ -147,7 +147,7 @@ class ForcedThirtyTests(unittest.TestCase):
             {"platforms": {"claude-code": {"success": [{"evidence_ref": "s"}],
                                            "failure": [{"evidence_ref": "f"}]}}}))
         entry = heartbeat_interval_options(self.paths, "claude-code")[1]
-        self.assertEqual(entry, {"minutes": 30, "available": True,
+        self.assertEqual(entry, {"minutes": 60, "available": True,
                                  "reason": entry["reason"]})
 
 

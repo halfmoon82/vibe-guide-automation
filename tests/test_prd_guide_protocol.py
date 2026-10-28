@@ -648,8 +648,8 @@ class PublishSectionTests(unittest.TestCase):
     def test_publish_step_tells_how_to_recover_a_parked_draft(self):
         """Where a draft is left when a swap is interrupted comes from the code."""
         import inspect
-        from vibe_guide import cli
-        source = inspect.getsource(cli._replace_draft)
+        from vibe_guide import publish
+        source = inspect.getsource(publish._replace_draft)
         self.assertIn('prefix="." + destination.name + ".draft."', source)
         self.assertIn('parked = holding / "draft"', source)
         self.assertIn("draft could not be restored", source)
@@ -743,8 +743,8 @@ class PublishSectionTests(unittest.TestCase):
         # remote Git actions as not performed, and the only merge gate needs
         # merge_local/merge_remote, which the published card never carries.
         import inspect
-        from vibe_guide import authorization, monitor
-        self.assertIn('"external_execution": "not_performed"', inspect.getsource(monitor))
+        from vibe_guide import authorization, change_requests
+        self.assertIn('"external_execution": "not_performed"', inspect.getsource(change_requests))
         self.assertIn('{"merge_local", "merge_remote"}', inspect.getsource(authorization.can_auto_merge))
         # The worker envelope is fixed, so it lists push/merge under deny too.
         from vibe_guide.authorization import _EXCLUDED_ACTIONS, _REMOTE_GIT_ACTIONS_SCOPE

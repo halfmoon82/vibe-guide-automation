@@ -222,7 +222,7 @@ class HeartbeatIntervalTests(unittest.TestCase):
         self.assertEqual((waiting['minutes'], waiting['mode']), (60, 'decision'))
         self.write_verification(self.evidence(success='logs/ok.txt', failure='logs/fail.txt'))
         pushed = heartbeat_interval(self.paths, 'run-1', decision_only=False)
-        self.assertEqual((pushed['minutes'], pushed['mode']), (30, 'push_verified'))
+        self.assertEqual((pushed['minutes'], pushed['mode']), (60, 'push_verified'))
         self.assertEqual(heartbeat_interval(self.paths, 'run-1', decision_only=True)['minutes'], 60)
 
     def test_interval_unverified_push_falls_back_with_reason(self):
