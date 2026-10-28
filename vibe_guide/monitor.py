@@ -110,6 +110,7 @@ from .task_registry import (
 from .config import load_project_config
 from .worker_questions import WORKER_QUESTION_EVENT, park_question as park_worker_question
 from .worktree_base import upstream_branches
+from .scope_landing import check_delivery as check_delivery_landing
 from .workflow_gate import require_capability_contract, require_entry, verify_workflow
 from .authorize_entry import load_live_workflow, select_plan_workflow, verify_workflow_artifacts
 from .diagnostics import validate_child_session_binding
@@ -6912,6 +6913,8 @@ class Monitor:
                         return
                     self._mark_blocked_unknown(snapshot, node_id, "; ".join(gate.reasons))
                     return
+            if role == "developer" and not check_delivery_landing(self, snapshot, node_id, active):
+                return
             visible_sdd_delivery = (
                 role == "developer"
                 and self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD

@@ -27,6 +27,8 @@ EXCERPT_LIMIT = 600
 QUESTION_DIR = "worker-questions"
 #: Node field naming the open question; structural keys only, never the text.
 MARKER_KEY = "worker_question"
+KIND_QUESTION = "question"
+KIND_SCOPE_LANDING = "scope_landing"
 
 
 def excerpt(text: Any) -> Optional[str]:
@@ -57,6 +59,19 @@ def _relative(paths: ProjectPaths, path: Path) -> str:
 def park_question(monitor: Any, snapshot: Any, node_id: str, event: Any,
                   active: Dict[str, Any]) -> None:
     """Persist the question and park the node until the supervisor answers."""
+    park(monitor, snapshot, node_id, active, excerpt(event.data.get("question_excerpt")),
+         session_state=event.data.get("session_state"))
+
+
+def park(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, Any], text: Any, *,
+         session_state: Any = None, kind: str = KIND_QUESTION,
+         event_name: str = "worker_question_raised",
+         event_data: Optional[Dict[str, Any]] = None) -> None:
+    """Park the node with ``text`` as what the supervisor has to answer.
+
+    ``kind`` names why: a worker's own question, or a delivery vibe refused
+    (``scope_landing``) whose readable reason the supervisor answers instead.
+    """
     role = str(active["role"])
     generation = int(active["generation"])
     path = run_dir(monitor.paths, snapshot.run_id, create=True) / QUESTION_DIR / _question_name(
@@ -67,8 +82,9 @@ def park_question(monitor: Any, snapshot: Any, node_id: str, event: Any,
         "role": role,
         "generation": generation,
         "task_id": active.get("task_id"),
-        "session_state": event.data.get("session_state"),
-        "excerpt": excerpt(event.data.get("question_excerpt")),
+        "kind": kind,
+        "session_state": session_state,
+        "excerpt": text,
         "asked_at": _now(),
         "answer": None,
     })
@@ -78,20 +94,22 @@ def park_question(monitor: Any, snapshot: Any, node_id: str, event: Any,
     monitor._set_binding_status(snapshot, node_id, role, "stopped")
     current = snapshot.nodes[node_id]
     current["status"] = AWAITING_STATUS
-    current["reason"] = "worker session ended without delivery and asked the supervisor"
-    current[MARKER_KEY] = {"file": relative, "role": role, "generation": generation}
+    current["reason"] = (
+        "delivery refused; the supervisor has to answer the worker"
+        if kind == KIND_SCOPE_LANDING
+        else "worker session ended without delivery and asked the supervisor")
+    current[MARKER_KEY] = {"file": relative, "role": role, "generation": generation, "kind": kind}
     current["active_role"] = None
     current["active_task"] = None
     current["quarantine"] = None
     current["retryable_action"] = None
     snapshot.handles.pop(node_id, None)
     monitor._release_node_lease(snapshot, node_id)
-    monitor._record(snapshot, "worker_question_raised", {
-        "run_id": snapshot.run_id,
-        "node_id": node_id,
-        "question_file": relative,
-        "session_state": event.data.get("session_state"),
-    }, active)
+    data = {"run_id": snapshot.run_id, "node_id": node_id, "question_file": relative}
+    if session_state is not None:
+        data["session_state"] = session_state
+    data.update(event_data or {})
+    monitor._record(snapshot, event_name, data, active)
 
 
 def pending_questions(paths: ProjectPaths, snapshot: Any) -> List[Dict[str, Any]]:
@@ -103,7 +121,7 @@ def pending_questions(paths: ProjectPaths, snapshot: Any) -> List[Dict[str, Any]
         marker = current.get(MARKER_KEY) if isinstance(current.get(MARKER_KEY), dict) else {}
         item = {"node_id": node_id, "role": marker.get("role"),
                 "generation": marker.get("generation"), "file": marker.get("file"),
-                "excerpt": None}
+                "kind": marker.get("kind") or KIND_QUESTION, "excerpt": None}
         try:
             record = read_json(paths.root / str(marker.get("file")))
         except (JsonMissingError, JsonCorruptError, TypeError):
@@ -170,18 +188,23 @@ def supervisor_answer_section(contract: Dict[str, Any]) -> str:
     answer = record.get("answer") if isinstance(record, dict) else None
     if not isinstance(answer, str) or not answer.strip():
         return ""
-    return (
-        "上一代你停下来向监工提问：「{}」\n监工答复：{}\n"
-        "按监工答复继续本节点工作，完成后照常交付。\n"
-    ).format(record.get("excerpt") or "", answer.strip())
+    header = ("上一代交付被 vibe 拒收：「{}」" if record.get("kind") == KIND_SCOPE_LANDING
+              else "上一代你停下来向监工提问：「{}」")
+    return (header + "\n监工答复：{}\n按监工答复继续本节点工作，完成后照常交付。\n").format(
+        record.get("excerpt") or "", answer.strip())
+
+
+def _label(item: Dict[str, Any]) -> str:
+    return "交付被拒收" if item.get("kind") == KIND_SCOPE_LANDING else "worker 提问"
 
 
 def render_beat_questions(questions: List[Dict[str, Any]], run_id: str, plan_id: str,
                           command_prefix: str = "vibe") -> str:
-    lines = ["decision：worker 停下来向监工提问，由监工判断并答复（只有产品取舍才转问产品经理）："]
+    lines = ["decision：worker 等监工答复（worker 提问或交付被拒收），由监工判断并答复"
+             "（只有产品取舍才转问产品经理）："]
     for item in questions:
-        lines.append("  节点 {}（{} 第 {} 代）：「{}」 全文：{}".format(
-            item["node_id"], item.get("role"), item.get("generation"),
+        lines.append("  节点 {}（{} 第 {} 代）{}：「{}」 全文：{}".format(
+            item["node_id"], item.get("role"), item.get("generation"), _label(item),
             item.get("excerpt") or "", item.get("file")))
         lines.append("    答复：{} requeue --plan {} --run-id {} --node {} --note '<答复>'".format(
             command_prefix, plan_id, run_id, item["node_id"]))
@@ -197,6 +220,6 @@ def render_status_lines(paths: Optional[ProjectPaths], snapshot: Any) -> str:
     if not questions:
         return ""
     return "\n".join(
-        "需要监工答复：节点 {} 的 worker 提问「{}」（全文 {}）".format(
-            item["node_id"], item.get("excerpt") or "", item.get("file"))
+        "需要监工答复：节点 {} 的{}「{}」（全文 {}）".format(
+            item["node_id"], _label(item), item.get("excerpt") or "", item.get("file"))
         for item in questions)

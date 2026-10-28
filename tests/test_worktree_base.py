@@ -32,8 +32,8 @@ from vibe_guide.adapters.task_provider import ProviderActionStore
 from vibe_guide.runners.claude_bg import ClaudeBgRunner
 from vibe_guide.task_registry import load_task_binding
 
+# Imported as a module: a test class bound at module level would run again here.
 from tests import test_claude_bg_delivery_gate as _gate_module
-from tests.test_claude_bg_delivery_gate import BackgroundDeliveryGateTests
 from tests.test_claude_bg_reconnect import GOOD, FakeLauncher as ReconnectLauncher
 from tests.test_claude_bg_reconnect import background_node as _fixture_background_node
 from tests.test_worktree_preflight_235 import FakeLauncher, FakeMonitor, FakeSnapshot, RepoCase, git
@@ -203,14 +203,14 @@ def _chained_node(node_id="bg"):
 
 
 class MonitorUpstreamDispatchTest(unittest.TestCase):
-    tearDown = BackgroundDeliveryGateTests.tearDown
-    _engine_plan = BackgroundDeliveryGateTests._engine_plan
-    monitor = BackgroundDeliveryGateTests.monitor
-    generation = BackgroundDeliveryGateTests.generation
+    tearDown = _gate_module.BackgroundDeliveryGateTests.tearDown
+    _engine_plan = _gate_module.BackgroundDeliveryGateTests._engine_plan
+    monitor = _gate_module.BackgroundDeliveryGateTests.monitor
+    generation = _gate_module.BackgroundDeliveryGateTests.generation
 
     def setUp(self):
         with mock.patch.object(_gate_module, "background_node", _chained_node):
-            BackgroundDeliveryGateTests.setUp(self)
+            _gate_module.BackgroundDeliveryGateTests.setUp(self)
 
     def runner(self, contracts):
         def factory(contract, worktree):

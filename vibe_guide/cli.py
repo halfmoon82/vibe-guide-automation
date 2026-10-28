@@ -154,7 +154,7 @@ from .installation import run_install, run_upgrade, migrate_state
 from .skills import SkillSpec, install_project_skill
 from .models import InstallRequest
 from .decision_boundary import answer_decision, decision_list, raise_decision
-from . import worker_questions
+from . import scope_landing, worker_questions
 
 
 SUCCESS = 0
@@ -1855,6 +1855,9 @@ def _snapshot_result(
     questions = worker_questions.render_status_lines(paths, snapshot)
     if questions:
         text += "\n" + questions
+    expansions = scope_landing.render_status_lines(snapshot)
+    if expansions:
+        text += "\n" + expansions
     if pending_verification:
         text += "\n" + _render_pending_verification(pending_verification)
     return _result(

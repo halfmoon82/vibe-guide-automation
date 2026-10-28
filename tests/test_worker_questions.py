@@ -20,7 +20,8 @@ from vibe_guide.runners.claude_bg import ClaudeBgRunner
 from vibe_guide.state import load_events, load_snapshot, map_user_status
 from vibe_guide.supervisor import render_beat_text, supervisor_preflight
 
-from tests.test_claude_bg_delivery_gate import BackgroundDeliveryGateTests
+# Imported as a module: a test class bound at module level would run again here.
+from tests import test_claude_bg_delivery_gate as _gate
 from tests.test_claude_bg_reconnect import UUID
 
 QUESTION = (
@@ -100,11 +101,11 @@ class MonitorQuestionTests(unittest.TestCase):
     """Drives the gated background path: start -> question -> answer -> redispatch."""
 
     # The gated vibeguide_monitor fixture, without re-running its own tests.
-    setUp = BackgroundDeliveryGateTests.setUp
-    tearDown = BackgroundDeliveryGateTests.tearDown
-    _engine_plan = BackgroundDeliveryGateTests._engine_plan
-    monitor = BackgroundDeliveryGateTests.monitor
-    start = BackgroundDeliveryGateTests.start
+    setUp = _gate.BackgroundDeliveryGateTests.setUp
+    tearDown = _gate.BackgroundDeliveryGateTests.tearDown
+    _engine_plan = _gate.BackgroundDeliveryGateTests._engine_plan
+    monitor = _gate.BackgroundDeliveryGateTests.monitor
+    start = _gate.BackgroundDeliveryGateTests.start
 
     def runner(self, state="working", reply=None, calls=None, node="bg"):
         # Only ``node`` is in ``state``; every other node keeps working.
