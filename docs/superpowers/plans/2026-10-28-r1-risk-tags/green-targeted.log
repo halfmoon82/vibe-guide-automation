@@ -1,0 +1,64 @@
+======================================================================
+FAIL: test_product_only_publish_has_schedulable_roots_and_bound_risk_tags (tests.test_node_spec_contract.ProductSpecPublishTests) (invalid=[])
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_spec_contract.py", line 113, in test_product_only_publish_has_schedulable_roots_and_bound_risk_tags
+    self.assertEqual(rejected.ready_nodes, [])
+AssertionError: Lists differ: ['date-range-filter'] != []
+
+First list contains 1 additional elements.
+First extra element 0:
+'date-range-filter'
+
+- ['date-range-filter']
++ []
+
+======================================================================
+FAIL: test_product_only_publish_has_schedulable_roots_and_bound_risk_tags (tests.test_node_spec_contract.ProductSpecPublishTests) (invalid=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_spec_contract.py", line 113, in test_product_only_publish_has_schedulable_roots_and_bound_risk_tags
+    self.assertEqual(rejected.ready_nodes, [])
+AssertionError: Lists differ: ['date-range-filter'] != []
+
+First list contains 1 additional elements.
+First extra element 0:
+'date-range-filter'
+
+- ['date-range-filter']
++ []
+
+======================================================================
+FAIL: test_product_only_publish_has_schedulable_roots_and_bound_risk_tags (tests.test_node_spec_contract.ProductSpecPublishTests) (invalid='security')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_spec_contract.py", line 113, in test_product_only_publish_has_schedulable_roots_and_bound_risk_tags
+    self.assertEqual(rejected.ready_nodes, [])
+AssertionError: Lists differ: ['date-range-filter'] != []
+
+First list contains 1 additional elements.
+First extra element 0:
+'date-range-filter'
+
+- ['date-range-filter']
++ []
+
+======================================================================
+FAIL: test_product_only_publish_has_schedulable_roots_and_bound_risk_tags (tests.test_node_spec_contract.ProductSpecPublishTests) (invalid=[''])
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_spec_contract.py", line 113, in test_product_only_publish_has_schedulable_roots_and_bound_risk_tags
+    self.assertEqual(rejected.ready_nodes, [])
+AssertionError: Lists differ: ['date-range-filter'] != []
+
+First list contains 1 additional elements.
+First extra element 0:
+'date-range-filter'
+
+- ['date-range-filter']
++ []
+
+----------------------------------------------------------------------
+Ran 164 tests in 3.227s
+
+FAILED (failures=4)

@@ -137,9 +137,17 @@ def build_workflow_evidence(paths, plan_id: str, authorization_token: str) -> Di
 
     node_ids = [str(item.get("id")) for item in nodes]
     objective = str(plan.get("prd_path", ""))
-    decisions = plan.get("decisions") or []
-    if not isinstance(decisions, list) or not decisions:
-        raise ValueError("a complex plan requires at least one approved product decision")
+    # A complex plan may legitimately carry zero product decisions: the PRD
+    # gate (`approve_prd`) only blocks *unresolved* decisions, so an empty
+    # list is a published, digest-bound fact rather than a missing section.
+    # `None` (absent key) is normalized to that same empty shape; every other
+    # non-list value -- including falsy ones like ``{}``, ``""`` or ``0`` --
+    # fails closed instead of being silently coerced.
+    decisions = plan.get("decisions")
+    if decisions is None:
+        decisions = []
+    if not isinstance(decisions, list):
+        raise ValueError("published product decisions must be a list")
     for item in decisions:
         if not isinstance(item, Mapping) or item.get("status") != "approved" or item.get("selected") not in (item.get("options") or []):
             raise ValueError("published product decisions are not all approved")
@@ -334,8 +342,15 @@ def _verify_lifecycle_invariant(root: Path, reference: str, records: Mapping[str
         plan = _read_json(root / "plan.json")
         if not isinstance(plan, Mapping) or not isinstance(recorded, str):
             raise AuthorizationDenied("workflow_evidence_stale: plan.json evidence is unusable")
+        # Same normalization contract as `build_workflow_evidence`: only an
+        # absent/null key means "no decisions".  A falsy non-list like
+        # ``false`` or ``{}`` is tampering, not an empty decision list, and
+        # its digest cannot match the authorized evidence.
+        decisions = plan.get("decisions")
+        if decisions is None:
+            decisions = []
         live = _canonical_digest(
-            {"decisions": plan.get("decisions") or [], "evidence_priority": plan.get("evidence_priority") or []}
+            {"decisions": decisions, "evidence_priority": plan.get("evidence_priority") or []}
         )
         if live != recorded:
             raise AuthorizationDenied("workflow_evidence_stale: plan.json decisions no longer match the authorized evidence")

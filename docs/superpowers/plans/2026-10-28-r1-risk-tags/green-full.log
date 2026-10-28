@@ -1,0 +1,261 @@
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/tempfile.py:817: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/tmpss410b6l'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/tempfile.py:817: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/tmpj3640oev'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/tempfile.py:817: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/tmpp39fcfd3'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/tempfile.py:817: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/tmpex6ew0dj'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/tempfile.py:817: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/tmppa47hw1x'>
+  _warnings.warn(warn_message, ResourceWarning)
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/tempfile.py:817: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/tmpgp_eis4w'>
+  _warnings.warn(warn_message, ResourceWarning)
+usage: vibe [-h] [--json] [--confirm] [--host-rules {skip,apply,rollback}]
+            [--host-rules-digest HOST_RULES_DIGEST] [--request REQUEST]
+            [--plan-id PLAN_ID] [--plan PLAN] [--run-id RUN_ID]
+            [--evidence EVIDENCE] [--s1 S1] [--node-spec NODE_SPEC]
+            [--from-prd FROM_PRD] [--print-protocol] [--adapter ADAPTER]
+            [--facts FACTS] [--provenance PROVENANCE]
+            [--project-id PROJECT_ID] [--authorize AUTHORIZE]
+            [--authorization-token LEGACY_AUTHORIZATION] [--manifest MANIFEST]
+            [--acceptance-state ACCEPTANCE_STATE]
+            [--observations OBSERVATIONS] [--watch] [--preview-card]
+            [--platform-handoff] [--mode {layered,bundled}]
+            [--source SKILL_SOURCE] [--sha SKILL_SHA] [--name SKILL_NAME]
+            [--subdir SKILL_SUBDIR] [--session-record SESSION_RECORD]
+            [--accept-decision] [--provider SUPERVISOR_PROVIDER]
+            [--session-id SESSION_ID] [--host SUPERVISOR_HOST]
+            [--wake-target WAKE_TARGET] [--context-hard-cap CONTEXT_HARD_CAP]
+            [--token-threshold TOKEN_THRESHOLD] [--reason HOLD_REASON]
+            [--category HOLD_CATEGORY] [--decision HOLD_DECISION]
+            [--authorization-gap HOLD_AUTHORIZATION_GAP] [--release]
+            [--node NODE_ID] [--role ROLE] [--payload WORKER_PAYLOAD]
+            [--generation WORKER_GENERATION] [--id DECISION_ID]
+            [--choice DECISION_CHOICE] [--digest DECISION_DIGEST]
+            [--via DECISION_VIA] [--note DECISION_NOTE]
+            [--question DECISION_QUESTION] [--options DECISION_OPTIONS]
+            [--recommendation DECISION_RECOMMENDATION]
+            [--decision-evidence DECISION_EVIDENCE]
+            [{scan,init,apply-agentsmd,doctor,install,upgrade,migrate-state,attest,plan,authorize,monitor,reconcile,status,resume,change-request,deploy,skill-install,supervisor-beat,supervisor-preflight,supervisor-register,supervisor-address,supervisor-hold,supervisor-handoff,supervisor-output,supervisor-mailbox,worker-deliver,decision-raise,decision-list,decision-answer,scope-expand,repair,requeue,heal-verify}]
+vibe: error: argument command: invalid choice: 'stall-check' (choose from 'scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify')
+usage: vibe [-h] [--json] [--confirm] [--host-rules {skip,apply,rollback}]
+            [--host-rules-digest HOST_RULES_DIGEST] [--request REQUEST]
+            [--plan-id PLAN_ID] [--plan PLAN] [--run-id RUN_ID]
+            [--evidence EVIDENCE] [--s1 S1] [--node-spec NODE_SPEC]
+            [--from-prd FROM_PRD] [--print-protocol] [--adapter ADAPTER]
+            [--facts FACTS] [--provenance PROVENANCE]
+            [--project-id PROJECT_ID] [--authorize AUTHORIZE]
+            [--authorization-token LEGACY_AUTHORIZATION] [--manifest MANIFEST]
+            [--acceptance-state ACCEPTANCE_STATE]
+            [--observations OBSERVATIONS] [--watch] [--preview-card]
+            [--platform-handoff] [--mode {layered,bundled}]
+            [--source SKILL_SOURCE] [--sha SKILL_SHA] [--name SKILL_NAME]
+            [--subdir SKILL_SUBDIR] [--session-record SESSION_RECORD]
+            [--accept-decision] [--provider SUPERVISOR_PROVIDER]
+            [--session-id SESSION_ID] [--host SUPERVISOR_HOST]
+            [--wake-target WAKE_TARGET] [--context-hard-cap CONTEXT_HARD_CAP]
+            [--token-threshold TOKEN_THRESHOLD] [--reason HOLD_REASON]
+            [--category HOLD_CATEGORY] [--decision HOLD_DECISION]
+            [--authorization-gap HOLD_AUTHORIZATION_GAP] [--release]
+            [--node NODE_ID] [--role ROLE] [--payload WORKER_PAYLOAD]
+            [--generation WORKER_GENERATION] [--id DECISION_ID]
+            [--choice DECISION_CHOICE] [--digest DECISION_DIGEST]
+            [--via DECISION_VIA] [--note DECISION_NOTE]
+            [--question DECISION_QUESTION] [--options DECISION_OPTIONS]
+            [--recommendation DECISION_RECOMMENDATION]
+            [--decision-evidence DECISION_EVIDENCE]
+            [{scan,init,apply-agentsmd,doctor,install,upgrade,migrate-state,attest,plan,authorize,monitor,reconcile,status,resume,change-request,deploy,skill-install,supervisor-beat,supervisor-preflight,supervisor-register,supervisor-address,supervisor-hold,supervisor-handoff,supervisor-output,supervisor-mailbox,worker-deliver,decision-raise,decision-list,decision-answer,scope-expand,repair,requeue,heal-verify}]
+vibe: error: argument command: invalid choice: 'stall-check' (choose from 'scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify')
+usage: vibe [-h] [--json] [--confirm] [--host-rules {skip,apply,rollback}]
+            [--host-rules-digest HOST_RULES_DIGEST] [--request REQUEST]
+            [--plan-id PLAN_ID] [--plan PLAN] [--run-id RUN_ID]
+            [--evidence EVIDENCE] [--s1 S1] [--node-spec NODE_SPEC]
+            [--from-prd FROM_PRD] [--print-protocol] [--adapter ADAPTER]
+            [--facts FACTS] [--provenance PROVENANCE]
+            [--project-id PROJECT_ID] [--authorize AUTHORIZE]
+            [--authorization-token LEGACY_AUTHORIZATION] [--manifest MANIFEST]
+            [--acceptance-state ACCEPTANCE_STATE]
+            [--observations OBSERVATIONS] [--watch] [--preview-card]
+            [--platform-handoff] [--mode {layered,bundled}]
+            [--source SKILL_SOURCE] [--sha SKILL_SHA] [--name SKILL_NAME]
+            [--subdir SKILL_SUBDIR] [--session-record SESSION_RECORD]
+            [--accept-decision] [--provider SUPERVISOR_PROVIDER]
+            [--session-id SESSION_ID] [--host SUPERVISOR_HOST]
+            [--wake-target WAKE_TARGET] [--context-hard-cap CONTEXT_HARD_CAP]
+            [--token-threshold TOKEN_THRESHOLD] [--reason HOLD_REASON]
+            [--category HOLD_CATEGORY] [--decision HOLD_DECISION]
+            [--authorization-gap HOLD_AUTHORIZATION_GAP] [--release]
+            [--node NODE_ID] [--role ROLE] [--payload WORKER_PAYLOAD]
+            [--generation WORKER_GENERATION] [--id DECISION_ID]
+            [--choice DECISION_CHOICE] [--digest DECISION_DIGEST]
+            [--via DECISION_VIA] [--note DECISION_NOTE]
+            [--question DECISION_QUESTION] [--options DECISION_OPTIONS]
+            [--recommendation DECISION_RECOMMENDATION]
+            [--decision-evidence DECISION_EVIDENCE]
+            [{scan,init,apply-agentsmd,doctor,install,upgrade,migrate-state,attest,plan,authorize,monitor,reconcile,status,resume,change-request,deploy,skill-install,supervisor-beat,supervisor-preflight,supervisor-register,supervisor-address,supervisor-hold,supervisor-handoff,supervisor-output,supervisor-mailbox,worker-deliver,decision-raise,decision-list,decision-answer,scope-expand,repair,requeue,heal-verify}]
+vibe: error: unrecognized arguments: --recheck
+usage: vibe [-h] [--json] [--confirm] [--host-rules {skip,apply,rollback}]
+            [--host-rules-digest HOST_RULES_DIGEST] [--request REQUEST]
+            [--plan-id PLAN_ID] [--plan PLAN] [--run-id RUN_ID]
+            [--evidence EVIDENCE] [--s1 S1] [--node-spec NODE_SPEC]
+            [--from-prd FROM_PRD] [--print-protocol] [--adapter ADAPTER]
+            [--facts FACTS] [--provenance PROVENANCE]
+            [--project-id PROJECT_ID] [--authorize AUTHORIZE]
+            [--authorization-token LEGACY_AUTHORIZATION] [--manifest MANIFEST]
+            [--acceptance-state ACCEPTANCE_STATE]
+            [--observations OBSERVATIONS] [--watch] [--preview-card]
+            [--platform-handoff] [--mode {layered,bundled}]
+            [--source SKILL_SOURCE] [--sha SKILL_SHA] [--name SKILL_NAME]
+            [--subdir SKILL_SUBDIR] [--session-record SESSION_RECORD]
+            [--accept-decision] [--provider SUPERVISOR_PROVIDER]
+            [--session-id SESSION_ID] [--host SUPERVISOR_HOST]
+            [--wake-target WAKE_TARGET] [--context-hard-cap CONTEXT_HARD_CAP]
+            [--token-threshold TOKEN_THRESHOLD] [--reason HOLD_REASON]
+            [--category HOLD_CATEGORY] [--decision HOLD_DECISION]
+            [--authorization-gap HOLD_AUTHORIZATION_GAP] [--release]
+            [--node NODE_ID] [--role ROLE] [--payload WORKER_PAYLOAD]
+            [--generation WORKER_GENERATION] [--id DECISION_ID]
+            [--choice DECISION_CHOICE] [--digest DECISION_DIGEST]
+            [--via DECISION_VIA] [--note DECISION_NOTE]
+            [--question DECISION_QUESTION] [--options DECISION_OPTIONS]
+            [--recommendation DECISION_RECOMMENDATION]
+            [--decision-evidence DECISION_EVIDENCE]
+            [{scan,init,apply-agentsmd,doctor,install,upgrade,migrate-state,attest,plan,authorize,monitor,reconcile,status,resume,change-request,deploy,skill-install,supervisor-beat,supervisor-preflight,supervisor-register,supervisor-address,supervisor-hold,supervisor-handoff,supervisor-output,supervisor-mailbox,worker-deliver,decision-raise,decision-list,decision-answer,scope-expand,repair,requeue,heal-verify}]
+vibe: error: unrecognized arguments: --recheck
+/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/tempfile.py:817: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/tmp75lxqmd9'>
+  _warnings.warn(warn_message, ResourceWarning)
+======================================================================
+ERROR: test_the_contract_validity_is_renewed_but_each_fact_keeps_its_own_clock (test_platform_handoff_contract_refresh.PureRuleTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/vibe_guide/capability_contract.py", line 109, in _parse_timestamp
+    parsed = datetime.fromisoformat(value)
+ValueError: Invalid isoformat string: '2020-01-01T00:00:00Z'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_platform_handoff_contract_refresh.py", line 352, in test_the_contract_validity_is_renewed_but_each_fact_keeps_its_own_clock
+    old = build_contract(root, host_id="h1", now=past, facts={
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/vibe_guide/capability_contract.py", line 339, in build_contract
+    fact = CapabilityFact(
+  File "<string>", line 10, in __init__
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/vibe_guide/capability_contract.py", line 166, in __post_init__
+    _timestamp(_parse_timestamp(self.checked_at, "checked_at")),
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/vibe_guide/capability_contract.py", line 111, in _parse_timestamp
+    raise ValueError("%s is not a valid timestamp" % field) from error
+ValueError: checked_at is not a valid timestamp
+
+======================================================================
+FAIL: test_ac_b3_preview_asks_pm_to_authorize_a_visibility_downgrade (test_integrated_prd_acceptance.ACB3VisibilityDowngradePreviewTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_integrated_prd_acceptance.py", line 1043, in test_ac_b3_preview_asks_pm_to_authorize_a_visibility_downgrade
+    self.assertTrue(
+AssertionError: False is not true : AC-B3: visible card signed, then every claude-code visible_task.* fact became False and background_task.launch True; `vibe monitor --preview-card` still reports topology {'background': 0, 'by_topology': {'background': 0, 'dual-visible': 2, 'visible-sdd': 0}, 'total': 2, 'visible': 2} with digest matching the publication True, changed_fields {}, status 'ok' -- no structured reauthorization signal for the visible→background downgrade
+
+======================================================================
+FAIL: test_ac_e1_evaluation_scaffold_reports_accuracy_ece_p95 (test_integrated_prd_acceptance.ACE1EntryTriageTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_integrated_prd_acceptance.py", line 1427, in test_ac_e1_evaluation_scaffold_reports_accuracy_ece_p95
+    self.assertEqual(
+AssertionError: 0 != 1 : AC-E1: expected exactly one triage evaluation scaffold under scripts/ (*triage*), found 0: []; cannot produce accuracy/ECE/p95
+
+======================================================================
+FAIL: test_ac_e1_gateway_down_leaves_a_degradation_record (test_integrated_prd_acceptance.ACE1EntryTriageTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_integrated_prd_acceptance.py", line 1408, in test_ac_e1_gateway_down_leaves_a_degradation_record
+    self.assertTrue(
+AssertionError: [] is not true : AC-E1: no degradation record -- `vibe plan` with the triage service off returned no triage/分诊/S1 degraded/降级 entry with a reason (payload keys ['command', 'node_spec', 'plan_id', 'rationale', 'route', 'status']) and wrote none under .vibe (files written: ['.vibe/session-gates.json']; outbound attempts: 0)
+
+======================================================================
+FAIL: test_current_text_registered (test_integration_fix_heartbeat_contract.DigestRegistryTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_integration_fix_heartbeat_contract.py", line 71, in test_current_text_registered
+    self.assertTrue(is_shipped_protocol('prd-guide', load_protocol('prd-guide')))
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_product_only_publish_has_schedulable_roots_and_bound_risk_tags (test_node_spec_contract.ProductSpecPublishTests) (invalid=[])
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_spec_contract.py", line 113, in test_product_only_publish_has_schedulable_roots_and_bound_risk_tags
+    self.assertNotIn("export-button", rejected.ready_nodes)
+AssertionError: Lists differ: ['date-range-filter'] != []
+
+First list contains 1 additional elements.
+First extra element 0:
+'date-range-filter'
+
+- ['date-range-filter']
++ []
+
+======================================================================
+FAIL: test_product_only_publish_has_schedulable_roots_and_bound_risk_tags (test_node_spec_contract.ProductSpecPublishTests) (invalid=None)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_spec_contract.py", line 113, in test_product_only_publish_has_schedulable_roots_and_bound_risk_tags
+    self.assertNotIn("export-button", rejected.ready_nodes)
+AssertionError: Lists differ: ['date-range-filter'] != []
+
+First list contains 1 additional elements.
+First extra element 0:
+'date-range-filter'
+
+- ['date-range-filter']
++ []
+
+======================================================================
+FAIL: test_product_only_publish_has_schedulable_roots_and_bound_risk_tags (test_node_spec_contract.ProductSpecPublishTests) (invalid='security')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_spec_contract.py", line 113, in test_product_only_publish_has_schedulable_roots_and_bound_risk_tags
+    self.assertNotIn("export-button", rejected.ready_nodes)
+AssertionError: Lists differ: ['date-range-filter'] != []
+
+First list contains 1 additional elements.
+First extra element 0:
+'date-range-filter'
+
+- ['date-range-filter']
++ []
+
+======================================================================
+FAIL: test_product_only_publish_has_schedulable_roots_and_bound_risk_tags (test_node_spec_contract.ProductSpecPublishTests) (invalid=[''])
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_spec_contract.py", line 113, in test_product_only_publish_has_schedulable_roots_and_bound_risk_tags
+    self.assertNotIn("export-button", rejected.ready_nodes)
+AssertionError: Lists differ: ['date-range-filter'] != []
+
+First list contains 1 additional elements.
+First extra element 0:
+'date-range-filter'
+
+- ['date-range-filter']
++ []
+
+======================================================================
+FAIL: test_the_current_protocol_is_registered (test_protocol_copy_refresh.ShippedDigestRegistryTests)
+Changing a protocol without registering it would strand every
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_protocol_copy_refresh.py", line 44, in test_the_current_protocol_is_registered
+    self.assertIn(_digest(load_protocol(name)), SHIPPED_PROTOCOL_DIGESTS[name], name)
+AssertionError: 'd84945dbabc656db5ceace7d6d54097f3eaf357512b9f675a7ec6600b5b5d54a' not found in frozenset({'12a69ed8e93c57af77fa531a2749fb8b479280bbc1891e4ae90e769926ba579e', 'd31adcdf3fb33d3b6e2fd557f7324cbdbd07a80acc0a8d18f5ce186c23971ac7', '7f5312b7dd47089720d54fbb22dd66e48602977c320b86ea6d3cdf6adbd794a4', '9afc9c94643cec8c79f097a7278abd902700aa4c51230afff9cc087e5f2a63a8', 'fc271522236eeb9a943c59b077547bab251ce5ff33a2997954ebda4433d01612', 'b72a2d622269183724af0c7e3198f88779549ca5f009f20a322b3aca03dae687', '01ca786432c5079da2685787986c342a551393208f79ff470814ca5b69f5d8a3', 'c27735328c843eb65d3c9ccf1d6d7d1d7872d0d778d3ce4135921710a822e224', '1348b17f5bfe692c5f623bc1637f55926e396658057cfd08b6ad1add8fe6c5e8', 'ffc1eb7655a839357a602ff708ae203fca2406f74a1919180530f742bf7583f1', 'f8bccb63f6ba536f26116211c5efb9c7838c46cc83f150e1c72d742ac5f7b5c3', '3f17774b7981938c52cf6c9a58476f3b46d1c4bf931328f78d0a0b689dabbd88', '1e13aa069970d089ae79444fe0b0fba4987ae1929e4cdf002cda40d5ff272f9a', '180f67396aa65b2019572f0e0154ee2e2be1b517e6179929466f2c24280b6166', '5e43f257106a86cfebb5c097656a39cbbe216ae717c807d9ce85a5777ec90384', '71c5130222474d5852c8233978e72f927c499d785f56948d78728acbd609a190', 'db6afb43acad8ccec154be3ed60f6b0a9f8e222ef4ced2b23a3411a897e2ed48', 'bba7d6c7c6976b5713d170f48062e18a81ea02a43071cc36850023b379e2b40c', 'a57224cd615fe68d46a0316a4240b939d677f338dc5604af8fe9485a01e61f7b', '62d464113310f1fb32a7fd3aeba880ae9d8034327fb05966ab6abb09faeb3777', '35277bfc6da0d71088b05a15c29e9041360cde5d9e3916121f6e94761e0ac1d7', '2526b81e2dc94cc865a6b47b5dd4ee933f922c627ee737531aaeaa8dd4aad6b2', '5b7aa976a0f9b2ac20ca014a38a101635d274bad40d1a57bc4920b179ed5f38e', 'acabc77986f59c191acdb8a4cbd7876f26f0a17d8400bc30d5b3020b6f5785ad', '5e262e2c569f89b0838ce29bc2fb6b790f78cd15f6cdd52ff834cfc249509d44', '85c507fb3e0788f310b5da4987eefd88fbcef549de51865ad9b2491c301cba40', '14a0edcdd465c0d1e69d1a4719d2075aa3d9f6e0a3b8289981b4fbaf3984b1b9', '12cacd7ba5c1bbb825831c0c7c6d09408d8fbc9063f0f6edd0bcdade3a9fe126', 'cb73d99b1241b4d05580be33a6bce4a2b8f62674e064b390d68a85ae8bc0db8f', '15c531ea1b21a28f8178e9c90fa7d80a4a8afec04a4de0ff624817b2d288a6ab', '0cbbd0e63a258cb0592e5f001b8d0dee0a0639752a2a762e463eddac98249307', 'e06e774bdd5082ce063b6782ef15862be5a03aaa0419d1cc8ab983fddd181c07', '4a5b7b344ab688db332cec606350800ee25b4c98ccafd00e1c0e68b626fb2f44', '58e05735b62294ab619c005ae56dc0e40622a374c3f0fb9861d7fdc57b570938', '65abc91f34211959e4917b17b0a979c5ce961f658b5dff4fcec939663dad609f', 'aaf782d07cc1a1c60e762a983d6fcac7143f67082ecffb7674d794ba58376e34', 'c2c11e2c6db35977be5df3c8ad6ea272cbba58acf0ca873794a5172ab74c08ea', '4bcee2236f297a664d8c8aa087590856298433546e1a7a61e56dc33b0418ceea', '524c8dcc8925d635361faf81deaa405f0ceae666f979f5f1d6002a31aaf4cca3', '9179bef46af413f27c0954f265777778f42af5a93d6012b0b5dd83e585ab0b08', 'f204123e31fa2f8ea67033dc50cba547cda8e862245fcf5e0475b8cb4b36f29e', '06e6c3cc275851e32127d378d6dcf3cec40dceafa3f8fe3c84058d528932ba93', 'd8dfb3a043d330928b0798e4614b671eaf885aeb37d7ef7f7923e39091ec3e3f', 'f8021c6c2f0ba4c78e90c91706c70f2faac47f7d6cb8eede909ba2c54ae98134', '8e6b6b2dadfc9b5e3cc6396189f17c169e434c8cd023f002055f2f9849474bee', '22d1ac5a2f9668afd90580b5444e886cbff89e51a1cf77e9754a96f191e6558e', 'e93c430fa34d2db44ba7dd6383cc61c6bd013a2a536642f13f6c976850e26b26', '9223364689e4ccf6bcd1720dfa58a47d730ced15cb8b304a5074f6bd074e799e', '7ddd009253a66c3267dc1f5bdd5be4a04cfdb186bb9609242aa037b141f77b65', '4720ebe75f624e66591e5faeea180936f9fa5cc53876d25ab6be04417bc6b5ba', 'c2b86f9f3ca04c0a55de6c5c2398ecc94c81c4f292b9a61fc12951ccb39eca6f', '52ab18b4f02bbe752e6e3c1949cb6b5a98facd5299e0fbe4123649ca4ef73c7d', 'd93d32ba556b02d8e132bb78829e8b8eaf354e5420553908873c576597c7634e', 'a6d940da69d2e43664a37d44f0a9e28ad7f5ca2ecb8ebb03f46cf05752acd94b', '578fd47330714a53c2de616aafff3a0a9604a79ff272374aa50d2baa58a5bb35', '0e6c7401ff1c6c6565da6a28202cc0312e7c3f5bbc3ba139a536cfaf3b11dfd0', '61cb93abacd89626877d47f1c83fdeafe7f683e280aa4012ed64e88824f947fb', '8335aee5c16b30fef9de2f1ed009df58b43f97bee4716dc09aa3dfc623b7509e', '217b7276e296ddaaacb00ee91bf4c4608610325bd292e7809dc4cc8b021799c1', '114272b960006cddc98ac69ea105a6abfb3734e43314d244e8cc0b6fe5a43921', '96d1c163c59b73e86a7967bc11ddf5dc6730d033ddf1b299efc0804eb3bf7e8b', '94d652883bf2bf187793f41f1b000c097664674ec9a7de8355fe8c179e7bee65', '08591263683208c510570d6af2f3733bb0596ecd1c00bdb2dc8fc7206fabaa13', '26f3c0f75baab3d6928dac25e86f1bab2d26828db401630ba0ce9fded393d72f', '2f0c8e32a2efc532df33c4392901d3a6712e4df32ac9b073d86f18c2b0d5019d', '54423a04770c2cd3fa34f9e2cbf320d2c0230460a8ebec5e8dd0264686d2e15b', 'f2f90466346715fcf1b65a8f8cc3f5be6aa5244c676fe4fb38fc725c89610c38', '870acaa688f538bd8d09cbeba77442780a17fcb56696d79f79028640b2e1e8dd', '4bd5a46dfefe563bc9b10b3165620cfab387447cf91bc27d4746bbd0a9543acf', '4ef389e8a32feee47c4d43fb5add9ec3b591e5a726e2621690833f4660040a3c', 'cdae7db3e3ebfcacc6db84453d9a903ae5376e1aa2134ce7d9fc838052b46708'}) : prd-guide
+
+======================================================================
+FAIL: test_digest_registered (test_protocol_docs.PrdGuideBackgroundTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_protocol_docs.py", line 107, in test_digest_registered
+    self.assertIn(digest, SHIPPED_PROTOCOL_DIGESTS["prd-guide"])
+AssertionError: 'd84945dbabc656db5ceace7d6d54097f3eaf357512b9f675a7ec6600b5b5d54a' not found in frozenset({'12a69ed8e93c57af77fa531a2749fb8b479280bbc1891e4ae90e769926ba579e', 'd31adcdf3fb33d3b6e2fd557f7324cbdbd07a80acc0a8d18f5ce186c23971ac7', '7f5312b7dd47089720d54fbb22dd66e48602977c320b86ea6d3cdf6adbd794a4', '9afc9c94643cec8c79f097a7278abd902700aa4c51230afff9cc087e5f2a63a8', 'fc271522236eeb9a943c59b077547bab251ce5ff33a2997954ebda4433d01612', 'b72a2d622269183724af0c7e3198f88779549ca5f009f20a322b3aca03dae687', '01ca786432c5079da2685787986c342a551393208f79ff470814ca5b69f5d8a3', 'c27735328c843eb65d3c9ccf1d6d7d1d7872d0d778d3ce4135921710a822e224', '1348b17f5bfe692c5f623bc1637f55926e396658057cfd08b6ad1add8fe6c5e8', 'ffc1eb7655a839357a602ff708ae203fca2406f74a1919180530f742bf7583f1', 'f8bccb63f6ba536f26116211c5efb9c7838c46cc83f150e1c72d742ac5f7b5c3', '3f17774b7981938c52cf6c9a58476f3b46d1c4bf931328f78d0a0b689dabbd88', '1e13aa069970d089ae79444fe0b0fba4987ae1929e4cdf002cda40d5ff272f9a', '180f67396aa65b2019572f0e0154ee2e2be1b517e6179929466f2c24280b6166', '5e43f257106a86cfebb5c097656a39cbbe216ae717c807d9ce85a5777ec90384', '71c5130222474d5852c8233978e72f927c499d785f56948d78728acbd609a190', 'db6afb43acad8ccec154be3ed60f6b0a9f8e222ef4ced2b23a3411a897e2ed48', 'bba7d6c7c6976b5713d170f48062e18a81ea02a43071cc36850023b379e2b40c', 'a57224cd615fe68d46a0316a4240b939d677f338dc5604af8fe9485a01e61f7b', '62d464113310f1fb32a7fd3aeba880ae9d8034327fb05966ab6abb09faeb3777', '35277bfc6da0d71088b05a15c29e9041360cde5d9e3916121f6e94761e0ac1d7', '2526b81e2dc94cc865a6b47b5dd4ee933f922c627ee737531aaeaa8dd4aad6b2', '5b7aa976a0f9b2ac20ca014a38a101635d274bad40d1a57bc4920b179ed5f38e', 'acabc77986f59c191acdb8a4cbd7876f26f0a17d8400bc30d5b3020b6f5785ad', '5e262e2c569f89b0838ce29bc2fb6b790f78cd15f6cdd52ff834cfc249509d44', '85c507fb3e0788f310b5da4987eefd88fbcef549de51865ad9b2491c301cba40', '14a0edcdd465c0d1e69d1a4719d2075aa3d9f6e0a3b8289981b4fbaf3984b1b9', '12cacd7ba5c1bbb825831c0c7c6d09408d8fbc9063f0f6edd0bcdade3a9fe126', 'cb73d99b1241b4d05580be33a6bce4a2b8f62674e064b390d68a85ae8bc0db8f', '15c531ea1b21a28f8178e9c90fa7d80a4a8afec04a4de0ff624817b2d288a6ab', '0cbbd0e63a258cb0592e5f001b8d0dee0a0639752a2a762e463eddac98249307', 'e06e774bdd5082ce063b6782ef15862be5a03aaa0419d1cc8ab983fddd181c07', '4a5b7b344ab688db332cec606350800ee25b4c98ccafd00e1c0e68b626fb2f44', '58e05735b62294ab619c005ae56dc0e40622a374c3f0fb9861d7fdc57b570938', '65abc91f34211959e4917b17b0a979c5ce961f658b5dff4fcec939663dad609f', 'aaf782d07cc1a1c60e762a983d6fcac7143f67082ecffb7674d794ba58376e34', 'c2c11e2c6db35977be5df3c8ad6ea272cbba58acf0ca873794a5172ab74c08ea', '4bcee2236f297a664d8c8aa087590856298433546e1a7a61e56dc33b0418ceea', '524c8dcc8925d635361faf81deaa405f0ceae666f979f5f1d6002a31aaf4cca3', '9179bef46af413f27c0954f265777778f42af5a93d6012b0b5dd83e585ab0b08', 'f204123e31fa2f8ea67033dc50cba547cda8e862245fcf5e0475b8cb4b36f29e', '06e6c3cc275851e32127d378d6dcf3cec40dceafa3f8fe3c84058d528932ba93', 'd8dfb3a043d330928b0798e4614b671eaf885aeb37d7ef7f7923e39091ec3e3f', 'f8021c6c2f0ba4c78e90c91706c70f2faac47f7d6cb8eede909ba2c54ae98134', '8e6b6b2dadfc9b5e3cc6396189f17c169e434c8cd023f002055f2f9849474bee', '22d1ac5a2f9668afd90580b5444e886cbff89e51a1cf77e9754a96f191e6558e', 'e93c430fa34d2db44ba7dd6383cc61c6bd013a2a536642f13f6c976850e26b26', '9223364689e4ccf6bcd1720dfa58a47d730ced15cb8b304a5074f6bd074e799e', '7ddd009253a66c3267dc1f5bdd5be4a04cfdb186bb9609242aa037b141f77b65', '4720ebe75f624e66591e5faeea180936f9fa5cc53876d25ab6be04417bc6b5ba', 'c2b86f9f3ca04c0a55de6c5c2398ecc94c81c4f292b9a61fc12951ccb39eca6f', '52ab18b4f02bbe752e6e3c1949cb6b5a98facd5299e0fbe4123649ca4ef73c7d', 'd93d32ba556b02d8e132bb78829e8b8eaf354e5420553908873c576597c7634e', 'a6d940da69d2e43664a37d44f0a9e28ad7f5ca2ecb8ebb03f46cf05752acd94b', '578fd47330714a53c2de616aafff3a0a9604a79ff272374aa50d2baa58a5bb35', '0e6c7401ff1c6c6565da6a28202cc0312e7c3f5bbc3ba139a536cfaf3b11dfd0', '61cb93abacd89626877d47f1c83fdeafe7f683e280aa4012ed64e88824f947fb', '8335aee5c16b30fef9de2f1ed009df58b43f97bee4716dc09aa3dfc623b7509e', '217b7276e296ddaaacb00ee91bf4c4608610325bd292e7809dc4cc8b021799c1', '114272b960006cddc98ac69ea105a6abfb3734e43314d244e8cc0b6fe5a43921', '96d1c163c59b73e86a7967bc11ddf5dc6730d033ddf1b299efc0804eb3bf7e8b', '94d652883bf2bf187793f41f1b000c097664674ec9a7de8355fe8c179e7bee65', '08591263683208c510570d6af2f3733bb0596ecd1c00bdb2dc8fc7206fabaa13', '26f3c0f75baab3d6928dac25e86f1bab2d26828db401630ba0ce9fded393d72f', '2f0c8e32a2efc532df33c4392901d3a6712e4df32ac9b073d86f18c2b0d5019d', '54423a04770c2cd3fa34f9e2cbf320d2c0230460a8ebec5e8dd0264686d2e15b', 'f2f90466346715fcf1b65a8f8cc3f5be6aa5244c676fe4fb38fc725c89610c38', '870acaa688f538bd8d09cbeba77442780a17fcb56696d79f79028640b2e1e8dd', '4bd5a46dfefe563bc9b10b3165620cfab387447cf91bc27d4746bbd0a9543acf', '4ef389e8a32feee47c4d43fb5add9ec3b591e5a726e2621690833f4660040a3c', 'cdae7db3e3ebfcacc6db84453d9a903ae5376e1aa2134ce7d9fc838052b46708'})
+
+----------------------------------------------------------------------
+Ran 3017 tests in 290.479s
+
+FAILED (failures=10, errors=1, skipped=3)
