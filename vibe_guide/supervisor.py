@@ -2592,6 +2592,11 @@ def _heal_verify_worker(paths, run_id, node_id, snapshot, events, base):
     from . import stall
     node = snapshot.nodes[node_id]
     result = worker_liveness.probe(paths, run_id, node_id, node)
+    if result["state"] == "unresolved":
+        # No session id to look at: there is no evidence either way, so nothing is
+        # re-checked and nothing is recorded -- a pass here would be invented.
+        return {**base, "status": "blocked_unknown",
+                "reason": "cannot identify this node's worker session; nothing to re-check"}
     if result["state"] == "silent":
         differences = ["worker session silent for %d minutes" % result["silent_minutes"]]
     elif result["state"] == "unknown":

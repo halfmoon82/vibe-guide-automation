@@ -169,6 +169,15 @@ class ReviewFixesTests(RunningWorkerFixture):
         out = self.beat()
         self.assertEqual(out.text, "idle")
 
+    def test_heal_verify_with_no_evidence_never_passes(self):
+        snapshot = load_snapshot(self.paths, self.run_id)
+        snapshot.nodes[NODE]["active_task"]["task_id"] = "developer:n1"
+        save_snapshot(self.paths, snapshot)
+        out = self.verify()
+        self.assertNotEqual(out.payload["status"], "verify_passed", out.payload)
+        self.assertEqual(out.payload["status"], "blocked_unknown", out.payload)
+        self.assertEqual(self.attempts(), [])
+
     def test_known_session_without_a_transcript_is_said_aloud(self):
         out = self.beat()
         self.assertIn("空转评估未知", out.text)
