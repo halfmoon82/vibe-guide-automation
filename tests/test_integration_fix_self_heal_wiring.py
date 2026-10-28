@@ -10,6 +10,20 @@ itself must all follow that role instead of defaulting to developer.
 import json
 import unittest
 
+from unittest import mock as _beat_mock
+
+# 本文件在一秒内连续调用 beat 来模拟多拍；关掉 120 秒同状态防重复窗口（该行为由
+# test_supervisor_runtime_consolidation 覆盖）。
+_NO_BEAT_REPEAT_WINDOW = _beat_mock.patch("vibe_guide.supervisor.BEAT_REPEAT_WINDOW_SECONDS", 0)
+
+
+def setUpModule():
+    _NO_BEAT_REPEAT_WINDOW.start()
+
+
+def tearDownModule():
+    _NO_BEAT_REPEAT_WINDOW.stop()
+
 from tests.test_self_heal_wiring import INVESTIGATE_LABEL, NODE, IncidentFixture
 from vibe_guide import supervisor
 from vibe_guide.cli import run_cli
