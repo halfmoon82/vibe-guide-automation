@@ -58,7 +58,7 @@ ENGINEERING_TOP_LEVEL_FIELDS = (
     "complexity_band", "route", "route_result", "capabilities", "project_id",
     "integration_contract", "spec_path", "plan_id",
 )
-ENGINEERING_NODE_FIELDS = ("status",)
+ENGINEERING_NODE_FIELDS = ("status", "risk_tags")
 # `worktree` and `branch` are derived per node so parallel writers cannot share
 # a directory.  The fill below only supplies what is missing, so a product spec
 # naming them would keep its own value and bypass that isolation entirely.
@@ -67,7 +67,7 @@ ENGINEERING_NODE_FIELDS = ("status",)
 # to name another machine's worker.
 ENGINEERING_CONTRACT_FIELDS = (
     "adapter_id", "project_id", "worker", "reviewer_worker", "worker_profile",
-    "worktree", "branch", "writer", "reviewer",
+    "worktree", "branch", "writer", "reviewer", "risk_tags",
 )
 ENGINEERING_FIELDS = {
     "top_level": ENGINEERING_TOP_LEVEL_FIELDS,
@@ -217,6 +217,13 @@ def complete_node_contracts(raw_nodes: List[Dict[str, Any]], adapter_id: str, pr
         contract.setdefault("branch", node_branch(item.get("id")))
         contract.setdefault("worker", contract.get("writer", "worker"))
         contract.setdefault("reviewer_worker", contract.get("reviewer", "reviewer"))
+        # Every executable node carries the risk of writing its file scope.
+        # This structural tag is not a business-risk rating or permission.
+        # Preserve legacy metadata, including invalid/contradictory claims:
+        # the DAG audit must still reject those rather than silently fix them.
+        profile = contract.get("worker_profile")
+        profile_tags = profile.get("risk_tags", ["write_scope"]) if isinstance(profile, dict) else ["write_scope"]
+        contract.setdefault("risk_tags", item.get("risk_tags", profile_tags))
         contract.setdefault("worker_profile", {
             "worker": contract.get("writer", "worker"),
             "model": "default",

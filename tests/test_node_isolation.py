@@ -24,6 +24,27 @@ def _nodes(*ids):
 
 
 class NodeIsolationTests(unittest.TestCase):
+    def test_existing_risk_metadata_is_preserved_without_conflicting_defaults(self):
+        for location in ("node", "contract", "profile"):
+            with self.subTest(location=location):
+                nodes = _nodes("security-change")
+                node = nodes[0]
+                contract = node["contract"]
+                target = {"node": node, "contract": contract, "profile": {}}[location]
+                target["risk_tags"] = ["security", "migration"]
+                if location == "profile":
+                    contract["worker_profile"] = target
+                complete_node_contracts(nodes, "claude-code", "proj")
+                self.assertEqual(contract["risk_tags"], ["security", "migration"])
+
+    def test_explicit_invalid_risk_tags_are_not_replaced_with_defaults(self):
+        for invalid in ([], None, "security", [""]):
+            with self.subTest(invalid=invalid):
+                nodes = _nodes("invalid-risk")
+                nodes[0]["contract"]["risk_tags"] = invalid
+                complete_node_contracts(nodes, "claude-code", "proj")
+                self.assertEqual(nodes[0]["contract"]["risk_tags"], invalid)
+
     def test_parallel_nodes_do_not_share_a_worktree(self):
         nodes = _nodes("export-button", "date-range-filter", "integration-review")
         complete_node_contracts(nodes, "claude-code", "proj")

@@ -1,0 +1,50 @@
+test_product_only_publish_has_schedulable_roots_and_bound_risk_tags (tests.test_node_spec_contract.ProductSpecPublishTests) ... FAIL
+test_product_cannot_supply_risk_tags_at_either_metadata_location (tests.test_node_spec_contract.ProductSpecPublishTests) ... test_existing_risk_metadata_is_preserved_without_conflicting_defaults (tests.test_node_isolation.NodeIsolationTests) ... test_explicit_invalid_risk_tags_are_not_replaced_with_defaults (tests.test_node_isolation.NodeIsolationTests) ... ok
+
+======================================================================
+ERROR: test_existing_risk_metadata_is_preserved_without_conflicting_defaults (tests.test_node_isolation.NodeIsolationTests) (location='node')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_isolation.py", line 38, in test_existing_risk_metadata_is_preserved_without_conflicting_defaults
+    self.assertEqual(contract["risk_tags"], ["security", "migration"])
+KeyError: 'risk_tags'
+
+======================================================================
+ERROR: test_existing_risk_metadata_is_preserved_without_conflicting_defaults (tests.test_node_isolation.NodeIsolationTests) (location='profile')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_isolation.py", line 38, in test_existing_risk_metadata_is_preserved_without_conflicting_defaults
+    self.assertEqual(contract["risk_tags"], ["security", "migration"])
+KeyError: 'risk_tags'
+
+======================================================================
+FAIL: test_product_only_publish_has_schedulable_roots_and_bound_risk_tags (tests.test_node_spec_contract.ProductSpecPublishTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_spec_contract.py", line 101, in test_product_only_publish_has_schedulable_roots_and_bound_risk_tags
+    self.assertEqual(audit.status, "ready", audit.to_dict())
+AssertionError: 'blocked_dag' != 'ready'
+- blocked_dag
++ ready
+ : {'status': 'blocked_dag', 'ready_nodes': [], 'blocked_nodes': ['export-button', 'date-range-filter', 'integration-review'], 'reasons': {'export-button': ['node export-button contract is missing risk_tags'], 'date-range-filter': ['node date-range-filter contract is missing risk_tags'], 'integration-review': ['hard dependencies not complete (accepted or delivered): export-button, date-range-filter']}, 'parallel_groups': {}}
+
+======================================================================
+FAIL: test_product_cannot_supply_risk_tags_at_either_metadata_location (tests.test_node_spec_contract.ProductSpecPublishTests) (location='node')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_spec_contract.py", line 119, in test_product_cannot_supply_risk_tags_at_either_metadata_location
+    self.assertNotEqual(result.payload.get("status"), "ok", result.payload)
+AssertionError: 'ok' == 'ok' : {'command': 'plan', 'status': 'ok', 'route': 'complex', 'score': 25, 's1': '5,5,5,5,5', 'plan': {'plan_id': 'risk-smuggling-node', 'version': 1, 'path': '/private/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/v45-node-spec-0_3rkezf/.vibe/plans/risk-smuggling-node/plan.json'}, 'nodes': ['export-button', 'date-range-filter', 'integration-review'], 'authorization_card': {'plan_id': 'risk-smuggling-node', 'plan_version': 1, 'digest': '9551eacddde6951eae239a8c17096ad69b4d9bd0619b171c7360017099a43ab0', 'node_contract_digest': 'e02614c8947cb533540066951c3173952ce2563a2c85504e8725dc83efaa357f', 'active_pair_limit': 3, 'remote_git_actions': 'deny', 'engine_evidence_ref': 'engine-attestation:5d383d14b8051869', 'execution_engine': 'vibeguide_monitor', 'engine_mode': 'dag', 'status': 'ok', 'path': '/private/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/v45-node-spec-0_3rkezf/.vibe/plans/risk-smuggling-node/authorization-card.json', 'sha256': '8405f491fcb9ce0e7739c1c3ba74d40856f8ac9fa644a71d6c2634ed9dca15f2', 'bytes': 4202, 'node_ids': ['date-range-filter', 'export-button', 'integration-review']}, 'authorization_digest': '9551eacddde6951eae239a8c17096ad69b4d9bd0619b171c7360017099a43ab0', 'handoff': {'from_stage': 'prd', 'from_status': 'approved', 'to_stage': 'spec_issue_dag', 'readiness': 'ready', 'evidence_refs': ['prd:risk-smuggling-node@1'], 'open_questions': [], 'required_user_action': 'continue_planning', 'prompt': 'PRD 已确认，请继续生成 Spec/Issue/DAG。', 'forbidden_automatic_actions': ['create_spec', 'create_worker', 'authorize', 'deploy'], 'revision': 1, 'authorizes': False, 'creates_worker': False}, 'handoff_text': "stage=prd status=approved readiness=ready revision=1 evidence_refs=['prd:risk-smuggling-node@1'] prompt=PRD 已确认，请继续生成 Spec/Issue/DAG。 open_questions=[]", 'checkpoints': []}
+
+======================================================================
+FAIL: test_product_cannot_supply_risk_tags_at_either_metadata_location (tests.test_node_spec_contract.ProductSpecPublishTests) (location='contract')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/r1-risk-tags/tests/test_node_spec_contract.py", line 119, in test_product_cannot_supply_risk_tags_at_either_metadata_location
+    self.assertNotEqual(result.payload.get("status"), "ok", result.payload)
+AssertionError: 'ok' == 'ok' : {'command': 'plan', 'status': 'ok', 'route': 'complex', 'score': 25, 's1': '5,5,5,5,5', 'plan': {'plan_id': 'risk-smuggling-contract', 'version': 1, 'path': '/private/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/v45-node-spec-0_3rkezf/.vibe/plans/risk-smuggling-contract/plan.json'}, 'nodes': ['export-button', 'date-range-filter', 'integration-review'], 'authorization_card': {'plan_id': 'risk-smuggling-contract', 'plan_version': 1, 'digest': '4ccface01bfbd8f073a7c126cfe6899fd78d13e2a2fe7409ce6a5eb54435b681', 'node_contract_digest': '17898651498fab8d856b9fccc29e2715b4578801e1568d3b6fbe2e9115733654', 'active_pair_limit': 3, 'remote_git_actions': 'deny', 'engine_evidence_ref': 'engine-attestation:2f26e4ade30087c6', 'execution_engine': 'vibeguide_monitor', 'engine_mode': 'dag', 'status': 'ok', 'path': '/private/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/v45-node-spec-0_3rkezf/.vibe/plans/risk-smuggling-contract/authorization-card.json', 'sha256': 'e14125983fc33e5d5984393d09e0eef851640cdc5589f78f114a41c195fd5848', 'bytes': 4206, 'node_ids': ['date-range-filter', 'export-button', 'integration-review']}, 'authorization_digest': '4ccface01bfbd8f073a7c126cfe6899fd78d13e2a2fe7409ce6a5eb54435b681', 'handoff': {'from_stage': 'prd', 'from_status': 'approved', 'to_stage': 'spec_issue_dag', 'readiness': 'ready', 'evidence_refs': ['prd:risk-smuggling-contract@1'], 'open_questions': [], 'required_user_action': 'continue_planning', 'prompt': 'PRD 已确认，请继续生成 Spec/Issue/DAG。', 'forbidden_automatic_actions': ['create_spec', 'create_worker', 'authorize', 'deploy'], 'revision': 1, 'authorizes': False, 'creates_worker': False}, 'handoff_text': "stage=prd status=approved readiness=ready revision=1 evidence_refs=['prd:risk-smuggling-contract@1'] prompt=PRD 已确认，请继续生成 Spec/Issue/DAG。 open_questions=[]", 'checkpoints': []}
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.167s
+
+FAILED (failures=3, errors=2)

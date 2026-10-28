@@ -27,6 +27,8 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-28: derive execution risk_tags; reject product-side overrides.
+        "d84945dbabc656db5ceace7d6d54097f3eaf357512b9f675a7ec6600b5b5d54a",
         # 2026-10-27: §6.5 stalled-node branch merged onto the §6.4 fork_thread rule.
         "4720ebe75f624e66591e5faeea180936f9fa5cc53876d25ab6be04417bc6b5ba",
         # 2026-10-27: §6.5 stalled-node branch (investigate, self-heal, verify, escalate).
