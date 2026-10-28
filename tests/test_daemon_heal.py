@@ -110,6 +110,32 @@ class ProgressionTests(Base):
         self.assertEqual([p[0] for p in self.pushed], ["run_complete"])
         self.assertTrue(daemon.supervisor.lease.released)
 
+    def test_gate_block_stops_before_any_tick_and_escalates(self):
+        supervisor = FakeSupervisor(["running"])
+        daemon = self.daemon(supervisor)
+        daemon._gate = lambda: {"status": "blocked_design", "reason": "authorization invalidated"}
+        outcome = daemon.run()
+        self.assertEqual((outcome["status"], outcome["run_status"]), ("blocked", "blocked_design"))
+        self.assertEqual(supervisor.calls, 0)
+        self.assertTrue(supervisor.lease.released)
+        self.assertTrue(self.pushed)
+
+    def test_gate_runs_every_tick_and_a_raising_gate_blocks(self):
+        supervisor = FakeSupervisor(["running", "running", "running"])
+        daemon = self.daemon(supervisor)
+        seen = []
+
+        def gate():
+            seen.append(1)
+            if len(seen) == 3:
+                raise OSError("evidence unreadable")
+            return None
+        daemon._gate = gate
+        outcome = daemon.run()
+        self.assertEqual(supervisor.calls, 2)
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertIn("gate_error", outcome["reason"])
+
     def test_lease_held_by_another_process_is_inactive_with_reason(self):
         daemon = self.daemon(FakeSupervisor(["running"], active=False))
         self.assertEqual(daemon.run()["status"], "lease_held")
@@ -337,6 +363,16 @@ class StatusAndProcessTests(Base):
                                                "--run-id", RUN, "--interval", "5"])
         self.assertTrue(seen["kwargs"]["start_new_session"])
 
+    def test_start_passes_model_and_provider_to_the_run_process(self):
+        seen = {}
+
+        def spawn(command, **kwargs):
+            seen["command"] = command
+            self.write_record()
+            return SimpleNamespace(pid=os.getpid(), poll=lambda: None)
+        dm.start_daemon(self.paths, RUN, "plan-x", model="m-1", provider="codex", spawn=spawn)
+        self.assertEqual(seen["command"][-4:], ["--model", "m-1", "--provider", "codex"])
+
     def test_stop_sends_sigterm_only_to_a_running_daemon(self):
         self.assertEqual(dm.stop_daemon(self.paths, RUN)["status"], "not_running")
         self.write_record()
@@ -406,6 +442,18 @@ class NotifierConfigTests(Base):
         (vibe / "config.json").write_text(json.dumps({"daemon": {"bogus": 1}}), encoding="utf-8")
         with self.assertRaises(ValueError):
             dm.load_config(self.paths)
+
+    def test_executable_comes_from_vibe_home_only(self):
+        vibe = Path(self.tmp.name) / ".vibe"
+        vibe.mkdir(exist_ok=True)
+        (vibe / "config.json").write_text(json.dumps({"daemon": {"executable": "/tmp/evil"}}), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            dm.load_config(self.paths)
+        (vibe / "config.json").write_text("{}", encoding="utf-8")
+        (Path(self.tmp.name) / "home" / "config.json").write_text(
+            json.dumps({"daemon": {"executable": "/usr/local/bin/claude", "extra_args": ["--x"]}}), encoding="utf-8")
+        config = dm.load_config(self.paths)
+        self.assertEqual((config.executable, config.extra_args), ("/usr/local/bin/claude", ["--x"]))
 
 
 if __name__ == "__main__":

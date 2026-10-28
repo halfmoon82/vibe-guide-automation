@@ -75,16 +75,35 @@ class DaemonConfig:
         return self
 
 
-def load_config(paths, overrides: Optional[Mapping[str, Any]] = None) -> DaemonConfig:
-    """Defaults, then the project's ``daemon`` object in ``.vibe/config.json``, then overrides."""
-    values: Dict[str, Any] = {}
+#: fields that choose which program this machine runs; only the user-level
+#: ``$VIBE_HOME/config.json`` may set them, never a project file.
+_MACHINE_ONLY_FIELDS = ("executable", "extra_args")
+
+
+def _daemon_section(read: Callable[[], str]) -> Dict[str, Any]:
     try:
-        data = json.loads(paths.resolve_vibe_path("config.json").read_text(encoding="utf-8"))
+        data = json.loads(read())
     except (OSError, ValueError):
-        data = {}
+        return {}
     section = data.get("daemon") if isinstance(data, dict) else None
-    if isinstance(section, dict):
-        values.update(section)
+    return dict(section) if isinstance(section, dict) else {}
+
+
+def load_config(paths, overrides: Optional[Mapping[str, Any]] = None) -> DaemonConfig:
+    """Defaults, then ``$VIBE_HOME`` and project ``daemon`` objects, then overrides.
+
+    ``executable`` and ``extra_args`` are accepted from ``$VIBE_HOME/config.json``
+    only: a project file that names them is refused, matching ``PmNotifier``.
+    """
+    values: Dict[str, Any] = {}
+    home = _daemon_section(lambda: paths.resolve_vibe_home_path("config.json").read_text(encoding="utf-8"))
+    project = _daemon_section(lambda: paths.resolve_vibe_path("config.json").read_text(encoding="utf-8"))
+    forbidden = [name for name in _MACHINE_ONLY_FIELDS if name in project]
+    if forbidden:
+        raise ValueError("daemon config %s may only be set in the user-level VIBE_HOME config"
+                         % ", ".join(forbidden))
+    values.update(home)
+    values.update(project)
     values.update({key: value for key, value in (overrides or {}).items() if value is not None})
     known = set(DaemonConfig.__dataclass_fields__)
     unknown = sorted(set(values) - known)
@@ -176,6 +195,7 @@ def register_pm_address(paths, run_id: str, provider: str, session_name: str) ->
 
 
 def start_daemon(paths, run_id: str, plan_id: str, *, interval: Optional[float] = None,
+                 model: Optional[str] = None, provider: Optional[str] = None,
                  spawn: Optional[Callable[..., Any]] = None, wait: float = 5.0) -> Dict[str, Any]:
     """Start the detached daemon unless one is already up for this run."""
     current = daemon_status(paths, run_id)
@@ -185,6 +205,10 @@ def start_daemon(paths, run_id: str, plan_id: str, *, interval: Optional[float] 
     command = [sys.executable, "-m", "vibe_guide", "daemon", "run", "--plan", plan_id, "--run-id", run_id]
     if interval is not None:
         command += ["--interval", str(interval)]
+    if model:
+        command += ["--model", model]
+    if provider:
+        command += ["--provider", provider]
     spawn = spawn or subprocess.Popen
     with open(str(directory / DAEMON_LOG_FILE), "ab") as log:
         process = spawn(command, cwd=str(paths.root), stdin=subprocess.DEVNULL,
@@ -286,6 +310,7 @@ class Daemon:
                  assess: Optional[Callable[[], Dict[str, Any]]] = None,
                  verify: Optional[Callable[[str, str], Dict[str, Any]]] = None,
                  retry: Optional[Callable[[str], Any]] = None,
+                 gate: Optional[Callable[[], Optional[Mapping[str, Any]]]] = None,
                  command_prefix: str = "vibe"):
         self.paths = paths
         self.run_id = run_id
@@ -299,6 +324,9 @@ class Daemon:
         self._assess = assess or self._default_assess
         self._verify = verify or self._default_verify
         self._retry = retry or self._default_retry
+        #: the same pre-resume checks the public ``resume`` runs; returns None
+        #: when the run may advance, else ``{"status", "reason"}`` to stop on.
+        self._gate = gate
         self._stop = False
         self._cycles = 0
         self._started_at = clock()
@@ -378,6 +406,14 @@ class Daemon:
         lost = False
         try:
             while not self._stop:
+                blocked = self._check_gate()
+                if blocked is not None:
+                    outcome = {"status": "blocked", "reason": blocked["reason"],
+                               "run_status": blocked.get("status")}
+                    self._run_status = blocked.get("status") or self._run_status
+                    self._escalate("", "daemon_gate_blocked",
+                                   "守护程序已暂停推进：%s" % blocked["reason"], "product_acceptance")
+                    break
                 self.tick()
                 if self._run_status in TERMINAL_STATUSES:
                     outcome = {"status": "terminal", "run_status": self._run_status}
@@ -401,6 +437,17 @@ class Daemon:
                 pass
             self._write_state("exited", outcome.get("reason") or outcome["status"])
         return outcome
+
+    def _check_gate(self) -> Optional[Dict[str, Any]]:
+        if self._gate is None:
+            return None
+        try:
+            result = self._gate()
+        except SystemExit:
+            raise
+        except Exception as error:  # an unverifiable gate is a block, never a pass
+            return {"status": "blocked_unknown", "reason": "gate_error: %s: %s" % (type(error).__name__, str(error)[:160])}
+        return dict(result) if result else None
 
     def _wait(self, seconds: float) -> None:
         remaining = seconds
