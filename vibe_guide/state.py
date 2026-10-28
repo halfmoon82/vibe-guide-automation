@@ -143,7 +143,12 @@ _NODE_STATUSES = {
     "brief_pending",
     "skipped_by_user",
     "blocked_by_required_node",
+    # A worker session ended without a delivery and asked the supervisor
+    # something (``worker_questions``); resumable once the supervisor answers.
+    "awaiting_supervisor",
 }
+#: Node status of a parked worker question; one spelling for every reader.
+AWAITING_SUPERVISOR_STATUS = "awaiting_supervisor"
 
 
 def verify_required_workflow_state(workflow):
@@ -192,7 +197,9 @@ _USER_RECOVERY_STATUSES = {
 #: -- the same vocabulary ``adapters.claude_bg.WORKTREE_REASON_CODES`` uses --
 #: so the label can name the required action without reading provider text.
 WORKTREE_PREFLIGHT_KEY = "worktree_preflight"
-WORKTREE_REASON_CODES = ("worktree_missing", "worktree_mismatch", "worktree_create_failed")
+WORKTREE_REASON_CODES = (
+    "worktree_missing", "worktree_mismatch", "worktree_create_failed", "worktree_merge_conflict",
+)
 WORKTREE_ACTION_STATUS = "需要监工建工作树"
 #: The marker's own keys, in one place because two writers need them: the CLI
 #: records what the launcher left behind (#235), and the monitor's replay of
@@ -205,6 +212,9 @@ WORKTREE_PREFLIGHT_KEYS = (
     "branch",
     "worktree_base",
     "worktree_command",
+    # Repository-relative paths git itself reported as conflicting when the
+    # accepted upstream branches were merged into a downstream node's base.
+    "conflict_files",
 )
 
 
@@ -283,6 +293,8 @@ def _derived_user_status(status: Any, reason: Any = "") -> str:
             return "自动修复中"
         status = record.get("status")
     value = str(status or "")
+    if value == AWAITING_SUPERVISOR_STATUS:
+        return STALL_INVESTIGATE_STATUS
     if value in _USER_DECISION_STATUSES:
         return "需要你决定"
     if value in _USER_PREPARING_STATUSES:
@@ -415,6 +427,7 @@ _EVENT_DATA_KEYS = {
     "branch",
     "worktree_base",
     "worktree_command",
+    "conflict_files",
     # session-root delivery warning (#240): the one observation that can see
     # which sandbox a worker actually ran in.  It is advisory structure vibe
     # itself composed from ``delivery_evidence.session_cwd``, never provider
@@ -504,6 +517,11 @@ _EVENT_DATA_KEYS = {
     "differences",
     "tier",
     "unchanged_beats",
+    # worker_question_raised / _answered: the run-relative file holding the
+    # question excerpt (the excerpt itself never enters the event stream) and
+    # the fixed-enum session state the question was read in.
+    "question_file",
+    "session_state",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",

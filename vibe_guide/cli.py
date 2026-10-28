@@ -154,6 +154,7 @@ from .installation import run_install, run_upgrade, migrate_state
 from .skills import SkillSpec, install_project_skill
 from .models import InstallRequest
 from .decision_boundary import answer_decision, decision_list, raise_decision
+from . import scope_landing, worker_questions
 
 
 SUCCESS = 0
@@ -813,8 +814,12 @@ def _claude_bg_launcher_factory(paths: ProjectPaths, launchers: Optional[List[An
             status_file=str(contract.get("status_file") or fallback),
             handoff_file=str(contract.get("handoff_file") or fallback),
         )
+        upstream = contract.get("upstream_branches")
         launcher = claude_bg.ClaudeBgLauncher(
-            routing, claude_bg.load_claude_bg_config(paths), model=model
+            routing, claude_bg.load_claude_bg_config(paths), model=model,
+            # Only a downstream node passes it, so launchers built for nodes
+            # without accepted upstreams keep their previous call shape.
+            **({"upstream_branches": list(upstream)} if upstream else {}),
         )
         if launchers is not None:
             launchers.append((str(contract.get("node_id") or ""), launcher))
@@ -1025,6 +1030,10 @@ def _record_worktree_preflight(
                     data[key] = report[key]
             record_event(monitor, snapshot, event, data)
             current.pop("worktree_preflight", None)
+            if report.get("worktree_base"):
+                # The base vibe built this worktree from (main plus accepted
+                # upstreams); delivery-time scope checks diff against it.
+                current["worktree_base"] = report["worktree_base"]
         elif WORKTREE_PREFLIGHT_KEY in current:
             # The directory is there and matches the contract now (the report
             # says nothing happened): the action a supervisor was asked to
@@ -1846,6 +1855,12 @@ def _snapshot_result(
     error_classes = _render_node_error_classes(snapshot)
     if error_classes:
         text += "\n" + error_classes
+    questions = worker_questions.render_status_lines(paths, snapshot)
+    if questions:
+        text += "\n" + questions
+    expansions = scope_landing.render_status_lines(snapshot)
+    if expansions:
+        text += "\n" + expansions
     if pending_verification:
         text += "\n" + _render_pending_verification(pending_verification)
     return _result(
@@ -3611,7 +3626,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 paths, plan, nodes,
                 topology_rulings=_observed_topology_rulings(paths, _card),
             )
-            payload = monitor.repair_node(args.node_id, args.run_id)
+            if load_snapshot(paths, args.run_id).nodes.get(args.node_id, {}).get(
+                    "status") == worker_questions.AWAITING_STATUS:
+                payload = worker_questions.answer_question(
+                    monitor, args.run_id, args.node_id, args.decision_note)
+            else:
+                payload = monitor.repair_node(args.node_id, args.run_id)
             snapshot = load_snapshot(paths, args.run_id)
             result = _snapshot_result(args.command, snapshot, args.as_json, paths=paths)
             result.payload["repair"] = payload

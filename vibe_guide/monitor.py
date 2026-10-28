@@ -108,6 +108,11 @@ from .task_registry import (
     load_historical_task_binding,
 )
 from .config import load_project_config
+from .worker_questions import WORKER_QUESTION_EVENT, park_question as park_worker_question
+from .worker_questions import REPLAY_EVENTS as WORKER_QUESTION_REPLAY_EVENTS
+from .worker_questions import replay as replay_worker_question
+from .worktree_base import upstream_branches
+from .scope_landing import check_delivery as check_delivery_landing
 from .workflow_gate import require_capability_contract, require_entry, verify_workflow
 from .authorize_entry import load_live_workflow, select_plan_workflow, verify_workflow_artifacts
 from .diagnostics import validate_child_session_binding
@@ -5596,6 +5601,7 @@ class Monitor:
             contract["predecessor_task_id"] = predecessor_task_id
         contract.setdefault("worktree", str(current["worktree"]))
         contract.setdefault("branch", str(current["branch"]))
+        contract["upstream_branches"] = upstream_branches(self.nodes, snapshot.nodes, node_id)
         if role == "reviewer" and continuation:
             # Resume prompts must carry the real developer delivery facts
             # observed by the monitor, bound to this snapshot generation.
@@ -6909,6 +6915,8 @@ class Monitor:
                         return
                     self._mark_blocked_unknown(snapshot, node_id, "; ".join(gate.reasons))
                     return
+            if role == "developer" and not check_delivery_landing(self, snapshot, node_id, active):
+                return
             visible_sdd_delivery = (
                 role == "developer"
                 and self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD
@@ -7560,6 +7568,8 @@ class Monitor:
             current["quarantine"] = None
             snapshot.handles.pop(node_id, None)
             self._release_node_lease(snapshot, node_id)
+        elif event.event == WORKER_QUESTION_EVENT:
+            park_worker_question(self, snapshot, node_id, event, active, runner, handle_id)
         else:
             self._mark_blocked_unknown(
                 snapshot, node_id, "unrecognized runner event: " + event.event
@@ -9921,6 +9931,8 @@ class Monitor:
                     # The launcher built the worktree: the action a supervisor
                     # was asked to take is done, so the marker must go.
                     current.pop(WORKTREE_PREFLIGHT_KEY, None)
+                    if marker.get("worktree_base"):
+                        current["worktree_base"] = marker["worktree_base"]
                 else:
                     # A block without its fixed-enum code is a malformed
                     # record, not a block: the label is derived from the code,
@@ -9932,6 +9944,11 @@ class Monitor:
                 # The label is derived from the marker, never stored beside
                 # it twice: recomputing keeps replay and the live path equal.
                 current["user_status"] = map_user_status(current)
+            elif record["event"] in WORKER_QUESTION_REPLAY_EVENTS:
+                # The park/answer paths append the event before the snapshot
+                # save; a crash in between must not turn the open question
+                # into "needs manual reconciliation".
+                replay_worker_question(snapshot, node_id, record["event"], data)
             else:
                 current["status"] = "blocked_unknown"
                 current["reason"] = "unapplied event needs manual reconciliation"

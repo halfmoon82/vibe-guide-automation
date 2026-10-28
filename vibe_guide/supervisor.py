@@ -694,7 +694,7 @@ def supervisor_preflight(
         return {"state": "unknown", "reason": "supervisor holds unreadable"}
     result = _mailbox_state(paths, run_id, holds)
     if result.get("state") == "decision":
-        result["decision_only"] = True
+        result["decision_only"] = not result.get("worker_questions")
         if not accept_decision:
             result = {key: value for key, value in result.items() if key != "heartbeat"}
             result["state"] = "work"
@@ -817,6 +817,14 @@ def _mailbox_state_inner(paths, run_id, holds):
             return decision_state
         return {"state": "unknown", "reason": "run snapshot unavailable"}
     statuses = _node_statuses(snapshot)
+    from .worker_questions import pending_questions
+
+    questions = pending_questions(paths, snapshot)
+    if questions:
+        # The supervisor answers these itself, so unlike a product decision
+        # they never slow the heartbeat down.
+        return {"state": "decision", "reason": "worker questions await the supervisor",
+                "worker_questions": questions, "decisions": decisions}
     # An answered decision is closed: its hold no longer parks anything, and a
     # node still in blocked_design behind it waits for the supervisor's resume
     # to consume the answer, not for the human.
@@ -2907,6 +2915,12 @@ def render_beat_text(paths, run_id, payload, *, plan_id, command_prefix="vibe",
     if state == "stop":
         return BEAT_REPEAT_TEXT
     if state == "decision":
+        if payload.get("worker_questions"):
+            from .worker_questions import render_beat_questions
+
+            payload["end_turn"] = False
+            return render_beat_questions(payload["worker_questions"], run_id, plan_id,
+                                         command_prefix) + tail
         return ("decision：读取决策信箱并向用户呈现未答卡片；心跳降频到 {} 分钟但不暂停，答案写回后恢复"
                 .format(HEARTBEAT_INTERVAL_DECISION_MINUTES)) + tail
     if state == "contract_drift":
