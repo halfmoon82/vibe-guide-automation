@@ -154,6 +154,7 @@ from .installation import run_install, run_upgrade, migrate_state
 from .skills import SkillSpec, install_project_skill
 from .models import InstallRequest
 from .decision_boundary import answer_decision, decision_list, raise_decision
+from . import worker_questions
 
 
 SUCCESS = 0
@@ -1846,6 +1847,9 @@ def _snapshot_result(
     error_classes = _render_node_error_classes(snapshot)
     if error_classes:
         text += "\n" + error_classes
+    questions = worker_questions.render_status_lines(paths, snapshot)
+    if questions:
+        text += "\n" + questions
     if pending_verification:
         text += "\n" + _render_pending_verification(pending_verification)
     return _result(
@@ -3611,7 +3615,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 paths, plan, nodes,
                 topology_rulings=_observed_topology_rulings(paths, _card),
             )
-            payload = monitor.repair_node(args.node_id, args.run_id)
+            if load_snapshot(paths, args.run_id).nodes.get(args.node_id, {}).get(
+                    "status") == worker_questions.AWAITING_STATUS:
+                payload = worker_questions.answer_question(
+                    monitor, args.run_id, args.node_id, args.decision_note)
+            else:
+                payload = monitor.repair_node(args.node_id, args.run_id)
             snapshot = load_snapshot(paths, args.run_id)
             result = _snapshot_result(args.command, snapshot, args.as_json, paths=paths)
             result.payload["repair"] = payload

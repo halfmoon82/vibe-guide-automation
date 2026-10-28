@@ -35,7 +35,7 @@ WORKTREE_BLOCKED_EVENT = "worktree_preflight_blocked"
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _BACKGROUNDED = re.compile(r"backgrounded\s*[·•.]\s*([0-9a-f]{8})\b")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_STATES = {"working", "done", "failed", "blocked", "stopped"}
+_STATES = {"working", "done", "failed", "blocked", "stopped", "idle"}
 _DEFAULT_TIMEOUT = 60.0
 
 

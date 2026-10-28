@@ -1,7 +1,8 @@
 """Supervisor runner over Claude Code background sessions.
 
 Completion is decided only by the worker's own delivery report; a session that
-reaches ``done`` without one is ``blocked_unknown``, never success.
+reaches ``done`` without one is never success: its last message is surfaced as
+a question for the supervisor, or ``blocked_unknown`` when it cannot be read.
 """
 
 import json
@@ -16,6 +17,8 @@ from ..adapters.claude_bg import ClaudeBgLauncher, ClaudeBgUnknown
 from ..contracts import RunEvent, RunHandle, Runner
 from ..paths import ProjectPaths
 from ..state import validate_run_id
+from ..worker_questions import QUESTION_STATES, WORKER_QUESTION_EVENT
+from ..worker_questions import excerpt as worker_question_excerpt
 from .provider_action import RESULT_EVENT_KEYS
 
 
@@ -421,14 +424,31 @@ class ClaudeBgRunner(Runner):
             return [RunEvent("blocked_unknown", dict(claims, reason=error.reason))]
         if state == "working":
             return []
+        if state in QUESTION_STATES:
+            question = self._question_excerpt(session)
+            if question:
+                return [RunEvent(WORKER_QUESTION_EVENT, dict(
+                    claims, question_excerpt=question, session_state=state))]
         reasons = {
             "done": ("blocked_unknown", "session done without worker delivery"),
+            "idle": ("needs_attention", "session idle, likely waiting for input"),
             "blocked": ("needs_attention", "session blocked, likely waiting for input"),
             "failed": ("failed_retryable", "session failed"),
             "stopped": ("stopped", "session stopped"),
         }
         event, reason = reasons[state]
         return [RunEvent(event, dict(claims, reason=reason))]
+
+    @staticmethod
+    def _question_excerpt(session: Dict[str, Any]) -> Optional[str]:
+        """The session's last assistant message, or None when it cannot be read."""
+        reader = getattr(session["launcher"], "final_reply", None)
+        if reader is None:
+            return None
+        try:
+            return worker_question_excerpt(reader(session["claims"]["session_id"]))
+        except (ClaudeBgUnknown, OSError, ValueError):
+            return None
 
     def stop(self, handle: RunHandle) -> None:
         session = self._session(handle)

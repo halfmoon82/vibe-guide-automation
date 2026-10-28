@@ -143,7 +143,12 @@ _NODE_STATUSES = {
     "brief_pending",
     "skipped_by_user",
     "blocked_by_required_node",
+    # A worker session ended without a delivery and asked the supervisor
+    # something (``worker_questions``); resumable once the supervisor answers.
+    "awaiting_supervisor",
 }
+#: Node status of a parked worker question; one spelling for every reader.
+AWAITING_SUPERVISOR_STATUS = "awaiting_supervisor"
 
 
 def verify_required_workflow_state(workflow):
@@ -283,6 +288,8 @@ def _derived_user_status(status: Any, reason: Any = "") -> str:
             return "自动修复中"
         status = record.get("status")
     value = str(status or "")
+    if value == AWAITING_SUPERVISOR_STATUS:
+        return STALL_INVESTIGATE_STATUS
     if value in _USER_DECISION_STATUSES:
         return "需要你决定"
     if value in _USER_PREPARING_STATUSES:
@@ -504,6 +511,11 @@ _EVENT_DATA_KEYS = {
     "differences",
     "tier",
     "unchanged_beats",
+    # worker_question_raised / _answered: the run-relative file holding the
+    # question excerpt (the excerpt itself never enters the event stream) and
+    # the fixed-enum session state the question was read in.
+    "question_file",
+    "session_state",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",
