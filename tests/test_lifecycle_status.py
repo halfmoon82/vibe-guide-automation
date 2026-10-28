@@ -20,10 +20,12 @@ class StatusSetTests(unittest.TestCase):
         self.assertEqual(m - s, {"ready", "blocked_deploy"})
         self.assertEqual(
             s - m,
-            {"retry_pending", "start_pending", "failed", "stopped", "skipped_by_user", "blocked_by_required_node"},
+            {"retry_pending", "start_pending", "failed", "stopped", "skipped_by_user", "blocked_by_required_node",
+             "awaiting_supervisor"},
         )
         self.assertEqual(t - s, {"created", "archived"})
-        self.assertEqual(s - t, {"planned", "retry_pending", "skipped_by_user", "blocked_by_required_node", "brief_pending"})
+        self.assertEqual(s - t, {"planned", "retry_pending", "skipped_by_user", "blocked_by_required_node", "brief_pending",
+                                 "awaiting_supervisor"})
         # terminal notions differ per layer: node accepted only; task adds archived/blocked_design/failed/stopped
         self.assertEqual(set(lifecycle.TERMINAL_TASK_STATUSES) - set(lifecycle.TERMINAL_NODE_STATUSES), set(lifecycle.TERMINAL_TASK_STATUSES))
         self.assertEqual(lifecycle.RUNNER_TERMINAL_STATUSES - lifecycle.TERMINAL_TASK_STATUSES, {"complete", "completed"})

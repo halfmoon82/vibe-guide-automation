@@ -116,6 +116,31 @@ class LandingTests(unittest.TestCase):
         self.assertEqual(snapshot.nodes["bg"]["scope_landing_rejection"],
                          [{"path": "bg2.py", "cause": scope_landing.CAUSE_HELD}])
 
+    def test_a_refused_delivery_keeps_a_delivered_binding_not_a_claimed_stop(self):
+        from vibe_guide.task_registry import load_task_binding
+
+        self.land("bg", {"bg.py": "work\n", "vibe_guide/cli.py": "edited\n"})
+        snapshot = self.deliver()
+        binding = load_task_binding(self.paths, "bg", "developer", run_id=snapshot.run_id)
+        self.assertEqual(binding.status, "delivered")
+
+    def test_main_merged_into_the_node_branch_is_not_the_nodes_landing(self):
+        root = self.paths.root
+        (root / "docs").mkdir(exist_ok=True)
+        (root / "docs" / "main-only.md").write_text("main moved on\n", encoding="utf-8")
+        git(root, "add", "docs/main-only.md")
+        git(root, "commit", "-qm", "main moves")
+        # vibe built the worktree, so the base is recorded.
+        snapshot = load_snapshot(self.paths, self.snapshot.run_id)
+        snapshot.nodes["bg"]["worktree_base"] = git(root, "rev-parse", "HEAD~1")
+        self.monitor()._save_snapshot(snapshot)
+        self.land("bg", {"bg.py": "work\n"})
+        git(root / ".worktrees" / "bg", "merge", "-q", "--no-edit", "main")
+
+        snapshot = self.deliver()
+
+        self.assertEqual(snapshot.nodes["bg"]["status"], "review", snapshot.nodes["bg"].get("reason"))
+
     def test_configured_mechanical_path_is_auto_expanded(self):
         (self.paths.vibe / "config.json").write_text(
             json.dumps({"auto_scope_paths": ["docs/notes.md"]}), encoding="utf-8")
@@ -177,9 +202,16 @@ class LandedFilesTest(unittest.TestCase):
         self.commit("own.txt", "mine\n")
         self.commit("shared.txt", "downstream edit\n")
 
-        files = scope_landing.landed_files(self.runner, self.base, "HEAD", ["node/up"])
+        files = scope_landing.landed_files(self.runner, self.base, "HEAD", ["refs/heads/node/up"])
 
         self.assertEqual(files, ["own.txt", "shared.txt"])
+
+    def test_glob_scope_entries_stay_inside_one_directory(self):
+        self.assertTrue(scope_landing._inside("src/a.py", ["src/*.py"]))
+        self.assertFalse(scope_landing._inside("src/deep/a.py", ["src/*.py"]))
+        self.assertTrue(scope_landing._inside("src/deep/a.py", ["src/**/*.py"]))
+        self.assertTrue(scope_landing._inside("src/deep/a.py", ["src"]))
+        self.assertFalse(scope_landing._inside("srcx/a.py", ["src"]))
 
 
 if __name__ == "__main__":

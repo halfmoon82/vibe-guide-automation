@@ -13,6 +13,7 @@ next generation's prompt when ``vibe requeue --note`` re-dispatches the node.
 
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional
 
 from .fsio import JsonCorruptError, JsonMissingError, atomic_write_json, read_json
@@ -29,13 +30,35 @@ QUESTION_DIR = "worker-questions"
 MARKER_KEY = "worker_question"
 KIND_QUESTION = "question"
 KIND_SCOPE_LANDING = "scope_landing"
+#: Events whose state change replay must rebuild after a crash between the
+#: event append and the snapshot save.
+REPLAY_EVENTS = frozenset({
+    "worker_question_raised", "scope_landing_rejected", "worker_question_answered",
+})
+#: Credential-shaped substrings a worker might have pasted into its message;
+#: the excerpt is printed into beat and status text, so they never leave here.
+_CREDENTIAL_PATTERNS = (
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
+     "[REDACTED]"),
+    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+                r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})"),
+     "[REDACTED]"),
+    (re.compile(r"(?i)\b(api[_-]?key|access[_-]?key|token|secret|password|passwd)(\s*[:=]\s*)\S+"),
+     r"\1\2[REDACTED]"),
+)
+
+
+def _scrub_credentials(text: str) -> str:
+    for pattern, replacement in _CREDENTIAL_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def excerpt(text: Any) -> Optional[str]:
     """The end of ``text`` (where the question is) in at most EXCERPT_LIMIT chars."""
     if not isinstance(text, str) or not text.strip():
         return None
-    text = text.strip()
+    text = _scrub_credentials(text.strip())
     if len(text) <= EXCERPT_LIMIT:
         return text
     return "…" + text[-(EXCERPT_LIMIT - 1):]
@@ -57,8 +80,16 @@ def _relative(paths: ProjectPaths, path: Path) -> str:
 
 
 def park_question(monitor: Any, snapshot: Any, node_id: str, event: Any,
-                  active: Dict[str, Any]) -> None:
-    """Persist the question and park the node until the supervisor answers."""
+                  active: Dict[str, Any], runner: Any, handle_id: str) -> None:
+    """Stop the ended session, persist its question and park the node.
+
+    The binding only turns terminal on a proven stop; a stop that cannot be
+    proven leaves the node ``blocked_unknown`` (the monitor's own rule), never
+    a terminal binding beside a session that might still write.
+    """
+    if not monitor._stop_active_for_transition(
+            snapshot, node_id, str(active["role"]), handle_id, runner, "stopped"):
+        return
     park(monitor, snapshot, node_id, active, excerpt(event.data.get("question_excerpt")),
          session_state=event.data.get("session_state"))
 
@@ -66,11 +97,13 @@ def park_question(monitor: Any, snapshot: Any, node_id: str, event: Any,
 def park(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, Any], text: Any, *,
          session_state: Any = None, kind: str = KIND_QUESTION,
          event_name: str = "worker_question_raised",
-         event_data: Optional[Dict[str, Any]] = None) -> None:
+         event_data: Optional[Dict[str, Any]] = None,
+         binding_status: Optional[str] = None) -> None:
     """Park the node with ``text`` as what the supervisor has to answer.
 
     ``kind`` names why: a worker's own question, or a delivery vibe refused
     (``scope_landing``) whose readable reason the supervisor answers instead.
+    ``binding_status`` is written when the caller has not settled the binding.
     """
     role = str(active["role"])
     generation = int(active["generation"])
@@ -89,9 +122,8 @@ def park(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, Any], text
         "answer": None,
     })
     relative = _relative(monitor.paths, path)
-    # The ended session will be stopped before the node is dispatched again;
-    # a terminal binding is what lets that dispatch continue the same task.
-    monitor._set_binding_status(snapshot, node_id, role, "stopped")
+    if binding_status is not None:
+        monitor._set_binding_status(snapshot, node_id, role, binding_status)
     current = snapshot.nodes[node_id]
     current["status"] = AWAITING_STATUS
     current["reason"] = (
@@ -99,17 +131,55 @@ def park(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, Any], text
         if kind == KIND_SCOPE_LANDING
         else "worker session ended without delivery and asked the supervisor")
     current[MARKER_KEY] = {"file": relative, "role": role, "generation": generation, "kind": kind}
+    _apply_parked(snapshot, node_id)
+    monitor._release_node_lease(snapshot, node_id)
+    data = {"run_id": snapshot.run_id, "node_id": node_id, "question_file": relative,
+            "kind": kind, "role": role, "generation": generation}
+    if session_state is not None:
+        data["session_state"] = session_state
+    data.update(event_data or {})
+    monitor._record(snapshot, event_name, data, active)
+
+
+def _apply_parked(snapshot: Any, node_id: str) -> None:
+    current = snapshot.nodes[node_id]
+    current["status"] = AWAITING_STATUS
     current["active_role"] = None
     current["active_task"] = None
     current["quarantine"] = None
     current["retryable_action"] = None
     snapshot.handles.pop(node_id, None)
-    monitor._release_node_lease(snapshot, node_id)
-    data = {"run_id": snapshot.run_id, "node_id": node_id, "question_file": relative}
-    if session_state is not None:
-        data["session_state"] = session_state
-    data.update(event_data or {})
-    monitor._record(snapshot, event_name, data, active)
+
+
+def _apply_answered(current: Dict[str, Any], marker: Dict[str, Any]) -> None:
+    role = str(marker.get("role") or "developer")
+    current["status"] = "rework"
+    current["reason"] = None
+    current["pair_archived"] = True
+    current["retryable_action"] = {
+        "role": role,
+        "phase": "review" if role == "reviewer" else "rework",
+        "continuation": True,
+        "pending_schedule": True,
+        "successor": False,
+        "successor_candidate": False,
+    }
+    current[MARKER_KEY] = dict(marker, answered=True)
+
+
+def replay(snapshot: Any, node_id: str, event_name: str, data: Dict[str, Any]) -> None:
+    """Rebuild the state change of an event whose snapshot save was lost."""
+    current = snapshot.nodes[node_id]
+    marker = {"file": data.get("question_file"), "role": data.get("role"),
+              "generation": data.get("generation"), "kind": data.get("kind") or KIND_QUESTION}
+    if not isinstance(marker["file"], str) or marker["role"] not in ("developer", "reviewer") \
+            or isinstance(marker["generation"], bool) or not isinstance(marker["generation"], int):
+        raise ValueError("worker question replay lacks its question file, role or generation")
+    if event_name == "worker_question_answered":
+        _apply_answered(current, marker)
+        return
+    current[MARKER_KEY] = marker
+    _apply_parked(snapshot, node_id)
 
 
 def pending_questions(paths: ProjectPaths, snapshot: Any) -> List[Dict[str, Any]]:
@@ -154,25 +224,15 @@ def answer_question(monitor: Any, run_id: str, node_id: str, answer: Any) -> Dic
     record["answer"] = text
     record["answered_at"] = _now()
     atomic_write_json(path, record)
-    role = str(marker.get("role") or "developer")
-    current["status"] = "rework"
-    current["reason"] = None
-    current["pair_archived"] = True
-    current["retryable_action"] = {
-        "role": role,
-        "phase": "review" if role == "reviewer" else "rework",
-        "continuation": True,
-        "pending_schedule": True,
-        "successor": False,
-        "successor_candidate": False,
-    }
-    current[MARKER_KEY] = dict(marker, answered=True)
+    _apply_answered(current, marker)
     monitor._record(snapshot, "worker_question_answered", {
         "run_id": run_id, "node_id": node_id, "question_file": marker.get("file"),
+        "role": marker.get("role"), "generation": marker.get("generation"),
+        "kind": marker.get("kind") or KIND_QUESTION,
     })
     monitor._save_snapshot(snapshot)
     return {"node_id": node_id, "status": current["status"], "file": marker.get("file"),
-            "role": role, "run_id": run_id}
+            "role": current["retryable_action"]["role"], "run_id": run_id}
 
 
 def supervisor_answer_section(contract: Dict[str, Any]) -> str:

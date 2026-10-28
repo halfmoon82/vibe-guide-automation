@@ -34,6 +34,10 @@ _CAUSE_TEXT = {
 }
 _CLAIM_REASON = "developer delivery landed outside the node files; project approved the acceptance-unchanged rule"
 REJECTION_KEY = "scope_landing_rejection"
+#: A refused delivery still arrived: the worker finished its turn, exactly the
+#: binding state an ordinary delivery awaiting rework carries.  No stop is
+#: claimed for a session vibe never stopped.
+_DELIVERED = "delivered"
 
 #: ``git(args) -> CompletedProcess`` run in the node worktree.
 GitRunner = Callable[[List[str]], Any]
@@ -51,22 +55,28 @@ def _names(git: GitRunner, args: List[str]) -> List[str]:
     return [name for name in (result.stdout or "").split("\0") if name]
 
 
-def landed_files(git: GitRunner, base: str, head: str, upstream: List[str]) -> List[str]:
-    """Files ``base..head`` changed, minus upstream content merged in unchanged."""
+def landed_files(git: GitRunner, base: str, head: str, merged_in: List[str]) -> List[str]:
+    """Files ``base..head`` changed, minus content merged in unchanged.
+
+    ``merged_in`` are revisions the node branch may have merged after its
+    base: accepted upstream branches and the main commit it last took in.
+    A file one of them changed, that the node left exactly as merged, is not
+    the node's own landing.
+    """
     changed = _names(git, [base, head])
-    for branch in upstream:
-        resolved = git(["rev-parse", "--verify", "--quiet", "refs/heads/%s^{commit}" % branch])
+    for revision in merged_in:
+        resolved = git(["rev-parse", "--verify", "--quiet", "%s^{commit}" % revision])
         tip = (resolved.stdout or "").strip()
         if resolved.returncode != 0 or not tip:
             continue
         if git(["merge-base", "--is-ancestor", tip, base]).returncode == 0:
             continue
-        from_upstream = set(_names(git, [base, tip]))
-        candidates = [name for name in changed if name in from_upstream]
+        from_merged = set(_names(git, [base, tip]))
+        candidates = [name for name in changed if name in from_merged]
         if not candidates:
             continue
         differs = set(_names(git, [tip, head, "--"] + candidates))
-        changed = [name for name in changed if name not in from_upstream or name in differs]
+        changed = [name for name in changed if name not in from_merged or name in differs]
     return sorted(changed)
 
 
@@ -77,25 +87,39 @@ def _git_in(directory: Path) -> GitRunner:
     return run
 
 
-def _resolve_base(monitor: Any, current: Dict[str, Any], git: GitRunner) -> str:
+def _project_head(monitor: Any) -> str:
+    project = _git_in(monitor.paths.root)(["rev-parse", "HEAD"])
+    if project.returncode != 0 or not project.stdout.strip():
+        raise ScopeLandingUnknown("the project HEAD is unreadable, so the node baseline is unknown")
+    return project.stdout.strip()
+
+
+def _resolve_base(monitor: Any, current: Dict[str, Any], git: GitRunner, project_head: str) -> str:
     recorded = current.get("worktree_base")
     if isinstance(recorded, str) and recorded.strip():
         if git(["rev-parse", "--verify", "--quiet", recorded + "^{commit}"]).returncode == 0:
             return recorded
-    project = _git_in(monitor.paths.root)(["rev-parse", "HEAD"])
-    if project.returncode != 0 or not project.stdout.strip():
-        raise ScopeLandingUnknown("the project HEAD is unreadable, so the node baseline is unknown")
-    merged = git(["merge-base", "HEAD", project.stdout.strip()])
+    merged = git(["merge-base", "HEAD", project_head])
     if merged.returncode != 0 or not merged.stdout.strip():
         raise ScopeLandingUnknown("the node branch shares no history with the project HEAD")
     return merged.stdout.strip()
+
+
+def _glob_match(path: List[str], pattern: List[str]) -> bool:
+    """Segment-wise glob: ``*`` stays inside one directory, ``**`` spans any."""
+    if not pattern:
+        return not path
+    if pattern[0] == "**":
+        return any(_glob_match(path[index:], pattern[1:]) for index in range(len(path) + 1))
+    return bool(path) and fnmatch.fnmatchcase(path[0], pattern[0]) \
+        and _glob_match(path[1:], pattern[1:])
 
 
 def _inside(path: str, entries: List[str]) -> bool:
     key = _scope_compare_key(path)
     for entry in entries:
         if any(char in entry for char in "*?["):
-            if fnmatch.fnmatchcase(path, entry):
+            if _glob_match(path.split("/"), entry.strip("/").split("/")):
                 return True
             continue
         scope = _scope_compare_key(entry)
@@ -113,17 +137,24 @@ def landing_report(monitor: Any, snapshot: Any, node_id: str) -> Optional[Dict[s
     from .worktree_base import upstream_branches
 
     current = snapshot.nodes[node_id]
-    worktree = Path(str(current.get("worktree") or ""))
-    if not str(current.get("worktree") or "").strip():
+    if not str(current.get("worktree") or "").strip() or not hasattr(monitor, "paths"):
         return None
+    worktree = Path(str(current["worktree"]))
     if not worktree.is_absolute():
         worktree = monitor.paths.root / worktree
     if not (worktree / ".git").exists():
         return None
     git = _git_in(worktree)
-    base = _resolve_base(monitor, current, git)
-    files = landed_files(git, base, "HEAD",
-                         upstream_branches(monitor.nodes, snapshot.nodes, node_id))
+    project_head = _project_head(monitor)
+    base = _resolve_base(monitor, current, git, project_head)
+    merged_in = ["refs/heads/" + branch
+                 for branch in upstream_branches(monitor.nodes, snapshot.nodes, node_id)]
+    # The main commit the branch last took in (a merge of or rebase onto a
+    # newer main); its content is main's, not the node's.
+    taken = git(["merge-base", "HEAD", project_head])
+    if taken.returncode == 0 and taken.stdout.strip():
+        merged_in.append(taken.stdout.strip())
+    files = landed_files(git, base, "HEAD", merged_in)
     node = monitor.nodes[node_id]
     scope = list(_write_scope_paths(node) or []) + list(monitor._node_scope_files(node_id, current))
     occupied = [_scope_compare_key(item)
@@ -174,7 +205,8 @@ def check_delivery(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, 
         snapshot.nodes[node_id][REJECTION_KEY] = [{"path": "*", "cause": CAUSE_UNREADABLE}]
         park(monitor, snapshot, node_id, active, _rejection_text([], str(error)[:300]),
              kind=KIND_SCOPE_LANDING, event_name="scope_landing_rejected",
-             event_data={"rejection_code": "scope_landing:" + CAUSE_UNREADABLE})
+             event_data={"rejection_code": "scope_landing:" + CAUSE_UNREADABLE},
+             binding_status=_DELIVERED)
         return False
     if report is None:
         return True
@@ -186,7 +218,8 @@ def check_delivery(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, 
                  "files": [item["path"] for item in report["rejected"]],
                  "rejection_code": "scope_landing:" + ",".join(
                      "{}={}".format(item["path"], item["cause"]) for item in report["rejected"]),
-             })
+             },
+             binding_status=_DELIVERED)
         return False
     snapshot.nodes[node_id].pop(REJECTION_KEY, None)
     if report["expanded"]:

@@ -187,6 +187,68 @@ class MonitorQuestionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             worker_questions.answer_question(self.monitor(), snapshot.run_id, "bg2", "go")
 
+    def test_the_ended_session_is_stopped_before_its_binding_turns_terminal(self):
+        from vibe_guide.task_registry import load_task_binding
+
+        snapshot = self.start()
+        calls = []
+        snapshot = self.monitor().resume(snapshot.run_id, self.runner("idle", QUESTION, calls))
+        self.assertIn(("stop", UUID), calls)
+        binding = load_task_binding(self.paths, "bg", "developer", run_id=snapshot.run_id)
+        self.assertEqual(binding.status, "stopped")
+
+    def test_a_stop_that_cannot_be_proven_keeps_the_node_blocked_unknown(self):
+        class Unstoppable(QuestionLauncher):
+            def stop(self, task_id):
+                raise ClaudeBgUnknown("claude stop failed")
+
+        snapshot = self.start()
+        runner = ClaudeBgRunner(
+            lambda c, w: Unstoppable("blocked" if c["node_id"] == "bg" else "working", QUESTION),
+            paths=self.paths, sleeper=lambda seconds: None)
+        snapshot = self.monitor().resume(snapshot.run_id, runner)
+        self.assertEqual(snapshot.nodes["bg"]["status"], "blocked_unknown")
+        self.assertEqual(worker_questions.pending_questions(self.paths, snapshot), [])
+
+    def _replay_after_lost_save(self, before):
+        """Put back the snapshot saved before the last step, as a crash would."""
+        (self.paths.vibe / "runs" / self.run_id / "state.json").write_bytes(before)
+        snapshot = load_snapshot(self.paths, self.run_id)
+        self.monitor()._reconcile_unapplied_events(snapshot)
+        return snapshot
+
+    def test_a_lost_snapshot_save_after_the_question_replays_to_awaiting(self):
+        snapshot = self.start()
+        self.run_id = snapshot.run_id
+        before = (self.paths.vibe / "runs" / self.run_id / "state.json").read_bytes()
+        self.monitor().resume(snapshot.run_id, self.runner("done", QUESTION))
+
+        replayed = self._replay_after_lost_save(before)
+
+        self.assertEqual(replayed.nodes["bg"]["status"], worker_questions.AWAITING_STATUS)
+        self.assertEqual(worker_questions.pending_questions(self.paths, replayed)[0]["excerpt"],
+                         QUESTION)
+
+    def test_a_lost_snapshot_save_after_the_answer_replays_to_rework(self):
+        snapshot = self.ask()
+        self.run_id = snapshot.run_id
+        before = (self.paths.vibe / "runs" / self.run_id / "state.json").read_bytes()
+        worker_questions.answer_question(self.monitor(), self.run_id, "bg", "按 main 开工")
+
+        replayed = self._replay_after_lost_save(before)
+
+        node = replayed.nodes["bg"]
+        self.assertEqual(node["status"], "rework")
+        self.assertEqual(node["retryable_action"]["role"], "developer")
+        self.assertTrue(node["retryable_action"]["pending_schedule"])
+
+    def test_credentials_in_the_last_message_never_reach_the_excerpt(self):
+        reply = "我卡住了，token=ghp_abcdefghijklmnopqrstuvwxyz0123 和 sk-ABCDEFGHIJKLMNOPQRSTUV 都不行，要不要换？"
+        text = worker_questions.excerpt(reply)
+        self.assertNotIn("ghp_abcdefghijklmnopqrstuvwxyz0123", text)
+        self.assertNotIn("sk-ABCDEFGHIJKLMNOPQRSTUV", text)
+        self.assertIn("要不要换？", text)
+
     def test_cli_requeue_with_a_note_answers_the_question(self):
         from vibe_guide.cli import run_cli
 

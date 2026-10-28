@@ -814,9 +814,12 @@ def _claude_bg_launcher_factory(paths: ProjectPaths, launchers: Optional[List[An
             status_file=str(contract.get("status_file") or fallback),
             handoff_file=str(contract.get("handoff_file") or fallback),
         )
+        upstream = contract.get("upstream_branches")
         launcher = claude_bg.ClaudeBgLauncher(
             routing, claude_bg.load_claude_bg_config(paths), model=model,
-            upstream_branches=contract.get("upstream_branches") or (),
+            # Only a downstream node passes it, so launchers built for nodes
+            # without accepted upstreams keep their previous call shape.
+            **({"upstream_branches": list(upstream)} if upstream else {}),
         )
         if launchers is not None:
             launchers.append((str(contract.get("node_id") or ""), launcher))
