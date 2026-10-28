@@ -1232,13 +1232,10 @@ class AuthorizationRecord:
         converted.setdefault("rotate_hard_cap", None)
         converted.setdefault("heartbeat_interval_forced", None)
         converted.setdefault("heartbeat_interval_forced_cost", None)
-        _validate_card_choice(
-            converted["heartbeat_interval_minutes"], HEARTBEAT_INTERVAL_CHOICES,
-            "heartbeat interval minutes",
+        _validate_stored_card_choice(
+            converted["heartbeat_interval_minutes"], "heartbeat interval minutes"
         )
-        _validate_card_choice(
-            converted["rotate_hard_cap"], ROTATE_HARD_CAP_CHOICES, "rotation hard cap"
-        )
+        _validate_stored_card_choice(converted["rotate_hard_cap"], "rotation hard cap")
         if converted["remote_git_actions"] not in {"allow", "deny"}:
             raise ValueError("authorization remote git action switch is invalid")
         for key in ("required_workflow", "skipped_nodes", "integration_review_scope"):
@@ -1391,6 +1388,22 @@ def _validate_card_choice(value: Any, choices: Tuple[int, ...], label: str) -> O
         raise ValueError(
             label + " must be one of " + ", ".join(str(item) for item in choices)
         )
+    return value
+
+
+def _validate_stored_card_choice(value: Any, label: str) -> Optional[int]:
+    """Accept any positive integer an earlier release may have signed.
+
+    The offered tiers change between releases (5.1 offered 30 minutes, 5.2
+    offers 60); a stored record carries the tier its card offered at the time,
+    so checking it against today's tiers would make finished runs unreadable.
+    New cards are still checked against the current tiers by
+    ``_validate_card_choice``, and the runtime reads only current tiers.
+    """
+    if value is None:
+        return None
+    if type(value) is not int or value <= 0:
+        raise ValueError(label + " must be a positive integer")
     return value
 
 

@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests import test_monitor as fixtures
 from vibe_guide.authorization import authorize, build_authorization_card
@@ -87,6 +88,52 @@ class LegacyRunCliTests(unittest.TestCase):
         result = self.host.run_cli(["status", "--plan", "e2e-plan", "--json"], runner=self.runner)
         self.assertEqual(result.exit_code, 0, result.text)
         self.assertEqual(result.payload["run_id"], self.run_id)
+
+
+class PreFiveTwoCardChoiceTests(unittest.TestCase):
+    """A run authorized by 5.1.x with a heartbeat tier 5.2 no longer offers (30).
+
+    Card vocabulary narrows between releases; a value the product manager
+    approved under the old vocabulary must not make the stored record unreadable.
+    """
+
+    def setUp(self):
+        host = fixtures.MonitorTests("setUp")
+        host.setUp()
+        self.addCleanup(host.tearDown)
+        self.paths = host.paths
+        self.capabilities = host.capabilities
+        nodes = [fixtures.node("n1")]
+        plan = Plan("plan-1", 1, "docs/prd.md", ["n1"], "draft")
+        with mock.patch("vibe_guide.authorization.HEARTBEAT_INTERVAL_CHOICES", (10, 30)):
+            card = build_authorization_card(plan, nodes, host.capabilities, heartbeat_interval_minutes=30)
+            self.monitor = Monitor(self.paths, plan, nodes)
+            self.snapshot = self.monitor.start(authorize(card, "AUTHORIZE"), FakeRunner())
+        self.state = run_dir(self.paths, self.snapshot.run_id, create=False) / "state.json"
+
+    def _as_legacy(self, status):
+        raw = json.loads(self.state.read_text(encoding="utf-8"))
+        raw.update({"legacy_run": False, "legacy_evidence": None, "legacy_evidence_digest": "", "status": status})
+        self.state.write_text(json.dumps(raw), encoding="utf-8")
+
+    def test_finished_run_with_retired_heartbeat_tier_stays_readable(self):
+        self._as_legacy("complete")
+        snapshot = load_snapshot(self.paths, self.snapshot.run_id)
+        self.assertEqual(snapshot.run_id, self.snapshot.run_id)
+        self.assertEqual(snapshot.authorization["heartbeat_interval_minutes"], 30)
+        self.assertFalse(legacy_run_in_flight(self.paths, self.snapshot.run_id))
+
+    def test_unfinished_run_with_retired_heartbeat_tier_gets_the_close_out_guidance(self):
+        self._as_legacy("running")
+        with self.assertRaises(PermissionError) as raised:
+            self.monitor.resume(self.snapshot.run_id, FakeRunner())
+        self.assertIn(LEGACY_RUN_BLOCK, str(raised.exception))
+
+    def test_new_cards_still_refuse_the_retired_tier(self):
+        nodes = [fixtures.node("n2")]
+        plan = Plan("plan-2", 1, "docs/prd.md", ["n2"], "draft")
+        with self.assertRaises(ValueError):
+            build_authorization_card(plan, nodes, self.capabilities, heartbeat_interval_minutes=30)
 
 
 if __name__ == "__main__":
