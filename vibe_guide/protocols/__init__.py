@@ -27,6 +27,16 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-28: integration merge — slim guide plus derived risk_tags rule (#321).
+        "a0b328bfbff4ccd5a9cd356be360df45b5fb3809afda8e898a7b6b65110f7914",
+        # 2026-10-28: tests re-pinned to the slim guide; <35KB; single-shift off switch.
+        "5aa107da27432d276ab913b86fa1749c756d16e564bcf41a0362ac782e5993e4",
+        # 2026-10-28: §6 slimmed to daemon + short session + three-level self-heal,
+        # pointing at supervisor-card.md; engine attestation 72h, merge rule, no
+        # engineering questions to the product manager.
+        "fd485222f9645667e76a203e4f4cda9dd226b2e9ec6a184f2c493b9f2d9e377b",
+        # 2026-10-28: heartbeat tiers 10/60 (was 10/30); dispatch_mode field.
+        "d529d1256141b67d1d3317a0b6de0c5a6e7599d36afd54813cc61019faeb13d6",
         # 2026-10-28: derive execution risk_tags; reject product-side overrides.
         "d84945dbabc656db5ceace7d6d54097f3eaf357512b9f675a7ec6600b5b5d54a",
         # 2026-10-27: §6.5 stalled-node branch merged onto the §6.4 fork_thread rule.
@@ -159,6 +169,10 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "a6d940da69d2e43664a37d44f0a9e28ad7f5ca2ecb8ebb03f46cf05752acd94b",
     }),
     "vibe-entry": frozenset({
+        # 2026-10-28: first-shift pointer §6.0.
+        "1f8ba7164902fd33df2db931d8a720458b21672500d299d568b7fbaf38e16b23",
+        # 2026-10-28: first-shift supervisor does daemon start + 60-minute fallback check.
+        "b3b201841310cec4de4d3e60cdef9773cb53cc5447317400b6543c481a7f344d",
         "315588896b6b69c069858aeaa2107146e6cbc3914f31b129e8057198842a0c38",
         "ddf7b12525e99fc740b11557833cf7ef78c8b8c197dc96586a3c7bebbb555056",
         # 2026-10-17: complex mode needs >=3 parallel nodes and cross-interrupt work; replies continue the tier.
@@ -181,6 +195,16 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # the file's sha256 and only accepts a digest published here.
     "visible-sdd-worker": frozenset({
         "30b226ff0a6711a91779785c28a993679e0a33c3aeb89e836cfd427194750945",
+    }),
+    # Short per-beat runbook; the beat prints it once per shift, then only
+    # its path and sha256.
+    "supervisor-card": frozenset({
+        "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
+    }),
+    # Second-level self-heal short session (daemon): the prompt the daemon feeds
+    # a one-shot repair session.
+    "heal-session": frozenset({
+        "f0338725e0669a5cc0fdee9b4189e7fd550f37c7e91bc922df68cfbc56dfe139",
     }),
 }
 

@@ -116,19 +116,13 @@ class ProtocolRuleTests(unittest.TestCase):
         from vibe_guide import protocols
         return (Path(protocols.__file__).parent / "prd-guide.md").read_text().splitlines()
 
-    def test_mailbox_section_says_retry_once_then_stop(self):
-        rule = [line for line in self._lines() if line.startswith("**宿主报\"找不到工具\"时不交班**")]
-        self.assertEqual(len(rule), 1)
-        for phrase in ("complete()", "UnresolvedNativeTool", "attempts", "第 2 次仍失败：停止服务信箱", "不要开交班会话"):
-            self.assertIn(phrase, rule[0])
-
-    def test_recovery_list_excludes_it_from_node_failures(self):
-        lines = self._lines()
-        start = lines.index("`blocked_unknown` 的标准恢复动作按原因执行：")
-        row = [line for line in lines[start:start + 10] if line.startswith("- 宿主报 `No such tool available`")]
+    # 旧「信箱」章节（complete()/UnresolvedNativeTool/attempts 的细节）已随监工手册删除，
+    # 规则本身保留为 §6.0 的一行：不是节点故障、重试一次后停下、不交班。
+    def test_no_such_tool_rule_is_not_node_failure_retry_once_no_rotation(self):
+        row = [line for line in self._lines() if "宿主报 `No such tool available`" in line]
         self.assertEqual(len(row), 1)
-        self.assertIn("不是节点故障", row[0])
-        self.assertIn("不交班", row[0])
+        for phrase in ("不是节点故障", "重试一次后停下", "不交班"):
+            self.assertIn(phrase, row[0])
 
 
 if __name__ == "__main__":

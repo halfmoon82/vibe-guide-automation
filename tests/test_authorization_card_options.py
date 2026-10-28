@@ -1,7 +1,7 @@
 """ISSUE-209: the card offers two operational choices, the runtime honours them.
 
 The card used to hard-code both numbers: the idle heartbeat base came from a
-constant (10, or 30 once a platform's push wake-up was verified) and the
+constant (10, or 60 once a platform's push wake-up was verified) and the
 rotation hard cap was ``DEFAULT_ROTATE_HARD_CAP``.  The product manager now
 picks both at publication, so the two things that can silently go wrong are:
 
@@ -96,12 +96,12 @@ class CardOptionAvailabilityTests(unittest.TestCase):
 
     def test_thirty_minutes_is_unavailable_until_the_push_wake_is_verified(self):
         options = heartbeat_interval_options(self.paths, "codex")
-        self.assertEqual([item["minutes"] for item in options], [10, 30])
+        self.assertEqual([item["minutes"] for item in options], [10, 60])
         self.assertTrue(options[0]["available"])
         # Not verified: selectable only as a forced choice with its price.
         self.assertTrue(options[1]["available"])
         self.assertTrue(options[1]["forced"])
-        self.assertIn("30 分钟", options[1]["cost"])
+        self.assertIn("60 分钟", options[1]["cost"])
         self.assertIn("no push wake verification registered", options[1]["reason"])
 
         self._verify()
@@ -113,7 +113,7 @@ class CardOptionAvailabilityTests(unittest.TestCase):
         # The card is built from the adapter id (``codex``) while the runtime
         # reads the address's provider (``codex-app-visible``).  If the two
         # spellings did not find the same registration, the card would offer
-        # nothing while the beat allowed 30 minutes -- the exact split between
+        # nothing while the beat allowed 60 minutes -- the exact split between
         # what was approved and what runs that this option exists to remove.
         self._verify(provider="codex-app-visible")
         self.assertTrue(heartbeat_interval_options(self.paths, "codex")[1]["available"])
@@ -123,7 +123,7 @@ class CardOptionAvailabilityTests(unittest.TestCase):
 
     def test_a_background_registration_never_answers_for_the_visible_path(self):
         # ``codex-background`` is the same platform but a different wake path;
-        # substituting its registration would offer 30 minutes on a visible task
+        # substituting its registration would offer 60 minutes on a visible task
         # whose wake-up was never verified.
         self._verify(provider="codex-background")
         options = heartbeat_interval_options(self.paths, "codex-app-visible")
@@ -132,7 +132,7 @@ class CardOptionAvailabilityTests(unittest.TestCase):
 
     def test_claude_code_has_a_channel_so_verification_alone_clears_the_force(self):
         # SendMessage is registered as Claude Code's channel; once both
-        # evidences are on file, 30 is an ordinary tier, not a forced one.
+        # evidences are on file, 60 is an ordinary tier, not a forced one.
         options = heartbeat_interval_options(self.paths, "claude-code")
         self.assertTrue(options[1]["forced"])
         self._verify(provider="claude-code")
@@ -214,7 +214,7 @@ class CardChoiceTests(unittest.TestCase):
         with self.assertRaises(ValueError) as raised:
             build_authorization_card(
                 plan, nodes, CAPS,
-                heartbeat_interval_minutes=30,
+                heartbeat_interval_minutes=60,
                 heartbeat_interval_options=heartbeat,
                 rotate_hard_cap_options=rotate,
             )
@@ -257,7 +257,7 @@ class CardChoiceTests(unittest.TestCase):
             rotate_hard_cap_options=rotate,
         )
         thirty = build_authorization_card(
-            plan, nodes, CAPS, heartbeat_interval_minutes=30,
+            plan, nodes, CAPS, heartbeat_interval_minutes=60,
             rotate_hard_cap=200000,
             heartbeat_interval_options=heartbeat,
             rotate_hard_cap_options=rotate,
@@ -275,12 +275,12 @@ class CardChoiceTests(unittest.TestCase):
         plan, nodes = _plan()
         heartbeat, rotate = self._options(verified=True, window=1000000)
         card = build_authorization_card(
-            plan, nodes, CAPS, heartbeat_interval_minutes=30, rotate_hard_cap=300000,
+            plan, nodes, CAPS, heartbeat_interval_minutes=60, rotate_hard_cap=300000,
             heartbeat_interval_options=heartbeat, rotate_hard_cap_options=rotate,
         )
         record = authorize(card, "AUTHORIZE")
         restored = AuthorizationRecord.from_dict(record.to_dict())
-        self.assertEqual(restored.heartbeat_interval_minutes, 30)
+        self.assertEqual(restored.heartbeat_interval_minutes, 60)
         self.assertEqual(restored.rotate_hard_cap, 300000)
         self.assertTrue(is_authorization_integrity_valid(restored))
 
@@ -321,11 +321,11 @@ class CardChoiceTests(unittest.TestCase):
         plan, nodes = _plan()
         heartbeat, rotate = self._options(verified=True, window=1000000)
         card = build_authorization_card(
-            plan, nodes, CAPS, heartbeat_interval_minutes=30, rotate_hard_cap=150000,
+            plan, nodes, CAPS, heartbeat_interval_minutes=60, rotate_hard_cap=150000,
             heartbeat_interval_options=heartbeat, rotate_hard_cap_options=rotate,
         )
         refreshed = refresh_authorization_card(plan, nodes, card)
-        self.assertEqual(refreshed.heartbeat_interval_minutes, 30)
+        self.assertEqual(refreshed.heartbeat_interval_minutes, 60)
         self.assertEqual(refreshed.rotate_hard_cap, 150000)
         # Availability is carried too, so the refreshed card still says which
         # tiers are unusable and why.
@@ -373,7 +373,7 @@ class PublishedCardTests(unittest.TestCase):
                          DEFAULT_HEARTBEAT_INTERVAL_MINUTES)
         self.assertEqual(card.rotate_hard_cap, DEFAULT_ROTATE_HARD_CAP_TOKENS)
         self.assertEqual([item["minutes"] for item in card.heartbeat_interval_options],
-                         [10, 30])
+                         [10, 60])
         self.assertEqual([item["tokens"] for item in card.rotate_hard_cap_options],
                          [150000, 200000, 300000, 500000, 800000])
         # The unusable tier is on the card, with its reason.
@@ -411,6 +411,31 @@ class PublishedCardTests(unittest.TestCase):
                                      "authorization-card.json").read_text())
                 self.assertEqual(stored["rotate_hard_cap"], cap)
 
+    def _verify_push(self, provider):
+        self.root.joinpath(".vibe").mkdir(exist_ok=True)
+        self.root.joinpath(".vibe/push-wake-verification.json").write_text(
+            json.dumps(_verified_payload(provider)), encoding="utf-8")
+
+    def test_publication_defaults_to_the_long_fallback_when_push_is_verified(self):
+        self._verify_push("codex")
+        _, _, card = _publish_plan(ProjectPaths(self.root), "push-plan", self._spec())
+        self.assertEqual(card.heartbeat_interval_minutes, 60)
+        self.assertEqual(card.rotate_hard_cap, DEFAULT_ROTATE_HARD_CAP_TOKENS)
+
+    def test_claude_code_publishes_background_by_default_and_visible_on_request(self):
+        def spec(**extra):
+            path = self._spec(**extra)
+            data = json.loads(path.read_text())
+            data["capabilities"]["agent_id"] = "claude-code"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            return path
+
+        _, _, default = _publish_plan(ProjectPaths(self.root), "bg-plan", spec())
+        self.assertEqual({w["topology"] for w in default.workers}, {"background"})
+        _, _, visible = _publish_plan(
+            ProjectPaths(self.root), "vis-plan", spec(dispatch_mode="visible"))
+        self.assertNotIn("background", {w["topology"] for w in (visible.workers or ())})
+
     def test_a_published_choice_is_read_back_from_the_plan(self):
         self.root.joinpath(".vibe").mkdir(exist_ok=True)
         self.root.joinpath(".vibe/push-wake-verification.json").write_text(
@@ -420,15 +445,15 @@ class PublishedCardTests(unittest.TestCase):
         _session_record(record, 1000, window=1000000)
         _, _, card = _publish_plan(
             ProjectPaths(self.root), "chosen-plan",
-            self._spec(heartbeat_interval_minutes=30, rotate_hard_cap=300000),
+            self._spec(heartbeat_interval_minutes=60, rotate_hard_cap=300000),
             session_record=str(record),
         )
-        self.assertEqual(card.heartbeat_interval_minutes, 30)
+        self.assertEqual(card.heartbeat_interval_minutes, 60)
         self.assertEqual(card.rotate_hard_cap, 300000)
         stored = json.loads(
             (self.root / ".vibe/plans/chosen-plan/authorization-card.json").read_text()
         )
-        self.assertEqual(stored["heartbeat_interval_minutes"], 30)
+        self.assertEqual(stored["heartbeat_interval_minutes"], 60)
         self.assertEqual(stored["rotate_hard_cap"], 300000)
 
 
@@ -521,8 +546,8 @@ class RuntimeChoiceTests(unittest.TestCase):
         self._verify()
         self._authorization(heartbeat_interval_minutes=10)
         self.assertEqual(heartbeat_interval(self.paths, "run-1", decision_only=False)["minutes"], 10)
-        self._authorization(heartbeat_interval_minutes=30)
-        self.assertEqual(heartbeat_interval(self.paths, "run-1", decision_only=False)["minutes"], 30)
+        self._authorization(heartbeat_interval_minutes=60)
+        self.assertEqual(heartbeat_interval(self.paths, "run-1", decision_only=False)["minutes"], 60)
 
     def test_a_value_outside_the_card_vocabulary_reads_as_no_choice(self):
         # The record is signed, but a corrupted or hand-edited file must not be
@@ -552,16 +577,16 @@ class RuntimeChoiceTests(unittest.TestCase):
 
     def test_a_revoked_verification_falls_back_and_names_the_choice(self):
         self._verify()
-        self._authorization(heartbeat_interval_minutes=30)  # card carries no force
+        self._authorization(heartbeat_interval_minutes=60)  # card carries no force
         (self.root / ".vibe/push-wake-verification.json").unlink()
         interval = heartbeat_interval(self.paths, "run-1", decision_only=False)
         self.assertEqual(interval["minutes"], 10)
-        self.assertIn("30", interval["reason"])
+        self.assertIn("60", interval["reason"])
 
     def test_the_old_automatic_upgrade_still_applies_without_a_choice(self):
         self._verify()
         self._authorization()
-        self.assertEqual(heartbeat_interval(self.paths, "run-1", decision_only=False)["minutes"], 30)
+        self.assertEqual(heartbeat_interval(self.paths, "run-1", decision_only=False)["minutes"], 60)
 
 
 if __name__ == "__main__":

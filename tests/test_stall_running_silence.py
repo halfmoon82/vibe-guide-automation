@@ -13,6 +13,20 @@ import os
 import tempfile
 import time
 import unittest
+
+from unittest import mock as _beat_mock
+
+# 本文件在一秒内连续调用 beat 来模拟多拍；关掉 120 秒同状态防重复窗口（该行为由
+# test_supervisor_runtime_consolidation 覆盖）。
+_NO_BEAT_REPEAT_WINDOW = _beat_mock.patch("vibe_guide.supervisor.BEAT_REPEAT_WINDOW_SECONDS", 0)
+
+
+def setUpModule():
+    _NO_BEAT_REPEAT_WINDOW.start()
+
+
+def tearDownModule():
+    _NO_BEAT_REPEAT_WINDOW.stop()
 from pathlib import Path
 from unittest.mock import patch
 
@@ -80,7 +94,7 @@ class SilentWorkerTests(RunningWorkerFixture):
         for _ in range(6):
             out = self.beat()
         self.assertIsNone(self.stall_entry(out))
-        self.assertEqual(out.text, "idle")
+        self.assertTrue(out.text.startswith("idle：本轮结束"), out.text)
         self.assertEqual(self.view()["user_status"], "已启动")
 
     def test_probe_does_not_change_the_progress_fingerprint(self):
@@ -167,7 +181,7 @@ class ReviewFixesTests(RunningWorkerFixture):
         snapshot.nodes[NODE]["active_task"]["task_id"] = "developer:n1"
         save_snapshot(self.paths, snapshot)
         out = self.beat()
-        self.assertEqual(out.text, "idle")
+        self.assertTrue(out.text.startswith("idle：本轮结束"), out.text)
 
     def test_heal_verify_with_no_evidence_never_passes(self):
         snapshot = load_snapshot(self.paths, self.run_id)

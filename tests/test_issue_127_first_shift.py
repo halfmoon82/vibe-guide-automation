@@ -29,7 +29,7 @@ class PrdGuideOpeningStepTests(unittest.TestCase):
 
     def section_and_opening(self):
         text = load_protocol("prd-guide")
-        start = text.index("## 6. 服务监工信箱")
+        start = text.index("## 6. 监工")
         section = text[start:text.index("\n## 7. ", start)]
         opening_start = section.index("### 6.0")
         opening_end = section.find("\n### ", opening_start)
@@ -73,7 +73,10 @@ class EntryProtocolFirstShiftTests(unittest.TestCase):
     def test_first_shift_is_a_fixed_step_of_the_complex_path(self):
         path = self.complex_path()
         self.assertIn("supervisor-register", path)
-        self.assertIn("supervisor-preflight", path)
+        # The preflight now runs inside `supervisor-beat`; the first shift
+        # starts the daemon and installs the beat command.
+        self.assertIn("daemon start", path)
+        self.assertIn("supervisor-beat", path)
 
     def test_first_shift_points_at_the_opening_section(self):
         self.assertIn("6.0", self.complex_path())

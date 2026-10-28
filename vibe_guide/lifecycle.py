@@ -78,3 +78,23 @@ def migrate_task_record(record: Mapping[str, Any]) -> Dict[str, Any]:
     if raw_status is not None and normalize_task_status(raw_status) == CanonicalTaskStatus.BLOCKED_UNKNOWN:
         legacy.setdefault("status", raw_status)
     return result
+
+
+# Unified status sets.  Values mirror the sets that exist today in the modules
+# named below; tests/test_lifecycle_status.py pins every difference.
+#: Node statuses in which work is in flight (state.py user-active minus the
+#: finished ones).
+ACTIVE_NODE_STATUSES = frozenset({"running", "review", "rework", "delivered"})
+#: Node statuses that never run again (stall.TERMINAL_STATUSES).
+TERMINAL_NODE_STATUSES = frozenset({"accepted"})
+#: Node statuses with a bound worker session (state._WORKER_SESSION_STATUSES).
+SESSION_OCCUPYING_STATUSES = frozenset({"running", "review", "rework"})
+#: Every status a task-registry binding may carry (task_registry._STATUSES).
+TASK_STATUSES = frozenset({
+    "created", "start_pending", "running", "delivered", "review", "rework",
+    "accepted", "archived", "blocked_design", "blocked_unknown", "failed", "stopped",
+})
+#: Task-registry statuses that end a task (task_registry._TERMINAL_STATUSES).
+TERMINAL_TASK_STATUSES = frozenset({"archived", "blocked_design", "failed", "stopped"})
+#: Provider-wait statuses that end a runner action (provider_action.WAIT_TERMINAL_STATUSES).
+RUNNER_TERMINAL_STATUSES = frozenset({"complete", "completed", "failed", "stopped"})

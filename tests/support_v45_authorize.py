@@ -93,7 +93,7 @@ _NODE_SPEC = {
 _REQUEST = "设计并实现探针功能，集成测试与部署 workflow pipeline 迁移"
 
 
-def publish_complex_probe(case) -> Path:
+def publish_complex_probe(case, dispatch_mode=None) -> Path:
     """Return a project root holding a freshly published complex plan."""
     root = Path(tempfile.mkdtemp(prefix="v45-authorize-"))
     case.addCleanup(_cleanup, root)
@@ -108,7 +108,8 @@ def publish_complex_probe(case) -> Path:
     )
 
     spec_path = root / "node-spec.json"
-    spec_path.write_text(json.dumps(_NODE_SPEC, ensure_ascii=False), encoding="utf-8")
+    spec = dict(_NODE_SPEC, **({"dispatch_mode": dispatch_mode} if dispatch_mode else {}))
+    spec_path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
     published = run_cli(
         [
             "plan", "--json", "--request", _REQUEST, "--s1", "5,5,5,5,5",

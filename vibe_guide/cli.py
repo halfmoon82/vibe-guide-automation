@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -40,7 +41,8 @@ from .doctor import doctor
 from .initializer import _rules_target, apply_agentsmd_proposal, init_project, refresh_protocol_copies
 from . import host_rules
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
-from .monitor import Monitor, ScopeDecisionRequired
+from .monitor import BLOCKED_UNKNOWN_DISPOSITION_KINDS, Monitor, ScopeDecisionRequired
+from .monitor_handoff import current_plan_digests, record_event
 from .supervisor_output import supervisor_output_batch
 from .supervisor_wakeup import idle_heartbeat_minutes, preflight_with_checkpoint
 from .supervisor import (
@@ -49,6 +51,9 @@ from .supervisor import (
     authorization_card_summary,
     current_supervisor_address,
     supervisor_mailbox_view,
+    provider_never_rotates,
+    mailbox_complete,
+    mailbox_result_template,
     beat_stall_report,
     render_stall_beat_text,
     heal_verify,
@@ -69,19 +74,20 @@ from .supervisor import (
     record_heartbeat_interval,
     HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
     HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
-    HEARTBEAT_INTERVAL_DECISION_MINUTES,
     DEFAULT_ROTATE_HARD_CAP,
     DEFAULT_ROTATE_SOFT_CAP,
     DEFAULT_ROTATE_TOKEN_THRESHOLD,
     rotate_hard_cap_for_run,
     supervisor_holds,
     supervisor_preflight,
+    supervisor_beat,
     HOST_SHIFT_DIFFERENCES,
     SESSION_RECORD_HINT,
 )
 from .change_requests import ChangeRequest, classify_merge_capability
 from .deploy import authorize_deploy, plan_deploy, verify_deploy, start_deploy
 from .paths import ProjectPaths
+from .publish import publish_plan as _publish_plan
 from .planner import (
     DecisionCard,
     PRD,
@@ -187,8 +193,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify'),
+        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon'),
     )
+    parser.add_argument("daemon_action", nargs="?", choices=("start", "status", "stop", "run", "register-pm"))
+    parser.add_argument("--interval", dest="daemon_interval", type=float, default=None)
+    parser.add_argument("--model", dest="daemon_model", default=None)
+    parser.add_argument("--session-name", dest="pm_session_name", default=None)
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--host-rules", dest="host_rules", choices=("skip", "apply", "rollback"),
@@ -209,7 +219,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--provenance")
     parser.add_argument("--project-id", dest="project_id")
     parser.add_argument("--authorize")
-    parser.add_argument("--authorization-token", dest="legacy_authorization")
     parser.add_argument("--manifest")
     parser.add_argument("--acceptance-state")
     parser.add_argument("--observations")
@@ -237,6 +246,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--authorization-gap", dest="hold_authorization_gap")
     parser.add_argument("--release", action="store_true", dest="hold_release")
     parser.add_argument("--node", dest="node_id")
+    parser.add_argument("--complete", dest="mailbox_complete", metavar="ACTION_ID",
+                        help="supervisor-mailbox: 把 --result 写成该信箱请求的回写（--result 为文件或 -）")
+    parser.add_argument("--template", dest="mailbox_template", metavar="ACTION_ID",
+                        help="supervisor-mailbox: 输出该请求回写的示例")
+    parser.add_argument("--result", dest="mailbox_result")
+    parser.add_argument("--disposition", dest="blocked_disposition",
+                        help="blocked-unknown: confirmed_benign|escalated_to_findings|resolved_with_facts|deferred_to_acceptance")
+    parser.add_argument("--item", dest="blocked_item",
+                        help="blocked-unknown: 只处置这一项（缺省处置该节点全部待处置项）")
     parser.add_argument("--role", dest="role", default="developer")
     parser.add_argument(
         "--payload",
@@ -995,7 +1013,7 @@ def _record_worktree_preflight(
             for key in _WORKTREE_REPORT_KEYS:
                 if report.get(key):
                     data[key] = report[key]
-            monitor._record(snapshot, event, data)
+            record_event(monitor, snapshot, event, data)
             current["worktree_preflight"] = {
                 key: value for key, value in data.items()
                 if key not in ("run_id", "node_id")
@@ -1005,7 +1023,7 @@ def _record_worktree_preflight(
             for key in _WORKTREE_REPORT_KEYS:
                 if report.get(key):
                     data[key] = report[key]
-            monitor._record(snapshot, event, data)
+            record_event(monitor, snapshot, event, data)
             current.pop("worktree_preflight", None)
         elif WORKTREE_PREFLIGHT_KEY in current:
             # The directory is there and matches the contract now (the report
@@ -1072,224 +1090,69 @@ def _s1_arg(entry: Any) -> str:
     return ",".join(str(value) for value in (score.steps, score.domains, score.uncertainty, score.failure_cost, score.toolchain))
 
 
-def _replace_draft(destination: Path, staging: Path) -> None:
-    """Swap a published staging directory in for a session draft.
+def _supervisor_mailbox_write(paths: ProjectPaths, args: argparse.Namespace) -> CLIResult:
+    """supervisor-mailbox --template / --complete: nothing is written unless the result is accepted."""
+    def blocked(reason: str) -> CLIResult:
+        return _result(BLOCKED, {"command": "supervisor-mailbox", "status": "blocked_invalid", "reason": reason},
+                       "信箱回写未写入：" + reason, args.as_json)
 
-    The draft is moved aside first and judged again there: whatever landed
-    in it before the move (another publication, a run) is caught while the
-    draft can still be put back.  Files the agent kept in the draft (the
-    product spec) move along; a name the publication itself writes is a
-    collision and aborts.  Any failure restores the draft.
-    """
-    holding = Path(tempfile.mkdtemp(prefix="." + destination.name + ".draft.", dir=str(destination.parent)))
-    parked = holding / "draft"
+    if args.mailbox_complete and args.mailbox_template:
+        return blocked("--complete 与 --template 只能二选一")
     try:
-        os.rename(str(destination), str(parked))
-    except BaseException:
-        # rmdir, not rmtree: an interrupt landing after the rename succeeded
-        # leaves the draft in here, and it must stay recoverable.
-        try:
-            os.rmdir(str(holding))
-        except OSError:
-            pass
-        raise
-    try:
-        extras = replaceable_draft_extras(parked)
-        if extras is None:
-            raise FileExistsError("plan already exists")
-        for extra in extras:
-            target = staging / extra.name
-            if target.exists() or target.is_symlink():
-                raise FileExistsError("plan already exists: draft file {} collides with the publication".format(extra.name))
-            shutil.copy2(str(extra), str(target))
-        os.replace(str(staging), str(destination))
-    except BaseException:
-        try:
-            os.rename(str(parked), str(destination))
-        except OSError as error:
-            raise OSError("draft could not be restored; it is kept at {}".format(parked)) from error
-        shutil.rmtree(str(holding), ignore_errors=True)
-        raise
-    shutil.rmtree(str(holding), ignore_errors=True)
-
-
-def _publish_plan(
-    paths: ProjectPaths, plan_id: str, source: Any, session_record: Optional[str] = None
-) -> Tuple[Plan, List[DAGNode], AuthorizationCard]:
-    # Callers hand over a normalized spec dict; a path is still accepted for
-    # the legacy direct-publish callers.
-    if isinstance(source, (str, Path)):
-        source = _read_json(Path(source))
-    if not isinstance(source, dict):
-        raise ValueError("node spec must be a JSON object")
-    decisions = [DecisionCard(**item) for item in source.get("decisions", [])]
-    prd = PRD(
-        str(source.get("title", "")).strip(),
-        str(source.get("objective", "")).strip(),
-    )
-    if not prd.title or not prd.objective:
-        raise ValueError("approved PRD title and objective are required")
-    approval = approve_prd(prd, decisions)
-    if not approval.approved:
-        raise PermissionError("product decisions remain unresolved")
-    raw_nodes = source.get("nodes", [])
-    # The band is settled by node_spec.normalize_node_spec from the session
-    # route; a spec carrying an integration contract is complex by definition.
-    is_complex_spec = source.get("complexity_band") == "complex" or bool(source.get("integration_contract"))
-    source_capabilities = AgentCapabilities.from_dict(source.get("capabilities", {}))
-    project_id = source.get("project_id")
-    # Visible task routing requires a confirmed project id. Legacy/background
-    # node specs predate that field and remain valid because they do not use
-    # the visible desktop-task route.
-    if source_capabilities.level == "full" and (not isinstance(project_id, str) or not project_id.strip()):
-        raise ValueError("node spec project_id is required for visible task routing")
-    if not isinstance(project_id, str) or not project_id.strip():
-        project_id = None
-    complete_node_contracts(raw_nodes, source_capabilities.agent_id, project_id.strip() if project_id else None)
-    nodes = [DAGNode.from_dict(item) for item in raw_nodes]
-    if not nodes:
-        raise ValueError("node spec must contain at least one node")
-    validation = validate_dag(nodes)
-    if not validation.valid:
-        raise ValueError("DAG is invalid: " + "; ".join(validation.errors))
-
-    destination = _plan_root(paths, plan_id)
-    plan = Plan(
-        plan_id,
-        1,
-        str(Path(".vibe") / "plans" / plan_id / "prd.md"),
-        [node.id for node in nodes],
-        "confirmed_pending_authorization",
-        authorization_required=True,
-        decisions=[asdict(item) for item in decisions],
-        nodes=nodes,
-        complexity_band="complex" if is_complex_spec else "",
-        spec_path=str(source.get("spec_path", "spec.md" if is_complex_spec else "")),
-        integration_contract=source.get("integration_contract", {}),
-        implementation_plan_path=str(Path(".vibe") / "plans" / plan_id / "planning-brief.md"),
-    )
-    if is_complex_spec:
-        plan = append_integration_review_node(plan)
-    nodes = list(plan.nodes)
-    capabilities = source_capabilities
-    engine_attestation = None
-    try:
-        if is_complex_spec:
-            observed_store = ProviderActionStore(paths).capabilities(
-                capabilities.agent_id
-            )
-            engine_attestation = create_engine_attestation(
-                plan.plan_id,
-                plan.version,
-                "vibeguide_monitor",
-                "dag",
-                observed_store["adapter_id"],
-                observed_store["facts"],
-                observed_store["provenance"],
-                datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-            )
-        capabilities = _observed_adapter(paths, capabilities.agent_id).capabilities
-    except (FileNotFoundError, OSError, TypeError, ValueError, ProviderPending):
-        if is_complex_spec:
-            raise PermissionError("engine_attestation_unavailable: verified Monitor engine evidence is required")
-        # Planning remains usable for explicitly injected/background test paths;
-        # the public monitor rechecks live observed capability before execution.
-        pass
-    _first_card_rulings = _observed_topology_rulings(paths)
-    # ISSUE-209: the card offers both operational choices with the availability
-    # this publication actually observed, and records the product manager's
-    # selection.  Availability comes from the platform's registered push
-    # wake-up and from the context window the publishing session reports; an
-    # unusable tier is listed with its reason, never hidden.
-    _heartbeat_options = heartbeat_interval_options(paths, capabilities.agent_id)
-    _rotate_options = rotate_hard_cap_options(context_window_from_record(session_record))
-    # An explicit ``null`` in the spec means "not stated", not "record nothing":
-    # a fresh publication always records a choice, and only a card written
-    # before the option existed is allowed to carry none.
-    _heartbeat_choice = source.get("heartbeat_interval_minutes")
-    _rotate_choice = source.get("rotate_hard_cap")
-    card = build_authorization_card(
-        plan,
-        nodes,
-        capabilities,
-        active_pair_limit=source.get("active_pair_limit"),
-        allowed_actions=source.get("allowed_actions"),
-        remote_git_actions=source.get("remote_git_actions", "deny"),
-        engine_attestation=engine_attestation,
-        topology_rulings=_first_card_rulings,
-        workers=_background_worker_entries(nodes, _first_card_rulings, paths),
-        heartbeat_interval_minutes=(
-            HEARTBEAT_INTERVAL_DEFAULT_MINUTES
-            if _heartbeat_choice is None
-            else _heartbeat_choice
-        ),
-        rotate_hard_cap=(
-            DEFAULT_ROTATE_HARD_CAP if _rotate_choice is None else _rotate_choice
-        ),
-        heartbeat_interval_options=_heartbeat_options,
-        rotate_hard_cap_options=_rotate_options,
-    )
-
-    plans_root = destination.parent
-    if plans_root.is_symlink():
-        raise ValueError("plans directory may not be a symlink")
-    plans_root.mkdir(parents=True, exist_ok=True)
-    # A session draft under the same id never held an authorization, so the
-    # protocol publishes over it; anything further along is never replaced.
-    # _plan_root resolves symlinks, so look at the id's own entry: an alias
-    # must never publish over the draft it points to.
-    is_draft = False
-    if (paths.vibe / "plans" / plan_id).is_symlink():
-        raise FileExistsError("plan already exists")
-    if destination.exists() or destination.is_symlink():
-        if replaceable_draft_extras(destination) is None:
-            raise FileExistsError("plan already exists")
-        is_draft = True
-    staging = Path(tempfile.mkdtemp(prefix="." + plan_id + ".", dir=str(plans_root)))
-    try:
-        render_plan_artifacts(plan, staging)
-        (staging / "specs").mkdir()
-        (staging / "issues").mkdir()
-        if engine_attestation is not None:
-            _atomic_json(staging / "engine-attestation.json", engine_attestation)
-        (staging / "prd.md").write_text(
-            render_prd_markdown(source, decisions, plan.evidence_priority), encoding="utf-8",
-        )
-        (staging / "planning-brief.md").write_text(
-            render_planning_brief_markdown(plan_id, source, plan), encoding="utf-8",
-        )
-        for node in nodes:
-            contract = node.contract
-            (staging / "specs" / (node.id + ".md")).write_text(
-                "# Spec: {}\n\nnode_id: {}\n状态：published\n审核：reviewed\n\n输入：{}\n\n输出：{}\n\n错误行为：{}\n\n验收示例：{}\n".format(
-                    node.title, node.id,
-                    contract.get("input"),
-                    contract.get("output"),
-                    contract.get("error_behavior"),
-                    contract.get("acceptance_example"),
-                ),
-                encoding="utf-8",
-            )
-            (staging / "issues" / (node.id + ".md")).write_text(
-                "# Issue: {}\n\nissue_id: {}\n状态：published\n审核：reviewed\n\n并行组：{}\n".format(
-                    node.title, node.id, node.parallel_group or "none"
-                ),
-                encoding="utf-8",
-            )
-        _atomic_json(staging / "plan.json", plan.to_dict())
-        _atomic_json(staging / "nodes.json", [node.to_dict() for node in nodes])
-        _atomic_json(staging / "authorization-card.json", card.to_dict())
-        _atomic_json(staging / "dag-audit.json", {"status": "reviewed", "node_count": len(nodes), "plan_revision": str(plan.version), "node_ids": [node.id for node in nodes]})
-        _atomic_json(staging / "plan-confirmation.json", {"status": "confirmed", "plan_id": plan.plan_id, "plan_revision": str(plan.version), "authorization_digest": card.digest, "authorization_required": True})
-        if is_draft:
-            _replace_draft(destination, staging)
+        if args.mailbox_template:
+            payload = mailbox_result_template(paths, args.run_id, args.mailbox_template)
+            return _result(SUCCESS, payload, json.dumps(payload, ensure_ascii=False, indent=2), args.as_json)
+        if not args.mailbox_result:
+            return blocked("--complete 需要 --result <文件或 ->")
+        if args.mailbox_result == "-":
+            raw = sys.stdin.read()
         else:
-            os.replace(str(staging), str(destination))
-    except BaseException:
-        if staging.exists():
-            shutil.rmtree(staging)
-        raise
-    return plan, nodes, card
+            raw = Path(args.mailbox_result).read_text(encoding="utf-8")
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError as error:
+            return blocked("--result 不是合法 JSON：{}".format(error.msg))
+        payload = mailbox_complete(paths, args.run_id, args.mailbox_complete, result)
+    except (OSError, TypeError, ValueError) as error:
+        return blocked(str(error)[:400])
+    text = "该请求此前已回写，未重复写入" if payload["status"] == "already_completed" else "信箱回写已写入"
+    return _result(SUCCESS, payload, text, args.as_json)
+
+
+def _blocked_unknown_command(paths: ProjectPaths, args: argparse.Namespace) -> CLIResult:
+    """blocked-unknown: record one disposition per pending item of a paused node."""
+    def blocked(reason: str) -> CLIResult:
+        return _result(BLOCKED, {"command": "blocked-unknown", "status": "blocked_invalid", "reason": reason},
+                       "blocked_unknown 处置未记录：" + reason, args.as_json)
+
+    missing = [name for name, value in (("--run-id", args.run_id), ("--node", args.node_id),
+                                        ("--disposition", args.blocked_disposition),
+                                        ("--reason", args.hold_reason)) if not value]
+    if missing:
+        return blocked("缺少参数：" + ", ".join(missing))
+    try:
+        if args.blocked_disposition not in BLOCKED_UNKNOWN_DISPOSITION_KINDS:
+            return blocked("--disposition 必须是：" + ", ".join(BLOCKED_UNKNOWN_DISPOSITION_KINDS))
+        current = load_snapshot(paths, args.run_id)
+        node = current.nodes.get(args.node_id)
+        if node is None:
+            return blocked("运行里没有节点 " + args.node_id)
+        pending = list(node.get("blocked_unknowns_pending") or [])
+        items = [args.blocked_item] if args.blocked_item else pending
+        if not items or any(item not in pending for item in items):
+            return blocked("节点没有可处置的待处置项（待处置：{}）".format(pending or "无"))
+        _directory, plan, nodes, card = _load_plan(paths, current.plan_id)
+        monitor = Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card))
+        for item in items:
+            snapshot = monitor.record_blocked_unknown_disposition(
+                args.run_id, args.node_id, item, args.blocked_disposition, args.hold_reason
+            )
+    except (FileNotFoundError, OSError, TypeError, ValueError, PermissionError) as error:
+        return blocked(str(error)[:400])
+    payload = {"command": "blocked-unknown", "status": "recorded", "run_id": args.run_id,
+               "node": args.node_id, "disposition": args.blocked_disposition, "items": items,
+               "remaining_pending": snapshot.nodes[args.node_id].get("blocked_unknowns_pending") or []}
+    return _result(SUCCESS, payload, "已记录 {} 项处置（{}）".format(len(items), args.blocked_disposition), args.as_json)
 
 
 def _load_plan(paths: ProjectPaths, plan_id: str):
@@ -1560,7 +1423,7 @@ def _renew_engine_attestation_if_stale(
     monitor = Monitor(
         paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card)
     )
-    current_prd, current_spec = monitor._current_plan_digests()
+    current_prd, current_spec = current_plan_digests(monitor)
     contract_unchanged = (
         is_authorization_valid(record, plan, nodes)
         and snapshot.authorization_digest == record.digest
@@ -2057,18 +1920,17 @@ def _first_shift_handoff(
         "     {}\n"
         "  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n"
         "     {}\n"
-        "     心跳按 {} 分钟建；命令输出会给出下一拍间隔（{}/{}/{} 分钟），与当前周期不一致时按输出调整。\n"
-        "     每拍只运行这一条；输出 idle 时只回一个字，decision 时向用户呈现未答卡片，work/unknown/rotate 时按输出分支继续。\n"
-        "没登记地址，worker 的完工唤醒信号无处可发；没心跳，rotate 的阈值检测不会发生。\n"
+        "     心跳按 {} 分钟建；命令输出会给出下一拍间隔（推送唤醒已验证或只剩未答决策时 {} 分钟），与当前周期不一致时按输出调整。\n"
+        "     每拍只运行这一条；输出 idle 时只回一个字，decision 时向用户呈现未答卡片，work/unknown 时按输出分支继续；"
+        "rotate 只会出现在有换班原语的平台，Claude Code 不换班，到上限也同会话继续。\n"
+        "没登记地址，worker 的完工唤醒信号无处可发；没心跳，空转与换班的检测不会发生。\n"
         "{}"
     ).format(
         run_id,
         SESSION_RECORD_HINT,
         heartbeat_command(run_id),
         HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
-        HEARTBEAT_INTERVAL_DEFAULT_MINUTES,
         HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES,
-        HEARTBEAT_INTERVAL_DECISION_MINUTES,
         HOST_SHIFT_DIFFERENCES,
     )
 
@@ -2423,8 +2285,16 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
     if args.command == "supervisor-mailbox":
         if not args.run_id:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        if args.mailbox_complete or args.mailbox_template:
+            return _supervisor_mailbox_write(paths, args)
         payload = supervisor_mailbox_view(paths, args.run_id)
         return _result(SUCCESS if payload["status"] == "ok" else UNKNOWN, payload, json.dumps(payload, ensure_ascii=False), args.as_json)
+
+    if args.command == "blocked-unknown":
+        return _blocked_unknown_command(paths, args)
+
+    if args.command == "daemon":
+        return _handle_daemon(args, paths, runner, supervisor_command_prefix, v2_state)
 
     if args.command == "heal-verify":
         if not (args.run_id and args.node_id):
@@ -2448,60 +2318,13 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             kwargs["token_threshold"] = args.token_threshold
         if args.context_hard_cap is not None:
             kwargs["context_hard_cap"] = args.context_hard_cap
-        payload = supervisor_preflight(paths, args.run_id, args.session_record,
-                                       accept_decision=args.accept_decision, **kwargs)
-        if payload.get("prepare_handoff"):
-            try:
-                handoff, _ = supervisor_handoff(paths, args.run_id, command_prefix=supervisor_command_prefix)
-                payload["handoff_summary"] = handoff["handoff_summary"]
-            except (FileNotFoundError, TypeError, ValueError, OSError) as error:
-                payload = {**payload, "handoff_status": "unknown",
-                           "handoff_error": "handoff preparation failed: " + str(error)}
-                if payload["state"] != "rotate":
-                    payload["state"] = "unknown"
-        state = payload.get("state")
-        try:
-            plan_id = load_snapshot(paths, args.run_id).plan_id
-        except (FileNotFoundError, OSError, TypeError, ValueError):
-            plan_id = "<plan_id>"
-        interval = _beat_interval(paths, args.run_id, payload, persist=True)
-        payload["heartbeat_interval"] = interval
-        tail = "；下一拍间隔 {} 分钟".format(interval["minutes"])
-        if state == "idle":
-            # 保持输出恰为 "idle"（既有测试与"只回一个字"的约定）；间隔见 JSON 的 heartbeat_interval。
-            text = "idle"
-        elif state == "decision":
-            text = "decision：读取决策信箱并向用户呈现未答卡片；心跳降频到 {} 分钟但不暂停，答案写回后恢复{}".format(
-                HEARTBEAT_INTERVAL_DECISION_MINUTES, tail)
-        elif state == "work":
-            text = "work：按 prd-guide §6.1 服务信箱一轮，推进用 {} resume --plan {} --run-id {}".format(
-                supervisor_command_prefix, plan_id, args.run_id
-            ) + tail
-        elif state == "contract_drift":
-            text = "contract_drift：能力合同与运行快照不一致，停止推进，立即走同一运行的重新授权流程；{}".format(
-                payload.get("hint", "")) + tail
-        elif state == "rotate":
-            text = "rotate：新开一个会话（必须建在本项目里：Codex 桌面用 create_thread 的 project 目标，禁止 projectless，否则读写 .vibe/ 逐条弹审批，#231；必须是全新会话，不要 fork_thread，fork 带整段历史会被登记拒绝），让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(
-                supervisor_command_prefix, args.run_id
-            ) + tail
-        else:
-            text = "unknown：按 work 处理，推进用 {} resume --plan {} --run-id {}；原因：{}".format(
-                supervisor_command_prefix, plan_id, args.run_id, payload.get("reason", "状态未知")
-            ) + tail
-        stall_report = beat_stall_report(paths, args.run_id)
-        payload["stall"] = stall_report
-        stall_text = render_stall_beat_text(stall_report, args.run_id, supervisor_command_prefix)
-        if stall_text:
-            # The stall line leads so the supervisor cannot read "idle"/"work"
-            # past it; rotate and contract_drift stay first (they stop the beat).
-            text = text + "\n" + stall_text if state in {"rotate", "contract_drift"} else stall_text + "\n" + text
-        code = SUCCESS if state in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
-        return _result(
-            code,
-            {"command": args.command, "heartbeat_command": heartbeat_command(args.run_id, command_prefix=supervisor_command_prefix), **payload},
-            text,
-            args.as_json,
+        payload, text, ok = supervisor_beat(
+            paths, args.run_id, args.session_record,
+            accept_decision=args.accept_decision, command_prefix=supervisor_command_prefix,
+            interval_for=lambda beat_payload: _beat_interval(paths, args.run_id, beat_payload, persist=True),
+            preflight_kwargs=kwargs,
         )
+        return _result(SUCCESS if ok else UNKNOWN, {"command": args.command, **payload}, text, args.as_json)
 
     if args.command == "decision-raise":
         if not (args.run_id and args.node_id and args.decision_question):
@@ -2610,7 +2433,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 single, _ = load_supervisor_single_shift(paths.root)
             except ValueError:
                 single = None
-            if single:
+            if provider_never_rotates(args.supervisor_provider):
+                rule = "Claude Code 不换班：到 {:,} 只提示上下文压力，同会话继续".format(cap)
+            elif single:
                 rule = "单班：只在达到硬上限 {:,} 时换班".format(cap)
             elif single is False:
                 rule = "增长换班（supervisor_single_shift=false）：达到硬上限 {:,}，或过 {:,} 后自接班增长 {:,} 时换班".format(
@@ -3762,63 +3587,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 paths, plan, nodes,
                 topology_rulings=_observed_topology_rulings(paths, _card),
             )
-            if isinstance(package, dict) and package.get('kind') == 'scope_correction':
-                snapshot = monitor.reconcile_scope(args.run_id, package)
-            elif isinstance(package, dict) and package.get('kind') == 'created_successor':
-                required = {'kind', 'node_id', 'action_id', 'request_digest',
-                            'predecessor_archive', 'preservation_path', 'preservation_digest'}
-                if set(package) != required or package['node_id'] not in monitor.nodes:
-                    raise ValueError('created successor reconciliation package is invalid')
-                target_runner = runner if runner is not None else _public_runner(paths, _card, nodes)
-                snapshot = monitor.reconcile_created_successor(args.run_id, package['node_id'],
-                    target_runner, **{key: package[key] for key in required - {'kind', 'node_id'}})
-                invalidation = _invalidation_path(directory)
-                if invalidation.exists():
-                    # Recheck the unchanged authorization and corrected runtime
-                    # projection; the old marker's prose is never permission.
-                    monitor._require_snapshot_authorization(snapshot)
-                    monitor._validate_execution_topology(snapshot)
-                    if invalidation.is_symlink() or _card.digest != snapshot.authorization_digest:
-                        raise ValueError('reconciled authorization does not match the current card')
-                    raw_invalidation = invalidation.read_bytes()
-                    marker = json.loads(raw_invalidation)
-                    if (not isinstance(marker, dict) or marker.get('status') != 'blocked_design'
-                            or marker.get('change_reason') != 'executable_contract_changed'):
-                        raise ValueError('invalidation requires a separate authorization decision')
-                    from .state import _atomic_bytes, run_dir, save_snapshot
-                    digest = hashlib.sha256(raw_invalidation).hexdigest()
-                    archive = run_dir(paths, args.run_id) / 'recovery' / ('invalidation-' + digest + '.json')
-                    if archive.parent.is_symlink() or archive.is_symlink():
-                        raise ValueError('invalidation archive may not traverse a symlink')
-                    _atomic_bytes(archive, raw_invalidation)
-                    monitor._record_topology_projection(snapshot, 'monitor.reconcile_successor',
-                        recovery_evidence={'invalidation_path': str(archive),
-                            'invalidation_digest': digest, 'authorization_digest': snapshot.authorization_digest})
-                    save_snapshot(paths, snapshot)
-                    if invalidation.read_bytes() != raw_invalidation:
-                        raise ValueError('invalidation changed during reconciliation')
-                    invalidation.unlink()
-            elif isinstance(package, dict) and package.get('kind') == 'adopted_dispatch':
-                from .orphan_recovery import ADOPTED_DISPATCH_PACKAGE, adopt_orphan_dispatch
-                if set(package) != ADOPTED_DISPATCH_PACKAGE or package['node_id'] not in monitor.nodes:
-                    raise ValueError('adopted dispatch reconciliation package is invalid')
-                if _invalidation_path(directory).exists() or _invalidation_path(directory).is_symlink():
-                    raise ValueError('authorization is invalidated; reauthorize before adopting')
-                target_runner = runner if runner is not None else _public_runner(paths, _card, nodes)
-                snapshot = adopt_orphan_dispatch(monitor, args.run_id, package['node_id'],
-                                                 package['action_id'], target_runner)
-            elif isinstance(package, dict) and package.get('kind') == 'self_reported_delivery':
-                from .self_report_recovery import (
-                    SELF_REPORTED_DELIVERY_PACKAGE, reconcile_self_reported_delivery)
-                if set(package) != SELF_REPORTED_DELIVERY_PACKAGE or package['node_id'] not in monitor.nodes:
-                    raise ValueError('self-reported delivery reconciliation package is invalid')
-                if _invalidation_path(directory).exists() or _invalidation_path(directory).is_symlink():
-                    raise ValueError('authorization is invalidated; reauthorize before reconciling')
-                target_runner = runner if runner is not None else _public_runner(paths, _card, nodes)
-                snapshot = reconcile_self_reported_delivery(monitor, args.run_id,
-                                                            package['node_id'], target_runner)
-            else:
-                snapshot = monitor.reconcile_evidence(args.run_id, package)
+            snapshot = monitor.reconcile_package(
+                args.run_id, package,
+                runner_factory=lambda: runner if runner is not None else _public_runner(paths, _card, nodes),
+                invalidation_path=_invalidation_path(directory),
+                authorization_digest=_card.digest,
+            )
             return _snapshot_result("reconcile", snapshot, args.as_json, paths=paths)
         except (FileNotFoundError, OSError, TypeError, ValueError, PermissionError) as error:
             return _result(
@@ -4057,6 +3831,86 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
     return _result(
         USAGE_ERROR, {"status": "usage_error"}, "参数错误", args.as_json
     )
+
+
+def _handle_daemon(args, paths, runner, command_prefix, v2_state=False) -> CLIResult:
+    """vibe daemon start|status|stop|run|register-pm (run is the detached process itself)."""
+    from . import daemon as daemon_module
+    action = args.daemon_action
+    base = {"command": "daemon", "action": action}
+    if action is None or not args.run_id:
+        return _result(BLOCKED, {**base, "status": "blocked_invalid", "reason": "daemon needs an action and --run-id"},
+                       "用法：vibe daemon start|status|stop|run|register-pm --run-id <run-id>", args.as_json)
+    try:
+        if action == "status":
+            payload = daemon_module.daemon_status(paths, args.run_id)
+            code = SUCCESS if payload["status"] == "running" else UNKNOWN
+            text = "守护程序：{}{}".format(payload["status"], "（%s）" % payload["reason"] if payload.get("reason") else "")
+            return _result(code, payload, text, args.as_json)
+        if action == "stop":
+            payload = daemon_module.stop_daemon(paths, args.run_id)
+            return _result(SUCCESS if payload["status"] in ("stopped", "not_running") else UNKNOWN, payload,
+                           "守护程序：" + payload["status"], args.as_json)
+        if action == "register-pm":
+            if not (args.supervisor_provider and args.pm_session_name):
+                return _result(BLOCKED, {**base, "status": "blocked_invalid", "reason": "--provider and --session-name are required"},
+                               "缺少 --provider 或 --session-name", args.as_json)
+            record = daemon_module.register_pm_address(paths, args.run_id, args.supervisor_provider, args.pm_session_name)
+            return _result(SUCCESS, {**base, "status": "registered", "run_id": args.run_id, **record}, "产品经理会话已登记", args.as_json)
+        if not args.plan:
+            return _result(BLOCKED, {**base, "status": "blocked_invalid", "reason": "--plan is required"},
+                           "缺少 --plan", args.as_json)
+        if action == "start":
+            payload = daemon_module.start_daemon(paths, args.run_id, args.plan, interval=args.daemon_interval,
+                                                 model=args.daemon_model, provider=args.supervisor_provider)
+            ok = payload["status"] in ("started", "already_running")
+            return _result(SUCCESS if ok else UNKNOWN, payload, "守护程序：" + payload["status"], args.as_json)
+        # run: the detached process.  Same assembly as `monitor --watch`, with the daemon loop on top.
+        config = daemon_module.load_config(paths, {"interval": args.daemon_interval, "model": args.daemon_model,
+                                                   "platform": args.supervisor_provider})
+        directory, plan, nodes, card = _load_plan(paths, args.plan)
+        run_id = _run_id(directory, args.run_id)
+        if runner is None:
+            runner = _public_runner(paths, card, nodes, [])
+        supervisor = Supervisor(
+            paths, Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card)),
+            runner, run_id)
+
+        def gate():
+            # The same pre-resume checks `vibe resume` makes, re-run every tick:
+            # the daemon must not advance a run the public path would refuse.
+            try:
+                gate_directory, gate_plan, gate_nodes, gate_card = _load_plan(paths, args.plan)
+                if v2_state:
+                    require_capability_contract(paths)
+                    _require_public_execution_gate(paths, gate_directory, gate_plan, gate_nodes, gate_card)
+                invalidation = _invalidation_path(gate_directory)
+                if not invalidation.exists() and _current_run_path(gate_directory).is_file():
+                    before = (gate_directory / "authorization.json").read_bytes()
+                    _renew_engine_attestation_if_stale(
+                        paths, gate_directory, gate_plan, gate_nodes, gate_card, run_id, runner)
+                    if (gate_directory / "authorization.json").read_bytes() != before:
+                        # Renewed: later ticks must run under the re-signed authorization.
+                        _d, new_plan, new_nodes, new_card = _load_plan(paths, args.plan)
+                        supervisor.monitor = Monitor(
+                            paths, new_plan, new_nodes,
+                            topology_rulings=_observed_topology_rulings(paths, new_card))
+            except PermissionError as error:
+                return {"status": "blocked_unknown", "reason": str(error)[:200]}
+            if invalidation.exists():
+                persisted = _read_json(invalidation)
+                reason = persisted.get("reason", "authorization invalidated") if isinstance(persisted, dict) \
+                    else "authorization invalidated"
+                return {"status": "blocked_design", "reason": str(reason)[:200]}
+            return None
+
+        outcome = daemon_module.Daemon(paths, run_id, supervisor, config, gate=gate,
+                                       command_prefix=command_prefix).run()
+        ok = outcome["status"] in ("terminal", "stopped", "max_cycles")
+        return _result(SUCCESS if ok else UNKNOWN, {**base, "run_id": run_id, **outcome}, "守护程序结束：" + outcome["status"], args.as_json)
+    except (OSError, ValueError, TypeError, FileNotFoundError) as error:
+        return _result(UNKNOWN, {**base, "status": "unknown", "reason": str(error)[:200]},
+                       "守护程序状态未知：" + str(error)[:200], args.as_json)
 
 
 def handle_monitor(

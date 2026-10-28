@@ -36,13 +36,13 @@ This module closes that gap without weakening the gate:
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
+from .digests import sha256_file
 from .authorization import _canonical_digest
 from .diagnostics import assert_planning_gate, require_execution_ready
 from .planner import required_workflow_nodes
@@ -62,11 +62,7 @@ class AuthorizationDenied(PermissionError):
 
 
 def _sha(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_file(path)
 
 
 def _atomic_json(path: Path, data: Any) -> None:

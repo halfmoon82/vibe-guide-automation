@@ -18,6 +18,20 @@ import json
 import re
 import tempfile
 import unittest
+
+from unittest import mock as _beat_mock
+
+# 本文件在一秒内连续调用 beat 来模拟多拍；关掉 120 秒同状态防重复窗口（该行为由
+# test_supervisor_runtime_consolidation 覆盖）。
+_NO_BEAT_REPEAT_WINDOW = _beat_mock.patch("vibe_guide.supervisor.BEAT_REPEAT_WINDOW_SECONDS", 0)
+
+
+def setUpModule():
+    _NO_BEAT_REPEAT_WINDOW.start()
+
+
+def tearDownModule():
+    _NO_BEAT_REPEAT_WINDOW.stop()
 from pathlib import Path
 from unittest.mock import patch
 
@@ -583,7 +597,7 @@ class CliTests(unittest.TestCase):
         run_cli(["supervisor-hold", "--run-id", run_id, "--node", node, "--category", "product_design", "--authorization-gap", "待拍板", "--reason", "等用户拍板"], root)
         result = run_cli(["supervisor-beat", "--run-id", run_id, "--session-record", log], root)
         self.assertEqual(result.exit_code, 0, result.payload)
-        self.assertEqual(result.text, "idle")
+        self.assertTrue(result.text.startswith("idle：本轮结束"), result.text)
         self.assertEqual(result.payload["state"], "idle")
 
     def test_supervisor_beat_work_and_rotate_explain_the_branch(self):
@@ -635,19 +649,14 @@ class DocumentationExampleTests(unittest.TestCase):
         for command in release:
             self.assertNotIn("--category", command)
 
+        # prd-guide 已压缩为一条创建命令示例；--release 的完整命令示例与「挂起命令刷新」
+        # 行随旧监工手册一并删除（release 示例由上面的 README 断言覆盖）。
         prd_commands = re.findall(r"`(vibe supervisor-hold[^`]+)`", prd_guide)
-        prd_create_or_refresh = [command for command in prd_commands if "--release" not in command]
-        prd_release = [command for command in prd_commands if "--release" in command]
-        self.assertTrue(prd_create_or_refresh)
-        self.assertTrue(prd_release)
-        for command in prd_create_or_refresh:
+        self.assertTrue(prd_commands)
+        for command in prd_commands:
+            self.assertNotIn("--release", command)
             self.assertRegex(command, self._CATEGORY_SYNTAX)
-        for command in prd_release:
-            self.assertNotIn("--category", command)
-
-        refresh_lines = [line for line in prd_guide.splitlines() if "挂起命令刷新" in line]
-        self.assertTrue(refresh_lines)
-        self.assertTrue(any(self._CATEGORY_SYNTAX.search(line) for line in refresh_lines))
+        self.assertRegex(prd_guide, r"`--release`\s*手工释放")
 
 
 if __name__ == "__main__":

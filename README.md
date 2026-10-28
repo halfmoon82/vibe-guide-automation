@@ -105,7 +105,7 @@ vibe status --plan <ID>                      读取当前快照，不轮询外�
 vibe resume --plan <ID>                      从快照、任务登记和事件证据继续
 vibe skill-install --source <GitHub> --sha <40hex> --name <名> [--subdir <子目录>] --confirm   按完整 SHA 拉取 GitHub skill，校验 subdir 合法性后物化到 .vibe/proposals/skills/<名>/ 并在 .vibe/config.json 登记；subdir 含 ..、绝对路径、首尾 / 或非法字符时拒绝且不落盘
 vibe supervisor-preflight --run-id <run> [--accept-decision] --session-record <file>   监工心跳预检，只读磁盘，输出 idle/work/decision/rotate/unknown；只有带 `--accept-decision` 才会输出 decision，不带时同一情形（只剩未答决策）输出 work；<file> 直接用本会话日志（Codex rollout / Claude Code jsonl）
-vibe supervisor-beat --run-id <run> --accept-decision --session-record <file>   心跳入口：预检 + 输出分支 + 下一拍间隔（按授权卡 `heartbeat_interval_minutes`：缺省 10，平台推送唤醒经验证登记后可选 30；只剩未答决策 60），并写入 `.vibe/runs/<run>/heartbeat-interval.json`，接班时 `supervisor-handoff` 会打印。推送唤醒登记文件 `.vibe/push-wake-verification.json`：`{"platforms": {"<provider>": {"success": [{"evidence_ref": "..."}], "failure": [{"evidence_ref": "..."}]}}}`，成功与失败各至少一条证据才算验证；文件读不到时按 10 分钟并在输出里写明原因
+vibe supervisor-beat --run-id <run> --accept-decision --session-record <file>   心跳入口：预检 + 输出分支 + 下一拍间隔（按授权卡 `heartbeat_interval_minutes`：缺省 10，平台推送唤醒经验证登记后为 60，此时它只是 `vibe daemon` 之外的兜底检查；只剩未答决策 60；该值由 vibe 推导，发布时不问产品经理），并写入 `.vibe/runs/<run>/heartbeat-interval.json`，接班时 `supervisor-handoff` 会打印。推送唤醒登记文件 `.vibe/push-wake-verification.json`：`{"platforms": {"<provider>": {"success": [{"evidence_ref": "..."}], "failure": [{"evidence_ref": "..."}]}}}`，成功与失败各至少一条证据才算验证；文件读不到时按 10 分钟并在输出里写明原因
 vibe supervisor-register --run-id <run> --provider <p> --session-id <id> --host <h> [--session-record <file>]   原子登记当前监工地址（保留历史，不含凭据）；给了日志就记下接班起点，换班按此后增长计算
 vibe supervisor-hold --run-id <run> --node <id> --category <product_acceptance|external_authorization> (--decision <决策ID>|--authorization-gap <缺口>) --reason <原因>   登记/刷新"节点等人拍板"，预检据此判为空闲；必须引用一条决策或一个授权缺口；product_design/deploy 仍可作别名（落盘存规范名），无 category 的旧挂起按 product_acceptance 读取
 vibe decision-answer --id <决策ID> --choice <选项> --digest <摘要>   回答决策；成功后提示「想马上续跑，去监工会话说继续；否则最晚下一次心跳自动接上」。已回答、节点仍停在 blocked_design 时预检输出 work（理由写明已回答待处理）；节点离开 blocked_design 后恢复正常判定，绑定在已答决策上的挂起不再引起反复 work；回答文件损坏或作废时预检输出 unknown 并写明原因
@@ -114,6 +114,9 @@ vibe supervisor-handoff --run-id <run>             打印接班所需的全部�
 vibe supervisor-address --run-id <run>             查询当前监工地址；未登记返回 unknown；带 --node/--role/--generation 时 wake 字段给出推送工具与填好的唤醒信号
 vibe worker-deliver --run-id <run> --node <id> --generation <n> --payload '<json>'   worker 在主项目目录自报交付（嵌套 delivery_evidence），格式错误当场返回
 vibe heal-verify --run-id <run> --node <id>   监工按排查包修完运行时文件后的复核：重跑同一读取校验，通过才推进并写入 `self_heal_attempt` 事件，不通过则节点保持原状并记一次失败尝试
+vibe daemon start|status|stop --run-id <run> [--plan <ID>]   授权后启动的分离本地进程（守护程序）：持监工租约，确定性地 resume、收交付、派后台 worker、拉 reviewer、一级自动重试，不调用模型；`status` 报告是否存活，崩溃或租约丢失时明确显示失活而不产生第二个写入者；`register-pm --provider <p> --session-name <名>` 登记需要拍板时推送的产品经理会话
+vibe supervisor-mailbox --run-id <run> [--template <action_id>|--complete <action_id> --result <文件或 ->]   信箱摘要、回写示例与回写；形状不对在写入前拒绝
+vibe blocked-unknown --run-id <run> --node <id> --disposition <处置> --reason <原因>   记录 blocked_unknown 处置
 ```
 
 新会话入口：agent 先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1——<=8 直接执行、9-15 轻规划，均不触碰 vibe，评分后输出一行 S1 评分与档位；>15 且能拆出 3 个以上可并行节点、又需跨会话/跨中断续跑时才 `vibe scan` + `vibe plan --request --s1` 进入正式路由（不满足则按轻规划，评分行注明未满足的条件；拿不准按轻规划；产品经理显式要求或显式 `--s1` 升级仍进复杂模式）；「授权」「选A」这类确认/续接回复延续当前档位，不重新评分。该协议完全自包含，不依赖任何外部技能。
@@ -192,9 +195,21 @@ V4.4 将工程故障限定在节点范围内，并保留同一任务身份。五
 
 ## 授权、监工和恢复
 
-### 节点卡住时：空转、排查与自愈
+### 监工形态：守护程序 + 短会话 + 三级自愈
 
-节点连续几拍心跳都没有任何进展（状态、代数、活跃任务、最新交付都不变）时，状态标签显示“需要监工排查”，不再显示“自动修复中”或“自动推进中”。监工此时不能只回“等待”，而是按顺序：读 vibe 给出的排查包（读取方期望什么格式、实际收到什么、差在哪、涉及哪些运行时文件）；在授权范围内自己修，可以改运行时文件，但不得直接改 `state.json` 和 `events.jsonl`；修完跑 `vibe heal-verify` 复核，通过才继续推进，并留下一条 `self_heal_attempt` 自愈记录。同一问题修了 2 次仍没进展，或需要越过产品范围、授权卡、deploy、凭据和系统权限边界时，状态变为“需要人处理”：监工带着排查包和已试过的尝试停下报告，等你决定。产品经理回来看到的是“已继续推进加一条自愈记录”，或“卡在哪、试过什么”的报告。
+授权后启动 `vibe daemon start --run-id <run> --plan <ID>`：一个分离的本地进程持监工租约，机械地推进整个运行（resume、收交付、派后台 worker、拉 reviewer、接受节点、一级自动重试），不调用模型。产品经理会话只保留 60 分钟兜底检查（推送唤醒未验证的平台为 10 分钟）：先看 `vibe daemon status`，失活则重启或上报，存活就结束本轮。发布时不再询问心跳间隔、换班上限等工程参数，由 vibe 按平台推导；Claude Code 默认后台派发，授权卡上可改选可见卡片，且永不换班。
+
+节点连续几拍都没有任何进展（状态、代数、活跃任务、最新交付都不变）时按三级处理：
+
+1. **一级**：守护程序自动重试，不耗模型。
+2. **二级**：仍空转到“需要监工排查”档，守护程序拉起一次一次性修复短会话（claude-code 用 `claude -p`，codex 用 `codex exec`，kimi-code 用 `kimi -p`；WorkBuddy 无命令行，写入信箱由其自动化每次新会话处理），输入排查包、监工卡和授权范围；会话可改排查包列出的运行时文件，不得直接改 `state.json` 和 `events.jsonl`，必须以 `vibe heal-verify` 结束，由守护程序复核，通过才推进并留下 `self_heal_attempt` 记录。每个运行同时最多一个短会话，次数与 token 有预算。
+3. **三级**：同一问题修了 2 次仍没进展，或需要越过产品范围、授权卡、deploy、凭据和系统权限边界，或预算用尽时，状态变为“需要人处理”：建决策卡并推送到登记的产品经理会话，带着排查包和已试过的尝试等你决定。
+
+短会话命令不可用或超时记为 unknown 并升级，不当成功；各平台一次性会话命令未经实测的路径在能力报告里标为未验证。
+
+能力档位：vibe 在规划时为每个节点派生平台无关的 `light` / `standard` / `deep` 三档（纯文档→light；带 migration/security/cross_module 标签、改动文件 ≥8 或跨 3 个以上模块→deep；其余 standard；reviewer 至少 standard；整合审查 deep），派发时按平台探针换算成具体模型与思考强度（探针失败回退平台默认并标注）；同一节点审查打回两次自动升一档。授权卡显示档位与当前换算结果，具体模型名不进授权指纹，换平台或换模型授权不失效。
+
+合并：授权卡允许远端 Git 动作时，独立终审通过、P0–P2 清零后由 vibe 标记「可合并」，监工执行合并命令，vibe 核实合并提交可达目标分支后才记为已合并。
 
 ### DAG 运行时约束
 
@@ -289,7 +304,7 @@ worker 用 `vibe worker-deliver` 自报的交付不带游标（游标只来自�
 
 授权卡是「发布时才签」的：执行门把在盘卡绑到 run 快照的 authorized digest 上，所以「卡已重出、尚未授权」在本产品里不可表示——只重出卡会让公开执行门以 `plan-confirmation.invalid` 关门。合同或 PRD 变化后要重新授权时，先用 `vibe monitor --plan <ID> --preview-card` 只读地看一遍将要签的卡：它报的是「相对当前在盘卡会改动哪些字段」（这才是要审的东西），并单独自检「刷新本身是否只动了引擎凭证字段」。确认后再跑带 `--authorize` 的那条，一次原子完成重新授权与派发。预览里的卡 digest 只是预览态——引擎凭证的时间戳进入凭证与卡的摘要，发布时会重新观测，所以别拿预览 digest 当审批凭据。
 
-计划发布超过 72 小时后，`engine-attestation.json` 会过期，`monitor --authorize` 会以 `execution_engine_unverified` 拒绝，而重新发布计划不是一条可用出路。同一 plan revision 上的重新授权会按发布路径同样的方式**重新观测**引擎凭证并重签，凭证先落盘、卡后发布，重新授权失败则逐字节还原，不需要重新发布计划。
+引擎证明有效期为 72 小时。计划发布超过 72 小时后，`engine-attestation.json` 会过期，`monitor --authorize` 会以 `execution_engine_unverified` 拒绝，而重新发布计划不是一条可用出路。同一 plan revision 上的重新授权会自动续签：按发布路径同样的方式**重新观测**引擎凭证并重签，凭证先落盘、卡后发布，重新授权失败则逐字节还原，不需要重新发布计划。
 
 桌面 App 原生能力不能由 Python 直接调用时，public CLI 使用 `.vibe/provider-actions/` 的 provider-neutral request/result bridge。`monitor/resume` 会写入有界、digest 绑定的 `create/locate/visibility/resume/wait` 请求；App 会话按 `native_tool` 调用公开能力并回写绑定结果。Codex 映射到 `create_thread`、`navigate_to_codex_page`、`send_message_to_thread` 和 `wait_threads`；其他 provider 必须先接入并验证自己的等价桌面控制面。未完成原生探针时不允许 background fallback；在真实 task ID、host、定位和可见性全部核验前，状态保持 `blocked_unknown`；node-spec 中的 provider/mode/thread/host 自声明不会成为证据。
 

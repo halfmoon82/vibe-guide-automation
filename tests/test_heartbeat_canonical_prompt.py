@@ -67,7 +67,7 @@ class ProtocolCarriesTheSameTextTests(unittest.TestCase):
 
     def test_rotate_branch_reuses_the_same_command(self):
         discipline = self.section("### 6.5", "## 7. ")
-        rotate = [line for line in discipline.splitlines() if line.startswith("- 输出 `rotate`")]
+        rotate = [line for line in discipline.splitlines() if line.startswith("- **换班（其他平台）**")]
         self.assertEqual(len(rotate), 1)
         self.assertIn("supervisor-handoff", rotate[0])
 
@@ -77,7 +77,7 @@ class ProtocolCarriesIntervalRulesTests(unittest.TestCase):
         text = load_protocol("prd-guide")
         start = text.index("### 6.5")
         discipline = text[start:text.index("## 7. ", start)]
-        lines = [line for line in discipline.splitlines() if line.startswith("- 输出 `decision`")]
+        lines = [line for line in discipline.splitlines() if line.startswith("- **预检**")]
         self.assertEqual(len(lines), 1)
         self.assertIn("--accept-decision", lines[0])
         self.assertIn("work", lines[0])

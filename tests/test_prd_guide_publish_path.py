@@ -367,7 +367,7 @@ class DraftReplacementBoundaryTests(_Project):
         """§5.3 branch ①: no parked draft, rerun the same command."""
         plan_id = self.draft()
         spec = self.write_spec(".vibe/plans/{}/product-spec.json".format(plan_id))
-        import vibe_guide.cli as cli_module
+        import vibe_guide.publish as cli_module
         with mock.patch.object(cli_module, "render_plan_artifacts", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 self.cli("plan", "--request", COMPLEX_REQUEST, "--plan-id", plan_id, "--s1", "5,5,5,5,5", "--from-prd", spec)

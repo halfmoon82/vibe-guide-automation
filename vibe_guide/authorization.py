@@ -54,8 +54,12 @@ _SENSITIVE_NAMES = (
 # new publication and a new authorization.  The option tuples are the schema's
 # own vocabulary (what a card may carry); ``supervisor`` decides what to do with
 # the value at runtime and is the only reader of them.
-HEARTBEAT_INTERVAL_CHOICES = (10, 30)
+#: The only place the beat cadence tiers are defined.  10 minutes while the
+#: platform's push wake-up is unverified; 60 once it is verified (the beat is
+#: then only a fallback behind the worker's push signal).
+HEARTBEAT_INTERVAL_CHOICES = (10, 60)
 DEFAULT_HEARTBEAT_INTERVAL_MINUTES = 10
+HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES = 60
 ROTATE_HARD_CAP_CHOICES = (150000, 200000, 300000, 500000, 800000)
 DEFAULT_ROTATE_HARD_CAP_TOKENS = 200000
 
@@ -698,9 +702,10 @@ def executable_contract_digest(nodes: List[DAGNode]) -> str:
 
 
 def legacy_executable_contract_digest(nodes: List[DAGNode]) -> str:
-    # 5.0.7 and earlier digested file scope too.  Runs those versions
-    # authorized persist this form, so readers must still recognize it; it is
-    # never written for new authorizations.
+    # Despite the name this is the per-node *scope* commitment (file scope
+    # included), written for every new authorization into ``node_scope_digests``.
+    # Only the aggregate acceptance of 5.0.7 digests was retired: runs
+    # authorized before the scope-free digest must be closed on the old version.
     return _canonical_digest({"nodes": canonical_node_contracts(nodes)})
 
 
@@ -708,7 +713,7 @@ _CONTRACT_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 def executable_contract_digest_matches(nodes: List[DAGNode], digest: Any) -> bool:
-    """True when ``digest`` is the current or the 5.0.7 digest of ``nodes``.
+    """True when ``digest`` is the current digest of ``nodes``.
 
     Anything but 64 lowercase hex characters is a mismatch.  The check comes
     first because ``secrets.compare_digest`` raises ``TypeError`` on
@@ -716,13 +721,7 @@ def executable_contract_digest_matches(nodes: List[DAGNode], digest: Any) -> boo
     """
     if not isinstance(digest, str) or not _CONTRACT_DIGEST.fullmatch(digest):
         return False
-    return any(
-        secrets.compare_digest(digest, candidate)
-        for candidate in (
-            executable_contract_digest(nodes),
-            legacy_executable_contract_digest(nodes),
-        )
-    )
+    return secrets.compare_digest(digest, executable_contract_digest(nodes))
 
 
 def verified_authorized_nodes(
@@ -744,11 +743,10 @@ def verified_authorized_nodes(
             for key, node in nodes.items()
         ):
             return {}
-        for algorithm in (executable_contract_digest, legacy_executable_contract_digest):
-            if algorithm(list(nodes.values())) == record.node_contract_digest and all(
-                algorithm([node]) == digests[key] for key, node in nodes.items()
-            ):
-                return nodes
+        if executable_contract_digest(list(nodes.values())) == record.node_contract_digest and all(
+            executable_contract_digest([node]) == digests[key] for key, node in nodes.items()
+        ):
+            return nodes
     except (TypeError, ValueError, KeyError):
         pass
     return {}
@@ -1123,6 +1121,10 @@ class AuthorizationCard:
     node_scope_digests: Optional[Dict[str, str]] = None
     heartbeat_interval_options: Tuple[Dict[str, Any], ...] = ()
     rotate_hard_cap_options: Tuple[Dict[str, Any], ...] = ()
+    # Per-node capability tier and what the current platform resolves it to.
+    # Unsigned display: the tier is derived from the signed node contract, and
+    # a concrete model name must never enter the digest.
+    model_tiers: Tuple[Dict[str, Any], ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -1480,10 +1482,32 @@ def _drop_unset_card_fields(result: Dict[str, Any]) -> Dict[str, Any]:
                 "heartbeat_interval_forced", "heartbeat_interval_forced_cost"):
         if result.get(key) is None:
             result.pop(key, None)
-    for key in ("heartbeat_interval_options", "rotate_hard_cap_options"):
+    for key in ("heartbeat_interval_options", "rotate_hard_cap_options", "model_tiers"):
         if not result.get(key):
             result.pop(key, None)
     return result
+
+
+def _model_tier_rows(nodes: List[DAGNode], platform: str) -> Tuple[Dict[str, Any], ...]:
+    """Each node's tier and its model on ``platform``; a failed probe is shown as unknown."""
+    from . import model_catalog
+
+    home = model_catalog.vibe_home_path()
+    rows = []
+    for node in sorted(nodes, key=lambda item: item.id):
+        tier = model_catalog.node_tier(node)
+        choice = model_catalog.resolve(platform, tier, vibe_home=home)
+        rows.append({
+            "node_id": node.id,
+            "tier": tier,
+            "reviewer_tier": model_catalog.node_tier(node, role="reviewer"),
+            "platform": choice.platform,
+            "resolved_model": choice.model,
+            "effort": choice.effort,
+            "resolution": choice.status,
+            "note": choice.note,
+        })
+    return tuple(rows)
 
 
 def build_authorization_card(
@@ -1745,6 +1769,7 @@ def build_authorization_card(
     # digest and the record schema unchanged for a caller that passes none.
     canonical["heartbeat_interval_options"] = heartbeat_options
     canonical["rotate_hard_cap_options"] = rotate_options
+    canonical["model_tiers"] = _model_tier_rows(nodes, capabilities.agent_id)
     card = AuthorizationCard(digest=digest, **canonical)
     # The issuing path checks its own output: a card the validator would
     # refuse must not be signed in the first place (ISSUE-08).

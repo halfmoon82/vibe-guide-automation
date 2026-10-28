@@ -1,4 +1,4 @@
-"""#216 ②: visible-sdd protocol delivery switch (inline default, opt-in ref)."""
+"""#216 ②: visible-sdd protocol delivery switch (ref default, opt-in inline)."""
 import hashlib
 import json
 import tempfile
@@ -29,14 +29,17 @@ def _prompt(root, config=None):
 
 
 class SddProtocolRefTests(unittest.TestCase):
-    def test_default_and_explicit_inline_are_identical_and_full_text(self):
-        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+    def test_default_and_explicit_ref_are_identical_and_inline_is_full_text(self):
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b, \
+                tempfile.TemporaryDirectory() as c:
             _, default = _prompt(a)
             default = default.replace(a, "ROOT")
-            _, inline = _prompt(b, {"sdd_protocol_delivery": "inline"})
-            inline = inline.replace(b, "ROOT")
-        self.assertEqual(default, inline)
-        self.assertIn(INLINE_HEADER + load_protocol(NAME) + "\n\n", default)
+            _, ref = _prompt(b, {"sdd_protocol_delivery": "ref"})
+            ref = ref.replace(b, "ROOT")
+            _, inline = _prompt(c, {"sdd_protocol_delivery": "inline"})
+        self.assertEqual(default, ref)
+        self.assertNotIn(load_protocol(NAME), default)
+        self.assertIn(INLINE_HEADER + load_protocol(NAME) + "\n\n", inline)
 
     def test_current_protocol_digest_is_published(self):
         digest = hashlib.sha256(protocol_path(NAME).read_bytes()).hexdigest()

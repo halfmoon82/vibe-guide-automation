@@ -995,11 +995,11 @@ class LauncherFactoryTests(ProjectCase):
 class PublishPathTests(unittest.TestCase):
     """The first-publication wiring: workers reach authorization-card.json."""
 
-    def publish(self, with_fact):
+    def publish(self, with_fact, dispatch_mode="visible"):
         import tests.support_v45_authorize as support
 
         if not with_fact:
-            return support.publish_complex_probe(self)
+            return support.publish_complex_probe(self, dispatch_mode=dispatch_mode)
         capabilities = dict(
             support._CAPABILITIES, facts=dict(support._CAPABILITIES["facts"], **{BG: True})
         )
@@ -1046,10 +1046,18 @@ class PublishPathTests(unittest.TestCase):
         self.assertTrue(validate_authorization_card_consistency(card))
 
     def test_published_card_without_fact_has_no_background_workers(self):
+        # Choosing "visible" on Claude Code keeps every node on visible cards.
         card = self.read_card(self.publish(False))
         for worker in card.get("workers") or ():
             self.assertNotEqual(worker["mode"], "background")
         self.assertEqual((card.get("topology_summary") or {}).get("background", 0), 0)
+
+    def test_claude_code_defaults_to_background_without_a_fact_or_a_choice(self):
+        card = self.read_card(self.publish(False, dispatch_mode=None))
+        workers = {w["node_id"]: w for w in card["workers"]}
+        self.assertEqual(workers["probe-node-a"]["topology"], "background")
+        self.assertEqual(workers["probe-node-a"]["mode"], "background")
+        self.assertEqual(card["topology_summary"]["background"], 1)
 
 
 if __name__ == "__main__":

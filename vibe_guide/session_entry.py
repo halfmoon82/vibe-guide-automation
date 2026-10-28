@@ -6,7 +6,6 @@ handled by the later authorization boundary.
 """
 
 from dataclasses import asdict, dataclass, replace
-import hashlib
 import json
 import os
 import re
@@ -14,6 +13,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .digests import sha256_bytes
 from .planner import RouteResult, S0Result, S1Score, TaskContext, EXPLICIT_COMPLEX_FLAG, asks_for_complex, classify_s0, is_continuation_message, parse_s1_context, route_task, score_s1
 
 
@@ -26,7 +26,7 @@ def _normalize_request(request: str) -> str:
 def stable_plan_id(request: str) -> str:
     """Return a path-safe id stable for equivalent request whitespace/case."""
     normalized = _normalize_request(request)
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    digest = sha256_bytes(normalized.encode("utf-8"))[:16]
     return "session-" + (digest or "0" * 16)
 
 
@@ -70,12 +70,12 @@ def default_s1_context(request: str) -> TaskContext:
         toolchain = max(toolchain, 3)
     return TaskContext(
         steps, domains, uncertainty, failure_cost, toolchain,
-        rationale={"source": "stable_default", "request_digest": hashlib.sha256(normalized.encode("utf-8")).hexdigest()},
+        rationale={"source": "stable_default", "request_digest": sha256_bytes(normalized.encode("utf-8"))},
     )
 
 
 def _default_node_spec(request: str, plan_id: str, route: RouteResult) -> Dict[str, Any]:
-    digest = hashlib.sha256(_normalize_request(request).encode("utf-8")).hexdigest()[:12]
+    digest = sha256_bytes(_normalize_request(request).encode("utf-8"))[:12]
     node_id = "session-node-" + (digest or "0" * 12)
     title = "会话请求：" + request.strip()[:80]
     return {
