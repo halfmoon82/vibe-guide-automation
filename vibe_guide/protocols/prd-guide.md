@@ -162,8 +162,9 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
   ],
   "rationale?": {"framing|tradeoffs|flow|acceptance": "verified_fact: ..."},
   "remote_git_actions?": "allow|deny",
-  "heartbeat_interval_minutes?": "10|30",
-  "rotate_hard_cap?": "150000|200000|300000|500000|800000"
+  "heartbeat_interval_minutes?": "10|60",
+  "rotate_hard_cap?": "150000|200000|300000|500000|800000",
+  "dispatch_mode?": "background|visible"
 }
 ```
 
@@ -193,10 +194,12 @@ vibe plan --request "<产品经理的原话>" --plan-id <plan_id> --from-prd <pr
 
 发布前还要问产品经理两个运行参数，答案写进产品 spec 顶层，缺省值由发布补齐：
 
-- `heartbeat_interval_minutes`：空闲基准心跳间隔，`10` 或 `30`，缺省 `10`。当前平台的推送唤醒已验证（`.vibe/push-wake-verification.json` 里该平台成功、失败证据各至少一条）时，`30` 正常可选。平台已知但推送未验证时，`30` 仍列出为**强制选择**：卡上标 `forced` 并写明代价（worker 完工后监工最长 30 分钟才会发现）；产品经理仍选它时，授权记录里写入 `heartbeat_interval_forced` 与代价原文，运行按 30 分钟出下一拍。平台未知或推送状态判不出来时该档不可用，卡上照样列出并写明原因。等答 60 分钟仍由 vibe 推导，不进卡。
+- `heartbeat_interval_minutes`：空闲基准心跳间隔，`10` 或 `60`，缺省 `10`。当前平台的推送唤醒已验证（`.vibe/push-wake-verification.json` 里该平台成功、失败证据各至少一条）时，`60` 正常可选，此时心跳只是推送信号之外的兜底。平台已知但推送未验证时，`60` 仍列出为**强制选择**：卡上标 `forced` 并写明代价（worker 完工后监工最长 60 分钟才会发现）；产品经理仍选它时，授权记录里写入 `heartbeat_interval_forced` 与代价原文，运行按 60 分钟出下一拍。平台未知或推送状态判不出来时该档不可用，卡上照样列出并写明原因。等答 60 分钟仍由 vibe 推导，不进卡。
 - `rotate_hard_cap`：换班硬上限，`150000` / `200000` / `300000` / `500000` / `800000`，缺省 `200000`。超过 20 万的档位只在宿主报告的上下文窗口不小于所选上限时可用：30 万、50 万、80 万分别需要至少同等大小的窗口。Codex 把窗口写在会话记录里，发布时加 `--session-record <本会话记录路径>` 传入该记录；未报告窗口的宿主不能选这些档位。模型宣称支持大窗口不替代当前会话的宿主证据；避免宿主先压缩、所选换班上限无法到达。
 
-两项都计入授权摘要，改任一项要用新的 `plan_id` 重新发布、重新授权，与改 `remote_git_actions` 同规则。运行时以授权记录里的值为准：条件不再满足时（推送登记被撤、接班会话窗口更小）退回默认值，并在预检 `reason` 里写明，不静默。没有这两项的旧计划保持改动前的行为不变：空闲间隔仍按推送唤醒是否已验证在 10/30 之间自动选，硬上限 200000。
+两项都计入授权摘要，改任一项要用新的 `plan_id` 重新发布、重新授权，与改 `remote_git_actions` 同规则。运行时以授权记录里的值为准：条件不再满足时（推送登记被撤、接班会话窗口更小）退回默认值，并在预检 `reason` 里写明，不静默。没有这两项的旧计划保持改动前的行为不变：空闲间隔仍按推送唤醒是否已验证在 10/60 之间自动选，硬上限 200000。
+
+- `dispatch_mode`（可选）：`background` 或 `visible`。Claude Code 上缺省按后台派发，产品经理想要每个开发/审查任务都是可进入的可见任务时写 `visible`；其他平台沿用该平台已验证的能力裁定。计入授权摘要，改它同样要新 `plan_id` 重新发布。
 
 用 §1 草案的同一个 `plan_id` 发布，vibe 会替换这份草案（草案从未持有授权）；已发布或已授权的计划不会被覆盖，仍报 `plan already exists`。发布同样不必传 `--s1`，vibe 沿用草案记下的评分，只升不降。
 
@@ -244,7 +247,7 @@ vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本
 vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>
 ```
 
-逐字照抄这一行，不得另写；每拍只执行一次，按命令输出的分支继续。心跳周期按授权卡上的 `heartbeat_interval_minutes` 建（缺省 10 分钟）；命令输出末尾给出下一拍间隔：卡上选了 10 就是 10，选了 30 就是 30，只剩未答决策时为 60 分钟；与当前周期不一致时按输出调整。卡上没记这项的旧运行保持原规则：某平台的推送唤醒经真实验证（成功、失败各至少一次原始证据）登记在 `.vibe/push-wake-verification.json` 后为 30 分钟。
+逐字照抄这一行，不得另写；每拍只执行一次，按命令输出的分支继续。心跳周期按授权卡上的 `heartbeat_interval_minutes` 建（缺省 10 分钟）；命令输出末尾给出下一拍间隔：卡上选了 10 就是 10，选了 60 就是 60，只剩未答决策时为 60 分钟；与当前周期不一致时按输出调整。卡上没记这项的旧运行保持原规则：某平台的推送唤醒经真实验证（成功、失败各至少一次原始证据）登记在 `.vibe/push-wake-verification.json` 后为 60 分钟。
 
 不要自己另写心跳指令，也不要把信箱服务直接写进心跳：自写的心跳每次都跑一整轮 `vibe resume`，跳过预检、不登记、不换班，空闲心跳的成本是设计值的 5–15 倍（2026-10-03 实测）。
 
@@ -490,7 +493,7 @@ worktree 需要你先建出来（`git worktree add <worktree> -b <branch>`），
 
 - **WorkBuddy**：`workbuddy_job__*` 五个工具名已登记，对应 WorkBuddy 官方 Jobs API。2026-10-26 本机（WorkBuddy 5.8.4 / CLI 2.161.0）定案：**Jobs API 派生的 detached agent 拿不到模型凭据，在产生任何输出前退出**——gateway 健康、spawn 正常、job 能建能跑（bash 对照作业成功），但模型请求用的是宿主进程内的会话级 run identity，CLI 启动时主动删除凭据引导变量、broker spawn 内层时再删 `CODEBUDDY_GATEWAY_AUTH`，任何不经 sidecar 亲自拉起的进程都拿不到凭证。这不是配置或沙箱问题，不能靠补 flag/补环境变量修好。可用的派发目标是**用户已在 UI 打开的窗口会话**（`POST /api/v1/sessions/{sid}/reply`），由 `workbuddy_job__create` 带 `session_id` 走会话侧路径；它要求项目目录里有开着的窗口、编排者自身窗口被排除，且一个窗口同时只承载一个任务。**WorkBuddy 上没有自动换班**：没有合法的"无焦点、独立、已登录模型会话"创建入口，`vibe supervisor-preflight` 报 `rotate` 时只能由用户在 UI 新开会话并运行 `vibe supervisor-handoff`（见 §6.5）。完整证据链见 `docs/workbuddy/workbuddy-dispatch-root-cause-and-fix.md`（同日补记的凭证边界一节）。
 
-**推送唤醒通道**（§6.5 里 `vibe supervisor-address` 返回的 `wake.channel`）按平台登记，不按派发路径分：Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`（2026-10-23 登记；在 `.vibe/push-wake-verification.json` 补齐成功、失败证据各一条之前，30 分钟档仍只能强制选择，见 §5.3），WorkBuddy 没有登记通道（`channel` 为 null，由心跳拉取）。
+**推送唤醒通道**（§6.5 里 `vibe supervisor-address` 返回的 `wake.channel`）按平台登记，不按派发路径分：Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`（2026-10-23 登记；在 `.vibe/push-wake-verification.json` 补齐成功、失败证据各一条之前，60 分钟档仍只能强制选择，见 §5.3），WorkBuddy 没有登记通道（`channel` 为 null，由心跳拉取）。
 
 ### 6.5 监工心跳纪律（预检 → idle/work/decision/rotate/unknown/contract_drift）
 
@@ -503,7 +506,7 @@ vibe supervisor-preflight --run-id <run-id> --accept-decision --session-record <
 - 每拍只运行生成命令一次，工具返回、重连和上下文恢复续接当前阶段。
 - 输出 `contract_drift`：**能力合同与运行快照的 digest 不一致**——典型诱因是别的会话的 git 写操作（checkout/stash/reset/merge）改写了 `.vibe` 运行态文件。它先于 idle/work/decision/rotate 判定返回；这一拍**停止推进、不当 idle 或 work 处理**，按输出提示走同一运行的重新授权流程（`vibe authorize` 同一 plan/run），不要继续派发或消费信箱。能力合同文件本身读不出时输出 `unknown`（见下），按 `work` 处理照旧。
 - 输出 `decision`：只有带 `--accept-decision` 才会输出（只剩未答决策、无其他可服务事项时）；旧版指令同一情形收到 `work`，按 `work` 走 resume，由 resume 渲染决策卡片。从 `.vibe/decisions/` 读取并渲染未答卡片；心跳降频到 60 分钟但不暂停，答案消费后恢复；降频状态写在 `.vibe/runs/<run-id>/heartbeat-interval.json`，接班时 `vibe supervisor-handoff` 会打印。
-- 输出 `idle`：所有节点都在运行、已完成或等人拍板，且无新请求。只回一字结束本轮，不做任何写。连续第二拍起仍是 `idle`（无可服务事项），下一拍间隔在当前档位（默认 10、推送验证 30）基础上放大到 3 倍、上限 60 分钟，`heartbeat-interval.json` 记 `mode=idle_backoff` 与 `idle_streak`，`vibe supervisor-handoff` 同步打印；出现新交付或唤醒（预检变为 `work` 等非 `idle`）的那一拍立即恢复基础间隔；只剩未答决策时仍是 §上条的 60 分钟。
+- 输出 `idle`：所有节点都在运行、已完成或等人拍板，且无新请求。只回一字结束本轮，不做任何写。连续第二拍起仍是 `idle`（无可服务事项），下一拍间隔在当前档位（默认 10、推送验证 60）基础上放大到 3 倍、上限 60 分钟，`heartbeat-interval.json` 记 `mode=idle_backoff` 与 `idle_streak`，`vibe supervisor-handoff` 同步打印；出现新交付或唤醒（预检变为 `work` 等非 `idle`）的那一拍立即恢复基础间隔；只剩未答决策时仍是 §上条的 60 分钟。
 - **等人拍板必须登记**：监工决定把某个节点挂起等用户回答时，先跑 `vibe supervisor-hold --run-id <run-id> --node <节点> --category <product_acceptance|external_authorization> --decision <决策ID>|--authorization-gap <缺口> --reason <一句话原因>`（必须引用一条决策 ID 或一个授权缺口，二选一；`product_design`/`deploy` 仍可作别名，落盘存规范名；没有 category 的旧挂起按 `product_acceptance` 读取，下次刷新须补上 category 和引用；`decision-answer` 必须带决策卡 `answer_cli` 里的 `--digest`，选项一变旧答案作废、决策重新待答）；用户用 `decision-answer` 回答后由运行自动消费：预检对「已回答、节点仍在 `blocked_design`」的决策报 `work`（理由写明已回答待处理），监工照常 resume 即可，不必口头转达，也不必手工释放挂起；决策已答的挂起不再引起反复 `work`；不经决策的挂起（授权缺口）仍用 `vibe supervisor-hold --run-id <run-id> --node <节点> --release` 手工释放。回答命令会提示「想马上续跑，去监工会话说继续；否则最晚下一次心跳自动接上」。只有 §7 的四类情况才能挂起或建决策，其余类别（如 `engineering`）会被拒绝，应走自愈路径。不登记，挂起的请求每次心跳都被当成 `work`，空闲心跳的成本是设计值的数倍（2026-10-05 run 140 实测：60 次预检 46 次误判）。挂起的节点上有 worker 交付或结果时仍然是 `work`。挂起会记下当时全盘节点状态：此后任何节点状态变化，或挂起满 6 小时，预检报 `work`（`hold needs recheck`），复核后仍在等人就对每个挂起节点再跑一次同一条挂起命令刷新。挂起节点的待服务请求在用户答复并解除挂起之前不执行，换班后的新班次同样遵守。`review`/`rework` 状态的节点不能挂起（它们只靠监工推进）。
 - 输出 `work`：有待服务请求、worker 已完工（含已自报但监工还没领取的交付），或有节点处在就绪/重试/未知等需要推进的状态。按 §6.1 原流程服务信箱，状态一律只从磁盘读，不凭记忆。
 - 输出 `rotate`：当前上下文达到 10 万且自接班以来增长至少 8 万 token（可配 `--token-threshold`），或达到 20 万的绝对上限（默认；用户明确临时覆盖时使用 `--context-hard-cap <tokens>`，增长阈值也需同步显式设置，不能只用 `--token-threshold` 冒充绝对上限已改变）；登记时没给 `--session-record` 的班次没有接班起点，按绝对值计算。单班是默认（2026-10-26 起，`supervisor_single_shift` 缺省即 `true`，预检输出带 `single_shift: true`）：同一监工会话服务整个运行，只在达到授权卡的绝对上限时输出 `rotate`，上面的增长条件不生效；项目 `.vibe/config.json` 显式写 `"supervisor_single_shift": false` 才恢复增长换班。执行换班：新开会话（**必须建在本项目里，禁止 projectless**：Codex 桌面用 `create_thread` 的 project 目标，Claude Code 在仓库根目录启动新会话——否则 cwd 落在宿主自动生成目录，创建时的沙箱权限档案不含项目根，每条读写 `.vibe/` 的命令都逐条弹审批，事后把会话归入项目不回溯，2026-10-17 run-ee4575fa 六班实测；`supervisor-register` 会从会话记录里检出这种 cwd 并给出非阻断警告），新会话必须是**全新会话**：不要用 `fork_thread` 或任何复制上一班历史的方式——fork 带上整段历史，接班即超过 10 万，`supervisor-register` 会拒绝 fork 出来的会话、起步就不低于 10 万的接班会话，以及不带本会话记录（`--session-record` 绝对路径、文件存在）的接班登记，上一班继续在岗（2026-10-26 run-63e7cfc2 实测接班即 29.7 万）。接班会话写不了 `.vibe/`（`session_gate_blocked`，原因带 `host sandbox denied access`）时不要重试、不要反复申请审批，停下把目录报给用户；项目根是 git 工作副本（如 Codex 自动建的 `~/.codex/worktrees/...`）时，宿主给新会话的可写目录通常只有主仓库，`supervisor-register` 会对此给出非阻断警告。让它跑 `vibe supervisor-handoff --run-id <run-id>`——这一条打印接班需要的全部内容（进度、等人拍板事项、填好的同一段心跳指令、接班步骤），新会话照做即可，不必再翻本协议、授权卡或完整状态：用 `vibe supervisor-register --session-record` 登记、自建心跳、置顶、改标题；删除旧心跳，旧会话归档。Claude Code 上没有换班原语，以清空自己（结束会话）代替；心跳降级为兜底机制，换班时是移交给新会话，不得只删除而不移交。**WorkBuddy 上没有自动换班原语**（2026-10-26 定案：Jobs detached 子进程拿不到模型 run identity，见 §6.4 的 WorkBuddy 条目），rotate 时报给用户的接班步骤是：用户在本项目目录的 WorkBuddy 里新开会话 → 新会话运行 `vibe supervisor-handoff --run-id <run-id>` 照做 → 旧会话删除自己的心跳并归档；不得承诺自动换班，也不得用 GUI 点击代开窗口（会和用户操作冲突）。
