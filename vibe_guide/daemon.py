@@ -23,9 +23,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from . import short_session, stall
+from . import fsio, short_session, stall
 from .contracts import RunEvent
-from .state import _atomic_bytes, append_event, load_events, load_snapshot, run_dir
+from .state import append_event, load_events, load_snapshot, run_dir
 
 DAEMON_FILE = "daemon.json"
 HEAL_STATE_FILE = "heal-state.json"
@@ -119,16 +119,16 @@ def _file(paths, run_id: str, name: str, create: bool = False) -> Path:
     return run_dir(paths, run_id, create=create) / name
 
 
-def _read_json(path: Path) -> Optional[Dict[str, Any]]:
+def _run_record(path: Path) -> Optional[Dict[str, Any]]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        value = fsio.read_json(path)
+    except (fsio.JsonMissingError, fsio.JsonCorruptError):
         return None
     return value if isinstance(value, dict) else None
 
 
-def _write_json(path: Path, value: Mapping[str, Any]) -> None:
-    _atomic_bytes(path, (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+def _save_run_record(path: Path, value: Mapping[str, Any]) -> None:
+    fsio.atomic_write_bytes(path, (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
 
 
 def pid_alive(pid: Any) -> bool:
@@ -163,7 +163,7 @@ def daemon_status(paths, run_id: str, *, now: Optional[float] = None,
     """Read-only: is the daemon of this run up, and if not, why."""
     now = time.time() if now is None else now
     base = {"command": "daemon", "action": "status", "run_id": run_id}
-    record = _read_json(_file(paths, run_id, DAEMON_FILE))
+    record = _run_record(_file(paths, run_id, DAEMON_FILE))
     if record is None:
         return {**base, "status": "not_started", "reason": "no daemon record for this run"}
     pid = record.get("pid")
@@ -172,7 +172,7 @@ def daemon_status(paths, run_id: str, *, now: Optional[float] = None,
     view = {**base, "pid": pid, "heartbeat_age": age, "cycles": record.get("cycles", 0),
             "run_status": record.get("run_status"), "last_error": record.get("last_error"),
             "lease": _lease_view(paths, run_id, pid)}
-    heal = _read_json(_file(paths, run_id, HEAL_STATE_FILE)) or {}
+    heal = _run_record(_file(paths, run_id, HEAL_STATE_FILE)) or {}
     view["heal"] = {key: heal.get(key) for key in ("sessions", "tokens", "cache_zero_streak")}
     state = record.get("state")
     if state != "running":
@@ -190,7 +190,7 @@ def register_pm_address(paths, run_id: str, provider: str, session_name: str) ->
     if not (isinstance(provider, str) and provider.strip() and isinstance(session_name, str) and session_name.strip()):
         raise ValueError("provider and session name are required")
     record = {"provider": provider.strip(), "session_name": session_name.strip(), "registered_at": time.time()}
-    _write_json(_file(paths, run_id, PM_ADDRESS_FILE, create=True), record)
+    _save_run_record(_file(paths, run_id, PM_ADDRESS_FILE, create=True), record)
     return record
 
 
@@ -232,7 +232,7 @@ def stop_daemon(paths, run_id: str, *, wait: float = 10.0,
                 alive: Callable[[Any], bool] = pid_alive,
                 kill: Callable[[int, int], None] = os.kill) -> Dict[str, Any]:
     base = {"command": "daemon", "action": "stop", "run_id": run_id}
-    record = _read_json(_file(paths, run_id, DAEMON_FILE))
+    record = _run_record(_file(paths, run_id, DAEMON_FILE))
     if record is None or record.get("state") != "running" or not alive(record.get("pid")):
         return {**base, "status": "not_running"}
     pid = record["pid"]
@@ -277,7 +277,7 @@ class PmNotifier:
         return None
 
     def __call__(self, message: str, kind: str, node_id: str = "") -> Dict[str, Any]:
-        address = _read_json(_file(self.paths, self.run_id, PM_ADDRESS_FILE, create=True))
+        address = _run_record(_file(self.paths, self.run_id, PM_ADDRESS_FILE, create=True))
         entry = {"at": time.time(), "kind": kind, "node_id": node_id, "message": message,
                  "target": (address or {}).get("session_name")}
         inbox = _file(self.paths, self.run_id, PM_INBOX_FILE, create=True)
@@ -355,10 +355,10 @@ class Daemon:
                   "started_at": self._started_at, "heartbeat": self.clock(), "cycles": self._cycles,
                   "run_status": self._run_status, "last_error": self._last_error,
                   "stale_seconds": max(self.config.stale_seconds, 4 * self.config.interval)}
-        _write_json(_file(self.paths, self.run_id, DAEMON_FILE, create=True), record)
+        _save_run_record(_file(self.paths, self.run_id, DAEMON_FILE, create=True), record)
 
     def _heal_state(self) -> Dict[str, Any]:
-        state = _read_json(_file(self.paths, self.run_id, HEAL_STATE_FILE)) or {}
+        state = _run_record(_file(self.paths, self.run_id, HEAL_STATE_FILE)) or {}
         state.setdefault("sessions", 0)
         state.setdefault("tokens", 0)
         state.setdefault("cache_zero_streak", 0)
@@ -367,7 +367,7 @@ class Daemon:
         return state
 
     def _save_heal_state(self, state: Mapping[str, Any]) -> None:
-        _write_json(_file(self.paths, self.run_id, HEAL_STATE_FILE, create=True), state)
+        _save_run_record(_file(self.paths, self.run_id, HEAL_STATE_FILE, create=True), state)
 
     def _event(self, name: str, **data: Any) -> None:
         provenance = None
