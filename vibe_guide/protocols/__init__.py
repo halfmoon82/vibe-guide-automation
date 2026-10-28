@@ -180,6 +180,11 @@ SHIPPED_PROTOCOL_DIGESTS = {
     "visible-sdd-worker": frozenset({
         "30b226ff0a6711a91779785c28a993679e0a33c3aeb89e836cfd427194750945",
     }),
+    # Second-level self-heal short session (daemon): the prompt the daemon feeds
+    # a one-shot repair session.
+    "heal-session": frozenset({
+        "f0338725e0669a5cc0fdee9b4189e7fd550f37c7e91bc922df68cfbc56dfe139",
+    }),
 }
 
 _HERE = Path(__file__).resolve().parent

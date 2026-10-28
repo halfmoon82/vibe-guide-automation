@@ -187,8 +187,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify'),
+        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon'),
     )
+    parser.add_argument("daemon_action", nargs="?", choices=("start", "status", "stop", "run", "register-pm"))
+    parser.add_argument("--interval", dest="daemon_interval", type=float, default=None)
+    parser.add_argument("--model", dest="daemon_model", default=None)
+    parser.add_argument("--session-name", dest="pm_session_name", default=None)
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--confirm", action="store_true")
     parser.add_argument("--host-rules", dest="host_rules", choices=("skip", "apply", "rollback"),
@@ -2426,6 +2430,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         payload = supervisor_mailbox_view(paths, args.run_id)
         return _result(SUCCESS if payload["status"] == "ok" else UNKNOWN, payload, json.dumps(payload, ensure_ascii=False), args.as_json)
 
+    if args.command == "daemon":
+        return _handle_daemon(args, paths, runner, supervisor_command_prefix)
+
     if args.command == "heal-verify":
         if not (args.run_id and args.node_id):
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id and --node are required"}, "缺少 --run-id 或 --node", args.as_json)
@@ -4057,6 +4064,55 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
     return _result(
         USAGE_ERROR, {"status": "usage_error"}, "参数错误", args.as_json
     )
+
+
+def _handle_daemon(args, paths, runner, command_prefix) -> CLIResult:
+    """vibe daemon start|status|stop|run|register-pm (run is the detached process itself)."""
+    from . import daemon as daemon_module
+    action = args.daemon_action
+    base = {"command": "daemon", "action": action}
+    if action is None or not args.run_id:
+        return _result(BLOCKED, {**base, "status": "blocked_invalid", "reason": "daemon needs an action and --run-id"},
+                       "用法：vibe daemon start|status|stop|run|register-pm --run-id <run-id>", args.as_json)
+    try:
+        if action == "status":
+            payload = daemon_module.daemon_status(paths, args.run_id)
+            code = SUCCESS if payload["status"] == "running" else UNKNOWN
+            text = "守护程序：{}{}".format(payload["status"], "（%s）" % payload["reason"] if payload.get("reason") else "")
+            return _result(code, payload, text, args.as_json)
+        if action == "stop":
+            payload = daemon_module.stop_daemon(paths, args.run_id)
+            return _result(SUCCESS if payload["status"] in ("stopped", "not_running") else UNKNOWN, payload,
+                           "守护程序：" + payload["status"], args.as_json)
+        if action == "register-pm":
+            if not (args.supervisor_provider and args.pm_session_name):
+                return _result(BLOCKED, {**base, "status": "blocked_invalid", "reason": "--provider and --session-name are required"},
+                               "缺少 --provider 或 --session-name", args.as_json)
+            record = daemon_module.register_pm_address(paths, args.run_id, args.supervisor_provider, args.pm_session_name)
+            return _result(SUCCESS, {**base, "status": "registered", "run_id": args.run_id, **record}, "产品经理会话已登记", args.as_json)
+        if not args.plan:
+            return _result(BLOCKED, {**base, "status": "blocked_invalid", "reason": "--plan is required"},
+                           "缺少 --plan", args.as_json)
+        if action == "start":
+            payload = daemon_module.start_daemon(paths, args.run_id, args.plan, interval=args.daemon_interval)
+            ok = payload["status"] in ("started", "already_running")
+            return _result(SUCCESS if ok else UNKNOWN, payload, "守护程序：" + payload["status"], args.as_json)
+        # run: the detached process.  Same assembly as `monitor --watch`, with the daemon loop on top.
+        config = daemon_module.load_config(paths, {"interval": args.daemon_interval, "model": args.daemon_model,
+                                                   "platform": args.supervisor_provider})
+        directory, plan, nodes, card = _load_plan(paths, args.plan)
+        run_id = _run_id(directory, args.run_id)
+        if runner is None:
+            runner = _public_runner(paths, card, nodes, [])
+        supervisor = Supervisor(
+            paths, Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card)),
+            runner, run_id)
+        outcome = daemon_module.Daemon(paths, run_id, supervisor, config, command_prefix=command_prefix).run()
+        ok = outcome["status"] in ("terminal", "stopped", "max_cycles")
+        return _result(SUCCESS if ok else UNKNOWN, {**base, "run_id": run_id, **outcome}, "守护程序结束：" + outcome["status"], args.as_json)
+    except (OSError, ValueError, TypeError, FileNotFoundError) as error:
+        return _result(UNKNOWN, {**base, "status": "unknown", "reason": str(error)[:200]},
+                       "守护程序状态未知：" + str(error)[:200], args.as_json)
 
 
 def handle_monitor(
