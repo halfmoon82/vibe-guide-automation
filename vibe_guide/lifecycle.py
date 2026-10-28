@@ -89,6 +89,11 @@ ACTIVE_NODE_STATUSES = frozenset({"running", "review", "rework", "delivered"})
 TERMINAL_NODE_STATUSES = frozenset({"accepted"})
 #: Node statuses with a bound worker session (state._WORKER_SESSION_STATUSES).
 SESSION_OCCUPYING_STATUSES = frozenset({"running", "review", "rework"})
+#: Every status a task-registry binding may carry (task_registry._STATUSES).
+TASK_STATUSES = frozenset({
+    "created", "start_pending", "running", "delivered", "review", "rework",
+    "accepted", "archived", "blocked_design", "blocked_unknown", "failed", "stopped",
+})
 #: Task-registry statuses that end a task (task_registry._TERMINAL_STATUSES).
 TERMINAL_TASK_STATUSES = frozenset({"archived", "blocked_design", "failed", "stopped"})
 #: Provider-wait statuses that end a runner action (provider_action.WAIT_TERMINAL_STATUSES).

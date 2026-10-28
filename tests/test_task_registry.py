@@ -8,7 +8,9 @@ from pathlib import Path
 
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.task_registry import (
+    DEFAULT_TOPOLOGY,
     TaskBinding,
+    default_topology,
     load_task_binding,
     save_task_binding,
     reconcile_shadowed_successor,
@@ -447,6 +449,34 @@ class TaskRegistryTests(unittest.TestCase):
         loaded = load_task_binding(self.paths, "N3", "developer")
 
         self.assertEqual(loaded.topology, "dual-visible")
+
+    def test_default_topology_is_background_only_for_claude_code(self):
+        self.assertEqual(default_topology("claude-code"), "background")
+        self.assertEqual(default_topology("claude-code-visible"), "background")
+        self.assertEqual(default_topology("codex"), "dual-visible")
+        self.assertEqual(default_topology("codex"), DEFAULT_TOPOLOGY)
+        self.assertEqual(default_topology("unknown-platform"), DEFAULT_TOPOLOGY)
+        self.assertEqual(default_topology(None), DEFAULT_TOPOLOGY)
+
+    def test_alias_field_rows_are_rejected_by_name(self):
+        for alias in ("thread_id", "host_id", "client_thread_id"):
+            with self.subTest(alias=alias):
+                save_task_binding(self.paths, self.binding())
+                registry = Path(self.temporary.name) / ".vibe/runs/run-1/tasks.json"
+                payload = json.loads(registry.read_text(encoding="utf-8"))
+                payload["bindings"][0][alias] = "thread-dev"
+                registry.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+                with self.assertRaises(ValueError) as caught:
+                    load_task_binding(self.paths, "N3", "developer")
+                self.assertIn(alias, str(caught.exception))
+                registry.unlink()
+
+    def test_codex_binding_reads_thread_id_camel_case(self):
+        save_task_binding(self.paths, self.binding())
+        loaded = load_task_binding(self.paths, "N3", "developer")
+        self.assertEqual(loaded.threadId, "thread-dev")
+        self.assertFalse(hasattr(loaded, "thread_id"))
+        self.assertFalse(hasattr(loaded, "host_id"))
 
     def test_visible_sdd_reviewer_role_is_rejected_at_construction(self):
         with self.assertRaises(ValueError):

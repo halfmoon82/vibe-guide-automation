@@ -1,11 +1,8 @@
 """Versioned, multi-process-safe registry for provider task bindings."""
 
 from dataclasses import dataclass, field
-import hashlib
 import json
-import os
 from pathlib import Path
-import tempfile
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .paths import ProjectPaths
@@ -30,8 +27,10 @@ from .binding_lifecycle import (
     RequestedBindingPolicy,
     verify_binding as verify_v4_binding,
 )
-from .lifecycle import migrate_task_record, normalize_task_status
-from .providers import CODEX_PROVIDER
+from .digests import sha256_bytes
+from .fsio import JsonCorruptError, JsonMissingError, atomic_write_json, read_json
+from .lifecycle import TASK_STATUSES, TERMINAL_TASK_STATUSES
+from .providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER
 
 
 REGISTRY_SCHEMA_VERSION = 1
@@ -39,32 +38,27 @@ BINDING_SCHEMA_VERSION = 1
 _ROLES = {"developer", "reviewer"}
 _MODES = {"visible", "background"}
 _TOPOLOGIES = {"visible-sdd", "dual-visible", "background"}
+# Fallback only: a DAG node that does not state its topology gets this one.
+# Per-platform defaults come from default_topology().
 DEFAULT_TOPOLOGY = "dual-visible"
-_STATUSES = {
-    "created",
-    "start_pending",
-    "running",
-    "delivered",
-    "review",
-    "rework",
-    "accepted",
-    "archived",
-    "blocked_design",
-    "blocked_unknown",
-    "failed",
-    "stopped",
-}
-_TERMINAL_STATUSES = {
-    "archived",
-    "blocked_design",
-    "failed",
-    "stopped",
-}
+_STATUSES = TASK_STATUSES
+_TERMINAL_STATUSES = TERMINAL_TASK_STATUSES
+# monitor.py imports this name; the write itself lives in fsio.
+_atomic_json = atomic_write_json
+# Alias spellings of threadId/hostId/clientThreadId; rows carrying them are rejected.
+_REJECTED_ALIAS_FIELDS = ("thread_id", "host_id", "client_thread_id")
 _DIGEST_HEX = set("0123456789abcdef")
 
 
 def _digest_reference(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return sha256_bytes(value.encode("utf-8"))
+
+
+def default_topology(host: Optional[str]) -> str:
+    """Default dispatch topology for a platform; unknown hosts keep DEFAULT_TOPOLOGY."""
+    if host in ("claude-code", CLAUDE_CODE_PROVIDER):
+        return "background"
+    return DEFAULT_TOPOLOGY
 
 
 @dataclass
@@ -89,8 +83,6 @@ class TaskBinding:
     visible: Optional[bool] = None
     limitations: List[str] = field(default_factory=list)
     topology: str = DEFAULT_TOPOLOGY
-    thread_id: Optional[str] = None
-    host_id: Optional[str] = None
     continuation_digest: Optional[str] = None
     generation: int = 0
     allowlist: List[str] = field(default_factory=list)
@@ -241,7 +233,6 @@ class TaskBinding:
                 self.task_id,
                 self.platform_task_id,
                 self.threadId,
-                self.thread_id,
             )
             if item is not None
         ]
@@ -253,9 +244,8 @@ class TaskBinding:
         self.task_id = canonical_id
         self.platform_task_id = canonical_id
         self.threadId = canonical_id if self.provider == CODEX_PROVIDER else self.threadId
-        self.thread_id = self.threadId
 
-        hosts = [item for item in (self.host, self.hostId, self.host_id) if item is not None]
+        hosts = [item for item in (self.host, self.hostId) if item is not None]
         if any(not isinstance(item, str) or not item for item in hosts):
             raise ValueError("platform host identity is invalid")
         if len(set(hosts)) > 1:
@@ -263,7 +253,6 @@ class TaskBinding:
         canonical_host = hosts[0] if hosts else None
         self.host = canonical_host
         self.hostId = canonical_host if self.provider == CODEX_PROVIDER else self.hostId
-        self.host_id = self.hostId
 
         expected_visible = self.mode == "visible"
         if self.visible is not None and self.visible != expected_visible:
@@ -390,6 +379,11 @@ class TaskBinding:
         if not isinstance(data, dict) or not set(data).issubset(allowed) or not expected.issubset(data):
             raise ValueError("task binding record schema is invalid")
         normalized = dict(data)
+        # threadId is the platform task identity; task_id/platform_task_id are
+        # its stored mirrors and follow it.
+        if normalized.get("threadId") is not None:
+            normalized["task_id"] = normalized["threadId"]
+            normalized["platform_task_id"] = normalized["threadId"]
         normalized.setdefault("allowlist", [])
         normalized.setdefault("capability_contract_digest", None)
         normalized.setdefault("successor_of", None)
@@ -410,32 +404,6 @@ class TaskBinding:
         ]:
             normalized["business_write_allowed"] = False
         return cls(**normalized)
-
-
-def _atomic_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.parent.is_symlink():
-        raise ValueError("registry parent may not be a symlink")
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix="." + path.name + ".", dir=str(path.parent)
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(
-                payload,
-                stream,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(str(temporary_path), str(path))
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
 
 
 def _run_tasks_path(paths: ProjectPaths, run_id: Optional[str], create: bool) -> Path:
@@ -462,10 +430,10 @@ def _read_registry(
     path: Path, expected_run_id: Optional[str] = None
 ) -> Tuple[int, List[TaskBinding]]:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+        raw = read_json(path)
+    except JsonMissingError:
         return 0, []
-    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as error:
+    except JsonCorruptError as error:
         raise ValueError("task registry is not valid JSON") from error
     if not isinstance(raw, dict) or set(raw) != {"schema_version", "revision", "bindings"}:
         raise ValueError("task registry schema is invalid")
@@ -477,34 +445,16 @@ def _read_registry(
         raise ValueError("task registry bindings must be a list")
     bindings = []
     for item in raw["bindings"]:
-        migrated = migrate_task_record(item)
-        # The registry stores the provider binding schema; migration is the
-        # only place legacy aliases are read.  Pending setup records cannot be
-        # materialized as visible TaskBinding objects until a real identity is
-        # observed, so fail closed instead of inventing one.
-        if migrated.get("status") == "SETUP_PENDING":
-            # Provider setup placeholders are handled by the visible adapter;
-            # the registry keeps their original schema until real identity is
-            # observed, rather than inventing a TaskBinding identity.
-            migrated = dict(item)
-        # Preserve already-canonical records byte-for-byte; migration only
-        # changes records that actually carry legacy aliases.
-        if not any(key in item for key in ("clientThreadId", "client_thread_id", "threadId", "thread_id")) and item.get("status") not in {"DELIVERY_COMPLETE", "delivered"}:
-            migrated = dict(item)
-        had_legacy_alias = any(key in item for key in ("thread_id", "host_id", "client_thread_id", "clientThreadId")) or item.get("status") == "DELIVERY_COMPLETE"
-        migrated["legacy"] = dict(migrated.get("legacy") or {}) if had_legacy_alias else {}
-        if "thread_id" in migrated and "threadId" not in migrated:
-            migrated["threadId"] = migrated["thread_id"]
-        if "host_id" in migrated and "hostId" not in migrated:
-            migrated["hostId"] = migrated["host_id"]
-        migrated.pop("thread_id", None)
-        migrated.pop("host_id", None)
-        migrated.pop("clientThreadId", None)
-        migrated.pop("client_thread_id", None)
-        status = migrated.get("status")
-        if isinstance(status, str):
-            migrated["status"] = status.casefold()
-        bindings.append(TaskBinding.from_dict(migrated))
+        if not isinstance(item, dict):
+            raise ValueError("task binding record schema is invalid")
+        # One field-name set only (threadId/hostId/clientThreadId): alias rows
+        # are refused by name, never migrated.
+        for alias in _REJECTED_ALIAS_FIELDS:
+            if alias in item:
+                raise ValueError(
+                    "task binding row uses unsupported alias field %s" % alias
+                )
+        bindings.append(TaskBinding.from_dict(item))
     if expected_run_id is not None:
         validate_run_id(expected_run_id)
         if any(binding.run_id != expected_run_id for binding in bindings):
@@ -659,7 +609,7 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding, *,
                 break
         if not replaced:
             destination_values.append(persistent)
-        _atomic_json(
+        atomic_write_json(
             destination,
             {
                 "schema_version": REGISTRY_SCHEMA_VERSION,
@@ -782,9 +732,9 @@ def reconcile_shadowed_successor(
             if json.loads(history.read_text()) != evidence:
                 raise ValueError('shadowed successor recovery evidence drift')
         else:
-            _atomic_json(history, evidence)
+            atomic_write_json(history, evidence)
         rows.append(new)
-        _atomic_json(destination, {'schema_version': REGISTRY_SCHEMA_VERSION,
+        atomic_write_json(destination, {'schema_version': REGISTRY_SCHEMA_VERSION,
                                   'revision': revision+1, 'bindings': [item.to_dict() for item in rows]})
 
 
