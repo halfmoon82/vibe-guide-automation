@@ -100,11 +100,11 @@ class SilentWorkerTests(RunningWorkerFixture):
         self.assertIsNone(self.stall_entry(out))
         self.assertEqual(self.view()["user_status"], "已启动")
 
-    def test_missing_transcript_is_unknown_not_flagged_and_not_a_beat_line(self):
+    def test_missing_transcript_is_unknown_not_flagged_as_stalled(self):
         out = self.beat()
         self.assertIsNone(self.stall_entry(out))
-        self.assertEqual(out.text, "idle")
         self.assertEqual(out.payload["stall"]["unknown_liveness"], [NODE])
+        self.assertNotEqual(out.text, "idle")
 
     def test_worker_that_already_delivered_is_not_flagged(self):
         self.write_transcript(SILENT_MINUTES)
@@ -148,7 +148,7 @@ class EscalationAndVerifyTests(RunningWorkerFixture):
         self.assertEqual(passed.payload["status"], "verify_passed", passed.payload)
 
     def test_two_failed_attempts_escalate_to_the_person(self):
-        self.write_transcript(SILENT_MINUTES)
+        self.write_transcript(35)
         self.beat()
         self.verify()
         self.verify()
@@ -157,6 +157,61 @@ class EscalationAndVerifyTests(RunningWorkerFixture):
         self.assertEqual(entry["tier"], "escalate_to_pm", out.text)
         self.assertTrue(out.text.startswith("需要人处理："), out.text)
         self.assertEqual(self.view()["user_status"], ESCALATE_LABEL)
+
+
+class ReviewFixesTests(RunningWorkerFixture):
+    """Findings from the independent review of the silent-worker fix."""
+
+    def test_unresolvable_session_is_not_reported_as_unknown_noise(self):
+        snapshot = load_snapshot(self.paths, self.run_id)
+        snapshot.nodes[NODE]["active_task"]["task_id"] = "developer:n1"
+        save_snapshot(self.paths, snapshot)
+        out = self.beat()
+        self.assertEqual(out.text, "idle")
+
+    def test_known_session_without_a_transcript_is_said_aloud(self):
+        out = self.beat()
+        self.assertIn("空转评估未知", out.text)
+        self.assertIn(NODE, out.text)
+        self.assertIn(SESSION, out.text)
+
+    def test_a_legitimate_long_command_never_reaches_the_person(self):
+        self.write_transcript(SILENT_MINUTES)
+        self.beat()
+        self.verify()
+        self.verify()
+        out = self.beat()
+        self.assertEqual(self.stall_entry(out)["tier"], "supervisor_investigate", out.text)
+        self.assertNotIn("需要人处理", out.text)
+
+    def test_only_this_generations_delivery_counts(self):
+        snapshot = load_snapshot(self.paths, self.run_id)
+        snapshot.nodes[NODE]["active_task"]["generation"] = 2
+        save_snapshot(self.paths, snapshot)
+        self.write_transcript(SILENT_MINUTES)
+        deliveries = self.root / ".vibe" / "provider-actions" / "deliveries"
+        deliveries.mkdir(parents=True, exist_ok=True)
+        old = deliveries / "{}-{}-developer-g1.json".format(self.run_id, NODE)
+        old.write_text("{}")
+        self.assertIsNotNone(self.stall_entry(self.beat()))
+        (deliveries / "{}-{}-developer-g2.json".format(self.run_id, NODE)).write_text("{}")
+        self.assertIsNone(self.stall_entry(self.beat()))
+
+    def test_silent_node_text_says_minutes_not_beats(self):
+        self.write_transcript(SILENT_MINUTES)
+        out = self.beat()
+        self.assertIn("静默 {} 分钟".format(SILENT_MINUTES), out.text)
+        self.assertNotIn("连续 1 拍", out.text)
+
+    def test_rework_and_review_sessions_are_watched_too(self):
+        for status in ("rework", "review"):
+            with self.subTest(status=status):
+                snapshot = load_snapshot(self.paths, self.run_id)
+                snapshot.nodes[NODE]["status"] = status
+                save_snapshot(self.paths, snapshot)
+                self.write_transcript(SILENT_MINUTES)
+                self.assertIsNotNone(self.stall_entry(self.beat()), status)
+                self.assertEqual(self.view()["user_status"], INVESTIGATE_LABEL)
 
 
 class LabelTests(unittest.TestCase):

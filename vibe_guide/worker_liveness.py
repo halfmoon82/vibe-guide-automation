@@ -16,6 +16,11 @@ from typing import Any, Dict, Mapping, Optional
 from .paths import ProjectPaths
 
 SILENCE_SECONDS = 15 * 60
+#: Escalating to a person needs twice the silence threshold: a single long
+#: command (a test run, a build) legitimately leaves the transcript untouched.
+ESCALATE_SILENCE_SECONDS = 2 * SILENCE_SECONDS
+#: Statuses in which a worker session is doing the node's work.
+SESSION_STATUSES = frozenset({"running", "review", "rework"})
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _HANDLE_SESSION_DIR = ("provider-actions", "claude-bg-sessions")
@@ -55,29 +60,40 @@ def transcript_path(paths: ProjectPaths, node: Mapping[str, Any]) -> Optional[Pa
 
 
 def has_delivered(paths: ProjectPaths, run_id: str, node_id: str, node: Mapping[str, Any]) -> bool:
-    """A worker that already reported is waiting on the supervisor, not silent."""
+    """This generation's worker already reported: it waits on the supervisor, not silent."""
     active = node.get("active_task")
-    role = active.get("role") if isinstance(active, Mapping) else None
-    if role not in ("developer", "reviewer"):
+    if not isinstance(active, Mapping):
         return False
-    directory = paths.vibe / "provider-actions" / "deliveries"
+    role, generation = active.get("role"), active.get("generation")
+    if role not in ("developer", "reviewer") or isinstance(generation, bool) or not isinstance(generation, int):
+        return False
+    path = paths.vibe / "provider-actions" / "deliveries" / "{}-{}-{}-g{}.json".format(
+        run_id, node_id, role, generation)
     try:
-        return any(directory.glob("%s-%s-%s-g*.json" % (run_id, node_id, role)))
+        return path.is_file()
     except OSError:
         return False
 
 
 def probe(paths: ProjectPaths, run_id: str, node_id: str, node: Mapping[str, Any],
           now: Optional[float] = None) -> Dict[str, Any]:
-    """``{"state": "silent"|"active"|"unknown", ...}`` for a running node's worker."""
+    """``{"state": "silent"|"active"|"unknown"|"unresolved", ...}`` for a node's worker.
+
+    ``unknown``: the session is identified but its transcript is missing or
+    unreadable -- said aloud, never healthy.  ``unresolved``: no session id can
+    be derived (other providers, legacy ids), so nothing can be claimed either way.
+    """
     if has_delivered(paths, run_id, node_id, node):
         return {"state": "active", "reason": "delivered"}
+    session = _session_id(paths, node)
+    if session is None:
+        return {"state": "unresolved", "reason": "no session id"}
     path = transcript_path(paths, node)
     if path is None:
-        return {"state": "unknown", "reason": "transcript not found"}
+        return {"state": "unknown", "reason": "transcript not found", "session": session}
     try:
         age = (now if now is not None else time.time()) - path.stat().st_mtime
     except OSError:
-        return {"state": "unknown", "reason": "transcript unreadable"}
+        return {"state": "unknown", "reason": "transcript unreadable", "session": session}
     state = "silent" if age >= SILENCE_SECONDS else "active"
-    return {"state": state, "silent_minutes": int(age // 60), "transcript": str(path)}
+    return {"state": state, "silent_minutes": int(age // 60), "transcript": str(path), "session": session}

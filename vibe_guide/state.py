@@ -175,6 +175,9 @@ _STALL_TIER_STATUS = {
     "supervisor_investigate": STALL_INVESTIGATE_STATUS,
     "escalate_to_pm": STALL_ESCALATE_STATUS,
 }
+#: Statuses in which a bound worker session is doing the node's work; a stalled one
+#: (its session went silent) is relabelled even though its own label is 已启动.
+_WORKER_SESSION_STATUSES = frozenset({"running", "review", "rework"})
 _USER_DECISION_STATUSES = {"blocked_design", "blocked_deploy"}
 _USER_PREPARING_STATUSES = {"initialized", "planned", "brief_pending", "start_pending"}
 _USER_ACTIVE_STATUSES = {
@@ -236,7 +239,10 @@ def map_user_status(status: Any, reason: Any = "") -> str:
     """
     label = _derived_user_status(status, reason)
     if isinstance(status, dict):
-        session_node = status.get("status") == "running" and isinstance(status.get("active_task"), dict)
+        session_node = (
+            status.get("status") in _WORKER_SESSION_STATUSES
+            and isinstance(status.get("active_task"), dict)
+        )
         if label == "自动修复中" or session_node:
             return _STALL_TIER_STATUS.get(status.get(STALL_TIER_KEY), label)
     return label
