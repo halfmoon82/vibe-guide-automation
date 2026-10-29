@@ -28,9 +28,11 @@ from .worker_questions import KIND_SCOPE_LANDING, park
 CAUSE_HELD = "held_by_other_node"
 CAUSE_NOT_EXPANDABLE = "not_auto_expandable"
 CAUSE_UNREADABLE = "landing_unreadable"
+CAUSE_UNCOMMITTED = "uncommitted"
 _CAUSE_TEXT = {
     CAUSE_HELD: "已被其他未完成节点的写范围占用",
     CAUSE_NOT_EXPANDABLE: "不在 tests/ 或 auto_scope_paths 内，也不满足项目已批准的验收不变规则",
+    CAUSE_UNCOMMITTED: "只在工作区或暂存区，没有 commit",
 }
 _CLAIM_REASON = "developer delivery landed outside the node files; project approved the acceptance-unchanged rule"
 REJECTION_KEY = "scope_landing_rejection"
@@ -105,6 +107,19 @@ def _resolve_base(monitor: Any, current: Dict[str, Any], git: GitRunner, project
     return merged.stdout.strip()
 
 
+def uncommitted_files(git: GitRunner) -> List[str]:
+    """Tracked or staged paths whose changes are not committed on the node branch.
+
+    Such a delivery never reaches the composed baseline of the nodes that
+    depend on it.  Untracked files are left alone: a worker's delivery marker
+    file is legitimately untracked, so they cannot be told apart from lost work.
+    """
+    result = git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=no"])
+    if result.returncode != 0:
+        raise ScopeLandingUnknown("git status failed: %s" % (result.stderr or "").strip()[-200:])
+    return sorted({entry[3:] for entry in (result.stdout or "").split("\0") if len(entry) > 3})
+
+
 def _glob_match(path: List[str], pattern: List[str]) -> bool:
     """Segment-wise glob: ``*`` stays inside one directory, ``**`` spans any."""
     if not pattern:
@@ -155,6 +170,7 @@ def landing_report(monitor: Any, snapshot: Any, node_id: str) -> Optional[Dict[s
     if taken.returncode == 0 and taken.stdout.strip():
         merged_in.append(taken.stdout.strip())
     files = landed_files(git, base, "HEAD", merged_in)
+    uncommitted = uncommitted_files(git)
     node = monitor.nodes[node_id]
     scope = list(_write_scope_paths(node) or []) + list(monitor._node_scope_files(node_id, current))
     occupied = [_scope_compare_key(item)
@@ -162,7 +178,9 @@ def landing_report(monitor: Any, snapshot: Any, node_id: str) -> Optional[Dict[s
     auto_paths = monitor._auto_scope_paths()
     approved = monitor._acceptance_rule_approved()
     expanded: List[Dict[str, str]] = []
-    rejected: List[Dict[str, str]] = []
+    rejected: List[Dict[str, str]] = [
+        {"path": path, "cause": CAUSE_UNCOMMITTED} for path in uncommitted
+    ]
     for path in files:
         if _inside(path, scope):
             continue
@@ -191,10 +209,20 @@ def _rejection_text(rejected: List[Dict[str, str]], error: Optional[str] = None)
     if error:
         return ("交付被拒收：无法核对这次交付实际改了哪些文件（{}）。"
                 "确认 worker 分支状态后再续派。".format(error))
-    listed = "；".join("{}（{}）".format(item["path"], _CAUSE_TEXT.get(item["cause"], item["cause"]))
-                      for item in rejected)
-    return ("交付被拒收：以下文件超出本节点的授权文件范围，且不能自动扩范围：{}。"
-            "请撤回这些改动后重新交付；确需改动时由监工按授权流程处理。".format(listed))
+    def listed(items: List[Dict[str, str]]) -> str:
+        return "；".join("{}（{}）".format(item["path"], _CAUSE_TEXT.get(item["cause"], item["cause"]))
+                        for item in items)
+
+    parts = []
+    loose = [item for item in rejected if item["cause"] == CAUSE_UNCOMMITTED]
+    outside = [item for item in rejected if item["cause"] != CAUSE_UNCOMMITTED]
+    if loose:
+        parts.append("以下改动没有 commit 到节点分支，不会进入依赖它的节点和整合基线：{}。"
+                     "请 git add 并 git commit 后重新交付。".format(listed(loose)))
+    if outside:
+        parts.append("以下文件超出本节点的授权文件范围，且不能自动扩范围：{}。"
+                     "请撤回这些改动后重新交付；确需改动时由监工按授权流程处理。".format(listed(outside)))
+    return "交付被拒收：" + "".join(parts)
 
 
 def check_delivery(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, Any]) -> bool:

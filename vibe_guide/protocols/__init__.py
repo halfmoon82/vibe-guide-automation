@@ -200,6 +200,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # its path and sha256.
     "supervisor-card": frozenset({
         "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
+        # work beat: no manual resume while the daemon advances the run.
+        "316ac78b3dead0703a8a118f308029ab2a9af709eb8d79cad780a1b5423060e1",
     }),
     # Second-level self-heal short session (daemon): the prompt the daemon feeds
     # a one-shot repair session.
