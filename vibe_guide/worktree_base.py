@@ -10,6 +10,9 @@ leaves no half-built worktree behind and names the conflicting files.
 
 from typing import Any, Callable, Dict, List, Mapping
 
+BASELINE_AUTHOR_NAME = "vibe-guide"
+BASELINE_AUTHOR_EMAIL = "vibe-guide@localhost"
+
 #: ``git(args) -> CommandResult`` (returncode/stdout/stderr) run in the repo.
 GitRunner = Callable[[List[str]], Any]
 
@@ -83,7 +86,12 @@ def compose_base(git: GitRunner, base: str, branches: List[str]) -> str:
             raise UpstreamBaseUnavailable(
                 "git merge-tree for %s failed (exit %s): %s"
                 % (branch, merged.returncode, _tail(merged)))
-        committed = git(["commit-tree", lines[0].strip(), "-p", base, "-p", tip,
+        # The baseline commit is vibe's own bookkeeping, so it carries a fixed
+        # identity: a machine with no git user configured (a fresh sandbox, a
+        # CI box) would otherwise fail here and the node would never get a tree.
+        committed = git(["-c", "user.name=" + BASELINE_AUTHOR_NAME,
+                         "-c", "user.email=" + BASELINE_AUTHOR_EMAIL,
+                         "commit-tree", lines[0].strip(), "-p", base, "-p", tip,
                          "-m", "vibe: merge accepted upstream %s into the node baseline" % branch])
         if committed.returncode != 0 or not (committed.stdout or "").strip():
             raise UpstreamBaseUnavailable(

@@ -110,6 +110,44 @@ class LandingTests(unittest.TestCase):
         self.assertEqual(status.payload["nodes"]["bg"]["scope_expansions"], ["tests/test_x.py"])
         self.assertIn("tests/test_x.py", status.text)
 
+    def stage_only(self, node_id, files):
+        worktree = self.paths.root / self.snapshot.nodes[node_id]["worktree"]
+        for name, text in files.items():
+            (worktree / name).write_text(text, encoding="utf-8")
+            git(worktree, "add", name)
+
+    def test_staged_but_uncommitted_delivery_is_refused_with_its_name(self):
+        # Rehearsal run-01202945: usage-docs left docs/usage.md staged and
+        # uncommitted, vibe accepted it, and the integration baseline never
+        # contained the file.
+        self.stage_only("bg", {"bg.py": "work\n"})
+        snapshot = self.deliver()
+
+        node = snapshot.nodes["bg"]
+        self.assertNotIn(node["status"], {"review", "delivered", "accepted"})
+        self.assertEqual(node["status"], worker_questions.AWAITING_STATUS)
+        self.assertEqual(node["scope_landing_rejection"],
+                         [{"path": "bg.py", "cause": scope_landing.CAUSE_UNCOMMITTED}])
+        self.assertEqual(self.events("delivered"), [])
+        [question] = worker_questions.pending_questions(self.paths, snapshot)
+        self.assertIn("bg.py", question["excerpt"])
+        self.assertIn("commit", question["excerpt"])
+
+    def test_unstaged_edit_of_a_tracked_file_is_refused_too(self):
+        worktree = self.paths.root / self.snapshot.nodes["bg"]["worktree"]
+        (worktree / "bg.py").write_text("edited, never added\n", encoding="utf-8")
+        snapshot = self.deliver()
+        self.assertEqual(snapshot.nodes["bg"]["scope_landing_rejection"],
+                         [{"path": "bg.py", "cause": scope_landing.CAUSE_UNCOMMITTED}])
+
+    def test_untracked_marker_file_does_not_block_a_committed_delivery(self):
+        self.land("bg", {"bg.py": "work\n"})
+        worktree = self.paths.root / self.snapshot.nodes["bg"]["worktree"]
+        (worktree / "delivery.md").write_text("done\n", encoding="utf-8")
+        snapshot = self.deliver()
+        self.assertEqual(snapshot.nodes["bg"]["status"], "review",
+                         snapshot.nodes["bg"].get("reason"))
+
     def test_a_file_held_by_another_active_node_is_rejected(self):
         self.land("bg", {"bg.py": "work\n", "bg2.py": "stolen\n"})
         snapshot = self.deliver()

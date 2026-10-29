@@ -135,6 +135,27 @@ def parse_claude_output(stdout: str):
     return text, usage
 
 
+def claude_error_text(stdout: str) -> str:
+    """The ``result`` text of a ``claude -p --output-format json`` error, else ""."""
+    try:
+        data = json.loads(stdout)
+    except ValueError:
+        return ""
+    if isinstance(data, list):
+        data = next((item for item in reversed(data)
+                     if isinstance(item, dict) and item.get("type") == "result"), None)
+    if not isinstance(data, dict) or data.get("is_error") is not True:
+        return ""
+    text = data.get("result")
+    return " ".join(text.split())[:200] if isinstance(text, str) else "the session reported an error"
+
+
+#: set by the Claude Code desktop host for its own sessions; a one-shot session
+#: that inherits them comes up "Not logged in" or "Invalid API key".  Bisected on
+#: the 5.2.1 rehearsal machine: these two are the whole set that matters.
+_HOST_ONLY_ENV = ("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "CLAUDE_CODE_HOST_AUTH_ENV_VAR")
+
+
 def _kill_group(process: "subprocess.Popen") -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -212,8 +233,10 @@ def launch(platform: str, prompt: str, *, model: Optional[str] = None,
         return ShortSessionResult(platform, STATUS_UNKNOWN, "command not available: %s" % command[0],
                                   command=command[:-1])
     try:
+        if env is None:
+            env = {key: value for key, value in os.environ.items() if key not in _HOST_ONLY_ENV}
         returncode, stdout, stderr = _run_process(
-            command, cwd=cwd, env=dict(env) if env is not None else None, timeout=timeout, poll=poll)
+            command, cwd=cwd, env=dict(env), timeout=timeout, poll=poll)
     except subprocess.TimeoutExpired:
         return ShortSessionResult(platform, STATUS_UNKNOWN, "timed out after %ds" % int(timeout),
                                   command=command[:-1])
@@ -222,9 +245,19 @@ def launch(platform: str, prompt: str, *, model: Optional[str] = None,
                                   command=command[:-1])
     usage = None
     text = stdout
+    error_text = ""
     if platform == PLATFORM_CLAUDE_CODE:
         text, usage = parse_claude_output(stdout)
-    status = STATUS_OK if returncode == 0 else STATUS_FAILED
-    reason = "" if returncode == 0 else "exit code %s" % returncode
+        error_text = claude_error_text(stdout)
+    failed = returncode != 0 or bool(error_text)
+    status = STATUS_FAILED if failed else STATUS_OK
+    if not failed:
+        reason = ""
+    elif error_text:
+        # The CLI's own words ("Not logged in", "Invalid API key") are what the
+        # product manager needs; nothing here is a credential.
+        reason = "exit code %s: %s" % (returncode, error_text)
+    else:
+        reason = "exit code %s" % returncode
     return ShortSessionResult(platform, status, reason, text[-_OUTPUT_LIMIT:], returncode, usage,
                               command=command[:-1])
