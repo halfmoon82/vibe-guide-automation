@@ -27,6 +27,8 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-29: integration review evidence is the four keys itself, no claim wrapper (D3).
+        "1cc9c70328c9f156faeb55638d28fb55e34d7c7b524da6a8f7680490e150575b",
         # 2026-10-28: integration merge — slim guide plus derived risk_tags rule (#321).
         "a0b328bfbff4ccd5a9cd356be360df45b5fb3809afda8e898a7b6b65110f7914",
         # 2026-10-28: tests re-pinned to the slim guide; <35KB; single-shift off switch.
