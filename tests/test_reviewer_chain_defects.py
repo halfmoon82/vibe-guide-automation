@@ -78,6 +78,7 @@ from unittest import mock
 
 from vibe_guide.capability_contract import build_contract, save_contract
 from vibe_guide.models import AgentCapabilities
+from vibe_guide.contracts import RunHandle
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.state import load_events, load_snapshot
 
@@ -185,3 +186,69 @@ class RepairAfterRejectionTests(_OneNodeCase):
         after = load_snapshot(self.paths, snapshot.run_id).nodes["n1"]
         self.assertEqual(after["status"], "blocked_unknown")
         self.assertEqual(after.get("recovery_action"), "reconcile_binding")
+
+
+class RealRunnerNoticeTests(unittest.TestCase):
+    """P1: the notice must exist on the runners that run in production."""
+
+    def test_claude_bg_runner_resumes_same_session_without_bumping_generation(self):
+        import tempfile
+        from vibe_guide.runners.claude_bg import ClaudeBgRunner
+        from tests.test_claude_bg_runner import FakeLauncher, UUID
+
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = FakeLauncher(state="idle")
+            runner = ClaudeBgRunner(
+                lambda c, w: launcher, delivery_reader=lambda claims: None,
+                paths=ProjectPaths(Path(tmp)),
+            )
+            handle = runner.start(
+                {"node_id": "n1", "role": "reviewer", "run_id": "r1",
+                 "generation": 1, "contract_path": "/c.md"}, Path("/tmp"))
+            runner.send_notice(handle, "fixed text")
+            self.assertEqual(launcher.calls[-1], ("resume", UUID, "fixed text"))
+            self.assertEqual(runner._session(handle)["claims"]["generation"], 1)
+
+    def test_claude_bg_runner_does_not_interrupt_a_working_session(self):
+        import tempfile
+        from vibe_guide.runners.claude_bg import ClaudeBgRunner
+        from tests.test_claude_bg_runner import FakeLauncher
+
+        with tempfile.TemporaryDirectory() as tmp:
+            launcher = FakeLauncher(state="working")
+            runner = ClaudeBgRunner(
+                lambda c, w: launcher, delivery_reader=lambda claims: None,
+                paths=ProjectPaths(Path(tmp)),
+            )
+            handle = runner.start(
+                {"node_id": "n1", "role": "reviewer", "run_id": "r1",
+                 "generation": 1, "contract_path": "/c.md"}, Path("/tmp"))
+            with self.assertRaises(Exception):
+                runner.send_notice(handle, "fixed text")
+            self.assertFalse([c for c in launcher.calls if c[0] in ("resume", "stop")])
+
+    def test_provider_action_runner_queues_resume_action_without_touching_wait_state(self):
+        import tempfile
+        from unittest.mock import patch
+        from vibe_guide.runners.provider_action import ProviderActionRunner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".vibe").mkdir()
+            (root / ".vibe" / "state.json").write_text("{}", encoding="utf-8")
+            with patch("vibe_guide.adapters.task_provider.require_entry"):
+                runner = ProviderActionRunner(ProjectPaths(root), "claude-code", "claude-code-visible")
+                handle = RunHandle("h1")
+                metadata = {
+                    "node_id": "n1", "role": "reviewer", "run_id": "r1", "task_id": "t1",
+                    "host": "local", "generation": 1, "pending_action": None,
+                    "pending_operation": None,
+                }
+                runner.store._atomic(runner._handle_path("h1"), dict(metadata))
+                runner.send_notice(handle, "fixed text")
+                runner.send_notice(handle, "fixed text")
+                after = runner.store._read(runner._handle_path("h1"))
+            self.assertIsNone(after["pending_action"])
+            requests = list((root / ".vibe" / "provider-actions").rglob("*.json"))
+            texts = [p.read_text(encoding="utf-8") for p in requests]
+            self.assertTrue(any("fixed text" in t and "t1" in t for t in texts))

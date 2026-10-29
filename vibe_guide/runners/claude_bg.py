@@ -454,6 +454,18 @@ class ClaudeBgRunner(Runner):
         session = self._session(handle)
         session["launcher"].stop(session["claims"]["session_id"])
 
+    def send_notice(self, handle: RunHandle, message: str) -> None:
+        """Deliver a fixed advisory message to the same session, same generation.
+
+        Only an idle/done/blocked session is resumed; a working one raises so
+        the notice never interrupts an in-flight turn.
+        """
+        session = self._session(handle)
+        claims = session["claims"]
+        if session["launcher"].status(claims["session_id"]) == "working":
+            raise ClaudeBgUnknown("session is still working; notice not sent")
+        session["launcher"].resume(claims["session_id"], message)
+
     def resume(self, handle: RunHandle, message: str, generation: int) -> None:
         session = self._session(handle)
         claims = session["claims"]
