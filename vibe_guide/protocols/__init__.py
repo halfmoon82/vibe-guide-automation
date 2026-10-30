@@ -27,6 +27,9 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-30: §7 general principle — engineering questions that do not change
+        # PRD decisions are decided and recorded by the supervisor/worker, never asked.
+        "8da79c1a2b3d8d19eee14e8459db451f5a8b3a521c93f4eb9a61db47026cef5c",
         # 2026-10-28: integration merge — slim guide plus derived risk_tags rule (#321).
         "a0b328bfbff4ccd5a9cd356be360df45b5fb3809afda8e898a7b6b65110f7914",
         # 2026-10-28: tests re-pinned to the slim guide; <35KB; single-shift off switch.
@@ -199,6 +202,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Short per-beat runbook; the beat prints it once per shift, then only
     # its path and sha256.
     "supervisor-card": frozenset({
+        # 2026-10-30: decision boundary — decide non-PRD engineering questions, no chat asks.
+        "d63b23f6594d536025e2348e92068b8f45a241c24a9b22999071249eb11a634a",
         "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
         # work beat: no manual resume while the daemon advances the run.
         "316ac78b3dead0703a8a118f308029ab2a9af709eb8d79cad780a1b5423060e1",
