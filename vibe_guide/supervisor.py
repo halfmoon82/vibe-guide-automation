@@ -3013,6 +3013,84 @@ def render_beat_text(paths, run_id, payload, *, plan_id, command_prefix="vibe",
         advance, payload.get("reason", "状态未知")) + tail
 
 
+def dead_daemon_report(paths, run_id):
+    """One line when this run's daemon is inactive or not running, else ``None``.
+
+    Report only.  The beat never starts a daemon and never tells the session to:
+    a restart belongs to launchd (card-daemon-launchd) or the product manager.
+    """
+    from .daemon import daemon_status
+
+    try:
+        status = daemon_status(paths, run_id)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        return {"status": "unknown", "reason": "daemon status unreadable: " + type(error).__name__,
+                "text": "守护程序失活（状态未知：读取失败，{}）；只上报，不重启，重启由 launchd 或产品经理手工处理"
+                        .format(type(error).__name__)}
+    if status.get("status") == "running":
+        return None
+    reason = status.get("reason") or status.get("status")
+    return {"status": status.get("status"), "reason": reason,
+            "text": "守护程序失活（{}，原因：{}）；只上报，不重启，重启由 launchd 或产品经理手工处理"
+                    .format(status.get("status"), reason)}
+
+
+def _pm_inbox_beat(paths, run_id):
+    """``(needs_pm, info, unknown_reason)`` from one real read of the inbox.
+
+    The cursor moves only when it was written; if it was not, nothing is
+    returned as delivered and the messages are still unread next beat.
+    """
+    from . import pm_inbox
+
+    result = pm_inbox.read_unread(paths, run_id)
+    if result["cursor_status"] == "unknown":
+        return [], [], result.get("reason") or "cursor unknown"
+    messages = pm_inbox.delivered(result)
+    return ([m for m in messages if pm_inbox.needs_pm(m)],
+            [m for m in messages if not pm_inbox.needs_pm(m)], None)
+
+
+def _pm_inbox_waiting(paths, run_id):
+    from . import pm_inbox
+
+    try:
+        return any(pm_inbox.needs_pm(m) for m in pm_inbox.read_unread(paths, run_id, peek=True)["messages"])
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _beat_extras(paths, run_id, payload, text):
+    """Add the unread inbox messages and the dead-daemon line to a beat's text."""
+    lines = []
+    try:
+        needs, info, unknown = _pm_inbox_beat(paths, run_id)
+    except (OSError, ValueError, TypeError) as error:
+        needs, info, unknown = [], [], "pm-inbox read failed: " + type(error).__name__
+    if unknown:
+        payload["pm_inbox"] = {"status": "unknown", "reason": unknown}
+        lines.append("产品经理收件箱状态未知（{}）：消息保持未读，下一拍重读".format(unknown))
+    if needs or info:
+        payload["pm_inbox"] = {"status": "delivered", "messages": needs, "informational": info}
+    if needs:
+        lines.insert(0, "产品经理待处理消息（只送达这一次）：\n" + "\n".join(
+            "- [{}] {}".format(m.get("kind"), m.get("message")) for m in needs))
+        if payload.get("state") not in {"rotate", "contract_drift", "unknown"}:
+            if payload.get("state") in {"idle", "stop"}:
+                text = ""  # the "end this turn" text no longer applies
+            payload["state"] = "decision"
+            payload["end_turn"] = False
+    for message in info:
+        lines.append("信息：{}".format(message.get("message")))
+    report = dead_daemon_report(paths, run_id)
+    if report:
+        payload["daemon_inactive"] = {"status": report["status"], "reason": report["reason"]}
+        lines.append(report["text"])
+    if not lines:
+        return text
+    return "\n".join(([text] if text else []) + lines)
+
+
 def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
                     command_prefix="vibe", interval_for=None, preflight_kwargs=None, now=None):
     """The one beat entry the CLI calls: ``(payload, text, ok)``.
@@ -3023,6 +3101,9 @@ def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
     fingerprint.  ``ok`` is False when the beat's state is unknown.
     """
     stop, fingerprint = beat_repeat_check(paths, run_id, now=now)
+    # A repeat never hides an unread product-manager message.
+    if stop and _pm_inbox_waiting(paths, run_id):
+        stop = None
     if stop:
         text = render_beat_text(paths, run_id, stop, plan_id="")
         return {**stop, "heartbeat_command": heartbeat_command(run_id, command_prefix=command_prefix)}, text, True
@@ -3052,6 +3133,8 @@ def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
     stall_text = render_stall_beat_text(report, run_id, command_prefix)
     if stall_text:
         text = text + "\n" + stall_text if state in {"rotate", "contract_drift"} else stall_text + "\n" + text
+    text = _beat_extras(paths, run_id, payload, text)
+    state = payload.get("state")
     ok = state in {"idle", "work", "decision", "rotate", "stop"} and payload.get("handoff_status") != "unknown"
     beat_repeat_commit(paths, run_id, fingerprint, payload, now=now)
     payload = {"heartbeat_command": heartbeat_command(run_id, command_prefix=command_prefix), **payload}

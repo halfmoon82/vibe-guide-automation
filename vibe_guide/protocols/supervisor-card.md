@@ -14,6 +14,12 @@
 8. `rotate`：新开会话接班（仅非 Claude Code）；Claude Code 永不换班，
    `context_pressure` 只是提示，同会话继续。
 
+## 守护程序与收件箱
+- 输出含「守护程序失活」时只把那一行连同原因上报，不执行 `daemon start`，也不去重启；
+  重启归 launchd 或产品经理手工。
+- 输出里的「产品经理待处理消息」只送达一次，照 `decision` 呈现给用户；
+  `vibe daemon inbox` 读未读消息，`--peek` 只看不推进。
+
 ## 回写
 - 信箱结果用 `complete_mailbox_action` 写；形状不对会在写入前被拒绝，
   错误里列出缺少或多出的字段名，按提示补齐后重写。

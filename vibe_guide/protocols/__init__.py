@@ -32,6 +32,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "8da79c1a2b3d8d19eee14e8459db451f5a8b3a521c93f4eb9a61db47026cef5c",
         # 2026-10-29: integration review evidence is the four keys itself, no claim wrapper (D3).
         "1cc9c70328c9f156faeb55638d28fb55e34d7c7b524da6a8f7680490e150575b",
+        # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.
+        "4c09b600fc2573be814da1165a7dec84516d24e6e4900f56463623b3d367e3e2",
         # 2026-10-28: integration merge — slim guide plus derived risk_tags rule (#321).
         "a0b328bfbff4ccd5a9cd356be360df45b5fb3809afda8e898a7b6b65110f7914",
         # 2026-10-28: tests re-pinned to the slim guide; <35KB; single-shift off switch.
@@ -174,6 +176,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "a6d940da69d2e43664a37d44f0a9e28ad7f5ca2ecb8ebb03f46cf05752acd94b",
     }),
     "vibe-entry": frozenset({
+        # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.
+        "494db728c15b604649902014d4e8f23f35beb9c70bb238257681845431243b87",
         # 2026-10-28: first-shift pointer §6.0.
         "1f8ba7164902fd33df2db931d8a720458b21672500d299d568b7fbaf38e16b23",
         # 2026-10-28: first-shift supervisor does daemon start + 60-minute fallback check.
@@ -206,6 +210,10 @@ SHIPPED_PROTOCOL_DIGESTS = {
     "supervisor-card": frozenset({
         # 2026-10-30: decision boundary — decide non-PRD engineering questions, no chat asks.
         "f68fa85b91eceac9701983ad766983699284794bbb35b38e0e32312e363319a6",
+        # 2026-10-30: dead-daemon report line and pm-inbox delivery.
+        "0c6053ff079072c65b4fa69899893f8cc80f51c7902cf54c3fadb2c9e56991d6",
+        # 2026-10-30: decision boundary — decide non-PRD engineering questions, no chat asks.
+        "d63b23f6594d536025e2348e92068b8f45a241c24a9b22999071249eb11a634a",
         "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
         # work beat: no manual resume while the daemon advances the run.
         "316ac78b3dead0703a8a118f308029ab2a9af709eb8d79cad780a1b5423060e1",

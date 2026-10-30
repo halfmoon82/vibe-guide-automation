@@ -196,7 +196,8 @@ def _parser() -> argparse.ArgumentParser:
         nargs="?",
         choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon'),
     )
-    parser.add_argument("daemon_action", nargs="?", choices=("start", "status", "stop", "run", "register-pm"))
+    parser.add_argument("daemon_action", nargs="?", choices=("start", "status", "stop", "run", "register-pm", "inbox"))
+    parser.add_argument("--peek", action="store_true", help="daemon inbox: 只看不推进游标")
     parser.add_argument("--interval", dest="daemon_interval", type=float, default=None)
     parser.add_argument("--model", dest="daemon_model", default=None)
     parser.add_argument("--session-name", dest="pm_session_name", default=None)
@@ -3854,7 +3855,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
 
 
 def _handle_daemon(args, paths, runner, command_prefix, v2_state=False) -> CLIResult:
-    """vibe daemon start|status|stop|run|register-pm (run is the detached process itself)."""
+    """vibe daemon start|status|stop|run|register-pm|inbox (run is the detached process itself)."""
     from . import daemon as daemon_module
     action = args.daemon_action
     base = {"command": "daemon", "action": action}
@@ -3867,6 +3868,18 @@ def _handle_daemon(args, paths, runner, command_prefix, v2_state=False) -> CLIRe
             code = SUCCESS if payload["status"] == "running" else UNKNOWN
             text = "守护程序：{}{}".format(payload["status"], "（%s）" % payload["reason"] if payload.get("reason") else "")
             return _result(code, payload, text, args.as_json)
+        if action == "inbox":
+            from . import pm_inbox
+            read = pm_inbox.read_unread(paths, args.run_id, peek=args.peek)
+            payload = {**base, **read, "count": len(read["messages"])}
+            unsure = read["cursor_status"] == "unknown"
+            lines = ["[%s] %s" % (item.get("kind"), item.get("message")) for item in read["messages"]]
+            text = "\n".join(lines) if lines else "收件箱：0 条未读"
+            if read["skipped"]:
+                text += "\n（跳过 %d 行无法解析）" % read["skipped"]
+            if unsure:
+                text += "\n游标状态未知（%s）：消息保持未读" % read.get("reason", "")
+            return _result(UNKNOWN if unsure else SUCCESS, payload, text, args.as_json)
         if action == "stop":
             payload = daemon_module.stop_daemon(paths, args.run_id)
             return _result(SUCCESS if payload["status"] in ("stopped", "not_running") else UNKNOWN, payload,
