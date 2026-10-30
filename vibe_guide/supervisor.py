@@ -2356,7 +2356,11 @@ def supervisor_mailbox_view(paths, run_id):
         item = {k: action[k] for k in _MAILBOX_KEYS if k in action}
         path = paths.vibe / "provider-actions/requests" / (str(action.get("action_id")) + ".json")
         request = action.get("request")
-        if action.get("operation") == "locate" and isinstance(request, dict):
+        if (
+            action.get("operation") == "locate"
+            and action.get("provider") == CODEX_PROVIDER
+            and isinstance(request, dict)
+        ):
             thread_id = request.get("threadId")
             if isinstance(thread_id, str) and thread_id:
                 # navigate_to_codex_page accepts threadId only; copying hostId

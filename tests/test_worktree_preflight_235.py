@@ -573,6 +573,24 @@ class RecorderTest(unittest.TestCase):
         self.assertEqual(snapshot.nodes["node-n1"]["worktree_base"], head)
         self.assertEqual(len(saved), 1)
 
+    def test_successor_existing_base_is_not_overwritten_by_current_head(self):
+        original_base = "a" * 40
+        predecessor_head = "c" * 40
+        report = {
+            "event": None,
+            "worktree": "/repo/.worktrees/node-n1",
+            "branch": "node/n1",
+            "worktree_base": predecessor_head,
+        }
+        changed, records, snapshot, saved = self.run_recorder(
+            report,
+            {"node-n1": {"status": "running", "worktree_base": original_base}},
+        )
+        self.assertFalse(changed)
+        self.assertEqual(records, [])
+        self.assertEqual(saved, [])
+        self.assertEqual(snapshot.nodes["node-n1"]["worktree_base"], original_base)
+
     def test_an_existing_worktree_clears_a_stale_marker(self):
         # The supervisor ran the command by hand: the directory is there and
         # matches the contract, so the marker must stop asking for it.

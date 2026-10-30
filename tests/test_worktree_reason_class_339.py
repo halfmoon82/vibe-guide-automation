@@ -102,6 +102,31 @@ class VisibleWorktreePreflightTests(unittest.TestCase):
         self.assertEqual(report["event"], WORKTREE_BLOCKED_EVENT)
         self.assertEqual(report["reason_code"], WORKTREE_MISSING)
 
+    def test_nested_non_git_project_keeps_provider_owned_create_flow(self):
+        legacy = self.root / "legacy-project"
+        legacy.mkdir()
+        worktree = legacy / ".worktrees" / "node-a"
+        launchers = []
+        runner = ProviderActionRunner(
+            ProjectPaths(legacy),
+            "codex-app-visible",
+            "codex-app-visible",
+            launchers=launchers,
+        )
+        contract = dict(
+            self.contract(),
+            worktree=str(worktree),
+            managed_root=str(legacy),
+        )
+        with mock.patch.object(
+            runner, "_require_result", side_effect=ProviderPending("pending")
+        ) as create:
+            with self.assertRaises(ProviderPending):
+                runner.task_binding(contract, worktree, "run-339", "start_pending")
+        create.assert_called_once()
+        self.assertEqual(launchers, [])
+        self.assertFalse(worktree.exists())
+
     def test_plain_directory_is_not_a_visible_dispatch_target(self):
         self.worktree.mkdir(parents=True)
         with mock.patch.object(self.runner, "_require_result") as create:

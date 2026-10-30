@@ -39,6 +39,35 @@ class MailboxLocateNativeArgsTests(unittest.TestCase):
             self.assertEqual(item["native_args"], {"threadId": "thread-337"})
             self.assertNotIn("hostId", item["native_args"])
 
+    def test_non_codex_locate_has_no_codex_native_args(self):
+        for provider in ("claude-code-visible", "workbuddy-visible"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                requests = root / ".vibe/provider-actions/requests"
+                requests.mkdir(parents=True)
+                action = {
+                    "schema_version": 1,
+                    "action_id": "action-locate",
+                    "operation": "locate",
+                    "provider": provider,
+                    "run_id": "run-337",
+                    "issue_id": "node-a",
+                    "role": "developer",
+                    "generation": 1,
+                    "sequence": 0,
+                    "native_tool": "provider_locate",
+                    "request_digest": "d" * 64,
+                    "request": {"threadId": "not-a-codex-thread"},
+                }
+                (requests / "action-locate.json").write_text(
+                    json.dumps(action), encoding="utf-8"
+                )
+                result = run_cli(
+                    ["supervisor-mailbox", "--run-id", "run-337", "--json"], root
+                )
+                self.assertEqual(result.exit_code, 0, result.payload)
+                self.assertNotIn("native_args", result.payload["pending"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

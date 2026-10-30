@@ -339,10 +339,11 @@ class ProviderActionRunner(Runner):
             base_sha=contract.get("base_sha"),
             **({"upstream_branches": list(upstream)} if upstream else {}),
         )
-        # Legacy non-git provider projects have no supervisor-git baseline to
-        # preflight; their provider-owned target flow is unchanged.  Every
-        # repository-managed visible dispatch uses the shared gate below.
-        if launcher._repository_root(Path(worktree)) is None:
+        # Only the current project's own .git makes it vibe-git-managed.
+        # An outer repository must not capture a nested legacy provider-owned
+        # project merely because it is an ancestor of the target worktree.
+        managed_root = Path(contract.get("managed_root") or self.paths.root)
+        if not (managed_root / ".git").exists():
             return
         self._worktree_launchers.append((node_id, launcher))
         launcher._prepare_worktree()

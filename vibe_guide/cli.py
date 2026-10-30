@@ -1034,6 +1034,12 @@ def _record_worktree_preflight(
         if not isinstance(report, dict) or node_id not in snapshot.nodes:
             continue
         current = snapshot.nodes[node_id]
+        existing_base = current.get("worktree_base")
+        has_valid_base = (
+            isinstance(existing_base, str)
+            and len(existing_base) == 40
+            and all(char in "0123456789abcdefABCDEF" for char in existing_base)
+        )
         event = report.get("event")
         if event == WORKTREE_BLOCKED_EVENT:
             data = {"run_id": snapshot.run_id, "node_id": node_id}
@@ -1067,11 +1073,16 @@ def _record_worktree_preflight(
             # says nothing happened): the action a supervisor was asked to
             # take is done, so the marker must stop claiming it.
             current.pop(WORKTREE_PREFLIGHT_KEY, None)
-            if report.get("worktree_base"):
+            if report.get("worktree_base") and not has_valid_base:
                 current["worktree_base"] = report["worktree_base"]
-        elif report.get("worktree_base") and current.get("worktree_base") != report["worktree_base"]:
-            # An already-existing worktree has no creation event, but its HEAD
-            # is still the exact scope-landing baseline.
+        elif (
+            report.get("worktree_base")
+            and not has_valid_base
+            and current.get("worktree_base") != report["worktree_base"]
+        ):
+            # An existing worktree can supply the initial scope baseline.  A
+            # successor already has one: its predecessor HEAD must never move
+            # that baseline forward and hide B..C from scope checks.
             current["worktree_base"] = report["worktree_base"]
         else:
             continue
