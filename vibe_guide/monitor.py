@@ -7622,6 +7622,13 @@ class Monitor:
                     current["status"] = self._v42_retry_status()
                     current["reason"] = str(redact_provider_text(raw_reason))
                     current["quarantine"] = None
+                    # The stopped session is dead: polling the old handle
+                    # would only report ``stopped`` again.  Retire it so the
+                    # retry scheduler dispatches a fresh session.
+                    stale = current.setdefault("stale_handles", [])
+                    if handle_id not in stale:
+                        stale.append(handle_id)
+                    snapshot.handles.pop(node_id, None)
                     return
             if failure.get("legacy_kind") == "engineering" and event.event != "stopped":
                 raw_reason = event.data.get("reason", event.event)

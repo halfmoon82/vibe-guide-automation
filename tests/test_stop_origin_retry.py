@@ -27,12 +27,34 @@ class StopOriginMonitorTests(unittest.TestCase):
         monitor, runner, snapshot = self.run_with(
             {"reason": "session stopped", "stop_origin": "unexpected"})
         self.assertNotIn(snapshot.nodes["n1"]["status"], {"stopped", "failed"})
-        self.assertTrue(snapshot.nodes["n1"]["retryable_action"]["same_task"])
+        self.assertEqual(len(runner.start_calls), 2)
+        self.assertEqual(snapshot.nodes["n1"]["status"], "running")
         # A second unexpected stop is final.
         runner.events[("n1", "developer")] = [
             ("stopped", {"reason": "session stopped", "stop_origin": "unexpected"})]
         again = monitor.tick(snapshot.run_id, runner)
         self.assertNotEqual(again.nodes["n1"]["status"], "running")
+
+    def test_persistent_unexpected_stop_redispatches_once_then_fails(self):
+        class AlwaysStopped(tm.FakeRunner):
+            def poll(self, handle):
+                self.events[("n1", "developer")] = [
+                    ("stopped", {"reason": "session stopped",
+                                 "stop_origin": "unexpected"})]
+                return super().poll(handle)
+
+        monitor, record = self.authorized_monitor([tm.node("n1")])
+        runner = AlwaysStopped()
+        snapshot = monitor.start(record, runner)
+        clock = [1000.0]
+        with patch("time.time", side_effect=lambda: clock[0]):
+            for _ in range(8):
+                snapshot = monitor.tick(snapshot.run_id, runner)
+                clock[0] += 500
+                if snapshot.nodes["n1"]["status"] in {"stopped", "failed"}:
+                    break
+        self.assertEqual(len(runner.start_calls), 2)
+        self.assertIn(snapshot.nodes["n1"]["status"], {"stopped", "failed"})
 
     def test_vibe_initiated_or_unrecorded_stop_stays_stopped(self):
         for data in ({"reason": "x", "stop_origin": "vibe"}, {"reason": "x"}):
