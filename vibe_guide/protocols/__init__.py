@@ -32,6 +32,10 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "74ba1dd845c4c32375a26b33cbcfad4ef590ecbfb11d69ca4c1764546545c359",
         # 2026-10-30: same section on the pre-integration base (PR #330 first commits).
         "184eeb880440caf19d6e7063407f3a91c14d4994b7c3b18a4c9f8dd8ac46fdba",
+        # 2026-10-30: §6.3 tells the truth about worktrees -- background dispatch
+        # creates a missing node worktree itself, visible dispatch still needs the
+        # directory (#235).
+        "d84deca52f5310b70406a2ba9eb264171dedbc8d8e6a5f2e3a2bdc204ea48bd3",
         # 2026-10-30: integration merge on origin/main 4b69de5 (D3 evidence wording,
         # dead-daemon report-only, card options).
         "86c72be2d652d9d76249a4222f3d9d7ba6b8ea5d72dfccfa8979ee59fdc47319",
