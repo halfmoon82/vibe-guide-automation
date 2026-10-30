@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -10,6 +11,8 @@ from vibe_guide.adapters.claude_bg import (
     ClaudeBgConfigRefused,
     ClaudeBgLauncher,
     ClaudeBgUnknown,
+    ClaudeBgWorktreeBlocked,
+    WORKTREE_MISSING,
     CommandResult,
     load_claude_bg_config,
     subprocess_executor,
@@ -24,6 +27,7 @@ SHORT = "1a2b3c4d"
 class FakeClaude:
     def __init__(self, worktree, state="done", launch_out=None, agents_cwd=None):
         self.calls = []
+        self.git_calls = []
         self.state = state
         self.launch_out = launch_out if launch_out is not None else "backgrounded · %s · node\n" % SHORT
         self.agents_cwd = agents_cwd or str(worktree)
@@ -37,10 +41,15 @@ class FakeClaude:
         self.bg_error = None
 
     def __call__(self, argv, cwd, timeout):
-        self.calls.append((list(argv), Path(cwd)))
+        argv = list(argv)
+        if argv[:1] == ["git"]:
+            # Worktree preflight and identity writes exercise the real git
+            # repository; only the Claude process is fake in these tests.
+            self.git_calls.append((argv, Path(cwd)))
+            return subprocess_executor(argv, cwd, timeout)
+        self.calls.append((argv, Path(cwd)))
         if self.error:
             raise self.error
-        argv = list(argv)
         if argv[:2] == ["claude", "agents"]:
             if self.agents_error:
                 raise self.agents_error
@@ -66,8 +75,27 @@ class LauncherCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name).resolve()
-        self.worktree = self.tmp / "wt"
-        self.worktree.mkdir()
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", str(self.repo), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "dev@example.com")
+        git("config", "user.name", "Dev")
+        git("config", "extensions.worktreeConfig", "true")
+        (self.repo / "base.txt").write_text("base\n", encoding="utf-8")
+        git("add", "base.txt")
+        git("commit", "-qm", "base")
+        self.base = git("rev-parse", "HEAD").stdout.strip()
+        self.worktree = self.repo / ".worktrees" / "wt"
+        git("worktree", "add", "-q", "-b", "node/a", str(self.worktree), self.base)
         self.contract = self.tmp / "contract.md"
         self.contract.write_text("do the thing", encoding="utf-8")
         self.routing = BackgroundTaskRouting("host", str(self.worktree), "node/a", "s.json", "h.json")
@@ -122,16 +150,25 @@ class LaunchTest(LauncherCase):
     def test_git_identity_set_in_worktree(self):
         config = ClaudeBgConfig("/abs/s.json", git_user_name="Bot", git_user_email="bot@x.io")
         self.launcher(config=config).launch("developer", "n1", self.contract)
-        git = [(a, c) for a, c in self.fake.calls if a[0] == "git"]
+        git = [(a, c) for a, c in self.fake.git_calls if a[:2] == ["git", "config"]]
         # --worktree: plain `git config` in a linked worktree writes the shared
         # .git/config and changes the identity of every other worktree.
         self.assertEqual([a for a, _ in git], [["git", "config", "--worktree", "user.name", "Bot"], ["git", "config", "--worktree", "user.email", "bot@x.io"]])
         self.assertTrue(all(c == self.worktree for _, c in git))
-        self.assertEqual(self.fake.calls[0][0][0], "git")
 
-    def test_no_git_identity_means_no_git_call(self):
+    def test_no_git_identity_means_no_git_config_call(self):
         self.launcher().launch("developer", "n1", self.contract)
-        self.assertFalse([a for a, _ in self.fake.calls if a[0] == "git"])
+        self.assertFalse([a for a, _ in self.fake.git_calls if a[:2] == ["git", "config"]])
+
+    def test_plain_directory_is_worktree_missing(self):
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        routing = BackgroundTaskRouting("host", str(plain), "node/a", "s.json", "h.json")
+        launcher = ClaudeBgLauncher(routing, self.config, executor=self.fake)
+        with self.assertRaises(ClaudeBgWorktreeBlocked) as caught:
+            launcher.launch("developer", "n1", self.contract)
+        self.assertEqual(caught.exception.reason_code, WORKTREE_MISSING)
+        self.assertEqual(self.fake.calls, [])
 
     def test_unparseable_output_is_unknown(self):
         self.fake.launch_out = "something else"
