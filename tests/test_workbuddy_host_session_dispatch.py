@@ -524,7 +524,7 @@ class WorktreePinningOnWorkBuddyTests(unittest.TestCase):
         text = load_protocol("prd-guide")
         section = text[text.index("### 6.3"):text.index("**环境事实**")]
         for token in ("WorkBuddy", "没有 `cwd` 参数", "每条命令先 `cd <worktree>`", "主项目",
-                      "串行节点也一样", "`vibe worker-deliver` 必须在**主项目目录**执行"):
+                      "串行节点也一样", "`vibe worker-deliver` 必须指向**主项目目录**"):
             self.assertIn(token, section, token)
         self.assertNotIn("放弃并行", section)
 
@@ -534,7 +534,7 @@ class WorktreePinningOnWorkBuddyTests(unittest.TestCase):
         text = load_protocol("visible-sdd-worker")
         section = text[text.index("## 1."):text.index("## 2.")]
         for token in ("worktree", "WorkBuddy", "每条命令先 `cd <worktree>`", "§6.3",
-                      "`vibe worker-deliver`：\n   它必须在主项目目录执行"):
+                      "`vibe worker-deliver`：\n   它必须带 `--project-root"):
             self.assertIn(token, section, token)
 
 

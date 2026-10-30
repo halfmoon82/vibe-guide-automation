@@ -27,6 +27,8 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-30: worker-deliver / supervisor-address take --project-root, no cwd.
+        "5a29abbca912f875fc886a1e58892eadb802e39341dfe4884c88009e135c1dc0",
         # 2026-10-30: §7 general principle — engineering questions that do not change
         # PRD decisions are decided and recorded by the supervisor/worker, never asked.
         "8da79c1a2b3d8d19eee14e8459db451f5a8b3a521c93f4eb9a61db47026cef5c",
@@ -197,11 +199,15 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Worker protocol delivered by reference (#216): a ref-mode dispatch pins
     # the file's sha256 and only accepts a digest published here.
     "visible-sdd-worker": frozenset({
+        # 2026-10-30: worker-deliver takes --project-root, no cwd.
+        "55653cf68dadeb47b04b778778b59729915cacd30061525d670bd9f729c2656b",
         "30b226ff0a6711a91779785c28a993679e0a33c3aeb89e836cfd427194750945",
     }),
     # Short per-beat runbook; the beat prints it once per shift, then only
     # its path and sha256.
     "supervisor-card": frozenset({
+        # 2026-10-30: --project-root section.
+        "5363abd3703c3f681b29b814421f016dce30af75c0760abdb33a6510752c9c58",
         # 2026-10-30: decision boundary — decide non-PRD engineering questions, no chat asks.
         "f68fa85b91eceac9701983ad766983699284794bbb35b38e0e32312e363319a6",
         "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",

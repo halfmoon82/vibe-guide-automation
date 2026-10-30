@@ -13,6 +13,11 @@
 8. `rotate`：新开会话接班（仅非 Claude Code）；Claude Code 永不换班，
    `context_pressure` 只是提示，同会话继续。
 
+## 项目根
+- 所有 `vibe` 子命令都可带 `--project-root <绝对路径>`（或环境变量 `VIBE_PROJECT_ROOT`，参数优先），
+  不依赖进程当前目录；给 worker 的 `worker-deliver`、`supervisor-address` 示例必须带它。
+  相对路径或不存在的目录会被拒绝。
+
 ## 回写
 - 信箱结果用 `complete_mailbox_action` 写；形状不对会在写入前被拒绝，
   错误里列出缺少或多出的字段名，按提示补齐后重写。

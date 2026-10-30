@@ -194,7 +194,7 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 
 - **守护程序干机械活**：授权后 `vibe daemon start|status|stop --run-id <run-id>` 起分离的本地进程并持监工租约，每个 tick 确定性地 resume、收交付、派后台 worker、拉 reviewer、接受节点、一级重试。
 - **产品经理会话只保留 60 分钟兜底检查**：登记地址（`vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>`；`vibe daemon register-pm --run-id <run-id> --provider <平台> --session-name <会话名>` 登记推送目标），心跳指令逐字用 vibe 打印的 `vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>`，每 60 分钟（推送唤醒未验证的平台 10 分钟，记录在 `.vibe/push-wake-verification.json`）一拍：先 `vibe daemon status`，失活则重启或上报，存活就结束本轮。不要自写心跳或把信箱服务写进心跳；不登记则唤醒无处可发，`rotate` 也无接班地址。
-- **推送优先**：worker 交付后用 `vibe supervisor-address --run-id <run> --node <n> --role <r> --generation <g>` 回答里的 `wake`（`channel`、`target`、`signal`）原样推送；`channel` 为 null 或地址 unknown 时不发，由兜底检查领取。
+- **推送优先**：worker 交付后用 `vibe supervisor-address --project-root <主项目绝对路径> --run-id <run> --node <n> --role <r> --generation <g>` 回答里的 `wake`（`channel`、`target`、`signal`）原样推送；`channel` 为 null 或地址 unknown 时不发，由兜底检查领取。
 - 状态从磁盘读；未知不当成功；宿主报 `No such tool available` 不是节点故障，重试一次后停下报告，不交班。
 
 ### 6.1 三级自愈与升级
@@ -254,7 +254,7 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 | Claude Code | 派发时传 `cwd` | 会话启动就落在 `worktree` 里 |
 | WorkBuddy | Agent 工具**没有 `cwd` 参数** | 派发提示里逐条要求**每条命令先 `cd <worktree>`**、写文件用绝对路径；串行节点也一样 |
 
-**唯一例外是交付自报**：`vibe worker-deliver` 必须在**主项目目录**执行（在 worktree 里会写进 worktree 自己的 `.vibe`，监工看不到）。
+**唯一例外是交付自报**：`vibe worker-deliver` 必须指向**主项目目录**：写成 `vibe worker-deliver --project-root <主项目绝对路径> …`（也可设环境变量 `VIBE_PROJECT_ROOT`，参数优先），不要依赖当前目录；在 worktree 里无参数执行会写进 worktree 自己的 `.vibe`，监工看不到。
 
 每个 developer/reviewer 的模型由节点档位按平台探针换算（失败回退平台默认），派发和续接显式传模型与思考档位；审查打回两次自动升一档，监工或修复会话可 ±1 档须给理由；模型名不进授权指纹。
 

@@ -15,7 +15,7 @@ dev 子代理实现 → review 子代理审查 →（存在 P0–P2）返工回 
    **派发时必须把子代理钉在合同的 `worktree` 上**：宿主有 `cwd` 参数就传 `cwd`；WorkBuddy 的 Agent
    工具没有 `cwd`，只能在提示里要求它**每条命令先 `cd <worktree>`**、写文件用绝对路径——漏一条命令
    就落回主项目树（见 prd-guide §6.3）。review 子代理同理。唯一例外是第 5 节的 `vibe worker-deliver`：
-   它必须在主项目目录执行。
+   它必须带 `--project-root <主项目绝对路径>`（或设 `VIBE_PROJECT_ROOT`），不依赖当前目录。
 2. **review 子代理**：**独立上下文**、**只读**、**非作者视角**审查 dev 的 diff，按 P0（资金/数据正确性）、P1（逻辑缺陷/事务边界）、P2（边界条件/行为回归）、P3（建议）分级产出意见。review 子代理不得是 dev 子代理本人，不得复用 dev 的实现上下文。
 3. **返工**：存在 P0–P2 时逐条核实（reviewer 意见也要验证，不盲从）→ 由 dev 子代理修复 → 重跑定向验证（须为绿）。
 4. **复审**：返工后回到 review 子代理复审，保留审查身份与证据链；最多 3 轮。三轮仍不收敛时由监工记录 `change_reviewer_or_split_node`，换 reviewer 或拆节点并保留唯一 writer；只有分歧会改变 PRD 验收判定时才升级产品决策。
@@ -186,7 +186,7 @@ fail-closed，不可重报。
 被拒后如何重报之外还有一条主动通道：`vibe worker-deliver` 可以把合法交付当场落盘并完成
 对应 pending 的 `wait` 请求，监工下一次 resume 即消费；`--payload` 的形状与上面的交付事件相同
 （嵌套 `delivery_evidence`，visible-sdd 另带 `in_session_review`），`--generation` 照抄派发指令里的值（返工续派时以续派指令给出的新值为准，旧值或不存在的更大值都会被当场拒绝；`--run-id`、`--node`、角色与派发不符同样当场拒绝），
-并且必须在主项目目录执行（在 worktree 里执行会写进 worktree 自己的 `.vibe`，监工看不到）。自报时监工
+并且必须带 `--project-root <主项目绝对路径>` 指向主项目（在 worktree 里无参数执行会写进 worktree 自己的 `.vibe`，监工看不到）。自报时监工
 还没发出 `wait` 也不会丢：交付先存档，监工下一次发出同一代的 `wait` 时自动领取；返工后的新一代
 不会领到上一代的存档。同一 payload 重复自报幂等，不产生
 第二个事件。监工侧校验门位置不变，也不信任唤醒信号的内容。

@@ -222,7 +222,8 @@ class RunnerTest(unittest.TestCase):
             self.assertTrue(prompt_path.is_file())
             self.assertTrue(str(prompt_path).startswith(str(root / ".vibe")))
             text = prompt_path.read_text(encoding="utf-8")
-            self.assertIn("vibe worker-deliver --run-id r1 --node n1 --role developer --generation 3", text)
+            self.assertIn("vibe worker-deliver --project-root", text)
+            self.assertIn("--run-id r1 --node n1 --role developer --generation 3", text)
             self.assertIn(".worktrees/n1", text)
             self.assertIn(".vibe/plans/p1/prd.md", text)
 
