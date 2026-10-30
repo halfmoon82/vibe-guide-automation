@@ -229,10 +229,9 @@ def validate_result_shape(operation, payload, *, role=None):
 
     Mirrors the rules the runner applies when it consumes the result, so a
     wrong shape fails here, before the write, instead of becoming a
-    ``blocked_unknown`` after it.  Operations without a reader-side shape
-    (locate, visibility, ...) are only required to be objects.  ``role`` is the
-    request's role: a developer's ``delivered``/``complete`` wait result must
-    carry ``delivery_evidence``.  Raises ``ValueError``; returns None.
+    ``blocked_unknown`` after it.  ``role`` is the request's role: a
+    developer's ``delivered``/``complete`` wait result must carry
+    ``delivery_evidence``.  Raises ``ValueError``; returns None.
     """
     if not isinstance(payload, dict):
         raise ValueError("provider action result payload must be an object")
@@ -265,6 +264,21 @@ def validate_result_shape(operation, payload, *, role=None):
                        for key in _BINDING_IDENTITY_FIELDS)
         ):
             errors.append("field binding needs a task identity: " + " or ".join(_BINDING_IDENTITY_FIELDS))
+        # The dispatcher binds on a host identity as well; without it the
+        # result is stored and then refused as ``dispatch_contract_invalid``,
+        # and a consumed result cannot be rewritten.
+        if isinstance(binding, dict):
+            host = binding.get("hostId") or binding.get("host")
+            if not (isinstance(host, str) and host.strip()):
+                errors.append("field binding needs a host identity: hostId or host")
+    elif operation in ("locate", "visibility"):
+        # Both readers test the flag itself (``located is True`` /
+        # ``visible is True and direct_enter is True``); a template carrying
+        # ``status`` instead failed only after the task already existed.
+        required_flags = ("located",) if operation == "locate" else ("visible", "direct_enter")
+        missing = [name for name in required_flags if payload.get(name) is not True]
+        if missing:
+            errors.append("field(s) must be true: " + ", ".join(missing))
     elif operation == "resume":
         errors = _shape_errors([RESUME_RECEIPT_FIELD], _RESUME_RESULT_FIELDS, payload)
         if RESUME_RECEIPT_FIELD in payload and payload[RESUME_RECEIPT_FIELD] is not True:

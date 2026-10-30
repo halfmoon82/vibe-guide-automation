@@ -2385,7 +2385,15 @@ def _template_payload(operation, role):
                                       "delivery_path": _TEMPLATE_PLACEHOLDER,
                                       "thread_status": _TEMPLATE_PLACEHOLDER}}
     if operation == "create":
-        return {"binding": {"threadId": _TEMPLATE_PLACEHOLDER}}
+        # The reader binds on both the task identity and a host identity
+        # (``hostId`` or ``host``); a template without the host produced a
+        # result the dispatcher refused after the task already existed.
+        return {"binding": {"threadId": _TEMPLATE_PLACEHOLDER,
+                            "hostId": _TEMPLATE_PLACEHOLDER}}
+    if operation == "locate":
+        return {"located": True}
+    if operation == "visibility":
+        return {"visible": True, "direct_enter": True}
     if operation == "resume":
         return {"resumed": True}
     return {"status": _TEMPLATE_PLACEHOLDER}
