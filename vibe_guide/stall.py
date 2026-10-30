@@ -53,14 +53,19 @@ def node_fingerprint(
     latest_evidence = evidence[-1] if isinstance(evidence, list) and evidence else None
     action = node.get("retryable_action")
     observation = action.get("last_observation_ref") if isinstance(action, Mapping) else None
+    # Every failed dispatch of a node with no bound session bumps its generation
+    # again; that counter is not progress, or a dispatch loop never reads as stalled.
+    redispatching = (
+        active is None and isinstance(action, Mapping) and action.get("reason_class") == "binding_unknown"
+    )
     task_state = None
     binding = tasks.get("{}:{}".format(node_id, role)) if tasks and node_id and role else None
     if isinstance(binding, Mapping):
         task_state = [binding.get("status"), binding.get("generation"), binding.get("cursor")]
     return _digest({
         "status": node.get("status"),
-        "developer_generation": node.get("developer_generation"),
-        "review_generation": node.get("review_generation"),
+        "developer_generation": None if redispatching else node.get("developer_generation"),
+        "review_generation": None if redispatching else node.get("review_generation"),
         "active_task": active,
         "task": task_state,
         "delivery": [node.get(key) for key in _DELIVERY_KEYS],

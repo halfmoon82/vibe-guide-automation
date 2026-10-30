@@ -25,7 +25,9 @@ from .authorization import (
     dispatch_topology_for_node,
     node_adapter_id,
     rebind_dispatch_contract,
+    REMOTE_GIT_ENFORCEMENT,
     refresh_authorization_card,
+    remote_git_denied,
 )
 from .adapters.base import (
     BACKGROUND_LAUNCH_LIMITATIONS,
@@ -196,7 +198,8 @@ def _parser() -> argparse.ArgumentParser:
         nargs="?",
         choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon'),
     )
-    parser.add_argument("daemon_action", nargs="?", choices=("start", "status", "stop", "run", "register-pm"))
+    parser.add_argument("daemon_action", nargs="?", choices=("start", "status", "stop", "run", "register-pm", "inbox"))
+    parser.add_argument("--peek", action="store_true", help="daemon inbox: 只看不推进游标")
     parser.add_argument("--interval", dest="daemon_interval", type=float, default=None)
     parser.add_argument("--model", dest="daemon_model", default=None)
     parser.add_argument("--session-name", dest="pm_session_name", default=None)
@@ -412,7 +415,7 @@ def _plan_root(paths: ProjectPaths, plan_id: str) -> Path:
 
 def _authorization_card(data: Dict[str, Any]) -> AuthorizationCard:
     converted = dict(data)
-    for key in ("remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"):
+    for key in ("remote_git_actions_options", "remote_git_actions_scope", "remote_git_enforcement", "deploy_authorization"):
         converted.pop(key, None)
     # The availability lists are unsigned metadata that must round-trip: a card
     # read back and rewritten (a refresh) would otherwise lose the reason a tier
@@ -434,6 +437,20 @@ def _authorization_card(data: Dict[str, Any]) -> AuthorizationCard:
     ):
         converted[key] = tuple(converted[key])
     return AuthorizationCard(**converted)
+
+
+def _daemon_option_lines(card) -> List[str]:
+    """Card lines for the two daemon options, with what each one means for recovery."""
+    from . import launchd_keepalive
+    daemon_on = getattr(card, "daemon", True)
+    keepalive_on = getattr(card, "launchd_keepalive", False)
+    lines = ["守护程序：{}｜授权后 vibe monitor 自动启动并登记；关闭则保持旧形态，由监工会话手工推进".format(
+        "开" if daemon_on else "关")]
+    lines.append("开机保活（launchd）：{}｜{}。这是守护程序被杀后自动重启的唯一途径；不勾选时守护程序被杀后不会自动恢复，"
+                 "监工心跳只报告、不重启".format("开" if keepalive_on else "关", launchd_keepalive.UNVERIFIED_NOTE))
+    lines.append("  各平台验证状态：" + "、".join(
+        "{} {}".format(name, state) for name, state in sorted(launchd_keepalive.PLATFORM_VERIFICATION.items())))
+    return lines
 
 
 def _card_discloses_background(card: Optional[AuthorizationCard]) -> bool:
@@ -817,6 +834,8 @@ def _claude_bg_launcher_factory(paths: ProjectPaths, launchers: Optional[List[An
         upstream = contract.get("upstream_branches")
         launcher = claude_bg.ClaudeBgLauncher(
             routing, claude_bg.load_claude_bg_config(paths), model=model,
+            # Only a deny card passes it, so allow keeps the previous call shape.
+            **({"remote_git_deny": True} if remote_git_denied(paths, contract) else {}),
             # Only a downstream node passes it, so launchers built for nodes
             # without accepted upstreams keep their previous call shape.
             **({"upstream_branches": list(upstream)} if upstream else {}),
@@ -1717,6 +1736,10 @@ def _render_card_preview(payload: Dict[str, Any], card: AuthorizationCard) -> st
             _render_card_options(card.rotate_hard_cap_options, "tokens", "token"),
         )
     )
+    lines.append("远端 Git 禁令（remote_git_actions=deny 时）：")
+    for entry in REMOTE_GIT_ENFORCEMENT:
+        lines.append("  {}：{}".format(entry["platform"], entry["note"]))
+    lines.extend(_daemon_option_lines(card))
     changed = payload.get("changed_fields") or {}
     if isinstance(changed, dict) and changed:
         lines.append("相对当前在盘卡，本次重新授权将改动 " + str(len(changed)) + " 个字段：")
@@ -1903,6 +1926,62 @@ def _beat_interval(paths: ProjectPaths, run_id: str, payload: Dict[str, Any], *,
         except (OSError, ValueError, TypeError) as error:
             interval = {**interval, "persist_error": str(error)[:200]}
     return interval
+
+
+def _auto_start_daemon(paths, plan_id: str, run_id: str, card, provider: Optional[str],
+                       *, starter=None, keepalive=None) -> Dict[str, Any]:
+    """Start (and register) the daemon the authorization card asked for.
+
+    A failure here is recorded and echoed on the card, never raised: the
+    monitor has already started and must not fail because the daemon did not.
+    With the daemon option off nothing happens and the supervisor session
+    advances the run by hand, as before.
+    """
+    if not getattr(card, "daemon", True):
+        return {"enabled": False, "status": "off"}
+    from . import daemon as daemon_module
+    from . import launchd_keepalive
+    starter = starter or daemon_module.start_daemon
+    result: Dict[str, Any] = {"enabled": True}
+    launchd_loaded = False
+    if getattr(card, "launchd_keepalive", False):
+        # launchd (RunAtLoad) starts the daemon itself; a second Popen instance
+        # would lose the supervisor lease and be relaunched every 30 seconds.
+        try:
+            command = daemon_module.build_run_command(run_id, plan_id, provider=provider)
+            keepalive = keepalive or launchd_keepalive.install
+            result["launchd"] = keepalive(paths, run_id, command)
+            launchd_loaded = result["launchd"].get("status") == "loaded"
+        except Exception as error:  # noqa: BLE001
+            result["launchd"] = {"status": "failed", "reason": "%s: %s" % (type(error).__name__, str(error)[:160])}
+    if launchd_loaded:
+        result.update(status="launchd_started", reason="守护程序由 launchd 拉起，未另行启动")
+    else:
+        try:
+            started = starter(paths, run_id, plan_id, provider=provider)
+            result.update(status=started.get("status", "unknown"), pid=started.get("pid"))
+            if started.get("reason"):
+                result["reason"] = started["reason"]
+        except Exception as error:  # noqa: BLE001 - recorded, never fatal for the monitor
+            result.update(status="start_failed", reason="%s: %s" % (type(error).__name__, str(error)[:160]))
+    try:
+        _atomic_json(daemon_module._file(paths, run_id, "daemon-launch.json", create=True), result)
+    except (OSError, ValueError):
+        pass
+    return result
+
+
+def _daemon_result_lines(result: Optional[Dict[str, Any]]) -> str:
+    if not result or not result.get("enabled"):
+        return ""
+    text = "守护程序：" + str(result.get("status"))
+    if result.get("reason"):
+        text += "（%s）" % result["reason"]
+    launchd = result.get("launchd")
+    if launchd:
+        text += "\n开机保活：" + str(launchd.get("status")) + (
+            "（%s）" % launchd["reason"] if launchd.get("reason") else "")
+    return text
 
 
 def _first_shift_handoff(
@@ -3263,6 +3342,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         )
 
     if args.command == "monitor":
+        # An injected runner is a test or an embedding: it must never leave a
+        # detached daemon (or a LaunchAgent) behind on the machine.
+        runner_injected = runner is not None
         if not args.plan:
             return _result(
                 BLOCKED,
@@ -3572,6 +3654,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 args.as_json,
             )
         handoff = _first_shift_handoff(paths, args.plan, snapshot.run_id, snapshot.status)
+        daemon_launch = None
+        if not args.watch and not runner_injected and snapshot.status not in ("complete", "failed"):
+            daemon_launch = _auto_start_daemon(
+                paths, args.plan, snapshot.run_id, card, args.supervisor_provider)
         if args.watch:
             supervisor = Supervisor(
                 paths,
@@ -3595,7 +3681,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 paths, args.plan, snapshot.run_id, getattr(snapshot, "status", None)
             )
             return _snapshot_result("monitor", snapshot, args.as_json, "supervisor", handoff, paths=paths)
-        return _snapshot_result("monitor", snapshot, args.as_json, "manual", handoff, paths=paths)
+        result = _snapshot_result("monitor", snapshot, args.as_json, "manual", handoff, paths=paths)
+        if daemon_launch is not None and daemon_launch.get("enabled"):
+            result.payload["daemon"] = daemon_launch
+            result = _result(result.exit_code, result.payload,
+                             result.text + "\n" + _daemon_result_lines(daemon_launch), args.as_json)
+        return result
 
     if args.command == "reconcile":
         try:
@@ -3860,7 +3951,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
 
 
 def _handle_daemon(args, paths, runner, command_prefix, v2_state=False) -> CLIResult:
-    """vibe daemon start|status|stop|run|register-pm (run is the detached process itself)."""
+    """vibe daemon start|status|stop|run|register-pm|inbox (run is the detached process itself)."""
     from . import daemon as daemon_module
     action = args.daemon_action
     base = {"command": "daemon", "action": action}
@@ -3873,8 +3964,25 @@ def _handle_daemon(args, paths, runner, command_prefix, v2_state=False) -> CLIRe
             code = SUCCESS if payload["status"] == "running" else UNKNOWN
             text = "守护程序：{}{}".format(payload["status"], "（%s）" % payload["reason"] if payload.get("reason") else "")
             return _result(code, payload, text, args.as_json)
+        if action == "inbox":
+            from . import pm_inbox
+            read = pm_inbox.read_unread(paths, args.run_id, peek=args.peek)
+            payload = {**base, **read, "count": len(read["messages"])}
+            unsure = read["cursor_status"] == "unknown"
+            lines = ["[%s] %s" % (item.get("kind"), item.get("message")) for item in read["messages"]]
+            text = "\n".join(lines) if lines else "收件箱：0 条未读"
+            if read["skipped"]:
+                text += "\n（跳过 %d 行无法解析）" % read["skipped"]
+            if unsure:
+                text += "\n游标状态未知（%s）：消息保持未读" % read.get("reason", "")
+            return _result(UNKNOWN if unsure else SUCCESS, payload, text, args.as_json)
         if action == "stop":
-            payload = daemon_module.stop_daemon(paths, args.run_id)
+            from . import launchd_keepalive
+            try:
+                unloaded = launchd_keepalive.uninstall(paths, args.run_id)
+            except Exception as error:  # noqa: BLE001
+                unloaded = {"status": "failed", "reason": type(error).__name__}
+            payload = {**daemon_module.stop_daemon(paths, args.run_id), "launchd": unloaded}
             return _result(SUCCESS if payload["status"] in ("stopped", "not_running") else UNKNOWN, payload,
                            "守护程序：" + payload["status"], args.as_json)
         if action == "register-pm":
@@ -3932,7 +4040,9 @@ def _handle_daemon(args, paths, runner, command_prefix, v2_state=False) -> CLIRe
 
         outcome = daemon_module.Daemon(paths, run_id, supervisor, config, gate=gate,
                                        command_prefix=command_prefix).run()
-        ok = outcome["status"] in ("terminal", "stopped", "max_cycles")
+        # lease_held / blocked are not faults: exiting non-zero would make launchd
+        # (KeepAlive SuccessfulExit=false) relaunch the daemon every 30 seconds.
+        ok = outcome["status"] in ("terminal", "stopped", "max_cycles", "lease_held", "blocked")
         return _result(SUCCESS if ok else UNKNOWN, {**base, "run_id": run_id, **outcome}, "守护程序结束：" + outcome["status"], args.as_json)
     except (OSError, ValueError, TypeError, FileNotFoundError) as error:
         return _result(UNKNOWN, {**base, "status": "unknown", "reason": str(error)[:200]},

@@ -136,6 +136,8 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
   "remote_git_actions?": "allow|deny",
   "heartbeat_interval_minutes?": "10|60",
   "rotate_hard_cap?": "150000|200000|300000|500000|800000",
+  "daemon?": "true|false",
+  "launchd_keepalive?": "true|false",
   "dispatch_mode?": "background|visible"
 }
 ```
@@ -143,6 +145,8 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
 `prd` 的推荐 section：`problem`、`user_scenarios`、`success_criteria`、`non_goals`、`code_evidence`；涉及图形界面时必须有 `design_mockups`（§2）。
 
 `heartbeat_interval_minutes`、`rotate_hard_cap`、`dispatch_mode` 由 vibe 按平台推导，缺省即可，**不向产品经理询问**（§5.3）。
+
+授权卡两项开关：`daemon`（守护程序，默认开：授权后 `vibe monitor` 自动启动并登记守护程序）、`launchd_keepalive`（开机保活，默认关）。开机保活是守护程序被杀后自动重启的唯一途径；不勾选时守护程序被杀后不会自动恢复，监工心跳只报告、不重启。各平台均未经真机验证，授权卡上如实标注。守护程序关闭时保持旧形态，监工会话手工推进。
 
 产品路径的 `risk_tags` 默认派生为 `write_scope`，表示节点写入合同文件范围的工程风险，不是业务风险评级或执行许可。旧 `--node-spec` 的显式标签保持原样；空值、错误类型和多处冲突仍由 DAG 审计拒绝。
 
@@ -193,7 +197,7 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 ### 6.0 形态与开工
 
 - **守护程序干机械活**：授权后 `vibe daemon start|status|stop --run-id <run-id>` 起分离的本地进程并持监工租约，每个 tick 确定性地 resume、收交付、派后台 worker、拉 reviewer、接受节点、一级重试。
-- **产品经理会话只保留 60 分钟兜底检查**：登记地址（`vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>`；`vibe daemon register-pm --run-id <run-id> --provider <平台> --session-name <会话名>` 登记推送目标），心跳指令逐字用 vibe 打印的 `vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>`，每 60 分钟（推送唤醒未验证的平台 10 分钟，记录在 `.vibe/push-wake-verification.json`）一拍：先 `vibe daemon status`，失活则重启或上报，存活就结束本轮。不要自写心跳或把信箱服务写进心跳；不登记则唤醒无处可发，`rotate` 也无接班地址。
+- **产品经理会话只保留 60 分钟兜底检查**：登记地址（`vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>`；`vibe daemon register-pm --run-id <run-id> --provider <平台> --session-name <会话名>` 登记推送目标），心跳指令逐字用 vibe 打印的 `vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>`，每 60 分钟（推送唤醒未验证的平台 10 分钟，记录在 `.vibe/push-wake-verification.json`）一拍：先 `vibe daemon status`，失活则上报（只上报，不重启：重启归 launchd 或产品经理手工），存活就结束本轮。不要自写心跳或把信箱服务写进心跳；不登记则唤醒无处可发，`rotate` 也无接班地址。
 - **推送优先**：worker 交付后用 `vibe supervisor-address --run-id <run> --node <n> --role <r> --generation <g>` 回答里的 `wake`（`channel`、`target`、`signal`）原样推送；`channel` 为 null 或地址 unknown 时不发，由兜底检查领取。
 - 状态从磁盘读；未知不当成功；宿主报 `No such tool available` 不是节点故障，重试一次后停下报告，不交班。
 
@@ -221,7 +225,7 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 
 #### 整合审查节点的 accepted
 
-它是整个 run 的验收，`evidence` 必须是对象，**恰好四个键**：
+它是整个 run 的验收，`evidence` 必须是对象，**恰好四个键**。evidence 本身就是这四个键：findings、iteration_compatibility、test_runtime_delivery、out_of_scope，不再套一层 claim。
 
 ```json
 {

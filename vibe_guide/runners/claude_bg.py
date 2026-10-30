@@ -11,8 +11,10 @@ import re
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 
+from .. import live_sessions
 from ..adapters.claude_bg import ClaudeBgLauncher, ClaudeBgUnknown
 from ..contracts import RunEvent, RunHandle, Runner
 from ..paths import ProjectPaths
@@ -101,7 +103,7 @@ class ClaudeBgRunner(Runner):
 
     def _register(self, launcher, contract: dict, session_id: str,
                   worktree: Path, handle_id: Optional[str] = None,
-                  stale: bool = False) -> RunHandle:
+                  stale: bool = False, vibe_stop: bool = False) -> RunHandle:
         if handle_id is None:
             # Unique across processes: a restarted runner must never reissue
             # a handle a persisted session record already owns.
@@ -120,6 +122,9 @@ class ClaudeBgRunner(Runner):
             # session: a superseded handle must never emit an event again
             # (the monitor would read it as an unregistered handle).
             "stale": stale,
+            # True once vibe itself asked this session to stop; a ``stopped``
+            # state without it is an unexpected stop (manual ``claude stop``).
+            "vibe_stop": vibe_stop,
             "contract": {key: contract[key] for key in _LAUNCHER_KEYS if key in contract},
             "worktree": str(worktree),
             "claims": {
@@ -147,7 +152,7 @@ class ClaudeBgRunner(Runner):
         """Write the session record a restarted runner adopts from."""
         session = self._sessions[handle_id]
         path = self._record_path(handle_id)
-        record = {key: session[key] for key in ("contract", "worktree", "claims", "stale")}
+        record = {key: session[key] for key in ("contract", "worktree", "claims", "stale", "vibe_stop")}
         # .vibe never stores absolute user paths: keep project worktrees relative.
         root = (self._paths or ProjectPaths.from_cwd(Path.cwd())).root
         try:
@@ -189,7 +194,8 @@ class ClaudeBgRunner(Runner):
             return None
         launcher = self.launcher_factory(contract, worktree)
         self._register(launcher, contract, session_id, worktree,
-                       handle_id=handle_id, stale=bool(record.get("stale")))
+                       handle_id=handle_id, stale=bool(record.get("stale")),
+                       vibe_stop=bool(record.get("vibe_stop")))
         return self._sessions[handle_id]
 
     def _prior_session_handles(self, node_id: str) -> List[str]:
@@ -248,6 +254,7 @@ class ClaudeBgRunner(Runner):
         launcher = session["launcher"]
         if launcher.status(session_id) in _RETIRED_STATES:
             return
+        self._note_vibe_stop(session, handle_id)
         launcher.stop(session_id)
         for delay in _RETIRE_SETTLE_SECONDS:
             self._sleeper(delay)
@@ -259,6 +266,11 @@ class ClaudeBgRunner(Runner):
             "(last seen %s); not dispatching a second writer beside it"
             % (session_id, state)
         )
+
+    def _note_vibe_stop(self, session: Dict[str, Any], handle_id: str) -> None:
+        """Persist that vibe is about to stop this session, before the stop."""
+        session["vibe_stop"] = True
+        self._persist(handle_id)
 
     def _mark_stale(self, handle_ids: List[str]) -> None:
         for handle_id in handle_ids:
@@ -323,6 +335,7 @@ class ClaudeBgRunner(Runner):
                 # the same node worktree; any earlier session still working
                 # there would be a second live writer.
                 self._retire_prior_sessions(contract)
+            self._refuse_live_node_session(contract, Path(worktree))
             contract_path = contract.get("contract_path") or self._write_prompt(contract)
             task_id = launcher.launch(role, node_id, Path(contract_path))["task_id"]
             try:
@@ -343,6 +356,49 @@ class ClaudeBgRunner(Runner):
                     ) from error
                 raise
         return self._register(launcher, contract, task_id, Path(worktree))
+
+    def _refuse_live_node_session(self, contract: dict, worktree: Path) -> None:
+        """Do not launch beside a live session this node already has.
+
+        A retry dispatch that finds the earlier session of the same node still
+        alive would add a second writer to the worktree.  Only nodes with a
+        prior session record are probed.
+        """
+        node_id = contract["node_id"]
+        role = contract.get("role", "developer")
+        sessions = []
+        for handle_id in self._prior_session_handles(node_id):
+            prior = self._adopt_persisted(handle_id)
+            # Only a same-role predecessor is a rival writer: the developer
+            # session that just delivered is not one when the reviewer starts.
+            if (prior is not None and not prior["stale"]
+                    and prior["claims"].get("role") == role):
+                sessions.append(prior["claims"]["session_id"])
+        if not sessions:
+            return
+        paths = self._paths or ProjectPaths.from_cwd(Path.cwd())
+        view = SimpleNamespace(
+            tasks={sid: {"mode": "background", "task_id": sid} for sid in sessions},
+            # No worktree match: only the named same-role sessions count.
+            nodes={},
+        )
+        try:
+            probe = live_sessions.probe_live_sessions(paths, view)
+        except Exception as error:
+            raise ClaudeBgUnknown(
+                "cannot verify node %s has no live session (%s); not dispatching "
+                "another writer" % (node_id, type(error).__name__)
+            ) from error
+        if probe.get("unknown"):
+            raise ClaudeBgUnknown(
+                "cannot verify node %s has no live session (%s); not dispatching "
+                "another writer" % (node_id, probe["unknown"])
+            )
+        if probe.get("live"):
+            raise ClaudeBgUnknown(
+                "node %s already has a live session (%s); not dispatching a second "
+                "writer beside it" % (node_id, ", ".join(probe["live"]))
+            )
 
     def _write_prompt(self, contract: dict) -> Path:
         """Materialize the worker prompt for a monitor payload.
@@ -437,7 +493,10 @@ class ClaudeBgRunner(Runner):
             "stopped": ("stopped", "session stopped"),
         }
         event, reason = reasons[state]
-        return [RunEvent(event, dict(claims, reason=reason))]
+        data = dict(claims, reason=reason)
+        if state == "stopped":
+            data["stop_origin"] = "vibe" if session.get("vibe_stop") else "unexpected"
+        return [RunEvent(event, data)]
 
     @staticmethod
     def _question_excerpt(session: Dict[str, Any]) -> Optional[str]:
@@ -452,7 +511,20 @@ class ClaudeBgRunner(Runner):
 
     def stop(self, handle: RunHandle) -> None:
         session = self._session(handle)
+        self._note_vibe_stop(session, handle.run_id)
         session["launcher"].stop(session["claims"]["session_id"])
+
+    def send_notice(self, handle: RunHandle, message: str) -> None:
+        """Deliver a fixed advisory message to the same session, same generation.
+
+        Only an idle/done/blocked session is resumed; a working one raises so
+        the notice never interrupts an in-flight turn.
+        """
+        session = self._session(handle)
+        claims = session["claims"]
+        if session["launcher"].status(claims["session_id"]) == "working":
+            raise ClaudeBgUnknown("session is still working; notice not sent")
+        session["launcher"].resume(claims["session_id"], message)
 
     def resume(self, handle: RunHandle, message: str, generation: int) -> None:
         session = self._session(handle)
@@ -466,4 +538,5 @@ class ClaudeBgRunner(Runner):
         claims["generation"] = generation
         session["contract"]["generation"] = generation
         session["delivered"] = False
+        session["vibe_stop"] = False
         self._persist(handle.run_id)

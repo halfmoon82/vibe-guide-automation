@@ -63,6 +63,7 @@ class Base(unittest.TestCase):
         (Path(self.tmp.name) / "home").mkdir()
         run_dir(self.paths, RUN, create=True)
         self.pushed = []
+        self.archived = []
         self.sessions = []
         self.session_results = []
         self.verify_calls = []
@@ -89,7 +90,8 @@ class Base(unittest.TestCase):
             self.paths, RUN, supervisor, dm.DaemonConfig(**values),
             sleep=lambda s: None, launcher=self.launcher, notifier=self.notifier,
             assess=assess or (lambda: {"status": "ok", "nodes": {}}), verify=self.verify,
-            retry=lambda node: self.retries.append(node))
+            retry=lambda node: self.retries.append(node),
+            archive=lambda: self.archived.append(RUN), sessions=lambda snapshot: {"live": [], "unknown": None})
 
     def event_kinds(self):
         return [(e["event"], e["data"].get("kind"), e["data"].get("reason_code")) for e in load_events(self.paths, RUN)]

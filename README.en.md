@@ -6,7 +6,7 @@ Vibe Guide is a local CLI for scanning a project, planning work, and running a r
 
 ## Installation
 
-The current release is **5.2.1**. Treat the matching `v5.2.1` tag, commit, and Release assets as the version source of truth; `dist/` is only a local build cache, not a download entry point. Release validation covers the wheel, source distribution, and source installation separately. Local builds only produce verification artifacts; they do not create tags or releases, push, merge, or deploy.
+The current release is **5.2.3**. Treat the matching `v5.2.3` tag, commit, and Release assets as the version source of truth; `dist/` is only a local build cache, not a download entry point. Release validation covers the wheel, source distribution, and source installation separately. Local builds only produce verification artifacts; they do not create tags or releases, push, merge, or deploy.
 
 ### Installation and initialization prerequisites
 
@@ -22,7 +22,7 @@ When a user asks to install or upgrade, the Agent must:
 
 1. Query the newest tag instead of trusting README text, `dist/` filenames, or memory:
    `git ls-remote --tags --sort='-v:refname' https://github.com/halfmoon82/vibe-guide-automation.git 'refs/tags/v*'`
-2. Select the newest stable tag (currently `v5.2.1`) and verify that the tag, commit, and downloadable Release assets agree. If that cannot be verified, keep the result `unknown`.
+2. Select the newest stable tag (currently `v5.2.3`) and verify that the tag, commit, and downloadable Release assets agree. If that cannot be verified, keep the result `unknown`.
 3. Install that version and verify both:
    `python3 -c "import vibe_guide; print(vibe_guide.__version__)"`
    `vibe --help`
@@ -34,7 +34,7 @@ An Agent must not assume that downloading or installing the package automaticall
 Install the published wheel:
 
 ```bash
-python3 -m pip install --user --upgrade vibe_guide-5.2.1-py3-none-any.whl
+python3 -m pip install --user --upgrade vibe_guide-5.2.3-py3-none-any.whl
 vibe --help
 ```
 
@@ -96,7 +96,9 @@ Complex-plan publication records a real provider engine attestation containing t
 
 ## Supervisor shape: daemon + short sessions + three-level self-heal
 
-After authorization, `vibe daemon start --run-id <run> --plan <ID>` starts a detached local process that holds the supervisor lease and mechanically drives the run (resume, collect deliveries, dispatch background workers, start reviewers, accept nodes, one automatic retry) without calling a model. The product-manager session keeps only a 60-minute fallback check (10 minutes on platforms whose push wake is unverified): look at `vibe daemon status`, restart or report if it is inactive, otherwise end the turn. Publication no longer asks about heartbeat interval or rotation cap; vibe derives them per platform. Claude Code dispatches in the background by default (the card can switch to visible cards) and never rotates.
+After authorization, `vibe monitor` starts and registers the daemon itself (card option "daemon", on by default; when off the run keeps the old shape and the supervisor session advances it by hand; a failed start does not fail the monitor, it is recorded and echoed on the card). `vibe daemon start --run-id <run> --plan <ID>` does the same by hand: a detached local process that holds the supervisor lease and mechanically drives the run (resume, collect deliveries, dispatch background workers, start reviewers, accept nodes, one automatic retry) without calling a model. The product-manager session keeps only a 60-minute fallback check (10 minutes on platforms whose push wake is unverified): look at `vibe daemon status`, report if it is inactive, otherwise end the turn. The heartbeat only reports; it never restarts. Publication no longer asks about heartbeat interval or rotation cap; vibe derives them per platform. Claude Code dispatches in the background by default (the card can switch to visible cards) and never rotates.
+
+**launchd keep-alive (card option, off by default)** is the only automatic way a killed daemon comes back. Left unticked, a killed daemon is not recovered automatically: the supervisor heartbeat reports, it does not restart, and the product manager runs `vibe daemon start` by hand. Ticked, authorization generates and validates one LaunchAgent plist per run (`KeepAlive` restarts only after an abnormal exit) and loads it with `launchctl`; `vibe daemon stop` unloads and deletes it. All four platforms use the same entry (`vibe_guide/launchd_keepalive.py`) and **none is verified on a real machine yet**; the authorization card says so too. Non-macOS returns `unsupported`. Tests use a fake launchctl and a temporary directory and never load a real LaunchAgent.
 
 When a node makes no progress for several beats (status, generation, active tasks and latest delivery all unchanged):
 
@@ -127,6 +129,20 @@ Single-shift supervisor: with `"supervisor_single_shift": true` in `.vibe/config
 Acceptance-based scope expansion: `acceptance_scope_rule_approved` in `.vibe/config.json` defaults to false, keeping supervisor auto-scope to `tests/` and `auto_scope_paths`. Set it to true only after the product manager approves and writes the matching `AGENTS.md` §6 patch; then low-risk files whose change keeps every PRD acceptance example unchanged may also be added.
 
 Decision notification bridge: the project `.vibe/config.json` may only contain `"notify_bridge": {"enabled": true}`; the command and timeout are read only from `notify_bridge` in the user-level `$VIBE_HOME/config.json`. A project-level `command` is refused and recorded as UNKNOWN.
+
+### Remote Git ban (remote_git_actions=deny)
+
+When the authorization card says `remote_git_actions: deny`, every platform's worker prompt carries one fixed ban: no git fetch, push, pull or gh, commit to the local branch only. With `allow`, no ban and no launch parameter is added. What each platform actually enforces:
+
+| Platform | Enforcement |
+|---|---|
+| claude-code background dispatch | Prompt ban plus launch interception (`claude --bg` with `--disallowedTools` and `GIT_ALLOW_PROTOCOL=vibe-denied`). Partial: `--disallowedTools` was probed to stop only `git push` and `env git push`, not `git -C … push` or `bash -c`; the variable blocks push and fetch in a plain shell but `env -u` clears it and gh and curl are unaffected; whether it reaches the tool shell of a background session is unverified |
+| claude-code visible task | Prompt only, not enforced |
+| codex | Prompt only, not enforced |
+| kimi-code | Prompt only, not enforced |
+| workbuddy | Prompt only, not enforced |
+
+The authorization card preview lists the same.
 
 ### Claude Code background dispatch (downgraded background)
 

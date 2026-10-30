@@ -29,10 +29,25 @@ SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
         # 2026-10-30: §6.1 level three — engineering failures stay with the system,
         # reported in product language; only product/authorization asks reach the PM.
+        "74ba1dd845c4c32375a26b33cbcfad4ef590ecbfb11d69ca4c1764546545c359",
+        # 2026-10-30: same section on the pre-integration base (PR #330 first commits).
         "184eeb880440caf19d6e7063407f3a91c14d4994b7c3b18a4c9f8dd8ac46fdba",
+        # 2026-10-30: integration merge on origin/main 4b69de5 (D3 evidence wording,
+        # dead-daemon report-only, card options).
+        "86c72be2d652d9d76249a4222f3d9d7ba6b8ea5d72dfccfa8979ee59fdc47319",
+        # 2026-10-30: intermediate merge states committed while integrating the node
+        # branches on origin/main (reviewer-chain, then pm-inbox).
+        "d582effbad11644c7ac1b369287930ca790ea807784e8570bfa6b032b6c410bf",
+        "9bb5bc9681624b0ed24b1cafd67a91fbb5ece1ff0236255d2bbeb2ff10baedc6",
+        # 2026-10-31: card options daemon (default on) and launchd_keepalive (default off).
+        "76151ffce225578bbaa2a756712fc2d54f190e2c0ad9142116f6c744882c2f7a",
+        # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.
+        "4c09b600fc2573be814da1165a7dec84516d24e6e4900f56463623b3d367e3e2",
         # 2026-10-30: §7 general principle — engineering questions that do not change
         # PRD decisions are decided and recorded by the supervisor/worker, never asked.
         "8da79c1a2b3d8d19eee14e8459db451f5a8b3a521c93f4eb9a61db47026cef5c",
+        # 2026-10-29: integration review evidence is the four keys itself, no claim wrapper (D3).
+        "1cc9c70328c9f156faeb55638d28fb55e34d7c7b524da6a8f7680490e150575b",
         # 2026-10-28: integration merge — slim guide plus derived risk_tags rule (#321).
         "a0b328bfbff4ccd5a9cd356be360df45b5fb3809afda8e898a7b6b65110f7914",
         # 2026-10-28: tests re-pinned to the slim guide; <35KB; single-shift off switch.
@@ -175,6 +190,10 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "a6d940da69d2e43664a37d44f0a9e28ad7f5ca2ecb8ebb03f46cf05752acd94b",
     }),
     "vibe-entry": frozenset({
+        # 2026-10-31: monitor auto-starts the daemon; launchd keep-alive is the only auto-restart path.
+        "cc4c48df44d0a871cd964097ca977992653ec7858162fa2b24be994ecf948287",
+        # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.
+        "494db728c15b604649902014d4e8f23f35beb9c70bb238257681845431243b87",
         # 2026-10-28: first-shift pointer §6.0.
         "1f8ba7164902fd33df2db931d8a720458b21672500d299d568b7fbaf38e16b23",
         # 2026-10-28: first-shift supervisor does daemon start + 60-minute fallback check.
@@ -206,16 +225,35 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # its path and sha256.
     "supervisor-card": frozenset({
         # 2026-10-30: the supervisor answers worker_questions itself.
+        "6afcb9ae73049f3e77d83c4c7f446487d7c1b20de5e251aa43595f8a75120cab",
+        # 2026-10-30: same line on the pre-integration base (PR #330 first commits).
         "26db462af06ca4e34319149c60ce9e27794316234071344bd6ed9949277aad06",
+        # 2026-10-30: integration merge on origin/main 4b69de5 (decision boundary from
+        # #327 plus the manual-stop section).
+        "168b38e302a823bed7f2a7ca2cc9c99a74946ac1a188847208b7afea1ba8f588",
+        # 2026-10-30: intermediate merge states committed while integrating the node
+        # branches on origin/main (closeout-land, then stop-and-dispatch).
+        "8d9698d5abeb4f6b55dda9129404137a9b01585b45d39aa10e1ea1f0d19df825",
+        "3ac123da03da8a194a6a6d2b63dbb5afe2e1044b1e07b7650619b0058b9d7498",
         # 2026-10-30: decision boundary — decide non-PRD engineering questions, no chat asks.
         "f68fa85b91eceac9701983ad766983699284794bbb35b38e0e32312e363319a6",
+        # 2026-10-30: dead-daemon report line and pm-inbox delivery.
+        "0c6053ff079072c65b4fa69899893f8cc80f51c7902cf54c3fadb2c9e56991d6",
+        # 2026-10-30: decision boundary — decide non-PRD engineering questions, no chat asks.
+        "d63b23f6594d536025e2348e92068b8f45a241c24a9b22999071249eb11a634a",
         "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
+        # work beat: no manual resume while the daemon advances the run.
+        "316ac78b3dead0703a8a118f308029ab2a9af709eb8d79cad780a1b5423060e1",
+        # manual stop: use vibe's stop entry, not `claude stop`.
+        "6ac171e78a2fb4d6f284727a362597f74c81a1dba96defe6c519496a2cbf7746",
     }),
     # Second-level self-heal short session (daemon): the prompt the daemon feeds
     # a one-shot repair session.
     "heal-session": frozenset({
         # 2026-10-30: unfixable engineering failures are reported, not escalated.
         "82f42d58ee688cc02f87faf5b569ec08ce04c1be86896432c00869f90ecdfc15",
+        # 2026-10-30: first wording (PR #330 first commit).
+        "fff2357e5bb4a39c3800444c976eee3d35151a31b07279f134231dcefa0cd95c",
         "f0338725e0669a5cc0fdee9b4189e7fd550f37c7e91bc922df68cfbc56dfe139",
     }),
 }
