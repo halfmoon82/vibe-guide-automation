@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
-from . import fsio, short_session, stall
+from . import fsio, model_catalog, pm_inbox, short_session, stall
 from .contracts import RunEvent
 from .state import append_event, load_events, load_snapshot, run_dir
 
@@ -288,6 +288,16 @@ class PmNotifier:
         return None
 
     def __call__(self, message: str, kind: str, node_id: str = "") -> Dict[str, Any]:
+        result = self._deliver(message, kind, node_id)
+        # The receipt says what became of the push; a receipt that cannot be
+        # written never changes the push result.
+        pm_inbox.write_receipt(self.paths, self.run_id, {
+            "at": time.time(), "kind": kind, "node_id": node_id,
+            "status": result.get("status"), "reason": result.get("reason"),
+            "target": result.get("target")})
+        return result
+
+    def _deliver(self, message: str, kind: str, node_id: str) -> Dict[str, Any]:
         address = _run_record(_file(self.paths, self.run_id, PM_ADDRESS_FILE, create=True))
         entry = {"at": time.time(), "kind": kind, "node_id": node_id, "message": message,
                  "target": (address or {}).get("session_name")}
@@ -720,6 +730,29 @@ class Daemon:
             "### 收尾命令\n%s heal-verify --run-id %s --node %s%s" % (self.command_prefix, self.run_id, node_id, role_flag),
         ])
 
+    def _session_model(self, node_id: str) -> Optional[str]:
+        """The model for this node's repair session: an explicit ``--model``, else its tier's.
+
+        A tier that cannot be resolved is not a failure: the platform default
+        is used (``None``) and ``model_tier_unresolved`` is recorded once.
+        """
+        if self.config.model:
+            return self.config.model
+        tier = reason = None
+        try:
+            node = self.supervisor.monitor.nodes[node_id]
+            tier = model_catalog.node_tier(node)
+            choice = model_catalog.resolve(self.config.platform, tier,
+                                           vibe_home=model_catalog.vibe_home_path())
+            if choice.status == "ok" and choice.model:
+                return choice.model
+            reason = choice.note or "status %s" % choice.status
+        except Exception as error:  # noqa: BLE001 - any failure here means "default model", never a failed repair
+            reason = "%s: %s" % (type(error).__name__, str(error)[:100])
+        self._event("model_tier_unresolved", node_id=node_id, tier=tier,
+                    platform=self.config.platform, reason=reason)
+        return None
+
     def _level_two(self, state, node_state, node_id, entry, snapshot) -> None:
         config = self.config
         if state["sessions"] >= config.max_sessions or state["tokens"] >= config.max_tokens:
@@ -734,7 +767,7 @@ class Daemon:
         self._save_heal_state(state)
         before = len(load_events(self.paths, self.run_id))
         result = self.launcher(
-            config.platform, self._prompt(node_id, entry, snapshot), model=config.model, cwd=str(self.paths.root),
+            config.platform, self._prompt(node_id, entry, snapshot), model=self._session_model(node_id), cwd=str(self.paths.root),
             timeout=config.session_timeout, executable=config.executable, extra_args=config.extra_args,
             mailbox_dir=str(_file(self.paths, self.run_id, "short-session-mailbox", create=True)),
             run_id=self.run_id, node_id=node_id, poll=lambda: self._write_state("running"))

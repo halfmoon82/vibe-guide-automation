@@ -27,6 +27,8 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.
+        "4c09b600fc2573be814da1165a7dec84516d24e6e4900f56463623b3d367e3e2",
         # 2026-10-30: §7 general principle — engineering questions that do not change
         # PRD decisions are decided and recorded by the supervisor/worker, never asked.
         "8da79c1a2b3d8d19eee14e8459db451f5a8b3a521c93f4eb9a61db47026cef5c",
@@ -172,6 +174,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "a6d940da69d2e43664a37d44f0a9e28ad7f5ca2ecb8ebb03f46cf05752acd94b",
     }),
     "vibe-entry": frozenset({
+        # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.
+        "494db728c15b604649902014d4e8f23f35beb9c70bb238257681845431243b87",
         # 2026-10-28: first-shift pointer §6.0.
         "1f8ba7164902fd33df2db931d8a720458b21672500d299d568b7fbaf38e16b23",
         # 2026-10-28: first-shift supervisor does daemon start + 60-minute fallback check.
@@ -202,6 +206,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Short per-beat runbook; the beat prints it once per shift, then only
     # its path and sha256.
     "supervisor-card": frozenset({
+        # 2026-10-30: dead-daemon report line and pm-inbox delivery.
+        "0c6053ff079072c65b4fa69899893f8cc80f51c7902cf54c3fadb2c9e56991d6",
         # 2026-10-30: decision boundary — decide non-PRD engineering questions, no chat asks.
         "d63b23f6594d536025e2348e92068b8f45a241c24a9b22999071249eb11a634a",
         "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",

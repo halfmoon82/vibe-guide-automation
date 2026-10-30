@@ -193,7 +193,7 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 ### 6.0 形态与开工
 
 - **守护程序干机械活**：授权后 `vibe daemon start|status|stop --run-id <run-id>` 起分离的本地进程并持监工租约，每个 tick 确定性地 resume、收交付、派后台 worker、拉 reviewer、接受节点、一级重试。
-- **产品经理会话只保留 60 分钟兜底检查**：登记地址（`vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>`；`vibe daemon register-pm --run-id <run-id> --provider <平台> --session-name <会话名>` 登记推送目标），心跳指令逐字用 vibe 打印的 `vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>`，每 60 分钟（推送唤醒未验证的平台 10 分钟，记录在 `.vibe/push-wake-verification.json`）一拍：先 `vibe daemon status`，失活则重启或上报，存活就结束本轮。不要自写心跳或把信箱服务写进心跳；不登记则唤醒无处可发，`rotate` 也无接班地址。
+- **产品经理会话只保留 60 分钟兜底检查**：登记地址（`vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>`；`vibe daemon register-pm --run-id <run-id> --provider <平台> --session-name <会话名>` 登记推送目标），心跳指令逐字用 vibe 打印的 `vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>`，每 60 分钟（推送唤醒未验证的平台 10 分钟，记录在 `.vibe/push-wake-verification.json`）一拍：先 `vibe daemon status`，失活则上报（只上报，不重启：重启归 launchd 或产品经理手工），存活就结束本轮。不要自写心跳或把信箱服务写进心跳；不登记则唤醒无处可发，`rotate` 也无接班地址。
 - **推送优先**：worker 交付后用 `vibe supervisor-address --run-id <run> --node <n> --role <r> --generation <g>` 回答里的 `wake`（`channel`、`target`、`signal`）原样推送；`channel` 为 null 或地址 unknown 时不发，由兜底检查领取。
 - 状态从磁盘读；未知不当成功；宿主报 `No such tool available` 不是节点故障，重试一次后停下报告，不交班。
 

@@ -212,9 +212,8 @@ def launch(platform: str, prompt: str, *, model: Optional[str] = None,
     """Start one short session and wait for it (bounded by ``timeout``).
 
     ``poll`` is called about once a second while waiting so the caller can keep
-    its own heartbeat alive.  ``model`` is whatever the caller resolved (the
-    model-tiers conversion is not wired in yet: ``None`` means the platform
-    default).
+    its own heartbeat alive.  ``model`` is whatever the caller resolved from the
+    node's tier (``model_catalog.resolve``); ``None`` means the platform default.
     """
     if platform == PLATFORM_WORKBUDDY:
         if mailbox_dir is None:
