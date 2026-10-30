@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional
 
+from .decision_boundary import ScopedDecisionMailbox
 from .fsio import JsonCorruptError, JsonMissingError, atomic_write_json, read_json
 from .paths import ProjectPaths
 from .state import AWAITING_SUPERVISOR_STATUS, load_snapshot, run_dir
@@ -239,7 +240,12 @@ def answer_question(monitor: Any, run_id: str, node_id: str, answer: Any) -> Dic
 
 
 def supervisor_answer_section(contract: Dict[str, Any]) -> str:
-    """The answered question of the previous generation, for the next prompt."""
+    """The answered question of the previous generation, for the next prompt.
+
+    Besides that per-generation answer, run-level decisions already answered
+    in this run are injected so every node (developer and reviewer alike)
+    sees the run's standing conclusions and does not re-ask them.
+    """
     try:
         generation = int(contract.get("generation"))
         root = Path(str(contract["project_root"]))
@@ -247,14 +253,46 @@ def supervisor_answer_section(contract: Dict[str, Any]) -> str:
             str(contract["node_id"]), str(contract.get("role") or "developer"), generation - 1)
         record = read_json(path)
     except (KeyError, TypeError, ValueError, OSError):
+        record = None
+    section = ""
+    if isinstance(record, dict):
+        answer = record.get("answer")
+        if isinstance(answer, str) and answer.strip():
+            header = ("上一代交付被 vibe 拒收：「{}」" if record.get("kind") == KIND_SCOPE_LANDING
+                      else "上一代你停下来向监工提问：「{}」")
+            section = (header + "\n监工答复：{}\n按监工答复继续本节点工作，完成后照常交付。\n").format(
+                record.get("excerpt") or "", answer.strip())
+    run_section = _run_answered_decisions_section(contract)
+    if run_section:
+        section = section + "\n" + run_section if section else run_section
+    return section
+
+
+def _run_answered_decisions_section(contract: Dict[str, Any]) -> str:
+    """Run-level answered decisions injected into every dispatch prompt.
+
+    Returns "" when there is nothing to inject; a one-line unknown marker
+    when the ledger cannot be read (treated as unanswered, but recorded).
+    """
+    try:
+        run_id = str(contract["run_id"])
+        root = Path(str(contract["project_root"]))
+    except (KeyError, TypeError, ValueError):
         return ""
-    answer = record.get("answer") if isinstance(record, dict) else None
-    if not isinstance(answer, str) or not answer.strip():
+    try:
+        answered = ScopedDecisionMailbox(ProjectPaths(root)).list_answered_scoped(run_id)
+    except (OSError, ValueError):
+        return "本 run 已答决策台账不可读（unknown），已答决策未注入"
+    run_scoped = [item for item in answered if item["scope"] == "run"]
+    if not run_scoped:
         return ""
-    header = ("上一代交付被 vibe 拒收：「{}」" if record.get("kind") == KIND_SCOPE_LANDING
-              else "上一代你停下来向监工提问：「{}」")
-    return (header + "\n监工答复：{}\n按监工答复继续本节点工作，完成后照常交付。\n").format(
-        record.get("excerpt") or "", answer.strip())
+    lines = ["本 run 已答决策（scope=run）："]
+    for item in run_scoped:
+        lines.append("- {}「{}」→ 结论：{}（来源：节点 {}）".format(
+            item["decision_id"], item.get("question") or "", item.get("choice") or "",
+            item.get("node_id") or "未知"))
+    lines.append("以上已答决策视为 run 级结论，同一问题不要重复提问。")
+    return "\n".join(lines)
 
 
 def _label(item: Dict[str, Any]) -> str:

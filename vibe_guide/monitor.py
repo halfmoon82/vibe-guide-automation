@@ -147,6 +147,7 @@ from .decision_boundary import NotificationBridge, ingest_worker_decisions
 from .orphan_recovery import ORPHAN_DISPATCH_ADOPTED, replay_orphan_adoption
 from .providers import CODEX_PROVIDER
 from .self_report_recovery import SELF_REPORT_DELIVERY_RECONCILED
+from .decision_boundary import ScopedDecisionMailbox
 from .decisions import DecisionMailbox
 
 
@@ -8911,7 +8912,7 @@ class Monitor:
             if isinstance(current.get("review_generation"), int):
                 evidence["review_generation"] = current["review_generation"]
         try:
-            mailbox = DecisionMailbox(self.paths)
+            mailbox = ScopedDecisionMailbox(self.paths)
             for attempt in range(1, _BLOCKED_DESIGN_MAX_ATTEMPTS + 1):
                 # An answered request is closed: a new block for the same cause
                 # needs a new question text (hence a new id) to reach the PM.
@@ -8925,6 +8926,7 @@ class Monitor:
                     options=[dict(item) for item in spec["options"]],
                     recommendation=None,
                     evidence=evidence,
+                    scope="run",
                 )
                 decision_id = str(record["decision_id"])
                 if mailbox.result(decision_id) is None:

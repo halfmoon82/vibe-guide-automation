@@ -816,7 +816,12 @@ class ProviderActionRunner(Runner):
         # follows as one JSON document, so the consistency block always goes
         # last -- after any inlined protocol text.
         consistency = self._consistency_instruction(contract)
-        prompt = head + self._remote_git_ban(contract) + consistency
+        # Run-level decisions already answered in this run reach the worker on
+        # first dispatch too, not only on continuation (#338).  Empty section
+        # adds nothing, and the consistency block still goes last.
+        answered_text = supervisor_answer_section(contract)
+        answered_text = ("\n" + answered_text) if answered_text else ""
+        prompt = head + self._remote_git_ban(contract) + answered_text + consistency
         create_request = {
             "prompt": prompt,
             "target": {
@@ -889,7 +894,8 @@ class ProviderActionRunner(Runner):
             create_request["topology"] = topology
             create_request["sdd_protocol"] = sdd_protocol
             create_request["prompt"] = (
-                head + self._remote_git_ban(contract) + "\n\n" + protocol_block + "\n\n" + consistency
+                head + self._remote_git_ban(contract) + answered_text
+                + "\n\n" + protocol_block + "\n\n" + consistency
             )
         if v39:
             # Keep the provider request bound to the same supervisor target

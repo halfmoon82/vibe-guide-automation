@@ -155,7 +155,7 @@ from .evidence import evaluate_v41_closeout
 from .installation import run_install, run_upgrade, migrate_state
 from .skills import SkillSpec, install_project_skill
 from .models import InstallRequest
-from .decision_boundary import answer_decision, decision_list, raise_decision
+from .decision_boundary import answer_decision, decision_list, raise_reusable_decision
 from . import scope_landing, worker_questions
 
 
@@ -315,6 +315,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--options", dest="decision_options")
     parser.add_argument("--recommendation", dest="decision_recommendation")
     parser.add_argument("--decision-evidence", dest="decision_evidence")
+    parser.add_argument("--scope", dest="decision_scope", choices=("run", "node"), default="run")
     return parser
 
 
@@ -2469,7 +2470,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             evidence = json.loads(args.decision_evidence) if args.decision_evidence else {}
             if not isinstance(evidence, dict):
                 raise ValueError("--decision-evidence must be a JSON object")
-            payload = raise_decision(
+            payload = raise_reusable_decision(
                 paths,
                 run_id=args.run_id,
                 node_id=args.node_id,
@@ -2478,6 +2479,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 recommendation=args.decision_recommendation,
                 evidence=evidence,
                 category=args.hold_category,
+                scope=args.decision_scope,
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "决策写入失败：" + str(error), args.as_json)
@@ -2487,6 +2489,15 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 UNKNOWN,
                 {"command": args.command, "status": "unknown", "reason": "decision notification bridge status unknown", **payload},
                 "决策已写入信箱，但通知桥状态未知",
+                args.as_json,
+            )
+        if isinstance(payload, dict) and payload.get("reused"):
+            request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+            return _result(
+                SUCCESS,
+                {"command": args.command, "status": "reused", **payload},
+                "复用本 run 已答决策 {}：结论 {}".format(
+                    request.get("decision_id") or "未知", payload.get("choice") or "未知"),
                 args.as_json,
             )
         return _result(SUCCESS, {"command": args.command, "status": "pending", **payload}, "决策已写入信箱", args.as_json)
