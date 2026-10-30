@@ -52,6 +52,9 @@ PRODUCT_SPEC_FIELDS: Dict[str, Any] = {
     # ISSUE-209 card choices; the protocol's §5.1 block must match this exactly.
     "heartbeat_interval_minutes?": "|".join(str(item) for item in HEARTBEAT_INTERVAL_CHOICES),
     "rotate_hard_cap?": "|".join(str(item) for item in ROTATE_HARD_CAP_CHOICES),
+    # Authorization-card daemon choices: true|false, defaults true / false.
+    "daemon?": "true|false",
+    "launchd_keepalive?": "true|false",
     # Claude Code dispatches in the background by default; "visible" switches to cards.
     "dispatch_mode?": "background|visible",
 }

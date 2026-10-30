@@ -136,6 +136,8 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
   "remote_git_actions?": "allow|deny",
   "heartbeat_interval_minutes?": "10|60",
   "rotate_hard_cap?": "150000|200000|300000|500000|800000",
+  "daemon?": "true|false",
+  "launchd_keepalive?": "true|false",
   "dispatch_mode?": "background|visible"
 }
 ```
@@ -143,6 +145,8 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
 `prd` 的推荐 section：`problem`、`user_scenarios`、`success_criteria`、`non_goals`、`code_evidence`；涉及图形界面时必须有 `design_mockups`（§2）。
 
 `heartbeat_interval_minutes`、`rotate_hard_cap`、`dispatch_mode` 由 vibe 按平台推导，缺省即可，**不向产品经理询问**（§5.3）。
+
+授权卡两项开关：`daemon`（守护程序，默认开：授权后 `vibe monitor` 自动启动并登记守护程序）、`launchd_keepalive`（开机保活，默认关）。开机保活是守护程序被杀后自动重启的唯一途径；不勾选时守护程序被杀后不会自动恢复，监工心跳只报告、不重启。各平台均未经真机验证，授权卡上如实标注。守护程序关闭时保持旧形态，监工会话手工推进。
 
 产品路径的 `risk_tags` 默认派生为 `write_scope`，表示节点写入合同文件范围的工程风险，不是业务风险评级或执行许可。旧 `--node-spec` 的显式标签保持原样；空值、错误类型和多处冲突仍由 DAG 审计拒绝。
 

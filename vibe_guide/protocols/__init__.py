@@ -27,6 +27,8 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-31: card options daemon (default on) and launchd_keepalive (default off).
+        "76151ffce225578bbaa2a756712fc2d54f190e2c0ad9142116f6c744882c2f7a",
         # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.
         "4c09b600fc2573be814da1165a7dec84516d24e6e4900f56463623b3d367e3e2",
         # 2026-10-30: §7 general principle — engineering questions that do not change
@@ -174,6 +176,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "a6d940da69d2e43664a37d44f0a9e28ad7f5ca2ecb8ebb03f46cf05752acd94b",
     }),
     "vibe-entry": frozenset({
+        # 2026-10-31: monitor auto-starts the daemon; launchd keep-alive is the only auto-restart path.
+        "cc4c48df44d0a871cd964097ca977992653ec7858162fa2b24be994ecf948287",
         # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.
         "494db728c15b604649902014d4e8f23f35beb9c70bb238257681845431243b87",
         # 2026-10-28: first-shift pointer §6.0.
