@@ -117,6 +117,51 @@ BACKGROUND_MODE_DISCLOSURES = (
 )
 
 
+#: Fixed worker-prompt ban, written only when the card says ``deny``.
+REMOTE_GIT_BAN_TEXT = (
+    "远端 Git 禁令：授权卡禁止远端 Git 动作。严禁执行 git fetch、git push、git pull 以及 gh 命令；"
+    "只在本地分支提交。"
+)
+#: ``claude --bg`` launch flags added only when the card says ``deny``.
+REMOTE_GIT_DISALLOWED_TOOLS = (
+    "Bash(git push:*)", "Bash(git fetch:*)", "Bash(git pull:*)", "Bash(gh:*)",
+)
+REMOTE_GIT_LAUNCH_ENV = {"GIT_ALLOW_PROTOCOL": "vibe-denied"}
+#: Per-platform enforcement under ``deny``, shown on the card and in the README.
+#: Unsigned display: it describes what vibe can enforce, not what was approved.
+REMOTE_GIT_ENFORCEMENT = (
+    {"platform": "claude-code 后台派发", "level": "partial",
+     "note": "提示词禁令加启动拦截（--disallowedTools 只拦住 git push，"
+             "拦不住 git -C push 与 bash -c；GIT_ALLOW_PROTOCOL 管不到 gh 和 curl，"
+             "且能否传进后台会话的工具 shell 未验证）：部分拦截，环境变量生效未验证"},
+    {"platform": "claude-code 可见任务", "level": "prompt_only", "note": "仅提示词约束，未强制"},
+    {"platform": "codex", "level": "prompt_only", "note": "仅提示词约束，未强制"},
+    {"platform": "kimi-code", "level": "prompt_only", "note": "仅提示词约束，未强制"},
+    {"platform": "workbuddy", "level": "prompt_only", "note": "仅提示词约束，未强制"},
+)
+
+
+def remote_git_denied(paths, contract):
+    """True only when the node's authorization card says ``deny``.
+
+    The contract's own ``remote_git_actions`` wins; otherwise the card of
+    ``plan_id`` is read.  No plan or an unreadable card means no information,
+    so nothing is added.  ``allow`` never adds a ban or launch flag.
+    """
+    value = (contract or {}).get("remote_git_actions")
+    if value is None and paths is not None and (contract or {}).get("plan_id"):
+        try:
+            card_path = paths.resolve_vibe_path(
+                PurePosixPath("plans") / str(contract["plan_id"]) / "authorization-card.json"
+            )
+            data = json.loads(open(str(card_path), encoding="utf-8").read())
+            if isinstance(data, dict):
+                value = data.get("remote_git_actions", "deny")
+        except (OSError, ValueError, TypeError):
+            return False
+    return value == "deny"
+
+
 def remote_git_actions_allowed(authorization, action):
     """Apply the V4.1 product-facing remote Git switch; deploy stays separate."""
     switch = getattr(authorization, "remote_git_actions", None)
@@ -1154,6 +1199,7 @@ class AuthorizationCard:
         result.update({
             "remote_git_actions_options": ["allow", "deny"],
             "remote_git_actions_scope": list(_REMOTE_GIT_ACTIONS_SCOPE),
+            "remote_git_enforcement": [dict(item) for item in REMOTE_GIT_ENFORCEMENT],
             "deploy_authorization": "separate",
             "heartbeat_interval_options": [
                 dict(item) for item in self.heartbeat_interval_options or ()

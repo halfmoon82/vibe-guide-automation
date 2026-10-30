@@ -235,6 +235,20 @@ V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 
 
 决策通知桥：项目 `.vibe/config.json` 只能写 `"notify_bridge": {"enabled": true}`；要执行的命令与超时只从用户级 `$VIBE_HOME/config.json` 的 `notify_bridge` 读取。项目配置里写 `command` 会被拒绝并记为 UNKNOWN。
 
+### 远端 Git 禁令（remote_git_actions=deny）
+
+授权卡 `remote_git_actions` 为 `deny` 时，四个平台的 worker 提示词都会加一条固定禁令：禁止 git fetch、push、pull 以及 gh，只在本地分支提交。为 `allow` 时不加禁令，也不加任何启动参数。各平台实际能拦到什么：
+
+| 平台 | 约束 |
+|---|---|
+| claude-code 后台派发 | 提示词禁令加启动拦截（`claude --bg` 带 `--disallowedTools` 与 `GIT_ALLOW_PROTOCOL=vibe-denied`）。部分拦截：`--disallowedTools` 实测只拦住 `git push` 与 `env git push`，拦不住 `git -C … push` 和 `bash -c`；环境变量在普通 shell 里拦 push、fetch，但 `env -u` 可取消，也管不到 gh 和 curl；该变量能否传进后台会话的工具 shell 未验证 |
+| claude-code 可见任务 | 仅提示词约束，未强制 |
+| codex | 仅提示词约束，未强制 |
+| kimi-code | 仅提示词约束，未强制 |
+| workbuddy | 仅提示词约束，未强制 |
+
+授权卡预览按同样口径列出。
+
 ### Claude Code 后台派发（降级后台）
 
 配置后，在 Claude Code 上授权一次即可无人值守派发 worker：监工用 `claude --bg` 启动后台会话（provider 为 `claude-code-background`）。这是降级后台，有三条限制：桌面侧边栏看不到这些会话；只能在真实终端里 `claude attach <short-id>` 进入；返工续接的是同一个会话。未配置时行为不变，仍需逐个点卡片。

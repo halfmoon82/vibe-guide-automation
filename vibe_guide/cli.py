@@ -25,7 +25,9 @@ from .authorization import (
     dispatch_topology_for_node,
     node_adapter_id,
     rebind_dispatch_contract,
+    REMOTE_GIT_ENFORCEMENT,
     refresh_authorization_card,
+    remote_git_denied,
 )
 from .adapters.base import (
     BACKGROUND_LAUNCH_LIMITATIONS,
@@ -413,7 +415,7 @@ def _plan_root(paths: ProjectPaths, plan_id: str) -> Path:
 
 def _authorization_card(data: Dict[str, Any]) -> AuthorizationCard:
     converted = dict(data)
-    for key in ("remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization"):
+    for key in ("remote_git_actions_options", "remote_git_actions_scope", "remote_git_enforcement", "deploy_authorization"):
         converted.pop(key, None)
     # The availability lists are unsigned metadata that must round-trip: a card
     # read back and rewritten (a refresh) would otherwise lose the reason a tier
@@ -832,6 +834,8 @@ def _claude_bg_launcher_factory(paths: ProjectPaths, launchers: Optional[List[An
         upstream = contract.get("upstream_branches")
         launcher = claude_bg.ClaudeBgLauncher(
             routing, claude_bg.load_claude_bg_config(paths), model=model,
+            # Only a deny card passes it, so allow keeps the previous call shape.
+            **({"remote_git_deny": True} if remote_git_denied(paths, contract) else {}),
             # Only a downstream node passes it, so launchers built for nodes
             # without accepted upstreams keep their previous call shape.
             **({"upstream_branches": list(upstream)} if upstream else {}),
@@ -1732,6 +1736,9 @@ def _render_card_preview(payload: Dict[str, Any], card: AuthorizationCard) -> st
             _render_card_options(card.rotate_hard_cap_options, "tokens", "token"),
         )
     )
+    lines.append("远端 Git 禁令（remote_git_actions=deny 时）：")
+    for entry in REMOTE_GIT_ENFORCEMENT:
+        lines.append("  {}：{}".format(entry["platform"], entry["note"]))
     lines.extend(_daemon_option_lines(card))
     changed = payload.get("changed_fields") or {}
     if isinstance(changed, dict) and changed:

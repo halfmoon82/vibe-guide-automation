@@ -26,6 +26,7 @@ from ..models import (
     WorkerProfile,
 )
 from ..model_router import provider_thinking_for
+from ..authorization import REMOTE_GIT_BAN_TEXT, remote_git_denied
 from ..paths import ProjectPaths
 from ..protocols import load_protocol, protocol_path, published_protocol_digest
 from ..task_registry import (
@@ -310,6 +311,10 @@ class ProviderActionRunner(Runner):
                 "no verified native control plane for provider {}".format(self.provider)
             )
         return tools[operation]
+
+    def _remote_git_ban(self, contract: Dict[str, Any]) -> str:
+        """The fixed ban line, only when the card says ``deny`` (else empty)."""
+        return "\n" + REMOTE_GIT_BAN_TEXT + "\n" if remote_git_denied(self.paths, contract) else ""
 
     def _consistency_instruction(self, contract: Dict[str, Any]) -> str:
         try:
@@ -810,7 +815,7 @@ class ProviderActionRunner(Runner):
         # follows as one JSON document, so the consistency block always goes
         # last -- after any inlined protocol text.
         consistency = self._consistency_instruction(contract)
-        prompt = head + consistency
+        prompt = head + self._remote_git_ban(contract) + consistency
         create_request = {
             "prompt": prompt,
             "target": {
@@ -883,7 +888,7 @@ class ProviderActionRunner(Runner):
             create_request["topology"] = topology
             create_request["sdd_protocol"] = sdd_protocol
             create_request["prompt"] = (
-                head + "\n\n" + protocol_block + "\n\n" + consistency
+                head + self._remote_git_ban(contract) + "\n\n" + protocol_block + "\n\n" + consistency
             )
         if v39:
             # Keep the provider request bound to the same supervisor target
@@ -1531,7 +1536,7 @@ class ProviderActionRunner(Runner):
             request = {
                 "threadId": binding.task_id,
                 "hostId": binding.host,
-                "prompt": self._continuation_prompt(contract) + "\n" + self._consistency_instruction(contract),
+                "prompt": self._continuation_prompt(contract) + self._remote_git_ban(contract) + "\n" + self._consistency_instruction(contract),
             }
             if route_model is not None:
                 request.update({"model": route_model, "thinking": provider_thinking_for(route_reasoning)})

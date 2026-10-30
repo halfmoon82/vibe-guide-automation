@@ -9,6 +9,7 @@ nor permanent unavailability.
 """
 
 from dataclasses import dataclass
+import inspect
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,11 @@ import subprocess
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
+from ..authorization import (
+    REMOTE_GIT_BAN_TEXT,
+    REMOTE_GIT_DISALLOWED_TOOLS,
+    REMOTE_GIT_LAUNCH_ENV,
+)
 from ..paths import ProjectPaths
 from .task_provider import BackgroundTaskRouting, ProviderUnavailable, VisibilityResult
 
@@ -142,8 +148,11 @@ _NO_USER_QUESTIONS = ("--disallowedTools", "AskUserQuestion")
 _RESUME_SETTLE_SECONDS = (5, 10, 20)
 
 
-def subprocess_executor(argv: Sequence[str], cwd: Path, timeout: float) -> CommandResult:
+def subprocess_executor(
+    argv: Sequence[str], cwd: Path, timeout: float, extra_env: Optional[Mapping[str, str]] = None
+) -> CommandResult:
     env = {key: value for key, value in os.environ.items() if key not in _HOST_ONLY_ENV}
+    env.update(extra_env or {})
     try:
         done = subprocess.run(
             list(argv),
@@ -161,6 +170,17 @@ def subprocess_executor(argv: Sequence[str], cwd: Path, timeout: float) -> Comma
     except OSError as error:
         raise ClaudeBgUnknown("cannot run %s: %s" % (argv[0], error))
     return CommandResult(done.returncode, done.stdout or "", done.stderr or "")
+
+
+def _accepts_env(executor) -> bool:
+    """Whether an injected executor takes the optional fourth ``env`` argument."""
+    try:
+        params = list(inspect.signature(executor).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is p.VAR_POSITIONAL for p in params):
+        return True
+    return len([p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]) >= 4
 
 
 @dataclass(frozen=True)
@@ -287,7 +307,12 @@ class ClaudeBgLauncher:
         transcript_locator: Callable[[str], Optional[Path]] = _default_transcript_locator,
         sleeper: Callable[[float], None] = time.sleep,
         upstream_branches: Optional[Sequence[str]] = None,
+        remote_git_deny: bool = False,
     ):
+        #: True only when the authorization card says ``remote_git_actions:
+        #: deny``: ``launch`` then appends the ban to the prompt and adds
+        #: ``--disallowedTools`` plus ``GIT_ALLOW_PROTOCOL``.  False adds nothing.
+        self.remote_git_deny = bool(remote_git_deny)
         self.routing = routing
         self.sleeper = sleeper
         self.config = config
@@ -306,7 +331,9 @@ class ClaudeBgLauncher:
         self.worktree_preflight: Optional[Dict[str, Any]] = None
 
     # -- helpers -----------------------------------------------------------
-    def _run(self, argv: List[str], cwd: Path) -> CommandResult:
+    def _run(self, argv: List[str], cwd: Path, env: Optional[Mapping[str, str]] = None) -> CommandResult:
+        if env and _accepts_env(self.executor):
+            return self.executor(argv, cwd, self.config.timeout, dict(env))
         return self.executor(argv, cwd, self.config.timeout)
 
     def _claude(self, *args: str) -> List[str]:
@@ -600,6 +627,15 @@ class ClaudeBgLauncher:
                 self._require_ok(self._run(["git", "config", "--worktree", key, value], worktree), "git config")
         name = "%s-%s" % (issue_id, role)
         started_ms = int(time.time() * 1000)
+        # One --disallowedTools argument: background workers never get
+        # AskUserQuestion (#328); under remote-git deny the remote git tools
+        # are added to the same list rather than passing the option twice.
+        denied_tools = [_NO_USER_QUESTIONS[1]]
+        if self.remote_git_deny:
+            if REMOTE_GIT_BAN_TEXT not in prompt:
+                prompt = prompt + "\n" + REMOTE_GIT_BAN_TEXT
+            denied_tools += list(REMOTE_GIT_DISALLOWED_TOOLS)
+        deny_flags: List[str] = [_NO_USER_QUESTIONS[0]] + denied_tools
         try:
             started = self._run(
                 self._claude(
@@ -612,12 +648,13 @@ class ClaudeBgLauncher:
                     self.config.settings_path,
                     "--permission-mode",
                     "bypassPermissions",
-                    *_NO_USER_QUESTIONS,
+                    *deny_flags,
                     # A prompt starting with "-" is otherwise read as an option (live).
                     "--",
                     prompt,
                 ),
                 worktree,
+                REMOTE_GIT_LAUNCH_ENV if self.remote_git_deny else None,
             )
             if started.returncode != 0 and _NOT_TRUSTED.search(
                 _ANSI.sub("", (started.stderr or "") + "\n" + (started.stdout or ""))
@@ -789,7 +826,16 @@ class ClaudeBgLauncher:
             # `claude stop` returns before the session stops counting as
             # running; resuming inside that window starts a copy (live).
             self.sleeper(delay)
-            result = self._run(self._claude("--bg", "--resume", task_id, "--", message), worktree)
+            deny = self.remote_git_deny
+            result = self._run(
+                self._claude(
+                    "--bg", "--resume", task_id,
+                    *(["--disallowedTools"] + list(REMOTE_GIT_DISALLOWED_TOOLS) if deny else []),
+                    "--", message,
+                ),
+                worktree,
+                REMOTE_GIT_LAUNCH_ENV if deny else None,
+            )
             combined = _ANSI.sub("", (result.stdout or "") + "\n" + (result.stderr or ""))
             if result.returncode != 0:
                 tail = combined.strip()[-200:]
