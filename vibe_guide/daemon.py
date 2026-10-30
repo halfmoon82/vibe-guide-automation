@@ -613,6 +613,8 @@ class Daemon:
             self._save_heal_state(state)
         elif self._report_failed:
             self._log("pm-inbox write failed for the unresolved report; close-out postponed")
+            self._last_error = {"type": "OSError", "reason": "unresolved report not written to pm-inbox; close-out postponed",
+                                "at": self.clock()}
             return None  # retry before announcing or archiving
         if not self._announce(status, blocked):
             return None
@@ -1027,6 +1029,7 @@ class Daemon:
 
     def _report_unresolved(self, snapshot, state: Dict[str, Any], *, final: bool) -> bool:
         """Tell the product manager once per set of unresolved items; reads disk only."""
+        self._report_failed = False  # only a push attempted in this call can hold the close-out back
         items = live_unresolved(state, snapshot)
         if not items:
             return False

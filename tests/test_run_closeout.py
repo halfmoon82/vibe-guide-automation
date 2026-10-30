@@ -235,9 +235,23 @@ class ParkedRunTests(LiveSessionTests):
         daemon._save_heal_state(state)
         outcome = daemon.run(max_cycles=20)
         self.assertEqual(outcome, {"status": "terminal", "run_status": "blocked_unknown"})
+        self.assertIn("close-out postponed", daemon._last_error["reason"])
         self.assertEqual(self.order[:6], [
             "push:unresolved_report:failed", "push:unresolved_report:failed", "push:unresolved_report",
             "push:run_blocked_unknown", "lease_release", "archive"])
+
+    def test_a_report_that_failed_mid_run_does_not_hold_back_a_later_close_out(self):
+        self.fail_reports(1)
+        supervisor = Supervisor([snap("running", {"n": node("running")}),
+                                 snap("complete", {"n": node("accepted")})])
+        daemon = self.make(supervisor, unresolved_report_seconds=60)
+        state = daemon._heal_state()
+        state["unresolved"] = {"n": {"code": "self_heal_no_progress", "at": 1.0, "example": "", "repairs": 2}}
+        daemon._save_heal_state(state)
+        outcome = daemon.run(max_cycles=20)
+        self.assertEqual(self.order.count("push:unresolved_report:failed"), 1)   # the periodic report failed once
+        self.assertEqual(outcome, {"status": "terminal", "run_status": "complete"})
+        self.assertIn("archive", self.order)
 
     def test_gate_block_retries_a_failed_report_a_few_times_then_exits(self):
         self.fail_reports(1)
@@ -254,7 +268,7 @@ class ParkedRunTests(LiveSessionTests):
         daemon._gate = lambda: {"status": "blocked_unknown", "reason": "gate_error: boom"}
         outcome = daemon.run()
         self.assertEqual(outcome["status"], "blocked")
-        self.assertEqual(self.order.count("push:unresolved_report:failed"), dm._REPORT_ATTEMPTS)
+        self.assertEqual(self.order.count("push:unresolved_report:failed"), 3)
 
     def test_a_failed_inbox_write_keeps_the_unresolved_report_pending(self):
         supervisor = Supervisor([self.blocked()])
