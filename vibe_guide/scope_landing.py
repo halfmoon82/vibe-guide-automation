@@ -259,6 +259,75 @@ def check_delivery(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, 
     return True
 
 
+#: Structural code of the empty-landing refusal (#336): the node worktree is
+#: an independent git worktree but ``base..HEAD`` (minus content merged in
+#: unchanged) changed nothing.  A report without a landing is not a delivery;
+#: the same session can commit real work and re-report.
+EMPTY_LANDING_CODE = "empty_landing"
+#: Event recorded when the contract opted in (``allow_empty_landing: true``)
+#: and an empty diff is allowed through.
+EMPTY_LANDING_ALLOWED_EVENT = "empty_landing_allowed"
+
+
+def check_delivery_content(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, Any],
+                           runner: Any = None, handle_id: Optional[str] = None) -> bool:
+    """True when the developer delivery actually landed something (#336).
+
+    Runs after ``check_delivery`` accepted the file scope: the same landing
+    report is reused, so a refusal here means the diff was readable and in
+    scope but *empty*.  That is a format-class error, not a supervisor
+    question: the worker is still live, so the refusal keeps the handle and
+    binding (``acceptance_rejected`` with the ``empty_landing`` structural
+    code) and the same session re-reports after a real commit.
+
+    A node without a git-worktree landing (no worktree configured, or the
+    guide/fake-provider modes where there is no branch claim to check) keeps
+    today's pass-through: this gate only judges landings that can be read.
+    When the contract carries ``allow_empty_landing: true`` an empty diff is
+    allowed through and recorded as ``empty_landing_allowed``.
+    """
+    try:
+        report = landing_report(monitor, snapshot, node_id)
+    except (ScopeLandingUnknown, OSError, subprocess.SubprocessError) as error:
+        # Unreadable diffs stay on the existing fail-closed path; the refusal
+        # there already parked the node, so there is nothing left to judge.
+        snapshot.nodes[node_id][REJECTION_KEY] = [{"path": "*", "cause": CAUSE_UNREADABLE}]
+        park(monitor, snapshot, node_id, active, _rejection_text([], str(error)[:300]),
+             kind=KIND_SCOPE_LANDING, event_name="scope_landing_rejected",
+             event_data={"rejection_code": "scope_landing:" + CAUSE_UNREADABLE},
+             binding_status=_DELIVERED)
+        return False
+    if report is None or report["files"]:
+        return True
+    contract = getattr(getattr(monitor, "nodes", {}).get(node_id), "contract", None)
+    if isinstance(contract, dict) and contract.get("allow_empty_landing") is True:
+        monitor._record(
+            snapshot,
+            EMPTY_LANDING_ALLOWED_EVENT,
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": str(active.get("role")) if isinstance(active, dict) else None,
+                "generation": active.get("generation") if isinstance(active, dict) else None,
+                "reason": "contract allow_empty_landing: true; empty diff allowed",
+            },
+            active,
+        )
+        return True
+    monitor._reject_acceptance_format(
+        snapshot,
+        node_id,
+        active,
+        "empty landing: the node worktree has no committed change since its base",
+        EMPTY_LANDING_CODE,
+        {"disposition": "acceptance_rejected",
+         "finding": ["empty landing: base..HEAD changed nothing"]},
+        runner=runner,
+        handle_id=handle_id,
+    )
+    return False
+
+
 def render_status_lines(snapshot: Any) -> str:
     lines = []
     for node_id, current in sorted((getattr(snapshot, "nodes", None) or {}).items()):

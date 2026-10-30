@@ -114,6 +114,7 @@ from .worker_questions import REPLAY_EVENTS as WORKER_QUESTION_REPLAY_EVENTS
 from .worker_questions import replay as replay_worker_question
 from .worktree_base import upstream_branches
 from .scope_landing import check_delivery as check_delivery_landing
+from .scope_landing import check_delivery_content as check_delivery_content_landing
 from .workflow_gate import require_capability_contract, require_entry, verify_workflow
 from .authorize_entry import load_live_workflow, select_plan_workflow, verify_workflow_artifacts
 from .diagnostics import validate_child_session_binding
@@ -137,6 +138,7 @@ from .checkpoint import (
 from .brief import ImplementationBrief, validate_implementation_brief
 from .manifest import RunManifest
 from .evidence import (
+    blocked_self_report_fields,
     build_integration_review_evidence,
     evaluate_v41_closeout,
     evaluate_delivery_evidence,
@@ -927,7 +929,7 @@ RECOVERY_FIDELITY_AUDIT = (
     },
     {
         "site": "_release_node_lease",
-        "call_sites": 23,
+        "call_sites": 25,
         "callers": (
             {
                 "caller": "_recover_reverse_blocked_acceptance",
@@ -942,7 +944,7 @@ RECOVERY_FIDELITY_AUDIT = (
                 "caller": (
                     "_apply_event, _start_task, reauthorize, _schedule_ready "
                     "helpers, _reconcile_unapplied_events and the remaining "
-                    "terminal-transition callers (the other 22 sites, including the #290 contract_error replay that re-plans an integration-review node)"
+                    "terminal-transition callers (the other 24 sites, including the #290 contract_error replay that re-plans an integration-review node and the #335 _park_blocked_engineering / blocked_engineering replay pair that parks a blocked self-report)"
                 ),
                 "verdict": "different_type",
                 "rationale": (
@@ -4199,7 +4201,8 @@ class Monitor:
                                             developer.task_id, developer.host or developer.hostId,
                                             delivery)
         gate = evaluate_delivery_evidence({**current, 'status':'DELIVERED'}, developer, delivery,
-                                          self_report_receipt=receipt is not None)
+                                          self_report_receipt=receipt is not None,
+                                          self_report=archived.get('payload'))
         if not gate.complete:
             raise ValueError('successor reconciliation developer delivery is incomplete')
         artifact = Path(delivery['delivery_path'])
@@ -6546,6 +6549,79 @@ class Monitor:
             binding.task_id, delivery,
         )
 
+    def _archived_blocked_engineering(self, snapshot, node_id, role, active):
+        """The consumed archive for this task is a blocked_engineering report."""
+        if not isinstance(active, dict):
+            return False
+        store_paths = getattr(self, "paths", None)
+        if store_paths is None:
+            return False
+        payload = ProviderActionStore(store_paths).archived_payload(
+            snapshot.run_id, node_id, role, active.get("generation")
+        )
+        return isinstance(payload, dict) and payload.get("event") == "blocked_engineering"
+
+    def _park_blocked_engineering(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        role: str,
+        event: Any,
+        active: Optional[Dict[str, Any]],
+        handle_id: Optional[str],
+    ) -> None:
+        """Park a worker's blocked self-report as supervisor disposition (#335).
+
+        The node stays ``blocked_unknown`` with the fixed ``engineering_blocked``
+        class; no reviewer is dispatched and no retryable action is scheduled,
+        because a declared engineering block cannot self-heal.  Everything
+        stamped here is a program constant: the worker's free text never
+        reaches the record or the event.
+        """
+        data = event.data if isinstance(event.data, dict) else {}
+        fields = blocked_self_report_fields(data) or ["event"]
+        reason = "worker reported a blocked engineering state ({})".format(
+            ", ".join(fields)
+        )
+        current = snapshot.nodes[node_id]
+        current["status"] = "blocked_unknown"
+        current["reason"] = reason
+        current["reason_class"] = "engineering_blocked"
+        current["reason_code"] = "blocked_self_report"
+        current.pop("recovery_action", None)
+        current.pop("error_type", None)
+        current["retryable_action"] = None
+        current["active_role"] = None
+        current["active_task"] = None
+        snapshot.handles.pop(node_id, None)
+        current["quarantine"] = {
+            "run_id": snapshot.run_id,
+            "handle_id": handle_id,
+            "reason": reason,
+        }
+        self._release_node_lease(snapshot, node_id)
+        if isinstance(active, dict) and active.get("role") in {"developer", "reviewer"}:
+            try:
+                self._set_binding_status(
+                    snapshot, node_id, str(active["role"]), "blocked_unknown"
+                )
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                pass
+        self._record(
+            snapshot,
+            "blocked_engineering",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": role,
+                "generation": active.get("generation") if isinstance(active, dict) else None,
+                "handle_id": handle_id,
+                "reason_class": "engineering_blocked",
+                "reason_code": "blocked_self_report",
+            },
+            active,
+        )
+
     def _reject_acceptance_format(
         self,
         snapshot: RunSnapshot,
@@ -6980,8 +7056,32 @@ class Monitor:
             self._release_node_lease(snapshot, node_id)
             return
 
+        if event.event == "blocked_engineering":
+            # #335: the worker surfaced an engineering blocker through the
+            # delivery channel.  That is not a delivery: park the node for
+            # supervisor disposition without dispatching a reviewer and
+            # without an auto-retry marker claiming the block self-heals.
+            self._park_blocked_engineering(snapshot, node_id, role, event, active, handle_id)
+            return
         if event.event in {"delivered", "complete"}:
             delivery = event.data.get("delivery_evidence")
+            store_paths = getattr(self, "paths", None)
+            archived = (ProviderActionStore(store_paths).archived_payload(
+                snapshot.run_id, node_id, role, active.get("generation")
+            ) if store_paths is not None and isinstance(active, dict) else None)
+            blocked_fields = blocked_self_report_fields(
+                archived if archived is not None
+                else (event.data if isinstance(event.data, dict) else {})
+            )
+            if blocked_fields:
+                # Defense in depth behind the worker-deliver shape gate: a
+                # blocked self-report that still reached a delivery event
+                # (archived before #335, or past validation) is parked, never
+                # judged as a delivery.  The archive, not the event data, is
+                # read first: runner projections forward only the delivery
+                # vocabulary and would hide the blocked fields.
+                self._park_blocked_engineering(snapshot, node_id, role, event, active, handle_id)
+                return
             if snapshot.execution_engine == "vibeguide_monitor":
                 binding = self._load_task_binding(snapshot, node_id, role)
                 background_receipt = self._background_receipt(
@@ -6995,6 +7095,7 @@ class Monitor:
                         snapshot, node_id, role, active, binding, delivery
                     ) is not None,
                     background_receipt=background_receipt is not None,
+                    self_report=archived if archived is not None else event.data,
                 )
                 if not gate.complete:
                     if gate.classification == "acceptance_rejected":
@@ -7021,6 +7122,10 @@ class Monitor:
                     self._mark_blocked_unknown(snapshot, node_id, "; ".join(gate.reasons))
                     return
             if role == "developer" and not check_delivery_landing(self, snapshot, node_id, active):
+                return
+            if role == "developer" and not check_delivery_content_landing(
+                self, snapshot, node_id, active, runner=runner, handle_id=handle_id
+            ):
                 return
             visible_sdd_delivery = (
                 role == "developer"
@@ -7570,6 +7675,17 @@ class Monitor:
             self._archive_pair(snapshot, node_id)
             self._release_node_lease(snapshot, node_id)
         elif event.event in {"unknown", "timeout", "state_unknown", "visibility_unknown"}:
+            if event.event == "visibility_unknown" and self._archived_blocked_engineering(
+                snapshot, node_id, role, active
+            ):
+                # #335: the runner's wait-event vocabulary does not know
+                # blocked_engineering yet, so a blocked self-report surfaces
+                # here as "provider event is unsupported" after the archive
+                # was consumed.  The archive still holds the full payload:
+                # park the node exactly as if the event name had flowed
+                # through, instead of losing the report to a generic block.
+                self._park_blocked_engineering(snapshot, node_id, role, event, active, handle_id)
+                return
             raw_reason = event.data.get("reason", event.event)
             reason = str(redact_provider_text(raw_reason))
             failure = classify_provider_failure(event.data)
@@ -10011,6 +10127,33 @@ class Monitor:
                 current["active_role"] = None
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
+                self._release_node_lease(snapshot, node_id)
+            elif record["event"] == "blocked_engineering":
+                # Crash-window twin of _park_blocked_engineering (#335): the
+                # event is appended before the snapshot save; without this
+                # branch the fall-through would replace the fixed
+                # engineering_blocked class with the generic "unapplied event
+                # needs manual reconciliation" block and the supervisor could
+                # no longer tell a declared engineering block from a lost one.
+                if data.get("reason_class") != "engineering_blocked" \
+                        or data.get("reason_code") != "blocked_self_report":
+                    raise ValueError("replayed blocked engineering evidence is invalid")
+                current["status"] = "blocked_unknown"
+                current["reason"] = "worker reported a blocked engineering state"
+                current["reason_class"] = "engineering_blocked"
+                current["reason_code"] = "blocked_self_report"
+                current.pop("recovery_action", None)
+                current["active_role"] = None
+                current["active_task"] = None
+                current["retryable_action"] = None
+                snapshot.handles.pop(node_id, None)
+                handle_id = data.get("handle_id")
+                if isinstance(handle_id, str) and handle_id:
+                    current["quarantine"] = {
+                        "run_id": snapshot.run_id,
+                        "handle_id": handle_id,
+                        "reason": "worker reported a blocked engineering state",
+                    }
                 self._release_node_lease(snapshot, node_id)
             elif record["event"] == "pair_archived":
                 current["pair_archived"] = True
