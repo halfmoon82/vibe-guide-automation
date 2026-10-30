@@ -192,6 +192,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "fc271522236eeb9a943c59b077547bab251ce5ff33a2997954ebda4433d01612",
         # 2026-10-18: heartbeat-wake (answered decisions consumed) combined with main's idle backoff (#239).
         "a6d940da69d2e43664a37d44f0a9e28ad7f5ca2ecb8ebb03f46cf05752acd94b",
+        # 2026-10-30: §6.4 locate 行补参数形状（Codex 只传 threadId，#316），§6.3 可见派发缺树机读码 worktree_missing（#337/#339 文档半）。
+        "303e7bf22443b896ee9cc1a158c82bf96421cc2789226409460a293a302eabb9",
     }),
     "vibe-entry": frozenset({
         # 2026-10-31: monitor auto-starts the daemon; launchd keep-alive is the only auto-restart path.
@@ -250,6 +252,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "316ac78b3dead0703a8a118f308029ab2a9af709eb8d79cad780a1b5423060e1",
         # manual stop: use vibe's stop entry, not `claude stop`.
         "6ac171e78a2fb4d6f284727a362597f74c81a1dba96defe6c519496a2cbf7746",
+        # 2026-10-30: locate 小节——照抄 native_args、不要多传参数（#337 文档半）。
+        "a10b4b7c4371c89dd2be5e0d2048160a2a54e1c2dca923b117f6fa8afbafec65",
     }),
     # Second-level self-heal short session (daemon): the prompt the daemon feeds
     # a one-shot repair session.

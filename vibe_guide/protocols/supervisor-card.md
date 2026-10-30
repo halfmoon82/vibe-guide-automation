@@ -25,6 +25,11 @@
   错误里列出缺少或多出的字段名，按提示补齐后重写。
 - 开发者交付必须带 `delivery_evidence`。
 
+## locate（定位/进入任务）
+- locate 照抄信箱 `native_args` 建议形状，不要多传参数：Codex `navigate_to_codex_page`
+  只传 `{"threadId": <task_id>}`，多传 hostId/page 即参数错误（#316）。
+- `{"located": true}` 只在任务真实可定位时回写。
+
 ## 决策边界
 - 只有改变 PRD 决策（产品范围、验收判定、设计）、部署发布、凭据权限、授权卡外不可撤销动作，
   以及新增第三方依赖、可见降级为后台不可见，才问用户。
