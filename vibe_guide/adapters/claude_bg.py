@@ -51,6 +51,27 @@ class ClaudeBgUnknown(ProviderUnavailable):
         self.reason = reason
 
 
+WORKSPACE_NOT_TRUSTED = "workspace_not_trusted"
+_NOT_TRUSTED = re.compile(r"workspace not trusted", re.IGNORECASE)
+
+
+class ClaudeBgWorkspaceUntrusted(ClaudeBgUnknown):
+    """``claude --bg`` refused to start because the directory was never trusted.
+
+    Retrying cannot help: someone has to run ``claude`` there once and accept
+    the prompt.  ``reason_code`` and the directory are program-authored, so a
+    caller can persist them verbatim while the CLI's own text stays redacted.
+    """
+
+    def __init__(self, reason_code: str, reason: str, worktree: str, branch: str = ""):
+        super().__init__(reason)
+        self.reason_code = reason_code
+        self.worktree = worktree
+        self.branch = branch
+        self.command = "cd %s && claude" % worktree
+        self.observation = {"reason_code": reason_code, "worktree": worktree, "branch": branch}
+
+
 class ClaudeBgWorktreeBlocked(ClaudeBgUnknown):
     """A worktree precondition this launcher will not repair on its own.
 
@@ -225,6 +246,25 @@ def load_claude_bg_config(paths: ProjectPaths) -> ClaudeBgConfig:
         git_user_email=text("git_user_email", None),
         timeout=float(timeout),
     )
+
+
+def list_agent_sessions(
+    config: ClaudeBgConfig, cwd: Path, executor: CommandExecutor = subprocess_executor
+) -> List[Mapping[str, Any]]:
+    """Every session ``claude agents --json --all`` reports, stopped ones included."""
+    result = executor([config.claude_command, "agents", "--json", "--all"], cwd, config.timeout)
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout or "").strip()[-200:]
+        raise ClaudeBgUnknown("claude agents failed (exit %s): %s" % (result.returncode, tail))
+    try:
+        data = json.loads(_ANSI.sub("", result.stdout or ""))
+    except json.JSONDecodeError:
+        raise ClaudeBgUnknown("claude agents output is not valid JSON")
+    if isinstance(data, dict):
+        data = data.get("agents", data.get("sessions"))
+    if not isinstance(data, list):
+        raise ClaudeBgUnknown("claude agents output has no session list")
+    return [item for item in data if isinstance(item, dict)]
 
 
 def _default_transcript_locator(task_id: str) -> Optional[Path]:
@@ -512,19 +552,7 @@ class ClaudeBgLauncher:
         return _ANSI.sub("", result.stdout or "")
 
     def _entries(self) -> List[Mapping[str, Any]]:
-        out = self._require_ok(
-            self._run(self._claude("agents", "--json", "--all"), self._cwd_for_query()),
-            "claude agents",
-        )
-        try:
-            data = json.loads(out)
-        except json.JSONDecodeError:
-            raise ClaudeBgUnknown("claude agents output is not valid JSON")
-        if isinstance(data, dict):
-            data = data.get("agents", data.get("sessions"))
-        if not isinstance(data, list):
-            raise ClaudeBgUnknown("claude agents output has no session list")
-        return [item for item in data if isinstance(item, dict)]
+        return list_agent_sessions(self.config, self._cwd_for_query(), self.executor)
 
     def _cwd_for_query(self) -> Path:
         return self._worktree()
@@ -573,30 +601,39 @@ class ClaudeBgLauncher:
         name = "%s-%s" % (issue_id, role)
         started_ms = int(time.time() * 1000)
         try:
-            out = self._require_ok(
-                self._run(
-                    self._claude(
-                        "--bg",
-                        "-n",
-                        name,
-                        "--model",
-                        self.model,
-                        "--settings",
-                        self.config.settings_path,
-                        "--permission-mode",
-                        "bypassPermissions",
-                        *_NO_USER_QUESTIONS,
-                        # A prompt starting with "-" is otherwise read as an option (live).
-                        "--",
-                        prompt,
-                    ),
-                    worktree,
+            started = self._run(
+                self._claude(
+                    "--bg",
+                    "-n",
+                    name,
+                    "--model",
+                    self.model,
+                    "--settings",
+                    self.config.settings_path,
+                    "--permission-mode",
+                    "bypassPermissions",
+                    *_NO_USER_QUESTIONS,
+                    # A prompt starting with "-" is otherwise read as an option (live).
+                    "--",
+                    prompt,
                 ),
-                "claude --bg",
+                worktree,
             )
+            if started.returncode != 0 and _NOT_TRUSTED.search(
+                _ANSI.sub("", (started.stderr or "") + "\n" + (started.stdout or ""))
+            ):
+                raise ClaudeBgWorkspaceUntrusted(
+                    WORKSPACE_NOT_TRUSTED,
+                    "claude refused to start in %s: the workspace was never trusted; run "
+                    "`claude` there once and accept the trust prompt, then retry" % worktree,
+                    str(worktree), self.routing.branch,
+                )
+            out = self._require_ok(started, "claude --bg")
             match = _BACKGROUNDED.search(out)
             if not match:
                 raise ClaudeBgUnknown("cannot parse 'backgrounded' short id from claude output")
+        except ClaudeBgWorkspaceUntrusted:
+            raise
         except ClaudeBgUnknown as error:
             raise ClaudeBgUnknown("%s; %s" % (error.reason, self._stop_strays(name, started_ms)))
         short_id = match.group(1)

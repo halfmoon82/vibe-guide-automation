@@ -205,6 +205,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         # 2026-10-30: decision boundary — decide non-PRD engineering questions, no chat asks.
         "f68fa85b91eceac9701983ad766983699284794bbb35b38e0e32312e363319a6",
         "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
+        # work beat: no manual resume while the daemon advances the run.
+        "316ac78b3dead0703a8a118f308029ab2a9af709eb8d79cad780a1b5423060e1",
     }),
     # Second-level self-heal short session (daemon): the prompt the daemon feeds
     # a one-shot repair session.

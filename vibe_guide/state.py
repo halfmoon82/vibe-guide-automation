@@ -522,6 +522,12 @@ _EVENT_DATA_KEYS = {
     # the fixed-enum session state the question was read in.
     "question_file",
     "session_state",
+    # daemon_lease_readopted / run_archive_deferred: an epoch number, the
+    # short ids of sessions still alive and the run status that was closed.
+    # Counters, identifiers and fixed enums only; no provider text.
+    "lease_epoch",
+    "live_sessions",
+    "run_status",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",

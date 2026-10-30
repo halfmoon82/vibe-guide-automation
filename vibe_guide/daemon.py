@@ -34,10 +34,18 @@ PM_INBOX_FILE = "pm-inbox.jsonl"
 DAEMON_LOG_FILE = "daemon.log"
 
 TERMINAL_STATUSES = frozenset({"complete", "failed", "blocked_design", "stopped"})
+#: closed out only once parked: no node is moving and every blocked node reached
+#: the product manager (or the grace period passed)
+PARKED_STATUS = "blocked_unknown"
+#: node statuses that mean the next tick may still dispatch, poll or accept work
+ACTIVE_NODE_STATUSES = frozenset({
+    "ready", "start_pending", "running", "review", "rework", "delivered", "retry_pending", "brief_pending",
+})
 LEASE_HELD_MESSAGE = "supervisor lease is held by another process"
 _ERROR_ESCALATION_STREAK = 5
 _ESCALATE_MARK = "VIBE_ESCALATE:"
 _REPAIRS_BEFORE_ESCALATION = 2
+_ARCHIVE_ATTEMPTS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -56,11 +64,14 @@ class DaemonConfig:
     max_sessions: int = 6
     max_tokens: int = 500000
     cache_zero_limit: int = 3
+    #: seconds a run may sit parked in blocked_unknown (no node moving) before the
+    #: daemon closes it out even if the stall ladder has not escalated every node
+    blocked_grace: float = 1800.0
     executable: Optional[str] = None
     extra_args: List[str] = field(default_factory=list)
 
     def validate(self) -> "DaemonConfig":
-        for name in ("interval", "heal_interval", "stale_seconds", "session_timeout"):
+        for name in ("interval", "heal_interval", "stale_seconds", "session_timeout", "blocked_grace"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
                 raise ValueError("daemon config %s must be a non-negative number" % name)
@@ -281,8 +292,11 @@ class PmNotifier:
         entry = {"at": time.time(), "kind": kind, "node_id": node_id, "message": message,
                  "target": (address or {}).get("session_name")}
         inbox = _file(self.paths, self.run_id, PM_INBOX_FILE, create=True)
-        with open(str(inbox), "a", encoding="utf-8") as stream:
-            stream.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+        try:
+            with open(str(inbox), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError as error:
+            return {"status": "inbox_failed", "reason": type(error).__name__}
         if address is None:
             return {"status": "no_address", "reason": "no product-manager session registered"}
         command = self._command()
@@ -311,6 +325,8 @@ class Daemon:
                  verify: Optional[Callable[[str, str], Dict[str, Any]]] = None,
                  retry: Optional[Callable[[str], Any]] = None,
                  gate: Optional[Callable[[], Optional[Mapping[str, Any]]]] = None,
+                 archive: Optional[Callable[[], Any]] = None,
+                 sessions: Optional[Callable[[Any], Dict[str, Any]]] = None,
                  command_prefix: str = "vibe"):
         self.paths = paths
         self.run_id = run_id
@@ -324,6 +340,16 @@ class Daemon:
         self._assess = assess or self._default_assess
         self._verify = verify or self._default_verify
         self._retry = retry or self._default_retry
+        self._archive = archive or self._default_archive
+        self._sessions = sessions or self._default_sessions
+        self._snapshot = None
+        #: run status being closed out; None while the run is still advancing
+        self._closing: Optional[str] = None
+        self._deferred_key: Optional[str] = None
+        self._deferred_since: Optional[float] = None
+        self._deferred_escalated = False
+        self._archive_failures = 0
+        self._parked_since: Optional[float] = None
         #: the same pre-resume checks the public ``resume`` runs; returns None
         #: when the run may advance, else ``{"status", "reason"}`` to stop on.
         self._gate = gate
@@ -343,6 +369,13 @@ class Daemon:
     def _default_verify(self, node_id, role):
         from .supervisor import heal_verify
         return heal_verify(self.paths, self.run_id, node_id, role=role)
+
+    def _default_archive(self):
+        return self.supervisor.monitor.archive_run(self.run_id, sessions_verified=True)
+
+    def _default_sessions(self, snapshot):
+        from .live_sessions import probe_live_sessions
+        return probe_live_sessions(self.paths, snapshot)
 
     def _default_retry(self, node_id):
         # The mechanical retry: one more resume/tick re-attaches bindings and
@@ -406,18 +439,26 @@ class Daemon:
         lost = False
         try:
             while not self._stop:
-                blocked = self._check_gate()
-                if blocked is not None:
-                    outcome = {"status": "blocked", "reason": blocked["reason"],
-                               "run_status": blocked.get("status")}
-                    self._run_status = blocked.get("status") or self._run_status
-                    self._escalate("", "daemon_gate_blocked",
-                                   "守护程序已暂停推进：%s" % blocked["reason"], "product_acceptance")
-                    break
-                self.tick()
-                if self._run_status in TERMINAL_STATUSES:
-                    outcome = {"status": "terminal", "run_status": self._run_status}
-                    break
+                if not self._closing:
+                    blocked = self._check_gate()
+                    if blocked is not None:
+                        outcome = {"status": "blocked", "reason": blocked["reason"],
+                                   "run_status": blocked.get("status")}
+                        self._run_status = blocked.get("status") or self._run_status
+                        self._escalate("", "daemon_gate_blocked",
+                                       "守护程序已暂停推进：%s" % blocked["reason"], "product_acceptance")
+                        break
+                    self.tick()
+                    self._closing = self._closeout_status()
+                if self._closing:
+                    # No more ticks: a finished or parked run must not be advanced
+                    # again while its sessions and archive are being settled.
+                    closed = self._close_out(self._closing)
+                    if closed is not None:
+                        outcome = closed
+                        break
+                    self._cycles += 1
+                    self._write_state("running")
                 if max_cycles is not None and self._cycles >= max_cycles:
                     outcome = {"status": "max_cycles", "cycles": self._cycles}
                     break
@@ -437,6 +478,117 @@ class Daemon:
                 pass
             self._write_state("exited", outcome.get("reason") or outcome["status"])
         return outcome
+
+    # -- close-out ---------------------------------------------------------
+    def _log(self, message: str) -> None:
+        print("%s %s" % (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(self.clock())), message),
+              file=sys.stderr, flush=True)
+
+    def _blocked_nodes(self) -> List[str]:
+        nodes = getattr(self._snapshot, "nodes", None) or {}
+        return sorted(node_id for node_id, node in nodes.items()
+                      if isinstance(node, dict) and node.get("status") == "blocked_unknown")
+
+    def _parked(self) -> bool:
+        """blocked_unknown with nothing left to advance, and every blocked node
+        handed to the product manager (or the grace period spent)."""
+        nodes = getattr(self._snapshot, "nodes", None) or {}
+        blocked = self._blocked_nodes()
+        if not blocked or any(isinstance(node, dict) and node.get("status") in ACTIVE_NODE_STATUSES
+                              for node in nodes.values()):
+            self._parked_since = None
+            return False
+        now = self.clock()
+        if self._parked_since is None:
+            self._parked_since = now
+        recorded = self._heal_state()["nodes"]
+        handed_over = all(recorded.get(node_id, {}).get("escalated") for node_id in blocked)
+        return handed_over or now - self._parked_since >= self.config.blocked_grace
+
+    def _closeout_status(self) -> Optional[str]:
+        status = self._run_status
+        if status in TERMINAL_STATUSES:
+            return status
+        if status == PARKED_STATUS and self._parked():
+            return status
+        return None
+
+    def _announce(self, status: str, blocked: List[str]) -> bool:
+        """The completion / decision message, in pm-inbox before anything is archived."""
+        state = self._heal_state()
+        key = "run:" + status
+        if key in state["pushed"]:
+            return True
+        if status == "complete":
+            text = "运行 %s 已结束：complete" % self.run_id
+        elif blocked:
+            text = "运行 %s 停在 %s，节点 %s 无法继续，需要你拍板或处理" % (self.run_id, status, "、".join(blocked))
+        else:
+            text = "运行 %s 需要你拍板或处理：%s" % (self.run_id, status)
+        result = self._push(text, "run_" + status)
+        if result.get("status") == "inbox_failed":
+            self._log("pm-inbox write failed (%s); archive postponed" % result.get("reason"))
+            return False
+        state["pushed"].append(key)
+        self._save_heal_state(state)
+        return True
+
+    def _defer(self, status: str, probe: Mapping[str, Any]) -> None:
+        live = list(probe.get("live") or [])
+        unknown = probe.get("unknown")
+        signature = json.dumps([live, bool(unknown)])
+        now = self.clock()
+        if self._deferred_since is None:
+            self._deferred_since = now
+        if signature != self._deferred_key:
+            self._deferred_key = signature
+            self._event("run_archive_deferred", run_status=status, live_sessions=live,
+                        reason_code="sessions_unknown" if unknown else "live_session")
+            self._log("archive deferred (%s): live=%s unknown=%s" % (status, live, unknown))
+        if not self._deferred_escalated and now - self._deferred_since >= self.config.blocked_grace:
+            self._deferred_escalated = True
+            detail = "仍有活会话 %s" % "、".join(live) if live else "无法确认会话是否已停止"
+            self._escalate("", "archive_deferred", "运行 %s 已收口但%s，暂不归档" % (self.run_id, detail),
+                           "product_acceptance")
+
+    def _close_out(self, status: str) -> Optional[Dict[str, Any]]:
+        """Settle a finished or parked run: message, session check, lease, archive.
+
+        Returns the daemon outcome once the run is archived (or archiving gave
+        up), ``None`` while it must be retried on the next cycle.
+        """
+        blocked = self._blocked_nodes() if status == PARKED_STATUS else []
+        if blocked:
+            state = self._heal_state()
+            for node_id in blocked:
+                self._escalate(node_id, "run_parked", "节点 %s 停在 blocked_unknown，无法继续" % node_id,
+                               "product_acceptance", state=state)
+            self._save_heal_state(state)
+        if not self._announce(status, blocked):
+            return None
+        try:
+            probe = self._sessions(self._snapshot)
+        except Exception as error:  # an unverifiable session list is "unknown", never "none"
+            probe = {"live": [], "unknown": "%s: %s" % (type(error).__name__, str(error)[:120])}
+        if probe.get("unknown") or probe.get("live"):
+            self._defer(status, probe)
+            return None
+        self._deferred_since = None
+        try:
+            self.supervisor.lease.release(self.run_id)
+        except (OSError, ValueError):
+            pass
+        try:
+            self._archive()
+        except (OSError, ValueError, TypeError) as error:
+            # archive_run has already left run_archive_failed on disk.
+            self._archive_failures += 1
+            self._log("archive failed (%d/%d): %s: %s" % (
+                self._archive_failures, _ARCHIVE_ATTEMPTS, type(error).__name__, str(error)[:200]))
+            if self._archive_failures >= _ARCHIVE_ATTEMPTS:
+                return {"status": "archive_failed", "run_status": status, "reason": type(error).__name__}
+            return None
+        return {"status": "terminal", "run_status": status}
 
     def _check_gate(self) -> Optional[Dict[str, Any]]:
         if self._gate is None:
@@ -460,7 +612,8 @@ class Daemon:
         from .supervisor import SupervisorLeaseConflict
         snapshot = None
         try:
-            snapshot = self.supervisor.run_once()
+            snapshot = self._run_once()
+            self._snapshot = snapshot
             self._error_streak = 0
         except SupervisorLeaseConflict:
             raise
@@ -483,6 +636,22 @@ class Daemon:
                 self._last_heal = now
                 self.heal_pass(snapshot)
         self._push_pending(snapshot)
+
+    def _run_once(self):
+        """One tick; a newer epoch still recorded under this pid is adopted once."""
+        from .supervisor import SupervisorLeaseConflict
+        try:
+            return self.supervisor.run_once()
+        except SupervisorLeaseConflict as original:
+            readopt = getattr(self.supervisor.lease, "readopt", None)
+            if readopt is None:
+                raise
+            try:
+                epoch = readopt(self.run_id)
+            except SupervisorLeaseConflict:
+                raise original
+            self._event("daemon_lease_readopted", lease_epoch=epoch)
+            return self.supervisor.run_once()
 
     def _record_error(self, error: BaseException) -> None:
         self._error_streak += 1
@@ -661,17 +830,9 @@ class Daemon:
         return result if isinstance(result, dict) else {"status": "unknown"}
 
     def _push_pending(self, snapshot) -> None:
-        """Report completion and unanswered decisions once each."""
+        """Report unanswered decisions once each (the run's own end is ``_announce``)."""
         state = self._heal_state()
         changed = False
-        status = self._run_status
-        if status in TERMINAL_STATUSES and ("run:" + status) not in state["pushed"]:
-            text = "运行 %s 已结束：%s" % (self.run_id, status)
-            if status != "complete":
-                text = "运行 %s 需要你拍板或处理：%s" % (self.run_id, status)
-            self._push(text, "run_" + status)
-            state["pushed"].append("run:" + status)
-            changed = True
         try:
             from .decision_boundary import decision_list
             pending = decision_list(self.paths, self.run_id)
