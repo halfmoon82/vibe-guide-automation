@@ -1038,6 +1038,16 @@ class ProviderActionStore:
         event = payload.get('event', 'delivered')
         if event not in _WORKER_DELIVERY_EVENTS:
             raise ValueError('worker delivery event is unsupported')
+        if (
+            issue_id == 'integration-review' and role == 'reviewer'
+            and event == 'accepted'
+        ):
+            # The integration reviewer's claim is judged by the same shape
+            # rules the monitor applies later; failing here lets the reviewer
+            # fix it in its own session instead of exiting on "recorded".
+            # The error text is built from program constants only.
+            from ..evidence import validate_integration_claim_shape
+            validate_integration_claim_shape(payload.get('evidence'))
 
         latest = self._latest_generation(run_id, issue_id, role)
         if latest is None:
