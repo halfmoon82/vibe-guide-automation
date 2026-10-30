@@ -8259,6 +8259,44 @@ class Monitor:
         count = record.get("count") if isinstance(record, dict) else 0
         return count if isinstance(count, int) and not isinstance(count, bool) else 0
 
+    def replace_ended_reviewer(self, node_id: str, run_id: str) -> Dict[str, Any]:
+        """Replace a rejected reviewer whose session is gone (daemon self-heal).
+
+        The caller has already shown the session is retired.  This does what a
+        manual ``vibe repair`` does for a reviewer that must be replaced: retire
+        the stopped identity, set ``reviewer_replacement_required`` and let
+        ``repair_node`` queue the successor.  At most once per node: a second
+        rejection is left to the product-manager escalation.  Reads no value
+        the reviewer wrote.
+        """
+        self._reset_binding_cache()
+        snapshot = self._recovery_snapshot(node_id, run_id)
+        current = snapshot.nodes[node_id]
+        count = self._acceptance_format_rejection_count(current)
+        if (
+            current.get("status") != "review"
+            or current.get("reviewer_auto_replaced") is True
+            or current.get("reviewer_replacement_required")
+            or not 0 < count < ACCEPTANCE_FORMAT_REJECTION_LIMIT
+        ):
+            raise ValueError("reviewer replacement preconditions are not met")
+        binding = self._set_binding_status(snapshot, node_id, "reviewer", "failed")
+        release_writer_lease(
+            self.paths, node_id, str(current.get("worktree", "")), snapshot.run_id
+        )
+        snapshot.handles.pop(node_id, None)
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = None
+        current["reviewer_identity"] = binding.task_id
+        current["reviewer_started"] = False
+        current["reviewer_replacement_required"] = True
+        current["reviewer_auto_replaced"] = True
+        current["recovery_action"] = "change_reviewer_or_split_node"
+        current["reason"] = "reviewer session ended after a rejected acceptance; replacement dispatched"
+        self._save_snapshot(snapshot)
+        return self.repair_node(node_id, snapshot.run_id)
+
     def repair_node(self, node_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
         """Repair a node in place; identity fields are immutable across repair."""
         self._reset_binding_cache()

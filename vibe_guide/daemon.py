@@ -21,6 +21,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from . import fsio, short_session, stall
@@ -677,6 +678,7 @@ class Daemon:
         if not isinstance(report, dict) or report.get("status") != "ok":
             return
         state = self._heal_state()
+        self._heal_ended_reviewers(snapshot, state)
         ran_session = False
         for node_id, entry in sorted((report.get("nodes") or {}).items()):
             fingerprint = self._fingerprint(snapshot, node_id)
@@ -704,6 +706,82 @@ class Daemon:
             ran_session = True
             self._level_two(state, node_state, node_id, entry, snapshot)
         self._save_heal_state(state)
+
+    def _rejected_and_waiting(self, node_id: str) -> bool:
+        """True when the node's latest event is an ``acceptance_rejected``.
+
+        The reviewer notice that follows a rejection is bookkeeping, not
+        progress, so it is skipped.
+        """
+        try:
+            events = load_events(self.paths, self.run_id)
+        except (OSError, ValueError, TypeError):
+            return False
+        for record in reversed(events):
+            data = record.get("data") or {}
+            if data.get("node_id") != node_id or record.get("event") == "acceptance_correction_notified":
+                continue
+            return record.get("event") == "acceptance_rejected"
+        return False
+
+    def _reviewer_session_state(self, snapshot, node_id: str):
+        """``("gone" | "live" | "unknown", reason)`` for this node's reviewer only."""
+        tasks = getattr(snapshot, "tasks", None)
+        binding = tasks.get(node_id + ":reviewer") if isinstance(tasks, dict) else None
+        if not isinstance(binding, dict):
+            return "unknown", "reviewer binding is not readable"
+        scoped = SimpleNamespace(tasks={node_id + ":reviewer": binding},
+                                 nodes={node_id: snapshot.nodes[node_id]})
+        try:
+            probe = self._sessions(scoped)
+        except Exception as error:  # a failed probe is "unknown", never a dispatch
+            return "unknown", type(error).__name__
+        if not isinstance(probe, dict) or probe.get("unknown") or not isinstance(probe.get("live"), list):
+            return "unknown", str((probe or {}).get("unknown") or "session state unreadable")[:160] if isinstance(probe, dict) else "session state unreadable"
+        return ("live", "") if probe["live"] else ("gone", "")
+
+    def _heal_ended_reviewers(self, snapshot, state) -> None:
+        """Replace a rejected reviewer whose session is gone, once per node.
+
+        Only a node parked in ``review`` whose last event is an
+        ``acceptance_rejected`` qualifies.  A live or unverifiable session is
+        never replaced.  A reviewer that was already replaced and was rejected
+        again goes to the product manager instead of a second replacement.
+        """
+        nodes = getattr(snapshot, "nodes", None)
+        if not isinstance(nodes, dict):
+            return
+        seen = state.setdefault("reviewer_heal", {})
+        for node_id, node in sorted(nodes.items()):
+            if not isinstance(node, dict) or node.get("status") != "review":
+                continue
+            if node.get("reviewer_replacement_required") or not self._rejected_and_waiting(node_id):
+                continue
+            mark = seen.setdefault(node_id, {})
+            if mark.get("escalated"):
+                continue
+            verdict, reason = self._reviewer_session_state(snapshot, node_id)
+            if verdict == "unknown":
+                if mark.get("unknown") != reason:
+                    mark["unknown"] = reason
+                    self._event("daemon_heal", node_id=node_id, kind="reviewer_replace_unknown",
+                                phase="level1", reason=reason)
+                continue
+            mark.pop("unknown", None)
+            if verdict == "live":
+                continue
+            if node.get("reviewer_auto_replaced") is True:
+                mark["escalated"] = True
+                self._escalate(node_id, "reviewer_rejected_again",
+                               "节点 %s 的替换审查员再次被退回且会话已退出" % node_id,
+                               "product_acceptance", state=state)
+                continue
+            try:
+                self.supervisor.monitor.replace_ended_reviewer(node_id, self.run_id)
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                self._record_error(error)
+                continue
+            self._event("daemon_heal", node_id=node_id, kind="reviewer_replace", phase="level1")
 
     def _prompt(self, node_id: str, entry: Mapping[str, Any], snapshot) -> str:
         from .protocols import load_protocol
