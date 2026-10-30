@@ -5260,6 +5260,38 @@ class Monitor:
     #: the retry: every model still gets exactly one attempt per round.
     _MODEL_UNAVAILABLE_MAX_ROUNDS = 2
 
+    #: Node-state keys written by the model fallback machinery.  Every
+    #: recovery entry point (repair / requeue / tier move) clears them so the
+    #: next dispatch re-resolves the model from scratch.
+    _MODEL_FALLBACK_BOOKKEEPING_KEYS = (
+        "model_dispatch_attempts",
+        "model_dispatch_chain",
+        "model_dispatch_chain_profile",
+        "model_unavailable_rounds",
+        "model_unavailable",
+    )
+
+    def _clear_model_fallback_state(self, current: Dict[str, Any]) -> bool:
+        """Drop monitor-authored model fallback state so recovery re-resolves the model.
+
+        Also removes the switched ``contract_overrides.worker_profile``: the
+        stale override would otherwise shadow :meth:`_apply_model_tier`
+        re-resolution (a fixed ``model_map`` or a tier move must take effect
+        on the next dispatch) and, for routed nodes, would keep replaying the
+        last chain model instead of the router-selected primary.  Returns
+        ``True`` when fallback state existed.
+        """
+        had_state = any(
+            key in current for key in self._MODEL_FALLBACK_BOOKKEEPING_KEYS
+        )
+        for key in self._MODEL_FALLBACK_BOOKKEEPING_KEYS:
+            current.pop(key, None)
+        overrides = current.get("contract_overrides")
+        if isinstance(overrides, dict) and "worker_profile" in overrides:
+            overrides.pop("worker_profile", None)
+            had_state = True
+        return had_state
+
     def _profile_model_chain(self, contract: Dict[str, Any], current: Dict[str, Any]) -> List[str]:
         """The dispatch model plus its configured fallbacks, in dispatch order."""
         recorded = current.get("model_dispatch_chain")
@@ -5316,6 +5348,11 @@ class Monitor:
             return "none"
         chain = self._profile_model_chain(contract, current)
         if not chain:
+            return "none"
+        if len(chain) < 2:
+            # No alternate configured: the model failure keeps the legacy
+            # retryable behavior (omit_thinking recovery, per-tick requeue).
+            # The exhausted/park path is only for chains with real alternates.
             return "none"
         raw_profile = contract.get("worker_profile")
         if not isinstance(raw_profile, dict):
@@ -5406,10 +5443,12 @@ class Monitor:
         ``retryable_action`` whose ``reason_class`` is ``model_unavailable``.
         A bounded number of full-chain re-walks stays schedulable so a
         transient platform outage can recover on its own; past that ceiling
-        the retry marker is dropped and the node waits for the supervisor (a
-        tier move or a fixed ``model_map``) instead of looping forever.  The
-        durable status vocabulary is unchanged: ``state.py`` knows no new
-        node status.
+        the retry marker is dropped and the node parks until the supervisor
+        acts -- ``repair_node``, ``schedule_retry`` and ``adjust_model_tier``
+        each clear the fallback state (and the switched override profile, so
+        a fixed ``model_map`` or a tier move takes effect) and requeue the
+        node.  The durable status vocabulary is unchanged: ``state.py``
+        knows no new node status.
         """
         attempts = [
             item for item in (current.get("model_dispatch_attempts") or [])
@@ -5428,12 +5467,27 @@ class Monitor:
         current["model_unavailable_rounds"] = rounds
         current["model_unavailable"] = {"rounds": rounds, "attempts": list(attempts)}
         current["status"] = self._v42_retry_status()
-        current["reason"] = "model chain exhausted: %s" % (detail or "no attempt recorded")
+        current["reason"] = "model fallback chain exhausted (%d models): %s" % (
+            len(attempts), detail or "no attempt recorded"
+        )
         current["active_task"] = None
         current["active_role"] = None
         current["start_intent"] = None
         if rounds >= self._MODEL_UNAVAILABLE_MAX_ROUNDS:
             current["retryable_action"] = None
+            self._record(
+                snapshot,
+                "model_unavailable_parked",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "role": role,
+                    "proof": {
+                        "rounds": rounds,
+                        "attempts": list(attempts),
+                    },
+                },
+            )
             return
         saved = current.get("model_dispatch_chain_profile")
         if isinstance(saved, dict):
@@ -5540,6 +5594,30 @@ class Monitor:
         before = self._effective_model_tier(self.nodes[node_id], current, "developer")
         after = model_catalog.adjust_tier(before, delta, reason)
         self._commit_model_tier_adjustment(snapshot, node_id, current, delta, before, after, reason, "supervisor")
+        if self._clear_model_fallback_state(current):
+            # A tier move supersedes the exhausted fallback chain: drop the
+            # switched override profile (so the new tier re-resolves the
+            # model) and requeue a parked node -- without a retryable_action
+            # the sweep never replays it.
+            if (
+                not isinstance(current.get("retryable_action"), dict)
+                and current.get("active_task") is None
+                and node_id not in snapshot.handles
+            ):
+                current["status"] = self._v42_retry_status()
+                current["retryable_action"] = {
+                    "role": "developer",
+                    "phase": "develop",
+                    "continuation": False,
+                    "successor": False,
+                    "same_task": True,
+                    "same_task_required": True,
+                    "attempt": 1,
+                    "reason_class": "model_unavailable",
+                    "next_retry_at": time.time(),
+                    "binding_digest": current.get("contract_digest", ""),
+                    "last_observation_ref": "model-tier-adjusted",
+                }
         self._save_snapshot(snapshot)
         return snapshot
 
@@ -5599,7 +5677,22 @@ class Monitor:
                     or profile.reasoning != expected.reasoning
                     or profile.route_digest != expected.route_digest
                 ):
-                    raise ValueError("worker model profile conflicts with routing evidence")
+                    chain = current.get("model_dispatch_chain")
+                    if (
+                        isinstance(chain, list)
+                        and profile.model in chain
+                        and profile.reasoning == expected.reasoning
+                        and profile.route_digest == expected.route_digest
+                    ):
+                        # Monitor-authored model fallback: the chain was
+                        # derived from this router-selected profile, so a
+                        # model inside it is a dispatch-time fallback switch,
+                        # not a writer conflict.  A profile outside the chain
+                        # (or with drifted reasoning/digest) still fails
+                        # closed below.
+                        pass
+                    else:
+                        raise ValueError("worker model profile conflicts with routing evidence")
             expanded = list(profile.allowlist)
             for item in current.get("scope_expansions", []):
                 if item not in expanded:
@@ -8494,6 +8587,20 @@ class Monitor:
                           "attempt": attempt, "reason_class": classification["kind"],
                           "reason": redact_provider_text(reason),
                           "next_retry_at": float(next_retry_at if next_retry_at is not None else time.time() + delay)})
+            # A supervisor requeue supersedes an in-flight fallback sequence:
+            # rewind the chain so the next dispatch starts from the resolved
+            # primary again.  (The role/phase defaults also make a requeue of
+            # a parked node -- which has no previous retry dict -- replayable;
+            # without them the sweep crashes on a missing ``role``.)
+            self._clear_model_fallback_state(current)
+            retry.setdefault(
+                "role",
+                str(current.get("active_role") or "developer"),
+            )
+            retry.setdefault(
+                "phase",
+                "review" if retry.get("role") == "reviewer" else "develop",
+            )
             current["retryable_action"] = retry
             current["status"] = "retry_pending" if classification["kind"] in {"retryable", "capacity_wait", "repairable"} else "blocked_unknown"
             current["reason"] = redact_provider_text(reason)
@@ -8950,8 +9057,38 @@ class Monitor:
                     "steps": steps,
                     "run_id": snapshot.run_id,
                     "reconciliation": reconciliation}
-        classification = classify_provider_failure({"reason": reason})
-        if classification["kind"] == "binding_unknown":
+        if isinstance(current.get("model_unavailable"), dict):
+            # Model-fallback park: the supervisor asked for repair after the
+            # chain exhausted every model.  The redacted persisted reason
+            # would classify as binding_unknown and park the node forever;
+            # instead clear the monitor-authored fallback state (and the
+            # switched override profile, so a fixed ``model_map`` or tier
+            # move takes effect) and requeue the same task.
+            self._clear_model_fallback_state(current)
+            current["status"] = self._v42_retry_status()
+            current["recovery_action"] = "requeue_same_task"
+            current["reason"] = "model fallback chain cleared by repair; requeueing"
+            current["retryable_action"] = {
+                "role": role,
+                "phase": "review" if role == "reviewer" else "develop",
+                "continuation": False,
+                "successor": False,
+                "same_task": True,
+                "same_task_required": True,
+                "attempt": 1,
+                "reason_class": "model_unavailable",
+                "next_retry_at": time.time(),
+                "binding_digest": current.get("contract_digest", ""),
+                "last_observation_ref": "model-fallback-repair",
+            }
+            classification = {"kind": "retryable", "legacy_kind": "engineering"}
+            fallback_repair = True
+        else:
+            classification = classify_provider_failure({"reason": reason})
+            fallback_repair = False
+        if fallback_repair:
+            pass  # the requeue above is the whole repair; never reclassify below
+        elif classification["kind"] == "binding_unknown":
             current["status"] = "blocked_unknown"
             current["recovery_action"] = "reconcile_binding"
             retry = current.get("retryable_action")

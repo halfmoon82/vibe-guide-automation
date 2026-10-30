@@ -25,7 +25,14 @@ from unittest.mock import patch
 from vibe_guide import model_catalog
 from vibe_guide.adapters.task_provider import ProviderUnavailable
 from vibe_guide.authorization import authorize, build_authorization_card
-from vibe_guide.models import AgentCapabilities, DAGNode, Plan
+from vibe_guide.models import (
+    AgentCapabilities,
+    DAGNode,
+    IssueComplexity,
+    LocalModel,
+    Plan,
+    WorkerProfile,
+)
 from vibe_guide.monitor import Monitor, model_failure_reason_class
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.state import load_events
@@ -197,6 +204,10 @@ class ModelFallbackDispatchTests(_ProjectCase):
         self.assertEqual(state["status"], "retry_pending")
         self.assertIsNone(state.get("retryable_action"))
         self.assertEqual(state["model_unavailable"]["rounds"], 2)
+        parked = [e for e in load_events(self.paths, snapshot.run_id)
+                  if e["event"] == "model_unavailable_parked"]
+        self.assertEqual(len(parked), 1)
+        self.assertEqual(parked[0]["data"]["proof"]["rounds"], 2)
         # two rounds maximum, three models each: never an unbounded loop
         self.assertEqual(len(runner.start_calls), 6)
         self.assertEqual(
@@ -222,6 +233,239 @@ class ModelFallbackDispatchTests(_ProjectCase):
         self.assertEqual(runner.start_calls[1]["worker_profile"]["model"], "k1")
         self.assertEqual(runner.start_calls[1]["worker_profile"]["fallbacks"],
                          [{"model": "k2"}, {"model": "k3"}])
+
+
+def _write_codex_map(home: Path, tiers):
+    (home / "config.json").write_text(
+        json.dumps({"model_map": {"codex": tiers}}), encoding="utf-8"
+    )
+
+
+def _routing_issue():
+    return IssueComplexity(
+        "I-routing", "spec:I-routing", 4, 3, 3, 4, 3, "large",
+        ["cross_module"], "complex", "evidence:I-routing",
+    )
+
+
+class RoutedNodeFallbackReplayTests(_ProjectCase):
+    """P1-1: a fallback switch inside the router-selected chain must replay."""
+
+    state = V42_STATE
+
+    def _routed_node(self):
+        return DAGNode(
+            "r1",
+            "r1",
+            [],
+            [],
+            "g1",
+            {
+                "files": ["vibe_guide/model_router.py"],
+                "worker": "worker-r1",
+                "reviewer_worker": "reviewer-r1",
+                "worktree": ".worktrees/r1",
+                "issue_complexity": _routing_issue().to_dict(),
+                "required_capabilities": ["visible_task"],
+                "model_probes": [
+                    LocalModel("rk1", ["visible_task"], 64000, ["deep"], True).to_dict(),
+                    LocalModel("rk2", ["visible_task"], 32000, ["deep"], True).to_dict(),
+                ],
+                "routing_required": True,
+            },
+            "ready",
+        )
+
+    def test_routed_node_dispatches_next_chain_model_after_quota_failure(self):
+        node = self._routed_node()
+        plan = Plan("plan-1", 1, "docs/prd.md", [node.id], "draft")
+        card = build_authorization_card(
+            plan, [node], AgentCapabilities("fake", True, True, True, True, True, "full")
+        )
+        runner = _FlakyRunner(
+            [ProviderUnavailable("quota exhausted for model rk1"), None]
+        )
+        monitor = Monitor(self.paths, plan, [node])
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+
+        self.assertEqual(snapshot.nodes["r1"]["status"], "running")
+        self.assertEqual(len(runner.start_calls), 2)
+        self.assertEqual(runner.start_calls[0]["worker_profile"]["model"], "rk1")
+        self.assertEqual(runner.start_calls[1]["worker_profile"]["model"], "rk2")
+        events = load_events(self.paths, snapshot.run_id)
+        fallbacks = [e for e in events if e["event"] == "model_fallback_used"]
+        self.assertEqual(len(fallbacks), 1)
+        self.assertEqual(fallbacks[0]["data"]["proof"]["to_model"], "rk2")
+
+    def test_chain_model_with_drifted_route_digest_still_conflicts(self):
+        # The chain exception never relaxes a real writer conflict: a profile
+        # whose model is inside the chain but whose routing digest drifted
+        # must still be rejected.
+        node = self._routed_node()
+        monitor = Monitor(self.paths, None, [node])
+        current = {
+            "worktree": ".worktrees/r1",
+            "branch": "branch-r1",
+            "contract_overrides": {},
+            "model_dispatch_chain": ["rk1", "rk2"],
+        }
+        profile = WorkerProfile(
+            "worker-r1",
+            "rk2",
+            "deep",
+            [],
+            {"issue_complexity_ref": "someone-else", "reasoning": "deep"},
+        )
+        contract = dict(node.contract, worker_profile=profile.to_dict())
+        with self.assertRaisesRegex(ValueError, "conflicts with routing evidence"):
+            monitor._prepare_worker_profile(node, contract, current, "developer")
+
+    def test_chain_model_with_matching_route_digest_is_accepted(self):
+        # The monitor-authored fallback switch itself (same reasoning and
+        # route digest, model inside the chain) must be accepted.
+        node = self._routed_node()
+        monitor = Monitor(self.paths, None, [node])
+        pristine = {
+            "worktree": ".worktrees/r1",
+            "branch": "branch-r1",
+            "contract_overrides": {},
+        }
+        accepted = monitor._prepare_worker_profile(
+            node, dict(node.contract), pristine, "developer"
+        )
+        current = {
+            "worktree": ".worktrees/r1",
+            "branch": "branch-r1",
+            "contract_overrides": {},
+            "model_dispatch_chain": ["rk1", "rk2"],
+        }
+        switched = WorkerProfile(
+            accepted.worker,
+            "rk2",
+            accepted.reasoning,
+            [],
+            dict(accepted.selection_basis),
+        )
+        contract = dict(node.contract, worker_profile=switched.to_dict())
+        replayed = monitor._prepare_worker_profile(node, contract, current, "developer")
+        self.assertEqual(replayed.model, "rk2")
+
+
+class ParkRecoveryTests(_ProjectCase):
+    """P1-2: repair / requeue / tier adjustment must recover a parked node."""
+
+    state = V42_STATE
+
+    def _parked_placeholder_run(self, standard=("m1", "m2", "m3")):
+        """Placeholder-profile node driven by model_map, parked after 2 rounds."""
+        home = Path(os.environ["VIBE_HOME"])
+        _write_codex_map(home, {"standard": list(standard)})
+        node = _fallback_node("n1", model="default", fallbacks=())
+        node.contract["adapter_id"] = "codex"
+        plan = Plan("plan-1", 1, "docs/prd.md", [node.id], "draft")
+        card = build_authorization_card(
+            plan, [node], AgentCapabilities("codex", True, True, True, True, True, "full")
+        )
+        reasons = [
+            "quota exhausted for model m1",
+            "Error 429: rate limit reached",
+            "unsupported model m3",
+        ]
+        runner = _FlakyRunner([ProviderUnavailable(text) for text in reasons * 2])
+        monitor = Monitor(self.paths, plan, [node])
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        for _ in range(10):
+            state = snapshot.nodes["n1"]
+            if state.get("retryable_action") is None and isinstance(
+                state.get("model_unavailable"), dict
+            ):
+                break
+            snapshot = monitor.tick(snapshot.run_id, runner)
+        return monitor, runner, snapshot, home
+
+    def test_repair_after_park_requeues_and_applies_fixed_model_map(self):
+        monitor, runner, snapshot, home = self._parked_placeholder_run()
+        self.assertEqual(len(runner.start_calls), 6)
+        self.assertIsNone(snapshot.nodes["n1"].get("retryable_action"))
+
+        # The supervisor fixes the map, then repairs the node in place.
+        _write_codex_map(home, {"standard": ["m9"]})
+        result = monitor.repair_node("n1", snapshot.run_id)
+        self.assertEqual(result["kind"], "retryable")
+        self.assertEqual(result["repair_action"], "same_task_retry")
+
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        state = snapshot.nodes["n1"]
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(len(runner.start_calls), 7)
+        self.assertEqual(runner.start_calls[-1]["worker_profile"]["model"], "m9")
+        self.assertNotIn("model_unavailable", state)
+        self.assertIsNone(state.get("model_dispatch_chain"))
+
+    def test_schedule_retry_after_park_clears_fallback_state(self):
+        monitor, runner, snapshot, _home = self._parked_placeholder_run()
+        monitor.schedule_retry(
+            "n1", "provider timeout", next_retry_at=__import__("time").time(),
+            run_id=snapshot.run_id,
+        )
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        state = snapshot.nodes["n1"]
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(len(runner.start_calls), 7)
+        # The chain rewinds to its head: no stale switched profile is kept.
+        self.assertEqual(runner.start_calls[-1]["worker_profile"]["model"], "m1")
+        self.assertNotIn("model_unavailable", state)
+
+    def test_tier_adjustment_after_park_requeues_with_new_tier(self):
+        monitor, runner, snapshot, home = self._parked_placeholder_run()
+        _write_codex_map(home, {"standard": ["m1", "m2", "m3"], "deep": ["d1"]})
+        snapshot = monitor.adjust_model_tier(snapshot.run_id, "n1", 1, "need a deeper model")
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        state = snapshot.nodes["n1"]
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(len(runner.start_calls), 7)
+        self.assertEqual(runner.start_calls[-1]["worker_profile"]["model"], "d1")
+        self.assertNotIn("model_unavailable", state)
+
+
+class UnconfiguredSingleModelTests(_ProjectCase):
+    """P2-3: without alternates the legacy retryable behavior is unchanged."""
+
+    state = V42_STATE
+
+    def test_single_model_chain_keeps_legacy_retryable_loop(self):
+        node = _fallback_node("n1", model="k1", fallbacks=())
+        plan = Plan("plan-1", 1, "docs/prd.md", [node.id], "draft")
+        card = build_authorization_card(
+            plan, [node], AgentCapabilities("fake", True, True, True, True, True, "full")
+        )
+        runner = _FlakyRunner(
+            [ProviderUnavailable("quota exhausted for model k1")] * 12
+        )
+        monitor = Monitor(self.paths, plan, [node])
+        snapshot = monitor.start(authorize(card, "AUTHORIZE"), runner)
+        for _ in range(9):
+            snapshot = monitor.tick(snapshot.run_id, runner)
+
+        state = snapshot.nodes["n1"]
+        # Legacy behavior: a retryable engineering failure requeues every
+        # tick until the provider recovers -- no park, no blocked_unknown.
+        self.assertEqual(state["status"], "retry_pending")
+        self.assertNotEqual(state["status"], "blocked_unknown")
+        self.assertEqual(len(runner.start_calls), 10)
+        self.assertTrue(
+            all(call["worker_profile"]["model"] == "k1" for call in runner.start_calls)
+        )
+        self.assertNotIn("model_unavailable", state)
+        self.assertIsNone(state.get("model_dispatch_chain"))
+        self.assertIsNone(state.get("model_dispatch_attempts"))
+        # The legacy recovery marker is a plain engineering retry, not a
+        # model-fallback state.
+        self.assertNotEqual(
+            (state.get("retryable_action") or {}).get("reason_class"),
+            "model_unavailable",
+        )
 
 
 class TierProfileFallbackFillTests(_ProjectCase):
