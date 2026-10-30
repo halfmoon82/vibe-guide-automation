@@ -51,6 +51,7 @@ _REPAIRS_BEFORE_ESCALATION = 2
 MAX_UNRESOLVED_REPORT_SECONDS = 6 * 3600
 UNRESOLVED_REPORT_KIND = "unresolved_report"
 _ARCHIVE_ATTEMPTS = 3
+_REPORT_ATTEMPTS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +374,7 @@ class Daemon:
         self._archive = archive or self._default_archive
         self._sessions = sessions or self._default_sessions
         self._snapshot = None
+        self._report_failed = False
         #: run status being closed out; None while the run is still advancing
         self._closing: Optional[str] = None
         self._deferred_key: Optional[str] = None
@@ -482,9 +484,13 @@ class Daemon:
                             self._escalate("", "daemon_gate_blocked", summary, "external_authorization")
                         else:
                             self._unresolved("", "daemon_gate_blocked", summary)
-                            state = self._heal_state()
-                            if self._report_unresolved(None, state, final=True):
-                                self._save_heal_state(state)
+                            for _ in range(_REPORT_ATTEMPTS):
+                                state = self._heal_state()
+                                reported = self._report_unresolved(None, state, final=True)
+                                if reported:
+                                    self._save_heal_state(state)
+                                if reported or not self._report_failed:
+                                    break
                         break
                     self.tick()
                     self._closing = self._closeout_status()
@@ -602,8 +608,14 @@ class Daemon:
                                  state=state)
             self._save_heal_state(state)
         state = self._heal_state()
-        if self._report_unresolved(self._snapshot, state, final=True):
+        reported = self._report_unresolved(self._snapshot, state, final=True)
+        if reported:
             self._save_heal_state(state)
+        elif self._report_failed:
+            self._log("pm-inbox write failed for the unresolved report; close-out postponed")
+            self._last_error = {"type": "OSError", "reason": "unresolved report not written to pm-inbox; close-out postponed",
+                                "at": self.clock()}
+            return None  # retry before announcing or archiving
         if not self._announce(status, blocked):
             return None
         try:
@@ -956,7 +968,7 @@ class Daemon:
         state = state if state is not None else self._heal_state()
         key = node_id or "daemon:" + code
         record = state.setdefault("unresolved", {})
-        if key in record:
+        if key in record and key in live_unresolved(state, self._snapshot):
             return
         monitor_nodes = getattr(getattr(self.supervisor, "monitor", None), "nodes", None) or {}
         contract = getattr(monitor_nodes.get(node_id), "contract", None) if node_id else None
@@ -1017,6 +1029,7 @@ class Daemon:
 
     def _report_unresolved(self, snapshot, state: Dict[str, Any], *, final: bool) -> bool:
         """Tell the product manager once per set of unresolved items; reads disk only."""
+        self._report_failed = False  # only a push attempted in this call can hold the close-out back
         items = live_unresolved(state, snapshot)
         if not items:
             return False
@@ -1030,7 +1043,8 @@ class Daemon:
                 return False
         text = "运行 %s 有 %d 项系统没能自动解决：\n\n%s" % (
             self.run_id, len(items), "\n\n".join(unresolved_lines(items)))
-        if self._push(text, UNRESOLVED_REPORT_KIND).get("status") == "inbox_failed":
+        self._report_failed = self._push(text, UNRESOLVED_REPORT_KIND).get("status") == "inbox_failed"
+        if self._report_failed:
             return False  # nothing reached the inbox: try again on the next cycle
         state["pushed"].append(signature)
         return True

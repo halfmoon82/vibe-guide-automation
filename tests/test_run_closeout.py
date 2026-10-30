@@ -202,16 +202,73 @@ class ParkedRunTests(LiveSessionTests):
         self.assertIn("archive", self.order)
         self.assertNoResidue()
 
-    def test_a_node_tracked_before_parking_is_still_reported_at_close_out(self):
-        supervisor = Supervisor([self.blocked()])
-        daemon = self.make(supervisor, blocked_grace=10 ** 6)
+    def fail_reports(self, times):
+        calls = {"n": 0}
+        original = self.notifier
+
+        def flaky(message, kind, node_id=""):
+            if kind == dm.UNRESOLVED_REPORT_KIND and calls["n"] < times:
+                calls["n"] += 1
+                self.order.append("push:%s:failed" % kind)
+                return {"status": "inbox_failed", "reason": "OSError"}
+            return original(message, kind, node_id)
+        self.notifier = flaky
+
+    def test_a_stale_item_does_not_swallow_the_parked_report(self):
+        daemon = self.make(Supervisor([self.blocked()]), blocked_grace=60)
+        daemon._last_heal = 10 ** 12  # the next heal pass is far away, so close-out sees the stale item first
         state = daemon._heal_state()
-        state["nodes"]["n"] = {"fingerprint": "from-an-earlier-stall", "escalated": False, "repairs": 1}
+        state["nodes"]["n"] = {"fingerprint": "old", "escalated": True, "repairs": 2}
+        state["unresolved"] = {"n": {"code": "self_heal_no_progress", "at": 1.0, "example": "", "repairs": 2}}
         daemon._save_heal_state(state)
-        daemon.run(max_cycles=1)
-        daemon._unresolved("n", "run_parked", "parked")
+        outcome = daemon.run(max_cycles=20)
+        self.assertEqual(outcome, {"status": "terminal", "run_status": "blocked_unknown"})
+        self.assertEqual(self.order[:3], ["push:unresolved_report", "push:run_blocked_unknown", "lease_release"])
+        inbox = (runs_archive_dir(self.paths, RUN) / dm.PM_INBOX_FILE).read_text(encoding="utf-8")
+        self.assertIn("run_parked", inbox)
+
+    def test_close_out_waits_for_the_report_before_announcing_and_archiving(self):
+        self.fail_reports(2)
+        daemon = self.make(Supervisor([self.blocked()]), blocked_grace=10 ** 6)
         state = daemon._heal_state()
-        self.assertEqual(list(dm.live_unresolved(state, daemon._snapshot)), ["n"])
+        state["nodes"]["n"] = {"escalated": True}
+        daemon._save_heal_state(state)
+        outcome = daemon.run(max_cycles=20)
+        self.assertEqual(outcome, {"status": "terminal", "run_status": "blocked_unknown"})
+        self.assertIn("close-out postponed", daemon._last_error["reason"])
+        self.assertEqual(self.order[:6], [
+            "push:unresolved_report:failed", "push:unresolved_report:failed", "push:unresolved_report",
+            "push:run_blocked_unknown", "lease_release", "archive"])
+
+    def test_a_report_that_failed_mid_run_does_not_hold_back_a_later_close_out(self):
+        self.fail_reports(1)
+        supervisor = Supervisor([snap("running", {"n": node("running")}),
+                                 snap("complete", {"n": node("accepted")})])
+        daemon = self.make(supervisor, unresolved_report_seconds=60)
+        state = daemon._heal_state()
+        state["unresolved"] = {"n": {"code": "self_heal_no_progress", "at": 1.0, "example": "", "repairs": 2}}
+        daemon._save_heal_state(state)
+        outcome = daemon.run(max_cycles=20)
+        self.assertEqual(self.order.count("push:unresolved_report:failed"), 1)   # the periodic report failed once
+        self.assertEqual(outcome, {"status": "terminal", "run_status": "complete"})
+        self.assertIn("archive", self.order)
+
+    def test_gate_block_retries_a_failed_report_a_few_times_then_exits(self):
+        self.fail_reports(1)
+        daemon = self.make(Supervisor([snap("running")]))
+        daemon._gate = lambda: {"status": "blocked_unknown", "reason": "gate_error: boom"}
+        outcome = daemon.run()
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertEqual(self.order.count("push:unresolved_report"), 1)
+        self.assertEqual(self.order.count("push:unresolved_report:failed"), 1)
+
+    def test_gate_block_gives_up_after_bounded_attempts(self):
+        self.fail_reports(10 ** 6)
+        daemon = self.make(Supervisor([snap("running")]))
+        daemon._gate = lambda: {"status": "blocked_unknown", "reason": "gate_error: boom"}
+        outcome = daemon.run()
+        self.assertEqual(outcome["status"], "blocked")
+        self.assertEqual(self.order.count("push:unresolved_report:failed"), 3)
 
     def test_a_failed_inbox_write_keeps_the_unresolved_report_pending(self):
         supervisor = Supervisor([self.blocked()])
