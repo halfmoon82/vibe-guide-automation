@@ -208,7 +208,10 @@ def explicit_project_root(argv: Sequence[str], environ=None) -> Optional[Path]:
         source = "VIBE_PROJECT_ROOT"
     if value is None or value == "":
         return None
-    root = Path(value).expanduser()
+    try:
+        root = Path(value).expanduser()
+    except RuntimeError as error:  # '~unknown-user' or no home directory
+        raise ProjectRootError(source + " 无法展开：" + value) from error
     if not root.is_absolute():
         raise ProjectRootError(source + " 必须是绝对路径：" + value)
     if not root.is_dir():
@@ -334,7 +337,7 @@ def run_install_or_upgrade(request: Any, json_output: bool = False) -> Dict[str,
         install_request = InstallRequest(
             str(request.get("mode", "layered")),
             bool(json_output),
-            Path(request.get("project_root", Path.cwd())),
+            Path(request["project_root"] if "project_root" in request else Path.cwd()),
         )
     else:
         raise TypeError("installation request must be a mapping or InstallRequest")

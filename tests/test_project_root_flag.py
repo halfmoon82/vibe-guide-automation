@@ -110,6 +110,34 @@ class ProjectRootFlagTests(unittest.TestCase):
         self.assertIn("vibe worker-deliver --project-root {} --run-id run-1".format(self.root), prompt)
         self.assertIn("vibe supervisor-address --project-root {} --run-id run-1".format(self.root), prompt)
 
+    def test_doctor_runs_when_getcwd_is_denied(self):
+        code, out = _run_main(["doctor", "--project-root", str(self.root), "--json"])
+        self.assertEqual(json.loads(out)["command"], "doctor")  # a diagnosis, not a getcwd crash
+
+    def test_unknown_tilde_user_is_a_usage_error_not_a_crash(self):
+        code, out = _run_main(["status", "--project-root", "~vibe-no-such-user-xyz", "--run-id", "run-1", "--json"])
+        self.assertEqual(code, 2, out)
+
+    def test_install_request_with_a_root_never_reads_cwd(self):
+        from vibe_guide import cli
+        seen = {}
+
+        class Stop(Exception):
+            pass
+
+        def capture(request, paths):
+            seen["root"] = request.project_root
+            raise Stop
+
+        with mock.patch("os.getcwd", side_effect=_deny_getcwd), mock.patch.object(cli, "run_install", capture):
+            try:
+                cli.run_install_or_upgrade({"operation": "install", "project_root": str(self.root)})
+            except Stop:
+                pass
+            except PermissionError:
+                self.fail("cwd was read although the request carried a project_root")
+        self.assertEqual(Path(seen["root"]), self.root)
+
 
 if __name__ == "__main__":
     unittest.main()
