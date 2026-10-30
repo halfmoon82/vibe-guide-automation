@@ -43,8 +43,6 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "8da79c1a2b3d8d19eee14e8459db451f5a8b3a521c93f4eb9a61db47026cef5c",
         # 2026-10-29: integration review evidence is the four keys itself, no claim wrapper (D3).
         "1cc9c70328c9f156faeb55638d28fb55e34d7c7b524da6a8f7680490e150575b",
-        # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.
-        "4c09b600fc2573be814da1165a7dec84516d24e6e4900f56463623b3d367e3e2",
         # 2026-10-28: integration merge — slim guide plus derived risk_tags rule (#321).
         "a0b328bfbff4ccd5a9cd356be360df45b5fb3809afda8e898a7b6b65110f7914",
         # 2026-10-28: tests re-pinned to the slim guide; <35KB; single-shift off switch.
