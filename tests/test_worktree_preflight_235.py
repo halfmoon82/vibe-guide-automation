@@ -188,7 +188,7 @@ class CreatesMissingWorktreeTest(RepoCase):
         )
         self.assertIn("already exists", error.reason)
 
-    def test_remote_only_branch_counts_as_existing(self):
+    def test_remote_only_branch_does_not_count_as_existing(self):
         origin = self.tmp / "origin.git"
         subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
         git(self.repo, "remote", "add", "origin", str(origin))
@@ -200,10 +200,8 @@ class CreatesMissingWorktreeTest(RepoCase):
             0,
         )
 
-        with self.assertRaises(ClaudeBgWorktreeBlocked) as ctx:
-            self.launcher()._prepare_worktree()
-        self.assertEqual(ctx.exception.reason_code, WORKTREE_MISSING)
-        self.assertFalse(self.worktree.exists())
+        git(self.repo, "update-ref", "-d", "refs/heads/" + self.branch, check=False)
+        self.assertFalse(self.launcher()._branch_exists(self.repo, self.branch))
 
     def test_launch_of_a_blocked_worktree_starts_no_session(self):
         git(self.repo, "branch", self.branch)

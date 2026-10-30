@@ -209,6 +209,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
         # work beat: no manual resume while the daemon advances the run.
         "316ac78b3dead0703a8a118f308029ab2a9af709eb8d79cad780a1b5423060e1",
+        # manual stop: use vibe's stop entry, not `claude stop`.
+        "6ac171e78a2fb4d6f284727a362597f74c81a1dba96defe6c519496a2cbf7746",
     }),
     # Second-level self-heal short session (daemon): the prompt the daemon feeds
     # a one-shot repair session.
