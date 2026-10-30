@@ -130,6 +130,20 @@ Acceptance-based scope expansion: `acceptance_scope_rule_approved` in `.vibe/con
 
 Decision notification bridge: the project `.vibe/config.json` may only contain `"notify_bridge": {"enabled": true}`; the command and timeout are read only from `notify_bridge` in the user-level `$VIBE_HOME/config.json`. A project-level `command` is refused and recorded as UNKNOWN.
 
+### Remote Git ban (remote_git_actions=deny)
+
+When the authorization card says `remote_git_actions: deny`, every platform's worker prompt carries one fixed ban: no git fetch, push, pull or gh, commit to the local branch only. With `allow`, no ban and no launch parameter is added. What each platform actually enforces:
+
+| Platform | Enforcement |
+|---|---|
+| claude-code background dispatch | Prompt ban plus launch interception (`claude --bg` with `--disallowedTools` and `GIT_ALLOW_PROTOCOL=vibe-denied`). Partial: `--disallowedTools` was probed to stop only `git push` and `env git push`, not `git -C … push` or `bash -c`; the variable blocks push and fetch in a plain shell but `env -u` clears it and gh and curl are unaffected; whether it reaches the tool shell of a background session is unverified |
+| claude-code visible task | Prompt only, not enforced |
+| codex | Prompt only, not enforced |
+| kimi-code | Prompt only, not enforced |
+| workbuddy | Prompt only, not enforced |
+
+The authorization card preview lists the same.
+
 ### Claude Code background dispatch (downgraded background)
 
 Once configured, one authorization on Claude Code lets the supervisor dispatch workers unattended: it starts background sessions with `claude --bg` (provider `claude-code-background`). This is a downgraded background mode with three limits: the desktop sidebar does not show these sessions; you can only enter them from a real terminal with `claude attach <short-id>`; rework resumes the same session. Without configuration nothing changes and you still click each card.
