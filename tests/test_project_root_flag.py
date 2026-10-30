@@ -153,6 +153,14 @@ class ProjectRootFlagTests(unittest.TestCase):
     def test_empty_env_var_still_means_unset(self):
         self.assertIsNone(explicit_project_root(["status"], {"VIBE_PROJECT_ROOT": ""}))
 
+    def test_other_argument_error_still_reports_usage_without_getcwd(self):
+        for argv in (["badcmd"], ["status", "--bogus"], ["status", "a", "b"],
+                     ["status", "--interval", "x"]):
+            with self.subTest(argv=argv):
+                code, out = _run_main(argv + ["--project-root", str(self.root)])
+                self.assertEqual(code, 2, out)
+                self.assertIn("参数错误", out)
+
     def test_parse_failure_does_not_print_usage_twice(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err):

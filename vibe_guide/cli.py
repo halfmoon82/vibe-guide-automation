@@ -197,11 +197,20 @@ def explicit_project_root(argv: Sequence[str], environ=None) -> Optional[Path]:
     """
     # Read it from the real parser so abbreviations (``--project-r``) resolve
     # the same way here and in run_cli; a parse error is run_cli's to report.
-    try:
-        with contextlib.redirect_stderr(open(os.devnull, "w")):
+    flag = None
+    with open(os.devnull, "w") as sink, contextlib.redirect_stderr(sink):
+        try:
             flag = _parser().parse_args(list(argv)).project_root_flag
-    except SystemExit:
-        flag = None
+        except SystemExit:
+            # Some other argument is wrong.  Still take the root if one was
+            # given, so run_cli reports the usage error without main() ever
+            # asking the (possibly unreadable) process directory.
+            probe = argparse.ArgumentParser(add_help=False)
+            probe.add_argument("--project-root", dest="root", default=None)
+            try:
+                flag = probe.parse_known_args(list(argv))[0].root
+            except SystemExit:
+                flag = None
     source = "--project-root"
     value = flag
     if value is None:
