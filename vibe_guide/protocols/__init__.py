@@ -203,7 +203,7 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # its path and sha256.
     "supervisor-card": frozenset({
         # 2026-10-30: decision boundary — decide non-PRD engineering questions, no chat asks.
-        "d63b23f6594d536025e2348e92068b8f45a241c24a9b22999071249eb11a634a",
+        "9b2b626337b2d5c07bf57403a8801b0cfc0137e6e47704ff1d188930ba820bdb",
         "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
     }),
     # Second-level self-heal short session (daemon): the prompt the daemon feeds
