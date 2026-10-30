@@ -58,6 +58,9 @@ _SENSITIVE_NAMES = (
 #: platform's push wake-up is unverified; 60 once it is verified (the beat is
 #: then only a fallback behind the worker's push signal).
 HEARTBEAT_INTERVAL_CHOICES = (10, 60)
+#: Card defaults for the daemon options; the signed payload carries a key only when it differs.
+DAEMON_DEFAULT = True
+LAUNCHD_KEEPALIVE_DEFAULT = False
 DEFAULT_HEARTBEAT_INTERVAL_MINUTES = 10
 HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES = 60
 ROTATE_HARD_CAP_CHOICES = (150000, 200000, 300000, 500000, 800000)
@@ -1012,6 +1015,8 @@ def _authorization_payload(
     heartbeat_interval_forced: Optional[bool] = None,
     heartbeat_interval_forced_cost: Optional[str] = None,
     node_scope_digests: Optional[Dict[str, str]] = None,
+    daemon: bool = True,
+    launchd_keepalive: bool = False,
 ) -> Dict[str, Any]:
     payload = {
         "schema_version": AUTHORIZATION_SCHEMA_VERSION,
@@ -1076,6 +1081,14 @@ def _authorization_payload(
     if heartbeat_interval_forced:
         payload["heartbeat_interval_forced"] = True
         payload["heartbeat_interval_forced_cost"] = heartbeat_interval_forced_cost or ""
+    # Daemon / launchd keep-alive choices: signed only when they differ from the
+    # defaults (daemon on, keep-alive off).  Absent therefore means "the
+    # default", so every record issued before the options existed keeps its
+    # digest bit for bit and reads back as daemon=on, launchd_keepalive=off.
+    if daemon != DAEMON_DEFAULT:
+        payload["daemon"] = daemon
+    if launchd_keepalive != LAUNCHD_KEEPALIVE_DEFAULT:
+        payload["launchd_keepalive"] = launchd_keepalive
     return payload
 
 
@@ -1121,6 +1134,9 @@ class AuthorizationCard:
     node_scope_digests: Optional[Dict[str, str]] = None
     heartbeat_interval_options: Tuple[Dict[str, Any], ...] = ()
     rotate_hard_cap_options: Tuple[Dict[str, Any], ...] = ()
+    # Daemon / launchd keep-alive choices (signed when non-default, see the payload).
+    daemon: bool = True
+    launchd_keepalive: bool = False
     # Per-node capability tier and what the current platform resolves it to.
     # Unsigned display: the tier is derived from the signed node contract, and
     # a concrete model name must never enter the digest.
@@ -1189,6 +1205,8 @@ class AuthorizationRecord:
     heartbeat_interval_forced: Optional[bool] = None
     heartbeat_interval_forced_cost: Optional[str] = None
     node_scope_digests: Optional[Dict[str, str]] = None
+    daemon: bool = True
+    launchd_keepalive: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -1199,6 +1217,13 @@ class AuthorizationRecord:
             "remote_git_actions_scope": list(_REMOTE_GIT_ACTIONS_SCOPE),
             "deploy_authorization": "separate",
         })
+        # Default choices stay out of the stored record, so a record whose
+        # options were never changed is byte-identical to one issued before
+        # the options existed.
+        if result.get("daemon") == DAEMON_DEFAULT:
+            result.pop("daemon", None)
+        if result.get("launchd_keepalive") == LAUNCHD_KEEPALIVE_DEFAULT:
+            result.pop("launchd_keepalive", None)
         return _drop_unset_card_fields(result)
 
     @classmethod
@@ -1218,7 +1243,7 @@ class AuthorizationRecord:
             "digest",
             "agent_id",
         }
-        allowed = required | {"node_scope_digests", "remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "heartbeat_interval_forced", "heartbeat_interval_forced_cost", "heartbeat_interval_options", "rotate_hard_cap_options"}
+        allowed = required | {"node_scope_digests", "remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "heartbeat_interval_forced", "heartbeat_interval_forced_cost", "heartbeat_interval_options", "rotate_hard_cap_options", "daemon", "launchd_keepalive"}
         if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
             raise ValueError("authorization record schema is invalid")
         if data["schema_version"] != AUTHORIZATION_SCHEMA_VERSION:
@@ -1232,6 +1257,9 @@ class AuthorizationRecord:
         converted.setdefault("rotate_hard_cap", None)
         converted.setdefault("heartbeat_interval_forced", None)
         converted.setdefault("heartbeat_interval_forced_cost", None)
+        converted.setdefault("daemon", DAEMON_DEFAULT)
+        converted.setdefault("launchd_keepalive", LAUNCHD_KEEPALIVE_DEFAULT)
+        _validate_daemon_choices(converted["daemon"], converted["launchd_keepalive"])
         _validate_stored_card_choice(
             converted["heartbeat_interval_minutes"], "heartbeat interval minutes"
         )
@@ -1483,6 +1511,13 @@ def _require_offered(
     return chosen
 
 
+def _validate_daemon_choices(daemon: Any, launchd_keepalive: Any) -> None:
+    if type(daemon) is not bool or type(launchd_keepalive) is not bool:
+        raise ValueError("authorization daemon choices must be booleans")
+    if launchd_keepalive and not daemon:
+        raise ValueError("launchd keep-alive requires the daemon option")
+
+
 def _drop_unset_card_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     """Serialize an unrecorded ISSUE-209 choice exactly like a pre-209 card.
 
@@ -1551,6 +1586,8 @@ def build_authorization_card(
     heartbeat_interval_options: Optional[Any] = None,
     rotate_hard_cap_options: Optional[Any] = None,
     enforce_choice_availability: bool = True,
+    daemon: bool = DAEMON_DEFAULT,
+    launchd_keepalive: bool = LAUNCHD_KEEPALIVE_DEFAULT,
 ) -> AuthorizationCard:
     node_ids = tuple(sorted(node.id for node in nodes))
     if node_ids != tuple(sorted(plan.node_ids)):
@@ -1708,6 +1745,7 @@ def build_authorization_card(
             contract_test_commands[node.id] = [
                 item["test_command"] for _index, item in entries
             ]
+    _validate_daemon_choices(daemon, launchd_keepalive)
     heartbeat_interval_minutes = _validate_card_choice(
         heartbeat_interval_minutes, HEARTBEAT_INTERVAL_CHOICES,
         "heartbeat interval minutes",
@@ -1774,6 +1812,8 @@ def build_authorization_card(
         heartbeat_interval_forced=heartbeat_interval_forced,
         heartbeat_interval_forced_cost=heartbeat_interval_forced_cost,
         node_scope_digests={node.id: legacy_executable_contract_digest([node]) for node in nodes},
+        daemon=daemon,
+        launchd_keepalive=launchd_keepalive,
     )
     digest = _canonical_digest(canonical)
     canonical["engine_authorization_digest"] = digest
@@ -1783,6 +1823,8 @@ def build_authorization_card(
     canonical["heartbeat_interval_options"] = heartbeat_options
     canonical["rotate_hard_cap_options"] = rotate_options
     canonical["model_tiers"] = _model_tier_rows(nodes, capabilities.agent_id)
+    canonical.setdefault("daemon", daemon)
+    canonical.setdefault("launchd_keepalive", launchd_keepalive)
     card = AuthorizationCard(digest=digest, **canonical)
     # The issuing path checks its own output: a card the validator would
     # refuse must not be signed in the first place (ISSUE-08).
@@ -1870,6 +1912,8 @@ def refresh_authorization_card(
         rotate_hard_cap=previous.rotate_hard_cap,
         heartbeat_interval_forced=previous.heartbeat_interval_forced,
         heartbeat_interval_forced_cost=previous.heartbeat_interval_forced_cost,
+        daemon=previous.daemon,
+        launchd_keepalive=previous.launchd_keepalive,
         # A caller that observed nothing keeps the availability the approved
         # card recorded: the alternative -- emitting an empty list -- would
         # erase the reason a tier was unavailable from the refreshed card.
@@ -1936,6 +1980,8 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         heartbeat_interval_forced=card.heartbeat_interval_forced,
         heartbeat_interval_forced_cost=card.heartbeat_interval_forced_cost,
         node_scope_digests=card.node_scope_digests,
+        daemon=card.daemon,
+        launchd_keepalive=card.launchd_keepalive,
     )
     if card.schema_version != AUTHORIZATION_SCHEMA_VERSION:
         raise ValueError("unsupported authorization card schema")
@@ -1978,6 +2024,8 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         heartbeat_interval_forced=card.heartbeat_interval_forced,
         heartbeat_interval_forced_cost=card.heartbeat_interval_forced_cost,
         node_scope_digests=card.node_scope_digests,
+        daemon=card.daemon,
+        launchd_keepalive=card.launchd_keepalive,
     )
 
 
@@ -2052,6 +2100,8 @@ def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
         heartbeat_interval_forced=record.heartbeat_interval_forced,
         heartbeat_interval_forced_cost=record.heartbeat_interval_forced_cost,
         node_scope_digests=record.node_scope_digests,
+        daemon=record.daemon,
+        launchd_keepalive=record.launchd_keepalive,
     )
     if not secrets.compare_digest(record.digest, _canonical_digest(canonical)):
         # V3/V4 records pre-dating execution-engine binding remain readable

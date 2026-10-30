@@ -206,6 +206,19 @@ def register_pm_address(paths, run_id: str, provider: str, session_name: str) ->
     return record
 
 
+def build_run_command(run_id: str, plan_id: str, *, interval: Optional[float] = None,
+                      model: Optional[str] = None, provider: Optional[str] = None) -> List[str]:
+    """argv of the detached ``daemon run`` process; launchd uses the very same one."""
+    command = [sys.executable, "-m", "vibe_guide", "daemon", "run", "--plan", plan_id, "--run-id", run_id]
+    if interval is not None:
+        command += ["--interval", str(interval)]
+    if model:
+        command += ["--model", model]
+    if provider:
+        command += ["--provider", provider]
+    return command
+
+
 def start_daemon(paths, run_id: str, plan_id: str, *, interval: Optional[float] = None,
                  model: Optional[str] = None, provider: Optional[str] = None,
                  spawn: Optional[Callable[..., Any]] = None, wait: float = 5.0) -> Dict[str, Any]:
@@ -214,13 +227,7 @@ def start_daemon(paths, run_id: str, plan_id: str, *, interval: Optional[float] 
     if current["status"] == "running":
         return {**current, "status": "already_running"}
     directory = run_dir(paths, run_id, create=True)
-    command = [sys.executable, "-m", "vibe_guide", "daemon", "run", "--plan", plan_id, "--run-id", run_id]
-    if interval is not None:
-        command += ["--interval", str(interval)]
-    if model:
-        command += ["--model", model]
-    if provider:
-        command += ["--provider", provider]
+    command = build_run_command(run_id, plan_id, interval=interval, model=model, provider=provider)
     spawn = spawn or subprocess.Popen
     with open(str(directory / DAEMON_LOG_FILE), "ab") as log:
         process = spawn(command, cwd=str(paths.root), stdin=subprocess.DEVNULL,
