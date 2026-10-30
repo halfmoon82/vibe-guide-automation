@@ -109,6 +109,13 @@ CommandExecutor = Callable[[Sequence[str], Path, float], CommandResult]
 # come up "Not logged in" (verified live 2026-10-14, the only variable needed).
 _HOST_ONLY_ENV = ("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",)
 
+# A worker that asks the user parks in `blocked` until a human answers; the
+# supervisor decides engineering questions itself.  Variadic, so it must come
+# before `--` or the prompt is swallowed as a tool name.  Launch only: a
+# session keeps its saved options, and passing any option to `--resume` starts
+# a copy instead of continuing it (verified live).
+_NO_USER_QUESTIONS = ("--disallowedTools", "AskUserQuestion")
+
 # Waits before each resume attempt after `claude stop` (seconds; live: 0s
 # copies, 5s continued the same session).
 _RESUME_SETTLE_SECONDS = (5, 10, 20)
@@ -578,6 +585,7 @@ class ClaudeBgLauncher:
                         self.config.settings_path,
                         "--permission-mode",
                         "bypassPermissions",
+                        *_NO_USER_QUESTIONS,
                         # A prompt starting with "-" is otherwise read as an option (live).
                         "--",
                         prompt,

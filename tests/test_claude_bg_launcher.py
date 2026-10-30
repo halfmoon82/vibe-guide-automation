@@ -91,6 +91,14 @@ class LaunchTest(LauncherCase):
         self.assertEqual(binding.task_id, UUID)
         self.assertEqual(binding.mode, "background")
 
+    def test_launch_denies_ask_user_question_before_the_prompt_separator(self):
+        self.launcher().launch("developer", "n1", self.contract)
+        argv = self.fake.calls[0][0]
+        self.assertEqual(argv[argv.index("--disallowedTools") + 1], "AskUserQuestion")
+        # Variadic flag: after `--` the prompt would be read as a tool name.
+        self.assertLess(argv.index("--disallowedTools"), argv.index("--"))
+        self.assertEqual(argv.count("--disallowedTools"), 1)
+
     def test_launch_argv_and_cwd(self):
         self.launcher(model="opus").launch("developer", "n1", self.contract)
         argv, cwd = self.fake.calls[0]
@@ -219,6 +227,14 @@ class ControlTest(LauncherCase):
         self.assertEqual(self.fake.calls[0][0], ["claude", "stop", SHORT])
         self.assertEqual(self.fake.calls[1][0], ["claude", "--bg", "--resume", UUID, "--", "rework please"])
         self.assertEqual(len(self.fake.calls), 2)
+
+    def test_resume_passes_no_options_so_the_session_is_continued_not_copied(self):
+        # A session keeps the options it was launched with (including
+        # --disallowedTools); any option on --resume starts a copy (live).
+        self.launcher().resume(UUID, "rework please")
+        argv = self.fake.calls[1][0]
+        self.assertNotIn("--disallowedTools", argv)
+        self.assertEqual(argv, ["claude", "--bg", "--resume", UUID, "--", "rework please"])
 
     def test_resume_rejects_short_id(self):
         with self.assertRaises(ClaudeBgUnknown):
