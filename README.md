@@ -8,7 +8,7 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 ## 安装
 
-当前发行版本为 `5.2.1`。版本真相以仓库中匹配的 `v5.2.1` tag、对应提交和 Release 资产为准；版本引用的写法约定：反引号 v 形式（如本句的 tag）只用于当前 release tag，历史版本写作 V4.5.0 这样大写、无反引号的形式，否则 release-tag-gate 会判为旧 tag 残留。`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
+当前发行版本为 `5.2.3`。版本真相以仓库中匹配的 `v5.2.3` tag、对应提交和 Release 资产为准；版本引用的写法约定：反引号 v 形式（如本句的 tag）只用于当前 release tag，历史版本写作 V4.5.0 这样大写、无反引号的形式，否则 release-tag-gate 会判为旧 tag 残留。`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
 
 ### 安装与初始化前提
 
@@ -24,7 +24,7 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 1. 先查询最新 tag，不根据 README、`dist/` 文件名或历史记忆判断版本：
    `git ls-remote --tags --sort='-v:refname' https://github.com/halfmoon82/vibe-guide-automation.git 'refs/tags/v*'`
-2. 选择最新稳定 tag（当前应为 `v5.2.1`），核对 tag、提交和可下载 Release 资产版本一致；无法核对时保持 `unknown`，不要猜测。
+2. 选择最新稳定 tag（当前应为 `v5.2.3`），核对 tag、提交和可下载 Release 资产版本一致；无法核对时保持 `unknown`，不要猜测。
 3. 在目标环境安装该版本，并验证：
    `python3 -c "import vibe_guide; print(vibe_guide.__version__)"`
    `vibe --help`
@@ -74,16 +74,16 @@ python3 -m vibe_guide --help
 2. **pipx 装 wheel 必须用构建出来的原文件名**，改名后的副本（如 `cli-162b481.whl`）会被拒：
 
    ```bash
-   pipx install --force dist/vibe_guide-5.2.1-py3-none-any.whl
+   pipx install --force dist/vibe_guide-5.2.3-py3-none-any.whl
    ```
 
 3. **沙箱内 `pip install <sdist>` 会报 `EEXIST: mkdir pip-req-build-*`**（换 `TMPDIR` 仍复现），改成解包后按目录安装，新 venv 先装 setuptools / wheel：
 
    ```bash
-   tar xzf dist/vibe_guide-5.2.1.tar.gz -C /tmp
+   tar xzf dist/vibe_guide-5.2.3.tar.gz -C /tmp
    python3 -m venv /tmp/vibe-sdist-check
    /tmp/vibe-sdist-check/bin/pip install setuptools wheel
-   /tmp/vibe-sdist-check/bin/pip install --no-build-isolation --no-deps /tmp/vibe_guide-5.2.1
+   /tmp/vibe-sdist-check/bin/pip install --no-build-isolation --no-deps /tmp/vibe_guide-5.2.3
    /tmp/vibe-sdist-check/bin/vibe --help
    ```
 
@@ -197,7 +197,9 @@ V4.4 将工程故障限定在节点范围内，并保留同一任务身份。五
 
 ### 监工形态：守护程序 + 短会话 + 三级自愈
 
-授权后启动 `vibe daemon start --run-id <run> --plan <ID>`：一个分离的本地进程持监工租约，机械地推进整个运行（resume、收交付、派后台 worker、拉 reviewer、接受节点、一级自动重试），不调用模型。产品经理会话只保留 60 分钟兜底检查（推送唤醒未验证的平台为 10 分钟）：先看 `vibe daemon status`，失活则重启或上报，存活就结束本轮。发布时不再询问心跳间隔、换班上限等工程参数，由 vibe 按平台推导；Claude Code 默认后台派发，授权卡上可改选可见卡片，且永不换班。
+授权后 `vibe monitor` 自动启动并登记守护程序（授权卡「守护程序」，默认开；关闭则保持旧形态，监工会话手工推进；启动失败不让 monitor 失败，记录并在卡片回显）。也可手工 `vibe daemon start --run-id <run> --plan <ID>`：一个分离的本地进程持监工租约，机械地推进整个运行（resume、收交付、派后台 worker、拉 reviewer、接受节点、一级自动重试），不调用模型。产品经理会话只保留 60 分钟兜底检查（推送唤醒未验证的平台为 10 分钟）：先看 `vibe daemon status`，失活则上报，存活就结束本轮。监工心跳只报告、不重启。发布时不再询问心跳间隔、换班上限等工程参数，由 vibe 按平台推导；Claude Code 默认后台派发，授权卡上可改选可见卡片，且永不换班。
+
+**开机保活（launchd，授权卡选项，默认关）**：它是守护程序被杀后自动重启的唯一途径。不勾选时守护程序被杀后不会自动恢复，监工心跳只报告、不重启，需产品经理手工 `vibe daemon start`。勾选后授权会为该 run 生成并校验一份 LaunchAgent plist（`KeepAlive` 仅在非正常退出时重启），用 `launchctl` 加载；`vibe daemon stop` 会卸载并删除。四个平台走同一入口（`vibe_guide/launchd_keepalive.py`），目前**均未经真机验证**，授权卡文案同样如实标注；非 macOS 返回 `unsupported`。测试只用假 launchctl 和临时目录，不加载真实 LaunchAgent。
 
 节点连续几拍都没有任何进展（状态、代数、活跃任务、最新交付都不变）时按三级处理：
 
@@ -232,6 +234,20 @@ V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 
 按验收结果扩范围：`.vibe/config.json` 的 `acceptance_scope_rule_approved` 默认 false，此时监工自动扩范围只限 `tests/` 与 `auto_scope_paths`；只有产品经理批准并写入 `AGENTS.md` §6 的对应补丁后才设为 true，届时「所有 PRD 验收例子判定不变」的低风险文件也可自扩。
 
 决策通知桥：项目 `.vibe/config.json` 只能写 `"notify_bridge": {"enabled": true}`；要执行的命令与超时只从用户级 `$VIBE_HOME/config.json` 的 `notify_bridge` 读取。项目配置里写 `command` 会被拒绝并记为 UNKNOWN。
+
+### 远端 Git 禁令（remote_git_actions=deny）
+
+授权卡 `remote_git_actions` 为 `deny` 时，四个平台的 worker 提示词都会加一条固定禁令：禁止 git fetch、push、pull 以及 gh，只在本地分支提交。为 `allow` 时不加禁令，也不加任何启动参数。各平台实际能拦到什么：
+
+| 平台 | 约束 |
+|---|---|
+| claude-code 后台派发 | 提示词禁令加启动拦截（`claude --bg` 带 `--disallowedTools` 与 `GIT_ALLOW_PROTOCOL=vibe-denied`）。部分拦截：`--disallowedTools` 实测只拦住 `git push` 与 `env git push`，拦不住 `git -C … push` 和 `bash -c`；环境变量在普通 shell 里拦 push、fetch，但 `env -u` 可取消，也管不到 gh 和 curl；该变量能否传进后台会话的工具 shell 未验证 |
+| claude-code 可见任务 | 仅提示词约束，未强制 |
+| codex | 仅提示词约束，未强制 |
+| kimi-code | 仅提示词约束，未强制 |
+| workbuddy | 仅提示词约束，未强制 |
+
+授权卡预览按同样口径列出。
 
 ### Claude Code 后台派发（降级后台）
 

@@ -442,9 +442,22 @@ class MailboxSectionTests(unittest.TestCase):
         self.assertIn("（嵌套对象，三键齐全，摊平无效）", section)
         reviewer = " ".join(self.row("6.2 信箱回写", "wait"))
         self.assertIn('"event": "accepted", "evidence"', reviewer)
-        # And vibe does not create the worktree for you.
-        self.assertIn("worktree 需先建好", self.subsection("6.3 派发合同"))
-        self.assertIn("vibe 不替你建", self.subsection("6.3 派发合同"))
+        # #235: background dispatch now creates a missing node worktree itself,
+        # while visible dispatch still needs the directory to exist.  Both halves
+        # are pinned so neither claim can drift away from the code alone.
+        contract = self.subsection("6.3 派发合同")
+        self.assertIn("后台派发（`claude-code-background`）由 vibe 在派发前自建缺失的节点 worktree", contract)
+        self.assertIn("可见派发仍需 worktree 先存在", contract)
+        # The two halves a supervisor acts on, and the label it must not wait
+        # for on paths that never record it (review finding on PR #333).
+        self.assertIn("vibe 不代建", contract)
+        self.assertIn("worktree_mismatch", contract)
+        self.assertIn("分支已存在", contract)
+        self.assertIn("干净、在合同 `branch` 与 `base_sha` 上的 git worktree", contract)
+        # The known gap, pinned so it cannot disappear from the docs unnoticed:
+        # daemon and post-watch beats never record worktree_preflight.
+        self.assertIn("守护程序续跑都不落这个标记", contract)
+        self.assertNotIn("vibe 不替你建", contract)
 
     def test_protocol_states_the_cursor_and_recovery_rules(self):
         """Two rules whose absence is silent, so nothing else would notice.

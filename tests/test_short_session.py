@@ -3,6 +3,7 @@ import os
 import stat
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from vibe_guide import short_session as ss
@@ -100,3 +101,54 @@ class LaunchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HostEnvironmentTests(unittest.TestCase):
+    """5.2.1 rehearsal: a short session started by a daemon that inherited the
+    desktop host's marker came up "Not logged in" and its answer was thrown away."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_probe(self, **kwargs):
+        exe = _script(self.tmp.name, "claude",
+                      'echo "{\\"result\\": \\"marker=${CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST:-absent}\\"}"')
+        return ss.launch("claude-code", "p", executable=exe, timeout=10, **kwargs)
+
+    def test_the_host_marker_is_not_passed_to_the_one_shot_session(self):
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "1"}):
+            result = self.run_probe()
+        self.assertIn("marker=absent", result.text)
+
+    def test_the_host_auth_marker_is_not_passed_either(self):
+        exe = _script(self.tmp.name, "claude",
+                      'echo "{\\"result\\": \\"auth=${CLAUDE_CODE_HOST_AUTH_ENV_VAR:-absent}\\"}"')
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CODE_HOST_AUTH_ENV_VAR": "ANTHROPIC_AUTH_TOKEN"}):
+            result = ss.launch("claude-code", "p", executable=exe, timeout=10)
+        self.assertIn("auth=absent", result.text)
+
+    def test_other_environment_still_reaches_the_session(self):
+        with unittest.mock.patch.dict(os.environ, {"VIBE_PROBE": "kept"}):
+            exe = _script(self.tmp.name, "claude", 'echo "{\\"result\\": \\"v=$VIBE_PROBE\\"}"')
+            result = ss.launch("claude-code", "p", executable=exe, timeout=10)
+        self.assertIn("v=kept", result.text)
+
+    def test_an_explicit_env_is_used_as_given(self):
+        result = self.run_probe(env={"PATH": os.environ["PATH"], "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST": "explicit"})
+        self.assertIn("marker=explicit", result.text)
+
+    def test_a_json_error_result_is_failed_and_keeps_its_message(self):
+        payload = json.dumps({"is_error": True, "result": "Not logged in · Please run /login"})
+        exe = _script(self.tmp.name, "claude", "echo '%s'; exit 1" % payload)
+        result = ss.launch("claude-code", "p", executable=exe, timeout=10)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("Not logged in", result.reason)
+        self.assertEqual(result.text, "Not logged in · Please run /login")
+
+    def test_a_json_error_with_exit_zero_is_still_failed(self):
+        payload = json.dumps({"is_error": True, "result": "Invalid API key"})
+        exe = _script(self.tmp.name, "claude", "echo '%s'" % payload)
+        result = ss.launch("claude-code", "p", executable=exe, timeout=10)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("Invalid API key", result.reason)

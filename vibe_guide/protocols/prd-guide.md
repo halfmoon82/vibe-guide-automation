@@ -136,6 +136,8 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
   "remote_git_actions?": "allow|deny",
   "heartbeat_interval_minutes?": "10|60",
   "rotate_hard_cap?": "150000|200000|300000|500000|800000",
+  "daemon?": "true|false",
+  "launchd_keepalive?": "true|false",
   "dispatch_mode?": "background|visible"
 }
 ```
@@ -143,6 +145,8 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
 `prd` 的推荐 section：`problem`、`user_scenarios`、`success_criteria`、`non_goals`、`code_evidence`；涉及图形界面时必须有 `design_mockups`（§2）。
 
 `heartbeat_interval_minutes`、`rotate_hard_cap`、`dispatch_mode` 由 vibe 按平台推导，缺省即可，**不向产品经理询问**（§5.3）。
+
+授权卡两项开关：`daemon`（守护程序，默认开：授权后 `vibe monitor` 自动启动并登记守护程序）、`launchd_keepalive`（开机保活，默认关）。开机保活是守护程序被杀后自动重启的唯一途径；不勾选时守护程序被杀后不会自动恢复，监工心跳只报告、不重启。各平台均未经真机验证，授权卡上如实标注。守护程序关闭时保持旧形态，监工会话手工推进。
 
 产品路径的 `risk_tags` 默认派生为 `write_scope`，表示节点写入合同文件范围的工程风险，不是业务风险评级或执行许可。旧 `--node-spec` 的显式标签保持原样；空值、错误类型和多处冲突仍由 DAG 审计拒绝。
 
@@ -193,7 +197,7 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 ### 6.0 形态与开工
 
 - **守护程序干机械活**：授权后 `vibe daemon start|status|stop --run-id <run-id>` 起分离的本地进程并持监工租约，每个 tick 确定性地 resume、收交付、派后台 worker、拉 reviewer、接受节点、一级重试。
-- **产品经理会话只保留 60 分钟兜底检查**：登记地址（`vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>`；`vibe daemon register-pm --run-id <run-id> --provider <平台> --session-name <会话名>` 登记推送目标），心跳指令逐字用 vibe 打印的 `vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>`，每 60 分钟（推送唤醒未验证的平台 10 分钟，记录在 `.vibe/push-wake-verification.json`）一拍：先 `vibe daemon status`，失活则重启或上报，存活就结束本轮。不要自写心跳或把信箱服务写进心跳；不登记则唤醒无处可发，`rotate` 也无接班地址。
+- **产品经理会话只保留 60 分钟兜底检查**：登记地址（`vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>`；`vibe daemon register-pm --run-id <run-id> --provider <平台> --session-name <会话名>` 登记推送目标），心跳指令逐字用 vibe 打印的 `vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>`，每 60 分钟（推送唤醒未验证的平台 10 分钟，记录在 `.vibe/push-wake-verification.json`）一拍：先 `vibe daemon status`，失活则上报（只上报，不重启：重启归 launchd 或产品经理手工），存活就结束本轮。不要自写心跳或把信箱服务写进心跳；不登记则唤醒无处可发，`rotate` 也无接班地址。
 - **推送优先**：worker 交付后用 `vibe supervisor-address --project-root <主项目绝对路径> --run-id <run> --node <n> --role <r> --generation <g>` 回答里的 `wake`（`channel`、`target`、`signal`）原样推送；`channel` 为 null 或地址 unknown 时不发，由兜底检查领取。
 - 状态从磁盘读；未知不当成功；宿主报 `No such tool available` 不是节点故障，重试一次后停下报告，不交班。
 
@@ -201,7 +205,7 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 
 1. **一级（守护程序自动）**：节点空转（同一节点连续数拍状态、代数、活跃任务、最新交付都不变）时先自动重试，不耗模型。
 2. **二级（修复短会话）**：仍空转到「需要监工排查」档，守护程序按平台拉起**一次**短会话（claude-code 用 `claude -p`，codex 用 `codex exec`，kimi-code 用 `kimi -p`；WorkBuddy 写入信箱），模型按节点档位换算，输入排查包、监工卡和授权范围。会话在授权范围内修复（可改排查包列出的运行时文件，不得直接改 `state.json` 和 `events.jsonl`），**必须以 `vibe heal-verify --run-id <run-id> --node <节点>` 结束**，复核通过才推进并记 `self_heal_attempt`。同时最多一个短会话，次数与 token 有预算，用尽升级。
-3. **三级（升给产品经理）**：同一空转指纹两次修复无进展，或修复要越过产品范围、授权卡、deploy、凭据与系统权限边界（§7），守护程序建决策卡并推送到登记的会话，标签变「需要人处理」；带排查包和已试尝试停下报告，不第三次重试，不挂成 `engineering` 类决策。
+3. **三级（工程故障留在系统内）**：同一空转指纹两次修复无进展、预算用尽、修复结果未知、守护程序连续出错，是工程问题，守护程序写 `engineering_unresolved` 事件，带排查包和已试次数停下报告，不建决策卡、不推送，不第三次重试，该节点不再拉修复会话。运行结束时，以及无进展超过 6 小时（可配置得更短，不可更长，同一组项目只报一次），用产品语言汇报「未能自动解决的项」（受影响的验收例子、现在的情况、三个选项）；`vibe status` 展示同一份。只有修复要越过产品范围、授权卡、deploy、凭据与系统权限边界（§7）时，才建决策卡并推送，标签变「需要人处理」。
 
 ### 6.2 信箱回写
 
@@ -221,7 +225,7 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 
 #### 整合审查节点的 accepted
 
-它是整个 run 的验收，`evidence` 必须是对象，**恰好四个键**：
+它是整个 run 的验收，`evidence` 必须是对象，**恰好四个键**。evidence 本身就是这四个键：findings、iteration_compatibility、test_runtime_delivery、out_of_scope，不再套一层 claim。
 
 ```json
 {
@@ -247,7 +251,13 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 
 ### 6.3 派发合同
 
-`request.child_binding` 的 `worktree`、`branch`、`allowlist` 由 vibe 按节点 id 派生，每个节点互不相同。**创建会话必须把工作目录设成合同里的 `worktree`**，在合同的 `branch` 上开发，只碰 `allowlist` 里的文件；worktree 需先建好（`git worktree add <worktree> -b <branch>`），vibe 不替你建。
+`request.child_binding` 的 `worktree`、`branch`、`allowlist` 由 vibe 按节点 id 派生，每个节点互不相同。**创建会话必须把工作目录设成合同里的 `worktree`**，在合同的 `branch` 上开发，只碰 `allowlist` 里的文件。
+
+**worktree 由谁建，按派发方式分。** 后台派发（`claude-code-background`）由 vibe 在派发前自建缺失的节点 worktree：目录不存在时按运行基线执行 `git worktree add <worktree> -b <branch> <base>`，并把该节点已验收的上游分支合入基线；分支已存在、目录不在任何 git 仓库内或基线读不到时拒绝创建，不复用、不覆盖已有分支。目录已存在则只核对它在合同的 `branch` 上（既有目录不是 git worktree 时不核对，按原行为直接派发），并把它当前的 HEAD 作为本次派发的基线（vibe 自建时写进节点 `worktree_base`），不切换、不重置、不覆盖；分支不符报 `worktree_mismatch` 并 fail-closed。
+
+在 `vibe monitor` / `vibe resume` 的一次性推进里，这类失败会把节点标成「需要监工建工作树」，`worktree_preflight` 里带机读码和一条可直接执行的处置命令（建树命令，或该码对应的核对/处置说明）。**`vibe monitor --watch` 进入 watch 之后的续跑、以及守护程序续跑都不落这个标记**，别只等状态变——按节点事件流或 `vibe status` 里该节点的「错误类别 …，code=…」行自查。
+
+**可见派发仍需 worktree 先存在**（Codex/Claude 的可见会话按合同目录挂载）：vibe 不代建；绑定时要求它是干净、在合同 `branch` 与 `base_sha` 上的 git worktree，并持有 writer lease；缺目录时由监工按合同 `base_sha` 建好后重新派发。
 
 | 宿主 | 设定工作目录的方式 | 做不到时的后果 |
 |---|---|---|

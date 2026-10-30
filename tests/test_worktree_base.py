@@ -245,3 +245,51 @@ class MonitorUpstreamDispatchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ComposedBaseWithoutGitIdentityTest(RepoCase):
+    """Recorded in the 5.2.1 rehearsal: no user.name/user.email anywhere, so
+    ``git commit-tree`` died and the downstream node never got a worktree."""
+
+    def setUp(self):
+        super().setUp()
+        for key in ("user.name", "user.email"):
+            git(self.repo, "config", "--unset", key)
+        isolated = {
+            "HOME": str(self.tmp / "nohome"), "XDG_CONFIG_HOME": str(self.tmp / "nohome"),
+            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+        }
+        patcher = mock.patch.dict("os.environ", isolated)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+            clean = mock.patch.dict("os.environ", {}, clear=False)
+            clean.start()
+            self.addCleanup(clean.stop)
+            __import__("os").environ.pop(name, None)
+
+    def launcher(self, upstream=()):
+        routing = BackgroundTaskRouting("host", str(self.worktree), self.branch, "s.json", "h.json")
+        return ClaudeBgLauncher(routing, ClaudeBgConfig(settings_path="/abs/settings.json"),
+                                executor=self.executor, upstream_branches=list(upstream))
+
+    def commit_upstream(self):
+        env = {"GIT_AUTHOR_NAME": "Up", "GIT_AUTHOR_EMAIL": "up@example.com",
+               "GIT_COMMITTER_NAME": "Up", "GIT_COMMITTER_EMAIL": "up@example.com"}
+        with mock.patch.dict("os.environ", env):
+            return commit_on_branch(self.repo, "node/up-a", "a.txt", "from a\n")
+
+    def test_the_composed_base_builds_without_a_configured_git_identity(self):
+        self.commit_upstream()
+        launcher = self.launcher(["node/up-a"])
+        launcher._prepare_worktree()
+        self.assertEqual((self.worktree / "a.txt").read_text(encoding="utf-8"), "from a\n")
+        self.assertEqual(launcher.worktree_preflight["event"], WORKTREE_CREATED_EVENT)
+
+    def test_the_machine_identity_is_not_borrowed_for_the_merge_commit(self):
+        self.commit_upstream()
+        launcher = self.launcher(["node/up-a"])
+        launcher._prepare_worktree()
+        head = self.head_of(self.worktree)
+        author = git(self.repo, "log", "-1", "--format=%an <%ae>", head).stdout.strip()
+        self.assertIn("vibe", author.lower())

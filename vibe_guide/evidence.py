@@ -354,22 +354,11 @@ def validate_integration_review_evidence(snapshot: Any, evidence: Dict[str, Any]
             raise ValueError("{} clearance does not match finding count".format(key.upper()))
 
 
-def build_integration_review_evidence(
-    snapshot: Any,
-    claim: Any,
-    agentsmd_acceptance_refs: Sequence[Any],
-    unverified_or_excluded: Sequence[Any],
-) -> Dict[str, Any]:
-    """Derive the run-bound review package from the reviewer's judgement.
+def validate_integration_claim_shape(claim: Any) -> None:
+    """Raise ``IntegrationClaimFormatError`` unless *claim* has the reviewer schema.
 
-    The reviewer supplies only what it alone can know -- the findings, the two
-    compatibility/runtime verdicts, and whether it saw changes outside the
-    aggregated scope.  Everything else is lineage the run already owns, so the
-    reviewer can neither forge it nor narrow it; supplying any of it is a
-    schema error rather than an override.  The acceptance references and the
-    permanent exclusions come from the plan's integration contract for the
-    same reason: a reviewer must not be able to shrink the scope it is being
-    held to.
+    Needs no run state, so ``worker-deliver`` can apply the very same rules the
+    monitor applies later.  Messages and codes are program constants only.
     """
     if not isinstance(claim, dict) or set(claim) != INTEGRATION_REVIEW_CLAIM_KEYS:
         # One message for every key-set deviation (the shipped schema must
@@ -413,6 +402,37 @@ def build_integration_review_evidence(
                 if not isinstance(verdict, dict)
                 else "claim_shape:{}:empty_evidence".format(key),
             )
+
+
+def build_integration_review_evidence(
+    snapshot: Any,
+    claim: Any,
+    agentsmd_acceptance_refs: Sequence[Any],
+    unverified_or_excluded: Sequence[Any],
+) -> Dict[str, Any]:
+    """Derive the run-bound review package from the reviewer's judgement.
+
+    The reviewer supplies only what it alone can know -- the findings, the two
+    compatibility/runtime verdicts, and whether it saw changes outside the
+    aggregated scope.  Everything else is lineage the run already owns, so the
+    reviewer can neither forge it nor narrow it; supplying any of it is a
+    schema error rather than an override.  The acceptance references and the
+    permanent exclusions come from the plan's integration contract for the
+    same reason: a reviewer must not be able to shrink the scope it is being
+    held to.
+    """
+    """Derive the run-bound review package from the reviewer's judgement.
+
+    The reviewer supplies only what it alone can know -- the findings, the two
+    compatibility/runtime verdicts, and whether it saw changes outside the
+    aggregated scope.  Everything else is lineage the run already owns, so the
+    reviewer can neither forge it nor narrow it; supplying any of it is a
+    schema error rather than an override.  The acceptance references and the
+    permanent exclusions come from the plan's integration contract for the
+    same reason: a reviewer must not be able to shrink the scope it is being
+    held to.
+    """
+    validate_integration_claim_shape(claim)
     nodes = _snapshot_value(snapshot, "nodes", {})
     package = {
         "schema_version": 1,

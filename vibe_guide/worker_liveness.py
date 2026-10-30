@@ -97,3 +97,27 @@ def probe(paths: ProjectPaths, run_id: str, node_id: str, node: Mapping[str, Any
         return {"state": "unknown", "reason": "transcript unreadable", "session": session}
     state = "silent" if age >= SILENCE_SECONDS else "active"
     return {"state": state, "silent_minutes": int(age // 60), "transcript": str(path), "session": session}
+
+
+def session_ended(paths: ProjectPaths, run_id: str, node_id: str, node: Mapping[str, Any],
+                  now: Optional[float] = None) -> bool:
+    """True only when the node's session has delivered and then gone silent.
+
+    The registry keeps reading ``review`` after a reviewer session exits, so a
+    stopped binding is not available as proof.  Fail closed: a missing or
+    unreadable transcript, an undelivered report, or recent activity all mean
+    the session may still be live.
+    """
+    if not has_delivered(paths, run_id, node_id, node):
+        return False
+    session = _session_id(paths, node)
+    if session is None:
+        return False
+    path = transcript_path(paths, node)
+    if path is None:
+        return False
+    try:
+        age = (now if now is not None else time.time()) - path.stat().st_mtime
+    except OSError:
+        return False
+    return age >= SILENCE_SECONDS

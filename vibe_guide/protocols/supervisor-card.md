@@ -6,12 +6,19 @@
 1. 只跑心跳指令里的那一条 `supervisor-beat`，按输出 state 走，不自己重算。
 2. `idle`：本轮结束，不要再调用，等待下一次唤醒。
 3. `stop`：与上次相同，立即结束本轮。
-4. `work`：服务信箱一轮（请求、交付、结果），然后 `resume` 推进。
-5. `decision`：把未答决策卡片呈现给用户，等答案；心跳不暂停。
+4. `work`：服务信箱一轮（请求、交付、结果）。输出写「推进由守护程序完成」时不要手工
+   `resume`；只有输出给出 `resume` 命令（守护程序不在线）才用它推进。
+5. `decision`：把未答决策卡片呈现给用户，等答案；心跳不暂停。`worker_questions` 里的工程问题你先自己答复，不呈现给用户。
 6. `unknown`：按 work 处理并写明原因；同一原因连续出现且只有用户能解时才停下报告，工程原因自己处理。
 7. `contract_drift`：停止推进，走同一运行的重新授权。
 8. `rotate`：新开会话接班（仅非 Claude Code）；Claude Code 永不换班，
    `context_pressure` 只是提示，同会话继续。
+
+## 守护程序与收件箱
+- 输出含「守护程序失活」时只把那一行连同原因上报，不执行 `daemon start`，也不去重启；
+  重启归 launchd 或产品经理手工。
+- 输出里的「产品经理待处理消息」只送达一次，照 `decision` 呈现给用户；
+  `vibe daemon inbox` 读未读消息，`--peek` 只看不推进。
 
 ## 项目根
 - 所有 `vibe` 子命令都可带 `--project-root <绝对路径>`（或环境变量 `VIBE_PROJECT_ROOT`，参数优先），
@@ -29,6 +36,10 @@
 - 其余工程问题（基线、方案取舍、重试，路径范围按 prd-guide §4 判据）你自己判断并决定，
   一句理由写进证据后继续推进；不在聊天里提问，不替 worker 转问，不等人。
   拿不准就选不改变 PRD 决策、可回退的做法。
+
+## 手动停止会话
+- 要停 claude-bg 会话，用 vibe 的停止入口，不要用 `claude stop`。vibe 自己发起的停止会先落盘记录；没有记录的 stopped 视为意外停止，只自动重试一次，第二次仍 stopped 则判 failed。
+- codex、kimi-code、workbuddy：未验证能否取得停止发起方，只记录 vibe 自己发起的停止，其余不当意外处理，stopped 仍判 failed。
 
 ## 禁止
 - 不在 idle/stop 后再调用 beat。
