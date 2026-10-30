@@ -308,6 +308,7 @@ class ClaudeBgLauncher:
         sleeper: Callable[[float], None] = time.sleep,
         upstream_branches: Optional[Sequence[str]] = None,
         remote_git_deny: bool = False,
+        base_sha: Optional[str] = None,
     ):
         #: True only when the authorization card says ``remote_git_actions:
         #: deny``: ``launch`` then appends the ban to the prompt and adds
@@ -323,6 +324,9 @@ class ClaudeBgLauncher:
         #: Accepted upstream node branches, in topological order, merged into
         #: the baseline of a worktree this launcher builds.
         self.upstream_branches = [str(item) for item in (upstream_branches or ())]
+        #: Optional supervisor-owned baseline (visible dispatch).  Background
+        #: callers keep their historical repository-HEAD baseline.
+        self.base_sha = base_sha
         #: What ``launch`` had to do about the node worktree (#235), read back
         #: by the CLI after the dispatch returns: ``{"event": ...,
         #: "worktree": ..., "branch": ..., "worktree_base": ..., ...}``.
@@ -378,9 +382,29 @@ class ClaudeBgLauncher:
 
     def _verify_worktree(self, path: Path) -> Path:
         if not (path / ".git").exists():
-            # Not a worktree root of its own: there is no branch claim to
-            # contradict, and the launcher has never owned this directory.
-            return path
+            # An ordinary directory has no verifiable branch, HEAD or writer
+            # identity.  It is never a degraded dispatch target.
+            repo = self._repository_root(path)
+            manual = self._manual_command(
+                path, self.routing.branch, None, "普通目录不是 git worktree"
+            )
+            if repo is not None:
+                try:
+                    base = self._read_base(repo)
+                    if self._branch_exists(repo, self.routing.branch):
+                        manual = "git worktree add %s %s" % (path, self.routing.branch)
+                    else:
+                        manual = self._manual_command(path, self.routing.branch, base)
+                except ClaudeBgUnknown:
+                    # The block below remains fail-closed; the command says
+                    # why no trustworthy baseline could be filled in.
+                    pass
+            raise self._blocked(
+                WORKTREE_MISSING,
+                "worktree %s is an ordinary directory without .git; refusing to dispatch into it"
+                % path,
+                manual,
+            )
         try:
             branch = self._git_branch(path)
             head = self._git_text(["rev-parse", "HEAD"], path)
@@ -446,7 +470,7 @@ class ClaudeBgLauncher:
                 self._manual_command(path, branch, None, "%s 不在任何 git 仓库内" % path),
             )
         try:
-            base = self._git_text(["rev-parse", "HEAD"], repo)
+            base = self._read_base(repo)
         except ClaudeBgUnknown as error:
             raise self._blocked(
                 WORKTREE_CREATE_FAILED,
@@ -500,6 +524,14 @@ class ClaudeBgLauncher:
             "worktree_base": base,
         }
         return path
+
+    def _read_base(self, repo: Path) -> str:
+        """Read the authorized baseline, or the repository HEAD for legacy callers."""
+        if self.base_sha:
+            return self._git_text(
+                ["rev-parse", "--verify", self.base_sha + "^{commit}"], repo
+            )
+        return self._git_text(["rev-parse", "HEAD"], repo)
 
     def _compose_upstream_base(self, repo: Path, path: Path, branch: str, base: str) -> str:
         """Main plus every accepted upstream branch; nothing is built on failure."""

@@ -317,14 +317,18 @@ class NeverOverwritesTest(RepoCase):
             self.launcher().launch("developer", "n1", self.contract)
         self.assertEqual(self.executor.claude_calls, [])
 
-    def test_plain_directory_keeps_its_previous_behaviour(self):
-        # A directory that is not a worktree root of its own makes no branch
-        # claim, so there is nothing to contradict and no git call to make.
+    def test_plain_directory_is_fail_closed_worktree_missing(self):
+        # An ordinary directory is not a node worktree: dispatching into it
+        # would bypass the branch, baseline and unique-writer contract.
         plain = self.tmp / "plain"
         plain.mkdir()
         launcher = self.launcher(worktree=plain)
-        self.assertEqual(launcher._prepare_worktree(), plain)
-        self.assertEqual(self.executor.git_calls, [])
+        with self.assertRaises(ClaudeBgWorktreeBlocked) as ctx:
+            launcher._prepare_worktree()
+        self.assertEqual(ctx.exception.reason_code, WORKTREE_MISSING)
+        self.assertEqual(
+            launcher.worktree_preflight["event"], WORKTREE_BLOCKED_EVENT
+        )
 
     def test_worktree_outside_any_repository_is_readable(self):
         outside = self.tmp / "outside" / "node-n1"
@@ -529,7 +533,10 @@ class RecorderTest(unittest.TestCase):
             "branch": "node/n1",
             "worktree_command": "git worktree add /repo/.worktrees/node-n1 -b node/n1 <base>",
         }
-        node = {"status": "blocked_unknown"}
+        node = {
+            "status": "blocked_unknown",
+            "retryable_action": {"role": "developer", "reason_class": "binding_unknown"},
+        }
         changed, records, snapshot, saved = self.run_recorder(report, {"node-n1": node})
         self.assertTrue(changed)
         self.assertEqual(records[0][0], WORKTREE_BLOCKED_EVENT)
@@ -537,6 +544,10 @@ class RecorderTest(unittest.TestCase):
         marker = snapshot.nodes["node-n1"][WORKTREE_PREFLIGHT_KEY]
         self.assertEqual(marker["worktree_command"], report["worktree_command"])
         self.assertEqual(snapshot.nodes["node-n1"]["user_status"], WORKTREE_ACTION_STATUS)
+        self.assertEqual(
+            snapshot.nodes["node-n1"]["retryable_action"]["reason_class"],
+            WORKTREE_MISSING,
+        )
         self.assertEqual(len(saved), 1)
 
     def test_an_existing_worktree_records_nothing(self):
@@ -545,6 +556,22 @@ class RecorderTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(records, [])
         self.assertEqual(saved, [])
+
+    def test_an_existing_worktree_records_its_head_as_scope_base(self):
+        head = "b" * 40
+        report = {
+            "event": None,
+            "worktree": "/repo/.worktrees/node-n1",
+            "branch": "node/n1",
+            "worktree_base": head,
+        }
+        changed, records, snapshot, saved = self.run_recorder(
+            report, {"node-n1": {"status": "running"}}
+        )
+        self.assertTrue(changed)
+        self.assertEqual(records, [])
+        self.assertEqual(snapshot.nodes["node-n1"]["worktree_base"], head)
+        self.assertEqual(len(saved), 1)
 
     def test_an_existing_worktree_clears_a_stale_marker(self):
         # The supervisor ran the command by hand: the directory is there and
@@ -857,6 +884,7 @@ class CliBackgroundDispatchTest(unittest.TestCase):
         self.assertEqual(marker["worktree_command"], data["worktree_command"])
         self.assertEqual(node["user_status"], WORKTREE_ACTION_STATUS)
         self.assertEqual(node["status"], "blocked_unknown")
+        self.assertEqual(node["retryable_action"]["reason_class"], WORKTREE_MISSING)
 
     def test_resume_after_the_supervisor_built_the_worktree_clears_the_marker(self):
         git(self.root, "branch", self.branch)
@@ -879,6 +907,7 @@ class CliBackgroundDispatchTest(unittest.TestCase):
         node = self.node(run_id)
         self.assertNotIn(WORKTREE_PREFLIGHT_KEY, node)
         self.assertNotEqual(node["user_status"], WORKTREE_ACTION_STATUS)
+        self.assertEqual(node["worktree_base"], self.head_of(self.worktree))
 
     # -- helpers -----------------------------------------------------------
     def branch_of(self, path):

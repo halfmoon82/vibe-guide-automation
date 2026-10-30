@@ -227,12 +227,13 @@ class SupervisorLease:
 
 
 class Supervisor:
-    def __init__(self, paths, monitor, runner, run_id: str, lease=None):
+    def __init__(self, paths, monitor, runner, run_id: str, lease=None, worktree_recorder=None):
         self.paths = paths
         self.monitor = monitor
         self.runner = runner
         self.run_id = run_id
         self.lease = lease or SupervisorLease(paths)
+        self.worktree_recorder = worktree_recorder
         try:
             monitor.lease_guard = lambda: self.lease.ensure_current(self.run_id)
         except AttributeError:
@@ -293,6 +294,8 @@ class Supervisor:
         if hasattr(snapshot, "run_id"):
             self.lease.ensure_current(self.run_id)
             save_snapshot(self.paths, snapshot)
+        if self.worktree_recorder is not None:
+            self.worktree_recorder(snapshot)
         return snapshot
 
     def run_until_terminal(self, *, interval: float = 1.0, max_cycles=None):
@@ -2353,6 +2356,12 @@ def supervisor_mailbox_view(paths, run_id):
         item = {k: action[k] for k in _MAILBOX_KEYS if k in action}
         path = paths.vibe / "provider-actions/requests" / (str(action.get("action_id")) + ".json")
         request = action.get("request")
+        if action.get("operation") == "locate" and isinstance(request, dict):
+            thread_id = request.get("threadId")
+            if isinstance(thread_id, str) and thread_id:
+                # navigate_to_codex_page accepts threadId only; copying hostId
+                # from visibility/wait requests is a native parameter error.
+                item["native_args"] = {"threadId": thread_id}
         if isinstance(request, dict):
             if isinstance(request.get("child_binding"), dict):
                 item["child_binding"] = request["child_binding"]

@@ -993,11 +993,13 @@ def _public_runner(
             paths,
             observed.adapter_id,
             AdapterRegistry().get(observed.adapter_id).manifest["provider"],
+            launchers=launchers,
         )
     return ProviderActionRunner(
         paths,
         observed.adapter_id,
         observed.capabilities.provider,
+        launchers=launchers,
     )
 
 
@@ -1026,6 +1028,7 @@ def _record_worktree_preflight(
     from .adapters.claude_bg import WORKTREE_BLOCKED_EVENT, WORKTREE_CREATED_EVENT
 
     changed = False
+    consumed = []
     for node_id, launcher in launchers or ():
         report = getattr(launcher, "worktree_preflight", None)
         if not isinstance(report, dict) or node_id not in snapshot.nodes:
@@ -1042,6 +1045,12 @@ def _record_worktree_preflight(
                 key: value for key, value in data.items()
                 if key not in ("run_id", "node_id")
             }
+            reason_code = report.get("reason_code")
+            current["reason_class"] = reason_code
+            retry = current.get("retryable_action")
+            if isinstance(retry, dict):
+                retry["reason_class"] = reason_code
+                retry["reason_code"] = reason_code
         elif event == WORKTREE_CREATED_EVENT:
             data = {"run_id": snapshot.run_id, "node_id": node_id}
             for key in _WORKTREE_REPORT_KEYS:
@@ -1058,12 +1067,22 @@ def _record_worktree_preflight(
             # says nothing happened): the action a supervisor was asked to
             # take is done, so the marker must stop claiming it.
             current.pop(WORKTREE_PREFLIGHT_KEY, None)
+            if report.get("worktree_base"):
+                current["worktree_base"] = report["worktree_base"]
+        elif report.get("worktree_base") and current.get("worktree_base") != report["worktree_base"]:
+            # An already-existing worktree has no creation event, but its HEAD
+            # is still the exact scope-landing baseline.
+            current["worktree_base"] = report["worktree_base"]
         else:
             continue
         current["user_status"] = map_user_status(current)
         changed = True
+        consumed.append((launcher, report))
     if changed:
         save_snapshot(paths, snapshot)
+    for launcher, report in consumed:
+        if getattr(launcher, "worktree_preflight", None) is report:
+            launcher.worktree_preflight = None
     return changed
 
 
@@ -3664,6 +3683,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card)),
                 runner,
                 snapshot.run_id,
+                worktree_recorder=lambda current: _record_worktree_preflight(
+                    paths, supervisor.monitor, current, launchers
+                ),
             )
             lease_result = supervisor.recover_or_start()
             if not lease_result.get("active_supervisors"):
@@ -4004,11 +4026,15 @@ def _handle_daemon(args, paths, runner, command_prefix, v2_state=False) -> CLIRe
                                                    "platform": args.supervisor_provider})
         directory, plan, nodes, card = _load_plan(paths, args.plan)
         run_id = _run_id(directory, args.run_id)
+        launchers = []
         if runner is None:
-            runner = _public_runner(paths, card, nodes, [])
+            runner = _public_runner(paths, card, nodes, launchers)
         supervisor = Supervisor(
             paths, Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card)),
-            runner, run_id)
+            runner, run_id,
+            worktree_recorder=lambda current: _record_worktree_preflight(
+                paths, supervisor.monitor, current, launchers
+            ))
 
         def gate():
             # The same pre-resume checks `vibe resume` makes, re-run every tick:
