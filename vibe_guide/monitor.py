@@ -696,6 +696,38 @@ def recovery_action_for_failure(observation: Any) -> str:
     return "reconcile_binding"
 
 
+#: Provider-error wording that moves dispatch to the next model in the
+#: profile's fallback chain (quota exhausted / rate limit / model unavailable).
+_MODEL_FAILURE_QUOTA_MARKERS = (
+    "quota", "额度", "insufficient balance", "credits exhausted",
+    "balance exhausted", "usage limit",
+)
+_MODEL_FAILURE_RATE_MARKERS = ("rate limit", "rate-limit", "too many requests", "429", "限流")
+_MODEL_FAILURE_UNAVAILABLE_MARKERS = (
+    "model unavailable", "unsupported model", "invalid model", "model not found",
+    "no such model", "unknown model", "model disabled", "模型不可用", "不支持的模型",
+)
+
+
+def model_failure_reason_class(text: Any) -> Optional[str]:
+    """Classify provider error text as a model-chain failure class, else ``None``.
+
+    Only quota/rate-limit/model-unavailable conditions justify switching
+    models; anything else (binding, worktree, plain timeouts) keeps the
+    existing recovery and never consumes the chain.
+    """
+    normalized = str(text or "").casefold()
+    if not normalized.strip():
+        return None
+    if any(marker in normalized for marker in _MODEL_FAILURE_QUOTA_MARKERS):
+        return "quota_exhausted"
+    if any(marker in normalized for marker in _MODEL_FAILURE_RATE_MARKERS):
+        return "rate_limit"
+    if any(marker in normalized for marker in _MODEL_FAILURE_UNAVAILABLE_MARKERS):
+        return "model_unavailable"
+    return None
+
+
 #: #256 ③: the ``recovery_action`` values a rescue may treat as the defect's
 #: own residue.  ``_mark_blocked_unknown`` derives the action from the failure
 #: reason's keywords, so a block that is *not* a defect also lands on
@@ -1154,6 +1186,10 @@ class Monitor:
                 "reason_class": str(failure["kind"]),
                 "reason": redact_provider_text(str(error)),
                 "error_type": type(error).__name__,
+                # Computed from the raw error: the redacted ``reason`` no
+                # longer carries the model-failure markers.  Internal routing
+                # only; never displayed.
+                "model_failure_class": model_failure_reason_class(str(error)),
                 **fixed,
                 "intent": payload.get("binding_intent") or (
                     intent.to_dict() if hasattr(intent, "to_dict") else dict(intent)
@@ -1182,6 +1218,7 @@ class Monitor:
                 "phase": "start",
                 "action_ref": action_ref,
                 "advance_generation": False,
+                "model_failure_class": model_failure_reason_class(str(error)),
                 "intent": action_basis,
             }
         # Existing runners expose RunHandle; only V4.4 contracts require
@@ -5218,6 +5255,205 @@ class Monitor:
             tier = model_catalog.max_tier(tier, "standard")
         return tier
 
+    #: Rounds a ``model_unavailable`` node may re-walk its chain before the
+    #: supervisor must act (move the tier or fix the configured map). Bounds
+    #: the retry: every model still gets exactly one attempt per round.
+    _MODEL_UNAVAILABLE_MAX_ROUNDS = 2
+
+    def _profile_model_chain(self, contract: Dict[str, Any], current: Dict[str, Any]) -> List[str]:
+        """The dispatch model plus its configured fallbacks, in dispatch order."""
+        recorded = current.get("model_dispatch_chain")
+        if (
+            isinstance(recorded, list)
+            and recorded
+            and all(isinstance(name, str) and name.strip() for name in recorded)
+        ):
+            return list(recorded)
+        raw = contract.get("worker_profile")
+        if not isinstance(raw, dict):
+            overrides = current.get("contract_overrides")
+            raw = overrides.get("worker_profile") if isinstance(overrides, dict) else None
+        if not isinstance(raw, dict):
+            return []
+        names: List[str] = []
+        primary = raw.get("model")
+        if isinstance(primary, str) and primary.strip():
+            names.append(primary)
+        for item in raw.get("fallbacks") or []:
+            name = item.get("model") if isinstance(item, dict) else item
+            if isinstance(name, str) and name.strip() and name not in names:
+                names.append(name)
+        return names
+
+    def _plan_model_fallback(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        contract: Dict[str, Any],
+        current: Dict[str, Any],
+        role: str,
+        phase: str,
+        continuation: bool,
+        error_text: Any,
+        reason_class: Optional[str] = None,
+    ) -> str:
+        """Advance the dispatch model along the profile chain after a model-class failure.
+
+        Returns ``"switch"`` when the scheduled retry must replay on the next
+        chain model (the ``model_fallback_used`` event is recorded and the
+        node stays retryable, never blocked), ``"exhausted"`` when every chain
+        model burned its single attempt (the caller then fails closed as a
+        retryable ``model_unavailable``), and ``"none"`` when the failure is
+        not a model-chain condition at all.
+
+        ``reason_class`` may carry the classification computed from the raw
+        provider error: durable ``reason`` text is redacted before this point,
+        which would erase the markers.
+        """
+        if reason_class is None:
+            reason_class = model_failure_reason_class(error_text)
+        if reason_class is None:
+            return "none"
+        chain = self._profile_model_chain(contract, current)
+        if not chain:
+            return "none"
+        raw_profile = contract.get("worker_profile")
+        if not isinstance(raw_profile, dict):
+            return "none"
+        failed_model = raw_profile.get("model")
+        if not isinstance(failed_model, str) or not failed_model.strip():
+            return "none"
+        attempts = current.get("model_dispatch_attempts")
+        if not isinstance(attempts, list):
+            attempts = []
+            current["model_dispatch_attempts"] = attempts
+        if not current.get("model_dispatch_chain_profile"):
+            # Keep the original profile so an exhausted round can rewind the
+            # chain to its head instead of retrying only the last model.
+            current["model_dispatch_chain_profile"] = dict(raw_profile)
+        if any(isinstance(item, dict) and item.get("model") == failed_model for item in attempts):
+            # Each model gets exactly one attempt per round.
+            return "none"
+        attempts.append({
+            "model": failed_model,
+            "reason_class": reason_class,
+            "reason": redact_provider_text(str(error_text))[:400],
+        })
+        current["model_dispatch_chain"] = chain
+        tried = {item.get("model") for item in attempts if isinstance(item, dict)}
+        for name in chain:
+            if name not in tried:
+                self._switch_model_fallback(
+                    snapshot, node_id, contract, current, role,
+                    failed_model, name, reason_class,
+                )
+                return "switch"
+        self._mark_model_unavailable(snapshot, node_id, current, role, phase, continuation)
+        return "exhausted"
+
+    def _switch_model_fallback(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        contract: Dict[str, Any],
+        current: Dict[str, Any],
+        role: str,
+        from_model: str,
+        to_model: str,
+        reason_class: str,
+    ) -> None:
+        """Point the dispatch copy (and its durable override) at the next chain model."""
+        raw_profile = contract.get("worker_profile")
+        profile = dict(raw_profile) if isinstance(raw_profile, dict) else {}
+        remaining = []
+        for item in profile.get("fallbacks") or []:
+            name = item.get("model") if isinstance(item, dict) else item
+            if name != to_model:
+                remaining.append(item)
+        profile["model"] = to_model
+        profile["fallbacks"] = remaining
+        contract["worker_profile"] = profile
+        current.setdefault("contract_overrides", {})["worker_profile"] = dict(profile)
+        self._record(
+            snapshot,
+            "model_fallback_used",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": role,
+                "proof": {
+                    "from_model": from_model,
+                    "to_model": to_model,
+                    "reason_class": reason_class,
+                },
+            },
+        )
+
+    def _mark_model_unavailable(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        current: Dict[str, Any],
+        role: str,
+        phase: str,
+        continuation: bool,
+    ) -> None:
+        """Every chain model failed: fail closed, retryable, never success/blocked_unknown.
+
+        The node lands on the existing retryable state machine
+        (``_v42_retry_status`` -- ``retry_pending`` on V4.2) with an explicit
+        ``model_unavailable`` marker carrying each model's own failure, and a
+        ``retryable_action`` whose ``reason_class`` is ``model_unavailable``.
+        A bounded number of full-chain re-walks stays schedulable so a
+        transient platform outage can recover on its own; past that ceiling
+        the retry marker is dropped and the node waits for the supervisor (a
+        tier move or a fixed ``model_map``) instead of looping forever.  The
+        durable status vocabulary is unchanged: ``state.py`` knows no new
+        node status.
+        """
+        attempts = [
+            item for item in (current.get("model_dispatch_attempts") or [])
+            if isinstance(item, dict)
+        ]
+        detail = "; ".join(
+            "%s: %s (%s)" % (item.get("model"), item.get("reason_class"), item.get("reason"))
+            for item in attempts
+        )
+        rounds = 0
+        try:
+            rounds = int(current.get("model_unavailable_rounds", 0) or 0)
+        except (TypeError, ValueError):
+            rounds = 0
+        rounds += 1
+        current["model_unavailable_rounds"] = rounds
+        current["model_unavailable"] = {"rounds": rounds, "attempts": list(attempts)}
+        current["status"] = self._v42_retry_status()
+        current["reason"] = "model chain exhausted: %s" % (detail or "no attempt recorded")
+        current["active_task"] = None
+        current["active_role"] = None
+        current["start_intent"] = None
+        if rounds >= self._MODEL_UNAVAILABLE_MAX_ROUNDS:
+            current["retryable_action"] = None
+            return
+        saved = current.get("model_dispatch_chain_profile")
+        if isinstance(saved, dict):
+            # Rewind to the chain head so the retry re-walks every model.
+            current.setdefault("contract_overrides", {})["worker_profile"] = dict(saved)
+        current["model_dispatch_attempts"] = []
+        current["retryable_action"] = {
+            "role": role,
+            "phase": phase,
+            "continuation": continuation,
+            "successor": False,
+            "same_task": True,
+            "same_task_required": True,
+            "attempt": rounds,
+            "reason_class": "model_unavailable",
+            "next_retry_at": time.time(),
+            "binding_digest": current.get("contract_digest", ""),
+            "last_observation_ref": "model-chain-exhausted",
+        }
+
     def _apply_model_tier(
         self, snapshot: RunSnapshot, node: DAGNode, contract: Dict[str, Any],
         current: Dict[str, Any], role: str,
@@ -5282,6 +5518,7 @@ class Monitor:
         try:
             profile = WorkerProfile(**dict(
                 raw, model=choice.model, reasoning=choice.reasoning,
+                fallbacks=[{"model": name} for name in choice.fallbacks],
                 selection_basis=basis, route_digest="",
             ))
         except (TypeError, ValueError):
@@ -5851,6 +6088,14 @@ class Monitor:
             if failure["kind"] == "external_decision":
                 current["retryable_action"] = None
             elif failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
+                fallback_plan = self._plan_model_fallback(
+                    snapshot, node_id, contract, current, role, phase, continuation, error
+                )
+                if fallback_plan == "exhausted":
+                    current["active_task"] = None
+                    current["active_role"] = None
+                    self._save_snapshot(snapshot)
+                    return False
                 current["retryable_action"] = {
                     "role": role,
                     "phase": phase,
@@ -5866,7 +6111,9 @@ class Monitor:
                 }
                 current["status"] = self._v42_retry_status()
                 current["reason"] = redact_provider_text(str(error))
-                if "reasoning" in str(error).casefold() or "model" in str(error).casefold():
+                if fallback_plan != "switch" and (
+                    "reasoning" in str(error).casefold() or "model" in str(error).casefold()
+                ):
                     options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
                     options["omit_thinking"] = True
                     current.setdefault("contract_overrides", {})["provider_options"] = options
@@ -6009,6 +6256,16 @@ class Monitor:
                     else classify_provider_failure({"kind": handle.get("kind"), "reason": reason})
                 )
                 if failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
+                    fallback_plan = self._plan_model_fallback(
+                        snapshot, node_id, contract, current, role, phase, continuation, reason,
+                        reason_class=handle.get("model_failure_class"),
+                    )
+                    if fallback_plan == "exhausted":
+                        current["active_task"] = None
+                        current["active_role"] = None
+                        current["start_intent"] = None
+                        self._save_snapshot(snapshot)
+                        return False
                     previous_retry = current.get("retryable_action")
                     previous_attempt = int(previous_retry.get("attempt", 0)) if isinstance(previous_retry, dict) else 0
                     retry = {
@@ -6024,7 +6281,9 @@ class Monitor:
                     current["reason"] = redact_provider_text(str(reason))
                     current["binding_phase"] = "retry_pending"
                     current["retryable_action"] = retry
-                    if "reasoning" in str(reason).casefold() or "model" in str(reason).casefold():
+                    if fallback_plan != "switch" and (
+                        "reasoning" in str(reason).casefold() or "model" in str(reason).casefold()
+                    ):
                         options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
                         options["omit_thinking"] = True
                         current.setdefault("contract_overrides", {})["provider_options"] = options
@@ -6063,6 +6322,14 @@ class Monitor:
                 if not isinstance(provider_run_id, str) or not provider_run_id:
                     current["status"] = "blocked_unknown"; current["reason"] = "provider proof has no task handle"; self._save_snapshot(snapshot); return False
                 handle = RunHandle(provider_run_id)
+            # A confirmed start retires per-round model fallback bookkeeping;
+            # a later dispatch failure rebuilds it from the live profile.
+            for bookkeeping_key in (
+                "model_dispatch_attempts", "model_dispatch_chain",
+                "model_dispatch_chain_profile", "model_unavailable_rounds",
+                "model_unavailable",
+            ):
+                current.pop(bookkeeping_key, None)
         except ProviderPending as error:
             # A bridge setup token (clientThreadId) is not a formal task. Keep
             # the writer lease and durable retry metadata, but clear the
@@ -6098,6 +6365,15 @@ class Monitor:
             # the next native create request.
             failure = classify_provider_failure(error)
             if failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
+                fallback_plan = self._plan_model_fallback(
+                    snapshot, node_id, contract, current, role, phase, continuation, error
+                )
+                if fallback_plan == "exhausted":
+                    current["active_task"] = None
+                    current["active_role"] = None
+                    current["start_intent"] = None
+                    self._save_snapshot(snapshot)
+                    return False
                 previous = current.get("retryable_action")
                 attempt = int(previous.get("attempt", 0) or 0) + 1 if isinstance(previous, dict) else 1
                 retry = {
@@ -6120,7 +6396,9 @@ class Monitor:
                 current["start_intent"] = None
                 current["quarantine"] = None
                 current["reason"] = redact_provider_text(str(error))
-                if "reasoning" in str(error).casefold() or "model" in str(error).casefold():
+                if fallback_plan != "switch" and (
+                    "reasoning" in str(error).casefold() or "model" in str(error).casefold()
+                ):
                     options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
                     options["omit_thinking"] = True
                     current.setdefault("contract_overrides", {})["provider_options"] = options

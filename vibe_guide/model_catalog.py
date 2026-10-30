@@ -15,7 +15,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 TIERS = ("light", "standard", "deep")
 HIGH_RISK_TAGS = frozenset({"migration", "security", "cross_module"})
@@ -35,6 +35,14 @@ class TierError(ValueError):
     """A tier or tier adjustment that is not allowed."""
 
 
+class ModelMapConfigError(ValueError):
+    """A user ``model_map`` entry that must be rejected as a whole.
+
+    The message always names the offending key path (``model_map.codex.normal``)
+    so the user can fix the configuration that was published.
+    """
+
+
 @dataclass(frozen=True)
 class ModelChoice:
     platform: str
@@ -44,6 +52,8 @@ class ModelChoice:
     status: str  # "ok" | "unknown"
     source: str
     note: str = ""
+    fallbacks: Tuple[str, ...] = ()
+    origin: str = "positional"  # "config" (model_map) | "positional" (probe/alias)
 
     @property
     def reasoning(self) -> str:
@@ -58,6 +68,8 @@ class ModelChoice:
             "status": self.status,
             "source": self.source,
             "note": self.note,
+            "fallbacks": list(self.fallbacks),
+            "origin": self.origin,
         }
 
 
@@ -234,6 +246,84 @@ def _pick_effort(model: Mapping[str, Any], tier: str) -> Optional[str]:
     return default if isinstance(default, str) and default else None
 
 
+#: Platforms a ``model_map`` may name (normalized through ``_platform_key``).
+_MODEL_MAP_PLATFORMS = frozenset({"codex", "claude-code"})
+
+
+def load_model_map(vibe_home: Optional[Path]) -> Optional[Dict[str, Dict[str, List[str]]]]:
+    """The validated ``model_map`` from ``$VIBE_HOME/config.json``.
+
+    Shape: ``{platform: {tier: [primary, fallback, ...]}}`` -- the first list
+    entry is the primary model, the rest its ordered fallback chain.  ``None``
+    means unconfigured (no file or no ``model_map`` key), in which case
+    :func:`resolve` keeps its positional behavior.  Any malformed entry --
+    unknown platform, unknown tier, empty list, non-string member -- rejects
+    the *whole* map and names the offending key path; a partially valid map
+    never takes effect.
+    """
+    if vibe_home is None:
+        return None
+    path = Path(vibe_home) / "config.json"
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ModelMapConfigError(
+            "model_map: cannot read %s (%s)" % (path, type(error).__name__)
+        ) from error
+    try:
+        data = json.loads(raw_text)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ModelMapConfigError(
+            "model_map: %s is not valid JSON (%s)" % (path, type(error).__name__)
+        ) from error
+    if not isinstance(data, dict):
+        raise ModelMapConfigError("model_map: %s must contain a JSON object" % path)
+    raw_map = data.get("model_map")
+    if raw_map is None:
+        return None
+    if not isinstance(raw_map, dict):
+        raise ModelMapConfigError("model_map must be an object mapping a platform to tiers")
+    normalized: Dict[str, Dict[str, List[str]]] = {}
+    for raw_platform, raw_tiers in raw_map.items():
+        platform_path = "model_map.%s" % raw_platform
+        key = _platform_key(raw_platform) if isinstance(raw_platform, str) else ""
+        if key not in _MODEL_MAP_PLATFORMS:
+            raise ModelMapConfigError(
+                "%s: unknown platform %r (expected one of %s)"
+                % (platform_path, raw_platform, ", ".join(sorted(_MODEL_MAP_PLATFORMS)))
+            )
+        if key in normalized:
+            raise ModelMapConfigError("%s duplicates platform %r" % (platform_path, key))
+        if not isinstance(raw_tiers, dict):
+            raise ModelMapConfigError(
+                "%s must be an object mapping a tier to a model list" % platform_path
+            )
+        tier_map: Dict[str, List[str]] = {}
+        for raw_tier, raw_models in raw_tiers.items():
+            tier_path = "%s.%s" % (platform_path, raw_tier)
+            if raw_tier not in TIERS:
+                raise ModelMapConfigError(
+                    "%s: unknown tier %r (expected one of %s)"
+                    % (tier_path, raw_tier, ", ".join(TIERS))
+                )
+            if not isinstance(raw_models, list) or not raw_models:
+                raise ModelMapConfigError(
+                    "%s must be a non-empty list of model names" % tier_path
+                )
+            models: List[str] = []
+            for item in raw_models:
+                if not isinstance(item, str) or not item.strip():
+                    raise ModelMapConfigError(
+                        "%s must contain only non-empty strings" % tier_path
+                    )
+                models.append(item)
+            tier_map[raw_tier] = models
+        normalized[key] = tier_map
+    return normalized
+
+
 def resolve(
     platform: str,
     tier: str,
@@ -246,6 +336,16 @@ def resolve(
     _check_tier(tier)
     key = _platform_key(platform)
     effort = _EFFORT[tier]
+    home = Path(vibe_home) if vibe_home is not None else None
+    model_map = load_model_map(home)
+    if model_map is not None:
+        tier_map = model_map.get(key)
+        if tier_map is not None and tier in tier_map:
+            entries = tier_map[tier]
+            return ModelChoice(
+                key, tier, entries[0], effort, "ok", "config", "",
+                fallbacks=tuple(entries[1:]), origin="config",
+            )
     if key == "claude-code":
         # Aliases follow the newest model of each family; nothing to probe.
         return ModelChoice(key, tier, _CLAUDE_ALIASES[tier], effort, "ok", "alias")
@@ -253,7 +353,6 @@ def resolve(
     if probe is None:
         return ModelChoice(key, tier, "default", None, "unknown", "none", "no model probe for this platform")
     stamp = time.time() if now is None else now
-    home = Path(vibe_home) if vibe_home is not None else None
     models = _read_cache(home, key, stamp)
     source = "cache"
     if models is None:
