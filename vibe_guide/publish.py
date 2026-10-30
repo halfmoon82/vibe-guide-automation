@@ -45,6 +45,16 @@ def _cli():
     return cli
 
 
+def _card_flag(source, key, default):
+    """A card on/off choice from the product spec; ``null`` or absent means the default."""
+    value = source.get(key)
+    if value is None:
+        return default
+    if type(value) is not bool:
+        raise ValueError("%s must be true or false" % key)
+    return value
+
+
 def _default_heartbeat_minutes(options) -> int:
     """The longest tier this platform may use without a forced-cost choice."""
     usable = [
@@ -232,6 +242,8 @@ def publish_plan(
         ),
         heartbeat_interval_options=_heartbeat_options,
         rotate_hard_cap_options=_rotate_options,
+        daemon=_card_flag(source, "daemon", True),
+        launchd_keepalive=_card_flag(source, "launchd_keepalive", False),
     )
 
     plans_root = destination.parent

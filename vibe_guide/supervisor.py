@@ -104,19 +104,21 @@ class SupervisorLease:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def _record(self, run_id: str, epoch: int, owner, released=False, started_at=None) -> Dict[str, Any]:
+    def _record(self, run_id: str, epoch: int, owner, released=False, started_at=None,
+                holder_pid=None) -> Dict[str, Any]:
         now = time.time()
         return {
-            "pid": self.pid, "run_id": run_id,
+            "pid": holder_pid or self.pid, "run_id": run_id,
             "started_at": started_at or now, "heartbeat": now,
             "lease_epoch": epoch, "owner": owner, "released": released,
         }
 
-    def cas_locked(self, run_id: str, expected_epoch: int, owner=None) -> int:
+    def cas_locked(self, run_id: str, expected_epoch: int, owner=None, holder_pid=None) -> int:
         """Upgrade the epoch by one if it still equals ``expected_epoch``.
 
         The caller must hold ``self.lock(run_id)``.  This is the only place
-        the epoch changes.
+        the epoch changes.  ``holder_pid`` keeps a live daemon recorded as the
+        process holding the lease while the owning session changes.
         """
         found = _record_epoch(_read_lease_record(self.path(run_id)))
         if found != expected_epoch:
@@ -125,7 +127,7 @@ class SupervisorLease:
                 % (expected_epoch, found)
             )
         new_epoch = expected_epoch + 1
-        self._write(run_id, self._record(run_id, new_epoch, owner))
+        self._write(run_id, self._record(run_id, new_epoch, owner, holder_pid=holder_pid))
         self._run_id = run_id
         self.lease_epoch = new_epoch
         return new_epoch
@@ -171,6 +173,28 @@ class SupervisorLease:
                 "supervisor lease epoch is stale: holding %s, current %s"
                 % (self.lease_epoch, found)
             )
+
+    def readopt(self, run_id: str) -> int:
+        """Adopt a newer epoch the lease file still records under this process.
+
+        A supervisor registration bumps the epoch while the daemon stays the
+        holding process.  Any other holder, a released lease or a lower epoch
+        stays a conflict.
+        """
+        with self.lock(run_id):
+            current = _read_lease_record(self.path(run_id))
+            if (
+                self.lease_epoch is None or self._run_id != run_id
+                or current is None or current.get("released")
+                or current.get("pid") != self.pid or current.get("run_id") != run_id
+                or _record_epoch(current) <= self.lease_epoch
+            ):
+                raise SupervisorLeaseConflict(
+                    "supervisor lease epoch %s cannot be re-adopted by pid %s"
+                    % (_record_epoch(current), self.pid)
+                )
+            self.lease_epoch = _record_epoch(current)
+            return self.lease_epoch
 
     def heartbeat(self, run_id: str) -> None:
         with self.lock(run_id):
@@ -1389,6 +1413,33 @@ def project_root_worktree_warning(paths):
     )
 
 
+def _live_daemon_holder(paths, run_id, lease_record):
+    """Pid of this run's running daemon when it is the process holding the lease."""
+    if not lease_record or lease_record.get("released"):
+        return None
+    pid = lease_record.get("pid")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        daemon = json.loads((run_dir(paths, run_id) / "daemon.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(daemon, dict) or daemon.get("state") != "running" or daemon.get("pid") != pid:
+        return None
+    beat, stale = daemon.get("heartbeat"), daemon.get("stale_seconds")
+    if not isinstance(beat, (int, float)) or time.time() - beat > float(stale or 120.0):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+    except OSError:
+        return None
+    return pid
+
+
 def register_supervisor_address(paths, run_id, address, *, session_record=None, expected_epoch=None):
     """Atomically record the current supervisor address; keeps history.
 
@@ -1478,6 +1529,7 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
                 epoch = lease.cas_locked(
                     run_id, expected_epoch,
                     {"provider": provider, "session_id": session_id, "host": host},
+                    holder_pid=_live_daemon_holder(paths, run_id, lease_record),
                 )
             except SupervisorLeaseConflict as error:
                 reject(str(error))
@@ -2899,16 +2951,32 @@ def _card_block(paths, run_id):
     return reference + "\n" + text, ref, True
 
 
+def _daemon_advances(paths, run_id) -> bool:
+    """True only while this run's daemon is running and holds the lease."""
+    from .daemon import daemon_status
+    try:
+        status = daemon_status(paths, run_id)
+        return status["status"] == "running" and status["lease"]["state"] == "held"
+    except (OSError, ValueError, TypeError, KeyError):
+        return False
+
+
 def render_beat_text(paths, run_id, payload, *, plan_id, command_prefix="vibe",
                      interval_minutes=None):
     """Text for one beat; sets ``end_turn`` and the card reference on ``payload``.
 
     A card that cannot be read or does not match its published digest turns a
     ``work`` beat into ``unknown`` with the reason instead of dropping the card.
+    While the run's daemon is running and holds the lease it advances the run,
+    so the beat does not offer a manual ``resume``.
     """
     state = payload.get("state")
     tail = "；下一拍间隔 {} 分钟".format(interval_minutes) if interval_minutes else ""
     resume = "{} resume --plan {} --run-id {}".format(command_prefix, plan_id, run_id)
+    if state in ("work", "unknown") and _daemon_advances(paths, run_id):
+        payload["advance_by"] = "daemon"
+        resume = None
+    advance = "推进由守护程序完成，不要手工 resume" if resume is None else "推进用 " + resume
     payload["end_turn"] = state in ("idle", "stop")
     if state == "idle":
         return IDLE_BEAT_TEXT
@@ -2935,14 +3003,92 @@ def render_beat_text(paths, run_id, payload, *, plan_id, command_prefix="vibe",
         except (OSError, ValueError) as error:
             payload["state"] = "unknown"
             payload["reason"] = "supervisor card unavailable: {}".format(str(error)[:160])
-            return "unknown：监工卡不可用（{}）；推进用 {}".format(payload["reason"], resume) + tail
+            return "unknown：监工卡不可用（{}）；{}".format(payload["reason"], advance) + tail
         payload["supervisor_card"] = {**ref, "full_text": first}
         context = ""
         if payload.get("context_pressure"):
             context = "\n" + payload["context_pressure"]["hint"]
-        return "work：服务信箱一轮，推进用 {}{}\n{}".format(resume, tail, block) + context
-    return "unknown：按 work 处理，推进用 {}；原因：{}".format(
-        resume, payload.get("reason", "状态未知")) + tail
+        return "work：服务信箱一轮，{}{}\n{}".format(advance, tail, block) + context
+    return "unknown：按 work 处理，{}；原因：{}".format(
+        advance, payload.get("reason", "状态未知")) + tail
+
+
+def dead_daemon_report(paths, run_id):
+    """One line when this run's daemon is inactive or not running, else ``None``.
+
+    Report only.  The beat never starts a daemon and never tells the session to:
+    a restart belongs to launchd (card-daemon-launchd) or the product manager.
+    """
+    from .daemon import daemon_status
+
+    try:
+        status = daemon_status(paths, run_id)
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        return {"status": "unknown", "reason": "daemon status unreadable: " + type(error).__name__,
+                "text": "守护程序失活（状态未知：读取失败，{}）；只上报，不重启，重启由 launchd 或产品经理手工处理"
+                        .format(type(error).__name__)}
+    if status.get("status") == "running":
+        return None
+    reason = status.get("reason") or status.get("status")
+    return {"status": status.get("status"), "reason": reason,
+            "text": "守护程序失活（{}，原因：{}）；只上报，不重启，重启由 launchd 或产品经理手工处理"
+                    .format(status.get("status"), reason)}
+
+
+def _pm_inbox_beat(paths, run_id):
+    """``(needs_pm, info, unknown_reason)`` from one real read of the inbox.
+
+    The cursor moves only when it was written; if it was not, nothing is
+    returned as delivered and the messages are still unread next beat.
+    """
+    from . import pm_inbox
+
+    result = pm_inbox.read_unread(paths, run_id)
+    if result["cursor_status"] == "unknown":
+        return [], [], result.get("reason") or "cursor unknown"
+    messages = pm_inbox.delivered(result)
+    return ([m for m in messages if pm_inbox.needs_pm(m)],
+            [m for m in messages if not pm_inbox.needs_pm(m)], None)
+
+
+def _pm_inbox_waiting(paths, run_id):
+    from . import pm_inbox
+
+    try:
+        return any(pm_inbox.needs_pm(m) for m in pm_inbox.read_unread(paths, run_id, peek=True)["messages"])
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _beat_extras(paths, run_id, payload, text):
+    """Add the unread inbox messages and the dead-daemon line to a beat's text."""
+    lines = []
+    try:
+        needs, info, unknown = _pm_inbox_beat(paths, run_id)
+    except (OSError, ValueError, TypeError) as error:
+        needs, info, unknown = [], [], "pm-inbox read failed: " + type(error).__name__
+    if unknown:
+        payload["pm_inbox"] = {"status": "unknown", "reason": unknown}
+        lines.append("产品经理收件箱状态未知（{}）：消息保持未读，下一拍重读".format(unknown))
+    if needs or info:
+        payload["pm_inbox"] = {"status": "delivered", "messages": needs, "informational": info}
+    if needs:
+        lines.insert(0, "产品经理待处理消息（只送达这一次）：\n" + "\n".join(
+            "- [{}] {}".format(m.get("kind"), m.get("message")) for m in needs))
+        if payload.get("state") not in {"rotate", "contract_drift", "unknown"}:
+            if payload.get("state") in {"idle", "stop"}:
+                text = ""  # the "end this turn" text no longer applies
+            payload["state"] = "decision"
+            payload["end_turn"] = False
+    for message in info:
+        lines.append("信息：{}".format(message.get("message")))
+    report = dead_daemon_report(paths, run_id)
+    if report:
+        payload["daemon_inactive"] = {"status": report["status"], "reason": report["reason"]}
+        lines.append(report["text"])
+    if not lines:
+        return text
+    return "\n".join(([text] if text else []) + lines)
 
 
 def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
@@ -2955,6 +3101,9 @@ def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
     fingerprint.  ``ok`` is False when the beat's state is unknown.
     """
     stop, fingerprint = beat_repeat_check(paths, run_id, now=now)
+    # A repeat never hides an unread product-manager message.
+    if stop and _pm_inbox_waiting(paths, run_id):
+        stop = None
     if stop:
         text = render_beat_text(paths, run_id, stop, plan_id="")
         return {**stop, "heartbeat_command": heartbeat_command(run_id, command_prefix=command_prefix)}, text, True
@@ -2984,6 +3133,8 @@ def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
     stall_text = render_stall_beat_text(report, run_id, command_prefix)
     if stall_text:
         text = text + "\n" + stall_text if state in {"rotate", "contract_drift"} else stall_text + "\n" + text
+    text = _beat_extras(paths, run_id, payload, text)
+    state = payload.get("state")
     ok = state in {"idle", "work", "decision", "rotate", "stop"} and payload.get("handoff_status") != "unknown"
     beat_repeat_commit(paths, run_id, fingerprint, payload, now=now)
     payload = {"heartbeat_command": heartbeat_command(run_id, command_prefix=command_prefix), **payload}

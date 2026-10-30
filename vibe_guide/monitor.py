@@ -57,6 +57,7 @@ from .planner import (
     resolve_scope_expansion,
 )
 from . import dag as _dag_module
+from . import worker_liveness
 from .dag import (
     _write_scope_paths,
     audit_dag,
@@ -163,6 +164,8 @@ LIFECYCLE_DECISION_RECOVERY_ACTION = "raise_missing_decision"
 # Decision-less blocked_design producers record a fixed enum cause; the monitor
 # registers a vibe-authored (never provider-derived) decision for it.
 _BLOCKED_DESIGN_MAX_ATTEMPTS = 20
+#: Findings from one reviewer identity before the node parks for a replacement.
+REVIEW_LOOP_LIMIT = 3
 _BLOCKED_DESIGN_DECISIONS = {
     "integration_scope_review": {
         "question": "整合审查要求把文件扩进已验收节点的范围，自动规则无法判定，需要产品经理复核是否允许扩范围",
@@ -247,6 +250,15 @@ REVERSE_BLOCK_REASON = (
 #: escalated to a visible ``blocked_unknown`` with a human recovery action
 #: instead of looping.
 ACCEPTANCE_FORMAT_REJECTION_LIMIT = 3
+
+#: Fixed text sent to the reviewer session whose delivery was rejected for its
+#: format (D2).  It is a program constant: nothing the reviewer wrote is ever
+#: echoed into it, the audit event or the supervisor-visible node field.
+ACCEPTANCE_REJECTION_NOTICE = (
+    "Your acceptance report was rejected for format. Re-report in this session: "
+    "evidence must be an object with exactly the keys findings, "
+    "iteration_compatibility, test_runtime_delivery, out_of_scope."
+)
 
 #: The node ``recovery_action`` stamped by the escalation above.  It names the
 #: human recovery entries, both of which exist in the CLI: reshape the
@@ -1132,11 +1144,17 @@ class Monitor:
                     "advance_generation": False,
                     "intent": action_basis,
                 }
+            named = getattr(error, "observation", None)
+            fixed = (
+                {"reason_code": named["reason_code"], "worktree": named.get("worktree")}
+                if isinstance(named, dict) and isinstance(named.get("reason_code"), str) else {}
+            )
             return {
                 "kind": str(failure["kind"]),
                 "reason_class": str(failure["kind"]),
                 "reason": redact_provider_text(str(error)),
                 "error_type": type(error).__name__,
+                **fixed,
                 "intent": payload.get("binding_intent") or (
                     intent.to_dict() if hasattr(intent, "to_dict") else dict(intent)
                 ),
@@ -2664,7 +2682,8 @@ class Monitor:
         return snapshot
 
     def archive_run(
-        self, run_id: str, *, force: bool = False, snapshot: Any = None
+        self, run_id: str, *, force: bool = False, snapshot: Any = None,
+        sessions_verified: bool = False,
     ) -> Dict[str, Any]:
         """Archive a finished run's evidence out of ``.vibe/runs/`` (issue #274).
 
@@ -2673,9 +2692,14 @@ class Monitor:
         shape).  Without ``force`` only runs whose persisted state reached a
         terminal status (``complete``/``failed``/``blocked_unknown``/
         ``blocked_design``/``stopped``) archive; live or stateless runs need
-        the explicit ``force`` flag from a human reconciliation package.  The
-        operation is idempotent and resumable; already-archived runs return
-        the existing manifest.
+        the explicit ``force`` flag from a human reconciliation package.  A
+        terminal run that did not finish cleanly may hold a quarantined writer
+        lease that keeps a possibly live session from being dispatched twice;
+        archiving moves that lease away, so every status but ``complete``
+        first proves its sessions are retired (``RunArchiveDeferred`` when one
+        is live or cannot be read) unless the caller already did
+        (``sessions_verified``).  The operation is idempotent and resumable;
+        already-archived runs return the existing manifest.
         """
         validate_run_id(run_id)
         from .state import _safe_project_path, runs_archive_dir
@@ -2710,6 +2734,9 @@ class Monitor:
                 "live or unverifiable run requires an explicit force"
                 .format(run_id, status if status is not None else "missing")
             )
+
+        if status != "complete" and not force and not sessions_verified and primary.is_dir():
+            self._require_sessions_retired(run_id, snapshot)
 
         events_path = primary / "events.jsonl"
         already_recorded = False
@@ -2754,6 +2781,23 @@ class Monitor:
                 provenance=provenance or None,
             )
         return manifest
+
+    def _require_sessions_retired(self, run_id: str, snapshot: Any = None) -> None:
+        from .live_sessions import RunArchiveDeferred, probe_live_sessions
+
+        if snapshot is None:
+            try:
+                snapshot = load_snapshot(self.paths, run_id)
+            except (OSError, ValueError, TypeError):
+                snapshot = None
+        probe = probe_live_sessions(self.paths, snapshot)
+        if probe["unknown"]:
+            raise RunArchiveDeferred(
+                "run {} was not archived: {}".format(run_id, probe["unknown"]))
+        if probe["live"]:
+            raise RunArchiveDeferred(
+                "run {} was not archived: session(s) still alive: {}; stop them first"
+                .format(run_id, ", ".join(probe["live"])))
 
     def _record_archive_failed(self, run_id: str, error: BaseException) -> None:
         """Append a ``run_archive_failed`` event with the failure reason class.
@@ -5186,6 +5230,24 @@ class Monitor:
         node contract, so it cannot affect the authorization digest.
         """
         raw = contract.get("worker_profile")
+        if not isinstance(raw, dict) and is_integration_review_node(node):
+            # The integration reviewer may reach dispatch with no profile dict;
+            # the v2 fallback would then pin the "default" model and skip the
+            # tier entirely.  Seed the same placeholder so it resolves as deep.
+            worker = str(contract.get("worker") or node.contract.get("worker") or "worker")
+            raw = {
+                "worker": worker, "model": "default", "reasoning": "normal",
+                "fallbacks": [],
+                "selection_basis": {
+                    "issue_complexity_ref": node.id, "complexity_band": "standard",
+                    "risk_tags": ["integration", "read-only"],
+                    "availability_evidence": "runtime",
+                },
+                "writer": worker,
+                "worktree": str(contract.get("worktree") or current.get("worktree") or "."),
+                "branch": str(contract.get("branch") or current.get("branch") or "branch-" + node.id),
+                "allowlist": list(contract.get("files") or [node.id + ".py"]),
+            }
         if not isinstance(raw, dict) or raw.get("model") not in (None, "", "default"):
             return
         if contract.get("routing_required") is True:
@@ -5971,6 +6033,9 @@ class Monitor:
                 else:
                     current["status"] = "blocked_unknown"
                     current["reason"] = reason
+                    if isinstance(handle.get("reason_code"), str):
+                        current["reason_code"] = handle["reason_code"]
+                        current["reason_class"] = str(failure["kind"])
                     current["binding_phase"] = handle.get("kind")
                     current["retryable_action"] = {
                         "role": role, "phase": phase,
@@ -5981,7 +6046,13 @@ class Monitor:
                         "binding_digest": current.get("contract_digest", ""),
                         "last_observation_ref": "provider-pending",
                     }
-                    self._record(snapshot, handle.get("kind", "binding_unknown"), {"run_id": snapshot.run_id, "node_id": node_id, "intent_digest": intent.get("intent_digest"), "proof": handle.get("proof")})
+                    unknown_event = {"run_id": snapshot.run_id, "node_id": node_id, "intent_digest": intent.get("intent_digest"), "proof": handle.get("proof")}
+                    if isinstance(handle.get("reason_code"), str):
+                        unknown_event["reason_code"] = handle["reason_code"]
+                        unknown_event["reason_class"] = str(failure["kind"])
+                        if isinstance(handle.get("worktree"), str):
+                            unknown_event["worktree"] = handle["worktree"]
+                    self._record(snapshot, handle.get("kind", "binding_unknown"), unknown_event)
                 current["active_task"] = None
                 current["active_role"] = None
                 current["start_intent"] = None
@@ -6545,6 +6616,40 @@ class Monitor:
         if extra_event_data:
             event_data.update(extra_event_data)
         self._record(snapshot, "acceptance_rejected", event_data, active)
+        self._notify_rejected_reviewer(snapshot, node_id, active, runner, handle_id)
+
+    def _notify_rejected_reviewer(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        active: Optional[Dict[str, Any]],
+        runner: Optional[Runner],
+        handle_id: Optional[str],
+    ) -> None:
+        """Tell the same reviewer session its report was rejected (D2).
+
+        Fixed text only, reviewer sessions only, best effort: a runner without
+        ``send_notice`` or a failing send leaves the rejection itself intact.
+        The supervisor sees the outcome through ``acceptance_correction_notified``
+        and the node's ``acceptance_correction_notice`` flag.
+        """
+        if not (isinstance(active, dict) and active.get("role") == "reviewer"):
+            return
+        sender = getattr(runner, "send_notice", None)
+        if not callable(sender) or not handle_id:
+            return
+        delivered = True
+        try:
+            sender(RunHandle(handle_id), ACCEPTANCE_REJECTION_NOTICE)
+        except Exception:  # noqa: BLE001 - the notice is advisory
+            delivered = False
+        snapshot.nodes[node_id]["acceptance_correction_notice"] = {"delivered": delivered}
+        self._record(
+            snapshot,
+            "acceptance_correction_notified",
+            {"run_id": snapshot.run_id, "node_id": node_id, "delivered": delivered},
+            active,
+        )
 
     def _note_acceptance_format_rejection(
         self,
@@ -7115,6 +7220,17 @@ class Monitor:
                 # The integration node is read-only: findings never create a
                 # business writer. Preserve the reviewer lineage and queue the
                 # same visible reviewer task for re-review.
+                current.setdefault("integration_findings", []).append(redact_provider_text(event.data))
+                try:
+                    review_round = int(current.get("review_loop_rounds", 0)) + 1
+                except (TypeError, ValueError):
+                    review_round = 1
+                current["review_loop_rounds"] = review_round
+                if review_round >= REVIEW_LOOP_LIMIT:
+                    self._park_review_loop(
+                        snapshot, node_id, current, active, role, handle_id, runner, review_round
+                    )
+                    return
                 current["status"] = "rework"
                 current["active_role"] = None
                 current["active_task"] = None
@@ -7123,7 +7239,6 @@ class Monitor:
                     "role": "reviewer", "phase": "review", "continuation": True,
                     "pending_schedule": True, "successor": False,
                 }
-                current.setdefault("integration_findings", []).append(redact_provider_text(event.data))
                 self._release_node_lease(snapshot, node_id)
                 return
             disposition = self._review_finding_disposition(event.data)
@@ -7177,54 +7292,9 @@ class Monitor:
                             model_catalog.adjust_tier(before, 1, "review rejected twice"),
                             "review rejected twice", "monitor",
                         )
-                if review_round >= 3:
-                    # Three unconverged rework rounds: the fix is a different
-                    # reviewer (or a split node), never another automatic
-                    # rework round and never a PM question (#153).  Park the
-                    # node with the documented action; executing it
-                    # (``vibe repair``) dispatches a successor reviewer.
-                    if not self._stop_active_for_transition(
-                        snapshot, node_id, role, handle_id, runner, "stopped"
-                    ):
-                        return
-                    current["status"] = "blocked_unknown"
-                    current["reason"] = (
-                        "review loop limit reached; change reviewer or split node required"
-                    )
-                    current["recovery_action"] = "change_reviewer_or_split_node"
-                    current["reviewer_replacement_required"] = True
-                    current["reviewer_started"] = False
-                    # Keep the stopped identity as the successor predecessor so
-                    # the replacement review cannot accidentally reuse it.
-                    current["reviewer_identity"] = active.get("task_id")
-                    current["active_role"] = None
-                    current["active_task"] = None
-                    snapshot.handles.pop(node_id, None)
-                    self._release_node_lease(snapshot, node_id)
-                    self._record(
-                        snapshot,
-                        "review_loop_limit_reached",
-                        {
-                            "run_id": snapshot.run_id,
-                            "node_id": node_id,
-                            "reason": current["reason"],
-                            "recovery_action": "change_reviewer_or_split_node",
-                            # The durable schema keeps structured values only
-                            # under pass-through keys, so the replay branch
-                            # restores the park from ``proof`` -- top-level
-                            # review_round / reviewer_replacement_required
-                            # would be dropped by _sanitize_event_data, and a
-                            # top-level ``reason`` would be redacted as
-                            # provider text even though it is a vibe-authored
-                            # fixed string.
-                            "proof": {
-                                "park_reason": current["reason"],
-                                "review_loop_rounds": review_round,
-                                "reviewer_replacement_required": True,
-                                "reviewer_identity": current.get("reviewer_identity"),
-                            },
-                        },
-                        active,
+                if review_round >= REVIEW_LOOP_LIMIT:
+                    self._park_review_loop(
+                        snapshot, node_id, current, active, role, handle_id, runner, review_round
                     )
                     return
                 current["active_role"] = None
@@ -7536,6 +7606,30 @@ class Monitor:
                     str(redact_provider_text(event.data.get("reason", event.event))),
                 )
                 return
+            if (
+                event.event == "stopped"
+                and event.data.get("stop_origin") == "unexpected"
+                and not current.get("unexpected_stop_retried")
+            ):
+                # Nobody at vibe asked for this stop (a manual ``claude stop``):
+                # retry the same task once.  A second unexpected stop, or any
+                # stop without an origin record, keeps the failed outcome.
+                current["unexpected_stop_retried"] = True
+                raw_reason = event.data.get("reason", event.event)
+                self._queue_active_retry(snapshot, node_id, raw_reason, observation=event.data)
+                if isinstance(current.get("retryable_action"), dict):
+                    self._set_binding_status(snapshot, node_id, role, "blocked_unknown")
+                    current["status"] = self._v42_retry_status()
+                    current["reason"] = str(redact_provider_text(raw_reason))
+                    current["quarantine"] = None
+                    # The stopped session is dead: polling the old handle
+                    # would only report ``stopped`` again.  Retire it so the
+                    # retry scheduler dispatches a fresh session.
+                    stale = current.setdefault("stale_handles", [])
+                    if handle_id not in stale:
+                        stale.append(handle_id)
+                    snapshot.handles.pop(node_id, None)
+                    return
             if failure.get("legacy_kind") == "engineering" and event.event != "stopped":
                 raw_reason = event.data.get("reason", event.event)
                 reason = str(redact_provider_text(raw_reason))
@@ -8131,6 +8225,102 @@ class Monitor:
             "same_task_required": True, "next_retry_at": current.get("retryable_action", {}).get("next_retry_at") if isinstance(current.get("retryable_action"), dict) else None})
         self._save_snapshot(snapshot)
 
+    def _park_review_loop(
+        self, snapshot, node_id, current, active, role, handle_id, runner, review_round
+    ) -> None:
+        # Three unconverged rework rounds: the fix is a different
+        # reviewer (or a split node), never another automatic
+        # rework round and never a PM question (#153).  Park the
+        # node with the documented action; executing it
+        # (``vibe repair``) dispatches a successor reviewer.
+        if not self._stop_active_for_transition(
+            snapshot, node_id, role, handle_id, runner, "stopped"
+        ):
+            return
+        current["status"] = "blocked_unknown"
+        current["reason"] = (
+            "review loop limit reached; change reviewer or split node required"
+        )
+        current["recovery_action"] = "change_reviewer_or_split_node"
+        current["reviewer_replacement_required"] = True
+        current["reviewer_started"] = False
+        # Keep the stopped identity as the successor predecessor so
+        # the replacement review cannot accidentally reuse it.
+        current["reviewer_identity"] = active.get("task_id")
+        current["active_role"] = None
+        current["active_task"] = None
+        snapshot.handles.pop(node_id, None)
+        self._release_node_lease(snapshot, node_id)
+        self._record(
+            snapshot,
+            "review_loop_limit_reached",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "reason": current["reason"],
+                "recovery_action": "change_reviewer_or_split_node",
+                # The durable schema keeps structured values only
+                # under pass-through keys, so the replay branch
+                # restores the park from ``proof`` -- top-level
+                # review_round / reviewer_replacement_required
+                # would be dropped by _sanitize_event_data, and a
+                # top-level ``reason`` would be redacted as
+                # provider text even though it is a vibe-authored
+                # fixed string.
+                "proof": {
+                    "park_reason": current["reason"],
+                    "review_loop_rounds": review_round,
+                    "reviewer_replacement_required": True,
+                    "reviewer_identity": current.get("reviewer_identity"),
+                },
+            },
+            active,
+        )
+
+    @staticmethod
+    def _acceptance_format_rejection_count(current: Dict[str, Any]) -> int:
+        record = current.get("acceptance_format_rejections")
+        count = record.get("count") if isinstance(record, dict) else 0
+        return count if isinstance(count, int) and not isinstance(count, bool) else 0
+
+    def replace_ended_reviewer(self, node_id: str, run_id: str) -> Dict[str, Any]:
+        """Replace a rejected reviewer whose session is gone (daemon self-heal).
+
+        The caller has already shown the session is retired.  This does what a
+        manual ``vibe repair`` does for a reviewer that must be replaced: retire
+        the stopped identity, set ``reviewer_replacement_required`` and let
+        ``repair_node`` queue the successor.  At most once per node: a second
+        rejection is left to the product-manager escalation.  Reads no value
+        the reviewer wrote.
+        """
+        self._reset_binding_cache()
+        snapshot = self._recovery_snapshot(node_id, run_id)
+        current = snapshot.nodes[node_id]
+        count = self._acceptance_format_rejection_count(current)
+        if (
+            current.get("status") != "review"
+            or current.get("reviewer_auto_replaced") is True
+            or current.get("reviewer_replacement_required")
+            or not 0 < count < ACCEPTANCE_FORMAT_REJECTION_LIMIT
+        ):
+            raise ValueError("reviewer replacement preconditions are not met")
+        binding = self._set_binding_status(snapshot, node_id, "reviewer", "failed")
+        release_writer_lease(
+            self.paths, node_id, str(current.get("worktree", "")), snapshot.run_id
+        )
+        snapshot.handles.pop(node_id, None)
+        current["active_role"] = None
+        current["active_task"] = None
+        current["quarantine"] = None
+        current["reviewer_identity"] = binding.task_id
+        current["reviewer_started"] = False
+        current["reviewer_replacement_required"] = True
+        current["reviewer_auto_replaced"] = True
+        current["recovery_action"] = "change_reviewer_or_split_node"
+        current["reason"] = "reviewer session ended after a rejected acceptance; replacement dispatched"
+        self._save_snapshot(snapshot)
+        return self.repair_node(node_id, snapshot.run_id)
+
     def repair_node(self, node_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
         """Repair a node in place; identity fields are immutable across repair."""
         self._reset_binding_cache()
@@ -8292,6 +8482,20 @@ class Monitor:
         binding_dead = binding_matches and binding.status in {
             "stopped", "failed", "archived",
         }
+        if (
+            not binding_dead and binding_matches and role == "reviewer"
+            and binding.status in {"running", "review"}
+            and 0 < self._acceptance_format_rejection_count(current)
+            < ACCEPTANCE_FORMAT_REJECTION_LIMIT
+            and worker_liveness.session_ended(
+                self.paths, snapshot.run_id, node_id, current
+            )
+        ):
+            # D4: a reviewer that delivered a malformed report and then exited
+            # leaves its binding reading "review".  Below the escalation limit
+            # that is a dead identity, not an unknown one: replace the
+            # reviewer instead of parking the node for reconcile_binding.
+            binding_dead = True
         retry = current.get("retryable_action")
         delivered_continuation = (
             binding_matches and binding.status == "delivered" and role == "developer"
@@ -9229,9 +9433,14 @@ class Monitor:
                 "supervisor_heartbeat",
                 "run_archived",
                 "run_archive_failed",
+                "run_archive_deferred",
+                "daemon_heal",
+                "daemon_lease_readopted",
             }:
-                # Heartbeats are supervisor lease telemetry and archive
-                # records are filesystem evidence, not node lifecycle events.
+                # Heartbeats are supervisor lease telemetry, archive records
+                # are filesystem evidence and daemon records are its own
+                # audit trail (self-heal steps, lease re-adoption, closeout);
+                # none of them is a node lifecycle event.
                 # They may be appended between snapshot writes and must be
                 # consumed before provider polling; a completed run can still
                 # be reopened by an accepted patch, at which point its reads
