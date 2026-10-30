@@ -138,6 +138,27 @@ class ProjectRootFlagTests(unittest.TestCase):
                 self.fail("cwd was read although the request carried a project_root")
         self.assertEqual(Path(seen["root"]), self.root)
 
+    def test_abbreviated_flag_is_honoured_not_ignored(self):
+        self.assertEqual(explicit_project_root(["status", "--project-r", str(self.root)]), self.root)
+
+    def test_empty_flag_and_file_path_are_refused(self):
+        with self.assertRaises(ProjectRootError):
+            explicit_project_root(["status", "--project-root", ""])
+        afile = self.root / "f.txt"
+        afile.write_text("x")
+        with self.assertRaises(ProjectRootError) as ctx:
+            explicit_project_root(["status", "--project-root", str(afile)])
+        self.assertIn("不是目录", str(ctx.exception))
+
+    def test_empty_env_var_still_means_unset(self):
+        self.assertIsNone(explicit_project_root(["status"], {"VIBE_PROJECT_ROOT": ""}))
+
+    def test_parse_failure_does_not_print_usage_twice(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(explicit_project_root(["status", "--no-such-option"]))
+        self.assertEqual(err.getvalue(), "")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -195,10 +195,11 @@ def explicit_project_root(argv: Sequence[str], environ=None) -> Optional[Path]:
     working directory.  An explicit value is never resolved against the
     working directory: a relative path is refused, and no ``getcwd`` happens.
     """
-    probe = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    probe.add_argument("--project-root", dest="root", default=None)
+    # Read it from the real parser so abbreviations (``--project-r``) resolve
+    # the same way here and in run_cli; a parse error is run_cli's to report.
     try:
-        flag = probe.parse_known_args(list(argv))[0].root
+        with contextlib.redirect_stderr(open(os.devnull, "w")):
+            flag = _parser().parse_args(list(argv)).project_root_flag
     except SystemExit:
         flag = None
     source = "--project-root"
@@ -206,16 +207,20 @@ def explicit_project_root(argv: Sequence[str], environ=None) -> Optional[Path]:
     if value is None:
         value = (os.environ if environ is None else environ).get("VIBE_PROJECT_ROOT")
         source = "VIBE_PROJECT_ROOT"
-    if value is None or value == "":
+    if value is None or (value == "" and source == "VIBE_PROJECT_ROOT"):
         return None
+    if value == "":
+        raise ProjectRootError(source + " 不能为空，需要绝对路径")
     try:
         root = Path(value).expanduser()
     except RuntimeError as error:  # '~unknown-user' or no home directory
         raise ProjectRootError(source + " 无法展开：" + value) from error
     if not root.is_absolute():
         raise ProjectRootError(source + " 必须是绝对路径：" + value)
-    if not root.is_dir():
+    if not root.exists():
         raise ProjectRootError(source + " 指向的目录不存在：" + value)
+    if not root.is_dir():
+        raise ProjectRootError(source + " 不是目录：" + value)
     return root
 
 
