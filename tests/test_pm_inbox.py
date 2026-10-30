@@ -115,7 +115,9 @@ class NotifierReceiptTests(Base):
 
 class BeatTests(Base):
     def beat(self):
-        payload, text, ok = supervisor_beat(self.paths, RUN, None, now=time.time())
+        from vibe_guide import supervisor as sv
+        with mock.patch.object(sv, "supervisor_preflight", return_value={"state": "idle"}):
+            payload, text, ok = supervisor_beat(self.paths, RUN, None, now=time.time())
         return payload, text
 
     def stale_daemon(self):
@@ -148,6 +150,20 @@ class BeatTests(Base):
         self.assertEqual(payload["pm_inbox"]["status"], "unknown")
         _, text = self.beat()
         self.assertIn("broke", text)
+
+    def test_unknown_state_is_not_rewritten_to_decision(self):
+        from vibe_guide import supervisor as sv
+        self.notify("run_failed", "broke")
+        payload = {"state": "unknown"}
+        text = sv._beat_extras(self.paths, RUN, payload, "preflight unknown")
+        self.assertEqual(payload["state"], "unknown")
+        self.assertIn("preflight unknown", text)
+        self.assertIn("broke", text)
+        with mock.patch.object(sv, "supervisor_preflight", return_value={"state": "unknown"}):
+            self.notify("run_failed", "again")
+            payload, _, ok = supervisor_beat(self.paths, RUN, None, now=time.time())
+        self.assertEqual(payload["state"], "unknown")
+        self.assertFalse(ok)
 
     def test_stale_daemon_is_reported_without_restart_advice(self):
         self.stale_daemon()

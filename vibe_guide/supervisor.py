@@ -3075,7 +3075,7 @@ def _beat_extras(paths, run_id, payload, text):
     if needs:
         lines.insert(0, "产品经理待处理消息（只送达这一次）：\n" + "\n".join(
             "- [{}] {}".format(m.get("kind"), m.get("message")) for m in needs))
-        if payload.get("state") not in {"rotate", "contract_drift"}:
+        if payload.get("state") not in {"rotate", "contract_drift", "unknown"}:
             if payload.get("state") in {"idle", "stop"}:
                 text = ""  # the "end this turn" text no longer applies
             payload["state"] = "decision"
