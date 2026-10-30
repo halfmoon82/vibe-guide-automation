@@ -111,7 +111,9 @@ _HOST_ONLY_ENV = ("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",)
 
 # A worker that asks the user parks in `blocked` until a human answers; the
 # supervisor decides engineering questions itself.  Variadic, so it must come
-# before `--` or the prompt is swallowed as a tool name (verified live).
+# before `--` or the prompt is swallowed as a tool name.  Launch only: a
+# session keeps its saved options, and passing any option to `--resume` starts
+# a copy instead of continuing it (verified live).
 _NO_USER_QUESTIONS = ("--disallowedTools", "AskUserQuestion")
 
 # Waits before each resume attempt after `claude stop` (seconds; live: 0s
@@ -750,9 +752,7 @@ class ClaudeBgLauncher:
             # `claude stop` returns before the session stops counting as
             # running; resuming inside that window starts a copy (live).
             self.sleeper(delay)
-            result = self._run(
-                self._claude("--bg", "--resume", task_id, *_NO_USER_QUESTIONS, "--", message), worktree
-            )
+            result = self._run(self._claude("--bg", "--resume", task_id, "--", message), worktree)
             combined = _ANSI.sub("", (result.stdout or "") + "\n" + (result.stderr or ""))
             if result.returncode != 0:
                 tail = combined.strip()[-200:]

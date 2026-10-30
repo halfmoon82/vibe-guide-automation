@@ -225,18 +225,16 @@ class ControlTest(LauncherCase):
     def test_resume_stops_then_resumes_with_full_uuid_only(self):
         self.launcher().resume(UUID, "rework please")
         self.assertEqual(self.fake.calls[0][0], ["claude", "stop", SHORT])
-        self.assertEqual(
-            self.fake.calls[1][0],
-            ["claude", "--bg", "--resume", UUID, "--disallowedTools", "AskUserQuestion", "--", "rework please"],
-        )
+        self.assertEqual(self.fake.calls[1][0], ["claude", "--bg", "--resume", UUID, "--", "rework please"])
         self.assertEqual(len(self.fake.calls), 2)
 
-    def test_resume_denies_ask_user_question_before_the_prompt_separator(self):
+    def test_resume_passes_no_options_so_the_session_is_continued_not_copied(self):
+        # A session keeps the options it was launched with (including
+        # --disallowedTools); any option on --resume starts a copy (live).
         self.launcher().resume(UUID, "rework please")
         argv = self.fake.calls[1][0]
-        self.assertEqual(argv[argv.index("--disallowedTools") + 1], "AskUserQuestion")
-        self.assertLess(argv.index("--disallowedTools"), argv.index("--"))
-        self.assertEqual(argv[-1], "rework please")
+        self.assertNotIn("--disallowedTools", argv)
+        self.assertEqual(argv, ["claude", "--bg", "--resume", UUID, "--", "rework please"])
 
     def test_resume_rejects_short_id(self):
         with self.assertRaises(ClaudeBgUnknown):
@@ -377,10 +375,7 @@ class ResumeSettleTest(LauncherCase):
         self.fake.resume_outs = [RUNNING_COPY, CONTINUED]
         self.launcher().resume(UUID, "x")
         argvs = self.argvs()
-        self.assertEqual(
-            [a for a in argvs if "--resume" in a],
-            [["claude", "--bg", "--resume", UUID, "--disallowedTools", "AskUserQuestion", "--", "x"]] * 2,
-        )
+        self.assertEqual([a for a in argvs if "--resume" in a], [["claude", "--bg", "--resume", UUID, "--", "x"]] * 2)
         self.assertIn(["claude", "stop", COPY], argvs)
         self.assertIn(["claude", "rm", COPY], argvs)
         self.assertEqual(len(self.sleeps), 2)
