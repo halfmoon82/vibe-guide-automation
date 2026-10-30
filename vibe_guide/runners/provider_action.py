@@ -209,7 +209,13 @@ _WAIT_RESULT_FIELDS = frozenset(
      WARNINGS_KEY) + RESULT_EVENT_KEYS
 )
 _CREATE_RESULT_FIELDS = frozenset(("binding", "threadId", "thread_id", "status", "cursor"))
-_BINDING_IDENTITY_FIELDS = ("threadId", "thread_id", "task_id", "clientThreadId")
+#: The value ``--template`` prints where the supervisor must substitute a real
+#: identity.  A result that still carries it is refused: storing it would bind
+#: a task that does not exist, and a stored result cannot be rewritten.
+TEMPLATE_PLACEHOLDER = "<填写>"
+#: Only the keys the create reader actually binds on; the shape check used to
+#: accept ``thread_id`` / ``clientThreadId``, which the reader then refused.
+_BINDING_IDENTITY_FIELDS = ("threadId", "task_id")
 _RESUME_RESULT_FIELDS = frozenset((RESUME_RECEIPT_FIELD, "status"))
 
 
@@ -271,14 +277,34 @@ def validate_result_shape(operation, payload, *, role=None):
             host = binding.get("hostId") or binding.get("host")
             if not (isinstance(host, str) and host.strip()):
                 errors.append("field binding needs a host identity: hostId or host")
+            for key in ("threadId", "task_id", "hostId", "host"):
+                if binding.get(key) == TEMPLATE_PLACEHOLDER:
+                    errors.append(
+                        "field binding.{} still holds the template placeholder; "
+                        "substitute the real value".format(key)
+                    )
     elif operation in ("locate", "visibility"):
         # Both readers test the flag itself (``located is True`` /
         # ``visible is True and direct_enter is True``); a template carrying
-        # ``status`` instead failed only after the task already existed.
-        required_flags = ("located",) if operation == "locate" else ("visible", "direct_enter")
-        missing = [name for name in required_flags if payload.get(name) is not True]
-        if missing:
-            errors.append("field(s) must be true: " + ", ".join(missing))
+        # ``status`` instead failed only after the task already existed.  A
+        # supervisor that genuinely could not observe the task must still be
+        # able to say so: the reader turns ``failed``/``status=error`` into a
+        # provider error instead of a visibility claim.
+        failed = payload.get("failed") is True or payload.get("status") in (
+            "failed", "error", "stopped",
+        )
+        if failed:
+            reason = payload.get("reason") or payload.get("error")
+            if not (isinstance(reason, str) and reason.strip()):
+                errors.append("field reason is required when the action failed")
+        else:
+            required_flags = ("located",) if operation == "locate" else ("visible", "direct_enter")
+            missing = [name for name in required_flags if payload.get(name) is not True]
+            if missing:
+                errors.append(
+                    "field(s) must be true: " + ", ".join(missing)
+                    + ", or report failed/reason when the action could not be observed"
+                )
     elif operation == "resume":
         errors = _shape_errors([RESUME_RECEIPT_FIELD], _RESUME_RESULT_FIELDS, payload)
         if RESUME_RECEIPT_FIELD in payload and payload[RESUME_RECEIPT_FIELD] is not True:

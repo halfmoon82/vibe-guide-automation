@@ -83,7 +83,10 @@ class MailboxCommandTests(unittest.TestCase):
                 role=role, generation=1, sequence=1,
                 native_tool="ccd_session_mgmt__send_message", request={"threadId": "t1"})
             example = self.cli("--template", action["action_id"]).payload["template"]
-            validate_result_shape(operation, example, role=role)
+            # A create template carries placeholders; the shape check refuses
+            # an unedited binding, so validate the filled-in form.
+            filled = json.loads(json.dumps(example, ensure_ascii=False).replace("<填写>", "real-value"))
+            validate_result_shape(operation, filled, role=role)
 
     def test_invalid_result_is_refused_and_leaves_the_request_pending(self):
         action_id = self.request("wait")["action_id"]

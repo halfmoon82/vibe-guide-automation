@@ -8,19 +8,34 @@ dispatcher refused with ``dispatch_contract_invalid`` after the visible task
 had already been created, and the consumed result could not be rewritten.
 """
 
+import json
 import unittest
 
-from vibe_guide.runners.provider_action import validate_result_shape
+from vibe_guide.runners.provider_action import TEMPLATE_PLACEHOLDER, validate_result_shape
 from vibe_guide.supervisor import _template_payload
 
 
+def filled(example):
+    """The template with every placeholder replaced by a real value."""
+    return json.loads(json.dumps(example, ensure_ascii=False).replace(TEMPLATE_PLACEHOLDER, "real-value"))
+
+
 class CreateTemplateTests(unittest.TestCase):
-    def test_template_carries_task_and_host_identity(self):
-        example = _template_payload("create", "developer")
-        validate_result_shape("create", example, role="developer")
+    def test_filled_template_carries_task_and_host_identity(self):
+        example = filled(_template_payload("create", "developer"))
         binding = example["binding"]
         self.assertIn("threadId", binding)
         self.assertIn("hostId", binding)
+        validate_result_shape("create", example, role="developer")
+
+    def test_unedited_template_is_refused_not_stored(self):
+        # A stored placeholder binding points at a session that never existed
+        # and cannot be rewritten afterwards, so it must fail before the write.
+        with self.assertRaises(ValueError) as caught:
+            validate_result_shape(
+                "create", _template_payload("create", "developer"), role="developer",
+            )
+        self.assertIn("placeholder", str(caught.exception))
 
     def test_result_without_host_identity_is_refused(self):
         with self.assertRaises(ValueError) as caught:
@@ -28,6 +43,15 @@ class CreateTemplateTests(unittest.TestCase):
                 "create", {"binding": {"threadId": "thread-1"}}, role="developer",
             )
         self.assertIn("host", str(caught.exception))
+
+    def test_identity_the_reader_does_not_read_is_refused(self):
+        # The reader binds on threadId or task_id only; accepting
+        # clientThreadId here only moved the failure past the write.
+        with self.assertRaises(ValueError):
+            validate_result_shape(
+                "create", {"binding": {"clientThreadId": "x", "host": "h"}},
+                role="developer",
+            )
 
     def test_legacy_host_key_is_still_accepted(self):
         validate_result_shape(
@@ -48,6 +72,21 @@ class LocateTemplateTests(unittest.TestCase):
             validate_result_shape("locate", {"status": "located"}, role="developer")
         self.assertIn("located", str(caught.exception))
 
+    def test_failed_observation_is_accepted_with_a_reason(self):
+        # A supervisor that could not locate the task must be able to say so
+        # instead of being pushed into claiming success.
+        validate_result_shape(
+            "locate", {"status": "error", "reason": "tool unavailable"}, role="developer",
+        )
+        validate_result_shape(
+            "locate", {"failed": True, "reason": "tool unavailable"}, role="developer",
+        )
+
+    def test_failed_observation_without_a_reason_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            validate_result_shape("locate", {"failed": True}, role="developer")
+        self.assertIn("reason", str(caught.exception))
+
 
 class VisibilityTemplateTests(unittest.TestCase):
     def test_template_carries_both_flags(self):
@@ -60,6 +99,12 @@ class VisibilityTemplateTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             validate_result_shape("visibility", {"visible": True}, role="developer")
         self.assertIn("direct_enter", str(caught.exception))
+
+    def test_failed_observation_is_accepted_with_a_reason(self):
+        validate_result_shape(
+            "visibility", {"failed": True, "reason": "thread not visible"},
+            role="developer",
+        )
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from .contracts import RunEvent
 from .decision_boundary import LEGACY_BOUNDARY_CATEGORY, validate_boundary_category
 from .providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER, WORKBUDDY_VISIBLE_PROVIDER
 from . import worker_liveness
+from .runners.provider_action import TEMPLATE_PLACEHOLDER as _TEMPLATE_PLACEHOLDER
 from .state import (
     append_event,
     interprocess_lock,
@@ -2366,15 +2367,13 @@ def supervisor_mailbox_view(paths, run_id):
             "pending_count": len(items), "pending": items}
 
 
-_TEMPLATE_PLACEHOLDER = "<填写>"
-
-
 def _template_payload(operation, role):
     """A result example for ``operation`` that passes ``validate_result_shape``.
 
-    Placeholder strings stand where the supervisor must put real values; the
-    shape check accepts them, so a template submitted unedited is stored --
-    the output tells the caller which values are placeholders.
+    Placeholder strings stand where the supervisor must put real values.  The
+    shape check refuses a create binding that still holds one: storing it would
+    bind a task identity that does not exist, and a stored result cannot be
+    rewritten.  The output tells the caller which values are placeholders.
     """
     if operation == "wait":
         if role == "reviewer":
