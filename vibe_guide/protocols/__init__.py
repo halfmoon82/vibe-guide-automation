@@ -27,6 +27,13 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-30: integration merge on origin/main 4b69de5 (D3 evidence wording,
+        # dead-daemon report-only, card options).
+        "86c72be2d652d9d76249a4222f3d9d7ba6b8ea5d72dfccfa8979ee59fdc47319",
+        # 2026-10-30: intermediate merge states committed while integrating the node
+        # branches on origin/main (reviewer-chain, then pm-inbox).
+        "d582effbad11644c7ac1b369287930ca790ea807784e8570bfa6b032b6c410bf",
+        "9bb5bc9681624b0ed24b1cafd67a91fbb5ece1ff0236255d2bbeb2ff10baedc6",
         # 2026-10-31: card options daemon (default on) and launchd_keepalive (default off).
         "76151ffce225578bbaa2a756712fc2d54f190e2c0ad9142116f6c744882c2f7a",
         # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.
@@ -214,6 +221,13 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Short per-beat runbook; the beat prints it once per shift, then only
     # its path and sha256.
     "supervisor-card": frozenset({
+        # 2026-10-30: integration merge on origin/main 4b69de5 (decision boundary from
+        # #327 plus the manual-stop section).
+        "168b38e302a823bed7f2a7ca2cc9c99a74946ac1a188847208b7afea1ba8f588",
+        # 2026-10-30: intermediate merge states committed while integrating the node
+        # branches on origin/main (closeout-land, then stop-and-dispatch).
+        "8d9698d5abeb4f6b55dda9129404137a9b01585b45d39aa10e1ea1f0d19df825",
+        "3ac123da03da8a194a6a6d2b63dbb5afe2e1044b1e07b7650619b0058b9d7498",
         # 2026-10-30: decision boundary — decide non-PRD engineering questions, no chat asks.
         "f68fa85b91eceac9701983ad766983699284794bbb35b38e0e32312e363319a6",
         # 2026-10-30: dead-daemon report line and pm-inbox delivery.

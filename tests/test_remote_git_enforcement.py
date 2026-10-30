@@ -58,13 +58,20 @@ class LaunchTests(unittest.TestCase):
     def test_deny_adds_flags_env_and_prompt(self):
         argv, env = self._bg_call(True)
         self.assertIn("--disallowedTools", argv)
+        # One option only: AskUserQuestion (#328) plus the remote git tools.
+        self.assertEqual(argv.count("--disallowedTools"), 1)
+        self.assertIn("AskUserQuestion", argv)
+        self.assertIn("Bash(git push:*)", argv)
         self.assertEqual(env, {"GIT_ALLOW_PROTOCOL": "vibe-denied"})
         self.assertIn(REMOTE_GIT_BAN_TEXT, argv[-1])
         self.assertLess(argv.index("--disallowedTools"), argv.index("--"))
 
     def test_allow_adds_nothing(self):
         argv, env = self._bg_call(False)
-        self.assertNotIn("--disallowedTools", argv)
+        # Background workers never get AskUserQuestion (#328) whatever the
+        # remote-git setting; allow adds no remote git tool and no env.
+        self.assertEqual(argv.count("--disallowedTools"), 1)
+        self.assertEqual(argv[argv.index("--disallowedTools") + 1], "AskUserQuestion")
         self.assertIsNone(env)
         self.assertNotIn(REMOTE_GIT_BAN_TEXT, argv[-1])
 
