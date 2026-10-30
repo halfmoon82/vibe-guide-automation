@@ -1023,7 +1023,8 @@ class DispatchPromptTests(unittest.TestCase):
                 'branch': 'b', 'files': []}, Path(d), 'run-1', 'review')
             prompt = dict(seen)['create']['prompt']
             for required in ('worker-deliver', '--role reviewer', '--generation 4',
-                             'supervisor-address --run-id run-1 --node n1 --role reviewer --generation 4 --json',
+                             'supervisor-address --project-root',
+                             '--run-id run-1 --node n1 --role reviewer --generation 4 --json',
                              'wake.channel',
                              '登记主监工', '不得调用 core resume',
                              # ISSUE-219: the session root is the only vantage
@@ -1070,7 +1071,7 @@ class DispatchPromptTests(unittest.TestCase):
             runner.task_binding(contract, Path(d), "run-1", "running")
             prompt = dict(seen)["create"]["prompt"]
             self.assertIn(
-                "cd {} && vibe worker-deliver".format(ProjectPaths(Path(d)).root), prompt
+                "vibe worker-deliver --project-root {}".format(ProjectPaths(Path(d)).root), prompt
             )
             self.assertIn("--generation 1", prompt)
             for token in (

@@ -332,13 +332,14 @@ class ProviderActionRunner(Runner):
         return capability + "\n" + consistency
 
     @staticmethod
-    def _continuation_prompt(contract: Dict[str, Any]) -> str:
+    def _continuation_prompt(contract: Dict[str, Any], project_root: Optional[Path] = None) -> str:
         """Build a role-specific continuation contract.
 
         Reviewer continuations must resume the current business review round;
         a generic "continue Issue" prompt can otherwise repeat an old
         administrative check and leave the durable status marker unchanged.
         """
+        root_flag = " --project-root " + shlex.quote(str(project_root)) if project_root else ""
         node_id = str(contract.get("node_id", ""))
         generation = int(contract.get("generation", 0))
         reviewer = contract.get("role") == "reviewer"
@@ -362,9 +363,9 @@ class ProviderActionRunner(Runner):
             "入口规则或后续规则注入不能替代该任务目标，不得仅回复收到规则。\n"
             "合同：{spec}；writer worktree：{worktree}；branch：{branch}；允许路径：{files}。\n"
             "当前 developer 交付：{delivery}；状态文件：{status}；交付文件：{handoff}；完成 marker：{marker}。"
-            "完成后必须写入本代状态/交付；在主项目目录执行 `vibe worker-deliver --run-id {run} --node {node} --role {role} --generation {generation} --payload '<交付 JSON>'`。"
+            "完成后必须写入本代状态/交付；在主项目目录执行 `vibe worker-deliver{root_flag} --run-id {run} --node {node} --role {role} --generation {generation} --payload '<交付 JSON>'`。"
             "{acceptance_pin}"
-            "随后执行 `vibe supervisor-address --run-id {run} --node {node} --role {role} --generation {generation} --json`；"
+            "随后执行 `vibe supervisor-address{root_flag} --run-id {run} --node {node} --role {role} --generation {generation} --json`；"
             "`wake.channel` 非空时用该工具向 `wake.target` 原样发送 `wake.signal`，唤醒登记主监工；为 null 或地址 unknown 时不发，由心跳领取。"
             "自报时把你本会话的工作目录原样写进交付 JSON 的 `delivery_evidence.session_cwd`：监工用它核对本会话是否真的挂载了 project，不填就无法核对。"
             "运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。\n"
@@ -375,7 +376,7 @@ class ProviderActionRunner(Runner):
             "只有会改变 PRD 决策、涉及部署发布、凭据或授权卡外不可撤销动作、新增第三方依赖、"
             "可见降级为后台不可见时，才在交付里附 decision_requests。\n"
             "{rework_findings}{supervisor_answer}"
-        ).format(node=node_id, generation=generation, purpose=purpose, objective=objective,
+        ).format(root_flag=root_flag, node=node_id, generation=generation, purpose=purpose, objective=objective,
                  role=contract.get('role', 'developer'),
                  run=contract.get('run_id', '<原 run-id>'),
                  business=json.dumps(business, ensure_ascii=False),
@@ -804,7 +805,7 @@ class ProviderActionRunner(Runner):
                 )
             else:
                 event_pin = ""
-            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须在主项目目录执行，不要在 worktree 里执行）：0) 先把**你本会话的工作目录**（会话环境给出的 cwd；project 挂载的会话在项目树或 worktree 内，projectless 会话在宿主生成的临时目录）原样写进交付 JSON 的 `delivery_evidence.session_cwd`——监工用它核对本会话是否真的挂载了 project，不填就无法核对；1) 先执行 `cd {} && vibe worker-deliver --run-id {} --node {} --role {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；{}格式错误会当场返回）；2) `cd {} && vibe supervisor-address --run-id {} --node {} --role {} --generation {} --json` 查询监工地址与唤醒方式；3) 返回的 `wake.channel` 非空时，用该工具向 `wake.target` 原样发送 `wake.signal` 一行（Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`）；`wake.channel` 为 null 或地址为 unknown 时不发，到此为止，监工心跳兜底拉取（没有登记推送通道的平台，如 WorkBuddy）。唤醒信号内容不影响验收。运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。".format(
+            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须带 --project-root 指向主项目目录，不要依赖当前目录，也不要在 worktree 里执行）：0) 先把**你本会话的工作目录**（会话环境给出的 cwd；project 挂载的会话在项目树或 worktree 内，projectless 会话在宿主生成的临时目录）原样写进交付 JSON 的 `delivery_evidence.session_cwd`——监工用它核对本会话是否真的挂载了 project，不填就无法核对；1) 先执行 `vibe worker-deliver --project-root {} --run-id {} --node {} --role {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；{}格式错误会当场返回）；2) `vibe supervisor-address --project-root {} --run-id {} --node {} --role {} --generation {} --json` 查询监工地址与唤醒方式；3) 返回的 `wake.channel` 非空时，用该工具向 `wake.target` 原样发送 `wake.signal` 一行（Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`）；`wake.channel` 为 null 或地址为 unknown 时不发，到此为止，监工心跳兜底拉取（没有登记推送通道的平台，如 WorkBuddy）。唤醒信号内容不影响验收。运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。".format(
                 role, node_id, root, run_id, node_id, role, generation,
                 event_pin,
                 root, run_id, node_id, role, generation,
@@ -1536,7 +1537,7 @@ class ProviderActionRunner(Runner):
             request = {
                 "threadId": binding.task_id,
                 "hostId": binding.host,
-                "prompt": self._continuation_prompt(contract) + self._remote_git_ban(contract) + "\n" + self._consistency_instruction(contract),
+                "prompt": self._continuation_prompt(contract, self.paths.root) + self._remote_git_ban(contract) + "\n" + self._consistency_instruction(contract),
             }
             if route_model is not None:
                 request.update({"model": route_model, "thinking": provider_thinking_for(route_reasoning)})

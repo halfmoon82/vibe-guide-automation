@@ -124,12 +124,12 @@ class DispatchTextTests(unittest.TestCase):
         prompts = {
             "create": self._create_prompt("developer"),
             "continuation": ProviderActionRunner._continuation_prompt(
-                {"node_id": "n1", "role": "developer", "generation": 5, "run_id": "run-1"}),
+                {"node_id": "n1", "role": "developer", "generation": 5, "run_id": "run-1"}, Path("/proj")),
         }
         for name, prompt in prompts.items():
             with self.subTest(prompt=name):
                 for required in (
-                    "supervisor-address --run-id run-1 --node n1 --role developer --generation 5 --json",
+                    "supervisor-address", "--project-root", "--run-id run-1 --node n1 --role developer --generation 5 --json",
                     "wake.channel", "wake.target", "wake.signal", "心跳",
                 ):
                     self.assertIn(required, prompt)

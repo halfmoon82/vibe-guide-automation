@@ -417,7 +417,7 @@ class ClaudeBgRunner(Runner):
         )
         path = paths.resolve_vibe_path(name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(ProviderActionRunner._continuation_prompt(contract), encoding="utf-8")
+        path.write_text(ProviderActionRunner._continuation_prompt(contract, (self._paths or ProjectPaths.from_cwd(Path.cwd())).root), encoding="utf-8")
         return path
 
     def adopt(self, contract: dict, worktree: Path, task_id: str) -> RunHandle:

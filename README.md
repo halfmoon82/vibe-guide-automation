@@ -111,8 +111,8 @@ vibe supervisor-hold --run-id <run> --node <id> --category <product_acceptance|e
 vibe decision-answer --id <决策ID> --choice <选项> --digest <摘要>   回答决策；成功后提示「想马上续跑，去监工会话说继续；否则最晚下一次心跳自动接上」。已回答、节点仍停在 blocked_design 时预检输出 work（理由写明已回答待处理）；节点离开 blocked_design 后恢复正常判定，绑定在已答决策上的挂起不再引起反复 work；回答文件损坏或作废时预检输出 unknown 并写明原因
 vibe supervisor-hold --run-id <run> --node <id> --release   解除"节点等人拍板"
 vibe supervisor-handoff --run-id <run>             打印接班所需的全部内容（进度、等人事项、心跳指令、步骤），换班时新会话只跑这一条
-vibe supervisor-address --run-id <run>             查询当前监工地址；未登记返回 unknown；带 --node/--role/--generation 时 wake 字段给出推送工具与填好的唤醒信号
-vibe worker-deliver --run-id <run> --node <id> --generation <n> --payload '<json>'   worker 在主项目目录自报交付（嵌套 delivery_evidence），格式错误当场返回
+vibe supervisor-address --run-id <run>             查询当前监工地址（所有子命令可加 `--project-root <绝对路径>` 或环境变量 `VIBE_PROJECT_ROOT`，不依赖当前目录）；未登记返回 unknown；带 --node/--role/--generation 时 wake 字段给出推送工具与填好的唤醒信号
+vibe worker-deliver --run-id <run> --node <id> --generation <n> --payload '<json>'   worker 自报交付（嵌套 delivery_evidence），格式错误当场返回；派发给 worker 的命令已带 `--project-root`，项目放在受系统保护的目录（如 ~/Desktop）也能交付
 vibe heal-verify --run-id <run> --node <id>   监工按排查包修完运行时文件后的复核：重跑同一读取校验，通过才推进并写入 `self_heal_attempt` 事件，不通过则节点保持原状并记一次失败尝试
 vibe daemon start|status|stop --run-id <run> [--plan <ID>]   授权后启动的分离本地进程（守护程序）：持监工租约，确定性地 resume、收交付、派后台 worker、拉 reviewer、一级自动重试，不调用模型；`status` 报告是否存活，崩溃或租约丢失时明确显示失活而不产生第二个写入者；`register-pm --provider <p> --session-name <名>` 登记需要拍板时推送的产品经理会话
 vibe supervisor-mailbox --run-id <run> [--template <action_id>|--complete <action_id> --result <文件或 ->]   信箱摘要、回写示例与回写；形状不对在写入前拒绝

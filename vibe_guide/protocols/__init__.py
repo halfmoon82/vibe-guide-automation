@@ -27,6 +27,10 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-30: worker-deliver / supervisor-address take --project-root, no cwd.
+        "5a29abbca912f875fc886a1e58892eadb802e39341dfe4884c88009e135c1dc0",
+        # 2026-10-30: --project-root commands merged with main's level-three and dead-daemon wording.
+        "0b9c426e09a41e95c65f7e46de6a31553c7c66eb6b7effbe6b62c0211c36b1d8",
         # 2026-10-30: §6.1 level three — engineering failures stay with the system,
         # reported in product language; only product/authorization asks reach the PM.
         "74ba1dd845c4c32375a26b33cbcfad4ef590ecbfb11d69ca4c1764546545c359",
@@ -223,11 +227,17 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Worker protocol delivered by reference (#216): a ref-mode dispatch pins
     # the file's sha256 and only accepts a digest published here.
     "visible-sdd-worker": frozenset({
+        # 2026-10-30: worker-deliver takes --project-root, no cwd.
+        "55653cf68dadeb47b04b778778b59729915cacd30061525d670bd9f729c2656b",
         "30b226ff0a6711a91779785c28a993679e0a33c3aeb89e836cfd427194750945",
     }),
     # Short per-beat runbook; the beat prints it once per shift, then only
     # its path and sha256.
     "supervisor-card": frozenset({
+        # 2026-10-30: --project-root section.
+        "5363abd3703c3f681b29b814421f016dce30af75c0760abdb33a6510752c9c58",
+        # 2026-10-30: --project-root section merged with the daemon-and-inbox section.
+        "aaed6c450958bae1a26473f59b1f12af11d49350ea478ae8f66bc8279da78452",
         # 2026-10-30: the supervisor answers worker_questions itself.
         "6afcb9ae73049f3e77d83c4c7f446487d7c1b20de5e251aa43595f8a75120cab",
         # 2026-10-30: same line on the pre-integration base (PR #330 first commits).

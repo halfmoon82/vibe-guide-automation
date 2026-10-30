@@ -184,6 +184,41 @@ def _explicit_role(argv: Sequence[str]) -> Optional[str]:
         return None
 
 
+class ProjectRootError(ValueError):
+    """--project-root / VIBE_PROJECT_ROOT is relative, missing or not a directory."""
+
+
+def explicit_project_root(argv: Sequence[str], environ=None) -> Optional[Path]:
+    """The project root named by ``--project-root`` (first) or ``VIBE_PROJECT_ROOT``.
+
+    Returns None when neither is given, so callers fall back to the process
+    working directory.  An explicit value is never resolved against the
+    working directory: a relative path is refused, and no ``getcwd`` happens.
+    """
+    probe = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    probe.add_argument("--project-root", dest="root", default=None)
+    try:
+        flag = probe.parse_known_args(list(argv))[0].root
+    except SystemExit:
+        flag = None
+    source = "--project-root"
+    value = flag
+    if value is None:
+        value = (os.environ if environ is None else environ).get("VIBE_PROJECT_ROOT")
+        source = "VIBE_PROJECT_ROOT"
+    if value is None or value == "":
+        return None
+    try:
+        root = Path(value).expanduser()
+    except RuntimeError as error:  # '~unknown-user' or no home directory
+        raise ProjectRootError(source + " 无法展开：" + value) from error
+    if not root.is_absolute():
+        raise ProjectRootError(source + " 必须是绝对路径：" + value)
+    if not root.is_dir():
+        raise ProjectRootError(source + " 指向的目录不存在：" + value)
+    return root
+
+
 def _result(
     code: int, payload: Dict[str, Any], text: str, as_json: bool
 ) -> CLIResult:
@@ -209,6 +244,7 @@ def _parser() -> argparse.ArgumentParser:
                         help="init: 回答「是否在用户级规则中加入 vibe 监工会话例外」")
     parser.add_argument("--host-rules-digest", dest="host_rules_digest",
                         help="init --host-rules apply: 授权预览差异的摘要")
+    parser.add_argument("--project-root", dest="project_root_flag", help="项目根绝对路径；给出后不再读取进程当前目录（也可用环境变量 VIBE_PROJECT_ROOT，参数优先）")
     parser.add_argument("--request")
     parser.add_argument("--plan-id")
     parser.add_argument("--plan")
@@ -301,7 +337,7 @@ def run_install_or_upgrade(request: Any, json_output: bool = False) -> Dict[str,
         install_request = InstallRequest(
             str(request.get("mode", "layered")),
             bool(json_output),
-            Path(request.get("project_root", Path.cwd())),
+            Path(request["project_root"] if "project_root" in request else Path.cwd()),
         )
     else:
         raise TypeError("installation request must be a mapping or InstallRequest")
@@ -4065,7 +4101,14 @@ _ANSWER_RESUME_HINT = "想马上续跑，去监工会话说继续；否则最晚
 
 def main(argv: Optional[Sequence[str]] = None, runner=None, *, supervisor_command_prefix="vibe") -> int:
     arguments = list(argv) if argv is not None else os.sys.argv[1:]
-    result = run_cli(arguments, Path.cwd(), runner=runner, supervisor_command_prefix=supervisor_command_prefix)
+    try:
+        explicit_root = explicit_project_root(arguments)
+    except ProjectRootError as error:
+        payload = {"status": "usage_error", "reason": str(error)}
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True) if "--json" in arguments else "参数错误：" + str(error))
+        return USAGE_ERROR
+    base_dir = explicit_root if explicit_root is not None else Path.cwd()
+    result = run_cli(arguments, base_dir, runner=runner, supervisor_command_prefix=supervisor_command_prefix)
     rendered = (json.dumps(result.payload, ensure_ascii=False, sort_keys=True)
                 if result.as_json else result.text)
     command = arguments[0] if arguments else ""
@@ -4075,7 +4118,7 @@ def main(argv: Optional[Sequence[str]] = None, runner=None, *, supervisor_comman
         run_id = arguments[index] if index < len(arguments) else None
     if run_id and (command.startswith("supervisor-") or command in {"monitor", "resume", "status", "reconcile"}):
         try:
-            rendered = bounded_supervisor_output(ProjectPaths.from_cwd(Path.cwd()), run_id, result.payload, rendered)
+            rendered = bounded_supervisor_output(ProjectPaths.from_cwd(base_dir), run_id, result.payload, rendered)
         except (OSError, ValueError, TypeError) as error:
             print(json.dumps({"status": "unknown", "reason": "output evidence unavailable: " + str(error)[:200]}))
             return result.exit_code or UNKNOWN

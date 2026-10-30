@@ -71,14 +71,17 @@ def install_source_facts(cwd=None, package_file=None, site_packages=None):
     means a version assertion made from here proves nothing about the
     installed release.  `hint` carries the wording for that case.
     """
-    working_dir = Path(cwd if cwd is not None else Path.cwd()).resolve()
+    try:
+        working_dir = Path(cwd if cwd is not None else Path.cwd()).resolve()
+    except OSError:  # an unreadable cwd (macOS privacy-protected folder, deleted directory)
+        working_dir = None
     package_path = Path(
         package_file if package_file is not None else __file__
     ).resolve()
     if site_packages is None:
         site_packages = _site_packages_paths()
     roots = [Path(root).resolve() for root in site_packages]
-    in_cwd = _is_within(package_path, working_dir)
+    in_cwd = working_dir is not None and _is_within(package_path, working_dir)
     in_site_packages = any(_is_within(package_path, root) for root in roots)
     hint = None
     # site-packages wins: a pipx venv under $HOME or a project's own .venv is
