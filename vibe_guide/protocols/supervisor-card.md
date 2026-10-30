@@ -19,6 +19,10 @@
   错误里列出缺少或多出的字段名，按提示补齐后重写。
 - 开发者交付必须带 `delivery_evidence`。
 
+## 手动停止会话
+- 要停 claude-bg 会话，用 vibe 的停止入口，不要用 `claude stop`。vibe 自己发起的停止会先落盘记录；没有记录的 stopped 视为意外停止，只自动重试一次，第二次仍 stopped 则判 failed。
+- codex、kimi-code、workbuddy：未验证能否取得停止发起方，只记录 vibe 自己发起的停止，其余不当意外处理，stopped 仍判 failed。
+
 ## 禁止
 - 不在 idle/stop 后再调用 beat。
 - 不把自报当成证据；未知状态不当成功。

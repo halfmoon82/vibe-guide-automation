@@ -7606,6 +7606,23 @@ class Monitor:
                     str(redact_provider_text(event.data.get("reason", event.event))),
                 )
                 return
+            if (
+                event.event == "stopped"
+                and event.data.get("stop_origin") == "unexpected"
+                and not current.get("unexpected_stop_retried")
+            ):
+                # Nobody at vibe asked for this stop (a manual ``claude stop``):
+                # retry the same task once.  A second unexpected stop, or any
+                # stop without an origin record, keeps the failed outcome.
+                current["unexpected_stop_retried"] = True
+                raw_reason = event.data.get("reason", event.event)
+                self._queue_active_retry(snapshot, node_id, raw_reason, observation=event.data)
+                if isinstance(current.get("retryable_action"), dict):
+                    self._set_binding_status(snapshot, node_id, role, "blocked_unknown")
+                    current["status"] = self._v42_retry_status()
+                    current["reason"] = str(redact_provider_text(raw_reason))
+                    current["quarantine"] = None
+                    return
             if failure.get("legacy_kind") == "engineering" and event.event != "stopped":
                 raw_reason = event.data.get("reason", event.event)
                 reason = str(redact_provider_text(raw_reason))

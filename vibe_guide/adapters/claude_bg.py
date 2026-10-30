@@ -524,7 +524,7 @@ class ClaudeBgLauncher:
         return _ANSI.sub("", result.stdout or "").strip()
 
     def _branch_exists(self, repo: Path, branch: str) -> bool:
-        for ref in ("refs/heads/" + branch, "refs/remotes/origin/" + branch):
+        for ref in ("refs/heads/" + branch,):
             result = self._run(["git", "show-ref", "--verify", "--quiet", ref], repo)
             if result.returncode == 0:
                 return True
