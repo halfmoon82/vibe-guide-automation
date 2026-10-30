@@ -171,10 +171,13 @@ class AutoStartTests(unittest.TestCase):
 
     def test_keepalive_card_calls_the_injected_installer(self):
         seen = []
+        starter = mock.Mock()
         result = self.hook(self.card(launchd_keepalive=True),
-                           starter=lambda *a, **k: {"status": "started", "pid": 7},
+                           starter=starter,
                            keepalive=lambda paths, run_id, command: seen.append((run_id, command)) or {"status": "loaded"})
         self.assertEqual(result["launchd"]["status"], "loaded")
+        self.assertEqual(result["status"], "launchd_started")
+        starter.assert_not_called()  # one instance only: launchd's
         self.assertEqual(seen[0][0], "run-abc12345")
         self.assertEqual(seen[0][1][-2:], ["--run-id", "run-abc12345"][-2:])
 
@@ -184,6 +187,7 @@ class AutoStartTests(unittest.TestCase):
         result = self.hook(self.card(launchd_keepalive=True),
                            starter=lambda *a, **k: {"status": "started"}, keepalive=boom)
         self.assertEqual(result["launchd"]["status"], "failed")
+        self.assertEqual(result["status"], "started")  # falls back to a direct start
 
 
 class CardTextTests(unittest.TestCase):

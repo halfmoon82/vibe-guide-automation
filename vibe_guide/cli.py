@@ -1930,20 +1930,27 @@ def _auto_start_daemon(paths, plan_id: str, run_id: str, card, provider: Optiona
     from . import launchd_keepalive
     starter = starter or daemon_module.start_daemon
     result: Dict[str, Any] = {"enabled": True}
-    try:
-        started = starter(paths, run_id, plan_id, provider=provider)
-        result.update(status=started.get("status", "unknown"), pid=started.get("pid"))
-        if started.get("reason"):
-            result["reason"] = started["reason"]
-    except Exception as error:  # noqa: BLE001 - recorded, never fatal for the monitor
-        result.update(status="start_failed", reason="%s: %s" % (type(error).__name__, str(error)[:160]))
+    launchd_loaded = False
     if getattr(card, "launchd_keepalive", False):
+        # launchd (RunAtLoad) starts the daemon itself; a second Popen instance
+        # would lose the supervisor lease and be relaunched every 30 seconds.
         try:
             command = daemon_module.build_run_command(run_id, plan_id, provider=provider)
             keepalive = keepalive or launchd_keepalive.install
             result["launchd"] = keepalive(paths, run_id, command)
+            launchd_loaded = result["launchd"].get("status") == "loaded"
         except Exception as error:  # noqa: BLE001
             result["launchd"] = {"status": "failed", "reason": "%s: %s" % (type(error).__name__, str(error)[:160])}
+    if launchd_loaded:
+        result.update(status="launchd_started", reason="守护程序由 launchd 拉起，未另行启动")
+    else:
+        try:
+            started = starter(paths, run_id, plan_id, provider=provider)
+            result.update(status=started.get("status", "unknown"), pid=started.get("pid"))
+            if started.get("reason"):
+                result["reason"] = started["reason"]
+        except Exception as error:  # noqa: BLE001 - recorded, never fatal for the monitor
+            result.update(status="start_failed", reason="%s: %s" % (type(error).__name__, str(error)[:160]))
     try:
         _atomic_json(daemon_module._file(paths, run_id, "daemon-launch.json", create=True), result)
     except (OSError, ValueError):
@@ -4020,7 +4027,9 @@ def _handle_daemon(args, paths, runner, command_prefix, v2_state=False) -> CLIRe
 
         outcome = daemon_module.Daemon(paths, run_id, supervisor, config, gate=gate,
                                        command_prefix=command_prefix).run()
-        ok = outcome["status"] in ("terminal", "stopped", "max_cycles")
+        # lease_held / blocked are not faults: exiting non-zero would make launchd
+        # (KeepAlive SuccessfulExit=false) relaunch the daemon every 30 seconds.
+        ok = outcome["status"] in ("terminal", "stopped", "max_cycles", "lease_held", "blocked")
         return _result(SUCCESS if ok else UNKNOWN, {**base, "run_id": run_id, **outcome}, "守护程序结束：" + outcome["status"], args.as_json)
     except (OSError, ValueError, TypeError, FileNotFoundError) as error:
         return _result(UNKNOWN, {**base, "status": "unknown", "reason": str(error)[:200]},
