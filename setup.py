@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="vibe-guide",
-    version="5.2.1",
+    version="5.2.3",
     packages=find_packages(),
     package_data={"vibe_guide.adapters": ["manifests/*.yaml"], "vibe_guide.protocols": ["*.md"]},
     include_package_data=True,
