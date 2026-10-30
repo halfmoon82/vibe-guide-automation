@@ -202,6 +202,29 @@ class ParkedRunTests(LiveSessionTests):
         self.assertIn("archive", self.order)
         self.assertNoResidue()
 
+    def test_a_node_tracked_before_parking_is_still_reported_at_close_out(self):
+        supervisor = Supervisor([self.blocked()])
+        daemon = self.make(supervisor, blocked_grace=10 ** 6)
+        state = daemon._heal_state()
+        state["nodes"]["n"] = {"fingerprint": "from-an-earlier-stall", "escalated": False, "repairs": 1}
+        daemon._save_heal_state(state)
+        daemon.run(max_cycles=1)
+        daemon._unresolved("n", "run_parked", "parked")
+        state = daemon._heal_state()
+        self.assertEqual(list(dm.live_unresolved(state, daemon._snapshot)), ["n"])
+
+    def test_a_failed_inbox_write_keeps_the_unresolved_report_pending(self):
+        supervisor = Supervisor([self.blocked()])
+        daemon = self.make(supervisor, blocked_grace=10 ** 6)
+        results = [{"status": "inbox_failed", "reason": "OSError"}]
+        daemon._push = lambda text, kind, node_id="": results.pop(0) if results else {"status": "queued_inbox"}
+        daemon._unresolved("n", "run_parked", "parked")
+        state = daemon._heal_state()
+        self.assertFalse(daemon._report_unresolved(None, state, final=True))
+        self.assertEqual([k for k in state["pushed"] if k.startswith("unresolved:")], [])
+        self.assertTrue(daemon._report_unresolved(None, state, final=True))   # retried, delivered
+        self.assertEqual(len([k for k in state["pushed"] if k.startswith("unresolved:")]), 1)
+
     def test_blocked_unknown_closes_after_the_grace_period_even_unescalated(self):
         supervisor = Supervisor([self.blocked()])
         outcome = self.make(supervisor, blocked_grace=60).run(max_cycles=20)

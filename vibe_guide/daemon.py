@@ -964,7 +964,11 @@ class Daemon:
         record[key] = {"code": code, "summary": summary[:300], "at": self.clock(), "example": example,
                        "repairs": (state["nodes"].get(node_id) or {}).get("repairs", 0) if node_id else 0}
         if node_id:
-            state["nodes"].setdefault(node_id, {})["escalated"] = True
+            node_state = state["nodes"].setdefault(node_id, {})
+            node_state["escalated"] = True
+            current = _node_fingerprint(self._snapshot, node_id)
+            if current:
+                node_state["fingerprint"] = current  # a stale one would make live_unresolved drop this item at once
         self._event("daemon_heal", node_id=node_id or "daemon", kind="engineering_unresolved", phase="level3",
                     reason_code=code, reason=summary[:200])
         if own_state:
@@ -1026,7 +1030,8 @@ class Daemon:
                 return False
         text = "运行 %s 有 %d 项系统没能自动解决：\n\n%s" % (
             self.run_id, len(items), "\n\n".join(unresolved_lines(items)))
-        self._push(text, UNRESOLVED_REPORT_KIND)
+        if self._push(text, UNRESOLVED_REPORT_KIND).get("status") == "inbox_failed":
+            return False  # nothing reached the inbox: try again on the next cycle
         state["pushed"].append(signature)
         return True
 
