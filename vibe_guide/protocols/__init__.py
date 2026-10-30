@@ -27,6 +27,9 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-30: §6.1 level three — engineering failures stay with the system,
+        # reported in product language; only product/authorization asks reach the PM.
+        "184eeb880440caf19d6e7063407f3a91c14d4994b7c3b18a4c9f8dd8ac46fdba",
         # 2026-10-30: §7 general principle — engineering questions that do not change
         # PRD decisions are decided and recorded by the supervisor/worker, never asked.
         "8da79c1a2b3d8d19eee14e8459db451f5a8b3a521c93f4eb9a61db47026cef5c",
@@ -202,6 +205,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Short per-beat runbook; the beat prints it once per shift, then only
     # its path and sha256.
     "supervisor-card": frozenset({
+        # 2026-10-30: the supervisor answers worker_questions itself.
+        "26db462af06ca4e34319149c60ce9e27794316234071344bd6ed9949277aad06",
         # 2026-10-30: decision boundary — decide non-PRD engineering questions, no chat asks.
         "f68fa85b91eceac9701983ad766983699284794bbb35b38e0e32312e363319a6",
         "f46228ef7199dc6837d97773ba2726d1466c0af2c33a42979653fce9f9c71002",
@@ -209,6 +214,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Second-level self-heal short session (daemon): the prompt the daemon feeds
     # a one-shot repair session.
     "heal-session": frozenset({
+        # 2026-10-30: unfixable engineering failures are reported, not escalated.
+        "fff2357e5bb4a39c3800444c976eee3d35151a31b07279f134231dcefa0cd95c",
         "f0338725e0669a5cc0fdee9b4189e7fd550f37c7e91bc922df68cfbc56dfe139",
     }),
 }

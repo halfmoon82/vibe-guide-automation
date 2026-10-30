@@ -118,7 +118,16 @@ class ProgressionTests(Base):
         self.assertEqual((outcome["status"], outcome["run_status"]), ("blocked", "blocked_design"))
         self.assertEqual(supervisor.calls, 0)
         self.assertTrue(supervisor.lease.released)
-        self.assertTrue(self.pushed)
+        self.assertEqual([p[0] for p in self.pushed], ["escalation"])
+        self.assertEqual(decision_list(self.paths, RUN)[0]["category"], "external_authorization")
+
+    def test_non_authorization_gate_block_is_reported_not_escalated(self):
+        daemon = self.daemon(FakeSupervisor(["running"]))
+        daemon._gate = lambda: {"status": "blocked_unknown", "reason": "gate_error: boom"}
+        daemon.run()
+        self.assertEqual(decision_list(self.paths, RUN), [])
+        self.assertEqual([p[0] for p in self.pushed], ["unresolved_report"])
+        self.assertIn("现在的情况", self.pushed[0][2])
 
     def test_gate_runs_every_tick_and_a_raising_gate_blocks(self):
         supervisor = FakeSupervisor(["running", "running", "running"])
@@ -167,29 +176,88 @@ class ProgressionTests(Base):
         self.assertEqual(record["last_error"]["type"], "ValueError")
         self.assertEqual(record["cycles"], 3)
 
-    def test_repeated_errors_escalate_once(self):
+    def test_repeated_errors_are_recorded_not_escalated(self):
         supervisor = FakeSupervisor(["running"])
         supervisor.run_once = lambda: (_ for _ in ()).throw(ValueError("boom"))
         daemon = self.daemon(supervisor)
         daemon.run(max_cycles=8)
-        kinds = [p[0] for p in self.pushed]
-        self.assertEqual(kinds.count("escalation"), 1)
+        self.assertEqual(self.pushed, [])
+        self.assertEqual(decision_list(self.paths, RUN), [])
+        self.assertEqual([k for k in self.event_kinds() if k[1] == "engineering_unresolved"],
+                         [("daemon_heal", "engineering_unresolved", "daemon_errors")])
+
+
+class UnresolvedReportTests(Base):
+    def run_stuck(self, **config):
+        self.now = [1000.0]
+        daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled(), **config)
+        daemon.clock = lambda: self.now[0]
+        daemon.run(max_cycles=6)
+        return daemon
+
+    def reports(self):
+        return [p for p in self.pushed if p[0] == "unresolved_report"]
+
+    def test_silent_before_the_deadline(self):
+        daemon = self.run_stuck()
+        self.now[0] += dm.MAX_UNRESOLVED_REPORT_SECONDS - 1
+        daemon.run(max_cycles=2)
+        self.assertEqual(self.pushed, [])
+
+    def test_reports_after_six_hours_once_per_set_of_items(self):
+        daemon = self.run_stuck()
+        sessions = len(self.sessions)
+        self.now[0] += dm.MAX_UNRESOLVED_REPORT_SECONDS + 1
+        daemon.run(max_cycles=2)
+        self.assertEqual(len(self.reports()), 1)
+        self.now[0] += 3 * dm.MAX_UNRESOLVED_REPORT_SECONDS
+        daemon.run(max_cycles=2)
+        self.assertEqual(len(self.reports()), 1)             # same set: no repeat
+        self.assertEqual(len(self.sessions), sessions)       # and no new repair session
+
+    def test_report_uses_product_language_with_fixed_options(self):
+        daemon = self.run_stuck(unresolved_report_seconds=60)
+        self.now[0] += 61
+        daemon.run(max_cycles=1)
+        text = self.reports()[0][2]
+        for option in dm.UNRESOLVED_OPTIONS:
+            self.assertIn(option, text)
+        body, expansion = text.rsplit("（展开：", 1)
+        self.assertIn("受影响的验收例子", body)
+        self.assertNotIn("self_heal_no_progress", body)
+        self.assertIn("self_heal_no_progress", expansion)
+
+    def test_terminal_run_reports_unresolved_items_immediately(self):
+        self.now = [1000.0]
+        daemon = self.daemon(FakeSupervisor(["running", "running", "running", "running", "complete"]),
+                             assess=lambda: stalled())
+        daemon.clock = lambda: self.now[0]
+        daemon.run()
+        self.assertEqual(len(self.reports()), 1)
+
+    def test_status_view_lists_the_same_items(self):
+        self.run_stuck()
+        lines = dm.unresolved_report(self.paths, RUN)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("再给系统一轮", lines[0])
+
+    def test_report_window_can_be_shortened_never_lengthened(self):
+        dm.DaemonConfig(unresolved_report_seconds=60).validate()
+        for bad in (0, dm.MAX_UNRESOLVED_REPORT_SECONDS + 1, True):
+            with self.assertRaises(ValueError):
+                dm.DaemonConfig(unresolved_report_seconds=bad).validate()
 
 
 class SelfHealTests(Base):
-    def test_level1_then_level2_then_pm_after_two_unfixed_repairs(self):
+    def test_level1_then_level2_then_recorded_after_two_unfixed_repairs(self):
         daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
         daemon.run(max_cycles=6)
         self.assertEqual(self.retries, [NODE])                  # level 1, once
         self.assertEqual(len(self.sessions), 2)                 # level 2, exactly twice
         self.assertEqual(self.verify_calls, [(NODE, "developer")] * 2)  # daemon re-checks itself
-        escalations = [p for p in self.pushed if p[0] == "escalation"]
-        self.assertEqual(len(escalations), 1)                   # level 3, once
-        decisions = decision_list(self.paths, RUN)
-        self.assertEqual(len(decisions), 1)
-        self.assertIn(decisions[0]["decision_id"], escalations[0][2])
-        self.assertEqual([p[0] for p in self.pushed].count("decision"), 0)  # no duplicate push for the card
-        self.assertIn(("daemon_heal", "escalated", "self_heal_no_progress"), self.event_kinds())
+        self.assertEqual(self.pushed, [])                       # level 3 never asks the PM
+        self.assertEqual(decision_list(self.paths, RUN), [])
+        self.assertIn(("daemon_heal", "engineering_unresolved", "self_heal_no_progress"), self.event_kinds())
 
     def test_session_prompt_carries_protocol_pack_and_close_command(self):
         daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
@@ -219,27 +287,38 @@ class SelfHealTests(Base):
         daemon.run(max_cycles=3)
         self.assertEqual(self.verify_calls, [])  # the session's own verify was read, not repeated
 
-    def test_unavailable_session_command_escalates_as_unknown(self):
+    def test_unavailable_session_command_is_recorded_as_unknown(self):
         self.session_results = [ss.ShortSessionResult("claude-code", "unknown", "command not available: claude")]
         daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
         daemon.run(max_cycles=3)
         self.assertEqual(len(self.sessions), 1)
         self.assertEqual(self.verify_calls, [])
-        self.assertIn(("daemon_heal", "escalated", "short_session_unknown"), self.event_kinds())
-        self.assertEqual([p[0] for p in self.pushed].count("escalation"), 1)
+        self.assertIn(("daemon_heal", "engineering_unresolved", "short_session_unknown"), self.event_kinds())
+        self.assertEqual(self.pushed, [])
+        self.assertEqual(decision_list(self.paths, RUN), [])
 
-    def test_product_decision_in_the_session_answer_escalates_right_away(self):
+    def test_authorization_in_the_session_answer_escalates_right_away(self):
         self.session_results = [ss.ShortSessionResult("claude-code", "ok", text="想了想\nVIBE_ESCALATE: 需要授权改范围")]
         daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
         daemon.run(max_cycles=3)
         self.assertIn(("daemon_heal", "escalated", "needs_decision"), self.event_kinds())
         self.assertEqual(decision_list(self.paths, RUN)[0]["category"], "external_authorization")
+        self.assertEqual([p[0] for p in self.pushed].count("escalation"), 1)
 
-    def test_budget_exhaustion_escalates_without_another_session(self):
+    def test_escalate_mark_without_authorization_stays_with_the_system(self):
+        self.session_results = [ss.ShortSessionResult("claude-code", "ok", text="VIBE_ESCALATE: 不确定怎么改")]
+        daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
+        daemon.run(max_cycles=3)
+        self.assertIn(("daemon_heal", "engineering_unresolved", "needs_decision"), self.event_kinds())
+        self.assertEqual(decision_list(self.paths, RUN), [])
+        self.assertEqual(self.pushed, [])
+
+    def test_budget_exhaustion_is_recorded_without_another_session(self):
         daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled(), max_sessions=0)
         daemon.run(max_cycles=3)
         self.assertEqual(self.sessions, [])
-        self.assertIn(("daemon_heal", "escalated", "budget_exhausted"), self.event_kinds())
+        self.assertIn(("daemon_heal", "engineering_unresolved", "budget_exhausted"), self.event_kinds())
+        self.assertEqual(self.pushed, [])
 
     def test_token_budget_counts_session_usage(self):
         usage = {"input": 400, "output": 200, "cache_read": 5, "cache_creation": 0}
@@ -247,13 +326,21 @@ class SelfHealTests(Base):
         daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled(), max_tokens=500)
         daemon.run(max_cycles=4)
         self.assertEqual(len(self.sessions), 1)
-        self.assertIn(("daemon_heal", "escalated", "budget_exhausted"), self.event_kinds())
+        self.assertIn(("daemon_heal", "engineering_unresolved", "budget_exhausted"), self.event_kinds())
 
-    def test_pack_escalate_tier_goes_straight_to_the_product_manager(self):
+    def test_pack_escalate_tier_is_recorded_without_asking_the_product_manager(self):
         daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled("escalate_to_pm"))
         daemon.run(max_cycles=2)
         self.assertEqual(self.sessions, [])
-        self.assertEqual([p[0] for p in self.pushed].count("escalation"), 1)
+        self.assertEqual(self.pushed, [])
+        self.assertEqual(decision_list(self.paths, RUN), [])
+
+    def test_given_up_node_gets_no_further_repair_session(self):
+        daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
+        daemon.run(max_cycles=6)
+        count = len(self.sessions)
+        daemon.run(max_cycles=6)
+        self.assertEqual(len(self.sessions), count)
 
     def test_changed_fingerprint_resets_the_repair_count(self):
         supervisor = FakeSupervisor(["running"])
