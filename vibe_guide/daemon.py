@@ -414,6 +414,7 @@ class Daemon:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 previous[sig] = signal.signal(sig, self.request_stop)
         self._write_state("running")
+        self._clear_unresolved("daemon:daemon_errors", "daemon:daemon_gate_blocked")  # left by an earlier process
         outcome = {"status": "stopped", "reason": "stop requested"}
         lost = False
         try:
@@ -480,6 +481,8 @@ class Daemon:
         snapshot = None
         try:
             snapshot = self.supervisor.run_once()
+            if self._error_streak >= _ERROR_ESCALATION_STREAK:
+                self._clear_unresolved("daemon:daemon_errors")  # the daemon recovered
             self._error_streak = 0
         except SupervisorLeaseConflict:
             raise
@@ -503,19 +506,25 @@ class Daemon:
                 self.heal_pass(snapshot)
         self._push_pending(snapshot)
 
-    def _record_error(self, error: BaseException) -> None:
+    def _record_error(self, error: BaseException, state: Optional[Dict[str, Any]] = None) -> None:
         self._error_streak += 1
         self._last_error = {"type": type(error).__name__, "reason": str(error)[:200], "at": self.clock()}
         if self._error_streak == _ERROR_ESCALATION_STREAK:
             self._unresolved("", "daemon_errors",
-                             "守护程序连续 %d 次推进失败：%s" % (self._error_streak, self._last_error["reason"]))
+                             "守护程序连续 %d 次推进失败：%s" % (self._error_streak, self._last_error["reason"]),
+                             state=state)
+
+    def _clear_unresolved(self, *keys: str) -> None:
+        state = self._heal_state()
+        record = state.get("unresolved") or {}
+        if any(key in record for key in keys):
+            for key in keys:
+                record.pop(key, None)
+            self._save_heal_state(state)
 
     # -- self-heal ---------------------------------------------------------
     def _fingerprint(self, snapshot, node_id: str) -> str:
-        try:
-            return stall.node_fingerprint(snapshot.nodes[node_id], snapshot.tasks, node_id)
-        except (AttributeError, KeyError, TypeError):
-            return ""
+        return _node_fingerprint(snapshot, node_id)
 
     def heal_pass(self, snapshot) -> None:
         try:
@@ -527,11 +536,8 @@ class Daemon:
             return
         state = self._heal_state()
         ran_session = False
-        snapshot_nodes = getattr(snapshot, "nodes", None) or {}
-        for key in list((state.get("unresolved") or {})):
-            node = snapshot_nodes.get(key)
-            if isinstance(node, Mapping) and node.get("status") == "accepted":
-                state["unresolved"].pop(key)
+        if state.get("unresolved"):
+            state["unresolved"] = live_unresolved(state, snapshot)
         for node_id, entry in sorted((report.get("nodes") or {}).items()):
             fingerprint = self._fingerprint(snapshot, node_id)
             node_state = state["nodes"].get(node_id)
@@ -552,7 +558,7 @@ class Daemon:
                 try:
                     self._retry(node_id)
                 except Exception as error:  # a retry is best effort; the next pass decides
-                    self._record_error(error)
+                    self._record_error(error, state)
                 continue
             if ran_session:
                 continue  # at most one short session per run at a time
@@ -609,9 +615,10 @@ class Daemon:
         mark = next((line for line in reversed(text.splitlines()) if _ESCALATE_MARK in line), None)
         if mark is not None:
             reason = mark.split(_ESCALATE_MARK, 1)[1].strip()[:300]
-            if "授权" in reason or "authoriz" in reason.lower():
-                self._escalate(node_id, "needs_decision", "节点 %s 的修复涉及授权：%s" % (node_id, reason),
-                               "external_authorization", state=state, entry=entry)
+            category = _escalate_category(reason)
+            if category:
+                self._escalate(node_id, "needs_decision", "节点 %s 的修复需要你来定：%s" % (node_id, reason),
+                               category, state=state, entry=entry)
             else:
                 self._unresolved(node_id, "needs_decision", "节点 %s 的修复会话无法判定：%s" % (node_id, reason),
                                  state=state, entry=entry)
@@ -659,7 +666,7 @@ class Daemon:
         """
         own_state = state is None
         state = state if state is not None else self._heal_state()
-        key = node_id or "daemon"
+        key = node_id or "daemon:" + code
         record = state.setdefault("unresolved", {})
         if key in record:
             return
@@ -670,7 +677,7 @@ class Daemon:
                        "repairs": (state["nodes"].get(node_id) or {}).get("repairs", 0) if node_id else 0}
         if node_id:
             state["nodes"].setdefault(node_id, {})["escalated"] = True
-        self._event("daemon_heal", node_id=key, kind="engineering_unresolved", phase="level3",
+        self._event("daemon_heal", node_id=node_id or "daemon", kind="engineering_unresolved", phase="level3",
                     reason_code=code, reason=summary[:200])
         if own_state:
             self._save_heal_state(state)
@@ -693,7 +700,7 @@ class Daemon:
                 question="%s。怎么处理？" % summary,
                 options=[{"id": "keep_trying", "label": "再给系统一轮", "impact": "范围不变，系统再试一次"},
                          {"id": "pm_takes_over", "label": "我来处理", "impact": "守护程序不再动这个节点，由你决定下一步"}],
-                recommendation="keep_trying",
+                recommendation="pm_takes_over",
                 evidence={"reason_code": code, "pack": (entry or {}).get("pack") if entry else None})
         except (OSError, ValueError, TypeError) as error:
             self._last_error = {"type": type(error).__name__, "reason": "decision card failed: %s" % str(error)[:120],
@@ -718,10 +725,11 @@ class Daemon:
 
     def _report_unresolved(self, snapshot, state: Dict[str, Any], *, final: bool) -> bool:
         """Tell the product manager once per set of unresolved items; reads disk only."""
-        items = state.get("unresolved") or {}
+        items = live_unresolved(state, snapshot)
         if not items:
             return False
-        signature = "unresolved:" + ",".join(sorted("%s=%s" % (key, item.get("code")) for key, item in items.items()))
+        signature = "unresolved:" + ",".join(
+            sorted("%s=%s@%s" % (key, item.get("code"), item.get("at")) for key, item in items.items()))
         if signature in state["pushed"]:
             return False
         if not final:
@@ -729,7 +737,7 @@ class Daemon:
             if self.clock() - oldest < self.config.unresolved_report_seconds:
                 return False
         text = "运行 %s 有 %d 项系统没能自动解决：\n\n%s" % (
-            self.run_id, len(items), "\n\n".join(unresolved_lines(state)))
+            self.run_id, len(items), "\n\n".join(unresolved_lines(items)))
         self._push(text, UNRESOLVED_REPORT_KIND)
         state["pushed"].append(signature)
         return True
@@ -767,23 +775,60 @@ UNRESOLVED_OPTIONS = ("调整这条验收（改变产品范围，需要你确认
                       "再给系统一轮")
 
 
-def unresolved_lines(state: Mapping[str, Any]) -> List[str]:
+def _escalate_category(reason: str) -> Optional[str]:
+    """Decision category named by the reason's fixed prefix; None means engineering."""
+    head = reason.lstrip()
+    if head.startswith("产品决策"):
+        return "product_acceptance"
+    if head.startswith(("授权", "外部权限")):
+        return "external_authorization"
+    return None
+
+
+def _node_fingerprint(snapshot, node_id: str) -> str:
+    try:
+        return stall.node_fingerprint(snapshot.nodes[node_id], snapshot.tasks, node_id)
+    except (AttributeError, KeyError, TypeError):
+        return ""
+
+
+def live_unresolved(state: Mapping[str, Any], snapshot=None) -> Dict[str, Any]:
+    """Items still stuck: a node that was accepted or moved on is no longer one."""
+    nodes = getattr(snapshot, "nodes", None) or {}
+    live = {}
+    for key, item in (state.get("unresolved") or {}).items():
+        if snapshot is not None and not key.startswith("daemon:"):
+            node = nodes.get(key)
+            if isinstance(node, Mapping) and node.get("status") == "accepted":
+                continue
+            stored = ((state.get("nodes") or {}).get(key) or {}).get("fingerprint")
+            current = _node_fingerprint(snapshot, key)
+            if stored and current and stored != current:
+                continue
+        live[key] = item
+    return live
+
+
+def unresolved_lines(items: Mapping[str, Any]) -> List[str]:
     """Product-language items for every engineering failure the system could not fix."""
     lines = []
-    for key, item in sorted((state.get("unresolved") or {}).items()):
+    for key, item in sorted(items.items()):
+        run_level = key.startswith("daemon:")
         lines.append("\n".join([
-            "受影响的验收例子：%s" % (item.get("example") or "（该节点未写验收例子）"),
+            "受影响的验收例子：%s" % ("整个运行的推进（守护程序层面，不对应某一条验收例子）" if run_level
+                              else item.get("example") or "（该节点未写验收例子）"),
             "现在的情况：已多次尝试仍未达成",
             "你可以选择：",
             *["  - " + option for option in UNRESOLVED_OPTIONS],
-            "（展开：%s，已试 %s 次，原因码 %s）" % (
-                "守护程序" if key == "daemon" else "节点 " + key, item.get("repairs", 0), item.get("code"))]))
+            "（展开：%s，原因码 %s）" % (
+                "守护程序" if run_level else "节点 %s，已试 %s 次" % (key, item.get("repairs", 0)), item.get("code"))]))
     return lines
 
 
-def unresolved_report(paths, run_id: str) -> List[str]:
+def unresolved_report(paths, run_id: str, snapshot=None) -> List[str]:
     """Read-only view of the same list the push carries, for ``vibe status``."""
-    return unresolved_lines(_run_record(_file(paths, run_id, HEAL_STATE_FILE)) or {})
+    state = _run_record(_file(paths, run_id, HEAL_STATE_FILE)) or {}
+    return unresolved_lines(live_unresolved(state, snapshot))
 
 
 def _pid_marker_alive(marker: Mapping[str, Any]) -> bool:

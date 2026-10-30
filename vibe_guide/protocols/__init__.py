@@ -215,7 +215,7 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # a one-shot repair session.
     "heal-session": frozenset({
         # 2026-10-30: unfixable engineering failures are reported, not escalated.
-        "fff2357e5bb4a39c3800444c976eee3d35151a31b07279f134231dcefa0cd95c",
+        "82f42d58ee688cc02f87faf5b569ec08ce04c1be86896432c00869f90ecdfc15",
         "f0338725e0669a5cc0fdee9b4189e7fd550f37c7e91bc922df68cfbc56dfe139",
     }),
 }

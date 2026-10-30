@@ -248,6 +248,82 @@ class UnresolvedReportTests(Base):
                 dm.DaemonConfig(unresolved_report_seconds=bad).validate()
 
 
+class UnresolvedLifecycleTests(Base):
+    def heal_state(self):
+        return json.loads((run_dir(self.paths, RUN) / dm.HEAL_STATE_FILE).read_text())
+
+    def test_daemon_error_entry_survives_the_heal_pass_that_triggered_it(self):
+        daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
+        daemon._error_streak = dm._ERROR_ESCALATION_STREAK - 1
+        daemon._retry = lambda node: (_ for _ in ()).throw(ValueError("retry broke"))
+        daemon.heal_pass(SimpleNamespace(status="running", nodes={NODE: {"status": "running"}}, tasks={}))
+        self.assertIn("daemon:daemon_errors", self.heal_state()["unresolved"])
+
+    def test_reappearing_item_is_reported_again(self):
+        self.now = [1000.0]
+        daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
+        daemon.clock = lambda: self.now[0]
+        daemon.run(max_cycles=6)
+        self.now[0] += dm.MAX_UNRESOLVED_REPORT_SECONDS + 1
+        daemon.run(max_cycles=1)
+        first = len([p for p in self.pushed if p[0] == "unresolved_report"])
+        state = self.heal_state()
+        state["unresolved"].pop(NODE)                      # fixed in between
+        dm._save_run_record(run_dir(self.paths, RUN) / dm.HEAL_STATE_FILE, state)
+        daemon._unresolved(NODE, "self_heal_no_progress", "again")  # stalls again, same code
+        self.now[0] += dm.MAX_UNRESOLVED_REPORT_SECONDS + 1
+        daemon.run(max_cycles=1)
+        self.assertEqual(len([p for p in self.pushed if p[0] == "unresolved_report"]), first + 1)
+
+    def test_accepted_or_moved_node_is_not_reported(self):
+        state = {"unresolved": {NODE: {"code": "x", "at": 0}}, "nodes": {NODE: {"fingerprint": "old"}}}
+        accepted = SimpleNamespace(nodes={NODE: {"status": "accepted"}}, tasks={})
+        self.assertEqual(dm.live_unresolved(state, accepted), {})
+        moved = SimpleNamespace(nodes={NODE: {"status": "running"}}, tasks={})
+        original = dm._node_fingerprint
+        dm._node_fingerprint = lambda snapshot, node: "new"
+        try:
+            self.assertEqual(dm.live_unresolved(state, moved), {})
+        finally:
+            dm._node_fingerprint = original
+        self.assertEqual(list(dm.live_unresolved(state, None)), [NODE])
+
+    def test_daemon_errors_clear_when_ticks_recover(self):
+        supervisor = FakeSupervisor(["running"])
+        calls = {"n": 0}
+        original = supervisor.run_once
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] <= dm._ERROR_ESCALATION_STREAK:
+                raise ValueError("boom")
+            return original()
+        supervisor.run_once = flaky
+        daemon = self.daemon(supervisor)
+        daemon.run(max_cycles=dm._ERROR_ESCALATION_STREAK + 2)
+        self.assertNotIn("daemon:daemon_errors", self.heal_state().get("unresolved", {}))
+
+    def test_gate_block_after_errors_is_still_recorded(self):
+        daemon = self.daemon(FakeSupervisor(["running"]))
+        daemon._unresolved("", "daemon_errors", "errors")
+        daemon._gate = lambda: {"status": "blocked_unknown", "reason": "gate_error: boom"}
+        daemon.run()
+        self.assertIn("daemon:daemon_gate_blocked", self.heal_state()["unresolved"])
+
+    def test_run_level_item_is_not_described_as_a_missing_acceptance_example(self):
+        text = "\n".join(dm.unresolved_lines({"daemon:daemon_errors": {"code": "daemon_errors", "at": 0}}))
+        self.assertNotIn("该节点未写验收例子", text)
+        self.assertIn("守护程序", text)
+
+    def test_acceptance_example_comes_from_the_node_contract(self):
+        supervisor = FakeSupervisor(["running"])
+        supervisor.monitor = SimpleNamespace(nodes={NODE: SimpleNamespace(
+            contract={"acceptance_example": "输入空表单时提示必填"})})
+        daemon = self.daemon(supervisor)
+        daemon._unresolved(NODE, "self_heal_no_progress", "stuck")
+        self.assertIn("输入空表单时提示必填", "\n".join(dm.unresolved_report(self.paths, RUN)))
+
+
 class SelfHealTests(Base):
     def test_level1_then_level2_then_recorded_after_two_unfixed_repairs(self):
         daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
@@ -298,15 +374,21 @@ class SelfHealTests(Base):
         self.assertEqual(decision_list(self.paths, RUN), [])
 
     def test_authorization_in_the_session_answer_escalates_right_away(self):
-        self.session_results = [ss.ShortSessionResult("claude-code", "ok", text="想了想\nVIBE_ESCALATE: 需要授权改范围")]
+        self.session_results = [ss.ShortSessionResult("claude-code", "ok", text="想了想\nVIBE_ESCALATE: 授权：需要改范围")]
         daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
         daemon.run(max_cycles=3)
         self.assertIn(("daemon_heal", "escalated", "needs_decision"), self.event_kinds())
         self.assertEqual(decision_list(self.paths, RUN)[0]["category"], "external_authorization")
         self.assertEqual([p[0] for p in self.pushed].count("escalation"), 1)
 
-    def test_escalate_mark_without_authorization_stays_with_the_system(self):
-        self.session_results = [ss.ShortSessionResult("claude-code", "ok", text="VIBE_ESCALATE: 不确定怎么改")]
+    def test_product_decision_category_raises_a_product_card(self):
+        self.session_results = [ss.ShortSessionResult("claude-code", "ok", text="VIBE_ESCALATE: 产品决策：验收要变")]
+        daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
+        daemon.run(max_cycles=3)
+        self.assertEqual(decision_list(self.paths, RUN)[0]["category"], "product_acceptance")
+
+    def test_escalate_mark_without_a_known_category_stays_with_the_system(self):
+        self.session_results = [ss.ShortSessionResult("claude-code", "ok", text="VIBE_ESCALATE: 不确定怎么改，也许要授权")]
         daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
         daemon.run(max_cycles=3)
         self.assertIn(("daemon_heal", "engineering_unresolved", "needs_decision"), self.event_kinds())
@@ -339,7 +421,8 @@ class SelfHealTests(Base):
         daemon = self.daemon(FakeSupervisor(["running"]), assess=lambda: stalled())
         daemon.run(max_cycles=6)
         count = len(self.sessions)
-        daemon.run(max_cycles=6)
+        for _ in range(6):
+            daemon.tick()
         self.assertEqual(len(self.sessions), count)
 
     def test_changed_fingerprint_resets_the_repair_count(self):
