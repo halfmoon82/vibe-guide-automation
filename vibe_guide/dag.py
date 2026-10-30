@@ -126,9 +126,10 @@ def append_integration_review_node(plan: Plan) -> Plan:
         # The claim schema is named here because this contract is the only
         # material the dispatched reviewer is guaranteed to read (ISSUE-83);
         # the full prose contract lives in prd-guide "整合审查节点的 accepted".
-        "output": "integration review report: a claim with exactly the keys "
-                  "findings, iteration_compatibility, test_runtime_delivery, "
-                  "out_of_scope (severity p0-p4, only resolved clears; p3/p4 "
+        "output": "integration review report: "
+                  "evidence 本身就是这四个键：findings、iteration_compatibility、"
+                  "test_runtime_delivery、out_of_scope，不再套一层 claim。"
+                  " (severity p0-p4, only resolved clears; p3/p4 "
                   "are observations that never count into the clearance)",
         "error_behavior": "malformed claims are rejected as acceptance_rejected "
                           "for re-report on the same session; contract drift, "

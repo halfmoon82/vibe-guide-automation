@@ -221,7 +221,7 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 
 #### 整合审查节点的 accepted
 
-它是整个 run 的验收，`evidence` 必须是对象，**恰好四个键**：
+它是整个 run 的验收，`evidence` 必须是对象，**恰好四个键**。evidence 本身就是这四个键：findings、iteration_compatibility、test_runtime_delivery、out_of_scope，不再套一层 claim。
 
 ```json
 {
