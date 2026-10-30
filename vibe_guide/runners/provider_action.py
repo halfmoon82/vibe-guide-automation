@@ -363,10 +363,11 @@ class ProviderActionRunner(Runner):
             "`wake.channel` 非空时用该工具向 `wake.target` 原样发送 `wake.signal`，唤醒登记主监工；为 null 或地址 unknown 时不发，由心跳领取。"
             "自报时把你本会话的工作目录原样写进交付 JSON 的 `delivery_evidence.session_cwd`：监工用它核对本会话是否真的挂载了 project，不填就无法核对。"
             "运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。\n"
-            "决策边界：不改变 PRD 决策的工程问题（实现方案、测试取舍、基线、小范围越界）自行判断并决定，"
+            "决策边界：不改变 PRD 决策的工程问题（实现方案、测试取舍、基线）自行判断并决定，"
             "把理由写进交付，不用 AskUserQuestion，不停下等人；"
-            "需要改允许路径外的文件时，先完成路径内的部分，把越界需求写进交付的 known_gaps 交监工裁决。"
-            "只有会改变 PRD 决策、涉及部署发布、凭据或授权卡外不可撤销动作时，才在交付里附 decision_requests。\n"
+            "需要改允许路径外的文件时，先完成路径内的部分，再按 prd-guide §4 用交付的 in_contract=false 加 consistency.scope_expansion 上报，不要只写在自由文本里。"
+            "只有会改变 PRD 决策、涉及部署发布、凭据或授权卡外不可撤销动作、新增第三方依赖、"
+            "可见降级为后台不可见时，才在交付里附 decision_requests。\n"
             "{rework_findings}{supervisor_answer}"
         ).format(node=node_id, generation=generation, purpose=purpose, objective=objective,
                  role=contract.get('role', 'developer'),
