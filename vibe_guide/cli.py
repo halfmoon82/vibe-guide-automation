@@ -1886,6 +1886,12 @@ def _snapshot_result(
         text += "\n" + expansions
     if pending_verification:
         text += "\n" + _render_pending_verification(pending_verification)
+    if paths is not None:
+        from . import daemon as daemon_module
+        unresolved = daemon_module.unresolved_report(paths, snapshot.run_id, snapshot)
+        if unresolved:
+            payload["unresolved"] = unresolved
+            text += "\n未能自动解决的项：\n" + "\n\n".join(unresolved)
     return _result(
         code,
         payload,

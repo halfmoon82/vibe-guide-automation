@@ -173,11 +173,12 @@ class LiveSessionTests(CloseoutBase):
         self.assertEqual(outcome, {"status": "terminal", "run_status": "complete"})
         self.assertIn("archive", self.order)
 
-    def test_a_long_deferral_goes_to_the_product_manager_once(self):
+    def test_a_long_deferral_is_reported_once_without_a_decision_card(self):
         self.probe = {"live": ["abcd1234"], "unknown": None}
         daemon = self.make(Supervisor([snap("complete")]), blocked_grace=60)
         daemon.run(max_cycles=8)
-        self.assertEqual(self.order.count("push:escalation"), 1)
+        self.assertEqual(self.order.count("push:escalation"), 0)
+        self.assertEqual(self.order.count("push:unresolved_report"), 1)
         self.assertNotIn("archive", self.order)
 
 
@@ -197,7 +198,7 @@ class ParkedRunTests(LiveSessionTests):
         daemon._save_heal_state(state)
         outcome = daemon.run(max_cycles=5)
         self.assertEqual(outcome, {"status": "terminal", "run_status": "blocked_unknown"})
-        self.assertEqual(self.order[:2], ["push:run_blocked_unknown", "lease_release"])
+        self.assertEqual(self.order[:3], ["push:unresolved_report", "push:run_blocked_unknown", "lease_release"])
         self.assertIn("archive", self.order)
         self.assertNoResidue()
 

@@ -63,7 +63,7 @@ class ReviewerHealTests(_OneNodeCase):
         self.assertIn("reviewer_replace", self.kinds())
         self.assertNotIn(SECRET, str(load_events(self.paths, self.run_id)))
 
-    def test_second_occurrence_escalates_instead_of_replacing(self):
+    def test_second_occurrence_is_recorded_instead_of_replacing(self):
         self.set_binding("stopped")
         daemon = self.daemon()
         self.heal(daemon)
@@ -78,10 +78,12 @@ class ReviewerHealTests(_OneNodeCase):
         node = self.heal(daemon)
         self.assertEqual(self.kinds().count("reviewer_replace"), 1)
         self.assertEqual(node["status"], "review")
-        self.assertEqual(len(decision_list(self.paths, self.run_id)), 1)
-        self.assertEqual(len(self.pushed), 1)
+        self.assertEqual(decision_list(self.paths, self.run_id), [])
+        self.assertEqual(self.pushed, [])
+        self.assertIn("n1", daemon._heal_state()["unresolved"])
         self.heal(daemon)
-        self.assertEqual(len(self.pushed), 1)
+        self.assertEqual(self.pushed, [])
+        self.assertEqual(self.kinds().count("reviewer_replace"), 1)
 
     def test_live_reviewer_is_left_alone(self):
         self.set_binding("running")

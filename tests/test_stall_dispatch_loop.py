@@ -78,7 +78,7 @@ class DaemonLadderOnDispatchLoopTests(unittest.TestCase):
         return SimpleNamespace(status="blocked_unknown", tasks={}, authorization={},
                                nodes={NODE: parked_node(self.generation)})
 
-    def test_node_climbs_retry_then_short_session_then_pm_while_generation_keeps_growing(self):
+    def test_node_climbs_retry_then_short_session_then_is_recorded_while_generation_keeps_growing(self):
         from vibe_guide import short_session as ss
 
         def launcher(platform, prompt, **kwargs):
@@ -97,7 +97,8 @@ class DaemonLadderOnDispatchLoopTests(unittest.TestCase):
             daemon.heal_pass(self.snapshot())
         self.assertEqual(retries, [NODE])
         self.assertEqual(len(self.sessions), 2)
-        self.assertEqual(self.pushed.count("escalation"), 1)
+        self.assertEqual(self.pushed, [])
+        self.assertIn(NODE, daemon._heal_state()["unresolved"])
 
 
 if __name__ == "__main__":

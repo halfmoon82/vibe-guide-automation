@@ -27,6 +27,11 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-30: §6.1 level three — engineering failures stay with the system,
+        # reported in product language; only product/authorization asks reach the PM.
+        "74ba1dd845c4c32375a26b33cbcfad4ef590ecbfb11d69ca4c1764546545c359",
+        # 2026-10-30: same section on the pre-integration base (PR #330 first commits).
+        "184eeb880440caf19d6e7063407f3a91c14d4994b7c3b18a4c9f8dd8ac46fdba",
         # 2026-10-30: integration merge on origin/main 4b69de5 (D3 evidence wording,
         # dead-daemon report-only, card options).
         "86c72be2d652d9d76249a4222f3d9d7ba6b8ea5d72dfccfa8979ee59fdc47319",
@@ -219,6 +224,10 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Short per-beat runbook; the beat prints it once per shift, then only
     # its path and sha256.
     "supervisor-card": frozenset({
+        # 2026-10-30: the supervisor answers worker_questions itself.
+        "6afcb9ae73049f3e77d83c4c7f446487d7c1b20de5e251aa43595f8a75120cab",
+        # 2026-10-30: same line on the pre-integration base (PR #330 first commits).
+        "26db462af06ca4e34319149c60ce9e27794316234071344bd6ed9949277aad06",
         # 2026-10-30: integration merge on origin/main 4b69de5 (decision boundary from
         # #327 plus the manual-stop section).
         "168b38e302a823bed7f2a7ca2cc9c99a74946ac1a188847208b7afea1ba8f588",
@@ -241,6 +250,10 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Second-level self-heal short session (daemon): the prompt the daemon feeds
     # a one-shot repair session.
     "heal-session": frozenset({
+        # 2026-10-30: unfixable engineering failures are reported, not escalated.
+        "82f42d58ee688cc02f87faf5b569ec08ce04c1be86896432c00869f90ecdfc15",
+        # 2026-10-30: first wording (PR #330 first commit).
+        "fff2357e5bb4a39c3800444c976eee3d35151a31b07279f134231dcefa0cd95c",
         "f0338725e0669a5cc0fdee9b4189e7fd550f37c7e91bc922df68cfbc56dfe139",
     }),
 }
