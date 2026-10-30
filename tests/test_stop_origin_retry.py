@@ -116,6 +116,26 @@ class RunnerStopOriginTests(unittest.TestCase):
         self.assertEqual(self.launcher.calls.count("launch"), 1)
 
 
+    def test_reviewer_dispatch_ignores_developer_session(self):
+        self.runner.start(self.contract, Path("/tmp"))
+        live = {"live": ["1a2b3c4d"], "unknown": None}
+        with patch("vibe_guide.live_sessions.probe_live_sessions", return_value=live) as probe:
+            self.runner.start(dict(self.contract, role="reviewer"), Path("/tmp"))
+        probe.assert_not_called()
+        self.assertEqual(self.launcher.calls.count("launch"), 2)
+
+    def test_unknown_probe_fails_closed(self):
+        self.runner.start(self.contract, Path("/tmp"))
+        unknown = {"live": [], "unknown": "claude agents could not be read"}
+        with patch("vibe_guide.live_sessions.probe_live_sessions", return_value=unknown):
+            with self.assertRaises(ClaudeBgUnknown):
+                self.runner.start(dict(self.contract, generation=2), Path("/tmp"))
+        with patch("vibe_guide.live_sessions.probe_live_sessions", side_effect=OSError):
+            with self.assertRaises(ClaudeBgUnknown):
+                self.runner.start(dict(self.contract, generation=2), Path("/tmp"))
+        self.assertEqual(self.launcher.calls.count("launch"), 1)
+
+
 class BranchExistsTests(unittest.TestCase):
     def test_remote_only_ref_is_not_an_existing_branch(self):
         with tempfile.TemporaryDirectory() as raw:

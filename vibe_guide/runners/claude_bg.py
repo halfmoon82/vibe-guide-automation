@@ -365,22 +365,35 @@ class ClaudeBgRunner(Runner):
         prior session record are probed.
         """
         node_id = contract["node_id"]
+        role = contract.get("role", "developer")
         sessions = []
         for handle_id in self._prior_session_handles(node_id):
             prior = self._adopt_persisted(handle_id)
-            if prior is not None and not prior["stale"]:
+            # Only a same-role predecessor is a rival writer: the developer
+            # session that just delivered is not one when the reviewer starts.
+            if (prior is not None and not prior["stale"]
+                    and prior["claims"].get("role") == role):
                 sessions.append(prior["claims"]["session_id"])
         if not sessions:
             return
         paths = self._paths or ProjectPaths.from_cwd(Path.cwd())
         view = SimpleNamespace(
             tasks={sid: {"mode": "background", "task_id": sid} for sid in sessions},
-            nodes={node_id: {"worktree": str(worktree)}},
+            # No worktree match: only the named same-role sessions count.
+            nodes={},
         )
         try:
             probe = live_sessions.probe_live_sessions(paths, view)
-        except Exception:
-            return
+        except Exception as error:
+            raise ClaudeBgUnknown(
+                "cannot verify node %s has no live session (%s); not dispatching "
+                "another writer" % (node_id, type(error).__name__)
+            ) from error
+        if probe.get("unknown"):
+            raise ClaudeBgUnknown(
+                "cannot verify node %s has no live session (%s); not dispatching "
+                "another writer" % (node_id, probe["unknown"])
+            )
         if probe.get("live"):
             raise ClaudeBgUnknown(
                 "node %s already has a live session (%s); not dispatching a second "
