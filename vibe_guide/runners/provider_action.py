@@ -1541,6 +1541,33 @@ class ProviderActionRunner(Runner):
         self.store._atomic(self._handle_path(handle.run_id), metadata)
         return handle
 
+    def send_notice(self, handle: RunHandle, message: str) -> None:
+        """Queue a fire-and-forget message to the bound thread (advisory).
+
+        Uses its own ``resume`` action sequence and leaves ``pending_action``
+        untouched, so the wait/poll state machine is unaffected.
+        """
+        metadata = self.store._read(self._handle_path(handle.run_id))
+        sequence = int(metadata.get("notice_sequence", 0)) + 1
+        contract = {
+            key: metadata.get(key)
+            for key in (
+                "node_id", "role", "generation", "dispatcher", "complexity_band",
+                "execution_engine", "engine_mode", "engine_evidence_ref",
+                "authorization_digest", "plan_id", "plan_version",
+            )
+            if metadata.get(key) is not None
+        }
+        self._action(
+            contract,
+            metadata["run_id"],
+            "resume",
+            {"threadId": metadata["task_id"], "hostId": metadata["host"], "prompt": message},
+            sequence=sequence,
+        )
+        metadata["notice_sequence"] = sequence
+        self.store._atomic(self._handle_path(handle.run_id), metadata)
+
     def is_pending(self, handle: RunHandle) -> bool:
         metadata = self.store._read(self._handle_path(handle.run_id))
         action_id = metadata.get("pending_action")

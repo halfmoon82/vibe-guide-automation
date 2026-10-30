@@ -57,6 +57,7 @@ from .planner import (
     resolve_scope_expansion,
 )
 from . import dag as _dag_module
+from . import worker_liveness
 from .dag import (
     _write_scope_paths,
     audit_dag,
@@ -249,6 +250,15 @@ REVERSE_BLOCK_REASON = (
 #: escalated to a visible ``blocked_unknown`` with a human recovery action
 #: instead of looping.
 ACCEPTANCE_FORMAT_REJECTION_LIMIT = 3
+
+#: Fixed text sent to the reviewer session whose delivery was rejected for its
+#: format (D2).  It is a program constant: nothing the reviewer wrote is ever
+#: echoed into it, the audit event or the supervisor-visible node field.
+ACCEPTANCE_REJECTION_NOTICE = (
+    "Your acceptance report was rejected for format. Re-report in this session: "
+    "evidence must be an object with exactly the keys findings, "
+    "iteration_compatibility, test_runtime_delivery, out_of_scope."
+)
 
 #: The node ``recovery_action`` stamped by the escalation above.  It names the
 #: human recovery entries, both of which exist in the CLI: reshape the
@@ -5220,6 +5230,24 @@ class Monitor:
         node contract, so it cannot affect the authorization digest.
         """
         raw = contract.get("worker_profile")
+        if not isinstance(raw, dict) and is_integration_review_node(node):
+            # The integration reviewer may reach dispatch with no profile dict;
+            # the v2 fallback would then pin the "default" model and skip the
+            # tier entirely.  Seed the same placeholder so it resolves as deep.
+            worker = str(contract.get("worker") or node.contract.get("worker") or "worker")
+            raw = {
+                "worker": worker, "model": "default", "reasoning": "normal",
+                "fallbacks": [],
+                "selection_basis": {
+                    "issue_complexity_ref": node.id, "complexity_band": "standard",
+                    "risk_tags": ["integration", "read-only"],
+                    "availability_evidence": "runtime",
+                },
+                "writer": worker,
+                "worktree": str(contract.get("worktree") or current.get("worktree") or "."),
+                "branch": str(contract.get("branch") or current.get("branch") or "branch-" + node.id),
+                "allowlist": list(contract.get("files") or [node.id + ".py"]),
+            }
         if not isinstance(raw, dict) or raw.get("model") not in (None, "", "default"):
             return
         if contract.get("routing_required") is True:
@@ -6588,6 +6616,40 @@ class Monitor:
         if extra_event_data:
             event_data.update(extra_event_data)
         self._record(snapshot, "acceptance_rejected", event_data, active)
+        self._notify_rejected_reviewer(snapshot, node_id, active, runner, handle_id)
+
+    def _notify_rejected_reviewer(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        active: Optional[Dict[str, Any]],
+        runner: Optional[Runner],
+        handle_id: Optional[str],
+    ) -> None:
+        """Tell the same reviewer session its report was rejected (D2).
+
+        Fixed text only, reviewer sessions only, best effort: a runner without
+        ``send_notice`` or a failing send leaves the rejection itself intact.
+        The supervisor sees the outcome through ``acceptance_correction_notified``
+        and the node's ``acceptance_correction_notice`` flag.
+        """
+        if not (isinstance(active, dict) and active.get("role") == "reviewer"):
+            return
+        sender = getattr(runner, "send_notice", None)
+        if not callable(sender) or not handle_id:
+            return
+        delivered = True
+        try:
+            sender(RunHandle(handle_id), ACCEPTANCE_REJECTION_NOTICE)
+        except Exception:  # noqa: BLE001 - the notice is advisory
+            delivered = False
+        snapshot.nodes[node_id]["acceptance_correction_notice"] = {"delivered": delivered}
+        self._record(
+            snapshot,
+            "acceptance_correction_notified",
+            {"run_id": snapshot.run_id, "node_id": node_id, "delivered": delivered},
+            active,
+        )
 
     def _note_acceptance_format_rejection(
         self,
@@ -8191,6 +8253,12 @@ class Monitor:
             active,
         )
 
+    @staticmethod
+    def _acceptance_format_rejection_count(current: Dict[str, Any]) -> int:
+        record = current.get("acceptance_format_rejections")
+        count = record.get("count") if isinstance(record, dict) else 0
+        return count if isinstance(count, int) and not isinstance(count, bool) else 0
+
     def repair_node(self, node_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
         """Repair a node in place; identity fields are immutable across repair."""
         self._reset_binding_cache()
@@ -8352,6 +8420,20 @@ class Monitor:
         binding_dead = binding_matches and binding.status in {
             "stopped", "failed", "archived",
         }
+        if (
+            not binding_dead and binding_matches and role == "reviewer"
+            and binding.status in {"running", "review"}
+            and 0 < self._acceptance_format_rejection_count(current)
+            < ACCEPTANCE_FORMAT_REJECTION_LIMIT
+            and worker_liveness.session_ended(
+                self.paths, snapshot.run_id, node_id, current
+            )
+        ):
+            # D4: a reviewer that delivered a malformed report and then exited
+            # leaves its binding reading "review".  Below the escalation limit
+            # that is a dead identity, not an unknown one: replace the
+            # reviewer instead of parking the node for reconcile_binding.
+            binding_dead = True
         retry = current.get("retryable_action")
         delivered_continuation = (
             binding_matches and binding.status == "delivered" and role == "developer"
