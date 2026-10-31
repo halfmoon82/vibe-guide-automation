@@ -89,6 +89,20 @@ def _git_in(directory: Path) -> GitRunner:
     return run
 
 
+def _project_git_available(monitor: Any) -> bool:
+    """True when the project root is a readable git checkout.
+
+    Scope landing is a git discipline: in a project that is not a git
+    checkout (fake providers, fixtures, guide mode) there is no base..HEAD
+    claim to enforce, so the compatibility paths stay open.
+    """
+    try:
+        resolved = _git_in(monitor.paths.root)(["rev-parse", "--verify", "--quiet", "HEAD"])
+        return resolved.returncode == 0 and bool((resolved.stdout or "").strip())
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _project_head(monitor: Any) -> str:
     project = _git_in(monitor.paths.root)(["rev-parse", "HEAD"])
     if project.returncode != 0 or not project.stdout.strip():
@@ -147,17 +161,54 @@ def landing_report(monitor: Any, snapshot: Any, node_id: str) -> Optional[Dict[s
     """``{"files", "expanded", "rejected", "base"}``, or None without a node worktree.
 
     A node whose worktree is not a git worktree root of its own (fake
-    providers, guide mode) has no branch claim to check.
+    providers, guide mode) has no branch claim to check -- but only when
+    there is no claim at all: no worktree configured, no monitor project
+    paths, or the directory does not exist yet.  A configured worktree that
+    *exists* without a ``.git`` (a plain directory) claimed to be an
+    independent git worktree and cannot vouch for anything: per #336 that is
+    "cannot confirm the landing", never "nothing landed", so it raises
+    ``ScopeLandingUnknown`` and the caller's fail-closed path parks the node.
     """
     from .worktree_base import upstream_branches
 
     current = snapshot.nodes[node_id]
-    if not str(current.get("worktree") or "").strip() or not hasattr(monitor, "paths"):
+    raw_worktree = str(current.get("worktree") or "")
+    if not raw_worktree.strip() or not hasattr(monitor, "paths"):
         return None
-    worktree = Path(str(current["worktree"]))
+    configured_absolute = Path(raw_worktree).is_absolute()
+    worktree = Path(raw_worktree)
     if not worktree.is_absolute():
         worktree = monitor.paths.root / worktree
+    if worktree == Path(monitor.paths.root).resolve() or worktree == monitor.paths.root:
+        return None  # the node writes the main tree by contract (worker-deliver does the same)
     if not (worktree / ".git").exists():
+        if worktree.exists():
+            # An existing directory that claims to be a node worktree but has
+            # no .git can vouch for nothing -- "cannot confirm the landing"
+            # is never "nothing landed".  An absolute claim is foreign by
+            # definition (vibe node worktrees are always repo-relative, see
+            # AGENTS.md §10); a repo-relative claim fails closed inside a
+            # real git project, while a non-git project is a fake/fixture
+            # with no landing discipline to enforce (IR-5 compatibility).
+            if configured_absolute or _project_git_available(monitor):
+                raise ScopeLandingUnknown(
+                    "worktree {} exists but is not an independent git worktree "
+                    "(no .git)".format(worktree)
+                )
+            return None
+        # Missing directory: "cannot confirm the landing" is never "nothing
+        # landed" (#336).  Branch existence is never a pass condition (IR-6,
+        # integration review g9): inside a git project the landing
+        # discipline exists, so a configured writer worktree that is gone at
+        # delivery time -- with or without its branch -- fails closed
+        # through the caller's park path.  Outside a git project (fake
+        # providers, fixtures, the launcher has not built it yet) there is
+        # no claim to check and the compatibility path stays open.
+        if _project_git_available(monitor):
+            raise ScopeLandingUnknown(
+                "worktree {} is missing at delivery time; the landing "
+                "cannot be confirmed".format(worktree)
+            )
         return None
     git = _git_in(worktree)
     project_head = _project_head(monitor)
@@ -225,16 +276,71 @@ def _rejection_text(rejected: List[Dict[str, str]], error: Optional[str] = None)
     return "交付被拒收：" + "".join(parts)
 
 
+#: Fixed classification of an unconfirmable-landing block (#336 / IR-6):
+#: the delivery gate could not read where the work landed, so the node is
+#: blocked_unknown with this structural code -- never a silent pass, and not
+#: the supervisor-question park used for rejected file lists.
+LANDING_UNREADABLE_CLASS = "landing_unreadable"
+LANDING_UNREADABLE_CODE = "scope_landing:landing_unreadable"
+
+
+def _park_landing_unreadable(monitor: Any, snapshot: Any, node_id: str,
+                             active: Dict[str, Any], error: Any,
+                             event_data: Dict[str, Any]) -> None:
+    """Park the node blocked_unknown: the delivery landing cannot be confirmed.
+
+    Distinct from the rejected-file-list park (``park`` with
+    ``KIND_SCOPE_LANDING``), which leaves a worker question a supervisor can
+    answer: here there is nothing to answer until the worktree state is
+    repaired, so #336 records blocked_unknown plus a structural code.
+    Everything stamped is a program constant; the worker's free text never
+    reaches the record.  ``worker_questions`` is deliberately not involved.
+    """
+    current = snapshot.nodes[node_id]
+    reason = "delivery landing cannot be confirmed ({})".format(str(error)[:200])
+    current["status"] = "blocked_unknown"
+    current["reason"] = reason
+    current["reason_class"] = LANDING_UNREADABLE_CLASS
+    current["reason_code"] = LANDING_UNREADABLE_CODE
+    current.pop("recovery_action", None)
+    current.pop("error_type", None)
+    current["retryable_action"] = None
+    current["active_role"] = None
+    current["active_task"] = None
+    snapshot.handles.pop(node_id, None)
+    current["quarantine"] = {
+        "run_id": snapshot.run_id,
+        "handle_id": active.get("handle_id") if isinstance(active, dict) else None,
+        "reason": reason,
+    }
+    monitor._release_node_lease(snapshot, node_id)
+    if isinstance(active, dict) and active.get("role") in {"developer", "reviewer"}:
+        try:
+            monitor._set_binding_status(snapshot, node_id, str(active["role"]), "blocked_unknown")
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            pass
+    monitor._record(snapshot, "scope_landing_rejected", event_data, active)
+
+
 def check_delivery(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, Any]) -> bool:
     """True when the developer delivery may proceed; False after refusing it."""
     try:
         report = landing_report(monitor, snapshot, node_id)
     except (ScopeLandingUnknown, OSError, subprocess.SubprocessError) as error:
         snapshot.nodes[node_id][REJECTION_KEY] = [{"path": "*", "cause": CAUSE_UNREADABLE}]
-        park(monitor, snapshot, node_id, active, _rejection_text([], str(error)[:300]),
-             kind=KIND_SCOPE_LANDING, event_name="scope_landing_rejected",
-             event_data={"rejection_code": "scope_landing:" + CAUSE_UNREADABLE},
-             binding_status=_DELIVERED)
+        _park_landing_unreadable(
+            monitor, snapshot, node_id, active, error,
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": active.get("role") if isinstance(active, dict) else None,
+                "generation": active.get("generation") if isinstance(active, dict) else None,
+                "handle_id": active.get("handle_id") if isinstance(active, dict) else None,
+                "reason_class": LANDING_UNREADABLE_CLASS,
+                "reason_code": LANDING_UNREADABLE_CODE,
+                "rejection_code": LANDING_UNREADABLE_CODE,
+            },
+        )
         return False
     if report is None:
         return True
@@ -257,6 +363,85 @@ def check_delivery(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, 
                                      list(report["expanded"])),
             "delivery_landing", active=active)
     return True
+
+
+#: Structural code of the empty-landing refusal (#336): the node worktree is
+#: an independent git worktree but ``base..HEAD`` (minus content merged in
+#: unchanged) changed nothing.  A report without a landing is not a delivery;
+#: the same session can commit real work and re-report.
+EMPTY_LANDING_CODE = "empty_landing"
+#: Event recorded when the contract opted in (``allow_empty_landing: true``)
+#: and an empty diff is allowed through.
+EMPTY_LANDING_ALLOWED_EVENT = "empty_landing_allowed"
+
+
+def check_delivery_content(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, Any],
+                           runner: Any = None, handle_id: Optional[str] = None) -> bool:
+    """True when the developer delivery actually landed something (#336).
+
+    Runs after ``check_delivery`` accepted the file scope: the same landing
+    report is reused, so a refusal here means the diff was readable and in
+    scope but *empty*.  That is a format-class error, not a supervisor
+    question: the worker is still live, so the refusal keeps the handle and
+    binding (``acceptance_rejected`` with the ``empty_landing`` structural
+    code) and the same session re-reports after a real commit.
+
+    A node without a git-worktree landing (no worktree configured, or the
+    guide/fake-provider modes where there is no branch claim to check) keeps
+    today's pass-through: this gate only judges landings that can be read.
+    When the contract carries ``allow_empty_landing: true`` an empty diff is
+    allowed through and recorded as ``empty_landing_allowed``.
+    """
+    try:
+        report = landing_report(monitor, snapshot, node_id)
+    except (ScopeLandingUnknown, OSError, subprocess.SubprocessError) as error:
+        # Unreadable diffs stay fail-closed: the node is parked
+        # blocked_unknown by _park_landing_unreadable, so there is nothing
+        # left to judge here.
+        snapshot.nodes[node_id][REJECTION_KEY] = [{"path": "*", "cause": CAUSE_UNREADABLE}]
+        _park_landing_unreadable(
+            monitor, snapshot, node_id, active, error,
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": active.get("role") if isinstance(active, dict) else None,
+                "generation": active.get("generation") if isinstance(active, dict) else None,
+                "handle_id": active.get("handle_id") if isinstance(active, dict) else None,
+                "reason_class": LANDING_UNREADABLE_CLASS,
+                "reason_code": LANDING_UNREADABLE_CODE,
+                "rejection_code": LANDING_UNREADABLE_CODE,
+            },
+        )
+        return False
+    if report is None or report["files"]:
+        return True
+    contract = getattr(getattr(monitor, "nodes", {}).get(node_id), "contract", None)
+    if isinstance(contract, dict) and contract.get("allow_empty_landing") is True:
+        monitor._record(
+            snapshot,
+            EMPTY_LANDING_ALLOWED_EVENT,
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": str(active.get("role")) if isinstance(active, dict) else None,
+                "generation": active.get("generation") if isinstance(active, dict) else None,
+                "reason": "contract allow_empty_landing: true; empty diff allowed",
+            },
+            active,
+        )
+        return True
+    monitor._reject_acceptance_format(
+        snapshot,
+        node_id,
+        active,
+        "empty landing: the node worktree has no committed change since its base",
+        EMPTY_LANDING_CODE,
+        {"disposition": "acceptance_rejected",
+         "finding": ["empty landing: base..HEAD changed nothing"]},
+        runner=runner,
+        handle_id=handle_id,
+    )
+    return False
 
 
 def render_status_lines(snapshot: Any) -> str:

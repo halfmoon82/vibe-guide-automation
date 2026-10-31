@@ -285,6 +285,16 @@ def _derived_user_status(status: Any, reason: Any = "") -> str:
             and worktree_reason_code(record)
         ):
             return WORKTREE_ACTION_STATUS
+        # #335: an engineering block needs supervisor investigation.  Check
+        # the structural class before either recovery marker can relabel it as
+        # self-healing, without shadowing worktree/decision/active states.
+        if (
+            record.get("reason_class") == "engineering_blocked"
+            and not record.get("active_task")
+            and record.get("status") not in _USER_ACTIVE_STATUSES
+            and record.get("status") not in _USER_DECISION_STATUSES
+        ):
+            return STALL_INVESTIGATE_STATUS
         if record.get("binding_phase") in _USER_RECOVERY_STATUSES:
             return "自动修复中"
         # A running node with no active handle but a durable retry marker is

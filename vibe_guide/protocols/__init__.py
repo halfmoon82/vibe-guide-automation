@@ -196,6 +196,11 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "fc271522236eeb9a943c59b077547bab251ce5ff33a2997954ebda4433d01612",
         # 2026-10-18: heartbeat-wake (answered decisions consumed) combined with main's idle backoff (#239).
         "a6d940da69d2e43664a37d44f0a9e28ad7f5ca2ecb8ebb03f46cf05752acd94b",
+        # 2026-10-30: §6.4 locate 行补参数形状（Codex 只传 threadId，#316），§6.3 可见派发缺树机读码 worktree_missing（#337/#339 文档半）。
+        "303e7bf22443b896ee9cc1a158c82bf96421cc2789226409460a293a302eabb9",
+        # 2026-10-31 IR-1: 整合聚合版：locate/worktree_missing（#337/#339 文档半）
+        # + --project-root 文档（IR-1 聚合修复）。
+        "4336b8a2977974248dbec483a4e8440ed60768234d76ffc0a6ac685e12ee97c5",
     }),
     "vibe-entry": frozenset({
         # 2026-10-31: monitor auto-starts the daemon; launchd keep-alive is the only auto-restart path.
@@ -260,6 +265,12 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "316ac78b3dead0703a8a118f308029ab2a9af709eb8d79cad780a1b5423060e1",
         # manual stop: use vibe's stop entry, not `claude stop`.
         "6ac171e78a2fb4d6f284727a362597f74c81a1dba96defe6c519496a2cbf7746",
+        # 2026-10-30: locate 小节——照抄 native_args、不要多传参数（#337 文档半）。
+        "a10b4b7c4371c89dd2be5e0d2048160a2a54e1c2dca923b117f6fa8afbafec65",
+        # 2026-10-31 IR-1: IR-1 聚合中间版 3312B，超顶，仅登记不采用。
+        "3d66a84077b893c6798fd0ea66adf6c16ff3b23bdd83524d2efd51e9c5df9df8",
+        # 2026-10-31 IR-1: 压缩版 3070B ≤3072B；项目根小节与整合线逐字节一致（免合并冲突），locate 保留。
+        "d458ed4067e8530f03e176b535f0e34a1cd4a756b85211bbaff351f9b8f30f8c",
     }),
     # Second-level self-heal short session (daemon): the prompt the daemon feeds
     # a one-shot repair session.

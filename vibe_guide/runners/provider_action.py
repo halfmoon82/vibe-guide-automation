@@ -296,11 +296,15 @@ class ProviderActionRunner(Runner):
         paths: ProjectPaths,
         adapter_id: str,
         provider: str,
+        launchers=None,
     ):
         self.paths = paths
         self.adapter_id = adapter_id
         self.provider = provider
         self.store = ProviderActionStore(paths)
+        #: Optional CLI-owned report collector.  Legacy direct callers retain
+        #: their old behavior; public dispatch always supplies this list.
+        self._worktree_launchers = launchers
 
     def _native_tool(self, operation: str) -> str:
         tools = NATIVE_TOOL_MAP.get(self.provider)
@@ -311,6 +315,38 @@ class ProviderActionRunner(Runner):
                 "no verified native control plane for provider {}".format(self.provider)
             )
         return tools[operation]
+
+    def _prepare_visible_worktree(self, contract: Dict[str, Any], worktree: Path) -> None:
+        """Use the background launcher's safe worktree preflight before create."""
+        from ..adapters.claude_bg import ClaudeBgConfig, ClaudeBgLauncher
+        from ..adapters.task_provider import BackgroundTaskRouting
+
+        node_id = str(contract.get("node_id") or "")
+        fallback = "provider-actions/deliveries/{}-{}.json".format(
+            contract.get("run_id"), node_id
+        )
+        routing = BackgroundTaskRouting(
+            host=str(contract.get("host") or "local"),
+            worktree=str(worktree),
+            branch=str(contract.get("branch") or ""),
+            status_file=str(contract.get("status_file") or fallback),
+            handoff_file=str(contract.get("handoff_file") or fallback),
+        )
+        upstream = contract.get("upstream_branches")
+        launcher = ClaudeBgLauncher(
+            routing,
+            ClaudeBgConfig(settings_path=""),
+            base_sha=contract.get("base_sha"),
+            **({"upstream_branches": list(upstream)} if upstream else {}),
+        )
+        # Only the current project's own .git makes it vibe-git-managed.
+        # An outer repository must not capture a nested legacy provider-owned
+        # project merely because it is an ancestor of the target worktree.
+        managed_root = Path(contract.get("managed_root") or self.paths.root)
+        if not (managed_root / ".git").exists():
+            return
+        self._worktree_launchers.append((node_id, launcher))
+        launcher._prepare_worktree()
 
     def _remote_git_ban(self, contract: Dict[str, Any]) -> str:
         """The fixed ban line, only when the card says ``deny`` (else empty)."""
@@ -775,6 +811,8 @@ class ProviderActionRunner(Runner):
             )
         if v39:
             self._validate_v39_create_binding(contract, worktree)
+        if self._worktree_launchers is not None:
+            self._prepare_visible_worktree(contract, worktree)
         predecessor = contract.get("predecessor_task_id")
         if predecessor is None and existing is not None:
             predecessor = existing.task_id
@@ -816,7 +854,12 @@ class ProviderActionRunner(Runner):
         # follows as one JSON document, so the consistency block always goes
         # last -- after any inlined protocol text.
         consistency = self._consistency_instruction(contract)
-        prompt = head + self._remote_git_ban(contract) + consistency
+        # Run-level decisions already answered in this run reach the worker on
+        # first dispatch too, not only on continuation (#338).  Empty section
+        # adds nothing, and the consistency block still goes last.
+        answered_text = supervisor_answer_section(contract)
+        answered_text = ("\n" + answered_text) if answered_text else ""
+        prompt = head + self._remote_git_ban(contract) + answered_text + consistency
         create_request = {
             "prompt": prompt,
             "target": {
@@ -889,7 +932,8 @@ class ProviderActionRunner(Runner):
             create_request["topology"] = topology
             create_request["sdd_protocol"] = sdd_protocol
             create_request["prompt"] = (
-                head + self._remote_git_ban(contract) + "\n\n" + protocol_block + "\n\n" + consistency
+                head + self._remote_git_ban(contract) + answered_text
+                + "\n\n" + protocol_block + "\n\n" + consistency
             )
         if v39:
             # Keep the provider request bound to the same supervisor target

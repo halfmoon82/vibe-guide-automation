@@ -155,7 +155,7 @@ from .evidence import evaluate_v41_closeout
 from .installation import run_install, run_upgrade, migrate_state
 from .skills import SkillSpec, install_project_skill
 from .models import InstallRequest
-from .decision_boundary import answer_decision, decision_list, raise_decision
+from .decision_boundary import answer_decision, decision_list, raise_reusable_decision
 from . import scope_landing, worker_questions
 
 
@@ -329,6 +329,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--options", dest="decision_options")
     parser.add_argument("--recommendation", dest="decision_recommendation")
     parser.add_argument("--decision-evidence", dest="decision_evidence")
+    parser.add_argument("--scope", dest="decision_scope", choices=("run", "node"), default="run")
     return parser
 
 
@@ -1043,11 +1044,13 @@ def _public_runner(
             paths,
             observed.adapter_id,
             AdapterRegistry().get(observed.adapter_id).manifest["provider"],
+            launchers=launchers,
         )
     return ProviderActionRunner(
         paths,
         observed.adapter_id,
         observed.capabilities.provider,
+        launchers=launchers,
     )
 
 
@@ -1076,11 +1079,18 @@ def _record_worktree_preflight(
     from .adapters.claude_bg import WORKTREE_BLOCKED_EVENT, WORKTREE_CREATED_EVENT
 
     changed = False
+    consumed = []
     for node_id, launcher in launchers or ():
         report = getattr(launcher, "worktree_preflight", None)
         if not isinstance(report, dict) or node_id not in snapshot.nodes:
             continue
         current = snapshot.nodes[node_id]
+        existing_base = current.get("worktree_base")
+        has_valid_base = (
+            isinstance(existing_base, str)
+            and len(existing_base) == 40
+            and all(char in "0123456789abcdefABCDEF" for char in existing_base)
+        )
         event = report.get("event")
         if event == WORKTREE_BLOCKED_EVENT:
             data = {"run_id": snapshot.run_id, "node_id": node_id}
@@ -1092,6 +1102,12 @@ def _record_worktree_preflight(
                 key: value for key, value in data.items()
                 if key not in ("run_id", "node_id")
             }
+            reason_code = report.get("reason_code")
+            current["reason_class"] = reason_code
+            retry = current.get("retryable_action")
+            if isinstance(retry, dict):
+                retry["reason_class"] = reason_code
+                retry["reason_code"] = reason_code
         elif event == WORKTREE_CREATED_EVENT:
             data = {"run_id": snapshot.run_id, "node_id": node_id}
             for key in _WORKTREE_REPORT_KEYS:
@@ -1108,12 +1124,27 @@ def _record_worktree_preflight(
             # says nothing happened): the action a supervisor was asked to
             # take is done, so the marker must stop claiming it.
             current.pop(WORKTREE_PREFLIGHT_KEY, None)
+            if report.get("worktree_base") and not has_valid_base:
+                current["worktree_base"] = report["worktree_base"]
+        elif (
+            report.get("worktree_base")
+            and not has_valid_base
+            and current.get("worktree_base") != report["worktree_base"]
+        ):
+            # An existing worktree can supply the initial scope baseline.  A
+            # successor already has one: its predecessor HEAD must never move
+            # that baseline forward and hide B..C from scope checks.
+            current["worktree_base"] = report["worktree_base"]
         else:
             continue
         current["user_status"] = map_user_status(current)
         changed = True
+        consumed.append((launcher, report))
     if changed:
         save_snapshot(paths, snapshot)
+    for launcher, report in consumed:
+        if getattr(launcher, "worktree_preflight", None) is report:
+            launcher.worktree_preflight = None
     return changed
 
 
@@ -2483,7 +2514,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             evidence = json.loads(args.decision_evidence) if args.decision_evidence else {}
             if not isinstance(evidence, dict):
                 raise ValueError("--decision-evidence must be a JSON object")
-            payload = raise_decision(
+            payload = raise_reusable_decision(
                 paths,
                 run_id=args.run_id,
                 node_id=args.node_id,
@@ -2492,6 +2523,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 recommendation=args.decision_recommendation,
                 evidence=evidence,
                 category=args.hold_category,
+                scope=args.decision_scope,
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "决策写入失败：" + str(error), args.as_json)
@@ -2501,6 +2533,15 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 UNKNOWN,
                 {"command": args.command, "status": "unknown", "reason": "decision notification bridge status unknown", **payload},
                 "决策已写入信箱，但通知桥状态未知",
+                args.as_json,
+            )
+        if isinstance(payload, dict) and payload.get("reused"):
+            request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+            return _result(
+                SUCCESS,
+                {"command": args.command, "status": "reused", **payload},
+                "复用本 run 已答决策 {}：结论 {}".format(
+                    request.get("decision_id") or "未知", payload.get("choice") or "未知"),
                 args.as_json,
             )
         return _result(SUCCESS, {"command": args.command, "status": "pending", **payload}, "决策已写入信箱", args.as_json)
@@ -3714,6 +3755,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card)),
                 runner,
                 snapshot.run_id,
+                worktree_recorder=lambda current: _record_worktree_preflight(
+                    paths, supervisor.monitor, current, launchers
+                ),
             )
             lease_result = supervisor.recover_or_start()
             if not lease_result.get("active_supervisors"):
@@ -4054,11 +4098,15 @@ def _handle_daemon(args, paths, runner, command_prefix, v2_state=False) -> CLIRe
                                                    "platform": args.supervisor_provider})
         directory, plan, nodes, card = _load_plan(paths, args.plan)
         run_id = _run_id(directory, args.run_id)
+        launchers = []
         if runner is None:
-            runner = _public_runner(paths, card, nodes, [])
+            runner = _public_runner(paths, card, nodes, launchers)
         supervisor = Supervisor(
             paths, Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card)),
-            runner, run_id)
+            runner, run_id,
+            worktree_recorder=lambda current: _record_worktree_preflight(
+                paths, supervisor.monitor, current, launchers
+            ))
 
         def gate():
             # The same pre-resume checks `vibe resume` makes, re-run every tick:
