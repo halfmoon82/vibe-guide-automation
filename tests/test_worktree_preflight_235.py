@@ -289,6 +289,20 @@ class NeverOverwritesTest(RepoCase):
         self.assertEqual(self.branch_of(self.worktree), self.branch)
         self.assertEqual(self.head_of(self.worktree), self.base)
 
+    def test_background_continuation_preserves_dirty_worktree(self):
+        self.prepare()
+        (self.worktree / "unfinished.py").write_text("uncommitted work\n", encoding="utf-8")
+        launcher = self.launcher()
+        self.assertEqual(launcher._prepare_worktree(), self.worktree)
+        self.assertEqual(
+            (self.worktree / "unfinished.py").read_text(encoding="utf-8"),
+            "uncommitted work\n",
+        )
+        self.assertEqual(self.branch_of(self.worktree), self.branch)
+        self.assertEqual(
+            [a for a, _ in self.executor.git_calls if "worktree" in a and "add" in a], []
+        )
+
     def test_existing_worktree_on_another_branch_is_reported_not_switched(self):
         self.prepare()
         git(self.worktree, "switch", "-q", "-c", "someone/else")
@@ -317,14 +331,18 @@ class NeverOverwritesTest(RepoCase):
             self.launcher().launch("developer", "n1", self.contract)
         self.assertEqual(self.executor.claude_calls, [])
 
-    def test_plain_directory_keeps_its_previous_behaviour(self):
-        # A directory that is not a worktree root of its own makes no branch
-        # claim, so there is nothing to contradict and no git call to make.
+    def test_plain_directory_is_fail_closed_worktree_missing(self):
+        # An ordinary directory is not a node worktree: dispatching into it
+        # would bypass the branch, baseline and unique-writer contract.
         plain = self.tmp / "plain"
         plain.mkdir()
         launcher = self.launcher(worktree=plain)
-        self.assertEqual(launcher._prepare_worktree(), plain)
-        self.assertEqual(self.executor.git_calls, [])
+        with self.assertRaises(ClaudeBgWorktreeBlocked) as ctx:
+            launcher._prepare_worktree()
+        self.assertEqual(ctx.exception.reason_code, WORKTREE_MISSING)
+        self.assertEqual(
+            launcher.worktree_preflight["event"], WORKTREE_BLOCKED_EVENT
+        )
 
     def test_worktree_outside_any_repository_is_readable(self):
         outside = self.tmp / "outside" / "node-n1"
@@ -529,7 +547,10 @@ class RecorderTest(unittest.TestCase):
             "branch": "node/n1",
             "worktree_command": "git worktree add /repo/.worktrees/node-n1 -b node/n1 <base>",
         }
-        node = {"status": "blocked_unknown"}
+        node = {
+            "status": "blocked_unknown",
+            "retryable_action": {"role": "developer", "reason_class": "binding_unknown"},
+        }
         changed, records, snapshot, saved = self.run_recorder(report, {"node-n1": node})
         self.assertTrue(changed)
         self.assertEqual(records[0][0], WORKTREE_BLOCKED_EVENT)
@@ -537,6 +558,10 @@ class RecorderTest(unittest.TestCase):
         marker = snapshot.nodes["node-n1"][WORKTREE_PREFLIGHT_KEY]
         self.assertEqual(marker["worktree_command"], report["worktree_command"])
         self.assertEqual(snapshot.nodes["node-n1"]["user_status"], WORKTREE_ACTION_STATUS)
+        self.assertEqual(
+            snapshot.nodes["node-n1"]["retryable_action"]["reason_class"],
+            WORKTREE_MISSING,
+        )
         self.assertEqual(len(saved), 1)
 
     def test_an_existing_worktree_records_nothing(self):
@@ -545,6 +570,40 @@ class RecorderTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(records, [])
         self.assertEqual(saved, [])
+
+    def test_an_existing_worktree_records_its_head_as_scope_base(self):
+        head = "b" * 40
+        report = {
+            "event": None,
+            "worktree": "/repo/.worktrees/node-n1",
+            "branch": "node/n1",
+            "worktree_base": head,
+        }
+        changed, records, snapshot, saved = self.run_recorder(
+            report, {"node-n1": {"status": "running"}}
+        )
+        self.assertTrue(changed)
+        self.assertEqual(records, [])
+        self.assertEqual(snapshot.nodes["node-n1"]["worktree_base"], head)
+        self.assertEqual(len(saved), 1)
+
+    def test_successor_existing_base_is_not_overwritten_by_current_head(self):
+        original_base = "a" * 40
+        predecessor_head = "c" * 40
+        report = {
+            "event": None,
+            "worktree": "/repo/.worktrees/node-n1",
+            "branch": "node/n1",
+            "worktree_base": predecessor_head,
+        }
+        changed, records, snapshot, saved = self.run_recorder(
+            report,
+            {"node-n1": {"status": "running", "worktree_base": original_base}},
+        )
+        self.assertFalse(changed)
+        self.assertEqual(records, [])
+        self.assertEqual(saved, [])
+        self.assertEqual(snapshot.nodes["node-n1"]["worktree_base"], original_base)
 
     def test_an_existing_worktree_clears_a_stale_marker(self):
         # The supervisor ran the command by hand: the directory is there and
@@ -857,6 +916,7 @@ class CliBackgroundDispatchTest(unittest.TestCase):
         self.assertEqual(marker["worktree_command"], data["worktree_command"])
         self.assertEqual(node["user_status"], WORKTREE_ACTION_STATUS)
         self.assertEqual(node["status"], "blocked_unknown")
+        self.assertEqual(node["retryable_action"]["reason_class"], WORKTREE_MISSING)
 
     def test_resume_after_the_supervisor_built_the_worktree_clears_the_marker(self):
         git(self.root, "branch", self.branch)
@@ -879,6 +939,7 @@ class CliBackgroundDispatchTest(unittest.TestCase):
         node = self.node(run_id)
         self.assertNotIn(WORKTREE_PREFLIGHT_KEY, node)
         self.assertNotEqual(node["user_status"], WORKTREE_ACTION_STATUS)
+        self.assertEqual(node["worktree_base"], self.head_of(self.worktree))
 
     # -- helpers -----------------------------------------------------------
     def branch_of(self, path):

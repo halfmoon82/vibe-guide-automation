@@ -1597,6 +1597,8 @@ def _model_tier_rows(nodes: List[DAGNode], platform: str) -> Tuple[Dict[str, Any
             "reviewer_tier": model_catalog.node_tier(node, role="reviewer"),
             "platform": choice.platform,
             "resolved_model": choice.model,
+            "fallbacks": list(choice.fallbacks),
+            "source": choice.origin,
             "effort": choice.effort,
             "resolution": choice.status,
             "note": choice.note,

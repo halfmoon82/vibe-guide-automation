@@ -114,6 +114,7 @@ from .worker_questions import REPLAY_EVENTS as WORKER_QUESTION_REPLAY_EVENTS
 from .worker_questions import replay as replay_worker_question
 from .worktree_base import upstream_branches
 from .scope_landing import check_delivery as check_delivery_landing
+from .scope_landing import check_delivery_content as check_delivery_content_landing
 from .workflow_gate import require_capability_contract, require_entry, verify_workflow
 from .authorize_entry import load_live_workflow, select_plan_workflow, verify_workflow_artifacts
 from .diagnostics import validate_child_session_binding
@@ -137,6 +138,7 @@ from .checkpoint import (
 from .brief import ImplementationBrief, validate_implementation_brief
 from .manifest import RunManifest
 from .evidence import (
+    blocked_self_report_fields,
     build_integration_review_evidence,
     evaluate_v41_closeout,
     evaluate_delivery_evidence,
@@ -147,6 +149,7 @@ from .decision_boundary import NotificationBridge, ingest_worker_decisions
 from .orphan_recovery import ORPHAN_DISPATCH_ADOPTED, replay_orphan_adoption
 from .providers import CODEX_PROVIDER
 from .self_report_recovery import SELF_REPORT_DELIVERY_RECONCILED
+from .decision_boundary import ScopedDecisionMailbox
 from .decisions import DecisionMailbox
 
 
@@ -696,6 +699,38 @@ def recovery_action_for_failure(observation: Any) -> str:
     return "reconcile_binding"
 
 
+#: Provider-error wording that moves dispatch to the next model in the
+#: profile's fallback chain (quota exhausted / rate limit / model unavailable).
+_MODEL_FAILURE_QUOTA_MARKERS = (
+    "quota", "额度", "insufficient balance", "credits exhausted",
+    "balance exhausted", "usage limit",
+)
+_MODEL_FAILURE_RATE_MARKERS = ("rate limit", "rate-limit", "too many requests", "429", "限流")
+_MODEL_FAILURE_UNAVAILABLE_MARKERS = (
+    "model unavailable", "unsupported model", "invalid model", "model not found",
+    "no such model", "unknown model", "model disabled", "模型不可用", "不支持的模型",
+)
+
+
+def model_failure_reason_class(text: Any) -> Optional[str]:
+    """Classify provider error text as a model-chain failure class, else ``None``.
+
+    Only quota/rate-limit/model-unavailable conditions justify switching
+    models; anything else (binding, worktree, plain timeouts) keeps the
+    existing recovery and never consumes the chain.
+    """
+    normalized = str(text or "").casefold()
+    if not normalized.strip():
+        return None
+    if any(marker in normalized for marker in _MODEL_FAILURE_QUOTA_MARKERS):
+        return "quota_exhausted"
+    if any(marker in normalized for marker in _MODEL_FAILURE_RATE_MARKERS):
+        return "rate_limit"
+    if any(marker in normalized for marker in _MODEL_FAILURE_UNAVAILABLE_MARKERS):
+        return "model_unavailable"
+    return None
+
+
 #: #256 ③: the ``recovery_action`` values a rescue may treat as the defect's
 #: own residue.  ``_mark_blocked_unknown`` derives the action from the failure
 #: reason's keywords, so a block that is *not* a defect also lands on
@@ -927,7 +962,7 @@ RECOVERY_FIDELITY_AUDIT = (
     },
     {
         "site": "_release_node_lease",
-        "call_sites": 23,
+        "call_sites": 26,
         "callers": (
             {
                 "caller": "_recover_reverse_blocked_acceptance",
@@ -942,7 +977,7 @@ RECOVERY_FIDELITY_AUDIT = (
                 "caller": (
                     "_apply_event, _start_task, reauthorize, _schedule_ready "
                     "helpers, _reconcile_unapplied_events and the remaining "
-                    "terminal-transition callers (the other 22 sites, including the #290 contract_error replay that re-plans an integration-review node)"
+                    "terminal-transition callers (the other 25 sites, including the #290 contract_error replay that re-plans an integration-review node, the #335 _park_blocked_engineering / blocked_engineering replay pair that parks a blocked self-report, and the #336 landing-unreadable replay twin)"
                 ),
                 "verdict": "different_type",
                 "rationale": (
@@ -1154,6 +1189,10 @@ class Monitor:
                 "reason_class": str(failure["kind"]),
                 "reason": redact_provider_text(str(error)),
                 "error_type": type(error).__name__,
+                # Computed from the raw error: the redacted ``reason`` no
+                # longer carries the model-failure markers.  Internal routing
+                # only; never displayed.
+                "model_failure_class": model_failure_reason_class(str(error)),
                 **fixed,
                 "intent": payload.get("binding_intent") or (
                     intent.to_dict() if hasattr(intent, "to_dict") else dict(intent)
@@ -1182,6 +1221,7 @@ class Monitor:
                 "phase": "start",
                 "action_ref": action_ref,
                 "advance_generation": False,
+                "model_failure_class": model_failure_reason_class(str(error)),
                 "intent": action_basis,
             }
         # Existing runners expose RunHandle; only V4.4 contracts require
@@ -4199,7 +4239,8 @@ class Monitor:
                                             developer.task_id, developer.host or developer.hostId,
                                             delivery)
         gate = evaluate_delivery_evidence({**current, 'status':'DELIVERED'}, developer, delivery,
-                                          self_report_receipt=receipt is not None)
+                                          self_report_receipt=receipt is not None,
+                                          self_report=archived.get('payload'))
         if not gate.complete:
             raise ValueError('successor reconciliation developer delivery is incomplete')
         artifact = Path(delivery['delivery_path'])
@@ -5218,6 +5259,269 @@ class Monitor:
             tier = model_catalog.max_tier(tier, "standard")
         return tier
 
+    #: Rounds a ``model_unavailable`` node may re-walk its chain before the
+    #: supervisor must act (move the tier or fix the configured map). Bounds
+    #: the retry: every model still gets exactly one attempt per round.
+    _MODEL_UNAVAILABLE_MAX_ROUNDS = 2
+
+    #: Node-state keys written by the model fallback machinery.  Every
+    #: recovery entry point (repair / requeue / tier move) clears them so the
+    #: next dispatch re-resolves the model from scratch.
+    _MODEL_FALLBACK_BOOKKEEPING_KEYS = (
+        "model_dispatch_attempts",
+        "model_dispatch_chain",
+        "model_dispatch_chain_profile",
+        "model_unavailable_rounds",
+        "model_unavailable",
+    )
+
+    def _clear_model_fallback_state(self, current: Dict[str, Any]) -> bool:
+        """Drop monitor-authored model fallback state so recovery re-resolves the model.
+
+        Also removes the switched ``contract_overrides.worker_profile``: the
+        stale override would otherwise shadow :meth:`_apply_model_tier`
+        re-resolution (a fixed ``model_map`` or a tier move must take effect
+        on the next dispatch) and, for routed nodes, would keep replaying the
+        last chain model instead of the router-selected primary.  Returns
+        ``True`` when fallback state existed.
+        """
+        had_state = any(
+            key in current for key in self._MODEL_FALLBACK_BOOKKEEPING_KEYS
+        )
+        for key in self._MODEL_FALLBACK_BOOKKEEPING_KEYS:
+            current.pop(key, None)
+        overrides = current.get("contract_overrides")
+        if isinstance(overrides, dict) and "worker_profile" in overrides:
+            overrides.pop("worker_profile", None)
+            had_state = True
+        return had_state
+
+    def _profile_model_chain(self, contract: Dict[str, Any], current: Dict[str, Any]) -> List[str]:
+        """The dispatch model plus its configured fallbacks, in dispatch order."""
+        recorded = current.get("model_dispatch_chain")
+        if (
+            isinstance(recorded, list)
+            and recorded
+            and all(isinstance(name, str) and name.strip() for name in recorded)
+        ):
+            return list(recorded)
+        raw = contract.get("worker_profile")
+        if not isinstance(raw, dict):
+            overrides = current.get("contract_overrides")
+            raw = overrides.get("worker_profile") if isinstance(overrides, dict) else None
+        if not isinstance(raw, dict):
+            return []
+        names: List[str] = []
+        primary = raw.get("model")
+        if isinstance(primary, str) and primary.strip():
+            names.append(primary)
+        for item in raw.get("fallbacks") or []:
+            name = item.get("model") if isinstance(item, dict) else item
+            if isinstance(name, str) and name.strip() and name not in names:
+                names.append(name)
+        return names
+
+    def _plan_model_fallback(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        contract: Dict[str, Any],
+        current: Dict[str, Any],
+        role: str,
+        phase: str,
+        continuation: bool,
+        error_text: Any,
+        reason_class: Optional[str] = None,
+    ) -> str:
+        """Advance the dispatch model along the profile chain after a model-class failure.
+
+        Returns ``"switch"`` when the scheduled retry must replay on the next
+        chain model (the ``model_fallback_used`` event is recorded and the
+        node stays retryable, never blocked), ``"exhausted"`` when every chain
+        model burned its single attempt (the caller then fails closed as a
+        retryable ``model_unavailable``), and ``"none"`` when the failure is
+        not a model-chain condition at all.
+
+        ``reason_class`` may carry the classification computed from the raw
+        provider error: durable ``reason`` text is redacted before this point,
+        which would erase the markers.
+        """
+        if reason_class is None:
+            reason_class = model_failure_reason_class(error_text)
+        if reason_class is None:
+            return "none"
+        chain = self._profile_model_chain(contract, current)
+        if not chain:
+            return "none"
+        if len(chain) < 2:
+            # No alternate configured: the model failure keeps the legacy
+            # retryable behavior (omit_thinking recovery, per-tick requeue).
+            # The exhausted/park path is only for chains with real alternates.
+            return "none"
+        raw_profile = contract.get("worker_profile")
+        if not isinstance(raw_profile, dict):
+            return "none"
+        failed_model = raw_profile.get("model")
+        if not isinstance(failed_model, str) or not failed_model.strip():
+            return "none"
+        attempts = current.get("model_dispatch_attempts")
+        if not isinstance(attempts, list):
+            attempts = []
+            current["model_dispatch_attempts"] = attempts
+        if not current.get("model_dispatch_chain_profile"):
+            # Keep the original profile so an exhausted round can rewind the
+            # chain to its head instead of retrying only the last model.
+            current["model_dispatch_chain_profile"] = dict(raw_profile)
+        if any(isinstance(item, dict) and item.get("model") == failed_model for item in attempts):
+            # Each model gets exactly one attempt per round.
+            return "none"
+        attempts.append({
+            "model": failed_model,
+            "reason_class": reason_class,
+            "reason": redact_provider_text(str(error_text))[:400],
+        })
+        current["model_dispatch_chain"] = chain
+        tried = {item.get("model") for item in attempts if isinstance(item, dict)}
+        for name in chain:
+            if name not in tried:
+                self._switch_model_fallback(
+                    snapshot, node_id, contract, current, role,
+                    failed_model, name, reason_class,
+                )
+                return "switch"
+        self._mark_model_unavailable(snapshot, node_id, current, role, phase, continuation)
+        return "exhausted"
+
+    def _switch_model_fallback(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        contract: Dict[str, Any],
+        current: Dict[str, Any],
+        role: str,
+        from_model: str,
+        to_model: str,
+        reason_class: str,
+    ) -> None:
+        """Point the dispatch copy (and its durable override) at the next chain model."""
+        raw_profile = contract.get("worker_profile")
+        profile = dict(raw_profile) if isinstance(raw_profile, dict) else {}
+        remaining = []
+        for item in profile.get("fallbacks") or []:
+            name = item.get("model") if isinstance(item, dict) else item
+            if name != to_model:
+                remaining.append(item)
+        profile["model"] = to_model
+        profile["fallbacks"] = remaining
+        contract["worker_profile"] = profile
+        current.setdefault("contract_overrides", {})["worker_profile"] = dict(profile)
+        self._record(
+            snapshot,
+            "model_fallback_used",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": role,
+                "proof": {
+                    "from_model": from_model,
+                    "to_model": to_model,
+                    "reason_class": reason_class,
+                    # Persist the fully resolved dispatch-time profile.  A
+                    # model_map chain exists only on this contract copy, not
+                    # in the signed node contract; without these fields a
+                    # crash replay would rebuild a placeholder default model
+                    # and silently drop the remaining fallbacks.
+                    "worker_profile": dict(profile),
+                    "chain": list(current.get("model_dispatch_chain") or []),
+                    "chain_profile": dict(
+                        current.get("model_dispatch_chain_profile") or raw_profile
+                    ),
+                },
+            },
+        )
+
+    def _mark_model_unavailable(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        current: Dict[str, Any],
+        role: str,
+        phase: str,
+        continuation: bool,
+    ) -> None:
+        """Every chain model failed: fail closed, retryable, never success/blocked_unknown.
+
+        The node lands on the existing retryable state machine
+        (``_v42_retry_status`` -- ``retry_pending`` on V4.2) with an explicit
+        ``model_unavailable`` marker carrying each model's own failure, and a
+        ``retryable_action`` whose ``reason_class`` is ``model_unavailable``.
+        A bounded number of full-chain re-walks stays schedulable so a
+        transient platform outage can recover on its own; past that ceiling
+        the retry marker is dropped and the node parks until the supervisor
+        acts -- ``repair_node``, ``schedule_retry`` and ``adjust_model_tier``
+        each clear the fallback state (and the switched override profile, so
+        a fixed ``model_map`` or a tier move takes effect) and requeue the
+        node.  The durable status vocabulary is unchanged: ``state.py``
+        knows no new node status.
+        """
+        attempts = [
+            item for item in (current.get("model_dispatch_attempts") or [])
+            if isinstance(item, dict)
+        ]
+        detail = "; ".join(
+            "%s: %s (%s)" % (item.get("model"), item.get("reason_class"), item.get("reason"))
+            for item in attempts
+        )
+        rounds = 0
+        try:
+            rounds = int(current.get("model_unavailable_rounds", 0) or 0)
+        except (TypeError, ValueError):
+            rounds = 0
+        rounds += 1
+        current["model_unavailable_rounds"] = rounds
+        current["model_unavailable"] = {"rounds": rounds, "attempts": list(attempts)}
+        current["status"] = self._v42_retry_status()
+        current["reason"] = "model fallback chain exhausted (%d models): %s" % (
+            len(attempts), detail or "no attempt recorded"
+        )
+        current["active_task"] = None
+        current["active_role"] = None
+        current["start_intent"] = None
+        if rounds >= self._MODEL_UNAVAILABLE_MAX_ROUNDS:
+            current["retryable_action"] = None
+            self._record(
+                snapshot,
+                "model_unavailable_parked",
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "role": role,
+                    "proof": {
+                        "rounds": rounds,
+                        "attempts": list(attempts),
+                    },
+                },
+            )
+            return
+        saved = current.get("model_dispatch_chain_profile")
+        if isinstance(saved, dict):
+            # Rewind to the chain head so the retry re-walks every model.
+            current.setdefault("contract_overrides", {})["worker_profile"] = dict(saved)
+        current["model_dispatch_attempts"] = []
+        current["retryable_action"] = {
+            "role": role,
+            "phase": phase,
+            "continuation": continuation,
+            "successor": False,
+            "same_task": True,
+            "same_task_required": True,
+            "attempt": rounds,
+            "reason_class": "model_unavailable",
+            "next_retry_at": time.time(),
+            "binding_digest": current.get("contract_digest", ""),
+            "last_observation_ref": "model-chain-exhausted",
+        }
+
     def _apply_model_tier(
         self, snapshot: RunSnapshot, node: DAGNode, contract: Dict[str, Any],
         current: Dict[str, Any], role: str,
@@ -5282,6 +5586,7 @@ class Monitor:
         try:
             profile = WorkerProfile(**dict(
                 raw, model=choice.model, reasoning=choice.reasoning,
+                fallbacks=[{"model": name} for name in choice.fallbacks],
                 selection_basis=basis, route_digest="",
             ))
         except (TypeError, ValueError):
@@ -5303,6 +5608,30 @@ class Monitor:
         before = self._effective_model_tier(self.nodes[node_id], current, "developer")
         after = model_catalog.adjust_tier(before, delta, reason)
         self._commit_model_tier_adjustment(snapshot, node_id, current, delta, before, after, reason, "supervisor")
+        if self._clear_model_fallback_state(current):
+            # A tier move supersedes the exhausted fallback chain: drop the
+            # switched override profile (so the new tier re-resolves the
+            # model) and requeue a parked node -- without a retryable_action
+            # the sweep never replays it.
+            if (
+                not isinstance(current.get("retryable_action"), dict)
+                and current.get("active_task") is None
+                and node_id not in snapshot.handles
+            ):
+                current["status"] = self._v42_retry_status()
+                current["retryable_action"] = {
+                    "role": "developer",
+                    "phase": "develop",
+                    "continuation": False,
+                    "successor": False,
+                    "same_task": True,
+                    "same_task_required": True,
+                    "attempt": 1,
+                    "reason_class": "model_unavailable",
+                    "next_retry_at": time.time(),
+                    "binding_digest": current.get("contract_digest", ""),
+                    "last_observation_ref": "model-tier-adjusted",
+                }
         self._save_snapshot(snapshot)
         return snapshot
 
@@ -5362,7 +5691,22 @@ class Monitor:
                     or profile.reasoning != expected.reasoning
                     or profile.route_digest != expected.route_digest
                 ):
-                    raise ValueError("worker model profile conflicts with routing evidence")
+                    chain = current.get("model_dispatch_chain")
+                    if (
+                        isinstance(chain, list)
+                        and profile.model in chain
+                        and profile.reasoning == expected.reasoning
+                        and profile.route_digest == expected.route_digest
+                    ):
+                        # Monitor-authored model fallback: the chain was
+                        # derived from this router-selected profile, so a
+                        # model inside it is a dispatch-time fallback switch,
+                        # not a writer conflict.  A profile outside the chain
+                        # (or with drifted reasoning/digest) still fails
+                        # closed below.
+                        pass
+                    else:
+                        raise ValueError("worker model profile conflicts with routing evidence")
             expanded = list(profile.allowlist)
             for item in current.get("scope_expansions", []):
                 if item not in expanded:
@@ -5851,6 +6195,14 @@ class Monitor:
             if failure["kind"] == "external_decision":
                 current["retryable_action"] = None
             elif failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
+                fallback_plan = self._plan_model_fallback(
+                    snapshot, node_id, contract, current, role, phase, continuation, error
+                )
+                if fallback_plan == "exhausted":
+                    current["active_task"] = None
+                    current["active_role"] = None
+                    self._save_snapshot(snapshot)
+                    return False
                 current["retryable_action"] = {
                     "role": role,
                     "phase": phase,
@@ -5866,7 +6218,9 @@ class Monitor:
                 }
                 current["status"] = self._v42_retry_status()
                 current["reason"] = redact_provider_text(str(error))
-                if "reasoning" in str(error).casefold() or "model" in str(error).casefold():
+                if fallback_plan != "switch" and (
+                    "reasoning" in str(error).casefold() or "model" in str(error).casefold()
+                ):
                     options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
                     options["omit_thinking"] = True
                     current.setdefault("contract_overrides", {})["provider_options"] = options
@@ -6009,6 +6363,16 @@ class Monitor:
                     else classify_provider_failure({"kind": handle.get("kind"), "reason": reason})
                 )
                 if failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
+                    fallback_plan = self._plan_model_fallback(
+                        snapshot, node_id, contract, current, role, phase, continuation, reason,
+                        reason_class=handle.get("model_failure_class"),
+                    )
+                    if fallback_plan == "exhausted":
+                        current["active_task"] = None
+                        current["active_role"] = None
+                        current["start_intent"] = None
+                        self._save_snapshot(snapshot)
+                        return False
                     previous_retry = current.get("retryable_action")
                     previous_attempt = int(previous_retry.get("attempt", 0)) if isinstance(previous_retry, dict) else 0
                     retry = {
@@ -6024,7 +6388,9 @@ class Monitor:
                     current["reason"] = redact_provider_text(str(reason))
                     current["binding_phase"] = "retry_pending"
                     current["retryable_action"] = retry
-                    if "reasoning" in str(reason).casefold() or "model" in str(reason).casefold():
+                    if fallback_plan != "switch" and (
+                        "reasoning" in str(reason).casefold() or "model" in str(reason).casefold()
+                    ):
                         options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
                         options["omit_thinking"] = True
                         current.setdefault("contract_overrides", {})["provider_options"] = options
@@ -6063,6 +6429,14 @@ class Monitor:
                 if not isinstance(provider_run_id, str) or not provider_run_id:
                     current["status"] = "blocked_unknown"; current["reason"] = "provider proof has no task handle"; self._save_snapshot(snapshot); return False
                 handle = RunHandle(provider_run_id)
+            # A confirmed start retires per-round model fallback bookkeeping;
+            # a later dispatch failure rebuilds it from the live profile.
+            for bookkeeping_key in (
+                "model_dispatch_attempts", "model_dispatch_chain",
+                "model_dispatch_chain_profile", "model_unavailable_rounds",
+                "model_unavailable",
+            ):
+                current.pop(bookkeeping_key, None)
         except ProviderPending as error:
             # A bridge setup token (clientThreadId) is not a formal task. Keep
             # the writer lease and durable retry metadata, but clear the
@@ -6098,6 +6472,15 @@ class Monitor:
             # the next native create request.
             failure = classify_provider_failure(error)
             if failure["kind"] in {"retryable", "capacity_wait", "repairable"}:
+                fallback_plan = self._plan_model_fallback(
+                    snapshot, node_id, contract, current, role, phase, continuation, error
+                )
+                if fallback_plan == "exhausted":
+                    current["active_task"] = None
+                    current["active_role"] = None
+                    current["start_intent"] = None
+                    self._save_snapshot(snapshot)
+                    return False
                 previous = current.get("retryable_action")
                 attempt = int(previous.get("attempt", 0) or 0) + 1 if isinstance(previous, dict) else 1
                 retry = {
@@ -6120,7 +6503,9 @@ class Monitor:
                 current["start_intent"] = None
                 current["quarantine"] = None
                 current["reason"] = redact_provider_text(str(error))
-                if "reasoning" in str(error).casefold() or "model" in str(error).casefold():
+                if fallback_plan != "switch" and (
+                    "reasoning" in str(error).casefold() or "model" in str(error).casefold()
+                ):
                     options = dict(current.get("contract_overrides", {}).get("provider_options", {}))
                     options["omit_thinking"] = True
                     current.setdefault("contract_overrides", {})["provider_options"] = options
@@ -6544,6 +6929,79 @@ class Monitor:
         return ProviderActionStore(self.paths).background_delivery_receipt(
             snapshot.run_id, node_id, role, active.get("generation"),
             binding.task_id, delivery,
+        )
+
+    def _archived_blocked_engineering(self, snapshot, node_id, role, active):
+        """The consumed archive for this task is a blocked_engineering report."""
+        if not isinstance(active, dict):
+            return False
+        store_paths = getattr(self, "paths", None)
+        if store_paths is None:
+            return False
+        payload = ProviderActionStore(store_paths).archived_payload(
+            snapshot.run_id, node_id, role, active.get("generation")
+        )
+        return isinstance(payload, dict) and payload.get("event") == "blocked_engineering"
+
+    def _park_blocked_engineering(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        role: str,
+        event: Any,
+        active: Optional[Dict[str, Any]],
+        handle_id: Optional[str],
+    ) -> None:
+        """Park a worker's blocked self-report as supervisor disposition (#335).
+
+        The node stays ``blocked_unknown`` with the fixed ``engineering_blocked``
+        class; no reviewer is dispatched and no retryable action is scheduled,
+        because a declared engineering block cannot self-heal.  Everything
+        stamped here is a program constant: the worker's free text never
+        reaches the record or the event.
+        """
+        data = event.data if isinstance(event.data, dict) else {}
+        fields = blocked_self_report_fields(data) or ["event"]
+        reason = "worker reported a blocked engineering state ({})".format(
+            ", ".join(fields)
+        )
+        current = snapshot.nodes[node_id]
+        current["status"] = "blocked_unknown"
+        current["reason"] = reason
+        current["reason_class"] = "engineering_blocked"
+        current["reason_code"] = "blocked_self_report"
+        current.pop("recovery_action", None)
+        current.pop("error_type", None)
+        current["retryable_action"] = None
+        current["active_role"] = None
+        current["active_task"] = None
+        snapshot.handles.pop(node_id, None)
+        current["quarantine"] = {
+            "run_id": snapshot.run_id,
+            "handle_id": handle_id,
+            "reason": reason,
+        }
+        self._release_node_lease(snapshot, node_id)
+        if isinstance(active, dict) and active.get("role") in {"developer", "reviewer"}:
+            try:
+                self._set_binding_status(
+                    snapshot, node_id, str(active["role"]), "blocked_unknown"
+                )
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                pass
+        self._record(
+            snapshot,
+            "blocked_engineering",
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": role,
+                "generation": active.get("generation") if isinstance(active, dict) else None,
+                "handle_id": handle_id,
+                "reason_class": "engineering_blocked",
+                "reason_code": "blocked_self_report",
+            },
+            active,
         )
 
     def _reject_acceptance_format(
@@ -6980,8 +7438,32 @@ class Monitor:
             self._release_node_lease(snapshot, node_id)
             return
 
+        if event.event == "blocked_engineering":
+            # #335: the worker surfaced an engineering blocker through the
+            # delivery channel.  That is not a delivery: park the node for
+            # supervisor disposition without dispatching a reviewer and
+            # without an auto-retry marker claiming the block self-heals.
+            self._park_blocked_engineering(snapshot, node_id, role, event, active, handle_id)
+            return
         if event.event in {"delivered", "complete"}:
             delivery = event.data.get("delivery_evidence")
+            store_paths = getattr(self, "paths", None)
+            archived = (ProviderActionStore(store_paths).archived_payload(
+                snapshot.run_id, node_id, role, active.get("generation")
+            ) if store_paths is not None and isinstance(active, dict) else None)
+            blocked_fields = blocked_self_report_fields(
+                archived if archived is not None
+                else (event.data if isinstance(event.data, dict) else {})
+            )
+            if blocked_fields:
+                # Defense in depth behind the worker-deliver shape gate: a
+                # blocked self-report that still reached a delivery event
+                # (archived before #335, or past validation) is parked, never
+                # judged as a delivery.  The archive, not the event data, is
+                # read first: runner projections forward only the delivery
+                # vocabulary and would hide the blocked fields.
+                self._park_blocked_engineering(snapshot, node_id, role, event, active, handle_id)
+                return
             if snapshot.execution_engine == "vibeguide_monitor":
                 binding = self._load_task_binding(snapshot, node_id, role)
                 background_receipt = self._background_receipt(
@@ -6995,6 +7477,7 @@ class Monitor:
                         snapshot, node_id, role, active, binding, delivery
                     ) is not None,
                     background_receipt=background_receipt is not None,
+                    self_report=archived if archived is not None else event.data,
                 )
                 if not gate.complete:
                     if gate.classification == "acceptance_rejected":
@@ -7021,6 +7504,10 @@ class Monitor:
                     self._mark_blocked_unknown(snapshot, node_id, "; ".join(gate.reasons))
                     return
             if role == "developer" and not check_delivery_landing(self, snapshot, node_id, active):
+                return
+            if role == "developer" and not check_delivery_content_landing(
+                self, snapshot, node_id, active, runner=runner, handle_id=handle_id
+            ):
                 return
             visible_sdd_delivery = (
                 role == "developer"
@@ -7570,6 +8057,17 @@ class Monitor:
             self._archive_pair(snapshot, node_id)
             self._release_node_lease(snapshot, node_id)
         elif event.event in {"unknown", "timeout", "state_unknown", "visibility_unknown"}:
+            if event.event == "visibility_unknown" and self._archived_blocked_engineering(
+                snapshot, node_id, role, active
+            ):
+                # #335: the runner's wait-event vocabulary does not know
+                # blocked_engineering yet, so a blocked self-report surfaces
+                # here as "provider event is unsupported" after the archive
+                # was consumed.  The archive still holds the full payload:
+                # park the node exactly as if the event name had flowed
+                # through, instead of losing the report to a generic block.
+                self._park_blocked_engineering(snapshot, node_id, role, event, active, handle_id)
+                return
             raw_reason = event.data.get("reason", event.event)
             reason = str(redact_provider_text(raw_reason))
             failure = classify_provider_failure(event.data)
@@ -8216,6 +8714,20 @@ class Monitor:
                           "attempt": attempt, "reason_class": classification["kind"],
                           "reason": redact_provider_text(reason),
                           "next_retry_at": float(next_retry_at if next_retry_at is not None else time.time() + delay)})
+            # A supervisor requeue supersedes an in-flight fallback sequence:
+            # rewind the chain so the next dispatch starts from the resolved
+            # primary again.  (The role/phase defaults also make a requeue of
+            # a parked node -- which has no previous retry dict -- replayable;
+            # without them the sweep crashes on a missing ``role``.)
+            self._clear_model_fallback_state(current)
+            retry.setdefault(
+                "role",
+                str(current.get("active_role") or "developer"),
+            )
+            retry.setdefault(
+                "phase",
+                "review" if retry.get("role") == "reviewer" else "develop",
+            )
             current["retryable_action"] = retry
             current["status"] = "retry_pending" if classification["kind"] in {"retryable", "capacity_wait", "repairable"} else "blocked_unknown"
             current["reason"] = redact_provider_text(reason)
@@ -8672,8 +9184,38 @@ class Monitor:
                     "steps": steps,
                     "run_id": snapshot.run_id,
                     "reconciliation": reconciliation}
-        classification = classify_provider_failure({"reason": reason})
-        if classification["kind"] == "binding_unknown":
+        if isinstance(current.get("model_unavailable"), dict):
+            # Model-fallback park: the supervisor asked for repair after the
+            # chain exhausted every model.  The redacted persisted reason
+            # would classify as binding_unknown and park the node forever;
+            # instead clear the monitor-authored fallback state (and the
+            # switched override profile, so a fixed ``model_map`` or tier
+            # move takes effect) and requeue the same task.
+            self._clear_model_fallback_state(current)
+            current["status"] = self._v42_retry_status()
+            current["recovery_action"] = "requeue_same_task"
+            current["reason"] = "model fallback chain cleared by repair; requeueing"
+            current["retryable_action"] = {
+                "role": role,
+                "phase": "review" if role == "reviewer" else "develop",
+                "continuation": False,
+                "successor": False,
+                "same_task": True,
+                "same_task_required": True,
+                "attempt": 1,
+                "reason_class": "model_unavailable",
+                "next_retry_at": time.time(),
+                "binding_digest": current.get("contract_digest", ""),
+                "last_observation_ref": "model-fallback-repair",
+            }
+            classification = {"kind": "retryable", "legacy_kind": "engineering"}
+            fallback_repair = True
+        else:
+            classification = classify_provider_failure({"reason": reason})
+            fallback_repair = False
+        if fallback_repair:
+            pass  # the requeue above is the whole repair; never reclassify below
+        elif classification["kind"] == "binding_unknown":
             current["status"] = "blocked_unknown"
             current["recovery_action"] = "reconcile_binding"
             retry = current.get("retryable_action")
@@ -8911,7 +9453,7 @@ class Monitor:
             if isinstance(current.get("review_generation"), int):
                 evidence["review_generation"] = current["review_generation"]
         try:
-            mailbox = DecisionMailbox(self.paths)
+            mailbox = ScopedDecisionMailbox(self.paths)
             for attempt in range(1, _BLOCKED_DESIGN_MAX_ATTEMPTS + 1):
                 # An answered request is closed: a new block for the same cause
                 # needs a new question text (hence a new id) to reach the PM.
@@ -8925,6 +9467,7 @@ class Monitor:
                     options=[dict(item) for item in spec["options"]],
                     recommendation=None,
                     evidence=evidence,
+                    scope="run",
                 )
                 decision_id = str(record["decision_id"])
                 if mailbox.result(decision_id) is None:
@@ -10012,6 +10555,33 @@ class Monitor:
                 current["active_task"] = None
                 snapshot.handles.pop(node_id, None)
                 self._release_node_lease(snapshot, node_id)
+            elif record["event"] == "blocked_engineering":
+                # Crash-window twin of _park_blocked_engineering (#335): the
+                # event is appended before the snapshot save; without this
+                # branch the fall-through would replace the fixed
+                # engineering_blocked class with the generic "unapplied event
+                # needs manual reconciliation" block and the supervisor could
+                # no longer tell a declared engineering block from a lost one.
+                if data.get("reason_class") != "engineering_blocked" \
+                        or data.get("reason_code") != "blocked_self_report":
+                    raise ValueError("replayed blocked engineering evidence is invalid")
+                current["status"] = "blocked_unknown"
+                current["reason"] = "worker reported a blocked engineering state"
+                current["reason_class"] = "engineering_blocked"
+                current["reason_code"] = "blocked_self_report"
+                current.pop("recovery_action", None)
+                current["active_role"] = None
+                current["active_task"] = None
+                current["retryable_action"] = None
+                snapshot.handles.pop(node_id, None)
+                handle_id = data.get("handle_id")
+                if isinstance(handle_id, str) and handle_id:
+                    current["quarantine"] = {
+                        "run_id": snapshot.run_id,
+                        "handle_id": handle_id,
+                        "reason": "worker reported a blocked engineering state",
+                    }
+                self._release_node_lease(snapshot, node_id)
             elif record["event"] == "pair_archived":
                 current["pair_archived"] = True
             elif record["event"] == "acceptance_rejected":
@@ -10153,6 +10723,113 @@ class Monitor:
                 # The label is derived from the marker, never stored beside
                 # it twice: recomputing keeps replay and the live path equal.
                 current["user_status"] = map_user_status(current)
+            elif record["event"] == "model_fallback_used":
+                proof = data.get("proof")
+                if (
+                    not isinstance(proof, dict)
+                    or not isinstance(proof.get("from_model"), str)
+                    or not proof["from_model"]
+                    or not isinstance(proof.get("to_model"), str)
+                    or not proof["to_model"]
+                    or not isinstance(proof.get("reason_class"), str)
+                    or not proof["reason_class"]
+                ):
+                    raise ValueError("replayed model fallback evidence is invalid")
+                overrides = current.setdefault("contract_overrides", {})
+                raw_profile = overrides.get("worker_profile")
+                if not isinstance(raw_profile, dict):
+                    raw_profile = self.nodes[node_id].contract.get("worker_profile")
+                if not isinstance(raw_profile, dict):
+                    raise ValueError("replayed model fallback profile is unavailable")
+                current.setdefault("model_dispatch_chain_profile", dict(raw_profile))
+                chain = self._profile_model_chain({"worker_profile": raw_profile}, current)
+                if chain:
+                    current["model_dispatch_chain"] = chain
+                attempts = current.setdefault("model_dispatch_attempts", [])
+                if not any(
+                    isinstance(item, dict) and item.get("model") == proof["from_model"]
+                    for item in attempts
+                ):
+                    attempts.append({
+                        "model": proof["from_model"],
+                        "reason_class": proof["reason_class"],
+                        "reason": "replayed model fallback",
+                    })
+                if isinstance(proof.get("worker_profile"), dict):
+                    profile = dict(proof["worker_profile"])
+                    if profile.get("model") != proof["to_model"]:
+                        raise ValueError("replayed model fallback profile is inconsistent")
+                    if isinstance(proof.get("chain_profile"), dict):
+                        current["model_dispatch_chain_profile"] = dict(proof["chain_profile"])
+                    if (
+                        isinstance(proof.get("chain"), list)
+                        and all(isinstance(name, str) and name for name in proof["chain"])
+                    ):
+                        current["model_dispatch_chain"] = list(proof["chain"])
+                else:
+                    profile = dict(raw_profile)
+                    profile["model"] = proof["to_model"]
+                    profile["fallbacks"] = [
+                        item for item in profile.get("fallbacks") or []
+                        if (item.get("model") if isinstance(item, dict) else item) != proof["to_model"]
+                    ]
+                overrides["worker_profile"] = profile
+            elif record["event"] == "model_unavailable_parked":
+                proof = data.get("proof")
+                if (
+                    not isinstance(proof, dict)
+                    or not isinstance(proof.get("rounds"), int)
+                    or isinstance(proof.get("rounds"), bool)
+                    or proof["rounds"] < 1
+                    or not isinstance(proof.get("attempts"), list)
+                ):
+                    raise ValueError("replayed model unavailable evidence is invalid")
+                attempts = proof["attempts"]
+                current["model_unavailable_rounds"] = proof["rounds"]
+                current["model_unavailable"] = {
+                    "rounds": proof["rounds"], "attempts": list(attempts),
+                }
+                current["status"] = self._v42_retry_status()
+                current["reason"] = "model fallback chain exhausted"
+                current["active_role"] = None
+                current["active_task"] = None
+                current["start_intent"] = None
+                current["retryable_action"] = None
+            elif record["event"] == "empty_landing_allowed":
+                # Audit-only event: the delivery transition that follows is
+                # authoritative.  Recognise it so a crash before the snapshot
+                # save never degrades an allowed empty landing into a manual
+                # reconciliation block.
+                pass
+            elif record["event"] == "scope_landing_rejected" and data.get(
+                "reason_class"
+            ) == "landing_unreadable":
+                # #336 / IR-6 crash-window twin of _park_landing_unreadable:
+                # an unconfirmable landing parks blocked_unknown, not the
+                # worker-question awaiting_supervisor state; without this
+                # branch the generic replay below would rebuild the legacy
+                # park and lose the structural code.
+                if data.get("reason_code") != "scope_landing:landing_unreadable":
+                    raise ValueError("replayed landing-unreadable evidence is invalid")
+                current["status"] = "blocked_unknown"
+                current["reason"] = "delivery landing cannot be confirmed"
+                current["reason_class"] = "landing_unreadable"
+                current["reason_code"] = "scope_landing:landing_unreadable"
+                current["scope_landing_rejection"] = [
+                    {"path": "*", "cause": "landing_unreadable"}
+                ]
+                current.pop("recovery_action", None)
+                current.pop("error_type", None)
+                current["retryable_action"] = None
+                current["active_role"] = None
+                current["active_task"] = None
+                snapshot.handles.pop(node_id, None)
+                current["quarantine"] = {
+                    "run_id": snapshot.run_id,
+                    "handle_id": data.get("handle_id"),
+                    "reason": "delivery landing cannot be confirmed",
+                }
+                self._release_node_lease(snapshot, node_id)
             elif record["event"] in WORKER_QUESTION_REPLAY_EVENTS:
                 # The park/answer paths append the event before the snapshot
                 # save; a crash in between must not turn the open question

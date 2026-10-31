@@ -132,7 +132,8 @@ class ProviderPending(RuntimeError):
 
 _PROVIDER_ACTIONS = {"create", "locate", "visibility", "resume", "wait"}
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-_WORKER_DELIVERY_EVENTS = {"delivered", "complete", "accepted", "review_finding"}
+_WORKER_DELIVERY_EVENTS = {"delivered", "complete", "accepted", "review_finding",
+                           "blocked_engineering"}
 
 
 def _is_complex_contract(value: Any) -> bool:
@@ -1020,24 +1021,38 @@ class ProviderActionStore:
             raise ValueError('worker delivery generation must be a positive integer')
         if not isinstance(payload, dict):
             raise ValueError('worker delivery payload must be an object')
+        event = payload.get('event', 'delivered')
+        if event not in _WORKER_DELIVERY_EVENTS:
+            raise ValueError('worker delivery event is unsupported')
         delivery = payload.get('delivery_evidence')
+        if delivery is None and event == 'blocked_engineering':
+            delivery = {}
         if not isinstance(delivery, dict):
             raise ValueError(
                 'worker delivery requires a nested delivery_evidence object'
             )
-        missing = [
-            key for key in ('completion_marker', 'delivery_path', 'thread_status')
-            if not (isinstance(delivery.get(key), str) and delivery[key].strip())
-        ]
-        if missing:
+        if event != 'blocked_engineering':
+            missing = [
+                key for key in ('completion_marker', 'delivery_path', 'thread_status')
+                if not (isinstance(delivery.get(key), str) and delivery[key].strip())
+            ]
+            if missing:
+                raise ValueError(
+                    'worker delivery is missing: {}'.format(', '.join(missing))
+                )
+            if delivery.get('thread_status') not in {'complete', 'completed', 'DELIVERED'}:
+                raise ValueError('worker delivery thread_status is not terminal')
+        from ..evidence import blocked_self_report_fields
+        blocked = blocked_self_report_fields(payload)
+        if blocked and event in {'delivered', 'complete'}:
+            # #335: a payload that says it is blocked is not a delivery.  The
+            # worker hears the format error immediately and re-reports with
+            # event=blocked_engineering instead; the refusal names only the
+            # field names, never the worker's own values.
             raise ValueError(
-                'worker delivery is missing: {}'.format(', '.join(missing))
+                'worker delivery event cannot be {} with blocked self-report '
+                'fields: {}'.format(event, ', '.join(blocked))
             )
-        if delivery.get('thread_status') not in {'complete', 'completed', 'DELIVERED'}:
-            raise ValueError('worker delivery thread_status is not terminal')
-        event = payload.get('event', 'delivered')
-        if event not in _WORKER_DELIVERY_EVENTS:
-            raise ValueError('worker delivery event is unsupported')
         if (
             issue_id == 'integration-review' and role == 'reviewer'
             and event == 'accepted'
@@ -1656,6 +1671,35 @@ class ProviderActionStore:
                 self._atomic(path, dict(report, consumed_by=action['action_id']))
                 return True
         return False
+
+    def archived_payload(self, run_id, issue_id, role, generation):
+        """The full worker payload archived for this task, or None.
+
+        The archive keeps everything the worker reported, unlike the runner
+        projections that forward only the delivery-event vocabulary, so gates
+        that must see the worker's own top-level state (#335 blocked
+        self-report fields) read it here.  Consumption does not delete the
+        file, and a missing or malformed archive is None, never a guess.
+        """
+        if not isinstance(issue_id, str) or not _SAFE_ID.fullmatch(issue_id):
+            return None
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+            return None
+        path = self._delivery_path(run_id, issue_id, role, generation)
+        if not path.is_file():
+            return None
+        try:
+            report = self._read(path)
+        except (ValueError, OSError):
+            # A corrupt or hostile archive never aborts the monitor tick:
+            # the caller falls back to the projected event data, which is
+            # exactly today's behavior.  Same fail-soft pattern as
+            # ``self_report_receipt``.
+            return None
+        if not isinstance(report, dict):
+            return None
+        payload = report.get("payload")
+        return payload if isinstance(payload, dict) else None
 
     def self_report_receipt(self, run_id, issue_id, role, generation, task_id, host,
                             delivery_evidence):

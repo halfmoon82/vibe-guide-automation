@@ -59,9 +59,40 @@ _DELIVERY_FORMAT_REASON_CODES = {
 }
 
 
+#: Top-level self-report fields that mark the payload as a blocked
+#: engineering state rather than a delivery (#335).  Only the field names are
+#: ever surfaced in refusals -- the worker's own values are free text.
+_BLOCKED_SELF_REPORT_FIELDS = ("status", "report_kind",
+                               "implementation_complete", "issue_complete")
+
+
+def blocked_self_report_fields(payload: Any) -> List[str]:
+    """Field names marking ``payload`` as a blocked self-report (#335).
+
+    ``status`` starting with ``blocked`` or ``report_kind`` starting with
+    ``blocked_`` says the worker is not done; ``implementation_complete`` /
+    ``issue_complete`` explicitly ``False`` says the same in the shape the
+    run-89693f36 payload used.  Any other value (including other falsy ones)
+    is not a blocked claim: absence of evidence is not evidence of a block.
+    """
+    if not isinstance(payload, dict):
+        return []
+    fields = []
+    status = payload.get("status")
+    if isinstance(status, str) and status.startswith("blocked"):
+        fields.append("status")
+    report_kind = payload.get("report_kind")
+    if isinstance(report_kind, str) and report_kind.startswith("blocked_"):
+        fields.append("report_kind")
+    for key in ("implementation_complete", "issue_complete"):
+        if payload.get(key) is False:
+            fields.append(key)
+    return fields
+
+
 def evaluate_delivery_evidence(
     node: Any, binding: Any, artifacts: Any, self_report_receipt: bool = False,
-    background_receipt: bool = False,
+    background_receipt: bool = False, self_report: Any = None,
 ) -> DeliveryEvidence:
     """Require complete, current delivery evidence before dependency unlock.
 
@@ -76,7 +107,19 @@ def evaluate_delivery_evidence(
     session has neither host nor cursor, so it replaces both -- and only
     when the binding itself is background; a visible binding keeps both
     requirements whatever the caller claims.
+
+    ``self_report`` is the full worker payload the delivery evidence was
+    nested in, when the caller has it (#335): a blocked self-state on that
+    payload dominates every other field, because a report that says it is
+    blocked is not a delivery no matter how complete its evidence looks.
     """
+    blocked = blocked_self_report_fields(self_report)
+    if blocked:
+        return DeliveryEvidence(
+            "blocked_unknown",
+            ["worker self-reported a blocked state: " + ", ".join(blocked)],
+            "blocked_unknown",
+        )
     get = lambda value, key, default=None: value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
     reasons: List[str] = []
     if get(node, "status") not in {"DELIVERED", "delivered"}:

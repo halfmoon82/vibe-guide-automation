@@ -253,11 +253,11 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 
 `request.child_binding` 的 `worktree`、`branch`、`allowlist` 由 vibe 按节点 id 派生，每个节点互不相同。**创建会话必须把工作目录设成合同里的 `worktree`**，在合同的 `branch` 上开发，只碰 `allowlist` 里的文件。
 
-**worktree 由谁建，按派发方式分。** 后台派发（`claude-code-background`）由 vibe 在派发前自建缺失的节点 worktree：目录不存在时按运行基线执行 `git worktree add <worktree> -b <branch> <base>`，并把该节点已验收的上游分支合入基线；分支已存在、目录不在任何 git 仓库内或基线读不到时拒绝创建，不复用、不覆盖已有分支。目录已存在则只核对它在合同的 `branch` 上（既有目录不是 git worktree 时不核对，按原行为直接派发），并把它当前的 HEAD 作为本次派发的基线（vibe 自建时写进节点 `worktree_base`），不切换、不重置、不覆盖；分支不符报 `worktree_mismatch` 并 fail-closed。
+**worktree 由谁建，按派发方式分。** 后台派发（`claude-code-background`）由 vibe 在派发前自建缺失的节点 worktree：目录不存在时按运行基线执行 `git worktree add <worktree> -b <branch> <base>`，并把该节点已验收的上游分支合入基线；分支已存在、目录不在任何 git 仓库内或基线读不到时拒绝创建，不复用、不覆盖已有分支。目录已存在则核对它在合同的 `branch` 上；既有目录不是 git worktree 时同样 fail-closed，不直接派发。随后把它当前的 HEAD 作为本次派发的基线（vibe 自建时写进节点 `worktree_base`），不切换、不重置、不覆盖；分支不符报 `worktree_mismatch` 并 fail-closed。
 
-在 `vibe monitor` / `vibe resume` 的一次性推进里，这类失败会把节点标成「需要监工建工作树」，`worktree_preflight` 里带机读码和一条可直接执行的处置命令（建树命令，或该码对应的核对/处置说明）。**`vibe monitor --watch` 进入 watch 之后的续跑、以及守护程序续跑都不落这个标记**，别只等状态变——按节点事件流或 `vibe status` 里该节点的「错误类别 …，code=…」行自查。
+在 `vibe monitor` / `vibe resume` 的一次性推进里，这类失败会把节点标成「需要监工建工作树」，`worktree_preflight` 里带机读码和一条可直接执行的处置命令（建树命令，或该码对应的核对/处置说明）。`vibe monitor --watch` 进入 watch 后的每一拍以及守护程序续跑也会记录同一预检标记，按节点事件流或 `vibe status` 复核。
 
-**可见派发仍需 worktree 先存在**（Codex/Claude 的可见会话按合同目录挂载）：vibe 不代建；绑定时要求它是干净、在合同 `branch` 与 `base_sha` 上的 git worktree，并持有 writer lease；缺目录时由监工按合同 `base_sha` 建好后重新派发。
+**可见派发同样先经 vibe 预检**（Codex/Claude 的可见会话按合同目录挂载）：缺失且能按合同安全创建时由 launcher 预检代建；绑定时要求它是干净、在合同 `branch` 与 `base_sha` 上的 git worktree，并持有 writer lease。目录不能安全创建、目录里没有 `.git` 或状态无法确认时派发被拒：机读码 `worktree_missing`（固定枚举，与后台派发同一词汇表），节点状态「需要监工建工作树」、`worktree_preflight` 里带可直接执行的建树命令；由监工按合同 `base_sha` 处理后重新派发。
 
 | 宿主 | 设定工作目录的方式 | 做不到时的后果 |
 |---|---|---|
@@ -277,7 +277,7 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 | 操作 | `codex-app-visible` | `claude-code-visible` | `workbuddy-visible` | `claude-code-background` |
 |---|---|---|---|---|
 | `create` | `codex_app__create_thread` | `ccd_session__spawn_task` | `workbuddy_job__create` | `claude --bg` |
-| `locate` | `codex_app__navigate_to_codex_page` | `ccd_window__open_session_in` | `workbuddy_job__get` | `claude attach <short-id>` |
+| `locate` | `codex_app__navigate_to_codex_page`：参数形状 `{"threadId": <task_id>}`，只传 threadId——不要多传 hostId/page，多传即参数错误（#316 实录） | `ccd_window__open_session_in`：在窗口中打开会话（session + 窗口）；参数形状未验证（2026-09-18 探测未单独跑过），照抄登记参数、不要多传 | `workbuddy_job__get`：传 job id（仓内 server 实证 `GET /api/v1/jobs/<id>`） | `claude attach <short-id>`（终端命令） |
 | `visibility` | `codex_app__wait_threads` | `ccd_session_mgmt__get_session` | `workbuddy_job__list` | `claude agents --json --all` |
 | `resume` | `codex_app__send_message_to_thread` | `ccd_session_mgmt__send_message` | `workbuddy_job__reply` | `claude stop` + `claude --bg --resume <完整会话 id>` |
 | `wait` | `codex_app__wait_threads` | `ccd_session_mgmt__list_events` | `workbuddy_job__wait` | 轮询 `claude agents --json --all` 的 `state` + `vibe worker-deliver` 自报 |
