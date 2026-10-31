@@ -196,22 +196,19 @@ def landing_report(monitor: Any, snapshot: Any, node_id: str) -> Optional[Dict[s
                     "(no .git)".format(worktree)
                 )
             return None
-        # Missing directory: distinguish "not built yet" (the launcher or
-        # supervisor may still create it; fake providers never do) from
-        # "removed after dispatch" (IR-6).  Only a git project where the
-        # node branch still exists proves the worktree was there and is
-        # now gone: that delivery must fail closed, not slide into review.
-        branch = str(current.get("branch") or "").strip()
-        if branch and _project_git_available(monitor):
-            tip = _git_in(monitor.paths.root)(
-                ["rev-parse", "--verify", "--quiet", branch]
+        # Missing directory: "cannot confirm the landing" is never "nothing
+        # landed" (#336).  Branch existence is never a pass condition (IR-6,
+        # integration review g9): inside a git project the landing
+        # discipline exists, so a configured writer worktree that is gone at
+        # delivery time -- with or without its branch -- fails closed
+        # through the caller's park path.  Outside a git project (fake
+        # providers, fixtures, the launcher has not built it yet) there is
+        # no claim to check and the compatibility path stays open.
+        if _project_git_available(monitor):
+            raise ScopeLandingUnknown(
+                "worktree {} is missing at delivery time; the landing "
+                "cannot be confirmed".format(worktree)
             )
-            if tip.returncode == 0 and (tip.stdout or "").strip():
-                raise ScopeLandingUnknown(
-                    "worktree {} is missing but its branch {} still exists "
-                    "in the project: the worktree was removed before "
-                    "delivery".format(worktree, branch)
-                )
         return None
     git = _git_in(worktree)
     project_head = _project_head(monitor)
