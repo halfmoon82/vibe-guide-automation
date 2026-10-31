@@ -60,6 +60,51 @@ class CreateTemplateTests(unittest.TestCase):
             role="developer",
         )
 
+    def test_failed_create_is_accepted_with_a_reason(self):
+        # The reader turns failed / status=failed into ProviderUnavailable for
+        # every operation, so create must be able to report an honest failure.
+        validate_result_shape("create", {"failed": True, "reason": "host refused"}, role="developer")
+        validate_result_shape("create", {"status": "failed", "reason": "host refused"}, role="developer")
+
+    def test_failed_create_without_a_reason_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            validate_result_shape("create", {"failed": True}, role="developer")
+        self.assertIn("reason", str(caught.exception))
+
+    def test_identity_is_judged_on_the_key_the_reader_binds(self):
+        # The reader takes ``threadId or task_id``; a valid task_id must not
+        # hide a non-string threadId that the reader would pick first.
+        with self.assertRaises(ValueError) as caught:
+            validate_result_shape(
+                "create",
+                {"binding": {"threadId": 5, "task_id": "t", "hostId": "h"}},
+                role="developer",
+            )
+        self.assertIn("task identity", str(caught.exception))
+
+    def test_blank_identity_is_refused(self):
+        for binding in ({"threadId": "t", "hostId": "  "}, {"threadId": "  ", "hostId": "h"}):
+            with self.subTest(binding=binding):
+                with self.assertRaises(ValueError):
+                    validate_result_shape("create", {"binding": binding}, role="developer")
+
+    def test_placeholder_variants_are_refused(self):
+        for value in ("＜填写＞", " <填写> ", "<填写>-1", "thread-<填写>"):
+            for field in ("task", "host"):
+                binding = {"threadId": "thread-1", "hostId": "local"}
+                binding["threadId" if field == "task" else "hostId"] = value
+                with self.subTest(value=value, field=field):
+                    with self.assertRaises(ValueError) as caught:
+                        validate_result_shape("create", {"binding": binding}, role="developer")
+                    self.assertIn("placeholder", str(caught.exception))
+
+    def test_real_values_close_to_the_placeholder_are_not_refused(self):
+        validate_result_shape(
+            "create",
+            {"binding": {"threadId": "<fill>", "hostId": "<h>"}},
+            role="developer",
+        )
+
 
 class LocateTemplateTests(unittest.TestCase):
     def test_template_uses_the_located_flag(self):

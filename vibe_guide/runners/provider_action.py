@@ -7,6 +7,7 @@ import os
 import shlex
 from pathlib import Path
 import subprocess
+import unicodedata
 from typing import Any, Dict, Optional
 
 from ..adapters.task_provider import (
@@ -209,6 +210,7 @@ _WAIT_RESULT_FIELDS = frozenset(
      WARNINGS_KEY) + RESULT_EVENT_KEYS
 )
 _CREATE_RESULT_FIELDS = frozenset(("binding", "threadId", "thread_id", "status", "cursor"))
+_CREATE_FAILURE_FIELDS = frozenset(("failed", "status", "reason", "error"))
 #: The value ``--template`` prints where the supervisor must substitute a real
 #: identity.  A result that still carries it is refused: storing it would bind
 #: a task that does not exist, and a stored result cannot be rewritten.
@@ -219,6 +221,15 @@ _BINDING_IDENTITY_FIELDS = ("threadId", "task_id")
 _RESUME_RESULT_FIELDS = frozenset((RESUME_RECEIPT_FIELD, "status"))
 
 
+def _holds_placeholder(value):
+    """True when a string still carries the template placeholder.
+
+    NFKC folds the full-width ``＜填写＞`` to ``<填写>``; a substring match also
+    catches padded and half-filled values such as ``" <填写> "`` or ``<填写>-1``.
+    """
+    return isinstance(value, str) and TEMPLATE_PLACEHOLDER in unicodedata.normalize("NFKC", value)
+
+
 def _shape_errors(required, allowed, payload):
     errors = []
     missing = sorted(key for key in required if key not in payload)
@@ -227,6 +238,47 @@ def _shape_errors(required, allowed, payload):
         errors.append("missing fields: " + ", ".join(missing))
     if extra:
         errors.append("unexpected fields: " + ", ".join(extra))
+    return errors
+
+
+def _reports_failure(payload):
+    return payload.get("failed") is True or payload.get("status") in ("failed", "error", "stopped")
+
+
+def _create_shape_errors(payload):
+    if _reports_failure(payload):
+        # The reader turns a failed create into ProviderUnavailable before it
+        # looks for a binding, so a supervisor that could not create the task
+        # must be able to say so with a reason.
+        errors = _shape_errors([], _CREATE_FAILURE_FIELDS, payload)
+        reason = payload.get("reason") or payload.get("error")
+        if not (isinstance(reason, str) and reason.strip()):
+            errors.append("field reason is required when the action failed")
+        return errors
+    errors = _shape_errors(["binding"], _CREATE_RESULT_FIELDS, payload)
+    binding = payload.get("binding")
+    if "binding" not in payload:
+        return errors
+    if not isinstance(binding, dict):
+        errors.append("field binding needs a task identity: " + " or ".join(_BINDING_IDENTITY_FIELDS))
+        return errors
+    # Judge the value the reader binds on (first truthy key), not "any key is
+    # valid": a valid second key must not hide a bad first one.
+    task_id = binding.get("threadId") or binding.get("task_id")
+    host = binding.get("hostId") or binding.get("host")
+    if not (isinstance(task_id, str) and task_id.strip()):
+        errors.append("field binding needs a task identity: " + " or ".join(_BINDING_IDENTITY_FIELDS))
+    # The dispatcher binds on a host identity as well; without it the result is
+    # stored and then refused as ``dispatch_contract_invalid``, and a consumed
+    # result cannot be rewritten.
+    if not (isinstance(host, str) and host.strip()):
+        errors.append("field binding needs a host identity: hostId or host")
+    for label, value in (("task identity", task_id), ("host identity", host)):
+        if _holds_placeholder(value):
+            errors.append(
+                "field binding {} still holds the template placeholder; "
+                "substitute the real value".format(label)
+            )
     return errors
 
 
@@ -262,27 +314,7 @@ def validate_result_shape(operation, payload, *, role=None):
         if "delivery_evidence" in payload and not isinstance(payload["delivery_evidence"], dict):
             errors.append("field delivery_evidence must be an object")
     elif operation == "create":
-        errors = _shape_errors(["binding"], _CREATE_RESULT_FIELDS, payload)
-        binding = payload.get("binding")
-        if "binding" in payload and (
-            not isinstance(binding, dict)
-            or not any(isinstance(binding.get(key), str) and binding[key]
-                       for key in _BINDING_IDENTITY_FIELDS)
-        ):
-            errors.append("field binding needs a task identity: " + " or ".join(_BINDING_IDENTITY_FIELDS))
-        # The dispatcher binds on a host identity as well; without it the
-        # result is stored and then refused as ``dispatch_contract_invalid``,
-        # and a consumed result cannot be rewritten.
-        if isinstance(binding, dict):
-            host = binding.get("hostId") or binding.get("host")
-            if not (isinstance(host, str) and host.strip()):
-                errors.append("field binding needs a host identity: hostId or host")
-            for key in ("threadId", "task_id", "hostId", "host"):
-                if binding.get(key) == TEMPLATE_PLACEHOLDER:
-                    errors.append(
-                        "field binding.{} still holds the template placeholder; "
-                        "substitute the real value".format(key)
-                    )
+        errors = _create_shape_errors(payload)
     elif operation in ("locate", "visibility"):
         # Both readers test the flag itself (``located is True`` /
         # ``visible is True and direct_enter is True``); a template carrying
