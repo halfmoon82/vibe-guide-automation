@@ -418,7 +418,10 @@ class ClaudeBgLauncher:
                 % (path, error.reason),
                 "git -C %s rev-parse --abbrev-ref HEAD" % path,
             )
-        if dirty:
+        if self.base_sha and dirty:
+            # Only the visible initial binding contract requires a clean
+            # worktree.  Background continuation/rework deliberately starts
+            # a fresh session beside uncommitted work in the same worktree.
             raise self._blocked(
                 WORKTREE_MISMATCH,
                 "worktree %s has uncommitted changes; refusing to dispatch into it" % path,

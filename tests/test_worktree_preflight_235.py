@@ -289,6 +289,20 @@ class NeverOverwritesTest(RepoCase):
         self.assertEqual(self.branch_of(self.worktree), self.branch)
         self.assertEqual(self.head_of(self.worktree), self.base)
 
+    def test_background_continuation_preserves_dirty_worktree(self):
+        self.prepare()
+        (self.worktree / "unfinished.py").write_text("uncommitted work\n", encoding="utf-8")
+        launcher = self.launcher()
+        self.assertEqual(launcher._prepare_worktree(), self.worktree)
+        self.assertEqual(
+            (self.worktree / "unfinished.py").read_text(encoding="utf-8"),
+            "uncommitted work\n",
+        )
+        self.assertEqual(self.branch_of(self.worktree), self.branch)
+        self.assertEqual(
+            [a for a, _ in self.executor.git_calls if "worktree" in a and "add" in a], []
+        )
+
     def test_existing_worktree_on_another_branch_is_reported_not_switched(self):
         self.prepare()
         git(self.worktree, "switch", "-q", "-c", "someone/else")
