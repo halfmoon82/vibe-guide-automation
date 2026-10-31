@@ -266,7 +266,12 @@ def _create_shape_errors(payload):
         for flag in _CREATE_FAILURE_FLAGS:
             if flag in payload and not isinstance(payload[flag], bool):
                 errors.append("field {} must be true or false".format(flag))
-        if "reason_class" in payload and payload["reason_class"] not in _FAILURE_REASON_CLASSES:
+        reason_class = payload.get("reason_class")
+        # Type first: a list or dict is unhashable, so the set lookup would
+        # raise TypeError instead of naming the field.
+        if "reason_class" in payload and not (
+            isinstance(reason_class, str) and reason_class in _FAILURE_REASON_CLASSES
+        ):
             errors.append("field reason_class must be one of: " + ", ".join(sorted(_FAILURE_REASON_CLASSES)))
         reason = payload.get("reason") or payload.get("error")
         if not (isinstance(reason, str) and reason.strip()):

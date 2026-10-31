@@ -91,7 +91,9 @@ class CreateTemplateTests(unittest.TestCase):
                     self.assertIn(flag, str(caught.exception))
 
     def test_failed_create_reason_class_must_be_one_the_reader_honours(self):
-        for bad in ("bogus", "capacity", "", None, 3):
+        # Unhashable values must be refused with a ValueError naming the field,
+        # not leak a TypeError from the set lookup.
+        for bad in ("bogus", "capacity", "", None, 3, ["engineering"], {"a": 1}):
             with self.subTest(value=bad):
                 with self.assertRaises(ValueError) as caught:
                     validate_result_shape(
@@ -140,6 +142,16 @@ class CreateTemplateTests(unittest.TestCase):
                 "create", {"status": "failed", "reason": "x", "bogus": 1}, role="developer",
             )
         self.assertIn("bogus", str(caught.exception))
+
+    def test_every_failure_status_the_reader_honours_is_a_failed_create(self):
+        # The reader fails a result for status failed/error/stopped alike; each
+        # must reach the failure branch (reason required, no binding needed).
+        for status in ("failed", "error", "stopped"):
+            with self.subTest(status=status):
+                validate_result_shape("create", {"status": status, "reason": "x"}, role="developer")
+                with self.assertRaises(ValueError) as caught:
+                    validate_result_shape("create", {"status": status}, role="developer")
+                self.assertIn("reason", str(caught.exception))
 
     def test_failed_create_without_a_reason_is_refused(self):
         with self.assertRaises(ValueError) as caught:
