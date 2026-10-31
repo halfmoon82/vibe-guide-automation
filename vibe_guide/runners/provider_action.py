@@ -210,7 +210,13 @@ _WAIT_RESULT_FIELDS = frozenset(
      WARNINGS_KEY) + RESULT_EVENT_KEYS
 )
 _CREATE_RESULT_FIELDS = frozenset(("binding", "threadId", "thread_id", "status", "cursor"))
-_CREATE_FAILURE_FIELDS = frozenset(("failed", "status", "reason", "error"))
+#: A failed create is stored whole and handed to the failure classifier, and the
+#: parameter-recovery gate requires ``task_created is False`` in it, so the
+#: structured fields those readers consume must pass the write-time check.
+_CREATE_FAILURE_FIELDS = frozenset(
+    ("failed", "status", "reason", "error", "reason_class", "task_created",
+     "credential_required", "login_required", "permission_required")
+)
 #: The value ``--template`` prints where the supervisor must substitute a real
 #: identity.  A result that still carries it is refused: storing it would bind
 #: a task that does not exist, and a stored result cannot be rewritten.

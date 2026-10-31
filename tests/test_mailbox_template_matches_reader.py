@@ -66,6 +66,24 @@ class CreateTemplateTests(unittest.TestCase):
         validate_result_shape("create", {"failed": True, "reason": "host refused"}, role="developer")
         validate_result_shape("create", {"status": "failed", "reason": "host refused"}, role="developer")
 
+    def test_failed_create_may_carry_the_fields_the_reader_consumes(self):
+        # ``task_created: false`` is what the parameter-recovery gate requires;
+        # ``login_required`` and friends decide external vs engineering.
+        for extra in ({"task_created": False}, {"login_required": True},
+                      {"credential_required": True}, {"permission_required": True},
+                      {"reason_class": "capacity"}):
+            with self.subTest(extra=extra):
+                validate_result_shape(
+                    "create", {"status": "failed", "reason": "x", **extra}, role="developer",
+                )
+
+    def test_failed_create_still_refuses_unknown_fields(self):
+        with self.assertRaises(ValueError) as caught:
+            validate_result_shape(
+                "create", {"status": "failed", "reason": "x", "bogus": 1}, role="developer",
+            )
+        self.assertIn("bogus", str(caught.exception))
+
     def test_failed_create_without_a_reason_is_refused(self):
         with self.assertRaises(ValueError) as caught:
             validate_result_shape("create", {"failed": True}, role="developer")
