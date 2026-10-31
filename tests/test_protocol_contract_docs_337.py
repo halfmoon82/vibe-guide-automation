@@ -54,7 +54,7 @@ class WorktreeMissingCodeTests(unittest.TestCase):
         cls.s63 = _section(cls.text, "### 6.3 ", "\n### 6.4")
 
     def test_visible_dispatch_missing_worktree_carries_machine_code(self):
-        start = self.s63.index("**可见派发仍需 worktree 先存在**")
+        start = self.s63.index("**可见派发同样先经 vibe 预检**")
         sentence = self.s63[start:]
         self.assertIn("worktree_missing", sentence)
         self.assertIn("需要监工建工作树", sentence)

@@ -27,6 +27,8 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-10-31: §6.3 matches unified preflight and per-beat recording (PR #370).
+        "76a38df79a11da515bd0408187ac13e03aa734984fb976f37a822e75124be6a5",
         # 2026-10-30: worker-deliver / supervisor-address take --project-root, no cwd.
         "5a29abbca912f875fc886a1e58892eadb802e39341dfe4884c88009e135c1dc0",
         # 2026-10-30: --project-root commands merged with main's level-three and dead-daemon wording.

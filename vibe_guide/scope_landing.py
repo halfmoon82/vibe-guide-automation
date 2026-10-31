@@ -98,9 +98,18 @@ def _project_git_available(monitor: Any) -> bool:
     """
     try:
         resolved = _git_in(monitor.paths.root)(["rev-parse", "--verify", "--quiet", "HEAD"])
-        return resolved.returncode == 0 and bool((resolved.stdout or "").strip())
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ScopeLandingUnknown("the project Git state is unreadable") from error
+    if resolved.returncode == 0 and bool((resolved.stdout or "").strip()):
+        return True
+    # A non-checkout is a legitimate fake/fixture compatibility path.  A
+    # checkout whose Git metadata cannot be read is not: treating the two
+    # alike would bypass both landing gates exactly when verification is
+    # unavailable (permissions, safe.directory, corruption, unsafe HEAD).
+    stderr = str(resolved.stderr or "").casefold()
+    if not (monitor.paths.root / ".git").exists() and "not a git repository" in stderr:
         return False
+    raise ScopeLandingUnknown("the project Git state is unreadable")
 
 
 def _project_head(monitor: Any) -> str:

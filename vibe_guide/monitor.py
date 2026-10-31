@@ -10713,6 +10713,72 @@ class Monitor:
                 # The label is derived from the marker, never stored beside
                 # it twice: recomputing keeps replay and the live path equal.
                 current["user_status"] = map_user_status(current)
+            elif record["event"] == "model_fallback_used":
+                proof = data.get("proof")
+                if (
+                    not isinstance(proof, dict)
+                    or not isinstance(proof.get("from_model"), str)
+                    or not proof["from_model"]
+                    or not isinstance(proof.get("to_model"), str)
+                    or not proof["to_model"]
+                    or not isinstance(proof.get("reason_class"), str)
+                    or not proof["reason_class"]
+                ):
+                    raise ValueError("replayed model fallback evidence is invalid")
+                overrides = current.setdefault("contract_overrides", {})
+                raw_profile = overrides.get("worker_profile")
+                if not isinstance(raw_profile, dict):
+                    raw_profile = self.nodes[node_id].contract.get("worker_profile")
+                if not isinstance(raw_profile, dict):
+                    raise ValueError("replayed model fallback profile is unavailable")
+                current.setdefault("model_dispatch_chain_profile", dict(raw_profile))
+                chain = self._profile_model_chain({"worker_profile": raw_profile}, current)
+                if chain:
+                    current["model_dispatch_chain"] = chain
+                attempts = current.setdefault("model_dispatch_attempts", [])
+                if not any(
+                    isinstance(item, dict) and item.get("model") == proof["from_model"]
+                    for item in attempts
+                ):
+                    attempts.append({
+                        "model": proof["from_model"],
+                        "reason_class": proof["reason_class"],
+                        "reason": "replayed model fallback",
+                    })
+                profile = dict(raw_profile)
+                profile["model"] = proof["to_model"]
+                profile["fallbacks"] = [
+                    item for item in profile.get("fallbacks") or []
+                    if (item.get("model") if isinstance(item, dict) else item) != proof["to_model"]
+                ]
+                overrides["worker_profile"] = profile
+            elif record["event"] == "model_unavailable_parked":
+                proof = data.get("proof")
+                if (
+                    not isinstance(proof, dict)
+                    or not isinstance(proof.get("rounds"), int)
+                    or isinstance(proof.get("rounds"), bool)
+                    or proof["rounds"] < 1
+                    or not isinstance(proof.get("attempts"), list)
+                ):
+                    raise ValueError("replayed model unavailable evidence is invalid")
+                attempts = proof["attempts"]
+                current["model_unavailable_rounds"] = proof["rounds"]
+                current["model_unavailable"] = {
+                    "rounds": proof["rounds"], "attempts": list(attempts),
+                }
+                current["status"] = self._v42_retry_status()
+                current["reason"] = "model fallback chain exhausted"
+                current["active_role"] = None
+                current["active_task"] = None
+                current["start_intent"] = None
+                current["retryable_action"] = None
+            elif record["event"] == "empty_landing_allowed":
+                # Audit-only event: the delivery transition that follows is
+                # authoritative.  Recognise it so a crash before the snapshot
+                # save never degrades an allowed empty landing into a manual
+                # reconciliation block.
+                pass
             elif record["event"] == "scope_landing_rejected" and data.get(
                 "reason_class"
             ) == "landing_unreadable":

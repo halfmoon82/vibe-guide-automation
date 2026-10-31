@@ -181,7 +181,10 @@ class DecisionMailbox:
         path = self._request_path(decision_id)
         if path.exists():
             existing = self._load_request(decision_id)
-            if all(existing.get(key) == record[key] for key in ("options", "recommendation", "category")):
+            identity_keys = ("options", "recommendation", "category")
+            if "scope" in record:
+                identity_keys += ("scope",)
+            if all(existing.get(key) == record.get(key) for key in identity_keys):
                 return existing
             # Changed content supersedes the request: the old answer is kept
             # only as archived evidence and the decision is pending again.

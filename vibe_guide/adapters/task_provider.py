@@ -1021,24 +1021,27 @@ class ProviderActionStore:
             raise ValueError('worker delivery generation must be a positive integer')
         if not isinstance(payload, dict):
             raise ValueError('worker delivery payload must be an object')
+        event = payload.get('event', 'delivered')
+        if event not in _WORKER_DELIVERY_EVENTS:
+            raise ValueError('worker delivery event is unsupported')
         delivery = payload.get('delivery_evidence')
+        if delivery is None and event == 'blocked_engineering':
+            delivery = {}
         if not isinstance(delivery, dict):
             raise ValueError(
                 'worker delivery requires a nested delivery_evidence object'
             )
-        missing = [
-            key for key in ('completion_marker', 'delivery_path', 'thread_status')
-            if not (isinstance(delivery.get(key), str) and delivery[key].strip())
-        ]
-        if missing:
-            raise ValueError(
-                'worker delivery is missing: {}'.format(', '.join(missing))
-            )
-        if delivery.get('thread_status') not in {'complete', 'completed', 'DELIVERED'}:
-            raise ValueError('worker delivery thread_status is not terminal')
-        event = payload.get('event', 'delivered')
-        if event not in _WORKER_DELIVERY_EVENTS:
-            raise ValueError('worker delivery event is unsupported')
+        if event != 'blocked_engineering':
+            missing = [
+                key for key in ('completion_marker', 'delivery_path', 'thread_status')
+                if not (isinstance(delivery.get(key), str) and delivery[key].strip())
+            ]
+            if missing:
+                raise ValueError(
+                    'worker delivery is missing: {}'.format(', '.join(missing))
+                )
+            if delivery.get('thread_status') not in {'complete', 'completed', 'DELIVERED'}:
+                raise ValueError('worker delivery thread_status is not terminal')
         from ..evidence import blocked_self_report_fields
         blocked = blocked_self_report_fields(payload)
         if blocked and event in {'delivered', 'complete'}:

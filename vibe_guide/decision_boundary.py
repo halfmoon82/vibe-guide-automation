@@ -217,7 +217,8 @@ def _record_scope(record: Mapping[str, Any]) -> str:
     return scope if scope in DECISION_SCOPES else LEGACY_DECISION_SCOPE
 
 
-def find_reusable_decision(paths, run_id: str, node_id: str, question, options):
+def find_reusable_decision(paths, run_id: str, node_id: str, question, options,
+                           requested_scope=DEFAULT_DECISION_SCOPE):
     """Look up an answered decision this raise may reuse.
 
     A match requires, besides the scope rule, that the earlier conclusion's
@@ -244,7 +245,8 @@ def find_reusable_decision(paths, run_id: str, node_id: str, question, options):
         if entry["choice"] not in option_ids:
             continue
         if entry["scope"] == "run" or (
-                entry["scope"] == "node" and entry.get("node_id") == node_id):
+                requested_scope != "run"
+                and entry["scope"] == "node" and entry.get("node_id") == node_id):
             return entry, "ok"
     return None, "ok"
 
@@ -273,7 +275,8 @@ def raise_reusable_decision(paths, *, run_id, node_id, question, options,
     create pending requests.  That duplication is accepted — the answers stay
     option-bound and the supervisor answers one and voids the other.
     """
-    matched, status = find_reusable_decision(paths, run_id, node_id, question, options)
+    matched, status = find_reusable_decision(
+        paths, run_id, node_id, question, options, requested_scope=scope)
     if matched is not None:
         request = ScopedDecisionMailbox(paths)._load_request(matched["decision_id"])
         return {
