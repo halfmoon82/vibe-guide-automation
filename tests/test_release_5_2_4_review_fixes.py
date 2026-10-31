@@ -1,4 +1,5 @@
 """Regression tests for the independent PR #370 review findings."""
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from vibe_guide.decision_boundary import ingest_worker_decisions, raise_reusable_decision
+from vibe_guide.adapters.task_provider import ProviderUnavailable
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.scope_landing import ScopeLandingUnknown, landing_report
 from vibe_guide.state import load_snapshot
@@ -13,7 +15,9 @@ from vibe_guide.state import load_snapshot
 from tests.test_decision_reuse_338 import DecisionReuseTests, _QUESTION
 from tests.test_delivery_self_report_shape import SelfReportShapeGateTests
 from tests.test_landing_required_before_review import EmptyLandingGateTests
-from tests.test_model_fallback_retry import ModelFallbackDispatchTests, _fallback_node
+from tests.test_model_fallback_retry import (
+    ModelFallbackDispatchTests, _fallback_node, _write_codex_map,
+)
 
 
 class GitUnreadableLandingTests(unittest.TestCase):
@@ -50,6 +54,31 @@ class EmptyLandingAllowedReplayTests(EmptyLandingGateTests):
 
 
 class ModelFallbackReplayTests(ModelFallbackDispatchTests):
+    def test_model_map_fallback_replays_the_complete_resolved_chain(self):
+        _write_codex_map(Path(os.environ["VIBE_HOME"]), {
+            "standard": ["m1", "m2", "m3"],
+        })
+        node = _fallback_node("n1", model="default", fallbacks=())
+        node.contract["adapter_id"] = "codex"
+        monitor, _runner, snapshot = self._start_fallback_run(node, [None])
+        crashed = load_snapshot(self.paths, snapshot.run_id)
+        current = crashed.nodes["n1"]
+        contract = dict(node.contract)
+        monitor._apply_model_tier(crashed, node, contract, current, "developer")
+        outcome = monitor._plan_model_fallback(
+            crashed, "n1", contract, current, "developer", "develop", False,
+            ProviderUnavailable("quota exhausted for model m1"),
+        )
+        self.assertEqual(outcome, "switch")
+
+        crashed = load_snapshot(self.paths, snapshot.run_id)
+        monitor._reconcile_unapplied_events(crashed)
+        current = crashed.nodes["n1"]
+        profile = current["contract_overrides"]["worker_profile"]
+        self.assertEqual(profile["model"], "m2")
+        self.assertEqual(profile["fallbacks"], [{"model": "m3"}])
+        self.assertEqual(current["model_dispatch_chain"], ["m1", "m2", "m3"])
+
     def test_model_fallback_used_replays_profile_switch(self):
         monitor, _runner, snapshot = self._start_fallback_run(_fallback_node("n1"), [None])
         crashed = load_snapshot(self.paths, snapshot.run_id)

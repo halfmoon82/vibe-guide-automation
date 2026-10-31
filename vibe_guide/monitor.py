@@ -5426,6 +5426,16 @@ class Monitor:
                     "from_model": from_model,
                     "to_model": to_model,
                     "reason_class": reason_class,
+                    # Persist the fully resolved dispatch-time profile.  A
+                    # model_map chain exists only on this contract copy, not
+                    # in the signed node contract; without these fields a
+                    # crash replay would rebuild a placeholder default model
+                    # and silently drop the remaining fallbacks.
+                    "worker_profile": dict(profile),
+                    "chain": list(current.get("model_dispatch_chain") or []),
+                    "chain_profile": dict(
+                        current.get("model_dispatch_chain_profile") or raw_profile
+                    ),
                 },
             },
         )
@@ -10745,12 +10755,24 @@ class Monitor:
                         "reason_class": proof["reason_class"],
                         "reason": "replayed model fallback",
                     })
-                profile = dict(raw_profile)
-                profile["model"] = proof["to_model"]
-                profile["fallbacks"] = [
-                    item for item in profile.get("fallbacks") or []
-                    if (item.get("model") if isinstance(item, dict) else item) != proof["to_model"]
-                ]
+                if isinstance(proof.get("worker_profile"), dict):
+                    profile = dict(proof["worker_profile"])
+                    if profile.get("model") != proof["to_model"]:
+                        raise ValueError("replayed model fallback profile is inconsistent")
+                    if isinstance(proof.get("chain_profile"), dict):
+                        current["model_dispatch_chain_profile"] = dict(proof["chain_profile"])
+                    if (
+                        isinstance(proof.get("chain"), list)
+                        and all(isinstance(name, str) and name for name in proof["chain"])
+                    ):
+                        current["model_dispatch_chain"] = list(proof["chain"])
+                else:
+                    profile = dict(raw_profile)
+                    profile["model"] = proof["to_model"]
+                    profile["fallbacks"] = [
+                        item for item in profile.get("fallbacks") or []
+                        if (item.get("model") if isinstance(item, dict) else item) != proof["to_model"]
+                    ]
                 overrides["worker_profile"] = profile
             elif record["event"] == "model_unavailable_parked":
                 proof = data.get("proof")
