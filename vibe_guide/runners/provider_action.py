@@ -217,6 +217,12 @@ _CREATE_FAILURE_FIELDS = frozenset(
     ("failed", "status", "reason", "error", "reason_class", "task_created",
      "credential_required", "login_required", "permission_required")
 )
+#: The readers judge these by truthiness / ``is False``, so a string such as
+#: ``"false"`` would read as true (or never match) and misroute the node.
+_CREATE_FAILURE_FLAGS = ("task_created", "credential_required", "login_required", "permission_required")
+#: Mirrors the recovery classes ``monitor.classify_provider_failure`` honours;
+#: any other value is silently ignored there.
+_FAILURE_REASON_CLASSES = frozenset(("engineering", "retryable", "capacity_wait", "repairable"))
 #: The value ``--template`` prints where the supervisor must substitute a real
 #: identity.  A result that still carries it is refused: storing it would bind
 #: a task that does not exist, and a stored result cannot be rewritten.
@@ -257,6 +263,11 @@ def _create_shape_errors(payload):
         # looks for a binding, so a supervisor that could not create the task
         # must be able to say so with a reason.
         errors = _shape_errors([], _CREATE_FAILURE_FIELDS, payload)
+        for flag in _CREATE_FAILURE_FLAGS:
+            if flag in payload and not isinstance(payload[flag], bool):
+                errors.append("field {} must be true or false".format(flag))
+        if "reason_class" in payload and payload["reason_class"] not in _FAILURE_REASON_CLASSES:
+            errors.append("field reason_class must be one of: " + ", ".join(sorted(_FAILURE_REASON_CLASSES)))
         reason = payload.get("reason") or payload.get("error")
         if not (isinstance(reason, str) and reason.strip()):
             errors.append("field reason is required when the action failed")

@@ -71,11 +71,68 @@ class CreateTemplateTests(unittest.TestCase):
         # ``login_required`` and friends decide external vs engineering.
         for extra in ({"task_created": False}, {"login_required": True},
                       {"credential_required": True}, {"permission_required": True},
-                      {"reason_class": "capacity"}):
+                      {"reason_class": "capacity_wait"}):
             with self.subTest(extra=extra):
                 validate_result_shape(
                     "create", {"status": "failed", "reason": "x", **extra}, role="developer",
                 )
+
+    def test_failed_create_flags_must_be_booleans(self):
+        # The readers test these by truthiness / ``is False``: the string
+        # "false" reads as true (misrouting the node as an external decision)
+        # or never matches (so parameter recovery is refused).
+        for flag in ("task_created", "login_required", "credential_required", "permission_required"):
+            for bad in ("false", "true", 0, 1, None):
+                with self.subTest(flag=flag, value=bad):
+                    with self.assertRaises(ValueError) as caught:
+                        validate_result_shape(
+                            "create", {"failed": True, "reason": "x", flag: bad}, role="developer",
+                        )
+                    self.assertIn(flag, str(caught.exception))
+
+    def test_failed_create_reason_class_must_be_one_the_reader_honours(self):
+        for bad in ("bogus", "capacity", "", None, 3):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError) as caught:
+                    validate_result_shape(
+                        "create", {"failed": True, "reason": "x", "reason_class": bad}, role="developer",
+                    )
+                self.assertIn("reason_class", str(caught.exception))
+
+    def test_failed_create_checks_agree_with_the_failure_classifier(self):
+        # What the write-time check lets through must be what the reader acts
+        # on: a boolean flag changes the classification, a refused one cannot.
+        from vibe_guide.monitor import classify_provider_failure
+
+        accepted = {"failed": True, "reason": "x", "login_required": True}
+        validate_result_shape("create", accepted, role="developer")
+        self.assertEqual(classify_provider_failure(accepted)["kind"], "external_decision")
+        for hint in ("engineering", "retryable", "capacity_wait", "repairable"):
+            result = {"failed": True, "reason": "x", "reason_class": hint}
+            validate_result_shape("create", result, role="developer")
+            self.assertNotEqual(classify_provider_failure(result)["kind"], "binding_unknown")
+
+    def test_failed_create_with_a_binding_is_refused(self):
+        # A result that both fails and binds is ambiguous; the reader fails it
+        # first, so storing the binding would only mislead a later reader.
+        with self.assertRaises(ValueError) as caught:
+            validate_result_shape(
+                "create",
+                {"failed": True, "reason": "x", "binding": {"threadId": "t", "hostId": "h"}},
+                role="developer",
+            )
+        self.assertIn("binding", str(caught.exception))
+
+    def test_host_is_judged_on_the_key_the_reader_binds(self):
+        # The reader takes ``hostId or host``, so a blank hostId shadows a valid
+        # ``host``. The reader would bind the blank string; the write-time check
+        # is deliberately stricter and refuses it.
+        with self.assertRaises(ValueError) as caught:
+            validate_result_shape(
+                "create", {"binding": {"threadId": "t", "hostId": "  ", "host": "local"}},
+                role="developer",
+            )
+        self.assertIn("host identity", str(caught.exception))
 
     def test_failed_create_still_refuses_unknown_fields(self):
         with self.assertRaises(ValueError) as caught:
