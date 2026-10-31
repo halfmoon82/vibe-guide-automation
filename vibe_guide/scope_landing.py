@@ -89,6 +89,20 @@ def _git_in(directory: Path) -> GitRunner:
     return run
 
 
+def _project_git_available(monitor: Any) -> bool:
+    """True when the project root is a readable git checkout.
+
+    Scope landing is a git discipline: in a project that is not a git
+    checkout (fake providers, fixtures, guide mode) there is no base..HEAD
+    claim to enforce, so the compatibility paths stay open.
+    """
+    try:
+        resolved = _git_in(monitor.paths.root)(["rev-parse", "--verify", "--quiet", "HEAD"])
+        return resolved.returncode == 0 and bool((resolved.stdout or "").strip())
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _project_head(monitor: Any) -> str:
     project = _git_in(monitor.paths.root)(["rev-parse", "HEAD"])
     if project.returncode != 0 or not project.stdout.strip():
@@ -158,19 +172,46 @@ def landing_report(monitor: Any, snapshot: Any, node_id: str) -> Optional[Dict[s
     from .worktree_base import upstream_branches
 
     current = snapshot.nodes[node_id]
-    if not str(current.get("worktree") or "").strip() or not hasattr(monitor, "paths"):
+    raw_worktree = str(current.get("worktree") or "")
+    if not raw_worktree.strip() or not hasattr(monitor, "paths"):
         return None
-    worktree = Path(str(current["worktree"]))
+    configured_absolute = Path(raw_worktree).is_absolute()
+    worktree = Path(raw_worktree)
     if not worktree.is_absolute():
         worktree = monitor.paths.root / worktree
     if worktree == Path(monitor.paths.root).resolve() or worktree == monitor.paths.root:
         return None  # the node writes the main tree by contract (worker-deliver does the same)
     if not (worktree / ".git").exists():
         if worktree.exists():
-            raise ScopeLandingUnknown(
-                "worktree {} exists but is not an independent git worktree "
-                "(no .git)".format(worktree)
+            # An existing directory that claims to be a node worktree but has
+            # no .git can vouch for nothing -- "cannot confirm the landing"
+            # is never "nothing landed".  An absolute claim is foreign by
+            # definition (vibe node worktrees are always repo-relative, see
+            # AGENTS.md §10); a repo-relative claim fails closed inside a
+            # real git project, while a non-git project is a fake/fixture
+            # with no landing discipline to enforce (IR-5 compatibility).
+            if configured_absolute or _project_git_available(monitor):
+                raise ScopeLandingUnknown(
+                    "worktree {} exists but is not an independent git worktree "
+                    "(no .git)".format(worktree)
+                )
+            return None
+        # Missing directory: distinguish "not built yet" (the launcher or
+        # supervisor may still create it; fake providers never do) from
+        # "removed after dispatch" (IR-6).  Only a git project where the
+        # node branch still exists proves the worktree was there and is
+        # now gone: that delivery must fail closed, not slide into review.
+        branch = str(current.get("branch") or "").strip()
+        if branch and _project_git_available(monitor):
+            tip = _git_in(monitor.paths.root)(
+                ["rev-parse", "--verify", "--quiet", branch]
             )
+            if tip.returncode == 0 and (tip.stdout or "").strip():
+                raise ScopeLandingUnknown(
+                    "worktree {} is missing but its branch {} still exists "
+                    "in the project: the worktree was removed before "
+                    "delivery".format(worktree, branch)
+                )
         return None
     git = _git_in(worktree)
     project_head = _project_head(monitor)

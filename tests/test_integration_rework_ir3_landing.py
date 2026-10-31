@@ -59,9 +59,22 @@ class LandingReportPlainDirectoryTests(unittest.TestCase):
                 landing_report(monitor, _snapshot(str(plain)), "node-a")
 
     def test_landing_report_raises_for_relative_plain_directory(self):
+        import subprocess
         with tempfile.TemporaryDirectory() as directory:
-            (Path(directory) / ".worktrees" / "node-a").mkdir(parents=True)
-            monitor = _Monitor(Path(directory))
+            root = Path(directory)
+            (root / ".worktrees" / "node-a").mkdir(parents=True)
+            # A repo-relative broken claim fails closed inside a real git
+            # project; the non-git-project compat shape lives in
+            # tests/test_integration_rework_ir5_ir6.py (IR-5).
+            subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.email", "t@e.c"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "config", "user.name", "T"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-q", "--allow-empty",
+                            "-m", "base"], check=True, capture_output=True)
+            monitor = _Monitor(root)
             with self.assertRaises(ScopeLandingUnknown):
                 landing_report(monitor, _snapshot(".worktrees/node-a"), "node-a")
 
