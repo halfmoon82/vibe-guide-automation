@@ -195,4 +195,3 @@ class EmptyLandingGateTests(unittest.TestCase):
         self.assertEqual(snapshot.nodes["bg2"]["status"], "review")
         self.assertEqual(self.events(snapshot.run_id, "acceptance_rejected"), [])
         self.assertEqual(self.events(snapshot.run_id, "empty_landing_allowed"), [])
-
