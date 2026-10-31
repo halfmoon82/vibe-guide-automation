@@ -276,16 +276,71 @@ def _rejection_text(rejected: List[Dict[str, str]], error: Optional[str] = None)
     return "交付被拒收：" + "".join(parts)
 
 
+#: Fixed classification of an unconfirmable-landing block (#336 / IR-6):
+#: the delivery gate could not read where the work landed, so the node is
+#: blocked_unknown with this structural code -- never a silent pass, and not
+#: the supervisor-question park used for rejected file lists.
+LANDING_UNREADABLE_CLASS = "landing_unreadable"
+LANDING_UNREADABLE_CODE = "scope_landing:landing_unreadable"
+
+
+def _park_landing_unreadable(monitor: Any, snapshot: Any, node_id: str,
+                             active: Dict[str, Any], error: Any,
+                             event_data: Dict[str, Any]) -> None:
+    """Park the node blocked_unknown: the delivery landing cannot be confirmed.
+
+    Distinct from the rejected-file-list park (``park`` with
+    ``KIND_SCOPE_LANDING``), which leaves a worker question a supervisor can
+    answer: here there is nothing to answer until the worktree state is
+    repaired, so #336 records blocked_unknown plus a structural code.
+    Everything stamped is a program constant; the worker's free text never
+    reaches the record.  ``worker_questions`` is deliberately not involved.
+    """
+    current = snapshot.nodes[node_id]
+    reason = "delivery landing cannot be confirmed ({})".format(str(error)[:200])
+    current["status"] = "blocked_unknown"
+    current["reason"] = reason
+    current["reason_class"] = LANDING_UNREADABLE_CLASS
+    current["reason_code"] = LANDING_UNREADABLE_CODE
+    current.pop("recovery_action", None)
+    current.pop("error_type", None)
+    current["retryable_action"] = None
+    current["active_role"] = None
+    current["active_task"] = None
+    snapshot.handles.pop(node_id, None)
+    current["quarantine"] = {
+        "run_id": snapshot.run_id,
+        "handle_id": active.get("handle_id") if isinstance(active, dict) else None,
+        "reason": reason,
+    }
+    monitor._release_node_lease(snapshot, node_id)
+    if isinstance(active, dict) and active.get("role") in {"developer", "reviewer"}:
+        try:
+            monitor._set_binding_status(snapshot, node_id, str(active["role"]), "blocked_unknown")
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            pass
+    monitor._record(snapshot, "scope_landing_rejected", event_data, active)
+
+
 def check_delivery(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, Any]) -> bool:
     """True when the developer delivery may proceed; False after refusing it."""
     try:
         report = landing_report(monitor, snapshot, node_id)
     except (ScopeLandingUnknown, OSError, subprocess.SubprocessError) as error:
         snapshot.nodes[node_id][REJECTION_KEY] = [{"path": "*", "cause": CAUSE_UNREADABLE}]
-        park(monitor, snapshot, node_id, active, _rejection_text([], str(error)[:300]),
-             kind=KIND_SCOPE_LANDING, event_name="scope_landing_rejected",
-             event_data={"rejection_code": "scope_landing:" + CAUSE_UNREADABLE},
-             binding_status=_DELIVERED)
+        _park_landing_unreadable(
+            monitor, snapshot, node_id, active, error,
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": active.get("role") if isinstance(active, dict) else None,
+                "generation": active.get("generation") if isinstance(active, dict) else None,
+                "handle_id": active.get("handle_id") if isinstance(active, dict) else None,
+                "reason_class": LANDING_UNREADABLE_CLASS,
+                "reason_code": LANDING_UNREADABLE_CODE,
+                "rejection_code": LANDING_UNREADABLE_CODE,
+            },
+        )
         return False
     if report is None:
         return True
@@ -340,13 +395,23 @@ def check_delivery_content(monitor: Any, snapshot: Any, node_id: str, active: Di
     try:
         report = landing_report(monitor, snapshot, node_id)
     except (ScopeLandingUnknown, OSError, subprocess.SubprocessError) as error:
-        # Unreadable diffs stay on the existing fail-closed path; the refusal
-        # there already parked the node, so there is nothing left to judge.
+        # Unreadable diffs stay fail-closed: the node is parked
+        # blocked_unknown by _park_landing_unreadable, so there is nothing
+        # left to judge here.
         snapshot.nodes[node_id][REJECTION_KEY] = [{"path": "*", "cause": CAUSE_UNREADABLE}]
-        park(monitor, snapshot, node_id, active, _rejection_text([], str(error)[:300]),
-             kind=KIND_SCOPE_LANDING, event_name="scope_landing_rejected",
-             event_data={"rejection_code": "scope_landing:" + CAUSE_UNREADABLE},
-             binding_status=_DELIVERED)
+        _park_landing_unreadable(
+            monitor, snapshot, node_id, active, error,
+            {
+                "run_id": snapshot.run_id,
+                "node_id": node_id,
+                "role": active.get("role") if isinstance(active, dict) else None,
+                "generation": active.get("generation") if isinstance(active, dict) else None,
+                "handle_id": active.get("handle_id") if isinstance(active, dict) else None,
+                "reason_class": LANDING_UNREADABLE_CLASS,
+                "reason_code": LANDING_UNREADABLE_CODE,
+                "rejection_code": LANDING_UNREADABLE_CODE,
+            },
+        )
         return False
     if report is None or report["files"]:
         return True

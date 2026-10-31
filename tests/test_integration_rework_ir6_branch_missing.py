@@ -24,8 +24,8 @@ class Ir6BranchMissingTests(EmptyLandingGateTests):
         snapshot = self.report(self.snapshot, "bg2")
 
         current = snapshot.nodes["bg2"]
-        self.assertNotIn(current["status"], {"review", "delivered", "accepted"},
-                         current.get("reason"))
+        self.assertEqual(current["status"], "blocked_unknown", current.get("reason"))
+        self.assertEqual(current.get("reason_class"), "landing_unreadable")
         self.assertTrue(
             self.events(snapshot.run_id, "scope_landing_rejected"),
             "a missing writer worktree must refuse even when its branch is gone",

@@ -929,7 +929,7 @@ RECOVERY_FIDELITY_AUDIT = (
     },
     {
         "site": "_release_node_lease",
-        "call_sites": 25,
+        "call_sites": 26,
         "callers": (
             {
                 "caller": "_recover_reverse_blocked_acceptance",
@@ -944,7 +944,7 @@ RECOVERY_FIDELITY_AUDIT = (
                 "caller": (
                     "_apply_event, _start_task, reauthorize, _schedule_ready "
                     "helpers, _reconcile_unapplied_events and the remaining "
-                    "terminal-transition callers (the other 24 sites, including the #290 contract_error replay that re-plans an integration-review node and the #335 _park_blocked_engineering / blocked_engineering replay pair that parks a blocked self-report)"
+                    "terminal-transition callers (the other 25 sites, including the #290 contract_error replay that re-plans an integration-review node, the #335 _park_blocked_engineering / blocked_engineering replay pair that parks a blocked self-report, and the #336 landing-unreadable replay twin)"
                 ),
                 "verdict": "different_type",
                 "rationale": (
@@ -10296,6 +10296,35 @@ class Monitor:
                 # The label is derived from the marker, never stored beside
                 # it twice: recomputing keeps replay and the live path equal.
                 current["user_status"] = map_user_status(current)
+            elif record["event"] == "scope_landing_rejected" and data.get(
+                "reason_class"
+            ) == "landing_unreadable":
+                # #336 / IR-6 crash-window twin of _park_landing_unreadable:
+                # an unconfirmable landing parks blocked_unknown, not the
+                # worker-question awaiting_supervisor state; without this
+                # branch the generic replay below would rebuild the legacy
+                # park and lose the structural code.
+                if data.get("reason_code") != "scope_landing:landing_unreadable":
+                    raise ValueError("replayed landing-unreadable evidence is invalid")
+                current["status"] = "blocked_unknown"
+                current["reason"] = "delivery landing cannot be confirmed"
+                current["reason_class"] = "landing_unreadable"
+                current["reason_code"] = "scope_landing:landing_unreadable"
+                current["scope_landing_rejection"] = [
+                    {"path": "*", "cause": "landing_unreadable"}
+                ]
+                current.pop("recovery_action", None)
+                current.pop("error_type", None)
+                current["retryable_action"] = None
+                current["active_role"] = None
+                current["active_task"] = None
+                snapshot.handles.pop(node_id, None)
+                current["quarantine"] = {
+                    "run_id": snapshot.run_id,
+                    "handle_id": data.get("handle_id"),
+                    "reason": "delivery landing cannot be confirmed",
+                }
+                self._release_node_lease(snapshot, node_id)
             elif record["event"] in WORKER_QUESTION_REPLAY_EVENTS:
                 # The park/answer paths append the event before the snapshot
                 # save; a crash in between must not turn the open question
