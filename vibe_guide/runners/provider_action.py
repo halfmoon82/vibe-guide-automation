@@ -7,6 +7,7 @@ import os
 import shlex
 from pathlib import Path
 import subprocess
+import unicodedata
 from typing import Any, Dict, Optional
 
 from ..adapters.task_provider import (
@@ -209,8 +210,36 @@ _WAIT_RESULT_FIELDS = frozenset(
      WARNINGS_KEY) + RESULT_EVENT_KEYS
 )
 _CREATE_RESULT_FIELDS = frozenset(("binding", "threadId", "thread_id", "status", "cursor"))
-_BINDING_IDENTITY_FIELDS = ("threadId", "thread_id", "task_id", "clientThreadId")
+#: A failed create is stored whole and handed to the failure classifier, and the
+#: parameter-recovery gate requires ``task_created is False`` in it, so the
+#: structured fields those readers consume must pass the write-time check.
+_CREATE_FAILURE_FIELDS = frozenset(
+    ("failed", "status", "reason", "error", "reason_class", "task_created",
+     "credential_required", "login_required", "permission_required")
+)
+#: The readers judge these by truthiness / ``is False``, so a string such as
+#: ``"false"`` would read as true (or never match) and misroute the node.
+_CREATE_FAILURE_FLAGS = ("task_created", "credential_required", "login_required", "permission_required")
+#: Mirrors the recovery classes ``monitor.classify_provider_failure`` honours;
+#: any other value is silently ignored there.
+_FAILURE_REASON_CLASSES = frozenset(("engineering", "retryable", "capacity_wait", "repairable"))
+#: The value ``--template`` prints where the supervisor must substitute a real
+#: identity.  A result that still carries it is refused: storing it would bind
+#: a task that does not exist, and a stored result cannot be rewritten.
+TEMPLATE_PLACEHOLDER = "<填写>"
+#: Only the keys the create reader actually binds on; the shape check used to
+#: accept ``thread_id`` / ``clientThreadId``, which the reader then refused.
+_BINDING_IDENTITY_FIELDS = ("threadId", "task_id")
 _RESUME_RESULT_FIELDS = frozenset((RESUME_RECEIPT_FIELD, "status"))
+
+
+def _holds_placeholder(value):
+    """True when a string still carries the template placeholder.
+
+    NFKC folds the full-width ``＜填写＞`` to ``<填写>``; a substring match also
+    catches padded and half-filled values such as ``" <填写> "`` or ``<填写>-1``.
+    """
+    return isinstance(value, str) and TEMPLATE_PLACEHOLDER in unicodedata.normalize("NFKC", value)
 
 
 def _shape_errors(required, allowed, payload):
@@ -224,15 +253,65 @@ def _shape_errors(required, allowed, payload):
     return errors
 
 
+def _reports_failure(payload):
+    return payload.get("failed") is True or payload.get("status") in ("failed", "error", "stopped")
+
+
+def _create_shape_errors(payload):
+    if _reports_failure(payload):
+        # The reader turns a failed create into ProviderUnavailable before it
+        # looks for a binding, so a supervisor that could not create the task
+        # must be able to say so with a reason.
+        errors = _shape_errors([], _CREATE_FAILURE_FIELDS, payload)
+        for flag in _CREATE_FAILURE_FLAGS:
+            if flag in payload and not isinstance(payload[flag], bool):
+                errors.append("field {} must be true or false".format(flag))
+        reason_class = payload.get("reason_class")
+        # Type first: a list or dict is unhashable, so the set lookup would
+        # raise TypeError instead of naming the field.
+        if "reason_class" in payload and not (
+            isinstance(reason_class, str) and reason_class in _FAILURE_REASON_CLASSES
+        ):
+            errors.append("field reason_class must be one of: " + ", ".join(sorted(_FAILURE_REASON_CLASSES)))
+        reason = payload.get("reason") or payload.get("error")
+        if not (isinstance(reason, str) and reason.strip()):
+            errors.append("field reason is required when the action failed")
+        return errors
+    errors = _shape_errors(["binding"], _CREATE_RESULT_FIELDS, payload)
+    binding = payload.get("binding")
+    if "binding" not in payload:
+        return errors
+    if not isinstance(binding, dict):
+        errors.append("field binding needs a task identity: " + " or ".join(_BINDING_IDENTITY_FIELDS))
+        return errors
+    # Judge the value the reader binds on (first truthy key), not "any key is
+    # valid": a valid second key must not hide a bad first one.
+    task_id = binding.get("threadId") or binding.get("task_id")
+    host = binding.get("hostId") or binding.get("host")
+    if not (isinstance(task_id, str) and task_id.strip()):
+        errors.append("field binding needs a task identity: " + " or ".join(_BINDING_IDENTITY_FIELDS))
+    # The dispatcher binds on a host identity as well; without it the result is
+    # stored and then refused as ``dispatch_contract_invalid``, and a consumed
+    # result cannot be rewritten.
+    if not (isinstance(host, str) and host.strip()):
+        errors.append("field binding needs a host identity: hostId or host")
+    for label, value in (("task identity", task_id), ("host identity", host)):
+        if _holds_placeholder(value):
+            errors.append(
+                "field binding {} still holds the template placeholder; "
+                "substitute the real value".format(label)
+            )
+    return errors
+
+
 def validate_result_shape(operation, payload, *, role=None):
     """Reject a mailbox result the reader would not accept, naming the fields.
 
     Mirrors the rules the runner applies when it consumes the result, so a
     wrong shape fails here, before the write, instead of becoming a
-    ``blocked_unknown`` after it.  Operations without a reader-side shape
-    (locate, visibility, ...) are only required to be objects.  ``role`` is the
-    request's role: a developer's ``delivered``/``complete`` wait result must
-    carry ``delivery_evidence``.  Raises ``ValueError``; returns None.
+    ``blocked_unknown`` after it.  ``role`` is the request's role: a
+    developer's ``delivered``/``complete`` wait result must carry
+    ``delivery_evidence``.  Raises ``ValueError``; returns None.
     """
     if not isinstance(payload, dict):
         raise ValueError("provider action result payload must be an object")
@@ -257,14 +336,29 @@ def validate_result_shape(operation, payload, *, role=None):
         if "delivery_evidence" in payload and not isinstance(payload["delivery_evidence"], dict):
             errors.append("field delivery_evidence must be an object")
     elif operation == "create":
-        errors = _shape_errors(["binding"], _CREATE_RESULT_FIELDS, payload)
-        binding = payload.get("binding")
-        if "binding" in payload and (
-            not isinstance(binding, dict)
-            or not any(isinstance(binding.get(key), str) and binding[key]
-                       for key in _BINDING_IDENTITY_FIELDS)
-        ):
-            errors.append("field binding needs a task identity: " + " or ".join(_BINDING_IDENTITY_FIELDS))
+        errors = _create_shape_errors(payload)
+    elif operation in ("locate", "visibility"):
+        # Both readers test the flag itself (``located is True`` /
+        # ``visible is True and direct_enter is True``); a template carrying
+        # ``status`` instead failed only after the task already existed.  A
+        # supervisor that genuinely could not observe the task must still be
+        # able to say so: the reader turns ``failed``/``status=error`` into a
+        # provider error instead of a visibility claim.
+        failed = payload.get("failed") is True or payload.get("status") in (
+            "failed", "error", "stopped",
+        )
+        if failed:
+            reason = payload.get("reason") or payload.get("error")
+            if not (isinstance(reason, str) and reason.strip()):
+                errors.append("field reason is required when the action failed")
+        else:
+            required_flags = ("located",) if operation == "locate" else ("visible", "direct_enter")
+            missing = [name for name in required_flags if payload.get(name) is not True]
+            if missing:
+                errors.append(
+                    "field(s) must be true: " + ", ".join(missing)
+                    + ", or report failed/reason when the action could not be observed"
+                )
     elif operation == "resume":
         errors = _shape_errors([RESUME_RECEIPT_FIELD], _RESUME_RESULT_FIELDS, payload)
         if RESUME_RECEIPT_FIELD in payload and payload[RESUME_RECEIPT_FIELD] is not True:
