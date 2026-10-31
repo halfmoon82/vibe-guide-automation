@@ -10,6 +10,7 @@ from unittest import mock
 from vibe_guide.adapters.claude_bg import (
     WORKTREE_BLOCKED_EVENT,
     WORKTREE_CREATED_EVENT,
+    WORKTREE_MISMATCH,
     WORKTREE_MISSING,
     ClaudeBgWorktreeBlocked,
 )
@@ -136,6 +137,30 @@ class VisibleWorktreePreflightTests(unittest.TestCase):
                 )
         create.assert_not_called()
         self.assertEqual(caught.exception.reason_code, WORKTREE_MISSING)
+
+    def test_existing_dirty_worktree_is_not_a_visible_dispatch_target(self):
+        git(self.root, "worktree", "add", str(self.worktree), "-b", self.branch)
+        (self.worktree / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+        with mock.patch.object(self.runner, "_require_result") as create:
+            with self.assertRaises(ClaudeBgWorktreeBlocked) as caught:
+                self.runner.task_binding(
+                    self.contract(), self.worktree, "run-339", "start_pending"
+                )
+        create.assert_not_called()
+        self.assertEqual(caught.exception.reason_code, WORKTREE_MISMATCH)
+
+    def test_existing_worktree_with_drifted_base_is_not_a_visible_dispatch_target(self):
+        git(self.root, "worktree", "add", str(self.worktree), "-b", self.branch)
+        (self.worktree / "base.txt").write_text("new commit\n", encoding="utf-8")
+        git(self.worktree, "add", "base.txt")
+        git(self.worktree, "commit", "-qm", "advance beyond contract base")
+        with mock.patch.object(self.runner, "_require_result") as create:
+            with self.assertRaises(ClaudeBgWorktreeBlocked) as caught:
+                self.runner.task_binding(
+                    self.contract(), self.worktree, "run-339", "start_pending"
+                )
+        create.assert_not_called()
+        self.assertEqual(caught.exception.reason_code, WORKTREE_MISMATCH)
 
 
 class _Monitor:

@@ -408,12 +408,29 @@ class ClaudeBgLauncher:
         try:
             branch = self._git_branch(path)
             head = self._git_text(["rev-parse", "HEAD"], path)
+            dirty = self._git_text(
+                ["status", "--porcelain", "--untracked-files=all"], path
+            )
         except ClaudeBgUnknown as error:
             raise self._blocked(
                 WORKTREE_MISMATCH,
                 "cannot read the git state of worktree %s (%s); refusing to dispatch into it"
                 % (path, error.reason),
                 "git -C %s rev-parse --abbrev-ref HEAD" % path,
+            )
+        if dirty:
+            raise self._blocked(
+                WORKTREE_MISMATCH,
+                "worktree %s has uncommitted changes; refusing to dispatch into it" % path,
+                "git -C %s status --porcelain --untracked-files=all" % path,
+            )
+        if self.base_sha and head.casefold() != str(self.base_sha).casefold():
+            raise self._blocked(
+                WORKTREE_MISMATCH,
+                "worktree %s HEAD %s is not the contract base %s" % (
+                    path, head, self.base_sha
+                ),
+                "git -C %s rev-parse HEAD" % path,
             )
         if branch != self.routing.branch:
             raise self._blocked(
