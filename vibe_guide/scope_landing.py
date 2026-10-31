@@ -147,7 +147,13 @@ def landing_report(monitor: Any, snapshot: Any, node_id: str) -> Optional[Dict[s
     """``{"files", "expanded", "rejected", "base"}``, or None without a node worktree.
 
     A node whose worktree is not a git worktree root of its own (fake
-    providers, guide mode) has no branch claim to check.
+    providers, guide mode) has no branch claim to check -- but only when
+    there is no claim at all: no worktree configured, no monitor project
+    paths, or the directory does not exist yet.  A configured worktree that
+    *exists* without a ``.git`` (a plain directory) claimed to be an
+    independent git worktree and cannot vouch for anything: per #336 that is
+    "cannot confirm the landing", never "nothing landed", so it raises
+    ``ScopeLandingUnknown`` and the caller's fail-closed path parks the node.
     """
     from .worktree_base import upstream_branches
 
@@ -157,7 +163,14 @@ def landing_report(monitor: Any, snapshot: Any, node_id: str) -> Optional[Dict[s
     worktree = Path(str(current["worktree"]))
     if not worktree.is_absolute():
         worktree = monitor.paths.root / worktree
+    if worktree == Path(monitor.paths.root).resolve() or worktree == monitor.paths.root:
+        return None  # the node writes the main tree by contract (worker-deliver does the same)
     if not (worktree / ".git").exists():
+        if worktree.exists():
+            raise ScopeLandingUnknown(
+                "worktree {} exists but is not an independent git worktree "
+                "(no .git)".format(worktree)
+            )
         return None
     git = _git_in(worktree)
     project_head = _project_head(monitor)
