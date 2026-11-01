@@ -2348,6 +2348,36 @@ _MAILBOX_KEYS = ("action_id", "operation", "native_tool", "issue_id", "role", "g
 _HOST_SESSION_ADAPTERS = {WORKBUDDY_VISIBLE_PROVIDER: "workbuddy"}
 
 
+def _ruled_topology(paths, action):
+    """The dispatch topology of the node this request belongs to.
+
+    Only ``create`` carries it; locate / visibility / wait follow the node's
+    latest create request at or below their own generation.
+    """
+    request = action.get("request")
+    if action.get("operation") == "create":
+        return request.get("topology") if isinstance(request, dict) else None
+    from .adapters.task_provider import ProviderActionStore
+    store = ProviderActionStore(paths)
+    best = None
+    for path in sorted((paths.vibe / "provider-actions/requests").glob("action-*.json")):
+        try:
+            other = store.action(path.stem)
+        except (OSError, ValueError):
+            continue
+        generation = other.get("generation")
+        if (
+            other.get("operation") == "create"
+            and all(other.get(key) == action.get(key) for key in ("provider", "run_id", "issue_id", "role"))
+            and isinstance(generation, int) and isinstance(action.get("generation"), int)
+            and generation <= action["generation"]
+            and (best is None or generation >= best["generation"])
+        ):
+            best = other
+    best_request = best.get("request") if best else None
+    return best_request.get("topology") if isinstance(best_request, dict) else None
+
+
 def _host_session_service(paths, action):
     """Self-service offer for a host that can only dispatch inside its session.
 
@@ -2358,8 +2388,7 @@ def _host_session_service(paths, action):
     nothing, so the native tool path stays the only instruction.
     """
     adapter_id = _HOST_SESSION_ADAPTERS.get(action.get("provider"))
-    request = action.get("request")
-    if adapter_id is None or not isinstance(request, dict) or request.get("topology") != "visible-sdd":
+    if adapter_id is None or _ruled_topology(paths, action) != "visible-sdd":
         return None
     from .adapters.task_provider import ProviderPending
     from .node_spec import observe_capabilities

@@ -120,3 +120,82 @@ class HostSessionServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+E2E_FIXTURE = Path(__file__).parent / "fixtures" / "e2e-project"
+IN_SESSION_REVIEW = {
+    "protocol": "vibe_guide/protocols/visible-sdd-worker.md",
+    "evidence_ref": "session#1",
+    "clearance": {"p0": 0, "p1": 0, "p2": 0},
+    "coverage": {"mode": "none", "reason": "fixture has no file manifest"},
+    "environment_facts_ref": "none",
+}
+
+
+class SelfServedRunTests(unittest.TestCase):
+    """A WorkBuddy session with no ``workbuddy_job__*`` tools drives a run to acceptance.
+
+    Only ``create`` carries the ruled topology; the later locate / visibility /
+    wait requests do not, so the self-service offer has to follow the node's
+    create request.  Nothing here uses the V4.4 proof: real dispatch never
+    sets ``binding_contract_version``.
+    """
+
+    def setUp(self):
+        import shutil
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "project"
+        shutil.copytree(E2E_FIXTURE, self.root)
+        self.cli = lambda argv: run_cli(argv + ["--json"], self.root)
+        self.assertEqual(self.cli(["init", "--confirm"]).exit_code, 0)
+        self.store = ProviderActionStore(ProjectPaths(self.root))
+        self.store.publish_capabilities(
+            "workbuddy", IN_SESSION_ONLY, PROVENANCE, project_id="project-fixture",
+        )
+        source = json.loads((self.root / "plan-source.json").read_text(encoding="utf-8"))
+        source["capabilities"]["agent_id"] = "workbuddy"
+        source["active_pair_limit"] = 1
+        source["nodes"] = [source["nodes"][0]]
+        contract = source["nodes"][0]["contract"]
+        contract.update({"adapter_id": "workbuddy", "project_id": "project-fixture", "host": "mac"})
+        for key in ("command", "provider", "mode"):
+            contract.pop(key, None)
+        (self.root / "wb-plan.json").write_text(json.dumps(source), encoding="utf-8")
+        planned = self.cli([
+            "plan", "--request", "设计并实现两个契约兼容的并行节点并完成独立审查",
+            "--plan-id", "wb-plan", "--s1", "4,4,4,4,4", "--node-spec", "wb-plan.json",
+        ])
+        self.assertEqual(planned.exit_code, 0, planned.text)
+        self.assertEqual(self.cli(["monitor", "--plan", "wb-plan", "--authorize", "AUTHORIZE"]).exit_code, 4)
+
+    def test_session_self_answers_every_request_and_the_node_is_accepted(self):
+        offered = {}
+        result = None
+        for _ in range(12):
+            for action in self.store.pending():
+                operation = action["operation"]
+                view = {i["action_id"]: i for i in self.cli(
+                    ["supervisor-mailbox", "--run-id", action["run_id"]]
+                ).payload["pending"]}
+                offered[operation] = view[action["action_id"]].get("service", {}).get("mode")
+                if operation == "create":
+                    payload = {"binding": {"task_id": "host-session", "host": "mac"}}
+                elif operation == "locate":
+                    payload = {"located": True}
+                elif operation == "visibility":
+                    payload = {"visible": True, "direct_enter": True}
+                else:
+                    payload = {"status": "completed", "event": "complete", "cursor": "c1",
+                               "evidence": "dev+review done", "in_session_review": IN_SESSION_REVIEW}
+                self.store.complete(action["action_id"], payload)
+            result = self.cli(["resume", "--plan", "wb-plan"])
+            if result.payload.get("status") == "complete":
+                break
+        self.assertEqual(result.payload.get("status"), "complete", result.text)
+        self.assertEqual(
+            offered,
+            {op: "host_session" for op in ("create", "locate", "visibility", "wait")},
+        )
+        self.assertEqual(result.payload["nodes"]["api"]["status"], "accepted")
