@@ -209,17 +209,22 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 
 ### 6.2 信箱回写
 
-可见派发（卡片、窗口会话）的请求由监工服务；后台派发由守护程序执行。每份请求用 `vibe supervisor-mailbox --run-id <run-id> --json` 看摘要（正文换成 `{sha256, bytes, path}`），用 `--template <action_id>` 取示例，填好后 `vibe supervisor-mailbox --complete <action_id> --result <文件或 ->` 回写；形状不对在写入前被拒（错误列出缺少或多出的字段名），不产生 `blocked_unknown`。回写按操作给字段：
+可见派发（卡片、窗口会话）的请求由监工服务；后台派发由守护程序执行。每份请求用 `vibe supervisor-mailbox --run-id <run-id> --json` 看摘要（正文换成 `{sha256, bytes, path}`），用 `--template <action_id>` 取示例，填好后 `vibe supervisor-mailbox --complete <action_id> --result <文件或 ->` 回写；形状不对在写入前被拒（报错写明缺什么、期望形状和可复制示例，结果文件不落盘），不产生 `blocked_unknown`；占位符 `<填写>`（含全角、前后空白、只填一半）一律拒收。`create`、`locate`、`visibility` 做不成时回写 `{"failed": true, "reason": "…"}`；`locate` 的宿主原始输出 `{"navigated": true}` 不是结果，要写 `{"located": true}`。下表由代码里的字段表生成，`--template` 取到的示例与它一致：
 
-| 操作 | payload |
-|---|---|
-| `create` | `{"binding": {"task_id": "<真实会话 id>", "host": "<本机标识>"}}`（`threadId`/`hostId` 同样接受；没有真实会话 id 就不回写） |
-| `locate` | `{"located": true}` |
-| `visibility` | `{"visible": true, "direct_enter": true}` |
-| `wait`（未完） | `{"status": "timeout", "cursor": "<游标>"}` |
-| `wait`（developer 完） | `{"status": "completed", "cursor": "<游标>", "event": "complete", "delivery_evidence": {"completion_marker": "…", "delivery_path": "…", "thread_status": "complete"}}`（嵌套对象，三键齐全，摊平无效） |
-| `wait`（reviewer 完） | `{"status": "completed", "cursor": "<游标>", "event": "accepted", "evidence": "<P0–P2 清零证据>"}` |
-| `resume` | `{"resumed": true}`（沿用原会话 id，不回写绑定） |
+<!-- mailbox-table:begin -->
+| 操作 | 角色 | payload | 说明 |
+|---|---|---|---|
+| `create` | 任意 | `{"binding": {"hostId": "<填写>", "threadId": "<填写>"}}` | 没有真实会话 id 就不回写；`task_id`/`host` 同样接受 |
+| `create`（失败） | 任意 | `{"failed": true, "reason": "<填写>"}` | 没能创建任务时如实说明原因 |
+| `locate` | 任意 | `{"located": true}` | 宿主原始输出 `{"navigated": true}` 不被接受 |
+| `locate`（失败） | 任意 | `{"failed": true, "reason": "<填写>"}` | 没能定位到任务时如实说明原因 |
+| `visibility` | 任意 | `{"direct_enter": true, "visible": true}` | 两个标志都必须为 true |
+| `visibility`（失败） | 任意 | `{"failed": true, "reason": "<填写>"}` | 没能观察到任务时如实说明原因 |
+| `wait`（未完） | 任意 | `{"status": "timeout"}` | 未完；`cursor` 给就必须是非空字符串（≤4096、无 NUL），不知道就不给 |
+| `wait`（完） | developer | `{"cursor": "<填写>", "delivery_evidence": {"completion_marker": "<填写>", "delivery_path": "<填写>", "thread_status": "complete"}, "event": "complete", "status": "completed"}` | （嵌套对象，三键齐全，摊平无效）；`cursor` 不知道就整个不给 |
+| `wait`（完） | reviewer | `{"cursor": "<填写>", "event": "accepted", "evidence": {"summary": "<填写>"}, "status": "completed"}` | P0–P2 清零证据 |
+| `resume` | 任意 | `{"resumed": true}` | 沿用原会话 id，不回写绑定 |
+<!-- mailbox-table:end -->
 
 `cursor` 给就必须是非空字符串（≤4096、无 NUL），不知道就整个不给；不确定就不回写。worker 自报（`vibe worker-deliver`）没有游标，交付门改认自报回执，不要再手工回写同代 `wait`。回写被拒后不要重写同一 `action_id`；`vibe resume` 会发新的 `create`（`generation` 加一），认最大的那个。
 
