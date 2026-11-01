@@ -19,6 +19,7 @@ from .authorization import (
 from .config import load_supervisor_single_shift
 from .contracts import RunEvent
 from .decision_boundary import LEGACY_BOUNDARY_CATEGORY, validate_boundary_category
+from .models import INTEGRATION_REVIEW_NODE_ID
 from .providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER, WORKBUDDY_VISIBLE_PROVIDER
 from . import worker_liveness
 from .runners.provider_action import TEMPLATE_PLACEHOLDER as _TEMPLATE_PLACEHOLDER
@@ -2348,6 +2349,32 @@ _MAILBOX_KEYS = ("action_id", "operation", "native_tool", "issue_id", "role", "g
 _HOST_SESSION_ADAPTERS = {WORKBUDDY_VISIBLE_PROVIDER: "workbuddy"}
 
 
+def _is_closeout_reviewer(action):
+    return (
+        action.get("issue_id") == INTEGRATION_REVIEW_NODE_ID
+        and action.get("role") == "reviewer"
+    )
+
+
+def _developer_identity_clash(paths, run_id, payload):
+    """The task id a closeout reviewer binding shares with a developer, else None."""
+    binding = payload.get("binding") if isinstance(payload, dict) else None
+    if not isinstance(binding, dict):
+        return None
+    task_id = binding.get("threadId") or binding.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    try:
+        registry = json.loads((run_dir(paths, run_id) / "tasks.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    bindings = registry.get("bindings") if isinstance(registry, dict) else None
+    for item in bindings if isinstance(bindings, list) else ():
+        if isinstance(item, dict) and item.get("role") == "developer" and item.get("task_id") == task_id:
+            return task_id
+    return None
+
+
 def _ruled_topology(paths, action):
     """The dispatch topology of the node this request belongs to.
 
@@ -2388,7 +2415,8 @@ def _host_session_service(paths, action):
     nothing, so the native tool path stays the only instruction.
     """
     adapter_id = _HOST_SESSION_ADAPTERS.get(action.get("provider"))
-    if adapter_id is None or _ruled_topology(paths, action) != "visible-sdd":
+    closeout = _is_closeout_reviewer(action)
+    if adapter_id is None or (not closeout and _ruled_topology(paths, action) != "visible-sdd"):
         return None
     from .adapters.task_provider import ProviderPending
     from .node_spec import observe_capabilities
@@ -2401,16 +2429,24 @@ def _host_session_service(paths, action):
     evidence_ref = capabilities.provenance.get(adapter_id + ".in_session_sdd")
     if not evidence_ref:
         return None
-    service = {
-        "mode": "host_session",
-        "evidence_ref": evidence_ref,
-        "instructions": (
+    if closeout:
+        instructions = (
+            "本宿主已登记只能会话内派发（无可见任务窗口工具）：不要等 {}，也不要因它缺失而停摆。"
+            "收口审查改由本会话内另起的独立只读子代理完成（独立上下文，不是实现者的上下文，不改业务代码）："
+            "create 回执的 task_id 必须是该审查子代理自己的独立标识（例如 <本会话 id>#integration-review），"
+            "不得与任何 developer 绑定的 task_id 相同；locate/visibility 核对后应答；"
+            "审查结论按 reviewer 声明回写。结果形状见 supervisor-mailbox --template。"
+        ).format(action.get("native_tool"))
+    else:
+        instructions = (
             "本宿主已登记只能会话内派发（无可见任务窗口工具）：不要等 {}，也不要因它缺失而停摆。"
             "由本会话自己承担该节点的 worker：create 用本会话自己的会话 id 与本机标识应答；"
             "locate/visibility 核对本会话就是该 worker 后应答；随后在本会话内按 visible-sdd 协议派 dev/review "
             "子代理，完成后用 vibe worker-deliver 自报。结果形状见 supervisor-mailbox --template。"
-        ).format(action.get("native_tool")),
-    }
+        ).format(action.get("native_tool"))
+    service = {"mode": "host_session", "evidence_ref": evidence_ref, "instructions": instructions}
+    if closeout:
+        service["independent_identity_required"] = True
     if action.get("operation") == "create":
         service["binding_fields"] = ["task_id", "host"]
     return service
@@ -2523,6 +2559,16 @@ def mailbox_complete(paths, run_id, action_id, payload):
     if store.result(action_id) is not None:
         return {"command": "supervisor-mailbox", "status": "already_completed",
                 "run_id": run_id, "action_id": action_id}
+    if (
+        request.get("operation") == "create"
+        and _is_closeout_reviewer(request)
+        and _host_session_service(paths, request) is not None
+        and _developer_identity_clash(paths, run_id, payload) is not None
+    ):
+        raise ValueError(
+            "收口审查必须是独立的审查子代理：create 回执的 task_id 与某个 developer 绑定相同，"
+            "请为审查子代理换一个独立标识（例如 <本会话 id>#integration-review）"
+        )
     complete_mailbox_action(paths, run_id, action_id, payload)
     return {"command": "supervisor-mailbox", "status": "completed",
             "run_id": run_id, "action_id": action_id}

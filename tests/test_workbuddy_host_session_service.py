@@ -54,8 +54,8 @@ class HostSessionServiceTests(unittest.TestCase):
         ProviderActionStore(self.paths).publish_capabilities("workbuddy", facts, PROVENANCE)
 
     def request(self, name, operation="create", provider="workbuddy-visible",
-                topology="visible-sdd", role="developer"):
-        basis = {"operation": operation, "provider": provider, "run_id": RUN, "issue_id": "n1",
+                topology="visible-sdd", role="developer", issue="n1"):
+        basis = {"operation": operation, "provider": provider, "run_id": RUN, "issue_id": issue,
                  "role": role, "generation": 1, "sequence": 0}
         action_id = "action-" + _canonical_digest(basis)[:32]
         action = {"schema_version": 1, "action_id": action_id, **basis,
@@ -118,8 +118,36 @@ class HostSessionServiceTests(unittest.TestCase):
         self.assertNotIn("service", self.pending()[action_id])
 
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_closeout_reviewer_is_offered_self_service_with_an_independence_rule(self):
+        self.attest(IN_SESSION_ONLY)
+        ids = {op: self.request("w", operation=op, topology="dual-visible", role="reviewer",
+                                issue="integration-review")
+               for op in ("create", "locate", "visibility", "wait")}
+        pending = self.pending()
+        for operation, action_id in ids.items():
+            service = pending[action_id].get("service")
+            self.assertIsInstance(service, dict, operation)
+            self.assertEqual(service["mode"], "host_session")
+            self.assertTrue(service["independent_identity_required"], operation)
+
+    def test_closeout_reviewer_keeps_the_native_path_without_in_session_evidence(self):
+        for facts in (None, FULL_VISIBLE):
+            with self.subTest(attested=facts is not None):
+                if facts:
+                    self.attest(facts)
+                action_id = self.request("w", topology="dual-visible", role="reviewer",
+                                         issue="integration-review")
+                self.assertNotIn("service", self.pending()[action_id])
+
+    def test_a_business_reviewer_is_still_never_self_served(self):
+        self.attest(IN_SESSION_ONLY)
+        action_id = self.request("w", topology="dual-visible", role="reviewer", issue="export-button")
+        self.assertNotIn("service", self.pending()[action_id])
+
+    def test_a_visible_sdd_developer_offer_does_not_claim_the_closeout_rule(self):
+        self.attest(IN_SESSION_ONLY)
+        action_id = self.request("w")
+        self.assertFalse(self.pending()[action_id]["service"].get("independent_identity_required", False))
 
 
 E2E_FIXTURE = Path(__file__).parent / "fixtures" / "e2e-project"
@@ -199,3 +227,102 @@ class SelfServedRunTests(unittest.TestCase):
             {op: "host_session" for op in ("create", "locate", "visibility", "wait")},
         )
         self.assertEqual(result.payload["nodes"]["api"]["status"], "accepted")
+
+
+class SelfServedCloseoutTests(unittest.TestCase):
+    """The whole product-manager plan, closeout included, on an in-session-only host."""
+
+    CLOSEOUT_CLAIM = {
+        "findings": [],
+        "iteration_compatibility": {"evidence": "compatible", "status": "verified"},
+        "test_runtime_delivery": {"evidence": "pytest: 10 passed", "status": "verified"},
+        "out_of_scope": [],
+    }
+
+    def setUp(self):
+        import shutil
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cli = lambda *argv: run_cli(list(argv) + ["--json"], self.root)
+        self.assertEqual(self.cli("init", "--confirm").payload["status"], "ok")
+        (self.root / "facts.json").write_text(json.dumps(IN_SESSION_ONLY), encoding="utf-8")
+        attested = self.cli("attest", "--adapter", "workbuddy", "--facts", "facts.json",
+                            "--provenance", PROVENANCE, "--project-id", "wbprobe")
+        self.assertEqual(attested.payload["status"], "ok", attested.payload)
+        shutil.copy(Path(__file__).parent / "fixtures" / "pm-path" / "product-spec.json",
+                    self.root / "product-spec.json")
+        published = self.cli("plan", "--request", "设计并实现保单查看页的 PDF 导出，集成日期范围筛选、编写测试并部署",
+                             "--plan-id", "pm-plan", "--s1", "5,5,5,5,5", "--from-prd", "product-spec.json")
+        self.assertEqual(published.payload["status"], "ok", published.payload)
+        self.assertEqual(self.cli("authorize", "--plan", "pm-plan", "--authorize", "AUTHORIZE").payload["status"], "ok")
+        self.cli("monitor", "--plan", "pm-plan", "--authorize", "AUTHORIZE")
+        self.store = ProviderActionStore(ProjectPaths(self.root))
+
+    def answer(self, action, reviewer_id="host-session"):
+        node, operation = action["issue_id"], action["operation"]
+        if operation == "create":
+            return {"binding": {"task_id": reviewer_id if node == "integration-review" else "host-session",
+                                "host": "mac"}}
+        if operation == "locate":
+            return {"located": True}
+        if operation == "visibility":
+            return {"visible": True, "direct_enter": True}
+        if node == "integration-review":
+            return {"status": "completed", "event": "accepted", "cursor": "c1", "evidence": self.CLOSEOUT_CLAIM}
+        (self.root / ("delivery-%s.md" % node)).write_text("DELIVERY_COMPLETE\n", encoding="utf-8")
+        return {"status": "completed", "event": "complete", "cursor": "c1", "evidence": "done",
+                "in_session_review": IN_SESSION_REVIEW,
+                "delivery_evidence": {"completion_marker": "DELIVERY_COMPLETE",
+                                      "delivery_path": "delivery-%s.md" % node,
+                                      "thread_status": "completed", "session_cwd": str(self.root)}}
+
+    def drive_until_closeout_create(self):
+        for _ in range(20):
+            pending = self.store.pending()
+            closeout = [a for a in pending if a["issue_id"] == "integration-review" and a["operation"] == "create"]
+            if closeout:
+                return closeout[0]
+            for action in pending:
+                self.store.complete(action["action_id"], self.answer(action))
+            self.cli("resume", "--plan", "pm-plan")
+        self.fail("run never reached the closeout dispatch")
+
+    def mailbox(self, run_id):
+        return {i["action_id"]: i for i in self.cli("supervisor-mailbox", "--run-id", run_id).payload["pending"]}
+
+    def complete(self, run_id, action, payload):
+        path = self.root / "result.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return self.cli("supervisor-mailbox", "--run-id", run_id, "--complete", action["action_id"],
+                        "--result", str(path))
+
+    def test_closeout_is_served_from_the_session_and_must_be_a_separate_identity(self):
+        create = self.drive_until_closeout_create()
+        run_id = create["run_id"]
+        service = self.mailbox(run_id)[create["action_id"]].get("service")
+        self.assertIsInstance(service, dict)
+        self.assertTrue(service["independent_identity_required"])
+
+        refused = self.complete(run_id, create, self.answer(create, reviewer_id="host-session"))
+        self.assertEqual(refused.payload["status"], "blocked_invalid", refused.payload)
+        self.assertIn("独立", refused.payload["reason"])
+        self.assertIsNone(self.store.result(create["action_id"]))
+
+        accepted = self.complete(run_id, create, self.answer(create, reviewer_id="host-session#integration-review"))
+        self.assertEqual(accepted.payload["status"], "completed", accepted.payload)
+
+        result = None
+        for _ in range(20):
+            for action in self.store.pending():
+                self.store.complete(action["action_id"], self.answer(action, "host-session#integration-review"))
+            result = self.cli("resume", "--plan", "pm-plan")
+            if result.payload.get("status") == "complete":
+                break
+        self.assertEqual(result.payload.get("status"), "complete", result.text)
+        self.assertEqual(result.payload["nodes"]["integration-review"]["status"], "accepted")
+
+
+if __name__ == "__main__":
+    unittest.main()
