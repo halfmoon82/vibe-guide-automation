@@ -197,10 +197,12 @@ class ParkedRunTests(LiveSessionTests):
         state["nodes"]["n"] = {"escalated": True}
         daemon._save_heal_state(state)
         outcome = daemon.run(max_cycles=5)
-        self.assertEqual(outcome, {"status": "terminal", "run_status": "blocked_unknown"})
+        self.assertEqual(outcome["status"], "parked")
+        self.assertEqual(outcome["run_status"], "blocked_unknown")
+        self.assertNotIn("archive", self.order)
+        self.assertTrue((run_dir(self.paths, RUN) / "state.json").is_file())
+        self.assertFalse((runs_archive_dir(self.paths, RUN)).exists())
         self.assertEqual(self.order[:3], ["push:unresolved_report", "push:run_blocked_unknown", "lease_release"])
-        self.assertIn("archive", self.order)
-        self.assertNoResidue()
 
     def fail_reports(self, times):
         calls = {"n": 0}
@@ -222,9 +224,13 @@ class ParkedRunTests(LiveSessionTests):
         state["unresolved"] = {"n": {"code": "self_heal_no_progress", "at": 1.0, "example": "", "repairs": 2}}
         daemon._save_heal_state(state)
         outcome = daemon.run(max_cycles=20)
-        self.assertEqual(outcome, {"status": "terminal", "run_status": "blocked_unknown"})
+        self.assertEqual(outcome["status"], "parked")
+        self.assertEqual(outcome["run_status"], "blocked_unknown")
+        self.assertNotIn("archive", self.order)
+        self.assertTrue((run_dir(self.paths, RUN) / "state.json").is_file())
+        self.assertFalse((runs_archive_dir(self.paths, RUN)).exists())
         self.assertEqual(self.order[:3], ["push:unresolved_report", "push:run_blocked_unknown", "lease_release"])
-        inbox = (runs_archive_dir(self.paths, RUN) / dm.PM_INBOX_FILE).read_text(encoding="utf-8")
+        inbox = (run_dir(self.paths, RUN) / dm.PM_INBOX_FILE).read_text(encoding="utf-8")
         self.assertIn("run_parked", inbox)
 
     def test_close_out_waits_for_the_report_before_announcing_and_archiving(self):
@@ -234,11 +240,15 @@ class ParkedRunTests(LiveSessionTests):
         state["nodes"]["n"] = {"escalated": True}
         daemon._save_heal_state(state)
         outcome = daemon.run(max_cycles=20)
-        self.assertEqual(outcome, {"status": "terminal", "run_status": "blocked_unknown"})
+        self.assertEqual(outcome["status"], "parked")
+        self.assertEqual(outcome["run_status"], "blocked_unknown")
+        self.assertNotIn("archive", self.order)
+        self.assertTrue((run_dir(self.paths, RUN) / "state.json").is_file())
+        self.assertFalse((runs_archive_dir(self.paths, RUN)).exists())
         self.assertIn("close-out postponed", daemon._last_error["reason"])
-        self.assertEqual(self.order[:6], [
+        self.assertEqual(self.order[:5], [
             "push:unresolved_report:failed", "push:unresolved_report:failed", "push:unresolved_report",
-            "push:run_blocked_unknown", "lease_release", "archive"])
+            "push:run_blocked_unknown", "lease_release"])
 
     def test_a_report_that_failed_mid_run_does_not_hold_back_a_later_close_out(self):
         self.fail_reports(1)
@@ -285,8 +295,12 @@ class ParkedRunTests(LiveSessionTests):
     def test_blocked_unknown_closes_after_the_grace_period_even_unescalated(self):
         supervisor = Supervisor([self.blocked()])
         outcome = self.make(supervisor, blocked_grace=60).run(max_cycles=20)
-        self.assertEqual(outcome, {"status": "terminal", "run_status": "blocked_unknown"})
-        self.assertNoResidue()
+        self.assertEqual(outcome["status"], "parked")
+        self.assertEqual(outcome["run_status"], "blocked_unknown")
+        self.assertNotIn("archive", self.order)
+        self.assertTrue((run_dir(self.paths, RUN) / "state.json").is_file())
+        self.assertFalse((runs_archive_dir(self.paths, RUN)).exists())
+
 
     def test_blocked_unknown_with_a_live_session_is_never_archived(self):
         self.probe = {"live": ["abcd1234"], "unknown": None}
