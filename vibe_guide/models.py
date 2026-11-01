@@ -138,6 +138,14 @@ EVIDENCE_PRIORITY = (
 # re-exports it for existing importers.
 INTEGRATION_REVIEW_NODE_ID = "integration-review"
 
+# The reserved remote-integration-delivery node id (issue #371).  Unlike
+# INTEGRATION_REVIEW_NODE_ID this node never appears in a published plan: the
+# monitor appends it to the running snapshot's node set once the integration
+# review is accepted and the authorization card carries
+# ``remote_git_actions: allow``.  It is monitor-driven (git/gh only, no worker
+# dispatch), so Plan must not validate it as a planned business node.
+REMOTE_DELIVERY_NODE_ID = "remote-delivery"
+
 
 @dataclass(frozen=True)
 class ObservationDisposition:

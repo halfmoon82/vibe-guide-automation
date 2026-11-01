@@ -44,6 +44,7 @@ from .models import (
     node_branch,
     node_worktree,
 )
+from .remote_delivery import REMOTE_DELIVERY_AUDIT_EVENTS
 from .paths import ProjectPaths
 from .path_ownership import validate_path_ownership
 from .binding_lifecycle import VisibleSddAcceptance
@@ -1557,6 +1558,9 @@ class Monitor:
         # registry is still the durable source of truth; clearing this cache
         # at each operation boundary prevents stale cross-tick identities.
         self._binding_cache: Dict[Tuple[str, str, str], TaskBinding] = {}
+        # Issue #371: test seams and non-git runners may inject a fake; None
+        # means the real git/gh executor is built per drive.
+        self._remote_delivery_executor = None
         self.context_policy = context_policy
 
     def _reset_binding_cache(self) -> None:
@@ -2053,6 +2057,30 @@ class Monitor:
             "reason": reason, "disposition": "degraded", "action": "isolate", "isolated": True,
         })
         self._save_snapshot(snapshot)
+
+    def _drive_remote_delivery(self, snapshot: RunSnapshot) -> bool:
+        """Advance the monitor-driven remote-delivery ring (issue #371).
+
+        No-op unless the authorization card allows remote Git actions and the
+        integration review is accepted; git/gh failures park the node
+        blocked_unknown and never fabricate evidence or complete the run.
+        """
+        from .remote_delivery import (
+            SubprocessRemoteDeliveryExecutor,
+            drive_remote_delivery,
+        )
+
+        executor = self._remote_delivery_executor
+        if executor is None:
+            executor = SubprocessRemoteDeliveryExecutor(
+                self.paths.root, plan_id=self.plan.plan_id,
+            )
+        return drive_remote_delivery(
+            snapshot,
+            executor,
+            record_event=lambda name, data: self._record(snapshot, name, data),
+            paths=self.paths,
+        )
 
     def merge_change_request_local(
         self,
@@ -2615,6 +2643,7 @@ class Monitor:
         self._consume_answered_decisions(snapshot)
         self._route_undecided_blocked_design(snapshot)
         self._poll_active_handles(snapshot, runner)
+        self._drive_remote_delivery(snapshot)
         self._record_topology_projection(snapshot, "monitor.tick")
         if self._context_allows_dispatch(snapshot, runner):
             self._schedule_ready(snapshot, runner)
@@ -2639,6 +2668,7 @@ class Monitor:
             "evidence": evidence,
             "clearance": evidence.get("clearance"),
         })
+        self._drive_remote_delivery(snapshot)
         self._refresh_run_status(snapshot)
         self._record_topology_projection(snapshot, "monitor.record_integration_review")
         self._save_snapshot(snapshot)
@@ -10044,6 +10074,17 @@ class Monitor:
                         records_bucket = bucket.setdefault("records", [])
                         if evidence not in records_bucket:
                             records_bucket.append(evidence)
+                snapshot.event_sequence = record["sequence"]
+                continue
+            if record["event"] in REMOTE_DELIVERY_AUDIT_EVENTS:
+                # Delivery state lives on the snapshot (node status plus
+                # remote_delivery_evidence), written before the event that
+                # reports it; replay acknowledges the audit record only.  A
+                # crash between the event and the snapshot save leaves the
+                # step unrecorded, and the next drive re-runs it
+                # idempotently (executor-side reuse checks).
+                if provenance.get("role") != "system":
+                    raise ValueError("remote delivery replay lacks system provenance")
                 snapshot.event_sequence = record["sequence"]
                 continue
             node_id = data.get("node_id")
