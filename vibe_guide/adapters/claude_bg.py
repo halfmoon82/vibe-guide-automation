@@ -447,9 +447,33 @@ class ClaudeBgLauncher:
             "event": None,
             "worktree": str(path),
             "branch": branch,
-            "worktree_base": head,
+            "worktree_base": self._node_base(path, head),
         }
         return path
+
+    def _node_base(self, path: Path, head: str) -> str:
+        """The start of this worktree's own work, from the one shared getter.
+
+        With a contract base the worktree HEAD is that base (checked above).
+        Without one the HEAD of an existing worktree may already hold worker
+        commits, so the answer comes from ``scope_landing.node_base`` -- the
+        same function the delivery check uses -- and falls back to HEAD only
+        when nothing better is readable.
+        """
+        if self.base_sha:
+            return head
+        from ..scope_landing import node_base
+
+        repo = self._repository_root(path.parent) or self._repository_root(path)
+        try:
+            project_head = self._git_text(["rev-parse", "HEAD"], repo) if repo else head
+
+            def run(args: List[str]) -> CommandResult:
+                return self._run(["git"] + list(args), path)
+
+            return node_base(run, None, project_head)[0]
+        except Exception:
+            return head
 
     def _manual_command(
         self, path: Path, branch: str, base: Optional[str], why: str = ""

@@ -103,8 +103,10 @@ class LandingTests(unittest.TestCase):
         self.assertEqual(node["scope_expansions"], ["tests/test_x.py"])
         [expanded] = self.events("scope_auto_expanded")
         self.assertEqual(expanded["data"]["files"], ["tests/test_x.py"])
-        self.assertEqual(expanded["data"]["scope_rules"],
-                         [{"path": "tests/test_x.py", "rule": "tests_dir"}])
+        # The fixture records no worktree_base, so the baseline is inferred and says so.
+        [rule] = expanded["data"]["scope_rules"]
+        self.assertEqual({k: rule[k] for k in ("path", "rule", "base")},
+                         {"path": "tests/test_x.py", "rule": "tests_dir", "base": "inferred"})
         status = _snapshot_result("status", load_snapshot(self.paths, snapshot.run_id), True,
                                   paths=self.paths)
         self.assertEqual(status.payload["nodes"]["bg"]["scope_expansions"], ["tests/test_x.py"])
@@ -202,8 +204,10 @@ class LandingTests(unittest.TestCase):
         result = scope_landing.landing_report(self.monitor(), load_snapshot(
             self.paths, self.snapshot.run_id), "bg")
         self.assertEqual(result["rejected"], [])
-        self.assertEqual(result["expanded"],
-                         [{"path": "vibe_guide/cli.py", "rule": "acceptance_unchanged"}])
+        self.assertEqual([{k: v for k, v in item.items() if k != "commits"}
+                          for item in result["expanded"]],
+                         [{"path": "vibe_guide/cli.py", "rule": "acceptance_unchanged",
+                           "base": "inferred"}])
 
 
 class LandedFilesTest(unittest.TestCase):

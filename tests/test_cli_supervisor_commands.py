@@ -52,7 +52,10 @@ class MailboxCommandTests(unittest.TestCase):
         action_id = self.request("wait")["action_id"]
         template = self.cli("--template", action_id)
         self.assertEqual(template.exit_code, 0, template.payload)
-        example = template.payload["template"]
+        example = dict(template.payload["template"])
+        # The cursor placeholder is refused by design; answer with a real one.
+        if "cursor" in example:
+            example["cursor"] = "cursor-1"
         validate_result_shape("wait", example, role="developer")
 
         done = self.cli("--complete", action_id, "--result", self.result_file(example))

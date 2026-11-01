@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from . import worker_liveness
 from .paths import ProjectPaths
 from .state import _atomic_bytes, run_dir
 
@@ -112,11 +113,15 @@ def assess_stalls(
     tasks: Optional[Mapping[str, Any]],
     events: Iterable[Mapping[str, Any]],
     previous: Any,
+    liveness: Optional[Mapping[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     """Return ``{"record": <new persisted record>, "nodes": {id: result}, "unknown_previous": bool}``.
 
     ``previous`` is the last persisted record (or anything unreadable, which is
-    treated as unknown and counted from zero).
+    treated as unknown and counted from zero).  ``liveness`` maps a node id to
+    its worker's liveness token: a token that moved since the last beat counts
+    as progress even though the node's own fields did not change.  A missing
+    token (``None``) is no evidence either way and never resets the counter.
     """
     unknown = not _valid_record(previous)
     prior = {} if unknown else previous["nodes"]
@@ -129,7 +134,9 @@ def assess_stalls(
         fingerprint = node_fingerprint(node, tasks, node_id)
         total = attempts.get(node_id, 0)
         old = prior.get(node_id)
-        if old and old["fingerprint"] == fingerprint:
+        signal = (liveness or {}).get(node_id)
+        moved = bool(old) and signal is not None and old.get("liveness") not in (None, signal)
+        if old and old["fingerprint"] == fingerprint and not moved:
             unchanged = old["unchanged_beats"] + 1
             baseline = min(old["attempts_baseline"], total)
         else:
@@ -140,6 +147,8 @@ def assess_stalls(
             "unchanged_beats": unchanged,
             "attempts_baseline": baseline,
         }
+        if signal is not None:
+            record_nodes[node_id]["liveness"] = signal
         results[node_id] = {
             "fingerprint": fingerprint,
             "unchanged_beats": unchanged,
@@ -181,6 +190,8 @@ def record_beat(
     events: List[Mapping[str, Any]],
 ) -> Dict[str, Any]:
     """Assess one beat against the persisted record and persist the new one."""
-    outcome = assess_stalls(nodes, tasks, events, load_progress(paths, run_id))
+    liveness = {node_id: worker_liveness.liveness_signal(paths, run_id, node_id, node)
+                for node_id, node in (nodes or {}).items() if isinstance(node, Mapping)}
+    outcome = assess_stalls(nodes, tasks, events, load_progress(paths, run_id), liveness)
     save_progress(paths, run_id, outcome["record"])
     return outcome
