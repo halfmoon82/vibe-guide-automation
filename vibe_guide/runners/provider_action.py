@@ -234,12 +234,156 @@ _RESUME_RESULT_FIELDS = frozenset((RESUME_RECEIPT_FIELD, "status"))
 
 
 def _holds_placeholder(value):
-    """True when a string still carries the template placeholder.
+    """True when a string is blank or still carries the template placeholder.
 
-    NFKC folds the full-width ``＜填写＞`` to ``<填写>``; a substring match also
-    catches padded and half-filled values such as ``" <填写> "`` or ``<填写>-1``.
+    The one placeholder judgement every mailbox check uses.  NFKC folds the
+    full-width ``＜填写＞`` to ``<填写>``; a substring match also catches padded
+    and half-filled values such as ``" <填写> "`` or ``<填写>-1``; surrounding
+    or whitespace-only text is blank, not a value.
     """
-    return isinstance(value, str) and TEMPLATE_PLACEHOLDER in unicodedata.normalize("NFKC", value)
+    if not isinstance(value, str):
+        return False
+    folded = unicodedata.normalize("NFKC", value)
+    return not folded.strip() or TEMPLATE_PLACEHOLDER in folded
+
+
+def _placeholder_paths(value, path=""):
+    """Dotted paths of every string leaf that still holds the placeholder.
+
+    Blank text is judged only where a field requires a value (identities,
+    reasons); here only the visible ``<填写>`` marker counts, so an optional
+    empty string is not reported.
+    """
+    found = []
+    if isinstance(value, str):
+        if value.strip() and _holds_placeholder(value):
+            found.append(path)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            found.extend(_placeholder_paths(item, "{}.{}".format(path, key) if path else str(key)))
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            found.extend(_placeholder_paths(item, "{}[{}]".format(path, index)))
+    return found
+
+
+#: The one table the mailbox template, the write-time check, the error hint and
+#: the ``prd-guide`` §6.2 table all read: operation x role x branch -> the
+#: example result.  ``role`` is ``None`` when the shape does not depend on it.
+#: Every ``PLACEHOLDER`` stands where the supervisor must put a real value; a
+#: result that keeps one is refused.  Changing a row changes all four at once
+#: (tests/test_mailbox_shape_table.py pins that).
+PLACEHOLDER = TEMPLATE_PLACEHOLDER
+MAILBOX_FIELD_TABLE = (
+    ("create", None, "ok", {"binding": {"threadId": PLACEHOLDER, "hostId": PLACEHOLDER}},
+     "没有真实会话 id 就不回写；`task_id`/`host` 同样接受"),
+    ("create", None, "failed", {"failed": True, "reason": PLACEHOLDER},
+     "没能创建任务时如实说明原因"),
+    ("locate", None, "ok", {"located": True}, "宿主原始输出 `{\"navigated\": true}` 不被接受"),
+    ("locate", None, "failed", {"failed": True, "reason": PLACEHOLDER},
+     "没能定位到任务时如实说明原因"),
+    ("visibility", None, "ok", {"visible": True, "direct_enter": True}, "两个标志都必须为 true"),
+    ("visibility", None, "failed", {"failed": True, "reason": PLACEHOLDER},
+     "没能观察到任务时如实说明原因"),
+    ("wait", None, "pending", {"status": "timeout"},
+     "未完；`cursor` 给就必须是非空字符串（≤4096、无 NUL），不知道就不给"),
+    ("wait", "developer", "complete",
+     {"status": "completed", "event": "complete", "cursor": PLACEHOLDER,
+      "delivery_evidence": {"completion_marker": PLACEHOLDER, "delivery_path": PLACEHOLDER,
+                            "thread_status": "complete"}},
+     "（嵌套对象，三键齐全，摊平无效）；`cursor` 填真实值（servicer 路径的交付门读它），不知道就整个删掉，别留占位符"),
+    ("wait", "reviewer", "complete",
+     {"status": "completed", "event": "accepted", "cursor": PLACEHOLDER,
+      "evidence": {"summary": PLACEHOLDER}},
+     "P0–P2 清零证据；`cursor` 填真实值，不知道就整个删掉，别留占位符"),
+    ("resume", None, "ok", {"resumed": True}, "沿用原会话 id，不回写绑定"),
+)
+
+
+def mailbox_row(operation, role, branch):
+    """The table row for ``operation`` x ``role`` x ``branch``, or None."""
+    for row in MAILBOX_FIELD_TABLE:
+        if row[0] == operation and row[1] in (None, role) and row[2] == branch:
+            return row
+    return None
+
+
+def mailbox_example(operation, role=None, branch="ok"):
+    """A deep copy of the example result; ``branch`` defaults to the success one."""
+    row = mailbox_row(operation, role, branch)
+    if row is None and branch == "ok":
+        # wait has no "ok": its success example is the role's completion.
+        row = mailbox_row(operation, role, "complete")
+    if row is None:
+        return None
+    return json.loads(json.dumps(row[3], ensure_ascii=False))
+
+
+#: Markers around the generated table in ``prd-guide.md`` §6.2.
+DOC_TABLE_BEGIN = "<!-- mailbox-table:begin -->"
+DOC_TABLE_END = "<!-- mailbox-table:end -->"
+_BRANCH_LABEL = {"ok": "", "failed": "（失败）", "pending": "（未完）", "complete": "（完）"}
+
+
+def render_doc_table():
+    """The prd-guide §6.2 table, generated from ``MAILBOX_FIELD_TABLE``."""
+    lines = ["| 操作 | 角色 | payload | 说明 |", "|---|---|---|---|"]
+    for operation, role, branch, example, note in MAILBOX_FIELD_TABLE:
+        lines.append("| `{}`{} | {} | `{}` | {} |".format(
+            operation, _BRANCH_LABEL.get(branch, branch), role or "任意",
+            json.dumps(example, ensure_ascii=False, sort_keys=True), note))
+    return "\n".join(lines)
+
+
+def _example_text(example):
+    return json.dumps(example, ensure_ascii=False, sort_keys=True)
+
+
+def _hint(operation, role, branch=None, wait_status=None):
+    """``expected:`` tail naming the shape to copy, drawn from the table."""
+    if branch is None:
+        branch = "complete" if operation == "wait" else "ok"
+    if operation == "wait" and branch == "complete" and wait_status in WAIT_TRANSIENT_STATUSES:
+        branch = "pending"
+    example = mailbox_example(operation, role, branch)
+    if example is None:
+        return ""
+    text = "; expected shape ({}): {}".format(branch, _example_text(example))
+    if branch not in ("failed",) and mailbox_row(operation, role, "failed") is not None:
+        text += "; if the action could not be done: " + _example_text(
+            mailbox_example(operation, role, "failed"))
+    return text
+
+
+def _coded(error, reason_code):
+    """Attach the independent ``reason_code`` the monitor records for ``error``.
+
+    ``observation`` is the channel ``Monitor._dispatch_with_intent`` already
+    reads a provider failure's fixed reason code from.
+    """
+    error.reason_code = reason_code
+    if reason_code is not None:
+        error.observation = {"reason_code": reason_code}
+    return error
+
+
+def _identity_fields(operation, payload):
+    """The fields whose value must be a real fact, not a template stand-in.
+
+    A task identity, host identity or failure reason that kept ``<填写>`` is
+    stored and then acted on (a binding to a task that does not exist, a
+    reason that says nothing).  Evidence text in a ``wait`` result is judged by
+    the delivery gate, not here.
+    """
+    found = {}
+    binding = payload.get("binding")
+    if operation == "create" and isinstance(binding, dict):
+        found["binding"] = binding
+    if _reports_failure(payload):
+        for key in ("reason", "error"):
+            if key in payload:
+                found[key] = payload[key]
+    return found
 
 
 def _shape_errors(required, allowed, payload):
@@ -295,12 +439,6 @@ def _create_shape_errors(payload):
     # result cannot be rewritten.
     if not (isinstance(host, str) and host.strip()):
         errors.append("field binding needs a host identity: hostId or host")
-    for label, value in (("task identity", task_id), ("host identity", host)):
-        if _holds_placeholder(value):
-            errors.append(
-                "field binding {} still holds the template placeholder; "
-                "substitute the real value".format(label)
-            )
     return errors
 
 
@@ -344,10 +482,7 @@ def validate_result_shape(operation, payload, *, role=None):
         # supervisor that genuinely could not observe the task must still be
         # able to say so: the reader turns ``failed``/``status=error`` into a
         # provider error instead of a visibility claim.
-        failed = payload.get("failed") is True or payload.get("status") in (
-            "failed", "error", "stopped",
-        )
-        if failed:
+        if _reports_failure(payload):
             reason = payload.get("reason") or payload.get("error")
             if not (isinstance(reason, str) and reason.strip()):
                 errors.append("field reason is required when the action failed")
@@ -359,12 +494,40 @@ def validate_result_shape(operation, payload, *, role=None):
                     "field(s) must be true: " + ", ".join(missing)
                     + ", or report failed/reason when the action could not be observed"
                 )
+            if operation == "locate" and "navigated" in payload:
+                # The host's raw navigation output; the reader never looks at it.
+                errors.append(
+                    'field navigated is the host\'s raw output, not the result: '
+                    'write {"located": true} instead'
+                )
     elif operation == "resume":
         errors = _shape_errors([RESUME_RECEIPT_FIELD], _RESUME_RESULT_FIELDS, payload)
         if RESUME_RECEIPT_FIELD in payload and payload[RESUME_RECEIPT_FIELD] is not True:
             errors.append("field {} must be true".format(RESUME_RECEIPT_FIELD))
+    if operation in ("wait", "create"):
+        # A cursor is stored and later compared (cursor-conflict check), so a
+        # blank or placeholder one is a fake position, not an optional blank.
+        cursors = [("cursor", payload["cursor"])] if "cursor" in payload else []
+        binding = payload.get("binding")
+        if operation == "create" and isinstance(binding, dict) and "cursor" in binding:
+            cursors.append(("binding.cursor", binding["cursor"]))
+        for path, value in cursors:
+            if _holds_placeholder(value):
+                errors.append(
+                    "field {} is blank or still holds the template placeholder; "
+                    "substitute the real cursor or omit the field".format(path)
+                )
+    for path in _placeholder_paths(_identity_fields(operation, payload)):
+        errors.append(
+            "field {} still holds the template placeholder; substitute the real value".format(path)
+        )
     if errors:
-        raise ValueError("{} result shape invalid: {}".format(operation, "; ".join(errors)))
+        branch = "failed" if operation in ("create", "locate", "visibility") and _reports_failure(payload) else None
+        raise ValueError(
+            "{} result shape invalid: {}{}".format(
+                operation, "; ".join(errors), _hint(operation, role, branch, payload.get("status"))
+            )
+        )
 
 
 def complete_mailbox_action(paths, run_id, action_id, payload, *, native=True):
@@ -534,7 +697,10 @@ class ProviderActionRunner(Runner):
         for name in ("worktree", "managed_root"):
             value = values[name]
             if not isinstance(value, str) or not value.strip() or "\x00" in value:
-                raise ProviderUnavailable("provider binding %s is blocked_unknown" % name)
+                raise _coded(
+                    ProviderUnavailable("provider binding %s is blocked_unknown" % name),
+                    "worktree_missing" if name == "worktree" else None,
+                )
             if not Path(value).is_absolute():
                 raise ProviderUnavailable("provider binding %s is blocked_unknown" % name)
 
@@ -748,12 +914,21 @@ class ProviderActionRunner(Runner):
         for name in ("worktree", "managed_root"):
             value = values[name]
             if not isinstance(value, str) or not value.strip():
-                raise ProviderUnavailable("provider binding %s is blocked_unknown" % name)
+                raise _coded(
+                    ProviderUnavailable("provider binding %s is blocked_unknown" % name),
+                    "worktree_missing" if name == "worktree" else None,
+                )
             path = Path(value)
             if not path.is_absolute():
-                raise ProviderUnavailable("provider binding %s is blocked_unknown" % name)
+                raise _coded(
+                    ProviderUnavailable("provider binding %s is blocked_unknown" % name),
+                    "worktree_missing" if name == "worktree" else None,
+                )
             if "\x00" in value:
-                raise ProviderUnavailable("provider binding %s is blocked_unknown" % name)
+                raise _coded(
+                    ProviderUnavailable("provider binding %s is blocked_unknown" % name),
+                    "worktree_missing" if name == "worktree" else None,
+                )
 
         branch = values["branch"]
         invalid_branch = (
@@ -1105,7 +1280,7 @@ class ProviderActionRunner(Runner):
         if not isinstance(task_id, str) or not task_id:
             raise ValueError("provider create result has no task identity")
         if not isinstance(host, str) or not host:
-            raise ValueError("provider create result has no host identity")
+            raise _coded(ValueError("provider create result has no host identity"), "mailbox_host_missing")
         if successor and predecessor and task_id == predecessor:
             raise ValueError("provider successor reused predecessor identity")
 
@@ -1132,7 +1307,15 @@ class ProviderActionRunner(Runner):
             {"threadId": task_id},
         )
         if located.get("located") is not True:
-            raise ValueError("provider task cannot be located")
+            raise _coded(
+                ValueError(
+                    "provider task cannot be located: the locate result must be "
+                    '{"located": true}' + (
+                        ' (got the host\'s raw {"navigated": true})' if "navigated" in located else ""
+                    )
+                ),
+                "mailbox_locate_shape",
+            )
         visible = self._require_result(
             contract,
             run_id,
