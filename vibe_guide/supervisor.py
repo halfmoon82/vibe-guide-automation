@@ -2840,8 +2840,18 @@ def _build_pack(paths, run_id, node_id, snapshot, events, role):
         paths, run_id, node_id, role,
         node_status=str(node.get("status") or ""),
         blocker=_node_blocker(node),
-        recent_events=[event.get("event") for event in events[-20:]],
+        recent_events=_collapse_adjacent_repeats(event.get("event") for event in events)[-20:],
     )
+
+
+def _collapse_adjacent_repeats(names):
+    """Event names with runs of the same name reduced to one, so a pack's tail
+    shows the last distinct steps rather than one repeated cycle event."""
+    collapsed = []
+    for name in names:
+        if not collapsed or collapsed[-1] != name:
+            collapsed.append(name)
+    return collapsed
 
 
 def _node_fingerprint(snapshot, node_id):
