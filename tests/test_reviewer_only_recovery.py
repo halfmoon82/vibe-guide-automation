@@ -417,3 +417,10 @@ class ParkedSelfReportTests(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunnerForwardsRoutingKeysTests(unittest.TestCase):
+    def test_wait_result_projection_carries_the_integration_routing_keys(self):
+        from vibe_guide.runners.provider_action import RESULT_EVENT_KEYS
+        for key in ("target_node_id", "scope_expansion", "files"):
+            self.assertIn(key, RESULT_EVENT_KEYS)

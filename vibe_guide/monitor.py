@@ -3538,29 +3538,14 @@ class Monitor:
         snapshot.handles.pop("integration-review", None)
         self._release_node_lease(snapshot, "integration-review")
 
+    @staticmethod
     def _integration_finding_fields(
-        self, snapshot: RunSnapshot, node_id: str, event: RunEvent,
+        snapshot: RunSnapshot, node_id: str, event: RunEvent,
         active: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Routing fields of an integration finding.
-
-        The provider result projection forwards only a fixed key set, so the
-        worker's own top-level ``target_node_id`` / ``scope_expansion`` /
-        ``files`` are read from the archived self-report when the event does
-        not carry them.
-        """
-        names = ("target_node_id", "scope_expansion", "files")
-        fields = {name: event.data.get(name) for name in names}
-        if all(value is None for value in fields.values()) and isinstance(active, dict):
-            try:
-                archived = ProviderActionStore(self.paths).archived_payload(
-                    snapshot.run_id, node_id, "reviewer", active.get("generation"))
-            except (OSError, TypeError, ValueError):
-                archived = None
-            if isinstance(archived, dict):
-                for name in names:
-                    fields[name] = archived.get(name)
-        return fields
+        """Routing fields of an integration finding (forwarded by the runner)."""
+        return {name: event.data.get(name)
+                for name in ("target_node_id", "scope_expansion", "files")}
 
     def _upstream_node_for_files(self, snapshot: RunSnapshot, files: Any) -> Optional[str]:
         """The one accepted upstream node whose scope holds every defect file."""
