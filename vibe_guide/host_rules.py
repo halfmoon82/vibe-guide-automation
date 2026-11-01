@@ -30,6 +30,11 @@ RECORD_RELATIVE = Path(".vibe") / "host-rules.json"
 BEGIN_PREFIX = "<!-- vibe-guide:host-supervisor-rules begin"
 END_MARKER = "<!-- vibe-guide:host-supervisor-rules end -->"
 QUESTION = "是否在用户级规则中加入 vibe 监工会话例外？"
+#: Shown once, in the run that records ``skip``; never again (PRD G2).
+SKIP_NOTICE = (
+    "已选择不应用：监工会话没有对齐门例外，心跳与接班回合仍会先输出对齐门卡片，"
+    "可能在监工会话里停下等人。如需加入，运行 vibe init --confirm --host-rules apply"
+)
 DECISIONS = ("skip", "apply", "rolled_back")
 
 _BEGIN_LINE = re.compile(
@@ -78,18 +83,49 @@ def _label(rel):
     return "~/" + rel
 
 
-def _check_path(home, rel):
-    """Return the absolute path for *rel*; refuse symlinks anywhere below home.
-
-    A symlinked rule file or directory (dotfiles setups) would make the write
-    and the backup land outside the place the user previewed.
-    """
-    path = Path(home) / rel
+def _has_symlink(home, rel):
     current = Path(home)
     for part in Path(rel).parts:
         current = current / part
         if current.is_symlink():
-            raise HostRulesError(_label(rel) + "：路径含符号链接，拒绝写入")
+            return True
+    return False
+
+
+def _covering_candidate(home, rel):
+    """The other candidate *rel* resolves to, or None.
+
+    Judged on the resolved real path (not the link text): a symlinked rule
+    file whose real target is another candidate's own non-symlinked file is
+    the same file, so that candidate already covers it.
+    """
+    if not _has_symlink(home, rel):
+        return None
+    try:
+        real = os.path.realpath(Path(home) / rel)
+    except (OSError, RuntimeError):
+        return None
+    for other in CANDIDATES:
+        if other != rel and not _has_symlink(home, other) \
+                and real == os.path.realpath(Path(home) / other):
+            return other
+    return None
+
+
+def _check_path(home, rel):
+    """Return the absolute path for *rel*; refuse symlinks anywhere below home.
+
+    A symlinked rule file or directory (dotfiles setups) would make the write
+    and the backup land outside the place the user previewed.  A link whose
+    real target is another candidate never gets here (see
+    ``_covering_candidate``); any other link is refused with its real target.
+    """
+    path = Path(home) / rel
+    if _has_symlink(home, rel):
+        raise HostRulesError(
+            _label(rel) + "：路径含符号链接，其真实路径 "
+            + os.path.realpath(path) + " 不在候选文件之内，拒绝写入"
+        )
     return path
 
 
@@ -160,6 +196,8 @@ def plan_apply(home):
     targets, errors = [], []
     for rel in CANDIDATES:
         try:
+            if _covering_candidate(home, rel):
+                continue
             path = _check_path(home, rel)
             read = _read_target(path, rel)
             if read is None:
@@ -554,9 +592,18 @@ def write_record(root, decision, applied=None):
 
 
 def _file_status(home, rel):
+    """Per-file state; ``unreadable`` is split by cause (G1)."""
+    if _covering_candidate(home, rel):
+        return "covered"
     try:
         read = _read_target(_check_path(home, rel), rel)
-    except (HostRulesError, OSError):
+    except HostRulesError:
+        return "symlink_outside" if _has_symlink(home, rel) else "unreadable"
+    except FileNotFoundError:
+        return "missing"
+    except PermissionError:
+        return "permission"
+    except OSError:
         return "unreadable"
     if read is None:
         return "absent"
@@ -642,7 +689,10 @@ def _init_step(root, home, choice, digest):
             }
         if decision != "skip":
             write_record(root, "skip")
-        return {"decision": "skip", "status": "answered", "paths": []}
+        payload = {"decision": "skip", "status": "answered", "paths": []}
+        if decision != "skip":
+            payload["notice"] = SKIP_NOTICE
+        return payload
     if choice == "rollback":
         result = rollback(home, record)
         payload = {"decision": decision, "status": result["status"], "paths": result["restored"]}
@@ -717,7 +767,8 @@ def summary_text(payload):
             + "确认后运行：" + payload["commands"][0]
         )
     texts = {
-        "answered": "用户级规则决定：" + str(payload.get("decision")),
+        "answered": "用户级规则决定：" + str(payload.get("decision"))
+        + ("\n" + payload["notice"] if payload.get("notice") else ""),
         "applied": "已写入用户级规则例外：" + "、".join(payload.get("paths", [])) + "（已备份，可回滚）",
         "current": "用户级规则例外已是当前版本，未改动",
         "rolled_back": "已回滚用户级规则例外：" + "、".join(payload.get("paths", []))
