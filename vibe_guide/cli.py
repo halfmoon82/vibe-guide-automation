@@ -61,6 +61,8 @@ from .supervisor import (
     heal_verify,
     stall_peek,
     register_supervisor_address,
+    record_owner_gate,
+    shift_model_warning,
     session_cwd_warning,
     project_root_worktree_warning,
     release_supervisor_hold,
@@ -2621,6 +2623,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     if payload["state"] != "rotate":
                         payload["state"] = "unknown"
             return payload
+        # A foreign session record is refused before any cached receipt can answer.
+        payload = record_owner_gate(paths, args.run_id, args.session_record,
+                                    command_prefix=supervisor_command_prefix)
+        if payload is not None:
+            return _result(UNKNOWN, {"command": args.command, **payload},
+                           "监工预检：register_first", args.as_json)
         # Contract drift is checked before any cached receipt can answer (#220).
         payload = supervisor_contract_drift(paths, args.run_id)
         if payload is None:
@@ -2671,6 +2679,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             else:
                 why = "记录里还没有上下文用量"
             text += "；未记下接班起点（{}），换班按绝对阈值计算".format(why)
+        model_warning = shift_model_warning(paths, args.run_id)
+        if model_warning:
+            text += "；警告：" + model_warning
         cwd_warning = session_cwd_warning(paths, args.session_record)
         if cwd_warning:
             text += "；警告：" + cwd_warning
@@ -2678,6 +2689,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         if worktree_warning:
             text += "；警告：" + worktree_warning
         payload = {"command": args.command, "status": "ok", "current": entry}
+        if model_warning:
+            payload["model_warning"] = model_warning
         if cwd_warning:
             payload["session_cwd_warning"] = cwd_warning
         if worktree_warning:
@@ -2761,7 +2774,22 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 args.run_id, args.node_id, args.role, payload, args.worker_generation
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "自报格式错误：" + str(error), args.as_json)
+            # A refused report ends the worker's turn like any other path, so
+            # the wake instruction rides on the refusal itself.
+            refusal = {"command": args.command, "status": "blocked_invalid", "reason": str(error)}
+            text = "自报格式错误：" + str(error)
+            try:
+                address = current_supervisor_address(
+                    paths, args.run_id, node_id=args.node_id, role=args.role,
+                    generation=args.worker_generation)
+            except (OSError, TypeError, ValueError):
+                address = None
+            wake = address.get("wake") if isinstance(address, dict) else None
+            if wake:
+                refusal["wake"] = wake
+                text += "\n" + ("唤醒：用 {} 向 {} 发送「{}」".format(wake["channel"], wake["target"], wake["signal"])
+                                if wake["channel"] else "唤醒：无推送通道（{}）".format(wake["reason"]))
+            return _result(BLOCKED, refusal, text, args.as_json)
         # Advisory notes (e.g. a dispatch that recorded no project mount) must
         # reach the worker's eyes, not just the JSON payload -- the worker is
         # the one who can tell the supervisor to re-dispatch (issue #219).

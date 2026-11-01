@@ -636,6 +636,202 @@ def provider_never_rotates(provider):
     return _provider_family(provider) == "claude"
 
 
+def _registry_current(paths, run_id):
+    try:
+        registry = _read_json_file(run_dir(paths, run_id) / _REGISTRY_NAME)
+    except (OSError, ValueError):
+        return None
+    current = registry.get("current") if isinstance(registry, dict) else None
+    return current if isinstance(current, dict) else None
+
+
+#: Event written when a beat or preflight is refused; ``reason_code`` is a fixed enum.
+BEAT_REJECTED_EVENT = "supervisor_beat_rejected"
+REASON_RECORD_NOT_REGISTERED = "record_not_registered"
+
+
+def record_owner_mismatch(paths, run_id, session_record):
+    """Why ``session_record`` is provably not the registered supervisor's, or None.
+
+    Registration binds the shift's own log by path digest.  Only a bound
+    registration can be contradicted: a record whose digest differs and whose
+    file name does not carry the registered session id belongs to someone else.
+    Unbound registrations and unregistered runs stay unjudged (None).
+    """
+    if session_record is None:
+        return None
+    current = _registry_current(paths, run_id)
+    if current is None:
+        return None
+    digest = current.get("session_record_digest")
+    if not (isinstance(digest, str) and digest):
+        return None
+    if digest == _record_digest(session_record):
+        return None
+    session_id = current.get("session_id")
+    try:
+        name = Path(str(session_record)).name
+    except (TypeError, ValueError):
+        name = ""
+    if isinstance(session_id, str) and session_id and session_id in name:
+        return None
+    return ("会话记录不属于登记的监工会话（登记会话 {}）：本会话不是登记监工，"
+            "先用自己的记录执行 supervisor-register，再跑 beat/preflight".format(session_id))
+
+
+def record_owner_gate(paths, run_id, session_record, *, command_prefix="vibe"):
+    """The ``register_first`` payload for a foreign session record, else None.
+
+    The refusal is written to the event stream (fixed ``reason_code``); a
+    failed write never turns the refusal into a pass.
+    """
+    reason = record_owner_mismatch(paths, run_id, session_record)
+    if reason is None:
+        return None
+    try:
+        provenance = None
+        try:
+            current = load_snapshot(paths, run_id)
+            provenance = {"role": "system", "task_id": None, "handle_id": None, "generation": 0,
+                          "authorization_digest": current.authorization_digest,
+                          "node_contract_digest": current.node_contract_digest}
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+        append_event(paths, RunEvent(BEAT_REJECTED_EVENT, {
+            "run_id": run_id, "reason_code": REASON_RECORD_NOT_REGISTERED,
+        }), provenance)
+    except (OSError, ValueError, TypeError):
+        pass
+    return {"state": "register_first", "reason": reason,
+            "reason_code": REASON_RECORD_NOT_REGISTERED,
+            "register_command": "{} supervisor-register --run-id {} --provider <平台> "
+                                "--session-id <本会话 id> --host <本机标识> "
+                                "--session-record <本会话记录路径>".format(command_prefix, run_id)}
+
+
+_MODEL_SCAN_BYTES = 1 << 20
+
+
+def session_model_tier(session_record):
+    """``{"model", "effort"}`` the session ran its latest turn with, or None.
+
+    Codex rollouts carry ``turn_context.payload.model`` and ``effort``; Claude
+    Code assistant entries carry ``message.model`` (no effort).  Reads the last
+    megabyte only; anything unreadable is None, never a guess.
+    """
+    try:
+        with Path(session_record).expanduser().open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - _MODEL_SCAN_BYTES))
+            raw = stream.read()
+    except (OSError, TypeError, ValueError):
+        return None
+    for line in reversed(raw.decode("utf-8", errors="replace").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        payload = entry.get("payload")
+        if entry.get("type") == "turn_context" and isinstance(payload, dict):
+            model = payload.get("model")
+            effort = payload.get("effort") or payload.get("reasoning_effort")
+            if isinstance(model, str) and model:
+                return {"model": model, "effort": effort if isinstance(effort, str) and effort else None}
+        message = entry.get("message")
+        model = message.get("model") if isinstance(message, dict) else None
+        if isinstance(model, str) and model and not model.startswith("<"):
+            return {"model": model, "effort": None}
+    return None
+
+
+def shift_model_warning(paths, run_id):
+    """Warning when the registered shift runs a different model or effort than the last one."""
+    try:
+        registry = _read_json_file(run_dir(paths, run_id) / _REGISTRY_NAME)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(registry, dict):
+        return None
+    current = registry.get("current")
+    history = registry.get("history")
+    previous = next((item for item in reversed(history) if isinstance(item, dict)), None) \
+        if isinstance(history, list) else None
+    if not isinstance(current, dict) or previous is None or not previous.get("model"):
+        return None
+    if not current.get("model"):
+        return ("接班会话的模型未能从会话记录读到，无法核对与上一班（{}）是否一致；登记不受影响"
+                .format(previous.get("model")))
+    differences = []
+    for key, label in (("model", "模型"), ("effort", "思考档位")):
+        before, after = previous.get(key), current.get(key)
+        if before and after and before != after:
+            differences.append("{}：上一班 {}，本班 {}".format(label, before, after))
+    if not differences:
+        return None
+    return "接班会话与上一班不一致（{}）；登记不受影响，但同一运行请保持同模型同档位".format("；".join(differences))
+
+
+def _mailbox_backlog(paths, run_id, holds):
+    """``(pending_count, unconsumed_nodes)`` the supervisor still has to service, or None if unreadable."""
+    try:
+        from .adapters.task_provider import ProviderActionStore
+
+        store = ProviderActionStore(paths)
+        pending = [a for a in store.pending(run_id) if a.get("issue_id") not in holds]
+        unconsumed = list(store.unconsumed_deliveries(run_id))
+    except Exception:
+        return None
+    return len(pending), unconsumed
+
+
+_ROTATE_DEFERRED_FILE = "rotate-deferred.json"
+#: A deferral older than this is a leftover from an earlier shift, not "last beat".
+_ROTATE_DEFER_WINDOW_SECONDS = 3600
+
+
+def _defer_rotation(paths, run_id, result):
+    """Turn a ``rotate`` result into ``work`` once when the mailbox still has things to service.
+
+    Rotating with pending requests or unconsumed deliveries hands the next
+    shift a backlog it has to rediscover.  The first rotate beat services it;
+    the next one rotates regardless, so a backlog that never clears cannot
+    pin a full session forever.
+    """
+    from .state import _atomic_bytes
+
+    marker = run_dir(paths, run_id) / _ROTATE_DEFERRED_FILE
+    try:
+        holds = supervisor_holds(paths, run_id)
+    except ValueError:
+        holds = {}
+    backlog = _mailbox_backlog(paths, run_id, holds)
+    if backlog is None or (not backlog[0] and not backlog[1]):
+        if marker.exists():
+            marker.unlink()
+        return result
+    if marker.exists():
+        deferred_at = (_read_json_file(marker) or {}).get("deferred_at") if _read_json_file(marker) else None
+        marker.unlink()
+        if isinstance(deferred_at, (int, float)) and 0 <= time.time() - deferred_at < _ROTATE_DEFER_WINDOW_SECONDS:
+            return result
+    _atomic_bytes(marker, _json_bytes({"deferred_at": time.time()}))
+    deferred = {key: value for key, value in result.items() if key != "state"}
+    deferred.update({
+        "state": "work",
+        "reason": "rotate deferred: mailbox has pending actions; service them this beat, rotate next beat",
+        "rotate_deferred": {"would_rotate_for": result.get("reason"),
+                            "pending_count": backlog[0], "unconsumed_deliveries": backlog[1]},
+        "pending": backlog[0], "nodes": backlog[1],
+    })
+    return deferred
+
+
 def supervisor_preflight(
     paths,
     run_id,
@@ -647,6 +843,11 @@ def supervisor_preflight(
     accept_decision=False,
 ):
     """Read-only disk check; returns exactly one of idle/work/decision/rotate/unknown.
+
+    Pure computation over the record it is given: whose record it is gets
+    decided at the entry points (``supervisor_beat`` and the CLI preflight)
+    through ``record_owner_gate``, so a caller that already knows the record
+    is its own (tests, the daemon) is not second-guessed here.
 
     - ``unknown``: the session record could not be read or parsed (never
       collapsed into idle).
@@ -698,10 +899,10 @@ def supervisor_preflight(
     pressure = None
     if tokens >= context_hard_cap:
         if not no_rotate:
-            return _with_cap_reason(
+            return _with_cap_reason(_defer_rotation(paths, run_id,
                 {"state": "rotate", "reason": "context over hard cap",
                  "tokens": tokens, "baseline": baseline,
-                 "context_hard_cap": context_hard_cap, "prepare_handoff": True},
+                 "context_hard_cap": context_hard_cap, "prepare_handoff": True}),
                 cap_reason,
             )
         pressure = {"tokens": tokens, "context_hard_cap": context_hard_cap,
@@ -714,10 +915,10 @@ def supervisor_preflight(
             return {"state": "unknown", "reason": "supervisor_single_shift invalid"}
     if (not no_rotate and not single_shift and tokens >= DEFAULT_ROTATE_SOFT_CAP
             and baseline is not None and tokens - baseline >= token_threshold):
-        return _with_cap_reason(
+        return _with_cap_reason(_defer_rotation(paths, run_id,
             {"state": "rotate", "reason": "context grew past threshold since takeover",
              "tokens": tokens, "baseline": baseline,
-             "context_hard_cap": context_hard_cap, "prepare_handoff": True},
+             "context_hard_cap": context_hard_cap, "prepare_handoff": True}),
             cap_reason,
         )
     try:
@@ -1583,6 +1784,11 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
             if baseline is not None and digest is not None:
                 entry["baseline_context"] = baseline
                 entry["session_record_digest"] = digest
+            tier = session_model_tier(session_record)
+            if tier is not None:
+                entry["model"] = tier["model"]
+                if tier["effort"]:
+                    entry["effort"] = tier["effort"]
         _write_registry(
             path,
             {"current": entry, "history": history, "rejected": rejected[-20:]},
@@ -2089,6 +2295,23 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
             snapshot.status, accepted, len(nodes),
             "；其余：" + "、".join(others) if others else ""),
     ]
+    successor = _successor_session(paths, run_id)
+    lines.append("接班会话的模型与思考档位：模型 {}，思考档位 {}（取自上一班登记；"
+                 "接班会话须与之相同，不同时 supervisor-register 会警告）".format(
+                     successor["model"] or "未记录", successor["effort"] or "未记录"))
+    blockers = payload["current_blockers"] = _current_blockers(paths, snapshot, {
+        node: {"status": data.get("status"), **({"blocked_reason": str(data.get("reason") or (data.get("quarantine") or {}).get("reason"))[:200]}
+                                                if data.get("reason") or (data.get("quarantine") or {}).get("reason") else {})}
+        for node, data in (snapshot.nodes or {}).items() if isinstance(data, dict)}, holds)
+    payload["successor_session"] = successor
+    if blockers:
+        lines.append("当前卡点：" + "；".join(
+            "{}（{}{}）".format(b["node"], b["status"], "：" + b["reason"] if b.get("reason") else "") for b in blockers))
+    else:
+        lines.append("当前卡点：无（没有节点卡在待处理状态）")
+    lines.append("已知出口：" + "；".join("{} → {}".format(when, command) for when, command in SUPERVISOR_KNOWN_EXITS))
+    lines.append("信箱回写形状字段表：" + MAILBOX_FIELD_TABLE_REF
+                 + "；用 supervisor-mailbox --run-id {} --template <动作 id> 取示例".format(run_id))
     if holds:
         lines.append("等人拍板（{} 项）：在本会话向用户复述一次即可，不要重新调查；"
                      "用户回复后先 vibe supervisor-hold --run-id {} --node <节点> --release，再推进。".format(
@@ -2160,6 +2383,61 @@ def _snapshot_refs(paths, run_id):
     return [_artifact_ref(directory / name)
             for name in ("state.json", "state.previous.json", "events.jsonl")
             if (directory / name).is_file()]
+
+
+#: Rules a supervisor needs on every shift but the card has no byte budget for
+#: (the card is capped at SUPERVISOR_CARD_BYTE_LIMIT).  They ride in
+#: handoff-summary.json, which every takeover reads first.
+SUPERVISOR_CARD_BYTE_LIMIT = 3072
+SUPERVISOR_SUMMARY_RULES = (
+    "监工不执行 `monitor --authorize`：授权只归产品经理；监工只在授权范围内推进。",
+    "beat 返回 register_first 说明本会话不是登记监工：先用本会话自己的记录 supervisor-register，不要借别人的会话记录。",
+    "beat 报 rotate_deferred 时，本拍先服务信箱待处理请求与未消费交付，下一拍再换班。",
+    "存在 awaiting_supervisor 节点时 beat 一定是 decision 或 work 并带问题摘要，由监工答复（requeue --note），不当作空闲。",
+    "接班会话与上一班模型或思考档位不同，supervisor-register 只警告不阻断；同一运行请保持同模型同档位。",
+)
+#: Where the mailbox result shapes are defined (rendered from MAILBOX_FIELD_TABLE).
+MAILBOX_FIELD_TABLE_REF = "prd-guide §6.2（同源 runners.provider_action.MAILBOX_FIELD_TABLE）"
+#: Ways out of a stuck node that exist as commands today.
+SUPERVISOR_KNOWN_EXITS = (
+    ("worker 提问或交付被拒", "requeue --plan <计划> --run-id <运行> --node <节点> --note '<答复>'，再 resume"),
+    ("需要改授权范围外的文件", "scope-expand --run-id <运行> --node <节点> --payload <JSON>"),
+    ("等产品经理拍板", "supervisor-hold --run-id <运行> --node <节点> --category … --decision|--authorization-gap …"),
+    ("节点空转或会话失效", "repair；修好后 heal-verify --run-id <运行> --node <节点>"),
+    ("状态未知（blocked_unknown）", "blocked-unknown 处置，不得当作成功"),
+    ("运行被误归档", "run-restore --run-id <运行>"),
+)
+
+
+def _successor_session(paths, run_id):
+    """Model and effort the incoming shift must use: the outgoing shift's own, as registered."""
+    current = _registry_current(paths, run_id) or {}
+    return {"model": current.get("model"), "effort": current.get("effort"),
+            "source": "supervisor-registry.json current" if current.get("model") else "unrecorded"}
+
+
+def _current_blockers(paths, snapshot, nodes, holds):
+    """Where the run is stuck right now: unaccepted nodes with their reason, plus open questions."""
+    blockers = []
+    try:
+        from .worker_questions import pending_questions
+
+        questions = {q["node_id"]: q for q in pending_questions(paths, snapshot)}
+    except Exception:
+        questions = {}
+    for node, data in sorted(nodes.items()):
+        status = data.get("status")
+        if status in ("accepted", "planned", "running"):
+            continue
+        item = {"node": node, "status": status}
+        if data.get("blocked_reason"):
+            item["reason"] = data["blocked_reason"]
+        if node in questions:
+            item["question"] = (questions[node].get("excerpt") or "")[:200]
+        if node in holds:
+            item["held"] = True
+        blockers.append(item)
+    return blockers[:20]
 
 
 def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_prefix):
@@ -2242,6 +2520,11 @@ def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_p
             "按工具清单里的全名重试一次，仍失败即停止服务信箱、向用户报告工具名路由故障，不交班、不开新会话。Codex 的 create 只用 create_thread（project 目标原样传），不得用 fork_thread 代替：fork 会带上本会话整段历史，complete() 查到 forked_from_id 即拒收并抛 ForkedProviderSession；新会话写不了工作副本时停下报告宿主权限，不要改用 fork。工程失败按现有恢复协议继续，"
             "不得用重复 preflight/resume 代替 native 调用；产品变化、外部授权或 deploy 才请求用户。"
         ),
+        "successor_session": _successor_session(paths, run_id),
+        "current_blockers": _current_blockers(paths, snapshot, nodes, holds),
+        "known_exits": [{"when": when, "command": command} for when, command in SUPERVISOR_KNOWN_EXITS],
+        "mailbox_field_table": MAILBOX_FIELD_TABLE_REF,
+        "supervisor_rules": list(SUPERVISOR_SUMMARY_RULES),
         "pending_count": len(pending), "evidence": evidence,
         "task_registry_status": "ok" if tasks_path.is_file() else "unknown",
         "output_policy": SUPERVISOR_OUTPUT_POLICY,
@@ -2999,6 +3282,10 @@ def render_beat_text(paths, run_id, payload, *, plan_id, command_prefix="vibe",
         resume = None
     advance = "推进由守护程序完成，不要手工 resume" if resume is None else "推进用 " + resume
     payload["end_turn"] = state in ("idle", "stop")
+    if state == "register_first":
+        payload["end_turn"] = True
+        return ("register_first：{}。先执行：{}；这一拍不换班、不推进，也不要再调用 beat"
+                .format(payload.get("reason"), payload.get("register_command")))
     if state == "idle":
         return IDLE_BEAT_TEXT
     if state == "stop":
@@ -3016,8 +3303,13 @@ def render_beat_text(paths, run_id, payload, *, plan_id, command_prefix="vibe",
         return ("contract_drift：能力合同与运行快照不一致，停止推进，立即走同一运行的重新授权流程；{}"
                 .format(payload.get("hint", ""))) + tail
     if state == "rotate":
-        return ("rotate：新开一个会话（必须建在本项目里、必须是全新会话，不要 fork_thread），"
-                "让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(command_prefix, run_id)) + tail
+        rotate_text = ("rotate：新开一个会话（必须建在本项目里、必须是全新会话，不要 fork_thread），"
+                       "让它跑 {} supervisor-handoff --run-id {} 并照输出接班".format(command_prefix, run_id)) + tail
+        if payload.get("worker_questions"):
+            from .worker_questions import render_beat_questions
+
+            rotate_text += "\n" + render_beat_questions(payload["worker_questions"], run_id, plan_id, command_prefix)
+        return rotate_text
     if state == "work":
         try:
             block, ref, first = _card_block(paths, run_id)
@@ -3029,6 +3321,15 @@ def render_beat_text(paths, run_id, payload, *, plan_id, command_prefix="vibe",
         context = ""
         if payload.get("context_pressure"):
             context = "\n" + payload["context_pressure"]["hint"]
+        deferred = payload.get("rotate_deferred")
+        if deferred:
+            context += ("\n本拍原应换班（{}），但信箱还有 {} 项待服务请求、{} 份未消费交付：先处理这些，下一拍再换班"
+                        .format(deferred.get("would_rotate_for"), deferred.get("pending_count"),
+                                len(deferred.get("unconsumed_deliveries") or [])))
+        if payload.get("worker_questions"):
+            from .worker_questions import render_beat_questions
+
+            context += "\n" + render_beat_questions(payload["worker_questions"], run_id, plan_id, command_prefix)
         return "work：服务信箱一轮，{}{}\n{}".format(advance, tail, block) + context
     return "unknown：按 work 处理，{}；原因：{}".format(
         advance, payload.get("reason", "状态未知")) + tail
@@ -3112,6 +3413,16 @@ def _beat_extras(paths, run_id, payload, text):
     return "\n".join(([text] if text else []) + lines)
 
 
+def _awaiting_questions(paths, run_id):
+    """Open ``awaiting_supervisor`` questions of this run (empty when unreadable)."""
+    try:
+        from .worker_questions import pending_questions
+
+        return pending_questions(paths, load_snapshot(paths, run_id))
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return []
+
+
 def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
                     command_prefix="vibe", interval_for=None, preflight_kwargs=None, now=None):
     """The one beat entry the CLI calls: ``(payload, text, ok)``.
@@ -3121,9 +3432,19 @@ def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
     (the CLI owns cadence persistence), render the text, then remember the
     fingerprint.  ``ok`` is False when the beat's state is unknown.
     """
+    foreign = record_owner_gate(paths, run_id, session_record, command_prefix=command_prefix)
+    if foreign is not None:
+        # Never rotate, never idle: a session that is not the registered
+        # supervisor has to register first, and the refusal is on the event stream.
+        text = render_beat_text(paths, run_id, foreign, plan_id="", command_prefix=command_prefix)
+        return {"heartbeat_command": heartbeat_command(run_id, command_prefix=command_prefix), **foreign}, text, False
     stop, fingerprint = beat_repeat_check(paths, run_id, now=now)
     # A repeat never hides an unread product-manager message.
     if stop and _pm_inbox_waiting(paths, run_id):
+        stop = None
+    # ... nor a node parked for the supervisor's answer.
+    awaiting = _awaiting_questions(paths, run_id)
+    if stop and awaiting:
         stop = None
     if stop:
         text = render_beat_text(paths, run_id, stop, plan_id="")
@@ -3143,6 +3464,14 @@ def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
         plan_id = load_snapshot(paths, run_id).plan_id
     except (FileNotFoundError, OSError, TypeError, ValueError):
         plan_id = "<plan_id>"
+    if awaiting and payload.get("state") in {"idle", "stop", "work", "decision", "rotate"}:
+        # A node waiting for the supervisor is never idle: the question summary
+        # rides on every beat until the answer lands, whatever else is pending.
+        payload["worker_questions"] = awaiting
+        if payload["state"] in {"idle", "stop"}:
+            payload["state"] = "decision"
+            payload["reason"] = "worker questions await the supervisor"
+            payload["decision_only"] = False
     interval = interval_for(payload) if interval_for else None
     if interval:
         payload["heartbeat_interval"] = interval
