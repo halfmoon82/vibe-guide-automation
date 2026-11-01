@@ -135,7 +135,10 @@ def liveness_signal(paths: ProjectPaths, run_id: str, node_id: str, node: Mappin
     parts = []
     deliveries = paths.vibe / "provider-actions" / "deliveries"
     try:
-        stamps = [path.stat().st_mtime_ns for path in deliveries.glob("{}-{}-*-g*.json".format(run_id, node_id))]
+        # exact node segment: node "dev" must not pick up "dev-api" deliveries
+        exact = re.compile(r"{}-{}-(developer|reviewer)-g\d+\.json".format(re.escape(run_id), re.escape(node_id)))
+        stamps = [path.stat().st_mtime_ns for path in deliveries.glob("{}-{}-*-g*.json".format(run_id, node_id))
+                  if exact.fullmatch(path.name)]
     except OSError:
         stamps = []
     if stamps:

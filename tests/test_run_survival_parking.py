@@ -149,6 +149,24 @@ class ParkingTests(Base):
         self.assertEqual(daemon.run(max_cycles=10)["status"], "parked")
         self.assertTrue(daemon._heal_state()["nodes"]["a"]["pm_notified"])
 
+    def test_an_unreached_pm_is_not_pushed_every_cycle(self):
+        for status in ("unknown", "timeout", "failed"):
+            with self.subTest(status=status):
+                self.setUp()
+                self.push_status = status
+                dm.register_pm_address(self.paths, RUN, "claude-code", "pm")
+                daemon = self.make(Supervisor(self.blocked()))  # blocked_grace=60, 30s per cycle
+                self.escalate(daemon, "a")
+                self.assertEqual(daemon.run(max_cycles=8)["status"], "max_cycles")  # 240s
+                # one push at once, then one per blocked_grace window: bounded, not one per cycle
+                blocked_pushes = [p for p in self.pushes if p[0] == "run_blocked_unknown"]
+                self.assertLessEqual(len(blocked_pushes), 1 + 240 // 60)
+                self.assertLess(len(blocked_pushes), 8)
+                self.assertNotIn("run_parked", self.events())
+                self.push_status = "sent"  # the retry still happens and settles the run (max_cycles is a running total)
+                self.assertEqual(daemon.run(max_cycles=20)["status"], "parked")
+                self.assertTrue(daemon._heal_state()["nodes"]["a"]["pm_notified"])
+
     def test_pm_address_notice_comes_from_the_real_notifier_receipt(self):
         notifier = dm.PmNotifier(self.paths, RUN)
         self.assertEqual(notifier("hi", "run_blocked_unknown")["status"], "no_address")
@@ -277,6 +295,14 @@ class StallLivenessTests(Base):
     def test_an_unreadable_signal_is_not_progress(self):
         self.assertEqual(worker_liveness.liveness_signal(self.paths, RUN, "n", {"status": "running"}), None)
         self.assertIn(stall.TIER_INVESTIGATE, self.beats(6, submit=False))
+
+    def test_a_node_id_that_prefixes_another_does_not_borrow_its_deliveries(self):
+        deliveries = self.paths.vibe / "provider-actions" / "deliveries"
+        deliveries.mkdir(parents=True, exist_ok=True)
+        (deliveries / ("%s-dev-api-developer-g1.json" % RUN)).write_text("{}", encoding="utf-8")
+        self.assertIsNone(worker_liveness.liveness_signal(self.paths, RUN, "dev", {"status": "running"}))
+        (deliveries / ("%s-dev-developer-g1.json" % RUN)).write_text("{}", encoding="utf-8")
+        self.assertIsNotNone(worker_liveness.liveness_signal(self.paths, RUN, "dev", {"status": "running"}))
 
 
 class ObservationOnlyTests(unittest.TestCase):

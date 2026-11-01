@@ -666,6 +666,10 @@ class Daemon:
         # Parking never leaves a delivered report or a mailbox request unserved:
         # the ticks that follow consume them first.  Work that stays unserved
         # for the whole grace period no longer holds the run back.
+        # Deliberate trade-off: a run must not stay open forever on a mailbox
+        # item nobody serves, so after ``blocked_grace`` it parks anyway.  The
+        # item stays in the mailbox and the run directory is kept, so
+        # ``run-restore`` or the next supervisor can still serve it.
         return not self._undelivered_work() or now - self._parked_since >= self.config.blocked_grace
 
     def _undelivered_work(self) -> List[str]:
@@ -703,8 +707,15 @@ class Daemon:
         if key in state["pushed"]:
             return True
         waiting = state.setdefault("announce_waiting", {})
-        if waiting.get(key) == "no_address" and not _file(self.paths, self.run_id, PM_ADDRESS_FILE).is_file():
-            return False  # already in the inbox; push again once an address is registered
+        entry = waiting.get(key)
+        if isinstance(entry, str):  # older heal-state: bare status, no timestamp
+            entry = {"status": entry, "at": 0}
+        if isinstance(entry, dict):
+            if entry.get("status") == "no_address":
+                if not _file(self.paths, self.run_id, PM_ADDRESS_FILE).is_file():
+                    return False  # already in the inbox; push again once an address is registered
+            elif self.clock() - float(entry.get("at") or 0) < max(self.config.blocked_grace, 1):
+                return False  # unreached receipt: retry once per blocked_grace (30 min default, same horizon as parking), not every cycle
         if status == "complete":
             text = "运行 %s 已结束：complete" % self.run_id
         elif blocked:
@@ -717,9 +728,9 @@ class Daemon:
             return False
         notified = result.get("status") in PM_NOTIFIED_STATUSES
         if not notified and status != "complete":
-            waiting[key] = str(result.get("status") or "unknown")
+            waiting[key] = {"status": str(result.get("status") or "unknown"), "at": self.clock()}
             self._save_heal_state(state)
-            self._log("product manager not reached (%s); run stays open" % waiting[key])
+            self._log("product manager not reached (%s); run stays open" % waiting[key]["status"])
             return False
         waiting.pop(key, None)
         self._mark_notified(state, blocked, result)
