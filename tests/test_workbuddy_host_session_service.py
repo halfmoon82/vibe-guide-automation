@@ -339,10 +339,13 @@ class SelfServedCloseoutTests(unittest.TestCase):
 
     def test_unreadable_task_registry_refuses_instead_of_waving_the_reviewer_through(self):
         create = self.drive_until_closeout_create()
-        (self.root / ".vibe" / "runs" / create["run_id"] / "tasks.json").write_text("{", encoding="utf-8")
-        refused = self.complete(create["run_id"], create, self.answer(create, reviewer_id="host-session#integration-review"))
-        self.assertEqual(refused.payload["status"], "blocked_invalid", refused.payload)
-        self.assertIsNone(self.store.result(create["action_id"]))
+        for damaged in ("{", "[]", '{"bindings": "none"}'):
+            with self.subTest(damaged=damaged):
+                (self.root / ".vibe" / "runs" / create["run_id"] / "tasks.json").write_text(damaged, encoding="utf-8")
+                refused = self.complete(create["run_id"], create,
+                                        self.answer(create, reviewer_id="host-session#integration-review"))
+                self.assertEqual(refused.payload["status"], "blocked_invalid", refused.payload)
+                self.assertIsNone(self.store.result(create["action_id"]))
 
 
 if __name__ == "__main__":
