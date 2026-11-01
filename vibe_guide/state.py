@@ -342,6 +342,7 @@ _EVENT_DATA_KEYS = {
     # kept only as bounded, credential-scrubbed text (``bounded_error_text``).
     "action_ref",
     "commits",
+    "base_inferred",
     "error",
     "change_request",
     "delivered",

@@ -1061,6 +1061,50 @@ def _public_runner(
 _WORKTREE_REPORT_KEYS = WORKTREE_PREFLIGHT_KEYS
 
 
+def _record_composed_bases(paths: ProjectPaths, monitor: Monitor, snapshot: RunSnapshot) -> bool:
+    """Record the baseline of a dispatched node no launcher reported on (the caller saves).
+
+    A Codex-visible dispatch builds the worktree outside vibe's launcher, so
+    nothing hands the CLI a ``worktree_base``.  When the node branch carries
+    the baseline commit vibe composed (main plus accepted upstreams), that
+    commit -- found by the shared ``node_base`` -- is the node's start; without
+    it the delivery check keeps inferring (and saying so).
+    """
+    from .scope_landing import _git_in, is_commit_sha, node_base
+
+    changed = False
+    for node_id, current in snapshot.nodes.items():
+        raw = str(current.get("worktree") or "")
+        if is_commit_sha(current.get("worktree_base")) or not raw.strip() \
+                or not (current.get("active_role") or current.get("active_task")):
+            continue
+        worktree = Path(raw)
+        if not worktree.is_absolute():
+            worktree = paths.root / worktree
+        if not (worktree / ".git").exists():
+            continue
+        try:
+            git = _git_in(worktree)
+            head = git(["rev-parse", "HEAD"])
+            project = _git_in(paths.root)(["rev-parse", "HEAD"])
+            if head.returncode != 0 or project.returncode != 0:
+                continue
+            base, inferred = node_base(git, None, project.stdout.strip())
+        except Exception:  # an unreadable branch is the delivery check's to report
+            continue
+        if inferred and base != project.stdout.strip() and _is_composed_baseline(git, base):
+            current["worktree_base"] = base
+            changed = True
+    return changed
+
+
+def _is_composed_baseline(git: Any, sha: str) -> bool:
+    from .worktree_base import BASELINE_AUTHOR_EMAIL
+
+    author = git(["log", "-1", "--format=%ae", sha])
+    return author.returncode == 0 and author.stdout.strip() == BASELINE_AUTHOR_EMAIL
+
+
 def _record_worktree_preflight(
     paths: ProjectPaths,
     monitor: Monitor,
@@ -1079,20 +1123,16 @@ def _record_worktree_preflight(
     """
     # Lazily, like the factory: the launcher module is optional at import time.
     from .adapters.claude_bg import WORKTREE_BLOCKED_EVENT, WORKTREE_CREATED_EVENT
+    from .scope_landing import is_commit_sha
 
-    changed = False
+    changed = _record_composed_bases(paths, monitor, snapshot)
     consumed = []
     for node_id, launcher in launchers or ():
         report = getattr(launcher, "worktree_preflight", None)
         if not isinstance(report, dict) or node_id not in snapshot.nodes:
             continue
         current = snapshot.nodes[node_id]
-        existing_base = current.get("worktree_base")
-        has_valid_base = (
-            isinstance(existing_base, str)
-            and len(existing_base) == 40
-            and all(char in "0123456789abcdefABCDEF" for char in existing_base)
-        )
+        has_valid_base = is_commit_sha(current.get("worktree_base"))
         event = report.get("event")
         if event == WORKTREE_BLOCKED_EVENT:
             data = {"run_id": snapshot.run_id, "node_id": node_id}
