@@ -221,8 +221,8 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 | `visibility` | 任意 | `{"direct_enter": true, "visible": true}` | 两个标志都必须为 true |
 | `visibility`（失败） | 任意 | `{"failed": true, "reason": "<填写>"}` | 没能观察到任务时如实说明原因 |
 | `wait`（未完） | 任意 | `{"status": "timeout"}` | 未完；`cursor` 给就必须是非空字符串（≤4096、无 NUL），不知道就不给 |
-| `wait`（完） | developer | `{"delivery_evidence": {"completion_marker": "<填写>", "delivery_path": "<填写>", "thread_status": "complete"}, "event": "complete", "status": "completed"}` | （嵌套对象，三键齐全，摊平无效）；`cursor` 知道才给（真实值），不知道就整个不给 |
-| `wait`（完） | reviewer | `{"event": "accepted", "evidence": {"summary": "<填写>"}, "status": "completed"}` | P0–P2 清零证据；`cursor` 知道才给（真实值），不知道就整个不给 |
+| `wait`（完） | developer | `{"cursor": "<填写>", "delivery_evidence": {"completion_marker": "<填写>", "delivery_path": "<填写>", "thread_status": "complete"}, "event": "complete", "status": "completed"}` | （嵌套对象，三键齐全，摊平无效）；`cursor` 填真实值（servicer 路径的交付门读它），不知道就整个删掉，别留占位符 |
+| `wait`（完） | reviewer | `{"cursor": "<填写>", "event": "accepted", "evidence": {"summary": "<填写>"}, "status": "completed"}` | P0–P2 清零证据；`cursor` 填真实值，不知道就整个删掉，别留占位符 |
 | `resume` | 任意 | `{"resumed": true}` | 沿用原会话 id，不回写绑定 |
 <!-- mailbox-table:end -->
 

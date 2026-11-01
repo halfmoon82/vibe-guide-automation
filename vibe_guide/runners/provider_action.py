@@ -288,13 +288,14 @@ MAILBOX_FIELD_TABLE = (
     ("wait", None, "pending", {"status": "timeout"},
      "未完；`cursor` 给就必须是非空字符串（≤4096、无 NUL），不知道就不给"),
     ("wait", "developer", "complete",
-     {"status": "completed", "event": "complete",
+     {"status": "completed", "event": "complete", "cursor": PLACEHOLDER,
       "delivery_evidence": {"completion_marker": PLACEHOLDER, "delivery_path": PLACEHOLDER,
                             "thread_status": "complete"}},
-     "（嵌套对象，三键齐全，摊平无效）；`cursor` 知道才给（真实值），不知道就整个不给"),
+     "（嵌套对象，三键齐全，摊平无效）；`cursor` 填真实值（servicer 路径的交付门读它），不知道就整个删掉，别留占位符"),
     ("wait", "reviewer", "complete",
-     {"status": "completed", "event": "accepted", "evidence": {"summary": PLACEHOLDER}},
-     "P0–P2 清零证据；`cursor` 知道才给（真实值），不知道就整个不给"),
+     {"status": "completed", "event": "accepted", "cursor": PLACEHOLDER,
+      "evidence": {"summary": PLACEHOLDER}},
+     "P0–P2 清零证据；`cursor` 填真实值，不知道就整个删掉，别留占位符"),
     ("resume", None, "ok", {"resumed": True}, "沿用原会话 id，不回写绑定"),
 )
 
