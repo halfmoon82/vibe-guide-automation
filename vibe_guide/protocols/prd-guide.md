@@ -254,6 +254,22 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 4. `severity` 只收 `p0`–`p4`，`status` 只收 `open`/`resolved`/`accepted`/`waived`：写 `critical`、`p5` 判 `integration finding schema is invalid`，写 `pending` 判 `integration finding status is invalid`。
 5. 两个判断的 `status` 同样封闭：写 `ok`、`passed` 判 `... evidence is incomplete`，写 `unknown`/`expired`/`stale` 判 `... evidence is unknown or expired`。
 
+#### 整合审查发现缺陷：指给上游节点返工
+
+整合审查报缺陷别只写 `review_finding` 一句话：不带 `target_node_id` 且缺陷文件不在任何已验收节点范围内时，只会让整合审查自己返工重审，三轮后停放。要让缺陷回到出问题的上游节点，在 `worker-deliver` 的 payload 顶层带 `target_node_id`（已验收节点的 id），需要新增文件再带 `scope_expansion`：
+
+```json
+{"event": "review_finding", "finding": {"severity": "p1", "detail": "<一句话>"},
+ "target_node_id": "mailbox-shape",
+ "scope_expansion": {"files": ["tests/test_mailbox_shape.py"], "reason": "<为什么只是补测试>",
+   "acceptance_examples_unchanged": true, "adds_third_party_dependency": false,
+   "visibility_downgrade": false}}
+```
+
+- 缺陷文件全在该节点原范围内：不用 `scope_expansion`（`scope-expand` 也回「无新增文件」），节点直接进返工，返工提示带上整合审查的发现。只给 `files`（缺陷文件列表）且都落在同一个已验收节点的范围内，监控自动指给它。
+- 只有改验收判定、新增第三方依赖、或文件被别的活跃节点占用才报产品经理复核，文案与上一条不同。
+- 上游节点的 HEAD 都没变时不会再开新的整合审查，节点显示「等待返工」。
+
 ### 6.3 派发合同
 
 `request.child_binding` 的 `worktree`、`branch`、`allowlist` 由 vibe 按节点 id 派生，每个节点互不相同。**创建会话必须把工作目录设成合同里的 `worktree`**，在合同的 `branch` 上开发，只碰 `allowlist` 里的文件。
