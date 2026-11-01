@@ -224,6 +224,10 @@ def doctor(report):
             warnings.append(label + ': vibe 监工会话例外标记块被人工改过')
         elif state == 'stale':
             warnings.append(label + ': vibe 监工会话例外标记块不是当前版本')
+        elif state == 'symlink_outside':
+            warnings.append(label + ': 符号链接指向候选文件之外，vibe 不会写入')
+        elif state == 'permission':
+            warnings.append(label + ': 没有读取权限')
     malformed = bool(report.skill_records_error or len(valid_skills) != len(report.skills))
     status = 'blocked' if malformed else ('attention' if issues else 'ready')
     proposals = []

@@ -14,7 +14,7 @@ with each file and its cause, and the node waits for the supervisor.
 import fnmatch
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .dag import _write_paths_overlap, _write_scope_paths
 from .planner import (
@@ -24,7 +24,11 @@ from .planner import (
     resolve_scope_expansion,
 )
 from .worker_questions import KIND_SCOPE_LANDING, park
+from .worktree_base import BASELINE_AUTHOR_EMAIL
 
+#: Value of the ``base`` key on a ``scope_auto_expanded`` rule whose baseline
+#: vibe worked out itself instead of reading the one it recorded.
+BASE_INFERRED = "inferred"
 CAUSE_HELD = "held_by_other_node"
 CAUSE_NOT_EXPANDABLE = "not_auto_expandable"
 CAUSE_UNREADABLE = "landing_unreadable"
@@ -119,15 +123,45 @@ def _project_head(monitor: Any) -> str:
     return project.stdout.strip()
 
 
-def _resolve_base(monitor: Any, current: Dict[str, Any], git: GitRunner, project_head: str) -> str:
-    recorded = current.get("worktree_base")
-    if isinstance(recorded, str) and recorded.strip():
-        if git(["rev-parse", "--verify", "--quiet", recorded + "^{commit}"]).returncode == 0:
-            return recorded
+#: ``(sha, inferred)``: the node baseline and whether vibe had to work it out.
+NodeBase = Tuple[str, bool]
+
+
+def is_commit_sha(value: Any) -> bool:
+    return (isinstance(value, str) and len(value) == 40
+            and all(char in "0123456789abcdefABCDEF" for char in value))
+
+
+def node_base(git: GitRunner, recorded: Any, project_head: str) -> NodeBase:
+    """The one answer to "where did this node's own work start".
+
+    Every landing judgement (scope, empty landing), the Claude background
+    launcher and the CLI recorder go through here, so they cannot disagree.
+    Order: the baseline recorded for the node; else the newest baseline commit
+    vibe itself composed into the branch (main plus accepted upstreams); else
+    the merge-base with the project HEAD.  The last two are inferred and say
+    so (``inferred=True``): the merge-base counts preset baseline commits as
+    the worker's own work, which is why a refusal built on it must say that.
+    """
+    if isinstance(recorded, str) and recorded.strip() \
+            and git(["rev-parse", "--verify", "--quiet", recorded + "^{commit}"]).returncode == 0:
+        return recorded, False
+    composed = git(["log", "-1", "--format=%H", "--fixed-strings",
+                    "--author=" + BASELINE_AUTHOR_EMAIL, "HEAD"])
+    if composed.returncode == 0 and is_commit_sha((composed.stdout or "").strip()):
+        return composed.stdout.strip(), True
     merged = git(["merge-base", "HEAD", project_head])
     if merged.returncode != 0 or not merged.stdout.strip():
         raise ScopeLandingUnknown("the node branch shares no history with the project HEAD")
-    return merged.stdout.strip()
+    return merged.stdout.strip(), True
+
+
+def _source_commits(git: GitRunner, base: str, path: str) -> List[str]:
+    """Short ids of the commits in ``base..HEAD`` that touched ``path``."""
+    result = git(["log", "--format=%h", "-n", "5", base + "..HEAD", "--", path])
+    if result.returncode != 0:
+        return []
+    return [line for line in (result.stdout or "").split() if line]
 
 
 def uncommitted_files(git: GitRunner) -> List[str]:
@@ -221,7 +255,7 @@ def landing_report(monitor: Any, snapshot: Any, node_id: str) -> Optional[Dict[s
         return None
     git = _git_in(worktree)
     project_head = _project_head(monitor)
-    base = _resolve_base(monitor, current, git, project_head)
+    base, base_inferred = node_base(git, current.get("worktree_base"), project_head)
     merged_in = ["refs/heads/" + branch
                  for branch in upstream_branches(monitor.nodes, snapshot.nodes, node_id)]
     # The main commit the branch last took in (a merge of or rebase onto a
@@ -262,16 +296,29 @@ def landing_report(monitor: Any, snapshot: Any, node_id: str) -> Optional[Dict[s
             rejected.append({"path": path, "cause": CAUSE_NOT_EXPANDABLE})
         else:
             expanded.append({"path": path, "rule": rule})
-    return {"files": files, "expanded": expanded, "rejected": rejected, "base": base}
+    for item in rejected:
+        if item["cause"] in (CAUSE_HELD, CAUSE_NOT_EXPANDABLE):
+            item["commits"] = _source_commits(git, base, item["path"])
+    if base_inferred:
+        for item in expanded:
+            item["base"] = BASE_INFERRED
+            item["commits"] = ",".join(_source_commits(git, base, item["path"]))
+    return {"files": files, "expanded": expanded, "rejected": rejected, "base": base,
+            "base_inferred": base_inferred}
 
 
-def _rejection_text(rejected: List[Dict[str, str]], error: Optional[str] = None) -> str:
+def _rejection_text(rejected: List[Dict[str, Any]], error: Optional[str] = None,
+                    base_inferred: bool = False) -> str:
     if error:
         return ("交付被拒收：无法核对这次交付实际改了哪些文件（{}）。"
                 "确认 worker 分支状态后再续派。".format(error))
-    def listed(items: List[Dict[str, str]]) -> str:
-        return "；".join("{}（{}）".format(item["path"], _CAUSE_TEXT.get(item["cause"], item["cause"]))
-                        for item in items)
+    def listed(items: List[Dict[str, Any]]) -> str:
+        def one(item: Dict[str, Any]) -> str:
+            text = _CAUSE_TEXT.get(item["cause"], item["cause"])
+            if item.get("commits"):
+                text += "；引入它的提交 " + "、".join(item["commits"])
+            return "{}（{}）".format(item["path"], text)
+        return "；".join(one(item) for item in items)
 
     parts = []
     loose = [item for item in rejected if item["cause"] == CAUSE_UNCOMMITTED]
@@ -282,6 +329,9 @@ def _rejection_text(rejected: List[Dict[str, str]], error: Optional[str] = None)
     if outside:
         parts.append("以下文件超出本节点的授权文件范围，且不能自动扩范围：{}。"
                      "请撤回这些改动后重新交付；确需改动时由监工按授权流程处理。".format(listed(outside)))
+    if base_inferred:
+        parts.append("注意：本节点没有记录起点（worktree_base），起点是按 merge-base 推算的，"
+                     "预置在分支上的基线提交可能被算成 worker 的改动；请对照上面的提交判断。")
     return "交付被拒收：" + "".join(parts)
 
 
@@ -354,11 +404,18 @@ def check_delivery(monitor: Any, snapshot: Any, node_id: str, active: Dict[str, 
     if report is None:
         return True
     if report["rejected"]:
-        snapshot.nodes[node_id][REJECTION_KEY] = list(report["rejected"])
-        park(monitor, snapshot, node_id, active, _rejection_text(report["rejected"]),
+        snapshot.nodes[node_id][REJECTION_KEY] = [
+            {key: value for key, value in item.items() if key != "commits"}
+            for item in report["rejected"]
+        ]
+        park(monitor, snapshot, node_id, active,
+             _rejection_text(report["rejected"], base_inferred=report["base_inferred"]),
              kind=KIND_SCOPE_LANDING, event_name="scope_landing_rejected",
              event_data={
                  "files": [item["path"] for item in report["rejected"]],
+                 "commits": ["{}:{}".format(item["path"], ",".join(item["commits"]))
+                             for item in report["rejected"] if item.get("commits")],
+                 "base_inferred": bool(report["base_inferred"]),
                  "rejection_code": "scope_landing:" + ",".join(
                      "{}={}".format(item["path"], item["cause"]) for item in report["rejected"]),
              },

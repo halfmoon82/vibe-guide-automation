@@ -61,6 +61,8 @@ from .supervisor import (
     heal_verify,
     stall_peek,
     register_supervisor_address,
+    record_owner_gate,
+    shift_model_warning,
     session_cwd_warning,
     project_root_worktree_warning,
     release_supervisor_hold,
@@ -245,7 +247,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon'),
+        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon', 'run-restore'),
     )
     parser.add_argument("daemon_action", nargs="?", choices=("start", "status", "stop", "run", "register-pm", "inbox"))
     parser.add_argument("--peek", action="store_true", help="daemon inbox: 只看不推进游标")
@@ -1059,6 +1061,50 @@ def _public_runner(
 _WORKTREE_REPORT_KEYS = WORKTREE_PREFLIGHT_KEYS
 
 
+def _record_composed_bases(paths: ProjectPaths, monitor: Monitor, snapshot: RunSnapshot) -> bool:
+    """Record the baseline of a dispatched node no launcher reported on (the caller saves).
+
+    A Codex-visible dispatch builds the worktree outside vibe's launcher, so
+    nothing hands the CLI a ``worktree_base``.  When the node branch carries
+    the baseline commit vibe composed (main plus accepted upstreams), that
+    commit -- found by the shared ``node_base`` -- is the node's start; without
+    it the delivery check keeps inferring (and saying so).
+    """
+    from .scope_landing import _git_in, is_commit_sha, node_base
+
+    changed = False
+    for node_id, current in snapshot.nodes.items():
+        raw = str(current.get("worktree") or "")
+        if is_commit_sha(current.get("worktree_base")) or not raw.strip() \
+                or not (current.get("active_role") or current.get("active_task")):
+            continue
+        worktree = Path(raw)
+        if not worktree.is_absolute():
+            worktree = paths.root / worktree
+        if not (worktree / ".git").exists():
+            continue
+        try:
+            git = _git_in(worktree)
+            head = git(["rev-parse", "HEAD"])
+            project = _git_in(paths.root)(["rev-parse", "HEAD"])
+            if head.returncode != 0 or project.returncode != 0:
+                continue
+            base, inferred = node_base(git, None, project.stdout.strip())
+        except Exception:  # an unreadable branch is the delivery check's to report
+            continue
+        if inferred and base != project.stdout.strip() and _is_composed_baseline(git, base):
+            current["worktree_base"] = base
+            changed = True
+    return changed
+
+
+def _is_composed_baseline(git: Any, sha: str) -> bool:
+    from .worktree_base import BASELINE_AUTHOR_EMAIL
+
+    author = git(["log", "-1", "--format=%ae", sha])
+    return author.returncode == 0 and author.stdout.strip() == BASELINE_AUTHOR_EMAIL
+
+
 def _record_worktree_preflight(
     paths: ProjectPaths,
     monitor: Monitor,
@@ -1077,20 +1123,16 @@ def _record_worktree_preflight(
     """
     # Lazily, like the factory: the launcher module is optional at import time.
     from .adapters.claude_bg import WORKTREE_BLOCKED_EVENT, WORKTREE_CREATED_EVENT
+    from .scope_landing import is_commit_sha
 
-    changed = False
+    changed = _record_composed_bases(paths, monitor, snapshot)
     consumed = []
     for node_id, launcher in launchers or ():
         report = getattr(launcher, "worktree_preflight", None)
         if not isinstance(report, dict) or node_id not in snapshot.nodes:
             continue
         current = snapshot.nodes[node_id]
-        existing_base = current.get("worktree_base")
-        has_valid_base = (
-            isinstance(existing_base, str)
-            and len(existing_base) == 40
-            and all(char in "0123456789abcdefABCDEF" for char in existing_base)
-        )
+        has_valid_base = is_commit_sha(current.get("worktree_base"))
         event = report.get("event")
         if event == WORKTREE_BLOCKED_EVENT:
             data = {"run_id": snapshot.run_id, "node_id": node_id}
@@ -1969,6 +2011,10 @@ def _snapshot_result(
         text += "\n" + _render_pending_verification(pending_verification)
     if paths is not None:
         from . import daemon as daemon_module
+        notice = daemon_module.pm_address_notice(paths, snapshot.run_id)
+        if notice:
+            payload["pm_address"] = {"status": "unregistered", "notice": notice}
+            text += "\n" + notice
         unresolved = daemon_module.unresolved_report(paths, snapshot.run_id, snapshot)
         if unresolved:
             payload["unresolved"] = unresolved
@@ -2518,7 +2564,30 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             interval_for=lambda beat_payload: _beat_interval(paths, args.run_id, beat_payload, persist=True),
             preflight_kwargs=kwargs,
         )
+        from . import daemon as daemon_module
+        notice = daemon_module.pm_address_notice(paths, args.run_id)
+        if notice:
+            payload = {**payload, "pm_address": {"status": "unregistered", "notice": notice}}
+            text = (text + "\n" if text else "") + notice
         return _result(SUCCESS if ok else UNKNOWN, {"command": args.command, **payload}, text, args.as_json)
+
+    if args.command == "run-restore":
+        if not args.run_id:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        from . import daemon as daemon_module
+        try:
+            payload = daemon_module.restore_run(paths, args.run_id)
+        except (OSError, ValueError, TypeError) as error:
+            return _result(UNKNOWN, {"command": args.command, "status": "unknown", "reason": str(error)[:200]},
+                           "恢复归档失败：" + str(error)[:200], args.as_json)
+        if payload["status"] == "restored":
+            text = "已恢复运行 {}（备份：{}；守护程序：{}）".format(
+                args.run_id, payload.get("backup"), (payload.get("daemon") or {}).get("status"))
+        elif payload["status"] == "already_live":
+            text = "运行 {} 已在 .vibe/runs/ 下，无需恢复，未做任何改动".format(args.run_id)
+        else:
+            text = "未恢复：{}".format(payload.get("reason") or payload["status"])
+        return _result(SUCCESS if payload["status"] in ("restored", "already_live") else UNKNOWN, payload, text, args.as_json)
 
     if args.command == "decision-raise":
         if not (args.run_id and args.node_id and args.decision_question):
@@ -2607,6 +2676,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     if payload["state"] != "rotate":
                         payload["state"] = "unknown"
             return payload
+        # A foreign session record is refused before any cached receipt can answer.
+        payload = record_owner_gate(paths, args.run_id, args.session_record,
+                                    command_prefix=supervisor_command_prefix)
+        if payload is not None:
+            return _result(UNKNOWN, {"command": args.command, **payload},
+                           "监工预检：register_first", args.as_json)
         # Contract drift is checked before any cached receipt can answer (#220).
         payload = supervisor_contract_drift(paths, args.run_id)
         if payload is None:
@@ -2657,6 +2732,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             else:
                 why = "记录里还没有上下文用量"
             text += "；未记下接班起点（{}），换班按绝对阈值计算".format(why)
+        model_warning = shift_model_warning(paths, args.run_id)
+        if model_warning:
+            text += "；警告：" + model_warning
         cwd_warning = session_cwd_warning(paths, args.session_record)
         if cwd_warning:
             text += "；警告：" + cwd_warning
@@ -2664,6 +2742,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         if worktree_warning:
             text += "；警告：" + worktree_warning
         payload = {"command": args.command, "status": "ok", "current": entry}
+        if model_warning:
+            payload["model_warning"] = model_warning
         if cwd_warning:
             payload["session_cwd_warning"] = cwd_warning
         if worktree_warning:
@@ -2747,7 +2827,22 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 args.run_id, args.node_id, args.role, payload, args.worker_generation
             )
         except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
-            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "自报格式错误：" + str(error), args.as_json)
+            # A refused report ends the worker's turn like any other path, so
+            # the wake instruction rides on the refusal itself.
+            refusal = {"command": args.command, "status": "blocked_invalid", "reason": str(error)}
+            text = "自报格式错误：" + str(error)
+            try:
+                address = current_supervisor_address(
+                    paths, args.run_id, node_id=args.node_id, role=args.role,
+                    generation=args.worker_generation)
+            except (OSError, TypeError, ValueError):
+                address = None
+            wake = address.get("wake") if isinstance(address, dict) else None
+            if wake:
+                refusal["wake"] = wake
+                text += "\n" + ("唤醒：用 {} 向 {} 发送「{}」".format(wake["channel"], wake["target"], wake["signal"])
+                                if wake["channel"] else "唤醒：无推送通道（{}）".format(wake["reason"]))
+            return _result(BLOCKED, refusal, text, args.as_json)
         # Advisory notes (e.g. a dispatch that recorded no project mount) must
         # reach the worker's eyes, not just the JSON payload -- the worker is
         # the one who can tell the supervisor to re-dispatch (issue #219).

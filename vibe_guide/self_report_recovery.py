@@ -25,15 +25,27 @@ Anything else raises ``ValueError`` before the first write.  A newer wait the
 monitor issued afterwards (same handle, no result) is retired with an audit
 marker; one that already has a result refuses the recovery.
 
+Role: the recovery follows the node's anchor role -- ``reviewer`` for a
+reviewer-only node (integration review), ``developer`` for every other node.
+
 Hybrid state: when that wait was already retired (as answered by the
 self-report receipt) but the handle still names it as ``pending_action`` and
 the binding holds a cursor, the same proof applies and recovery clears the
 dangling action instead of refusing for the cursor.  A cursor with a live wait
 or a wait retired for another reason is still refused.
+
+Parked reviewer: a reviewer that reported and was then stopped (a review-loop
+park, ``change_reviewer_or_split_node``) leaves an archived delivery nothing
+consumed, because the parked node has no live handle to wait on.
+``consume_parked_delivery`` runs inside ``Monitor.resume``: it finds the
+reviewer's handle metadata, consumes the archive once through a wait of the
+same task/generation, and feeds the bound result back through the normal
+event path.  The consumed archive is the once-only guard, so a second resume
+finds nothing to do.
 """
 from typing import Any, Dict
 
-from .adapters.task_provider import ProviderActionStore
+from .adapters.task_provider import ProviderActionStore, ProviderUnavailable
 from .contracts import RunHandle
 from .evidence import evaluate_delivery_evidence
 from .state import interprocess_lock, load_events, load_snapshot, run_dir, save_snapshot
@@ -42,8 +54,13 @@ from .supervisor import SupervisorLease
 SELF_REPORT_DELIVERY_RECONCILED = "self_report_delivery_reconciled"
 SELF_REPORTED_DELIVERY_PACKAGE = frozenset({"kind", "node_id"})
 _RETIRE_REASON = "answered_by_self_report_receipt"
-_ROLE = "developer"
 _ENTRY = "monitor.reconcile_self_reported_delivery"
+#: Events a bound self-report may replay as, by role.  A reviewer reports its
+#: conclusion (accepted / review_finding) rather than a developer handoff.
+_REPLAY_EVENTS = {
+    "developer": frozenset({"delivered", "complete"}),
+    "reviewer": frozenset({"delivered", "complete", "accepted", "review_finding"}),
+}
 #: The only node events the cursor refusal and its re-polls leave behind.
 _STUCK_PATTERN = frozenset({"blocked_unknown", "retry_scheduled", "unknown", "timeout",
                             "acceptance_rejected"})
@@ -64,6 +81,10 @@ def _retired_reason(store, action_id: str, run_id: str):
             and marker.get("request_digest") == action.get("request_digest")):
         return marker.get("reason")
     return None
+
+
+def _role_of(monitor, node_id: str, current: Dict[str, Any]) -> str:
+    return monitor._primary_role(node_id, current)
 
 
 def _require(condition: bool, reason: str) -> None:
@@ -88,18 +109,20 @@ def _collect(monitor, snapshot, node_id: str, runner) -> Dict[str, Any]:
     current = snapshot.nodes[node_id]
     _require(current.get("status") in {"blocked_unknown", "retry_pending"},
              "node is not blocked_unknown or retry_pending")
+    role = _role_of(monitor, node_id, current)
+    generation_key = "review_generation" if role == "reviewer" else "developer_generation"
     active = current.get("active_task")
-    _require(isinstance(active, dict) and active.get("role") == _ROLE,
-             "node has no active developer task")
+    _require(isinstance(active, dict) and active.get("role") == role,
+             "node has no active {} task".format(role))
     handle_id = active.get("handle_id")
     generation = active.get("generation")
     task_id = active.get("task_id")
     _require(isinstance(handle_id, str) and handle_id and snapshot.handles.get(node_id) == handle_id,
              "active task handle is not the registered handle")
     _require(type(generation) is int and generation >= 1
-             and current.get("developer_generation") == generation
-             and current.get("developer_identity") == task_id,
-             "active task is not the node's current developer generation")
+             and current.get(generation_key) == generation
+             and current.get(role + "_identity") == task_id,
+             "active task is not the node's current {} generation".format(role))
     _require(current.get("start_intent") is None, "node has a pending start intent")
     retry = current.get("retryable_action")
     _require(retry is None or (isinstance(retry, dict) and retry.get("same_task") is True
@@ -107,16 +130,16 @@ def _collect(monitor, snapshot, node_id: str, runner) -> Dict[str, Any]:
                                and not retry.get("successor")),
              "node has a pending retry of another kind")
 
-    binding = monitor._load_task_binding(snapshot, node_id, _ROLE)
+    binding = monitor._load_task_binding(snapshot, node_id, role)
     _require(binding.task_id == task_id and binding.generation == generation,
              "task binding is not the active task")
 
     store = ProviderActionStore(monitor.paths)
-    archive = store._read(store._delivery_path(snapshot.run_id, node_id, _ROLE, generation))
+    archive = store._read(store._delivery_path(snapshot.run_id, node_id, role, generation))
     payload = archive.get("payload")
     _require(isinstance(payload, dict), "archived self-report is missing")
     delivery = payload.get("delivery_evidence")
-    receipt = store.self_report_receipt(snapshot.run_id, node_id, _ROLE, generation,
+    receipt = store.self_report_receipt(snapshot.run_id, node_id, role, generation,
                                         binding.task_id, binding.host or binding.hostId, delivery)
     _require(receipt is not None, "no consumed self-report receipt for this task and generation")
     result = store.result(receipt["action_id"])
@@ -152,7 +175,7 @@ def _collect(monitor, snapshot, node_id: str, runner) -> Dict[str, Any]:
              "the run's runner cannot replay a wait result")
     metadata = store._read(runner._handle_path(handle_id))
     _require(metadata.get("run_id") == snapshot.run_id and metadata.get("node_id") == node_id
-             and metadata.get("role") == _ROLE and metadata.get("task_id") == task_id
+             and metadata.get("role") == role and metadata.get("task_id") == task_id
              and metadata.get("generation") == generation,
              "handle metadata names another task")
     later = metadata.get("pending_action")
@@ -162,7 +185,7 @@ def _collect(monitor, snapshot, node_id: str, runner) -> Dict[str, Any]:
         later_action = store.action(later)
         _require(later_action.get("run_id") == snapshot.run_id
                  and later_action.get("issue_id") == node_id
-                 and later_action.get("role") == _ROLE
+                 and later_action.get("role") == role
                  and later_action.get("generation") == generation
                  and later_action.get("sequence", 0) > receipt.get("sequence", 0),
                  "pending wait is not a later wait of this task")
@@ -176,7 +199,7 @@ def _collect(monitor, snapshot, node_id: str, runner) -> Dict[str, Any]:
         _require(retired, "binding has a cursor; the normal wait path applies")
         _require(_retired_reason(store, later, snapshot.run_id) == _RETIRE_REASON,
                  "pending wait was retired for another reason")
-    return {"active": active, "handle_id": handle_id, "generation": generation,
+    return {"role": role, "active": active, "handle_id": handle_id, "generation": generation,
             "task_id": task_id, "receipt": receipt, "result": result,
             "metadata": metadata, "later": later, "retired": retired, "store": store}
 
@@ -199,28 +222,139 @@ def _reconcile_locked(monitor, run_id: str, node_id: str, runner):
         metadata["pending_operation"] = None
 
     current = snapshot.nodes[node_id]
-    current["status"] = "running"
+    current["status"] = "review" if proof["role"] == "reviewer" else "running"
     current["retryable_action"] = None
     current["quarantine"] = None
     current["reason"] = None
     current["recovery_action"] = None
     receipt = proof["receipt"]
+    role = proof["role"]
     monitor._record(snapshot, SELF_REPORT_DELIVERY_RECONCILED, {
-        "run_id": run_id, "node_id": node_id, "role": _ROLE,
+        "run_id": run_id, "node_id": node_id, "role": role,
         "task_id": proof["task_id"], "generation": proof["generation"],
         "handle_id": proof["handle_id"],
         "action_id": receipt["action_id"], "request_digest": receipt["request_digest"],
         **({"source": "retired_wait_with_cursor"} if proof["retired"] else {}),
     })
     handle = RunHandle(proof["handle_id"])
-    claims = {"node_id": node_id, "role": _ROLE, "task_id": proof["task_id"],
+    claims = {"node_id": node_id, "role": role, "task_id": proof["task_id"],
               "handle_id": proof["handle_id"], "generation": proof["generation"]}
     # The same projection a poll applies to this bound result.
     events = runner._wait_result(handle, metadata, claims, proof["result"])
-    _require(len(events) == 1 and events[0].event in {"delivered", "complete"},
+    _require(len(events) == 1 and events[0].event in _REPLAY_EVENTS[role],
              "bound result does not replay as a delivery")
     monitor._apply_event(snapshot, node_id, proof["handle_id"], events[0], runner)
     monitor._record_topology_projection(snapshot, _ENTRY)
     monitor._refresh_run_status(snapshot)
     save_snapshot(monitor.paths, snapshot)
     return snapshot
+
+
+_PARKED_SOURCE = "parked_resume"
+
+
+def _find_handle(store, runner, snapshot, node_id: str, role: str, task_id: str,
+                 generation: int):
+    """The (handle_id, metadata) a stopped task left behind, or (None, None)."""
+    directory = store._directory("handles")
+    for path in sorted(directory.glob("*.json")):
+        try:
+            metadata = store._read(path)
+        except (OSError, ValueError):
+            continue
+        if (isinstance(metadata, dict) and metadata.get("run_id") == snapshot.run_id
+                and metadata.get("node_id") == node_id and metadata.get("role") == role
+                and metadata.get("task_id") == task_id
+                and metadata.get("generation") == generation):
+            return path.stem, metadata
+    return None, None
+
+
+def consume_parked_delivery(monitor, snapshot, node_id: str, runner) -> bool:
+    """Consume a parked reviewer's unconsumed self-report once, inside resume.
+
+    Returns True when a delivery was consumed and replayed (``snapshot`` was
+    mutated; the caller saves), False when there is nothing to do.  Any doubt
+    returns False before the first write: the parked node stays parked.
+    """
+    current = snapshot.nodes.get(node_id)
+    if not isinstance(current, dict) or current.get("status") != "blocked_unknown":
+        return False
+    if (current.get("active_task") is not None or current.get("start_intent") is not None
+            or node_id in snapshot.handles
+            or isinstance(current.get("retryable_action"), dict)):
+        return False
+    role = "reviewer"
+    generation = current.get("review_generation")
+    task_id = current.get(role + "_identity")
+    if type(generation) is not int or generation < 1 or not isinstance(task_id, str) or not task_id:
+        return False
+    if not (current.get("reviewer_replacement_required") is True
+            or monitor._primary_role(node_id, current) == "reviewer"):
+        return False
+    try:
+        binding = monitor._load_task_binding(snapshot, node_id, role)
+    except (FileNotFoundError, OSError, TypeError, ValueError):
+        return False
+    if (binding.task_id != task_id or binding.generation != generation
+            or binding.status not in {"stopped", "failed", "archived"}):
+        return False
+    store = ProviderActionStore(monitor.paths)
+    try:
+        archive = store._read(store._delivery_path(snapshot.run_id, node_id, role, generation))
+    except (OSError, ValueError):
+        return False
+    if (not isinstance(archive, dict) or archive.get("consumed_by")
+            or archive.get("run_id") != snapshot.run_id or archive.get("issue_id") != node_id
+            or archive.get("role") != role or archive.get("generation") != generation
+            or not isinstance(archive.get("payload"), dict)):
+        return False
+    handle_id, metadata = _find_handle(store, runner, snapshot, node_id, role, task_id, generation)
+    if (handle_id is None or not hasattr(runner, "_issue_wait") or not hasattr(runner, "_wait_result")
+            or metadata.get("pending_action")):
+        return False
+    try:
+        action = runner._issue_wait(RunHandle(handle_id), metadata)
+    except (KeyError, OSError, TypeError, ValueError, PermissionError, ProviderUnavailable):
+        return False
+    # Issuing a wait hands an unconsumed archive to it; consume explicitly only
+    # when that did not happen.  Either way the archive ends up consumed by
+    # exactly this wait, which is what makes the recovery once-only.
+    result = store.result(action["action_id"])
+    if result is None:
+        store._consume_archived_delivery(snapshot.run_id, node_id, role, generation)
+        result = store.result(action["action_id"])
+    try:
+        taken = store._read(store._delivery_path(snapshot.run_id, node_id, role, generation))
+    except (OSError, ValueError):
+        taken = None
+    if (not isinstance(result, dict) or not isinstance(taken, dict)
+            or taken.get("consumed_by") != action["action_id"]):
+        if result is None:
+            store.retire_wait(action["action_id"], "parked_delivery_not_consumed")
+            metadata["pending_action"] = None
+            metadata["pending_operation"] = None
+            store._atomic(runner._handle_path(handle_id), metadata)
+        return False
+    # Re-register the stopped task only long enough to apply its conclusion.
+    current["status"] = "review"
+    current["active_role"] = role
+    current["active_task"] = {"role": role, "task_id": task_id, "generation": generation,
+                              "handle_id": handle_id}
+    current["reviewer_replacement_required"] = False
+    current["recovery_action"] = None
+    current["reason"] = None
+    snapshot.handles[node_id] = handle_id
+    monitor._record(snapshot, SELF_REPORT_DELIVERY_RECONCILED, {
+        "run_id": snapshot.run_id, "node_id": node_id, "role": role,
+        "task_id": task_id, "generation": generation, "handle_id": handle_id,
+        "action_id": action["action_id"], "source": _PARKED_SOURCE,
+    })
+    claims = {"node_id": node_id, "role": role, "task_id": task_id,
+              "handle_id": handle_id, "generation": generation}
+    events = runner._wait_result(RunHandle(handle_id), metadata, claims, result)
+    if len(events) != 1:
+        monitor._mark_blocked_unknown(snapshot, node_id, "parked delivery did not replay as one event")
+        return True
+    monitor._apply_event(snapshot, node_id, handle_id, events[0], runner)
+    return True
