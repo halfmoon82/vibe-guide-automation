@@ -362,7 +362,13 @@ def validate_integration_review_evidence(snapshot: Any, evidence: Dict[str, Any]
     if not isinstance(scope, dict) or not isinstance(scope.get("nodes"), list):
         raise ValueError("integration aggregated scope is invalid")
     nodes = _snapshot_value(snapshot, "nodes", {})
-    expected_nodes = [node_id for node_id in nodes if node_id != "integration-review"] if isinstance(nodes, dict) else []
+    # The monitor-driven remote-delivery ring (issue #371) is appended to the
+    # run after the review and is not part of the aggregate the reviewer was
+    # held to; it must not make the reviewed scope look drifted.
+    expected_nodes = [
+        node_id for node_id in nodes
+        if node_id not in ("integration-review", "remote-delivery")
+    ] if isinstance(nodes, dict) else []
     if scope.get("nodes") != expected_nodes or len(set(scope["nodes"])) != len(scope["nodes"]):
         raise ValueError("integration aggregated scope conflicts with run")
     if scope.get("out_of_scope"):
@@ -489,7 +495,9 @@ def build_integration_review_evidence(
         "aggregated_scope": {
             "nodes": [
                 node_id for node_id in (nodes if isinstance(nodes, dict) else {})
-                if node_id != "integration-review"
+                # The monitor-driven remote-delivery ring (issue #371) is
+                # appended after the review; it is not part of the aggregate.
+                if node_id not in ("integration-review", "remote-delivery")
             ],
             "out_of_scope": deepcopy(claim["out_of_scope"]),
         },
@@ -540,7 +548,13 @@ def evaluate_v41_closeout(snapshot: Any) -> CloseoutDecision:
         accepted = all(isinstance(node, dict) and node.get("status") == "accepted" for node in nodes.values())
         return CloseoutDecision(accepted, "complete" if accepted else "running", [] if accepted else ["business nodes are not all accepted"])
     reasons = []
-    business = [node for node_id, node in nodes.items() if node_id != integration_id]
+    # The monitor-driven remote-delivery ring (issue #371) is appended after
+    # the business nodes are done; it is gated separately below and is not a
+    # business node whose acceptance feeds the integration closeout.
+    business = [
+        node for node_id, node in nodes.items()
+        if node_id not in (integration_id, "remote-delivery")
+    ]
     if not all(isinstance(node, dict) and node.get("status") == "accepted" for node in business):
         reasons.append("business nodes are not all accepted")
     if not isinstance(integration, dict) or integration.get("status") != "accepted":
@@ -557,6 +571,28 @@ def evaluate_v41_closeout(snapshot: Any) -> CloseoutDecision:
         clearance = evidence.get("clearance")
         if not isinstance(clearance, dict) or any(clearance.get(key) != 0 for key in ("p0", "p1", "p2")):
             reasons.append("integration P0/P1/P2 clearance is not zero")
+    if integration_id is not None and not reasons:
+        # Issue #371: with remote_git_actions=allow the run DAG gains an
+        # explicit monitor-driven remote-delivery ring after the integration
+        # review.  The run cannot complete until that node is accepted with
+        # current, digest-bound, remotely verified evidence; deny mode keeps
+        # the historical behavior untouched.
+        from .remote_delivery import (
+            delivery_evidence_current,
+            remote_delivery_required,
+        )
+        if remote_delivery_required(_snapshot_value(snapshot, "authorization", {})):
+            delivery_node = nodes.get("remote-delivery")
+            if not isinstance(delivery_node, dict):
+                reasons.append("remote delivery node is pending")
+            elif delivery_node.get("status") != "accepted":
+                reasons.append("remote delivery is not accepted")
+            else:
+                delivery_evidence = _snapshot_value(snapshot, "remote_delivery_evidence", {})
+                if not isinstance(delivery_evidence, dict) or not delivery_evidence:
+                    reasons.append("remote delivery evidence is missing")
+                elif not delivery_evidence_current(snapshot, delivery_evidence):
+                    reasons.append("remote delivery evidence does not match current digests")
     return CloseoutDecision(not reasons, "complete" if not reasons else "running", reasons)
 
 

@@ -215,8 +215,11 @@ class CloseoutTextTests(unittest.TestCase):
         snapshot.status = "complete"
         self.assertTrue(evaluate_v41_closeout(snapshot).allowed)
         self.assertEqual(render_v41_closeout_status(snapshot), "整合通过但外部动作未授权")
+        # Issue #371: allow 模式还要求显式的 remote-delivery 环节通过，
+        # 整合 Review 本身通过并不足以让整个 run 验收。
         snapshot.authorization = {"remote_git_actions": "allow"}
-        self.assertEqual(render_v41_closeout_status(snapshot), "整合 Review 已通过")
+        self.assertFalse(evaluate_v41_closeout(snapshot).allowed)
+        self.assertEqual(render_v41_closeout_status(snapshot), "远端整合交付进行中：尚未验收")
 
     def test_text_withholds_acceptance_when_the_closeout_does_not_allow_it(self):
         snapshot = _snapshot()

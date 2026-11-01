@@ -2142,6 +2142,19 @@ def render_v41_closeout_status(snapshot: RunSnapshot) -> str:
             return "整合通过但外部动作未授权"
         return "整合 Review 已通过"
     if integration:
+        # With remote_git_actions=allow the acceptance gate additionally
+        # requires the monitor-driven remote-delivery ring (issue #371); say
+        # so instead of blaming the integration review that already passed.
+        auth = getattr(snapshot, "authorization", {}) or {}
+        remote = auth.get("remote_git_actions") if isinstance(auth, dict) else getattr(auth, "remote_git_actions", "deny")
+        if remote == "allow":
+            delivery = nodes.get("remote-delivery") or {}
+            delivery_status = str(delivery.get("status", "")).casefold()
+            if delivery_status in {"rework"}:
+                return "远端整合交付返工：未闭合/不可验收"
+            if delivery_status in {"blocked_unknown", "blocked_design", "blocked_deploy"}:
+                return "远端整合交付受阻：未闭合/不可验收"
+            return "远端整合交付进行中：尚未验收"
         return "整合 Review 未闭合/不可验收"
     return "运行状态：{}".format(getattr(snapshot, "status", "unknown"))
 

@@ -527,6 +527,21 @@ _EVENT_DATA_KEYS = {
     "differences",
     "tier",
     "unchanged_beats",
+    # remote delivery (#371): which step produced the record and its
+    # structural outcomes -- branch names, a PR URL/number, git SHAs, the
+    # remote-verification fact block and the retryable flag.  All are
+    # identifiers vibe composed or read from git/gh output; none is provider
+    # free text.
+    "step",
+    "pr_url",
+    "pr_number",
+    "head_sha",
+    "merge_commit",
+    "source_branch",
+    "target_branch",
+    "remote_verification",
+    "retryable",
+    "delivery",
     # worker_question_raised / _answered: the run-relative file holding the
     # question excerpt (the excerpt itself never enters the event stream) and
     # the fixed-enum session state the question was read in.
@@ -772,6 +787,11 @@ class RunSnapshot:
     business_write_allowed: bool = False
     # V4.1 aggregate integration-review evidence. Optional for historical runs.
     integration_review_evidence: Dict[str, Any] = field(default_factory=dict)
+    # Issue #371 remote-integration-delivery evidence.  Only populated for
+    # runs whose authorization allows remote Git actions; the run cannot
+    # complete while the monitor-driven ``remote-delivery`` node is pending.
+    # Optional for historical runs and for deny-mode runs.
+    remote_delivery_evidence: Dict[str, Any] = field(default_factory=dict)
     workflow: Optional[Dict[str, Any]] = None
     prd_digest: str = ""
     spec_digest: str = ""
@@ -882,7 +902,7 @@ class RunSnapshot:
             "binding_state",
             "business_write_allowed",
         }
-        allowed = with_capability | binding_fields | {"integration_review_evidence", "workflow", "prd_digest", "spec_digest", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "ready_set", "topology_digest", "started_nodes", "active_concurrency", "capacity", "monitor_entry_evidence", "parallel_groups", "v44_binding_intent", "v44_binding_proof"}
+        allowed = with_capability | binding_fields | {"integration_review_evidence", "remote_delivery_evidence", "workflow", "prd_digest", "spec_digest", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "ready_set", "topology_digest", "started_nodes", "active_concurrency", "capacity", "monitor_entry_evidence", "parallel_groups", "v44_binding_intent", "v44_binding_proof"}
         if isinstance(data, dict):
             # Pre-5.2 snapshots: read them (status/closeout) but drop the keys.
             data = {key: value for key, value in data.items() if key not in LEGACY_RUN_KEYS}
@@ -895,6 +915,7 @@ class RunSnapshot:
         normalized.setdefault("binding_state", "blocked_unknown")
         normalized.setdefault("business_write_allowed", False)
         normalized.setdefault("integration_review_evidence", {})
+        normalized.setdefault("remote_delivery_evidence", {})
         normalized.setdefault("prd_digest", "")
         normalized.setdefault("spec_digest", "")
         normalized.setdefault("execution_engine", "")
@@ -920,6 +941,8 @@ class RunSnapshot:
             normalized["v44_binding_proof"] = V44BindingProof.from_dict(normalized["v44_binding_proof"]).to_dict()
         if not isinstance(normalized["integration_review_evidence"], dict):
             raise ValueError("snapshot integration review evidence is invalid")
+        if not isinstance(normalized["remote_delivery_evidence"], dict):
+            raise ValueError("snapshot remote delivery evidence is invalid")
         if normalized.get("workflow") is not None and not isinstance(normalized["workflow"], dict):
             raise ValueError("snapshot workflow is invalid")
         for key in ("prd_digest", "spec_digest"):
@@ -1336,7 +1359,17 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
         raise ValueError("snapshot contract lineage is inconsistent")
     if authorization.plan_id != snapshot.plan_id or authorization.plan_version != snapshot.plan_version:
         raise ValueError("snapshot plan lineage is inconsistent")
-    if set(snapshot.nodes) != set(authorization.node_ids):
+    extra_nodes = set(snapshot.nodes) - set(authorization.node_ids)
+    if extra_nodes:
+        # Issue #371: the monitor-driven remote-delivery ring is appended to
+        # the running snapshot after the integration review is accepted and
+        # retired again if a reauthorization revokes remote_git_actions, so
+        # it is tolerated regardless of the current switch position; the
+        # monitor reconciles the node on the next drive.  Any other extra
+        # node is still a lineage break.
+        if extra_nodes != {"remote-delivery"}:
+            raise ValueError("snapshot node set is inconsistent")
+    if set(authorization.node_ids) - set(snapshot.nodes):
         raise ValueError("snapshot node set is inconsistent")
     if any(not isinstance(key, str) or not isinstance(value, str) for key, value in snapshot.handles.items()):
         raise ValueError("snapshot handles are invalid")
@@ -1365,6 +1398,17 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
                 validate_integration_review_evidence(snapshot, current_evidence)
             except (TypeError, ValueError) as error:
                 raise ValueError("complete run integration evidence is invalid") from error
+        if "remote-delivery" in snapshot.nodes:
+            delivery = snapshot.remote_delivery_evidence
+            if not isinstance(delivery, dict) or not delivery:
+                raise ValueError("complete run lacks remote delivery evidence")
+            try:
+                from .remote_delivery import validate_remote_delivery_evidence
+                validate_remote_delivery_evidence(snapshot, delivery)
+            except (TypeError, ValueError) as error:
+                raise ValueError("complete run remote delivery evidence is invalid") from error
+            if snapshot.nodes["remote-delivery"].get("status") != "accepted":
+                raise ValueError("complete run contains an unaccepted remote delivery node")
 
     first = records[0] if records else None
     if first is None or first["event"] != "run_started":
@@ -1389,7 +1433,12 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
     current_prd_digest = first["data"].get("prd_digest")
     current_spec_digest = first["data"].get("spec_digest")
     current_capability_contract_digest = first_capability_contract_digest
-    if sorted(first["data"].get("node_ids", [])) != sorted(snapshot.nodes):
+    # Issue #371: the monitor-driven remote-delivery ring is appended after
+    # run start, so the run-start event keeps the authorized node set; the
+    # snapshot may legitimately carry the ring on top of it.
+    run_start_nodes = sorted(first["data"].get("node_ids", []))
+    snapshot_nodes = sorted(set(snapshot.nodes) - {"remote-delivery"})
+    if run_start_nodes != snapshot_nodes:
         raise ValueError("run-start node lineage is inconsistent")
     retained_acceptance_proofs = []
     latest_node_contract_digests = None
@@ -1609,6 +1658,11 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
 
     for node_id, node in snapshot.nodes.items():
         if node.get("status") != "accepted":
+            continue
+        if node_id == "remote-delivery":
+            # Issue #371: the monitor-driven delivery ring is accepted on
+            # remote facts (remote_delivery_evidence), not on a reviewer
+            # session; its gate is the delivery-evidence check above.
             continue
         contract_digest = node.get("contract_digest")
         acceptance = node.get("acceptance")
