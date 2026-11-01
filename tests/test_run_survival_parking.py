@@ -214,6 +214,24 @@ class RepairBudgetTests(Base):
         daemon.heal_pass(snapshot)
         self.assertEqual(self.launched, ["b"])
 
+    def test_at_most_one_repair_session_still_starts_per_pass(self):
+        self.launched = []
+        nodes = {"a": node("running"), "b": node("running")}
+        snapshot = snap("running", nodes)
+        report = {"status": "ok", "nodes": {n: {"tier": "supervisor_investigate", "pack": {"role": "developer"}}
+                                            for n in nodes}}
+        daemon = self.make(Supervisor(snapshot))
+        daemon._assess = lambda: report
+        daemon.launcher = self.launcher
+        daemon._verify = lambda n, r: {"status": "verify_failed"}
+        state = daemon._heal_state()
+        state["nodes"] = {n: {"fingerprint": dm._node_fingerprint(snapshot, n), "retried": True,
+                              "repairs": 0, "escalated": False} for n in nodes}
+        daemon._save_heal_state(state)
+        daemon._snapshot = snapshot
+        daemon.heal_pass(snapshot)
+        self.assertEqual(self.launched, ["a"])
+
     def test_nothing_to_re_check_is_inconclusive_and_not_a_failed_repair(self):
         nodes = {"a": node("running")}
         daemon = self.make(Supervisor(snap("running", nodes)))
