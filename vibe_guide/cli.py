@@ -245,7 +245,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon'),
+        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon', 'run-restore'),
     )
     parser.add_argument("daemon_action", nargs="?", choices=("start", "status", "stop", "run", "register-pm", "inbox"))
     parser.add_argument("--peek", action="store_true", help="daemon inbox: 只看不推进游标")
@@ -1969,6 +1969,10 @@ def _snapshot_result(
         text += "\n" + _render_pending_verification(pending_verification)
     if paths is not None:
         from . import daemon as daemon_module
+        notice = daemon_module.pm_address_notice(paths, snapshot.run_id)
+        if notice:
+            payload["pm_address"] = {"status": "unregistered", "notice": notice}
+            text += "\n" + notice
         unresolved = daemon_module.unresolved_report(paths, snapshot.run_id, snapshot)
         if unresolved:
             payload["unresolved"] = unresolved
@@ -2505,7 +2509,30 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             interval_for=lambda beat_payload: _beat_interval(paths, args.run_id, beat_payload, persist=True),
             preflight_kwargs=kwargs,
         )
+        from . import daemon as daemon_module
+        notice = daemon_module.pm_address_notice(paths, args.run_id)
+        if notice:
+            payload = {**payload, "pm_address": {"status": "unregistered", "notice": notice}}
+            text = (text + "\n" if text else "") + notice
         return _result(SUCCESS if ok else UNKNOWN, {"command": args.command, **payload}, text, args.as_json)
+
+    if args.command == "run-restore":
+        if not args.run_id:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        from . import daemon as daemon_module
+        try:
+            payload = daemon_module.restore_run(paths, args.run_id)
+        except (OSError, ValueError, TypeError) as error:
+            return _result(UNKNOWN, {"command": args.command, "status": "unknown", "reason": str(error)[:200]},
+                           "恢复归档失败：" + str(error)[:200], args.as_json)
+        if payload["status"] == "restored":
+            text = "已恢复运行 {}（备份：{}；守护程序：{}）".format(
+                args.run_id, payload.get("backup"), (payload.get("daemon") or {}).get("status"))
+        elif payload["status"] == "already_live":
+            text = "运行 {} 已在 .vibe/runs/ 下，无需恢复，未做任何改动".format(args.run_id)
+        else:
+            text = "未恢复：{}".format(payload.get("reason") or payload["status"])
+        return _result(SUCCESS if payload["status"] in ("restored", "already_live") else UNKNOWN, payload, text, args.as_json)
 
     if args.command == "decision-raise":
         if not (args.run_id and args.node_id and args.decision_question):

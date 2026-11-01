@@ -2792,10 +2792,11 @@ class Monitor:
         already_recorded = False
         if events_path.is_file() and not events_path.is_symlink():
             try:
-                already_recorded = any(
-                    record.get("event") == "run_archived"
-                    for record in load_events(self.paths, run_id)
-                )
+                marks = [
+                    record.get("event") for record in load_events(self.paths, run_id)
+                    if record.get("event") in {"run_archived", "run_unarchived"}
+                ]
+                already_recorded = bool(marks) and marks[-1] == "run_archived"
             except (OSError, ValueError):
                 already_recorded = False
         try:
@@ -8083,6 +8084,8 @@ class Monitor:
             self._archive_pair(snapshot, node_id)
             self._release_node_lease(snapshot, node_id)
         elif event.event in {"unknown", "timeout", "state_unknown", "visibility_unknown"}:
+            if self._observe_live_handle(snapshot, node_id, role, event, active, handle_id):
+                return
             if event.event == "visibility_unknown" and self._archived_blocked_engineering(
                 snapshot, node_id, role, active
             ):
@@ -8603,6 +8606,47 @@ class Monitor:
     @staticmethod
     def _finding_changes_prd_acceptance(data: Dict[str, Any]) -> bool:
         return monitor_acceptance._finding_changes_prd_acceptance(data)
+
+    def _observe_live_handle(
+        self, snapshot: RunSnapshot, node_id: str, role: str, event: RunEvent,
+        active: Dict[str, Any], handle_id: str,
+    ) -> bool:
+        """A pending wait or timeout on a live handle with a valid cursor is only watched.
+
+        The session is still bound and its cursor still resolves, so the next
+        poll can read the same task again: no retry is queued and the binding
+        status stays put.  Returns True when the event was handled this way.
+        """
+        reason = str(event.data.get("reason", ""))
+        if event.event == "timeout":
+            kind = "timeout"
+        elif event.event == "visibility_unknown" and reason == "provider wait is pending":
+            kind = "pending"
+        else:
+            return False
+        current = snapshot.nodes[node_id]
+        if (
+            node_id == "integration-review"
+            or current.get("status") not in {"running", "review", "rework"}
+            or snapshot.handles.get(node_id) != handle_id
+            or current.get("retryable_action")
+        ):
+            return False
+        try:
+            binding = self._load_task_binding(snapshot, node_id, role)
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return False
+        if binding.status not in {"running", "review", "rework"} or not binding.cursor:
+            return False
+        seen = current.get("provider_observation")
+        count = (seen.get("count", 0) if isinstance(seen, dict) and seen.get("kind") == kind else 0) + 1
+        current["provider_observation"] = {"kind": kind, "count": count}
+        if count == 1 or count % 30 == 0:
+            self._record(snapshot, "provider_observation", {
+                "run_id": snapshot.run_id, "node_id": node_id, "kind": kind,
+                "observation_count": count,
+            }, active)
+        return True
 
     def _record_runner_event(
         self,
@@ -10005,6 +10049,10 @@ class Monitor:
                 "run_archive_deferred",
                 "daemon_heal",
                 "daemon_lease_readopted",
+                "provider_observation",
+                "run_parked",
+                "run_unarchived",
+                "run_park_deferred",
             }:
                 # Heartbeats are supervisor lease telemetry, archive records
                 # are filesystem evidence and daemon records are its own
