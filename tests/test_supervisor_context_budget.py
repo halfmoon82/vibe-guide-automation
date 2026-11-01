@@ -162,6 +162,43 @@ class HandoffRecoveryTests(unittest.TestCase):
             output=json.loads(bounded_supervisor_output(ProjectPaths(Path(root)),'run-1',payload,json.dumps(payload)))
             self.assertEqual(output['handoff_summary'],payload['handoff_summary'])
 
+    def _oversized_monitor_payload(self, **extra):
+        nodes = {'node-%d' % i: {'status': 'running', 'user_status': 'x' * 300, 'detail': 'd' * 500}
+                 for i in range(30)}
+        payload = {'command': 'monitor', 'status': 'running', 'run_id': 'run-1', 'nodes': nodes}
+        payload.update(extra)
+        return payload
+
+    def test_truncated_output_keeps_first_shift_handoff_whole(self):
+        from vibe_guide.supervisor import bounded_supervisor_output, SUPERVISOR_OUTPUT_LIMIT
+        handoff = '首班监工还有两件事没做：登记地址 supervisor-register；用 vibe 生成的原话自建心跳。' * 20
+        payload = self._oversized_monitor_payload(handoff=handoff)
+        with tempfile.TemporaryDirectory() as root:
+            short = bounded_supervisor_output(ProjectPaths(Path(root)), 'run-1', payload, json.dumps(payload, ensure_ascii=False))
+        self.assertLessEqual(len(short.encode()), SUPERVISOR_OUTPUT_LIMIT)
+        output = json.loads(short)
+        self.assertTrue(output['truncated'])
+        self.assertEqual(output['handoff'], handoff)
+        self.assertEqual(sorted(output['nodes']), sorted(payload['nodes']))
+
+    def test_truncated_output_keeps_daemon_start_failure(self):
+        from vibe_guide.supervisor import bounded_supervisor_output
+        daemon = {'enabled': True, 'status': 'start_failed', 'reason': 'OSError: boom'}
+        payload = self._oversized_monitor_payload(daemon=daemon)
+        with tempfile.TemporaryDirectory() as root:
+            output = json.loads(bounded_supervisor_output(ProjectPaths(Path(root)), 'run-1', payload, json.dumps(payload)))
+        self.assertTrue(output['truncated'])
+        self.assertEqual(output['daemon'], daemon)
+
+    def test_truncated_output_without_handoff_adds_no_handoff_key(self):
+        from vibe_guide.supervisor import bounded_supervisor_output
+        payload = self._oversized_monitor_payload()
+        with tempfile.TemporaryDirectory() as root:
+            output = json.loads(bounded_supervisor_output(ProjectPaths(Path(root)), 'run-1', payload, json.dumps(payload)))
+        self.assertTrue(output['truncated'])
+        self.assertNotIn('handoff', output)
+        self.assertNotIn('daemon', output)
+
     def test_handoff_preparation_race_cannot_clear_hard_stop(self):
         from vibe_guide.cli import run_cli
         with tempfile.TemporaryDirectory() as directory:

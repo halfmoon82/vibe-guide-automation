@@ -2287,7 +2287,8 @@ def bounded_supervisor_output(paths, run_id, payload, rendered):
     path = directory / (hashlib.sha256(raw).hexdigest() + ".txt")
     _atomic_bytes(path, raw)
     short = {k: payload[k] for k in ("command", "state", "status", "run_id", "plan_id",
-                                    "tokens", "baseline", "prepare_handoff", "pending", "handoff_summary", "handoff_status", "handoff_error")
+                                    "tokens", "baseline", "prepare_handoff", "pending", "handoff_summary", "handoff_status", "handoff_error",
+                                    "handoff", "daemon")
              if k in payload}
     if "reason" in payload:
         short["reason"] = str(payload["reason"])[:200]
