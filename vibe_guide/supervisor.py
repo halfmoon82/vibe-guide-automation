@@ -21,7 +21,11 @@ from .contracts import RunEvent
 from .decision_boundary import LEGACY_BOUNDARY_CATEGORY, validate_boundary_category
 from .providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER, WORKBUDDY_VISIBLE_PROVIDER
 from . import worker_liveness
-from .runners.provider_action import TEMPLATE_PLACEHOLDER as _TEMPLATE_PLACEHOLDER
+from .runners.provider_action import (
+    MAILBOX_FIELD_TABLE,
+    TEMPLATE_PLACEHOLDER as _TEMPLATE_PLACEHOLDER,
+    mailbox_example,
+)
 from .state import (
     append_event,
     interprocess_lock,
@@ -2383,32 +2387,28 @@ def supervisor_mailbox_view(paths, run_id):
 def _template_payload(operation, role):
     """A result example for ``operation`` that passes ``validate_result_shape``.
 
-    Placeholder strings stand where the supervisor must put real values.  The
-    shape check refuses a create binding that still holds one: storing it would
-    bind a task identity that does not exist, and a stored result cannot be
-    rewritten.  The output tells the caller which values are placeholders.
+    Read from ``MAILBOX_FIELD_TABLE``, the same table the write-time check, its
+    error hint and the prd-guide §6.2 table use.  Placeholder strings stand
+    where the supervisor must put real values; the check refuses a result that
+    keeps one, because a stored result cannot be rewritten.
     """
     if operation == "wait":
-        if role == "reviewer":
-            return {"status": "complete", "event": "accepted",
-                    "evidence": {"summary": _TEMPLATE_PLACEHOLDER}}
-        return {"status": "complete", "event": "delivered",
-                "delivery_evidence": {"completion_marker": _TEMPLATE_PLACEHOLDER,
-                                      "delivery_path": _TEMPLATE_PLACEHOLDER,
-                                      "thread_status": _TEMPLATE_PLACEHOLDER}}
-    if operation == "create":
-        # The reader binds on both the task identity and a host identity
-        # (``hostId`` or ``host``); a template without the host produced a
-        # result the dispatcher refused after the task already existed.
-        return {"binding": {"threadId": _TEMPLATE_PLACEHOLDER,
-                            "hostId": _TEMPLATE_PLACEHOLDER}}
-    if operation == "locate":
-        return {"located": True}
-    if operation == "visibility":
-        return {"visible": True, "direct_enter": True}
-    if operation == "resume":
-        return {"resumed": True}
-    return {"status": _TEMPLATE_PLACEHOLDER}
+        # Only a reviewer's completion differs; every other caller gets the
+        # developer delivery example, as before.
+        role = "reviewer" if role == "reviewer" else "developer"
+    example = mailbox_example(operation, role, "ok")
+    if example is None:
+        return {"status": _TEMPLATE_PLACEHOLDER}
+    return example
+
+
+def _template_branches(operation, role):
+    """The other branches (e.g. ``failed``) for the same operation, from the table."""
+    return {
+        row[2]: mailbox_example(operation, role, row[2])
+        for row in MAILBOX_FIELD_TABLE
+        if row[0] == operation and row[1] in (None, role) and row[2] not in ("ok", "complete")
+    }
 
 
 def mailbox_result_template(paths, run_id, action_id):
@@ -2422,7 +2422,8 @@ def mailbox_result_template(paths, run_id, action_id):
     return {"command": "supervisor-mailbox", "status": "ok", "run_id": run_id,
             "action_id": action_id, "operation": operation, "role": request.get("role"),
             "placeholder": _TEMPLATE_PLACEHOLDER,
-            "template": _template_payload(operation, request.get("role"))}
+            "template": _template_payload(operation, request.get("role")),
+            "alternatives": _template_branches(operation, request.get("role"))}
 
 
 def mailbox_complete(paths, run_id, action_id, payload):

@@ -68,6 +68,8 @@ from .dag import (
 from .adapters.task_provider import ProviderActionStore, ProviderPending, ProviderUnavailable
 from .state import (
     CONSISTENCY_CORRECTION_KEYS,
+    MAILBOX_REASON_CODES,
+    bounded_error_text,
     RECOVERY_SIGNATURE_KEYS,
     RunSnapshot,
     require_not_legacy_run,
@@ -1161,6 +1163,8 @@ class Monitor:
                 reason_code = "worker_profile_conflict"
             elif "child binding" in error_text or "task binding" in error_text:
                 reason_code = "child_binding_conflict"
+            elif getattr(error, "reason_code", None) in MAILBOX_REASON_CODES:
+                reason_code = error.reason_code
             else:
                 reason_code = None
             if reason_code is not None:
@@ -1177,6 +1181,8 @@ class Monitor:
                     "phase": "start",
                     "action_ref": action_ref,
                     "advance_generation": False,
+                    "error_type": type(error).__name__,
+                    "error": bounded_error_text(error),
                     "intent": action_basis,
                 }
             named = getattr(error, "observation", None)
@@ -1204,6 +1210,8 @@ class Monitor:
                 reason_code = "worker_profile_conflict"
             elif "child binding" in text or "task binding" in text:
                 reason_code = "child_binding_conflict"
+            elif getattr(error, "reason_code", None) in MAILBOX_REASON_CODES:
+                reason_code = error.reason_code
             elif isinstance(error, (ValueError, TypeError)):
                 reason_code = "dispatch_contract_invalid"
             else:
@@ -1221,6 +1229,8 @@ class Monitor:
                 "phase": "start",
                 "action_ref": action_ref,
                 "advance_generation": False,
+                "error_type": type(error).__name__,
+                "error": bounded_error_text(error),
                 "model_failure_class": model_failure_reason_class(str(error)),
                 "intent": action_basis,
             }
@@ -5832,6 +5842,8 @@ class Monitor:
                     if current["status"] == "planned" else "dispatch_contract_invalid"
                 ),
                 "action_ref": action_ref,
+                "error_type": type(error).__name__,
+                "error": bounded_error_text(error),
             },
         )
         self._save_snapshot(snapshot)
@@ -6357,6 +6369,20 @@ class Monitor:
                     # Local profile/child contract drift is repairable and must
                     # not become a product block or a new writer generation.
                     failure_kind = "repairable"
+                    self._record(
+                        snapshot,
+                        "contract_error",
+                        {
+                            "run_id": snapshot.run_id,
+                            "node_id": node_id,
+                            "role": role,
+                            "phase": "start",
+                            "reason_code": handle.get("reason_code"),
+                            "action_ref": handle.get("action_ref"),
+                            "error_type": handle.get("error_type"),
+                            "error": handle.get("error"),
+                        },
+                    )
                 failure = (
                     {"kind": failure_kind}
                     if failure_kind in {"retryable", "capacity_wait", "repairable", "binding_unknown", "external_decision"}
@@ -10677,6 +10703,11 @@ class Monitor:
                 current["reviewer_replacement_required"] = True
                 current["acceptance"] = None
                 current["status"] = "blocked_unknown"
+            elif record["event"] == "contract_error" and data.get("phase") == "start":
+                # Evidence only: the dispatch-time rejection is rebuilt from
+                # the retry marker the same start path saves.
+                if provenance.get("role") != "system":
+                    raise ValueError("dispatch contract_error replay provenance is invalid")
             elif (
                 record["event"] == "contract_error"
                 and data.get("reason_code") == "integration_initial_preflight_retry"
