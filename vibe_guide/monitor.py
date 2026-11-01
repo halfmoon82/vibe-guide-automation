@@ -10052,6 +10052,7 @@ class Monitor:
                 "provider_observation",
                 "run_parked",
                 "run_unarchived",
+                "run_park_deferred",
             }:
                 # Heartbeats are supervisor lease telemetry, archive records
                 # are filesystem evidence and daemon records are its own

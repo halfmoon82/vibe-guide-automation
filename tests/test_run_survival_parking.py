@@ -323,6 +323,25 @@ class ObservationOnlyTests(unittest.TestCase):
                 self.assertEqual(current["provider_observation"]["count"], 1)
                 self.assertIn("provider_observation", [e["event"] for e in load_events(paths, second.run_id)])
 
+    def test_run_park_deferred_event_replays_through_a_real_monitor_tick(self):
+        from vibe_guide.state import RunEvent, append_event, load_snapshot
+        paths, first, _second = self.start([])
+        snap = load_snapshot(paths, first.run_id)
+        prov = {"role": "system", "task_id": None, "handle_id": None, "generation": 0,
+                "authorization_digest": snap.authorization_digest,
+                "node_contract_digest": snap.node_contract_digest}
+        append_event(paths, RunEvent("run_park_deferred", {
+            "run_id": first.run_id, "reason_code": "undelivered_work", "observation_count": 1}), prov)
+        last = load_events(paths, first.run_id)[-1]
+        self.assertEqual(last["data"].get("reason_code"), "undelivered_work")
+        self.assertEqual(last["data"].get("observation_count"), 1)
+        # A real Monitor replays the event instead of raising on an unknown node.
+        monitor = Monitor(paths, Plan("survival", 1, "docs/prd.md", ["n1"], "draft"),
+                          [DAGNode("n1", "n1", [], [], "control",
+                                   {"files": ["n1.py"], "worker": "w", "worktree": ".worktrees/n1", "branch": "b"}, "ready")])
+        with patch("vibe_guide.monitor.require_entry", return_value=None):
+            monitor.tick(first.run_id, FakeRunner(events={}))
+
     def test_without_a_valid_cursor_the_old_retry_path_still_applies(self):
         _paths, _first, second = self.start([("timeout", {"reason": "provider timeout"})], cursor=None)
         self.assertEqual(second.nodes["n1"]["status"], "retry_pending")
