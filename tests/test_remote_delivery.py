@@ -154,6 +154,8 @@ class RemoteDeliveryDriveTests(unittest.TestCase):
         names = [name for name, _ in recorded]
         self.assertIn("remote_delivery_node_appended", names)
         self.assertIn("remote_delivery_accepted", names)
+        completed = [data.get("step") for name, data in recorded if name == "remote_delivery_step_completed"]
+        self.assertEqual(completed, list(REMOTE_DELIVERY_STEPS))
         accepted = dict(recorded)["remote_delivery_accepted"]["delivery"]
         self.assertEqual(accepted["pr_url"], PR_URL)
         self.assertEqual(accepted["head_sha"], H1)
@@ -308,6 +310,33 @@ class RemoteDeliveryEvidenceValidationTests(unittest.TestCase):
             validate_remote_delivery_evidence(snapshot, evidence)
 
 
+class ReauthorizationAndLineageTests(unittest.TestCase):
+    def test_revoking_remote_git_actions_retires_the_ring(self):
+        snapshot = _snapshot(remote="allow")
+        drive_remote_delivery(snapshot, FakeExecutor())
+        self.assertEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "accepted")
+        snapshot.authorization = {"remote_git_actions": "deny"}
+        recorded, record_event = _events()
+        self.assertTrue(drive_remote_delivery(snapshot, FakeExecutor(), record_event))
+        self.assertNotIn(REMOTE_DELIVERY_NODE_ID, snapshot.nodes)
+        self.assertEqual(snapshot.remote_delivery_evidence, {})
+        self.assertIn("remote_delivery_retired", [name for name, _ in recorded])
+
+    def test_incomplete_lineage_digest_refuses_with_a_clear_reason(self):
+        snapshot = _snapshot()
+        snapshot.node_contract_digest = ""
+        executor = FakeExecutor()
+        recorded, record_event = _events()
+        drive_remote_delivery(snapshot, executor, record_event)
+        self.assertEqual(executor.calls, [])
+        node = snapshot.nodes[REMOTE_DELIVERY_NODE_ID]
+        self.assertEqual(node["status"], "blocked_unknown")
+        self.assertFalse(node["failure"]["retryable"])
+        self.assertIn("lineage", node["failure"]["reason"])
+        failed = dict(recorded)["remote_delivery_failed"]
+        self.assertEqual(failed["reason_class"], "remote_delivery_lineage_incomplete")
+
+
 class SubprocessExecutorTests(unittest.TestCase):
     def test_create_pr_reuses_an_open_pr_for_the_same_head(self):
         import json as _json
@@ -323,6 +352,55 @@ class SubprocessExecutorTests(unittest.TestCase):
             facts = executor.execute("create_pr", {"source_branch": "vibe/x", "head_sha": H1})
         self.assertTrue(facts["reused"])
         self.assertEqual(facts["pr_url"], PR_URL)
+
+    def test_merge_is_idempotent_when_the_pr_is_already_merged(self):
+        import json as _json
+        from unittest import mock
+
+        executor = SubprocessRemoteDeliveryExecutor("/repo", plan_id="plan-1")
+
+        def fake_gh(repo, args, timeout=120):
+            if args[:2] == ["pr", "view"]:
+                return _json.dumps({
+                    "state": "MERGED",
+                    "headRefOid": H1,
+                    "mergeCommit": {"oid": H2},
+                })
+            raise AssertionError("unexpected gh call: {}".format(args))
+
+        with mock.patch("vibe_guide.remote_delivery._run_gh", side_effect=fake_gh):
+            facts = executor.execute(
+                "merge", {"pr_url": PR_URL, "head_sha": H1}
+            )
+        self.assertTrue(facts["already_merged"])
+        self.assertEqual(facts["merge_commit"], H2)
+
+    def test_merge_rejects_a_merged_pr_whose_head_differs(self):
+        import json as _json
+        from unittest import mock
+
+        executor = SubprocessRemoteDeliveryExecutor("/repo", plan_id="plan-1")
+
+        def fake_gh(repo, args, timeout=120):
+            return _json.dumps({
+                "state": "MERGED",
+                "headRefOid": H3,
+                "mergeCommit": {"oid": H2},
+            })
+
+        with mock.patch("vibe_guide.remote_delivery._run_gh", side_effect=fake_gh):
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                executor.execute("merge", {"pr_url": PR_URL, "head_sha": H1})
+        self.assertFalse(caught.exception.retryable)
+
+    def test_merge_unreadable_pr_state_fails_retryable(self):
+        from unittest import mock
+
+        executor = SubprocessRemoteDeliveryExecutor("/repo", plan_id="plan-1")
+        with mock.patch("vibe_guide.remote_delivery._run_gh", return_value="not json"):
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                executor.execute("merge", {"pr_url": PR_URL, "head_sha": H1})
+        self.assertTrue(caught.exception.retryable)
 
     def test_create_pr_falls_back_to_creating_when_no_open_pr_matches(self):
         import json as _json
@@ -345,7 +423,7 @@ class SubprocessExecutorTests(unittest.TestCase):
 
 
 import tempfile
-from pathlib import Path as _Path
+from pathlib import Path, PurePath as _Path
 
 from vibe_guide.authorization import authorize, build_authorization_card
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan
@@ -416,15 +494,16 @@ class SnapshotPersistenceTests(unittest.TestCase):
             loaded = load_snapshot(paths, "run-1")
             self.assertIn(REMOTE_DELIVERY_NODE_ID, loaded.nodes)
 
-    def test_deny_run_snapshot_rejects_the_delivery_ring(self):
+    def test_deny_run_snapshot_still_loads_so_the_monitor_can_retire_the_ring(self):
         with tempfile.TemporaryDirectory() as directory:
             paths, record = self._paths_and_record("deny", directory)
             nodes = {
                 "n1": {"status": "running"},
                 REMOTE_DELIVERY_NODE_ID: {"status": "planned"},
             }
-            with self.assertRaises(ValueError):
-                save_snapshot(paths, self._snapshot(record, nodes))
+            save_snapshot(paths, self._snapshot(record, nodes))
+            loaded = load_snapshot(paths, "run-1")
+            self.assertIn(REMOTE_DELIVERY_NODE_ID, loaded.nodes)
 
     def _accept_n1(self, paths, record):
         contract_digest = "c" * 64
@@ -505,6 +584,86 @@ class SnapshotPersistenceTests(unittest.TestCase):
                     record, snapshot.nodes, status="complete", delivery={},
                     event_sequence=2,
                 ))
+
+
+class PrepareRealGitTests(unittest.TestCase):
+    """The _prepare fix (review P1): merges land on the source branch inside
+    a dedicated temporary worktree, never on the user's checked-out branch."""
+
+    import os
+    import subprocess as _subprocess
+
+    def _git(self, repo, *args):
+        return self._subprocess.run(
+            ["git", "-C", str(repo)] + list(args),
+            capture_output=True, text=True, check=True,
+            env={
+                **self.os.environ,
+                "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+            },
+        ).stdout.strip()
+
+    def _fixture(self, directory):
+        root = Path(directory)
+        origin = root / "origin.git"
+        repo = root / "repo"
+        self._subprocess.run(["git", "init", "--bare", str(origin)], capture_output=True, check=True)
+        self._subprocess.run(["git", "init", str(repo)], capture_output=True, check=True)
+        (repo / "base.txt").write_text("base\n")
+        self._git(repo, "add", ".")
+        self._git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "base")
+        self._git(repo, "branch", "-M", "main")
+        self._git(repo, "remote", "add", "origin", str(origin))
+        self._git(repo, "push", "-u", "origin", "main")
+        for name, changes in (
+            ("node/a", {"base.txt": "a-version\n", "a.txt": "a\n"}),
+            ("node/b", {"b.txt": "b\n"}),
+        ):
+            self._git(repo, "checkout", "-b", name)
+            for fname, content in changes.items():
+                (repo / fname).write_text(content)
+            self._git(repo, "add", ".")
+            self._git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", name)
+        self._git(repo, "checkout", "main")
+        return repo, origin
+
+    def test_prepare_merges_node_branches_onto_source_without_touching_checkout(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, origin = self._fixture(directory)
+            main_sha = self._git(repo, "rev-parse", "main")
+            executor = SubprocessRemoteDeliveryExecutor(repo, plan_id="p1")
+            facts = executor.execute("prepare", {"node_branches": ["node/a", "node/b"]})
+            source = facts["source_branch"]
+            self.assertEqual(source, "vibe/integration-candidate-p1")
+            self.assertEqual(facts["target_branch"], "main")
+            self.assertNotEqual(facts["head_sha"], main_sha)
+            # The user's checked-out branch and worktree are untouched.
+            self.assertEqual(self._git(repo, "rev-parse", "HEAD"), main_sha)
+            self.assertEqual(self._git(repo, "status", "--porcelain"), "")
+            # The source branch actually carries the node content, and the
+            # temporary worktree was removed.
+            self._git(repo, "merge-base", "--is-ancestor", "node/a", source)
+            self._git(repo, "merge-base", "--is-ancestor", "node/b", source)
+            self.assertFalse((repo / ".worktrees" / "remote-delivery-p1").exists())
+
+    def test_prepare_marks_merge_conflicts_as_non_retryable(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, origin = self._fixture(directory)
+            self._git(repo, "checkout", "-b", "node/c")
+            (repo / "base.txt").write_text("conflicting\n")
+            self._git(repo, "add", ".")
+            self._git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "node/c")
+            self._git(repo, "checkout", "main")
+            executor = SubprocessRemoteDeliveryExecutor(repo, plan_id="p1")
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                executor.execute("prepare", {"node_branches": ["node/a", "node/c"]})
+            self.assertFalse(caught.exception.retryable)
+            self.assertFalse((repo / ".worktrees" / "remote-delivery-p1").exists())
 
 
 class ReplayTests(unittest.TestCase):

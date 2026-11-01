@@ -10078,11 +10078,12 @@ class Monitor:
                 continue
             if record["event"] in REMOTE_DELIVERY_AUDIT_EVENTS:
                 # Delivery state lives on the snapshot (node status plus
-                # remote_delivery_evidence), written before the event that
-                # reports it; replay acknowledges the audit record only.  A
-                # crash between the event and the snapshot save leaves the
-                # step unrecorded, and the next drive re-runs it
-                # idempotently (executor-side reuse checks).
+                # remote_delivery_evidence), updated before the event that
+                # reports it and saved at the monitor boundary; replay
+                # acknowledges the audit record only.  A crash between the
+                # event and the snapshot save leaves the step unrecorded,
+                # and the next drive re-runs it idempotently (executor-side
+                # reuse checks, including the already-merged PR read-back).
                 if provenance.get("role") != "system":
                     raise ValueError("remote delivery replay lacks system provenance")
                 snapshot.event_sequence = record["sequence"]

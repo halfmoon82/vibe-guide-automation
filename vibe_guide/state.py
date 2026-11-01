@@ -1362,11 +1362,12 @@ def _validate_snapshot(snapshot: RunSnapshot, records: List[Dict[str, Any]]) -> 
     extra_nodes = set(snapshot.nodes) - set(authorization.node_ids)
     if extra_nodes:
         # Issue #371: the monitor-driven remote-delivery ring is appended to
-        # the running snapshot after the integration review is accepted; it
-        # is never part of the authorized plan DAG.  Any other extra node is
-        # still a lineage break.
-        from .remote_delivery import remote_delivery_required
-        if extra_nodes != {"remote-delivery"} or not remote_delivery_required(snapshot.authorization):
+        # the running snapshot after the integration review is accepted and
+        # retired again if a reauthorization revokes remote_git_actions, so
+        # it is tolerated regardless of the current switch position; the
+        # monitor reconciles the node on the next drive.  Any other extra
+        # node is still a lineage break.
+        if extra_nodes != {"remote-delivery"}:
             raise ValueError("snapshot node set is inconsistent")
     if set(authorization.node_ids) - set(snapshot.nodes):
         raise ValueError("snapshot node set is inconsistent")

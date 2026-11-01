@@ -30,13 +30,19 @@ authorization invalidates the old evidence instead of reusing it.
 Failure never reports success: a step failure parks the node
 ``blocked_unknown`` (retryable) or ``rework`` (review findings) and the run
 cannot reach ``complete`` until the node is accepted with valid, current,
-verified evidence.  Neither mode touches deploy, launchd or production
-writes -- this engine only ever runs git/gh commands.
+verified evidence.  Every step is individually idempotent -- merge included:
+an already-merged PR with the recorded head reads back as a succeeded merge
+step, so a crash between the remote side effect and the snapshot save can
+never park the run on a merge that can never succeed.  If a reauthorization
+revokes ``remote_git_actions`` the ring is retired (node and evidence
+dropped, event recorded) instead of bricking the run.  Neither mode touches
+deploy, launchd or production writes -- this engine only ever runs git/gh
+commands.
 """
-from dataclasses import dataclass
 import json
 import re
 import subprocess
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .digests import canonical_json_digest
@@ -61,6 +67,9 @@ REMOTE_DELIVERY_AUDIT_EVENTS = frozenset({
     "remote_delivery_rework",
     "remote_delivery_evidence_invalidated",
     "remote_delivery_accepted",
+    # The ring is retired when a reauthorization revokes
+    # remote_git_actions; the node and its evidence are dropped.
+    "remote_delivery_retired",
 })
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -301,21 +310,56 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             return [str(item) for item in branches if isinstance(item, str) and item.strip()]
         return []
 
+    def _worktree_path(self, source: str) -> Path:
+        slug = _slug(self._plan_id or source)
+        return Path(str(self._repo)) / ".worktrees" / ("remote-delivery-" + slug)
+
     def _prepare(self, context: Mapping[str, Any]) -> Dict[str, Any]:
         repo, target, timeout = self._repo, self._target, self._timeout
         source = self._source_branch(context)
+        branches = self._accepted_node_branches(context)
         _run_git(repo, ["fetch", "origin", target], timeout=timeout)
-        _run_git(repo, ["branch", "-f", source, "origin/" + target], timeout=timeout)
-        for branch in self._accepted_node_branches(context):
-            _run_git(repo, ["merge", "--no-edit", branch], timeout=timeout)
-        head = _run_git(repo, ["rev-parse", source], timeout=timeout)
+        # Merge inside a dedicated temporary worktree checked out on the
+        # source branch: ``git merge`` acts on the *checked-out* branch, so
+        # merging in the main repo would land the node branches on whatever
+        # the user happens to have checked out (and read back the unchanged
+        # source ref as the head).
+        worktree = self._worktree_path(source)
+        if worktree.exists():
+            try:
+                _run_git(repo, ["worktree", "remove", "--force", str(worktree)], timeout=timeout)
+            except RemoteDeliveryFailed:
+                pass
+        try:
+            _run_git(
+                repo,
+                ["worktree", "add", "--force", str(worktree), "-B", source, "origin/" + target],
+                timeout=timeout,
+            )
+            for branch in branches:
+                try:
+                    _run_git(worktree, ["merge", "--no-edit", branch], timeout=timeout)
+                except RemoteDeliveryFailed as error:
+                    # A conflict is deterministic: retrying the same merge
+                    # can only fail the same way, so do not burn a tick slot.
+                    raise RemoteDeliveryFailed(
+                        "prepare",
+                        "merge of {} failed (conflict or bad branch): {}".format(branch, error.reason),
+                        retryable=False,
+                    ) from error
+            head = _run_git(worktree, ["rev-parse", "HEAD"], timeout=timeout)
+        finally:
+            try:
+                _run_git(repo, ["worktree", "remove", "--force", str(worktree)], timeout=timeout)
+            except RemoteDeliveryFailed:
+                pass
         if not _SHA_RE.match(head):
             raise RemoteDeliveryFailed("prepare", "source head is not a SHA", retryable=False)
         return {
             "source_branch": source,
             "target_branch": target,
             "head_sha": head,
-            "merged_node_branches": self._accepted_node_branches(context),
+            "merged_node_branches": branches,
         }
 
     def _push(self, context: Mapping[str, Any]) -> Dict[str, Any]:
@@ -414,29 +458,48 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
         head_sha = str(context.get("head_sha") or "")
         if not pr_url.startswith("http"):
             raise RemoteDeliveryFailed("merge", "PR URL is missing", retryable=False)
-        if head_sha:
-            current = _run_gh(
-                repo, ["pr", "view", pr_url, "--json", "headRefOid"], timeout=timeout
-            )
-            try:
-                current_head = str(json.loads(current).get("headRefOid") or "")
-            except ValueError:
-                current_head = ""
-            if current_head and current_head != head_sha:
+        view = _run_gh(
+            repo, ["pr", "view", pr_url, "--json", "state,headRefOid,mergeCommit"], timeout=timeout
+        )
+        try:
+            payload = json.loads(view)
+        except ValueError as error:
+            raise RemoteDeliveryFailed(
+                "merge", "PR state is unreadable", retryable=True
+            ) from error
+        if not isinstance(payload, Mapping):
+            raise RemoteDeliveryFailed("merge", "PR state is unreadable", retryable=True)
+        current_head = str(payload.get("headRefOid") or "")
+        merge_oid = str((payload.get("mergeCommit") or {}).get("oid") or "")
+        pr_state = str(payload.get("state") or "")
+        if pr_state == "MERGED":
+            # Idempotent resume: the remote side effect already happened
+            # (e.g. a crash between ``gh pr merge`` and the snapshot save).
+            # Only accept it when the merged head is the head we reviewed.
+            if head_sha and current_head and current_head != head_sha:
                 raise RemoteDeliveryFailed(
-                    "merge", "PR head moved after review; delivery must re-verify", retryable=True
+                    "merge", "merged PR head does not match the recorded head", retryable=False
                 )
+            if not _SHA_RE.match(merge_oid):
+                raise RemoteDeliveryFailed(
+                    "merge", "merged PR lacks a merge commit SHA", retryable=True
+                )
+            return {
+                "pr_url": pr_url,
+                "merge_commit": merge_oid,
+                "merge_method": "squash",
+                "already_merged": True,
+            }
+        if head_sha and current_head and current_head != head_sha:
+            raise RemoteDeliveryFailed(
+                "merge", "PR head moved after review; delivery must re-verify", retryable=True
+            )
         output = _run_gh(repo, ["pr", "merge", pr_url, "--squash"], timeout=timeout)
         match = re.search(r"\b([0-9a-f]{40})\b", output)
         merge_commit = match.group(1) if match else ""
         if not merge_commit:
-            view = _run_gh(
-                repo, ["pr", "view", pr_url, "--json", "mergeCommit"], timeout=timeout
-            )
-            try:
-                merge_commit = str((json.loads(view).get("mergeCommit") or {}).get("oid") or "")
-            except ValueError:
-                merge_commit = ""
+            if _SHA_RE.match(merge_oid):
+                merge_commit = merge_oid
         if not _SHA_RE.match(merge_commit):
             raise RemoteDeliveryFailed("merge", "merge commit SHA is unavailable", retryable=True)
         return {"pr_url": pr_url, "merge_commit": merge_commit, "merge_method": "squash"}
@@ -452,9 +515,24 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             pr_state = str(json.loads(state_raw).get("state") or "")
         except ValueError:
             pr_state = ""
-        _run_git(repo, ["fetch", "origin", target], timeout=timeout)
-        main_head = _run_git(repo, ["rev-parse", "FETCH_HEAD"], timeout=timeout)
-        _run_git(repo, ["merge-base", "--is-ancestor", merge_commit, "FETCH_HEAD"], timeout=timeout)
+        # Fetch into a private ref: the shared FETCH_HEAD can be clobbered
+        # by any concurrent fetch in the main repo.
+        verify_ref = "refs/vibe-remote-delivery/verify-main"
+        try:
+            _run_git(
+                repo,
+                ["fetch", "origin", "+refs/heads/{}:{}".format(target, verify_ref)],
+                timeout=timeout,
+            )
+            main_head = _run_git(repo, ["rev-parse", verify_ref], timeout=timeout)
+            _run_git(
+                repo, ["merge-base", "--is-ancestor", merge_commit, verify_ref], timeout=timeout
+            )
+        finally:
+            try:
+                _run_git(repo, ["update-ref", "-d", verify_ref], timeout=timeout)
+            except RemoteDeliveryFailed:
+                pass
         return {
             "pr_url": pr_url,
             "merge_commit": merge_commit,
@@ -462,11 +540,6 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             "main_head_sha": main_head,
             "verified": pr_state == "MERGED",
         }
-
-
-@dataclass
-class _DriveResult:
-    changed: bool = False
 
 
 def _context_from_evidence(evidence: Mapping[str, Any], snapshot: Any) -> Dict[str, Any]:
@@ -557,10 +630,30 @@ def drive_remote_delivery(
     when the snapshot was changed; the caller persists it.
     """
     authorization = _snapshot_value(snapshot, "authorization", {})
-    if not remote_delivery_required(authorization):
-        return False
+    required = remote_delivery_required(authorization)
     nodes = _snapshot_value(snapshot, "nodes", {}) or {}
     if not isinstance(nodes, dict):
+        return False
+    run_id = str(_snapshot_value(snapshot, "run_id", ""))
+    existing = nodes.get(REMOTE_DELIVERY_NODE_ID)
+    if existing is not None and not required:
+        # A reauthorization revoked remote_git_actions: retire the ring and
+        # its evidence instead of leaving an undrivable node that would also
+        # fail snapshot load validation on every subsequent tick.
+        nodes.pop(REMOTE_DELIVERY_NODE_ID, None)
+        if isinstance(snapshot, dict):
+            snapshot["remote_delivery_evidence"] = {}
+        else:
+            snapshot.remote_delivery_evidence = {}
+        _record_event(record_event, "remote_delivery_retired", {
+            "run_id": run_id,
+            "node_id": REMOTE_DELIVERY_NODE_ID,
+            "status": "retired",
+            "change_reason": "remote_git_actions_revoked",
+            "reason": "remote_git_actions revoked by reauthorization; delivery ring retired",
+        })
+        return True
+    if not required:
         return False
     integration = nodes.get(INTEGRATION_REVIEW_NODE_ID)
     if not isinstance(integration, dict) or integration.get("status") != "accepted":
@@ -582,8 +675,28 @@ def drive_remote_delivery(
             "source": "monitor.remote_delivery",
             "status": "planned",
         })
-    evidence = _snapshot_value(snapshot, "remote_delivery_evidence", {}) or {}
     binding = delivery_binding(snapshot)
+    for key in ("authorization_digest", "node_contract_digest", "integration_digest"):
+        if not _DIGEST_RE.match(binding.get(key, "")):
+            # Refuse to start rather than park on a retryable loop whose
+            # closeout reason would misread as digest drift.
+            node["status"] = "blocked_unknown"
+            node["failure"] = {
+                "step": "lineage",
+                "reason": "delivery lineage digest {} is incomplete".format(key),
+                "retryable": False,
+            }
+            _record_event(record_event, "remote_delivery_failed", {
+                "run_id": run_id,
+                "node_id": REMOTE_DELIVERY_NODE_ID,
+                "step": "lineage",
+                "status": "blocked_unknown",
+                "retryable": False,
+                "reason_class": "remote_delivery_lineage_incomplete",
+                "reason": node["failure"]["reason"],
+            })
+            return True
+    evidence = _snapshot_value(snapshot, "remote_delivery_evidence", {}) or {}
     if evidence and not binding_matches(evidence.get("binding"), binding):
         _record_event(record_event, "remote_delivery_evidence_invalidated", {
             "run_id": _snapshot_value(snapshot, "run_id", ""),
@@ -602,8 +715,6 @@ def drive_remote_delivery(
     if not evidence:
         evidence = _initial_evidence(snapshot, context)
     steps = evidence.setdefault("steps", {})
-
-    run_id = str(_snapshot_value(snapshot, "run_id", ""))
 
     def persist() -> None:
         if isinstance(snapshot, dict):
@@ -627,6 +738,18 @@ def drive_remote_delivery(
                 if value not in (None, ""):
                     evidence[key] = value
             steps[step] = {"status": "succeeded", "facts": dict(facts)}
+            persist()
+            step_event = {
+                "run_id": run_id,
+                "node_id": REMOTE_DELIVERY_NODE_ID,
+                "step": step,
+                "status": "succeeded",
+            }
+            for key in ("source_branch", "target_branch", "head_sha", "pr_url", "merge_commit"):
+                value = evidence.get(key)
+                if value not in (None, ""):
+                    step_event[key] = value
+            _record_event(record_event, "remote_delivery_step_completed", step_event)
             if step == "review":
                 if facts.get("changes_requested"):
                     evidence["status"] = "rework"
