@@ -660,6 +660,8 @@ class ProviderActionRunner(Runner):
             "{acceptance_pin}"
             "随后执行 `vibe supervisor-address{root_flag} --run-id {run} --node {node} --role {role} --generation {generation} --json`；"
             "`wake.channel` 非空时用该工具向 `wake.target` 原样发送 `wake.signal`，唤醒登记主监工；为 null 或地址 unknown 时不发，由心跳领取。"
+            "任何结束回合之前（交付、交付被拒、向监工提问、被阻塞）都要执行这条 supervisor-address 并按返回发信号；"
+            "worker-deliver 拒收时返回值已带 `wake` 指令，同样照发。"
             "自报时把你本会话的工作目录原样写进交付 JSON 的 `delivery_evidence.session_cwd`：监工用它核对本会话是否真的挂载了 project，不填就无法核对。"
             "运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。\n"
             "决策边界：不改变 PRD 决策的工程问题（实现方案、测试取舍、基线）自行判断并决定，"
@@ -1112,7 +1114,7 @@ class ProviderActionRunner(Runner):
                 )
             else:
                 event_pin = ""
-            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须带 --project-root 指向主项目目录，不要依赖当前目录，也不要在 worktree 里执行）：0) 先把**你本会话的工作目录**（会话环境给出的 cwd；project 挂载的会话在项目树或 worktree 内，projectless 会话在宿主生成的临时目录）原样写进交付 JSON 的 `delivery_evidence.session_cwd`——监工用它核对本会话是否真的挂载了 project，不填就无法核对；1) 先执行 `vibe worker-deliver --project-root {} --run-id {} --node {} --role {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；{}格式错误会当场返回）；2) `vibe supervisor-address --project-root {} --run-id {} --node {} --role {} --generation {} --json` 查询监工地址与唤醒方式；3) 返回的 `wake.channel` 非空时，用该工具向 `wake.target` 原样发送 `wake.signal` 一行（Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`）；`wake.channel` 为 null 或地址为 unknown 时不发，到此为止，监工心跳兜底拉取（没有登记推送通道的平台，如 WorkBuddy）。唤醒信号内容不影响验收。运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。".format(
+            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须带 --project-root 指向主项目目录，不要依赖当前目录，也不要在 worktree 里执行）：0) 先把**你本会话的工作目录**（会话环境给出的 cwd；project 挂载的会话在项目树或 worktree 内，projectless 会话在宿主生成的临时目录）原样写进交付 JSON 的 `delivery_evidence.session_cwd`——监工用它核对本会话是否真的挂载了 project，不填就无法核对；1) 先执行 `vibe worker-deliver --project-root {} --run-id {} --node {} --role {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；{}格式错误会当场返回）；2) `vibe supervisor-address --project-root {} --run-id {} --node {} --role {} --generation {} --json` 查询监工地址与唤醒方式；3) 返回的 `wake.channel` 非空时，用该工具向 `wake.target` 原样发送 `wake.signal` 一行（Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`）；`wake.channel` 为 null 或地址为 unknown 时不发，到此为止，监工心跳兜底拉取（没有登记推送通道的平台，如 WorkBuddy）。唤醒信号内容不影响验收。任何结束回合之前（交付、交付被拒、向监工提问、被阻塞）都要执行第 2)、3) 步并按返回发信号；worker-deliver 拒收时返回值已带 `wake` 指令，同样照发。运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。".format(
                 role, node_id, root, run_id, node_id, role, generation,
                 event_pin,
                 root, run_id, node_id, role, generation,
@@ -1934,6 +1936,19 @@ class ProviderActionRunner(Runner):
             metadata["pending_operation"] = None
             self.store._atomic(self._handle_path(handle.run_id), metadata)
 
+        action = self._issue_wait(handle, metadata)
+        result = self.store.result(action["action_id"])
+        if result is None:
+            return [
+                RunEvent(
+                    "visibility_unknown",
+                    {**claims, "reason": "provider wait is pending"},
+                )
+            ]
+        return self._wait_result(handle, metadata, claims, result)
+
+    def _issue_wait(self, handle: RunHandle, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Write the next non-blocking (``timeoutMs`` 0) wait request and record it as pending."""
         contract = {
             "node_id": metadata["node_id"],
             "role": metadata["role"],
@@ -1971,15 +1986,7 @@ class ProviderActionRunner(Runner):
         metadata["pending_action"] = action["action_id"]
         metadata["pending_operation"] = "wait"
         self.store._atomic(self._handle_path(handle.run_id), metadata)
-        result = self.store.result(action["action_id"])
-        if result is None:
-            return [
-                RunEvent(
-                    "visibility_unknown",
-                    {**claims, "reason": "provider wait is pending"},
-                )
-            ]
-        return self._wait_result(handle, metadata, claims, result)
+        return action
 
     def _wait_result(
         self,
@@ -1990,6 +1997,7 @@ class ProviderActionRunner(Runner):
     ):
         status = result.get("status")
         cursor = result.get("cursor")
+        previous_cursor = metadata.get("cursor")
         if cursor is not None and not cursor_is_valid(cursor):
             return [
                 RunEvent(
@@ -2011,6 +2019,13 @@ class ProviderActionRunner(Runner):
         metadata["pending_operation"] = None
         self.store._atomic(self._handle_path(handle.run_id), metadata)
         if status in WAIT_TRANSIENT_STATUSES:
+            if status == "timeout" and (cursor is None or cursor == previous_cursor) and all(
+                    metadata.get(key) is not None
+                    for key in ("node_id", "role", "run_id", "generation", "task_id", "host")):
+                # A timeout that moved nothing is not news for the supervisor:
+                # queue the next non-blocking wait now, from the same cursor,
+                # instead of leaving the node unwatched until the next tick.
+                self._issue_wait(handle, metadata)
             return [RunEvent("visibility_unknown", {**claims, "reason": str(status)})]
         event_name = result.get("event")
         if event_name is None and status in WAIT_STATUS_AS_EVENT:
