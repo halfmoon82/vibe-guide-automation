@@ -2234,7 +2234,7 @@ def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_p
             "核对当前 run/授权、任务身份、writer、generation 和 cursor；读取动作 evidence，"
             "按 native_tool 执行真实调用，保留完整原始结果；调用 ProviderActionStore.complete"
             "(action_id, payload, request_digest=原请求摘要)，再执行 resume 并核验状态/cursor/交付变化。"
-            "已完成动作不重复调用；新观测使用新 sequence。宿主报 No such tool available 时 complete() 拒收并抛 UnresolvedNativeTool："
+            "已完成动作不重复调用；新观测使用新 sequence。待办项带 service.mode=host_session 时，宿主已登记只能会话内派发：不按 native_tool 调用，改按 service.instructions 由本会话自答，这不算工具名路由故障。宿主报 No such tool available 时 complete() 拒收并抛 UnresolvedNativeTool："
             "按工具清单里的全名重试一次，仍失败即停止服务信箱、向用户报告工具名路由故障，不交班、不开新会话。Codex 的 create 只用 create_thread（project 目标原样传），不得用 fork_thread 代替：fork 会带上本会话整段历史，complete() 查到 forked_from_id 即拒收并抛 ForkedProviderSession；新会话写不了工作副本时停下报告宿主权限，不要改用 fork。工程失败按现有恢复协议继续，"
             "不得用重复 preflight/resume 代替 native 调用；产品变化、外部授权或 deploy 才请求用户。"
         ),
@@ -2345,6 +2345,48 @@ def authorization_card_summary(paths, plan_id, card=None):
 _MAILBOX_KEYS = ("action_id", "operation", "native_tool", "issue_id", "role", "generation", "sequence", "request_digest")
 
 
+_HOST_SESSION_ADAPTERS = {WORKBUDDY_VISIBLE_PROVIDER: "workbuddy"}
+
+
+def _host_session_service(paths, action):
+    """Self-service offer for a host that can only dispatch inside its session.
+
+    Offered only on attested evidence: the adapter's own record must rule
+    ``in_session_sdd`` (the in-session fact passes with provenance and the
+    visible lifecycle is not attested), and the request itself is a
+    ``visible-sdd`` one.  Missing, unreadable or contrary evidence offers
+    nothing, so the native tool path stays the only instruction.
+    """
+    adapter_id = _HOST_SESSION_ADAPTERS.get(action.get("provider"))
+    request = action.get("request")
+    if adapter_id is None or not isinstance(request, dict) or request.get("topology") != "visible-sdd":
+        return None
+    from .adapters.task_provider import ProviderPending
+    from .node_spec import observe_capabilities
+    try:
+        capabilities = observe_capabilities(paths, adapter_id).detection.capabilities
+    except (ProviderPending, KeyError, TypeError, ValueError, OSError):
+        return None
+    if capabilities.mode != "in_session_sdd" or capabilities.visible_automation:
+        return None
+    evidence_ref = capabilities.provenance.get(adapter_id + ".in_session_sdd")
+    if not evidence_ref:
+        return None
+    service = {
+        "mode": "host_session",
+        "evidence_ref": evidence_ref,
+        "instructions": (
+            "本宿主已登记只能会话内派发（无可见任务窗口工具）：不要等 {}，也不要因它缺失而停摆。"
+            "由本会话自己承担该节点的 worker：create 用本会话自己的会话 id 与本机标识应答；"
+            "locate/visibility 核对本会话就是该 worker 后应答；随后在本会话内按 visible-sdd 协议派 dev/review "
+            "子代理，完成后用 vibe worker-deliver 自报。结果形状见 supervisor-mailbox --template。"
+        ).format(action.get("native_tool")),
+    }
+    if action.get("operation") == "create":
+        service["binding_fields"] = ["task_id", "host"]
+    return service
+
+
 def supervisor_mailbox_view(paths, run_id):
     """Pending provider requests with prompt bodies replaced by {sha256, bytes, path}."""
     from .adapters.task_provider import ProviderActionStore
@@ -2368,6 +2410,9 @@ def supervisor_mailbox_view(paths, run_id):
                 # navigate_to_codex_page accepts threadId only; copying hostId
                 # from visibility/wait requests is a native parameter error.
                 item["native_args"] = {"threadId": thread_id}
+        service = _host_session_service(paths, action)
+        if service is not None:
+            item["service"] = service
         if isinstance(request, dict):
             if isinstance(request.get("child_binding"), dict):
                 item["child_binding"] = request["child_binding"]
@@ -2381,7 +2426,7 @@ def supervisor_mailbox_view(paths, run_id):
             "pending_count": len(items), "pending": items}
 
 
-def _template_payload(operation, role):
+def _template_payload(operation, role, provider=None):
     """A result example for ``operation`` that passes ``validate_result_shape``.
 
     Placeholder strings stand where the supervisor must put real values.  The
@@ -2401,6 +2446,11 @@ def _template_payload(operation, role):
         # The reader binds on both the task identity and a host identity
         # (``hostId`` or ``host``); a template without the host produced a
         # result the dispatcher refused after the task already existed.
+        if provider not in (None, CODEX_PROVIDER):
+            # ``threadId`` / ``hostId`` are Codex-only names; every other
+            # provider binds on the provider-neutral pair.
+            return {"binding": {"task_id": _TEMPLATE_PLACEHOLDER,
+                                "host": _TEMPLATE_PLACEHOLDER}}
         return {"binding": {"threadId": _TEMPLATE_PLACEHOLDER,
                             "hostId": _TEMPLATE_PLACEHOLDER}}
     if operation == "locate":
@@ -2423,7 +2473,7 @@ def mailbox_result_template(paths, run_id, action_id):
     return {"command": "supervisor-mailbox", "status": "ok", "run_id": run_id,
             "action_id": action_id, "operation": operation, "role": request.get("role"),
             "placeholder": _TEMPLATE_PLACEHOLDER,
-            "template": _template_payload(operation, request.get("role"))}
+            "template": _template_payload(operation, request.get("role"), request.get("provider"))}
 
 
 def mailbox_complete(paths, run_id, action_id, payload):
