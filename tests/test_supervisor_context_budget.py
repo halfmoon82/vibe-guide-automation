@@ -164,7 +164,7 @@ class HandoffRecoveryTests(unittest.TestCase):
 
     def _oversized_monitor_payload(self, **extra):
         nodes = {'node-%d' % i: {'status': 'running', 'user_status': 'x' * 300, 'detail': 'd' * 500}
-                 for i in range(8)}
+                 for i in range(30)}
         payload = {'command': 'monitor', 'status': 'running', 'run_id': 'run-1', 'nodes': nodes}
         payload.update(extra)
         return payload
@@ -187,6 +187,7 @@ class HandoffRecoveryTests(unittest.TestCase):
         payload = self._oversized_monitor_payload(daemon=daemon)
         with tempfile.TemporaryDirectory() as root:
             output = json.loads(bounded_supervisor_output(ProjectPaths(Path(root)), 'run-1', payload, json.dumps(payload)))
+        self.assertTrue(output['truncated'])
         self.assertEqual(output['daemon'], daemon)
 
     def test_truncated_output_without_handoff_adds_no_handoff_key(self):
@@ -194,6 +195,7 @@ class HandoffRecoveryTests(unittest.TestCase):
         payload = self._oversized_monitor_payload()
         with tempfile.TemporaryDirectory() as root:
             output = json.loads(bounded_supervisor_output(ProjectPaths(Path(root)), 'run-1', payload, json.dumps(payload)))
+        self.assertTrue(output['truncated'])
         self.assertNotIn('handoff', output)
         self.assertNotIn('daemon', output)
 
