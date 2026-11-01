@@ -2353,7 +2353,7 @@ def _host_session_service(paths, action):
 
     Offered only on attested evidence: the adapter's own record must rule
     ``in_session_sdd`` (the in-session fact passes with provenance and the
-    visible lifecycle is not attested), and the request itself is a
+    visible lifecycle is not fully attested), and the request itself is a
     ``visible-sdd`` one.  Missing, unreadable or contrary evidence offers
     nothing, so the native tool path stays the only instruction.
     """
@@ -2367,7 +2367,7 @@ def _host_session_service(paths, action):
         capabilities = observe_capabilities(paths, adapter_id).detection.capabilities
     except (ProviderPending, KeyError, TypeError, ValueError, OSError):
         return None
-    if capabilities.mode != "in_session_sdd" or capabilities.visible_automation:
+    if capabilities.mode != "in_session_sdd":
         return None
     evidence_ref = capabilities.provenance.get(adapter_id + ".in_session_sdd")
     if not evidence_ref:
