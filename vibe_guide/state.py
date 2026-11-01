@@ -336,6 +336,20 @@ CONSISTENCY_CORRECTION_KEYS = (
     "decision",
 )
 _EVENT_DATA_KEYS = {
+    # Every key a ``Monitor._record`` call site writes must be here, or
+    # ``_sanitize_event_data`` drops it without a word
+    # (tests/test_event_key_allowlist.py scans the call sites).  ``error`` is
+    # kept only as bounded, credential-scrubbed text (``bounded_error_text``).
+    "action_ref",
+    "commits",
+    "error",
+    "change_request",
+    "delivered",
+    "modified_files",
+    "parameter_recovery",
+    "review_round_voided",
+    "reviewer_replacement_required",
+    "topology",
     # Fixed-enum cause (and repo node id) of a decision-less blocked_design,
     # so the monitor can register vibe-authored decision text after a replay.
     "blocked_design_cause",
@@ -733,6 +747,39 @@ def durable_projection(value: Any) -> Any:
     return _sanitize_durable_value(value)
 
 
+#: Independent ``reason_code`` values for a mailbox result the dispatcher
+#: refuses (a missing host, a wrongly shaped locate) rather than a generic
+#: ``dispatch_contract_invalid``.  A missing contract worktree reports
+#: ``worktree_missing`` through the provider-failure observation instead.
+MAILBOX_REASON_CODES = frozenset(("mailbox_host_missing", "mailbox_locate_shape"))
+#: A ``contract_error`` event keeps the failure text only this long.
+ERROR_TEXT_LIMIT = 200
+_ERROR_SCRUBBERS = (
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
+     "[REDACTED]"),
+    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+                r"|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})"), "[REDACTED]"),
+    (re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)\b(api[_-]?key|access[_-]?key|token|secret|password|passwd|credential)(\s*[:=]\s*)\S+"),
+     r"\1\2[REDACTED]"),
+    (re.compile(r"\b[A-Fa-f0-9]{40,}\b|\b[A-Za-z0-9+/_-]{48,}={0,2}"), "[REDACTED]"),
+    (re.compile(r"/Users/[^/\s]+"), "/Users/~"),
+)
+
+
+def bounded_error_text(value: Any) -> str:
+    """A failure's text with credentials scrubbed, cut to ``ERROR_TEXT_LIMIT``.
+
+    The event log keeps enough of the message to name the failing field
+    without keeping provider payloads whole: scrub first, then truncate, so a
+    secret straddling the cut is never half-kept.
+    """
+    text = " ".join(str(value).split())
+    for pattern, replacement in _ERROR_SCRUBBERS:
+        text = pattern.sub(replacement, text)
+    return text[:ERROR_TEXT_LIMIT]
+
+
 def _sanitize_event_data(data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("event data is invalid")
@@ -742,6 +789,10 @@ def _sanitize_event_data(data: Dict[str, Any]) -> Dict[str, Any]:
             continue
         normalized = _normalize_data_key(key)
         if normalized not in _EVENT_DATA_KEYS or _is_sensitive_data_key(key):
+            continue
+        if normalized == "error":
+            # Not provider free text here: the dispatcher's own bounded message.
+            result[normalized] = bounded_error_text(value)
             continue
         result[normalized] = _sanitize_durable_value(value, normalized)
     return result
