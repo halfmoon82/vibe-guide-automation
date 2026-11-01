@@ -14,6 +14,7 @@ a platform's one-shot command) is reported as unverified, never as success.
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -26,7 +27,10 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from . import fsio, model_catalog, pm_inbox, short_session, stall
 from .contracts import RunEvent
-from .state import append_event, load_events, load_snapshot, run_dir
+from .state import (
+    _safe_project_path, append_event, load_events, load_snapshot, run_dir, runs_archive_dir,
+    unarchive_run, validate_run_id,
+)
 
 DAEMON_FILE = "daemon.json"
 HEAL_STATE_FILE = "heal-state.json"
@@ -42,6 +46,9 @@ PARKED_STATUS = "blocked_unknown"
 ACTIVE_NODE_STATUSES = frozenset({
     "ready", "start_pending", "running", "review", "rework", "delivered", "retry_pending", "brief_pending",
 })
+#: push receipts that count as the product manager having been told
+PM_NOTIFIED_STATUSES = frozenset({"sent", "queued_inbox"})
+PARKED_RUN_STATE = "parked"
 LEASE_HELD_MESSAGE = "supervisor lease is held by another process"
 _ERROR_ESCALATION_STREAK = 5
 _ESCALATE_MARK = "VIBE_ESCALATE:"
@@ -280,6 +287,92 @@ def stop_daemon(paths, run_id: str, *, wait: float = 10.0,
     return {**base, "status": "stop_pending", "pid": pid, "reason": "process still alive after SIGTERM"}
 
 
+def pm_address_notice(paths, run_id: str) -> Optional[str]:
+    """Plain-language line when the product manager could not be reached for lack of an address.
+
+    Read-only.  Present only while the newest push receipt says ``no_address``
+    and no address has been registered since; ``None`` otherwise.
+    """
+    try:
+        if _file(paths, run_id, PM_ADDRESS_FILE).is_file():
+            return None
+        lines = _file(paths, run_id, pm_inbox.RECEIPT_FILE).read_text(encoding="utf-8").splitlines()
+    except (OSError, ValueError):
+        return None
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict):
+            if record.get("status") == "no_address":
+                return ("产品经理地址未登记：守护程序的通知只写进了收件箱，没有送达；"
+                        "该运行不会自动关闭。请用 vibe daemon register-pm 登记产品经理会话")
+            return None
+    return None
+
+
+def restore_run(paths, run_id: str, *, starter: Optional[Callable[..., Any]] = None,
+                clock: Callable[[], float] = time.time) -> Dict[str, Any]:
+    """Bring an archived run back under ``.vibe/runs/`` and restart its daemon.
+
+    Backs the archive up first, moves it back with ``unarchive_run`` (which never
+    overwrites newer evidence), appends one ``run_unarchived`` event and starts
+    the daemon.  Idempotent: a run that is already live and whose last archive
+    marker has been answered changes nothing.
+    """
+    validate_run_id(run_id)
+    base = {"command": "run-restore", "run_id": run_id}
+    live = _safe_project_path(paths, ".vibe", "runs", run_id)
+    archive = runs_archive_dir(paths, run_id)
+    backup_ref = None
+    if live.exists():
+        if _last_archive_mark(paths, run_id) != "run_archived":
+            return {**base, "status": "already_live", "changed": False}
+    elif not archive.is_dir():
+        return {**base, "status": "not_found", "changed": False,
+                "reason": "no archived run directory for this run id"}
+    else:
+        backup_name = "%s-%d" % (run_id, int(clock()))
+        backup = _safe_project_path(paths, ".vibe", "runs-restore-backups", backup_name)
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(str(archive), str(backup), symlinks=True)
+        backup_ref = "runs-restore-backups/" + backup_name
+        if not unarchive_run(paths, run_id):
+            return {**base, "status": "restore_failed", "changed": False, "backup": backup_ref}
+    provenance = plan_id = None
+    try:
+        snapshot = load_snapshot(paths, run_id)
+        plan_id = snapshot.plan_id
+        provenance = {"role": "system", "task_id": None, "handle_id": None, "generation": 0,
+                      "authorization_digest": snapshot.authorization_digest,
+                      "node_contract_digest": snapshot.node_contract_digest}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    data = {"run_id": run_id}
+    if backup_ref:
+        data["backup_ref"] = backup_ref
+    append_event(paths, RunEvent("run_unarchived", data), provenance)
+    result = {**base, "status": "restored", "changed": True, "backup": backup_ref}
+    if not plan_id:
+        return {**result, "daemon": {"status": "not_started", "reason": "plan id unreadable; run vibe daemon start"}}
+    try:
+        started = (starter or start_daemon)(paths, run_id, plan_id)
+        result["daemon"] = {"status": started.get("status", "unknown"), "reason": started.get("reason", "")}
+    except Exception as error:  # noqa: BLE001 - the restore itself already happened
+        result["daemon"] = {"status": "start_failed", "reason": type(error).__name__}
+    return result
+
+
+def _last_archive_mark(paths, run_id: str) -> Optional[str]:
+    try:
+        marks = [item.get("event") for item in load_events(paths, run_id)
+                 if item.get("event") in ("run_archived", "run_unarchived")]
+    except (OSError, ValueError, TypeError):
+        return None
+    return marks[-1] if marks else None
+
+
 # ---------------------------------------------------------------------------
 # push to the product manager
 
@@ -358,6 +451,7 @@ class Daemon:
                  gate: Optional[Callable[[], Optional[Mapping[str, Any]]]] = None,
                  archive: Optional[Callable[[], Any]] = None,
                  sessions: Optional[Callable[[Any], Dict[str, Any]]] = None,
+                 pending_work: Optional[Callable[[], List[str]]] = None,
                  command_prefix: str = "vibe"):
         self.paths = paths
         self.run_id = run_id
@@ -373,6 +467,8 @@ class Daemon:
         self._retry = retry or self._default_retry
         self._archive = archive or self._default_archive
         self._sessions = sessions or self._default_sessions
+        self._pending_work = pending_work or self._default_pending_work
+        self._park_deferred_key: Optional[str] = None
         self._snapshot = None
         self._report_failed = False
         #: run status being closed out; None while the run is still advancing
@@ -409,6 +505,18 @@ class Daemon:
         from .live_sessions import probe_live_sessions
         return probe_live_sessions(self.paths, snapshot)
 
+    def _default_pending_work(self) -> List[str]:
+        """Delivered-but-unconsumed reports and unserved mailbox requests of this run.
+
+        Raises when the mailbox cannot be read: an unreadable mailbox is never "empty".
+        """
+        from .adapters.task_provider import ProviderActionStore
+        store = ProviderActionStore(self.paths)
+        found = ["delivery:%s" % item for item in store.unconsumed_deliveries(self.run_id)]
+        found += ["result:%s" % item for item in store.unpolled_results(self.run_id)]
+        found += ["request:%s" % item.get("action_id") for item in store.pending(self.run_id)]
+        return found
+
     def _default_retry(self, node_id):
         # The mechanical retry: one more resume/tick re-attaches bindings and
         # re-reads deliveries.  Provider-specific restarts are an injected hook.
@@ -429,6 +537,7 @@ class Daemon:
         state.setdefault("cache_zero_streak", 0)
         state.setdefault("nodes", {})
         state.setdefault("pushed", [])
+        state.setdefault("budget", {})
         return state
 
     def _save_heal_state(self, state: Mapping[str, Any]) -> None:
@@ -472,6 +581,8 @@ class Daemon:
         lost = False
         try:
             while not self._stop:
+                if self._closing == PARKED_STATUS and self._undelivered_work():
+                    self._closing = None  # a delivery or request arrived: serve it before parking
                 if not self._closing:
                     blocked = self._check_gate()
                     if blocked is not None:
@@ -520,7 +631,10 @@ class Daemon:
                 self.supervisor.lease.release(self.run_id)
             except (OSError, ValueError):
                 pass
-            self._write_state("exited", outcome.get("reason") or outcome["status"])
+            if outcome.get("status") == "parked":
+                self._write_state(PARKED_RUN_STATE, outcome.get("reason") or "")
+            else:
+                self._write_state("exited", outcome.get("reason") or outcome["status"])
         return outcome
 
     # -- close-out ---------------------------------------------------------
@@ -547,7 +661,26 @@ class Daemon:
             self._parked_since = now
         recorded = self._heal_state()["nodes"]
         handed_over = all(recorded.get(node_id, {}).get("escalated") for node_id in blocked)
-        return handed_over or now - self._parked_since >= self.config.blocked_grace
+        if not (handed_over or now - self._parked_since >= self.config.blocked_grace):
+            return False
+        # Parking never leaves a delivered report or a mailbox request unserved:
+        # the ticks that follow consume them first.  Work that stays unserved
+        # for the whole grace period no longer holds the run back.
+        return not self._undelivered_work() or now - self._parked_since >= self.config.blocked_grace
+
+    def _undelivered_work(self) -> List[str]:
+        """Unserved mailbox work; an unreadable mailbox counts as work (never as empty)."""
+        try:
+            found = list(self._pending_work() or [])
+        except Exception as error:  # noqa: BLE001
+            found = ["mailbox_unreadable:%s" % type(error).__name__]
+        key = ",".join(sorted(found))
+        if found and key != self._park_deferred_key:
+            self._park_deferred_key = key
+            self._event("run_park_deferred", reason_code="undelivered_work", observation_count=len(found))
+        if not found:
+            self._park_deferred_key = None
+        return found
 
     def _closeout_status(self) -> Optional[str]:
         status = self._run_status
@@ -558,11 +691,20 @@ class Daemon:
         return None
 
     def _announce(self, status: str, blocked: List[str]) -> bool:
-        """The completion / decision message, in pm-inbox before anything is archived."""
+        """The completion / decision message, in pm-inbox before anything is archived.
+
+        True once the run may be settled.  A run that needs the product manager
+        (anything but ``complete``) is settled only after the push receipt says
+        ``sent`` or ``queued_inbox``; ``no_address`` or an unknown receipt keeps
+        it open.
+        """
         state = self._heal_state()
         key = "run:" + status
         if key in state["pushed"]:
             return True
+        waiting = state.setdefault("announce_waiting", {})
+        if waiting.get(key) == "no_address" and not _file(self.paths, self.run_id, PM_ADDRESS_FILE).is_file():
+            return False  # already in the inbox; push again once an address is registered
         if status == "complete":
             text = "运行 %s 已结束：complete" % self.run_id
         elif blocked:
@@ -573,9 +715,26 @@ class Daemon:
         if result.get("status") == "inbox_failed":
             self._log("pm-inbox write failed (%s); archive postponed" % result.get("reason"))
             return False
+        notified = result.get("status") in PM_NOTIFIED_STATUSES
+        if not notified and status != "complete":
+            waiting[key] = str(result.get("status") or "unknown")
+            self._save_heal_state(state)
+            self._log("product manager not reached (%s); run stays open" % waiting[key])
+            return False
+        waiting.pop(key, None)
+        self._mark_notified(state, blocked, result)
         state["pushed"].append(key)
         self._save_heal_state(state)
         return True
+
+    @staticmethod
+    def _mark_notified(state: Dict[str, Any], node_ids, result: Mapping[str, Any]) -> None:
+        """``pm_notified`` is set only by a receipt that says the message was delivered or queued."""
+        if result.get("status") not in PM_NOTIFIED_STATUSES:
+            return
+        for node_id in node_ids:
+            if node_id:
+                state["nodes"].setdefault(node_id, {})["pm_notified"] = True
 
     def _defer(self, status: str, probe: Mapping[str, Any]) -> None:
         live = list(probe.get("live") or [])
@@ -626,6 +785,12 @@ class Daemon:
             self._defer(status, probe)
             return None
         self._deferred_since = None
+        if status == PARKED_STATUS:
+            # Parked, not archived: the run directory stays where it is so the
+            # supervisor or the product manager can look at it and archive it
+            # explicitly.  The lease is released when the daemon exits.
+            self._event("run_parked", run_status=status, blocked_nodes=blocked)
+            return {"status": "parked", "run_status": status, "reason": "parked: %s" % ",".join(blocked)}
         try:
             self.supervisor.lease.release(self.run_id)
         except (OSError, ValueError):
@@ -744,7 +909,8 @@ class Daemon:
             fingerprint = self._fingerprint(snapshot, node_id)
             node_state = state["nodes"].get(node_id)
             if not node_state or node_state.get("fingerprint") != fingerprint:
-                node_state = {"fingerprint": fingerprint, "retried": False, "repairs": 0, "escalated": False}
+                node_state = {"fingerprint": fingerprint, "retried": False, "repairs": 0, "escalated": False,
+                              "pm_notified": False}
                 state["nodes"][node_id] = node_state
                 (state.get("unresolved") or {}).pop(node_id, None)  # the node moved: no longer stuck
             if node_state["escalated"]:
@@ -764,8 +930,7 @@ class Daemon:
                 continue
             if ran_session:
                 continue  # at most one short session per run at a time
-            ran_session = True
-            self._level_two(state, node_state, node_id, entry, snapshot)
+            ran_session = self._level_two(state, node_state, node_id, entry, snapshot)
         self._save_heal_state(state)
 
     def _rejected_and_waiting(self, node_id: str) -> bool:
@@ -881,16 +1046,22 @@ class Daemon:
                     platform=self.config.platform, reason=reason)
         return None
 
-    def _level_two(self, state, node_state, node_id, entry, snapshot) -> None:
+    def _level_two(self, state, node_state, node_id, entry, snapshot) -> bool:
+        """One repair session for this node; True only when a session was actually started.
+
+        The budget is per node: a node that spent its own sessions or tokens is
+        handed over without touching what the other nodes may still use.
+        """
         config = self.config
-        if state["sessions"] >= config.max_sessions or state["tokens"] >= config.max_tokens:
+        budget = state.setdefault("budget", {}).setdefault(node_id, {"sessions": 0, "tokens": 0})
+        if budget["sessions"] >= config.max_sessions or budget["tokens"] >= config.max_tokens:
             self._unresolved(node_id, "budget_exhausted",
-                             "节点 %s 空转，短会话预算已用尽（%d 次 / %d token）" % (node_id, state["sessions"], state["tokens"]),
+                             "节点 %s 空转，短会话预算已用尽（%d 次 / %d token）" % (node_id, budget["sessions"], budget["tokens"]),
                              state=state, entry=entry)
-            return
+            return False
         marker = state.get("active")
         if isinstance(marker, dict) and marker.get("pid") != os.getpid() and _pid_marker_alive(marker):
-            return
+            return False
         state["active"] = {"node_id": node_id, "pid": os.getpid(), "started_at": self.clock()}
         self._save_heal_state(state)
         before = len(load_events(self.paths, self.run_id))
@@ -901,8 +1072,9 @@ class Daemon:
             run_id=self.run_id, node_id=node_id, poll=lambda: self._write_state("running"))
         state["active"] = None
         state["sessions"] += 1
+        budget["sessions"] += 1
         node_state["repairs"] += 1
-        self._account_usage(state, result)
+        self._account_usage(state, result, budget)
         self._event("daemon_heal", node_id=node_id, kind="short_session", phase="level2",
                     reason_code=result.status, reason=result.reason)
         if result.status in (short_session.STATUS_UNKNOWN, short_session.STATUS_QUEUED):
@@ -910,7 +1082,7 @@ class Daemon:
             self._unresolved(node_id, "short_session_unknown",
                              "节点 %s 的修复短会话结果未知（%s）" % (node_id, result.reason or result.status),
                              state=state, entry=entry)
-            return
+            return True
         text = result.text or ""
         mark = next((line for line in reversed(text.splitlines()) if _ESCALATE_MARK in line), None)
         if mark is not None:
@@ -922,8 +1094,10 @@ class Daemon:
             else:
                 self._unresolved(node_id, "needs_decision", "节点 %s 的修复会话无法判定：%s" % (node_id, reason),
                                  state=state, entry=entry)
-            return
-        self._recheck(node_id, entry, before)
+            return True
+        if self._recheck(node_id, entry, before) == "inconclusive":
+            node_state["repairs"] = max(0, node_state["repairs"] - 1)  # nothing was checked: not a failed repair
+        return True
 
     def _recheck(self, node_id: str, entry: Mapping[str, Any], events_before: int) -> str:
         """The daemon's own verdict: the session's heal-verify if it ran one, else ours."""
@@ -934,15 +1108,24 @@ class Daemon:
             outcome = (own[-1].get("data") or {}).get("outcome")
         else:
             role = (entry.get("pack") or {}).get("role") or "developer"
-            outcome = "passed" if self._verify(node_id, role).get("status") == "verify_passed" else "failed"
+            verdict = self._verify(node_id, role)
+            if verdict.get("status") == "verify_passed":
+                outcome = "passed"
+            elif verdict.get("status") == "blocked_unknown" and "nothing to re-check" in str(verdict.get("reason", "")):
+                outcome = "inconclusive"  # the session could not be identified: no evidence either way
+            else:
+                outcome = "failed"
         self._event("daemon_heal", node_id=node_id, kind="recheck", phase="level2", reason_code=str(outcome))
         return str(outcome)
 
-    def _account_usage(self, state, result) -> None:
+    def _account_usage(self, state, result, budget=None) -> None:
         usage = result.usage
         if usage is None:
             return
-        state["tokens"] += usage["input"] + usage["output"] + usage["cache_creation"]
+        spent = usage["input"] + usage["output"] + usage["cache_creation"]
+        state["tokens"] += spent
+        if budget is not None:
+            budget["tokens"] += spent
         if usage["cache_read"] == 0:
             state["cache_zero_streak"] += 1
         else:
@@ -1015,6 +1198,7 @@ class Daemon:
         message = "【需要你处理】%s（运行 %s）。决策卡：%s" % (
             summary, self.run_id, decision_id or "未能建立，见 pm-inbox")
         push = self._push(message, "escalation", node_id)
+        self._mark_notified(state, [node_id], push)
         self._event("daemon_heal", node_id=node_id or "daemon", kind="escalated", phase="level3",
                     reason_code=code, reason=push.get("status", "unknown"))
         if own_state:
@@ -1043,10 +1227,12 @@ class Daemon:
                 return False
         text = "运行 %s 有 %d 项系统没能自动解决：\n\n%s" % (
             self.run_id, len(items), "\n\n".join(unresolved_lines(items)))
-        self._report_failed = self._push(text, UNRESOLVED_REPORT_KIND).get("status") == "inbox_failed"
+        pushed = self._push(text, UNRESOLVED_REPORT_KIND)
+        self._report_failed = pushed.get("status") == "inbox_failed"
         if self._report_failed:
             return False  # nothing reached the inbox: try again on the next cycle
         state["pushed"].append(signature)
+        self._mark_notified(state, [key for key in items if not key.startswith("daemon:")], pushed)
         return True
 
     def _push_pending(self, snapshot) -> None:

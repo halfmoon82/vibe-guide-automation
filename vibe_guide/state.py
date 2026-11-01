@@ -552,6 +552,11 @@ _EVENT_DATA_KEYS = {
     "lease_epoch",
     "live_sessions",
     "run_status",
+    # provider_observation / run_parked / run_unarchived: a poll counter, the
+    # run-relative name of the pre-restore backup and the node ids parked.
+    "observation_count",
+    "backup_ref",
+    "blocked_nodes",
 }
 _SENSITIVE_DATA_NAMES = (
     "api_key",
