@@ -288,13 +288,13 @@ MAILBOX_FIELD_TABLE = (
     ("wait", None, "pending", {"status": "timeout"},
      "未完；`cursor` 给就必须是非空字符串（≤4096、无 NUL），不知道就不给"),
     ("wait", "developer", "complete",
-     {"status": "completed", "cursor": PLACEHOLDER, "event": "complete",
+     {"status": "completed", "event": "complete",
       "delivery_evidence": {"completion_marker": PLACEHOLDER, "delivery_path": PLACEHOLDER,
                             "thread_status": "complete"}},
-     "（嵌套对象，三键齐全，摊平无效）；`cursor` 不知道就整个不给"),
+     "（嵌套对象，三键齐全，摊平无效）；`cursor` 知道才给（真实值），不知道就整个不给"),
     ("wait", "reviewer", "complete",
-     {"status": "completed", "cursor": PLACEHOLDER, "event": "accepted", "evidence": {"summary": PLACEHOLDER}},
-     "P0–P2 清零证据"),
+     {"status": "completed", "event": "accepted", "evidence": {"summary": PLACEHOLDER}},
+     "P0–P2 清零证据；`cursor` 知道才给（真实值），不知道就整个不给"),
     ("resume", None, "ok", {"resumed": True}, "沿用原会话 id，不回写绑定"),
 )
 
@@ -503,6 +503,19 @@ def validate_result_shape(operation, payload, *, role=None):
         errors = _shape_errors([RESUME_RECEIPT_FIELD], _RESUME_RESULT_FIELDS, payload)
         if RESUME_RECEIPT_FIELD in payload and payload[RESUME_RECEIPT_FIELD] is not True:
             errors.append("field {} must be true".format(RESUME_RECEIPT_FIELD))
+    if operation in ("wait", "create"):
+        # A cursor is stored and later compared (cursor-conflict check), so a
+        # blank or placeholder one is a fake position, not an optional blank.
+        cursors = [("cursor", payload["cursor"])] if "cursor" in payload else []
+        binding = payload.get("binding")
+        if operation == "create" and isinstance(binding, dict) and "cursor" in binding:
+            cursors.append(("binding.cursor", binding["cursor"]))
+        for path, value in cursors:
+            if _holds_placeholder(value):
+                errors.append(
+                    "field {} is blank or still holds the template placeholder; "
+                    "substitute the real cursor or omit the field".format(path)
+                )
     for path in _placeholder_paths(_identity_fields(operation, payload)):
         errors.append(
             "field {} still holds the template placeholder; substitute the real value".format(path)

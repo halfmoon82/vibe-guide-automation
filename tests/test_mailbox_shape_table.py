@@ -102,6 +102,24 @@ class PlaceholderJudgement(unittest.TestCase):
                         validate_result_shape(operation, build(value), role="developer")
                     self.assertIn("placeholder", str(caught.exception))
 
+    def test_cursor_placeholder_or_blank_is_refused_for_wait_and_create(self):
+        wait = {"status": "completed", "event": "accepted"}
+        for value in self.VARIANTS + ("", "  ", "　"):
+            for operation, build in (
+                ("wait", lambda v: dict(wait, cursor=v)),
+                ("create", lambda v: {"binding": {"threadId": "t", "hostId": "h"}, "cursor": v}),
+                ("create", lambda v: {"binding": {"threadId": "t", "hostId": "h", "cursor": v}}),
+            ):
+                with self.subTest(operation=operation, value=value):
+                    with self.assertRaises(ValueError) as caught:
+                        validate_result_shape(operation, build(value), role="reviewer")
+                    self.assertIn("cursor", str(caught.exception))
+                    self.assertIn("placeholder", str(caught.exception))
+
+    def test_real_cursor_is_accepted(self):
+        validate_result_shape("wait", {"status": "completed", "event": "accepted", "cursor": "c-1"},
+                              role="reviewer")
+
     def test_blank_identity_is_missing_not_a_value(self):
         for value in ("", "  ", "　"):
             with self.subTest(value=value):
