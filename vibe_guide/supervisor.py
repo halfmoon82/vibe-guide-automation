@@ -2350,10 +2350,7 @@ _HOST_SESSION_ADAPTERS = {WORKBUDDY_VISIBLE_PROVIDER: "workbuddy"}
 
 
 def _is_closeout_reviewer(action):
-    return (
-        action.get("issue_id") == INTEGRATION_REVIEW_NODE_ID
-        and action.get("role") == "reviewer"
-    )
+    return action.get("issue_id") == INTEGRATION_REVIEW_NODE_ID
 
 
 def _developer_identity_clash(paths, run_id, payload):
@@ -2410,9 +2407,11 @@ def _host_session_service(paths, action):
 
     Offered only on attested evidence: the adapter's own record must rule
     ``in_session_sdd`` (the in-session fact passes with provenance and the
-    visible lifecycle is not fully attested), and the request itself is a
-    ``visible-sdd`` one.  Missing, unreadable or contrary evidence offers
-    nothing, so the native tool path stays the only instruction.
+    visible lifecycle is not fully attested), and the request is either a
+    ``visible-sdd`` one or belongs to the closeout review, which stays a
+    reviewer dispatch but may be served by an independent in-session subagent.
+    Missing, unreadable or contrary evidence offers nothing, so the native
+    tool path stays the only instruction.
     """
     adapter_id = _HOST_SESSION_ADAPTERS.get(action.get("provider"))
     closeout = _is_closeout_reviewer(action)
