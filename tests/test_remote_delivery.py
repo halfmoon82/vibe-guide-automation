@@ -322,6 +322,20 @@ class ReauthorizationAndLineageTests(unittest.TestCase):
         self.assertEqual(snapshot.remote_delivery_evidence, {})
         self.assertIn("remote_delivery_retired", [name for name, _ in recorded])
 
+    def test_degenerate_digest_after_acceptance_blocks_with_a_clear_reason(self):
+        snapshot = _snapshot()
+        drive_remote_delivery(snapshot, FakeExecutor())
+        self.assertEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "accepted")
+        snapshot.node_contract_digest = ""
+        # The stale binding invalidates the evidence (old facts must not be
+        # reused), and the lineage guard then refuses to re-drive with a
+        # clear non-retryable reason instead of a misleading retry loop.
+        self.assertTrue(drive_remote_delivery(snapshot, FakeExecutor()))
+        node = snapshot.nodes[REMOTE_DELIVERY_NODE_ID]
+        self.assertEqual(node["status"], "blocked_unknown")
+        self.assertEqual(node["failure"]["step"], "lineage")
+        self.assertFalse(node["failure"]["retryable"])
+
     def test_incomplete_lineage_digest_refuses_with_a_clear_reason(self):
         snapshot = _snapshot()
         snapshot.node_contract_digest = ""
@@ -648,6 +662,24 @@ class PrepareRealGitTests(unittest.TestCase):
             self._git(repo, "merge-base", "--is-ancestor", "node/a", source)
             self._git(repo, "merge-base", "--is-ancestor", "node/b", source)
             self.assertFalse((repo / ".worktrees" / "remote-delivery-p1").exists())
+
+    def test_push_publishes_the_source_branch_and_is_idempotent(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, origin = self._fixture(directory)
+            executor = SubprocessRemoteDeliveryExecutor(repo, plan_id="p1")
+            prepared = executor.execute("prepare", {"node_branches": ["node/a", "node/b"]})
+            pushed = executor.execute(
+                "push", {"source_branch": prepared["source_branch"], "head_sha": prepared["head_sha"]}
+            )
+            self.assertFalse(pushed["already_pushed"])
+            remote_head = self._git(repo, "ls-remote", "origin", "refs/heads/" + prepared["source_branch"]).split()[0]
+            self.assertEqual(remote_head, prepared["head_sha"])
+            again = executor.execute(
+                "push", {"source_branch": prepared["source_branch"], "head_sha": prepared["head_sha"]}
+            )
+            self.assertTrue(again["already_pushed"])
 
     def test_prepare_marks_merge_conflicts_as_non_retryable(self):
         import tempfile

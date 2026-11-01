@@ -373,7 +373,15 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
         remote_sha = remote_head[0] if remote_head else ""
         already = remote_sha == local_head
         if not already:
-            _run_git(repo, ["push", "--force-with-lease", "origin", "{}:{}".format(source, source)], timeout=timeout)
+            if remote_sha:
+                # Pin the lease to the SHA ls-remote just observed: a bare
+                # --force-with-lease fails "stale info" when no local
+                # remote-tracking ref exists, which nothing in this engine
+                # maintains.
+                lease = "--force-with-lease=refs/heads/{}:{}".format(source, remote_sha)
+                _run_git(repo, ["push", lease, "origin", "{}:{}".format(source, source)], timeout=timeout)
+            else:
+                _run_git(repo, ["push", "origin", "{}:{}".format(source, source)], timeout=timeout)
         return {"source_branch": source, "head_sha": local_head, "already_pushed": already}
 
     def _create_pr(self, context: Mapping[str, Any]) -> Dict[str, Any]:
@@ -676,6 +684,21 @@ def drive_remote_delivery(
             "status": "planned",
         })
     binding = delivery_binding(snapshot)
+    evidence = _snapshot_value(snapshot, "remote_delivery_evidence", {}) or {}
+    if evidence and not binding_matches(evidence.get("binding"), binding):
+        _record_event(record_event, "remote_delivery_evidence_invalidated", {
+            "run_id": _snapshot_value(snapshot, "run_id", ""),
+            "node_id": REMOTE_DELIVERY_NODE_ID,
+            "reason": "digest binding changed; prior delivery evidence is not reusable",
+            "change_reason": "remote_delivery_binding_changed",
+        })
+        evidence = {}
+        node["status"] = "planned"
+    elif node.get("status") == "accepted":
+        # Only an accepted node with current, digest-bound evidence may stop;
+        # staleness is handled above.
+        return False
+    binding = delivery_binding(snapshot)
     for key in ("authorization_digest", "node_contract_digest", "integration_digest"):
         if not _DIGEST_RE.match(binding.get(key, "")):
             # Refuse to start rather than park on a retryable loop whose
@@ -696,20 +719,6 @@ def drive_remote_delivery(
                 "reason": node["failure"]["reason"],
             })
             return True
-    evidence = _snapshot_value(snapshot, "remote_delivery_evidence", {}) or {}
-    if evidence and not binding_matches(evidence.get("binding"), binding):
-        _record_event(record_event, "remote_delivery_evidence_invalidated", {
-            "run_id": _snapshot_value(snapshot, "run_id", ""),
-            "node_id": REMOTE_DELIVERY_NODE_ID,
-            "reason": "digest binding changed; prior delivery evidence is not reusable",
-            "change_reason": "remote_delivery_binding_changed",
-        })
-        evidence = {}
-        node["status"] = "planned"
-    elif node.get("status") == "accepted":
-        # Only an accepted node with current, digest-bound evidence may stop;
-        # staleness is handled above.
-        return False
 
     context = _context_from_evidence(evidence, snapshot)
     if not evidence:
