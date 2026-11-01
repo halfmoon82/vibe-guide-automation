@@ -139,6 +139,12 @@ class HostSessionServiceTests(unittest.TestCase):
                                          issue="integration-review")
                 self.assertNotIn("service", self.pending()[action_id])
 
+    def test_closeout_keeps_the_native_path_when_a_visible_create_is_attested(self):
+        self.attest(dict(IN_SESSION_ONLY, **{"workbuddy.visible_task.create": True}))
+        action_id = self.request("w", topology="dual-visible", role="reviewer",
+                                 issue="integration-review")
+        self.assertNotIn("service", self.pending()[action_id])
+
     def test_a_business_reviewer_is_still_never_self_served(self):
         self.attest(IN_SESSION_ONLY)
         action_id = self.request("w", topology="dual-visible", role="reviewer", issue="export-button")
@@ -322,6 +328,21 @@ class SelfServedCloseoutTests(unittest.TestCase):
                 break
         self.assertEqual(result.payload.get("status"), "complete", result.text)
         self.assertEqual(result.payload["nodes"]["integration-review"]["status"], "accepted")
+
+    def test_identity_clash_ignores_case_and_surrounding_whitespace(self):
+        create = self.drive_until_closeout_create()
+        for spelling in ("Host-Session", " host-session ", "host-session\n"):
+            with self.subTest(spelling=spelling):
+                refused = self.complete(create["run_id"], create, self.answer(create, reviewer_id=spelling))
+                self.assertEqual(refused.payload["status"], "blocked_invalid", refused.payload)
+                self.assertIsNone(self.store.result(create["action_id"]))
+
+    def test_unreadable_task_registry_refuses_instead_of_waving_the_reviewer_through(self):
+        create = self.drive_until_closeout_create()
+        (self.root / ".vibe" / "runs" / create["run_id"] / "tasks.json").write_text("{", encoding="utf-8")
+        refused = self.complete(create["run_id"], create, self.answer(create, reviewer_id="host-session#integration-review"))
+        self.assertEqual(refused.payload["status"], "blocked_invalid", refused.payload)
+        self.assertIsNone(self.store.result(create["action_id"]))
 
 
 if __name__ == "__main__":

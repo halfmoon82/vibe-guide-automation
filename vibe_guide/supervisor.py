@@ -2353,22 +2353,38 @@ def _is_closeout_reviewer(action):
     return action.get("issue_id") == INTEGRATION_REVIEW_NODE_ID
 
 
+def _normalized_identity(value):
+    return value.strip().casefold() if isinstance(value, str) else ""
+
+
 def _developer_identity_clash(paths, run_id, payload):
-    """The task id a closeout reviewer binding shares with a developer, else None."""
+    """Why a closeout reviewer binding cannot be accepted, else None.
+
+    The reviewer's task id must not equal any developer binding of the run
+    (case and surrounding whitespace do not make it a different identity).
+    A registry that cannot be read proves nothing about independence, so it
+    refuses rather than waving the binding through.
+    """
     binding = payload.get("binding") if isinstance(payload, dict) else None
     if not isinstance(binding, dict):
         return None
-    task_id = binding.get("threadId") or binding.get("task_id")
-    if not isinstance(task_id, str) or not task_id:
+    task_id = _normalized_identity(binding.get("threadId") or binding.get("task_id"))
+    if not task_id:
         return None
     try:
         registry = json.loads((run_dir(paths, run_id) / "tasks.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
+        return "无法读取本次运行的任务登记，不能确认审查身份独立"
     bindings = registry.get("bindings") if isinstance(registry, dict) else None
-    for item in bindings if isinstance(bindings, list) else ():
-        if isinstance(item, dict) and item.get("role") == "developer" and item.get("task_id") == task_id:
-            return task_id
+    if not isinstance(bindings, list):
+        return "本次运行的任务登记格式不可识别，不能确认审查身份独立"
+    for item in bindings:
+        if (
+            isinstance(item, dict)
+            and item.get("role") == "developer"
+            and _normalized_identity(item.get("task_id")) == task_id
+        ):
+            return "create 回执的 task_id 与某个 developer 绑定相同"
     return None
 
 
@@ -2424,6 +2440,12 @@ def _host_session_service(paths, action):
     except (ProviderPending, KeyError, TypeError, ValueError, OSError):
         return None
     if capabilities.mode != "in_session_sdd":
+        return None
+    if closeout and any(
+        capabilities.evidence.get(adapter_id + ".visible_task." + name)
+        for name in ("create", "enter", "resume", "wait")
+    ):
+        # A host that can open some visible task keeps the two-window closeout.
         return None
     evidence_ref = capabilities.provenance.get(adapter_id + ".in_session_sdd")
     if not evidence_ref:
@@ -2562,12 +2584,13 @@ def mailbox_complete(paths, run_id, action_id, payload):
         request.get("operation") == "create"
         and _is_closeout_reviewer(request)
         and _host_session_service(paths, request) is not None
-        and _developer_identity_clash(paths, run_id, payload) is not None
     ):
-        raise ValueError(
-            "收口审查必须是独立的审查子代理：create 回执的 task_id 与某个 developer 绑定相同，"
-            "请为审查子代理换一个独立标识（例如 <本会话 id>#integration-review）"
-        )
+        clash = _developer_identity_clash(paths, run_id, payload)
+        if clash is not None:
+            raise ValueError(
+                "收口审查必须是独立的审查子代理：{}。请为审查子代理换一个独立标识"
+                "（例如 <本会话 id>#integration-review）".format(clash)
+            )
     complete_mailbox_action(paths, run_id, action_id, payload)
     return {"command": "supervisor-mailbox", "status": "completed",
             "run_id": run_id, "action_id": action_id}
