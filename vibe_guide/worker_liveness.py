@@ -121,3 +121,32 @@ def session_ended(paths: ProjectPaths, run_id: str, node_id: str, node: Mapping[
     except OSError:
         return False
     return age >= SILENCE_SECONDS
+
+
+def liveness_signal(paths: ProjectPaths, run_id: str, node_id: str, node: Mapping[str, Any]) -> Optional[str]:
+    """A token that changes while the node's worker is still producing output.
+
+    It folds the newest delivery file for the node and the session transcript's
+    modification time (whole seconds).  A worker that keeps submitting moves the
+    token even when the supervisor has not written anything back yet, so the
+    stall counter can tell "worker alive, supervisor late" from "nothing moves".
+    ``None`` means no signal could be read; callers must not treat it as alive.
+    """
+    parts = []
+    deliveries = paths.vibe / "provider-actions" / "deliveries"
+    try:
+        # exact node segment: node "dev" must not pick up "dev-api" deliveries
+        exact = re.compile(r"{}-{}-(developer|reviewer)-g\d+\.json".format(re.escape(run_id), re.escape(node_id)))
+        stamps = [path.stat().st_mtime_ns for path in deliveries.glob("{}-{}-*-g*.json".format(run_id, node_id))
+                  if exact.fullmatch(path.name)]
+    except OSError:
+        stamps = []
+    if stamps:
+        parts.append("d%d" % max(stamps))
+    try:
+        path = transcript_path(paths, node)
+        if path is not None:
+            parts.append("t%d" % int(path.stat().st_mtime))
+    except OSError:
+        pass
+    return "|".join(parts) if parts else None
