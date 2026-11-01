@@ -142,6 +142,48 @@ def _latest_reviewer_findings(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
     return best_findings
 
 
+#: Dispatch-prompt note for the integration reviewer: how a defect reaches the
+#: upstream node that owns it (copyable payload).  Without ``target_node_id``
+#: the finding only sends this reviewer round again and parks after three.
+INTEGRATION_REVIEW_ROUTING_NOTE = (
+    "整合审查发现缺陷时用 review_finding 上报，并在 worker-deliver 的 payload 顶层带 target_node_id"
+    "（缺陷所在的已验收上游节点 id）；缺陷文件都在该节点原范围内时监控直接让它返工，"
+    "需要新增文件再带 scope_expansion。可复制示例："
+    "{\"event\": \"review_finding\", \"finding\": {\"severity\": \"p1\", \"detail\": \"<一句话>\"}, "
+    "\"target_node_id\": \"<上游节点 id>\", "
+    "\"scope_expansion\": {\"files\": [\"<新增文件>\"], \"reason\": \"<为什么>\", "
+    "\"acceptance_examples_unchanged\": true, \"adds_third_party_dependency\": false, "
+    "\"visibility_downgrade\": false}}。无需新增文件时省略 scope_expansion。\n"
+)
+
+
+def _integration_findings(contract: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The integration reviewer's finding that sent this node back, or [].
+
+    The monitor stamps ``integration_finding_ref`` (reviewer node and
+    generation) on the rework contract; the finding itself is read from that
+    reviewer's archived report.  Any miss yields [].
+    """
+    ref = contract.get("integration_finding_ref")
+    run_id = contract.get("run_id")
+    project_root = contract.get("project_root")
+    if not (isinstance(ref, dict) and isinstance(ref.get("node_id"), str) and ref["node_id"]
+            and type(ref.get("generation")) is int
+            and isinstance(run_id, str) and run_id
+            and isinstance(project_root, str) and project_root):
+        return []
+    path = (Path(project_root) / ".vibe" / "provider-actions" / "deliveries"
+            / "{}-{}-reviewer-g{}.json".format(run_id, ref["node_id"], ref["generation"]))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    payload = data.get("payload") if isinstance(data, dict) else None
+    if not isinstance(payload, dict) or payload.get("event") != "review_finding":
+        return []
+    return _payload_findings(payload)
+
+
 def rework_findings_section(contract: Dict[str, Any]) -> str:
     """Append this round's reviewer findings to a developer rework prompt.
 
@@ -152,9 +194,11 @@ def rework_findings_section(contract: Dict[str, Any]) -> str:
     (``detail``/``evidence``/...) are replaced by the placeholder, and every
     other field keeps its original text.
     """
+    if contract.get("role") == "reviewer" and contract.get("node_id") == "integration-review":
+        return INTEGRATION_REVIEW_ROUTING_NOTE
     if contract.get("role") != "developer" or contract.get("phase") != "rework":
         return ""
-    findings = _latest_reviewer_findings(contract)
+    findings = _latest_reviewer_findings(contract) + _integration_findings(contract)
     if not findings:
         return ""
     projected = [durable_projection(item) for item in findings]

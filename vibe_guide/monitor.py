@@ -150,13 +150,26 @@ from .engine_attestation import validate_engine_attestation
 from .decision_boundary import NotificationBridge, ingest_worker_decisions
 from .orphan_recovery import ORPHAN_DISPATCH_ADOPTED, replay_orphan_adoption
 from .providers import CODEX_PROVIDER
-from .self_report_recovery import SELF_REPORT_DELIVERY_RECONCILED
+from .self_report_recovery import SELF_REPORT_DELIVERY_RECONCILED, consume_parked_delivery
 from .decision_boundary import ScopedDecisionMailbox
 from .decisions import DecisionMailbox
 
 
 class ScopeDecisionRequired(PermissionError):
     """The requested expansion crosses a product-owned scope boundary."""
+
+
+#: Two different situations used to share one "needs product-manager review"
+#: message.  Only the first is a product boundary.
+SCOPE_REVIEW_REASON = (
+    "scope expansion requires product-manager review: the request would change "
+    "an acceptance judgment or add a third-party dependency, or its files are "
+    "held by another active node"
+)
+NO_NEW_FILES_NOTE = (
+    "no new files to add to the scope: every requested file is already in the "
+    "node's scope, so the node goes straight to rework (next: `vibe resume`)"
+)
 
 
 DECISION_NOTIFICATION_UNKNOWN_REASON = "decision notification bridge status unknown"
@@ -1572,6 +1585,26 @@ class Monitor:
     def _reset_binding_cache(self) -> None:
         self._binding_cache.clear()
 
+    def _primary_role(self, node_id: str, current: Optional[Dict[str, Any]] = None) -> str:
+        """The role whose binding anchors this node: reviewer for reviewer-only nodes.
+
+        The integration-review node has no developer, and a node whose only
+        generations are reviews (``developer_generation == 0`` with
+        ``review_generation > 0``) is reviewer-only too.  Recovery code that
+        loaded the developer binding unconditionally must go through here.
+        """
+        node = self.nodes.get(node_id)
+        if node is not None and is_integration_review_node(node):
+            return "reviewer"
+        if isinstance(current, dict):
+            try:
+                if (int(current.get("developer_generation", 0) or 0) == 0
+                        and int(current.get("review_generation", 0) or 0) > 0):
+                    return "reviewer"
+            except (TypeError, ValueError):
+                pass
+        return "developer"
+
     def _node_dispatch_topology(self, node: DAGNode) -> str:
         """Rule the dispatch topology for one node.
 
@@ -2272,6 +2305,10 @@ class Monitor:
         self._heal_entry_evidence(snapshot)
         self._consume_answered_decisions(snapshot)
         self._route_undecided_blocked_design(snapshot)
+        for node_id in list(snapshot.nodes):
+            # A parked reviewer's already-archived report is consumed once
+            # here; the parked node has no live handle to wait on (#360).
+            consume_parked_delivery(self, snapshot, node_id, runner)
         for node_id, current in snapshot.nodes.items():
             if current.get("status") == "start_pending":
                 self._mark_blocked_unknown(
@@ -3008,6 +3045,10 @@ class Monitor:
         node_id = package["node_id"]
         if not isinstance(node_id, str) or node_id not in self.nodes:
             raise ValueError("scope correction node is invalid")
+        if self._primary_role(node_id, snapshot.nodes[node_id]) == "reviewer":
+            # Not applicable: scope corrections re-register a developer's
+            # write allowlist; a reviewer-only node writes nothing.
+            raise ValueError("scope correction does not apply to reviewer-only node")
         binding = self._load_task_binding(snapshot, node_id, "developer")
         supplied = TaskBinding.from_dict(package["task_binding"]).to_dict()
         actual = binding.to_dict()
@@ -3096,6 +3137,8 @@ class Monitor:
 
     def _apply_scope_correction(self, snapshot: RunSnapshot, node_id: str,
                                 proof: Dict[str, Any]) -> None:
+        if self._primary_role(node_id, snapshot.nodes[node_id]) == "reviewer":
+            raise ValueError("scope correction does not apply to reviewer-only node")
         resolution = self._validate_scope_correction(snapshot, node_id, proof)
         binding = load_task_binding(self.paths, node_id, "developer", run_id=snapshot.run_id)
         if self._scope_binding_digest(binding.to_dict()) != proof["binding_digest"]:
@@ -3165,6 +3208,14 @@ class Monitor:
             if set(item) != {"node_id", "developer", "reviewer"}:
                 raise ValueError("reconciliation node record is invalid")
             current = snapshot.nodes[node_id]
+            if self._primary_role(node_id, current) == "reviewer":
+                # Not applicable: a reviewer-only node (integration review)
+                # has no developer to promote, and its acceptance needs the
+                # derived run-level package (`record_integration_review`).
+                raise ValueError(
+                    "reconciliation does not cover reviewer-only node {}; "
+                    "record its integration review instead".format(node_id)
+                )
             for role in ("developer", "reviewer"):
                 claim = item[role]
                 if not isinstance(claim, dict):
@@ -3487,6 +3538,35 @@ class Monitor:
         snapshot.handles.pop("integration-review", None)
         self._release_node_lease(snapshot, "integration-review")
 
+    @staticmethod
+    def _integration_finding_fields(
+        snapshot: RunSnapshot, node_id: str, event: RunEvent,
+        active: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Routing fields of an integration finding (forwarded by the runner)."""
+        return {name: event.data.get(name)
+                for name in ("target_node_id", "scope_expansion", "files")}
+
+    def _upstream_node_for_files(self, snapshot: RunSnapshot, files: Any) -> Optional[str]:
+        """The one accepted upstream node whose scope holds every defect file."""
+        if not isinstance(files, list) or not files or not all(isinstance(f, str) and f for f in files):
+            return None
+        owners = set()
+        for item in files:
+            holders = [
+                other_id for other_id, other in snapshot.nodes.items()
+                if other.get("status") == "accepted"
+                and not is_integration_review_node(self.nodes[other_id])
+                and any(
+                    item == scoped or (scoped.endswith("/") and item.startswith(scoped))
+                    for scoped in self._node_scope_files(other_id, other)
+                )
+            ]
+            if len(holders) != 1:
+                return None
+            owners.add(holders[0])
+        return owners.pop() if len(owners) == 1 else None
+
     def _apply_scope_expansion(
         self,
         snapshot: RunSnapshot,
@@ -3560,8 +3640,12 @@ class Monitor:
         ):
             raise ValueError("accepted patch requires an inactive accepted node")
         resolution = self._resolve_scope_request(snapshot, node_id, request)
-        if resolution is None or not resolution.files:
-            raise ScopeDecisionRequired("scope expansion requires product-manager review")
+        if resolution is None:
+            raise ScopeDecisionRequired(SCOPE_REVIEW_REASON)
+        if not resolution.files:
+            # Nothing to expand: the defect is inside the node's own scope.
+            # That is an engineering rework, never a product review.
+            current["reason"] = NO_NEW_FILES_NOTE
         self._apply_scope_expansion(
             snapshot,
             node_id,
@@ -3958,6 +4042,9 @@ class Monitor:
         it is not evidence for creating a successor or another writer.
         """
         current = snapshot.nodes[node_id]
+        if self._primary_role(node_id, current) == "reviewer":
+            # Not applicable: there is no developer delivery to continue.
+            return False
         if self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
             # A delivered visible-sdd binding only reaches blocked_unknown
             # when its in-session review evidence was rejected.  That is a
@@ -4099,9 +4186,13 @@ class Monitor:
         current = snapshot.nodes[node_id]
         if provenance["role"] != "reviewer":
             raise ValueError("unapplied acceptance lacks reviewer provenance")
-        generation = int(current.get("developer_generation", 0))
+        # A reviewer-only node (integration review) binds its single session
+        # as the reviewer; every other visible-sdd node binds the developer.
+        session_role = self._primary_role(node_id, current)
+        generation = int(current.get(
+            "review_generation" if session_role == "reviewer" else "developer_generation", 0))
         if (
-            provenance["task_id"] != current.get("developer_identity")
+            provenance["task_id"] != current.get(session_role + "_identity")
             or provenance["generation"] != generation
             or generation <= 0
         ):
@@ -4109,7 +4200,7 @@ class Monitor:
                 "unapplied visible-sdd acceptance identity or generation is stale"
             )
         try:
-            registered = self._load_task_binding(snapshot, node_id, "developer")
+            registered = self._load_task_binding(snapshot, node_id, session_role)
         except (FileNotFoundError, OSError, TypeError, ValueError) as error:
             raise ValueError(
                 "unapplied visible-sdd acceptance developer binding is unavailable"
@@ -4412,10 +4503,19 @@ class Monitor:
                     or action.get("operation") not in {"create", "locate", "visibility"}):
                 return False
             created_action = store.related_action(action, "create")
+            # `authorization_digest` is deliberately not compared: `monitor
+            # --authorize` rewrites the engine proof and with it the digest,
+            # which would strand an in-flight create forever.  The stable
+            # facts are the plan revision, the node contract digest and the
+            # request digest checked above.
+            stored_contract = ((getattr(snapshot, "nodes", None) or {}).get(node_id) or {}).get("contract_digest")
+            known_nodes = self.__dict__.get("nodes") or {}
+            if (stored_contract and node_id in known_nodes
+                    and stored_contract != executable_contract_digest([known_nodes[node_id]])):
+                return False
             for candidate in (action, created_action):
                 request = candidate["request"]
-                if (request.get("authorization_digest") != authorization_digest
-                        or request.get("plan_id") != getattr(self.plan, "plan_id", "")
+                if (request.get("plan_id") != getattr(self.plan, "plan_id", "")
                         or request.get("plan_version") != self.plan.version):
                     return False
             request = created_action["request"]
@@ -4984,7 +5084,14 @@ class Monitor:
             return
         if current.get("status") != "blocked_unknown":
             return
-        if current.get("reviewer_started") is not True:
+        if (current.get("reviewer_replacement_required")
+                or current.get("recovery_action") in {
+                    "change_reviewer_or_split_node", ACCEPTANCE_FORMAT_ESCALATION_RECOVERY}):
+            # A deliberate park (review loop, rejected-format escalation) is
+            # repaired by `vibe repair`, never replayed automatically.
+            return
+        if (current.get("reviewer_started") is not True
+                and self._primary_role(node_id, current) != "reviewer"):
             return
         if current.get("retryable_action") is not None:
             return
@@ -4996,45 +5103,61 @@ class Monitor:
         ):
             return
 
-        try:
-            developer = self._load_task_binding(snapshot, node_id, "developer")
-        except (FileNotFoundError, OSError, TypeError, ValueError):
-            return
+        reviewer_only = self._primary_role(node_id, current) == "reviewer"
+        developer = None
+        if not reviewer_only:
+            try:
+                developer = self._load_task_binding(snapshot, node_id, "developer")
+            except (FileNotFoundError, OSError, TypeError, ValueError):
+                return
 
+        # A reviewer-only node has no developer to prove; its stopped, failed
+        # or archived reviewer binding is a terminal identity that a successor
+        # may replace.  A dual node still demands the binding be absent.
+        replaceable_reviewer = None
         try:
-            self._load_task_binding(snapshot, node_id, "reviewer")
+            existing_reviewer = self._load_task_binding(snapshot, node_id, "reviewer")
         except FileNotFoundError:
-            pass
+            existing_reviewer = None
         except (OSError, TypeError, ValueError):
             return
-        else:
-            return
+        if existing_reviewer is not None:
+            if not (reviewer_only and existing_reviewer.status in {"stopped", "failed", "archived"}):
+                return
+            replaceable_reviewer = existing_reviewer
 
-        try:
-            requested = ProviderActionStore(self.paths).has_request(
-                snapshot.run_id, node_id, "reviewer"
-            )
-        except (OSError, TypeError, ValueError):
-            return
-        if requested:
-            return
+        if replaceable_reviewer is None:
+            try:
+                requested = ProviderActionStore(self.paths).has_request(
+                    snapshot.run_id, node_id, "reviewer"
+                )
+            except (OSError, TypeError, ValueError):
+                return
+            if requested:
+                return
 
-        try:
-            developer_generation = int(current.get("developer_generation", 0))
-        except (TypeError, ValueError):
-            return
-        if (
-            developer.status != "delivered"
-            or developer.task_id != current.get("developer_identity")
-            or developer.generation != developer_generation
-        ):
-            return
+        if developer is not None:
+            try:
+                developer_generation = int(current.get("developer_generation", 0))
+            except (TypeError, ValueError):
+                return
+            if (
+                developer.status != "delivered"
+                or developer.task_id != current.get("developer_identity")
+                or developer.generation != developer_generation
+            ):
+                return
 
         predecessor = current.get("reviewer_identity")
         if predecessor is not None and (
             not isinstance(predecessor, str) or not predecessor
         ):
             return
+        if replaceable_reviewer is not None:
+            if predecessor is not None and predecessor != replaceable_reviewer.task_id:
+                return
+            predecessor = replaceable_reviewer.task_id
+            current["pair_archived"] = True
         current["retryable_action"] = {
             "role": "reviewer",
             "phase": "review",
@@ -5099,7 +5222,10 @@ class Monitor:
             # A visible-sdd node binds a single worker session; its
             # acceptance never passed through the reviewer binding path.
             return False
-        if node_id == "integration-review":
+        if node_id == "integration-review" or self._primary_role(node_id, current) == "reviewer":
+            # Not applicable: reviewer-only nodes have no developer binding to
+            # pair with, and integration review closes out through its
+            # run-level package.
             return False
         # #256 ①: every decision below reads facts captured *now*.  The node
         # mapping and the shared binding objects are mutated in place further
@@ -5850,7 +5976,71 @@ class Monitor:
         self._save_snapshot(snapshot)
         return False
 
+    def _reviewed_commit_set(self, snapshot: RunSnapshot, node_id: str) -> Optional[Dict[str, str]]:
+        """HEADs of the upstream business nodes a reviewer-only node would review.
+
+        None when any head cannot be read: an unknown set never proves that
+        nothing changed, so the caller reviews as usual.
+        """
+        heads: Dict[str, str] = {}
+        for other_id, other in snapshot.nodes.items():
+            if other_id == node_id or is_integration_review_node(self.nodes[other_id]):
+                continue
+            try:
+                root = self._worktree_path(other)
+                result = subprocess.run(
+                    ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
+                    capture_output=True, text=True, timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError, TypeError, ValueError):
+                return None
+            head = result.stdout.strip()
+            if result.returncode != 0 or len(head) != 40:
+                return None
+            heads[other_id] = head
+        return heads or None
+
     def _start_task(
+        self,
+        snapshot: RunSnapshot,
+        node_id: str,
+        role: str,
+        phase: str,
+        runner: Runner,
+        continuation: bool,
+        successor: bool = False,
+    ) -> bool:
+        """Dispatch one task; a repeat integration review of unchanged commits waits for rework.
+
+        A re-review that follows a finding is pointless while every reviewed
+        commit equals the previous round: the findings are still open and
+        nobody has fixed them.  The reviewer is not started; the node shows
+        ``rework`` (waiting for the upstream rework) until a head moves.
+        """
+        current = snapshot.nodes[node_id]
+        track = role == "reviewer" and is_integration_review_node(self.nodes[node_id])
+        heads = self._reviewed_commit_set(snapshot, node_id) if track else None
+        if (heads is not None and current.get("integration_findings")
+                and current.get("reviewed_commit_set") == heads):
+            current["status"] = "rework"
+            current["reason"] = "等待返工：被审提交与上一轮相同，未新开 reviewer"
+            if current.get("waiting_for_rework") is not True:
+                current["waiting_for_rework"] = True
+                self._record(snapshot, "review_skipped_unchanged_commits", {
+                    "run_id": snapshot.run_id, "node_id": node_id,
+                    "commits": ["{}:{}".format(key, value) for key, value in sorted(heads.items())],
+                })
+            return False
+        started = self._start_task_dispatch(
+            snapshot, node_id, role, phase, runner, continuation, successor)
+        if track and started and heads is not None:
+            current["reviewed_commit_set"] = heads
+            current["waiting_for_rework"] = False
+        if started and role == "developer" and phase == "rework":
+            current.pop("integration_finding_ref", None)
+        return started
+
+    def _start_task_dispatch(
         self,
         snapshot: RunSnapshot,
         node_id: str,
@@ -5993,6 +6183,11 @@ class Monitor:
         # contract, file allowlist and worktree/branch; visible-sdd sessions
         # additionally receive the SDD protocol pointer they must follow.
         contract["topology"] = topology
+        finding_ref = current.get("integration_finding_ref")
+        if role == "developer" and phase == "rework" and isinstance(finding_ref, dict):
+            # The integration reviewer's finding that sent this node back;
+            # the rework prompt reads it from the reviewer's archived report.
+            contract["integration_finding_ref"] = dict(finding_ref)
         if topology == TOPOLOGY_VISIBLE_SDD:
             contract["sdd_protocol"] = VISIBLE_SDD_PROTOCOL_REF
         elif topology == TOPOLOGY_BACKGROUND:
@@ -7677,8 +7872,15 @@ class Monitor:
                 return
             self._record_runner_event(snapshot, node_id, event, active)
             if node_id == "integration-review":
-                target_node_id = event.data.get("target_node_id")
-                scope_request = event.data.get("scope_expansion")
+                fields = self._integration_finding_fields(snapshot, node_id, event, active)
+                target_node_id = fields.get("target_node_id")
+                scope_request = fields.get("scope_expansion")
+                if target_node_id is None and scope_request is None:
+                    # No explicit routing: when every defect file sits inside
+                    # one accepted upstream node's scope, that node is the
+                    # target and the rework needs no scope change (#366).
+                    target_node_id = self._upstream_node_for_files(
+                        snapshot, fields.get("files"))
                 if target_node_id is not None or scope_request is not None:
                     if (
                         not isinstance(target_node_id, str)
@@ -7692,10 +7894,13 @@ class Monitor:
                             "integration scope expansion target is invalid",
                         )
                         return
-                    resolution = self._resolve_scope_request(
-                        snapshot, target_node_id, scope_request
-                    )
-                    if resolution is None or not resolution.files:
+                    if scope_request is None:
+                        resolution = ScopeExpansionResolution([], [], "")
+                    else:
+                        resolution = self._resolve_scope_request(
+                            snapshot, target_node_id, scope_request
+                        )
+                    if resolution is None:
                         requested_files = _requested_scope_files(scope_request)
                         current["status"] = "blocked_design"
                         current["blocked_design_cause"] = "integration_scope_review"
@@ -7731,6 +7936,11 @@ class Monitor:
                         queue_rework=True,
                         active=active,
                     )
+                    # The target's rework prompt reads this finding.
+                    snapshot.nodes[target_node_id]["integration_finding_ref"] = {
+                        "node_id": node_id,
+                        "generation": (active or {}).get("generation"),
+                    }
                 # The integration node is read-only: findings never create a
                 # business writer. Preserve the reviewer lineage and queue the
                 # same visible reviewer task for re-review.
@@ -8792,7 +9002,7 @@ class Monitor:
             self._clear_model_fallback_state(current)
             retry.setdefault(
                 "role",
-                str(current.get("active_role") or "developer"),
+                str(current.get("active_role") or self._primary_role(node_id, current)),
             )
             retry.setdefault(
                 "phase",
@@ -8973,7 +9183,7 @@ class Monitor:
         role = str(
             current.get("active_role")
             or (current.get("active_task") or {}).get("role")
-            or "developer"
+            or self._primary_role(node_id, current)
         )
         binding = None
         binding_unreadable = False
@@ -9000,6 +9210,25 @@ class Monitor:
             or node_id in snapshot.handles
             or isinstance(current.get("quarantine"), dict)
         )
+        if (
+            not stuck_marks
+            and role == "reviewer"
+            and self._primary_role(node_id, current) == "reviewer"
+            and binding is not None
+            and binding.status in {"stopped", "failed", "archived"}
+            and binding.task_id == current.get("reviewer_identity")
+            and current.get("status") not in {"accepted"}
+            and not (
+                isinstance(current.get("retryable_action"), dict)
+                and current["retryable_action"].get("pending_schedule") is True
+                and current["retryable_action"].get("successor") is True
+            )
+        ):
+            # A reviewer-only node (integration review) whose reviewer was
+            # stopped keeps no active task or handle: the dead binding itself
+            # is the stuck mark.  Without it the cleanup below never ran and
+            # no successor was queued.
+            stuck_marks = True
         if stuck_marks and binding_unreadable:
             current["status"] = "blocked_unknown"
             current["recovery_action"] = "reconcile_binding"

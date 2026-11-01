@@ -94,6 +94,9 @@ RESULT_EVENT_KEYS = (
     "evidence", "finding", "in_contract", "consistency",
     "delivery_evidence", "completion_marker", "delivery_path",
     "thread_status", "in_session_review",
+    # Integration-review routing: which accepted upstream node a finding
+    # belongs to, the scope it asks for, and the defect files.
+    "target_node_id", "scope_expansion", "files",
 )
 
 #: Advisory observations a wait result may carry *beside* the delivery payload
