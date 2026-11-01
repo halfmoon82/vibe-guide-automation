@@ -19,6 +19,7 @@ from .authorization import (
 from .config import load_supervisor_single_shift
 from .contracts import RunEvent
 from .decision_boundary import LEGACY_BOUNDARY_CATEGORY, validate_boundary_category
+from .models import INTEGRATION_REVIEW_NODE_ID
 from .providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER, WORKBUDDY_VISIBLE_PROVIDER
 from . import worker_liveness
 from .runners.provider_action import TEMPLATE_PLACEHOLDER as _TEMPLATE_PLACEHOLDER
@@ -2234,7 +2235,7 @@ def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_p
             "核对当前 run/授权、任务身份、writer、generation 和 cursor；读取动作 evidence，"
             "按 native_tool 执行真实调用，保留完整原始结果；调用 ProviderActionStore.complete"
             "(action_id, payload, request_digest=原请求摘要)，再执行 resume 并核验状态/cursor/交付变化。"
-            "已完成动作不重复调用；新观测使用新 sequence。宿主报 No such tool available 时 complete() 拒收并抛 UnresolvedNativeTool："
+            "已完成动作不重复调用；新观测使用新 sequence。待办项带 service.mode=host_session 时，宿主已登记只能会话内派发：不按 native_tool 调用，改按 service.instructions 由本会话自答，这不算工具名路由故障。宿主报 No such tool available 时 complete() 拒收并抛 UnresolvedNativeTool："
             "按工具清单里的全名重试一次，仍失败即停止服务信箱、向用户报告工具名路由故障，不交班、不开新会话。Codex 的 create 只用 create_thread（project 目标原样传），不得用 fork_thread 代替：fork 会带上本会话整段历史，complete() 查到 forked_from_id 即拒收并抛 ForkedProviderSession；新会话写不了工作副本时停下报告宿主权限，不要改用 fork。工程失败按现有恢复协议继续，"
             "不得用重复 preflight/resume 代替 native 调用；产品变化、外部授权或 deploy 才请求用户。"
         ),
@@ -2345,6 +2346,133 @@ def authorization_card_summary(paths, plan_id, card=None):
 _MAILBOX_KEYS = ("action_id", "operation", "native_tool", "issue_id", "role", "generation", "sequence", "request_digest")
 
 
+_HOST_SESSION_ADAPTERS = {WORKBUDDY_VISIBLE_PROVIDER: "workbuddy"}
+
+
+def _is_closeout_reviewer(action):
+    return action.get("issue_id") == INTEGRATION_REVIEW_NODE_ID
+
+
+def _normalized_identity(value):
+    return value.strip().casefold() if isinstance(value, str) else ""
+
+
+def _developer_identity_clash(paths, run_id, payload):
+    """Why a closeout reviewer binding cannot be accepted, else None.
+
+    The reviewer's task id must not equal any developer binding of the run
+    (case and surrounding whitespace do not make it a different identity).
+    A registry that cannot be read proves nothing about independence, so it
+    refuses rather than waving the binding through.
+    """
+    binding = payload.get("binding") if isinstance(payload, dict) else None
+    if not isinstance(binding, dict):
+        return None
+    task_id = _normalized_identity(binding.get("threadId") or binding.get("task_id"))
+    if not task_id:
+        return None
+    try:
+        registry = json.loads((run_dir(paths, run_id) / "tasks.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "无法读取本次运行的任务登记，不能确认审查身份独立"
+    bindings = registry.get("bindings") if isinstance(registry, dict) else None
+    if not isinstance(bindings, list):
+        return "本次运行的任务登记格式不可识别，不能确认审查身份独立"
+    for item in bindings:
+        if (
+            isinstance(item, dict)
+            and item.get("role") == "developer"
+            and _normalized_identity(item.get("task_id")) == task_id
+        ):
+            return "create 回执的 task_id 与某个 developer 绑定相同"
+    return None
+
+
+def _ruled_topology(paths, action):
+    """The dispatch topology of the node this request belongs to.
+
+    Only ``create`` carries it; locate / visibility / wait follow the node's
+    latest create request at or below their own generation.
+    """
+    request = action.get("request")
+    if action.get("operation") == "create":
+        return request.get("topology") if isinstance(request, dict) else None
+    from .adapters.task_provider import ProviderActionStore
+    store = ProviderActionStore(paths)
+    best = None
+    for path in sorted((paths.vibe / "provider-actions/requests").glob("action-*.json")):
+        try:
+            other = store.action(path.stem)
+        except (OSError, ValueError):
+            continue
+        generation = other.get("generation")
+        if (
+            other.get("operation") == "create"
+            and all(other.get(key) == action.get(key) for key in ("provider", "run_id", "issue_id", "role"))
+            and isinstance(generation, int) and isinstance(action.get("generation"), int)
+            and generation <= action["generation"]
+            and (best is None or generation >= best["generation"])
+        ):
+            best = other
+    best_request = best.get("request") if best else None
+    return best_request.get("topology") if isinstance(best_request, dict) else None
+
+
+def _host_session_service(paths, action):
+    """Self-service offer for a host that can only dispatch inside its session.
+
+    Offered only on attested evidence: the adapter's own record must rule
+    ``in_session_sdd`` (the in-session fact passes with provenance and the
+    visible lifecycle is not fully attested), and the request is either a
+    ``visible-sdd`` one or belongs to the closeout review, which stays a
+    reviewer dispatch but may be served by an independent in-session subagent.
+    Missing, unreadable or contrary evidence offers nothing, so the native
+    tool path stays the only instruction.
+    """
+    adapter_id = _HOST_SESSION_ADAPTERS.get(action.get("provider"))
+    closeout = _is_closeout_reviewer(action)
+    if adapter_id is None or (not closeout and _ruled_topology(paths, action) != "visible-sdd"):
+        return None
+    from .adapters.task_provider import ProviderPending
+    from .node_spec import observe_capabilities
+    try:
+        capabilities = observe_capabilities(paths, adapter_id).detection.capabilities
+    except (ProviderPending, KeyError, TypeError, ValueError, OSError):
+        return None
+    if capabilities.mode != "in_session_sdd":
+        return None
+    if closeout and any(
+        capabilities.evidence.get(adapter_id + ".visible_task." + name)
+        for name in ("create", "enter", "resume", "wait")
+    ):
+        # A host that can open some visible task keeps the two-window closeout.
+        return None
+    evidence_ref = capabilities.provenance.get(adapter_id + ".in_session_sdd")
+    if not evidence_ref:
+        return None
+    if closeout:
+        instructions = (
+            "本宿主已登记只能会话内派发（无可见任务窗口工具）：不要等 {}，也不要因它缺失而停摆。"
+            "收口审查改由本会话内另起的独立只读子代理完成（独立上下文，不是实现者的上下文，不改业务代码）："
+            "create 回执的 task_id 必须是该审查子代理自己的独立标识（例如 <本会话 id>#integration-review），"
+            "不得与任何 developer 绑定的 task_id 相同；locate/visibility 核对后应答；"
+            "审查结论按 reviewer 声明回写。结果形状见 supervisor-mailbox --template。"
+        ).format(action.get("native_tool"))
+    else:
+        instructions = (
+            "本宿主已登记只能会话内派发（无可见任务窗口工具）：不要等 {}，也不要因它缺失而停摆。"
+            "由本会话自己承担该节点的 worker：create 用本会话自己的会话 id 与本机标识应答；"
+            "locate/visibility 核对本会话就是该 worker 后应答；随后在本会话内按 visible-sdd 协议派 dev/review "
+            "子代理，完成后用 vibe worker-deliver 自报。结果形状见 supervisor-mailbox --template。"
+        ).format(action.get("native_tool"))
+    service = {"mode": "host_session", "evidence_ref": evidence_ref, "instructions": instructions}
+    if closeout:
+        service["independent_identity_required"] = True
+    if action.get("operation") == "create":
+        service["binding_fields"] = ["task_id", "host"]
+    return service
+
+
 def supervisor_mailbox_view(paths, run_id):
     """Pending provider requests with prompt bodies replaced by {sha256, bytes, path}."""
     from .adapters.task_provider import ProviderActionStore
@@ -2368,6 +2496,9 @@ def supervisor_mailbox_view(paths, run_id):
                 # navigate_to_codex_page accepts threadId only; copying hostId
                 # from visibility/wait requests is a native parameter error.
                 item["native_args"] = {"threadId": thread_id}
+        service = _host_session_service(paths, action)
+        if service is not None:
+            item["service"] = service
         if isinstance(request, dict):
             if isinstance(request.get("child_binding"), dict):
                 item["child_binding"] = request["child_binding"]
@@ -2381,7 +2512,7 @@ def supervisor_mailbox_view(paths, run_id):
             "pending_count": len(items), "pending": items}
 
 
-def _template_payload(operation, role):
+def _template_payload(operation, role, provider=None):
     """A result example for ``operation`` that passes ``validate_result_shape``.
 
     Placeholder strings stand where the supervisor must put real values.  The
@@ -2401,6 +2532,11 @@ def _template_payload(operation, role):
         # The reader binds on both the task identity and a host identity
         # (``hostId`` or ``host``); a template without the host produced a
         # result the dispatcher refused after the task already existed.
+        if provider not in (None, CODEX_PROVIDER):
+            # ``threadId`` / ``hostId`` are Codex-only names; every other
+            # provider binds on the provider-neutral pair.
+            return {"binding": {"task_id": _TEMPLATE_PLACEHOLDER,
+                                "host": _TEMPLATE_PLACEHOLDER}}
         return {"binding": {"threadId": _TEMPLATE_PLACEHOLDER,
                             "hostId": _TEMPLATE_PLACEHOLDER}}
     if operation == "locate":
@@ -2423,7 +2559,7 @@ def mailbox_result_template(paths, run_id, action_id):
     return {"command": "supervisor-mailbox", "status": "ok", "run_id": run_id,
             "action_id": action_id, "operation": operation, "role": request.get("role"),
             "placeholder": _TEMPLATE_PLACEHOLDER,
-            "template": _template_payload(operation, request.get("role"))}
+            "template": _template_payload(operation, request.get("role"), request.get("provider"))}
 
 
 def mailbox_complete(paths, run_id, action_id, payload):
@@ -2444,6 +2580,17 @@ def mailbox_complete(paths, run_id, action_id, payload):
     if store.result(action_id) is not None:
         return {"command": "supervisor-mailbox", "status": "already_completed",
                 "run_id": run_id, "action_id": action_id}
+    if (
+        request.get("operation") == "create"
+        and _is_closeout_reviewer(request)
+        and _host_session_service(paths, request) is not None
+    ):
+        clash = _developer_identity_clash(paths, run_id, payload)
+        if clash is not None:
+            raise ValueError(
+                "收口审查必须是独立的审查子代理：{}。请为审查子代理换一个独立标识"
+                "（例如 <本会话 id>#integration-review）".format(clash)
+            )
     complete_mailbox_action(paths, run_id, action_id, payload)
     return {"command": "supervisor-mailbox", "status": "completed",
             "run_id": run_id, "action_id": action_id}
