@@ -5,6 +5,7 @@ CLI against the real provider mailbox, the way a supervisor would on the new
 platform; nothing hand-edits ``.vibe/`` except where a test deliberately
 builds a foreign project or an unstamped (pre-5.2.6) plan.
 """
+import dataclasses
 import json
 import shutil
 import unittest
@@ -13,7 +14,8 @@ from unittest import mock
 
 from vibe_guide.authorization import DISPATCH_TOPOLOGY_KEY
 from vibe_guide.capability_contract import build_contract
-from vibe_guide.handoff_rebind import STOP_EVIDENCE_FIELDS, project_identity_problem
+from vibe_guide.handoff_rebind import STOP_EVIDENCE_FIELDS, drain_report, project_identity_problem
+from vibe_guide.monitor_handoff import handoff_drain_blockers
 from vibe_guide.protocols import SHIPPED_PROTOCOL_DIGESTS, load_protocol, published_protocol_digest
 from vibe_guide.state import load_events
 from vibe_guide.task_registry import TERMINAL_TASK_STATUSES, TaskBinding, load_task_binding, save_task_binding
@@ -37,6 +39,41 @@ class DrainCase(HandoffCase):
         snapshot = self.snapshot()
         self.assertTrue(snapshot.nodes[SECOND].get("developer_identity"), snapshot.nodes[SECOND])
         return snapshot
+
+    def second_reviewer_running(self, *, handle_live=True):
+        """The second node's developer delivered and its reviewer is running.
+
+        The fixture plan reviews inside the developer session, so a separate
+        reviewer never starts on its own and the registry refuses to add one
+        to a visible-sdd node.  Take a real running run, point it at a
+        reviewer the way the monitor does (run's active task and handle), and
+        return the registry as the monitor leaves it: developer ``delivered``,
+        reviewer ``review``.  ``handle_live=False`` is the same reviewer after
+        its delivery was consumed -- the binding still reads ``review``.
+        """
+        snapshot = self.second_running_on("workbuddy")
+        developer = load_task_binding(self.paths, SECOND, "developer", run_id=self.run_id)
+        bindings = {
+            "developer": dataclasses.replace(developer, status="delivered", topology="dual-visible"),
+            "reviewer": dataclasses.replace(developer, role="reviewer", task_id="reviewer-task-1",
+                                            platform_task_id="reviewer-task-1", status="review",
+                                            topology="dual-visible"),
+        }
+        current = snapshot.nodes[SECOND]
+        current["reviewer_identity"] = "reviewer-task-1"
+        current["status"] = "review"
+        if handle_live:
+            current["active_role"] = "reviewer"
+            current["active_task"] = {"role": "reviewer", "task_id": "reviewer-task-1",
+                                      "generation": 1, "handle_id": "reviewer-handle"}
+            snapshot.handles[SECOND] = "reviewer-handle"
+        else:
+            current["active_role"] = None
+            current["active_task"] = None
+            snapshot.handles.pop(SECOND, None)
+        registry = mock.patch("vibe_guide.monitor_handoff.load_task_binding",
+                              side_effect=lambda paths, node_id, role, run_id=None: bindings[role])
+        return snapshot, registry
 
     def files(self):
         names = ("state.json", "tasks.json", "events.jsonl")
@@ -163,6 +200,30 @@ class LiveWorkerRefusesTheHandoffTests(DrainCase):
         self.assertEqual(refusal.payload["status"], "handoff_refused", refusal.payload)
         self.assertEqual(refusal.payload["live_workers"][0]["status"], "unknown")
         self.assertTrue(refusal.payload["stop_evidence_templates"])
+
+    def test_a_running_reviewer_is_not_drained(self):
+        # P1-3: a running reviewer's binding reads "review" -- the same value
+        # a delivered reviewer leaves behind; only the run's live task/handle
+        # tells them apart, so the running one must block the handoff.
+        snapshot, registry = self.second_reviewer_running(handle_live=True)
+        with registry:
+            blockers = handoff_drain_blockers(self.paths, snapshot, [SECOND])
+        self.assertEqual([(b["node_id"], b["role"], b["task_id"]) for b in blockers],
+                         [(SECOND, "reviewer", "reviewer-task-1")], blockers)
+        self.assertEqual(blockers[0]["status"], "review")
+        report = drain_report(blockers, plan_id=PLAN, run_id=self.run_id, project_root=self.root,
+                              from_platform="workbuddy", to_platform="claude-code")
+        self.assertEqual(report["nodes"], [SECOND])
+        template = report["stop_evidence_templates"][0]
+        self.assertEqual((template["node_id"], template["role"], template["task_id"]),
+                         (SECOND, "reviewer", "reviewer-task-1"))
+        self.assertTrue(report["stop_evidence_command"].startswith("vibe reconcile --project-root "))
+        self.assertIn(report["stop_evidence_command"], report["message"])
+
+    def test_a_reviewer_whose_delivery_was_consumed_is_drained(self):
+        snapshot, registry = self.second_reviewer_running(handle_live=False)
+        with registry:
+            self.assertEqual(handoff_drain_blockers(self.paths, snapshot, [SECOND]), [])
 
     def test_a_delivered_worker_is_drained(self):
         self.published_on("workbuddy")

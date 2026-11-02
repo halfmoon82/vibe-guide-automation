@@ -150,11 +150,23 @@ def _registered_stops(events) -> set:
     return stops
 
 
+def _holds_live_task(snapshot: RunSnapshot, node_id: str, current, role: str, task_id: str) -> bool:
+    """Whether the run still holds ``task_id`` as the node's live task."""
+    active = current.get("active_task")
+    if isinstance(active, dict) and (
+        active.get("task_id") == task_id
+        or (active.get("role") == role and not active.get("task_id"))
+    ):
+        return True
+    return node_id in snapshot.handles and current.get("active_role") == role
+
+
 def handoff_drain_blockers(paths, snapshot: RunSnapshot, unfinished) -> list:
     """Old-platform workers a handoff must not run past (PRD 5.2.6 D2).
 
     Read-only.  A worker is drained when its task binding has handed the work
-    back (delivered/accepted/review) or ended (archived/failed/stopped/
+    back (delivered/accepted/review) and the run no longer holds it as the
+    node's live task, or ended (archived/failed/stopped/
     blocked_design), or when a stop was registered for exactly that task.  A
     create nobody claimed is not a worker: the handoff hides it.  Everything
     else -- a running binding, an unreadable registry, an identity with no
@@ -191,7 +203,14 @@ def handoff_drain_blockers(paths, snapshot: RunSnapshot, unfinished) -> list:
                                      reason="任务登记读不出，无法判定是否已停"))
                 continue
             if binding is not None and binding.task_id == task_id:
-                if binding.status in TERMINAL_TASK_STATUSES or binding.status in _DRAINED_STATUSES[role]:
+                if binding.status in TERMINAL_TASK_STATUSES:
+                    continue
+                # A handed-back status alone is not proof: a running reviewer's
+                # binding already reads "review" (``Monitor._running_status``),
+                # the same value its consumed delivery leaves.  Only when the
+                # run no longer holds this task as its live one is it drained.
+                if binding.status in _DRAINED_STATUSES[role] and not _holds_live_task(
+                        snapshot, node_id, current, role, task_id):
                     continue
                 blockers.append(dict(entry, status=binding.status, provider=binding.provider or "",
                                      reason="任务登记仍是 {}".format(binding.status)))
