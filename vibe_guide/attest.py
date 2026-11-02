@@ -15,7 +15,16 @@ from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore
 from .node_spec import observe_capabilities
 
-CAPABILITIES_RELATIVE_PATH = ".vibe/provider-actions/capabilities.json"
+CAPABILITIES_RELATIVE_DIR = ".vibe/provider-actions"
+#: Kept in the summary under its historical key so existing readers and the
+#: golden summaries stay byte-identical; the file attest actually writes is
+#: :func:`capabilities_relative_path` (``record_path`` in the CLI payload).
+CAPABILITIES_RELATIVE_PATH = CAPABILITIES_RELATIVE_DIR + "/capabilities.json"
+
+
+def capabilities_relative_path(adapter_id: str) -> str:
+    """Where one adapter's own record lives (the only file attest writes)."""
+    return "{}/capabilities-{}.json".format(CAPABILITIES_RELATIVE_DIR, adapter_id)
 
 
 def expected_fact_names(adapter_id: str) -> List[str]:
@@ -59,8 +68,23 @@ def validate_session_facts(adapter_id: str, facts: Any) -> Dict[str, bool]:
     return {name: facts[name] for name in expected + stated_optional}
 
 
-def record_session_capabilities(paths: Any, adapter_id: str, facts: Any, provenance: Any, project_id: Optional[str] = None) -> Dict[str, Any]:
-    """Validate, write the bridge file, and return the detection summary."""
+def record_session_capabilities(
+    paths: Any,
+    adapter_id: str,
+    facts: Any,
+    provenance: Any,
+    project_id: Optional[str] = None,
+    *,
+    host_version: Optional[str] = None,
+    session_id: Optional[str] = None,
+    observed_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate, write this adapter's own record, and return the detection summary.
+
+    ``host_version`` and ``session_id`` come from the calling session (the
+    CLI fills them from host detection or ``--host-version``); ``observed_at``
+    defaults to now.  They date the observation, they never change a fact.
+    """
     if not paths.vibe.is_dir():
         raise PermissionError("init_required: 请先运行 vibe init --confirm，再登记会话能力")
     if not isinstance(adapter_id, str) or not adapter_id.strip():
@@ -73,6 +97,7 @@ def record_session_capabilities(paths: Any, adapter_id: str, facts: Any, provena
     validated = validate_session_facts(adapter_id, facts)
     ProviderActionStore(paths).publish_capabilities(
         adapter_id, validated, provenance.strip(), project_id.strip() if project_id else None,
+        observed_at=observed_at, host_version=host_version, session_id=session_id,
     )
     # Read back this adapter's own record, not whatever adapter attested last.
     observed = observe_capabilities(paths, adapter_id)

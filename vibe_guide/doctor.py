@@ -239,3 +239,88 @@ def doctor(report):
         if not contract.ok:
             proposals.append('.vibe/proposals/agentsmd/proposal.md')
     return DoctorReport(not issues, issues, facts, status=status, proposals=proposals, warnings=warnings)
+
+
+#: A capability registration older than this needs a second look.
+REGISTRATION_REVIEW_DAYS = 14
+
+
+def _parse_observed_at(value):
+    from datetime import datetime, timezone
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _same_version(left, right):
+    """Equal host versions, ignoring separators and a leading product name."""
+    def numbers(value):
+        return tuple(int(part) for part in re.findall(r'\d+', str(value)))
+    a, b = numbers(left), numbers(right)
+    return a == b if a and b else str(left).strip() == str(right).strip()
+
+
+def capability_registrations(records, host, now=None):
+    """Per-platform capability registrations and whether each needs review.
+
+    Display only: this never feeds ``issues`` or the status, so the project
+    verdict stays the same whoever runs doctor.  ``host`` is the calling
+    session's :class:`~vibe_guide.host_detect.HostDetection`; its version is
+    compared only with the registration of its own platform.
+    """
+    from datetime import datetime, timezone
+    from .platform_ledger import platform_for_provider
+    now = now or datetime.now(timezone.utc)
+    rows = []
+    for adapter_id, record in sorted(records.items()):
+        observed_at = record.get('observed_at')
+        recorded_version = record.get('host_version')
+        reasons = []
+        parsed = _parse_observed_at(observed_at)
+        if parsed is None:
+            reasons.append('登记没有日期')
+        else:
+            age_days = (now - parsed).total_seconds() / 86400.0
+            if age_days > REGISTRATION_REVIEW_DAYS:
+                reasons.append('登记已超过 {} 天'.format(REGISTRATION_REVIEW_DAYS))
+        current_version = None
+        platform = platform_for_provider(adapter_id) or adapter_id
+        if host is not None and host.platform == platform:
+            current_version = host.host_version
+        if current_version and recorded_version and not _same_version(current_version, recorded_version):
+            reasons.append('宿主版本已从 {} 变为 {}'.format(recorded_version, current_version))
+        elif current_version and not recorded_version:
+            reasons.append('登记没有宿主版本，当前为 {}'.format(current_version))
+        rows.append({
+            'adapter_id': adapter_id,
+            'observed_at': observed_at,
+            'host_version': recorded_version,
+            'session_id': record.get('session_id'),
+            'current_host_version': current_version,
+            'needs_review': bool(reasons),
+            'review_reasons': reasons,
+        })
+    return rows
+
+
+def render_registrations(host, rows):
+    """One line for the current platform, one per registration."""
+    lines = ['当前平台：' + (host.describe() if host is not None else '未知')]
+    if not rows:
+        lines.append('能力登记：无')
+    for row in rows:
+        line = '能力登记 {}：日期 {}，宿主版本 {}'.format(
+            row['adapter_id'], row['observed_at'] or '未记录', row['host_version'] or '未记录')
+        if row['needs_review']:
+            line += '；需复核（' + '；'.join(row['review_reasons']) + '）'
+        lines.append(line)
+    return lines

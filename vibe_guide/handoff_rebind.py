@@ -27,6 +27,23 @@ class HandoffRebindError(Exception):
     """The new platform cannot be proven; the caller keeps ``blocked_unknown``."""
 
 
+class HandoffNothingToMove(HandoffRebindError):
+    """The run has no unfinished node: a handoff would only rewrite history."""
+
+
+def require_unfinished_nodes(unfinished: Sequence[str], card_agent: str) -> None:
+    """Refuse a handoff of a run whose every node is already accepted.
+
+    Nothing is left to dispatch, so moving the card would only relabel the
+    platform that actually did the work (socialmedia run-63e7cfc2: 8/8
+    accepted on Codex, then flipped to workbuddy by a later handoff).
+    """
+    if not list(unfinished):
+        raise HandoffNothingToMove(
+            "platform handoff: 本运行已没有未完成节点，无需交接；授权卡平台保持 {}".format(card_agent)
+        )
+
+
 def resolve_handoff_target(
     *,
     explicit: Optional[str],

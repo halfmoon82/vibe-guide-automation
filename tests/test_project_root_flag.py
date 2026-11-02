@@ -19,11 +19,22 @@ def _deny_getcwd():
     raise PermissionError(1, "Operation not permitted")
 
 
+# main() checks --provider/--adapter against the calling host's session-id
+# variables; drop them so the result is the same in a host session and a
+# plain terminal.
+_HOST_IDENTITY_ENV = (
+    "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID", "CODEBUDDY_SESSION_ID",
+)
+
+
 def _run_main(argv, env=None):
     out = io.StringIO()
     with mock.patch.dict(os.environ, env or {}, clear=False), \
             mock.patch("os.getcwd", side_effect=_deny_getcwd), \
             contextlib.redirect_stdout(out):
+        for name in _HOST_IDENTITY_ENV:
+            os.environ.pop(name, None)
         code = main(argv)
     return code, out.getvalue()
 
