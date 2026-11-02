@@ -251,12 +251,9 @@ def _make_background(leg, start):
 
 
 def _make_background_retry(leg):
-    # Defect found by this node (no issue number yet; listed in the delivery):
-    # when a handoff to a background platform is interrupted after the worker
-    # start was recorded, the retry is refused as "an old-platform worker may be
-    # writing" although the run already moved, so the half-done handoff never
-    # converges.  The visible-platform interruption does converge (matrix above).
-    @unittest.expectedFailure
+    # The retry-refusal defect found earlier (a background handoff interrupted
+    # after the worker start was recorded was refused on retry) is fixed in
+    # monitor_handoff.py (da530f7), so this now passes as a plain test.
     def retry_test(self):
         self.source, self.target = leg
         self.background = True
