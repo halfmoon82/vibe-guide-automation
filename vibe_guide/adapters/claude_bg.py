@@ -836,6 +836,47 @@ class ClaudeBgLauncher:
             raise ClaudeBgUnknown("unknown session state: %r" % (state,))
         return state
 
+    _HTTP_400 = re.compile(
+        r"(api error:?\s*400\b|\bhttp\s*400\b|\"status\":\s*400\b|"
+        r"model[^\n]{0,80}(not supported|unsupported|does not exist|not found))",
+        re.IGNORECASE,
+    )
+
+    def failure_class(self, task_id: str) -> Optional[str]:
+        """``provider_http_400`` when the transcript ends in a gateway 400.
+
+        Only the tail of the transcript is read and only a fixed code is
+        returned, so provider wording never leaves this method.
+        """
+        self._short(task_id)
+        path = self.transcript_locator(task_id)
+        if path is None:
+            return None
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()[-20:]
+        except (OSError, UnicodeDecodeError):
+            return None
+        for line in reversed(lines):
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            flagged = item.get("isApiErrorMessage") is True or bool(item.get("error"))
+            if not flagged:
+                continue
+            if self._HTTP_400.search(json.dumps(item, ensure_ascii=False)):
+                return "provider_http_400"
+            return None
+        return None
+
+    def can_resume(self, task_id: str) -> bool:
+        """The same session can be continued only while its transcript exists."""
+        self._short(task_id)
+        path = self.transcript_locator(task_id)
+        return path is not None and Path(path).is_file()
+
     def final_reply(self, task_id: str) -> Optional[str]:
         self._short(task_id)
         path = self.transcript_locator(task_id)
