@@ -293,6 +293,8 @@ _PROJECT_MOUNT_NONE = 'none'
 WARNINGS_KEY = 'warnings'
 
 _ADVISORY_RESULT_KEYS = (WARNINGS_KEY,)
+#: fixed payload marker: the worker could not send the wake signal; the daemon's next cycle takes the report
+WAKE_FAILED_KEY = 'wake_failed'
 
 
 def _requested_project_mount(request: Any, operation: str) -> Optional[str]:
@@ -1959,6 +1961,34 @@ class ProviderActionStore:
                 and not report.get('consumed_by')
             ):
                 found.append(report.get('issue_id'))
+        return found
+
+    def unconsumed_delivery_records(self, run_id):
+        """Read-only ``[{issue_id, role, generation, wake_failed}]`` of archived
+        self-reports nothing has taken yet.
+
+        ``wake_failed`` is the worker's fixed marker that it could not send the
+        wake signal; it only tells the daemon to expect the report, since the
+        daemon receives every unconsumed report on its next cycle anyway.
+        """
+        deliveries = self.root / 'deliveries'
+        if not deliveries.is_dir():
+            return []
+        found = []
+        for path in sorted(deliveries.glob('*.json')):
+            report = self._read(path)
+            if (
+                isinstance(report, dict)
+                and report.get('run_id') == run_id
+                and not report.get('consumed_by')
+            ):
+                payload = report.get('payload')
+                found.append({
+                    'issue_id': report.get('issue_id'),
+                    'role': report.get('role'),
+                    'generation': report.get('generation'),
+                    'wake_failed': isinstance(payload, dict) and payload.get(WAKE_FAILED_KEY) is True,
+                })
         return found
 
     def has_request(
