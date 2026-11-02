@@ -27,6 +27,9 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-11-03: §4/§7 platform-handoff exception -- a visible-to-background
+        # change on handoff is disclosed, not confirmed; drain first (card-and-handoff).
+        "0d3a9757b3c7f33496926f33392d0c99f3f9433e56ef1b97560bae5c3daf3317",
         # 2026-11-02: integration-review finding routing (reviewer-only-recovery).
         "6e70f36c4dd6ad5b998dcdb2a833b2c97749ead76cbd36c6a85bd3077409bd22",
         # 2026-11-01: one mailbox field table drives the prd-guide write-back table (mailbox-shape).
@@ -247,6 +250,9 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Short per-beat runbook; the beat prints it once per shift, then only
     # its path and sha256.
     "supervisor-card": frozenset({
+        # 2026-11-03: decision boundary names the platform-handoff disclosure
+        # exception; wording trimmed to stay within 3072 bytes (card-and-handoff).
+        "b26036fdbcdbcf344cbf0590d2aac3ce1fe24f68c8ef8dd49446b189e72e49c3",
         # 2026-11-02: integration-review finding routing (reviewer-only-recovery).
         "9ef9917c810a139a879bade238765acb4fbd6a3ddac793fc7261632e6288b93d",
         # 2026-10-30: --project-root section.

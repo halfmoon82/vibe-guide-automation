@@ -672,7 +672,8 @@ class ProviderActionRunner(Runner):
             "需要改允许路径外的文件时，不要改路径外文件，也不要停下等人：先完成路径内的部分并正常交付，"
             "在交付说明里写清要改哪些文件、为什么，范围由监工和审查员裁决。"
             "只有会改变 PRD 决策、涉及部署发布、凭据或授权卡外不可撤销动作、新增第三方依赖、"
-            "可见降级为后台不可见时，才在交付里附 decision_requests。\n"
+            "可见降级为后台不可见时，才在交付里附 decision_requests；"
+            "唯一例外：跨平台交接把可见改成后台只披露、不算请求。\n"
             "{rework_findings}{supervisor_answer}"
         ).format(root_flag=root_flag, node=node_id, generation=generation, purpose=purpose, objective=objective,
                  role=contract.get('role', 'developer'),
