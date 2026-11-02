@@ -332,7 +332,7 @@ class LiveSessionProbeTests(CloseoutBase):
 
     def snapshot(self):
         return SimpleNamespace(
-            status="blocked_unknown",
+            run_id=RUN, status="blocked_unknown",
             nodes={"n": node("blocked_unknown", worktree=str(Path(self.tmp.name) / ".worktrees" / "n"))},
             tasks={"n:developer": {"mode": "background", "task_id": self.SESSION, "status": "start_pending"}})
 
@@ -369,11 +369,21 @@ class LiveSessionProbeTests(CloseoutBase):
         result = self.run_probe(entries=[{"sessionId": other, "state": "working", "cwd": "/somewhere/else"}])
         self.assertEqual(result, {"live": [], "unknown": None})
 
-    def test_unregistered_session_inside_a_node_worktree_is_live(self):
+    def test_unregistered_session_inside_a_node_worktree_is_not_live(self):
+        # #377: an old run's session whose cwd is in a same-named worktree is not this run's.
         other = "bbbbbbbb-0000-0000-0000-000000000000"
         cwd = str(Path(self.tmp.name) / ".worktrees" / "n")
         result = self.run_probe(entries=[{"sessionId": other, "state": "working", "cwd": cwd}])
-        self.assertEqual(result["live"], [other[:8]])
+        self.assertEqual(result, {"live": [], "unknown": None})
+
+    def test_session_launched_by_this_run_but_not_yet_registered_is_live(self):
+        other = "bbbbbbbb-0000-0000-0000-000000000000"
+        records = self.paths.vibe / "provider-actions" / "claude-bg-sessions"
+        records.mkdir(parents=True, exist_ok=True)
+        (records / "claude-bg-n-1-abcd1234.json").write_text(json.dumps({"claims": {
+            "run_id": RUN, "node_id": "n", "generation": 1, "session_id": other}}), encoding="utf-8")
+        result = self.run_probe(entries=[{"sessionId": other, "state": "working", "cwd": "/elsewhere"}])
+        self.assertEqual(result, {"live": [other[:8]], "unknown": None})
 
     def test_retired_sessions_do_not_block(self):
         entries = [{"sessionId": self.SESSION, "state": state, "cwd": "/x"} for state in ("stopped", "done", "failed")]
