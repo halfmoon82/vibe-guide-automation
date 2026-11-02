@@ -14,6 +14,40 @@ from typing import Any, Dict, List, Optional
 
 from .state import durable_projection
 
+#: Every auto-scope sentence starts with this, so tests can find it (#381).
+AUTO_SCOPE_RULE_PREFIX = "自动放行："
+
+
+def auto_scope_rule_sentence(project_root: Any) -> str:
+    """One sentence telling a developer which out-of-scope files the gate accepts (#381).
+
+    Mirrors ``scope_landing.landing_report``: ``tests/`` files, the project's
+    ``auto_scope_paths``, and -- only when the project approved it -- any
+    repository file that changes no approved acceptance verdict, each provided
+    no other active node holds it.  An unreadable or invalid config never
+    widens the sentence (same fallback as the monitor).
+    """
+    from .config import load_project_config
+
+    paths: tuple = ()
+    approved = False
+    if project_root is not None:
+        try:
+            config = load_project_config(Path(project_root))
+            paths, approved = tuple(config.auto_scope_paths), bool(config.acceptance_scope_rule_approved)
+        except (OSError, ValueError, TypeError):
+            paths, approved = (), False
+    targets = "tests/ 下的文件"
+    if paths:
+        targets += "、项目登记的 " + "、".join(paths)
+    if approved:
+        targets += "，以及不改变任何已批准验收例子判定结果的同仓库文件"
+    return (
+        AUTO_SCOPE_RULE_PREFIX + targets
+        + "，只要没有被其他活跃节点占用，就可以直接修改并随本次交付提交，交付门会自动放行并记录，"
+        "不需要监工中转（tests/ 外的依赖清单、部署、凭据、外部系统配置不在此列）。"
+    )
+
 #: Severities that never send a node back to the developer.  This mirrors
 #: ``Monitor._review_finding_disposition``: only P3 is an observation; P0-P2,
 #: P4/P5 and any missing or malformed severity all return to the developer,

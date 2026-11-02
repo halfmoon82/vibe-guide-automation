@@ -270,6 +270,46 @@ def _run_gh(repo: Any, args: Sequence[str], timeout: int = 120) -> str:
     return completed.stdout.strip()
 
 
+NODE_BRANCH_PREFIX = "node/"
+
+
+def run_node_branches(snapshot: Any) -> List[str]:
+    """The run's business node branches (``node/*``), sorted and unique."""
+    nodes = _snapshot_value(snapshot, "nodes", {}) or {}
+    branches = set()
+    if isinstance(nodes, Mapping):
+        for node_id, node in nodes.items():
+            if node_id in (INTEGRATION_REVIEW_NODE_ID, REMOTE_DELIVERY_NODE_ID):
+                continue
+            branch = node.get("branch") if isinstance(node, Mapping) else None
+            if isinstance(branch, str) and branch.startswith(NODE_BRANCH_PREFIX):
+                branches.add(branch)
+    return sorted(branches)
+
+
+def remote_node_branch_deviations(repo: Any, branches: Sequence[str], timeout: int = 30) -> Dict[str, Any]:
+    """Which of the run's node branches reached ``origin`` (#379).
+
+    Workers never push; only the remote-delivery ring does, and it pushes
+    its integration branch, never a ``node/*`` branch.  A node branch on the
+    remote is therefore a boundary deviation.  An unreadable remote is
+    ``checked: False`` with a reason -- never "no deviation".
+    """
+    try:
+        listed = _run_git(repo, ["ls-remote", "--heads", "origin", "refs/heads/" + NODE_BRANCH_PREFIX + "*"],
+                          timeout=timeout)
+    except RemoteDeliveryFailed as error:
+        return {"checked": False, "branches": [],
+                "reason": "未检查：读不到远端（{}），不能当成没有越界".format(error.reason)}
+    remote = set()
+    for line in listed.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].startswith("refs/heads/"):
+            remote.add(parts[1][len("refs/heads/"):])
+    wanted = {str(item) for item in branches if isinstance(item, str)}
+    return {"checked": True, "branches": sorted(remote & wanted)}
+
+
 def _slug(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
     return cleaned or "run"
@@ -614,6 +654,10 @@ def _write_delivery_report(paths: Any, snapshot: Any, evidence: Mapping[str, Any
             "remote_verification": evidence.get("remote_verification"),
             "binding": evidence.get("binding"),
             "steps": sorted((evidence.get("steps") or {}).keys()),
+            "deviations": {
+                "remote_node_branches": remote_node_branch_deviations(
+                    paths.root, run_node_branches(snapshot)),
+            },
         }
         atomic_write_json(directory / "remote-delivery-report.json", report)
     except (OSError, ValueError, TypeError):
