@@ -414,6 +414,9 @@ class MailboxSectionTests(unittest.TestCase):
         # payload (ProviderActionRunner._wait_result), so omitting it fails the
         # gate; only a worker-deliver receipt stands in for it.
         self.assertIn("cursor", developer)
+        developer = {**developer, "delivery_evidence": {
+            **developer["delivery_evidence"],
+            "completion_marker": "marker-1", "delivery_path": "delivery.json"}}
         self.assertEqual(gate(developer).status, "DELIVERED", gate(developer).reasons)
         flat = {k: v for k, v in developer.items() if k != "delivery_evidence"}
         flat.update(developer["delivery_evidence"])
