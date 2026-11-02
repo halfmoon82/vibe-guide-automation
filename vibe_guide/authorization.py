@@ -14,6 +14,7 @@ from .models import (
     DAGNode,
     Plan,
 )
+from .platform_ledger import REMOTE_GIT_ENFORCEMENT, card_capability_rows, require_ledger
 
 
 AUTHORIZATION_SCHEMA_VERSION = 2
@@ -127,18 +128,9 @@ REMOTE_GIT_DISALLOWED_TOOLS = (
     "Bash(git push:*)", "Bash(git fetch:*)", "Bash(git pull:*)", "Bash(gh:*)",
 )
 REMOTE_GIT_LAUNCH_ENV = {"GIT_ALLOW_PROTOCOL": "vibe-denied"}
-#: Per-platform enforcement under ``deny``, shown on the card and in the README.
-#: Unsigned display: it describes what vibe can enforce, not what was approved.
-REMOTE_GIT_ENFORCEMENT = (
-    {"platform": "claude-code 后台派发", "level": "partial",
-     "note": "提示词禁令加启动拦截（--disallowedTools 只拦住 git push，"
-             "拦不住 git -C push 与 bash -c；GIT_ALLOW_PROTOCOL 管不到 gh 和 curl，"
-             "且能否传进后台会话的工具 shell 未验证）：部分拦截，环境变量生效未验证"},
-    {"platform": "claude-code 可见任务", "level": "prompt_only", "note": "仅提示词约束，未强制"},
-    {"platform": "codex", "level": "prompt_only", "note": "仅提示词约束，未强制"},
-    {"platform": "kimi-code", "level": "prompt_only", "note": "仅提示词约束，未强制"},
-    {"platform": "workbuddy", "level": "prompt_only", "note": "仅提示词约束，未强制"},
-)
+# Per-platform enforcement under ``deny`` (``REMOTE_GIT_ENFORCEMENT``) is
+# defined in the platform capability ledger; it is unsigned display describing
+# what vibe can enforce, not what was approved.
 
 
 def remote_git_denied(paths, contract):
@@ -1186,6 +1178,10 @@ class AuthorizationCard:
     # Unsigned display: the tier is derived from the signed node contract, and
     # a concrete model name must never enter the digest.
     model_tiers: Tuple[Dict[str, Any], ...] = ()
+    # The card platform's row of the platform capability ledger: every cell
+    # with its verified / pm_ruling / unverified label and provenance.
+    # Unsigned display, like ``model_tiers``.
+    platform_capabilities: Tuple[Dict[str, Any], ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -1576,7 +1572,8 @@ def _drop_unset_card_fields(result: Dict[str, Any]) -> Dict[str, Any]:
                 "heartbeat_interval_forced", "heartbeat_interval_forced_cost"):
         if result.get(key) is None:
             result.pop(key, None)
-    for key in ("heartbeat_interval_options", "rotate_hard_cap_options", "model_tiers"):
+    for key in ("heartbeat_interval_options", "rotate_hard_cap_options", "model_tiers",
+                "platform_capabilities"):
         if not result.get(key):
             result.pop(key, None)
     return result
@@ -1637,6 +1634,12 @@ def build_authorization_card(
     daemon: bool = DAEMON_DEFAULT,
     launchd_keepalive: bool = LAUNCHD_KEEPALIVE_DEFAULT,
 ) -> AuthorizationCard:
+    # The card describes dispatch from the platform capability ledger; an
+    # unreadable ledger refuses publication with the reason instead of guessing.
+    try:
+        require_ledger()
+    except ValueError as error:
+        raise ValueError(str(error)) from error
     node_ids = tuple(sorted(node.id for node in nodes))
     if node_ids != tuple(sorted(plan.node_ids)):
         raise ValueError("authorization nodes must exactly match the plan")
@@ -1871,6 +1874,7 @@ def build_authorization_card(
     canonical["heartbeat_interval_options"] = heartbeat_options
     canonical["rotate_hard_cap_options"] = rotate_options
     canonical["model_tiers"] = _model_tier_rows(nodes, capabilities.agent_id)
+    canonical["platform_capabilities"] = card_capability_rows(capabilities.agent_id)
     canonical.setdefault("daemon", daemon)
     canonical.setdefault("launchd_keepalive", launchd_keepalive)
     card = AuthorizationCard(digest=digest, **canonical)

@@ -2,3 +2,4 @@ include README.md
 include README.en.md
 recursive-include vibe_guide/protocols *.md
 recursive-include vibe_guide/adapters/manifests *.yaml
+recursive-include vibe_guide platform_ledger.json
