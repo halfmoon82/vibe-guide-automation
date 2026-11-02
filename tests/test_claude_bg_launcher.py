@@ -18,6 +18,7 @@ from vibe_guide.adapters.claude_bg import (
     subprocess_executor,
 )
 from vibe_guide.adapters.task_provider import BackgroundTaskProvider, BackgroundTaskRouting
+from vibe_guide.authorization import WORKER_PUSH_BAN_TEXT
 from vibe_guide.paths import ProjectPaths
 
 UUID = "1a2b3c4d-1111-4222-8333-444455556666"
@@ -131,8 +132,11 @@ class LaunchTest(LauncherCase):
         self.launcher(model="opus").launch("developer", "n1", self.contract)
         argv, cwd = self.fake.calls[0]
         self.assertEqual(cwd, self.worktree)
-        for token in ("--bg", "--model", "--settings", "/abs/settings.json", "--permission-mode", "bypassPermissions", "do the thing"):
+        for token in ("--bg", "--model", "--settings", "/abs/settings.json", "--permission-mode", "bypassPermissions"):
             self.assertIn(token, argv)
+        # The contract text leads; the worker push ban (#379) is appended.
+        self.assertTrue(argv[-1].startswith("do the thing"))
+        self.assertTrue(argv[-1].endswith(WORKER_PUSH_BAN_TEXT))
         self.assertEqual(argv[argv.index("--model") + 1], "opus")
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "bypassPermissions")
 
@@ -141,7 +145,8 @@ class LaunchTest(LauncherCase):
         self.contract.write_text("-- starts with a dash", encoding="utf-8")
         self.launcher().launch("developer", "n1", self.contract)
         argv, _ = self.fake.calls[0]
-        self.assertEqual(argv[-2:], ["--", "-- starts with a dash"])
+        self.assertEqual(argv[-2], "--")
+        self.assertTrue(argv[-1].startswith("-- starts with a dash"))
 
     def test_ansi_in_output_is_tolerated(self):
         self.fake.launch_out = "\x1b[32mbackgrounded\x1b[0m · %s · n\n" % SHORT

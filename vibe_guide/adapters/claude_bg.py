@@ -22,6 +22,8 @@ from ..authorization import (
     REMOTE_GIT_BAN_TEXT,
     REMOTE_GIT_DISALLOWED_TOOLS,
     REMOTE_GIT_LAUNCH_ENV,
+    WORKER_PUSH_BAN_TEXT,
+    WORKER_PUSH_DISALLOWED_TOOLS,
 )
 from ..paths import ProjectPaths
 from .task_provider import BackgroundTaskRouting, ProviderUnavailable, VisibilityResult
@@ -311,8 +313,9 @@ class ClaudeBgLauncher:
         base_sha: Optional[str] = None,
     ):
         #: True only when the authorization card says ``remote_git_actions:
-        #: deny``: ``launch`` then appends the ban to the prompt and adds
-        #: ``--disallowedTools`` plus ``GIT_ALLOW_PROTOCOL``.  False adds nothing.
+        #: deny``: ``launch`` then appends the remote-Git ban to the prompt and
+        #: adds ``--disallowedTools`` plus ``GIT_ALLOW_PROTOCOL``.  False still
+        #: bans the push (#379): the push ban text and push/gh tools, no env.
         self.remote_git_deny = bool(remote_git_deny)
         self.routing = routing
         self.sleeper = sleeper
@@ -704,13 +707,17 @@ class ClaudeBgLauncher:
         name = "%s-%s" % (issue_id, role)
         started_ms = int(time.time() * 1000)
         # One --disallowedTools argument: background workers never get
-        # AskUserQuestion (#328); under remote-git deny the remote git tools
-        # are added to the same list rather than passing the option twice.
+        # AskUserQuestion (#328); the remote git tools are added to the same
+        # list rather than passing the option twice.  Workers never push
+        # (#379): allow still bans push/gh, deny bans every remote git tool.
         denied_tools = [_NO_USER_QUESTIONS[1]]
-        if self.remote_git_deny:
-            if REMOTE_GIT_BAN_TEXT not in prompt:
-                prompt = prompt + "\n" + REMOTE_GIT_BAN_TEXT
-            denied_tools += list(REMOTE_GIT_DISALLOWED_TOOLS)
+        ban_text, ban_tools = (
+            (REMOTE_GIT_BAN_TEXT, REMOTE_GIT_DISALLOWED_TOOLS) if self.remote_git_deny
+            else (WORKER_PUSH_BAN_TEXT, WORKER_PUSH_DISALLOWED_TOOLS)
+        )
+        if ban_text not in prompt:
+            prompt = prompt + "\n" + ban_text
+        denied_tools += list(ban_tools)
         deny_flags: List[str] = [_NO_USER_QUESTIONS[0]] + denied_tools
         try:
             started = self._run(

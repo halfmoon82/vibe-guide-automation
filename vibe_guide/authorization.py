@@ -128,6 +128,14 @@ REMOTE_GIT_DISALLOWED_TOOLS = (
     "Bash(git push:*)", "Bash(git fetch:*)", "Bash(git pull:*)", "Bash(gh:*)",
 )
 REMOTE_GIT_LAUNCH_ENV = {"GIT_ALLOW_PROTOCOL": "vibe-denied"}
+#: Worker-prompt push ban for every other card (#379): ``allow`` authorizes
+#: the monitor-driven remote-delivery ring to push, never a worker.
+WORKER_PUSH_BAN_TEXT = (
+    "推送禁令：开发与审查 worker 一律不得推送——严禁 git push（含 git -C … push、bash -c 包装）、"
+    "严禁创建 PR 或运行 gh 命令；只在本地节点分支提交，推送与 PR 只由远端交付环执行。"
+)
+#: ``claude --bg`` launch flags for the same ban (fetch/pull stay usable).
+WORKER_PUSH_DISALLOWED_TOOLS = ("Bash(git push:*)", "Bash(gh:*)")
 # Per-platform enforcement under ``deny`` (``REMOTE_GIT_ENFORCEMENT``) is
 # defined in the platform capability ledger; it is unsigned display describing
 # what vibe can enforce, not what was approved.
@@ -152,6 +160,15 @@ def remote_git_denied(paths, contract):
         except (OSError, ValueError, TypeError):
             return False
     return value == "deny"
+
+
+def worker_push_ban_text(paths, contract):
+    """The ban line every developer/reviewer prompt carries (#379).
+
+    ``deny`` keeps the stricter remote-Git ban; any other card (``allow``,
+    none, unreadable) still forbids the worker to push.
+    """
+    return REMOTE_GIT_BAN_TEXT if remote_git_denied(paths, contract) else WORKER_PUSH_BAN_TEXT
 
 
 def remote_git_actions_allowed(authorization, action):
