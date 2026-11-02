@@ -13,7 +13,7 @@ import shutil
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .authorization import (
     AuthorizationCard,
@@ -39,7 +39,8 @@ from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
 from .config import load_project_config, load_supervisor_single_shift
 from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
-from .doctor import doctor
+from .doctor import capability_registrations, doctor, render_registrations
+from . import platform_ledger
 from .initializer import _rules_target, apply_agentsmd_proposal, init_project, refresh_protocol_copies
 from . import host_rules
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
@@ -105,9 +106,11 @@ from .planner import (
 from .session_entry import build_session_entry, draft_s1, materialize_session_entry, replaceable_draft_extras
 from .capability_contract import contract_path, save_contract
 from .handoff_rebind import (
+    HandoffNothingToMove,
     HandoffRebindError,
     contract_for_platform,
     rebind_nodes,
+    require_unfinished_nodes,
     resolve_handoff_target,
     stranded_nodes,
     unfinished_node_ids,
@@ -131,7 +134,15 @@ from .authorize_entry import (
     materialize_workflow_evidence,
     verify_workflow_artifacts,
 )
-from .attest import record_session_capabilities
+from .attest import capabilities_relative_path, record_session_capabilities
+from .host_detect import (
+    HostDetection,
+    HostMismatchError,
+    HostUnknownError,
+    detect_host,
+    resolve_adapter,
+)
+from .platform_ledger import platform_for_provider
 from .protocols import PRD_GUIDE_NAME, load_protocol
 from .state import _atomic_bytes, load_events, load_snapshot, validate_run_id
 from .state import RunSnapshot
@@ -241,6 +252,68 @@ def _result(
     return CLIResult(code, payload, text, as_json)
 
 
+def _host_adapter(
+    command: str, explicit: Optional[str], host: HostDetection, flag: str = "--adapter",
+) -> Tuple[Optional[str], Optional[CLIResult]]:
+    """The platform a command acts for, checked against the calling host.
+
+    Returns ``(adapter, None)`` or ``(None, refusal)``.  A flag that disagrees
+    with the detected host is refused naming what the environment says;
+    contradictory or partial host evidence stays unknown and needs the flag.
+    ``(None, None)`` means no host evidence and no flag: the command keeps its
+    own fallback (attest then asks for ``--adapter``).
+    """
+    try:
+        return resolve_adapter(explicit, host, flag), None
+    except (HostMismatchError, HostUnknownError) as error:
+        return None, _result(
+            BLOCKED,
+            {"command": command, "status": "blocked_invalid", "reason": str(error),
+             "host": host.to_dict()},
+            "已拒绝：" + str(error),
+            False,
+        )
+
+
+def _authorize_host_check(
+    paths: ProjectPaths, plan_id: str, explicit: Optional[str], host: HostDetection,
+) -> Optional[CLIResult]:
+    """Refuse authorizing a card for a platform other than the calling session's.
+
+    The platform is ``--adapter`` (checked against the host) or the detected
+    host.  Neither known: nothing to compare, authorize behaves as before.  A
+    card that cannot be read is left to authorize's own error reporting.
+    """
+    if not str(explicit or "").strip() and not host.known:
+        # An unknown host has no platform to compare; the card stays authority.
+        return None
+    adapter, refusal = _host_adapter("authorize", explicit, host)
+    if refusal is not None or adapter is None:
+        return refusal
+    try:
+        raw = _read_json(_plan_root(paths, plan_id) / "authorization-card.json")
+    except (OSError, ValueError, TypeError):
+        return None
+    card_agent = str(raw.get("agent_id") or "") if isinstance(raw, dict) else ""
+    wanted = platform_for_provider(adapter) or adapter
+    if card_agent in ("", "pending") or (platform_for_provider(card_agent) or card_agent) == wanted:
+        return None
+    reason = (
+        "授权卡平台是 {}，本会话是 {}（{}）：请在 {} 会话里授权，或在本会话重新发布计划"
+        .format(card_agent, adapter, host.describe() if not explicit else "--adapter", card_agent)
+    )
+    return _result(
+        BLOCKED,
+        {"command": "authorize", "status": "blocked_invalid", "reason": reason, "host": host.to_dict()},
+        "授权未记录：" + reason,
+        False,
+    )
+
+
+def _with_json(result: CLIResult, as_json: bool) -> CLIResult:
+    return CLIResult(result.exit_code, result.payload, result.text, as_json)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vibe", add_help=False)
     parser.add_argument("-h", "--help", action="store_true", dest="show_help")
@@ -271,6 +344,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--from-prd", dest="from_prd")
     parser.add_argument("--print-protocol", action="store_true", dest="print_protocol")
     parser.add_argument("--adapter")
+    parser.add_argument("--host-version", dest="host_version",
+                        help="attest: 本会话宿主版本（环境里读不到时手工给出）")
     parser.add_argument("--facts")
     parser.add_argument("--provenance")
     parser.add_argument("--project-id", dest="project_id")
@@ -934,6 +1009,8 @@ def _platform_handoff_rebind(
     authorization = snapshot.authorization if isinstance(snapshot.authorization, dict) else {}
     run_agent = str(authorization.get("agent_id") or "")
     unfinished = unfinished_node_ids(nodes, snapshot.nodes)
+    # A run with nothing left to do keeps the platform that executed it.
+    require_unfinished_nodes(unfinished, card.agent_id)
     run_drift = bool(run_agent) and any(
         node_adapter_id(node) != run_agent for node in nodes if node.id in unfinished
     )
@@ -2336,7 +2413,14 @@ def _run_id(directory: Path, requested: Optional[str]) -> str:
 _PROTOCOL_REFRESH_COMMANDS = {"plan", "monitor", "resume"}
 
 
-def run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_prefix="vibe") -> CLIResult:
+def run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_prefix="vibe",
+            environ: Optional[Mapping[str, str]] = None) -> CLIResult:
+    """Run one command.  ``environ`` is the calling host's environment.
+
+    Only the command-line entry (``main``) passes the real process
+    environment; a programmatic caller that passes none gets no host
+    detection, so its result never depends on which host it runs under.
+    """
     # A package upgrade runs no project code, so an unedited protocol copy
     # left by an earlier release is brought current on the next working
     # command instead.
@@ -2355,7 +2439,7 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_p
             refreshed = refresh_protocol_copies(ProjectPaths.from_cwd(Path(cwd)).root)
         except (OSError, ValueError):
             refreshed = []
-    result = _run_cli(argv, cwd, runner, supervisor_command_prefix=supervisor_command_prefix)
+    result = _run_cli(argv, cwd, runner, supervisor_command_prefix=supervisor_command_prefix, environ=environ)
     if refreshed:
         result = CLIResult(
             result.exit_code,
@@ -2368,7 +2452,8 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_p
     return result
 
 
-def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_prefix="vibe") -> CLIResult:
+def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_prefix="vibe",
+             environ: Optional[Mapping[str, str]] = None) -> CLIResult:
     parser = _parser()
     try:
         args = parser.parse_args(list(argv))
@@ -2388,6 +2473,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             USAGE_ERROR, {"status": "usage_error"}, "参数错误", False
         )
     paths = ProjectPaths.from_cwd(Path(cwd))
+    host = detect_host(environ)
 
     v2_state = False
     v42_state = False
@@ -2696,6 +2782,13 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
     if args.command == "supervisor-register":
         if not args.run_id:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        # The address names the calling session's platform: --provider may
+        # spell it (claude-code-background ...) but not name another host.
+        register_provider, refusal = _host_adapter(
+            args.command, args.supervisor_provider, host, flag="--provider")
+        if refusal is not None:
+            return _with_json(refusal, args.as_json)
+        args.supervisor_provider = register_provider
         try:
             entry = register_supervisor_address(paths, args.run_id, {
                 "provider": args.supervisor_provider,
@@ -3058,12 +3151,27 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 for issue in issues
                 if issue != "no candidate Agent command found"
             ]
+        ledger_error = platform_ledger.LEDGER_ERROR
+        if ledger_error:
+            issues.append("platform ledger unreadable: " + ledger_error)
         ready = not issues
         status = report.status
-        if ready:
+        if ledger_error:
+            status = "blocked"
+        elif ready:
             status = "ready"
         elif status != "blocked":
             status = "attention"
+        # Shown beside the verdict, never part of it: the calling platform
+        # and each registration's date and host version.  Read-only.
+        registrations_error = None
+        try:
+            registrations = capability_registrations(
+                ProviderActionStore(paths).capabilities_all(), host)
+        except (OSError, TypeError, ValueError) as error:
+            registrations = []
+            registrations_error = str(error)
+            report.warnings.append("能力登记读不出：" + registrations_error)
         payload = {
             "command": "doctor",
             "status": "ok" if status == "ready" else status,
@@ -3072,6 +3180,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             "issues": issues,
             "facts": report.facts,
             "provider_bridge": bridge_payload,
+            "current_platform": host.to_dict(),
+            "capability_registrations": registrations,
+            "capability_registrations_error": registrations_error,
             "proposals": report.proposals,
             "warnings": list(report.warnings),
         }
@@ -3082,6 +3193,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         )
         if report.warnings:
             text += "；提醒：" + "；".join(report.warnings)
+        text += "\n" + "\n".join(render_registrations(host, registrations))
         return _result(
             SUCCESS if status == "attention" or ready else BLOCKED, payload, text, args.as_json
         )
@@ -3207,7 +3319,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             return _result(UNKNOWN, {"command": "deploy", "status": "blocked_unknown", "reason": str(error)}, "Deploy 状态未知：" + str(error), args.as_json)
 
     if args.command == "attest":
-        missing = [flag for flag, value in (("--adapter", args.adapter), ("--facts", args.facts), ("--provenance", args.provenance)) if not value]
+        attest_adapter, refusal = _host_adapter("attest", args.adapter, host)
+        if refusal is not None:
+            return _with_json(refusal, args.as_json)
+        missing = [flag for flag, value in (("--adapter", attest_adapter), ("--facts", args.facts), ("--provenance", args.provenance)) if not value]
         if missing:
             return _result(
                 BLOCKED,
@@ -3217,7 +3332,15 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             )
         try:
             facts = _read_json(paths.resolve_relative(args.facts))
-            summary = record_session_capabilities(paths, args.adapter, facts, args.provenance, args.project_id)
+            # The session id and version describe the calling host, so they
+            # are recorded only when that host is the platform attesting.
+            same_host = host.platform is not None and host.platform == (
+                platform_for_provider(attest_adapter) or attest_adapter)
+            summary = record_session_capabilities(
+                paths, attest_adapter, facts, args.provenance, args.project_id,
+                host_version=args.host_version or (host.host_version if same_host else None),
+                session_id=host.session_id if same_host else None,
+            )
         except PermissionError as error:
             return _result(
                 BLOCKED,
@@ -3234,6 +3357,11 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             )
         payload = {"command": "attest", "status": "ok"}
         payload.update(summary)
+        # When and on which host version this was observed: doctor dates it.
+        recorded = ProviderActionStore(paths).capabilities(summary["adapter_id"])
+        payload["record_path"] = capabilities_relative_path(summary["adapter_id"])
+        for key in ("observed_at", "host_version", "session_id"):
+            payload[key] = recorded.get(key)
         # Three dispatch shapes, not two: a verified visible lifecycle, the
         # in-session SDD topology (concurrent in-session subagents instead of
         # a visible task window), or guide-only.  ``.get`` keeps summaries
@@ -3255,6 +3383,15 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         return _result(SUCCESS, payload, text, args.as_json)
 
     if args.command == "plan":
+        # Publishing binds the card to the calling session's platform: no
+        # --adapter means the detected host; a flag naming another host is
+        # refused before anything is read or written.
+        # Only publishing binds a platform; screening a request does not.
+        plan_adapter: Optional[str] = args.adapter
+        if args.from_prd or args.node_spec:
+            plan_adapter, refusal = _host_adapter("plan", args.adapter, host)
+            if refusal is not None:
+                return _with_json(refusal, args.as_json)
         try:
             entry = build_session_entry(args.request or "", args.s1, args.plan_id)
             if args.from_prd and not args.s1:
@@ -3342,7 +3479,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     raise ValueError("node spec must be a JSON object")
             # The session route settles the band only on the product path;
             # a hand-written node spec keeps declaring its own band.
-            source = normalize_node_spec(source, entry, paths, route_governs_band=bool(args.from_prd), adapter_id=args.adapter)
+            source = normalize_node_spec(source, entry, paths, route_governs_band=bool(args.from_prd), adapter_id=plan_adapter)
             # Evaluate the PRD checkpoints before _publish_plan().  This gate
             # is deliberately side-effect free: unresolved product choices,
             # missing/unverified evidence, and invalid Skill references must
@@ -3471,6 +3608,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         )
 
     if args.command == "authorize":
+        if args.plan:
+            refusal = _authorize_host_check(paths, args.plan, args.adapter, host)
+            if refusal is not None:
+                return _with_json(refusal, args.as_json)
         if not args.plan:
             return _result(
                 BLOCKED,
@@ -3561,6 +3702,13 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         # confirm.
         if args.preview_card:
             return _preview_authorization_card(paths, args.plan, args.as_json)
+        handoff_adapter: Optional[str] = None
+        if args.platform_handoff:
+            # The handoff target is the calling session's platform; a flag
+            # naming another host is refused before anything moves.
+            handoff_adapter, refusal = _host_adapter("monitor", args.adapter, host)
+            if refusal is not None:
+                return _with_json(refusal, args.as_json)
         # Plan-bound confirmations may use an explicit revision token.
         if args.authorize != "AUTHORIZE" and not (
             args.authorize == "AUTHORIZE_V39_REV3_SELF_HEAL_NON_DEPLOY_SCOPE"
@@ -3617,7 +3765,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             handoff_observation: Tuple[Any, ...] = ()
             if args.platform_handoff and reauthorizing_current_run:
                 nodes, handoff_agent = _platform_handoff_rebind(
-                    paths, directory, nodes, card, args.adapter
+                    paths, directory, nodes, card, handoff_adapter
                 )
                 # Only a handoff observes against the target platform and
                 # keeps still-current evidence; any other reauthorization
@@ -3787,6 +3935,14 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 BLOCKED,
                 {"command": "monitor", "status": "preflight_blocked", "check_ids": list(error.check_ids), "reason": str(error)},
                 "预检已阻塞：" + ", ".join(error.check_ids),
+                args.as_json,
+            )
+        except HandoffNothingToMove as error:
+            return _result(
+                BLOCKED,
+                {"command": "monitor", "dispatcher": "monitor", "status": "blocked_invalid",
+                 "reason": str(error)},
+                "平台交接已拒绝：" + str(error),
                 args.as_json,
             )
         except HandoffRebindError as error:
@@ -4278,7 +4434,8 @@ def main(argv: Optional[Sequence[str]] = None, runner=None, *, supervisor_comman
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True) if "--json" in arguments else "参数错误：" + str(error))
         return USAGE_ERROR
     base_dir = explicit_root if explicit_root is not None else Path.cwd()
-    result = run_cli(arguments, base_dir, runner=runner, supervisor_command_prefix=supervisor_command_prefix)
+    result = run_cli(arguments, base_dir, runner=runner, supervisor_command_prefix=supervisor_command_prefix,
+                     environ=os.environ)
     rendered = (json.dumps(result.payload, ensure_ascii=False, sort_keys=True)
                 if result.as_json else result.text)
     command = arguments[0] if arguments else ""
