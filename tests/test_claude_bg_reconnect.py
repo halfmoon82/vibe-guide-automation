@@ -22,6 +22,10 @@ from vibe_guide.monitor import Monitor
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.claude_bg import ClaudeBgRunner
 from vibe_guide.task_registry import load_task_binding
+from tests import support_vibe_home as hermetic
+
+
+setUpModule, tearDownModule = hermetic.module_hooks()
 
 UUID = "1a2b3c4d-1111-4222-8333-444455556666"
 

@@ -5,6 +5,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from tests import support_vibe_home as hermetic
+
+
+setUpModule, tearDownModule = hermetic.module_hooks()
 
 
 class PackagingAcceptanceTests(unittest.TestCase):

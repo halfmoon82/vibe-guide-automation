@@ -8,6 +8,10 @@ from vibe_guide.state import load_events, load_snapshot
 from vibe_guide.task_registry import load_task_binding, save_task_binding
 
 from tests.test_reviewer_chain_defects import _OneNodeCase
+from tests import support_vibe_home as hermetic
+
+
+setUpModule, tearDownModule = hermetic.module_hooks()
 
 SECRET = "REVIEWER-SECRET-VALUE"
 BAD = ("accepted", {"delivery_evidence": {"thread_status": "complete", "note": SECRET}})

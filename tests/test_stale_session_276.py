@@ -22,6 +22,10 @@ from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.claude_bg import ClaudeBgRunner
 from vibe_guide.runners.fake import FakeRunner
 from vibe_guide.state import load_events, save_snapshot
+from tests import support_vibe_home as hermetic
+
+
+setUpModule, tearDownModule = hermetic.module_hooks()
 
 # Match the fake's generated session ids (first and second launch).
 UUID_A = "00000001-1111-4222-8333-000000000001"
