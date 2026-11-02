@@ -11,42 +11,17 @@ from .base import (
     ManifestError,
 )
 from .task_provider import TaskProviderAdapter
+from ..platform_ledger import DISPATCH_TOPOLOGY_MATRIX, PLATFORMS
 
 
-SUPPORTED_ADAPTER_IDS = frozenset({
-    "codex", "claude-code", "cursor", "grok", "workbuddy", "kimi-code",
-    "deepseek-harness",
-})
+SUPPORTED_ADAPTER_IDS = frozenset(PLATFORMS)
 
-# Dispatch-topology ruling table (v4.6 ISSUE-07). ``probe_pass`` applies when
-# the platform's `<id>.in_session_sdd` fact probe passes with provenance;
-# ``probe_unknown`` applies when the evidence is UNKNOWN or unsupported.
-# UNKNOWN is fail-closed: it never yields ``in_session_sdd``.
-DISPATCH_TOPOLOGY_MATRIX = {
-    "codex": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
-    "claude-code": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
-    "cursor": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
-    "kimi-code": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
-    # DeepSeek Harness dispatches dual-visible until its probe evidence passes.
-    "deepseek-harness": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
-    # WorkBuddy takes the same row shape as Claude Code, on measured evidence
-    # (2026-10-06, this host):
-    #   * visible-task dispatch is NOT available -- the desktop jobs API
-    #     creates a job record whose worker never leaves ``starting…``: all 39
-    #     agent jobs produced zero log bytes (36 never created a log file,
-    #     3 created a 0-byte one) while all 5 shell jobs ran to completion.
-    #     A live worker process was observed sitting on the sandbox broker
-    #     socket with no output, so this is a platform-side failure, not a
-    #     caller-side one.
-    #   * in-session subagents DO run concurrently -- two arms launched from a
-    #     single message started 0.019s apart and finished independently, so
-    #     the earlier "subagents can only run serially" ruling is withdrawn.
-    # ``visible-sdd`` is exactly the in-session dev/review-subagent protocol
-    # (``vibe_guide/protocols/visible-sdd-worker.md`` §1), which is what
-    # WorkBuddy can actually serve.  ``probe_unknown`` stays fail-closed.
-    "workbuddy": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
-    "grok": {"probe_pass": "dual-visible", "probe_unknown": "dual-visible"},
-}
+# Dispatch-topology rulings come from the platform capability ledger
+# (``vibe_guide/platform_ledger.json``), which carries each row's provenance.
+# ``probe_pass`` applies when the platform's `<id>.in_session_sdd` fact probe
+# passes with provenance; ``probe_unknown`` applies when the evidence is
+# UNKNOWN or unsupported.  UNKNOWN is fail-closed: it never yields
+# ``in_session_sdd``.
 
 _TOPOLOGY_ROW_KEYS = {"probe_pass", "probe_unknown"}
 _TOPOLOGY_ROW_VALUES = {TOPOLOGY_IN_SESSION_SDD, TOPOLOGY_DUAL_VISIBLE}
