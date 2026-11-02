@@ -436,10 +436,92 @@ def dispatch_topology_for_node(
     return DEFAULT_WORKER_TOPOLOGY
 
 
+#: Node-contract key the authorization stamps each node's dispatch topology
+#: under.  It is a routing leaf (see ``acceptance_contract_projection``): a
+#: platform handoff rewrites it together with ``adapter_id``.
+DISPATCH_TOPOLOGY_KEY = "dispatch_topology"
+#: Every handoff disclosure line starts with this, on the card and in events.
+HANDOFF_DISCLOSURE_PREFIX = "平台交接 "
+
+
+def has_stamped_dispatch_topology(node: DAGNode) -> bool:
+    """Whether the node contract carries an authorization-bound topology."""
+    contract = node.contract if isinstance(node.contract, dict) else {}
+    return contract.get(DISPATCH_TOPOLOGY_KEY) in _WORKER_TOPOLOGIES
+
+
+def ruled_dispatch_topology(
+    node: DAGNode,
+    topology_rulings: Optional[Dict[str, str]] = None,
+    adapter_id: Optional[str] = None,
+) -> str:
+    """The topology a fresh authorization stamps for ``node``.
+
+    Same ruling as :func:`dispatch_topology_for_node` with no persisted value,
+    with one difference for the integration-review closeout: on a platform
+    ruled ``background`` it is executed by the same background runner, so it
+    is stamped ``background`` (the card's mode then matches the task registry,
+    #2 of the 5.2.6 PRD).  Elsewhere it stays a reviewer-only ``dual-visible``
+    node, never ``visible-sdd``.  ``adapter_id`` names a platform other than
+    the one the contract currently names (a handoff target).
+    """
+    adapter = adapter_id if adapter_id is not None else node_adapter_id(node)
+    ruling = (topology_rulings or {}).get(adapter)
+    if getattr(node, "id", "") == INTEGRATION_REVIEW_NODE_ID:
+        if ruling == WORKER_TOPOLOGY_BACKGROUND:
+            return WORKER_TOPOLOGY_BACKGROUND
+        return WORKER_TOPOLOGY_DUAL_VISIBLE
+    if ruling == RULING_IN_SESSION_SDD:
+        return WORKER_TOPOLOGY_VISIBLE_SDD
+    if ruling == WORKER_TOPOLOGY_BACKGROUND:
+        return WORKER_TOPOLOGY_BACKGROUND
+    return DEFAULT_WORKER_TOPOLOGY
+
+
+def stamp_dispatch_topology(
+    nodes: List[DAGNode], topology_rulings: Optional[Dict[str, str]]
+) -> Dict[str, str]:
+    """Write each node's dispatch topology into its contract, in place.
+
+    Called once, when a new plan is published and before its card digest is
+    computed, so the stamp is part of the authorized contract.  From then on
+    :func:`dispatch_topology_for_node` reads only the stamp.  A contract that
+    already carries a value keeps it.  Returns ``{node_id: topology}``.
+    """
+    stamped: Dict[str, str] = {}
+    for node in nodes:
+        if not isinstance(node.contract, dict):
+            continue
+        if not has_stamped_dispatch_topology(node):
+            node.contract[DISPATCH_TOPOLOGY_KEY] = ruled_dispatch_topology(
+                node, topology_rulings
+            )
+        stamped[node.id] = node.contract[DISPATCH_TOPOLOGY_KEY]
+    return stamped
+
+
+def topology_is_visible(topology: Any) -> bool:
+    return topology in (WORKER_TOPOLOGY_VISIBLE_SDD, WORKER_TOPOLOGY_DUAL_VISIBLE)
+
+
+def handoff_disclosure_text(from_platform: str, to_platform: str, before: str, after: str) -> str:
+    """The card/event line disclosing a dispatch change made by a handoff."""
+    def label(topology: str) -> str:
+        return "{}（{}）".format(topology, "可见" if topology_is_visible(topology) else "后台")
+
+    change = "可见变后台" if topology_is_visible(before) and not topology_is_visible(after) else (
+        "后台变可见" if not topology_is_visible(before) and topology_is_visible(after) else "派发方式变化"
+    )
+    return (
+        HANDOFF_DISCLOSURE_PREFIX + "{} → {}：派发方式由 {} 变为 {}（{}）；按 platform_handoff 例外只披露、不单独确认"
+    ).format(from_platform or "未知", to_platform or "未知", label(before), label(after), change)
+
+
 def _rerule_workers(
     previous_workers: Any,
     nodes: List[DAGNode],
     topology_rulings: Optional[Dict[str, str]],
+    disclosures: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, Any], ...]:
     """Re-derive every worker entry's topology from the live ruling.
 
@@ -467,6 +549,14 @@ def _rerule_workers(
             raise ValueError(
                 "worker entry outside the authorized DAG: " + entry["node_id"]
             )
+        if has_stamped_dispatch_topology(node):
+            # The stamp is the authorized dispatch: the card follows it in
+            # both directions, so a handoff that moved it to another platform
+            # is described exactly as the supervisor will now dispatch.
+            reruled.append(
+                _entry_for_stamp(entry, node, (disclosures or {}).get(node.id))
+            )
+            continue
         if (
             entry.get("mode") == "background"
             or entry.get("topology") == WORKER_TOPOLOGY_BACKGROUND
@@ -490,6 +580,53 @@ def _rerule_workers(
             updated["role"] = "developer"
         reruled.append(updated)
     return tuple(reruled)
+
+
+#: Ledger ``visibility`` value of a background dispatch path that the fixed
+#: Claude Code launch disclosures describe (desktop-invisible, terminal attach).
+_LEDGER_BACKGROUND_TERMINAL_VISIBILITY = "background_not_visible"
+
+
+def background_limitations(node: DAGNode) -> List[str]:
+    """What a background entry cannot see, chosen by the platform ledger.
+
+    The ledger's ``visibility`` cell for the node's platform decides which
+    disclosure applies: a platform whose background path the ledger records
+    as ``background_not_visible`` gets the launch disclosures that name the
+    terminal ``claude attach`` entry; any other platform (no recorded
+    background path) gets the generic downgrade disclosure.  Both cover every
+    ``BACKGROUND_LIMITATION_REQUIREMENTS`` category.
+    """
+    from .adapters.base import BACKGROUND_LAUNCH_LIMITATIONS
+    from .platform_ledger import LEDGER
+
+    cell = LEDGER.cell(node_adapter_id(node) or None, "visibility")
+    if cell.get("value") == _LEDGER_BACKGROUND_TERMINAL_VISIBILITY:
+        return list(BACKGROUND_LAUNCH_LIMITATIONS)
+    return list(BACKGROUND_MODE_DISCLOSURES)
+
+
+def _entry_for_stamp(entry: Dict[str, Any], node: DAGNode, disclosure: Optional[str]) -> Dict[str, Any]:
+    topology = dispatch_topology_for_node(node)
+    updated = dict(entry)
+    updated["topology"] = topology
+    updated["mode"] = "background" if topology == WORKER_TOPOLOGY_BACKGROUND else "visible"
+    if node.id == INTEGRATION_REVIEW_NODE_ID:
+        updated["role"] = "reviewer"
+    elif topology == WORKER_TOPOLOGY_VISIBLE_SDD:
+        updated["role"] = "developer"
+    limitations = [item for item in (entry.get("limitations") or ()) if isinstance(item, str)]
+    if topology == WORKER_TOPOLOGY_BACKGROUND:
+        if _background_limitation_gaps(tuple(limitations)):
+            limitations = [item for item in background_limitations(node) if item not in limitations] + limitations
+    else:
+        # Background disclosures no longer describe a visible dispatch; only
+        # earlier handoff disclosures are history worth keeping.
+        limitations = [item for item in limitations if item.startswith(HANDOFF_DISCLOSURE_PREFIX)]
+    if disclosure and disclosure not in limitations:
+        limitations.append(disclosure)
+    updated["limitations"] = limitations
+    return updated
 
 
 def validate_authorization_card_consistency(card):
@@ -800,7 +937,12 @@ def acceptance_contract_projection(node: DAGNode) -> Dict[str, Any]:
     """
     projected = canonical_node_contracts([node])[0]
     contract = dict(projected["contract"])
-    for key in ("adapter_id", "worker", "reviewer_worker", "model", "reasoning", "route_digest"):
+    for key in (
+        "adapter_id", "worker", "reviewer_worker", "model", "reasoning", "route_digest",
+        # The dispatch topology moves with the platform on a handoff; it is
+        # how the work is dispatched, not what is accepted.
+        DISPATCH_TOPOLOGY_KEY,
+    ):
         contract.pop(key, None)
     profile = contract.get("worker_profile")
     if isinstance(profile, dict):
@@ -824,7 +966,9 @@ def route_only_acceptance_binds(
     )
 
 
-def rebind_dispatch_contract(contract: Dict[str, Any], to_adapter: str) -> Dict[str, Any]:
+def rebind_dispatch_contract(
+    contract: Dict[str, Any], to_adapter: str, topology: Optional[str] = None
+) -> Dict[str, Any]:
     """The contract with only its platform-naming dispatch fields moved.
 
     ``acceptance_contract_projection`` is the one definition of which leaves
@@ -838,6 +982,10 @@ def rebind_dispatch_contract(contract: Dict[str, Any], to_adapter: str) -> Dict[
     old = contract.get("adapter_id")
     rebound = dict(contract)
     rebound["adapter_id"] = to_adapter
+    # Only a contract the authorization stamped carries a topology; an old
+    # (unstamped) contract keeps ruling live and is never stamped here.
+    if topology in _WORKER_TOPOLOGIES and rebound.get(DISPATCH_TOPOLOGY_KEY) in _WORKER_TOPOLOGIES:
+        rebound[DISPATCH_TOPOLOGY_KEY] = topology
     if isinstance(old, str) and old.strip():
         for key in ("worker", "reviewer_worker"):
             if rebound.get(key) == old:
@@ -1682,7 +1830,9 @@ def build_authorization_card(
         if entry["node_id"] == INTEGRATION_REVIEW_NODE_ID else entry
         for entry in normalized_workers
     )
-    if topology_rulings is not None:
+    if topology_rulings is not None or any(
+        has_stamped_dispatch_topology(node) for node in nodes
+    ):
         # The card has to describe the dispatch the supervisor will actually
         # perform from the *first* publication on, not only after a refresh.
         # ``_normalize_workers_schema`` defaults every undeclared entry to the
@@ -1894,8 +2044,13 @@ def refresh_authorization_card(
     heartbeat_interval_options: Optional[Any] = None,
     rotate_hard_cap_options: Optional[Any] = None,
     agent_id: Optional[str] = None,
+    disclosures: Optional[Dict[str, str]] = None,
 ) -> AuthorizationCard:
     """Rebuild a same-plan card while retaining its approved agent/capacity scope.
+
+    ``disclosures`` (``{node_id: text}``) is for a platform handoff only: the
+    dispatch change each moved node discloses on the new card instead of
+    asking for a separate confirmation (PRD 5.2.6 D1).
 
     ``agent_id`` is for a platform handoff only: it names the platform the
     run moves to.  Left ``None`` the approved agent is carried forward.
@@ -1936,7 +2091,7 @@ def refresh_authorization_card(
     )
     if getattr(plan, "complexity_band", "") == "complex" and workflow is None:
         raise ValueError("complex reauthorization requires preserved workflow evidence")
-    workers = _rerule_workers(previous.workers, nodes, topology_rulings)
+    workers = _rerule_workers(previous.workers, nodes, topology_rulings, disclosures)
     return build_authorization_card(
         plan,
         nodes,

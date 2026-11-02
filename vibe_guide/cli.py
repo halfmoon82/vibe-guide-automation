@@ -22,7 +22,12 @@ from .authorization import (
     is_authorization_valid,
     build_authorization_card,
     INTEGRATION_REVIEW_NODE_ID,
+    background_limitations,
     dispatch_topology_for_node,
+    handoff_disclosure_text,
+    has_stamped_dispatch_topology,
+    ruled_dispatch_topology,
+    stamp_dispatch_topology,
     node_adapter_id,
     rebind_dispatch_contract,
     REMOTE_GIT_ENFORCEMENT,
@@ -30,7 +35,6 @@ from .authorization import (
     remote_git_denied,
 )
 from .adapters.base import (
-    BACKGROUND_LAUNCH_LIMITATIONS,
     Environment as AdapterEnvironment,
     TOPOLOGY_BACKGROUND,
     TOPOLOGY_IN_SESSION_SDD,
@@ -45,7 +49,7 @@ from .initializer import _rules_target, apply_agentsmd_proposal, init_project, r
 from . import host_rules
 from .models import AgentCapabilities, DAGNode, Plan, DeployManifest, DeployState, PRD, SkillProfile
 from .monitor import BLOCKED_UNKNOWN_DISPOSITION_KINDS, Monitor, ScopeDecisionRequired
-from .monitor_handoff import current_plan_digests, record_event
+from .monitor_handoff import current_plan_digests, handoff_drain_blockers, record_event
 from .supervisor_output import supervisor_output_batch
 from .supervisor_wakeup import idle_heartbeat_minutes, preflight_with_checkpoint
 from .supervisor import (
@@ -106,9 +110,13 @@ from .planner import (
 from .session_entry import build_session_entry, draft_s1, materialize_session_entry, replaceable_draft_extras
 from .capability_contract import contract_path, save_contract
 from .handoff_rebind import (
+    HandoffNotDrained,
     HandoffNothingToMove,
+    HandoffProjectMismatch,
     HandoffRebindError,
     contract_for_platform,
+    drain_report,
+    project_identity_problem,
     rebind_nodes,
     require_unfinished_nodes,
     resolve_handoff_target,
@@ -675,8 +683,38 @@ def _background_launcher_problem(paths: ProjectPaths) -> Optional[str]:
     return None
 
 
-def _background_execution_note(topology: str) -> str:
-    return "该节点在本运行中同样由后台会话执行（拓扑保持 {}：先交付、再派独立 reviewer 复审）".format(topology)
+def _dispatchable_rulings(
+    paths: ProjectPaths, topology_rulings: Optional[Dict[str, str]]
+) -> Optional[Dict[str, str]]:
+    """The rulings the dispatcher can actually carry out, for the stamp.
+
+    A ``background`` ruling (Claude Code's default) is only kept for a
+    platform whose observed capabilities really launch background sessions;
+    otherwise the runner is the visible one, and stamping ``background``
+    would sign a card for a dispatch that cannot happen.  Such a platform
+    falls back to what its own recorded evidence rules.
+    """
+    if not topology_rulings:
+        return topology_rulings
+    effective = dict(topology_rulings)
+    observed: Optional[Dict[str, str]] = None
+    for adapter_id, ruling in topology_rulings.items():
+        if ruling != TOPOLOGY_BACKGROUND:
+            continue
+        try:
+            mode = _observed_adapter(paths, adapter_id).capabilities.mode
+        except (ProviderPending, OSError, TypeError, ValueError, KeyError):
+            mode = None
+        if mode == TOPOLOGY_BACKGROUND:
+            continue
+        if observed is None:
+            observed = _observed_topology_rulings(paths)
+        fallback = observed.get(adapter_id)
+        if fallback is None or fallback == TOPOLOGY_BACKGROUND:
+            effective.pop(adapter_id, None)
+        else:
+            effective[adapter_id] = fallback
+    return effective
 
 
 def _background_worker_entries(
@@ -684,38 +722,33 @@ def _background_worker_entries(
     topology_rulings: Optional[Dict[str, str]],
     paths: ProjectPaths,
 ) -> Optional[Dict[str, Dict[str, Any]]]:
-    """Card worker entries disclosing the background downgrade, or None.
+    """Stamp every node's dispatch topology, then the card's background entries.
 
-    ``None`` when no node is ruled ``background`` so the card stays exactly
-    what it was without the background fact.  Once any node is background,
-    the same background runner executes the rest of the run (for instance the
-    integration-review closeout), so those nodes get a disclosure entry too --
-    keeping the topology the supervisor actually dispatches them under.
+    Publication calls this once, before the card digest is computed, so the
+    stamp written into each node contract here is part of what is authorized;
+    from then on dispatch reads only the stamp (PRD 5.2.6, card-and-handoff).
+    The integration-review closeout on a background platform is stamped
+    ``background`` too: the background runner executes it, so card mode and
+    task registry agree.
+
+    Returns ``None`` when no node is background so the card stays exactly
+    what it was without the background fact; otherwise one disclosure entry
+    per background node, whose limitations name the ledger's visibility.
     """
-    ruled = {node.id: dispatch_topology_for_node(node, topology_rulings) for node in nodes}
+    ruled = stamp_dispatch_topology(nodes, _dispatchable_rulings(paths, topology_rulings))
     if TOPOLOGY_BACKGROUND not in ruled.values():
         return None
     problem = _background_launcher_problem(paths)
-    background_adapters = {
-        node_adapter_id(node) for node in nodes if ruled[node.id] == TOPOLOGY_BACKGROUND
-    }
     unavailable = ["后台启动器不可用：" + problem] if problem else []
     entries: Dict[str, Dict[str, Any]] = {}
     for node in nodes:
-        topology = ruled[node.id]
-        limitations = list(BACKGROUND_LAUNCH_LIMITATIONS)
-        if topology != TOPOLOGY_BACKGROUND:
-            # Only nodes the same background runner executes: the closeout
-            # node, or a node routed to a background-ruled platform.
-            if node.id != INTEGRATION_REVIEW_NODE_ID and node_adapter_id(node) not in background_adapters:
-                continue
-            limitations.append(_background_execution_note(topology))
-        entry = {
-            "topology": topology,
-            "mode": "background" if topology == TOPOLOGY_BACKGROUND else "visible",
-            "limitations": limitations + unavailable,
+        if ruled.get(node.id) != TOPOLOGY_BACKGROUND:
+            continue
+        entries[node.id] = {
+            "topology": TOPOLOGY_BACKGROUND,
+            "mode": "background",
+            "limitations": background_limitations(node) + unavailable,
         }
-        entries[node.id] = entry
     return entries
 
 
@@ -994,26 +1027,92 @@ def _background_runner(
     )
 
 
+def _handoff_project_problem(paths: ProjectPaths, run_id: str) -> Optional[str]:
+    """Why this session's project is not the run's project, or ``None``.
+
+    Read straight from the files (the session contract and the run's
+    ``worktree_created`` events) so the refusal can name the project
+    difference instead of a generic capability-contract failure.
+    """
+    try:
+        raw = json.loads(contract_path(paths).read_text(encoding="utf-8"))
+        from .capability_contract import _project_digest
+
+        contract_matches = raw.get("project_digest") == _project_digest(paths.root)
+    except (OSError, TypeError, ValueError, AttributeError):
+        contract_matches = True  # a missing contract is refused by its own gate
+    try:
+        worktrees = [
+            (event.get("data") or {}).get("worktree")
+            for event in load_events(paths, run_id)
+            if event.get("event") == "worktree_created"
+        ]
+    except (OSError, TypeError, ValueError):
+        worktrees = []
+    return project_identity_problem(paths.root, worktrees, contract_matches)
+
+
+def _handoff_dispatch_changes(
+    paths: ProjectPaths,
+    card: AuthorizationCard,
+    before: List[DAGNode],
+    after: List[DAGNode],
+    target: str,
+) -> List[Dict[str, Any]]:
+    """Each moved node's dispatch topology before and after the handoff."""
+    live = _observed_topology_rulings(paths, card)
+    by_id = {node.id: node for node in after}
+    changes = []
+    for node in before:
+        moved = by_id.get(node.id)
+        if moved is None or node_adapter_id(moved) == node_adapter_id(node):
+            continue
+        old = dispatch_topology_for_node(node, live)
+        new = dispatch_topology_for_node(moved, live)
+        if old == new:
+            continue
+        changes.append({
+            "node_id": node.id,
+            "from_platform": node_adapter_id(node),
+            "to_platform": target,
+            "from_topology": old,
+            "to_topology": new,
+            "text": handoff_disclosure_text(node_adapter_id(node), target, old, new),
+        })
+    return changes
+
+
 def _platform_handoff_rebind(
     paths: ProjectPaths,
     directory: Path,
     nodes: List[DAGNode],
     card: AuthorizationCard,
     explicit: Optional[str],
-) -> Tuple[List[DAGNode], Optional[str]]:
-    """Nodes and target platform of a ``--platform-handoff``.
+) -> Tuple[List[DAGNode], Optional[str], List[Dict[str, Any]]]:
+    """Nodes, target platform and dispatch changes of a ``--platform-handoff``.
 
-    Returns ``(nodes, None)`` unchanged when no platform can be named,
+    Returns ``(nodes, None, [])`` unchanged when no platform can be named,
     which is exactly the behaviour before this existed.  A named platform that is
     not attested and dispatchable raises ``HandoffRebindError``: the run is
     never pointed at a platform nobody verified.
+
+    Before anything moves (PRD 5.2.6 D2): another project refuses
+    (``HandoffProjectMismatch``), and any old-platform worker that cannot be
+    shown stopped refuses with the nodes and both ways to drain
+    (``HandoffNotDrained``).  Nothing is written on either refusal.  A
+    drained run continues without a confirmation stop; each node's dispatch
+    change is returned for the event and the new card (D1).
     """
-    snapshot = load_snapshot(paths, _run_id(directory, None))
+    run_id = _run_id(directory, None)
+    snapshot = load_snapshot(paths, run_id)
     authorization = snapshot.authorization if isinstance(snapshot.authorization, dict) else {}
     run_agent = str(authorization.get("agent_id") or "")
     unfinished = unfinished_node_ids(nodes, snapshot.nodes)
     # A run with nothing left to do keeps the platform that executed it.
     require_unfinished_nodes(unfinished, card.agent_id)
+    problem = _handoff_project_problem(paths, run_id)
+    if problem is not None:
+        raise HandoffProjectMismatch(problem)
     run_drift = bool(run_agent) and any(
         node_adapter_id(node) != run_agent for node in nodes if node.id in unfinished
     )
@@ -1034,6 +1133,12 @@ def _platform_handoff_rebind(
         contract_provider=contract.provider,
         dispatchable_others=dispatchable,
     )
+    blockers = handoff_drain_blockers(paths, snapshot, unfinished)
+    if blockers:
+        raise HandoffNotDrained(drain_report(
+            blockers, plan_id=card.plan_id, run_id=run_id, project_root=paths.root,
+            from_platform=card.agent_id, to_platform=target or contract.provider,
+        ))
     if target is None:
         # Only a contract naming a platform that is attested and dispatchable
         # is an actionable disagreement; one naming something nobody attested
@@ -1052,7 +1157,7 @@ def _platform_handoff_rebind(
                     contract.provider, ", ".join(stranded)
                 )
             )
-        return nodes, None
+        return nodes, None, []
     try:
         _observed_adapter(paths, target)
     except (ProviderPending, ValueError) as error:
@@ -1060,8 +1165,80 @@ def _platform_handoff_rebind(
             "platform handoff: 新平台 {} 未登记能力或没有可验证的派发通道（先在新平台会话里 "
             "vibe attest --adapter {}）：{}".format(target, target, error)
         ) from error
-    rebound, _moved = rebind_nodes(nodes, unfinished, target)
-    return rebound, target
+    # The target's own ruling, not walked back by the old card: a dispatch
+    # change is disclosed on the new card, never refused (PRD 5.2.6 D1).
+    target_rulings = _observed_topology_rulings(paths)
+    topologies = {
+        node.id: ruled_dispatch_topology(node, target_rulings, adapter_id=target)
+        for node in nodes
+        if node.id in unfinished and has_stamped_dispatch_topology(node)
+    }
+    rebound, _moved = rebind_nodes(nodes, unfinished, target, topologies)
+    return rebound, target, _handoff_dispatch_changes(paths, card, nodes, rebound, target)
+
+
+#: The one doctor line about authorized plans that predate the dispatch stamp.
+UNSTAMPED_PLAN_WARNING = (
+    "已授权的旧计划（{}）节点合同里没有写入派发方式：继续按当前平台实时判断，授权仍然有效；"
+    "新发布的计划才会把派发方式写进合同"
+)
+
+
+def _unstamped_authorized_plans(paths: ProjectPaths) -> List[str]:
+    """Authorized plans whose node contracts carry no dispatch topology stamp.
+
+    Read-only and best effort: an unreadable plan is skipped, never reported
+    as unstamped.  One sorted list, so doctor names them in a single line.
+    """
+    root = paths.vibe / "plans"
+    if root.is_symlink() or not root.is_dir():
+        return []
+    found = []
+    for directory in sorted(root.iterdir(), key=lambda item: item.name):
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        if not (directory / "authorization.json").is_file() or not (directory / "nodes.json").is_file():
+            continue
+        try:
+            items = json.loads((directory / "nodes.json").read_text(encoding="utf-8"))
+            if not isinstance(items, list) or not items:
+                continue
+            if any(
+                not isinstance(item, dict)
+                or not has_stamped_dispatch_topology(DAGNode.from_dict(item))
+                for item in items
+            ):
+                found.append(directory.name)
+        except (OSError, TypeError, ValueError, KeyError):
+            continue
+    return found
+
+
+def _record_handoff_disclosure(
+    paths: ProjectPaths,
+    monitor: Monitor,
+    snapshot: Any,
+    from_platform: str,
+    to_platform: str,
+    changes: List[Dict[str, Any]],
+) -> None:
+    """Append the handoff's dispatch changes to the run (PRD 5.2.6 D1).
+
+    Written once per reauthorization that actually happened, after it
+    succeeded; ``changes`` may be empty, which records that nothing about the
+    dispatch changed.  Disclosure only: nothing waits on it.
+    """
+    record_event(monitor, snapshot, "platform_handoff_disclosed", {
+        "run_id": snapshot.run_id,
+        "change_reason": "platform_handoff",
+        "node_ids": sorted(item["node_id"] for item in changes),
+        "proof": {
+            "from_platform": from_platform,
+            "to_platform": to_platform,
+            "changes": [dict(item) for item in changes],
+        },
+    })
+    save_snapshot(paths, snapshot)
 
 
 def _handed_off_accepted_nodes(paths: ProjectPaths, card: AuthorizationCard) -> frozenset:
@@ -3157,6 +3334,11 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         ledger_error = platform_ledger.LEDGER_ERROR
         if ledger_error:
             issues.append("platform ledger unreadable: " + ledger_error)
+        unstamped = _unstamped_authorized_plans(paths)
+        if unstamped:
+            # A warning, not an issue: such a plan stays valid and keeps
+            # ruling dispatch live (PRD 5.2.6 card-and-handoff).
+            report.warnings.append(UNSTAMPED_PLAN_WARNING.format(", ".join(unstamped)))
         ready = not issues
         status = report.status
         if ledger_error:
@@ -3712,6 +3894,27 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             handoff_adapter, refusal = _host_adapter("monitor", args.adapter, host)
             if refusal is not None:
                 return _with_json(refusal, args.as_json)
+            # Checked before the capability-contract gate so another project
+            # is named as such, not as an unreadable contract.
+            try:
+                handoff_directory = _plan_root(paths, args.plan)
+                handoff_run = (
+                    _run_id(handoff_directory, None)
+                    if _current_run_path(handoff_directory).is_file() else None
+                )
+            except (OSError, TypeError, ValueError):
+                handoff_run = None
+            project_problem = (
+                _handoff_project_problem(paths, handoff_run) if handoff_run else None
+            )
+            if project_problem is not None:
+                return _result(
+                    BLOCKED,
+                    {"command": "monitor", "dispatcher": "monitor", "status": "handoff_refused",
+                     "reason_code": "project_identity_mismatch", "reason": project_problem},
+                    "平台交接已拒绝：" + project_problem,
+                    args.as_json,
+                )
         # Plan-bound confirmations may use an explicit revision token.
         if args.authorize != "AUTHORIZE" and not (
             args.authorize == "AUTHORIZE_V39_REV3_SELF_HEAL_NON_DEPLOY_SCOPE"
@@ -3766,8 +3969,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             handoff_accepted: Optional[frozenset] = None
             handoff_committed: List[bool] = [False]
             handoff_observation: Tuple[Any, ...] = ()
+            handoff_changes: List[Dict[str, Any]] = []
+            previous_agent = card.agent_id
             if args.platform_handoff and reauthorizing_current_run:
-                nodes, handoff_agent = _platform_handoff_rebind(
+                nodes, handoff_agent, handoff_changes = _platform_handoff_rebind(
                     paths, directory, nodes, card, handoff_adapter
                 )
                 # Only a handoff observes against the target platform and
@@ -3798,6 +4003,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                         topology_rulings=_observed_topology_rulings(paths, card),
                         engine_attestation=engine_attestation,
                         agent_id=handoff_agent,
+                        disclosures={item["node_id"]: item["text"] for item in handoff_changes},
                     )
                     record = authorize(card, args.authorize)
                     if runner is None:
@@ -3820,6 +4026,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                         ),
                     )
                     handoff_committed[0] = handoff_nodes is not None
+                    if args.platform_handoff:
+                        _record_handoff_disclosure(
+                            paths, monitor, snapshot, previous_agent, card.agent_id, handoff_changes
+                        )
                     _record_worktree_preflight(paths, monitor, snapshot, launchers)
                     if handoff_nodes is not None:
                         # Without this the next resume reads the old platform
@@ -3858,6 +4068,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                         topology_rulings=_observed_topology_rulings(paths, card),
                         engine_attestation=engine_attestation,
                         agent_id=handoff_agent,
+                        disclosures={item["node_id"]: item["text"] for item in handoff_changes},
                     )
                     record = authorize(card, args.authorize)
                     if runner is None:
@@ -3877,6 +4088,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                         else "capability_contract_changed",
                     )
                     handoff_committed[0] = handoff_nodes is not None
+                    if args.platform_handoff:
+                        _record_handoff_disclosure(
+                            paths, monitor, snapshot, previous_agent, card.agent_id, handoff_changes
+                        )
                     _record_worktree_preflight(paths, monitor, snapshot, launchers)
                     if handoff_nodes is not None:
                         _atomic_json(
@@ -3938,6 +4153,23 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 BLOCKED,
                 {"command": "monitor", "status": "preflight_blocked", "check_ids": list(error.check_ids), "reason": str(error)},
                 "预检已阻塞：" + ", ".join(error.check_ids),
+                args.as_json,
+            )
+        except HandoffNotDrained as error:
+            report = dict(error.report)
+            return _result(
+                BLOCKED,
+                {"command": "monitor", "dispatcher": "monitor", "status": "handoff_refused",
+                 "reason_code": "handoff_not_drained", "reason": report.pop("message"), **report},
+                "平台交接已拒绝：" + str(error),
+                args.as_json,
+            )
+        except HandoffProjectMismatch as error:
+            return _result(
+                BLOCKED,
+                {"command": "monitor", "dispatcher": "monitor", "status": "handoff_refused",
+                 "reason_code": "project_identity_mismatch", "reason": str(error)},
+                "平台交接已拒绝：" + str(error),
                 args.as_json,
             )
         except HandoffNothingToMove as error:
