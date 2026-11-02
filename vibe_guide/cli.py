@@ -1133,7 +1133,7 @@ def _platform_handoff_rebind(
         contract_provider=contract.provider,
         dispatchable_others=dispatchable,
     )
-    blockers = handoff_drain_blockers(paths, snapshot, unfinished)
+    blockers = handoff_drain_blockers(paths, snapshot, unfinished, to_platform=target)
     if blockers:
         raise HandoffNotDrained(drain_report(
             blockers, plan_id=card.plan_id, run_id=run_id, project_root=paths.root,

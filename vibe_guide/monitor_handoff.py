@@ -161,7 +161,36 @@ def _holds_live_task(snapshot: RunSnapshot, node_id: str, current, role: str, ta
     return node_id in snapshot.handles and current.get("active_role") == role
 
 
-def handoff_drain_blockers(paths, snapshot: RunSnapshot, unfinished) -> list:
+def _pre_move_identities(snapshot: RunSnapshot, events, to_platform) -> Optional[Dict[str, Any]]:
+    """Per node, the task identities bound *before* the run moved to ``to_platform``.
+
+    ``None`` unless the run already recorded a platform_handoff
+    reauthorization and is now authorized on ``to_platform``: a retry of a
+    handoff that was interrupted after the run moved, or a re-run of one that
+    finished.  Then the new platform's own tasks -- created after the move --
+    are not old-platform workers.  The tasks bound before the move are exactly
+    the node's ``handoff_superseded`` identities (written by that
+    reauthorization), so only those keep blocking.
+    """
+    if not to_platform:
+        return None
+    authorization = snapshot.authorization if isinstance(snapshot.authorization, dict) else {}
+    if authorization.get("agent_id") != to_platform:
+        return None
+    if not any(
+        event.get("event") == "authorization_reauthorized"
+        and (event.get("data") or {}).get("change_reason") == "platform_handoff"
+        for event in events
+    ):
+        return None
+    return {
+        node_id: dict(current.get("handoff_superseded") or {})
+        for node_id, current in snapshot.nodes.items()
+        if isinstance(current, dict)
+    }
+
+
+def handoff_drain_blockers(paths, snapshot: RunSnapshot, unfinished, to_platform=None) -> list:
     """Old-platform workers a handoff must not run past (PRD 5.2.6 D2).
 
     Read-only.  A worker is drained when its task binding has handed the work
@@ -171,10 +200,16 @@ def handoff_drain_blockers(paths, snapshot: RunSnapshot, unfinished) -> list:
     create nobody claimed is not a worker: the handoff hides it.  Everything
     else -- a running binding, an unreadable registry, an identity with no
     binding, a claimed create -- cannot be shown to have stopped and blocks.
+
+    When the run already moved to ``to_platform`` (an interrupted handoff
+    being retried), a task the new platform created after the move is not an
+    old-platform worker and never blocks; tasks bound before the move still
+    must be drained (``_pre_move_identities``).
     """
     store = ProviderActionStore(paths)
     events = load_events(paths, snapshot.run_id)[: snapshot.event_sequence]
     stops = _registered_stops(events)
+    pre_move = _pre_move_identities(snapshot, events, to_platform)
     confirmed = {
         (event.get("data") or {}).get("node_id")
         for event in events if event.get("event") == "start_confirmed"
@@ -194,6 +229,8 @@ def handoff_drain_blockers(paths, snapshot: RunSnapshot, unfinished) -> list:
             entry = {"node_id": node_id, "role": role, "task_id": task_id}
             if (node_id, role, task_id) in stops:
                 continue
+            if pre_move is not None and (pre_move.get(node_id) or {}).get(role) != task_id:
+                continue  # created on the new platform after the run moved
             try:
                 binding = load_task_binding(paths, node_id, role, run_id=snapshot.run_id)
             except FileNotFoundError:

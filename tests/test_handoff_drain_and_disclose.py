@@ -234,6 +234,62 @@ class LiveWorkerRefusesTheHandoffTests(DrainCase):
         self.assertNotEqual(result.payload["status"], "handoff_refused", result.payload)
 
 
+class InterruptedHandoffRetryTests(DrainCase):
+    """Integration review g1 P2: a retry after the run moved must converge.
+
+    A handoff interrupted after the run was reauthorized onto the new platform
+    leaves the new platform's own task (a background start, ``start_pending``)
+    in the registry.  The retry must not take it for an old-platform worker;
+    a task bound before the move still blocks.
+    """
+
+    def moved_with_new_task(self, *, superseded=None):
+        self.published_on("workbuddy")
+        self.switch_platform("claude-code")
+        moved = self.handoff()
+        self.assertNotEqual(moved.payload["status"], "handoff_refused", moved.payload)
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.authorization["agent_id"], "claude-code")
+        current = snapshot.nodes[SECOND]
+        current["developer_identity"] = "developer:" + SECOND
+        current["handoff_superseded"] = superseded
+        binding = TaskBinding(provider="claude-bg", mode="background", issue_id=SECOND, role="developer",
+                              task_id="developer:" + SECOND, run_id=self.run_id, status="start_pending",
+                              topology="background", visible=False,
+                              limitations=["后台不可见"])
+        registry = mock.patch("vibe_guide.monitor_handoff.load_task_binding",
+                              side_effect=lambda paths, node_id, role, run_id=None: binding)
+        return snapshot, registry
+
+    def test_the_new_platforms_own_task_does_not_block_the_retry(self):
+        snapshot, registry = self.moved_with_new_task()
+        with registry:
+            self.assertEqual(
+                handoff_drain_blockers(self.paths, snapshot, [SECOND], to_platform="claude-code"), [])
+
+    def test_a_task_bound_before_the_move_still_blocks_the_retry(self):
+        snapshot, registry = self.moved_with_new_task(superseded={"developer": "developer:" + SECOND})
+        with registry:
+            blockers = handoff_drain_blockers(self.paths, snapshot, [SECOND], to_platform="claude-code")
+        self.assertEqual([(b["node_id"], b["role"], b["status"]) for b in blockers],
+                         [(SECOND, "developer", "start_pending")], blockers)
+
+    def test_handing_off_onward_counts_every_current_task_as_old(self):
+        # The run sits on claude-code; moving it on to codex makes claude-code
+        # the old platform, so its running task blocks.
+        snapshot, registry = self.moved_with_new_task()
+        with registry:
+            for target in ("codex", None):
+                blockers = handoff_drain_blockers(self.paths, snapshot, [SECOND], to_platform=target)
+                self.assertEqual([b["node_id"] for b in blockers], [SECOND], target)
+
+    def test_without_a_recorded_handoff_nothing_is_exempt(self):
+        snapshot = self.second_running_on("workbuddy")
+        snapshot.authorization = dict(snapshot.authorization, agent_id="claude-code")
+        blockers = handoff_drain_blockers(self.paths, snapshot, [SECOND], to_platform="claude-code")
+        self.assertEqual([b["node_id"] for b in blockers], [SECOND], blockers)
+
+
 class ProjectIdentityTests(DrainCase):
     def test_another_project_root_is_refused_as_a_project_difference(self):
         self.second_running_on("workbuddy")
