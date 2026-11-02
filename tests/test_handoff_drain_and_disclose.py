@@ -16,7 +16,7 @@ from vibe_guide.capability_contract import build_contract
 from vibe_guide.handoff_rebind import STOP_EVIDENCE_FIELDS, project_identity_problem
 from vibe_guide.protocols import SHIPPED_PROTOCOL_DIGESTS, load_protocol, published_protocol_digest
 from vibe_guide.state import load_events
-from vibe_guide.task_registry import TERMINAL_TASK_STATUSES, load_task_binding
+from vibe_guide.task_registry import TERMINAL_TASK_STATUSES, TaskBinding, load_task_binding, save_task_binding
 
 from tests import test_integration_review_closeout_entry as closeout
 from tests.test_platform_handoff_rebind import FIRST, PLAN, SECOND, HandoffCase
@@ -243,6 +243,60 @@ class DispatchChangeIsDisclosedTests(DrainCase):
                         if e["event"] == "authorization_reauthorized"]
         self.assertEqual(reauthorized[-1]["data"]["change_reason"], "platform_handoff")
         self.assertEqual(reauthorized[-1]["data"]["changed_nodes"], [])
+
+
+class VisibleToBackgroundSuccessorRegistersTests(DrainCase):
+    """Acceptance 3 + 4 together: the stopped visible worker's background successor registers."""
+
+    def stopped_on_codex_then_handed_to_claude_code(self):
+        self.second_running_on("codex")
+        old = load_task_binding(self.paths, SECOND, "developer", run_id=self.run_id)
+        self.assertIn(old.topology, {"visible-sdd", "dual-visible"})
+        self.switch_platform("claude-code")
+        refusal = self.handoff()
+        self.assertEqual(refusal.payload["status"], "handoff_refused", refusal.payload)
+        self.register_stop(refusal)
+        old = load_task_binding(self.paths, SECOND, "developer", run_id=self.run_id)
+        self.assertEqual(old.status, "stopped")
+        return old
+
+    def successor(self, old, **override):
+        values = dict(
+            provider="claude-code-background", mode="background", issue_id=SECOND,
+            role="developer", task_id=old.task_id + ":handoff", host=None,
+            worktree=old.worktree, branch=old.branch, run_id=self.run_id,
+            status="running", topology="background", generation=old.generation + 1,
+            allowlist=list(old.allowlist), successor_of=old.task_id,
+            handoff_from_provider=old.provider, limitations=["后台：不可见、不可直接进入"],
+        )
+        values.update(override)
+        return TaskBinding(**values)
+
+    def test_background_successor_registers_and_is_the_single_live_binding(self):
+        old = self.stopped_on_codex_then_handed_to_claude_code()
+        successor = self.successor(old)
+        save_task_binding(self.paths, successor)
+        live = self.live_bindings(SECOND)
+        self.assertEqual(len(live), 1, live)
+        self.assertEqual((live[0]["mode"], live[0]["topology"]), ("background", "background"))
+        # Later status updates of the successor are not topology drift either.
+        successor.status = "review"
+        save_task_binding(self.paths, successor)
+        self.assertEqual(len(self.live_bindings(SECOND)), 1)
+
+    def test_writer_root_and_branch_stay_pinned_across_the_handoff(self):
+        old = self.stopped_on_codex_then_handed_to_claude_code()
+        for field_name, value in (("worktree", ".worktrees/elsewhere"), ("branch", "node/elsewhere")):
+            with self.subTest(field=field_name), self.assertRaisesRegex(ValueError, "identity drift"):
+                save_task_binding(self.paths, self.successor(old, **{field_name: value}))
+        self.assertTrue(old.allowlist)
+        with self.assertRaisesRegex(ValueError, "identity drift"):  # allowlist never shrinks
+            save_task_binding(self.paths, self.successor(old, allowlist=list(old.allowlist)[:-1]))
+
+    def test_without_handoff_lineage_a_topology_change_is_still_refused(self):
+        old = self.stopped_on_codex_then_handed_to_claude_code()
+        with self.assertRaises(ValueError):
+            save_task_binding(self.paths, self.successor(old, provider=old.provider, handoff_from_provider=None))
 
 
 class _IdleRunner:
