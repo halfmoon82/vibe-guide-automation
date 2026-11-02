@@ -31,6 +31,7 @@ from .authorization import (
     _scoped_values,
 )
 from .contracts import RunEvent, RunHandle, Runner
+from .runners.claude_bg import PROVIDER_HTTP_400
 from .models import (
     DAGNode,
     Plan,
@@ -978,7 +979,7 @@ RECOVERY_FIDELITY_AUDIT = (
     },
     {
         "site": "_release_node_lease",
-        "call_sites": 26,
+        "call_sites": 27,
         "callers": (
             {
                 "caller": "_recover_reverse_blocked_acceptance",
@@ -993,7 +994,7 @@ RECOVERY_FIDELITY_AUDIT = (
                 "caller": (
                     "_apply_event, _start_task, reauthorize, _schedule_ready "
                     "helpers, _reconcile_unapplied_events and the remaining "
-                    "terminal-transition callers (the other 25 sites, including the #290 contract_error replay that re-plans an integration-review node, the #335 _park_blocked_engineering / blocked_engineering replay pair that parks a blocked self-report, and the #336 landing-unreadable replay twin)"
+                    "terminal-transition callers (the other 26 sites, including the #376 provider-400 successor retirement, the #290 contract_error replay that re-plans an integration-review node, the #335 _park_blocked_engineering / blocked_engineering replay pair that parks a blocked self-report, and the #336 landing-unreadable replay twin)"
                 ),
                 "verdict": "different_type",
                 "rationale": (
@@ -1007,13 +1008,13 @@ RECOVERY_FIDELITY_AUDIT = (
     },
     {
         "site": "_mark_blocked_unknown",
-        "call_sites": 53,
+        "call_sites": 55,
         "callers": (
             {
                 "caller": (
                     "_apply_event, _start_task, _schedule_ready, "
                     "_accept_visible_sdd_delivery and the remaining block "
-                    "sites (the other 46 sites)"
+                    "sites (the other 48 sites, including the #376 provider-400 escalation and its unrecorded-binding wait)"
                 ),
                 "verdict": "different_type",
                 "rationale": (
@@ -8327,6 +8328,7 @@ class Monitor:
             # #255 consecutive-rejection counter the same session raised.
             current["reason"] = None
             current.pop("acceptance_format_rejections", None)
+            current.pop("transient_failure", None)
             current["active_role"] = None
             current["active_task"] = None
             current["quarantine"] = None
@@ -8383,6 +8385,9 @@ class Monitor:
                     quarantine_lease=False,
                     retryable_same_task=False,
                 )
+        elif event.event == "failed_retryable" and event.data.get("reason_code") == PROVIDER_HTTP_400:
+            self._handle_provider_transient_failure(
+                snapshot, node_id, role, event, active, handle_id)
         elif event.event in {"failed", "stopped", "terminal_failed"}:
             failure = classify_provider_failure(event.data)
             if failure["kind"] == "external_decision":
@@ -8453,6 +8458,168 @@ class Monitor:
             self._mark_blocked_unknown(
                 snapshot, node_id, "unrecognized runner event: " + event.event
             )
+
+    #: Consecutive identical provider failures before the node is escalated.
+    PROVIDER_FAILURE_LIMIT = 3
+
+    def _handle_provider_transient_failure(
+        self, snapshot: RunSnapshot, node_id: str, role: str,
+        event: RunEvent, active: Dict[str, Any], handle_id: str,
+    ) -> None:
+        """Gateway 400 on a background session: same task first, successor second.
+
+        The session is already ``failed`` at the provider, so the old session
+        is confirmed gone.  Recovery order (prd-guide section 7): continue the
+        same task with a short backoff; only when the session can no longer be
+        continued retire its binding and queue a successor.  Three identical
+        failures in a row escalate with the provider 400 named.
+        """
+        current = snapshot.nodes[node_id]
+        code = str(event.data["reason_code"])
+        previous = current.get("transient_failure")
+        count = int(previous.get("count", 0)) + 1 if (
+            isinstance(previous, dict) and previous.get("reason_code") == code) else 1
+        resumable = event.data.get("resumable") is not False
+        current["transient_failure"] = {"reason_code": code, "count": count}
+        base = {"run_id": snapshot.run_id, "node_id": node_id, "role": role,
+                "handle_id": handle_id, "reason_code": code, "attempt": count}
+        reason = "provider 400 ({}): the gateway rejected the session request".format(code)
+        if count >= self.PROVIDER_FAILURE_LIMIT:
+            escalation = "provider 400 ({}) {} times in a row; automatic retries stopped, needs repair".format(
+                code, count)
+            self._record(
+                snapshot, "provider_failure_escalated",
+                dict(base, reason=reason, error=escalation), active)
+            self._mark_blocked_unknown(
+                snapshot, node_id,
+escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
+            return
+        self._record(
+            snapshot, "provider_transient_failure",
+            dict(base, reason=reason, reason_class="retryable",
+                 repair_action="same_task" if resumable else "successor"), active)
+        delay = min(60.0, float(2 ** (count - 1)))
+        if resumable:
+            self._queue_active_retry(
+                snapshot, node_id, reason, record_event=False,
+                observation={"reason_class": "retryable", "reason": reason})
+            retry = current.get("retryable_action")
+            if not isinstance(retry, dict):
+                self._mark_blocked_unknown(
+                    snapshot, node_id, "provider 400: no active task to continue", quarantine_lease=False)
+                return
+            retry.pop("defer_once", None)
+            retry["attempt"] = count
+            retry["next_retry_at"] = time.time() + delay
+            self._set_binding_status(snapshot, node_id, role, "blocked_unknown")
+            current["status"] = self._v42_retry_status()
+            current["reason"] = reason
+            current["quarantine"] = None
+            stale = current.setdefault("stale_handles", [])
+            if handle_id not in stale:
+                stale.append(handle_id)
+            snapshot.handles.pop(node_id, None)
+            return
+        # Not continuable: the provider reports the old session failed, which is
+        # the exit proof.  Retire its binding before any successor is queued; if
+        # that cannot be recorded, wait with the reason instead of guessing.
+        try:
+            binding = self._set_binding_status(snapshot, node_id, role, "failed")
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            current["status"] = "blocked_unknown"
+            current["reason"] = "provider 400: old session exit could not be recorded; no new session started"
+            return
+        self._retire_session_for_successor(snapshot, node_id, role, binding.task_id, reason)
+
+    def _retire_session_for_successor(
+        self, snapshot: RunSnapshot, node_id: str, role: str,
+        predecessor: Optional[str], reason: str,
+    ) -> None:
+        """Release the dead session's slot and queue a successor dispatch."""
+        current = snapshot.nodes[node_id]
+        handle_id = snapshot.handles.pop(node_id, None)
+        self._release_node_lease(snapshot, node_id)
+        if handle_id:
+            stale = current.setdefault("stale_handles", [])
+            if handle_id not in stale:
+                stale.append(handle_id)
+        current["quarantine"] = None
+        current["active_role"] = None
+        current["active_task"] = None
+        current["start_intent"] = None
+        current["pair_archived"] = True
+        if role == "reviewer":
+            current["status"] = "rework"
+            current["reviewer_started"] = False
+        else:
+            current["status"] = "retry_pending"
+        current["reason"] = reason
+        current["recovery_action"] = "repair_node"
+        current["retryable_action"] = {
+            "role": role,
+            "phase": "review" if role == "reviewer" else "develop",
+            "continuation": False,
+            "pending_schedule": True,
+            "successor": True,
+            "same_task": False,
+            "same_task_required": False,
+            "old_task_reconciled": True,
+            "predecessor_task_id": predecessor,
+            "reason": reason,
+        }
+
+    def retire_dead_session(
+        self, node_id: str, run_id: str, runner: Any,
+    ) -> Dict[str, Any]:
+        """CLI exit for a node stuck behind a dead session (``repair --retire-dead-session``).
+
+        Only a provider-confirmed end state (failed / stopped / done) retires
+        the session; anything else leaves the node untouched and says why.
+        """
+        snapshot = self._recovery_snapshot(node_id, run_id)
+        current = snapshot.nodes[node_id]
+        active = current.get("active_task")
+        role = str(
+            current.get("active_role")
+            or (active or {}).get("role")
+            or self._primary_role(node_id, current)
+        )
+        handle_id = snapshot.handles.get(node_id) or (
+            active.get("handle_id") if isinstance(active, dict) else None)
+
+        def refuse(why: str) -> Dict[str, Any]:
+            current["reason"] = why
+            self._save_snapshot(snapshot)
+            return {"node_id": node_id, "kind": "retire_dead_session", "retired": False,
+                    "status": current.get("status"), "reason": why, "run_id": snapshot.run_id}
+
+        if not handle_id:
+            return refuse("no session handle recorded; cannot confirm the old session exited")
+        state_of = getattr(runner, "session_state", None)
+        if state_of is None:
+            return refuse("runner cannot report session state; old session exit not confirmed")
+        try:
+            state = state_of(RunHandle(handle_id))
+        except Exception as error:  # provider answers are untrusted; fail closed
+            return refuse("session state unreadable ({}); old session exit not confirmed".format(
+                type(error).__name__))
+        if state not in {"failed", "stopped", "done"}:
+            return refuse("session is still {!r}; not retired".format(state))
+        try:
+            binding = self._set_binding_status(snapshot, node_id, role, "failed")
+        except (FileNotFoundError, OSError, TypeError, ValueError):
+            return refuse("old session binding could not be retired; no new session started")
+        reason = "dead session retired by repair (provider state {})".format(state)
+        self._retire_session_for_successor(snapshot, node_id, role, binding.task_id, reason)
+        self._record(snapshot, "node_repaired", {
+            "run_id": snapshot.run_id, "node_id": node_id, "kind": "stuck_session",
+            "repair_action": "retire_dead_session", "role": role,
+            "predecessor_task_id": binding.task_id, "handle_id": handle_id,
+            "preserved_identity": False, "same_task": False, "successor": True})
+        self._save_snapshot(snapshot)
+        return {"node_id": node_id, "kind": "retire_dead_session", "retired": True,
+                "status": current["status"], "task_id": binding.task_id,
+                "run_id": snapshot.run_id}
 
     def _stop_active_for_transition(
         self,

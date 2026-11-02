@@ -413,6 +413,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--digest", dest="decision_digest")
     parser.add_argument("--via", dest="decision_via")
     parser.add_argument("--note", dest="decision_note")
+    parser.add_argument(
+        "--retire-dead-session", dest="retire_dead_session", action="store_true",
+        help="repair: retire a node's provider-confirmed dead session so it can be redispatched")
     parser.add_argument("--question", dest="decision_question")
     parser.add_argument("--options", dest="decision_options")
     parser.add_argument("--recommendation", dest="decision_recommendation")
@@ -4320,6 +4323,11 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     "status") == worker_questions.AWAITING_STATUS:
                 payload = worker_questions.answer_question(
                     monitor, args.run_id, args.node_id, args.decision_note)
+            elif getattr(args, "retire_dead_session", False):
+                payload = monitor.retire_dead_session(
+                    args.node_id, args.run_id,
+                    runner if runner is not None
+                    else _background_runner(paths, _card.agent_id, ""))
             else:
                 payload = monitor.repair_node(args.node_id, args.run_id)
             snapshot = load_snapshot(paths, args.run_id)
