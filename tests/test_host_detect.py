@@ -153,6 +153,24 @@ class PublishUsesTheHostTests(_Project):
         ok = self.cli(["authorize", "--plan", "hd", "--authorize", "AUTHORIZE"], CLAUDE_ENV)
         self.assertEqual(ok.payload["status"], "ok", ok.payload)
 
+    def test_authorize_with_contradictory_or_partial_host_requires_the_flag(self):
+        self.attest("claude-code")
+        self.assertEqual(self.publish(CLAUDE_ENV).payload["status"], "ok")
+        argv = ["authorize", "--plan", "hd", "--authorize", "AUTHORIZE"]
+        for env in (dict(CODEX_ENV, **WORKBUDDY_ENV), {"CLAUDECODE": "1"}):
+            with self.subTest(env=env):
+                refused = self.cli(argv, env)
+                self.assertEqual(refused.payload["status"], "blocked_invalid", refused.payload)
+                self.assertIn("--adapter", refused.payload["reason"])
+        ok = self.cli(argv + ["--adapter", "claude-code"], dict(CODEX_ENV, **WORKBUDDY_ENV))
+        self.assertEqual(ok.payload["status"], "ok", ok.payload)
+
+    def test_authorize_without_host_evidence_keeps_the_card_as_authority(self):
+        self.attest("claude-code")
+        self.assertEqual(self.publish(CLAUDE_ENV).payload["status"], "ok")
+        ok = self.cli(["authorize", "--plan", "hd", "--authorize", "AUTHORIZE"], PLAIN_ENV)
+        self.assertEqual(ok.payload["status"], "ok", ok.payload)
+
     def test_supervisor_register_checks_the_provider_against_the_host(self):
         argv = ["supervisor-register", "--run-id", "run-1", "--session-id", "S", "--host", "mac"]
         refused = self.cli(argv + ["--provider", "workbuddy"], CODEX_ENV)

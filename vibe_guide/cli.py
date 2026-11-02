@@ -281,11 +281,14 @@ def _authorize_host_check(
     """Refuse authorizing a card for a platform other than the calling session's.
 
     The platform is ``--adapter`` (checked against the host) or the detected
-    host.  Neither known: nothing to compare, authorize behaves as before.  A
-    card that cannot be read is left to authorize's own error reporting.
+    host.  No flag and no host evidence at all: nothing to compare, authorize
+    behaves as before.  Contradictory or partial host evidence without the
+    flag is refused like plan/attest/supervisor-register: it stays unknown and
+    needs ``--adapter``.  A card that cannot be read is left to authorize's
+    own error reporting.
     """
-    if not str(explicit or "").strip() and not host.known:
-        # An unknown host has no platform to compare; the card stays authority.
+    if not str(explicit or "").strip() and not host.known and not host.evidence:
+        # No host evidence at all: no platform to compare, the card stays authority.
         return None
     adapter, refusal = _host_adapter("authorize", explicit, host)
     if refusal is not None or adapter is None:
