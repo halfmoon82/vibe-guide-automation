@@ -27,7 +27,7 @@ from ..models import (
     WorkerProfile,
 )
 from ..model_router import provider_thinking_for
-from ..authorization import REMOTE_GIT_BAN_TEXT, remote_git_denied
+from ..authorization import worker_push_ban_text
 from ..paths import ProjectPaths
 from ..protocols import load_protocol, protocol_path, published_protocol_digest
 from ..task_registry import (
@@ -40,7 +40,7 @@ from ..task_registry import (
     save_task_binding,
 )
 from ..workflow_gate import session_contract_prompt
-from ..prompts import rework_findings_section
+from ..prompts import auto_scope_rule_sentence, rework_findings_section
 from ..worker_questions import supervisor_answer_section
 from ..state import read_writer_lease
 from ..providers import (
@@ -609,8 +609,8 @@ class ProviderActionRunner(Runner):
         launcher._prepare_worktree()
 
     def _remote_git_ban(self, contract: Dict[str, Any]) -> str:
-        """The fixed ban line, only when the card says ``deny`` (else empty)."""
-        return "\n" + REMOTE_GIT_BAN_TEXT + "\n" if remote_git_denied(self.paths, contract) else ""
+        """The fixed ban line: remote-Git ban under ``deny``, push ban otherwise (#379)."""
+        return "\n" + worker_push_ban_text(self.paths, contract) + "\n"
 
     def _consistency_instruction(self, contract: Dict[str, Any]) -> str:
         try:
@@ -667,9 +667,10 @@ class ProviderActionRunner(Runner):
             "worker-deliver 拒收时返回值已带 `wake` 指令，同样照发。发信号失败（工具报错或收不到回应）时不要重试等待：用同一份交付 JSON 在顶层加 `\"wake_failed\": true` 再执行一次 worker-deliver，守护程序下一周期会据此接收。"
             "自报时把你本会话的工作目录原样写进交付 JSON 的 `delivery_evidence.session_cwd`：监工用它核对本会话是否真的挂载了 project，不填就无法核对。"
             "运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。\n"
+            "{auto_scope}"
             "决策边界：不改变 PRD 决策的工程问题（实现方案、测试取舍、基线）自行判断并决定，"
             "把理由写进交付，不用 AskUserQuestion，不停下等人；"
-            "需要改允许路径外的文件时，不要改路径外文件，也不要停下等人：先完成路径内的部分并正常交付，"
+            "需要改允许路径外、且不在自动放行范围内的文件时，不要改这些文件，也不要停下等人：先完成其余部分并正常交付，"
             "在交付说明里写清要改哪些文件、为什么，范围由监工和审查员裁决。"
             "只有会改变 PRD 决策、涉及部署发布、凭据或授权卡外不可撤销动作、新增第三方依赖、"
             "可见降级为后台不可见时，才在交付里附 decision_requests；"
@@ -688,6 +689,7 @@ class ProviderActionRunner(Runner):
                  handoff=contract.get("handoff_file") or contract.get("delivery_path", "原交付文件"),
                  marker=contract.get("completion_marker", "原交付 marker"),
                  acceptance_pin=acceptance_pin,
+                 auto_scope="" if reviewer else auto_scope_rule_sentence(project_root) + "\n",
                  rework_findings=rework_findings_section(contract),
                  supervisor_answer=supervisor_answer_section(contract))
 
@@ -1125,6 +1127,9 @@ class ProviderActionRunner(Runner):
             )
         else:
             head = "请执行 {} 任务，Issue {}。".format(role, node_id)
+        if role == "developer":
+            # #381: say up front which out-of-scope files the gate accepts.
+            head += "\n" + auto_scope_rule_sentence(self.paths.root)
         # Consumers split the prompt on the consistency marker and parse what
         # follows as one JSON document, so the consistency block always goes
         # last -- after any inlined protocol text.
