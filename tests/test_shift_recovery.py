@@ -378,9 +378,15 @@ class PromptTemplateUpgradeTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
         self.assertIsNotNone(self.store.result(self.old['action_id']))
 
-    def test_unbound_prompt_change_is_still_drift(self):
-        with self.assertRaisesRegex(ValueError, 'identity drift'):
-            self.emit({**self.request, 'prompt': 'new template'})
+    def test_unbound_prompt_change_supersedes_the_leftover_request(self):
+        # Same generation, never answered, never bound: the old request is
+        # replaced (with an event) instead of demanding manual file removal.
+        again = self.emit({**self.request, 'prompt': 'new template'})
+        self.assertEqual(again['request']['prompt'], 'new template')
+        self.assertEqual(len(list((self.store.root / 'superseded').glob('*.json'))), 1)
+        logs = ''.join(p.read_text(encoding='utf-8')
+                       for p in self.paths.vibe.rglob('events.jsonl'))
+        self.assertIn('create_request_superseded', logs)
 
     def test_bound_non_prompt_change_is_still_drift(self):
         self.store.complete(self.old['action_id'], {'binding': {'task_id': 't1', 'host': 'h'}})
