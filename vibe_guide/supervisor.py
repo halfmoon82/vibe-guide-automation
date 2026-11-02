@@ -17,6 +17,7 @@ from .authorization import (
     ROTATE_HARD_CAP_CHOICES,
 )
 from .config import load_supervisor_single_shift
+from .platform_ledger import never_rotates, wake_channel_for
 from .contracts import RunEvent
 from .decision_boundary import LEGACY_BOUNDARY_CATEGORY, validate_boundary_category
 from .models import INTEGRATION_REVIEW_NODE_ID
@@ -633,8 +634,8 @@ def _registered_provider(paths, run_id):
 
 
 def provider_never_rotates(provider):
-    """Claude Code (any spelling) has no automatic shift change."""
-    return _provider_family(provider) == "claude"
+    """The platform capability ledger rules that this platform never rotates."""
+    return never_rotates(provider)
 
 
 def _registry_current(paths, run_id):
@@ -1797,22 +1798,12 @@ def register_supervisor_address(paths, run_id, address, *, session_record=None, 
     return entry
 
 
-#: The push tool a worker uses to wake a supervisor, per host family.  Issue
-#: #208: dispatch text used to say "the authorized channel, fixed format"
-#: without naming either, so workers could only skip the wake-up.  A host is
-#: listed here only with real receipt evidence (Codex: #167); the others say
-#: plainly that there is no channel and the heartbeat collects the delivery.
-WAKE_CHANNELS = {
-    "codex": "send_message_to_thread",
-    # Registered as a channel (#220 follow-up, 2026-10-23); it still counts as
-    # *verified* only once .vibe/push-wake-verification.json carries both a
-    # success and a failure evidence for claude-code.
-    "claude": "SendMessage",
-}
-WAKE_NO_CHANNEL_REASON = {
-    "claude": "Claude Code 没有已验证的推送通道（#154 实测 unverified），等监工心跳拉取",
-    "workbuddy": "WorkBuddy 没有推送通道，等监工心跳拉取",
-}
+# The push tool a worker uses to wake a supervisor, and why a platform has
+# none, come from the platform capability ledger (``platform_ledger``):
+# ``WAKE_CHANNELS`` / ``WAKE_NO_CHANNEL_REASON`` are defined there only.  Issue
+# #208: dispatch text has to name the tool, or workers can only skip the
+# wake-up.  A channel being listed is not verification: the long heartbeat tier
+# still needs the project's own push-wake-verification evidence.
 
 
 def wake_signal(run_id, node_id=None, role=None, generation=None):
@@ -1836,14 +1827,7 @@ def wake_channel(provider):
     target and the signal) and the authorization card's long-interval availability:
     a card must never offer a cadence the dispatch path could not wake.
     """
-    family = _provider_family(provider)
-    channel = WAKE_CHANNELS.get(family)
-    if channel is None:
-        return None, WAKE_NO_CHANNEL_REASON.get(
-            family,
-            "平台 {} 没有已登记的推送通道，等监工心跳拉取".format(provider or "未知"),
-        )
-    return channel, ""
+    return wake_channel_for(provider)
 
 
 def wake_instruction(address, run_id, node_id=None, role=None, generation=None):
@@ -1924,23 +1908,10 @@ _WAKE_PROVIDER_GROUPS = {
 }
 
 
-def _provider_family(provider):
-    """The platform family a provider string belongs to, or None.
-
-    Used where the *platform* is what matters (the wake channel is per platform,
-    not per dispatch path), so any spelling of a platform resolves the same.
-    """
-    value = str(provider or "").lower()
-    return next(
-        (name for name in ("codex", "claude", "workbuddy") if value.startswith(name)),
-        None,
-    )
-
-
 def _wake_provider_group(provider):
     """The push wake-up path a provider spelling belongs to, or None.
 
-    Stricter than :func:`_provider_family` on purpose: the push-wake registry is
+    Stricter than the ledger's per-platform lookup on purpose: the push-wake registry is
     keyed per wake path, so ``codex-background`` must never answer for
     ``codex-app-visible`` even though both are the codex platform.
     """
