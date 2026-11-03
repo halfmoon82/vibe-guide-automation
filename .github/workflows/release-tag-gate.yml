@@ -178,6 +178,22 @@ jobs:
           print(f"OK: tag {tag}、三处版本声明、两份 README 全部一致")
           PY
 
+      - name: Every vibe_guide module must import on minimum Python (3.9)
+        # decision_boundary 用了 Dict 却没导入：3.14 延迟解析注解不报，
+        # 3.9–3.13 上任何 vibe 命令启动即 NameError。默认 Python 是 3.12，
+        # 只在默认版本上跑会漏，所以在项目声明的最低版本上再跑一次。
+        shell: bash
+        env:
+          LEGACY_PY: ${{ steps.legacy-python.outputs.python-path }}
+        run: |
+          # 最低版本解释器缺失时必须报「未检查」并失败，不能当作通过。
+          if [ -z "$LEGACY_PY" ] || [ ! -x "$LEGACY_PY" ]; then
+            echo "未检查：Python 3.9 解释器不可用，全模块导入测试未在最低版本上运行"
+            exit 1
+          fi
+          "$LEGACY_PY" -c 'import sys; assert sys.version_info[:2] == (3, 9), sys.version'
+          "$LEGACY_PY" -m unittest tests.test_module_imports -v
+
       - name: Packaging acceptance (wheel / sdist / source install + upgrade path)
         # AGENTS.md:148 要求 wheel、sdist、源码安装分别验证，且验证明确的
         # 旧版本到新版本路径。只比对产物文件名不够：一个文件名正确但
