@@ -246,6 +246,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Worker protocol delivered by reference (#216): a ref-mode dispatch pins
     # the file's sha256 and only accepts a digest published here.
     "visible-sdd-worker": frozenset({
+        # 2026-11-03: WorkBuddy Explore-type subagent fallback (single-run observation, #390).
+        "9c65bef62c1d30ede26db9153a272349f34043f1d0326bfdb5fa22e8ce70af84",
         # 2026-10-30: worker-deliver takes --project-root, no cwd.
         "55653cf68dadeb47b04b778778b59729915cacd30061525d670bd9f729c2656b",
         "30b226ff0a6711a91779785c28a993679e0a33c3aeb89e836cfd427194750945",
