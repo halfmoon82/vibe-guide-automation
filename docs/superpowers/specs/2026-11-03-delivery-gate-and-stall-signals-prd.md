@@ -3,7 +3,7 @@
 - 计划编号：`session-6cb7b10c98fb560b`（`vibe plan` 先判 simple，按实际失败代价显式升级为 complex，S1=17：steps 3、domains 3、uncertainty 3、failure_cost 5、toolchain 3）
 - 基线：`v5.2.6`（`main` 的 `aeab928`）。本文行号指这个提交。
 - 产品 spec：同目录 `2026-11-03-delivery-gate-and-stall-signals-product-spec.json`
-- 状态：草稿，六个产品决定都已闭合；待独立复审通过、产品经理定稿确认和选远端 Git 开关后才能发布。
+- 状态：已定稿（产品经理 2026-11-03 定稿，含 D2 缩窄），六个产品决定都已闭合；远端 Git 动作选「允许」。
 - 证据来源：issue [#385](https://github.com/halfmoon82/vibe-guide-automation/issues/385)、[#386](https://github.com/halfmoon82/vibe-guide-automation/issues/386)、[#387](https://github.com/halfmoon82/vibe-guide-automation/issues/387)、[#390](https://github.com/halfmoon82/vibe-guide-automation/issues/390)、[#391](https://github.com/halfmoon82/vibe-guide-automation/issues/391)；5.2.5 的真实运行 run-345fc559（Claude Code 后台）和 5.2.6 的另一个项目里的真实运行 run-9fef3109（WorkBuddy）。
 
 ## 1. 问题
