@@ -65,6 +65,8 @@ from .supervisor import (
     render_stall_beat_text,
     heal_verify,
     stall_peek,
+    session_id_unknown_nodes,
+    session_id_unknown_status_lines,
     register_supervisor_address,
     record_owner_gate,
     shift_model_warning,
@@ -2281,6 +2283,11 @@ def _snapshot_result(
     error_classes = _render_node_error_classes(snapshot)
     if error_classes:
         text += "\n" + error_classes
+    if paths is not None:
+        session_unknown = session_id_unknown_status_lines(paths, snapshot)
+        if session_unknown:
+            payload["session_id_unknown"] = session_id_unknown_nodes(paths, snapshot)
+            text += "\n" + "\n".join(session_unknown)
     questions = worker_questions.render_status_lines(paths, snapshot)
     if questions:
         text += "\n" + questions

@@ -2933,14 +2933,14 @@ def _node_blocker(node):
     return ""
 
 
-def _probe_session_nodes(paths, run_id, snapshot):
+def _probe_session_nodes(paths, run_id, snapshot, detail=None):
     """({node_id: probe} for silent workers, {node_id: session} whose liveness is unknown).
 
     Read-only: it only stats transcript files, so the preflight and the status
     peek may call it too.  A node whose session cannot be identified at all
     (another provider, a legacy id) is in neither: nothing can be claimed.
     """
-    silent, unknown = {}, {}
+    silent, unknown, unknown_detail = {}, {}, {}
     for node_id, node in (snapshot.nodes or {}).items():
         if not _is_session_node(node):
             continue
@@ -2949,7 +2949,27 @@ def _probe_session_nodes(paths, run_id, snapshot):
             silent[node_id] = result
         elif result["state"] == "unknown":
             unknown[node_id] = result["session"]
+            unknown_detail[node_id] = result
+    if detail is not None:
+        detail.update(unknown_detail)
     return silent, unknown
+
+
+def session_id_unknown_nodes(paths, snapshot):
+    """Node ids at work whose session id cannot be derived (non-Claude platforms).
+
+    They stay out of the beat; ``vibe status`` node details say 会话编号未知.
+    """
+    return sorted(
+        node_id for node_id, node in (snapshot.nodes or {}).items()
+        if _is_session_node(node) and worker_liveness._session_id(paths, node) is None
+    )
+
+
+def session_id_unknown_status_lines(paths, snapshot):
+    """``vibe status`` lines for nodes whose session id is unknown, one per node."""
+    return ["节点 {}：会话编号未知（无法读取会话记录，不参与空转评估）".format(node_id)
+            for node_id in session_id_unknown_nodes(paths, snapshot)]
 
 
 def _build_pack(paths, run_id, node_id, snapshot, events, role):
@@ -3091,7 +3111,8 @@ def beat_stall_report(paths, run_id):
         return {"status": "unknown", "nodes": {}, "run_readable": False,
                 "reason": "run unreadable: " + type(error).__name__}
     try:
-        silent, unknown_liveness = _probe_session_nodes(paths, run_id, snapshot)
+        unknown_details = {}
+        silent, unknown_liveness = _probe_session_nodes(paths, run_id, snapshot, unknown_details)
         outcome = stall.record_beat(
             paths, run_id, _stall_candidates(snapshot, silent), snapshot.tasks, events
         )
@@ -3123,6 +3144,7 @@ def beat_stall_report(paths, run_id):
                 "reason": "stall assessment unavailable: " + type(error).__name__}
     return {"status": "ok", "run_readable": True, "unknown_previous": outcome["unknown_previous"],
             "unknown_liveness": sorted(unknown_liveness), "unknown_sessions": unknown_liveness,
+            "unknown_details": unknown_details,
             "nodes": nodes}
 
 
@@ -3145,11 +3167,20 @@ def render_stall_beat_text(report, run_id, command_prefix="vibe"):
         # An unreadable run already degrades the whole beat; a readable run whose
         # stall assessment failed must not read as "nothing stalled".
         unknown.append("空转评估未知：{}".format(report.get("reason", "")))
+    details = report.get("unknown_details") or {}
     for node_id, session in sorted((report.get("unknown_sessions") or {}).items()):
-        # The session is identified but leaves no transcript to read: the beat must
-        # not read as plain "idle" -- the supervisor looks at that session itself.
-        unknown.append("空转评估未知：节点 {} 的 worker 会话 {} 读不到会话记录，无法判断是否仍在工作".format(
-            node_id, session))
+        # The session is identified but its transcript could not be read: say which
+        # kind of "cannot read" it is; the supervisor looks at that session itself.
+        info = details.get(node_id) or {}
+        category = info.get("category")
+        if category == "not_found":
+            reason = "未找到会话记录（已搜索 {} 个项目目录）".format(info.get("searched", 0))
+        elif category == "unreadable":
+            reason = "会话记录目录不可读（{}）".format("、".join(info.get("unreadable") or []) or "无路径")
+        else:
+            reason = "无法判断读不到会话记录的原因"
+        unknown.append("空转评估未知：节点 {} 的 worker 会话 {} {}，无法判断是否仍在工作".format(
+            node_id, session, reason))
     for node_id, entry in sorted(report.get("nodes", {}).items()):
         silent = entry.get("silent_minutes")
         since = "worker 会话静默 {} 分钟".format(silent) if silent is not None else "连续 {} 拍进展不变".format(
