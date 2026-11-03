@@ -10493,6 +10493,7 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
                 "run_archive_deferred",
                 "daemon_heal",
                 "daemon_lease_readopted",
+                "delivery_unreceived",
                 "provider_observation",
                 "run_parked",
                 "run_unarchived",
@@ -10500,7 +10501,7 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
             }:
                 # Heartbeats are supervisor lease telemetry, archive records
                 # are filesystem evidence and daemon records are its own
-                # audit trail (self-heal steps, lease re-adoption, closeout);
+                # audit trail (self-heal steps, lease re-adoption, delivery watch, closeout);
                 # none of them is a node lifecycle event.
                 # They may be appended between snapshot writes and must be
                 # consumed before provider polling; a completed run can still
