@@ -23,8 +23,9 @@ from typing import Any, Dict, List, Optional
 from .adapters.base import Environment
 from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
+from .dag import DEPENDENCY_REASONS_FIELD, unreasoned_edge_errors
 from .authorization import HEARTBEAT_INTERVAL_CHOICES, ROTATE_HARD_CAP_CHOICES
-from .models import IntegrationAcceptanceContract, node_branch, node_worktree
+from .models import DAGNode, IntegrationAcceptanceContract, node_branch, node_worktree
 from .prd_profiles import render_planning_brief
 from .scanner import resolve_rules_file
 
@@ -40,7 +41,8 @@ PRODUCT_SPEC_FIELDS: Dict[str, Any] = {
         {"id": "str", "title": "str", "depends_on": ["node id"], "integration_after": ["node id"],
          "parallel_group": "str|null",
          "contract": {"input": "str", "output": "str", "error_behavior": "str", "acceptance_example": "str"},
-         "files": ["project-relative path"]}
+         "files": ["project-relative path"],
+         "dependency_reasons?": {"<depends_on node id>": "str"}}
     ],
     "prd?": {"<section>": [{"value": "str", "source": "user_confirmed|system_inferred|needs_confirmation|unverified"}]},
     "goals?": [
@@ -205,6 +207,13 @@ def complete_node_contracts(raw_nodes: List[Dict[str, Any]], adapter_id: str, pr
             raise TypeError("node contract must be an object")
         if "files" in item:
             contract.setdefault("files", list(item.pop("files") or []))
+        # dag-serial-audit: one sentence per depends_on edge saying which
+        # output of the upstream node this node needs.  It travels in the
+        # contract (DAGNode has no such field) and is copied verbatim; a
+        # malformed value is not repaired here, the DAG audit reads it as
+        # "no reason" and refuses the edge.
+        if DEPENDENCY_REASONS_FIELD in item:
+            contract.setdefault(DEPENDENCY_REASONS_FIELD, item.pop(DEPENDENCY_REASONS_FIELD))
         contract.setdefault("adapter_id", adapter_id)
         if project_id:
             contract.setdefault("project_id", project_id)
@@ -246,6 +255,23 @@ def complete_node_contracts(raw_nodes: List[Dict[str, Any]], adapter_id: str, pr
             "branch": contract["branch"],
             "allowlist": contract.get("files", []) or ["."],
         })
+
+
+def refuse_unreasoned_serial_edges(raw_nodes: List[Dict[str, Any]]) -> None:
+    """Decision D6 = A: a product spec may not publish a reasonless depends_on.
+
+    Runs on the product path only, after the contracts are completed so the
+    write scope (``files``) and ``dependency_reasons`` sit where the DAG audit
+    reads them.  Nodes that do not even build are left to the publish gate,
+    which reports them in its own terms.
+    """
+    try:
+        nodes = [DAGNode.from_dict(dict(item)) for item in raw_nodes]
+    except (KeyError, TypeError, ValueError):
+        return
+    messages = [message for values in unreasoned_edge_errors(nodes).values() for message in values]
+    if messages:
+        raise ValueError("DAG is invalid: " + "; ".join(messages))
 
 
 def derive_integration_contract(spec: Dict[str, Any], entry: Any, paths: Any) -> Dict[str, Any]:
@@ -362,6 +388,8 @@ def normalize_node_spec(spec: Any, entry: Any, paths: Any, route_governs_band: b
         # contract fails first on an empty compatibility scope.
         raise ValueError("node spec must contain at least one node")
     complete_node_contracts(raw_nodes, adapter_id, project_id)
+    if route_governs_band:
+        refuse_unreasoned_serial_edges(raw_nodes)
 
     if band == "complex":
         if not out.get("integration_contract"):

@@ -117,6 +117,45 @@ class ProductSpecPublishTests(_ProjectCase):
         self.assertEqual(rejected.status, "blocked_dag", rejected.to_dict())
         self.assertTrue(any("risk_tags mismatch" in reason for reason in rejected.reasons["export-button"]))
 
+    def _serial_spec(self, reasons=None):
+        spec = _product_spec()
+        spec["nodes"][1]["depends_on"] = [spec["nodes"][0]["id"]]
+        if reasons is not None:
+            spec["nodes"][1]["dependency_reasons"] = reasons
+        return spec
+
+    def test_reasonless_serial_edge_refuses_publish_and_names_the_edge(self):
+        self.write_capabilities()
+        for reasons in (None, {"export-button": ""}, {"export-button": "   "}):
+            with self.subTest(reasons=reasons):
+                plan_id = "serial-none-{}".format(len(str(reasons)))
+                result = self.plan_from_prd(self.write_spec(self._serial_spec(reasons)), plan_id=plan_id)
+                self.assertNotEqual(result.payload.get("status"), "ok", result.payload)
+                text = json.dumps(result.payload, ensure_ascii=False)
+                self.assertIn("export-button → date-range-filter", text)
+                self.assertIn("补理由", text)
+                self.assertIn("depends_on", text)
+                self.assertFalse(self.plan_dir(plan_id).exists())
+
+    def test_declared_data_dependency_publishes_and_lands_in_dag_audit(self):
+        self.write_capabilities()
+        reason = "依赖 export-button 节点产出的 PDF 文件格式"
+        result = self.plan_from_prd(self.write_spec(self._serial_spec({"export-button": reason})))
+        self.assertEqual(result.payload.get("status"), "ok", result.payload)
+        dag = json.loads((self.plan_dir() / "dag.yaml").read_text(encoding="utf-8"))
+        serial = dag["audit"]["serial"]
+        self.assertEqual(serial["max_parallel_width"], 1)
+        self.assertEqual(serial["critical_path_length"], 2)
+        self.assertEqual(serial["unreasoned_edges"], [])
+        self.assertEqual(
+            [(e["from"], e["to"], e["reason_type"], e.get("reason")) for e in serial["edges"]],
+            [("export-button", "date-range-filter", "data_dependency", reason)],
+        )
+        nodes = json.loads((self.plan_dir() / "nodes.json").read_text(encoding="utf-8"))
+        follower = next(node for node in nodes if node["id"] == "date-range-filter")
+        self.assertEqual(follower["contract"]["dependency_reasons"], {"export-button": reason})
+        self.assertNotIn("dependency_reasons", follower)
+
     def test_product_cannot_supply_risk_tags_at_either_metadata_location(self):
         self.write_capabilities()
         for location in ("node", "contract"):
@@ -208,6 +247,28 @@ class ProductSpecPublishTests(_ProjectCase):
         root = publish_complex_probe(self)
         plan = json.loads((root / ".vibe" / "plans" / "probe-plan" / "plan.json").read_text(encoding="utf-8"))
         self.assertEqual(plan["status"], "confirmed_pending_authorization")
+        dag = json.loads((root / ".vibe" / "plans" / "probe-plan" / "dag.yaml").read_text(encoding="utf-8"))
+        self.assertIn("max_parallel_width", dag["audit"]["serial"])
+        self.assertIn("critical_path_length", dag["audit"]["serial"])
+
+    def test_gate_refuses_a_reasonless_edge_and_the_audit_lists_it(self):
+        """The gate (product path only) refuses; the audit block lists the same edge."""
+        from vibe_guide.dag import serial_audit
+        from vibe_guide.models import DAGNode
+        from vibe_guide.node_spec import refuse_unreasoned_serial_edges
+        raw = [
+            {"id": "a", "title": "a", "depends_on": [], "integration_after": [], "parallel_group": None,
+             "contract": {"input": "i", "output": "o", "error_behavior": "e", "acceptance_example": "x",
+                          "files": ["vibe_guide/a.py"]}, "status": "planned"},
+            {"id": "b", "title": "b", "depends_on": ["a"], "integration_after": [], "parallel_group": None,
+             "contract": {"input": "i", "output": "o", "error_behavior": "e", "acceptance_example": "x",
+                          "files": ["vibe_guide/b.py"]}, "status": "planned"},
+        ]
+        with self.assertRaises(ValueError) as caught:
+            refuse_unreasoned_serial_edges(raw)
+        self.assertIn("a → b", str(caught.exception))
+        audit = serial_audit([DAGNode.from_dict(item) for item in raw])
+        self.assertEqual(audit["unreasoned_edges"], [{"from": "a", "to": "b"}])
 
 
 class DraftAndRoutingTests(_ProjectCase):
