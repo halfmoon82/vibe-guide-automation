@@ -8,8 +8,10 @@ result template carried Codex-only names (``threadId`` / ``hostId``).
 """
 
 import json
+import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from vibe_guide.adapters.task_provider import ProviderActionStore, _canonical_digest
@@ -33,7 +35,7 @@ NATIVE = {
     "workbuddy-visible": {"create": "workbuddy_job__create", "locate": "workbuddy_job__get",
                           "visibility": "workbuddy_job__list", "resume": "workbuddy_job__reply",
                           "wait": "workbuddy_job__wait"},
-    "codex-app-visible": {"create": "codex_app__create_thread"},
+    "codex-app-visible": {"create": "codex_app__create_thread", "locate": "codex_app__navigate_to_codex_page"},
 }
 PROVENANCE = "WorkBuddy 桌面会话实测：Agent 子代理可并行；无可见任务窗口工具"
 
@@ -42,7 +44,7 @@ def filled(example):
     return json.loads(json.dumps(example, ensure_ascii=False).replace(TEMPLATE_PLACEHOLDER, "real"))
 
 
-class HostSessionServiceTests(unittest.TestCase):
+class HostSessionBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -71,6 +73,8 @@ class HostSessionServiceTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.payload)
         return {item["action_id"]: item for item in result.payload["pending"]}
 
+
+class HostSessionServiceTests(HostSessionBase):
     def test_create_template_uses_the_provider_neutral_identity_fields(self):
         action_id = self.request("w")
         template = mailbox_result_template(self.paths, RUN, action_id)["template"]
@@ -154,6 +158,76 @@ class HostSessionServiceTests(unittest.TestCase):
         self.attest(IN_SESSION_ONLY)
         action_id = self.request("w")
         self.assertFalse(self.pending()[action_id]["service"].get("independent_identity_required", False))
+
+
+class AutofillTests(HostSessionBase):
+    """create write-back with the session's own id fills locate and visibility (#390)."""
+
+    SESSION = "wb-session-1"
+
+    def pending_with_env(self, env):
+        with mock.patch.dict(os.environ, env, clear=False):
+            return self.pending()
+
+    def create_done(self, task_id, issue="n1"):
+        create = self.request("w", issue=issue)
+        ProviderActionStore(self.paths).complete(
+            create, {"binding": {"task_id": task_id, "host": "mac"}}, native=False)
+        return {op: self.request("w", operation=op, topology=None, issue=issue)
+                for op in ("locate", "visibility")}
+
+    def events(self):
+        path = self.root / ".vibe/runs" / RUN / "events.jsonl"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("CODEBUDDY_SESSION_ID", None)
+        self.attest(IN_SESSION_ONLY)
+
+    def test_matching_session_id_fills_both_and_logs_the_basis(self):
+        ids = self.create_done(self.SESSION)
+        pending = self.pending_with_env({"CODEBUDDY_SESSION_ID": self.SESSION})
+        store = ProviderActionStore(self.paths)
+        for operation, action_id in ids.items():
+            self.assertNotIn(action_id, pending)
+            self.assertEqual(store.result(action_id).get("located" if operation == "locate" else "visible"), True)
+        self.assertIn("host_session_autofill", self.events())
+        self.assertIn(PROVENANCE, self.events())
+
+    def test_other_session_id_fills_nothing(self):
+        ids = self.create_done("someone-else")
+        pending = self.pending_with_env({"CODEBUDDY_SESSION_ID": self.SESSION})
+        for action_id in ids.values():
+            self.assertIn(action_id, pending)
+        self.assertNotIn("host_session_autofill", self.events())
+
+    def test_unreadable_session_id_fills_nothing(self):
+        ids = self.create_done(self.SESSION)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODEBUDDY_SESSION_ID", None)
+            pending = self.pending()
+        for action_id in ids.values():
+            self.assertIn(action_id, pending)
+
+    def test_missing_capability_evidence_fills_nothing(self):
+        self.attest(FULL_VISIBLE)
+        ids = self.create_done(self.SESSION)
+        pending = self.pending_with_env({"CODEBUDDY_SESSION_ID": self.SESSION})
+        for action_id in ids.values():
+            self.assertIn(action_id, pending)
+
+    def test_closeout_review_is_never_filled(self):
+        ids = self.create_done(self.SESSION, issue="integration-review")
+        pending = self.pending_with_env({"CODEBUDDY_SESSION_ID": self.SESSION})
+        for action_id in ids.values():
+            self.assertIn(action_id, pending)
+
+    def test_codex_mailbox_is_unchanged(self):
+        action_id = self.request("c", operation="locate", provider="codex-app-visible", topology=None)
+        pending = self.pending_with_env({"CODEBUDDY_SESSION_ID": self.SESSION})
+        self.assertIn(action_id, pending)
+        self.assertNotIn("service", pending[action_id])
 
 
 E2E_FIXTURE = Path(__file__).parent / "fixtures" / "e2e-project"
