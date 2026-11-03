@@ -277,6 +277,15 @@ class UnknownCategoryTests(RunningWorkerFixture):
         self.assertEqual(len(lines), 1)
         self.assertIn("会话编号未知", lines[0])
         self.assertIn(NODE, lines[0])
+        view = _snapshot_result("status", snapshot, False, paths=self.paths)
+        self.assertIn("节点 {}：会话编号未知".format(NODE), view.text)
+        self.assertEqual(view.payload["session_id_unknown"], [NODE])
+
+    def test_status_is_silent_about_session_id_when_it_is_known(self):
+        view = _snapshot_result("status", load_snapshot(self.paths, self.run_id), False,
+                                paths=self.paths)
+        self.assertNotIn("会话编号未知", view.text)
+        self.assertNotIn("session_id_unknown", view.payload)
 
     def test_claude_config_dir_is_searched(self):
         alt = Path(self.temporary.name) / "alt" / "projects" / "p"
