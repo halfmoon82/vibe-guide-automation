@@ -35,6 +35,9 @@ _LAUNCHER_KEYS = ("node_id", "role", "run_id", "generation", "host", "branch",
 #: this issue exists to kill.  It matches the set ``ClaudeBgLauncher.stop``
 #: accepts as proof the session ended.
 _RETIRED_STATES = frozenset({"stopped", "done", "failed"})
+
+#: Fixed reason code for a session the upstream gateway rejected with HTTP 400.
+PROVIDER_HTTP_400 = "provider_http_400"
 #: ``claude stop`` returns before ``claude agents`` shows the session down;
 #: resuming or launching inside that window starts a copy (live).  Wait
 #: through these delays, then refuse to add a second writer.
@@ -494,9 +497,46 @@ class ClaudeBgRunner(Runner):
         }
         event, reason = reasons[state]
         data = dict(claims, reason=reason)
+        if state == "failed":
+            data.update(self._failure_facts(session))
         if state == "stopped":
             data["stop_origin"] = "vibe" if session.get("vibe_stop") else "unexpected"
         return [RunEvent(event, data)]
+
+    @staticmethod
+    def _failure_facts(session: Dict[str, Any]) -> Dict[str, Any]:
+        """Program-authored facts about a failed session; never provider text.
+
+        ``reason_code`` is set only when the launcher can attribute the
+        failure to a gateway 400 / unsupported-model rejection.  ``resumable``
+        says whether the same session can still be continued (its transcript
+        is on disk); an unreadable answer leaves the field out so the monitor
+        treats it as resumable rather than opening a second session.
+        """
+        launcher = session["launcher"]
+        facts: Dict[str, Any] = {}
+        task_id = session["claims"]["session_id"]
+        classify = getattr(launcher, "failure_class", None)
+        if classify is not None:
+            try:
+                code = classify(task_id)
+            except (ClaudeBgUnknown, OSError, ValueError):
+                code = None
+            if code == PROVIDER_HTTP_400:
+                facts["reason_code"] = code
+                facts["reason"] = "provider_http_400: the gateway rejected the session request (HTTP 400)"
+        can_resume = getattr(launcher, "can_resume", None)
+        if can_resume is not None and "reason_code" in facts:
+            try:
+                facts["resumable"] = bool(can_resume(task_id))
+            except (ClaudeBgUnknown, OSError, ValueError):
+                pass
+        return facts
+
+    def session_state(self, handle: RunHandle) -> str:
+        """The provider's current state word for the handle's session."""
+        session = self._session(handle)
+        return session["launcher"].status(session["claims"]["session_id"])
 
     @staticmethod
     def _question_excerpt(session: Dict[str, Any]) -> Optional[str]:

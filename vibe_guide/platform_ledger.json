@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "description": "平台能力账本：每个平台一行，每格标 verified / pm_ruling / unverified 并带出处。项目级 .vibe/push-wake-verification.json 是各项目自己的实测记录，本账本只给平台默认值。dispatch 一格的 probe_pass 仍要本平台 in_session_sdd 探针带出处通过才生效。",
+  "platforms": {
+    "claude-code": {
+      "display_name": "Claude Code",
+      "dispatch": {
+        "value": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible", "default_mode": "background"},
+        "status": "verified",
+        "source": {"run_id": "run-0d53e1d1", "date": "2026-10-18", "host_version": "5.0.18（vibe）", "ref": "claude --bg 后台派发真机实测；授权卡默认后台，可改选可见卡片（prd-guide §派发方式）"}
+      },
+      "visibility": {
+        "value": "background_not_visible",
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-10-13", "host_version": null, "ref": "claude --bg 派发实测：桌面侧边栏看不到，只能在终端 claude attach 进入；可见卡片路径另走 spawn_task"}
+      },
+      "integration_review": {
+        "value": "background",
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-11-02", "host_version": "vibe 5.2.5", "ref": "5.2.5 Claude Code 运行任务登记里整合评审实际为 mode=background（PRD session-dd89468c829181ed 问题 2）"}
+      },
+      "worker_wake": {
+        "value": "SendMessage",
+        "status": "verified",
+        "source": {"run_id": "run-64c826b5bca6427e86c152baa142a304", "date": "2026-10-23", "host_version": null, "ref": "后台 worker 用 SendMessage 向监工会话名发 vibe-wake 成功一次、失败两次（目标须是会话名，UUID 不可达）"},
+        "note": "reviewer 会话可能缺 SendMessage（#380，run-3218a7e6 实测）：发不了唤醒时由心跳领取"
+      },
+      "supervisor_notification": {
+        "value": null,
+        "status": "unverified",
+        "source": null,
+        "note": "后台会话完成时监工侧没有已验证的完成通知，靠 worker 唤醒或心跳"
+      },
+      "heartbeat": {
+        "value": "cron",
+        "status": "verified",
+        "source": {"run_id": "run-345fc559f3a747f7b9929d85f6f70eb9", "date": "2026-11-02", "host_version": "Claude Code 2.1.316", "ref": "监工会话用宿主周期任务建兜底检查（只在本会话存活）"},
+        "condition": "非 bypass 权限模式下建周期任务可能被权限检查以「未授权的持久化」拦下，需用户放行（2026-10-27 交接演练实测）"
+      },
+      "rotation": {
+        "value": "never",
+        "status": "pm_ruling",
+        "source": {"run_id": null, "date": "2026-10-27", "host_version": null, "ref": "产品经理裁定：Claude Code 没有自动换班原语，同会话继续，心跳 rotate 忽略"}
+      },
+      "nested_dispatch": {
+        "value": null,
+        "status": "unverified",
+        "source": null
+      },
+      "push_block": {
+        "value": [
+          {"path": "claude-code 后台派发", "level": "partial",
+           "note": "提示词禁令加启动拦截（--disallowedTools 只拦住 git push，拦不住 git -C push 与 bash -c；GIT_ALLOW_PROTOCOL 管不到 gh 和 curl，且能否传进后台会话的工具 shell 未验证）：部分拦截，环境变量生效未验证"},
+          {"path": "claude-code 可见任务", "level": "prompt_only", "note": "仅提示词约束，未强制"}
+        ],
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-10-30", "host_version": "vibe 5.2.x", "ref": "remote-git-enforce（fc029f9）：deny 时提示词禁令与 claude --bg 启动拦截"}
+      }
+    },
+    "codex": {
+      "display_name": "Codex",
+      "dispatch": {
+        "value": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible", "default_mode": "visible"},
+        "status": "verified",
+        "source": {"run_id": "run-63e7cfc2", "date": "2026-11-02", "host_version": null, "ref": "socialmedia 运行 8/8 在 Codex 上完成，20 个任务登记均为 Codex 可见 thread"}
+      },
+      "visibility": {
+        "value": "visible_enterable",
+        "status": "verified",
+        "source": {"run_id": "run-63e7cfc2", "date": "2026-11-02", "host_version": null, "ref": "create_thread 创建用户可见、可进入的 thread"}
+      },
+      "integration_review": {
+        "value": "visible_task",
+        "status": "verified",
+        "source": {"run_id": "run-63e7cfc2", "date": "2026-11-02", "host_version": null, "ref": "整合评审作为独立可见 reviewer thread 派发"}
+      },
+      "worker_wake": {
+        "value": "send_message_to_thread",
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-10-08", "host_version": null, "ref": "#154 / #167 Codex 完工唤醒实测：原生接收一次"}
+      },
+      "supervisor_notification": {
+        "value": null,
+        "status": "unverified",
+        "source": null
+      },
+      "heartbeat": {
+        "value": "automations",
+        "status": "verified",
+        "source": {"run_id": "run-63e7cfc2", "date": "2026-11-02", "host_version": null, "ref": "3 班 Codex 监工各自用宿主周期任务建兜底检查"}
+      },
+      "rotation": {
+        "value": "new_thread",
+        "status": "verified",
+        "source": {"run_id": "run-63e7cfc2", "date": "2026-11-02", "host_version": null, "ref": "3 班监工均为 Codex：接班用 create_thread 在本项目新开全新会话（禁止 fork_thread）"}
+      },
+      "nested_dispatch": {
+        "value": null,
+        "status": "unverified",
+        "source": null
+      },
+      "push_block": {
+        "value": [
+          {"path": "codex", "level": "prompt_only", "note": "仅提示词约束，未强制"}
+        ],
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-10-30", "host_version": "vibe 5.2.x", "ref": "remote-git-enforce（fc029f9）：Codex 只有提示词禁令"}
+      }
+    },
+    "workbuddy": {
+      "display_name": "WorkBuddy",
+      "dispatch": {
+        "value": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible", "default_mode": "in_session_subagent"},
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-10-06", "host_version": "WorkBuddy 5.8.4", "ref": "jobs API 的 agent job 39 次全部停在 starting；会话内子代理可并发（两路 0.019s 内先后启动）。5.9.4 上 Jobs 未重测"}
+      },
+      "visibility": {
+        "value": "in_main_session_only",
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-11-01", "host_version": null, "ref": "#374：WorkBuddy 只能会话内派发，子代理在主会话里可见，不能单独进入"}
+      },
+      "integration_review": {
+        "value": "in_session_readonly_subagent",
+        "status": "pm_ruling",
+        "source": {"run_id": null, "date": "2026-11-01", "host_version": null, "ref": "产品经理裁定：无可见任务窗口能力时收口审查由会话内独立只读子代理完成（AGENTS.md §6）"}
+      },
+      "worker_wake": {
+        "value": null,
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-11-02", "host_version": null, "ref": "PRD session-dd89468c829181ed 问题 3：worker 没有主动唤醒监工的通道"},
+        "note": "WorkBuddy 没有 worker 唤醒通道（子代理完成通知只到主会话，记为监工侧通知），兜底检查按 10 分钟，等监工心跳拉取"
+      },
+      "supervisor_notification": {
+        "value": "subagent_completion",
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-11-02", "host_version": null, "ref": "PRD session-dd89468c829181ed 问题 3：子代理完成后主会话收到通知"},
+        "note": "监工侧通知，不算 worker 唤醒通道，不改变兜底检查间隔"
+      },
+      "heartbeat": {
+        "value": "automations",
+        "status": "verified",
+        "source": {"run_id": "run-7e11e64785964eafadaaf8b75233c64e", "date": "2026-10-08", "host_version": null, "ref": "docs/workbuddy/workbuddy-in-session-dispatch-verification.md：无 shell 级周期任务，对应物是宿主周期自动化 automation_update"}
+      },
+      "rotation": {
+        "value": "user_opens_session",
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-10-26", "host_version": "WorkBuddy 5.8.4 / CLI 2.161.0", "ref": "docs/workbuddy/workbuddy-dispatch-root-cause-and-fix.md §0.1：无公开的独立会话创建入口，换班只能由用户在本项目新开会话"}
+      },
+      "nested_dispatch": {
+        "value": "subagent_cannot_dispatch",
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-11-02", "host_version": null, "ref": "PRD session-dd89468c829181ed 按实测改正：WorkBuddy 子代理不能再派子代理"}
+      },
+      "push_block": {
+        "value": [
+          {"path": "workbuddy", "level": "prompt_only", "note": "仅提示词约束，未强制"}
+        ],
+        "status": "verified",
+        "source": {"run_id": null, "date": "2026-10-30", "host_version": "vibe 5.2.x", "ref": "remote-git-enforce（fc029f9）：WorkBuddy 只有提示词禁令"}
+      }
+    },
+    "kimi-code": {
+      "display_name": "Kimi Code",
+      "dispatch": {
+        "value": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+        "status": "unverified", "source": null,
+        "note": "没有运行记录；probe_pass 仍要本平台探针带出处通过"
+      },
+      "push_block": {
+        "value": [
+          {"path": "kimi-code", "level": "prompt_only", "note": "仅提示词约束，未强制（未验证）"}
+        ],
+        "status": "unverified", "source": null
+      }
+    },
+    "cursor": {
+      "display_name": "Cursor",
+      "dispatch": {
+        "value": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+        "status": "unverified", "source": null,
+        "note": "没有运行记录；probe_pass 仍要本平台探针带出处通过"
+      }
+    },
+    "deepseek-harness": {
+      "display_name": "DeepSeek Harness",
+      "dispatch": {
+        "value": {"probe_pass": "in_session_sdd", "probe_unknown": "dual-visible"},
+        "status": "unverified", "source": null,
+        "note": "没有运行记录；探针证据通过前按 dual-visible 派发"
+      }
+    },
+    "grok": {
+      "display_name": "Grok",
+      "dispatch": {
+        "value": {"probe_pass": "dual-visible", "probe_unknown": "dual-visible"},
+        "status": "unverified", "source": null,
+        "note": "没有运行记录；不支持会话内派发"
+      }
+    }
+  }
+}

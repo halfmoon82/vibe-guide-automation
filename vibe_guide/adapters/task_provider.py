@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -132,6 +133,8 @@ class ProviderPending(RuntimeError):
 
 _PROVIDER_ACTIONS = {"create", "locate", "visibility", "resume", "wait"}
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+#: Capability-record keys beyond the required four; older records lack them.
+_OPTIONAL_CAPABILITY_KEYS = frozenset({"project_id", "observed_at", "host_version", "session_id"})
 _WORKER_DELIVERY_EVENTS = {"delivered", "complete", "accepted", "review_finding",
                            "blocked_engineering"}
 
@@ -291,6 +294,8 @@ _PROJECT_MOUNT_NONE = 'none'
 WARNINGS_KEY = 'warnings'
 
 _ADVISORY_RESULT_KEYS = (WARNINGS_KEY,)
+#: fixed payload marker: the worker could not send the wake signal; the daemon's next cycle takes the report
+WAKE_FAILED_KEY = 'wake_failed'
 
 
 def _requested_project_mount(request: Any, operation: str) -> Optional[str]:
@@ -387,7 +392,20 @@ class ProviderActionStore:
         facts: Mapping[str, Any],
         provenance: str,
         project_id: Optional[str] = None,
+        *,
+        observed_at: Optional[str] = None,
+        host_version: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> None:
+        """Write this adapter's own capability record, and nothing else's.
+
+        ``observed_at`` (UTC, ISO 8601; defaults to now), ``host_version`` and
+        ``session_id`` date the observation so ``vibe doctor`` can tell when
+        it needs a second look.  The pre-split single ``capabilities.json`` is
+        migrated here, once: a record that names another adapter moves to its
+        own file unless that file exists, then the single file is removed.
+        Read paths never perform this migration.
+        """
         if not isinstance(adapter_id, str) or not adapter_id:
             raise ValueError("adapter id is required")
         if not _SAFE_ID.fullmatch(adapter_id):
@@ -410,6 +428,7 @@ class ProviderActionStore:
             "adapter_id": adapter_id,
             "facts": dict(facts),
             "provenance": provenance,
+            "observed_at": observed_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         # The project id is optional: visible-task routing needs it, other
         # routes do not, and only the recording session can vouch for it.
@@ -417,32 +436,49 @@ class ProviderActionStore:
             if not isinstance(project_id, str) or not project_id.strip():
                 raise ValueError("provider capability project_id must be a non-empty string")
             payload["project_id"] = project_id.strip()
+        for key, value in (("host_version", host_version), ("session_id", session_id)):
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip() or len(value) > 256:
+                raise ValueError("provider capability {} must be a short non-empty string".format(key))
+            payload[key] = value.strip()
+        self._validate_capability(payload)
         self.root.mkdir(parents=True, exist_ok=True)
         # The per-adapter file is authoritative (issue #279): each adapter's
-        # session attests its own record and no later attest of *another*
-        # adapter can overwrite it.  The legacy single-file bridge is kept as
-        # a mirror of the latest record so pre-split readers still work.
-        # Before the mirror is overwritten, a pre-split record that belongs to
-        # another adapter and has no per-adapter file yet is migrated into its
-        # own file, so the first attest after an upgrade loses nothing.
-        legacy = self.root / "capabilities.json"
-        if legacy.is_file() and not legacy.is_symlink():
-            try:
-                previous = self._validate_capability(self._read(legacy))
-            except (OSError, ValueError):
-                previous = None
-            if previous is not None:
-                previous_id = str(previous["adapter_id"])
-                migrated = self.root / ("capabilities-" + previous_id + ".json")
-                if (_SAFE_ID.fullmatch(previous_id) and previous_id != adapter_id
-                        and not migrated.exists()):
-                    self._atomic(migrated, previous)
+        # session attests its own record and no attest of *another* adapter
+        # overwrites it.
         self._atomic(self.root / ("capabilities-" + adapter_id + ".json"), payload)
-        self._atomic(legacy, payload)
+        self._migrate_legacy_capability(adapter_id)
+
+    def _migrate_legacy_capability(self, attested: str) -> None:
+        """One-time move of the pre-split ``capabilities.json`` (attest only).
+
+        A record for another adapter moves into its own file when that file
+        does not exist yet; a record for the adapter just attested is
+        superseded.  Either way the single file is then removed, as is one
+        that no longer validates (no reader can use it, and the pre-split
+        attest overwrote it the same way).  A record naming an unsafe id is
+        left untouched and readers skip it.
+        """
+        legacy = self.root / "capabilities.json"
+        if not legacy.is_file() or legacy.is_symlink():
+            return
+        try:
+            previous = self._validate_capability(self._read(legacy))
+        except (OSError, ValueError):
+            legacy.unlink()
+            return
+        previous_id = str(previous["adapter_id"])
+        if not _SAFE_ID.fullmatch(previous_id):
+            return
+        migrated = self.root / ("capabilities-" + previous_id + ".json")
+        if previous_id != attested and not migrated.exists():
+            self._atomic(migrated, previous)
+        legacy.unlink()
 
     def _validate_capability(self, value: Dict[str, Any]) -> Dict[str, Any]:
         required = {"schema_version", "adapter_id", "facts", "provenance"}
-        if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - {"project_id"}:
+        if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - _OPTIONAL_CAPABILITY_KEYS:
             raise ValueError("provider capability schema is invalid")
         if value["schema_version"] != self.schema_version:
             raise ValueError("provider capability schema is unsupported")
@@ -454,6 +490,8 @@ class ProviderActionStore:
         The per-adapter files win; the legacy ``capabilities.json`` record
         joins only for adapters that predate the split and never got a
         per-adapter file.  No record is ever attributed to another adapter.
+        Read-only: the legacy file is migrated by ``publish_capabilities``
+        (attest), never here.
         """
         records: Dict[str, Dict[str, Any]] = {}
         if not self.root.is_dir():
@@ -468,7 +506,8 @@ class ProviderActionStore:
         legacy = self.root / "capabilities.json"
         if legacy.is_file() and not legacy.is_symlink():
             record = self._validate_capability(self._read(legacy))
-            records.setdefault(str(record["adapter_id"]), record)
+            if _SAFE_ID.fullmatch(str(record["adapter_id"])):
+                records.setdefault(str(record["adapter_id"]), record)
         return records
 
     def capabilities(self, adapter_id: Optional[str] = None) -> Dict[str, Any]:
@@ -579,16 +618,26 @@ class ProviderActionStore:
         path = directory / (action_id + ".json")
         existing = self._read(path) if path.exists() else None
         if existing is not None and existing != payload:
-            if not self._prompt_only_upgrade(existing, payload):
+            if self._prompt_only_upgrade(existing, payload):
+                # The worker already acted on the original prompt; keep it, and
+                # do not record a dispatch baseline after the fact.
+                return existing
+            try:
+                superseded = self._supersede_same_generation_create(existing, payload)
+            except ValueError:
+                superseded = False
+                refusal = sys.exc_info()[1]
+            else:
+                refusal = ValueError("provider action request identity drift")
+            if superseded:
+                existing = None
+            else:
                 if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
                     self._record_dispatch_head(
                         run_id, issue_id, role, generation, request["child_binding"],
                         _requested_project_mount(request, operation),
                     )
-                raise ValueError("provider action request identity drift")
-            # The worker already acted on the original prompt; keep it, and do
-            # not record a dispatch baseline after the fact.
-            return existing
+                raise refusal
         if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
             # Before the request is visible to the host: the baseline must
             # predate any work the dispatched worker could do.
@@ -602,6 +651,96 @@ class ProviderActionStore:
         if operation == "wait" and not probe:
             self._consume_archived_delivery(run_id, issue_id, role, generation)
         return payload
+
+    def _supersede_same_generation_create(
+        self, existing: Dict[str, Any], payload: Dict[str, Any]
+    ) -> bool:
+        """Replace a leftover create of the same node/role/generation (#344 #363).
+
+        A redispatch after a shift or re-authorization rebuilds the same
+        action id with a different request, which used to be refused as
+        identity drift until a person moved the old file away.  The old
+        request is replaced (and an event recorded) only when it can no
+        longer matter: its task already has termination evidence in the run's
+        ``tasks.json``, or it never produced a task at all (no result, no
+        binding).  A live or undecidable old task keeps the refusal, and the
+        message names the evidence that is missing.
+        """
+        from ..contracts import RunEvent
+        from ..state import append_event, interprocess_lock
+        from ..task_registry import (
+            _TERMINAL_STATUSES, _read_registry, _registry_lock, _run_tasks_path,
+        )
+
+        if existing.get("operation") != "create" or payload.get("operation") != "create":
+            return False
+        run_id = existing.get("run_id")
+        issue_id = existing.get("issue_id")
+        role = existing.get("role")
+        generation = existing.get("generation")
+        action_id = existing.get("action_id")
+        label = "{} {} generation {}".format(issue_id, role, generation)
+        try:
+            old_result = self.result(action_id)
+        except (OSError, TypeError, ValueError):
+            old_result = False  # unreadable: cannot tell whether a task exists
+        try:
+            lock = _registry_lock(self.paths)
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            with interprocess_lock(lock):
+                _revision, rows = _read_registry(
+                    _run_tasks_path(self.paths, run_id, create=False), run_id
+                )
+        except (OSError, TypeError, ValueError):
+            rows = None
+        if old_result is False or rows is None:
+            raise ValueError(
+                "provider action request identity drift: the leftover create of {} "
+                "cannot be judged (its result or the task registry is unreadable); "
+                "needs termination evidence of the old task".format(label)
+            )
+        bindings = [
+            item for item in rows
+            if item.issue_id == issue_id and item.role == role and item.generation == generation
+        ]
+        if bindings:
+            live = [item for item in bindings if item.status not in _TERMINAL_STATUSES]
+            if live:
+                raise ValueError(
+                    "provider action request identity drift: the old task of {} is still "
+                    "{}; needs termination evidence (status stopped/failed/archived "
+                    "in tasks.json) before the create can be replaced".format(
+                        label, live[0].status)
+                )
+            reason = "old_task_terminated"
+        elif old_result is None:
+            reason = "old_request_never_produced_a_task"
+        else:
+            raise ValueError(
+                "provider action request identity drift: the old create of {} has a "
+                "result but no task binding yet, so the old task may be alive; needs "
+                "termination evidence of the old task".format(label)
+            )
+        append_event(self.paths, RunEvent("create_request_superseded", {
+            "run_id": run_id,
+            "node_id": issue_id,
+            "role": role,
+            "generation": generation,
+            "reason_code": reason,
+            "superseded_creates": [action_id],
+        }))
+        archive = self._directory("superseded")
+        with interprocess_lock(self._directory("locks") / (action_id + ".lock")):
+            self._atomic(archive / "{}-{}.json".format(action_id, existing["request_digest"][:16]), {
+                "schema_version": self.schema_version,
+                "reason": reason,
+                "request": existing,
+                "result": old_result,
+            })
+            result_path = self._directory("results") / (action_id + ".json")
+            if result_path.exists() and not result_path.is_symlink():
+                result_path.unlink()
+        return True
 
     def _prompt_only_upgrade(self, existing: Dict[str, Any], payload: Dict[str, Any]) -> bool:
         """A newer vibe rewrote only the prompt template of an answered create.
@@ -1923,6 +2062,34 @@ class ProviderActionStore:
                 and not report.get('consumed_by')
             ):
                 found.append(report.get('issue_id'))
+        return found
+
+    def unconsumed_delivery_records(self, run_id):
+        """Read-only ``[{issue_id, role, generation, wake_failed}]`` of archived
+        self-reports nothing has taken yet.
+
+        ``wake_failed`` is the worker's fixed marker that it could not send the
+        wake signal; it only tells the daemon to expect the report, since the
+        daemon receives every unconsumed report on its next cycle anyway.
+        """
+        deliveries = self.root / 'deliveries'
+        if not deliveries.is_dir():
+            return []
+        found = []
+        for path in sorted(deliveries.glob('*.json')):
+            report = self._read(path)
+            if (
+                isinstance(report, dict)
+                and report.get('run_id') == run_id
+                and not report.get('consumed_by')
+            ):
+                payload = report.get('payload')
+                found.append({
+                    'issue_id': report.get('issue_id'),
+                    'role': report.get('role'),
+                    'generation': report.get('generation'),
+                    'wake_failed': isinstance(payload, dict) and payload.get(WAKE_FAILED_KEY) is True,
+                })
         return found
 
     def has_request(

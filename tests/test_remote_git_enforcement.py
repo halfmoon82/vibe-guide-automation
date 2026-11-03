@@ -14,6 +14,7 @@ from vibe_guide.adapters.task_provider import BackgroundTaskRouting
 from vibe_guide.authorization import (
     REMOTE_GIT_BAN_TEXT,
     REMOTE_GIT_ENFORCEMENT,
+    WORKER_PUSH_BAN_TEXT,
     remote_git_denied,
 )
 from vibe_guide.paths import ProjectPaths
@@ -66,14 +67,18 @@ class LaunchTests(unittest.TestCase):
         self.assertIn(REMOTE_GIT_BAN_TEXT, argv[-1])
         self.assertLess(argv.index("--disallowedTools"), argv.index("--"))
 
-    def test_allow_adds_nothing(self):
+    def test_allow_bans_only_the_push(self):
         argv, env = self._bg_call(False)
         # Background workers never get AskUserQuestion (#328) whatever the
-        # remote-git setting; allow adds no remote git tool and no env.
+        # remote-git setting; allow still bans the worker push (#379) but
+        # keeps fetch/pull and adds no env.
         self.assertEqual(argv.count("--disallowedTools"), 1)
         self.assertEqual(argv[argv.index("--disallowedTools") + 1], "AskUserQuestion")
+        self.assertIn("Bash(git push:*)", argv)
+        self.assertNotIn("Bash(git fetch:*)", argv)
         self.assertIsNone(env)
         self.assertNotIn(REMOTE_GIT_BAN_TEXT, argv[-1])
+        self.assertIn(WORKER_PUSH_BAN_TEXT, argv[-1])
 
 
 class PromptTests(unittest.TestCase):
@@ -92,7 +97,9 @@ class PromptTests(unittest.TestCase):
                 REMOTE_GIT_BAN_TEXT,
                 runner._remote_git_ban({"remote_git_actions": "deny"}),
             )
-            self.assertEqual(runner._remote_git_ban({"remote_git_actions": "allow"}), "")
+            allow = runner._remote_git_ban({"remote_git_actions": "allow"})
+            self.assertNotIn(REMOTE_GIT_BAN_TEXT, allow)
+            self.assertIn(WORKER_PUSH_BAN_TEXT, allow)
 
     def test_card_on_disk_decides_when_contract_is_silent(self):
         plan = Path(self.tmp.name) / ".vibe/plans/p1"

@@ -23,6 +23,10 @@ from vibe_guide.supervisor import render_beat_text, supervisor_preflight
 # Imported as a module: a test class bound at module level would run again here.
 from tests import test_claude_bg_delivery_gate as _gate
 from tests.test_claude_bg_reconnect import UUID
+from tests import support_vibe_home as hermetic
+
+
+setUpModule, tearDownModule = hermetic.module_hooks()
 
 QUESTION = (
     "我已读完合同。上游节点的代码不在当前基线里，需要监工决定：从 main 开工，"

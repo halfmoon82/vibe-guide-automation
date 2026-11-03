@@ -27,7 +27,8 @@ from ..models import (
     WorkerProfile,
 )
 from ..model_router import provider_thinking_for
-from ..authorization import REMOTE_GIT_BAN_TEXT, remote_git_denied
+from ..authorization import worker_push_ban_text
+from ..evidence import TEMPLATE_PLACEHOLDER, holds_placeholder
 from ..paths import ProjectPaths
 from ..protocols import load_protocol, protocol_path, published_protocol_digest
 from ..task_registry import (
@@ -40,7 +41,7 @@ from ..task_registry import (
     save_task_binding,
 )
 from ..workflow_gate import session_contract_prompt
-from ..prompts import rework_findings_section
+from ..prompts import auto_scope_rule_sentence, rework_findings_section
 from ..worker_questions import supervisor_answer_section
 from ..state import read_writer_lease
 from ..providers import (
@@ -229,25 +230,13 @@ _FAILURE_REASON_CLASSES = frozenset(("engineering", "retryable", "capacity_wait"
 #: The value ``--template`` prints where the supervisor must substitute a real
 #: identity.  A result that still carries it is refused: storing it would bind
 #: a task that does not exist, and a stored result cannot be rewritten.
-TEMPLATE_PLACEHOLDER = "<填写>"
 #: Only the keys the create reader actually binds on; the shape check used to
 #: accept ``thread_id`` / ``clientThreadId``, which the reader then refused.
 _BINDING_IDENTITY_FIELDS = ("threadId", "task_id")
 _RESUME_RESULT_FIELDS = frozenset((RESUME_RECEIPT_FIELD, "status"))
 
 
-def _holds_placeholder(value):
-    """True when a string is blank or still carries the template placeholder.
-
-    The one placeholder judgement every mailbox check uses.  NFKC folds the
-    full-width ``＜填写＞`` to ``<填写>``; a substring match also catches padded
-    and half-filled values such as ``" <填写> "`` or ``<填写>-1``; surrounding
-    or whitespace-only text is blank, not a value.
-    """
-    if not isinstance(value, str):
-        return False
-    folded = unicodedata.normalize("NFKC", value)
-    return not folded.strip() or TEMPLATE_PLACEHOLDER in folded
+_holds_placeholder = holds_placeholder
 
 
 def _placeholder_paths(value, path=""):
@@ -389,6 +378,23 @@ def _identity_fields(operation, payload):
     return found
 
 
+def _delivery_evidence_placeholders(operation, role, payload):
+    """Paths of the three delivery keys that still hold the template marker.
+
+    Only a developer's delivered/complete wait result carries them; the same
+    predicate the delivery gate applies (``evidence.holds_placeholder``).
+    """
+    evidence = payload.get("delivery_evidence")
+    if not (operation == "wait" and role == "developer" and isinstance(evidence, dict)
+            and payload.get("event") in ("delivered", "complete")):
+        return []
+    return [
+        "delivery_evidence." + key
+        for key in ("completion_marker", "delivery_path", "thread_status")
+        if isinstance(evidence.get(key), str) and evidence[key].strip() and holds_placeholder(evidence[key])
+    ]
+
+
 def _shape_errors(required, allowed, payload):
     errors = []
     missing = sorted(key for key in required if key not in payload)
@@ -520,7 +526,7 @@ def validate_result_shape(operation, payload, *, role=None):
                     "field {} is blank or still holds the template placeholder; "
                     "substitute the real cursor or omit the field".format(path)
                 )
-    for path in _placeholder_paths(_identity_fields(operation, payload)):
+    for path in _placeholder_paths(_identity_fields(operation, payload)) + _delivery_evidence_placeholders(operation, role, payload):
         errors.append(
             "field {} still holds the template placeholder; substitute the real value".format(path)
         )
@@ -609,8 +615,8 @@ class ProviderActionRunner(Runner):
         launcher._prepare_worktree()
 
     def _remote_git_ban(self, contract: Dict[str, Any]) -> str:
-        """The fixed ban line, only when the card says ``deny`` (else empty)."""
-        return "\n" + REMOTE_GIT_BAN_TEXT + "\n" if remote_git_denied(self.paths, contract) else ""
+        """The fixed ban line: remote-Git ban under ``deny``, push ban otherwise (#379)."""
+        return "\n" + worker_push_ban_text(self.paths, contract) + "\n"
 
     def _consistency_instruction(self, contract: Dict[str, Any]) -> str:
         try:
@@ -664,15 +670,17 @@ class ProviderActionRunner(Runner):
             "随后执行 `vibe supervisor-address{root_flag} --run-id {run} --node {node} --role {role} --generation {generation} --json`；"
             "`wake.channel` 非空时用该工具向 `wake.target` 原样发送 `wake.signal`，唤醒登记主监工；为 null 或地址 unknown 时不发，由心跳领取。"
             "任何结束回合之前（交付、交付被拒、向监工提问、被阻塞）都要执行这条 supervisor-address 并按返回发信号；"
-            "worker-deliver 拒收时返回值已带 `wake` 指令，同样照发。"
+            "worker-deliver 拒收时返回值已带 `wake` 指令，同样照发。发信号失败（工具报错或收不到回应）时不要重试等待：用同一份交付 JSON 在顶层加 `\"wake_failed\": true` 再执行一次 worker-deliver，守护程序下一周期会据此接收。"
             "自报时把你本会话的工作目录原样写进交付 JSON 的 `delivery_evidence.session_cwd`：监工用它核对本会话是否真的挂载了 project，不填就无法核对。"
             "运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。\n"
+            "{auto_scope}"
             "决策边界：不改变 PRD 决策的工程问题（实现方案、测试取舍、基线）自行判断并决定，"
             "把理由写进交付，不用 AskUserQuestion，不停下等人；"
-            "需要改允许路径外的文件时，不要改路径外文件，也不要停下等人：先完成路径内的部分并正常交付，"
+            "需要改允许路径外、且不在自动放行范围内的文件时，不要改这些文件，也不要停下等人：先完成其余部分并正常交付，"
             "在交付说明里写清要改哪些文件、为什么，范围由监工和审查员裁决。"
             "只有会改变 PRD 决策、涉及部署发布、凭据或授权卡外不可撤销动作、新增第三方依赖、"
-            "可见降级为后台不可见时，才在交付里附 decision_requests。\n"
+            "可见降级为后台不可见时，才在交付里附 decision_requests；"
+            "唯一例外：跨平台交接把可见改成后台只披露、不算请求。\n"
             "{rework_findings}{supervisor_answer}"
         ).format(root_flag=root_flag, node=node_id, generation=generation, purpose=purpose, objective=objective,
                  role=contract.get('role', 'developer'),
@@ -687,6 +695,7 @@ class ProviderActionRunner(Runner):
                  handoff=contract.get("handoff_file") or contract.get("delivery_path", "原交付文件"),
                  marker=contract.get("completion_marker", "原交付 marker"),
                  acceptance_pin=acceptance_pin,
+                 auto_scope="" if reviewer else auto_scope_rule_sentence(project_root) + "\n",
                  rework_findings=rework_findings_section(contract),
                  supervisor_answer=supervisor_answer_section(contract))
 
@@ -1117,13 +1126,16 @@ class ProviderActionRunner(Runner):
                 )
             else:
                 event_pin = ""
-            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须带 --project-root 指向主项目目录，不要依赖当前目录，也不要在 worktree 里执行）：0) 先把**你本会话的工作目录**（会话环境给出的 cwd；project 挂载的会话在项目树或 worktree 内，projectless 会话在宿主生成的临时目录）原样写进交付 JSON 的 `delivery_evidence.session_cwd`——监工用它核对本会话是否真的挂载了 project，不填就无法核对；1) 先执行 `vibe worker-deliver --project-root {} --run-id {} --node {} --role {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；{}格式错误会当场返回）；2) `vibe supervisor-address --project-root {} --run-id {} --node {} --role {} --generation {} --json` 查询监工地址与唤醒方式；3) 返回的 `wake.channel` 非空时，用该工具向 `wake.target` 原样发送 `wake.signal` 一行（Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`）；`wake.channel` 为 null 或地址为 unknown 时不发，到此为止，监工心跳兜底拉取（没有登记推送通道的平台，如 WorkBuddy）。唤醒信号内容不影响验收。任何结束回合之前（交付、交付被拒、向监工提问、被阻塞）都要执行第 2)、3) 步并按返回发信号；worker-deliver 拒收时返回值已带 `wake` 指令，同样照发。运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。".format(
+            head = "请执行 {} 任务，Issue {}。完工步骤（固定顺序，两条命令都必须带 --project-root 指向主项目目录，不要依赖当前目录，也不要在 worktree 里执行）：0) 先把**你本会话的工作目录**（会话环境给出的 cwd；project 挂载的会话在项目树或 worktree 内，projectless 会话在宿主生成的临时目录）原样写进交付 JSON 的 `delivery_evidence.session_cwd`——监工用它核对本会话是否真的挂载了 project，不填就无法核对；1) 先执行 `vibe worker-deliver --project-root {} --run-id {} --node {} --role {} --generation {} --payload '<交付 JSON>'` 自报落盘（交付 JSON 形状同交付事件：嵌套的 delivery_evidence 对象含 completion_marker、delivery_path、thread_status，visible-sdd 另带 in_session_review；{}格式错误会当场返回）；2) `vibe supervisor-address --project-root {} --run-id {} --node {} --role {} --generation {} --json` 查询监工地址与唤醒方式；3) 返回的 `wake.channel` 非空时，用该工具向 `wake.target` 原样发送 `wake.signal` 一行（Codex 为 `send_message_to_thread`，Claude Code 为 `SendMessage`）；`wake.channel` 为 null 或地址为 unknown 时不发，到此为止，监工心跳兜底拉取（没有登记推送通道的平台，如 WorkBuddy）。唤醒信号内容不影响验收。任何结束回合之前（交付、交付被拒、向监工提问、被阻塞）都要执行第 2)、3) 步并按返回发信号；worker-deliver 拒收时返回值已带 `wake` 指令，同样照发。发信号失败（工具报错或收不到回应）时不要重试等待：用同一份交付 JSON 在顶层加 `\"wake_failed\": true` 再执行一次 worker-deliver，守护程序下一周期会据此接收。运行消费由登记主监工负责，worker 不得调用 core resume、reconcile 或消费 mailbox。".format(
                 role, node_id, root, run_id, node_id, role, generation,
                 event_pin,
                 root, run_id, node_id, role, generation,
             )
         else:
             head = "请执行 {} 任务，Issue {}。".format(role, node_id)
+        if role == "developer":
+            # #381: say up front which out-of-scope files the gate accepts.
+            head += "\n" + auto_scope_rule_sentence(self.paths.root)
         # Consumers split the prompt on the consistency marker and parse what
         # follows as one JSON document, so the consistency block always goes
         # last -- after any inlined protocol text.

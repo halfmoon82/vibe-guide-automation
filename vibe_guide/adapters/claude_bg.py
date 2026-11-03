@@ -22,6 +22,8 @@ from ..authorization import (
     REMOTE_GIT_BAN_TEXT,
     REMOTE_GIT_DISALLOWED_TOOLS,
     REMOTE_GIT_LAUNCH_ENV,
+    WORKER_PUSH_BAN_TEXT,
+    WORKER_PUSH_DISALLOWED_TOOLS,
 )
 from ..paths import ProjectPaths
 from .task_provider import BackgroundTaskRouting, ProviderUnavailable, VisibilityResult
@@ -311,8 +313,9 @@ class ClaudeBgLauncher:
         base_sha: Optional[str] = None,
     ):
         #: True only when the authorization card says ``remote_git_actions:
-        #: deny``: ``launch`` then appends the ban to the prompt and adds
-        #: ``--disallowedTools`` plus ``GIT_ALLOW_PROTOCOL``.  False adds nothing.
+        #: deny``: ``launch`` then appends the remote-Git ban to the prompt and
+        #: adds ``--disallowedTools`` plus ``GIT_ALLOW_PROTOCOL``.  False still
+        #: bans the push (#379): the push ban text and push/gh tools, no env.
         self.remote_git_deny = bool(remote_git_deny)
         self.routing = routing
         self.sleeper = sleeper
@@ -704,13 +707,17 @@ class ClaudeBgLauncher:
         name = "%s-%s" % (issue_id, role)
         started_ms = int(time.time() * 1000)
         # One --disallowedTools argument: background workers never get
-        # AskUserQuestion (#328); under remote-git deny the remote git tools
-        # are added to the same list rather than passing the option twice.
+        # AskUserQuestion (#328); the remote git tools are added to the same
+        # list rather than passing the option twice.  Workers never push
+        # (#379): allow still bans push/gh, deny bans every remote git tool.
         denied_tools = [_NO_USER_QUESTIONS[1]]
-        if self.remote_git_deny:
-            if REMOTE_GIT_BAN_TEXT not in prompt:
-                prompt = prompt + "\n" + REMOTE_GIT_BAN_TEXT
-            denied_tools += list(REMOTE_GIT_DISALLOWED_TOOLS)
+        ban_text, ban_tools = (
+            (REMOTE_GIT_BAN_TEXT, REMOTE_GIT_DISALLOWED_TOOLS) if self.remote_git_deny
+            else (WORKER_PUSH_BAN_TEXT, WORKER_PUSH_DISALLOWED_TOOLS)
+        )
+        if ban_text not in prompt:
+            prompt = prompt + "\n" + ban_text
+        denied_tools += list(ban_tools)
         deny_flags: List[str] = [_NO_USER_QUESTIONS[0]] + denied_tools
         try:
             started = self._run(
@@ -835,6 +842,47 @@ class ClaudeBgLauncher:
         if state not in _STATES:
             raise ClaudeBgUnknown("unknown session state: %r" % (state,))
         return state
+
+    _HTTP_400 = re.compile(
+        r"(api error:?\s*400\b|\bhttp\s*400\b|\"status\":\s*400\b|"
+        r"model[^\n]{0,80}(not supported|unsupported|does not exist|not found))",
+        re.IGNORECASE,
+    )
+
+    def failure_class(self, task_id: str) -> Optional[str]:
+        """``provider_http_400`` when the transcript ends in a gateway 400.
+
+        Only the tail of the transcript is read and only a fixed code is
+        returned, so provider wording never leaves this method.
+        """
+        self._short(task_id)
+        path = self.transcript_locator(task_id)
+        if path is None:
+            return None
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()[-20:]
+        except (OSError, UnicodeDecodeError):
+            return None
+        for line in reversed(lines):
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            flagged = item.get("isApiErrorMessage") is True or bool(item.get("error"))
+            if not flagged:
+                continue
+            if self._HTTP_400.search(json.dumps(item, ensure_ascii=False)):
+                return "provider_http_400"
+            return None
+        return None
+
+    def can_resume(self, task_id: str) -> bool:
+        """The same session can be continued only while its transcript exists."""
+        self._short(task_id)
+        path = self.transcript_locator(task_id)
+        return path is not None and Path(path).is_file()
 
     def final_reply(self, task_id: str) -> Optional[str]:
         self._short(task_id)

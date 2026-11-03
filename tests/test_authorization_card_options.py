@@ -422,7 +422,11 @@ class PublishedCardTests(unittest.TestCase):
         self.assertEqual(card.heartbeat_interval_minutes, 60)
         self.assertEqual(card.rotate_hard_cap, DEFAULT_ROTATE_HARD_CAP_TOKENS)
 
-    def test_claude_code_publishes_background_by_default_and_visible_on_request(self):
+    def test_claude_code_without_a_verified_launcher_publishes_visible_either_way(self):
+        # 5.2.6 card-and-handoff: the card states what will really dispatch.
+        # This fixture has no verified background launcher, so the default
+        # publishes visible too (background-by-default with a verified
+        # launcher is covered in test_claude_bg_wiring.PublishPathTests).
         def spec(**extra):
             path = self._spec(**extra)
             data = json.loads(path.read_text())
@@ -431,7 +435,8 @@ class PublishedCardTests(unittest.TestCase):
             return path
 
         _, _, default = _publish_plan(ProjectPaths(self.root), "bg-plan", spec())
-        self.assertEqual({w["topology"] for w in default.workers}, {"background"})
+        self.assertNotIn("background", {w["topology"] for w in (default.workers or ())})
+        self.assertNotIn("background", {w["mode"] for w in (default.workers or ())})
         _, _, visible = _publish_plan(
             ProjectPaths(self.root), "vis-plan", spec(dispatch_mode="visible"))
         self.assertNotIn("background", {w["topology"] for w in (visible.workers or ())})

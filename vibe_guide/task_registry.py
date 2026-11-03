@@ -495,6 +495,24 @@ def _all_bindings(paths: ProjectPaths) -> List[TaskBinding]:
     return result
 
 
+def _behind_platform_handoff(current: TaskBinding, persistent: TaskBinding,
+                             same_role: List[TaskBinding]) -> bool:
+    """A stopped binding of the same run that a recorded platform handoff
+    superseded may keep its old dispatch topology: the new platform's
+    dispatch mode differs by design (disclosed, never confirmed)."""
+    if current.run_id != persistent.run_id:
+        return False
+    if current.status not in {"stopped", "failed", "archived"}:
+        return False
+    if current.generation >= persistent.generation:
+        return False
+    return any(
+        item.handoff_from_provider is not None
+        and current.generation < item.generation <= persistent.generation
+        for item in [*same_role, persistent]
+    )
+
+
 def save_task_binding(paths: ProjectPaths, binding: TaskBinding, *,
                       expected_binding: Optional[Dict[str, Any]] = None) -> None:
     # Reconstruct from the persistence form so a token assigned after
@@ -530,14 +548,16 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding, *,
             latest = sorted(same_role, key=lambda item: item.generation)[-1]
             # #289: a successor created on a new platform after a recorded
             # platform_handoff names the predecessor's provider as lineage.
-            # Only then may provider, host and capability contract differ;
-            # writer root, branch, topology/mode and allowlist stay fixed.
+            # Only then may provider, host, capability contract and the
+            # dispatch mode/topology differ (the new platform may dispatch
+            # visible work in the background: disclosed, not confirmed);
+            # writer root and branch stay fixed, allowlist only grows.
             handoff = (
                 persistent.handoff_from_provider is not None
                 and persistent.handoff_from_provider == latest.provider
             )
             pinned = (
-                ("mode", "worktree", "branch", "topology")
+                ("worktree", "branch")
                 if handoff else
                 ("provider", "mode", "host", "worktree", "branch", "topology",
                  "allowlist", "capability_contract_digest")
@@ -574,7 +594,9 @@ def save_task_binding(paths: ProjectPaths, binding: TaskBinding, *,
                         "visible-sdd topology registers a single developer binding"
                     )
             if current.role == persistent.role:
-                if current.topology != persistent.topology and (
+                if current.topology != persistent.topology and not (
+                    _behind_platform_handoff(current, persistent, same_role)
+                ) and (
                     current.run_id == persistent.run_id
                     or (current.status not in _TERMINAL_STATUSES
                         and not _run_is_complete(paths, current.run_id))

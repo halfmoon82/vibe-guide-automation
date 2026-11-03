@@ -5,9 +5,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tests.test_daemon_heal import NODE, RUN, Base, FakeSupervisor, stalled
+from tests import support_vibe_home as hermetic
 from vibe_guide import model_catalog
 from vibe_guide.models import DAGNode
 from vibe_guide.state import load_events
+
+
+setUpModule, tearDownModule = hermetic.module_hooks()
 
 
 def node(tags):

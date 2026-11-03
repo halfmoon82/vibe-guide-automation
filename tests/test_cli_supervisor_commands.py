@@ -56,6 +56,10 @@ class MailboxCommandTests(unittest.TestCase):
         # The cursor placeholder is refused by design; answer with a real one.
         if "cursor" in example:
             example["cursor"] = "cursor-1"
+        evidence = example.get("delivery_evidence")
+        if isinstance(evidence, dict):
+            evidence["completion_marker"] = "marker-1"
+            evidence["delivery_path"] = ".vibe/runs/x/delivery.json"
         validate_result_shape("wait", example, role="developer")
 
         done = self.cli("--complete", action_id, "--result", self.result_file(example))

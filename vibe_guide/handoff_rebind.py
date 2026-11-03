@@ -27,6 +27,23 @@ class HandoffRebindError(Exception):
     """The new platform cannot be proven; the caller keeps ``blocked_unknown``."""
 
 
+class HandoffNothingToMove(HandoffRebindError):
+    """The run has no unfinished node: a handoff would only rewrite history."""
+
+
+def require_unfinished_nodes(unfinished: Sequence[str], card_agent: str) -> None:
+    """Refuse a handoff of a run whose every node is already accepted.
+
+    Nothing is left to dispatch, so moving the card would only relabel the
+    platform that actually did the work (socialmedia run-63e7cfc2: 8/8
+    accepted on Codex, then flipped to workbuddy by a later handoff).
+    """
+    if not list(unfinished):
+        raise HandoffNothingToMove(
+            "platform handoff: 本运行已没有未完成节点，无需交接；授权卡平台保持 {}".format(card_agent)
+        )
+
+
 def resolve_handoff_target(
     *,
     explicit: Optional[str],
@@ -143,13 +160,16 @@ def unfinished_node_ids(
 
 
 def rebind_nodes(
-    nodes: Sequence[DAGNode], movable: Iterable[str], target: str
+    nodes: Sequence[DAGNode], movable: Iterable[str], target: str,
+    topologies: Optional[Mapping[str, str]] = None,
 ) -> Tuple[List[DAGNode], List[str]]:
     """Copies of ``nodes`` with only the movable ones' routing moved to ``target``.
 
     Accepted nodes are returned as the very same objects: their dispatch
-    binding is history and is never rewritten.  Returns the new node list and
-    the ids that actually changed platform.
+    binding is history and is never rewritten.  ``topologies`` names the
+    dispatch topology each moved node gets on ``target``; only a contract the
+    authorization stamped carries one, so old contracts are unaffected.
+    Returns the new node list and the ids that actually changed platform.
     """
     movable_ids = set(movable)
     result: List[DAGNode] = []
@@ -158,7 +178,121 @@ def rebind_nodes(
         if node.id not in movable_ids or node_adapter_id(node) == target:
             result.append(node)
             continue
-        contract = rebind_dispatch_contract(node.contract, target)
+        contract = rebind_dispatch_contract(
+            node.contract, target, (topologies or {}).get(node.id)
+        )
         result.append(DAGNode.from_dict(dict(node.to_dict(), contract=contract)))
         moved.append(node.id)
     return result, sorted(moved)
+
+
+# ------------------------------------------------------------ drain (PRD D2)
+
+#: The one supported command that registers a stopped old-platform worker.
+STOP_EVIDENCE_KIND = "handoff_worker_stopped"
+#: How the old worker was established as stopped.  The second value is the
+#: way out when the old platform can no longer be opened at all.
+STOP_EVIDENCE_HOW = ("stopped_on_old_platform", "old_platform_unreachable")
+#: Exactly these keys, nothing else (``Monitor.reconcile_package`` refuses the rest).
+STOP_EVIDENCE_FIELDS = (
+    "kind", "node_id", "role", "task_id", "stopped_on", "how_stopped", "note",
+)
+
+
+class HandoffNotDrained(HandoffRebindError):
+    """A worker may still be writing on the old platform: the handoff is refused."""
+
+    def __init__(self, report: Dict[str, Any]):
+        self.report = report
+        super().__init__(report["message"])
+
+
+class HandoffProjectMismatch(HandoffRebindError):
+    """The calling session is in another project than the run."""
+
+
+def _within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def project_identity_problem(
+    root: Path, recorded_worktrees: Iterable[str], contract_matches: bool
+) -> Optional[str]:
+    """Why the calling project is not the run's project, or ``None``.
+
+    Two independent records name the run's project: the session capability
+    contract (bound to the project root by digest) and the absolute worktree
+    paths the run created.  Either one disagreeing means another project --
+    a copy of the repository, say -- and a handoff there would point a second
+    copy of the run at the same branches.
+    """
+    resolved = Path(root).resolve(strict=False)
+    if not contract_matches:
+        return (
+            "platform handoff: 项目身份不同：本会话的项目根 {} 与会话能力合同登记的项目不一致；"
+            "请在运行所在的项目里执行交接".format(resolved)
+        )
+    foreign = sorted(
+        item for item in recorded_worktrees
+        if isinstance(item, str) and Path(item).is_absolute()
+        and not _within(Path(item).resolve(strict=False), resolved)
+    )
+    if foreign:
+        return (
+            "platform handoff: 项目身份不同：本会话的项目根是 {}，运行登记的工作树在 {}；"
+            "请在运行所在的项目里执行交接".format(resolved, foreign[0])
+        )
+    return None
+
+
+def stop_evidence_template(blocker: Mapping[str, Any], from_platform: str) -> Dict[str, Any]:
+    """The evidence package to fill in for one live worker (every field named)."""
+    return {
+        "kind": STOP_EVIDENCE_KIND,
+        "node_id": blocker["node_id"],
+        "role": blocker["role"],
+        "task_id": blocker["task_id"],
+        "stopped_on": from_platform or "<旧平台>",
+        "how_stopped": "|".join(STOP_EVIDENCE_HOW),
+        "note": "<怎么确认它已停：在旧平台停掉的会话名/时间，或旧平台打不开的原因>",
+    }
+
+
+def drain_report(
+    blockers: Sequence[Mapping[str, Any]], *, plan_id: str, run_id: str,
+    project_root: Path, from_platform: str, to_platform: str,
+) -> Dict[str, Any]:
+    """The refusal a handoff returns while old-platform workers may be live."""
+    root = str(Path(project_root).resolve(strict=False))
+    evidence_file = ".vibe/handoff-stop-<节点>-<角色>.json"
+    command = (
+        "vibe reconcile --project-root {root} --plan {plan} --run-id {run} --evidence {file}"
+    ).format(root=root, plan=plan_id, run=run_id, file=evidence_file)
+    nodes = sorted({str(item["node_id"]) for item in blockers})
+    return {
+        "message": (
+            "platform handoff: 旧平台 {} 上还有 worker 可能在写（{}），交接已拒绝，运行状态未改动。"
+            "排空后重跑交接：①等它交付；②在旧平台停掉它（旧平台打不开时写明原因），"
+            "再用 `{}` 登记终止证据".format(from_platform or "未知", ", ".join(nodes), command)
+        ),
+        "from_platform": from_platform,
+        "to_platform": to_platform,
+        "live_workers": [dict(item) for item in blockers],
+        "nodes": nodes,
+        "drain_options": [
+            {"option": "wait_for_delivery",
+             "text": "等该 worker 交付：旧平台监工接收交付后重跑交接"},
+            {"option": "register_stop_evidence",
+             "text": "在旧平台停掉该 worker（旧平台打不开时 how_stopped 写 old_platform_unreachable），"
+                     "把下面的证据写进项目内文件后执行 stop_evidence_command，再重跑交接"},
+        ],
+        "stop_evidence_command": command,
+        "stop_evidence_fields": list(STOP_EVIDENCE_FIELDS),
+        "stop_evidence_templates": [
+            stop_evidence_template(item, from_platform) for item in blockers
+        ],
+    }

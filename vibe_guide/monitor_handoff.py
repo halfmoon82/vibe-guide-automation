@@ -7,7 +7,9 @@ from . import digests, fsio
 from .adapters.task_provider import ProviderActionStore
 from .contracts import Runner
 from .models import DAGNode
-from .state import RunSnapshot, run_dir, save_snapshot
+from .lifecycle import TERMINAL_TASK_STATUSES
+from .state import RunSnapshot, load_events, run_dir, save_snapshot
+from .task_registry import load_task_binding
 
 
 def _identity_from_contract(node: DAGNode, role: str) -> Optional[str]:
@@ -129,6 +131,243 @@ def _prove_old_task_stopped_or_absent(
     return None
 
 
+#: Binding states whose task has handed its work back: same table the
+#: successor proof archives (``Monitor._HANDOFF_ARCHIVABLE_STATUSES``).
+_DRAINED_STATUSES = {
+    "developer": frozenset({"delivered", "accepted"}),
+    "reviewer": frozenset({"review", "delivered", "accepted"}),
+}
+HANDOFF_WORKER_STOPPED_EVENT = "handoff_worker_stopped"
+
+
+def _registered_stops(events) -> set:
+    stops = set()
+    for event in events:
+        if event.get("event") != HANDOFF_WORKER_STOPPED_EVENT:
+            continue
+        data = event.get("data") or {}
+        stops.add((data.get("node_id"), data.get("role"), data.get("predecessor_task_id")))
+    return stops
+
+
+def _holds_live_task(snapshot: RunSnapshot, node_id: str, current, role: str, task_id: str) -> bool:
+    """Whether the run still holds ``task_id`` as the node's live task."""
+    active = current.get("active_task")
+    if isinstance(active, dict) and (
+        active.get("task_id") == task_id
+        or (active.get("role") == role and not active.get("task_id"))
+    ):
+        return True
+    return node_id in snapshot.handles and current.get("active_role") == role
+
+
+def _pre_move_identities(snapshot: RunSnapshot, events, to_platform) -> Optional[Dict[str, Any]]:
+    """Per node, the task identities bound *before* the run moved to ``to_platform``.
+
+    ``None`` unless the run already recorded a platform_handoff
+    reauthorization and is now authorized on ``to_platform``: a retry of a
+    handoff that was interrupted after the run moved, or a re-run of one that
+    finished.  Then the new platform's own tasks -- created after the move --
+    are not old-platform workers.  The tasks bound before the move are exactly
+    the node's ``handoff_superseded`` identities (written by that
+    reauthorization), so only those keep blocking.
+    """
+    if not to_platform:
+        return None
+    authorization = snapshot.authorization if isinstance(snapshot.authorization, dict) else {}
+    if authorization.get("agent_id") != to_platform:
+        return None
+    if not any(
+        event.get("event") == "authorization_reauthorized"
+        and (event.get("data") or {}).get("change_reason") == "platform_handoff"
+        for event in events
+    ):
+        return None
+    return {
+        node_id: dict(current.get("handoff_superseded") or {})
+        for node_id, current in snapshot.nodes.items()
+        if isinstance(current, dict)
+    }
+
+
+def handoff_drain_blockers(paths, snapshot: RunSnapshot, unfinished, to_platform=None) -> list:
+    """Old-platform workers a handoff must not run past (PRD 5.2.6 D2).
+
+    Read-only.  A worker is drained when its task binding has handed the work
+    back (delivered/accepted/review) and the run no longer holds it as the
+    node's live task, or ended (archived/failed/stopped/
+    blocked_design), or when a stop was registered for exactly that task.  A
+    create nobody claimed is not a worker: the handoff hides it.  Everything
+    else -- a running binding, an unreadable registry, an identity with no
+    binding, a claimed create -- cannot be shown to have stopped and blocks.
+
+    When the run already moved to ``to_platform`` (an interrupted handoff
+    being retried), a task the new platform created after the move is not an
+    old-platform worker and never blocks; tasks bound before the move still
+    must be drained (``_pre_move_identities``).
+    """
+    store = ProviderActionStore(paths)
+    events = load_events(paths, snapshot.run_id)[: snapshot.event_sequence]
+    stops = _registered_stops(events)
+    pre_move = _pre_move_identities(snapshot, events, to_platform)
+    confirmed = {
+        (event.get("data") or {}).get("node_id")
+        for event in events if event.get("event") == "start_confirmed"
+    }
+    blockers = []
+    for node_id in sorted(unfinished):
+        current = snapshot.nodes.get(node_id) or {}
+        intent = current.get("start_intent") if isinstance(current.get("start_intent"), dict) else None
+        seen = False
+        for role in ("developer", "reviewer"):
+            identity = current.get(role + "_identity")
+            role_intent = intent if intent and intent.get("role") == role else None
+            if not identity and role_intent is None:
+                continue
+            seen = True
+            task_id = str(identity or role_intent.get("task_id") or "")
+            entry = {"node_id": node_id, "role": role, "task_id": task_id}
+            if (node_id, role, task_id) in stops:
+                continue
+            if pre_move is not None and (pre_move.get(node_id) or {}).get(role) != task_id:
+                continue  # created on the new platform after the run moved
+            try:
+                binding = load_task_binding(paths, node_id, role, run_id=snapshot.run_id)
+            except FileNotFoundError:
+                binding = None
+            except (OSError, TypeError, ValueError):
+                blockers.append(dict(entry, status="unknown", provider="",
+                                     reason="任务登记读不出，无法判定是否已停"))
+                continue
+            if binding is not None and binding.task_id == task_id:
+                if binding.status in TERMINAL_TASK_STATUSES:
+                    continue
+                # A handed-back status alone is not proof: a running reviewer's
+                # binding already reads "review" (``Monitor._running_status``),
+                # the same value its consumed delivery leaves.  Only when the
+                # run no longer holds this task as its live one is it drained.
+                if binding.status in _DRAINED_STATUSES[role] and not _holds_live_task(
+                        snapshot, node_id, current, role, task_id):
+                    continue
+                blockers.append(dict(entry, status=binding.status, provider=binding.provider or "",
+                                     reason="任务登记仍是 {}".format(binding.status)))
+                continue
+            if binding is None and role_intent is not None and node_id not in confirmed:
+                try:
+                    claim = store.claim_evidence(snapshot.run_id, node_id)
+                except (OSError, TypeError, ValueError):
+                    claim = "unreadable"
+                if claim is None:
+                    continue  # unclaimed create: hidden by the handoff
+                blockers.append(dict(entry, status="start_pending", provider="",
+                                     reason="信箱里的创建请求已被领取（{}），会话可能已在写".format(claim)))
+                continue
+            blockers.append(dict(entry, status="unknown", provider=getattr(binding, "provider", "") or "",
+                                 reason="运行记着该任务，但任务登记里没有对应的绑定，无法判定是否已停"))
+        if seen:
+            continue
+        if current.get("active_task") or node_id in snapshot.handles:
+            blockers.append({"node_id": node_id, "role": str(current.get("active_role") or "developer"),
+                             "task_id": str((current.get("active_task") or {}).get("task_id") or ""),
+                             "status": "unknown", "provider": "",
+                             "reason": "运行仍挂着活动句柄，无法判定是否已停"})
+            continue
+        # No identity recorded yet, but the mailbox shows a claimed request
+        # (a create answered, a lock, a session record): a session may exist.
+        try:
+            claim = store.claim_evidence(snapshot.run_id, node_id)
+        except (OSError, TypeError, ValueError):
+            claim = "unreadable"
+        if claim is not None or node_id in confirmed:
+            blockers.append({"node_id": node_id, "role": "developer", "task_id": "",
+                             "status": "in_flight", "provider": "",
+                             "reason": "信箱里有该节点已被领取的请求（{}），会话可能已在写".format(
+                                 claim or "start_confirmed")})
+    return blockers
+
+
+def record_handoff_worker_stopped(monitor, run_id: str, package: Dict[str, Any]) -> RunSnapshot:
+    """Register that one old-platform worker has stopped, for a handoff.
+
+    The stop is the operator's declaration (the old platform may no longer
+    open at all), recorded with how it was established.  The task binding,
+    when there is one, turns ``stopped`` so the later successor proof sees a
+    terminal predecessor; the event is the evidence a re-run of the handoff
+    reads.  Nothing is dispatched and no other node is touched.
+    """
+    from .handoff_rebind import STOP_EVIDENCE_FIELDS, STOP_EVIDENCE_HOW, STOP_EVIDENCE_KIND
+
+    if not isinstance(package, dict) or set(package) != set(STOP_EVIDENCE_FIELDS):
+        raise ValueError(
+            "handoff_worker_stopped package must have exactly: " + ", ".join(STOP_EVIDENCE_FIELDS)
+        )
+    if package["kind"] != STOP_EVIDENCE_KIND:
+        raise ValueError("handoff_worker_stopped package kind is invalid")
+    node_id, role, task_id = package["node_id"], package["role"], package["task_id"]
+    if node_id not in monitor.nodes:
+        raise ValueError("handoff_worker_stopped names a node outside the run")
+    if role not in ("developer", "reviewer"):
+        raise ValueError("handoff_worker_stopped role must be developer or reviewer")
+    if package["how_stopped"] not in STOP_EVIDENCE_HOW:
+        raise ValueError("handoff_worker_stopped how_stopped must be one of: " + ", ".join(STOP_EVIDENCE_HOW))
+    for key in ("task_id", "stopped_on", "note"):
+        value = package[key]
+        if not isinstance(value, str) or not value.strip() or value.startswith("<"):
+            raise ValueError("handoff_worker_stopped {} must be filled in".format(key))
+    monitor._reset_binding_cache()
+    snapshot = monitor_load_snapshot(monitor, run_id)
+    current = snapshot.nodes[node_id]
+    if current.get("status") == "accepted":
+        raise ValueError("handoff_worker_stopped: node is already accepted")
+    intent = current.get("start_intent") if isinstance(current.get("start_intent"), dict) else {}
+    known = {current.get(role + "_identity")}
+    if intent.get("role") == role:
+        known.add(intent.get("task_id"))
+    if task_id not in known:
+        raise ValueError("handoff_worker_stopped task_id is not this node's current {} task".format(role))
+    previous_status = ""
+    try:
+        binding = monitor._load_task_binding(snapshot, node_id, role)
+    except FileNotFoundError:
+        binding = None
+    if binding is not None and binding.task_id == task_id:
+        previous_status = binding.status
+        if binding.status not in TERMINAL_TASK_STATUSES:
+            monitor._set_binding_status(snapshot, node_id, role, "stopped")
+    active = current.get("active_task")
+    if isinstance(active, dict) and active.get("role") == role and active.get("task_id") == task_id:
+        # The same release ``_stop_active_for_transition`` makes after a
+        # provider-confirmed stop; here the stop happened on the old platform,
+        # whose handle the new platform's runner cannot stop again.
+        snapshot.handles.pop(node_id, None)
+        current["active_role"] = None
+        current["active_task"] = None
+        current["old_task_reconciled"] = True
+    monitor._record(
+        snapshot,
+        HANDOFF_WORKER_STOPPED_EVENT,
+        {
+            "run_id": snapshot.run_id,
+            "node_id": node_id,
+            "role": role,
+            "predecessor_task_id": task_id,
+            "previous_binding_status": previous_status,
+            "source": package["stopped_on"],
+            "reason": package["how_stopped"],
+            "proof": {"how_stopped": package["how_stopped"], "stopped_on": package["stopped_on"],
+                      "note": package["note"]},
+        },
+    )
+    monitor._save_snapshot(snapshot)
+    return snapshot
+
+
+def monitor_load_snapshot(monitor, run_id):
+    from .state import load_snapshot
+
+    return load_snapshot(monitor.paths, run_id)
+
+
 def _hide_stale_handoff_creates(monitor, snapshot: RunSnapshot, runner: Runner) -> None:
     """Hide the old platform's unclaimed creates of every unfinished node.
 
@@ -187,6 +426,8 @@ def reconcile_package(monitor, run_id, package, *, runner_factory, invalidation_
     ``authorization_digest`` the digest of the card currently published.
     """
     kind = package.get("kind") if isinstance(package, dict) else None
+    if kind == HANDOFF_WORKER_STOPPED_EVENT:
+        return record_handoff_worker_stopped(monitor, run_id, package)
     if kind == "scope_correction":
         return monitor.reconcile_scope(run_id, package)
     if kind == "created_successor":
