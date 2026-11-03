@@ -3,7 +3,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="vibe-guide",
-    version="5.2.5",
+    version="5.2.6",
     packages=find_packages(),
     package_data={
         "vibe_guide": ["platform_ledger.json"],
