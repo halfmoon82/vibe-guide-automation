@@ -2492,6 +2492,8 @@ def render_v41_closeout_status(snapshot: RunSnapshot) -> str:
             delivery_status = str(delivery.get("status", "")).casefold()
             if delivery_status in {"rework"}:
                 return "远端整合交付返工：未闭合/不可验收"
+            if delivery.get("waiting_on"):
+                return "远端整合交付等待 GitHub 评审：在等 {}".format(delivery["waiting_on"])
             if delivery_status in {"blocked_unknown", "blocked_design", "blocked_deploy"}:
                 return "远端整合交付受阻：未闭合/不可验收"
             return "远端整合交付进行中：尚未验收"

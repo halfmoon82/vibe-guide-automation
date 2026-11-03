@@ -267,6 +267,86 @@ class RemoteDeliveryDriveTests(unittest.TestCase):
         self.assertNotIn("merge", snapshot.remote_delivery_evidence["steps"])
 
 
+class ReviewGateWaiverTests(unittest.TestCase):
+    def _review(self, protection, reviewers=None, approved=False, changes=False):
+        facts = {"approved": approved, "changes_requested": changes, "pr_state": "OPEN",
+                 "review_protection": protection}
+        if reviewers is not None:
+            facts["requested_reviewers"] = reviewers
+        return facts
+
+    def test_no_protection_merges_on_integration_evidence(self):
+        snapshot = _snapshot()
+        drive_remote_delivery(snapshot, FakeExecutor(review=self._review("none")))
+        self.assertEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "accepted")
+        self.assertEqual(snapshot.remote_delivery_evidence["review_basis"], "integration_review_evidence")
+
+    def test_changes_requested_still_rework(self):
+        snapshot = _snapshot()
+        executor = FakeExecutor(review=self._review("none", changes=True))
+        drive_remote_delivery(snapshot, executor)
+        self.assertEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "rework")
+        self.assertNotIn("merge", executor.calls)
+
+    def test_protection_required_or_unknown_waits_and_names_reviewer(self):
+        for protection in ("required", "unknown"):
+            snapshot = _snapshot()
+            executor = FakeExecutor(review=self._review(protection, reviewers=["alice"]))
+            drive_remote_delivery(snapshot, executor)
+            node = snapshot.nodes[REMOTE_DELIVERY_NODE_ID]
+            self.assertEqual(node["status"], "blocked_unknown")
+            self.assertIn("alice", node["waiting_on"])
+            self.assertIn("alice", node["failure"]["reason"])
+            self.assertNotIn("merge", executor.calls)
+            self.assertNotIn("review", snapshot.remote_delivery_evidence["steps"])
+
+    def test_approved_records_github_review_basis(self):
+        snapshot = _snapshot()
+        drive_remote_delivery(snapshot, FakeExecutor())
+        self.assertEqual(snapshot.remote_delivery_evidence["review_basis"], "github_review")
+
+    def test_digest_drift_does_not_waive(self):
+        snapshot = _snapshot()
+        drive_remote_delivery(snapshot, FakeExecutor(review=self._review("required")))
+        snapshot.integration_review_evidence = dict(
+            snapshot.integration_review_evidence, drift_marker="x")
+        executor = FakeExecutor(review=self._review("none"))
+        drive_remote_delivery(snapshot, executor)
+        node = snapshot.nodes[REMOTE_DELIVERY_NODE_ID]
+        self.assertNotEqual(node["status"], "accepted")
+        self.assertNotIn("merge", executor.calls)
+
+
+class GhProtectionProbeTests(unittest.TestCase):
+    def _probe(self, replies):
+        from unittest import mock
+        from vibe_guide import remote_delivery as rd
+
+        def fake(repo, args, timeout=120):
+            reply = replies[args[1].split("/", 3)[-1]] if False else None
+            for key, value in sorted(replies.items(), key=lambda kv: -len(kv[0])):
+                if args[1].endswith(key):
+                    if isinstance(value, Exception):
+                        raise value
+                    return value
+            raise RemoteDeliveryFailed("gh", "404", retryable=True)
+        with mock.patch.object(rd, "_run_gh", fake):
+            return rd.SubprocessRemoteDeliveryExecutor(".")._review_protection()
+
+    def test_matrix(self):
+        branch_off = '{"protected": false}'
+        self.assertEqual(self._probe({"/branches/main": branch_off, "/rules/branches/main": "[]"}), "none")
+        self.assertEqual(self._probe({"/branches/main": branch_off,
+            "/rules/branches/main": '[{"type":"pull_request","parameters":{"required_approving_review_count":1}}]'}), "required")
+        self.assertEqual(self._probe({"/branches/main": '{"protected": true}',
+            "/branches/main/protection": '{"required_pull_request_reviews":{"required_approving_review_count":1}}'}), "required")
+        self.assertEqual(self._probe({"/branches/main": '{"protected": true}',
+            "/branches/main/protection": '{}', "/rules/branches/main": "[]"}), "none")
+        self.assertEqual(self._probe({"/branches/main": "not json"}), "unknown")
+        self.assertEqual(self._probe({"/branches/main": branch_off}), "unknown")
+        self.assertEqual(self._probe({}), "unknown")
+
+
 class RemoteDeliveryEvidenceValidationTests(unittest.TestCase):
     def accepted_evidence(self):
         snapshot = _snapshot()
