@@ -3101,7 +3101,70 @@ def _silent_pack(run_id, node_id, node, probe):
     }
 
 
-def beat_stall_report(paths, run_id):
+_MAILBOX_WAIT_FILE = "mailbox-wait.json"
+#: A request the supervisor session has not served after this long is escalated once.
+MAILBOX_WAIT_ESCALATE_SECONDS = 3600
+#: Dispatch-establishing requests; a ``wait`` poll on an already bound worker is not a dispatch block.
+_MAILBOX_WAIT_OPERATIONS = frozenset({"create", "locate", "visibility", "resume"})
+
+
+def _mailbox_wait_nodes(paths, run_id, snapshot, now):
+    """Nodes with unserved mailbox requests that only the supervisor session can serve.
+
+    ``({node_id: {"count", "oldest_seconds"}}, None)``, or ``({}, reason)`` when the
+    mailbox cannot be read (never read as empty).  Requests of ``*-background``
+    providers are served by the daemon, so they are not waited on.
+    """
+    from .adapters.task_provider import ProviderActionStore
+    try:
+        pending = ProviderActionStore(paths).pending(run_id)
+    except Exception as error:
+        return {}, type(error).__name__
+    waiting = {}
+    for action in pending:
+        node_id = action.get("issue_id")
+        node = (snapshot.nodes or {}).get(node_id)
+        if (not isinstance(node, dict) or node.get("status") == "accepted"
+                or action.get("operation") not in _MAILBOX_WAIT_OPERATIONS
+                or str(action.get("provider") or "").endswith("-background")):
+            continue
+        try:
+            age = max(0.0, now - (paths.vibe / "provider-actions/requests"
+                                  / (str(action.get("action_id")) + ".json")).stat().st_mtime)
+        except OSError:
+            age = 0.0
+        entry = waiting.setdefault(node_id, {"count": 0, "oldest_seconds": 0.0})
+        entry["count"] += 1
+        entry["oldest_seconds"] = max(entry["oldest_seconds"], age)
+    return waiting, None
+
+
+def _mailbox_escalated_seen(paths, run_id):
+    try:
+        data = json.loads((run_dir(paths, run_id) / _MAILBOX_WAIT_FILE).read_text(encoding="utf-8"))
+        return set(data.get("escalated", []))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return set()
+
+
+def mailbox_wait_mark_reported(paths, run_id, report):
+    """Remember which nodes' 60-minute escalation a heartbeat has now shown (once each)."""
+    from .state import _atomic_bytes
+    waiting = report.get("mailbox_waiting") or {}
+    if report.get("mailbox_unreadable"):
+        return
+    live = sorted(node_id for node_id, entry in waiting.items()
+                  if entry["oldest_seconds"] >= MAILBOX_WAIT_ESCALATE_SECONDS)
+    if live == sorted(_mailbox_escalated_seen(paths, run_id)):
+        return
+    try:
+        _atomic_bytes(run_dir(paths, run_id, create=True) / _MAILBOX_WAIT_FILE,
+                      json.dumps({"escalated": live}).encode("utf-8") + b"\n")
+    except OSError:
+        pass
+
+
+def beat_stall_report(paths, run_id, now=None):
     """Assess one beat (exactly one ``stall.record_beat``) and describe stalled nodes."""
     from . import stall
     try:
@@ -3113,9 +3176,12 @@ def beat_stall_report(paths, run_id):
     try:
         unknown_details = {}
         silent, unknown_liveness = _probe_session_nodes(paths, run_id, snapshot, unknown_details)
-        outcome = stall.record_beat(
-            paths, run_id, _stall_candidates(snapshot, silent), snapshot.tasks, events
-        )
+        waiting, mailbox_unreadable = _mailbox_wait_nodes(
+            paths, run_id, snapshot, time.time() if now is None else now)
+        seen = _mailbox_escalated_seen(paths, run_id)
+        candidates = {node_id: node for node_id, node in _stall_candidates(snapshot, silent).items()
+                      if node_id not in waiting}
+        outcome = stall.record_beat(paths, run_id, candidates, snapshot.tasks, events)
         nodes = {}
         for node_id, result in outcome["nodes"].items():
             node = snapshot.nodes[node_id]
@@ -3145,6 +3211,11 @@ def beat_stall_report(paths, run_id):
     return {"status": "ok", "run_readable": True, "unknown_previous": outcome["unknown_previous"],
             "unknown_liveness": sorted(unknown_liveness), "unknown_sessions": unknown_liveness,
             "unknown_details": unknown_details,
+            "mailbox_waiting": {
+                node_id: {**entry, "escalate": entry["oldest_seconds"] >= MAILBOX_WAIT_ESCALATE_SECONDS
+                          and node_id not in seen}
+                for node_id, entry in waiting.items()},
+            "mailbox_unreadable": mailbox_unreadable,
             "nodes": nodes}
 
 
@@ -3167,6 +3238,15 @@ def render_stall_beat_text(report, run_id, command_prefix="vibe"):
         # An unreadable run already degrades the whole beat; a readable run whose
         # stall assessment failed must not read as "nothing stalled".
         unknown.append("空转评估未知：{}".format(report.get("reason", "")))
+    if report.get("mailbox_unreadable"):
+        unknown.append("信箱待服务未知：读不到信箱（{}），不能当成信箱为空".format(report["mailbox_unreadable"]))
+    waiting_lines = []
+    for node_id, entry in sorted((report.get("mailbox_waiting") or {}).items()):
+        line = "信箱待服务：节点 {} 有 {} 条请求等监工会话服务，最早一条已等 {} 分钟".format(
+            node_id, entry["count"], int(entry["oldest_seconds"] // 60))
+        if entry.get("escalate"):
+            line += "；已等满 60 分钟，需要监工服务信箱：回到监工会话，用 supervisor-mailbox 服务这些请求"
+        waiting_lines.append(line)
     details = report.get("unknown_details") or {}
     for node_id, session in sorted((report.get("unknown_sessions") or {}).items()):
         # The session is identified but its transcript could not be read: say which
@@ -3204,7 +3284,7 @@ def render_stall_beat_text(report, run_id, command_prefix="vibe"):
                 "修完运行时文件后复核：{} heal-verify --run-id {} --node {}{}".format(
                     node_id, since, _pack_text(entry["pack"]),
                     command_prefix, run_id, node_id, role_flag))
-    return "\n".join(escalate + investigate + unknown)
+    return "\n".join(waiting_lines + escalate + investigate + unknown)
 
 
 def _heal_verify_worker(paths, run_id, node_id, snapshot, events, base):
@@ -3641,6 +3721,7 @@ def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
     report = beat_stall_report(paths, run_id)
     payload["stall"] = report
     stall_text = render_stall_beat_text(report, run_id, command_prefix)
+    mailbox_wait_mark_reported(paths, run_id, report)
     if stall_text:
         text = text + "\n" + stall_text if state in {"rotate", "contract_drift"} else stall_text + "\n" + text
     text = _beat_extras(paths, run_id, payload, text)
