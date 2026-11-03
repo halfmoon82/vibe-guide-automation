@@ -31,6 +31,7 @@ from .authorization import (
     node_adapter_id,
     rebind_dispatch_contract,
     REMOTE_GIT_ENFORCEMENT,
+    option_requires_cost_acceptance,
     refresh_authorization_card,
     remote_git_denied,
 )
@@ -42,7 +43,7 @@ from .adapters.base import (
 from .adapters.registry import AdapterRegistry
 from .adapters.task_provider import ProviderActionStore, ProviderPending
 from .config import load_project_config, load_supervisor_single_shift
-from .dag import render_plan_artifacts, validate_dag, append_integration_review_node
+from .dag import render_dependency_graph_text, render_plan_artifacts, validate_dag, append_integration_review_node
 from .doctor import capability_registrations, doctor, render_registrations
 from . import platform_ledger
 from .initializer import _rules_target, apply_agentsmd_proposal, init_project, refresh_protocol_copies
@@ -65,6 +66,8 @@ from .supervisor import (
     render_stall_beat_text,
     heal_verify,
     stall_peek,
+    session_id_unknown_nodes,
+    session_id_unknown_status_lines,
     register_supervisor_address,
     record_owner_gate,
     shift_model_warning,
@@ -140,6 +143,7 @@ from .authorize_entry import (
     AuthorizationDenied,
     load_live_workflow,
     materialize_workflow_evidence,
+    show_card_with_graph,
     verify_workflow_artifacts,
 )
 from .attest import capabilities_relative_path, record_session_capabilities
@@ -366,6 +370,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--observations")
     parser.add_argument("--watch", action="store_true", dest="watch")
     parser.add_argument("--preview-card", action="store_true", dest="preview_card")
+    parser.add_argument("--show-card", action="store_true", dest="show_card",
+                        help="authorize: 展示授权卡与依赖图并记录展示回执（授权前必须先展示）")
     parser.add_argument("--platform-handoff", action="store_true", dest="platform_handoff",
                         help="monitor: 换平台交接时重新授权同一运行（只允许派发绑定与能力合同变化）")
     parser.add_argument("--mode", choices=("layered", "bundled"), default="layered")
@@ -1765,6 +1771,15 @@ _VOLATILE_CARD_FIELDS = frozenset(
     {"digest", "engine_evidence_ref", "engine_authorization_digest"}
 )
 
+#: Unsigned display fields a refresh may re-render without changing what was
+#: approved: the dependency graph (derived from the signed node contracts) and
+#: the observed tiers with their ``selected`` mark.  A 5.2.6 card has no graph
+#: and spells the cost tier ``forced``; re-rendering them must not read as
+#: drift, or a running 5.2.6 run could not renew its engine evidence.
+_DISPLAY_CARD_FIELDS = frozenset(
+    {"dependency_graph", "heartbeat_interval_options", "rotate_hard_cap_options"}
+)
+
 
 def _normalize_card_value(value: Any) -> Any:
     """Return ``value`` in the shape a JSON round-trip would give it.
@@ -1863,7 +1878,7 @@ def _renew_engine_attestation_if_stale(
         topology_rulings=_observed_topology_rulings(paths, card),
         engine_attestation=fresh,
     )
-    if set(_card_field_diff(card, refreshed)) - _VOLATILE_CARD_FIELDS:
+    if set(_card_field_diff(card, refreshed)) - _VOLATILE_CARD_FIELDS - _DISPLAY_CARD_FIELDS:
         return None
     new_record = authorize(refreshed, "AUTHORIZE")
     # Background launchers this renewal builds, so the worktree preflight
@@ -2031,7 +2046,7 @@ def _derive_card_preview(
     drift = (
         None
         if carried is None
-        else sorted(set(_card_field_diff(carried, published)) - _VOLATILE_CARD_FIELDS)
+        else sorted(set(_card_field_diff(carried, published)) - _VOLATILE_CARD_FIELDS - _DISPLAY_CARD_FIELDS)
     )
     payload = {
         "command": "monitor",
@@ -2057,12 +2072,15 @@ def _derive_card_preview(
     return payload, published
 
 
-def _render_card_options(options: Any, key: str, unit: str) -> str:
+def _render_card_options(options: Any, key: str, unit: str, chosen: Any = None) -> str:
     """Render one availability list: every tier, with the reason it is not.
 
     The card never hides an unusable tier (product decision 2026-10-13), so the
     human render has to name it and its reason rather than print the usable
-    subset only.
+    subset only.  Exactly one tier -- the card's chosen value -- is marked
+    「已选中」; a tier that costs something to choose says so, and is never
+    worded as if it were the chosen one (#391).  ``chosen`` of ``None`` reads
+    the per-option ``selected`` mark (absent on 5.2.6 cards: nothing marked).
     """
     entries = [item for item in (options or ()) if isinstance(item, dict)]
     if not entries:
@@ -2070,13 +2088,65 @@ def _render_card_options(options: Any, key: str, unit: str) -> str:
     parts = []
     for item in entries:
         label = "{:,} {}".format(item.get(key), unit)
-        if item.get("available") and item.get("forced"):
-            parts.append("{}（强制选择：{}）".format(label, item.get("cost") or "未记录代价"))
-        elif item.get("available"):
-            parts.append(label)
-        else:
-            parts.append("{}（不可用：{}）".format(label, item.get("reason") or "未记录原因"))
+        selected = (item.get(key) == chosen) if chosen is not None else item.get("selected") is True
+        notes = []
+        if item.get("available") and option_requires_cost_acceptance(item):
+            notes.append("选它要付代价：{}；{}".format(
+                item.get("cost") or "未记录代价", item.get("reason") or "未记录原因"))
+        elif not item.get("available"):
+            notes.append("不可用：{}".format(item.get("reason") or "未记录原因"))
+        text = label + ("（{}）".format("；".join(notes)) if notes else "")
+        parts.append("【已选中】" + text if selected else text)
     return "、".join(parts)
+
+
+def _render_heartbeat_card_line(card: Any) -> str:
+    """The card's heartbeat line: the chosen value stated alone, then the tiers."""
+    minutes = getattr(card, "heartbeat_interval_minutes", None)
+    chosen = (
+        "{} 分钟".format(minutes) if minutes is not None
+        else "未记录（按默认 {} 分钟）".format(HEARTBEAT_INTERVAL_DEFAULT_MINUTES)
+    )
+    return "心跳间隔：选中 {}｜全部选项：{}".format(
+        chosen,
+        _render_card_options(card.heartbeat_interval_options, "minutes", "分钟", minutes),
+    )
+
+
+def _render_card_graph(card: Any, graph: Optional[Dict[str, Any]] = None) -> str:
+    """Dependency graph lines for a card; the reason when it cannot be rendered."""
+    graph = graph if graph is not None else getattr(card, "dependency_graph", None)
+    if graph is None:
+        return "依赖图：这张卡签发于依赖图上卡之前，用 vibe authorize --plan {} --show-card 按当前节点渲染".format(
+            getattr(card, "plan_id", "<plan_id>"))
+    if isinstance(graph, dict) and "error" in graph:
+        return str(graph["error"])
+    return render_dependency_graph_text(graph)
+
+
+def _render_authorization_card_text(card: AuthorizationCard, graph: Dict[str, Any]) -> str:
+    """The card shown before authorization, with its dependency graph."""
+    summary = card.topology_summary or {}
+    by_topology = summary.get("by_topology") or {}
+    lines = [
+        "授权卡（计划 {}，版本 {}，卡 digest {}）".format(card.plan_id, card.plan_version, card.digest),
+        "节点：" + "、".join(card.node_ids),
+        "拓扑：visible-sdd {}｜dual-visible {}｜background {}".format(
+            by_topology.get("visible-sdd", 0),
+            by_topology.get("dual-visible", 0),
+            by_topology.get("background", 0),
+        ),
+        "远端 Git 动作：{}；部署、发布、生产写入、凭据、对外通信不在授权范围".format(card.remote_git_actions),
+        _render_heartbeat_card_line(card),
+        "换班硬上限：选中 {}｜全部选项：{}".format(
+            "{:,}".format(card.rotate_hard_cap) if card.rotate_hard_cap is not None
+            else "未记录（按默认 {:,}）".format(DEFAULT_ROTATE_HARD_CAP),
+            _render_card_options(card.rotate_hard_cap_options, "tokens", "token", card.rotate_hard_cap),
+        ),
+        _render_card_graph(card, graph),
+    ]
+    lines.extend(_daemon_option_lines(card))
+    return "\n".join(lines)
 
 
 def _render_card_preview(payload: Dict[str, Any], card: AuthorizationCard) -> str:
@@ -2103,22 +2173,16 @@ def _render_card_preview(payload: Dict[str, Any], card: AuthorizationCard) -> st
                 entry.get("node_id"), entry.get("topology"), entry.get("role")
             )
         )
+    lines.append(_render_heartbeat_card_line(card))
     lines.append(
-        "心跳间隔：{} 分钟｜可选 {}".format(
-            card.heartbeat_interval_minutes
-            if card.heartbeat_interval_minutes is not None
-            else "未记录（按默认 {}）".format(HEARTBEAT_INTERVAL_DEFAULT_MINUTES),
-            _render_card_options(card.heartbeat_interval_options, "minutes", "分钟"),
-        )
-    )
-    lines.append(
-        "换班硬上限：{}｜可选 {}".format(
+        "换班硬上限：选中 {}｜全部选项：{}".format(
             "{:,}".format(card.rotate_hard_cap)
             if card.rotate_hard_cap is not None
             else "未记录（按默认 {:,}）".format(DEFAULT_ROTATE_HARD_CAP),
-            _render_card_options(card.rotate_hard_cap_options, "tokens", "token"),
+            _render_card_options(card.rotate_hard_cap_options, "tokens", "token", card.rotate_hard_cap),
         )
     )
+    lines.append(_render_card_graph(card))
     lines.append("远端 Git 禁令（remote_git_actions=deny 时）：")
     for entry in REMOTE_GIT_ENFORCEMENT:
         lines.append("  {}：{}".format(entry["platform"], entry["note"]))
@@ -2281,6 +2345,11 @@ def _snapshot_result(
     error_classes = _render_node_error_classes(snapshot)
     if error_classes:
         text += "\n" + error_classes
+    if paths is not None:
+        session_unknown = session_id_unknown_status_lines(paths, snapshot)
+        if session_unknown:
+            payload["session_id_unknown"] = session_id_unknown_nodes(paths, snapshot)
+            text += "\n" + "\n".join(session_unknown)
     questions = worker_questions.render_status_lines(paths, snapshot)
     if questions:
         text += "\n" + questions
@@ -2485,6 +2554,8 @@ def render_v41_closeout_status(snapshot: RunSnapshot) -> str:
             delivery_status = str(delivery.get("status", "")).casefold()
             if delivery_status in {"rework"}:
                 return "远端整合交付返工：未闭合/不可验收"
+            if delivery.get("waiting_on"):
+                return "远端整合交付等待 GitHub 评审：在等 {}".format(delivery["waiting_on"])
             if delivery_status in {"blocked_unknown", "blocked_design", "blocked_deploy"}:
                 return "远端整合交付受阻：未闭合/不可验收"
             return "远端整合交付进行中：尚未验收"
@@ -3832,6 +3903,45 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 BLOCKED,
                 {"command": "authorize", "status": "blocked", "reason": "plan is required"},
                 "授权未记录：需要计划",
+                args.as_json,
+            )
+        if args.show_card:
+            # Read-only towards the authorization: it renders the card with its
+            # dependency graph and records the display receipt the next
+            # ``vibe authorize`` requires (decision D5 = A).
+            try:
+                _plan_root(paths, args.plan)
+                shown = show_card_with_graph(paths, args.plan)
+                card = _authorization_card(shown["card"])
+            except AuthorizationDenied as error:
+                return _result(
+                    BLOCKED,
+                    {"command": "authorize", "status": "blocked", "reason": str(error),
+                     "reason_code": "dependency_graph_unrenderable"},
+                    "授权卡未展示：" + str(error),
+                    args.as_json,
+                )
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                return _result(
+                    BLOCKED,
+                    {"command": "authorize", "status": "blocked_design", "reason": str(error)},
+                    "授权卡未展示：" + str(error),
+                    args.as_json,
+                )
+            text = _render_authorization_card_text(card, shown["dependency_graph"])
+            return _result(
+                SUCCESS,
+                {
+                    "command": "authorize",
+                    "status": "card_shown",
+                    "plan_id": args.plan,
+                    "authorization_card": authorization_card_summary(paths, args.plan),
+                    "dependency_graph": shown["dependency_graph"],
+                    "dependency_graph_text": _render_card_graph(card, shown["dependency_graph"]),
+                    "card_text": text,
+                    "display_receipt": shown["receipt"],
+                },
+                text + "\n已记录依赖图展示回执；产品经理确认后执行 vibe authorize --plan {} --authorize AUTHORIZE".format(args.plan),
                 args.as_json,
             )
         try:

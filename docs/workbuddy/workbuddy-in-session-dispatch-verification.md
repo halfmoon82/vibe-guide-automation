@@ -213,3 +213,18 @@ candidate_sessions(cwd=项目) -> 恰好宿主会话
 3. 那 4 条旧 `topology=None` create 的结果由谁写入，**未定位**（见上一节）。
 4. `_answer_resume` 的终态负结果仍只落 `visibility_unknown` → 节点停 `blocked_unknown`（已知未收敛）。
 5. 心跳（周期自动化）未建。
+
+## 子代理类型与模型的可用性（降级路径，单次运行观察）
+
+**来源与置信度：** 仅来自一次运行的观察：run-9fef3109，2026-11-03，issue #390。**单次运行，宿主版本未知**。
+这不是「已验证」结论，也不是平台的永久限制；账号、套餐、内容策略和宿主版本变化后都可能不同，换环境须重测。
+
+| Agent 工具子代理类型 | 模型 | 观察结果 |
+| --- | --- | --- |
+| general-purpose | claude 系各模型 | 被内容策略拦截 |
+| general-purpose | gpt 系模型 | 个人免费用户不被允许 |
+| Explore | sonnet | 可用；能跑 Bash；**没有写文件和编辑工具** |
+
+该次运行中，dev/review 子代理改走 Explore 加 sonnet 后正常交付。使用限制：Explore 子代理不能直接写文件，
+改动文件只能通过 Bash 完成（例如重定向、`git apply`），且每条命令仍须先 `cd <worktree>`。
+这条路径只是 general-purpose 不可用时的降级选项，不改变平台账本，也不代表其他平台的行为。

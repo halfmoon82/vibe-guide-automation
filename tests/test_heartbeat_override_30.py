@@ -56,22 +56,29 @@ class ForcedThirtyTests(unittest.TestCase):
         card = self._card(60)
         self.assertEqual(card.heartbeat_interval_minutes, 60)
         entry = card.heartbeat_interval_options[1]
-        self.assertTrue(entry["forced"])
+        self.assertTrue(entry["requires_cost_acceptance"])
+        self.assertNotIn("forced", entry)
+        self.assertTrue(entry["selected"])
+        self.assertFalse(card.heartbeat_interval_options[0]["selected"])
         self.assertEqual(entry["cost"], FORCED_INTERVAL_COST)
         self.assertIn("最长 60 分钟", entry["cost"])
         rendered = _render_card_options(card.heartbeat_interval_options, "minutes", "分钟")
-        self.assertIn("强制选择", rendered)
+        self.assertNotIn("强制", rendered)
+        self.assertIn("选它要付代价", rendered)
+        self.assertEqual(rendered.count("【已选中】"), 1)
+        self.assertIn("【已选中】60 分钟", rendered)
         self.assertIn(entry["cost"], rendered)
 
     def test_choosing_10_leaves_the_card_as_before(self):
         card = self._card(10)
         self.assertEqual(card.heartbeat_interval_minutes, 10)
         self.assertEqual(card.heartbeat_interval_options[0],
-                         {"minutes": 10, "available": True, "reason": ""})
+                         {"minutes": 10, "available": True, "reason": "", "selected": True})
+        self.assertFalse(card.heartbeat_interval_options[1]["selected"])
 
     def test_a_forced_tier_without_a_cost_refuses_publication(self):
         options = [{"minutes": 10, "available": True, "reason": ""},
-                   {"minutes": 60, "available": True, "reason": "x", "forced": True}]
+                   {"minutes": 60, "available": True, "reason": "x", "requires_cost_acceptance": True}]
         with self.assertRaises(ValueError) as raised:
             self._card(60, options)
         self.assertIn("cost", str(raised.exception))

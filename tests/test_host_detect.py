@@ -27,6 +27,7 @@ from vibe_guide.host_detect import (
 from vibe_guide.paths import ProjectPaths
 
 from tests import test_platform_handoff_rebind as rebind
+from tests.support_v45_authorize import with_display_receipt
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pm-path" / "product-spec.json"
 COMPLEX_REQUEST = "设计并实现支付系统，迁移数据、集成接口、编写测试并部署"
@@ -97,6 +98,7 @@ class _Project(unittest.TestCase):
         self.assertEqual(run_cli(["init", "--confirm", "--json"], self.root).payload["status"], "ok")
 
     def cli(self, argv, env=None):
+        with_display_receipt(argv, self.root, env)
         return run_cli(list(argv) + ["--json"], self.root, environ=env)
 
     def attest(self, adapter, env=None, extra=()):

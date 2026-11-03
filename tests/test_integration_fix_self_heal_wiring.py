@@ -152,3 +152,92 @@ class ReviewerVerifyTests(ReviewerStallFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+UPSTREAM_SESSION = "3c2b5d0c-4959-456a-8713-d8ee40a5b380"
+
+
+class UpstreamReworkExemptionTests(IncidentFixture):
+    """#386: integration review waits on an upstream it sent back; that is not a stall."""
+
+    ROLE = "reviewer"
+
+    def setUp(self):
+        import os
+        import time
+        from pathlib import Path
+        from unittest.mock import patch
+        super().setUp()
+        self.time = time
+        home = Path(self.temporary.name) / "home"
+        (home / ".claude" / "projects" / "proj").mkdir(parents=True)
+        self.transcript = home / ".claude" / "projects" / "proj" / (UPSTREAM_SESSION + ".jsonl")
+        patcher = patch.dict(os.environ, {"HOME": str(home)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.os = os
+        snapshot = load_snapshot(self.paths, self.run_id)
+        # n1 plays integration-review (the incident fixture's retry-pending node);
+        # "up" is the upstream node it sent back.
+        snapshot.nodes["integration-review"] = snapshot.nodes.pop(NODE)
+        # the status _queue_integration_review_rework leaves it in
+        snapshot.nodes["integration-review"]["status"] = "rework"
+        snapshot.nodes["up"] = {
+            "status": "rework", "integration_finding_ref": {"node_id": "integration-review", "generation": 1},
+            "developer_generation": 2,
+            "active_task": {"generation": 2, "handle_id": "bridge-x", "role": "developer",
+                            "task_id": UPSTREAM_SESSION},
+        }
+        # The authorized node set is fixed, so the extended snapshot is served in memory.
+        self.snapshot = snapshot
+        loader = patch("vibe_guide.supervisor.load_snapshot", lambda *args, **kwargs: self.snapshot)
+        loader.start()
+        self.addCleanup(loader.stop)
+
+    def transcript_age(self, minutes):
+        self.transcript.write_text('{"type":"assistant"}\n', encoding="utf-8")
+        stamp = self.time.time() - minutes * 60
+        self.os.utime(self.transcript, (stamp, stamp))
+
+    def beats(self, count=4):
+        for _ in range(count):
+            out = self.beat()
+        return out.payload["stall"]["nodes"]
+
+    def test_integration_review_is_exempt_while_upstream_is_active(self):
+        self.transcript_age(1)
+        nodes = self.beats()
+        self.assertNotIn("integration-review", nodes)
+        self.assertNotIn("up", nodes)
+
+    def test_dead_upstream_is_escalated_instead_of_integration_review(self):
+        self.transcript_age(20)
+        nodes = self.beats()
+        self.assertNotIn("integration-review", nodes)
+        self.assertEqual(nodes["up"]["tier"], "supervisor_investigate")
+
+    def test_unreadable_upstream_evidence_is_not_activity(self):
+        nodes = self.beats()  # no transcript at all: unknown
+        self.assertIn("integration-review", nodes)
+
+    def test_exemption_ends_when_upstream_is_accepted(self):
+        self.transcript_age(1)
+        self.snapshot.nodes["up"]["status"] = "accepted"
+        nodes = self.beats()
+        self.assertIn("integration-review", nodes)
+
+    def test_other_nodes_are_not_exempt(self):
+        self.transcript_age(1)
+        self.snapshot.nodes["other"] = dict(self.snapshot.nodes["integration-review"])
+        self.assertIn("other", self.beats())
+
+    def test_platform_without_transcripts_exempts_only_while_upstream_idle_count_is_low(self):
+        self.snapshot.nodes["up"]["active_task"] = {
+            "generation": 2, "handle_id": "codex-1", "role": "developer", "task_id": "developer:up"}
+        for beat in range(1, 6):
+            nodes = self.beat().payload["stall"]["nodes"]
+            if beat < 3:
+                self.assertNotIn("integration-review", nodes)
+        self.assertNotIn("integration-review", nodes)
+        self.assertIn("up", nodes)
+        self.assertEqual(nodes["up"]["tier"], "supervisor_investigate")

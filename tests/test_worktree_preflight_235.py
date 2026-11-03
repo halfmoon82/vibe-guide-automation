@@ -50,6 +50,7 @@ from vibe_guide.state import (
 )
 from vibe_guide.contracts import RunEvent
 from vibe_guide.paths import ProjectPaths
+from tests.support_v45_authorize import show_card
 
 UUID = "1a2b3c4d-1111-4222-8333-444455556666"
 SHORT = "1a2b3c4d"
@@ -817,6 +818,7 @@ class CliBackgroundDispatchTest(unittest.TestCase):
             self.root,
         )
         self.assertEqual(planned.payload.get("status"), "ok", planned.payload)
+        show_card(self.root, self.PLAN_ID)
         authorized = cli.run_cli(
             [
                 "authorize", "--plan", self.PLAN_ID,

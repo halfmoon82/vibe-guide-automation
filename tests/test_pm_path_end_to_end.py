@@ -16,6 +16,7 @@ from vibe_guide.cli import run_cli
 from vibe_guide.diagnostics import assert_planning_gate
 from vibe_guide.node_spec import reject_engineering_fields
 from vibe_guide.paths import ProjectPaths
+from tests.support_v45_authorize import with_display_receipt
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pm-path" / "product-spec.json"
 REQUEST = "设计并实现保单查看页的 PDF 导出，集成日期范围筛选、编写测试并部署"
@@ -34,6 +35,7 @@ class ProductManagerPathTests(unittest.TestCase):
         self.paths = ProjectPaths(self.root)
 
     def cli(self, *argv):
+        with_display_receipt(argv, self.root)
         return run_cli(list(argv) + ["--json"], self.root)
 
     def test_natural_language_to_run_started_without_hand_editing_vibe_files(self):

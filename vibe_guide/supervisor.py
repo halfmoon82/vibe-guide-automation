@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .authorization import (
+    COST_ACCEPTANCE_MARKER,
     DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
     DEFAULT_ROTATE_HARD_CAP_TOKENS,
     HEARTBEAT_INTERVAL_CHOICES,
@@ -1981,6 +1982,13 @@ def _push_wake_available(paths, provider):
 #: What choosing the long interval costs when push wake-up is not verified.
 FORCED_INTERVAL_COST = "worker 完工后监工最长 {} 分钟才会发现".format(HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES)
 
+#: The long tier's reason on the card while push wake-up is unverified, worded
+#: as prd-guide 6.0 states the rule; the raw detail follows in brackets.
+PUSH_WAKE_UNVERIFIED_REASON = (
+    "推送唤醒未验证的平台默认 {} 分钟（验证记录在 .vibe/push-wake-verification.json"
+    "，成功、失败证据各一条）：{{}}".format(HEARTBEAT_INTERVAL_DEFAULT_MINUTES)
+)
+
 
 def heartbeat_interval_options(paths, provider):
     """Every idle base a card may offer, with availability and the reason.
@@ -1997,11 +2005,15 @@ def heartbeat_interval_options(paths, provider):
             continue
         available, reason = _push_wake_available(paths, provider)
         if not available and isinstance(provider, str) and provider:
-            # No verified push wake-up: the long tier stays selectable as a forced choice
-            # (product decision 2026-10-23) with its price on the card.  An
-            # unknown provider cannot be judged, so it stays unavailable.
-            entries.append({"minutes": minutes, "available": True, "reason": reason,
-                            "forced": True, "cost": FORCED_INTERVAL_COST})
+            # No verified push wake-up: the long tier stays selectable only by
+            # accepting its price (product decision 2026-10-23).  The marker
+            # says "choosing this costs something", never "this is chosen":
+            # the chosen tier is marked ``selected`` by the card (#391).  The
+            # reason uses the prd-guide 6.0 wording.  An unknown provider
+            # cannot be judged, so it stays unavailable.
+            entries.append({"minutes": minutes, "available": True,
+                            "reason": PUSH_WAKE_UNVERIFIED_REASON.format(reason),
+                            COST_ACCEPTANCE_MARKER: True, "cost": FORCED_INTERVAL_COST})
             continue
         entries.append({"minutes": minutes, "available": available, "reason": reason})
     return entries
@@ -2305,8 +2317,14 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
     lines.append("决策信箱：待回答 {} 项；心跳降频但不暂停".format(
         "未知" if decisions is None else len(decisions)))
     interval = payload["heartbeat_interval"]
-    lines.append("心跳间隔：当前 {} 分钟（{}，{}）".format(interval["minutes"], interval.get("mode"), interval.get("reason"))
-                 if interval else "心跳间隔：未记录，按默认 {} 分钟建".format(HEARTBEAT_INTERVAL_DEFAULT_MINUTES))
+    if interval:
+        lines.append("心跳间隔：当前 {} 分钟（{}，{}）".format(interval["minutes"], interval.get("mode"), interval.get("reason")))
+    else:
+        # No beat yet: derive the value the first beat will use from the card
+        # choice, so the handoff never prints 10 for a card that selected 60.
+        derived = heartbeat_interval(paths, run_id, decision_only=False)
+        lines.append("心跳间隔：尚未开拍，按授权卡与平台推导为 {} 分钟建（{}，{}）".format(
+            derived["minutes"], derived.get("mode"), derived.get("reason")))
     if decisions:
         for decision in decisions:
             lines.append("  - {}（类别 {}）：{}（选项：{}）".format(
@@ -2574,7 +2592,8 @@ def bounded_supervisor_output(paths, run_id, payload, rendered):
 
 
 _CARD_SUMMARY_KEYS = ("plan_id", "plan_version", "digest", "node_contract_digest", "active_pair_limit",
-                      "remote_git_actions", "engine_evidence_ref", "execution_engine", "engine_mode")
+                      "remote_git_actions", "engine_evidence_ref", "execution_engine", "engine_mode",
+                      "heartbeat_interval_minutes", "dependency_graph")
 
 
 def authorization_card_summary(paths, plan_id, card=None):
@@ -2598,6 +2617,14 @@ def authorization_card_summary(paths, plan_id, card=None):
         "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
         "node_ids": list(card.get("node_ids") or []),
     })
+    # The dependency graph rides in the card output itself, so an agent never
+    # has to paste it separately (issue authorization-card).
+    graph = card.get("dependency_graph")
+    if isinstance(graph, dict) and "error" not in graph:
+        from .dag import render_dependency_graph_text
+        summary["dependency_graph_text"] = render_dependency_graph_text(graph)
+    elif isinstance(graph, dict):
+        summary["dependency_graph_text"] = str(graph.get("error"))
     return summary
 
 
@@ -2731,11 +2758,64 @@ def _host_session_service(paths, action):
     return service
 
 
-def supervisor_mailbox_view(paths, run_id):
+_AUTOFILL_ANSWERS = {
+    "locate": {"located": True},
+    "visibility": {"visible": True, "direct_enter": True},
+}
+
+
+def _autofill_host_session(paths, store, action, session_id):
+    """Answer one locate/visibility request on the session's behalf; True when answered.
+
+    Only when all three hold: the request is served by ``_host_session_service``
+    (in_session_sdd with a capability evidence ref), the node's create result
+    binds a task id equal to this session's id, and the node is not the
+    closeout review.  Anything unreadable or missing answers nothing, leaving
+    the manual write-back in place.  The event is written before the answer.
+    """
+    operation = action.get("operation")
+    if operation not in _AUTOFILL_ANSWERS or _is_closeout_reviewer(action) or not session_id:
+        return False
+    service = _host_session_service(paths, action)
+    if service is None or not service.get("evidence_ref"):
+        return False
+    try:
+        create = store.related_action(action, "create", required=False)
+        result = store.result(create["action_id"]) if create else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    binding = result.get("binding") if isinstance(result, dict) else None
+    if not isinstance(binding, dict):
+        return False
+    task_id = binding.get("task_id") or binding.get("threadId")
+    if not isinstance(task_id, str) or task_id.strip() != session_id:
+        return False
+    try:
+        append_event(paths, RunEvent("host_session_autofill", {
+            "run_id": action["run_id"], "node_id": action.get("issue_id"),
+            "generation": action.get("generation"), "sequence": action.get("sequence"),
+            "operation": operation, "action_id": action["action_id"],
+            "create_action_id": create["action_id"],
+            "basis": ["in_session_sdd 派发且带能力证据引用", "create 回执任务编号等于本会话编号",
+                      "非收口审查节点"],
+            "evidence_ref": service["evidence_ref"], "task_id": task_id, "session_id": session_id,
+        }))
+        return store.complete(action["action_id"], dict(_AUTOFILL_ANSWERS[operation]), native=False)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def supervisor_mailbox_view(paths, run_id, environ=None):
     """Pending provider requests with prompt bodies replaced by {sha256, bytes, path}."""
     from .adapters.task_provider import ProviderActionStore
+    from .host_detect import detect_host
     try:
-        pending = ProviderActionStore(paths).pending(run_id)
+        store = ProviderActionStore(paths)
+        pending = store.pending(run_id)
+        detection = detect_host(os.environ if environ is None else environ)
+        session_id = detection.session_id if detection.platform == "workbuddy" else None
+        if session_id and any(a.get("operation") in _AUTOFILL_ANSWERS for a in pending):
+            pending = [a for a in pending if not _autofill_host_session(paths, store, a, session_id)]
     except (OSError, ValueError) as error:
         return {"command": "supervisor-mailbox", "status": "unknown", "run_id": run_id,
                 "reason": "provider mailbox unreadable: {}".format(str(error)[:160])}
@@ -2847,6 +2927,17 @@ def mailbox_complete(paths, run_id, action_id, payload):
                 "（例如 <本会话 id>#integration-review）".format(clash)
             )
     complete_mailbox_action(paths, run_id, action_id, payload)
+    if request.get("operation") == "create":
+        from .host_detect import detect_host
+        detection = detect_host(os.environ)
+        if detection.platform == "workbuddy" and detection.session_id:
+            for operation in _AUTOFILL_ANSWERS:
+                try:
+                    follow = store.related_action(request, operation, required=False)
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+                if follow is not None and store.result(follow["action_id"]) is None:
+                    _autofill_host_session(paths, store, follow, detection.session_id)
     return {"command": "supervisor-mailbox", "status": "completed",
             "run_id": run_id, "action_id": action_id}
 
@@ -2901,6 +2992,86 @@ def _stall_candidates(snapshot, session_nodes=None):
     }
 
 
+_INTEGRATION_NODE = "integration-review"
+
+
+def _integration_rework_targets(snapshot, events):
+    """Upstream nodes sent back by an integration-review finding and still unaccepted (#386).
+
+    A node qualifies when its latest scope_auto_expanded event carries the
+    integration_rework trigger, or it still holds the ``integration_finding_ref``
+    stamp.  Acceptance ends the rework.
+    """
+    latest = {}
+    for event in events or ():
+        if isinstance(event, dict) and event.get("event") == "scope_auto_expanded":
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            if isinstance(data.get("node_id"), str):
+                latest[data["node_id"]] = data.get("trigger")
+    targets = []
+    for node_id, node in (snapshot.nodes or {}).items():
+        if node_id == _INTEGRATION_NODE or not isinstance(node, dict) or node.get("status") == "accepted":
+            continue
+        if latest.get(node_id) == "integration_rework" or isinstance(node.get("integration_finding_ref"), dict):
+            targets.append(node_id)
+    return sorted(targets)
+
+
+def _upstream_rework_verdict(paths, run_id, snapshot, node_id):
+    """``(verdict, probe_state)``: "active", "stuck" or "unknown" for an upstream in rework.
+
+    Only positive evidence counts as active: a live transcript (Claude), or, where
+    no session record exists (other platforms), a worker status whose own idle
+    count is still under the stall threshold.  A silent transcript or an idle count
+    at the threshold is "stuck": that node is escalated on its own.  Unreadable
+    evidence is "unknown", never active.
+    """
+    from . import stall
+    node = snapshot.nodes.get(node_id)
+    if not isinstance(node, dict) or node.get("status") not in worker_liveness.SESSION_STATUSES:
+        return "unknown", None
+    state = None
+    if _is_session_node(node):
+        state = worker_liveness.probe(paths, run_id, node_id, node)["state"]
+        if state == "active":
+            return "active", state
+        if state == "silent":
+            return "stuck", state
+        if state != "unresolved":
+            return "unknown", state
+    record = stall.load_progress(paths, run_id)
+    entry = record["nodes"].get(node_id) if record else None
+    if entry and entry["fingerprint"] == stall.node_fingerprint(node, snapshot.tasks, node_id):
+        return ("stuck" if entry["unchanged_beats"] >= stall.STALL_BEATS else "active"), state
+    return "active", state
+
+
+def integration_rework_exemption(paths, run_id, snapshot, events):
+    """``(exempt, extra)``: the integration review node while an upstream rework it caused runs.
+
+    ``exempt`` holds node ids left out of the stall assessment.  The exemption holds
+    while the upstream is active, or stuck (then the upstream is the one escalated,
+    never the integration review); it does not hold on unreadable evidence.
+    ``extra`` maps upstream nodes needing their own stall evaluation (no session
+    record to read, so the fingerprint is all there is) to their snapshot nodes.
+    """
+    integration = (snapshot.nodes or {}).get(_INTEGRATION_NODE)
+    if not isinstance(integration, dict) or integration.get("status") != "rework":
+        return set(), {}
+    exempt, extra = set(), {}
+    try:
+        for target in _integration_rework_targets(snapshot, events):
+            verdict, state = _upstream_rework_verdict(paths, run_id, snapshot, target)
+            if verdict == "unknown":
+                continue
+            exempt.add(_INTEGRATION_NODE)
+            if state is None or state == "unresolved":
+                extra[target] = snapshot.nodes[target]
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return set(), {}  # evidence unreadable: unknown, not active
+    return exempt, extra
+
+
 def _heal_pack_path(paths, run_id, node_id):
     return run_dir(paths, run_id) / _HEAL_PACK_FILE.format(node_id)
 
@@ -2933,14 +3104,14 @@ def _node_blocker(node):
     return ""
 
 
-def _probe_session_nodes(paths, run_id, snapshot):
+def _probe_session_nodes(paths, run_id, snapshot, detail=None):
     """({node_id: probe} for silent workers, {node_id: session} whose liveness is unknown).
 
     Read-only: it only stats transcript files, so the preflight and the status
     peek may call it too.  A node whose session cannot be identified at all
     (another provider, a legacy id) is in neither: nothing can be claimed.
     """
-    silent, unknown = {}, {}
+    silent, unknown, unknown_detail = {}, {}, {}
     for node_id, node in (snapshot.nodes or {}).items():
         if not _is_session_node(node):
             continue
@@ -2949,7 +3120,27 @@ def _probe_session_nodes(paths, run_id, snapshot):
             silent[node_id] = result
         elif result["state"] == "unknown":
             unknown[node_id] = result["session"]
+            unknown_detail[node_id] = result
+    if detail is not None:
+        detail.update(unknown_detail)
     return silent, unknown
+
+
+def session_id_unknown_nodes(paths, snapshot):
+    """Node ids at work whose session id cannot be derived (non-Claude platforms).
+
+    They stay out of the beat; ``vibe status`` node details say 会话编号未知.
+    """
+    return sorted(
+        node_id for node_id, node in (snapshot.nodes or {}).items()
+        if _is_session_node(node) and worker_liveness._session_id(paths, node) is None
+    )
+
+
+def session_id_unknown_status_lines(paths, snapshot):
+    """``vibe status`` lines for nodes whose session id is unknown, one per node."""
+    return ["节点 {}：会话编号未知（无法读取会话记录，不参与空转评估）".format(node_id)
+            for node_id in session_id_unknown_nodes(paths, snapshot)]
 
 
 def _build_pack(paths, run_id, node_id, snapshot, events, role):
@@ -3031,9 +3222,11 @@ def stall_peek(paths, run_id, snapshot):
     try:
         events = load_events(paths, run_id)
         silent, _ = _probe_session_nodes(paths, run_id, snapshot)
+        exempt, _extra = integration_rework_exemption(paths, run_id, snapshot, events)
         return {
             node_id: tier
             for node_id, node in _stall_candidates(snapshot).items()
+            if node_id not in exempt
             if not _is_session_node(node) or node_id in silent
             for unchanged, tier in [_node_stall_state(paths, run_id, snapshot, events, node_id)]
             if tier in _STALL_REPORT_TIERS and unchanged
@@ -3081,7 +3274,70 @@ def _silent_pack(run_id, node_id, node, probe):
     }
 
 
-def beat_stall_report(paths, run_id):
+_MAILBOX_WAIT_FILE = "mailbox-wait.json"
+#: A request the supervisor session has not served after this long is escalated once.
+MAILBOX_WAIT_ESCALATE_SECONDS = 3600
+#: Dispatch-establishing requests; a ``wait`` poll on an already bound worker is not a dispatch block.
+_MAILBOX_WAIT_OPERATIONS = frozenset({"create", "locate", "visibility", "resume"})
+
+
+def _mailbox_wait_nodes(paths, run_id, snapshot, now):
+    """Nodes with unserved mailbox requests that only the supervisor session can serve.
+
+    ``({node_id: {"count", "oldest_seconds"}}, None)``, or ``({}, reason)`` when the
+    mailbox cannot be read (never read as empty).  Requests of ``*-background``
+    providers are served by the daemon, so they are not waited on.
+    """
+    from .adapters.task_provider import ProviderActionStore
+    try:
+        pending = ProviderActionStore(paths).pending(run_id)
+    except Exception as error:
+        return {}, type(error).__name__
+    waiting = {}
+    for action in pending:
+        node_id = action.get("issue_id")
+        node = (snapshot.nodes or {}).get(node_id)
+        if (not isinstance(node, dict) or node.get("status") == "accepted"
+                or action.get("operation") not in _MAILBOX_WAIT_OPERATIONS
+                or str(action.get("provider") or "").endswith("-background")):
+            continue
+        try:
+            age = max(0.0, now - (paths.vibe / "provider-actions/requests"
+                                  / (str(action.get("action_id")) + ".json")).stat().st_mtime)
+        except OSError:
+            age = 0.0
+        entry = waiting.setdefault(node_id, {"count": 0, "oldest_seconds": 0.0})
+        entry["count"] += 1
+        entry["oldest_seconds"] = max(entry["oldest_seconds"], age)
+    return waiting, None
+
+
+def _mailbox_escalated_seen(paths, run_id):
+    try:
+        data = json.loads((run_dir(paths, run_id) / _MAILBOX_WAIT_FILE).read_text(encoding="utf-8"))
+        return set(data.get("escalated", []))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return set()
+
+
+def mailbox_wait_mark_reported(paths, run_id, report):
+    """Remember which nodes' 60-minute escalation a heartbeat has now shown (once each)."""
+    from .state import _atomic_bytes
+    waiting = report.get("mailbox_waiting") or {}
+    if report.get("mailbox_unreadable"):
+        return
+    live = sorted(node_id for node_id, entry in waiting.items()
+                  if entry["oldest_seconds"] >= MAILBOX_WAIT_ESCALATE_SECONDS)
+    if live == sorted(_mailbox_escalated_seen(paths, run_id)):
+        return
+    try:
+        _atomic_bytes(run_dir(paths, run_id, create=True) / _MAILBOX_WAIT_FILE,
+                      json.dumps({"escalated": live}).encode("utf-8") + b"\n")
+    except OSError:
+        pass
+
+
+def beat_stall_report(paths, run_id, now=None):
     """Assess one beat (exactly one ``stall.record_beat``) and describe stalled nodes."""
     from . import stall
     try:
@@ -3091,10 +3347,18 @@ def beat_stall_report(paths, run_id):
         return {"status": "unknown", "nodes": {}, "run_readable": False,
                 "reason": "run unreadable: " + type(error).__name__}
     try:
-        silent, unknown_liveness = _probe_session_nodes(paths, run_id, snapshot)
-        outcome = stall.record_beat(
-            paths, run_id, _stall_candidates(snapshot, silent), snapshot.tasks, events
-        )
+        unknown_details = {}
+        silent, unknown_liveness = _probe_session_nodes(paths, run_id, snapshot, unknown_details)
+        waiting, mailbox_unreadable = _mailbox_wait_nodes(
+            paths, run_id, snapshot, time.time() if now is None else now)
+        seen = _mailbox_escalated_seen(paths, run_id)
+        exempt, extra = integration_rework_exemption(paths, run_id, snapshot, events)
+        candidates = {node_id: node for node_id, node in _stall_candidates(snapshot, silent).items()
+                      if node_id not in waiting and node_id not in exempt}
+        for node_id, node in extra.items():
+            if node_id not in waiting:
+                candidates.setdefault(node_id, node)
+        outcome = stall.record_beat(paths, run_id, candidates, snapshot.tasks, events)
         nodes = {}
         for node_id, result in outcome["nodes"].items():
             node = snapshot.nodes[node_id]
@@ -3123,6 +3387,12 @@ def beat_stall_report(paths, run_id):
                 "reason": "stall assessment unavailable: " + type(error).__name__}
     return {"status": "ok", "run_readable": True, "unknown_previous": outcome["unknown_previous"],
             "unknown_liveness": sorted(unknown_liveness), "unknown_sessions": unknown_liveness,
+            "unknown_details": unknown_details,
+            "mailbox_waiting": {
+                node_id: {**entry, "escalate": entry["oldest_seconds"] >= MAILBOX_WAIT_ESCALATE_SECONDS
+                          and node_id not in seen}
+                for node_id, entry in waiting.items()},
+            "mailbox_unreadable": mailbox_unreadable,
             "nodes": nodes}
 
 
@@ -3145,11 +3415,29 @@ def render_stall_beat_text(report, run_id, command_prefix="vibe"):
         # An unreadable run already degrades the whole beat; a readable run whose
         # stall assessment failed must not read as "nothing stalled".
         unknown.append("空转评估未知：{}".format(report.get("reason", "")))
+    if report.get("mailbox_unreadable"):
+        unknown.append("信箱待服务未知：读不到信箱（{}），不能当成信箱为空".format(report["mailbox_unreadable"]))
+    waiting_lines = []
+    for node_id, entry in sorted((report.get("mailbox_waiting") or {}).items()):
+        line = "信箱待服务：节点 {} 有 {} 条请求等监工会话服务，最早一条已等 {} 分钟".format(
+            node_id, entry["count"], int(entry["oldest_seconds"] // 60))
+        if entry.get("escalate"):
+            line += "；已等满 60 分钟，需要监工服务信箱：回到监工会话，用 supervisor-mailbox 服务这些请求"
+        waiting_lines.append(line)
+    details = report.get("unknown_details") or {}
     for node_id, session in sorted((report.get("unknown_sessions") or {}).items()):
-        # The session is identified but leaves no transcript to read: the beat must
-        # not read as plain "idle" -- the supervisor looks at that session itself.
-        unknown.append("空转评估未知：节点 {} 的 worker 会话 {} 读不到会话记录，无法判断是否仍在工作".format(
-            node_id, session))
+        # The session is identified but its transcript could not be read: say which
+        # kind of "cannot read" it is; the supervisor looks at that session itself.
+        info = details.get(node_id) or {}
+        category = info.get("category")
+        if category == "not_found":
+            reason = "未找到会话记录（已搜索 {} 个项目目录）".format(info.get("searched", 0))
+        elif category == "unreadable":
+            reason = "会话记录目录不可读（{}）".format("、".join(info.get("unreadable") or []) or "无路径")
+        else:
+            reason = "无法判断读不到会话记录的原因"
+        unknown.append("空转评估未知：节点 {} 的 worker 会话 {} {}，无法判断是否仍在工作".format(
+            node_id, session, reason))
     for node_id, entry in sorted(report.get("nodes", {}).items()):
         silent = entry.get("silent_minutes")
         since = "worker 会话静默 {} 分钟".format(silent) if silent is not None else "连续 {} 拍进展不变".format(
@@ -3173,7 +3461,7 @@ def render_stall_beat_text(report, run_id, command_prefix="vibe"):
                 "修完运行时文件后复核：{} heal-verify --run-id {} --node {}{}".format(
                     node_id, since, _pack_text(entry["pack"]),
                     command_prefix, run_id, node_id, role_flag))
-    return "\n".join(escalate + investigate + unknown)
+    return "\n".join(waiting_lines + escalate + investigate + unknown)
 
 
 def _heal_verify_worker(paths, run_id, node_id, snapshot, events, base):
@@ -3610,6 +3898,7 @@ def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
     report = beat_stall_report(paths, run_id)
     payload["stall"] = report
     stall_text = render_stall_beat_text(report, run_id, command_prefix)
+    mailbox_wait_mark_reported(paths, run_id, report)
     if stall_text:
         text = text + "\n" + stall_text if state in {"rotate", "contract_drift"} else stall_text + "\n" + text
     text = _beat_extras(paths, run_id, payload, text)

@@ -66,6 +66,10 @@ DEFAULT_HEARTBEAT_INTERVAL_MINUTES = 10
 HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES = 60
 ROTATE_HARD_CAP_CHOICES = (150000, 200000, 300000, 500000, 800000)
 DEFAULT_ROTATE_HARD_CAP_TOKENS = 200000
+#: Option marker for a tier usable only by accepting its stated ``cost``.
+#: Replaces the 5.2.6 option key ``forced``, which read as "selected" (#391);
+#: a stored card carrying ``forced`` is still read as this marker.
+COST_ACCEPTANCE_MARKER = "requires_cost_acceptance"
 
 # V4.6 ISSUE-02: structured per-node worker declarations on authorization
 # cards.  Every node records its dispatch topology and the identity source of
@@ -1347,6 +1351,10 @@ class AuthorizationCard:
     # with its verified / pm_ruling / unverified label and provenance.
     # Unsigned display, like ``model_tiers``.
     platform_capabilities: Tuple[Dict[str, Any], ...] = ()
+    # Dependency graph shown with the card: predecessors, parallel groups,
+    # width, critical path, reasonless serial edges.  Unsigned display; a
+    # 5.2.6 card has none and the graph is derived from its nodes instead.
+    dependency_graph: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -1660,7 +1668,8 @@ def _normalized_option_entries(
     for item in options:
         if not isinstance(item, dict):
             raise ValueError(label + " option must be an object")
-        unknown = set(item) - {key, "available", "reason", "forced", "cost"}
+        unknown = set(item) - {key, "available", "reason", "forced", "cost",
+                               COST_ACCEPTANCE_MARKER, "selected"}
         if unknown:
             raise ValueError(
                 label + " option has unknown keys: "
@@ -1681,20 +1690,45 @@ def _normalized_option_entries(
         if not available and not reason.strip():
             raise ValueError(label + " option is unavailable without a reason")
         entry = {key: value, "available": available, "reason": reason}
-        # A forced tier is usable only by an explicit product choice and must
+        # A cost tier is usable only by an explicit product choice and must
         # state its price on the card: a missing cost refuses publication.
-        # Absent for ordinary tiers, so existing cards stay byte-identical.
-        if "forced" in item or "cost" in item:
-            forced = item.get("forced")
+        # Absent for ordinary tiers.  The 5.2.6 key ``forced`` is still read
+        # (a stored card carries it); when both are present the new key wins.
+        # Only the new key is written back: ``forced`` read as "selected" (#391).
+        if COST_ACCEPTANCE_MARKER in item or "forced" in item or "cost" in item:
+            marker = item.get(COST_ACCEPTANCE_MARKER, item.get("forced"))
             cost = item.get("cost")
-            if forced is not True or not available:
-                raise ValueError(label + " option forced marker must be true on an available tier")
+            if marker is not True or not available:
+                raise ValueError(label + " option cost-acceptance marker must be true on an available tier")
             if not isinstance(cost, str) or not cost.strip():
-                raise ValueError(label + " forced option has no cost statement")
-            entry["forced"] = True
+                raise ValueError(label + " cost-acceptance option has no cost statement")
+            entry[COST_ACCEPTANCE_MARKER] = True
             entry["cost"] = cost
         entries.append(entry)
     return tuple(entries)
+
+
+def option_requires_cost_acceptance(item: Any) -> bool:
+    """Whether an availability entry is a cost tier; reads the 5.2.6 ``forced`` key too."""
+    if not isinstance(item, dict):
+        return False
+    if COST_ACCEPTANCE_MARKER in item:
+        return item.get(COST_ACCEPTANCE_MARKER) is True
+    return item.get("forced") is True
+
+
+def mark_selected_option(
+    options: Tuple[Dict[str, Any], ...], key: str, chosen: Optional[int]
+) -> Tuple[Dict[str, Any], ...]:
+    """Mark exactly the chosen tier ``selected`` and every other tier not.
+
+    Unsigned display, like the availability itself.  ``chosen`` of ``None``
+    (a card that predates the choice) selects nothing.
+    """
+    return tuple(
+        dict(item, selected=(chosen is not None and item.get(key) == chosen))
+        for item in options
+    )
 
 
 def _require_offered(
@@ -1734,7 +1768,8 @@ def _drop_unset_card_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     the option existed, so their stored digests keep verifying.
     """
     for key in ("node_scope_digests", "heartbeat_interval_minutes", "rotate_hard_cap",
-                "heartbeat_interval_forced", "heartbeat_interval_forced_cost"):
+                "heartbeat_interval_forced", "heartbeat_interval_forced_cost",
+                "dependency_graph"):
         if result.get(key) is None:
             result.pop(key, None)
     for key in ("heartbeat_interval_options", "rotate_hard_cap_options", "model_tiers",
@@ -1985,7 +2020,7 @@ def build_authorization_card(
     if heartbeat_interval_options is not None:
         heartbeat_interval_forced, heartbeat_interval_forced_cost = None, None
         for item in heartbeat_options:
-            if item.get("forced") and item["minutes"] == heartbeat_interval_minutes:
+            if item.get(COST_ACCEPTANCE_MARKER) and item["minutes"] == heartbeat_interval_minutes:
                 heartbeat_interval_forced, heartbeat_interval_forced_cost = True, item["cost"]
     # Only a freshly requested choice is checked against observed availability;
     # a carried-forward one (options not observed) is left to the runtime.
@@ -2038,8 +2073,19 @@ def build_authorization_card(
     # Observed availability is not signed: it describes this publication's
     # environment, not the approval.  Adding it after the digest keeps both the
     # digest and the record schema unchanged for a caller that passes none.
-    canonical["heartbeat_interval_options"] = heartbeat_options
-    canonical["rotate_hard_cap_options"] = rotate_options
+    canonical["heartbeat_interval_options"] = mark_selected_option(
+        heartbeat_options, "minutes", heartbeat_interval_minutes)
+    canonical["rotate_hard_cap_options"] = mark_selected_option(
+        rotate_options, "tokens", rotate_hard_cap)
+    # The dependency graph is shown with the card (issue authorization-card).
+    # Unsigned display derived from the signed node contracts (``depends_on``
+    # is inside ``node_contract_digest``); a graph that cannot be rendered is
+    # recorded with its reason, and ``vibe authorize`` refuses on it.
+    from .dag import DependencyGraphError, dependency_graph
+    try:
+        canonical["dependency_graph"] = dependency_graph(nodes)
+    except DependencyGraphError as error:
+        canonical["dependency_graph"] = {"error": str(error)}
     canonical["model_tiers"] = _model_tier_rows(nodes, capabilities.agent_id)
     canonical["platform_capabilities"] = card_capability_rows(capabilities.agent_id)
     canonical.setdefault("daemon", daemon)

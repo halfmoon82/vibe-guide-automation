@@ -33,6 +33,7 @@ from vibe_guide.state import load_snapshot
 from vibe_guide.task_registry import TERMINAL_TASK_STATUSES
 
 from tests import test_integration_review_closeout_entry as closeout
+from tests.support_v45_authorize import with_display_receipt
 
 PLAN = "pe"
 NODES = ("export-button", "date-range-filter")
@@ -75,6 +76,7 @@ class PlatformCase(unittest.TestCase):
 
     # -- operations a user can do -------------------------------------------
     def cli(self, *argv):
+        with_display_receipt(argv, self.root)
         return run_cli(list(argv) + ["--json"], self.root)
 
     def attest(self, platform, *, sdd=True, background=False):

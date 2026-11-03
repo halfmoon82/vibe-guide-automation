@@ -21,6 +21,7 @@ from .authorization import (
     DEFAULT_ROTATE_HARD_CAP_TOKENS,
     AuthorizationCard,
     build_authorization_card,
+    option_requires_cost_acceptance,
 )
 from .dag import append_integration_review_node, render_plan_artifacts, validate_dag
 from .engine_attestation import create_engine_attestation
@@ -56,10 +57,10 @@ def _card_flag(source, key, default):
 
 
 def _default_heartbeat_minutes(options) -> int:
-    """The longest tier this platform may use without a forced-cost choice."""
+    """The longest tier this platform may use without accepting a stated cost."""
     usable = [
         entry["minutes"] for entry in options
-        if entry.get("available") and not entry.get("forced")
+        if entry.get("available") and not option_requires_cost_acceptance(entry)
     ]
     return max(usable) if usable else DEFAULT_HEARTBEAT_INTERVAL_MINUTES
 

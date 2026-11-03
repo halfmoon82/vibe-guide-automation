@@ -16,6 +16,10 @@ dev 子代理实现 → review 子代理审查 →（存在 P0–P2）返工回 
    工具没有 `cwd`，只能在提示里要求它**每条命令先 `cd <worktree>`**、写文件用绝对路径——漏一条命令
    就落回主项目树（见 prd-guide §6.3）。review 子代理同理。唯一例外是第 5 节的 `vibe worker-deliver`：
    它必须带 `--project-root <主项目绝对路径>`（或设 `VIBE_PROJECT_ROOT`），不依赖当前目录。
+   **WorkBuddy 降级路径**（单次运行观察：run-9fef3109，2026-11-03，issue #390，宿主版本未知，非已验证、非永久限制）：
+   Agent 工具 general-purpose 类型下 claude 系模型曾被内容策略拦、gpt 系模型不被个人免费用户允许时，
+   可改用 Explore 类型加 sonnet 派发 dev/review 子代理。限制：Explore 有 Bash、没有写文件和编辑工具，
+   dev 子代理只能经 Bash 改文件。详见 docs/workbuddy/workbuddy-in-session-dispatch-verification.md。
 2. **review 子代理**：**独立上下文**、**只读**、**非作者视角**审查 dev 的 diff，按 P0（资金/数据正确性）、P1（逻辑缺陷/事务边界）、P2（边界条件/行为回归）、P3（建议）分级产出意见。review 子代理不得是 dev 子代理本人，不得复用 dev 的实现上下文。
 3. **返工**：存在 P0–P2 时逐条核实（reviewer 意见也要验证，不盲从）→ 由 dev 子代理修复 → 重跑定向验证（须为绿）。
 4. **复审**：返工后回到 review 子代理复审，保留审查身份与证据链；最多 3 轮。三轮仍不收敛时由监工记录 `change_reviewer_or_split_node`，换 reviewer 或拆节点并保留唯一 writer；只有分歧会改变 PRD 验收判定时才升级产品决策。

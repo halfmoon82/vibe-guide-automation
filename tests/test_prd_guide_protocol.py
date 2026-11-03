@@ -58,6 +58,22 @@ class ProtocolShippingTests(unittest.TestCase):
         text = load_protocol("prd-guide")
         self.assertEqual(protocol_schema_example(text), PRODUCT_SPEC_FIELDS)
 
+    def test_protocol_states_the_serial_edge_rule_on_one_line(self):
+        """dag-serial-audit: §4 carries D6, both fixes and the no-reason readings."""
+        from vibe_guide.dag import DEPENDENCY_REASON_MAX_CHARS, DEPENDENCY_REASONS_FIELD, EDGE_REASON_LABELS
+        from vibe_guide.protocols import load_protocol
+        text = load_protocol("prd-guide")
+        section = text[text.index("## 4. 拆节点"):text.index("## 5.")]
+        lines = [line for line in section.splitlines() if "每条 `depends_on` 都要有理由" in line]
+        self.assertEqual(len(lines), 1, lines)
+        line = lines[0]
+        for label in EDGE_REASON_LABELS.values():
+            self.assertIn(label, line)
+        for needle in ("D6", "拒绝发布", "补理由", "改为并行", "`{}`".format(DEPENDENCY_REASONS_FIELD),
+                       "空字符串", "只有空格", "{} 字".format(DEPENDENCY_REASON_MAX_CHARS),
+                       "最大并行宽度", "关键路径长度", "5.2.6 及更早"):
+            self.assertIn(needle, line)
+
     def test_protocol_lists_every_engineering_field_as_forbidden(self):
         from vibe_guide.node_spec import ENGINEERING_FIELDS
         from vibe_guide.protocols import load_protocol

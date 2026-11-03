@@ -313,6 +313,10 @@ class DAGAuditResult:
     blocked_nodes: List[str]
     reasons: Dict[str, List[str]]
     parallel_groups: Optional[Dict[str, List[str]]] = None
+    # Serial-edge audit (dag-serial-audit): parallel waves, maximum width,
+    # critical path and every depends_on edge's reason type.  Optional so a
+    # result built without it keeps its old dictionary shape.
+    serial: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.status not in {"ready", "blocked_design", "blocked_dag", "blocked_unknown"}:
@@ -327,13 +331,16 @@ class DAGAuditResult:
         })
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "status": self.status,
             "ready_nodes": list(self.ready_nodes),
             "blocked_nodes": list(self.blocked_nodes),
             "reasons": {key: list(value) for key, value in self.reasons.items()},
             "parallel_groups": {key: list(value) for key, value in self.parallel_groups.items()},
         }
+        if self.serial is not None:
+            payload["serial"] = json.loads(json.dumps(self.serial, ensure_ascii=False))
+        return payload
 
 
 _CONTRACT_FIELDS = (
@@ -490,6 +497,288 @@ def validate_dag(nodes: List[DAGNode]) -> DAGValidation:
     errors = _structural_errors(nodes)
     errors.extend(error for node in nodes for error in (_contract_error(node),) if error)
     return DAGValidation(not errors, tuple(errors))
+
+
+# ---------------------------------------------------------------------------
+# Serial-edge audit: every depends_on edge needs a reason (issue dag-serial-audit)
+# ---------------------------------------------------------------------------
+
+#: Node-level product spec field (moved into the contract by node_spec):
+#: ``{"<depends_on node id>": "一句话说明依赖它的什么产出"}``.
+DEPENDENCY_REASONS_FIELD = "dependency_reasons"
+#: Longest accepted reason; one sentence, not a document.
+DEPENDENCY_REASON_MAX_CHARS = 200
+
+EDGE_REASON_WRITE_OVERLAP = "write_scope_overlap"
+EDGE_REASON_DATA_DEPENDENCY = "data_dependency"
+EDGE_REASON_NONE = "none"
+EDGE_REASON_LABELS = {
+    EDGE_REASON_WRITE_OVERLAP: "写范围重叠",
+    EDGE_REASON_DATA_DEPENDENCY: "数据依赖",
+    EDGE_REASON_NONE: "无理由",
+}
+
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def dependency_reason_problem(value: Any) -> Optional[str]:
+    """Why one declared reason is not usable, or ``None`` when it is.
+
+    A reason is one non-blank line of at most 200 characters.  Anything else
+    (missing, non-string, blank, multi-line, too long) reads as no reason:
+    the gate never defaults an unusable value to a pass.
+    """
+    if value is None:
+        return "未填写"
+    if not isinstance(value, str):
+        return "不是字符串"
+    text = value.strip()
+    if not text:
+        return "为空或只有空格"
+    if _CONTROL_CHARACTERS.search(text):
+        return "含换行或控制字符，只能写一句话"
+    if len(text) > DEPENDENCY_REASON_MAX_CHARS:
+        return "超过 {} 字".format(DEPENDENCY_REASON_MAX_CHARS)
+    return None
+
+
+def _declared_dependency_reasons(node: DAGNode) -> Tuple[Dict[str, Any], Optional[str]]:
+    """The node's raw reason mapping and a format problem with the field itself."""
+    contract = node.contract if isinstance(node.contract, Mapping) else {}
+    if DEPENDENCY_REASONS_FIELD not in contract:
+        return {}, None
+    raw = contract.get(DEPENDENCY_REASONS_FIELD)
+    if not isinstance(raw, Mapping):
+        return {}, "{} 必须是“依赖节点 id → 一句话理由”的对象".format(DEPENDENCY_REASONS_FIELD)
+    return {str(key): value for key, value in raw.items()}, None
+
+
+def _edge_scope_overlap(left: Optional[List[str]], right: Optional[List[str]]) -> List[str]:
+    if not left or not right:
+        return []
+    return sorted({path for path in left for other in right if _write_paths_overlap(path, other)})
+
+
+def serial_edges(nodes: Sequence[DAGNode]) -> List[Dict[str, Any]]:
+    """Classify every business ``depends_on`` edge by its reason.
+
+    Order: write-scope overlap first (the code proves it), then a declared
+    data-dependency reason, otherwise ``none``.  An unverifiable write scope
+    proves no overlap.  Edges into the integration-review node are its fixed
+    contract (it depends on every business node) and are not listed; edges
+    to unknown nodes are structural errors reported elsewhere.
+    """
+    by_id = {node.id: node for node in nodes}
+    scopes = {node.id: _conflict_write_scope(node) for node in nodes}
+    edges: List[Dict[str, Any]] = []
+    for node in nodes:
+        if is_integration_review_node(node):
+            continue
+        reasons, field_problem = _declared_dependency_reasons(node)
+        for dependency in dict.fromkeys(node.depends_on):
+            if dependency not in by_id or is_integration_review_node(by_id[dependency]):
+                continue
+            edge: Dict[str, Any] = {"from": dependency, "to": node.id}
+            overlap = _edge_scope_overlap(scopes.get(dependency), scopes.get(node.id))
+            reason_problem = field_problem or dependency_reason_problem(reasons.get(dependency))
+            if overlap:
+                edge["reason_type"] = EDGE_REASON_WRITE_OVERLAP
+                edge["overlap"] = overlap[:3]
+            elif reason_problem is None:
+                edge["reason_type"] = EDGE_REASON_DATA_DEPENDENCY
+                edge["reason"] = reasons[dependency].strip()
+            else:
+                edge["reason_type"] = EDGE_REASON_NONE
+                edge["problem"] = reason_problem
+            edge["reason_label"] = EDGE_REASON_LABELS[edge["reason_type"]]
+            edges.append(edge)
+    return edges
+
+
+def _unreasoned_edge_message(edge: Mapping[str, Any]) -> str:
+    source, target = edge["from"], edge["to"]
+    return (
+        "依赖边 {source} → {target} 无理由：两端写范围不重叠，且节点 {target} 的数据依赖理由{problem}。"
+        "修改办法（二选一）：① 补理由：在节点 {target} 的 {field} 里为 {source} 写一句话，"
+        "说明依赖 {source} 的什么产出（例如“依赖 {source} 产出的账本文件格式”）；"
+        "② 去掉 {target} 对 {source} 的 depends_on，让两个节点并行".format(
+            source=source, target=target, problem=edge.get("problem", "未填写"),
+            field=DEPENDENCY_REASONS_FIELD,
+        )
+    )
+
+
+def unreasoned_edge_errors(nodes: Sequence[DAGNode]) -> Dict[str, List[str]]:
+    """Publish-blocking messages per dependent node for every reasonless edge.
+
+    Decision D6 = A.  The product path (``vibe plan --from-prd``) enforces
+    this in ``node_spec.normalize_node_spec``; the legacy hand-written
+    ``--node-spec`` path and plans published by 5.2.6 or earlier are not
+    re-audited -- their edges still appear in ``serial_audit`` as ``none``.
+    """
+    errors: Dict[str, List[str]] = {}
+    for edge in serial_edges(nodes):
+        if edge["reason_type"] == EDGE_REASON_NONE:
+            errors.setdefault(edge["to"], []).append(_unreasoned_edge_message(edge))
+    return errors
+
+
+def parallel_shape(nodes: Sequence[DAGNode]) -> Dict[str, Any]:
+    """Parallel waves, maximum width and critical path of the business DAG.
+
+    A node's wave is the length of the longest ``depends_on`` chain ending at
+    it, so a wave is the set of nodes that can run at once when every node
+    takes the same time.  Width is the largest wave; the critical path is the
+    longest chain counted in nodes.  The integration-review node is left out:
+    it always closes the plan and would add one to every chain.  A cycle or
+    an unknown dependency leaves the shape undefined (``None`` values).
+    """
+    business = [node for node in nodes if not is_integration_review_node(node)]
+    ids = {node.id for node in business}
+    graph = {node.id: [dep for dep in dict.fromkeys(node.depends_on)] for node in business}
+    if any(dep not in ids for deps in graph.values() for dep in deps) or len(ids) != len(business):
+        return {"parallel_waves": None, "max_parallel_width": None, "critical_path_length": None}
+    depth: Dict[str, int] = {}
+    in_progress: set = set()
+
+    def visit(node_id: str) -> Optional[int]:
+        if node_id in depth:
+            return depth[node_id]
+        if node_id in in_progress:
+            return None
+        in_progress.add(node_id)
+        best = 0
+        for dep in graph[node_id]:
+            value = visit(dep)
+            if value is None:
+                return None
+            best = max(best, value)
+        in_progress.discard(node_id)
+        depth[node_id] = best + 1
+        return depth[node_id]
+
+    for node in business:
+        if visit(node.id) is None:
+            return {"parallel_waves": None, "max_parallel_width": None, "critical_path_length": None}
+    waves: List[List[str]] = []
+    for node in business:
+        level = depth[node.id]
+        while len(waves) < level:
+            waves.append([])
+        waves[level - 1].append(node.id)
+    return {
+        "parallel_waves": waves,
+        "max_parallel_width": max((len(wave) for wave in waves), default=0),
+        "critical_path_length": len(waves),
+    }
+
+
+def serial_audit(nodes: Sequence[DAGNode]) -> Dict[str, Any]:
+    """The DAG audit block the authorization card reads."""
+    edges = serial_edges(nodes)
+    summary = dict(parallel_shape(nodes))
+    summary["edges"] = edges
+    summary["unreasoned_edges"] = [
+        {"from": edge["from"], "to": edge["to"]}
+        for edge in edges if edge["reason_type"] == EDGE_REASON_NONE
+    ]
+    return summary
+
+
+#: Schema of the dependency graph the authorization card carries.
+DEPENDENCY_GRAPH_SCHEMA = 1
+
+
+class DependencyGraphError(ValueError):
+    """The dependency graph cannot be rendered; authorization must not skip it."""
+
+
+def dependency_graph(nodes: Sequence[DAGNode]) -> Dict[str, Any]:
+    """The dependency graph shown with the authorization card (issue authorization-card).
+
+    Every node with its predecessors, parallel group and wave, plus the
+    parallel waves, maximum parallel width, critical path length and the
+    reasonless serial edges.  Built from the same ``serial_audit`` the DAG
+    audit reports, so the card and the audit cannot disagree.  Raises
+    ``DependencyGraphError`` when the shape is undefined (a cycle, an unknown
+    dependency, duplicate ids): the card is never shown without its graph.
+    """
+    nodes = list(nodes or [])
+    if not nodes:
+        raise DependencyGraphError("依赖图渲染失败：计划没有节点")
+    ids = [node.id for node in nodes]
+    if len(set(ids)) != len(ids):
+        raise DependencyGraphError("依赖图渲染失败：节点 id 重复")
+    known = set(ids)
+    unknown = sorted({dep for node in nodes for dep in node.depends_on if dep not in known})
+    if unknown:
+        raise DependencyGraphError("依赖图渲染失败：依赖了不存在的节点 " + "、".join(unknown))
+    audit = serial_audit(nodes)
+    waves = audit.get("parallel_waves")
+    if waves is None:
+        raise DependencyGraphError("依赖图渲染失败：依赖关系有环，算不出并行宽度和关键路径")
+    wave_of = {node_id: index + 1 for index, wave in enumerate(waves) for node_id in wave}
+    groups: Dict[str, List[str]] = {}
+    graph_nodes = []
+    for node in sorted(nodes, key=lambda item: item.id):
+        group = _node_metadata(node, "parallel_group")
+        if group:
+            groups.setdefault(str(group), []).append(node.id)
+        graph_nodes.append({
+            "id": node.id,
+            "depends_on": sorted(dict.fromkeys(node.depends_on)),
+            "parallel_group": str(group) if group else None,
+            "wave": wave_of.get(node.id),
+            "integration_review": is_integration_review_node(node),
+        })
+    return {
+        "schema": DEPENDENCY_GRAPH_SCHEMA,
+        "nodes": graph_nodes,
+        "parallel_waves": [sorted(wave) for wave in waves],
+        "parallel_groups": {name: sorted(members) for name, members in sorted(groups.items())},
+        "max_parallel_width": audit["max_parallel_width"],
+        "critical_path_length": audit["critical_path_length"],
+        "edges": audit["edges"],
+        "unreasoned_edges": audit["unreasoned_edges"],
+    }
+
+
+def dependency_graph_digest(graph: Mapping[str, Any]) -> str:
+    """Canonical digest a display receipt binds to."""
+    basis = json.dumps(graph, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def render_dependency_graph_text(graph: Mapping[str, Any]) -> str:
+    """Plain-language rendering of :func:`dependency_graph` for the card."""
+    lines = ["依赖图：最大并行宽度 {}｜关键路径长度 {} 个节点（不含整合审查）".format(
+        graph.get("max_parallel_width"), graph.get("critical_path_length"))]
+    for index, wave in enumerate(graph.get("parallel_waves") or [], start=1):
+        lines.append("  第 {} 波{}：{}".format(
+            index, "（可同时开工）" if len(wave) > 1 else "", "、".join(wave)))
+    lines.append("  每个节点的前置节点：")
+    for node in graph.get("nodes") or []:
+        depends = node.get("depends_on") or []
+        if node.get("integration_review"):
+            predecessor = "全部业务节点（{}）".format("、".join(depends)) if depends else "无"
+        else:
+            predecessor = "、".join(depends) if depends else "无"
+        group = node.get("parallel_group")
+        lines.append("    {} ← {}{}".format(
+            node.get("id"), predecessor, "（并行组 {}）".format(group) if group else ""))
+    groups = graph.get("parallel_groups") or {}
+    if groups:
+        lines.append("  并行组：" + "；".join(
+            "{}：{}".format(name, "、".join(members)) for name, members in groups.items()))
+    else:
+        lines.append("  并行组：无")
+    unreasoned = graph.get("unreasoned_edges") or []
+    if unreasoned:
+        lines.append("  无理由串行边（两端写范围不重叠、也没写数据依赖理由）：" + "；".join(
+            "{} → {}".format(edge.get("from"), edge.get("to")) for edge in unreasoned))
+    else:
+        lines.append("  无理由串行边：无")
+    return "\n".join(lines)
 
 
 def ready_nodes(nodes: List[DAGNode]) -> List[DAGNode]:
@@ -1059,7 +1348,7 @@ def audit_dag(plan: Plan) -> DAGAuditResult:
         group = _node_metadata(node, "parallel_group")
         if node.id in ready and group:
             groups.setdefault(str(group), []).append(node.id)
-    return DAGAuditResult(status, ready, blocked, reasons, groups)
+    return DAGAuditResult(status, ready, blocked, reasons, groups, serial_audit(nodes))
 
 
 def render_plan_artifacts(plan: Plan, output_dir: Path) -> PlanArtifacts:

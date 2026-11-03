@@ -27,6 +27,13 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-11-03: §5.3 show the card with its dependency graph before
+        # authorizing (--show-card receipt, D5) and one selected heartbeat
+        # tier (#391) (authorization-card).
+        "4cb7ec45e154083b45e79927075f059299e5cb406dad1104f0de8b60f0ce0d49",
+        # 2026-11-03: §4 every depends_on edge needs a reason (D6), §5.1 gains
+        # the optional node field dependency_reasons (dag-serial-audit).
+        "0b82fc85530030d519203fa76f8497a5215ef5ee8d8a8764a11863496a7a4396",
         # 2026-11-03: §4/§7 platform-handoff exception -- a visible-to-background
         # change on handoff is disclosed, not confirmed; drain first (card-and-handoff).
         "0d3a9757b3c7f33496926f33392d0c99f3f9433e56ef1b97560bae5c3daf3317",
@@ -243,6 +250,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Worker protocol delivered by reference (#216): a ref-mode dispatch pins
     # the file's sha256 and only accepts a digest published here.
     "visible-sdd-worker": frozenset({
+        # 2026-11-03: WorkBuddy Explore-type subagent fallback (single-run observation, #390).
+        "9c65bef62c1d30ede26db9153a272349f34043f1d0326bfdb5fa22e8ce70af84",
         # 2026-10-30: worker-deliver takes --project-root, no cwd.
         "55653cf68dadeb47b04b778778b59729915cacd30061525d670bd9f729c2656b",
         "30b226ff0a6711a91779785c28a993679e0a33c3aeb89e836cfd427194750945",

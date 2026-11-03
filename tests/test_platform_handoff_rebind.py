@@ -31,6 +31,7 @@ from vibe_guide.paths import ProjectPaths
 from vibe_guide.state import load_events, load_snapshot
 
 from tests import test_integration_review_closeout_entry as closeout
+from tests.support_v45_authorize import with_display_receipt
 
 CLEARED_CLAIM = closeout.CLEARED_CLAIM
 FIXTURE = closeout.FIXTURE
@@ -57,6 +58,7 @@ class HandoffCase(unittest.TestCase):
         self.waits = {}
 
     def cli(self, *argv):
+        with_display_receipt(argv, self.root)
         return run_cli(list(argv) + ["--json"], self.root)
 
     def attest(self, adapter, name=None):
@@ -94,6 +96,8 @@ class HandoffCase(unittest.TestCase):
         self.attest(adapter)
         spec = json.loads(FIXTURE.read_text(encoding="utf-8"))
         spec["nodes"][1]["depends_on"] = [FIRST]
+        # D6: a product-path edge without a write overlap needs a reason.
+        spec["nodes"][1]["dependency_reasons"] = {FIRST: "依赖第一个节点产出的导出文件格式"}
         spec["nodes"][1]["integration_after"] = []
         (self.root / "spec.json").write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
         planned = self.cli("plan", "--request", REQUEST, "--plan-id", PLAN, "--s1", "5,5,5,5,5",

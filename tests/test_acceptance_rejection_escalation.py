@@ -56,6 +56,7 @@ from vibe_guide.task_registry import TaskBinding, load_task_binding
 # The lineage-complete snapshot stand-in and cleared claim from the closeout
 # entry tests; the pure derivation reads the same lineage fields.
 from tests.test_integration_review_closeout_entry import CLEARED_CLAIM, _snapshot
+from tests.support_v45_authorize import with_display_receipt
 
 
 def _business_node(node_id):
@@ -566,6 +567,7 @@ class IntegrationReviewerEscalationEndToEndTests(unittest.TestCase):
     def cli(self, *argv):
         from vibe_guide.cli import run_cli
 
+        with_display_receipt(argv, self.root)
         return run_cli(list(argv) + ["--json"], self.root)
 
     def test_escalated_integration_reviewer_closes_through_the_human_entry(self):

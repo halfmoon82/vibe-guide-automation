@@ -477,7 +477,7 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             raise RemoteDeliveryFailed("review", "PR URL is missing", retryable=False)
         raw = _run_gh(
             repo,
-            ["pr", "view", pr_url, "--json", "reviews,state"],
+            ["pr", "view", pr_url, "--json", "reviews,state,reviewRequests"],
             timeout=timeout,
         )
         try:
@@ -493,12 +493,70 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             isinstance(item, Mapping) and item.get("state") == "CHANGES_REQUESTED"
             for item in (reviews if isinstance(reviews, list) else [])
         )
-        return {
+        requests = payload.get("reviewRequests") if isinstance(payload, Mapping) else []
+        reviewers = []
+        for item in (requests if isinstance(requests, list) else []):
+            if isinstance(item, Mapping):
+                name = item.get("login") or item.get("slug") or item.get("name")
+                if isinstance(name, str) and name.strip():
+                    reviewers.append(name.strip())
+        facts = {
             "pr_url": pr_url,
             "approved": approved,
             "changes_requested": changes_requested,
             "pr_state": str(payload.get("state") or "") if isinstance(payload, Mapping) else "",
+            "requested_reviewers": reviewers,
         }
+        # Only probe protection when no GitHub approval exists and nothing
+        # blocks the PR: it decides whether the integration review evidence
+        # may stand in for a GitHub review.
+        if not approved and not changes_requested:
+            facts["review_protection"] = self._review_protection()
+        return facts
+
+    def _review_protection(self) -> str:
+        """``"none"`` only when both classic protection and rulesets are
+        positively confirmed to require no review; every failure, unparseable
+        reply or 404 (cannot tell "off" from "no permission") is ``"unknown"``."""
+        repo, target, timeout = self._repo, self._target, self._timeout
+        try:
+            branch = json.loads(_run_gh(
+                repo, ["api", "repos/{{owner}}/{{repo}}/branches/{}".format(target)], timeout=timeout))
+            if not isinstance(branch, Mapping) or not isinstance(branch.get("protected"), bool):
+                return "unknown"
+            if branch["protected"]:
+                classic = json.loads(_run_gh(
+                    repo, ["api", "repos/{{owner}}/{{repo}}/branches/{}/protection".format(target)],
+                    timeout=timeout))
+                if not isinstance(classic, Mapping):
+                    return "unknown"
+                reviews = classic.get("required_pull_request_reviews")
+                if reviews is not None:
+                    if not isinstance(reviews, Mapping):
+                        return "unknown"
+                    count = reviews.get("required_approving_review_count")
+                    if not isinstance(count, int) or isinstance(count, bool) or count > 0 \
+                            or reviews.get("require_code_owner_reviews") is not False:
+                        return "required"
+            rules = json.loads(_run_gh(
+                repo, ["api", "repos/{{owner}}/{{repo}}/rules/branches/{}".format(target)],
+                timeout=timeout))
+            if not isinstance(rules, list):
+                return "unknown"
+            for rule in rules:
+                if not isinstance(rule, Mapping):
+                    return "unknown"
+                if rule.get("type") == "pull_request":
+                    params = rule.get("parameters")
+                    if not isinstance(params, Mapping):
+                        return "required"
+                    count = params.get("required_approving_review_count")
+                    if not isinstance(count, int) or isinstance(count, bool) or count > 0 \
+                            or params.get("require_code_owner_review") is not False:
+                        return "required"
+            return "none"
+        except (RemoteDeliveryFailed, ValueError, TypeError):
+            return "unknown"
 
     def _merge(self, context: Mapping[str, Any]) -> Dict[str, Any]:
         repo, timeout = self._repo, self._timeout
@@ -651,6 +709,13 @@ def _write_delivery_report(paths: Any, snapshot: Any, evidence: Mapping[str, Any
             "head_sha": evidence.get("head_sha"),
             "pr_url": evidence.get("pr_url"),
             "merge_commit": evidence.get("merge_commit"),
+            "review_basis": evidence.get("review_basis"),
+            "waiting_on": evidence.get("waiting_on"),
+            "review_basis_text": {
+                "integration_review_evidence": "merged on integration review evidence (no GitHub review required)",
+                "github_review": "waited for and merged after a GitHub review",
+                "waiting_for_github_review": "waiting for GitHub review",
+            }.get(str(evidence.get("review_basis") or ""), ""),
             "remote_verification": evidence.get("remote_verification"),
             "binding": evidence.get("binding"),
             "steps": sorted((evidence.get("steps") or {}).keys()),
@@ -736,7 +801,7 @@ def drive_remote_delivery(
             "reason": "digest binding changed; prior delivery evidence is not reusable",
             "change_reason": "remote_delivery_binding_changed",
         })
-        evidence = {}
+        evidence = {"binding_drifted": True}
         node["status"] = "planned"
     elif node.get("status") == "accepted":
         # Only an accepted node with current, digest-bound evidence may stop;
@@ -765,8 +830,11 @@ def drive_remote_delivery(
             return True
 
     context = _context_from_evidence(evidence, snapshot)
-    if not evidence:
+    if not evidence or set(evidence) == {"binding_drifted"}:
+        drifted = bool(evidence.get("binding_drifted"))
         evidence = _initial_evidence(snapshot, context)
+        if drifted:
+            evidence["binding_drifted"] = True
     steps = evidence.setdefault("steps", {})
 
     def persist() -> None:
@@ -817,10 +885,33 @@ def drive_remote_delivery(
                         "reason": "review requested changes",
                     })
                     return True
-                if not facts.get("approved"):
+                if facts.get("approved"):
+                    evidence["review_basis"] = "github_review"
+                elif (
+                    facts.get("review_protection") == "none"
+                    and integration.get("status") == "accepted"
+                    and not evidence.get("binding_drifted")
+                    and binding_matches(evidence.get("binding"), delivery_binding(snapshot))
+                ):
+                    # D3-A: no review protection on the target branch, so the
+                    # accepted, digest-bound integration review stands in.
+                    evidence["review_basis"] = "integration_review_evidence"
+                else:
+                    waiting = [str(x) for x in (facts.get("requested_reviewers") or []) if x]
+                    who = ", ".join(waiting) if waiting else "GitHub reviewer (none assigned)"
+                    node["waiting_on"] = who
+                    evidence["waiting_on"] = who
+                    evidence["review_basis"] = "waiting_for_github_review"
+                    # The review gate has not passed: never leave it recorded
+                    # as succeeded, or a retry would skip it and merge.
+                    steps.pop("review", None)
+                    persist()
+                    _write_delivery_report(paths, snapshot, evidence)
                     raise RemoteDeliveryFailed(
-                        step, "integration PR has no approving review", retryable=True
+                        step, "waiting for GitHub review from {}".format(who), retryable=True
                     )
+                node.pop("waiting_on", None)
+                evidence.pop("waiting_on", None)
             if step == "verify":
                 verification = {
                     "verified": facts.get("verified") is True,
