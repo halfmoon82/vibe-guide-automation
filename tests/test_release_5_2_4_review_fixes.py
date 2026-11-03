@@ -10,7 +10,8 @@ from vibe_guide.decision_boundary import ingest_worker_decisions, raise_reusable
 from vibe_guide.adapters.task_provider import ProviderUnavailable
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.scope_landing import ScopeLandingUnknown, landing_report
-from vibe_guide.state import load_snapshot
+from vibe_guide.contracts import RunEvent
+from vibe_guide.state import append_event, load_snapshot
 
 from tests.test_decision_reuse_338 import DecisionReuseTests, _QUESTION
 from tests.test_delivery_self_report_shape import SelfReportShapeGateTests
@@ -51,6 +52,21 @@ class EmptyLandingAllowedReplayTests(EmptyLandingGateTests):
         self.assertNotEqual(crashed.nodes["bg"]["status"], "blocked_unknown")
         self.assertNotEqual(crashed.nodes["bg"].get("reason"),
                             "unapplied event needs manual reconciliation")
+
+    def test_daemon_delivery_unreceived_telemetry_does_not_wedge_replay(self):
+        crashed = load_snapshot(self.paths, self.snapshot.run_id)
+        sequence = append_event(
+            self.paths,
+            RunEvent("delivery_unreceived", {
+                "run_id": crashed.run_id, "reason_code": "unreceived_after_two_cycles",
+                "observation_count": 1}),
+            {"role": "system", "task_id": None, "handle_id": None, "generation": 0,
+             "authorization_digest": crashed.authorization_digest,
+             "node_contract_digest": crashed.node_contract_digest},
+        )
+        self.assertGreater(sequence, crashed.event_sequence)
+        self.monitor()._reconcile_unapplied_events(crashed)
+        self.assertEqual(crashed.event_sequence, sequence)
 
 
 class ModelFallbackReplayTests(ModelFallbackDispatchTests):
