@@ -88,6 +88,7 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
 - `integration_after`：先各自开发、最后联调的关系，不阻塞启动。
 - `parallel_group`：可同时开工的一组，用同一组名；不分组写 `null`。
 - **写范围重叠的节点必须用 `depends_on` 串行。**两节点 `files` 重叠时，`integration_after` 和 `parallel_group` 都不能解除冲突（它们不阻塞启动）；先把同文件工作归到同一节点，确要拆开用 `depends_on` 串起来。同一 `parallel_group` 内的重叠连 `depends_on` 也救不了，只能拆开路径或移出该组。
+- **每条 `depends_on` 都要有理由，否则发布被拒（决定 D6）。**vibe 为每条依赖边自动判定理由类型：两端 `files` 重叠记为“写范围重叠”；不重叠但下游节点在 `dependency_reasons` 里为这条边写了一句话，记为“数据依赖”；两者都没有记为“无理由”，`vibe plan` 拒绝发布并指明边。修改办法二选一：① 补理由——在下游节点写 `"dependency_reasons": {"<上游节点 id>": "依赖 <上游节点> 产出的 xxx 文件格式"}`，一句话说明依赖谁的什么产出；② 去掉这条 `depends_on`，改为并行。理由缺失、为空字符串、只有空格、不是字符串、含换行或超过 200 字，一律按“无理由”处理。不要为了省事把节点串成一条线：DAG 审计结果（`dag.yaml` 的 `audit.serial`）会写出最大并行宽度、关键路径长度和每条边的理由类型，供授权卡展示。5.2.6 及更早已发布的计划不重新审计。
 - 每个节点 `contract` 四个字段用验收语言写，不写实现细节：`input`（拿到什么）、`output`（交出什么）、`error_behavior`（出错时对用户的表现）、`acceptance_example`（验收者照做就能判断通过与否的具体例子）。
 - `files`：节点会动的文件，项目相对路径。这是**工程文件清单**，不是产品范围；宁可列全。漏列的文件监工可不问产品经理、自行补进该节点范围，须同时满足：① 在本仓库内；② 不涉及部署、凭据、外部系统配置；③ 没有被其他活跃节点的写范围覆盖；④ 留下 `scope_auto_expanded` 纠偏记录；⑤ 走通下面两类判据之一。
 
@@ -125,7 +126,8 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
     {"id": "str", "title": "str", "depends_on": ["node id"], "integration_after": ["node id"],
      "parallel_group": "str|null",
      "contract": {"input": "str", "output": "str", "error_behavior": "str", "acceptance_example": "str"},
-     "files": ["project-relative path"]}
+     "files": ["project-relative path"],
+     "dependency_reasons?": {"<depends_on node id>": "str"}}
   ],
   "prd?": {"<section>": [{"value": "str", "source": "user_confirmed|system_inferred|needs_confirmation|unverified"}]},
   "goals?": [
