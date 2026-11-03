@@ -2966,6 +2966,12 @@ def session_id_unknown_nodes(paths, snapshot):
     )
 
 
+def session_id_unknown_status_lines(paths, snapshot):
+    """``vibe status`` lines for nodes whose session id is unknown, one per node."""
+    return ["节点 {}：会话编号未知（无法读取会话记录，不参与空转评估）".format(node_id)
+            for node_id in session_id_unknown_nodes(paths, snapshot)]
+
+
 def _build_pack(paths, run_id, node_id, snapshot, events, role):
     from .heal_pack import build_heal_pack
     node = snapshot.nodes[node_id]

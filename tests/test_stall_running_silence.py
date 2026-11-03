@@ -273,6 +273,10 @@ class UnknownCategoryTests(RunningWorkerFixture):
         self.assertNotIn("空转评估未知", self.beat().text)
         snapshot = load_snapshot(self.paths, self.run_id)
         self.assertEqual(supervisor.session_id_unknown_nodes(self.paths, snapshot), [NODE])
+        lines = supervisor.session_id_unknown_status_lines(self.paths, snapshot)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("会话编号未知", lines[0])
+        self.assertIn(NODE, lines[0])
 
     def test_claude_config_dir_is_searched(self):
         alt = Path(self.temporary.name) / "alt" / "projects" / "p"
