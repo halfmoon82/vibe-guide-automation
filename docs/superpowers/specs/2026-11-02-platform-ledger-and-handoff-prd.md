@@ -54,7 +54,7 @@ vibe 号称一套 CLI 连接多个平台，但它既不知道自己现在跑在�
 8. 全量测试的结果不受本机 `~/.vibe-guide/config.json` 影响，也不受宿主环境变量（`CLAUDECODE`、`CODEX_THREAD_ID`、`CODEBUDDY_SESSION_ID` 等）影响：在 Claude Code 会话里跑和在普通终端里跑，结果一致。（`system_inferred`）
 9. 对一个已经没有未完成节点的 run 执行交接：被拒绝或什么都不做，授权卡保留实际执行的平台。（`system_inferred`）
 
-成功标准 1、2、6 和 WorkBuddy 5.9.4 的 Jobs 重测只能在真机上验证，放在验收期做，不归任何开发节点。
+成功标准 1、6 和 WorkBuddy 5.9.4 的 Jobs 重测只能在真机上验证，放在验收期做，不归任何开发节点。成功标准 2 分两层：夹具版由 platform-e2e 节点覆盖，真机版放在验收期做。
 
 ## 5. 非目标
 

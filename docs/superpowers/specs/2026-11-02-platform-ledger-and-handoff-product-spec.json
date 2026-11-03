@@ -370,7 +370,7 @@
    "parallel_group": null,
    "contract": {
     "input": "授权卡为 allow 或 deny 时派发开发与审查 worker；返工中的开发者需要改 tests/ 下文件或协议摘要登记文件。",
-    "output": "无论 allow 还是 deny，开发与审查 worker 的提示词都带推送禁令，后台派发都带 --disallowedTools；只有远端交付环节点可以推送。收口时检查远端是否出现新的 node/* 分支，出现即写进 vibe status --json 的偏差字段和交付报告。派发与返工提示用一句话写明自动放行规则。本项目 .vibe/config.json 的 auto_scope_paths 登记 vibe_guide/protocols/__init__.py（项目登记，按 AGENTS.md §6 判据一；代码默认值不变）。",
+    "output": "无论 allow 还是 deny，开发与审查 worker 的提示词都带推送禁令，后台派发都带 --disallowedTools；只有远端交付环节点可以推送。收口时检查远端是否出现新的 node/* 分支，出现即写进 vibe status --json 的偏差字段和交付报告。派发与返工提示用一句话写明自动放行规则。监工在本机 .vibe/config.json 的 auto_scope_paths 登记 vibe_guide/protocols/__init__.py（项目登记，按 AGENTS.md §6 判据一；该文件被 .gitignore，不入库、不属于本节点的交付文件；代码默认值不变）。",
     "error_behavior": "远端分支检查读不到远端时写明未检查，不当成没有越界；远端交付环自身的推送不受禁令影响。",
     "acceptance_example": "1) allow 卡派发开发 worker：提示词含禁令，后台命令行含 --disallowedTools，有测试断言。2) 远端多出一个 node/* 分支：vibe status --json 的偏差字段列出该分支。3) 返工开发者改 protocols/__init__.py：交付通过，不需要监工中转。4) 返工提示含自动放行规则一句话，有测试断言。"
    },
@@ -382,7 +382,6 @@
     "vibe_guide/scope_landing.py",
     "vibe_guide/remote_delivery.py",
     "vibe_guide/cli.py",
-    ".vibe/config.json",
     "tests/test_worker_push_ban_allow.py",
     "tests/test_rework_prompt_auto_scope.py"
    ]
