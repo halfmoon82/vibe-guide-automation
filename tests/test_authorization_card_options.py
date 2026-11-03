@@ -100,14 +100,14 @@ class CardOptionAvailabilityTests(unittest.TestCase):
         self.assertTrue(options[0]["available"])
         # Not verified: selectable only as a forced choice with its price.
         self.assertTrue(options[1]["available"])
-        self.assertTrue(options[1]["forced"])
+        self.assertTrue(options[1]["requires_cost_acceptance"])
         self.assertIn("60 分钟", options[1]["cost"])
         self.assertIn("no push wake verification registered", options[1]["reason"])
 
         self._verify()
         verified = heartbeat_interval_options(self.paths, "codex")
         self.assertTrue(verified[1]["available"], verified)
-        self.assertNotIn("forced", verified[1])
+        self.assertNotIn("requires_cost_acceptance", verified[1])
 
     def test_the_adapter_id_and_the_registered_provider_name_one_platform(self):
         # The card is built from the adapter id (``codex``) while the runtime
@@ -127,23 +127,23 @@ class CardOptionAvailabilityTests(unittest.TestCase):
         # whose wake-up was never verified.
         self._verify(provider="codex-background")
         options = heartbeat_interval_options(self.paths, "codex-app-visible")
-        self.assertTrue(options[1]["forced"])
+        self.assertTrue(options[1]["requires_cost_acceptance"])
         self.assertIn("not registered", options[1]["reason"])
 
     def test_claude_code_has_a_channel_so_verification_alone_clears_the_force(self):
         # SendMessage is registered as Claude Code's channel; once both
         # evidences are on file, 60 is an ordinary tier, not a forced one.
         options = heartbeat_interval_options(self.paths, "claude-code")
-        self.assertTrue(options[1]["forced"])
+        self.assertTrue(options[1]["requires_cost_acceptance"])
         self._verify(provider="claude-code")
         options = heartbeat_interval_options(self.paths, "claude-code")
         self.assertTrue(options[1]["available"])
-        self.assertNotIn("forced", options[1])
+        self.assertNotIn("requires_cost_acceptance", options[1])
 
     def test_an_unknown_provider_cannot_be_forced(self):
         options = heartbeat_interval_options(self.paths, None)
         self.assertFalse(options[1]["available"])
-        self.assertNotIn("forced", options[1])
+        self.assertNotIn("requires_cost_acceptance", options[1])
 
     def test_three_hundred_thousand_needs_a_reported_window(self):
         unknown = rotate_hard_cap_options(None)

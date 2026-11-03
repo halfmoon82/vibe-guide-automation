@@ -118,7 +118,41 @@ def publish_complex_probe(case, dispatch_mode=None) -> Path:
         root,
     )
     assert published.payload.get("status") == "ok", published.payload
+    show_card(root, "probe-plan")
     return root
+
+
+def show_card(root: Path, plan_id: str) -> None:
+    """Show the card with its dependency graph, recording the display receipt.
+
+    ``vibe authorize`` refuses a new authorization without that receipt
+    (decision D5 = A).  Every test that publishes through this helper gets it
+    automatically; a test that publishes on its own calls this before
+    ``vibe authorize``, or asserts the refusal.
+    """
+    shown = run_cli(["authorize", "--json", "--plan", plan_id, "--show-card"], root)
+    assert shown.payload.get("status") == "card_shown", shown.payload
+
+
+def with_display_receipt(argv, root, environ=None) -> None:
+    """Record the display receipt before an ``authorize --authorize`` call.
+
+    For test fixtures that drive ``vibe authorize`` through their own
+    ``run_cli`` wrapper: call it with the argv about to run.  Anything that is
+    not a granting ``authorize`` is left alone.  The show-card call reuses the
+    same ``--plan``, ``--adapter`` and environment, so a host refusal stays
+    the authorize call's own result rather than this helper's.
+    """
+    argv = list(argv)
+    if not argv or argv[0] != "authorize" or "--authorize" not in argv or "--show-card" in argv:
+        return
+    if "--plan" not in argv:
+        return
+    show = ["authorize", "--json", "--show-card", "--plan", argv[argv.index("--plan") + 1]]
+    if "--adapter" in argv:
+        show += ["--adapter", argv[argv.index("--adapter") + 1]]
+    kwargs = {"environ": environ} if environ is not None else {}
+    run_cli(show, root, **kwargs)
 
 
 def publish_second_plan(root: Path, plan_id: str) -> None:
@@ -140,6 +174,7 @@ def publish_second_plan(root: Path, plan_id: str) -> None:
         root,
     )
     assert published.payload.get("status") == "ok", published.payload
+    show_card(root, plan_id)
 
 
 def _cleanup(root: Path) -> None:

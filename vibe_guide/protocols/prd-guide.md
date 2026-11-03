@@ -176,7 +176,7 @@ vibe plan --request "<产品经理的原话>" --plan-id <plan_id> --from-prd <pr
 
 替换中途被打断（如 Ctrl-C）或 reason 含 `draft could not be restored` 时，先确认草案有没有被挪开：以 reason 里给出的路径为准，没给路径就找 `.vibe/plans/.<plan_id>.draft.*/draft`（命中多个时别猜：把每个目录的修改时间和其中 `plan.json` 的状态列给产品经理，请他选）。①找不到：草案没被挪动，直接按原命令重新发布；②找到了且 `.vibe/plans/<plan_id>` 不存在：把它整个挪回这个位置，再按原命令重新发布；③找到了且 `.vibe/plans/<plan_id>` 已存在就不要覆盖，也不要当成本次发布成功：从挪开的草案里取回产品 spec 放到 `.vibe/plans` 之外（见 §5.1），告诉产品经理这个编号已被占用，再换一个新的 `plan_id` 重新发布，`--s1` 照挪开草案 `plan.json` 里 `route_result.dimensions` 的 `steps,domains,uncertainty,failure_cost,toolchain` 依次填。旧编号下那份计划原样留着：不念它的卡、不对它 `vibe authorize` 或 `vibe monitor`，授权和开工只用新编号；把它的编号和 `plan.json` 的状态列给产品经理，说明它可能是本次被打断的发布，也可能是别的会话的，清不清理由产品经理决定。处理完后，挪开的草案移到废纸篓，剩下的空隐藏目录可以删掉。
 
-- `status: ok`：vibe 已生成 PRD、Spec、Issue、DAG 审计、授权卡。把 `authorization_card` 用产品语言念给产品经理：做哪几件事、哪些同时开工、每件事一个开发任务加一个独立审查任务、节点档位与换算出的模型、派发方式（Claude Code 默认后台、可改选可见卡片，§6.4）、远端 Git 开关、永远不含部署/发布/生产写入/凭据/对外通信。
+- `status: ok`：vibe 已生成 PRD、Spec、Issue、DAG 审计、授权卡。先跑 `vibe authorize --plan <plan_id> --show-card --json`，它输出授权卡和依赖图（`card_text`：每个节点的前置节点、并行组、最大并行宽度、关键路径长度、无理由串行边），并记录展示回执；把 `card_text` 原样给产品经理看，不要自己另画依赖图。没有回执、或回执对应的计划版本、授权卡、依赖图已变化，`vibe authorize` 拒绝（reason 以 `dependency_graph_not_shown` 开头），重新 `--show-card` 再展示；依赖图渲染失败时展示和授权都被拒，把 reason 原样告诉产品经理。心跳间隔一行只有一个「已选中」，就是 `heartbeat_interval_minutes`；推送唤醒未验证时 60 分钟一项标「选它要付代价」，不是已选中。再用产品语言念给产品经理：做哪几件事、哪些同时开工、每件事一个开发任务加一个独立审查任务、节点档位与换算出的模型、派发方式（Claude Code 默认后台、可改选可见卡片，§6.4）、远端 Git 开关、永远不含部署/发布/生产写入/凭据/对外通信。
 - 分开说两件事，别让 `allow` 像"允许了又排除了"：`excluded_actions` 里的推送/合并是说开发任务自己永远不推送；`allowed_actions` 里的是说产品经理允许后这些动作进入授权范围，vibe 只在独立终审通过后校验并记录，不代为执行。**合并规则**：独立终审通过、P0–P2 清零后，vibe 标记「可合并」，由监工执行合并命令，vibe 再核实合并提交可达目标分支才记为已合并；监工自报不算证据。选 `deny` 时 `allowed_actions` 不含任何远端 Git 动作，`excluded_actions` 照样列着推送/合并。
 - 想改远端 Git 开关或运行参数：`vibe authorize` 改不了。把产品 spec 复制到 `.vibe/plans` 之外（见 §5.1），改字段，用新的 `plan_id` 重新发布（`--plan-id <新编号> --s1 <s1>`，`<s1>` 照抄首次发布结果里的 `s1`：草案已被替换，新编号没有评分可沿用），再念新卡。
 - 引擎证明有效期 72 小时：同一 plan revision 超期后，`vibe authorize` 重新观测引擎凭证并自动续签，无需重新发布计划；PRD、Spec、节点文件真有改动时不借续签放行。
@@ -185,6 +185,7 @@ vibe plan --request "<产品经理的原话>" --plan-id <plan_id> --from-prd <pr
 产品经理说"授权"后：
 
 ```bash
+vibe authorize --plan <plan_id> --show-card --json   # 授权前展示过就不用再跑；计划或卡变了要重跑
 vibe authorize --plan <plan_id> --authorize AUTHORIZE --json
 vibe monitor --plan <plan_id> --authorize AUTHORIZE --json
 vibe daemon start --run-id <run-id> --plan <plan_id>

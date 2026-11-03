@@ -25,6 +25,7 @@ from unittest import mock
 
 from vibe_guide.cli import run_cli
 from vibe_guide.session_entry import stable_plan_id
+from tests.support_v45_authorize import with_display_receipt
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pm-path" / "product-spec.json"
 # Complex from its text alone: the §1 path.
@@ -47,6 +48,7 @@ class _Project(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
 
     def cli(self, *argv):
+        with_display_receipt(argv, self.root)
         return run_cli(list(argv) + ["--json"], self.root)
 
     def prepare_session(self):

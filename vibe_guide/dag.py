@@ -685,6 +685,102 @@ def serial_audit(nodes: Sequence[DAGNode]) -> Dict[str, Any]:
     return summary
 
 
+#: Schema of the dependency graph the authorization card carries.
+DEPENDENCY_GRAPH_SCHEMA = 1
+
+
+class DependencyGraphError(ValueError):
+    """The dependency graph cannot be rendered; authorization must not skip it."""
+
+
+def dependency_graph(nodes: Sequence[DAGNode]) -> Dict[str, Any]:
+    """The dependency graph shown with the authorization card (issue authorization-card).
+
+    Every node with its predecessors, parallel group and wave, plus the
+    parallel waves, maximum parallel width, critical path length and the
+    reasonless serial edges.  Built from the same ``serial_audit`` the DAG
+    audit reports, so the card and the audit cannot disagree.  Raises
+    ``DependencyGraphError`` when the shape is undefined (a cycle, an unknown
+    dependency, duplicate ids): the card is never shown without its graph.
+    """
+    nodes = list(nodes or [])
+    if not nodes:
+        raise DependencyGraphError("依赖图渲染失败：计划没有节点")
+    ids = [node.id for node in nodes]
+    if len(set(ids)) != len(ids):
+        raise DependencyGraphError("依赖图渲染失败：节点 id 重复")
+    known = set(ids)
+    unknown = sorted({dep for node in nodes for dep in node.depends_on if dep not in known})
+    if unknown:
+        raise DependencyGraphError("依赖图渲染失败：依赖了不存在的节点 " + "、".join(unknown))
+    audit = serial_audit(nodes)
+    waves = audit.get("parallel_waves")
+    if waves is None:
+        raise DependencyGraphError("依赖图渲染失败：依赖关系有环，算不出并行宽度和关键路径")
+    wave_of = {node_id: index + 1 for index, wave in enumerate(waves) for node_id in wave}
+    groups: Dict[str, List[str]] = {}
+    graph_nodes = []
+    for node in sorted(nodes, key=lambda item: item.id):
+        group = _node_metadata(node, "parallel_group")
+        if group:
+            groups.setdefault(str(group), []).append(node.id)
+        graph_nodes.append({
+            "id": node.id,
+            "depends_on": sorted(dict.fromkeys(node.depends_on)),
+            "parallel_group": str(group) if group else None,
+            "wave": wave_of.get(node.id),
+            "integration_review": is_integration_review_node(node),
+        })
+    return {
+        "schema": DEPENDENCY_GRAPH_SCHEMA,
+        "nodes": graph_nodes,
+        "parallel_waves": [sorted(wave) for wave in waves],
+        "parallel_groups": {name: sorted(members) for name, members in sorted(groups.items())},
+        "max_parallel_width": audit["max_parallel_width"],
+        "critical_path_length": audit["critical_path_length"],
+        "edges": audit["edges"],
+        "unreasoned_edges": audit["unreasoned_edges"],
+    }
+
+
+def dependency_graph_digest(graph: Mapping[str, Any]) -> str:
+    """Canonical digest a display receipt binds to."""
+    basis = json.dumps(graph, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def render_dependency_graph_text(graph: Mapping[str, Any]) -> str:
+    """Plain-language rendering of :func:`dependency_graph` for the card."""
+    lines = ["依赖图：最大并行宽度 {}｜关键路径长度 {} 个节点（不含整合审查）".format(
+        graph.get("max_parallel_width"), graph.get("critical_path_length"))]
+    for index, wave in enumerate(graph.get("parallel_waves") or [], start=1):
+        lines.append("  第 {} 波{}：{}".format(
+            index, "（可同时开工）" if len(wave) > 1 else "", "、".join(wave)))
+    lines.append("  每个节点的前置节点：")
+    for node in graph.get("nodes") or []:
+        depends = node.get("depends_on") or []
+        if node.get("integration_review"):
+            predecessor = "全部业务节点（{}）".format("、".join(depends)) if depends else "无"
+        else:
+            predecessor = "、".join(depends) if depends else "无"
+        group = node.get("parallel_group")
+        lines.append("    {} ← {}{}".format(
+            node.get("id"), predecessor, "（并行组 {}）".format(group) if group else ""))
+    groups = graph.get("parallel_groups") or {}
+    if groups:
+        lines.append("  并行组：" + "；".join(
+            "{}：{}".format(name, "、".join(members)) for name, members in groups.items()))
+    else:
+        lines.append("  并行组：无")
+    unreasoned = graph.get("unreasoned_edges") or []
+    if unreasoned:
+        lines.append("  无理由串行边（两端写范围不重叠、也没写数据依赖理由）：" + "；".join(
+            "{} → {}".format(edge.get("from"), edge.get("to")) for edge in unreasoned))
+    else:
+        lines.append("  无理由串行边：无")
+    return "\n".join(lines)
+
+
 def ready_nodes(nodes: List[DAGNode]) -> List[DAGNode]:
     if _structural_errors(nodes):
         return []

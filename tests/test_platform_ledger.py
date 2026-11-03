@@ -234,7 +234,7 @@ class RuntimeParameterTests(unittest.TestCase):
 
     def test_workbuddy_new_card_keeps_the_ten_minute_fallback(self):
         options = heartbeat_interval_options(self.paths, "workbuddy")
-        self.assertTrue(options[1].get("forced"), options)
+        self.assertTrue(options[1].get("requires_cost_acceptance"), options)
         self.assertEqual(_default_heartbeat_minutes(options), 10)
         # A verified platform still gets the long tier by default.
         self.assertEqual(_default_heartbeat_minutes(

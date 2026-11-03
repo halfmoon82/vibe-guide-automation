@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .authorization import (
+    COST_ACCEPTANCE_MARKER,
     DEFAULT_HEARTBEAT_INTERVAL_MINUTES,
     DEFAULT_ROTATE_HARD_CAP_TOKENS,
     HEARTBEAT_INTERVAL_CHOICES,
@@ -1981,6 +1982,13 @@ def _push_wake_available(paths, provider):
 #: What choosing the long interval costs when push wake-up is not verified.
 FORCED_INTERVAL_COST = "worker 完工后监工最长 {} 分钟才会发现".format(HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES)
 
+#: The long tier's reason on the card while push wake-up is unverified, worded
+#: as prd-guide 6.0 states the rule; the raw detail follows in brackets.
+PUSH_WAKE_UNVERIFIED_REASON = (
+    "推送唤醒未验证的平台默认 {} 分钟（验证记录在 .vibe/push-wake-verification.json"
+    "，成功、失败证据各一条）：{{}}".format(HEARTBEAT_INTERVAL_DEFAULT_MINUTES)
+)
+
 
 def heartbeat_interval_options(paths, provider):
     """Every idle base a card may offer, with availability and the reason.
@@ -1997,11 +2005,15 @@ def heartbeat_interval_options(paths, provider):
             continue
         available, reason = _push_wake_available(paths, provider)
         if not available and isinstance(provider, str) and provider:
-            # No verified push wake-up: the long tier stays selectable as a forced choice
-            # (product decision 2026-10-23) with its price on the card.  An
-            # unknown provider cannot be judged, so it stays unavailable.
-            entries.append({"minutes": minutes, "available": True, "reason": reason,
-                            "forced": True, "cost": FORCED_INTERVAL_COST})
+            # No verified push wake-up: the long tier stays selectable only by
+            # accepting its price (product decision 2026-10-23).  The marker
+            # says "choosing this costs something", never "this is chosen":
+            # the chosen tier is marked ``selected`` by the card (#391).  The
+            # reason uses the prd-guide 6.0 wording.  An unknown provider
+            # cannot be judged, so it stays unavailable.
+            entries.append({"minutes": minutes, "available": True,
+                            "reason": PUSH_WAKE_UNVERIFIED_REASON.format(reason),
+                            COST_ACCEPTANCE_MARKER: True, "cost": FORCED_INTERVAL_COST})
             continue
         entries.append({"minutes": minutes, "available": available, "reason": reason})
     return entries
@@ -2305,8 +2317,14 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
     lines.append("决策信箱：待回答 {} 项；心跳降频但不暂停".format(
         "未知" if decisions is None else len(decisions)))
     interval = payload["heartbeat_interval"]
-    lines.append("心跳间隔：当前 {} 分钟（{}，{}）".format(interval["minutes"], interval.get("mode"), interval.get("reason"))
-                 if interval else "心跳间隔：未记录，按默认 {} 分钟建".format(HEARTBEAT_INTERVAL_DEFAULT_MINUTES))
+    if interval:
+        lines.append("心跳间隔：当前 {} 分钟（{}，{}）".format(interval["minutes"], interval.get("mode"), interval.get("reason")))
+    else:
+        # No beat yet: derive the value the first beat will use from the card
+        # choice, so the handoff never prints 10 for a card that selected 60.
+        derived = heartbeat_interval(paths, run_id, decision_only=False)
+        lines.append("心跳间隔：尚未开拍，按授权卡与平台推导为 {} 分钟建（{}，{}）".format(
+            derived["minutes"], derived.get("mode"), derived.get("reason")))
     if decisions:
         for decision in decisions:
             lines.append("  - {}（类别 {}）：{}（选项：{}）".format(
@@ -2574,7 +2592,8 @@ def bounded_supervisor_output(paths, run_id, payload, rendered):
 
 
 _CARD_SUMMARY_KEYS = ("plan_id", "plan_version", "digest", "node_contract_digest", "active_pair_limit",
-                      "remote_git_actions", "engine_evidence_ref", "execution_engine", "engine_mode")
+                      "remote_git_actions", "engine_evidence_ref", "execution_engine", "engine_mode",
+                      "heartbeat_interval_minutes", "dependency_graph")
 
 
 def authorization_card_summary(paths, plan_id, card=None):
@@ -2598,6 +2617,14 @@ def authorization_card_summary(paths, plan_id, card=None):
         "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
         "node_ids": list(card.get("node_ids") or []),
     })
+    # The dependency graph rides in the card output itself, so an agent never
+    # has to paste it separately (issue authorization-card).
+    graph = card.get("dependency_graph")
+    if isinstance(graph, dict) and "error" not in graph:
+        from .dag import render_dependency_graph_text
+        summary["dependency_graph_text"] = render_dependency_graph_text(graph)
+    elif isinstance(graph, dict):
+        summary["dependency_graph_text"] = str(graph.get("error"))
     return summary
 
 

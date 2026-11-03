@@ -19,6 +19,7 @@ from vibe_guide.cli import run_cli
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.provider_action import TEMPLATE_PLACEHOLDER, validate_result_shape
 from vibe_guide.supervisor import mailbox_result_template
+from tests.support_v45_authorize import with_display_receipt
 
 RUN = "run-1"
 IN_SESSION_ONLY = {
@@ -256,7 +257,7 @@ class SelfServedRunTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name) / "project"
         shutil.copytree(E2E_FIXTURE, self.root)
-        self.cli = lambda argv: run_cli(argv + ["--json"], self.root)
+        self.cli = lambda argv: (with_display_receipt(argv, self.root), run_cli(argv + ["--json"], self.root))[1]
         self.assertEqual(self.cli(["init", "--confirm"]).exit_code, 0)
         self.store = ProviderActionStore(ProjectPaths(self.root))
         self.store.publish_capabilities(
@@ -325,7 +326,7 @@ class SelfServedCloseoutTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.cli = lambda *argv: run_cli(list(argv) + ["--json"], self.root)
+        self.cli = lambda *argv: (with_display_receipt(argv, self.root), run_cli(list(argv) + ["--json"], self.root))[1]
         self.assertEqual(self.cli("init", "--confirm").payload["status"], "ok")
         (self.root / "facts.json").write_text(json.dumps(IN_SESSION_ONLY), encoding="utf-8")
         attested = self.cli("attest", "--adapter", "workbuddy", "--facts", "facts.json",

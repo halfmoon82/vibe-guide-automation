@@ -22,7 +22,7 @@ from vibe_guide.cli import run_cli
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.workflow_gate import verify_workflow
 
-from tests.support_v45_authorize import _CAPABILITIES, _NODE_SPEC, _REQUEST
+from tests.support_v45_authorize import _CAPABILITIES, _NODE_SPEC, _REQUEST, show_card
 
 
 def _publish_probe(case, spec_overrides=None):
@@ -52,6 +52,7 @@ def _publish_probe(case, spec_overrides=None):
         root,
     )
     assert published.payload.get("status") == "ok", published.payload
+    show_card(root, "probe-plan")
     return root
 
 

@@ -27,6 +27,10 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-11-03: §5.3 show the card with its dependency graph before
+        # authorizing (--show-card receipt, D5) and one selected heartbeat
+        # tier (#391) (authorization-card).
+        "4cb7ec45e154083b45e79927075f059299e5cb406dad1104f0de8b60f0ce0d49",
         # 2026-11-03: §4 every depends_on edge needs a reason (D6), §5.1 gains
         # the optional node field dependency_reasons (dag-serial-audit).
         "0b82fc85530030d519203fa76f8497a5215ef5ee8d8a8764a11863496a7a4396",

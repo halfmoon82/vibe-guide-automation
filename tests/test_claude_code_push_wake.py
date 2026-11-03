@@ -54,13 +54,13 @@ class ClaudeCodePushWakeTests(unittest.TestCase):
 
     def test_failure_evidence_alone_does_not_verify(self):
         self._register(failure=[{"evidence_ref": "f"}])
-        self.assertTrue(heartbeat_interval_options(self.paths, "claude-code")[1]["forced"])
+        self.assertTrue(heartbeat_interval_options(self.paths, "claude-code")[1]["requires_cost_acceptance"])
 
     def test_success_and_failure_evidence_clear_the_force(self):
         self._register(success=[{"evidence_ref": "s"}], failure=[{"evidence_ref": "f"}])
         entry = heartbeat_interval_options(self.paths, "claude-code")[1]
         self.assertTrue(entry["available"])
-        self.assertNotIn("forced", entry)
+        self.assertNotIn("requires_cost_acceptance", entry)
 
 
 if __name__ == "__main__":

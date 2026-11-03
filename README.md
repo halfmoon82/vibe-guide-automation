@@ -98,7 +98,8 @@ vibe attest --adapter <id> --facts <json>    登记本会话实测到的能力�
 vibe plan --request <请求>                   先走 S0/S1 分流；complex 请求生成 draft
 vibe plan --request <请求> --from-prd <spec> 用产品级 spec 发布复杂计划，工程字段自动派生
 vibe plan --print-protocol                   打印 PRD 引导协议（agent 用）
-vibe authorize --plan <ID> --authorize AUTHORIZE   记录一次用户授权（十节点门禁证据）
+vibe authorize --plan <ID> --show-card              展示授权卡与依赖图（前置节点、并行组、最大并行宽度、关键路径长度、无理由串行边），并记录展示回执
+vibe authorize --plan <ID> --authorize AUTHORIZE   记录一次用户授权（十节点门禁证据）；没有对应当前计划版本、授权卡和依赖图的展示回执时拒绝，提示先 --show-card
 vibe monitor --plan <ID> --authorize AUTHORIZE     启动监工；没有精确授权时拒绝
 vibe monitor --plan <ID> --preview-card            只读预览重新授权将要发布的授权卡；不写盘、不授权、不派发，不需要 token
 vibe status --plan <ID>                      读取当前快照，不轮询外部 provider
@@ -294,7 +295,7 @@ python3 -m vibe_guide.mcp_servers.workbuddy_jobs --selfcheck     # 探测控制�
 
 该整合流程只适用于 `complex`；`simple` 与 `light_plan` 仍走轻量路径，不生成最终整合 Review。整合通过不等于 merge、push 或 deploy：授权卡的 `remote_git_actions` 仅是远端 Git 总开关，deploy、凭据和系统权限始终需要独立授权与验证。
 
-当前版本中，确认授权卡后需要两步：`vibe authorize --plan <ID> --authorize AUTHORIZE` 记录十节点门禁证据，再 `vibe monitor --plan <ID> --authorize AUTHORIZE` 启动 Monitor。旧版 CLI 兼容路径仍可接受显式 `--authorize`：
+当前版本中，授权前先 `vibe authorize --plan <ID> --show-card` 把授权卡连同依赖图展示给产品经理，并记录展示回执（`.vibe/plans/<ID>/dependency-graph-receipt.json`，绑定计划版本、卡 digest 和依赖图 digest，任一变化后回执失效、需重新展示；依赖图渲染失败时展示与授权都被拒并写明原因）；确认授权卡后需要两步：`vibe authorize --plan <ID> --authorize AUTHORIZE` 记录十节点门禁证据，再 `vibe monitor --plan <ID> --authorize AUTHORIZE` 启动 Monitor。展示回执只约束新授权：已有 run 的计划（含 5.2.6 签发的授权卡）照常重新授权与推进。授权卡的心跳间隔只把选中值标为「已选中」；推送唤醒未验证时 60 分钟一项标「选它要付代价」，不表示已选中。旧版 CLI 兼容路径仍可接受显式 `--authorize`：
 
 ```bash
 vibe monitor --plan example-plan --json

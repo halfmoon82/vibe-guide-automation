@@ -42,8 +42,12 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
+from datetime import datetime, timezone
+
 from .digests import sha256_file
 from .authorization import _canonical_digest
+from .dag import DependencyGraphError, dependency_graph, dependency_graph_digest
+from .models import DAGNode
 from .diagnostics import assert_planning_gate, require_execution_ready
 from .planner import required_workflow_nodes
 from .state import interprocess_lock
@@ -101,6 +105,133 @@ def _artifact(root: Path, name: str) -> Dict[str, str]:
     return {"ref": name, "sha256": _sha(path)}
 
 
+#: Receipt that the dependency graph went out with the authorization card
+#: (decision D5 = A).  Written by ``vibe authorize --show-card``; a new
+#: authorization without a matching receipt is refused.
+DISPLAY_RECEIPT_NAME = "dependency-graph-receipt.json"
+DISPLAY_RECEIPT_SCHEMA = 1
+SHOW_CARD_HINT = "先展示依赖图：vibe authorize --plan {} --show-card，把输出（授权卡与依赖图）给产品经理看，再授权"
+
+
+def _plan_root(paths, plan_id: str) -> Path:
+    return paths.resolve_vibe_path(Path("plans") / plan_id)
+
+
+def published_dependency_graph(root: Path) -> Dict[str, Any]:
+    """The dependency graph of the published nodes, or ``DependencyGraphError``.
+
+    Always re-derived from ``nodes.json``: a 5.2.6 card carries no graph, and
+    a card that does must agree with it (checked by the caller).
+    """
+    raw = _read_json(root / "nodes.json")
+    if not isinstance(raw, list) or not raw:
+        raise DependencyGraphError("依赖图渲染失败：nodes.json 不是非空列表")
+    try:
+        nodes = [DAGNode.from_dict(dict(item)) for item in raw]
+    except (TypeError, ValueError) as error:
+        raise DependencyGraphError("依赖图渲染失败：节点无法读取：" + str(error)) from error
+    return dependency_graph(nodes)
+
+
+def _card_graph_problem(card: Mapping[str, Any], graph: Mapping[str, Any]) -> Any:
+    """Why the card's own graph cannot stand for ``graph``, else ``None``."""
+    shown = card.get("dependency_graph")
+    if shown is None:
+        return None  # a card issued before the graph existed: the derived graph is shown
+    if not isinstance(shown, Mapping):
+        return "授权卡上的依赖图格式不对"
+    if "error" in shown:
+        return str(shown.get("error"))
+    if dependency_graph_digest(shown) != dependency_graph_digest(graph):
+        return "授权卡上的依赖图与当前节点不一致，请重新发布计划"
+    return None
+
+
+def display_receipt_problem(
+    receipt: Any, plan_id: str, plan_version: Any, card_digest: Any, graph_digest: str
+) -> Any:
+    """Why ``receipt`` does not prove this card's graph was shown, else ``None``.
+
+    The receipt binds the plan id, the plan version, the card digest and the
+    graph digest, so a changed plan version, card or graph voids it.
+    """
+    if not isinstance(receipt, Mapping):
+        return "没有依赖图展示回执"
+    if receipt.get("schema") != DISPLAY_RECEIPT_SCHEMA or receipt.get("plan_id") != plan_id:
+        return "依赖图展示回执不属于这个计划"
+    if str(receipt.get("plan_version")) != str(plan_version):
+        return "计划版本已变化（回执对应版本 {}，当前 {}），旧回执失效".format(
+            receipt.get("plan_version"), plan_version)
+    if receipt.get("card_digest") != card_digest:
+        return "授权卡已变化，旧回执失效"
+    if receipt.get("dependency_graph_digest") != graph_digest:
+        return "依赖图已变化，旧回执失效"
+    return None
+
+
+def show_card_with_graph(paths, plan_id: str) -> Dict[str, Any]:
+    """Derive the card's dependency graph and record the display receipt.
+
+    Raises ``AuthorizationDenied`` with the reason when the graph cannot be
+    rendered: the card is never shown, and so never authorized, without it.
+    """
+    root = _plan_root(paths, plan_id)
+    plan = _read_json(root / "plan.json")
+    card = _read_json(root / "authorization-card.json")
+    if not isinstance(plan, Mapping) or not isinstance(card, Mapping):
+        raise ValueError("published plan and authorization card must be objects")
+    try:
+        graph = published_dependency_graph(root)
+    except DependencyGraphError as error:
+        raise AuthorizationDenied(str(error)) from error
+    problem = _card_graph_problem(card, graph)
+    if problem is not None:
+        raise AuthorizationDenied("依赖图渲染失败：" + problem)
+    receipt = {
+        "schema": DISPLAY_RECEIPT_SCHEMA,
+        "plan_id": plan_id,
+        "plan_version": plan.get("version"),
+        "card_digest": card.get("digest"),
+        "dependency_graph_digest": dependency_graph_digest(graph),
+        "shown_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    _atomic_json(root / DISPLAY_RECEIPT_NAME, receipt)
+    return {"plan": dict(plan), "card": dict(card), "dependency_graph": graph, "receipt": receipt}
+
+
+def _require_display_receipt(root: Path, plan_id: str, plan: Mapping[str, Any], card: Mapping[str, Any]) -> Dict[str, Any]:
+    """Refuse a new authorization whose dependency graph was never shown.
+
+    Only a new authorization is held to it: a plan that already has a run
+    (``current-run.json``) was authorized before, and its same-run
+    reauthorizations are not re-gated (no retroactive effect on running runs).
+    """
+    try:
+        graph = published_dependency_graph(root)
+    except DependencyGraphError as error:
+        raise AuthorizationDenied("授权被拒：" + str(error)) from error
+    problem = _card_graph_problem(card, graph)
+    if problem is not None:
+        raise AuthorizationDenied("授权被拒：依赖图渲染失败：" + problem)
+    graph_digest = dependency_graph_digest(graph)
+    if (root / "current-run.json").exists():
+        return {"dependency_graph_digest": graph_digest, "display_receipt": "not_required_existing_run"}
+    path = root / DISPLAY_RECEIPT_NAME
+    receipt = None
+    if path.is_file() and not path.is_symlink():
+        try:
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            receipt = None
+    problem = display_receipt_problem(
+        receipt, plan_id, plan.get("version"), card.get("digest"), graph_digest)
+    if problem is not None:
+        raise AuthorizationDenied(
+            "dependency_graph_not_shown: {}；{}".format(problem, SHOW_CARD_HINT.format(plan_id)))
+    return {"dependency_graph_digest": graph_digest, "display_receipt": "matched",
+            "display_receipt_shown_at": str(receipt.get("shown_at"))}
+
+
 def build_workflow_evidence(paths, plan_id: str, authorization_token: str) -> Dict[str, Any]:
     """Project the published plan of ``plan_id`` into verified workflow evidence.
 
@@ -156,6 +287,7 @@ def build_workflow_evidence(paths, plan_id: str, authorization_token: str) -> Di
         raise ValueError("published DAG audit does not match the node set")
     if confirmation.get("authorization_digest") != card.get("digest"):
         raise ValueError("plan confirmation is not bound to the authorization card digest")
+    display = _require_display_receipt(root, plan_id, plan, card)
 
     # `classify_s0` screens the raw user request, which a published plan does not
     # retain; running it on the PRD path or body returns `simple` for a complex
@@ -253,7 +385,13 @@ def build_workflow_evidence(paths, plan_id: str, authorization_token: str) -> Di
                 "remote_git_actions": str(card.get("remote_git_actions")),
                 "excluded_actions": list(card.get("excluded_actions") or []),
             },
-            {"verified_fact": "published authorization-card.json read from disk", "artifact": _artifact(root, "authorization-card.json")},
+            {
+                "verified_fact": "published authorization-card.json read from disk; its dependency graph was shown",
+                "artifact": _artifact(root, "authorization-card.json"),
+                # Plain values, not an artifact: a later --show-card rewrites
+                # the receipt, which must not stale a running run's evidence.
+                **display,
+            },
         ),
         (
             # Recorded only from the token the user actually supplied; the guard

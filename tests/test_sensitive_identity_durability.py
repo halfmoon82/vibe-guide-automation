@@ -33,6 +33,7 @@ from vibe_guide.state import (
     load_snapshot,
     save_snapshot,
 )
+from tests.support_v45_authorize import with_display_receipt
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pm-path" / "product-spec.json"
 REQUEST = "设计并实现保单查看页的 PDF 导出，集成日期范围筛选、编写测试并部署"
@@ -421,6 +422,7 @@ class SensitiveNodeIdJourneyTests(unittest.TestCase):
         self.paths = ProjectPaths(self.root)
 
     def cli(self, *argv):
+        with_display_receipt(argv, self.root)
         return run_cli(list(argv) + ["--json"], self.root)
 
     def test_product_spec_node_named_token_refresh_reaches_a_loadable_run(self):
