@@ -4,12 +4,36 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 from copy import deepcopy
 
 from .paths import ProjectPaths
 from .state import _atomic_bytes, run_dir
+
+
+#: The value ``--template`` prints where the supervisor must substitute a real
+#: fact.  Defined here so the write-time mailbox check and the delivery gate
+#: judge it with one predicate.
+TEMPLATE_PLACEHOLDER = "<填写>"
+
+
+def holds_placeholder(value: Any) -> bool:
+    """True when a string is blank or still carries the template placeholder.
+
+    NFKC folds the full-width ``＜填写＞`` to ``<填写>``; a substring match also
+    catches padded and half-filled values such as ``" <填写> "`` or
+    ``<填写>-1``; whitespace-only text is blank, not a value.
+    """
+    if not isinstance(value, str):
+        return False
+    folded = unicodedata.normalize("NFKC", value)
+    return not folded.strip() or TEMPLATE_PLACEHOLDER in folded
+
+
+def _has_value(value: Any) -> bool:
+    return bool(value) and not holds_placeholder(value)
 
 
 @dataclass(frozen=True)
@@ -134,9 +158,9 @@ def evaluate_delivery_evidence(
         reasons.append("worktree or branch is missing")
     if get(binding, "cursor") in (None, "") and not (self_report_receipt or background):
         reasons.append("current cursor is missing")
-    if not isinstance(artifacts, dict) or not artifacts.get("completion_marker"):
+    if not isinstance(artifacts, dict) or not _has_value(artifacts.get("completion_marker")):
         reasons.append("completion marker is missing")
-    if not isinstance(artifacts, dict) or not artifacts.get("delivery_path"):
+    if not isinstance(artifacts, dict) or not _has_value(artifacts.get("delivery_path")):
         reasons.append("delivery path is missing")
     thread_status = get(artifacts, "thread_status")
     if thread_status not in {"complete", "completed", "DELIVERED"}:

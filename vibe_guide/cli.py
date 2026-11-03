@@ -413,6 +413,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--digest", dest="decision_digest")
     parser.add_argument("--via", dest="decision_via")
     parser.add_argument("--note", dest="decision_note")
+    parser.add_argument(
+        "--retire-dead-session", dest="retire_dead_session", action="store_true",
+        help="repair: retire a node's provider-confirmed dead session so it can be redispatched")
     parser.add_argument("--question", dest="decision_question")
     parser.add_argument("--options", dest="decision_options")
     parser.add_argument("--recommendation", dest="decision_recommendation")
@@ -2119,6 +2122,8 @@ def _render_card_preview(payload: Dict[str, Any], card: AuthorizationCard) -> st
     lines.append("远端 Git 禁令（remote_git_actions=deny 时）：")
     for entry in REMOTE_GIT_ENFORCEMENT:
         lines.append("  {}：{}".format(entry["platform"], entry["note"]))
+    lines.append("worker 推送禁令（allow 与 deny 都适用）：开发与审查 worker 提示词一律禁止 push 与创建 PR，"
+                 "claude-code 后台派发另加 --disallowedTools 拦截 git push 与 gh；推送只由远端交付环执行")
     lines.extend(_daemon_option_lines(card))
     changed = payload.get("changed_fields") or {}
     if isinstance(changed, dict) and changed:
@@ -2204,6 +2209,24 @@ def _stalled_nodes_view(
     return nodes, tiers
 
 
+def _closeout_deviations(command: str, snapshot: Any, paths: Optional[ProjectPaths]) -> Optional[Dict[str, Any]]:
+    """Remote ``node/*`` branches of this run, read only by ``status`` at closeout (#379).
+
+    Closeout means every business node is accepted; before that nothing is
+    queried, so routine status calls never reach the network.
+    """
+    from .models import INTEGRATION_REVIEW_NODE_ID, REMOTE_DELIVERY_NODE_ID
+    from .remote_delivery import remote_node_branch_deviations, run_node_branches
+
+    if command != "status" or paths is None:
+        return None
+    business = [node for node_id, node in (snapshot.nodes or {}).items()
+                if node_id not in (INTEGRATION_REVIEW_NODE_ID, REMOTE_DELIVERY_NODE_ID)]
+    if not business or any(node.get("status") != "accepted" for node in business):
+        return None
+    return remote_node_branch_deviations(paths.root, run_node_branches(snapshot))
+
+
 def _snapshot_result(
     command: str,
     snapshot: Any,
@@ -2266,6 +2289,13 @@ def _snapshot_result(
         text += "\n" + expansions
     if pending_verification:
         text += "\n" + _render_pending_verification(pending_verification)
+    deviations = _closeout_deviations(command, snapshot, paths)
+    if deviations is not None:
+        payload["deviations"] = {"remote_node_branches": deviations}
+        if not deviations["checked"]:
+            text += "\n远端节点分支越界检查：" + deviations["reason"]
+        elif deviations["branches"]:
+            text += "\n偏差：以下节点分支被推到了远端（worker 不得推送）：" + "、".join(deviations["branches"])
     if paths is not None:
         from . import daemon as daemon_module
         notice = daemon_module.pm_address_notice(paths, snapshot.run_id)
@@ -4320,6 +4350,11 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     "status") == worker_questions.AWAITING_STATUS:
                 payload = worker_questions.answer_question(
                     monitor, args.run_id, args.node_id, args.decision_note)
+            elif getattr(args, "retire_dead_session", False):
+                payload = monitor.retire_dead_session(
+                    args.node_id, args.run_id,
+                    runner if runner is not None
+                    else _background_runner(paths, _card.agent_id, ""))
             else:
                 payload = monitor.repair_node(args.node_id, args.run_id)
             snapshot = load_snapshot(paths, args.run_id)

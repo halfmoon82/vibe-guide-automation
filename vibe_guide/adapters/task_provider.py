@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
@@ -617,16 +618,26 @@ class ProviderActionStore:
         path = directory / (action_id + ".json")
         existing = self._read(path) if path.exists() else None
         if existing is not None and existing != payload:
-            if not self._prompt_only_upgrade(existing, payload):
+            if self._prompt_only_upgrade(existing, payload):
+                # The worker already acted on the original prompt; keep it, and
+                # do not record a dispatch baseline after the fact.
+                return existing
+            try:
+                superseded = self._supersede_same_generation_create(existing, payload)
+            except ValueError:
+                superseded = False
+                refusal = sys.exc_info()[1]
+            else:
+                refusal = ValueError("provider action request identity drift")
+            if superseded:
+                existing = None
+            else:
                 if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
                     self._record_dispatch_head(
                         run_id, issue_id, role, generation, request["child_binding"],
                         _requested_project_mount(request, operation),
                     )
-                raise ValueError("provider action request identity drift")
-            # The worker already acted on the original prompt; keep it, and do
-            # not record a dispatch baseline after the fact.
-            return existing
+                raise refusal
         if isinstance(request, dict) and isinstance(request.get("child_binding"), dict):
             # Before the request is visible to the host: the baseline must
             # predate any work the dispatched worker could do.
@@ -640,6 +651,96 @@ class ProviderActionStore:
         if operation == "wait" and not probe:
             self._consume_archived_delivery(run_id, issue_id, role, generation)
         return payload
+
+    def _supersede_same_generation_create(
+        self, existing: Dict[str, Any], payload: Dict[str, Any]
+    ) -> bool:
+        """Replace a leftover create of the same node/role/generation (#344 #363).
+
+        A redispatch after a shift or re-authorization rebuilds the same
+        action id with a different request, which used to be refused as
+        identity drift until a person moved the old file away.  The old
+        request is replaced (and an event recorded) only when it can no
+        longer matter: its task already has termination evidence in the run's
+        ``tasks.json``, or it never produced a task at all (no result, no
+        binding).  A live or undecidable old task keeps the refusal, and the
+        message names the evidence that is missing.
+        """
+        from ..contracts import RunEvent
+        from ..state import append_event, interprocess_lock
+        from ..task_registry import (
+            _TERMINAL_STATUSES, _read_registry, _registry_lock, _run_tasks_path,
+        )
+
+        if existing.get("operation") != "create" or payload.get("operation") != "create":
+            return False
+        run_id = existing.get("run_id")
+        issue_id = existing.get("issue_id")
+        role = existing.get("role")
+        generation = existing.get("generation")
+        action_id = existing.get("action_id")
+        label = "{} {} generation {}".format(issue_id, role, generation)
+        try:
+            old_result = self.result(action_id)
+        except (OSError, TypeError, ValueError):
+            old_result = False  # unreadable: cannot tell whether a task exists
+        try:
+            lock = _registry_lock(self.paths)
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            with interprocess_lock(lock):
+                _revision, rows = _read_registry(
+                    _run_tasks_path(self.paths, run_id, create=False), run_id
+                )
+        except (OSError, TypeError, ValueError):
+            rows = None
+        if old_result is False or rows is None:
+            raise ValueError(
+                "provider action request identity drift: the leftover create of {} "
+                "cannot be judged (its result or the task registry is unreadable); "
+                "needs termination evidence of the old task".format(label)
+            )
+        bindings = [
+            item for item in rows
+            if item.issue_id == issue_id and item.role == role and item.generation == generation
+        ]
+        if bindings:
+            live = [item for item in bindings if item.status not in _TERMINAL_STATUSES]
+            if live:
+                raise ValueError(
+                    "provider action request identity drift: the old task of {} is still "
+                    "{}; needs termination evidence (status stopped/failed/archived "
+                    "in tasks.json) before the create can be replaced".format(
+                        label, live[0].status)
+                )
+            reason = "old_task_terminated"
+        elif old_result is None:
+            reason = "old_request_never_produced_a_task"
+        else:
+            raise ValueError(
+                "provider action request identity drift: the old create of {} has a "
+                "result but no task binding yet, so the old task may be alive; needs "
+                "termination evidence of the old task".format(label)
+            )
+        append_event(self.paths, RunEvent("create_request_superseded", {
+            "run_id": run_id,
+            "node_id": issue_id,
+            "role": role,
+            "generation": generation,
+            "reason_code": reason,
+            "superseded_creates": [action_id],
+        }))
+        archive = self._directory("superseded")
+        with interprocess_lock(self._directory("locks") / (action_id + ".lock")):
+            self._atomic(archive / "{}-{}.json".format(action_id, existing["request_digest"][:16]), {
+                "schema_version": self.schema_version,
+                "reason": reason,
+                "request": existing,
+                "result": old_result,
+            })
+            result_path = self._directory("results") / (action_id + ".json")
+            if result_path.exists() and not result_path.is_symlink():
+                result_path.unlink()
+        return True
 
     def _prompt_only_upgrade(self, existing: Dict[str, Any], payload: Dict[str, Any]) -> bool:
         """A newer vibe rewrote only the prompt template of an answered create.
