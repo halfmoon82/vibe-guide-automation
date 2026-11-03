@@ -2965,6 +2965,86 @@ def _stall_candidates(snapshot, session_nodes=None):
     }
 
 
+_INTEGRATION_NODE = "integration-review"
+
+
+def _integration_rework_targets(snapshot, events):
+    """Upstream nodes sent back by an integration-review finding and still unaccepted (#386).
+
+    A node qualifies when its latest scope_auto_expanded event carries the
+    integration_rework trigger, or it still holds the ``integration_finding_ref``
+    stamp.  Acceptance ends the rework.
+    """
+    latest = {}
+    for event in events or ():
+        if isinstance(event, dict) and event.get("event") == "scope_auto_expanded":
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            if isinstance(data.get("node_id"), str):
+                latest[data["node_id"]] = data.get("trigger")
+    targets = []
+    for node_id, node in (snapshot.nodes or {}).items():
+        if node_id == _INTEGRATION_NODE or not isinstance(node, dict) or node.get("status") == "accepted":
+            continue
+        if latest.get(node_id) == "integration_rework" or isinstance(node.get("integration_finding_ref"), dict):
+            targets.append(node_id)
+    return sorted(targets)
+
+
+def _upstream_rework_verdict(paths, run_id, snapshot, node_id):
+    """``(verdict, probe_state)``: "active", "stuck" or "unknown" for an upstream in rework.
+
+    Only positive evidence counts as active: a live transcript (Claude), or, where
+    no session record exists (other platforms), a worker status whose own idle
+    count is still under the stall threshold.  A silent transcript or an idle count
+    at the threshold is "stuck": that node is escalated on its own.  Unreadable
+    evidence is "unknown", never active.
+    """
+    from . import stall
+    node = snapshot.nodes.get(node_id)
+    if not isinstance(node, dict) or node.get("status") not in worker_liveness.SESSION_STATUSES:
+        return "unknown", None
+    state = None
+    if _is_session_node(node):
+        state = worker_liveness.probe(paths, run_id, node_id, node)["state"]
+        if state == "active":
+            return "active", state
+        if state == "silent":
+            return "stuck", state
+        if state != "unresolved":
+            return "unknown", state
+    record = stall.load_progress(paths, run_id)
+    entry = record["nodes"].get(node_id) if record else None
+    if entry and entry["fingerprint"] == stall.node_fingerprint(node, snapshot.tasks, node_id):
+        return ("stuck" if entry["unchanged_beats"] >= stall.STALL_BEATS else "active"), state
+    return "active", state
+
+
+def integration_rework_exemption(paths, run_id, snapshot, events):
+    """``(exempt, extra)``: the integration review node while an upstream rework it caused runs.
+
+    ``exempt`` holds node ids left out of the stall assessment.  The exemption holds
+    while the upstream is active, or stuck (then the upstream is the one escalated,
+    never the integration review); it does not hold on unreadable evidence.
+    ``extra`` maps upstream nodes needing their own stall evaluation (no session
+    record to read, so the fingerprint is all there is) to their snapshot nodes.
+    """
+    integration = (snapshot.nodes or {}).get(_INTEGRATION_NODE)
+    if not isinstance(integration, dict) or integration.get("status") != "rework":
+        return set(), {}
+    exempt, extra = set(), {}
+    try:
+        for target in _integration_rework_targets(snapshot, events):
+            verdict, state = _upstream_rework_verdict(paths, run_id, snapshot, target)
+            if verdict == "unknown":
+                continue
+            exempt.add(_INTEGRATION_NODE)
+            if state is None or state == "unresolved":
+                extra[target] = snapshot.nodes[target]
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return set(), {}  # evidence unreadable: unknown, not active
+    return exempt, extra
+
+
 def _heal_pack_path(paths, run_id, node_id):
     return run_dir(paths, run_id) / _HEAL_PACK_FILE.format(node_id)
 
@@ -3115,9 +3195,11 @@ def stall_peek(paths, run_id, snapshot):
     try:
         events = load_events(paths, run_id)
         silent, _ = _probe_session_nodes(paths, run_id, snapshot)
+        exempt, _extra = integration_rework_exemption(paths, run_id, snapshot, events)
         return {
             node_id: tier
             for node_id, node in _stall_candidates(snapshot).items()
+            if node_id not in exempt
             if not _is_session_node(node) or node_id in silent
             for unchanged, tier in [_node_stall_state(paths, run_id, snapshot, events, node_id)]
             if tier in _STALL_REPORT_TIERS and unchanged
@@ -3243,8 +3325,12 @@ def beat_stall_report(paths, run_id, now=None):
         waiting, mailbox_unreadable = _mailbox_wait_nodes(
             paths, run_id, snapshot, time.time() if now is None else now)
         seen = _mailbox_escalated_seen(paths, run_id)
+        exempt, extra = integration_rework_exemption(paths, run_id, snapshot, events)
         candidates = {node_id: node for node_id, node in _stall_candidates(snapshot, silent).items()
-                      if node_id not in waiting}
+                      if node_id not in waiting and node_id not in exempt}
+        for node_id, node in extra.items():
+            if node_id not in waiting:
+                candidates.setdefault(node_id, node)
         outcome = stall.record_beat(paths, run_id, candidates, snapshot.tasks, events)
         nodes = {}
         for node_id, result in outcome["nodes"].items():
