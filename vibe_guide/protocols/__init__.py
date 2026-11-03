@@ -27,6 +27,9 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-11-03: §4 every depends_on edge needs a reason (D6), §5.1 gains
+        # the optional node field dependency_reasons (dag-serial-audit).
+        "0b82fc85530030d519203fa76f8497a5215ef5ee8d8a8764a11863496a7a4396",
         # 2026-11-03: §4/§7 platform-handoff exception -- a visible-to-background
         # change on handoff is disclosed, not confirmed; drain first (card-and-handoff).
         "0d3a9757b3c7f33496926f33392d0c99f3f9433e56ef1b97560bae5c3daf3317",

@@ -797,5 +797,161 @@ class ParallelGroupAuditTests(unittest.TestCase):
                     )
 
 
+def serial_node(node_id, depends=None, files=None, reasons=None):
+    """A product-path node: files and dependency reasons sit in the contract."""
+    contract = {
+        "input": "request", "output": "result",
+        "error_behavior": "return an error", "acceptance_example": "example passes",
+        "files": files if files is not None else ["vibe_guide/" + node_id + ".py"],
+    }
+    if reasons is not None:
+        contract["dependency_reasons"] = reasons
+    return DAGNode(node_id, node_id, depends or [], [], None, contract, "planned")
+
+
+class SerialEdgeAuditTests(unittest.TestCase):
+    """dag-serial-audit: every depends_on edge needs a reason (decision D6 = A)."""
+
+    def _edge(self, nodes):
+        from vibe_guide.dag import serial_edges
+        edges = serial_edges(nodes)
+        self.assertEqual(len(edges), 1, edges)
+        return edges[0]
+
+    def test_overlapping_write_scope_is_a_reason(self):
+        nodes = [
+            serial_node("a", files=["vibe_guide/shared.py"]),
+            serial_node("b", depends=["a"], files=["vibe_guide/shared.py", "tests/test_b.py"]),
+        ]
+        edge = self._edge(nodes)
+        self.assertEqual((edge["from"], edge["to"]), ("a", "b"))
+        self.assertEqual(edge["reason_type"], "write_scope_overlap")
+        self.assertEqual(edge["reason_label"], "写范围重叠")
+        self.assertEqual(self._gate(nodes), {})
+
+    def _gate(self, nodes):
+        from vibe_guide.dag import unreasoned_edge_errors
+        return unreasoned_edge_errors(nodes)
+
+    def test_edge_without_overlap_or_reason_is_refused_with_both_fixes(self):
+        nodes = [serial_node("a"), serial_node("b", depends=["a"])]
+        self.assertEqual(self._edge(nodes)["reason_type"], "none")
+        errors = self._gate(nodes)
+        self.assertEqual(list(errors), ["b"])
+        message = errors["b"]
+        self.assertEqual(len(message), 1, errors)
+        self.assertIn("a → b", message[0])
+        self.assertIn("补理由", message[0])
+        self.assertIn("dependency_reasons", message[0])
+        self.assertIn("去掉 b 对 a 的 depends_on", message[0])
+        self.assertIn("并行", message[0])
+
+    def test_declared_sentence_is_a_data_dependency(self):
+        nodes = [
+            serial_node("a"),
+            serial_node("b", depends=["a"], reasons={"a": "依赖 A 节点产出的账本文件格式"}),
+        ]
+        edge = self._edge(nodes)
+        self.assertEqual(edge["reason_type"], "data_dependency")
+        self.assertEqual(edge["reason_label"], "数据依赖")
+        self.assertEqual(edge["reason"], "依赖 A 节点产出的账本文件格式")
+        self.assertEqual(self._gate(nodes), {})
+
+    def test_unusable_reason_values_read_as_no_reason(self):
+        for reasons in (
+            {"a": ""}, {"a": "   "}, {"a": None}, {"a": 3}, {"a": ["依赖 A"]},
+            {"a": "第一行\n第二行"}, {"a": "长" * 201}, {"other": "依赖 other 的产出"},
+            "依赖 A 节点产出的文件", ["依赖 A"],
+        ):
+            with self.subTest(reasons=reasons):
+                nodes = [serial_node("a"), serial_node("b", depends=["a"], reasons=reasons)]
+                self.assertEqual(self._edge(nodes)["reason_type"], "none")
+                self.assertIn("b", self._gate(nodes))
+
+    def test_unverifiable_scope_proves_no_overlap(self):
+        nodes = [serial_node("a", files=[]), serial_node("b", depends=["a"], files=[])]
+        self.assertEqual(self._edge(nodes)["reason_type"], "none")
+
+    def test_full_serial_chain_of_five_has_width_one_and_path_five(self):
+        from vibe_guide.dag import parallel_shape
+        ids = ["n1", "n2", "n3", "n4", "n5"]
+        nodes = [
+            serial_node(node_id, depends=[ids[index - 1]] if index else None,
+                        reasons={ids[index - 1]: "依赖上一节点产出的接口"} if index else None)
+            for index, node_id in enumerate(ids)
+        ]
+        shape = parallel_shape(nodes)
+        self.assertEqual(shape["max_parallel_width"], 1)
+        self.assertEqual(shape["critical_path_length"], 5)
+        self.assertEqual(shape["parallel_waves"], [[node_id] for node_id in ids])
+
+    def test_diamond_shape_counts_the_widest_wave(self):
+        from vibe_guide.dag import parallel_shape
+        reason = {"a": "依赖 a 产出的格式"}
+        nodes = [
+            serial_node("a"), serial_node("b", ["a"], reasons=reason),
+            serial_node("c", ["a"], reasons=reason), serial_node("e"),
+            serial_node("d", ["b", "c"], reasons={"b": "依赖 b 的输出", "c": "依赖 c 的输出"}),
+        ]
+        shape = parallel_shape(nodes)
+        self.assertEqual(shape["parallel_waves"], [["a", "e"], ["b", "c"], ["d"]])
+        self.assertEqual(shape["max_parallel_width"], 2)
+        self.assertEqual(shape["critical_path_length"], 3)
+
+    def test_cycle_leaves_shape_undefined(self):
+        from vibe_guide.dag import parallel_shape
+        shape = parallel_shape([serial_node("a", ["b"]), serial_node("b", ["a"])])
+        self.assertIsNone(shape["max_parallel_width"])
+        self.assertIsNone(shape["critical_path_length"])
+
+    def test_integration_review_edges_are_not_audited_or_counted(self):
+        from vibe_guide.dag import INTEGRATION_REVIEW_NODE_ID, parallel_shape, serial_edges
+        nodes = [
+            serial_node("a"), serial_node("b"),
+            serial_node(INTEGRATION_REVIEW_NODE_ID, depends=["a", "b"], files=["."]),
+        ]
+        self.assertEqual(serial_edges(nodes), [])
+        self.assertEqual(parallel_shape(nodes)["critical_path_length"], 1)
+        self.assertEqual(parallel_shape(nodes)["max_parallel_width"], 2)
+
+    def test_audit_result_and_dag_artifact_carry_the_serial_block(self):
+        nodes = [
+            serial_node("a"),
+            serial_node("b", depends=["a"], reasons={"a": "依赖 a 产出的账本文件格式"}),
+            serial_node("c"),
+        ]
+        plan = Plan("plan-serial", 1, ".vibe/plans/plan-serial/prd.md",
+                    ["a", "b", "c"], "confirmed_pending_authorization", nodes=nodes)
+        serial = audit_dag(plan).to_dict()["serial"]
+        self.assertEqual(serial["max_parallel_width"], 2)
+        self.assertEqual(serial["critical_path_length"], 2)
+        self.assertEqual(serial["unreasoned_edges"], [])
+        self.assertEqual(
+            [(edge["from"], edge["to"], edge["reason_type"]) for edge in serial["edges"]],
+            [("a", "b", "data_dependency")],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = render_plan_artifacts(plan, Path(directory))
+            written = json.loads(artifacts.dag_path.read_text(encoding="utf-8"))
+        self.assertEqual(written["audit"]["serial"], serial)
+
+    def test_old_audit_result_without_serial_keeps_its_shape(self):
+        result = DAGAuditResult("ready", ["a"], [], {"a": []}, {})
+        self.assertNotIn("serial", result.to_dict())
+
+    def test_plan_published_before_the_rule_still_loads(self):
+        """5.2.6-era nodes.json (no dependency_reasons, reasonless edge) reads back."""
+        legacy = [
+            {"id": "a", "title": "a", "depends_on": [], "integration_after": [], "parallel_group": None,
+             "contract": {"input": "i", "output": "o", "error_behavior": "e", "acceptance_example": "x",
+                          "files": ["vibe_guide/a.py"]}, "status": "accepted"},
+            {"id": "b", "title": "b", "depends_on": ["a"], "integration_after": [], "parallel_group": None,
+             "contract": {"input": "i", "output": "o", "error_behavior": "e", "acceptance_example": "x",
+                          "files": ["vibe_guide/b.py"]}, "status": "planned"},
+        ]
+        nodes = [DAGNode.from_dict(item) for item in legacy]
+        self.assertEqual([node.id for node in ready_nodes(nodes)], ["b"])
+
+
 if __name__ == "__main__":
     unittest.main()
