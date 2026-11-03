@@ -1,0 +1,596 @@
+{
+  "title": "交付环免评审合并、空转信号与心跳卡面准确性（5.2.7）",
+  "objective": "5.2.5 与 5.2.6 真实运行暴露的五个问题（#385 #386 #387 #390 #391）：没开评审保护的仓库里整合审查通过后，交付环不再被 GitHub 评审卡死；节点在等上游返工、或等监工服务信箱请求时，不再被当成卡住、不再白开修复短会话；心跳读不到会话记录时说清原因，并修掉真实原因；授权卡上的心跳间隔只出现一个明确的选中值，且与文档口径一致。依据 docs/superpowers/specs/2026-11-03-delivery-gate-and-stall-signals-prd.md。",
+  "decisions": [
+    {
+      "question": "单账号仓库、main 没开「需要评审」的分支保护、整合审查已验收通过（P0–P2 清零）时，交付环要不要等 GitHub 评审？",
+      "options": [
+        "A. 不等 GitHub 评审，直接合并并核实合并提交可达目标分支；PR 上有 CHANGES_REQUESTED 仍退回返工；仓库开了「需要评审」的分支保护或无法确定时仍等 GitHub 评审，并写明在等谁",
+        "B. 不自动合并，交付环停下，等产品经理在 vibe 里点一次「批准合并」"
+      ],
+      "impact": "A 沿用 AGENTS.md §10「独立终审通过、P0–P2 清零后由监工合并」的规则，单账号仓库不再被卡；B 每个 run 多一次打断，并且要新增「产品经理批准合并」入口。",
+      "recommendation": "A. 不等 GitHub 评审，直接合并并核实合并提交可达目标分支；PR 上有 CHANGES_REQUESTED 仍退回返工；仓库开了「需要评审」的分支保护或无法确定时仍等 GitHub 评审，并写明在等谁",
+      "status": "approved",
+      "selected": "A. 不等 GitHub 评审，直接合并并核实合并提交可达目标分支；PR 上有 CHANGES_REQUESTED 仍退回返工；仓库开了「需要评审」的分支保护或无法确定时仍等 GitHub 评审，并写明在等谁",
+      "field": "delivery.review_gate"
+    },
+    {
+      "question": "#387「读不到会话记录」的范围怎么定？issue 写的根因（只在主项目目录找）与代码和本机实测不符。",
+      "options": [
+        "A. 按 issue 建议改项目目录推算方式",
+        "B. 先把「读不到」分成未找到、目录不可读、会话编号未知三类并写进心跳，再按查出的真实原因修；查不出就如实说未能复现"
+      ],
+      "impact": "A 不会改变任何结果（代码本来就在所有项目目录里按会话编号查找）；B 让心跳说清原因，真实原因有证据后才改代码。",
+      "recommendation": "B. 先把「读不到」分成未找到、目录不可读、会话编号未知三类并写进心跳，再按查出的真实原因修；查不出就如实说未能复现",
+      "status": "approved",
+      "selected": "B. 先把「读不到」分成未找到、目录不可读、会话编号未知三类并写进心跳，再按查出的真实原因修；查不出就如实说未能复现",
+      "field": "stall.transcript_lookup_scope"
+    },
+    {
+      "question": "D1 的免评审，适用于「凡没开评审保护的仓库」，还是只适用于「只有一个账号的仓库」？",
+      "options": [
+        "A. 凡 main 没开「需要评审」的分支保护都免评审（包括有多个协作者的仓库）",
+        "B. 只在能确认仓库只有一个账号（协作者只有作者本人）时免评审；有多个协作者、或查不出协作者时仍等 GitHub 评审"
+      ],
+      "impact": "A 实现最简单，但多人仓库里原来要等同事批准的 PR，今后会在整合审查通过后直接合并；B 保留多人仓库的评审要求，但要多查一次协作者，查失败时按「等评审」处理。",
+      "recommendation": "B. 只在能确认仓库只有一个账号（协作者只有作者本人）时免评审；有多个协作者、或查不出协作者时仍等 GitHub 评审",
+      "status": "approved",
+      "selected": "A. 凡 main 没开「需要评审」的分支保护都免评审（包括有多个协作者的仓库）",
+      "field": "delivery.review_gate_scope"
+    },
+    {
+      "question": "#390 issue 里除「信箱待服务不判空转」之外还有两项附带内容，要不要纳入 5.2.7？①host_session 下 create 回写后，locate、visibility 由 vibe 自动补齐或一次回写完成（issue 验收例子 2）；②把 WorkBuddy 子代理通道的实测降级路径（general-purpose 全被内容策略拦、Explore 类型可用）登记进 adapter 文档。",
+      "options": [
+        "A. 都纳入：新增一个节点处理 ①，②写进 adapter 文档",
+        "B. 都不纳入：只做「信箱待服务不判空转」，①②另立 issue",
+        "C. 只纳入 ②（文档登记），① 另立 issue"
+      ],
+      "impact": "A 改信箱回写协议，范围和风险最大，节点多一个；B 范围最小，#390 的验收例子 2 不在本迭代验收；C 只补文档，不动协议。",
+      "recommendation": "C. 只纳入 ②（文档登记），① 另立 issue",
+      "status": "approved",
+      "selected": "A. 都纳入：新增一个节点处理 ①，②写进 adapter 文档",
+      "field": "mailbox.host_session_autocomplete_scope"
+    },
+    {
+      "question": "授权前没有「依赖图已随授权卡一起展示」的回执时，授权怎么处理？",
+      "options": [
+        "A. 拒绝授权，提示先展示依赖图",
+        "B. 只在授权卡上标出「图未展示」，不拒绝授权"
+      ],
+      "impact": "A 让「图与卡同屏」从靠自觉变成靠门禁，但授权流程多一步回执；B 改动小，但回到靠自觉。",
+      "recommendation": "A. 拒绝授权，提示先展示依赖图",
+      "status": "approved",
+      "selected": "A. 拒绝授权，提示先展示依赖图",
+      "field": "authorization.dag_graph_receipt"
+    },
+    {
+      "question": "一条串行依赖既没有写范围重叠、也没有声明理由时，发布计划怎么处理？",
+      "options": [
+        "A. 拒绝发布，要求补理由或改成可并行",
+        "B. 只在审计结果和授权卡上标红，不拒绝发布"
+      ],
+      "impact": "A 能真正压住「全部串成一条线」，但已有流程里写不出理由的依赖会被挡；B 不挡，但仍靠人看。",
+      "recommendation": "A. 拒绝发布，要求补理由或改成可并行",
+      "status": "approved",
+      "selected": "A. 拒绝发布，要求补理由或改成可并行",
+      "field": "dag.serial_edge_reason"
+    }
+  ],
+  "prd": {
+    "problem": [
+      {
+        "value": "远端交付环在单账号仓库里过不去：run-345fc559 整合审查第 3 代 P0–P2 清零后，交付环 prepare、push、create_pr 都成功（PR #384），review 步骤两次失败（事件 5573、5586），节点落 blocked_unknown。原因是交付环只认 GitHub 上 state=APPROVED 的评审，而仓库只有一个账号，GitHub 拒绝作者批准自己的 PR。PR #384 最后由 halfmoon82 账号手工合并。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "整合审查在等上游返工时被误判空转：run-345fc559 整合审查第 1 代报 P2 并指向 card-and-handoff（事件 4966），上游正确进入第 4 代返工；整合审查节点指纹不变，被判空转，auto_retry 一次后连开 3 个修复短会话，都是 nothing to re-check，第 5097 条 self_heal_no_progress，节点和 run 都落 blocked_unknown，心跳报「需要人处理」。上游验收后整合审查自动开第 2 代，run 自行恢复，所以是误报。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "心跳反复报「空转评估未知：节点 X 的 worker 会话读不到会话记录」（host-detect、daemon-consumes、card-and-handoff、platform-e2e、integration-review 都出现过）。issue 认为会话记录在工作树对应的项目目录下、而代码只去主项目目录找；但读取代码按会话编号在所有项目目录里查找，v5.2.5 与 v5.2.6 代码相同，2026-11-03 在本机核对登记过的 85 个 worker 会话，每个都能找到记录。真实原因没有定位。",
+        "source": "unverified"
+      },
+      {
+        "value": "信箱请求没人服务被误判成节点卡住（#390，WorkBuddy in_session_sdd，run-9fef3109）：信箱里待服务的请求在空转判定里完全没被考虑，节点停在 retry_pending，被当成空转，守护程序先 auto_retry、再开修复短会话，都是 nothing to re-check，最后 self_heal_no_progress，心跳连续 13 拍报「需要人处理」。本机该 run 的事件日志里至少有 423 条 retry_scheduled（数字还在涨）、12 条 self_heal_attempt，三个节点停在 retry_pending（attempt 141）。这条判定路径上没有任何按平台或拓扑分支的代码，所以不是 WorkBuddy 独有：凡是信箱请求靠监工会话服务的派发方式（Codex 可见、Claude Code 可见卡片、WorkBuddy）原则上都会这样；目前只在 WorkBuddy 上见到，其他平台是读代码的推断。Claude Code 后台由守护程序的运行器自己服务信箱，推断不受影响，未实测。",
+        "source": "unverified"
+      },
+      {
+        "value": "授权卡心跳间隔自相矛盾（#391，v5.2.6）：卡上两个选项里 60 分钟那项标 forced:true、最终选中的却是 10 分钟，产品经理看不出到底是哪个；forced 在代码里的意思是「强制选择档，要带价格才能选」，不是「已选中」。这是所有「推送唤醒未验证」平台的卡面结构问题（按 provider 取值：codex、claude-code、workbuddy、cursor、grok、kimi-code、deepseek-harness 在没有项目登记文件时都是 60 项 forced、选中 10；选中 60 取决于项目 push-wake-verification.json 的登记），不是 WorkBuddy 独有。WorkBuddy 的取值 10 分钟与 prd-guide §6.0、§6.4 和 README 的现行口径（未验证推送唤醒的平台 10 分钟）一致，矛盾只在 forced 字段名和 60 项的 reason 措辞。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "低版本 Python 上 vibe 一启动就崩（另一台机器升级时反馈）：v5.2.4 起 decision_boundary.py 用了 Dict 但没导入；项目声明支持 Python 3.9 及以上；在本机 3.12、3.13 上用 main 的副本实测，89 个模块里 13 个导入失败，同一个 NameError，vibe_guide.cli 也在其中；只补这一个导入后两个版本都是 0 个失败。3.14 因为延迟解析类型注解不报。发布检查只在打 tag 时跑，3.9 只用在旧打包路径上，没有任何一步在最低支持版本上导入全部模块。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "“图形 DAG 与授权卡一起展示”和“能并行尽量并行”两条纪律没有被机械执行：产品经理观察到展示图要靠追问，DAG 经常被偷懒串成一条线。授权卡数据里只有节点列表，没有依赖图字段；vibe authorize 的门禁只查十节点证据，没有“图已展示”回执；audit_dag 只检查环和写范围重叠，不检查串行边有没有理由，也不计算并行宽度。本机 32 个有 3 个以上节点的已发布计划里，5 个整条串行；排除整合审查和收口节点后，223 条串行边中 71 条（约 32%）两端写范围没有交集，其中有多少是真实的数据依赖现在区分不了（depends_on 没有理由字段）。",
+        "source": "user_confirmed"
+      }
+    ],
+    "user_scenarios": [
+      {
+        "value": "产品经理在只有一个 GitHub 账号的仓库里授权一个 run；整合审查通过后，交付环直接合并并核实，不需要他去 GitHub 上找人批准。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "同样的仓库里，有人在 PR 上要求修改：交付环退回返工，不会因为整合审查通过而照合。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "有多个协作者、但 main 没有评审保护的仓库：整合审查通过后同样直接合并，不等同事批准（产品经理选 A，接受这一行为变化）。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "仓库开了「需要评审」的分支保护，或 vibe 查不出有没有开：交付环等 GitHub 评审，交付报告写明在等谁。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "整合审查发回上游节点返工、返工要跑很久：监工心跳不再对整合审查报假警，也不白开修复短会话；上游真卡死时，被升级的是上游。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "监工会话还没来得及服务信箱请求的节点：心跳写「信箱待服务」，而不是报「需要人处理」、也不白开修复短会话；请求等满 60 分钟仍没人服务，心跳仍报「信箱待服务」并加上「需要监工服务信箱」的升级提示。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "监工看心跳时，如果有节点的会话记录读不到，能直接看出是「没找到」还是「目录不可读」，不用逐个手工核对。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "产品经理看授权卡时，心跳间隔只出现一个明确的选中值，与监工预检打印的一致；卡上的说法与 prd-guide 一致。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "在 Python 3.9 的机器上升级后运行 vibe：正常启动，不报 NameError。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "产品经理授权前一定能看到依赖图，包括并行宽度、关键路径长度和没有理由的串行边；没展示过图，授权被拒并提示先展示。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "agent 拆节点时想把节点串成一条线：每条没有写范围重叠的依赖必须写明数据依赖理由，写不出就要改成可并行，否则计划发布不了（规则细节由决定 D6 定）。",
+        "source": "user_confirmed"
+      }
+    ],
+    "success_criteria": [
+      {
+        "value": "满足免评审条件（D3 选 A：凡 main 没有评审保护的仓库，包括有多个协作者的仓库）、整合审查已验收且绑定的授权与整合摘要没漂移：交付环不等 GitHub 评审，合并后核实合并提交可达目标分支。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "PR 上有 CHANGES_REQUESTED：照旧进入 rework，优先于免评审。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "分支保护要求评审，或分支保护查不出来（接口返回 404 分不清「没开」和「没权限」、仓库用的是新式 ruleset 查不到、调用失败或无法解析）：等 GitHub 评审，不得默认当作没开；交付报告和 vibe status 写明在等谁。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "整合审查绑定的授权摘要或整合摘要已漂移：不免评审，沿用既有绑定校验。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "整合审查发回上游返工、上游仍有活动：整合审查节点不进入 supervisor_investigate，不开修复短会话，run 不变 blocked_unknown。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "上游返工节点自己卡死：按原规则升级，升级对象是上游节点；非 Claude 平台没有会话记录信号时，豁免只看上游节点的状态，上游自己的空转评估照常，所以豁免不会永久有效。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "节点有待服务的信箱请求：不进入空转评估，不开修复短会话，不落 blocked_unknown；心跳写「信箱待服务」并带请求数和最早一条已等时长。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "信箱请求等满 60 分钟仍无人服务：心跳仍以「信箱待服务」为主语，并加上「已等满 60 分钟，需要监工服务信箱」的升级提示，只提示一次（按已等时长判断，不依赖修复短会话次数），仍不开修复短会话；60 分钟内只报信箱待服务；信箱读不到按未知处理，不当成空。#390 issue 的验收例子要求 60 分钟内报「信箱待服务」，这里一致；满 60 分钟加升级提示是有意增加的上限，issue 没有给无人服务的上限。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "由守护程序服务信箱的后台派发节点，空转判定行为与 5.2.6 一致。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "WorkBuddy in_session_sdd 下，监工会话回写一次 create 后，信箱不再出现同一节点同一代的 locate、visibility，节点直接进入等待；自动补齐只在三个条件都满足时才做（in_session_sdd 且带能力证据引用、create 回执的任务编号等于本会话编号、不是收口审查节点），否则退回手工回写，不得把没有可见窗口的节点写成可见。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "WorkBuddy 子代理通道的实测降级路径登记进 WorkBuddy 的验证文档和 visible-sdd 协议：general-purpose 类型下各模型全被内容策略拦或不被允许，Explore 类型可用（能跑 Bash、没有写文件工具），dev/review 子代理改走 Explore 后正常交付；文档里标明这是单次运行的观察、宿主版本未知，来源写 run-9fef3109、2026-11-03、issue #390；不改平台账本（账本每格只有一个状态，nested_dispatch 现为已验证，往里加未验证备注会自相矛盾）。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "读不到会话记录时，心跳写明具体类别：未找到会话记录、会话记录目录不可读；会话记录存在于任一项目目录（含工作树对应目录）时不报。「会话编号未知」不进心跳（非 Claude 平台的节点本来就没有 Claude 会话编号，每拍都报会变成噪声），只在 vibe status 的节点详情里写明。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "授权卡上选中项单独标出；卡上的选中值与预检打印一致；prd-guide、README 对各平台心跳间隔的说法与授权卡一致；各平台默认选中取值不变；已授权在跑 run 的心跳间隔不变，5.2.6 签发的旧授权卡仍能通过核对。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "真机心跳读取只能在验收期验证：在 Claude Code 监工会话里跑一个多节点后台 run，有会话记录的节点不再被报读不到；真实原因未能复现时，交付里写「未能复现」，不宣称修好。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "全量测试（python3 -m unittest discover -s tests）通过，失败数不高于 main 上的既有基线。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "Python 3.9 和 3.12、3.13 上 vibe --help 正常；新增的全模块导入测试在 3.9 上被执行，故意删掉一个导入会让它失败并指出模块名。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "审计为每条 depends_on 边标注理由类型：写范围重叠、数据依赖、无理由；无理由的边按决定 D6 处理；审计结果输出每个计划的最大并行宽度和关键路径长度。5.2.6 及更早已发布的计划照常读取，不重新审计。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "授权卡的输出内容里自带依赖图（每个节点的前置节点、并行组、最大并行宽度、关键路径长度、无理由串行边），不依赖 agent 另行粘贴；没有“依赖图已随授权卡展示”的回执，vibe authorize 拒绝并提示先展示；已授权在跑的 run 不追溯。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "本迭代自己的节点依赖也满足上一条规则：每条串行边都有写范围重叠或声明的数据依赖理由。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "展示回执对应当前计划版本和依赖图，计划或依赖图变化后回执失效；现有涉及授权的测试（本机 72 个测试文件）通过统一测试辅助自动补回执，不逐个改。",
+        "source": "system_inferred"
+      }
+    ],
+    "non_goals": [
+      {
+        "value": "不新增「产品经理批准合并」入口（决定 D1 选 A）。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "开了「需要评审」分支保护的仓库，评审要求不变。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "不改修复短会话 inconclusive 结果在 self_heal_no_progress 里的通用计数，只处理「整合审查在等上游返工」和「节点有待服务信箱请求」这两种合理等待。#386 issue 的第二条建议不采纳：否则真无法识别会话的卡死也不会升级。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "不按 #387 issue 原建议改项目目录推算方式（决定 D2 选 B）。",
+        "source": "user_confirmed"
+      },
+      {
+        "value": "不改任何平台默认选中的心跳间隔取值；#391 issue 建议的「WorkBuddy in_session_sdd 默认 60 分钟」与现行规则相反，若要改，另立决定。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "不改由守护程序服务信箱的后台派发路径；不改信箱请求本身的回写格式（只在决定 D4 纳入的 host_session 自动补齐范围内，由 vibe 代为补写 locate 和 visibility）；不改 retry_pending 的重试节奏。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "#390 issue 的第 3 条建议（授权卡、接力口令明确写明 in_session_sdd 下监工会话必须常驻，离线期间节点不推进）不纳入本迭代；本迭代只让「信箱待服务」在心跳里被看见，并在等满 60 分钟时提示。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "不涉及部署、发版和凭据；不处理 #347。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "不追溯审计 5.2.6 及更早已发布的计划，不让已授权、在跑的 run 失效。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "不要求把全模块导入测试扩展成全量多版本矩阵测试；只在最低支持版本上多跑这一个导入检查。",
+        "source": "system_inferred"
+      }
+    ],
+    "code_evidence": [
+      {
+        "value": "交付环 review 步骤：RemoteGitExecutor._review 只跑 gh pr view --json reviews,state，返回 approved（任一 state==APPROVED）、changes_requested、pr_state；没有批准时抛 integration PR has no approving review。vibe_guide/remote_delivery.py:473、:820-823。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "CHANGES_REQUESTED 分支把节点置为 rework 并发 remote_delivery_rework：vibe_guide/remote_delivery.py:803-818。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "整合审查已验收的证据与绑定：snapshot.integration_review_evidence、integration_evidence_digest（:104）、delivery_binding（:119，含 authorization_digest、node_contract_digest、topology_digest、integration_digest）；绑定变化作废旧证据（:731 附近）。到 review 步骤时已验收和绑定都已满足。",
+        "source": "unverified"
+      },
+      {
+        "value": "现有代码没有查分支保护的调用（remote_delivery.py 里没有 protection、reviewDecision、gh api）；全仓库 git grep reviewDecision 无结果。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "交付环状态文案在 vibe_guide/cli.py:2475-2495（远端整合交付返工、受阻、进行中），目前不会写「在等 GitHub 评审」。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "现有测试：tests/test_remote_delivery.py 的 test_missing_approval_blocks_merge（:262）、test_review_findings_park_rework_and_never_complete（:244）、test_drive_waits_until_the_integration_review_is_accepted（:125）；没有分支保护相关用例。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "空转指纹只含节点自身字段（status、两个 generation、active_task、任务绑定、delivery、最新 evidence、observation），没有「上游节点在为我返工」，也没有「信箱待服务」：vibe_guide/stall.py:41 node_fingerprint；STALL_BEATS=3（:24）。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "空转升级档只看修复短会话次数：stall.py:103-109 _tier，未变拍数达到 STALL_BEATS 后，attempts_since 达到 ESCALATE_ATTEMPTS（=2，:25）才升级，否则停在 supervisor_investigate。所以「不开修复短会话」的节点现在永远升不到升级档，需要按已等时长另设上报条件。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "空转候选节点：supervisor.py:2884 _stall_candidates 取 map_user_status==「自动修复中」的节点，加上会话静默的 running 节点；state.py:191-192 把 retry_pending 等恢复类状态归入「自动修复中」，所以信箱请求待服务（节点停在 retry_pending）会进入空转评估。stall.py 全文没有信箱或 pending 请求的概念；信箱只在 supervisor.py:782 _mailbox_backlog（推迟轮班）和 daemon.py:509、:707 的收尾判断里被看。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "整合审查带 target_node_id 上报 review_finding 后，monitor 调 _apply_scope_expansion(..., \"integration_rework\", queue_rework=True)，并在上游节点写 integration_finding_ref={node_id, generation}：vibe_guide/monitor.py:7925-7993。空转判定只需要读这个标记。",
+        "source": "unverified"
+      },
+      {
+        "value": "self_heal_no_progress 的判定在 vibe_guide/daemon.py:977（heal_pass）：tier 为 escalate_to_pm，或同一指纹下修复次数达到 _REPAIRS_BEFORE_ESCALATION；修复结果 nothing to re-check 在 vibe_guide/supervisor.py:3189、vibe_guide/heal_pack.py:189、:196 产生，daemon.py:1174 判为 inconclusive。",
+        "source": "unverified"
+      },
+      {
+        "value": "空转判定路径上没有按 provider、adapter 或拓扑分支的代码（worker_liveness._session_id 只认 Claude 会话编号，对 retry_pending 节点不起作用）；Claude Code 后台由 runners/claude_bg.py 的运行器服务信箱（未读到完整服务循环）。",
+        "source": "unverified"
+      },
+      {
+        "value": "worker 活动信号 worker_liveness.liveness_signal 由交付文件时间戳加 Claude 会话记录时间组成；非 Claude 平台只有交付文件，没有交付文件时返回 None，None 按未知处理，不当成有活动。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "读会话记录：vibe_guide/worker_liveness.py:52 transcript_path 在 ~/.claude/projects 下 glob 「*/<会话编号>.jsonl」，没有按目录名推算；根目录不是目录时直接返回 None，probe 因此统一报 transcript not found，分不出「没找到」和「目录读不了」。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "心跳渲染「读不到会话记录」：vibe_guide/supervisor.py:3151 render_stall_beat_text，只渲染 unknown_sessions，不渲染 unresolved；会话编号来源 worker_liveness._session_id（:29）。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "另一个项目的本机 run（run-9fef3109）的事件日志：至少 423 条 retry_scheduled、12 条 self_heal_attempt（原因都是 nothing to re-check），三节点停在 retry_pending（attempt 141）。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "心跳间隔选项生成：supervisor.py:1985 heartbeat_interval_options；60 分钟项在推送唤醒未验证时返回 available:true、forced:true、cost（:1998-2004），推送唤醒判定 _push_wake_available（:1968）、_push_wake_verified（:1958）、platform_ledger.wake_channel_for（:251）；forced 的语义是「强制选择档、要带代价」。默认选中值：publish.py:58 _default_heartbeat_minutes 取「可用且非 forced」的最大分钟数，没有就回落 10（authorization.py:65）。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "心跳间隔的文档口径：prd-guide.md:167、:200、:311 与 README.md:108、:200 都写「推送唤醒未验证的平台 10 分钟」，与代码默认选中一致；矛盾只在 forced 字段名和 60 项的 reason 措辞。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "现有心跳卡面测试：tests/test_authorization_card_options.py、tests/test_heartbeat_override_30.py:55-99、tests/test_claude_code_push_wake.py。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "host_session 只是 supervisor.py:2726 _host_session_service()（2679-2731）给信箱条目挂的 service.mode 标记，没有单独的运行时分支；只有 _HOST_SESSION_ADAPTERS（:2607）里的 workbuddy、且 capabilities.mode==in_session_sdd 并带 provenance 时才提供（:2700-2710）。信箱请求按 create→locate→visibility 串行出现，是因为 runners/provider_action.py:1320-1346 _require_result 每步没结果就抛 ProviderPending（:858-863），下一次 resume 才发下一步。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "locate 回写形状是 {\"located\":true}，visibility 是 {\"visible\":true,\"direct_enter\":true}：provider_action.py:274-277、complete_mailbox_action（:542）校验；supervisor.py mailbox_complete（:2820-2851）是回写入口。目前没有自动补齐的先例；host_session_id() 在 tool_servers/workbuddy_sessions.py:146，代码里没有现成的「create 回执任务编号等于本会话编号」校验，需要新写。",
+        "source": "unverified"
+      },
+      {
+        "value": "现有 host_session 相关测试：tests/test_workbuddy_host_session_service.py 的 test_in_session_only_host_is_told_to_serve_the_request_itself（:85）、test_session_self_answers_every_request_and_the_node_is_accepted（:207，目前断言 create/locate/visibility/wait 都 offered 为 host_session，补齐后会改）、test_closeout_is_served_from_the_session_and_must_be_a_separate_identity（:307）；另有 tests/test_supervisor_mailbox_216.py。",
+        "source": "unverified"
+      },
+      {
+        "value": "WorkBuddy 子代理实测的登记位置：docs/workbuddy/workbuddy-in-session-dispatch-verification.md（现有文档没有子代理模型矩阵）和 vibe_guide/protocols/visible-sdd-worker.md；不放 workbuddy.yaml（tests/test_platform_ledger.py:89 钉死「清单不带能力结论」），也不放平台账本：账本每格只有一个 status，nested_dispatch 现为 verified，往里加「未验证」的备注会让卡面自相矛盾，新增格又会破坏 7 平台 x 9 格的断言（tests/test_platform_ledger.py:101）。protocols/__init__.py 用 sha256 钉死 prd-guide.md 和 visible-sdd-worker.md，改正文必须同步登记新摘要。",
+        "source": "unverified"
+      },
+      {
+        "value": "导入缺失：vibe_guide/decision_boundary.py:14 只导入 Any、Mapping、Optional，:165 的 _build_record 注解用了 Dict；v5.2.3 没有该注解，v5.2.4、v5.2.5、v5.2.6 和 main 都有。pyproject.toml 与 setup.py 声明 python_requires >=3.9。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "发布检查：.github/workflows/release-tag-gate.yml 只在推送 v* 标签和手动触发时跑，先装 3.9 再装 3.12，3.9 只给旧打包路径用；仓库里没有任何一步在最低支持版本上导入全部模块。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "DAG 审计只检查结构、写范围冲突和并行组：vibe_guide/dag.py:942 audit_dag、:871 _write_scope_conflict_errors、:725 _parallel_group_errors；没有并行宽度、关键路径或串行边理由的计算。render_plan_artifacts（dag.py:1065）输出的 plan.md 只有“节点名加 ready 或 blocked”的清单，不画依赖。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "授权卡与授权命令：authorization.py 的卡片字段含 node_ids、workers、topology_summary、file_scope，没有依赖图；cli.py:3825 的 authorize 只调用 materialize_workflow_evidence，门禁是十节点证据（workflow_gate.py:11 含 dag_audit、plan_confirmation、authorization_card、user_authorization），没有“图已展示”回执。supervisor.py:3280 的 supervisor-card-shown.json 只是监工卡的已展示标记。",
+        "source": "system_inferred"
+      },
+      {
+        "value": "规则出处：AGENTS.md:73 写“展示授权卡，列明 DAG 范围、ready 节点、并行组……”，没有“图形”二字，也没有说图与卡必须同屏；README.md:293 只写十节点强制链。",
+        "source": "system_inferred"
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "id": "remote-review-gate",
+      "title": "整合审查通过后交付环免等 GitHub 评审并写明在等谁（#385）",
+      "depends_on": [],
+      "integration_after": [],
+      "parallel_group": "wave1",
+      "contract": {
+        "input": "交付环已推送并创建 PR，整合审查节点已验收（P0–P2 清零），PR 上没有任何 GitHub 批准评审；仓库可能没有评审保护，也可能开了「需要评审」的分支保护（含分支保护规则和新式 ruleset）。",
+        "output": "满足以下全部条件时，交付环不等 GitHub 评审，直接合并并核实合并提交可达目标分支：整合审查已验收、绑定的授权摘要与整合摘要没漂移、PR 上没有 CHANGES_REQUESTED、能确认目标分支没有「需要评审」的保护。任一条件不满足，保持原行为。交付报告写明本次是凭整合审查证据合并，还是等了 GitHub 评审；等待时交付报告和 vibe status 写明在等谁（GitHub 评审人）。",
+        "error_behavior": "查询分支保护失败、返回无法解析、返回 404（分不清「没开」和「没权限」）、或仓库用 ruleset 而接口查不到时，一律等 GitHub 评审，不得默认当作没开；PR 上有 CHANGES_REQUESTED 时照旧进入 rework。",
+        "acceptance_example": "1) 满足 D3 范围、main 没有评审保护、整合审查已验收：交付环不等评审，合并后核实通过，报告写明凭整合审查证据合并。2) PR 上有 CHANGES_REQUESTED：进入 rework，不合并。3) main 开了「需要评审」的分支保护：等 GitHub 评审，报告和 vibe status 写明在等谁。4) 分支保护查询失败、返回 404 或用 ruleset 查不出：等 GitHub 评审，不合并。5) 整合审查绑定的授权摘要已变：不免评审，按原规则处理。6) 仓库有多个协作者、但 main 没有评审保护（决定 D3 选 A）：同样不等评审，报告写明凭整合审查证据合并；不做协作者数量判断。"
+      },
+      "files": [
+        "vibe_guide/remote_delivery.py",
+        "vibe_guide/cli.py",
+        "tests/test_remote_delivery.py"
+      ]
+    },
+    {
+      "id": "stall-visibility",
+      "title": "心跳说清读不到会话记录的原因，并修掉真实原因（#387）",
+      "depends_on": [],
+      "integration_after": [],
+      "parallel_group": "wave1",
+      "contract": {
+        "input": "一个后台 worker 节点，已识别出会话编号，但心跳读不到它的会话记录；原因可能是没找到、~/.claude/projects 不可读（如宿主沙箱拒绝）、或刚启动记录还没写出。",
+        "output": "空转评估的 unknown 结果带具体类别：未找到会话记录（写明搜索了几个项目目录）、会话记录目录不可读；心跳文案按类别写，不再统一写「读不到会话记录」。会话编号推不出的节点（非 Claude 平台）不进心跳，只在 vibe status 的节点详情里写明「会话编号未知」。会话记录存在于任一项目目录（含工作树对应目录）时不报。同时查出在真实环境里「读不到」的实际原因并修掉；查不出时在交付里写「未能复现，已能区分类别」。",
+        "error_behavior": "原因类别无法判断时保持 unknown 并写明无法判断，不得当成活着或没活着；不得宣称修好一个没有复现的问题。",
+        "acceptance_example": "1) 有会话编号但任何项目目录下都没有对应 .jsonl：心跳写「未找到会话记录」并带搜索的目录数。2) ~/.claude/projects 存在但读取被拒：心跳写「会话记录目录不可读」。3) 会话记录在工作树对应的项目目录下：心跳不报。4) 会话编号推不出：心跳不报，vibe status 节点详情写「会话编号未知」。5) 交付里写明真实原因，或写明「未能复现」。"
+      },
+      "files": [
+        "vibe_guide/worker_liveness.py",
+        "vibe_guide/supervisor.py",
+        "tests/test_stall_running_silence.py"
+      ]
+    },
+    {
+      "id": "stall-mailbox-wait",
+      "title": "节点有待服务信箱请求时不被判空转，等满 60 分钟才上报（#390）",
+      "depends_on": [
+        "stall-visibility"
+      ],
+      "integration_after": [],
+      "parallel_group": null,
+      "contract": {
+        "input": "节点有未回写的信箱请求（create、locate、visibility 等，派发靠监工会话服务），节点停在 retry_pending，指纹不变；监工会话还没开班或暂时离线。",
+        "output": "有待服务信箱请求的节点不进入空转评估，不开修复短会话，不落 blocked_unknown；心跳写「信箱待服务」，带请求数和最早一条已等时长。请求等满 60 分钟仍无人服务：心跳仍以「信箱待服务」为主语，并加上「已等满 60 分钟，需要监工服务信箱」的升级提示，只提示一次，文案写明要做的动作是回到监工会话服务信箱，仍不开修复短会话。按已等时长判断，不依赖修复短会话次数。由守护程序服务信箱的后台派发节点、其他节点的空转判定、修复短会话 inconclusive 的通用计数都不变。",
+        "error_behavior": "信箱读不到时按未知处理，心跳写明读不到信箱，不当成信箱为空；不得让一个无人服务的信箱被永久豁免（60 分钟必须上报）。",
+        "acceptance_example": "1) WorkBuddy in_session_sdd 下三个节点各有一个待服务的 create 请求，监工会话还没服务：连续多拍心跳都写「信箱待服务」，不出现 self_heal_attempt，不出现「需要人处理：进展不变」。2) 同样的待服务请求在 Codex 可见派发的夹具里结果一致。3) 同一批请求等满 60 分钟仍无人服务：心跳仍以「信箱待服务」为主语，并加一次「已等满 60 分钟，需要监工服务信箱」的升级提示，不开修复短会话。4) 信箱读不到：心跳写明读不到信箱。5) 由守护程序服务信箱的后台节点连续空转：行为与 5.2.6 一致。"
+      },
+      "files": [
+        "vibe_guide/stall.py",
+        "vibe_guide/supervisor.py",
+        "vibe_guide/daemon.py",
+        "tests/test_stall_detector.py",
+        "tests/test_stall_dispatch_loop.py",
+        "tests/test_daemon_heal.py",
+        "tests/test_supervisor_mailbox_216.py"
+      ]
+    },
+    {
+      "id": "host-session-autofill",
+      "title": "WorkBuddy 会话回写 create 后，定位和可见确认由 vibe 补齐（#390 附带）",
+      "depends_on": [
+        "stall-mailbox-wait"
+      ],
+      "integration_after": [],
+      "parallel_group": null,
+      "contract": {
+        "input": "WorkBuddy in_session_sdd 下监工会话回写了一个节点的 create，create 回执里的任务编号等于本会话编号。",
+        "output": "vibe 仅在同时满足三个条件时，在同一代、同一序号上补写 locate 和 visibility 的应答（locate 为已定位，visibility 为可见且可直接进入）：①该节点的派发是 in_session_sdd 且带能力证据引用（与现有 _host_session_service 提供 host_session 的条件相同），②create 回执的任务编号等于本会话编号，③不是收口审查节点（收口审查必须是独立标识，不能由本会话代答）。补写时在事件日志留下记录，写明三个依据和证据引用；之后信箱不再出现同一节点同一代的 locate、visibility 请求，节点直接进入等待。授权卡和任务登记里已写明的派发方式与限制披露不变。",
+        "error_behavior": "任一条件不满足、缺能力证据引用、或读不到本会话编号：不补写，退回现有手工回写；不得把没有可见窗口的节点写成可见或可直接进入，不得把降级路径标成完整可见自动化；补写不得绕过「能力判断必须引用证据」的规则。",
+        "acceptance_example": "1) 三个条件都满足：回写一次 create 后，信箱不再出现该节点该代的 locate、visibility，节点推进到等待。2) 任务编号不等于本会话编号：不补写，locate、visibility 照常出现。3) 缺能力证据引用：不补写，退回手工回写。4) 收口审查节点：不补写，仍要求独立标识的手工回写。5) 读不到本会话编号：不补写。6) Codex、Claude Code 的信箱行为与 5.2.6 一致。7) 事件日志里有补写记录，写明三个依据和证据引用；授权卡与任务登记里的派发方式和限制披露与补写前一致。"
+      },
+      "files": [
+        "vibe_guide/supervisor.py",
+        "vibe_guide/runners/provider_action.py",
+        "tests/test_workbuddy_host_session_service.py",
+        "tests/test_supervisor_mailbox_216.py"
+      ]
+    },
+    {
+      "id": "stall-upstream-rework",
+      "title": "整合审查等上游返工时不被判空转（#386）",
+      "depends_on": [
+        "host-session-autofill"
+      ],
+      "integration_after": [],
+      "parallel_group": null,
+      "contract": {
+        "input": "整合审查带 target_node_id 发回缺陷，上游节点因此进入返工；整合审查节点这段时间指纹不变。",
+        "output": "只要有上游节点因整合审查的发现正在返工，且上游仍有活动，整合审查节点不进入 supervisor_investigate，不开修复短会话，run 不变 blocked_unknown；豁免随上游返工结束而结束。上游节点自己仍按原规则评估空转，上游卡死时升级对象是上游节点。其他节点的空转判定和修复短会话 inconclusive 的通用计数不变。",
+        "error_behavior": "判断「上游仍有活动」读不到证据时，按未知处理，不当成有活动；非 Claude 平台没有会话记录信号，只看上游节点的状态和交付文件，上游自己的空转评估照常，所以豁免不会永久有效；不得让一个真卡死的上游节点被永久豁免。",
+        "acceptance_example": "1) 整合审查发回上游返工、上游返工持续 60 分钟且有活动：整合审查节点不进入 supervisor_investigate，不开修复短会话，run 不变 blocked_unknown。2) 上游节点会话已退出、指纹不变：上游节点按原规则升级，整合审查不被升级。3) 上游返工结束后整合审查自己又空转：按原规则评估。4) 非 Claude 平台的夹具里重复第 1、2 条：结果一致。5) 其他节点连续空转：行为与 5.2.6 一致。"
+      },
+      "files": [
+        "vibe_guide/stall.py",
+        "vibe_guide/supervisor.py",
+        "vibe_guide/daemon.py",
+        "tests/test_stall_detector.py",
+        "tests/test_integration_fix_self_heal_wiring.py",
+        "tests/test_daemon_heal.py"
+      ]
+    },
+    {
+      "id": "workbuddy-subagent-docs",
+      "title": "WorkBuddy 子代理通道降级路径登记进验证文档和协议（#390 附带）",
+      "depends_on": [
+        "dag-serial-audit"
+      ],
+      "integration_after": [],
+      "parallel_group": null,
+      "contract": {
+        "input": "run-9fef3109 的实测：WorkBuddy Agent 工具 general-purpose 类型下各 claude 模型被内容策略拦、gpt 类模型不被个人免费用户允许；Explore 类型可用，能跑 Bash，没有写文件和编辑工具；dev/review 子代理改走 Explore 加 sonnet 后正常交付。",
+        "output": "WorkBuddy 的验证文档和 visible-sdd 协议里写明这条降级路径和使用限制，并标明来源是单次运行的观察（运行编号、日期 2026-11-03、issue #390），宿主版本未知；协议摘要登记同步更新。平台账本、各平台清单文件不改。",
+        "error_behavior": "不得把单次运行的观察写成「已验证」或平台永久限制；不得改变平台账本和其他平台的条目；改了协议正文必须同步更新摘要登记，否则协议校验测试失败。",
+        "acceptance_example": "1) WorkBuddy 验证文档有子代理类型与模型的可用性矩阵，写明观察来源和「单次运行、宿主版本未知」。2) visible-sdd 协议里 WorkBuddy 子代理说明写明可走 Explore 类型及其限制（有 Bash、没有写文件工具）。3) 平台账本仍是 7 个平台 9 格，内容与改前一致。4) 协议摘要登记与改后的正文一致，相关测试通过。"
+      },
+      "files": [
+        "docs/workbuddy/workbuddy-in-session-dispatch-verification.md",
+        "vibe_guide/protocols/visible-sdd-worker.md",
+        "vibe_guide/protocols/__init__.py"
+      ]
+    },
+    {
+      "id": "python39-import-guard",
+      "title": "低版本 Python 上也能启动：补缺失的导入并加全模块导入测试",
+      "depends_on": [],
+      "integration_after": [],
+      "parallel_group": "wave1",
+      "contract": {
+        "input": "Python 3.9 到 3.13 上安装 v5.2.4 到 v5.2.6 或当前 main 的 vibe：decision_boundary 模块用了 Dict 但没导入，运行 vibe 任何命令都在启动时报 NameError；3.14 因为延迟解析类型注解不报。",
+        "output": "decision_boundary 补上缺失的导入；新增一个测试，逐个导入 vibe_guide 下所有模块，任一导入失败即失败；该测试在项目声明的最低支持版本 Python 3.9 上也被执行（在持续集成或发布门里加一步，不只在默认 Python 上跑）。",
+        "error_behavior": "全模块导入测试遇到只在特定平台才能导入的可选模块时，要显式列出豁免名单并写明原因，不能整体跳过；最低版本检查缺失时，发布门必须报告“未检查”而不是通过。",
+        "acceptance_example": "1) 在 Python 3.9、3.12、3.13 上 vibe --help 正常，不报 NameError。2) 故意在某模块删掉一个导入，全模块导入测试失败并指出模块名。3) 发布门里有一步在 Python 3.9 上跑这个导入测试；把它移除后，门禁自检测试失败。4) 从 v5.2.5 升级到含修复的版本，在 3.9 上 vibe --help 正常。"
+      },
+      "files": [
+        "vibe_guide/decision_boundary.py",
+        "tests/test_module_imports.py",
+        ".github/workflows/release-tag-gate.yml"
+      ]
+    },
+    {
+      "id": "dag-serial-audit",
+      "title": "每条串行依赖必须有理由，审计输出并行宽度（DAG 过度串行门禁）",
+      "depends_on": [],
+      "integration_after": [],
+      "parallel_group": "wave1",
+      "contract": {
+        "input": "产品 spec 里的节点依赖：每条 depends_on 边，两端节点的写范围可能有重叠，也可能没有；agent 可能为了省事把节点串成一条线。",
+        "output": "审计为每条 depends_on 边自动判断理由：两端写范围重叠，记为“写范围重叠”；没有重叠但产品 spec 里声明了数据依赖理由，记为“数据依赖”；两者都没有的边记为“无理由”。规则（决定 D6 选 A）：无理由的边拒绝发布，并指明边和修改办法（补理由，或去掉依赖改为可并行）。审计结果输出每个计划的最大并行宽度、关键路径长度和每条边的理由类型，写进 DAG 审计结果，供授权卡使用。产品 spec 节点新增一个可选的依赖理由字段，由 vibe 校验；PRD 引导协议同步写明这条规则。数据依赖理由的写法：节点可以为每条依赖写一句话，说明依赖谁的什么产出（例如“依赖 platform-ledger 产出的账本文件格式”）。",
+        "error_behavior": "依赖理由字段缺失或格式不对：按“无理由”处理，不得默认通过；旧计划（5.2.6 及更早已发布的）不重新审计，读取不报错。",
+        "acceptance_example": "1) 两个节点写范围重叠且 depends_on 串行：边理由为“写范围重叠”，通过。2) 两个节点写范围不重叠、没有声明理由、却有 depends_on：发布被拒，报错写明边和两个修改办法。3) 同样的边，在节点里写上一句话“依赖 A 节点产出的 xxx 文件格式”：通过，理由类型为“数据依赖”；理由为空字符串或只有空格：仍按“无理由”拒绝。4) 审计结果含最大并行宽度和关键路径长度，对一个全串行的 5 节点计划，宽度为 1、关键路径为 5。5) 5.2.6 及更早已发布的计划照常读取，不报错。"
+      },
+      "files": [
+        "vibe_guide/dag.py",
+        "vibe_guide/node_spec.py",
+        "vibe_guide/planner.py",
+        "vibe_guide/protocols/prd-guide.md",
+        "vibe_guide/protocols/__init__.py",
+        "tests/test_dag.py",
+        "tests/test_node_spec_contract.py",
+        "tests/test_prd_guide_protocol.py"
+      ]
+    },
+    {
+      "id": "authorization-card",
+      "title": "授权卡必须带依赖图，授权前要有展示回执；心跳间隔只出现一个选中值（#391）",
+      "depends_on": [
+        "stall-upstream-rework",
+        "remote-review-gate",
+        "workbuddy-subagent-docs"
+      ],
+      "integration_after": [],
+      "parallel_group": null,
+      "contract": {
+        "input": "一个已通过 DAG 审计的复杂计划，需要向产品经理展示授权卡；授权卡上心跳间隔有 10 分钟和 60 分钟两项，60 分钟项在推送唤醒未验证时带“强制选择、要付代价”的标记，但默认选中的是 10 分钟。",
+        "output": "①授权卡的输出内容里自带依赖图：每个节点的前置节点、并行组、最大并行宽度、关键路径长度，以及无理由串行边（如有）；不依赖 agent 另行粘贴。②授权前需要有“依赖图已随授权卡展示”的回执，没有回执，vibe authorize 拒绝并提示先展示（决定 D5 选 A）；回执对应当前计划版本和依赖图，计划或依赖图变化后回执失效。③卡面上心跳间隔选中项单独标出，其余项不再用“强制”表达“已选中”；卡上的选中值与监工预检打印一致；各平台默认选中的取值不变；60 分钟项的原因措辞与 prd-guide §6.0 一致；prd-guide、README 对各平台心跳间隔的说法与授权卡一致。④现有涉及授权的测试（本机有 72 个测试文件涉及授权）不逐个改：提供一个统一的测试辅助，在测试里授权前自动补上展示回执；辅助之外直接调用授权入口的测试仍按“无回执即拒绝”断言。",
+        "error_behavior": "旧版授权卡（带旧字段、没有依赖图和回执）仍能被读取并核对签名，已授权、在跑的 run 不因此失效；新旧字段并存时以新字段为准，缺失时按旧字段推断；展示回执只约束新授权，不追溯已授权的 run；依赖图渲染失败时，授权被拒并写明原因，不得跳过图直接授权。",
+        "acceptance_example": "1) 渲染一张授权卡：输出里有依赖图，含并行宽度和关键路径长度，agent 不需要另行粘贴。2) 没有展示回执时 vibe authorize 被拒，提示先展示依赖图；展示后再授权成功。3) 计划版本变化后，旧回执不再有效，需要重新展示。4) 一个有无理由串行边的计划，授权卡上能看到这条边。5) WorkBuddy 授权卡只出现一个被标为选中的心跳间隔，且与预检打印一致；在没有项目登记文件的环境里，各平台选中 10 分钟；已登记推送唤醒证据且有推送通道的平台（codex、claude-code）选中 60 分钟，与 5.2.6 取值一致。6) 一张 5.2.6 签发的授权卡在新版本下仍能通过核对，run 照常推进。 7) 用统一测试辅助授权的既有测试仍然通过；绕过辅助、直接调用授权入口且没有回执的测试被拒。8) 依赖图渲染失败时授权被拒并写明原因。"
+      },
+      "files": [
+        "vibe_guide/authorization.py",
+        "vibe_guide/publish.py",
+        "vibe_guide/supervisor.py",
+        "vibe_guide/cli.py",
+        "vibe_guide/dag.py",
+        "vibe_guide/workflow_gate.py",
+        "vibe_guide/protocols/prd-guide.md",
+        "vibe_guide/protocols/__init__.py",
+        "README.md",
+        "tests/test_authorization_card_options.py",
+        "tests/test_heartbeat_override_30.py",
+        "tests/test_claude_code_push_wake.py",
+        "tests/test_workflow_gate.py",
+        "vibe_guide/authorize_entry.py",
+        "tests/support_authorization_receipt.py"
+      ]
+    }
+  ]
+}
