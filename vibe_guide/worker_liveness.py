@@ -49,14 +49,55 @@ def _session_id(paths: ProjectPaths, node: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def _project_roots() -> list:
+    """Directories that hold Claude Code's per-project transcript folders."""
+    roots = []
+    config = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config:
+        roots.append(Path(os.path.expanduser(config)) / "projects")
+    home = Path(os.path.expanduser("~")) / ".claude" / "projects"
+    if home not in roots:
+        roots.append(home)
+    return roots
+
+
+def locate_transcript(session: str) -> Dict[str, Any]:
+    """Look for ``<session>.jsonl`` under every project directory.
+
+    ``{"path": Path|None, "searched": int, "unreadable": [str]}``.  A directory
+    the host refuses to list lands in ``unreadable``; ``Path.glob`` would swallow
+    that and make a denied directory look like a missing transcript.
+    """
+    searched, unreadable = 0, []
+    for root in _project_roots():
+        try:
+            entries = list(os.scandir(root))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unreadable.append(str(root))
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_dir():
+                    continue
+            except OSError:
+                continue
+            searched += 1
+            candidate = Path(entry.path) / (session + ".jsonl")
+            try:
+                if candidate.is_file():
+                    return {"path": candidate, "searched": searched, "unreadable": unreadable}
+            except OSError:
+                unreadable.append(entry.path)
+    return {"path": None, "searched": searched, "unreadable": unreadable}
+
+
 def transcript_path(paths: ProjectPaths, node: Mapping[str, Any]) -> Optional[Path]:
     session = _session_id(paths, node)
-    root = Path(os.path.expanduser("~")) / ".claude" / "projects"
-    if session is None or not root.is_dir():
+    if session is None:
         return None
-    for candidate in root.glob("*/%s.jsonl" % session):
-        return candidate
-    return None
+    return locate_transcript(session)["path"]
 
 
 def has_delivered(paths: ProjectPaths, run_id: str, node_id: str, node: Mapping[str, Any]) -> bool:
@@ -88,13 +129,19 @@ def probe(paths: ProjectPaths, run_id: str, node_id: str, node: Mapping[str, Any
     session = _session_id(paths, node)
     if session is None:
         return {"state": "unresolved", "reason": "no session id"}
-    path = transcript_path(paths, node)
+    found = locate_transcript(session)
+    path = found["path"]
     if path is None:
-        return {"state": "unknown", "reason": "transcript not found", "session": session}
+        if found["unreadable"]:
+            return {"state": "unknown", "reason": "transcript dir unreadable", "category": "unreadable",
+                    "session": session, "searched": found["searched"], "unreadable": found["unreadable"]}
+        return {"state": "unknown", "reason": "transcript not found", "category": "not_found",
+                "session": session, "searched": found["searched"]}
     try:
         age = (now if now is not None else time.time()) - path.stat().st_mtime
     except OSError:
-        return {"state": "unknown", "reason": "transcript unreadable", "session": session}
+        return {"state": "unknown", "reason": "transcript unreadable", "category": "unreadable",
+                "session": session, "searched": found["searched"], "unreadable": [str(path)]}
     state = "silent" if age >= SILENCE_SECONDS else "active"
     return {"state": state, "silent_minutes": int(age // 60), "transcript": str(path), "session": session}
 

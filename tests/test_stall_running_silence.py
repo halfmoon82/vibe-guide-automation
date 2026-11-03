@@ -237,6 +237,51 @@ class ReviewFixesTests(RunningWorkerFixture):
                 self.assertEqual(self.view()["user_status"], INVESTIGATE_LABEL)
 
 
+class UnknownCategoryTests(RunningWorkerFixture):
+    """#387: an unknown liveness result names its category in the beat."""
+
+    def test_not_found_says_how_many_project_dirs_were_searched(self):
+        (self.home / ".claude" / "projects" / "other").mkdir()
+        out = self.beat()
+        self.assertIn("未找到会话记录（已搜索 2 个项目目录）", out.text)
+        self.assertNotIn("读不到会话记录", out.text)
+
+    def test_unreadable_projects_dir_is_its_own_category(self):
+        real = os.scandir
+
+        def deny(path="."):
+            if str(path).endswith(os.path.join(".claude", "projects")):
+                raise PermissionError(13, "denied")
+            return real(path)
+
+        with patch("vibe_guide.worker_liveness.os.scandir", deny):
+            out = self.beat()
+        self.assertIn("会话记录目录不可读", out.text)
+        self.assertNotIn("未找到会话记录", out.text)
+
+    def test_transcript_in_a_worktree_project_dir_is_not_reported(self):
+        wt = self.home / ".claude" / "projects" / "-repo--worktrees-node-x"
+        wt.mkdir()
+        (wt / (SESSION + ".jsonl")).write_text("{}\n", encoding="utf-8")
+        out = self.beat()
+        self.assertNotIn("空转评估未知", out.text)
+
+    def test_unknown_session_id_stays_out_of_the_beat_but_is_listed(self):
+        snapshot = load_snapshot(self.paths, self.run_id)
+        snapshot.nodes[NODE]["active_task"]["task_id"] = "developer:n1"
+        save_snapshot(self.paths, snapshot)
+        self.assertNotIn("空转评估未知", self.beat().text)
+        snapshot = load_snapshot(self.paths, self.run_id)
+        self.assertEqual(supervisor.session_id_unknown_nodes(self.paths, snapshot), [NODE])
+
+    def test_claude_config_dir_is_searched(self):
+        alt = Path(self.temporary.name) / "alt" / "projects" / "p"
+        alt.mkdir(parents=True)
+        (alt / (SESSION + ".jsonl")).write_text("{}\n", encoding="utf-8")
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(Path(self.temporary.name) / "alt")}):
+            self.assertNotIn("空转评估未知", self.beat().text)
+
+
 class LabelTests(unittest.TestCase):
     def test_marker_relabels_a_running_node_only_when_it_has_a_session(self):
         marked = {"status": "running", "stall_tier": "supervisor_investigate"}
