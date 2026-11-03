@@ -776,13 +776,12 @@ class AuthorizationCardTests(ProjectCase):
         self.assertEqual(entries["n1"]["topology"], "background")
         self.assertEqual(entries["n1"]["mode"], "background")
         self.assertEqual(entries["n1"]["limitations"], list(BACKGROUND_LAUNCH_LIMITATIONS))
+        # 5.2.6 card-and-handoff: the integration review is dispatched in the
+        # background too, so the card says background (card == dispatch).
         review = entries["integration-review"]
-        self.assertEqual(review["topology"], "dual-visible")
-        self.assertEqual(review["mode"], "visible")
-        self.assertEqual(review["limitations"][:3], list(BACKGROUND_LAUNCH_LIMITATIONS))
-        self.assertEqual(len(review["limitations"]), 4)
-        self.assertIn("同样由后台会话执行", review["limitations"][3])
-        self.assertIn("dual-visible", review["limitations"][3])
+        self.assertEqual(review["topology"], "background")
+        self.assertEqual(review["mode"], "background")
+        self.assertEqual(review["limitations"], list(BACKGROUND_LAUNCH_LIMITATIONS))
 
     def test_first_card_discloses_three_limitations(self):
         nodes = [make_node("n1", ["a.py"]), make_node("n2", ["b.py"])]
@@ -1019,12 +1018,11 @@ class PublishPathTests(unittest.TestCase):
         self.assertEqual(node["mode"], "background")
         self.assertEqual(node["limitations"], list(BACKGROUND_LAUNCH_LIMITATIONS))
         review = workers["integration-review"]
-        self.assertEqual(review["topology"], "dual-visible")
-        self.assertEqual(review["mode"], "visible")
-        self.assertEqual(review["limitations"][:3], list(BACKGROUND_LAUNCH_LIMITATIONS))
-        self.assertIn("同样由后台会话执行", review["limitations"][3])
-        self.assertEqual(card["topology_summary"]["background"], 1)
-        self.assertEqual(card["topology_summary"]["by_topology"]["dual-visible"], 1)
+        self.assertEqual(review["topology"], "background")
+        self.assertEqual(review["mode"], "background")
+        self.assertEqual(review["limitations"], list(BACKGROUND_LAUNCH_LIMITATIONS))
+        self.assertEqual(card["topology_summary"]["background"], 2)
+        self.assertEqual(card["topology_summary"]["by_topology"]["dual-visible"], 0)
 
     def test_refresh_keeps_published_disclosures(self):
         from vibe_guide.cli import _load_plan
@@ -1037,11 +1035,11 @@ class PublishPathTests(unittest.TestCase):
         )
         by_id = {w["node_id"]: w for w in reruled}
         self.assertEqual(by_id["probe-node-a"]["topology"], "background")
-        self.assertEqual(by_id["integration-review"]["topology"], "dual-visible")
-        self.assertEqual(len(by_id["integration-review"]["limitations"]), 4)
+        self.assertEqual(by_id["integration-review"]["topology"], "background")
+        self.assertEqual(by_id["integration-review"]["limitations"], list(BACKGROUND_LAUNCH_LIMITATIONS))
         summary = authorization._topology_summary(reruled)
-        self.assertEqual(summary["background"], 1)
-        self.assertEqual(summary["visible"], 1)
+        self.assertEqual(summary["background"], 2)
+        self.assertEqual(summary["visible"], 0)
         self.assertEqual(summary, card.topology_summary)
         self.assertTrue(validate_authorization_card_consistency(card))
 
@@ -1052,12 +1050,15 @@ class PublishPathTests(unittest.TestCase):
             self.assertNotEqual(worker["mode"], "background")
         self.assertEqual((card.get("topology_summary") or {}).get("background", 0), 0)
 
-    def test_claude_code_defaults_to_background_without_a_fact_or_a_choice(self):
+    def test_claude_code_without_a_verified_launcher_publishes_what_it_dispatches(self):
+        # 5.2.6 card-and-handoff: no verified background launcher means the
+        # nodes really dispatch visibly, so the card and the stamped contract
+        # say visible instead of promising a background run it cannot start.
         card = self.read_card(self.publish(False, dispatch_mode=None))
         workers = {w["node_id"]: w for w in card["workers"]}
-        self.assertEqual(workers["probe-node-a"]["topology"], "background")
-        self.assertEqual(workers["probe-node-a"]["mode"], "background")
-        self.assertEqual(card["topology_summary"]["background"], 1)
+        self.assertEqual(workers["probe-node-a"]["topology"], "dual-visible")
+        self.assertEqual(workers["probe-node-a"]["mode"], "visible")
+        self.assertEqual(card["topology_summary"]["background"], 0)
 
 
 if __name__ == "__main__":

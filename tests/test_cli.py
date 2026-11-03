@@ -435,12 +435,23 @@ class CliContractTests(unittest.TestCase):
                 ProjectPaths(root),
                 build_contract(root, provider="cursor", host_id="local"),
             )
-            handed_off = run_cli(
-                ["monitor", "--plan", "handoff", "--authorize", "AUTHORIZE",
-                 "--platform-handoff", "--json"],
-                root,
-                runner=runner,
-            )
+            handoff_args = ["monitor", "--plan", "handoff", "--authorize", "AUTHORIZE",
+                            "--platform-handoff", "--json"]
+            # 5.2.6: the old platform's workers are still running, so the
+            # handoff is refused until they are drained; register each stop.
+            refused = run_cli(handoff_args, root, runner=runner)
+            self.assertEqual(refused.payload.get("status"), "handoff_refused", refused.text)
+            templates = refused.payload["stop_evidence_templates"]
+            self.assertTrue(templates, refused.text)
+            for index, template in enumerate(templates):
+                evidence = ".vibe/handoff-stop-{}.json".format(index)
+                (root / evidence).write_text(json.dumps(dict(
+                    template, how_stopped="stopped_on_old_platform",
+                    note="旧平台会话已停止"), ensure_ascii=False), encoding="utf-8")
+                registered = run_cli(["reconcile", "--plan", "handoff", "--run-id", run_id,
+                                      "--evidence", evidence, "--json"], root)
+                self.assertNotEqual(registered.payload.get("status"), "blocked_unknown", registered.text)
+            handed_off = run_cli(handoff_args, root, runner=runner)
             self.assertEqual(handed_off.payload.get("run_id"), run_id, handed_off.text)
             reasons = [
                 event["data"]["change_reason"]

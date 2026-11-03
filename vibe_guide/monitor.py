@@ -6242,6 +6242,24 @@ class Monitor:
                 # ``handoff_from_provider``).  Only set after the terminal
                 # proof above.
                 contract["platform_handoff_successor"] = True
+            elif (
+                predecessor_task_id
+                and self._handoff_superseded_identity(current, role) == predecessor_task_id
+            ):
+                # A retry of the same handoff successor (its first create was
+                # still pending) carries the lineage proven on the first
+                # attempt: the predecessor binding is still the terminal one.
+                try:
+                    predecessor_binding = self._load_task_binding(snapshot, node_id, role)
+                except (FileNotFoundError, OSError, TypeError, ValueError):
+                    predecessor_binding = None
+                if (
+                    predecessor_binding is not None
+                    and predecessor_binding.task_id == predecessor_task_id
+                    and predecessor_binding.status in {"stopped", "failed", "archived"}
+                ):
+                    contract["handoff_from_provider"] = predecessor_binding.provider
+                    contract["platform_handoff_successor"] = True
             contract["predecessor_task_id"] = predecessor_task_id
         contract.setdefault("worktree", str(current["worktree"]))
         contract.setdefault("branch", str(current["branch"]))
@@ -10337,6 +10355,9 @@ class Monitor:
                 "monitor_entry_evidence_reconciled",
                 "capacity_counter_corrected",
                 "capacity_registry_unknown",
+                # Handoff disclosure (PRD 5.2.6 D1): the card already carries
+                # it; the event is the audit record, never a node lifecycle step.
+                "platform_handoff_disclosed",
             }:
                 # System projection evidence is read-only metadata; legacy
                 # V3.9 replay must not interpret it as a node lifecycle event.
@@ -11005,6 +11026,21 @@ class Monitor:
                 # Evidence only: the lease file was re-keyed before the event.
                 if provenance.get("role") != "system" or not self._run_has_platform_handoff(snapshot):
                     raise ValueError("handoff lease rebound replay provenance is invalid")
+            elif record["event"] == "handoff_worker_stopped":
+                # The registry already holds the stopped binding; mirror the
+                # live path's release of the old platform's handle.
+                if provenance.get("role") != "system":
+                    raise ValueError("handoff worker stop replay provenance is invalid")
+                active = current.get("active_task")
+                if (
+                    isinstance(active, dict)
+                    and active.get("role") == data.get("role")
+                    and active.get("task_id") == data.get("predecessor_task_id")
+                ):
+                    snapshot.handles.pop(node_id, None)
+                    current["active_role"] = None
+                    current["active_task"] = None
+                    current["old_task_reconciled"] = True
             elif record["event"] == "handoff_stale_creates_hidden":
                 # Evidence only: the stale markers were written before the event.
                 if provenance.get("role") != "system" or not self._run_has_platform_handoff(snapshot):

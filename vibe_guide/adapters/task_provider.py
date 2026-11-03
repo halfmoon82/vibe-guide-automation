@@ -132,6 +132,8 @@ class ProviderPending(RuntimeError):
 
 _PROVIDER_ACTIONS = {"create", "locate", "visibility", "resume", "wait"}
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+#: Capability-record keys beyond the required four; older records lack them.
+_OPTIONAL_CAPABILITY_KEYS = frozenset({"project_id", "observed_at", "host_version", "session_id"})
 _WORKER_DELIVERY_EVENTS = {"delivered", "complete", "accepted", "review_finding",
                            "blocked_engineering"}
 
@@ -291,6 +293,8 @@ _PROJECT_MOUNT_NONE = 'none'
 WARNINGS_KEY = 'warnings'
 
 _ADVISORY_RESULT_KEYS = (WARNINGS_KEY,)
+#: fixed payload marker: the worker could not send the wake signal; the daemon's next cycle takes the report
+WAKE_FAILED_KEY = 'wake_failed'
 
 
 def _requested_project_mount(request: Any, operation: str) -> Optional[str]:
@@ -387,7 +391,20 @@ class ProviderActionStore:
         facts: Mapping[str, Any],
         provenance: str,
         project_id: Optional[str] = None,
+        *,
+        observed_at: Optional[str] = None,
+        host_version: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> None:
+        """Write this adapter's own capability record, and nothing else's.
+
+        ``observed_at`` (UTC, ISO 8601; defaults to now), ``host_version`` and
+        ``session_id`` date the observation so ``vibe doctor`` can tell when
+        it needs a second look.  The pre-split single ``capabilities.json`` is
+        migrated here, once: a record that names another adapter moves to its
+        own file unless that file exists, then the single file is removed.
+        Read paths never perform this migration.
+        """
         if not isinstance(adapter_id, str) or not adapter_id:
             raise ValueError("adapter id is required")
         if not _SAFE_ID.fullmatch(adapter_id):
@@ -410,6 +427,7 @@ class ProviderActionStore:
             "adapter_id": adapter_id,
             "facts": dict(facts),
             "provenance": provenance,
+            "observed_at": observed_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         # The project id is optional: visible-task routing needs it, other
         # routes do not, and only the recording session can vouch for it.
@@ -417,32 +435,49 @@ class ProviderActionStore:
             if not isinstance(project_id, str) or not project_id.strip():
                 raise ValueError("provider capability project_id must be a non-empty string")
             payload["project_id"] = project_id.strip()
+        for key, value in (("host_version", host_version), ("session_id", session_id)):
+            if value is None:
+                continue
+            if not isinstance(value, str) or not value.strip() or len(value) > 256:
+                raise ValueError("provider capability {} must be a short non-empty string".format(key))
+            payload[key] = value.strip()
+        self._validate_capability(payload)
         self.root.mkdir(parents=True, exist_ok=True)
         # The per-adapter file is authoritative (issue #279): each adapter's
-        # session attests its own record and no later attest of *another*
-        # adapter can overwrite it.  The legacy single-file bridge is kept as
-        # a mirror of the latest record so pre-split readers still work.
-        # Before the mirror is overwritten, a pre-split record that belongs to
-        # another adapter and has no per-adapter file yet is migrated into its
-        # own file, so the first attest after an upgrade loses nothing.
-        legacy = self.root / "capabilities.json"
-        if legacy.is_file() and not legacy.is_symlink():
-            try:
-                previous = self._validate_capability(self._read(legacy))
-            except (OSError, ValueError):
-                previous = None
-            if previous is not None:
-                previous_id = str(previous["adapter_id"])
-                migrated = self.root / ("capabilities-" + previous_id + ".json")
-                if (_SAFE_ID.fullmatch(previous_id) and previous_id != adapter_id
-                        and not migrated.exists()):
-                    self._atomic(migrated, previous)
+        # session attests its own record and no attest of *another* adapter
+        # overwrites it.
         self._atomic(self.root / ("capabilities-" + adapter_id + ".json"), payload)
-        self._atomic(legacy, payload)
+        self._migrate_legacy_capability(adapter_id)
+
+    def _migrate_legacy_capability(self, attested: str) -> None:
+        """One-time move of the pre-split ``capabilities.json`` (attest only).
+
+        A record for another adapter moves into its own file when that file
+        does not exist yet; a record for the adapter just attested is
+        superseded.  Either way the single file is then removed, as is one
+        that no longer validates (no reader can use it, and the pre-split
+        attest overwrote it the same way).  A record naming an unsafe id is
+        left untouched and readers skip it.
+        """
+        legacy = self.root / "capabilities.json"
+        if not legacy.is_file() or legacy.is_symlink():
+            return
+        try:
+            previous = self._validate_capability(self._read(legacy))
+        except (OSError, ValueError):
+            legacy.unlink()
+            return
+        previous_id = str(previous["adapter_id"])
+        if not _SAFE_ID.fullmatch(previous_id):
+            return
+        migrated = self.root / ("capabilities-" + previous_id + ".json")
+        if previous_id != attested and not migrated.exists():
+            self._atomic(migrated, previous)
+        legacy.unlink()
 
     def _validate_capability(self, value: Dict[str, Any]) -> Dict[str, Any]:
         required = {"schema_version", "adapter_id", "facts", "provenance"}
-        if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - {"project_id"}:
+        if not isinstance(value, dict) or not required.issubset(value) or set(value) - required - _OPTIONAL_CAPABILITY_KEYS:
             raise ValueError("provider capability schema is invalid")
         if value["schema_version"] != self.schema_version:
             raise ValueError("provider capability schema is unsupported")
@@ -454,6 +489,8 @@ class ProviderActionStore:
         The per-adapter files win; the legacy ``capabilities.json`` record
         joins only for adapters that predate the split and never got a
         per-adapter file.  No record is ever attributed to another adapter.
+        Read-only: the legacy file is migrated by ``publish_capabilities``
+        (attest), never here.
         """
         records: Dict[str, Dict[str, Any]] = {}
         if not self.root.is_dir():
@@ -468,7 +505,8 @@ class ProviderActionStore:
         legacy = self.root / "capabilities.json"
         if legacy.is_file() and not legacy.is_symlink():
             record = self._validate_capability(self._read(legacy))
-            records.setdefault(str(record["adapter_id"]), record)
+            if _SAFE_ID.fullmatch(str(record["adapter_id"])):
+                records.setdefault(str(record["adapter_id"]), record)
         return records
 
     def capabilities(self, adapter_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1923,6 +1961,34 @@ class ProviderActionStore:
                 and not report.get('consumed_by')
             ):
                 found.append(report.get('issue_id'))
+        return found
+
+    def unconsumed_delivery_records(self, run_id):
+        """Read-only ``[{issue_id, role, generation, wake_failed}]`` of archived
+        self-reports nothing has taken yet.
+
+        ``wake_failed`` is the worker's fixed marker that it could not send the
+        wake signal; it only tells the daemon to expect the report, since the
+        daemon receives every unconsumed report on its next cycle anyway.
+        """
+        deliveries = self.root / 'deliveries'
+        if not deliveries.is_dir():
+            return []
+        found = []
+        for path in sorted(deliveries.glob('*.json')):
+            report = self._read(path)
+            if (
+                isinstance(report, dict)
+                and report.get('run_id') == run_id
+                and not report.get('consumed_by')
+            ):
+                payload = report.get('payload')
+                found.append({
+                    'issue_id': report.get('issue_id'),
+                    'role': report.get('role'),
+                    'generation': report.get('generation'),
+                    'wake_failed': isinstance(payload, dict) and payload.get(WAKE_FAILED_KEY) is True,
+                })
         return found
 
     def has_request(

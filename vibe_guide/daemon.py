@@ -478,6 +478,7 @@ class Daemon:
         self._deferred_escalated = False
         self._archive_failures = 0
         self._parked_since: Optional[float] = None
+        self._delivery_waits = (None, 0)
         #: the same pre-resume checks the public ``resume`` runs; returns None
         #: when the run may advance, else ``{"status", "reason"}`` to stop on.
         self._gate = gate
@@ -581,7 +582,7 @@ class Daemon:
         lost = False
         try:
             while not self._stop:
-                if self._closing == PARKED_STATUS and self._undelivered_work():
+                if self._closing == PARKED_STATUS and (self._receivable_deliveries() or self._undelivered_work()):
                     self._closing = None  # a delivery or request arrived: serve it before parking
                 if not self._closing:
                     blocked = self._check_gate()
@@ -663,14 +664,44 @@ class Daemon:
         handed_over = all(recorded.get(node_id, {}).get("escalated") for node_id in blocked)
         if not (handed_over or now - self._parked_since >= self.config.blocked_grace):
             return False
-        # Parking never leaves a delivered report or a mailbox request unserved:
-        # the ticks that follow consume them first.  Work that stays unserved
-        # for the whole grace period no longer holds the run back.
-        # Deliberate trade-off: a run must not stay open forever on a mailbox
-        # item nobody serves, so after ``blocked_grace`` it parks anyway.  The
-        # item stays in the mailbox and the run directory is kept, so
-        # ``run-restore`` or the next supervisor can still serve it.
+        # Parking never leaves a delivered report unreceived: while a report
+        # for a node's current generation is unconsumed the ticks go on and
+        # receive it, however long the run has been blocked (#382).
+        if self._receivable_deliveries():
+            return False
+        # Other mailbox work (requests, unpolled results) that stays unserved
+        # for the whole grace period no longer holds the run back: a run must
+        # not stay open forever on an item nobody serves.  The item stays in
+        # the mailbox and the run directory is kept, so ``run-restore`` or the
+        # next supervisor can still serve it.
         return not self._undelivered_work() or now - self._parked_since >= self.config.blocked_grace
+
+    def _receivable_deliveries(self) -> List[str]:
+        """Unconsumed worker reports addressed to a node's current generation.
+
+        ``["issue:role:g<n>"]``.  A report of a superseded generation, or for an
+        accepted node, is history and never holds the run open.  An unreadable
+        mailbox or a node record without a generation counts as receivable:
+        unknown is never "nothing to receive".
+        """
+        try:
+            from .adapters.task_provider import ProviderActionStore
+            records = ProviderActionStore(self.paths).unconsumed_delivery_records(self.run_id)
+        except Exception:  # noqa: BLE001
+            return ["mailbox_unreadable"]
+        nodes = getattr(self._snapshot, "nodes", None) or {}
+        found = []
+        for record in records:
+            node = nodes.get(record.get("issue_id"))
+            if not isinstance(node, dict):
+                continue
+            if node.get("status") == "accepted":
+                continue
+            current = node.get("review_generation" if record.get("role") == "reviewer" else "developer_generation")
+            if type(current) is int and type(record.get("generation")) is int and current != record["generation"]:
+                continue
+            found.append("%s:%s:g%s" % (record.get("issue_id"), record.get("role"), record.get("generation")))
+        return found
 
     def _undelivered_work(self) -> List[str]:
         """Unserved mailbox work; an unreadable mailbox counts as work (never as empty)."""
@@ -866,6 +897,23 @@ class Daemon:
                 self._last_heal = now
                 self.heal_pass(snapshot)
         self._push_pending(snapshot)
+        self._watch_deliveries()
+
+    def _watch_deliveries(self) -> None:
+        """A report still unreceived after two cycles is made visible, not left silent."""
+        pending = self._receivable_deliveries()
+        key = ",".join(sorted(pending))
+        if not pending:
+            self._delivery_waits = (None, 0)
+            self._clear_unresolved("daemon:delivery_unreceived")
+            return
+        waited = self._delivery_waits[1] + 1 if self._delivery_waits[0] == key else 1
+        self._delivery_waits = (key, waited)
+        if waited == 2:
+            self._event("delivery_unreceived", reason_code="unreceived_after_two_cycles",
+                        observation_count=len(pending))
+            self._unresolved("", "delivery_unreceived",
+                             "已登记的交付 %s 两个周期仍未被接收" % "、".join(pending[:3]))
 
     def _run_once(self):
         """One tick; a newer epoch still recorded under this pid is adopted once."""

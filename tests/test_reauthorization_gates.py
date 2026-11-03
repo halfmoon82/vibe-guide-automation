@@ -1939,25 +1939,26 @@ class CardPreviewTests(unittest.TestCase):
         # refresh with new evidence -- must stay clean.
         self.assertEqual(result.payload["engine_refresh_drift"], [])
 
-    def test_the_preview_reports_a_topology_move(self):
-        """The fixture rules ``dual-visible``; a passing probe must move it.
+    def test_a_later_probe_does_not_move_a_stamped_topology(self):
+        """The plan's contract carries the topology stamped at publication.
 
-        The card-level half of the preview's job: the business node follows the
-        new ruling, while the closeout node keeps the reviewer-role dispatch
-        that rule 2 of ``dispatch_topology_for_node`` reserves for it -- the run
-        cannot close out without it.
+        5.2.6 card-and-handoff: dispatch reads only the stamped value, so a
+        probe that passes after publication (here ``in_session_sdd``) must not
+        move any node on the reauthorized card; only a platform handoff
+        rewrites the stamp.
         """
+        nodes = json.loads((self.directory / "nodes.json").read_text(encoding="utf-8"))
+        nodes = nodes["nodes"] if isinstance(nodes, dict) else nodes
+        stamped = {node["id"]: node["contract"].get("dispatch_topology") for node in nodes}
+        self.assertEqual(stamped, {"probe-node-a": "dual-visible", "integration-review": "dual-visible"})
         self._probe_in_session_sdd()
 
-        changed = self._preview().payload["changed_fields"]
+        payload = self._preview().payload
+        self.assertEqual(payload.get("status"), "ok", payload)
+        changed = payload["changed_fields"]
 
-        self.assertIn("workers", changed)
-        self.assertIn("topology_summary", changed)
-        workers = changed["workers"]["next"]
-        self.assertEqual(
-            {entry["node_id"]: entry["topology"] for entry in workers},
-            {"probe-node-a": "visible-sdd", "integration-review": "dual-visible"},
-        )
+        self.assertNotIn("workers", changed)
+        self.assertNotIn("topology_summary", changed)
 
     def _probe_in_session_sdd(self):
         store = self.root / ".vibe" / "provider-actions" / "capabilities.json"
