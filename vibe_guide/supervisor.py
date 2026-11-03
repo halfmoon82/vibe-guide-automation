@@ -2731,11 +2731,64 @@ def _host_session_service(paths, action):
     return service
 
 
-def supervisor_mailbox_view(paths, run_id):
+_AUTOFILL_ANSWERS = {
+    "locate": {"located": True},
+    "visibility": {"visible": True, "direct_enter": True},
+}
+
+
+def _autofill_host_session(paths, store, action, session_id):
+    """Answer one locate/visibility request on the session's behalf; True when answered.
+
+    Only when all three hold: the request is served by ``_host_session_service``
+    (in_session_sdd with a capability evidence ref), the node's create result
+    binds a task id equal to this session's id, and the node is not the
+    closeout review.  Anything unreadable or missing answers nothing, leaving
+    the manual write-back in place.  The event is written before the answer.
+    """
+    operation = action.get("operation")
+    if operation not in _AUTOFILL_ANSWERS or _is_closeout_reviewer(action) or not session_id:
+        return False
+    service = _host_session_service(paths, action)
+    if service is None or not service.get("evidence_ref"):
+        return False
+    try:
+        create = store.related_action(action, "create", required=False)
+        result = store.result(create["action_id"]) if create else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    binding = result.get("binding") if isinstance(result, dict) else None
+    if not isinstance(binding, dict):
+        return False
+    task_id = binding.get("task_id") or binding.get("threadId")
+    if not isinstance(task_id, str) or task_id.strip() != session_id:
+        return False
+    try:
+        append_event(paths, RunEvent("host_session_autofill", {
+            "run_id": action["run_id"], "node_id": action.get("issue_id"),
+            "generation": action.get("generation"), "sequence": action.get("sequence"),
+            "operation": operation, "action_id": action["action_id"],
+            "create_action_id": create["action_id"],
+            "basis": ["in_session_sdd 派发且带能力证据引用", "create 回执任务编号等于本会话编号",
+                      "非收口审查节点"],
+            "evidence_ref": service["evidence_ref"], "task_id": task_id, "session_id": session_id,
+        }))
+        return store.complete(action["action_id"], dict(_AUTOFILL_ANSWERS[operation]), native=False)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def supervisor_mailbox_view(paths, run_id, environ=None):
     """Pending provider requests with prompt bodies replaced by {sha256, bytes, path}."""
     from .adapters.task_provider import ProviderActionStore
+    from .host_detect import detect_host
     try:
-        pending = ProviderActionStore(paths).pending(run_id)
+        store = ProviderActionStore(paths)
+        pending = store.pending(run_id)
+        detection = detect_host(os.environ if environ is None else environ)
+        session_id = detection.session_id if detection.platform == "workbuddy" else None
+        if session_id and any(a.get("operation") in _AUTOFILL_ANSWERS for a in pending):
+            pending = [a for a in pending if not _autofill_host_session(paths, store, a, session_id)]
     except (OSError, ValueError) as error:
         return {"command": "supervisor-mailbox", "status": "unknown", "run_id": run_id,
                 "reason": "provider mailbox unreadable: {}".format(str(error)[:160])}
@@ -2847,6 +2900,17 @@ def mailbox_complete(paths, run_id, action_id, payload):
                 "（例如 <本会话 id>#integration-review）".format(clash)
             )
     complete_mailbox_action(paths, run_id, action_id, payload)
+    if request.get("operation") == "create":
+        from .host_detect import detect_host
+        detection = detect_host(os.environ)
+        if detection.platform == "workbuddy" and detection.session_id:
+            for operation in _AUTOFILL_ANSWERS:
+                try:
+                    follow = store.related_action(request, operation, required=False)
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+                if follow is not None and store.result(follow["action_id"]) is None:
+                    _autofill_host_session(paths, store, follow, detection.session_id)
     return {"command": "supervisor-mailbox", "status": "completed",
             "run_id": run_id, "action_id": action_id}
 
