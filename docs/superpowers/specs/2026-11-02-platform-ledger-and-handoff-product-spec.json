@@ -1,0 +1,433 @@
+{
+ "title": "平台能力账本、当前平台识别与跨平台交接（5.2.6）",
+ "objective": "vibe 能认出当前所在平台，按一本带出处和日期的平台能力账本如实生成授权卡并严格照卡派发；跨平台交接前确认旧平台无人在写、披露派发方式变化后继续；Claude Code 后台运行不需监工手工 resume 即可推进到收口。同时修复 #344 #363 #376 #377 #378 #379 #380 #381 #382。依据 docs/superpowers/specs/2026-11-02-platform-ledger-and-handoff-prd.md。",
+ "remote_git_actions": "allow",
+ "decisions": [
+  {
+   "question": "跨平台交接后新平台的派发方式或可见性变了，要不要停下来让产品经理确认？",
+   "options": [
+    "A. 交接前出差异授权卡，产品经理确认一次",
+    "B. 不确认，只把差异写进交接记录和授权卡作披露（AGENTS.md 可见降后台规则的例外，只限 platform_handoff）",
+    "C. 只允许派发方式相同的平台之间交接"
+   ],
+   "impact": "A 每次交接多一次打断；B 不打断，可见性变化只被记录；C 限制可交接的平台组合。",
+   "recommendation": "A. 交接前出差异授权卡，产品经理确认一次",
+   "status": "approved",
+   "selected": "B. 不确认，只把差异写进交接记录和授权卡作披露（AGENTS.md 可见降后台规则的例外，只限 platform_handoff）",
+   "field": "handoff.topology_change_confirmation"
+  },
+  {
+   "question": "交接时还有 worker 在旧平台跑，怎么办？",
+   "options": [
+    "A. 交接前必须排空：等交付或在旧平台停掉并留终止证据，否则拒绝交接",
+    "B. 允许交接，旧任务在旧平台跑完，新平台接收它的交付"
+   ],
+   "impact": "A 保证同一节点只有一个写入者，交接可能要等；B 省时间但单写入者更难保证、实现复杂得多。",
+   "recommendation": "A. 交接前必须排空：等交付或在旧平台停掉并留终止证据，否则拒绝交接",
+   "status": "approved",
+   "selected": "A. 交接前必须排空：等交付或在旧平台停掉并留终止证据，否则拒绝交接",
+   "field": "handoff.live_worker_policy"
+  },
+  {
+   "question": "没有运行记录的平台（Cursor、Grok、DeepSeek Harness、Kimi Code）要不要纳入本迭代？",
+   "options": [
+    "A. 不纳入，账本标未验证，授权卡照实显示",
+    "B. 纳入，每个平台先做一次能力探针"
+   ],
+   "impact": "A 范围收敛在三个已实测平台；B 要为四个平台各做一次真机探针。",
+   "recommendation": "A. 不纳入，账本标未验证，授权卡照实显示",
+   "status": "approved",
+   "selected": "A. 不纳入，账本标未验证，授权卡照实显示",
+   "field": "platform_ledger.untested_platforms"
+  }
+ ],
+ "prd": {
+  "problem": [
+   {
+    "value": "授权卡上的平台可能是错的：socialmedia run-63e7cfc2 在 Codex 上 8/8 完成，节点合同、20 个任务登记、3 班监工全是 Codex；run 全部验收后（第 968 条 accepted），WorkBuddy 会话接管时对它跑了 platform_handoff（第 972 条），把一个没有未完成节点的 run 的授权卡平台改成了 workbuddy。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "授权卡说的和实际派的不一样：5.2.5 的 Claude Code 运行里，授权卡整合评审一项 mode=visible、拓扑 dual-visible（备注文字写了同样由后台会话执行），任务登记实际是 mode=background。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "平台能力散在多处且与实测不符：派发方式矩阵、唤醒通道表、换班规则、推送拦截表、清单 yaml、项目级 push-wake-verification.json 彼此不引用；WorkBuddy 被写成没有唤醒通道（实测子代理完成会通知主会话，但不是 worker 主动唤醒）、WorkBuddy automations 心跳无记录、Claude Code 推送是否已验证只记在单个项目里。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "能力登记没有时间和宿主版本：WorkBuddy 10-30 已升 5.9.4，Jobs 起不来的结论来自 5.8.4。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "跨平台交接没在真机上走完：旧平台有 worker 在跑时会出现第二个写入者，派发方式变化不留记录。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "5.2.5 之后登记的 #376–#382，以及只修了一部分的 #344（第 1 条）、#363（E 条），让 Claude Code 后台运行仍要靠人推进。",
+    "source": "user_confirmed"
+   }
+  ],
+  "user_scenarios": [
+   {
+    "value": "产品经理在 Claude Code、Codex 或 WorkBuddy 会话里发布计划：授权卡写对当前平台，并说清后台还是可见、哪些看不到、推送拦截强度。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "产品经理在新平台会话里交接一个进行中的 run：旧平台有 worker 在跑就被拒并告知节点和排空办法；排空后交接直接完成，派发方式变化写进交接记录，不再单独问。",
+    "source": "user_confirmed"
+   },
+   {
+    "value": "Claude Code 后台运行中 worker 交付或 reviewer 发不出唤醒：守护程序两个周期内接收并推进，监工不用手工 resume。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "网关间歇拒绝模型（400）：系统先在同一任务上退避续接，续接不了才换新会话；连续 3 次失败才升级并写明原因。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "授权卡为 allow 时的开发 worker：提示词和启动参数都带推送禁令；返工时知道哪些文件会被自动放行。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "宿主升级后维护者跑 vibe doctor：看到哪些能力结论需要复核。",
+    "source": "system_inferred"
+   }
+  ],
+  "success_criteria": [
+   {
+    "value": "三个平台各发布一次计划且不带 --adapter，授权卡平台与当前会话一致；传错 --adapter 被拒。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "三个平台各跑一个 2 节点 run，任务登记的派发方式与授权卡逐条一致，含 Claude Code 上的整合评审。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "代码里不再有第二份平台能力表：派发方式、唤醒通道、换班、推送拦截都从同一本账本读；模型档位命名不在本迭代范围。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "交接时旧平台有 worker 在跑：交接被拒并列出节点与排空办法；排空后交接成功，同一节点只有 1 个写入者。",
+    "source": "user_confirmed"
+   },
+   {
+    "value": "跨平台交接时派发方式变化：交接不停下等确认，交接记录与新授权卡都能读到变化。",
+    "source": "user_confirmed"
+   },
+   {
+    "value": "Claude Code 后台运行 30 分钟不手工 resume，所有交付在 2 个守护周期内被接收。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "9 个开放 issue 的验收例子全部有测试覆盖并通过。",
+    "source": "user_confirmed"
+   },
+   {
+    "value": "全量测试结果不受本机 ~/.vibe-guide/config.json 影响，也不受宿主环境变量影响：在 Claude Code 会话里跑和在普通终端里跑结果一致。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "对一个已经没有未完成节点的 run 执行交接：被拒绝或什么都不做，授权卡保留实际执行的平台。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "成功标准中三个平台的真机发布、2 节点 run、30 分钟后台运行，以及 WorkBuddy 5.9.4 的 Jobs 重测，在验收期真机完成，不归任何开发节点。",
+    "source": "system_inferred"
+   }
+  ],
+  "non_goals": [
+   {
+    "value": "不接入 Cursor、Grok、DeepSeek Harness、Kimi Code 的真实派发，账本标未验证。",
+    "source": "user_confirmed"
+   },
+   {
+    "value": "不追求可见性：交接后变成后台派发也接受，只披露。",
+    "source": "user_confirmed"
+   },
+   {
+    "value": "不新增 supervisor-read，不做宿主层输出截断。",
+    "source": "user_confirmed"
+   },
+   {
+    "value": "不重构 monitor.py；不改模型选档规则；不修 AC-B3/AC-E1 的 3 条有意保留的基线失败。",
+    "source": "system_inferred"
+   },
+   {
+    "value": "不部署、不发布、不动凭据、不新增第三方依赖、不改用户级规则文件。",
+    "source": "user_confirmed"
+   }
+  ],
+  "code_evidence": [
+   {
+    "value": "当前平台只来自 --adapter 或唯一一份能力登记，不读宿主环境：vibe_guide/node_spec.py normalize_node_spec。",
+    "source": "unverified"
+   },
+   {
+    "value": "能力登记只存 facts/provenance/project_id，无时间与版本：vibe_guide/attest.py record_session_capabilities、vibe_guide/adapters/task_provider.py publish_capabilities。",
+    "source": "unverified"
+   },
+   {
+    "value": "派发方式矩阵无出处：vibe_guide/adapters/registry.py DISPATCH_TOPOLOGY_MATRIX。",
+    "source": "unverified"
+   },
+   {
+    "value": "唤醒通道与换班硬编码：vibe_guide/supervisor.py WAKE_CHANNELS、WAKE_NO_CHANNEL_REASON、provider_never_rotates。",
+    "source": "unverified"
+   },
+   {
+    "value": "推送禁令只在 deny 时加：vibe_guide/authorization.py remote_git_denied、REMOTE_GIT_BAN_TEXT。",
+    "source": "unverified"
+   },
+   {
+    "value": "节点 dispatch_topology 从未被写入，每次实时判断；验收投影只把 adapter_id/worker/reviewer_worker/model/reasoning/route_digest 当路由字段，交接门拒绝其余合同变化：vibe_guide/authorization.py dispatch_topology_for_node、acceptance_contract_projection。",
+    "source": "unverified"
+   },
+   {
+    "value": "交接前不检查在跑的 worker：vibe_guide/cli.py _platform_handoff_rebind、vibe_guide/monitor.py _apply_reauthorization_transition。",
+    "source": "unverified"
+   },
+   {
+    "value": "活会话两路合并：tasks.json 里的会话编号，或 cwd 在本 run 节点工作树内的会话；后一路会把旧 run 同名工作树里的会话也算进来：vibe_guide/live_sessions.py probe_live_sessions。",
+    "source": "unverified"
+   },
+   {
+    "value": "守护程序每拍 resume(poll_handles=False) 加 tick，为何不接收交付未查明：vibe_guide/supervisor.py run_once。",
+    "source": "unverified"
+   },
+   {
+    "value": "会话 failed 映射为 failed_retryable 后落 blocked_unknown：vibe_guide/runners/claude_bg.py。",
+    "source": "unverified"
+   },
+   {
+    "value": "wait 回写证据字段不做占位符检查：vibe_guide/runners/provider_action.py _identity_fields、vibe_guide/evidence.py evaluate_delivery_evidence。",
+    "source": "unverified"
+   },
+   {
+    "value": "同 action_id 旧请求内容不同即 identity drift：vibe_guide/adapters/task_provider.py ProviderActionStore。",
+    "source": "unverified"
+   },
+   {
+    "value": "新数据文件不会进 wheel/sdist：setup.py package_data 只收 manifests/*.yaml 与 protocols/*.md，MANIFEST.in 同。",
+    "source": "unverified"
+   },
+   {
+    "value": "项目没写 auto_scope_paths 时自动放行清单为空：vibe_guide/config.py _auto_scope_paths。",
+    "source": "unverified"
+   }
+  ]
+ },
+ "nodes": [
+  {
+   "id": "test-isolation",
+   "title": "测试不再读本机配置（#378）",
+   "depends_on": [],
+   "integration_after": [],
+   "parallel_group": null,
+   "contract": {
+    "input": "本机 ~/.vibe-guide/config.json 有任意 model_map、或该文件不存在；测试在 Claude Code、Codex、WorkBuddy 会话里跑（带 CLAUDECODE、CODEX_THREAD_ID、CODEBUDDY_SESSION_ID 等变量），或在普通终端里跑。",
+    "output": "全量测试结果与本机配置和宿主环境变量无关：VIBE_HOME 指向一份固定的最小配置（含 claude_bg、无 model_map），宿主身份变量在测试里默认清除，需要特定配置或特定宿主的用例自己声明。按 python3 -m unittest discover -s tests 的跑法也能生效（可以逐个测试文件接入，tests/ 下的文件按自动放行规则可以改）。",
+    "error_behavior": "某个用例确实依赖缺省配置或某个宿主变量时，必须在用例里显式声明，不能靠本机恰好的环境。",
+    "acceptance_example": "1) 本机 config.json 加入 model_map 后跑全量，结果与不加时一致。2) 临时挪走本机 config.json 跑全量，结果一致。3) 在 Claude Code 会话里跑全量与在普通终端里跑，结果一致。4) test_daemon_short_session_tier 两条在以上各种情况下都通过。"
+   },
+   "files": [
+    "tests/support_vibe_home.py",
+    "tests/test_vibe_home_isolation.py",
+    "tests/test_daemon_short_session_tier.py"
+   ]
+  },
+  {
+   "id": "platform-ledger",
+   "title": "一本平台能力账本代替 5 处散表",
+   "depends_on": [],
+   "integration_after": [],
+   "parallel_group": null,
+   "contract": {
+    "input": "已实测的 Claude Code、Codex、WorkBuddy 能力，以及未实测的 Cursor、Grok、DeepSeek Harness、Kimi Code。",
+    "output": "随包发布一本平台能力账本（装进 wheel 和 sdist），每个平台一行：派发方式、用户能否看到与进入、整合评审怎么派、worker 唤醒监工的通道、监工侧能收到的完成通知、心跳机制（含权限模式条件）、能否换班、嵌套派发限制、推送拦截强度。每格标 verified、pm_ruling 或 unverified，并带出处（run 编号、日期、宿主版本）。DISPATCH_TOPOLOGY_MATRIX、WAKE_CHANNELS、WAKE_NO_CHANNEL_REASON、provider_never_rotates 的判断、REMOTE_GIT_ENFORCEMENT 都改成从账本读，代码里不再各自定义。清单 yaml 只保留探针定义，能力结论只在账本里。项目级 push-wake-verification.json 继续作为本项目的实测记录，账本给出平台默认值。按实测改正：WorkBuddy 主会话能收到子代理完成通知（记为监工侧通知，不算 worker 唤醒通道，兜底检查仍按 10 分钟）、WorkBuddy 心跳为 automations、WorkBuddy 子代理不能再派子代理、Claude Code reviewer 会话可能缺 SendMessage。",
+    "error_behavior": "账本缺某平台或某格时按 unverified 处理，派发走最保守的路径，授权卡写明未验证，不猜。账本读不出来时计划发布被拒并说明原因。已授权的进行中 run 升级后，兜底检查间隔等运行参数不因账本改动而变化。",
+    "acceptance_example": "1) 在 vibe_guide/ 下搜索 DISPATCH_TOPOLOGY_MATRIX、WAKE_CHANNELS、WAKE_NO_CHANNEL_REASON、REMOTE_GIT_ENFORCEMENT 的赋值定义，只出现在账本模块里；有测试锁定这一点。2) 从安装好的 wheel 里导入并读取账本成功（与源码目录读取结果一致）。3) Cursor 一行全部为 unverified，授权卡上对应显示「未验证」。4) WorkBuddy 新计划的授权卡兜底检查仍是 10 分钟；用 5.2.5 授权的进行中 run 升级后，授权卡运行参数不变。"
+   },
+   "files": [
+    "vibe_guide/platform_ledger.py",
+    "vibe_guide/platform_ledger.json",
+    "vibe_guide/adapters/registry.py",
+    "vibe_guide/supervisor.py",
+    "vibe_guide/authorization.py",
+    "setup.py",
+    "MANIFEST.in",
+    "tests/test_platform_ledger.py"
+   ]
+  },
+  {
+   "id": "host-detect",
+   "title": "认出当前平台，能力登记带时间和版本",
+   "depends_on": [
+    "platform-ledger"
+   ],
+   "integration_after": [],
+   "parallel_group": null,
+   "contract": {
+    "input": "在某个宿主会话里执行 vibe plan、vibe attest、vibe supervisor-register、vibe monitor --platform-handoff 或 vibe doctor，可能带也可能不带 --adapter。",
+    "output": "只按会话/线程编号类的环境变量识别当前平台：WorkBuddy 看 CODEBUDDY_SESSION_ID，Codex 看 CODEX_THREAD_ID 或 CODEX_SESSION_ID，Claude Code 看 CLAUDE_CODE_SESSION_ID 加 CLAUDECODE；配置目录类变量不算身份。先看 WorkBuddy 和 Codex，再看 Claude Code。识别结果用于 plan、authorize、attest、supervisor-register（在命令行入口里校验）：没给 --adapter 时用它，给了但与环境不一致时拒绝。attest 记录 observed_at、宿主版本、会话 id，只写本平台自己的登记；旧版单文件 capabilities.json 只在 attest 时一次性迁移，读路径不写文件。vibe doctor 在结论之外单独显示当前平台和每份登记的日期、宿主版本，登记超过 14 天或宿主版本变化时提示需复核，doctor 的项目结论不随调用者环境变化。对已经没有未完成节点的 run 执行交接：拒绝，授权卡平台不变。",
+    "error_behavior": "环境变量识别不出或互相矛盾时保持未知，要求 --adapter，不猜；--adapter 与环境矛盾时拒绝并写明环境识别结果。账本读不出时 doctor 报错。",
+    "acceptance_example": "1) 设置 CLAUDE_CODE_SESSION_ID 和 CLAUDECODE=1、不带 --adapter 发布计划，授权卡 agent_id 为 claude-code。2) 同时设置 CODEBUDDY_SESSION_ID 与 CLAUDECODE，识别为 workbuddy；只设置 WORKBUDDY_CONFIG_DIR 不算 workbuddy。3) 环境为 Codex 却传 --adapter workbuddy，发布被拒且报错含 codex。4) 重放 socialmedia 场景：8/8 已验收的 run 上执行 --platform-handoff，被拒，授权卡 agent_id 仍为 codex。5) 把登记的宿主版本改小一位，doctor 显示需复核；同一项目在 Claude Code 会话和普通终端跑 doctor，项目结论相同。6) 读能力登记的命令（plan、status、doctor）跑完后，provider-actions 目录下文件没有变化。"
+   },
+   "files": [
+    "vibe_guide/host_detect.py",
+    "vibe_guide/node_spec.py",
+    "vibe_guide/attest.py",
+    "vibe_guide/adapters/task_provider.py",
+    "vibe_guide/cli.py",
+    "vibe_guide/doctor.py",
+    "vibe_guide/handoff_rebind.py",
+    "tests/test_host_detect.py"
+   ]
+  },
+  {
+   "id": "daemon-consumes",
+   "title": "守护程序自己接收交付；唤醒失败有兜底；活会话只数本 run（#382 #380 #377）",
+   "depends_on": [
+    "host-detect"
+   ],
+   "integration_after": [],
+   "parallel_group": null,
+   "contract": {
+    "input": "Claude Code 后台运行中，worker 或 reviewer 已用 worker-deliver 登记交付，监工不手工 resume；有的 reviewer 会话发不了 SendMessage；项目里有旧 run 遗留的活会话。",
+    "output": "先交一份定位结论，写明守护程序每拍为什么不接收已登记交付（含停车判定是否让 tick 停止），再修复。已登记交付在 2 个守护周期内被接收，节点进入下一状态，运行顶层为 blocked_unknown 时也一样；有未消费交付时不停车。交付里可以写一个固定标记表示未能发唤醒，守护程序下一周期据此接收，派发提示写明这个退路。归档前的活会话判断改为：本 run tasks.json 里登记的会话，加上由本 run 自己的派发请求启动、还没写进 tasks.json 的会话（按 run 编号 + 节点 + 代数匹配）；不再按工作树路径匹配。",
+    "error_behavior": "交付形状不对时照常拒收并给出期望形状，不静默停住；活会话探测读不出时按未知处理并推迟归档，不当成没有活会话。",
+    "acceptance_example": "1) 夹具里 worker 登记交付后不手工 resume，2 个守护周期内节点进入下一状态。2) 运行顶层为 blocked_unknown、另一节点有未消费交付：交付仍被接收，run 不停车。3) reviewer 交付带未能发唤醒标记：下一周期接收，worker-deliver 不拒收这个字段。4) 旧 run 的活会话 cwd 在本 run 同名工作树内：本 run 归档不被推迟。5) 本 run 刚启动、还没绑定进 tasks.json 的会话仍活着：归档被推迟。"
+   },
+   "files": [
+    "vibe_guide/daemon.py",
+    "vibe_guide/supervisor.py",
+    "vibe_guide/live_sessions.py",
+    "vibe_guide/runners/provider_action.py",
+    "vibe_guide/adapters/task_provider.py",
+    "tests/test_daemon_consumes_deliveries.py",
+    "tests/test_live_sessions_scope.py"
+   ]
+  },
+  {
+   "id": "card-and-handoff",
+   "title": "授权卡与实际派发一致；交接前排空、交接后披露",
+   "depends_on": [
+    "daemon-consumes"
+   ],
+   "integration_after": [],
+   "parallel_group": null,
+   "contract": {
+    "input": "新发布一个计划；或在新平台会话里对进行中的 run 执行 vibe monitor --platform-handoff，旧平台可能还有 worker 在跑，新旧平台派发方式可能不同。",
+    "output": "新计划授权时，把每个节点的派发方式写进节点合同，之后派发只认这个值；派发方式属于路由字段：交接时随平台一起改写，不参与验收合同比较，所以交接不会因此被判成改了验收合同。授权卡上每个节点的派发方式、mode、看不到的部分都取自账本，整合评审的 mode 与实际派发一致。交接前先检查：旧平台在跑的 worker、在飞的信箱请求、派发方式差异、项目根差异。有在跑的 worker 就拒绝交接，列出节点与两种排空办法：等它交付；或在旧平台停掉后，用一条受支持的命令在新平台登记终止证据（写明需要的字段）。全部排空后交接继续，不停下确认；派发方式变化写进交接事件和新授权卡。把交接时可见降后台只披露不确认这条例外写进 AGENTS.md §6 与 §12、监工卡、prd-guide §4 与 §7，以及 worker 派发提示里的同一条规则。",
+    "error_behavior": "在跑 worker 无法判定是否已停时按在跑处理并拒绝交接，同时给出登记终止证据的命令，旧平台已经打不开时也有出路；项目根不同时拒绝交接并说明是项目身份不同；已授权的旧计划没有写入派发方式的，沿用实时判断，不被判授权失效，doctor 提示一次。",
+    "acceptance_example": "1) Claude Code 上发布含整合评审的计划：授权卡整合评审 mode 为 background，任务登记也是 background。2) 交接时旧平台有 1 个 worker 在跑：交接被拒，输出含该节点、两种排空办法和登记终止证据的命令，运行状态不变。3) 用该命令登记终止证据后重跑交接：成功，该节点在 tasks.json 里非终态绑定恰好 1 条。4) 新格式计划从 Codex 交接到 Claude Code：交接成功，不报改了验收合同，节点合同里的派发方式变成新平台的值，交接事件与新授权卡都写明可见变后台。5) 用 5.2.5 授权的旧 run 升级后 resume：不报授权失效。6) 改了 prd-guide.md 或监工卡后，协议摘要登记同步更新，相关测试通过。"
+   },
+   "files": [
+    "vibe_guide/authorization.py",
+    "vibe_guide/cli.py",
+    "vibe_guide/handoff_rebind.py",
+    "vibe_guide/monitor_handoff.py",
+    "vibe_guide/monitor.py",
+    "AGENTS.md",
+    "vibe_guide/protocols/prd-guide.md",
+    "vibe_guide/protocols/supervisor-card.md",
+    "vibe_guide/protocols/__init__.py",
+    "vibe_guide/runners/provider_action.py",
+    "tests/test_card_matches_dispatch.py",
+    "tests/test_handoff_drain_and_disclose.py"
+   ]
+  },
+  {
+   "id": "transient-failure",
+   "title": "网关 400 自动退避重派（#376）",
+   "depends_on": [
+    "card-and-handoff"
+   ],
+   "integration_after": [],
+   "parallel_group": null,
+   "contract": {
+    "input": "后台 worker 会话被上游网关以 400 或模型不支持拒绝，会话随即退出为 failed。",
+    "output": "这类失败记为可重试的 provider 暂时故障，事件里保留 reason_code=provider_http_400（不被打码成固定占位，也不被事件键允许表丢掉）。恢复顺序按 prd-guide §7：先在同一任务上退避续接；续接失败（会话已不可续接）才在旧会话终止后换新会话。连续 3 次同样失败才升级，升级信息写明 provider 400。提供 vibe repair --retire-dead-session 作为死会话卡住节点的 CLI 出口。",
+    "error_behavior": "无法确认旧会话已退出时不换新会话，节点保持等待并写明原因；其他类型的 failed 行为不变。",
+    "acceptance_example": "1) 夹具里会话以 400 失败：节点不进入 blocked_unknown，3 分钟内恢复（同任务续接或换新会话），事件里能读到 provider_http_400（直接读 events.jsonl 核对）。2) 同任务续接可用时不创建新会话。3) 连续 3 次 400：升级，信息含 provider 400。4) 对死会话卡住的节点执行 vibe repair --retire-dead-session：节点恢复可派发。"
+   },
+   "files": [
+    "vibe_guide/runners/claude_bg.py",
+    "vibe_guide/adapters/claude_bg.py",
+    "vibe_guide/monitor.py",
+    "vibe_guide/state.py",
+    "vibe_guide/cli.py",
+    "tests/test_provider_transient_failure.py"
+   ]
+  },
+  {
+   "id": "worker-boundaries",
+   "title": "allow 模式也禁止 worker 推送；返工提示写清自动放行（#379 #381）",
+   "depends_on": [
+    "transient-failure"
+   ],
+   "integration_after": [],
+   "parallel_group": null,
+   "contract": {
+    "input": "授权卡为 allow 或 deny 时派发开发与审查 worker；返工中的开发者需要改 tests/ 下文件或协议摘要登记文件。",
+    "output": "无论 allow 还是 deny，开发与审查 worker 的提示词都带推送禁令，后台派发都带 --disallowedTools；只有远端交付环节点可以推送。收口时检查远端是否出现新的 node/* 分支，出现即写进 vibe status --json 的偏差字段和交付报告。派发与返工提示用一句话写明自动放行规则。监工在本机 .vibe/config.json 的 auto_scope_paths 登记 vibe_guide/protocols/__init__.py（项目登记，按 AGENTS.md §6 判据一；该文件被 .gitignore，不入库、不属于本节点的交付文件；代码默认值不变）。",
+    "error_behavior": "远端分支检查读不到远端时写明未检查，不当成没有越界；远端交付环自身的推送不受禁令影响。",
+    "acceptance_example": "1) allow 卡派发开发 worker：提示词含禁令，后台命令行含 --disallowedTools，有测试断言。2) 远端多出一个 node/* 分支：vibe status --json 的偏差字段列出该分支。3) 返工开发者改 protocols/__init__.py：交付通过，不需要监工中转。4) 返工提示含自动放行规则一句话，有测试断言。"
+   },
+   "files": [
+    "vibe_guide/authorization.py",
+    "vibe_guide/adapters/claude_bg.py",
+    "vibe_guide/runners/provider_action.py",
+    "vibe_guide/prompts.py",
+    "vibe_guide/scope_landing.py",
+    "vibe_guide/remote_delivery.py",
+    "vibe_guide/cli.py",
+    "tests/test_worker_push_ban_allow.py",
+    "tests/test_rework_prompt_auto_scope.py"
+   ]
+  },
+  {
+   "id": "mailbox-leftovers",
+   "title": "部分填写模板被拒；同代重派自动顶替旧请求（#344 #363）",
+   "depends_on": [
+    "worker-boundaries"
+   ],
+   "integration_after": [],
+   "parallel_group": null,
+   "contract": {
+    "input": "developer 的 delivered 或 complete wait 回写里 delivery_evidence 仍有 <填写>；同一节点同一代的 create 请求留着上一次没消费完的旧请求。",
+    "output": "写前校验对 developer 的 delivered/complete wait 回写，把 delivery_evidence 三个键纳入占位符检查，拒收时点名字段；交付门复用同一个占位符判定。同代重派时，旧请求满足以下任一条就记一条事件并顶替旧请求，不再要求人工移走文件：旧任务已有终止证据；或旧请求从未产生任务（没有结果、没有绑定）。都不满足仍拒绝并说明原因。",
+    "error_behavior": "旧任务仍活着或无法判定时保持 identity drift 拒绝，并写明需要的终止证据；拒收的回写不落盘，请求保持待处理。",
+    "acceptance_example": "1) 回写 completion_marker 为 <填写>、其余字段齐全：被拒，报错点名 delivery_evidence.completion_marker，结果文件不存在。2) 同代 create 有旧请求残留且旧任务已 stopped：重派成功，事件流有顶替记录。3) 同代 create 的旧请求从没被回写（无结果、无绑定）：重派成功，事件流有顶替记录。4) 旧任务仍活着：重派被拒，报错说明缺终止证据。5) 换班或重授权后重派：该节点在 tasks.json 里非终态绑定恰好 1 条。"
+   },
+   "files": [
+    "vibe_guide/runners/provider_action.py",
+    "vibe_guide/evidence.py",
+    "vibe_guide/adapters/task_provider.py",
+    "tests/test_mailbox_partial_template.py",
+    "tests/test_same_generation_supersede.py"
+   ]
+  },
+  {
+   "id": "platform-e2e",
+   "title": "三个平台 × 三种起点的端到端测试",
+   "depends_on": [
+    "mailbox-leftovers"
+   ],
+   "integration_after": [
+    "test-isolation"
+   ],
+   "parallel_group": null,
+   "contract": {
+    "input": "Claude Code、Codex、WorkBuddy 三个平台的夹具；交接场景的三种起点：从没失败、失败过一次、重跑。",
+    "output": "每个平台一套端到端夹具；交接场景覆盖三种起点（从没失败、失败过一次、重跑）乘以四种情况（派发方式不变、可见变会话内子代理、可见变后台、交接时有在跑 worker），外加已全部验收的 run 上交接。主断言是用户可见的不变量：授权卡平台与派发方式等于任务登记里的实际值、同一节点非终态绑定恰好 1 条、信箱里待认领的 create 恰好 1 份。测试里不直接调用内部构造函数制造用户做不到的状态。真机项不在本节点。",
+    "error_behavior": "某个组合在当前代码下做不到时，测试标为预期失败并写明原因和 issue 编号，不删掉。",
+    "acceptance_example": "1) 每个平台的 2 节点夹具：授权卡里每个节点的 agent_id 与 mode 逐条等于 tasks.json 里的实际值。2) 失败过一次的起点交接后，信箱里该节点待认领的 create 恰好 1 份。3) 已全部验收的 run 上交接：被拒，授权卡不变。4) 测试文件里 grep 不到 save_contract、build_contract、Monitor.reauthorize 的直接调用。"
+   },
+   "files": [
+    "tests/test_platform_e2e.py",
+    "tests/test_handoff_e2e_starts.py"
+   ]
+  }
+ ]
+}
