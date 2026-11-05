@@ -304,3 +304,45 @@ python3 -m vibe_guide --help; git diff --check   # OK
 - RED `/tmp/r4-r11-red.log`：2 测试中 3 个子例失败，构造器直接/间接和代理均错误退役；GREEN `/tmp/r4-r11-green.log`：14 项 OK，包含完整 retire call/return、不落事件和保留 lease、惰性字符串/注释/正则、R10 及基线纠偏。定向 `/tmp/r4-r11-targeted.log`：172 项 OK；加载指定 writer root，HEAD `82a16d4`。`python3 -m vibe_guide --help`、`git diff --check` 通过。
 - 固定源码全量 `/tmp/r4-r11-full-final.log`：4212 项，61 failures、20 errors、3 skipped、4 expected failures，exit 1，**全量失败**。与上轮 78 个失败身份相比本轮 81 个，15 个新增、12 个不再出现；其原因和回归关系 UNKNOWN。全量前后源码 SHA 一致：`plan_amendment.py` `aa206e17a8837d85ed438ae8e948202c8bb0995e08a7487cd0da3ce0be888904`；`state.py` `f64f0f5db712e2a53fef38a2a0a164f244a4f30c88e20fac8eef1df29fca6f0d`；`cli.py` `4a90f8a8f4fc41e2b382c49dcb3c96199cb0472b7cbaefdbd2ee57c139bc9c56`；`task_provider.py` `24e0ac3576ed3ac2e70bbb4c04f09b615f34cac8549cd57c947e6aeb0de1f6a7`；测试 `bc1acd903fc2caf968e3b4bac876440da35526098d3349d84ff1cf1edcf5c883`。
 - 七份真实 consumer 归档在本轮正向子集下均遇到无法分类表达式，保持 **UNKNOWN**，故真实完整 proof 未成立；先导 create 逐三个旧 action 的正向不重叠证明亦未闭合。未伪造或放宽凭证，未运行真实 retire、confirm、hold release、resume、daemon、mailbox；未增加依赖、安装、创建 task/worktree、push/PR/merge 或 deploy。独立复审前不是 acceptance。
+
+## 第 12 轮后的只读取证（源码 `cc8eee4`，不改变 R12 bounded review）
+
+七份原生归档按当前 `_embedded_create_invocations` 从头逐 call 检查，首次不能分类的位置如下；SHA 是原始 exec 输入的 UTF-8 SHA-256，行号为各自原生 JSONL 的一基行号。相同 call 出现在不同归档时保留两处，不能仅靠同 id 推断完整继承链。
+
+| consumer session | 首个未知 call / 行 | 形态 | 输入 SHA-256 |
+| --- | --- | --- | --- |
+| `01a1aa72-4b33-70c1-9138-a6776b3fc293` | `call_Fu7jbdPvFFUNUuDNl2EmcFai` / 53 | `const` + `Promise.allSettled` 并发工具调用 | `1d3a131cc58e776a3eb53e17d03330a4bd29515e73747f042135a9412e76aa35` |
+| `01a1aa87-0050-78d2-a720-0df5ae6212a1` | `call_f5fbac8368ab4ce08a7e5f5ed5b497d5` / 19 | `const r = await tools.exec_command(...)` | `ac0e7cd5593bf92aaad982a279a98603304a979419951c3d70ed33d8c87de39e` |
+| `01a1a449-fdcf-76f2-86ec-cf3140bdd562` | `call_ZHnTl6HE48iq28hHsaWtnEQS` / 73 | `ALL_TOOLS.map` 箭头函数 | `a3a17c857a3eb50f68aff14afef097ee42050733117cf95c6591c9384d7f64ce` |
+| `01a1a596-77a2-7a23-8db7-70b4d0c5a2db` | `call_M6qZxbNcAcPPWSv1JCcgZpt5` / 11 | `ALL_TOOLS.filter` 与后续调用 | `371b1594614aca86684cf51aba738cb8f47cad4bee013bce9950fb1305d3cff9` |
+| `01a1a5d5-8ef4-7701-b0f5-9dbb5c1969a2` | `call_M6qZxbNcAcPPWSv1JCcgZpt5` / 11 | 同上，另一份归档记录 | `371b1594614aca86684cf51aba738cb8f47cad4bee013bce9950fb1305d3cff9` |
+| `01a1a593-4497-7e82-afc7-52ac64e3128e` | `call_QYwKOt4mg1rjZnn0ZVTWhemV` / 16 | `ALL_TOOLS.map`、对象映射与可选链 | `9dc8ddb19f75beeba7e0f1f78c9a531f8bedcc13fcadb9b8eebb7f4554058e69` |
+| `01a1a593-6bc2-7232-b9b4-ea1c6e60a568` | `call_cVrXJFBiQWDp7Crcg7ifnGcQ` / 16 | 同类 `ALL_TOOLS.map` 表达式 | `e36fd61dbea04640597e6d85f1c97949abc7ddee917f52a12466e0d41f6c3099` |
+
+进一步逐输入扫描的可分类数/输入数分别为上述顺序 `16/97`、`106/260`、`230/311`、`18/24`、`37/51`、`27/29`、`29/30`。这里计的是有 `input` 的记录，不是所有原生调用数，亦不是完整 proof；未知形态并不自动安全。原先三条后续词法拒绝仍存在：`call_MwtAQu3h135qtZCKrsnWyLuu` 输入 SHA `00a9b5b95fda27c1983d338b611f636a9f4ec0d3a616cf72196573d4595f3e65`；`call_SLCGtEjg5TArZ4YlAgrFyJMW` 为 `4890116720d79576850584b5e7339d5c62c52d8c7c32129567b3db19a52666c2`；`call_frZ3yeJsjWkHhgec4yjPhad5` 为 `679507dbbd7ec086a31a7ce8dc60e5d9eb381316f660ed210540a53e8fa4c398`。它们有结构化 SyntaxError 返回，但该文字不能证明未执行。简单支持 `const`、映射或并行调用不足以闭合全部记录；本轮未发现能证明完整链成立的单一最小修改，因此不放宽解析与排除规则，保留 **UNKNOWN**。
+
+先导 create 正向证据：用户批准与卡/合同摘要见主目录 `events.jsonl` 第一行；`2026-11-05-visible-recovery.json` 的 `epoch3_successor_developer_historical_snapshot` 将 developer `01a1aae8-2756-72e0-983c-abd8847e3245` 绑定原 writer root、branch 和起点 `7f0376f`。epoch3 原生归档 SHA `4076861bc4f0a59ce590bb9f4ccccd2fcbdc55f17a50d141b7dbfd85639d0265`，`call_rUHb9rlGBpe5Yo8E6e1ybx1b` 的 call/return ordinal 为 1857/1860，target 为同一 project/local，返回该 developer/local；参数 prompt 含先导 worktree、branch、R8、起点，SHA `2a47f390680a74e686ac9fc73dac0d1b38c4273634efb9e105e60ba90ceb2484`。对应 developer 原生归档 SHA `36713c47c6ea8baa6348fbdd2ec2493700f3b05ce8e9bf2d778835e774710da2`，225 行 ordinal 连续，session_meta 身份吻合，但首 user 不含该创建 prompt，不能使用 supervisor 首 user 绑定规则。
+
+三份旧 action 逐项核对：`action-9a0178ee7e2ca0ae8d9057bfdd969343` 属 `replay-system-telemetry`，请求文件 SHA `b64a7eac1c6b1a20e685297fac29b27199dc0a62ea28546b2c9428c83740fcb7`；`action-b01f77d58df8b25fa52303e95e2f2331` 属 `same-platform-supervisor-heal`，SHA `287c5bbdb1bab1a72f60435926178dbb0cdcde639772f364bf9df8d69cbe7c59`；`action-b17e914ce47487ca801b2c03f9c4bd0e` 属 `worker-blocked-guidance`，SHA `b95f82c003c77a2a134125c5db21ba094acae0e618681232500ac0cfa1d3eb93`。三者 target 与先导 create 相同，各自 node/worktree/branch 与先导不同；其 id/digest/节点/worktree/branch 未在该 call 输入出现、prompt 亦不同。这是定位证据，不能排除被改写的旧 action，也不能作为正向不重叠证明；源会话绑定及整个 consumer create 集合尚未闭合，不新增 bootstrap 例外。
+
+15 个全量新增失败身份（14 方法，两个子例）对照：原 `cc8eee4` 全量 `/tmp/r4-r11-full-final.log` 为 4212 项 61F/20E；用同一 Python 3.9、现有干净 `8852367` 基线和冻结 writer 分别跑同一 14 方法，基线 3 失败、writer 4 失败（含子例），不相同身份仍不等价于回归。逐项首次结果如下，列中 B/W 为基线/writer；FAIL 为原始日志对应身份或方法的失败，PASS 为该方法无失败：
+
+| 方法或子例（`test_` 前缀省略） | B | W |
+| --- | --- | --- |
+| `a_platform_without_a_dispatch_lifecycle_is_refused_the_same_way` | PASS | PASS |
+| `a_rerun_that_reauthorizes_again_does_not_hide_the_new_platforms_create` | PASS | PASS |
+| `an_acceptance_change_alongside_the_handoff_is_refused_and_nothing_moves` | PASS | FAIL |
+| `evidence_swapped_but_event_not_written_rolls_back_and_converges` | PASS | PASS |
+| `hard_kill_leaving_new_evidence_without_the_event_converges` | PASS | PASS |
+| `missing_or_corrupt_primary_preserves_backup_recovery` (`corrupt=False`) | PASS | FAIL |
+| `monitor_persists_a_blocked_worktree_marker_and_recomputes_the_status` | PASS | FAIL |
+| `nodes_written_but_card_not_converges_on_rerun` | FAIL | PASS |
+| `product_spec_node_named_token_refresh_reaches_a_loadable_run` | FAIL | PASS |
+| `public_entry_synchronizes_scope_without_new_task_or_request` | PASS | FAIL |
+| `stale_binding_or_authorization_is_rejected_before_writes` (`generation`) | FAIL | PASS |
+| 同上（`task_id`） | PASS | PASS |
+| `successor_is_the_only_live_writer_right_after_the_handoff` | PASS | PASS |
+| `terminated_binding_cannot_gain_scope_from_stale_active_snapshot` | PASS | PASS |
+| `writer_root_and_branch_stay_pinned_across_the_handoff` | PASS | PASS |
+
+四个 writer 首次失败方法再跑：基线在 worktree-marker 和 scope-reconcile 出现与 writer 首次相同的断言失败；writer 的这两个断言第二次通过，但 worktree 临时目录清理有 `Directory not empty` 错误。交接用例交替各运行三次：基线 2 通过 1 失败、writer 2 通过 1 失败，失败均是 `node never reached accepted: export-button`；这些是观察到的波动，不能据此断言其根因或无回归。handoff recovery 首次 writer 的 `corrupt=False` 失败，第二次该方法在两树均通过。验证日志：`/tmp/r4-r12-baseline-15.log` SHA `02c7cd9d09a738a838cacb1d7d26f03282e8c6ac1df67ad8bd59d51d2dec31d3`；`/tmp/r4-r12-current-15.log` SHA `883c79c4824b3aa9c37d0a4641a3966b27229ef8abb9269ab581ab6e05ff04db`；`/tmp/r4-r12-base-remaining.log` SHA `c1e38d4084b1fdb1d6946ae0659a961b2291cf0c6621af7edb855dd33c949029`；`/tmp/r4-r12-current-remaining.log` SHA `98bb12fb5df9bd1fa30128aa36e3b85fd6f196dd21469143db10dd044a9c3347`；`/tmp/r4-r12-handoff-ab.log` SHA `c06fc06b747938597abaf98481cf9b30e944c6f823a8e5fcec9d0b44d466d205`。测试只用现有基线树与临时夹具，未新建工作树或真实任务，基线树与 writer 均 clean。15 项的根因及回归关系仍 **UNKNOWN**，未找到在本次既定白名单内可唯一证明的最小修复；未改生产源码，未重跑全量，也不能据局部重跑改变全量失败结论。
