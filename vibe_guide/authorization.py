@@ -122,10 +122,19 @@ BACKGROUND_MODE_DISCLOSURES = (
 )
 
 
-#: Fixed worker-prompt ban, written only when the card says ``deny``.
+#: Fixed worker-prompt ban, written only when the card says ``deny`` without
+#: the signed local-commit exception.  r4: a plain deny forbids the whole
+#: commit/push/PR/MR/merge group, so the prompt must not promise a commit.
 REMOTE_GIT_BAN_TEXT = (
-    "远端 Git 禁令：授权卡禁止远端 Git 动作。严禁执行 git fetch、git push、git pull 以及 gh 命令；"
-    "只在本地分支提交。"
+    "远端 Git 禁令：授权卡禁止全部 Git 动作，包括本地 commit、git fetch、git push、git pull "
+    "以及 gh 命令；严禁提交代码，交付通过会话交付通道上报。"
+)
+#: Prompt ban for ``deny`` plus the signed ``local_commit_allowed`` exception:
+#: whitelist-only local commits on the node branch, every remote verb banned.
+LOCAL_COMMIT_ALLOWED_BAN_TEXT = (
+    "远端 Git 禁令：授权卡禁止远端 Git 动作，但允许白名单内的本地 commit。"
+    "仅限在本节点分支上以 git add <显式路径> 提交 file_scope 内的文件；"
+    "严禁 git add . 或 git add -A，严禁 git push/fetch/pull、PR/MR、任何形式的 merge 以及 gh 命令。"
 )
 #: ``claude --bg`` launch flags added only when the card says ``deny``.
 REMOTE_GIT_DISALLOWED_TOOLS = (
@@ -148,31 +157,63 @@ WORKER_PUSH_DISALLOWED_TOOLS = ("Bash(git push:*)", "Bash(gh:*)")
 def remote_git_denied(paths, contract):
     """True only when the node's authorization card says ``deny``.
 
-    The contract's own ``remote_git_actions`` wins; otherwise the card of
-    ``plan_id`` is read.  No plan or an unreadable card means no information,
-    so nothing is added.  ``allow`` never adds a ban or launch flag.
+    ``allow`` never adds a ban or launch flag; a deny carrying the signed
+    local-commit exception still returns True (the remote ban stands).
     """
-    value = (contract or {}).get("remote_git_actions")
-    if value is None and paths is not None and (contract or {}).get("plan_id"):
+    switch, _exception = _card_remote_git_fields(paths, contract)
+    if switch is None:
+        return False
+    return switch == "deny"
+
+
+def _card_remote_git_fields(paths, contract):
+    """(remote_git_actions, local_commit_allowed) for a node contract.
+
+    The contract's own fields win; otherwise the card of ``plan_id`` is read.
+    No plan or an unreadable card means no information and the caller adds
+    nothing.  Both fields share one read so card, prompt and runtime never
+    disagree about which exception a ``deny`` card carries.
+    """
+    switch = (contract or {}).get("remote_git_actions")
+    exception = (contract or {}).get("local_commit_allowed")
+    if (switch is None or exception is None) and paths is not None \
+            and (contract or {}).get("plan_id"):
         try:
             card_path = paths.resolve_vibe_path(
                 PurePosixPath("plans") / str(contract["plan_id"]) / "authorization-card.json"
             )
-            data = json.loads(open(str(card_path), encoding="utf-8").read())
+            data = json.loads(card_path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                value = data.get("remote_git_actions", "deny")
+                if switch is None:
+                    switch = data.get("remote_git_actions", "deny")
+                if exception is None:
+                    exception = data.get("local_commit_allowed")
         except (OSError, ValueError, TypeError):
-            return False
-    return value == "deny"
+            return None, None
+    return switch, exception
+
+
+def local_commit_permitted(paths, contract):
+    """True only when a ``deny`` card carries the signed commit exception."""
+    switch, exception = _card_remote_git_fields(paths, contract)
+    return switch == "deny" and exception is True
 
 
 def worker_push_ban_text(paths, contract):
     """The ban line every developer/reviewer prompt carries (#379).
 
-    ``deny`` keeps the stricter remote-Git ban; any other card (``allow``,
-    none, unreadable) still forbids the worker to push.
+    ``deny`` without the signed exception keeps the strictest ban -- no local
+    commit either; ``deny`` with the exception scopes commits to the node
+    file scope and branch; any other card (``allow``, none, unreadable)
+    still forbids the worker to push.
     """
-    return REMOTE_GIT_BAN_TEXT if remote_git_denied(paths, contract) else WORKER_PUSH_BAN_TEXT
+    switch, exception = _card_remote_git_fields(paths, contract)
+    if switch == "deny":
+        return (
+            LOCAL_COMMIT_ALLOWED_BAN_TEXT if exception is True
+            else REMOTE_GIT_BAN_TEXT
+        )
+    return WORKER_PUSH_BAN_TEXT
 
 
 def remote_git_actions_allowed(authorization, action):
@@ -186,6 +227,93 @@ def remote_git_actions_allowed(authorization, action):
     if normalized not in _REMOTE_GIT_ACTIONS:
         return False
     return switch == "allow"
+
+
+def commit_landing_gate(
+    worktree,
+    expected_branch,
+    base,
+    file_scope,
+    local_commit_allowed,
+) -> Dict[str, Any]:
+    """Judge the commits a developer delivery landed on the node branch.
+
+    One rule for the whole stack -- monitor delivery, CLI fixtures and these
+    docs read the same helper: under ``remote_git_actions=deny`` plus the
+    signed ``local_commit_allowed`` exception, the worker may land commits
+    only on its contracted node branch and only inside the authorized file
+    scope; without the exception the deny covers commits too, so any landed
+    commit is refused.  ``unknown`` is never success: an unreadable Git
+    state blocks the delivery exactly like any other unverifiable claim.
+
+    Returns ``{"status": "ok"|"rejected"|"unknown", ...}``.
+    """
+    import subprocess
+    from pathlib import Path as _Path
+
+    directory = _Path(str(worktree))
+
+    def _git(args):
+        return subprocess.run(
+            ["git", "-C", str(directory)] + list(args),
+            capture_output=True, text=True, timeout=60, check=False)
+
+    def _names(*args):
+        result = _git(["diff", "--name-only", "--no-renames"] + list(args))
+        if result.returncode != 0:
+            raise RuntimeError(
+                "git diff failed: " + (result.stderr or "").strip()[-200:])
+        return [item for item in (result.stdout or "").splitlines() if item]
+
+    if not (directory / ".git").exists() or not directory.exists():
+        return {"status": "unknown",
+                "reason": "worktree is not a readable git worktree: {}".format(directory)}
+    branch = _git(["symbolic-ref", "--short", "HEAD"])
+    if branch.returncode != 0:
+        return {"status": "unknown",
+                "reason": "the node branch cannot be read (detached or broken HEAD)"}
+    actual_branch = (branch.stdout or "").strip()
+    expected = str(expected_branch or "").strip()
+    try:
+        landed = _names(str(base) + "..HEAD") if base else []
+        staged = _names("--cached", "HEAD")
+        worktree_dirty = _git(["status", "--porcelain", "--untracked-files=no"])
+        dirty = [
+            item[3:].strip()
+            for item in (worktree_dirty.stdout or "").splitlines()
+            if item and item[0] in " MARC" or (item and item[:2].strip())
+        ]
+    except RuntimeError as error:
+        return {"status": "unknown", "reason": str(error)}
+    commits = _git(["rev-list", "--count", str(base) + "..HEAD"]) if base else None
+    commit_count = 0
+    if commits is not None and commits.returncode == 0:
+        try:
+            commit_count = int((commits.stdout or "").strip())
+        except ValueError:
+            commit_count = -1
+    if actual_branch != expected:
+        return {"status": "rejected",
+                "reason": "commits must land on the contracted node branch "
+                          "{} (actual: {})".format(expected, actual_branch),
+                "branch": actual_branch}
+    if not local_commit_allowed:
+        if commit_count != 0 or staged or dirty:
+            return {"status": "rejected",
+                    "reason": "remote_git_actions=deny without the signed "
+                              "local_commit_allowed exception forbids commits; "
+                              "deliver through the session channel instead",
+                    "commits": commit_count}
+        return {"status": "ok", "commits": 0}
+    if file_scope is not None:
+        scope = {str(item) for item in file_scope}
+        outside = [item for item in sorted(set(landed) | set(staged))
+                   if item not in scope]
+        if outside:
+            return {"status": "rejected",
+                    "reason": "commits landed outside the authorized file scope",
+                    "files": outside}
+    return {"status": "ok", "commits": commit_count, "files": sorted(set(landed))}
 
 
 def validate_remote_git_permissions(remote_git_actions, allowed_actions):
@@ -654,6 +782,9 @@ def validate_authorization_card_consistency(card):
     data = card.to_dict() if hasattr(card, "to_dict") else dict(card)
     switch = data.get("remote_git_actions", "deny")
     validate_remote_git_permissions(switch, data.get("allowed_actions", ()))
+    if data.get("local_commit_allowed") is True and switch != "deny":
+        raise ValueError(
+            "local_commit_allowed is only valid beside remote_git_actions=deny")
     allowed = set(data.get("allowed_actions", ()))
     excluded = set(data.get("excluded_actions", ()))
     # ``excluded_actions`` is the worker-side envelope (workers never push or
@@ -1223,6 +1354,7 @@ def _authorization_payload(
     node_scope_digests: Optional[Dict[str, str]] = None,
     daemon: bool = True,
     launchd_keepalive: bool = False,
+    local_commit_allowed: Optional[bool] = None,
 ) -> Dict[str, Any]:
     payload = {
         "schema_version": AUTHORIZATION_SCHEMA_VERSION,
@@ -1295,6 +1427,11 @@ def _authorization_payload(
         payload["daemon"] = daemon
     if launchd_keepalive != LAUNCHD_KEEPALIVE_DEFAULT:
         payload["launchd_keepalive"] = launchd_keepalive
+    # r4 local-commit exception: bound into the digest only when the product
+    # spec recorded ``true``.  Absent/false keeps every earlier digest bit
+    # for bit, matching the ISSUE-209 preservation rule.
+    if local_commit_allowed is True:
+        payload["local_commit_allowed"] = True
     return payload
 
 
@@ -1338,6 +1475,9 @@ class AuthorizationCard:
     heartbeat_interval_forced: Optional[bool] = None
     heartbeat_interval_forced_cost: Optional[str] = None
     node_scope_digests: Optional[Dict[str, str]] = None
+    # Signed only when true (see _authorization_payload): a deny card may
+    # carry one narrow commit exception; anything else stays pre-r4.
+    local_commit_allowed: Optional[bool] = None
     heartbeat_interval_options: Tuple[Dict[str, Any], ...] = ()
     rotate_hard_cap_options: Tuple[Dict[str, Any], ...] = ()
     # Daemon / launchd keep-alive choices (signed when non-default, see the payload).
@@ -1355,6 +1495,15 @@ class AuthorizationCard:
     # width, critical path, reasonless serial edges.  Unsigned display; a
     # 5.2.6 card has none and the graph is derived from its nodes instead.
     dependency_graph: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        # The exception exists only inside ``deny``; ``allow`` already grants
+        # commit, so ``allow`` + the flag would be two permission sources.
+        if self.local_commit_allowed not in (None, False, True):
+            raise ValueError("local_commit_allowed must be true or unset")
+        if self.local_commit_allowed is True                 and self.remote_git_actions != "deny":
+            raise ValueError(
+                "local_commit_allowed is only valid beside remote_git_actions=deny")
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -1420,6 +1569,7 @@ class AuthorizationRecord:
     heartbeat_interval_forced: Optional[bool] = None
     heartbeat_interval_forced_cost: Optional[str] = None
     node_scope_digests: Optional[Dict[str, str]] = None
+    local_commit_allowed: Optional[bool] = None
     daemon: bool = True
     launchd_keepalive: bool = False
 
@@ -1458,7 +1608,7 @@ class AuthorizationRecord:
             "digest",
             "agent_id",
         }
-        allowed = required | {"node_scope_digests", "remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "heartbeat_interval_forced", "heartbeat_interval_forced_cost", "heartbeat_interval_options", "rotate_hard_cap_options", "daemon", "launchd_keepalive"}
+        allowed = required | {"node_scope_digests", "remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "heartbeat_interval_forced", "heartbeat_interval_forced_cost", "heartbeat_interval_options", "rotate_hard_cap_options", "daemon", "launchd_keepalive", "local_commit_allowed"}
         if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
             raise ValueError("authorization record schema is invalid")
         if data["schema_version"] != AUTHORIZATION_SCHEMA_VERSION:
@@ -1474,6 +1624,14 @@ class AuthorizationRecord:
         converted.setdefault("heartbeat_interval_forced_cost", None)
         converted.setdefault("daemon", DAEMON_DEFAULT)
         converted.setdefault("launchd_keepalive", LAUNCHD_KEEPALIVE_DEFAULT)
+        # Signed only when true; anything stored means an explicit choice and
+        # a deny-only combination or the digest check below refuses it.
+        if converted.get("local_commit_allowed") is not True:
+            converted["local_commit_allowed"] = None
+        if converted["local_commit_allowed"] is True \
+                and converted["remote_git_actions"] != "deny":
+            raise ValueError(
+                "local_commit_allowed is only valid beside remote_git_actions=deny")
         _validate_daemon_choices(converted["daemon"], converted["launchd_keepalive"])
         _validate_stored_card_choice(
             converted["heartbeat_interval_minutes"], "heartbeat interval minutes"
@@ -1768,6 +1926,7 @@ def _drop_unset_card_fields(result: Dict[str, Any]) -> Dict[str, Any]:
     the option existed, so their stored digests keep verifying.
     """
     for key in ("node_scope_digests", "heartbeat_interval_minutes", "rotate_hard_cap",
+                "local_commit_allowed",
                 "heartbeat_interval_forced", "heartbeat_interval_forced_cost",
                 "dependency_graph"):
         if result.get(key) is None:
@@ -1810,6 +1969,7 @@ def build_authorization_card(
     active_pair_limit: Optional[int] = None,
     allowed_actions: Optional[Tuple[str, ...]] = None,
     remote_git_actions: str = "deny",
+    local_commit_allowed: Optional[bool] = None,
     required_workflow: Optional[Tuple[str, ...]] = None,
     skipped_nodes: Optional[Tuple[str, ...]] = None,
     integration_contract: Optional[Dict[str, Any]] = None,
@@ -1999,6 +2159,13 @@ def build_authorization_card(
                 item["test_command"] for _index, item in entries
             ]
     _validate_daemon_choices(daemon, launchd_keepalive)
+    if local_commit_allowed is False:
+        local_commit_allowed = None
+    if local_commit_allowed is not None and local_commit_allowed is not True:
+        raise ValueError("local_commit_allowed must be true or unset")
+    if local_commit_allowed is True and remote_git_actions != "deny":
+        raise ValueError(
+            "local_commit_allowed is only valid beside remote_git_actions=deny")
     heartbeat_interval_minutes = _validate_card_choice(
         heartbeat_interval_minutes, HEARTBEAT_INTERVAL_CHOICES,
         "heartbeat interval minutes",
@@ -2067,6 +2234,7 @@ def build_authorization_card(
         node_scope_digests={node.id: legacy_executable_contract_digest([node]) for node in nodes},
         daemon=daemon,
         launchd_keepalive=launchd_keepalive,
+        local_commit_allowed=local_commit_allowed,
     )
     digest = _canonical_digest(canonical)
     canonical["engine_authorization_digest"] = digest
@@ -2090,6 +2258,7 @@ def build_authorization_card(
     canonical["platform_capabilities"] = card_capability_rows(capabilities.agent_id)
     canonical.setdefault("daemon", daemon)
     canonical.setdefault("launchd_keepalive", launchd_keepalive)
+    canonical.setdefault("local_commit_allowed", None)
     card = AuthorizationCard(digest=digest, **canonical)
     # The issuing path checks its own output: a card the validator would
     # refuse must not be signed in the first place (ISSUE-08).
@@ -2104,6 +2273,7 @@ def refresh_authorization_card(
     workflow: Optional[Dict[str, Any]] = None,
     topology_rulings: Optional[Dict[str, str]] = None,
     engine_attestation: Optional[Dict[str, Any]] = None,
+    local_commit_allowed: Optional[bool] = None,
     heartbeat_interval_options: Optional[Any] = None,
     rotate_hard_cap_options: Optional[Any] = None,
     agent_id: Optional[str] = None,
@@ -2184,6 +2354,10 @@ def refresh_authorization_card(
         heartbeat_interval_forced_cost=previous.heartbeat_interval_forced_cost,
         daemon=previous.daemon,
         launchd_keepalive=previous.launchd_keepalive,
+        local_commit_allowed=(
+            local_commit_allowed if local_commit_allowed is not None
+            else previous.local_commit_allowed
+        ),
         # A caller that observed nothing keeps the availability the approved
         # card recorded: the alternative -- emitting an empty list -- would
         # erase the reason a tier was unavailable from the refreshed card.
@@ -2252,6 +2426,7 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         node_scope_digests=card.node_scope_digests,
         daemon=card.daemon,
         launchd_keepalive=card.launchd_keepalive,
+        local_commit_allowed=card.local_commit_allowed,
     )
     if card.schema_version != AUTHORIZATION_SCHEMA_VERSION:
         raise ValueError("unsupported authorization card schema")
@@ -2296,6 +2471,7 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         node_scope_digests=card.node_scope_digests,
         daemon=card.daemon,
         launchd_keepalive=card.launchd_keepalive,
+        local_commit_allowed=card.local_commit_allowed,
     )
 
 
@@ -2372,6 +2548,7 @@ def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
         node_scope_digests=record.node_scope_digests,
         daemon=record.daemon,
         launchd_keepalive=record.launchd_keepalive,
+        local_commit_allowed=record.local_commit_allowed,
     )
     if not secrets.compare_digest(record.digest, _canonical_digest(canonical)):
         # V3/V4 records pre-dating execution-engine binding remain readable

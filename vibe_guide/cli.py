@@ -34,6 +34,7 @@ from .authorization import (
     option_requires_cost_acceptance,
     refresh_authorization_card,
     remote_git_denied,
+    local_commit_permitted,
 )
 from .adapters.base import (
     Environment as AdapterEnvironment,
@@ -139,6 +140,7 @@ from .scanner import scan_project
 from .diagnostics import screen_session, require_session_screened
 from .diagnostics import assert_planning_gate, _valid_plan_confirmation_binding
 from .workflow_gate import is_v42_sdd_first_state, require_capability_contract
+from . import plan_amendment
 from .authorize_entry import (
     AuthorizationDenied,
     load_live_workflow,
@@ -287,6 +289,123 @@ def _host_adapter(
         )
 
 
+def _plan_amend_command(paths: ProjectPaths, args) -> CLIResult:
+    """Public CLI for protected same-plan/run contract amendments (r4 P1).
+
+    propose renders an immutable candidate only; show binds the display
+    receipt to that candidate; confirm requires the candidate-bound token
+    and performs the protected same-run transfer.  A blocked candidate is
+    a policy denial; unreadable state stays blocked_unknown.
+    """
+    from . import plan_amendment
+
+    stage = args.daemon_action
+    if stage not in {"propose", "show", "confirm"}:
+        return _result(
+            BLOCKED,
+            {"command": "plan-amend", "status": "blocked",
+             "reason": "stage is required: propose | show | confirm"},
+            "plan-amend 需要阶段：propose | show | confirm",
+            args.as_json,
+        )
+    if not args.plan:
+        return _result(
+            BLOCKED,
+            {"command": "plan-amend", "status": "blocked",
+             "reason": "--plan is required"},
+            "plan-amend 需要 --plan",
+            args.as_json,
+        )
+    try:
+        if stage == "propose":
+            if not args.amend_spec or not args.amend_reason:
+                return _result(
+                    BLOCKED,
+                    {"command": "plan-amend", "status": "blocked",
+                     "reason": "propose requires --spec and --reason"},
+                    "plan-amend propose 需要 --spec 与 --reason",
+                    args.as_json,
+                )
+            spec = _read_json(Path(args.amend_spec))
+            candidate = plan_amendment.propose(
+                paths, args.plan, spec, args.amend_reason)
+            return _result(
+                SUCCESS,
+                {"command": "plan-amend", "status": "proposed",
+                 "plan_id": args.plan,
+                 "amendment_digest": candidate["amendment_digest"],
+                 "revision": candidate["revision"],
+                 "node_ids": candidate["node_ids"],
+                 "diff": candidate["diff"],
+                 "dag_audit": candidate["dag_audit"],
+                 "candidate_card": candidate["candidate_card"],
+                 "previous_authorization_digest":
+                     candidate["previous_authorization_digest"]},
+                "修订候选已生成（pending_authorization）；展示：vibe plan-amend show --plan {} --amendment {}".format(
+                    args.plan, candidate["amendment_digest"]),
+                args.as_json,
+            )
+        if not args.amendment:
+            return _result(
+                BLOCKED,
+                {"command": "plan-amend", "status": "blocked",
+                 "reason": "--amendment is required"},
+                "plan-amend 需要 --amendment",
+                args.as_json,
+            )
+        if stage == "show":
+            shown = plan_amendment.show(paths, args.plan, args.amendment)
+            return _result(
+                SUCCESS,
+                {"command": "plan-amend", "status": "shown", **shown},
+                shown["confirmation_hint"],
+                args.as_json,
+            )
+        confirmed = plan_amendment.confirm(
+            paths, args.plan, args.amendment, args.amend_confirm or "")
+        return _result(
+            SUCCESS,
+            {"command": "plan-amend", **confirmed},
+            "修订已切换到同一 run：{}（旧授权 {} → 新授权 {}）".format(
+                confirmed["run_id"],
+                confirmed["previous_authorization_digest"][:12],
+                confirmed["authorization_digest"][:12]),
+            args.as_json,
+        )
+    except AuthorizationDenied as error:
+        return _result(
+            BLOCKED,
+            {"command": "plan-amend", "status": "blocked",
+             "reason": str(error)},
+            "plan-amend 被拒：" + str(error),
+            args.as_json,
+        )
+    except PermissionError as error:
+        return _result(
+            BLOCKED,
+            {"command": "plan-amend", "status": "blocked",
+             "reason": str(error)},
+            "plan-amend 被拒：" + str(error),
+            args.as_json,
+        )
+    except FileExistsError as error:
+        return _result(
+            BLOCKED,
+            {"command": "plan-amend", "status": "blocked",
+             "reason": str(error)},
+            "plan-amend 被拒：" + str(error),
+            args.as_json,
+        )
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return _result(
+            BLOCKED,
+            {"command": "plan-amend", "status": "blocked_design",
+             "reason": str(error)},
+            "plan-amend 失败：" + str(error),
+            args.as_json,
+        )
+
+
 def _authorize_host_check(
     paths: ProjectPaths, plan_id: str, explicit: Optional[str], host: HostDetection,
 ) -> Optional[CLIResult]:
@@ -335,9 +454,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon', 'run-restore'),
+        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'plan-amend', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon', 'run-restore'),
     )
-    parser.add_argument("daemon_action", nargs="?", choices=("start", "status", "stop", "run", "register-pm", "inbox"))
+    parser.add_argument("daemon_action", nargs="?",
+                        choices=("start", "status", "stop", "run", "register-pm", "inbox",
+                                 "propose", "show", "confirm"))
     parser.add_argument("--peek", action="store_true", help="daemon inbox: 只看不推进游标")
     parser.add_argument("--interval", dest="daemon_interval", type=float, default=None)
     parser.add_argument("--model", dest="daemon_model", default=None)
@@ -364,6 +485,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--facts")
     parser.add_argument("--provenance")
     parser.add_argument("--project-id", dest="project_id")
+    parser.add_argument("--amendment", help="plan-amend: 候选修订摘要")
+    parser.add_argument("--amend-spec", dest="amend_spec",
+                        help="plan-amend: 业务修订 spec 路径")
+    parser.add_argument("--amend-reason", dest="amend_reason",
+                        help="plan-amend: 修订原因")
+    parser.add_argument("--confirm-token", dest="amend_confirm",
+                        help="plan-amend: 候选专属确认令牌 AMEND <digest>")
     parser.add_argument("--authorize")
     parser.add_argument("--manifest")
     parser.add_argument("--acceptance-state")
@@ -1008,7 +1136,9 @@ def _claude_bg_launcher_factory(paths: ProjectPaths, launchers: Optional[List[An
         launcher = claude_bg.ClaudeBgLauncher(
             routing, claude_bg.load_claude_bg_config(paths), model=model,
             # Only a deny card passes it, so allow keeps the previous call shape.
-            **({"remote_git_deny": True} if remote_git_denied(paths, contract) else {}),
+            **({"remote_git_deny": True,
+                "local_commit_allowed": local_commit_permitted(paths, contract)}
+               if remote_git_denied(paths, contract) else {}),
             # Only a downstream node passes it, so launchers built for nodes
             # without accepted upstreams keep their previous call shape.
             **({"upstream_branches": list(upstream)} if upstream else {}),
@@ -3893,6 +4023,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             SUCCESS, payload, "复杂计划产物已生成，等待一次授权", args.as_json
         )
 
+    if args.command == "plan-amend":
+        return _plan_amend_command(paths, args)
+
     if args.command == "authorize":
         if args.plan:
             refusal = _authorize_host_check(paths, args.plan, args.adapter, host)
@@ -3911,6 +4044,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             # ``vibe authorize`` requires (decision D5 = A).
             try:
                 _plan_root(paths, args.plan)
+                plan_amendment.require_no_pending_transfer(paths, args.plan)
                 shown = show_card_with_graph(paths, args.plan)
                 card = _authorization_card(shown["card"])
             except AuthorizationDenied as error:
@@ -3945,6 +4079,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 args.as_json,
             )
         try:
+            plan_amendment.require_no_pending_transfer(paths, args.plan)
             workflow = materialize_workflow_evidence(paths, args.plan, args.authorize or "")
         except AuthorizationDenied as error:
             # A policy denial, identified by its type rather than by whether the

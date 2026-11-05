@@ -214,6 +214,20 @@ V4.4 将工程故障限定在节点范围内，并保留同一任务身份。五
 
 合并：授权卡允许远端 Git 动作时，独立终审通过、P0–P2 清零后由 vibe 标记「可合并」，监工执行合并命令，vibe 核实合并提交可达目标分支后才记为已合并。
 
+### 同 plan/run 合同修订（vibe plan-amend）
+
+已授权运行的业务合同只能经公开受保护路径修订，不得直接改有效工件、不得另起 run：
+
+```bash
+vibe plan-amend propose --plan <plan> --amend-spec <业务修订spec.json> --amend-reason "<原因>"
+vibe plan-amend show --plan <plan> --amendment <digest>
+vibe plan-amend confirm --plan <plan> --amendment <digest> --confirm-token "AMEND <digest>"
+```
+
+- 提议生成不可变候选（差异、DAG 审计、pending 新卡），不动有效卡/授权/快照，不派发任务；节点集合、plan.version、run 身份与任务 cursor 必须原样保留，节点增删、工程字段注入、未闭合产品决定一律拒绝。
+- 展示回执绑定候选摘要；确认令牌 `AMEND <digest>` 只对这一个候选有效，旧回执、其他候选、篡改候选都被拒。
+- 确认时在同一受保护事务中重验旧摘要、owner、任务、租约与在途副作用：活跃或未知执行者无法证明安全静止即 fail closed；事件提交前崩溃恢复完整旧态，事件提交后幂等完成新投影；切换未完成期间所有入口（authorize/monitor/resume/daemon/直接 Monitor）不消费结果、不派发。旧卡/旧授权记录归档在 `plans/<plan>/amendments/<digest>/` 下可查。
+
 ### DAG 运行时约束
 
 每个 Agent Task 都是某个 Issue 的运行时实例；任务线程、Provider 返回值或 worker 自报不会替代 Issue/DAG 合同。节点完成独立验收后，Monitor 立即依据最新的 `depends_on` 状态重算 `ready_set`，已解锁的节点可以继续调度，不等待整批任务形成 barrier。
@@ -238,7 +252,7 @@ V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 
 
 ### 远端 Git 禁令（remote_git_actions=deny）
 
-授权卡 `remote_git_actions` 为 `deny` 时，四个平台的 worker 提示词都会加一条固定禁令：禁止 git fetch、push、pull 以及 gh，只在本地分支提交。为 `allow` 时不加禁令，也不加任何启动参数。各平台实际能拦到什么：
+授权卡 `remote_git_actions` 为 `deny` 时，四个平台的 worker 提示词都会加一条固定禁令。deny 覆盖整个 commit/push/PR/MR/merge 组：无例外时连本地 commit 也禁止，交付通过会话交付通道上报；产品经理可在产品 spec 写 `local_commit_allowed: true`，签发一个仅允许「本节点分支 + 授权文件白名单 + 显式路径 git add」的本地 commit 窄例外，push/PR/MR/merge 及任何别名仍全部禁止。为 `allow` 时不加禁令，也不加任何启动参数；`allow` 与 `local_commit_allowed: true` 并存会被拒绝（两套权限来源）。各平台实际能拦到什么：
 
 | 平台 | 约束 |
 |---|---|

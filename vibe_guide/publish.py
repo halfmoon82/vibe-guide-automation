@@ -234,6 +234,7 @@ def publish_plan(
         active_pair_limit=source.get("active_pair_limit"),
         allowed_actions=source.get("allowed_actions"),
         remote_git_actions=source.get("remote_git_actions", "deny"),
+        local_commit_allowed=_card_flag(source, "local_commit_allowed", None),
         engine_attestation=engine_attestation,
         topology_rulings=_first_card_rulings,
         workers=_cli()._background_worker_entries(nodes, _first_card_rulings, paths),

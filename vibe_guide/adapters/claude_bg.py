@@ -19,6 +19,7 @@ import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from ..authorization import (
+    LOCAL_COMMIT_ALLOWED_BAN_TEXT,
     REMOTE_GIT_BAN_TEXT,
     REMOTE_GIT_DISALLOWED_TOOLS,
     REMOTE_GIT_LAUNCH_ENV,
@@ -310,13 +311,17 @@ class ClaudeBgLauncher:
         sleeper: Callable[[float], None] = time.sleep,
         upstream_branches: Optional[Sequence[str]] = None,
         remote_git_deny: bool = False,
+        local_commit_allowed: bool = False,
         base_sha: Optional[str] = None,
     ):
         #: True only when the authorization card says ``remote_git_actions:
         #: deny``: ``launch`` then appends the remote-Git ban to the prompt and
         #: adds ``--disallowedTools`` plus ``GIT_ALLOW_PROTOCOL``.  False still
         #: bans the push (#379): the push ban text and push/gh tools, no env.
+        #: ``local_commit_allowed`` narrows the deny prompt to whitelist-only
+        #: local commits (r4): the remote tool/env bans stay identical.
         self.remote_git_deny = bool(remote_git_deny)
+        self.local_commit_allowed = bool(local_commit_allowed)
         self.routing = routing
         self.sleeper = sleeper
         self.config = config
@@ -712,7 +717,10 @@ class ClaudeBgLauncher:
         # (#379): allow still bans push/gh, deny bans every remote git tool.
         denied_tools = [_NO_USER_QUESTIONS[1]]
         ban_text, ban_tools = (
-            (REMOTE_GIT_BAN_TEXT, REMOTE_GIT_DISALLOWED_TOOLS) if self.remote_git_deny
+            (REMOTE_GIT_BAN_TEXT, REMOTE_GIT_DISALLOWED_TOOLS)
+            if self.remote_git_deny and not self.local_commit_allowed
+            else (LOCAL_COMMIT_ALLOWED_BAN_TEXT, REMOTE_GIT_DISALLOWED_TOOLS)
+            if self.remote_git_deny
             else (WORKER_PUSH_BAN_TEXT, WORKER_PUSH_DISALLOWED_TOOLS)
         )
         if ban_text not in prompt:

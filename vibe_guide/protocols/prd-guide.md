@@ -136,6 +136,7 @@ vibe skill-install --source https://github.com/phuryn/pm-skills --sha 8607e3b077
   ],
   "rationale?": {"framing|tradeoffs|flow|acceptance": "verified_fact: ..."},
   "remote_git_actions?": "allow|deny",
+  "local_commit_allowed?": "true|false",
   "heartbeat_interval_minutes?": "10|60",
   "rotate_hard_cap?": "150000|200000|300000|500000|800000",
   "daemon?": "true|false",
@@ -166,7 +167,7 @@ vibe attest --adapter <claude-code|codex|...> --facts <facts.json> --provenance 
 
 ### 5.3 发布、授权、开工
 
-发布前只问一件事：允许还是禁止远端 Git 动作（提交、推送、开 PR、合并），写进产品 spec 的 `remote_git_actions`（`allow` / `deny`，缺省 `deny`）。**不问心跳间隔与换班上限**：授权卡上的 `heartbeat_interval_minutes` 等运行参数由 vibe 推导（推送唤醒已验证的平台兜底检查为 60 分钟，未验证为 10 分钟）。
+发布前问两件事：允许还是禁止远端 Git 动作（提交、推送、开 PR、合并），写进产品 spec 的 `remote_git_actions`（`allow` / `deny`，缺省 `deny`）；选 `deny` 时再问是否签发本地 commit 窄例外 `local_commit_allowed`（缺省 `false`：deny 下连本地 commit 也禁止；`true` 只允许本节点分支、授权文件白名单、显式路径 `git add`，push/PR/MR/merge 仍全禁）。`allow` + `local_commit_allowed: true` 会被拒绝。**不问心跳间隔与换班上限**：授权卡上的 `heartbeat_interval_minutes` 等运行参数由 vibe 推导（推送唤醒已验证的平台兜底检查为 60 分钟，未验证为 10 分钟）。
 
 ```bash
 vibe plan --request "<产品经理的原话>" --plan-id <plan_id> --from-prd <product-spec.json> --json

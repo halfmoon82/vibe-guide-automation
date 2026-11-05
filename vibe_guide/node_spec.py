@@ -51,6 +51,8 @@ PRODUCT_SPEC_FIELDS: Dict[str, Any] = {
     ],
     "rationale?": {"framing|tradeoffs|flow|acceptance": "verified_fact: ..."},
     "remote_git_actions?": "allow|deny",
+    # Signed narrow exception inside deny: local whitelist commits only.
+    "local_commit_allowed?": "true|false",
     # ISSUE-209 card choices; the protocol's §5.1 block must match this exactly.
     "heartbeat_interval_minutes?": "|".join(str(item) for item in HEARTBEAT_INTERVAL_CHOICES),
     "rotate_hard_cap?": "|".join(str(item) for item in ROTATE_HARD_CAP_CHOICES),

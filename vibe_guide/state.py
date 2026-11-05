@@ -368,6 +368,9 @@ _EVENT_DATA_KEYS = {
     *CONSISTENCY_CORRECTION_KEYS,
     "authorization_digest",
     "authorization_epoch",
+    # r4 plan_amendment transfers: which confirmed candidate the
+    # authorization_reauthorized event applied.
+    "amendment_digest",
     "superseded_creates",
     "capability_contract_digest",
     "checkpoint_sha",

@@ -114,11 +114,23 @@ from .task_registry import (
 )
 from .config import load_project_config
 from .worker_questions import WORKER_QUESTION_EVENT, park_question as park_worker_question
+from .worker_questions import KIND_SCOPE_LANDING, park as park_delivery_refusal
 from .worker_questions import REPLAY_EVENTS as WORKER_QUESTION_REPLAY_EVENTS
 from .worker_questions import replay as replay_worker_question
 from .worktree_base import upstream_branches
 from .scope_landing import check_delivery as check_delivery_landing
 from .scope_landing import check_delivery_content as check_delivery_content_landing
+from .scope_landing import _git_in as _landing_git_in
+from .scope_landing import node_base as _landing_node_base
+from .scope_landing import _project_head as _landing_project_head
+from .scope_landing import (
+    CAUSE_UNREADABLE as _LANDING_CAUSE_UNREADABLE,
+    LANDING_UNREADABLE_CLASS as _LANDING_UNREADABLE_CLASS,
+    LANDING_UNREADABLE_CODE as _LANDING_UNREADABLE_CODE,
+    REJECTION_KEY as _LANDING_REJECTION_KEY,
+    _park_landing_unreadable,
+)
+from .authorization import commit_landing_gate
 from .workflow_gate import require_capability_contract, require_entry, verify_workflow
 from .authorize_entry import load_live_workflow, select_plan_workflow, verify_workflow_artifacts
 from .diagnostics import validate_child_session_binding
@@ -1829,6 +1841,129 @@ class Monitor:
             from .supervisor import ensure_caller_not_superseded
             ensure_caller_not_superseded(self.paths, run_id)
 
+    def _check_developer_commit_landing(
+        self, snapshot: RunSnapshot, node_id: str, active: Dict[str, Any]
+    ) -> bool:
+        """Enforce the commit half of the remote-Git contract before delivery.
+
+        Commits must sit on the contracted node branch inside the
+        authorized file scope, for every stored authorization: the r4
+        ``local_commit_allowed`` flag narrows what prompts *promise*, while
+        the landing rule is what the pre-r4 runtime always enforced --
+        branch identity plus scope.  Nothing here touches remote delivery:
+        pushes stay banned on every card and ``remote_delivery_required``
+        only reads ``allow``.
+        """
+        current = snapshot.nodes[node_id]
+        raw = str(current.get("worktree") or "")
+        if not raw.strip():
+            return True
+        if getattr(self, "paths", None) is None or getattr(self, "nodes", None) is None:
+            # Partial/stub monitors (event-projection fixtures): the gate
+            # needs real project paths to evaluate; leave those replays to
+            # the landing report's own rules.
+            return True
+        worktree = Path(raw)
+        if not worktree.is_absolute():
+            worktree = self.paths.root / worktree
+        if worktree == Path(self.paths.root).resolve() or worktree == self.paths.root:
+            return True  # main-tree contract: the delivery channel is the path
+        if not (worktree / ".git").exists():
+            return True  # no git claim; scope landing's own rules decide
+        try:
+            authorization = self._snapshot_record(snapshot)
+        except (KeyError, TypeError, ValueError):
+            return True  # fixture/legacy run without a record: unchanged path
+        node = self.nodes[node_id]
+        expected_branch = (
+            current.get("branch")
+            or node.contract.get("branch")
+            or node_branch(node_id)
+        )
+        git = _landing_git_in(worktree)
+        try:
+            base, _inferred = _landing_node_base(
+                git, current.get("worktree_base"), _landing_project_head(self))
+        except Exception:
+            base = None
+        # Commits stay permitted on the node branch for every stored record:
+        # a card missing ``local_commit_allowed`` keeps its pre-r4 meaning,
+        # so this gate polices *where* commits land -- the contracted node
+        # branch -- while the per-node file scope, including its approved
+        # expansions, remains the landing report's own call.  The signed
+        # exception narrows prompts and card text only.
+        result = commit_landing_gate(
+            worktree=worktree,
+            expected_branch=expected_branch,
+            base=base,
+            file_scope=None,
+            local_commit_allowed=True,
+        )
+        if result["status"] == "ok":
+            return True
+        if result["status"] == "unknown":
+            # Same fail-closed class as #336's unreadable landing: nothing
+            # to answer until the worktree reads again, so the structural
+            # blocked_unknown park applies; ``rejection_code`` names the
+            # commit gate specifically and the reason_code keeps the crash-
+            # window replay twin valid.
+            current[_LANDING_REJECTION_KEY] = [
+                {"path": "*", "cause": _LANDING_CAUSE_UNREADABLE}]
+            _park_landing_unreadable(
+                self, snapshot, node_id, active,
+                "commit landing cannot be verified: "
+                + str(result.get("reason"))[:200],
+                {
+                    "run_id": snapshot.run_id,
+                    "node_id": node_id,
+                    "role": active.get("role") if isinstance(active, dict) else None,
+                    "generation": active.get("generation") if isinstance(active, dict) else None,
+                    "handle_id": active.get("handle_id") if isinstance(active, dict) else None,
+                    "reason_class": _LANDING_UNREADABLE_CLASS,
+                    "reason_code": _LANDING_UNREADABLE_CODE,
+                    "rejection_code": "commit_landing:unreadable",
+                },
+            )
+            return False
+        code = "commit_policy:" + (
+            "wrong_branch" if result.get("branch")
+            else "outside_scope" if result.get("files")
+            else "commits_forbidden")
+        park_delivery_refusal(
+            self, snapshot, node_id, active,
+            "交付被拒收：{}。".format(result.get("reason")),
+            kind=KIND_SCOPE_LANDING,
+            event_name="scope_landing_rejected",
+            event_data={
+                "files": list(result.get("files") or ()),
+                "rejection_code": code,
+            },
+            binding_status="delivered",
+        )
+        return False
+
+    def _require_amendment_barrier(self, owner_digest: Optional[str] = None) -> None:
+        """Fail closed while a contract-amendment transfer is unresolved.
+
+        ``plan_amendment.require_no_pending_transfer`` recovers what can be
+        recovered and raises on anything ambiguous; the digest of the
+        transfer that owns this call is let through so ``confirm`` itself
+        can reauthorize inside its own protected window.
+        """
+        from . import plan_amendment
+        marker = None
+        try:
+            marker = plan_amendment._marker_state(self.paths, self.plan.plan_id)
+        except PermissionError:
+            raise
+        except Exception:
+            return
+        if marker is None:
+            return
+        if owner_digest is not None and marker.get("amendment_digest") == owner_digest:
+            return
+        plan_amendment.require_no_pending_transfer(self.paths, self.plan.plan_id)
+
     def _save_snapshot(self, snapshot: Any) -> None:
         self._guard_lease(getattr(snapshot, "run_id", None))
         save_snapshot(self.paths, snapshot)
@@ -2163,6 +2298,7 @@ class Monitor:
     ) -> RunSnapshot:
         self._reset_binding_cache()
         self._archive_finished_runs()
+        self._require_amendment_barrier()
         self._require_record(record)
         state = self.paths.vibe / "state.json"
         capability_contract_digest = ""
@@ -2293,6 +2429,7 @@ class Monitor:
     def resume(self, run_id: str, runner: Runner, poll_handles: bool = True) -> RunSnapshot:
         self._reset_binding_cache()
         self._archive_finished_runs()
+        self._require_amendment_barrier()
         require_entry(self.paths, "resume:" + str(run_id), "resume")
         require_not_legacy_run(self.paths, run_id)
         snapshot = load_snapshot(self.paths, run_id)
@@ -2400,10 +2537,12 @@ class Monitor:
         record: AuthorizationRecord,
         runner: Runner,
         change_reason: str,
+        amendment_digest: Optional[str] = None,
     ) -> RunSnapshot:
         """Continue the same run under a newly confirmed same-plan contract."""
 
         self._reset_binding_cache()
+        self._require_amendment_barrier(amendment_digest)
         self._require_record(record)
         # A completed run is archived out of .vibe/runs/ (issue #274);
         # reauthorization reopens it, so its evidence moves back first.
@@ -2658,6 +2797,7 @@ class Monitor:
             "invalidated_acceptances": invalidated_acceptances,
             "change_reason": change_reason,
             "continuation": continuation,
+            "amendment_digest": amendment_digest,
         }
         # Validate the complete transition before publishing its durable event.
         # A rejected proof must not poison replay with an unappliable event.
@@ -2683,6 +2823,7 @@ class Monitor:
     def tick(self, run_id: str, runner: Runner) -> RunSnapshot:
         self._reset_binding_cache()
         self._archive_finished_runs()
+        self._require_amendment_barrier()
         require_not_legacy_run(self.paths, run_id)
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
@@ -3739,6 +3880,7 @@ class Monitor:
                 "capability_contract_changed",
                 "engine_attestation_renewed",
                 "platform_handoff",
+                "plan_amendment",
             }
         ):
             raise ValueError("reauthorization replacement lineage is inconsistent")
@@ -7774,6 +7916,8 @@ class Monitor:
                         return
                     self._mark_blocked_unknown(snapshot, node_id, "; ".join(gate.reasons))
                     return
+            if role == "developer" and not self._check_developer_commit_landing(snapshot, node_id, active):
+                return
             if role == "developer" and not check_delivery_landing(self, snapshot, node_id, active):
                 return
             if role == "developer" and not check_delivery_content_landing(

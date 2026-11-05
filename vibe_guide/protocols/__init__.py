@@ -27,6 +27,9 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-11-04: §5.1 gains local_commit_allowed? (deny-only signed
+        # exception) and §5.3 asks it as a second publish-time choice (r4).
+        "febe39ff42a0b89e75ef85674bb518cf2d53a5f527a0f7263f2e3a0be7fe66a2",
         # 2026-11-03: §5.3 show the card with its dependency graph before
         # authorizing (--show-card receipt, D5) and one selected heartbeat
         # tier (#391) (authorization-card).
@@ -250,6 +253,9 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Worker protocol delivered by reference (#216): a ref-mode dispatch pins
     # the file's sha256 and only accepts a digest published here.
     "visible-sdd-worker": frozenset({
+        # 2026-11-04: close-out rule states the deny/no-exception commit ban
+        # and the signed local_commit_allowed whitelist exception (r4).
+        "a300c173735dffc1fba47f948ade71a292e268b0a09aa4aef871c95fab5c4db4",
         # 2026-11-03: WorkBuddy Explore-type subagent fallback (single-run observation, #390).
         "9c65bef62c1d30ede26db9153a272349f34043f1d0326bfdb5fa22e8ce70af84",
         # 2026-10-30: worker-deliver takes --project-root, no cwd.
