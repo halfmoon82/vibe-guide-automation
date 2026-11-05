@@ -563,3 +563,116 @@ class AmendmentTokenEvidenceTests(_PreparedTransfer):
             '"granted": true, "token": "AUTHORIZE"',
             json.dumps(record, ensure_ascii=False).replace(" ", "").replace(
                 '"', '"') or "")
+
+
+class FilesScopeProjectionTests(unittest.TestCase):
+    """contract.files is the business field; worker_profile.allowlist is its
+    derived engineering projection and must be refreshed together or the
+    write-scope audit collides with the stale projection."""
+
+    def setUp(self):
+        self.root, self.paths, self.plan_root, self.record = _authorized_probe(self)
+        self.snapshot, _runner = _start_run(
+            self.paths, self.plan_root, self.record, quiesce=True)
+        self.spec = _amendment_spec(self.plan_root)
+
+    def _files(self, node_dict):
+        return list((node_dict.get("contract") or {}).get("files") or [])
+
+    def test_files_change_refreshes_allowlist_and_propose_passes(self):
+        old_nodes = _read(self.plan_root, "nodes.json")
+        target = next(n for n in old_nodes if n["id"] != "integration-review")
+        old_files = self._files(target)
+        new_files = ["telemetry/{}.py".format(target["id"].replace("-", "_"))]
+        self.assertNotEqual(old_files, new_files)
+        for item in self.spec["nodes"]:
+            if item["id"] == target["id"]:
+                item["contract"]["files"] = list(new_files)
+        candidate = plan_amendment.propose(
+            self.paths, "probe-plan", self.spec, "迁移节点文件范围")
+        directory = plan_amendment.candidate_dir(
+            self.paths, "probe-plan", candidate["amendment_digest"])
+        merged = {n["id"]: n for n in _read(directory, "nodes.json")}
+        node = merged[target["id"]]
+        self.assertEqual(self._files(node), new_files)
+        profile = (node.get("contract") or {}).get("worker_profile") or {}
+        previous_profile = (target.get("contract") or {}).get(
+            "worker_profile") or {}
+        if previous_profile:
+            self.assertEqual(profile.get("allowlist"), new_files)
+            for key, value in previous_profile.items():
+                if key != "allowlist":
+                    self.assertEqual(profile.get(key), value)
+        # The candidate card's file scope agrees with the new projection.
+        self.assertIn(new_files[0],
+                      candidate["candidate_card"]["file_scope"])
+
+    def test_files_migration_between_nodes_refreshes_both_profiles(self):
+        old_nodes = _read(self.plan_root, "nodes.json")
+        business = [n for n in old_nodes if n["id"] != "integration-review"]
+        if len(business) < 2:
+            self.skipTest("fixture has one business node")
+        first, second = business[0], business[1]
+        first_files, second_files = self._files(first), self._files(second)
+        for item in self.spec["nodes"]:
+            if item["id"] == first["id"]:
+                item["contract"]["files"] = list(second_files)
+            if item["id"] == second["id"]:
+                item["contract"]["files"] = list(first_files)
+        candidate = plan_amendment.propose(
+            self.paths, "probe-plan", self.spec, "节点间迁移文件")
+        directory = plan_amendment.candidate_dir(
+            self.paths, "probe-plan", candidate["amendment_digest"])
+        merged = {n["id"]: n for n in _read(directory, "nodes.json")}
+        self.assertEqual(
+            self._files(merged[first["id"]]), second_files)
+        self.assertEqual(
+            self._files(merged[second["id"]]), first_files)
+
+    def test_other_worker_profile_fields_still_rejected(self):
+        # A profile change that is not exactly allowlist==new files still
+        # fails closed -- exercised end-to-end by corrupting the merge
+        # output, plus unit-checked on the predicate itself.
+        from unittest import mock
+
+        original = plan_amendment._merge_nodes
+
+        def forged_merge(spec, previous_nodes):
+            nodes = original(spec, previous_nodes)
+            for node in nodes:
+                profile = node.contract.get("worker_profile")
+                if isinstance(profile, dict):
+                    profile["model"] = "forged-model"
+                    break
+            return nodes
+
+        with mock.patch.object(
+                plan_amendment, "_merge_nodes", forged_merge):
+            with self.assertRaises(ValueError):
+                plan_amendment.propose(
+                    self.paths, "probe-plan", self.spec, "篡改工程字段")
+
+    def test_profile_projection_diff_unit(self):
+        diff = plan_amendment._profile_projection_diff
+        old_profile = {"allowlist": ["old.py"], "model": "m",
+                       "worker": "w", "branch": "node/x"}
+        # The one allowed difference: allowlist becomes the new files.
+        self.assertIsNone(diff(old_profile, {
+            "allowlist": ["new.py"], "model": "m",
+            "worker": "w", "branch": "node/x",
+            "files": ["new.py"]}))
+        # allowlist set to something other than files: rejected.
+        self.assertEqual(diff(old_profile, {
+            "allowlist": ["other.py"], "model": "m",
+            "worker": "w", "branch": "node/x",
+            "files": ["new.py"]}), "worker_profile")
+        # Any other field drift: rejected.
+        self.assertEqual(diff(old_profile, {
+            "allowlist": ["new.py"], "model": "m2",
+            "worker": "w", "branch": "node/x",
+            "files": ["new.py"]}), "worker_profile.model")
+        # Same profile: clean.
+        self.assertIsNone(diff(old_profile, dict(old_profile)))
+        # Missing/new types: rejected.
+        self.assertEqual(diff(old_profile, {"model": "m"}),
+                         "worker_profile.allowlist")

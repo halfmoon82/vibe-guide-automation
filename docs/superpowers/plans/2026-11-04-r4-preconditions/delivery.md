@@ -126,3 +126,23 @@ python3 -m vibe_guide --help; git diff --check                                  
 python3 -m unittest tests.test_plan_amendment tests.test_plan_amendment_recovery -v   # 25 例 OK（新增 3 例）
 python3 -m unittest <11 个受影响文件> -v                                            # 284 例 OK
 ```
+
+## 第 4 次交付（真实 plan/run propose 阻断修复，2026-11-05）
+
+### B01 阻断：files 修订刷新 worker_profile.allowlist 派生投影
+
+- 根因：`worker_profile.allowlist` 是发布期 `contract.files or ["."]` 的派生投影（`node_spec.complete_node_contracts`）。修订 spec 改 `contract.files` 时旧投影不刷新，`_conflict_write_scope` 把陈旧 allowlist 与新 files 取并集，缩窄/迁移文件范围的修订必撞写范围冲突；且工程字段回验又禁止改 profile，构成死锁。派发路径（`Monitor._prepare_worker_profile` → `WorkerProfile.from_dict`）读的也是这份存储投影，不刷新会按旧范围绑定。
+- `_merge_nodes`：files 变化且节点持有 dict 形态 `worker_profile` 时，按同一派生规则（`_derived_allowlist`，镜像 `files or ["."]`）原地刷新 `allowlist`；其余 profile 字段保持位级不变。files 为 truthy 非 list（无合法投影）时不动投影，交给回验 fail closed。
+- `_profile_projection_diff`：工程字段回验对 `worker_profile` 的唯一放行差集——`allowlist` 恰等于新 files 的派生投影、其余字段位级不变；投影缺失、不等于投影、其他字段漂移或类型异常分别报 `worker_profile.allowlist`/`worker_profile`/`worker_profile.<key>`。
+- 新用例 `FilesScopeProjectionTests`：files 变更刷新投影且 propose 通过并绑定候选卡 file_scope；节点间文件迁移（夹具单业务节点 skip）；篡改非 allowlist 字段端到端拒绝；谓词级单测覆盖合法投影/伪造 allowlist/其他字段漂移/缺键。
+
+### 验证（writer root）
+
+```bash
+python3 -m unittest tests.test_plan_amendment tests.test_plan_amendment_recovery tests.test_local_commit_authorization   # 52 例 OK（skip 1：单业务节点夹具）
+python3 -m unittest tests.test_dag tests.test_planner tests.test_prd_guide_publish_path tests.test_authorization_card_options tests.test_empty_decisions_authorize tests.test_auto_scope_files tests.test_scope_landing tests.test_node_scoped_blocking   # 235 例 OK
+python3 -m unittest tests.test_monitor tests.test_monitor_binding_transaction tests.test_cli_supervisor_commands tests.test_rework_prompt_auto_scope   # 180 例 OK
+python3 -m vibe_guide --help; git diff --check   # OK
+```
+
+未验证项不变：真实桌面 App、真实目标 plan/run 切换、远端 Git、发布/deploy 均不在先导范围；此前披露的基线环境性失败与计时 flake 判断不变。

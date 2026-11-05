@@ -233,8 +233,66 @@ def _merge_nodes(spec: Dict[str, Any],
         contract = node_dict.setdefault("contract", {})
         for key, value in item.get("contract", {}).items():
             contract[key] = value
+        # ``worker_profile.allowlist`` is a *derived* projection of
+        # ``contract.files`` (node_spec: ``files or ["."]``).  A files
+        # amendment must refresh it in place or the write-scope audit
+        # unions the stale projection with the new files and dispatch
+        # would still bind the old allowlist.  Every other profile field
+        # stays byte-identical; a ``files`` value that cannot derive a
+        # projection (a non-list truthy value) is left untouched so the
+        # engineering re-verification below fails closed.
+        old_files = (previous.get("contract") or {}).get("files")
+        new_files = contract.get("files")
+        derived = _derived_allowlist(new_files)
+        if (derived is not None and new_files != old_files
+                and isinstance(contract.get("worker_profile"), dict)):
+            contract["worker_profile"] = dict(
+                contract["worker_profile"], allowlist=derived)
         merged.append(DAGNode.from_dict(node_dict))
     return merged
+
+
+def _derived_allowlist(files: Any) -> Optional[List[str]]:
+    """Mirror the publish-time projection ``contract.files or ["."]``.
+
+    Returns ``None`` when ``files`` is a non-list truthy value: nothing
+    legitimate derives from it and the caller must leave the stored
+    projection untouched so re-verification rejects the amendment.
+    """
+    if isinstance(files, list):
+        return list(files) or ["."]
+    if not files:
+        return ["."]
+    return None
+
+
+def _profile_projection_diff(previous: Any,
+                             merged: Any) -> Optional[str]:
+    """The only engineering difference a files amendment may create.
+
+    ``previous`` is the stored ``worker_profile``; ``merged`` is the
+    merged profile plus the node's new ``contract.files`` under the
+    ``"files"`` key.  Returns a field path when the profile differs by
+    anything other than ``allowlist`` becoming exactly the projection
+    derived from those files, ``None`` when the difference is legal.
+    """
+    if merged == previous:
+        return None
+    if not isinstance(merged, dict) or not isinstance(previous, dict):
+        return "worker_profile"
+    expected = _derived_allowlist(merged.get("files"))
+    if expected is None:
+        return "worker_profile.allowlist"
+    if "allowlist" not in merged:
+        return "worker_profile.allowlist"
+    if merged.get("allowlist") != expected:
+        return "worker_profile"
+    for key in set(previous) | set(merged):
+        if key in ("allowlist", "files"):
+            continue
+        if previous.get(key) != merged.get(key):
+            return "worker_profile." + str(key)
+    return None
 
 
 def _business_diff(old_nodes: Dict[str, Dict[str, Any]],
@@ -353,7 +411,21 @@ def propose(
     for node in nodes:
         previous = DAGNode.from_dict(previous_nodes[node.id])
         for key, value in previous.contract.items():
-            if key not in _BUSINESS_CONTRACT_KEYS and node.contract.get(key) != value:
+            if key in _BUSINESS_CONTRACT_KEYS:
+                continue
+            if key == "worker_profile":
+                merged_profile = node.contract.get("worker_profile")
+                if merged_profile == value:
+                    continue
+                if isinstance(merged_profile, dict):
+                    merged_profile = dict(
+                        merged_profile, files=node.contract.get("files"))
+                drift = _profile_projection_diff(value, merged_profile)
+                if drift is not None:
+                    raise ValueError(
+                        "contract amendment cannot change engineering field "
+                        "contract.{} on node {}".format(drift, node.id))
+            elif node.contract.get(key) != value:
                 raise ValueError(
                     "contract amendment cannot change engineering field "
                     "contract.{} on node {}".format(key, node.id))
