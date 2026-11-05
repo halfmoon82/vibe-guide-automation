@@ -230,6 +230,10 @@ def _js_tokens(source: str) -> List[Any]:
             tokens.append(("string", value))
             index += 1
             continue
+        # A backslash outside a literal can escape any part of an identifier
+        # (including the host object). Do not split it into harmless tokens.
+        if char == "\\":
+            raise ValueError("escaped JavaScript identifier has unknown native effects")
         match = re.match(r"[A-Za-z_$][A-Za-z0-9_$]*|[0-9]+", source[index:])
         if match:
             value = match.group(0)
@@ -1608,27 +1612,19 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
         try:
             call["embedded_create"] = _embedded_create_invocations(source) > 0
         except ValueError:
-            # An exact host compile-time SyntaxError has no execution phase;
-            # retain the call and its paired return, never silently drop it.
-            # Anything else remains unknown. The isolated syntax probe does
-            # not execute the source and uses an existing runtime only.
+            # Only this fully constrained source form proves a raw newline
+            # inside a quoted JS string, a lexical error before execution.
+            # Error text alone could instead be thrown at runtime. Other
+            # malformed or engine-specific forms remain unknown.
             output = (call.get("return_payload") or {}).get("output")
             if not (call["name"] == "exec" and isinstance(output, list)
                     and len(output) == 2 and all(isinstance(x, dict) and x.get("type") == "input_text" for x in output)
                     and re.fullmatch(r"Script failed\nWall time [0-9.]+ seconds\nOutput:\n", str(output[0].get("text", "")))
-                    and str(output[1].get("text", "")).startswith("Script error:\nSyntaxError:")):
+                    and output[1].get("text") == "Script error:\nSyntaxError: Invalid or unexpected token"
+                    and re.fullmatch(
+                        r'text\(await tools\.exec_command\(\{cmd:"[A-Za-z0-9 _.-]*\n[A-Za-z0-9 _.-]*"\}\)\);',
+                        source)):
                 raise
-            try:
-                check = subprocess.run(["node", "--input-type=module", "--check"],
-                    input=source, text=True, capture_output=True, timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
-                raise ValueError("native syntax check unavailable")
-            if check.returncode == 0 or "SyntaxError:" not in check.stderr:
-                raise ValueError("native syntax failure could not be verified")
-            native_error = str(output[1].get("text", "")).split("SyntaxError:", 1)[1].strip()
-            local_error = check.stderr.split("SyntaxError:", 1)[1].splitlines()[0].strip()
-            if not native_error or native_error != local_error:
-                raise ValueError("native syntax failure differs from local syntax check")
             call["syntax_rejected"] = True
     return {"calls": ordered, "unpaired": unpaired,
             "returned": sorted(returned), "returns": returns,
