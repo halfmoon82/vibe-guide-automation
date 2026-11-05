@@ -916,8 +916,13 @@ class _LegacyUninvokedFixture(unittest.TestCase):
 
     def _write_lease(self):
         from vibe_guide.state import acquire_writer_lease
+        from vibe_guide.monitor import Monitor
+        snapshot = load_snapshot(self.paths, self.run_id)
+        intent = Monitor._prospective_intent_digest(
+            snapshot, self.NODE, "developer", 1, snapshot.nodes[self.NODE])
         self.assertTrue(acquire_writer_lease(
-            self.paths, self.NODE, self.node["worktree"], self.run_id))
+            self.paths, self.NODE, self.node["worktree"], self.run_id,
+            intent_digest=intent, role="developer", generation=1))
         [lease_file] = list((self.paths.vibe / "leases").glob("*.json"))
         return lease_file
 
@@ -956,12 +961,31 @@ class _LegacyUninvokedFixture(unittest.TestCase):
     def _receipt(self, session_id, archive="archived", read="archived"):
         path = Path(tempfile.mkdtemp(prefix="r4-receipt-")) / (
             "receipt-" + session_id + ".json")
+        read_result = {"id": session_id, "hostId": "local",
+                       "status": {"type": read},
+                       "latest_turn": [{"id": "terminal-turn", "status": "completed", "error": None}]}
+        archive_result = {"threadId": session_id, "archived": archive == "archived"}
+        entries = []
+        for call_id, tool, args, result in [
+            ("read-terminal", "read_thread", {"threadId": session_id}, read_result),
+            ("archive-terminal", "set_thread_archived", {"threadId": session_id, "archived": True}, archive_result),
+        ]:
+            entries.extend([
+                {"type": "response_item", "payload": {"type": "function_call", "name": tool,
+                    "call_id": call_id, "arguments": json.dumps(args)}},
+                {"type": "response_item", "payload": {"type": "function_call_output",
+                    "call_id": call_id, "output": json.dumps(result)}}])
+        source = self._rollout(entries, name="native-observer.jsonl")
         payload = {
-            "kind": "native_termination_receipt",
-            "session_id": session_id,
-            "read_thread_status": read,
-            "archive_status": archive,
-            "receipt_ref": "native read_thread/set_thread_archived",
+            "schema": 1, "kind": "native_consumer_termination_evidence",
+            "plan_id": "probe-plan", "run_id": self.run_id,
+            "source": "Codex App public read_thread and set_thread_archived tools",
+            "observer": {"session_record": str(source)},
+            "consumers": [{"thread_id": session_id,
+                           "native_observation": read_result,
+                           "native_archive_result": archive_result,
+                           "native_call_refs": {"read_thread": "read-terminal",
+                                                "set_thread_archived": "archive-terminal"}}],
         }
         path.write_text(json.dumps(payload, sort_keys=True),
                         encoding="utf-8")
@@ -969,10 +993,15 @@ class _LegacyUninvokedFixture(unittest.TestCase):
 
     def _consumer(self, session_id, path, calls=None, archive="archived",
                   read="archived", kind="owner"):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if not any(json.loads(line).get("type") == "session_meta" for line in lines):
+            path.write_text(json.dumps({"type": "session_meta", "payload": {"id": session_id}})
+                            + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
         receipt = self._receipt(session_id, archive, read)
         return {
             "session_id": session_id,
             "kind": kind,
+            "host": "local",
             "rollout_path": str(path),
             "rollout_sha256": self._sha(path),
             "native_terminal": {
@@ -980,6 +1009,8 @@ class _LegacyUninvokedFixture(unittest.TestCase):
                 "read_thread_status": read,
                 "receipt_path": str(receipt),
                 "receipt_sha256": self._sha(receipt),
+                "source_rollout_path": json.loads(receipt.read_text())["observer"]["session_record"],
+                "source_rollout_sha256": self._sha(Path(json.loads(receipt.read_text())["observer"]["session_record"])),
             },
             "native_calls": list(calls if calls is not None else []),
         }
@@ -1062,6 +1093,8 @@ class _LegacyUninvokedFixture(unittest.TestCase):
             "native_tool": "codex_app__create_thread",
             "request": {
                 "authorization_digest": self.auth_digest,
+                "target": {"type": "project", "projectId": "same-project",
+                           "environment": {"type": "local"}},
                 "child_binding": {
                     "node_id": self.NODE, "role": "developer",
                     "worktree": self.node["worktree"],
@@ -1437,8 +1470,8 @@ class RetireCrashRecoveryTests(_LegacyUninvokedFixture):
         # residue, no second event, then confirm passes.
         result = self._retire()
         self.assertEqual(result["status"], "retired")
-        self.assertFalse(intents[0].exists())
-        self.assertFalse(list(locks.glob("*.lock")))
+        self.assertEqual(json.loads(intents[0].read_text())["phase"], "complete")
+        self.assertTrue((locks / (self.action_id + ".lock")).is_file())
         self.assertEqual(
             len([e for e in load_events(self.paths, self.run_id)
                  if e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT]), 1)
@@ -1505,12 +1538,25 @@ class RetireDeclaredCreatesTests(_LegacyUninvokedFixture):
     def _consumer_with_create(self, payload_extra=None, returned_threads=None,
                               output_text=None, name="create_thread",
                               call_id="call-boot"):
+        successor = self.NEW_OWNER
+        prompt = "Resume this registered supervisor shift"
+        target = {"type": "project", "projectId": "same-project",
+                  "environment": {"type": "local"}}
+        successor_log = self._rollout([
+            {"type": "session_meta", "payload": {"id": successor}},
+            {"type": "response_item", "payload": {"type": "message",
+                "role": "user", "content": [{"type": "input_text", "text": prompt}]}},
+        ], name="successor.jsonl")
+        from vibe_guide.supervisor import _record_digest
+        registry_path = self.paths.vibe / "runs" / self.run_id / "supervisor-registry.json"
+        registry = json.loads(registry_path.read_text())
+        registry["current"]["session_record_digest"] = _record_digest(successor_log)
+        registry_path.write_text(json.dumps(registry))
         output_text = output_text or json.dumps(
-            {"threadId": "01a1aa87-0050-78d2-a720-0df5ae6212a1",
-             "hostId": "local"})
+            {"threadId": successor, "hostId": "local", "target": target})
         call_payload = {
             "type": "function_call", "name": name,
-            "call_id": call_id}
+            "call_id": call_id, "arguments": json.dumps({"prompt": prompt, "target": target})}
         if payload_extra:
             call_payload.update(payload_extra)
         entries = [
@@ -1527,16 +1573,25 @@ class RetireDeclaredCreatesTests(_LegacyUninvokedFixture):
             consumer["declared_creates"] = [{
                 "call_id": call_id,
                 "purpose": "supervisor rotation bootstrap",
+                "successor_record_path": str(successor_log),
+                "successor_record_sha256": self._sha(successor_log),
                 "returned_thread_ids": returned_threads}]
         return consumer
 
     def test_declared_bootstrap_create_passes(self):
         consumer = self._consumer_with_create(
-            returned_threads=["01a1aa87-0050-78d2-a720-0df5ae6212a1"])
+            returned_threads=[self.NEW_OWNER])
         evidence = self._mutate(
             lambda e: e["retired_consumers"].append(consumer))
         result = self._retire(evidence)
         self.assertEqual(result["status"], "retired")
+        event = [e for e in load_events(self.paths, self.run_id)
+                 if e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT][0]
+        creates = event["data"]["retirement_proof"]["creates"]
+        self.assertEqual(creates[0]["session_id"], "boot-supervisor")
+        self.assertEqual(creates[0]["successor_session_id"], self.NEW_OWNER)
+        self.assertEqual(len(creates[0]["parameters_digest"]), 64)
+        self.assertEqual(len(creates[0]["return_digest"]), 64)
 
     def test_undeclared_create_refuses(self):
         consumer = self._consumer_with_create(returned_threads=None)
@@ -1552,7 +1607,7 @@ class RetireDeclaredCreatesTests(_LegacyUninvokedFixture):
         consumer = self._consumer_with_create(
             payload_extra={"arguments": json.dumps(
                 {"action_id": self.action_id})},
-            returned_threads=["01a1aa87-0050-78d2-a720-0df5ae6212a1"])
+            returned_threads=[self.NEW_OWNER])
         evidence = self._mutate(
             lambda e: e["retired_consumers"].append(consumer))
         with self.assertRaises((PermissionError, ValueError)):
@@ -1562,7 +1617,7 @@ class RetireDeclaredCreatesTests(_LegacyUninvokedFixture):
         consumer = self._consumer_with_create(
             payload_extra={"arguments": json.dumps(
                 {"request_digest": self.request["request_digest"]})},
-            returned_threads=["01a1aa87-0050-78d2-a720-0df5ae6212a1"])
+            returned_threads=[self.NEW_OWNER])
         evidence = self._mutate(
             lambda e: e["retired_consumers"].append(consumer))
         with self.assertRaises((PermissionError, ValueError)):
@@ -1578,7 +1633,7 @@ class RetireDeclaredCreatesTests(_LegacyUninvokedFixture):
 
     def test_declared_phantom_create_refuses(self):
         consumer = self._consumer_with_create(
-            returned_threads=["01a1aa87-0050-78d2-a720-0df5ae6212a1"])
+            returned_threads=[self.NEW_OWNER])
         consumer["declared_creates"].append({
             "call_id": "call-ghost", "purpose": "phantom",
             "returned_thread_ids": ["x"]})
@@ -1775,3 +1830,313 @@ class RetireBaseCorrectionTests(_LegacyUninvokedFixture):
         save_snapshot(self.paths, snapshot)
         with self.assertRaises((PermissionError, ValueError)):
             self._retire()
+
+
+class R8ReceiptTests(_LegacyUninvokedFixture):
+    def test_consumer_rollout_must_be_the_named_session(self):
+        consumer = self.evidence["retired_consumers"][0]
+        path = Path(consumer["rollout_path"])
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["payload"]["id"] = "another-session"
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        consumer["rollout_sha256"] = self._sha(path)
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+    def test_arbitrary_digest_file_is_not_terminal_proof(self):
+        consumer = self.evidence["retired_consumers"][0]
+        receipt = Path(consumer["native_terminal"]["receipt_path"])
+        receipt.write_text("# README, not a native receipt")
+        consumer["native_terminal"]["receipt_sha256"] = self._sha(receipt)
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+    def test_receipt_content_must_bind_session_run_host_and_source(self):
+        consumer = self.evidence["retired_consumers"][0]
+        receipt = Path(consumer["native_terminal"]["receipt_path"])
+        original = json.loads(receipt.read_text())
+        mutations = [
+            lambda d: d["consumers"][0].update(thread_id="other"),
+            lambda d: d.update(run_id="run-other"),
+            lambda d: d["consumers"][0]["native_observation"].update(hostId="foreign"),
+            lambda d: d.update(source=""),
+            lambda d: d["consumers"][0]["native_observation"]["status"].update(type="active"),
+            lambda d: d["consumers"][0]["native_archive_result"].update(archived=False),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                data = copy.deepcopy(original)
+                mutate(data)
+                receipt.write_text(json.dumps(data))
+                consumer["native_terminal"]["receipt_sha256"] = self._sha(receipt)
+                with self.assertRaises((PermissionError, ValueError)):
+                    self._retire()
+
+
+
+class R8CreateTests(RetireDeclaredCreatesTests):
+    def test_rewritten_worker_cannot_self_declare_bootstrap(self):
+        consumer = self._consumer_with_create(
+            payload_extra={"arguments": json.dumps({
+                "prompt": "rewritten worker instructions",
+                "target": {"type": "project", "projectId": "same-project",
+                           "environment": {"type": "local"}}})},
+            returned_threads=[self.NEW_OWNER])
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(self._mutate(
+                lambda e: e["retired_consumers"].append(consumer)))
+
+    def test_unknown_javascript_cannot_be_zero_create(self):
+        cases = [
+            'const f=tools.mcp__codex_app__create_thread; await f({});',
+            '`${await tools.mcp__codex_app__create_thread({})}`',
+            'await tools.mcp__codex_app__create_thread ({})',
+            'const f=tools["mcp__codex_app__create_thread"]; await f({});',
+            'const t=globalThis["tools"]; await t["svc__codex_app__create_thread"]({});',
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                try:
+                    count = plan_amendment._embedded_create_invocations(source)
+                except (ValueError, PermissionError):
+                    continue
+                self.assertGreater(count, 0)
+
+    def test_mixed_return_text_does_not_bind_created_thread(self):
+        consumer = self._consumer_with_create(
+            returned_threads=[self.NEW_OWNER],
+            output_text='error: no task created; note ' + self.NEW_OWNER)
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(self._mutate(
+                lambda e: e["retired_consumers"].append(consumer)))
+
+
+class R8LockLeaseTests(_LegacyUninvokedFixture):
+    def test_legacy_unbound_lease_cannot_retire_action(self):
+        from vibe_guide.state import release_writer_lease, acquire_writer_lease
+        self.assertTrue(release_writer_lease(self.paths, self.NODE, self.node["worktree"], self.run_id))
+        self.assertTrue(acquire_writer_lease(self.paths, self.NODE, self.node["worktree"], self.run_id))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+    def test_action_lock_identity_remains_after_retire(self):
+        self._retire()
+        lock = self.paths.vibe / "provider-actions" / "locks" / (self.action_id + ".lock")
+        self.assertTrue(lock.is_file(), "shared flock inode must never be unlinked")
+        inode = lock.stat().st_ino
+        self._retire()
+        self.assertEqual(lock.stat().st_ino, inode)
+
+    def test_queued_complete_and_late_complete_share_stable_inode(self):
+        import subprocess
+        import sys
+        import time
+        from unittest.mock import patch
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        lock = self.paths.vibe / "provider-actions" / "locks" / (self.action_id + ".lock")
+        child = ("from pathlib import Path; from vibe_guide.paths import ProjectPaths; "
+                 "from vibe_guide.adapters.task_provider import ProviderActionStore; "
+                 "import sys; print('ready', flush=True); "
+                 "ProviderActionStore(ProjectPaths(Path(sys.argv[1]))).complete("
+                 "sys.argv[2], {'thread_id':'late'}, native=False)")
+        spawned = []
+        original = plan_amendment.save_snapshot
+
+        def queue_before_unlock(*args):
+            process = subprocess.Popen([sys.executable, "-c", child, str(self.root), self.action_id],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            spawned.append(process)
+            self.assertEqual(process.stdout.readline().strip(), "ready")
+            time.sleep(0.2)
+            self.assertIsNone(process.poll())
+            return original(*args)
+
+        with patch.object(plan_amendment, "save_snapshot", side_effect=queue_before_unlock):
+            self._retire()
+        inode = lock.stat().st_ino
+        output, errors = spawned[0].communicate(timeout=10)
+        self.assertEqual(spawned[0].returncode, 0, errors)
+        self.assertEqual(lock.stat().st_ino, inode)
+        self._confirm_blocked()
+        self.assertTrue(ProviderActionStore(self.paths).complete(
+            self.action_id, {"thread_id": "late"}, native=False))
+        self.assertEqual(lock.stat().st_ino, inode)
+        self._confirm_blocked()
+
+    def test_foreign_run_lease_blocks_retire(self):
+        from vibe_guide.state import _lease_id
+        data = json.loads(self.lease_file.read_text())
+        data.update(run_id="run-other", lease_id=_lease_id(
+            self.NODE, self.node["worktree"], "run-other", data["role"],
+            data["generation"], data["intent_digest"]))
+        self.lease_file.write_text(json.dumps(data))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+        self.assertTrue(self.lease_file.exists())
+
+    def test_foreign_run_same_root_blocks_confirm(self):
+        self._retire()
+        from vibe_guide.state import acquire_writer_lease
+        self.assertTrue(acquire_writer_lease(
+            self.paths, self.NODE, self.node["worktree"], "run-other"))
+        self._confirm_blocked()
+
+    def test_release_failure_cannot_report_retired(self):
+        from unittest.mock import patch
+        with patch.object(plan_amendment, "release_writer_lease", return_value=False):
+            with self.assertRaises((PermissionError, ValueError)):
+                self._retire()
+        self.assertTrue(self.lease_file.exists())
+
+    def test_event_readback_retains_proof_but_redacts_text(self):
+        self._retire()
+        [event] = [e for e in load_events(self.paths, self.run_id)
+                   if e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT]
+        proof = event["data"].get("retirement_proof", {})
+        self.assertEqual(proof.get("evidence_sha256"), hashlib.sha256(
+            json.dumps(self.evidence, ensure_ascii=False,
+                       sort_keys=True).encode()).hexdigest())
+        self.assertEqual(proof["owner_takeover"]["old_session_id"], self.OLD_OWNER)
+        self.assertEqual(proof["retired_consumers"][0]["rollout_sha256"],
+                         self.evidence["retired_consumers"][0]["rollout_sha256"])
+
+    def test_event_proof_rejects_sensitive_free_text(self):
+        from vibe_guide.contracts import RunEvent
+        from vibe_guide.state import append_event
+        secret = "sk-sensitive-example-123456"
+        append_event(self.paths, RunEvent("retire_uninvoked_legacy", {
+            "run_id": self.run_id, "plan_id": "probe-plan",
+            "retirement_proof": {"evidence_sha256": "a" * 64,
+                "prompt": secret, "requests": [{"action_id": secret,
+                    "request_digest": "b" * 64, "provider_output": secret}],
+                "owner_takeover": {"old_session_id": secret, "raw": secret}},
+        }), {"role": "system", "generation": 0})
+        data = load_events(self.paths, self.run_id)[-1]["data"]
+        self.assertEqual(data["retirement_proof"]["evidence_sha256"], "a" * 64)
+        self.assertEqual(data["retirement_proof"]["requests"][0]["request_digest"], "b" * 64)
+        self.assertNotIn(secret, json.dumps(data))
+
+
+class R8CorrectionRecoveryTests(RetireBaseCorrectionTests):
+    def _add_second_pending_action(self):
+        from vibe_guide.monitor import Monitor
+        from vibe_guide.state import acquire_writer_lease
+
+        node_id = "probe-node-b"
+        snapshot = load_snapshot(self.paths, self.run_id)
+        node = dict(snapshot.nodes[node_id])
+        head = self._git_init_branch(self.root / node["worktree"], node["branch"])
+        node.update(status="running", worktree_base=head, active_task=None,
+                    active_role=None, retryable_action={
+                        "role": "developer", "phase": "develop",
+                        "last_observation_ref": "provider-pending",
+                        "same_task": True, "same_task_required": True,
+                        "successor": False})
+        snapshot.nodes[node_id] = node
+        save_snapshot(self.paths, snapshot)
+        intent = Monitor._prospective_intent_digest(
+            snapshot, node_id, "developer", 1, node)
+        self.assertTrue(acquire_writer_lease(
+            self.paths, node_id, node["worktree"], self.run_id,
+            intent_digest=intent, role="developer", generation=1))
+
+        basis = {"operation": "create", "provider": "codex-app-visible",
+                 "run_id": self.run_id, "issue_id": node_id,
+                 "role": "developer", "generation": 1, "sequence": 0}
+        action_id = "action-" + plan_amendment._canonical_digest(basis)[:32]
+        request = {"schema_version": 1, "action_id": action_id,
+                   "native_tool": "codex_app__create_thread",
+                   "request": {"authorization_digest": self.auth_digest,
+                               "target": {"type": "project", "projectId": "same-project",
+                                          "environment": {"type": "local"}},
+                               "child_binding": {"node_id": node_id, "role": "developer",
+                                                 "worktree": node["worktree"],
+                                                 "branch": node["branch"]}}, **basis}
+        request["request_digest"] = plan_amendment._canonical_digest(request)
+        path = self.paths.vibe / "provider-actions" / "requests" / (action_id + ".json")
+        path.write_text(json.dumps(request, sort_keys=True), encoding="utf-8")
+        self.evidence["requests"].append({
+            "action_id": action_id, "request_digest": request["request_digest"],
+            "request_sha256": self._sha(path), "issue_id": node_id,
+            "role": "developer", "generation": 1})
+        self.evidence["worktrees"].append({"node_id": node_id,
+            "worktree": node["worktree"], "branch": node["branch"], "head": head})
+        return node_id, action_id, head
+
+    def test_two_actions_recover_each_boundary_without_losing_holds(self):
+        from unittest.mock import patch
+        from tests import support_v45_authorize
+
+        for boundary in ("stale-first", "stale-second", "before_event", "after_event",
+                         "after_snapshot", "lease-first", "lease-second", "after_cleanup"):
+            with self.subTest(boundary=boundary):
+                fixture = R8CorrectionRecoveryTests(methodName="runTest")
+                spec = copy.deepcopy(support_v45_authorize._NODE_SPEC)
+                second = copy.deepcopy(spec["nodes"][0])
+                second.update(id="probe-node-b", title="探针节点 B")
+                spec["nodes"][0]["contract"]["files"] = ["probe-a.py"]
+                second["contract"]["files"] = ["probe-b.py"]
+                spec["nodes"].append(second)
+                with patch.object(support_v45_authorize, "_NODE_SPEC", spec):
+                    fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                node_b, action_b, head_b = fixture._add_second_pending_action()
+                holds = fixture.paths.vibe / "runs" / fixture.run_id / "supervisor-holds.json"
+                hold_bytes = b'{"probe-node-a":{"reason":"hold-a"},"probe-node-b":{"reason":"hold-b"}}'
+                holds.write_bytes(hold_bytes)
+                fault = {"stale-first": "after_stale:" + fixture.action_id,
+                         "stale-second": "after_stale:" + action_b,
+                         "lease-first": "after_lease:" + fixture.NODE,
+                         "lease-second": "after_lease:" + node_b}.get(boundary, boundary)
+                with self.assertRaises(RuntimeError):
+                    plan_amendment.retire_uninvoked_legacy(
+                        fixture.paths, "probe-plan", fixture.digest, fixture.evidence,
+                        _fault_at=fault)
+                self.assertEqual(holds.read_bytes(), hold_bytes)
+                self.assertEqual(fixture._retire()["status"], "retired")
+                self.assertEqual(fixture._retire()["status"], "retired")
+                self.assertEqual(holds.read_bytes(), hold_bytes)
+                events = [e for e in load_events(fixture.paths, fixture.run_id)
+                          if e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT]
+                self.assertEqual(len(events), 1)
+                self.assertEqual(set(events[0]["data"]["superseded_creates"]),
+                                 {fixture.action_id, action_b})
+                snapshot = load_snapshot(fixture.paths, fixture.run_id)
+                self.assertEqual(snapshot.nodes[fixture.NODE]["worktree_base"], fixture.corrected_base)
+                self.assertEqual(snapshot.nodes[node_b]["worktree_base"], head_b)
+                for node_id in (fixture.NODE, node_b):
+                    self.assertEqual(snapshot.nodes[node_id]["status"], "planned")
+                    self.assertIsNone(snapshot.nodes[node_id]["retryable_action"])
+                self.assertFalse(list((fixture.paths.vibe / "leases").glob("*.json")))
+
+    def test_correction_replay_all_crash_boundaries(self):
+        for fault in ("after_stale:" + self.action_id, "before_event", "after_event",
+                      "after_snapshot", "after_lease:" + self.NODE, "after_cleanup"):
+            with self.subTest(fault=fault):
+                # Each subtest gets its own independent fixture.
+                fixture = R8CorrectionRecoveryTests(methodName="runTest")
+                fixture.setUp()
+                actual_fault = fault.replace(self.action_id, fixture.action_id)
+                with self.assertRaises(RuntimeError):
+                    plan_amendment.retire_uninvoked_legacy(
+                        fixture.paths, "probe-plan", fixture.digest, fixture.evidence, _fault_at=actual_fault)
+                self.assertEqual(fixture._retire()["status"], "retired")
+                self.assertEqual(fixture._retire()["status"], "retired")
+                events = [e for e in load_events(fixture.paths, fixture.run_id)
+                          if e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT]
+                self.assertEqual(len(events), 1)
+                self.assertEqual(load_snapshot(fixture.paths, fixture.run_id).nodes[fixture.NODE]["worktree_base"], fixture.corrected_base)
+                fixture.doCleanups()
+
+    def test_snapshot_to_lease_crash_replays_same_correction(self):
+        from unittest.mock import patch
+        with patch.object(plan_amendment, "release_writer_lease",
+                          side_effect=RuntimeError("crash after snapshot")):
+            with self.assertRaises(RuntimeError):
+                self._retire()
+        self.assertEqual(load_snapshot(self.paths, self.run_id)
+                         .nodes[self.NODE]["worktree_base"], self.corrected_base)
+        self.assertEqual(self._retire()["status"], "retired")
+        self.assertEqual(self._retire()["status"], "retired")
+        self.assertEqual(len([e for e in load_events(self.paths, self.run_id)
+                             if e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT]), 1)

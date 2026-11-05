@@ -231,3 +231,41 @@ python3 -m vibe_guide --help; git diff --check   # OK
 - epoch2 原生终止回执为合成 shape（archive_status/read_thread_status 已由 owner 原生核验，但未有独立 receipt 文件落盘）；其余 5 消费者可用 native-consumer-termination.json 作为 receipt 源。
 - 协调者活动日志仅绑定到 prefix cut-off（audit JSON cc477f7b…f8f60b5eda96c25f55dfc2），其后的 create 仍按 unknown 处理。
 - 模板字符串内嵌入调用的 lexing 为保守边界；真实日志未出现该形态。
+
+## 第 8 次交付（R8-1～6 返工，待独立复审）
+
+本节取代第 7 次交付中的锁文件删除、宽松 create 判定和 proof PASS 叙述；历史记录仅作当时自报，不作为当前验证结论。第 7 次声称全量基线等价和 flake 的归因本轮未独立证实，保持 **UNKNOWN**，不据此宣称无回归。临时脚本合成回执不构成原生终止证据。
+
+接班基线：branch fix/v528-r4-preconditions、HEAD 7f0376fb9bc7ca3876e259692714e972731127a4；本次 successor 接手前以 /tmp/r4-epoch4-terra2-freeze.json 校验四个未提交文件 SHA、HEAD、branch、status 均一致。本节是开发验证，不代表独立 reviewer 清零或真实 run 可执行。
+
+### 六项实现及验证
+
+1. **R8-1 回执**：匹配 plan/run、consumer/session、host、状态和终止 turn；调用引用须匹配源记录中的原生参数及结构化返回，rollout session_meta 也须对应。任意文件 SHA、篡改状态/来源及其他 session 拒绝。fixture：R8ReceiptTests。
+2. **R8-2 create**：静态解析参数并拒绝未知间接/动态形式；允许排除的 create 须绑定 target、结构化返回、已登记 supervisor successor 的 session record 及该会话首条 prompt；调用及返回摘要入事件。R8CreateTests 检查改写 worker prompt、混合返回、未知 JS；RetireDeclaredCreatesTests 检查合法继任及假声明。多次 create 同一调用返回暂按未知拒绝，不广泛放行 bootstrap。
+3. **R8-3 锁**：保留共享 action lock inode 和 complete intent，不在持锁时 unlink；test_queued_complete_and_late_complete_share_stable_inode 用独立子进程测试排队 complete、后来调用和迟到结果阻断。
+4. **R8-4 崩溃恢复**：同证据摘要和 action 集合绑定唯一已提交事件，纠偏投影事件后可恢复；单 action 的 stale/event/snapshot/lease/cleanup 各中断点重复执行只产生一个事件。新增双节点、双 action 夹具，逐个 stale、event 前后、snapshot、逐 lease、cleanup 共八个中断点重放两次，核对唯一事件、两个状态、纠偏、租约与 hold 原字节；禁用事件恢复的 mutation 使测试失败。该测试仍须独立审查。
+5. **R8-5 租约**：同一 lease 锁内按 run/node/root/status/role/generation/intent 验证，完整记录 CAS 释放，失败抛错；跨 run 同 root 或节点冲突阻断；未绑定 action 的旧租约拒绝。见 R8LockLeaseTests。
+6. **R8-6 事件**：真实 append/readback 保留结构化 plan/run/授权/候选、request/consumer/lease/create 摘要、epoch 与纠偏摘要；提供敏感文本负例和同一证据崩溃重放。
+
+### RED → GREEN 与验证
+
+- 前任 RED：/tmp/r4-r8-red.log，11 个新测试产生 16 failures + 1 error（含子例）。接班后起点 25 项中 2 失败；额外发现未绑定旧 lease、错误 session rollout、动态属性绕过及事件缺 create 摘要，均先复现失败后修复。
+- PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_plan_amendment*.py'：111 项 OK；test_local_commit_authorization.py：23 项 OK。来源为指定 writer root，版本 5.2.7，加载时 HEAD 如上。
+- 冻结源码全量：`PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 -m unittest discover -s tests -v`，4195 项、50 failures、21 errors、3 skipped、4 expected failures，exit 1；日志 `/tmp/r4-r8-full-epoch4.log`。**全量失败，非 PASS。**
+- 全量发现 helper ratchet 本次回归，原因是新增私有摘要 helper 与共享摘要约束冲突；修复复用 `sha256_bytes` 并保留原排序 JSON 的字节编码。修复后 `tests.test_helper_ratchet`、双 action 恢复、真实事件读回共 17 项 OK，111 项定向重新通过。全量是在此最小修复前的冻结源码执行；修复后未重复整套，不能声称最终源码全量通过。
+- 失败归因：与前一完整失败日志 `/tmp/r4_full_v2.log` 按测试名比较，71 条中 63 条相同；这不等于基线证明。29 条接管失败中 29 条与既有 8852367 基线日志 `/tmp/r4-t1-base.log` 同名；敏感身份一项亦有基线失败。差异中的两个安装测试在已有干净基线 8852367 与当前树复现相同缺包/缺入口；另外四个差异项单独重跑当前树通过，其中整合审查一项在组合重跑仍失败、单独通过。其余同名与差异项的根因/回归关系保持 UNKNOWN；测试报告 `/tmp/r4-new-fail-current.log`、`/tmp/r4-new-fail-baseline.log`、`/tmp/r4-closeout-isolated.log`。未新建基线 worktree、未修改基线源码。
+- python3 -m vibe_guide --help 与 git diff --check 通过。首次本轮运行因源码变化中断（退出 130），不计为完整结果。
+
+### 真实回执及未验证边界
+
+对 epoch2 01a1aa72-4b33-70c1-9138-a6776b3fc293，以 epoch2-native-terminal-receipt.json 与真实 observer session 源的 read/archive 调用和返回只读核对通过。owner 随后提供 epoch4-native-terminal-receipt.json（SHA-256 163620b58ede1c6cd3ca7fecf99e39cd3df3bc84557d7e0b441b250386e26415），包含以下五个 consumer 的调用引用；只读验证 observer 快照长度、SHA 与原日志前缀逐字节一致，并用 `_verify_terminal_receipt` 对五行逐项通过。此前 native-consumer-termination.json 本身仍缺调用引用。这只证明上述终止调用及绑定，**完整消费日志、请求排除、唯一 writer 与真实 retire 全链仍 UNKNOWN**：
+
+- 01a1a449-fdcf-76f2-86ec-cf3140bdd562
+- 01a1a596-77a2-7a23-8db7-70b4d0c5a2db
+- 01a1a5d5-8ef4-7701-b0f5-9dbb5c1969a2
+- 01a1a593-4497-7e82-afc7-52ac64e3128e
+- 01a1a593-6bc2-7232-b9b4-ea1c6e60a568
+
+完整证据仍须绑定 consumer 的 rollout SHA、session_meta、全部调用与请求、lease，并由独立 reviewer 核验；活动源日志持续追加时全文件 SHA 会变化，不能视为稳定。禁止合成补证。
+
+真实目标 run 的 retire、confirm、hold release、resume、daemon、mailbox 均未执行；真实跨 action 全链证据、桌面能力、远端 Git、发布与 deploy 均未验证或未授权。未创建新 worktree、任务或依赖；未 push、PR、merge。

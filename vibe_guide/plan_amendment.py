@@ -66,7 +66,7 @@ from .dag import (
     integration_review_scope,
     is_integration_review_node,
 )
-from .digests import sha256_file as _artifact_hash
+from .digests import sha256_bytes, sha256_file as _artifact_hash
 from .fsio import JsonCorruptError, JsonMissingError, read_json as _fsio_read_json
 from .diagnostics import assert_planning_gate, require_execution_ready
 from .models import DAGNode, Plan, node_branch, node_worktree
@@ -83,6 +83,8 @@ from .state import (
     load_events,
     load_snapshot,
     read_writer_lease,
+    retirement_writer_lease,
+    _lease_lock,
     release_writer_lease,
     save_snapshot,
 )
@@ -146,75 +148,157 @@ _EMBEDDED_CREATE_MARKERS = (
 )
 
 
-def _embedded_create_invocations(text: str) -> int:
-    """Create invocations in exec JavaScript outside strings and comments.
-
-    A tools.mcp__codex_app__create_thread( inside a quoted cmd string (a
-    subprocess can never reach host tools), inside a prompt, or inside a
-    comment is a textual reference.  Template-literal expressions are
-    scanned as string content -- a conservative limitation of this lexical
-    pass, recorded here instead of guessed around.
-    """
-    count = 0
+def _js_tokens(source: str) -> List[Any]:
+    """Lex data literals without running JavaScript. Unknown executable forms refuse."""
+    import ast
+    tokens = []
     index = 0
-    state = None  # None | 'single' | 'double' | 'template' | 'line' | 'block'
-    length = len(text)
-    while index < length:
-        char = text[index]
-        nxt = text[index + 1] if index + 1 < length else ""
-        if state is None:
-            if char == "/" and nxt == "/":
-                state = "line"
-                index += 2
-                continue
-            if char == "/" and nxt == "*":
-                state = "block"
-                index += 2
-                continue
-            if char == "'":
-                state = "single"
-                index += 1
-                continue
-            if char == chr(34):
-                state = "double"
-                index += 1
-                continue
-            if char == chr(96):
-                state = "template"
-                index += 1
-                continue
-            matched = False
-            for marker in _EMBEDDED_CREATE_MARKERS:
-                if text.startswith(marker, index):
-                    count += 1
-                    index += len(marker)
-                    matched = True
+    while index < len(source):
+        char = source[index]
+        if char.isspace():
+            index += 1
+            continue
+        if source.startswith("//", index):
+            end = source.find("\n", index)
+            index = len(source) if end < 0 else end + 1
+            continue
+        if source.startswith("/*", index):
+            end = source.find("*/", index + 2)
+            if end < 0:
+                raise ValueError("unterminated JavaScript comment")
+            index = end + 2
+            continue
+        if char in {"'", '"', "`"}:
+            quote, start = char, index
+            index += 1
+            while index < len(source):
+                if source[index] == "\\":
+                    index += 2
+                    continue
+                if source[index] == quote:
                     break
-            if not matched:
                 index += 1
-            continue
-        if state == "line":
-            if char == chr(10):
-                state = None
+            if index == len(source):
+                raise ValueError("unterminated JavaScript literal")
+            raw = source[start:index + 1]
+            if quote == "`":
+                if "${" in raw:
+                    # Expressions can execute calls, even when the template
+                    # value is discarded. Never count them as quoted text.
+                    raise ValueError("template interpolation has unknown native effects")
+                value = raw[1:-1]
+            else:
+                try:
+                    value = json.loads(raw) if quote == '"' else ast.literal_eval(raw)
+                except (ValueError, SyntaxError) as error:
+                    raise ValueError("unknown JavaScript string literal") from error
+            tokens.append(("string", value))
             index += 1
             continue
-        if state == "block":
-            if char == "*" and nxt == "/":
-                state = None
-                index += 2
-                continue
+        match = re.match(r"[A-Za-z_$][A-Za-z0-9_$]*|[0-9]+", source[index:])
+        if match:
+            value = match.group(0)
+            tokens.append(("id", value))
+            index += len(value)
+        else:
+            tokens.append(("punct", char))
             index += 1
-            continue
-        if char == chr(92):
-            index += 2
-            continue
-        if ((state == "single" and char == "'")
-                or (state == "double" and char == chr(34))
-                or (state == "template" and char == chr(96))):
-            state = None
-        index += 1
-    return count
+    return tokens
 
+
+def _static_js_value(tokens, position, constants):
+    if position >= len(tokens):
+        raise ValueError("missing native call argument")
+    kind, value = tokens[position]
+    if kind == "string":
+        return value, position + 1
+    if kind == "id":
+        if value in {"true", "false", "null"}:
+            return {"true": True, "false": False, "null": None}[value], position + 1
+        if value.isdigit():
+            return int(value), position + 1
+        if value in constants:
+            return copy.deepcopy(constants[value]), position + 1
+        raise ValueError("native arguments contain an unresolved variable")
+    if value not in {"{", "["}:
+        raise ValueError("native arguments are not static data")
+    is_object = value == "{"
+    closing = "}" if is_object else "]"
+    result = {} if is_object else []
+    position += 1
+    while position < len(tokens) and tokens[position][1] != closing:
+        if is_object:
+            key_kind, key = tokens[position]
+            if key_kind not in {"id", "string"} or key in result:
+                raise ValueError("unknown/duplicate native argument key")
+            position += 1
+            if position < len(tokens) and tokens[position][1] == ":":
+                item, position = _static_js_value(tokens, position + 1, constants)
+            elif key in constants:
+                item = copy.deepcopy(constants[key])
+            else:
+                raise ValueError("unresolved shorthand native argument")
+            result[key] = item
+        else:
+            item, position = _static_js_value(tokens, position, constants)
+            result.append(item)
+        if position < len(tokens) and tokens[position][1] == ",":
+            position += 1
+        elif position >= len(tokens) or tokens[position][1] != closing:
+            raise ValueError("native arguments contain executable expressions")
+    if position >= len(tokens):
+        raise ValueError("unterminated native argument")
+    return result, position + 1
+
+
+def _static_tool_invocations(source, names):
+    tokens = _js_tokens(source)
+    constants, invocations = {}, []
+    for index, (kind, value) in enumerate(tokens):
+        if kind != "id":
+            continue
+        # A capability reference can be aliased/computed; refusing it is
+        # essential because absence of a literal call is not non-invocation.
+        if value == "tools":
+            if (index + 3 >= len(tokens) or tokens[index + 1][1] != "."
+                    or tokens[index + 2][0] != "id" or tokens[index + 3][1] != "("):
+                raise ValueError("indirect host tool access has unknown native effects")
+        if value in {"eval", "Function", "Reflect"}:
+            raise ValueError("dynamic JavaScript has unknown native effects")
+        if value == "const" and index + 3 < len(tokens) and tokens[index + 2][1] == "=":
+            try:
+                item, end = _static_js_value(tokens, index + 3, constants)
+                if end < len(tokens) and tokens[end][1] == ";":
+                    constants[tokens[index + 1][1]] = item
+            except ValueError:
+                pass
+        if value in constants and index + 1 < len(tokens) and tokens[index + 1][1] == "=":
+            # const reassignment, destructuring and computed evaluation are
+            # outside the auditable subset; do not evaluate a guessed value.
+            if index == 0 or tokens[index - 1][1] != "const":
+                raise ValueError("native argument constant was reassigned")
+        if value not in names:
+            continue
+        if index + 1 >= len(tokens) or tokens[index + 1][1] != "(":
+            raise ValueError("aliased native tool reference")
+        args, end = _static_js_value(tokens, index + 2, constants)
+        if not isinstance(args, dict) or end >= len(tokens) or tokens[end][1] != ")":
+            raise ValueError("native invocation arguments are unknown")
+        invocations.append((value, args))
+    return invocations
+
+
+def _embedded_create_invocations(text: str) -> int:
+    tokens = _js_tokens(text)
+    if any(kind == "id" and value in {"globalThis", "global", "window", "self"}
+           for kind, value in tokens):
+        raise ValueError("indirect global access has unknown native effects")
+    if any(kind == "string" and value in _FORBIDDEN_RETIRE_CALLS | {"svc__codex_app__create_thread", "tools"}
+           and index > 0 and tokens[index - 1][1] == "["
+           for index, (kind, value) in enumerate(tokens)):
+        raise ValueError("computed host access has unknown native effects")
+    return len(_static_tool_invocations(text, _FORBIDDEN_RETIRE_CALLS | {
+        "mcp__codex_app__create_thread"}))
 
 
 def project_paths(root: Any) -> ProjectPaths:
@@ -897,6 +981,13 @@ def _live_executors(paths: ProjectPaths, run_id: str) -> List[str]:
                 lease_run = lease.get("run_id")
                 status = lease.get("status")
                 if lease_run is not None and lease_run != run_id:
+                    roots = {(paths.root / str(node.get("worktree"))).resolve()
+                             for node in snapshot.nodes.values() if node.get("worktree")}
+                    lease_root = lease.get("worktree")
+                    if (not isinstance(lease_root, str)
+                            or (paths.root / lease_root).resolve() in roots
+                            or lease.get("node_id") in snapshot.nodes):
+                        problems.append("foreign run writer lease conflicts with this run: " + lease_file.name)
                     continue
                 # A released lease is unlinked, so anything on disk is an
                 # unproven writer: ``active`` is live, ``quarantined`` is
@@ -1381,7 +1472,7 @@ def _git_probe(worktree: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def _rollout_native_calls(path: Path) -> List[Dict[str, Any]]:
+def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
     """Structured call/return pairs of one rollout log; fail closed on noise.
 
     Only a real ``function_call``/tool-call payload names a native
@@ -1411,6 +1502,8 @@ def _rollout_native_calls(path: Path) -> List[Dict[str, Any]]:
                     path.name, line_number))
         payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else entry
         kind = payload.get("type")
+        if only_ids is not None and (payload.get("call_id") or payload.get("id")) not in only_ids:
+            continue
         if isinstance(kind, str) and "call" in kind and (
                 kind not in _NATIVE_CALL_TYPES
                 and kind not in _NATIVE_RETURN_TYPES):
@@ -1489,7 +1582,137 @@ def _retire_field(evidence: Dict[str, Any], key: str) -> Any:
     return value
 
 
-def _retire_consumer_proof(consumer: Dict[str, Any], index: int) -> None:
+def _native_return_values(payload):
+    """Decode structured native results, including the exec/MCP text envelope.
+
+    A thread id merely mentioned in prose, an error, or an unknown block
+    cannot be promoted to a create/termination result.
+    """
+    def decode(value):
+        if isinstance(value, str):
+            try:
+                return decode(json.loads(value))
+            except (ValueError, TypeError):
+                if re.fullmatch(r"Script completed\nWall time [^\n]+\nOutput:\n?", value):
+                    return []
+                raise ValueError("native return contains unstructured text")
+        if isinstance(value, list):
+            result = []
+            for block in value:
+                result.extend(decode(block))
+            return result
+        if not isinstance(value, dict):
+            raise ValueError("native return is not structured")
+        if value.get("isError") is True or value.get("error") not in (None, False):
+            raise ValueError("native return is an error")
+        if value.get("type") in {"text", "input_text"} and isinstance(value.get("text"), str):
+            return decode(value["text"])
+        if "content" in value:
+            return decode(value["content"])
+        return [value]
+    if not isinstance(payload, dict) or "output" not in payload:
+        raise ValueError("native return missing output")
+    return decode(payload["output"])
+
+
+def _native_call_arguments(call, tool):
+    payload = call.get("payload") or {}
+    name = str(call.get("name") or "")
+    aliases = {tool, "codex_app__" + tool, "svc__codex_app__" + tool,
+               "mcp__codex_app__" + tool, "tools.mcp__codex_app__" + tool}
+    if name in aliases:
+        args = payload.get("arguments")
+        try:
+            args = json.loads(args) if isinstance(args, str) else args
+        except ValueError as error:
+            raise ValueError("native call arguments are not JSON") from error
+        if not isinstance(args, dict):
+            raise ValueError("native call lacks actual arguments")
+        return [args]
+    source = payload.get("input")
+    if not isinstance(source, str):
+        raise ValueError("native call has no static arguments")
+    return [args for _name, args in _static_tool_invocations(source, aliases)]
+
+
+def _verify_terminal_receipt(consumer, plan_id, run_id, host):
+    session, terminal = consumer["session_id"], consumer["native_terminal"]
+    try:
+        receipt = json.loads(Path(terminal["receipt_path"]).read_text(encoding="utf-8"))
+        if (not isinstance(receipt, dict) or receipt.get("schema") != 1
+                or receipt.get("kind") != "native_consumer_termination_evidence"
+                or receipt.get("plan_id") != plan_id or receipt.get("run_id") != run_id
+                or not str(receipt.get("source") or "").startswith(
+                    "Codex App public read_thread and set_thread_archived")
+                or consumer.get("host") != host):
+            raise ValueError("native receipt source/plan/run/host mismatch")
+        rows = receipt.get("consumers")
+        if not isinstance(rows, list):
+            raise ValueError("native receipt consumers missing")
+        rows = [row for row in rows if isinstance(row, dict) and row.get("thread_id") == session]
+        if len(rows) != 1:
+            raise ValueError("native receipt does not uniquely bind the consumer")
+        row = rows[0]
+        observation, archived = row.get("native_observation"), row.get("native_archive_result")
+        if not isinstance(observation, dict) or not isinstance(archived, dict):
+            raise ValueError("native receipt missing tool results")
+        state = observation.get("status")
+        if (observation.get("id") != session or observation.get("hostId") != host
+                or not isinstance(state, dict) or state.get("type") != terminal["read_thread_status"]
+                or state.get("type") not in {"archived", "stopped", "failed", "closed", "terminated", "notLoaded"}
+                or archived.get("threadId") != session or archived.get("archived") is not True):
+            raise ValueError("native receipt terminal state/session/host mismatch")
+        turns = observation.get("latest_turn")
+        if (not isinstance(turns, list) or not turns
+                or any(not isinstance(turn, dict) or not turn.get("id")
+                       or turn.get("status") not in {"completed", "failed", "interrupted"} for turn in turns)):
+            raise ValueError("native receipt has no proven terminal turn")
+        source = terminal.get("source_rollout_path")
+        if not isinstance(source, str) or not source:
+            raise ValueError("native receipt requires source rollout binding")
+        if _artifact_hash(Path(source)) != terminal.get("source_rollout_sha256"):
+            raise ValueError("native receipt source digest mismatch")
+        observer = receipt.get("observer") or {}
+        if observer.get("session_record") is not None and observer["session_record"] != source:
+            raise ValueError("native receipt observer source mismatch")
+        refs = row.get("native_call_refs") or terminal.get("native_call_refs")
+        if not isinstance(refs, dict):
+            raise ValueError("native receipt requires tool call references")
+        if any(not isinstance(refs.get(tool), str) or not refs[tool]
+               for tool in ("read_thread", "set_thread_archived")):
+            raise ValueError("native receipt has invalid call references")
+        audit = _rollout_native_calls(Path(source), only_ids=set(refs.values()))
+        for tool in ("read_thread", "set_thread_archived"):
+            [call] = [call for call in audit["calls"] if call["call_id"] == refs.get(tool)]
+            args = _native_call_arguments(call, tool)
+            if len(args) != 1 or args[0].get("threadId") != session:
+                raise ValueError("native receipt source call targets another consumer")
+            if tool == "set_thread_archived" and args[0].get("archived") is not True:
+                raise ValueError("native receipt source did not archive")
+            values = _native_return_values(call.get("return_payload"))
+            if len(values) != 1:
+                raise ValueError("native receipt source return is ambiguous")
+            value = values[0]
+            if tool == "set_thread_archived":
+                if value.get("threadId") != session or value.get("archived") is not True:
+                    raise ValueError("native archive source return mismatch")
+            else:
+                thread = value.get("thread", value)
+                actual_turns = value.get("turns", value.get("latest_turn"))
+                if (thread.get("id") != session or thread.get("hostId") != host
+                        or thread.get("status") != observation["status"]
+                        or not isinstance(actual_turns, list)):
+                    raise ValueError("native read source return mismatch")
+                for turn in turns:
+                    if not any(all(other.get(k) == turn.get(k) for k in ("id", "status", "error"))
+                               for other in actual_turns if isinstance(other, dict)):
+                        raise ValueError("native source terminal turn mismatch")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise PermissionError("consumer {} native terminal proof invalid: {}".format(session, error)) from error
+
+
+def _retire_consumer_proof(consumer: Dict[str, Any], index: int,
+                           plan_id: str, run_id: str, host: str) -> Dict[str, Any]:
     """Re-verify one archived consumer's rollout inside the lock."""
     session = consumer.get("session_id")
     if not isinstance(session, str) or not session:
@@ -1521,6 +1744,7 @@ def _retire_consumer_proof(consumer: Dict[str, Any], index: int) -> None:
     except (OSError, ValueError) as error:
         raise PermissionError(
             "consumer {} receipt unreadable: {}".format(session, error))
+    _verify_terminal_receipt(consumer, plan_id, run_id, host)
     rollout = consumer.get("rollout_path")
     if not isinstance(rollout, str) or not rollout:
         raise ValueError(
@@ -1534,6 +1758,13 @@ def _retire_consumer_proof(consumer: Dict[str, Any], index: int) -> None:
     if actual != consumer.get("rollout_sha256"):
         raise PermissionError(
             "consumer {} rollout digest drifted".format(session))
+    try:
+        metadata = [json.loads(line).get("payload") for line in rollout_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip() and json.loads(line).get("type") == "session_meta"]
+    except (OSError, ValueError, AttributeError) as error:
+        raise PermissionError("consumer rollout metadata unreadable") from error
+    if len(metadata) != 1 or not isinstance(metadata[0], dict) or metadata[0].get("id") != session:
+        raise PermissionError("consumer rollout does not bind its session")
     try:
         audit = _rollout_native_calls(rollout_path)
     except (OSError, ValueError) as error:
@@ -1816,7 +2047,7 @@ def _retire_intent(store: ProviderActionStore, run_id: str,
             or data.get("run_id") != run_id):
         raise PermissionError(
             "a different retire attempt's intent record is present")
-    if data.get("phase") not in {"intent", "locked"}:
+    if data.get("phase") not in {"intent", "locked", "complete"}:
         raise PermissionError("retire intent record phase is invalid")
     return data
 
@@ -1937,6 +2168,26 @@ def _retire_stale_marker(store: ProviderActionStore, action_id: str):
     return data if isinstance(data, dict) else None
 
 
+def _retirement_event(paths, run_id, amendment_digest, evidence):
+    """History is authoritative only for this exact proof and request set."""
+    matches = [event for event in load_events(paths, run_id)
+               if event["event"] == RETIRE_UNINVOKED_EVENT
+               and event["data"].get("amendment_digest") == amendment_digest]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise PermissionError("multiple retirement boundary events")
+    event = matches[0]
+    data = event["data"]
+    if (data.get("plan_id") != evidence.get("plan_id")
+            or data.get("authorization_digest") != evidence.get("authorization_digest")
+            or data.get("retirement_proof", {}).get("evidence_sha256") != sha256_bytes(
+                json.dumps(evidence, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+            or set(data.get("superseded_creates", [])) != {r["action_id"] for r in evidence["requests"]}):
+        raise PermissionError("retirement event does not bind this evidence")
+    return event
+
+
 def _verify_retire_evidence(
         paths: ProjectPaths, plan_id: str, amendment_digest: str,
         evidence: Dict[str, Any]) -> Dict[str, Any]:
@@ -1967,6 +2218,7 @@ def _verify_retire_evidence(
         raise PermissionError(
             "retire evidence authorization does not bind the live record")
     snapshot = lineage["snapshot"]
+    committed = _retirement_event(paths, run_id, amendment_digest, evidence)
     takeover = evidence.get("owner_takeover")
     if not isinstance(takeover, dict):
         raise ValueError("retire evidence requires owner_takeover")
@@ -1999,7 +2251,7 @@ def _verify_retire_evidence(
     for index, consumer in enumerate(retired):
         if not isinstance(consumer, dict):
             raise ValueError("retired consumer {} must be an object".format(index))
-        audits.append(_retire_consumer_proof(consumer, index))
+        audits.append(_retire_consumer_proof(consumer, index, plan_id, run_id, current.get("host")))
         retired_ids.add(consumer["session_id"])
     for audit in audits:
         for call_id in audit["unpaired"]:
@@ -2026,7 +2278,7 @@ def _verify_retire_evidence(
                 + ", ".join(str(item) for item in uncovered))
     store = ProviderActionStore(paths)
     pairs = _retire_request_problems(store, evidence, run_id)
-    _verify_declared_creates(pairs, retired, audits)
+    creates = _verify_declared_creates(paths, registry, pairs, retired, audits)
     worktrees = evidence.get("worktrees")
     if not isinstance(worktrees, list) or len(worktrees) != len(pairs):
         raise ValueError(
@@ -2074,15 +2326,25 @@ def _verify_retire_evidence(
         if worktree != node.get("worktree") or branch != node.get("branch"):
             raise PermissionError(
                 "node {} worktree/branch evidence does not bind".format(node_id))
-        if read_writer_lease(paths, node_id, str(worktree)) is None:
-            foreign = (paths.vibe / "leases")
-            held = any(
-                json.loads(candidate.read_text(encoding="utf-8")).get("node_id") == node_id
-                for candidate in foreign.glob("*.json")
-                if candidate.is_file()) if foreign.is_dir() else False
-            if held or node.get("status") != "planned":
-                raise PermissionError(
-                    "node {} writer lease is missing or foreign".format(node_id))
+        lease = retirement_writer_lease(paths, node_id, str(worktree), run_id)
+        if lease is None and committed is None:
+            raise PermissionError("writer lease missing before retirement boundary")
+        request = next((a for _id, _p, _old, a in pairs if a.get("issue_id") == node_id), None)
+        if request is None:
+            raise PermissionError("worktree has no matching retired request")
+        if lease is not None:
+            record = lease["record"]
+            from .monitor import Monitor
+            intent = (node.get("start_intent") or {}).get("intent_digest") or Monitor._prospective_intent_digest(
+                snapshot, node_id, request["role"], request["generation"], node)
+            if (record.get("role") != request["role"]
+                    or record.get("generation") != request["generation"]
+                    or record.get("intent_digest") != intent):
+                raise PermissionError("writer lease does not bind the retired action intent")
+            if committed is not None:
+                recorded = committed["data"]["retirement_proof"].get("leases", [])
+                if not any(row.get("lease_id") == record["lease_id"] for row in recorded):
+                    raise PermissionError("writer lease changed after retirement event")
         wt_path = paths.root / str(worktree)
         if not wt_path.is_dir():
             raise PermissionError(
@@ -2104,7 +2366,12 @@ def _verify_retire_evidence(
                 "node {} worktree head is not the bound head".format(node_id))
         stored_base = node.get("worktree_base")
         if corrected_base is not None:
-            if stored_base != correction.get("old_snapshot_base"):
+            correction_committed = (committed is not None and
+                committed["data"].get("base_corrections", {}).get(node_id) == {
+                    "old_snapshot_digest": correction.get("old_snapshot_base"),
+                    "corrected_base_digest": corrected_base})
+            if (stored_base != correction.get("old_snapshot_base")
+                    and not (correction_committed and stored_base == corrected_base)):
                 raise PermissionError(
                     "node {} stored worktree_base does not match the "
                     "correction premise".format(node_id))
@@ -2124,7 +2391,7 @@ def _verify_retire_evidence(
                 "node {} worktree is not clean".format(node_id))
         clean_nodes[node_id] = {
             "worktree": worktree, "head": actual_head,
-            "corrected_base": corrected_base}
+            "corrected_base": corrected_base, "lease": lease}
     request_nodes = {
         str(item.get("issue_id")) for item in evidence["requests"]}
     if set(clean_nodes) != request_nodes:
@@ -2136,8 +2403,10 @@ def _verify_retire_evidence(
         "pairs": pairs,
         "takeover": takeover,
         "retired_consumers": retired,
+        "creates": creates,
         "clean_nodes": clean_nodes,
         "store": store,
+        "committed": committed,
     }
 
 
@@ -2158,21 +2427,11 @@ def _call_return_text(payload: Any) -> Optional[str]:
 
 
 def _verify_declared_creates(
-        pairs: List[Any], consumers: List[Dict[str, Any]],
+        paths: ProjectPaths, registry: Dict[str, Any], pairs: List[Any], consumers: List[Dict[str, Any]],
         audits: List[Dict[str, Any]]) -> None:
-    """Every flagged create is declared, returned and not a retired request.
-
-    A retired supervisor legitimately invokes ``create_thread`` for its own
-    successor or for bootstrap housekeeping, so 'zero creates in every
-    consumer log' is the wrong invariant.  The right one is: a flagged
-    create call is safe only when (a) its payload provably does not carry
-    the identity of any retired pending request -- the action id, the
-    request digest, or the worker prompt verbatim that the mailbox
-    request would have delivered -- and (b) the evidence declares it with
-    the thread ids its audited return actually produced.  Undeclared,
-    undeclared-only, unreturned or binding calls all fail closed.
-    """
+    """Only a demonstrably registered supervisor successor is excluded."""
     bindings = []
+    create_proofs = []
     for action_id, _path, _already, action in pairs:
         marks = {str(action_id)}
         digest = action.get("request_digest")
@@ -2211,6 +2470,8 @@ def _verify_declared_creates(
                 raise ValueError(
                     "consumer {} declared_creates[{}] requires call_id".format(
                         session, index))
+            if call_id in declared_map:
+                raise ValueError("duplicate declared create call")
             declared_map[call_id] = item
         flagged = [
             call for call in audit["calls"]
@@ -2230,36 +2491,69 @@ def _verify_declared_creates(
                 raise PermissionError(
                     "consumer {} has an undeclared create invocation {} at "
                     "line {}".format(session, call["call_id"], call["line"]))
-            purpose = declaration.get("purpose")
-            if not isinstance(purpose, str) or not purpose.strip():
-                raise ValueError(
-                    "consumer {} declared create {} requires purpose".format(
-                        session, call["call_id"]))
+            args_list = _native_call_arguments(call, "create_thread")
             thread_ids = declaration.get("returned_thread_ids")
-            if (not isinstance(thread_ids, list) or not thread_ids
+            if (not isinstance(thread_ids, list) or len(thread_ids) != len(args_list)
+                    or not thread_ids or len(set(thread_ids)) != len(thread_ids)
                     or any(not isinstance(item, str) or not item
                            for item in thread_ids)):
                 raise ValueError(
                     "consumer {} declared create {} requires "
                     "returned_thread_ids".format(session, call["call_id"]))
             ret_entry = all_returns.get(call["call_id"])
-            output_text = (
-                _call_return_text(ret_entry.get("payload"))
-                if isinstance(ret_entry, dict) else None)
-            if output_text is None:
-                raise PermissionError(
-                    "consumer {} declared create {} has no audited "
-                    "return".format(session, call["call_id"]))
-            for thread_id in thread_ids:
-                if thread_id not in output_text:
-                    raise PermissionError(
-                        "consumer {} declared create {} return does not "
-                        "contain thread {}".format(
-                            session, call["call_id"], thread_id))
+            values = _native_return_values(ret_entry.get("payload") if isinstance(ret_entry, dict) else None)
+            if len(values) != len(args_list):
+                raise PermissionError("create return count does not bind invocations")
+            record_path = declaration.get("successor_record_path")
+            if len(args_list) != 1 or not isinstance(record_path, str) or not record_path:
+                raise PermissionError("create successor source is ambiguous")
+            source = Path(record_path)
+            if _artifact_hash(source) != declaration.get("successor_record_sha256"):
+                raise PermissionError("successor source digest mismatch")
+            from .supervisor import _record_digest
+            thread_id, args, value = thread_ids[0], args_list[0], values[0]
+            entries = [entry for entry in [registry.get("current")] + (registry.get("history") or [])
+                       if isinstance(entry, dict) and entry.get("session_id") == thread_id]
+            if (len(entries) != 1 or entries[0].get("provider") != "codex"
+                    or entries[0].get("session_record_digest") != _record_digest(source)):
+                raise PermissionError("create result is not a registered supervisor successor")
+            target = args.get("target")
+            expected_targets = [(action.get("request") or {}).get("target") for _, _, _, action in pairs]
+            if (not isinstance(target, dict) or target.get("type") != "project"
+                    or not isinstance(target.get("projectId"), str) or not target["projectId"]
+                    or any(not isinstance(t, dict) or target.get("projectId") != t.get("projectId")
+                           for t in expected_targets)
+                    or not isinstance(args.get("prompt"), str) or not args["prompt"]
+                    or value.get("threadId") != thread_id
+                    or value.get("hostId") != entries[0].get("host")):
+                raise PermissionError("create arguments, target or structured return mismatch")
+            if "target" in value and value["target"] != target:
+                raise PermissionError("create return target mismatch")
+            meta = None
+            user_texts = []
+            for raw in source.read_text(encoding="utf-8").splitlines():
+                item = json.loads(raw)
+                if item.get("type") == "session_meta":
+                    if meta is not None:
+                        raise PermissionError("duplicate successor session metadata")
+                    meta = item.get("payload")
+                payload = item.get("payload") or {}
+                if item.get("type") == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+                    for block in payload.get("content") or []:
+                        if isinstance(block, dict) and isinstance(block.get("text"), str):
+                            user_texts.append(block["text"])
+            if not isinstance(meta, dict) or meta.get("id") != thread_id or not user_texts or args["prompt"] != user_texts[0]:
+                raise PermissionError("successor session does not bind create prompt")
+            create_proofs.append({"session_id": session, "call_id": call["call_id"],
+                                  "successor_session_id": thread_id,
+                                  "source_rollout_sha256": declaration["successor_record_sha256"],
+                                  "parameters_digest": _canonical_digest(args),
+                                  "return_digest": _canonical_digest(value)})
         if declared_map:
             raise PermissionError(
                 "consumer {} declares creates absent from its own log: "
                 "{}".format(session, ", ".join(sorted(declared_map))))
+    return create_proofs
 
 
 def retire_uninvoked_legacy(
@@ -2278,13 +2572,12 @@ def retire_uninvoked_legacy(
     before the event leaves intent+locks+markers that a rerun converges,
     and a crash after it leaves a coalesced event plus the same residue --
     either way the next call finishes the boundary without a twin event.
-    The intent record and our lock files are deleted once the boundary is
-    durable so nothing reads them as a foreign claim afterwards.
+    The completed intent remains as provenance for stable lock inodes.
     """
     if not isinstance(amendment_digest, str) or not amendment_digest:
         raise ValueError("retire requires the bound amendment digest")
     plan_root = _plan_root(paths, plan_id)
-    with interprocess_lock(plan_root / ".amendment.lock"):
+    with interprocess_lock(plan_root / ".amendment.lock"), interprocess_lock(_lease_lock(paths)):
         if _marker_state(paths, plan_id) is not None:
             raise PermissionError(
                 "an amendment transfer is in progress; retire cannot "
@@ -2298,9 +2591,8 @@ def retire_uninvoked_legacy(
         action_ids = [item[0] for item in pairs]
         stale_dir = store.root / "stale"
         from contextlib import ExitStack
-        evidence_sha = hashlib.sha256(
-            json.dumps(evidence, ensure_ascii=False,
-                       sort_keys=True).encode("utf-8")).hexdigest()
+        evidence_sha = sha256_bytes(json.dumps(
+            evidence, ensure_ascii=False, sort_keys=True).encode("utf-8"))
         locks_dir = store._directory("locks")
         intent_path = _retire_intent_path(store, amendment_digest)
         intent_base = {
@@ -2350,6 +2642,8 @@ def retire_uninvoked_legacy(
                     "evidence_sha256": evidence_sha,
                 }
                 _atomic_json(stale_dir / (action_id + ".json"), marker)
+                if _fault_at == "after_stale:" + action_id:
+                    raise RuntimeError("retire fault injected after stale marker")
             changed = snapshot.nodes
             worktree_items = {
                 str(item.get("node_id")): item
@@ -2381,9 +2675,7 @@ def retire_uninvoked_legacy(
             }
             if _fault_at == "before_event":
                 raise RuntimeError("retire fault injected before event")
-            snapshot.event_sequence = append_event(
-                paths,
-                RunEvent(RETIRE_UNINVOKED_EVENT, {
+            retirement_event = RunEvent(RETIRE_UNINVOKED_EVENT, {
                     "run_id": run_id,
                     "plan_id": plan_id,
                     "amendment_digest": amendment_digest,
@@ -2410,35 +2702,56 @@ def retire_uninvoked_legacy(
                         for node_id in sorted(context["clean_nodes"])
                         if context["clean_nodes"][node_id][
                             "corrected_base"] is not None},
-                    "evidence": {
+                    "retirement_proof": {
                         "evidence_sha256": evidence_sha,
+                        "creates": context["creates"],
+                        "requests": [{"action_id": action_id,
+                                      "request_digest": action["request_digest"],
+                                      "request_sha256": _artifact_hash(path)}
+                                     for action_id, path, _old, action in pairs],
+                        "leases": [dict(item["lease"]["record"])
+                                   for item in context["clean_nodes"].values()
+                                   if item["lease"] is not None],
                         "owner_takeover": context["takeover"],
                         "retired_consumers": [
                             {"session_id": item["session_id"],
                              "rollout_sha256": item["rollout_sha256"],
-                             "native_terminal": item["native_terminal"]}
+                             "receipt_sha256": item["native_terminal"]["receipt_sha256"],
+                             "source_rollout_sha256": item["native_terminal"].get("source_rollout_sha256"),
+                             "host": item.get("host", "local")}
                             for item in context["retired_consumers"]],
                     },
-                }),
-                provenance,
-            )
+                })
+            if context["committed"] is None:
+                snapshot.event_sequence = append_event(paths, retirement_event, provenance)
+            else:
+                snapshot.event_sequence = max(snapshot.event_sequence, context["committed"]["sequence"])
             if _fault_at == "after_event":
                 raise RuntimeError("retire fault injected after event")
             save_snapshot(paths, snapshot)
+            if _fault_at == "after_snapshot":
+                raise RuntimeError("retire fault injected after snapshot")
             for node_id in sorted(context["clean_nodes"]):
-                release_writer_lease(
+                lease = context["clean_nodes"][node_id]["lease"]
+                if lease is None:
+                    continue
+                released = release_writer_lease(
                     paths, node_id,
                     str(context["clean_nodes"][node_id]["worktree"]),
-                    run_id)
-            # The boundary is durable.  Our own residue -- the intent
-            # record and the held lock payloads -- is cleanup, not claim
-            # evidence; delete it before releasing the kernel locks so a
-            # late foreign claim is still the only lock a reader sees.
-            intent_path.unlink(missing_ok=True)
-            for action_id in action_ids:
-                residue = locks_dir / (action_id + ".lock")
-                if residue.is_file():
-                    residue.unlink()
+                    run_id, expected=lease, _locked=True)
+                if not released:
+                    raise PermissionError("writer lease CAS release failed")
+                if _fault_at == "after_lease:" + node_id:
+                    raise RuntimeError("retire fault injected after lease release")
+            # Never unlink shared flock paths: queued waiters retain their
+            # inode. The durable intent distinguishes our mutex metadata
+            # from a provider claim, including after cleanup/replay.
+            _atomic_json(intent_path, dict(
+                intent_base, phase="complete", lock_shas={
+                    action_id: _artifact_hash(locks_dir / (action_id + ".lock"))
+                    for action_id in sorted(action_ids)}))
+            if _fault_at == "after_cleanup":
+                raise RuntimeError("retire fault injected after cleanup")
         return {
             "status": "retired",
             "plan_id": plan_id,

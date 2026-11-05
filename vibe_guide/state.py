@@ -376,6 +376,8 @@ _EVENT_DATA_KEYS = {
     # corrected commit digests per node); kept at data level because
     # 'evidence' is provider-text redacted.
     "base_corrections",
+    "retirement_proof",
+    "plan_id",
     "capability_contract_digest",
     "checkpoint_sha",
     "last_event_seq",
@@ -809,6 +811,39 @@ def bounded_error_text(value: Any) -> str:
     return text[:ERROR_TEXT_LIMIT]
 
 
+def _sanitize_retirement_proof(value: Any) -> Any:
+    """Only typed identifiers/digests, never provider prose, enter this proof."""
+    identifiers = {"session_id", "old_session_id", "new_session_id", "successor_session_id", "host", "call_id",
+                   "action_id", "node_id", "role", "read_call_id", "archive_call_id"}
+    digests = {"evidence_sha256", "request_digest", "request_sha256", "rollout_sha256",
+               "receipt_sha256", "source_rollout_sha256", "parameters_digest",
+               "return_digest", "lease_id", "intent_digest"}
+    containers = {"owner_takeover", "retired_consumers", "requests", "leases", "creates"}
+    epochs = {"old_lease_epoch", "new_lease_epoch", "generation"}
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key, item in value.items():
+        if key in containers:
+            if isinstance(item, dict):
+                result[key] = _sanitize_retirement_proof(item)
+            elif isinstance(item, list):
+                result[key] = [_sanitize_retirement_proof(row) for row in item
+                               if isinstance(row, dict)]
+        elif key in digests:
+            if item is None and key == "intent_digest":
+                result[key] = None
+            elif isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item):
+                result[key] = item
+        elif key in identifiers:
+            if (isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,160}", item)
+                    and not re.match(r"(?:sk-|gh[pousr]_|github_pat_|xox[baprs]-)", item)):
+                result[key] = item
+        elif key in epochs and type(item) is int and item >= 0:
+            result[key] = item
+    return result
+
+
 def _sanitize_event_data(data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("event data is invalid")
@@ -818,6 +853,9 @@ def _sanitize_event_data(data: Dict[str, Any]) -> Dict[str, Any]:
             continue
         normalized = _normalize_data_key(key)
         if normalized not in _EVENT_DATA_KEYS or _is_sensitive_data_key(key):
+            continue
+        if normalized == "retirement_proof":
+            result[normalized] = _sanitize_retirement_proof(value)
             continue
         if normalized == "error":
             # Not provider free text here: the dispatcher's own bounded message.
@@ -2168,11 +2206,61 @@ def quarantine_writer_lease(
         return True
 
 
+def retirement_writer_lease(paths: ProjectPaths, node_id: str, worktree: str,
+                            run_id: str) -> Optional[Dict[str, Any]]:
+    """Exact lease/CAS identity. Caller holds _lease_lock through its use.
+
+    A lease on the node OR the resolved writer root conflicts across runs.
+    Unreadable records cannot be excluded safely and therefore refuse.
+    """
+    root = (paths.root / worktree).resolve()
+    matches = []
+    for candidate in sorted(_safe_project_path(paths, ".vibe", "leases").glob("*.json")):
+        if candidate.is_symlink():
+            raise PermissionError("writer lease may not be a symlink")
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise PermissionError("writer lease unreadable") from error
+        if not isinstance(data, dict) or not isinstance(data.get("worktree"), str):
+            raise PermissionError("writer lease identity unknown")
+        if data.get("node_id") != node_id and (paths.root / data["worktree"]).resolve() != root:
+            continue
+        if (data.get("schema_version") != LEASE_SCHEMA_VERSION
+                or data.get("node_id") != node_id or data.get("worktree") != worktree
+                or data.get("run_id") != run_id or data.get("status") != "active"):
+            raise PermissionError("foreign or unknown writer lease identity")
+        role, generation, intent = (data.get(key) for key in ("role", "generation", "intent_digest"))
+        legacy = role is None and generation is None and intent is None
+        if not legacy and (role not in {"developer", "reviewer"}
+                           or type(generation) is not int or generation < 1
+                           or not isinstance(intent, str) or not re.fullmatch(r"[0-9a-f]{64}", intent)):
+            raise PermissionError("incomplete writer lease identity")
+        if (data.get("lease_id") != _lease_id(node_id, worktree, run_id, role, generation, intent)
+                or candidate != _lease_path(paths, node_id, worktree, intent, role, generation)):
+            raise PermissionError("writer lease identity digest mismatch")
+        matches.append({"filename": candidate.name, "record": data})
+    if len(matches) > 1:
+        raise PermissionError("multiple writer leases on the affected root")
+    return matches[0] if matches else None
+
+
 def release_writer_lease(
-    paths: ProjectPaths, node_id: str, worktree: str, run_id: str
+    paths: ProjectPaths, node_id: str, worktree: str, run_id: str,
+    *, expected: Optional[Dict[str, Any]] = None, _locked: bool = False,
 ) -> bool:
+    # Retirement holds the shared lease lock across validation, event and
+    # projection. Other callers retain the historical release API.
+    from contextlib import nullcontext
     lease_path = _lease_path(paths, node_id, worktree)
-    with interprocess_lock(_lease_lock(paths)):
+    with (nullcontext() if _locked else interprocess_lock(_lease_lock(paths))):
+        if expected is not None:
+            found = retirement_writer_lease(paths, node_id, worktree, run_id)
+            if found != expected:
+                return False
+            target = _safe_project_path(paths, ".vibe", "leases", expected["filename"])
+            target.unlink()
+            return not target.exists()
         candidates = [lease_path]
         if not lease_path.exists():
             try:
