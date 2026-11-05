@@ -363,3 +363,16 @@ python3 -m vibe_guide --help; git diff --check   # OK
 - 单独全量 `/tmp/r4-r14-full-serial.log`：4227 项，55 failures、20 errors、3 skipped、4 expected failures，exit 1；SHA `02ad774b7c7aa268a0748a6fda02be743dcdab1fc420cfc37c3f57ca4d89715b`。这是在中断重叠全量后重新串行执行的冻结源码结果；不把先前受干扰的 `/tmp/r4-r14-full-final.log`（63F/22E）混入结论。与 R13 全量 81 个失败身份比较：本轮 75 个，10 个新增、16 个不再出现；新增/消失和测试时序交替，失败归因仍 **UNKNOWN**。源码全量前后 SHA 一致：`plan_amendment.py` `b929ad22ce7f3315ec6aed4d7b280324621c0931ce32018e22f8b1ec32a53d5d`；`state.py` `f64f0f5db712e2a53fef38a2a0a164f244a4f30c88e20fac8eef1df29fca6f0d`；`cli.py` `4a90f8a8f4fc41e2b382c49dcb3c96199cb0472b7cbaefdbd2ee57c139bc9c56`；`task_provider.py` `24e0ac3576ed3ac2e70bbb4c04f09b615f34cac8549cd57c947e6aeb0de1f6a7`；测试 `6ae3c53a5b14a7cb072e0fa41a1718a6d3740204a1a782c8ac58b8781620d0df`。
 - 新增失败中，快照/事件竞态已有可复核的测试夹具路径：测试写入 malformed proof 后只截断 `events.jsonl`，当 `state.json` 与 `state.previous.json` 已推进到更高 event_sequence 时，下一次 `load_snapshot` 会因 snapshot references missing events 抛错。当前树 20 次隔离重复中 3 次复现；clean `8852367` 基线 15 次中 4 次复现，日志分别为 `/tmp/r4-r14-snapshot-repeat.log` SHA `2ba55681fb043461493906f16061dc1fe08a961ee4fae3611cf6f3cac7ab5b51` 与 `/tmp/r4-r14-snapshot-baseline-repeat.log` SHA `4efaf9c53ae01cd55736b4676a207856891bc587b0ebfbe045c5579f2ac813a0`。该证据定位测试夹具/事件快照时序问题，不能证明本轮源码回归，未在本授权范围内修复主状态协议。
 - 先导 create、三个旧 action 的正向不重叠、真实 retire proof 仍 UNKNOWN；未执行真实 retire、confirm、hold/lease release、resume、daemon、mailbox；未创建 task/worktree、增加依赖、安装、远端 Git 或 deploy。
+
+## 第 15 轮完整 UNKNOWN 盘点（待独立复审）
+
+- 对七份原生归档的所有 `input` 逐条扫描，不再只保留每份首个未知；完整清单 `/tmp/r4-r15-every-unknown.jsonl`，331 条未知记录，SHA-256 `f52f440bd60870c6358926cf1b7a5085b2425a93314a9351a7035a5f2b82ab42`。分类总量与 R14 一致：`17/97`、`109/260`、`234/311`、`18/24`、`37/51`、`27/29`、`29/30`。
+- 未知共性及可闭合障碍：
+  - 并发数组含复杂模板、shell 字符串、变量或未知 host，不能仅凭 `Promise.allSettled` 形状证明无 create；
+  - `const` 工具调用参数包含对象数组、模板、变量、回调或复杂静态表达式，继续放宽会承认执行期表达式；
+  - `ALL_TOOLS.filter/map/find` 回调包含正则、对象映射、可选链、计算属性和后续调用；当前只证明 `map(t => t.name)` 安全；
+  - 复杂 shell 参数、补丁/消息模板、逗号表达式、嵌套工具调用、未终止字面量和 SyntaxError 返回没有 Python-only 的安全编译证明；
+  - 真实 create 或动态宿主访问必须继续按潜在调用处理，并绑定完整 call/return、身份及 action 来源。
+- 因此要闭合真实 proof，必须同时为每个剩余输入建立有限语法证明、为每个潜在 host call 建立完整 call/return、为跨归档继承调用绑定源记录和 cursor，并取得三个旧 action 的独立正向不重叠来源。当前没有满足这些条件的单一最小扩展；不再增加解析器范围，继续 **UNKNOWN**。
+- 先导 developer 原生归档 `rollout-2026-11-05T16-51-43-01a1aae8-2756-72e0-983c-abd8847e3245.jsonl` SHA `36713c47c6ea8baa6348fbdd2ec2493700f3b05ce8e9bf2d778835e774710da2`，仅在 ordinal 140/142 的输出中出现三个旧 action 文本，未形成三个 action 的独立正向来源；没有新增 bootstrap 例外。真实 retire proof 继续 UNKNOWN。
+- 本轮没有源码修改；只新增本盘点证据，不执行真实 retire、confirm、hold/lease release、resume、daemon、mailbox，不创建 task/worktree、不安装依赖、不执行远端 Git 或 deploy。
