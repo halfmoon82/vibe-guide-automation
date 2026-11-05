@@ -2393,6 +2393,64 @@ class R13StaticSubsetTests(_LegacyUninvokedFixture):
                     plan_amendment._embedded_create_invocations(source)
 
 
+class R14StaticSubsetTests(_LegacyUninvokedFixture):
+    _exec_consumer = R10ReviewTests._exec_consumer
+
+    def test_tool_names_map_allows_complete_retire(self):
+        source = 'text(ALL_TOOLS.map(t => t.name));'
+        consumer = self._exec_consumer(source, "ok", "r14-names-map")
+        self.evidence["retired_consumers"].append(consumer)
+        try:
+            count = plan_amendment._embedded_create_invocations(source)
+        except ValueError as error:
+            self.fail("metadata map is not classified: {}".format(error))
+        self.assertEqual(count, 0)
+        self.assertEqual(self._retire()["status"], "retired")
+
+    def test_map_callback_cannot_hide_create_in_complete_retire(self):
+        sources = [
+            'text(ALL_TOOLS.map(t => tools.mcp__codex_app__create_thread({prompt:"x"})));',
+            'text(ALL_TOOLS.map(t => (t.name, tools.mcp__codex_app__create_thread({prompt:"x"}))));',
+            'text(ALL_TOOLS.map(t => t["name"]));',
+            'text(ALL_TOOLS.map(t => t.constructor.constructor("return tools")()));',
+            'text(ALL_TOOLS.map(tools => tools.name));',
+        ]
+        for index, source in enumerate(sources):
+            with self.subTest(source=source):
+                fixture = R14StaticSubsetTests(methodName="runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                consumer = fixture._exec_consumer(source,
+                    [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                     {"type": "input_text", "text": json.dumps({"threadId": "spawned", "hostId": "local"})}],
+                    "r14-map-{}".format(index))
+                fixture.evidence["retired_consumers"].append(consumer)
+                with self.assertRaises((ValueError, PermissionError)):
+                    fixture._retire()
+                self.assertTrue(fixture.lease_file.exists())
+                self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                                     for e in load_events(fixture.paths, fixture.run_id)))
+
+    def test_create_after_metadata_map_is_counted_and_blocks_retire(self):
+        source = ('text(ALL_TOOLS.map(t => t.name)); '
+                  'await tools.mcp__codex_app__create_thread({prompt:"x"});')
+        consumer = self._exec_consumer(source,
+            [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+             {"type": "input_text", "text": json.dumps({"threadId": "spawned", "hostId": "local"})}],
+            "r14-map-create")
+        self.evidence["retired_consumers"].append(consumer)
+        try:
+            count = plan_amendment._embedded_create_invocations(source)
+        except ValueError as error:
+            self.fail("sequential create is not classified: {}".format(error))
+        self.assertEqual(count, 1)
+        with self.assertRaises(PermissionError):
+            self._retire()
+        self.assertTrue(self.lease_file.exists())
+        self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                             for e in load_events(self.paths, self.run_id)))
+
+
 class R8ReceiptTests(_LegacyUninvokedFixture):
     def test_consumer_rollout_must_be_the_named_session(self):
         consumer = self.evidence["retired_consumers"][0]

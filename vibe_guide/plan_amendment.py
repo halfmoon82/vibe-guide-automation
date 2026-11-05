@@ -376,6 +376,19 @@ def _audit_static_exec(tokens):
             return pos + 6
         if tokens[pos][0] in {"string", "regex"}:
             return pos + 1
+        # Only the metadata projection ``ALL_TOOLS.map(x => x.name)`` is
+        # accepted. No callback body, invocation, computed member or alias
+        # is admitted; the parameter must not shadow a host/builtin name.
+        if tokens[pos:pos + 4] == [
+                ("id", "ALL_TOOLS"), ("punct", "."),
+                ("id", "map"), ("punct", "(")]:
+            if (pos + 9 >= len(tokens) or tokens[pos + 4][0] != "id"
+                    or tokens[pos + 4][1] in reserved | bindings
+                    or tokens[pos + 5:pos + 7] != [("punct", "="), ("punct", ">")]
+                    or tokens[pos + 7:pos + 10] != [tokens[pos + 4], ("punct", "."), ("id", "name")]
+                    or pos + 10 >= len(tokens) or tokens[pos + 10] != ("punct", ")")):
+                raise ValueError("unknown metadata projection")
+            return pos + 11
         if tokens[pos:pos + 2] == [("id", "text"), ("punct", "(")]:
             if (pos + 5 < len(tokens) and tokens[pos + 2][0] == "id"
                     and tokens[pos + 2][1] in output_bindings
