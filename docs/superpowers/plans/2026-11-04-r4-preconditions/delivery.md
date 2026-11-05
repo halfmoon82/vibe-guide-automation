@@ -146,3 +146,29 @@ python3 -m vibe_guide --help; git diff --check   # OK
 ```
 
 未验证项不变：真实桌面 App、真实目标 plan/run 切换、远端 Git、发布/deploy 均不在先导范围；此前披露的基线环境性失败与计时 flake 判断不变。
+
+## 第 5 次交付（第 5 轮复审返工，2026-11-05）
+
+### P1-6（B04/B12）：IR 节点派生 contract.files 在 files 修订后重派生
+
+- 裁定：采纳 reviewer 建议 (a)——按发布规则对 `integration-review` 节点自动重派生 `contract.files = integration_review_scope(merged_business)`，并把 spec 中对 IR.files 的显式声明判为工程字段拒绝（与发布期行为一致，IR 只聚合不持有范围）。未选 (b)：让产品 spec 抄写派生值只会制造第二处可漂移的口径。
+- `_rederive_integration_review` 在业务字段合并后运行：`files` 重写为合并后并集；若 IR 携带陈旧 dict 形态 `worker_profile`（旧派生期之前的 plan），`allowlist` 收窄到并集保持单投影；并集为空时按发布回退补 `files=[]` + 全项目 fallback profile（否则 dispatch 永远无法给 IR 绑定会话）。
+- `_validate_amendment_spec`：IR 节点的 `contract.files` 移出可写业务键，显式声明按「由系统自动生成」拒绝，错误文本复用既有工程字段口径。
+- `_business_diff` 如实把 IR.contract.files 的变化记入 `contract.files` 项（业务键口径），候选卡 `file_scope` 与节点存储投影自洽。
+
+### P2-4：双业务节点夹具覆盖迁移与 IR 派生
+
+- 新增 `_multi_authorized_probe`：走真实 `vibe plan` 发布双业务节点（`alpha/one.py`、`beta/two.py`）+ 授权 + run 静止，替代会 skip 的单节点夹具。
+- `IntegrationReviewScopeTests` 6 例：IR.files 起始并集断言；业务 files 修订后 IR.files=新并集且候选卡 file_scope 含新路径；节点间文件迁移同时刷新两端 allowlist 与 IR 并集；spec 显式 IR.files 拒绝；业务 files 清空收窄 IR 并集（重叠 ["."] 场景先串行化，验证 `dependency_reasons`/depends_on 修订路径）；全空并集时 IR 获发布回退 profile。
+- 顺带删除在单节点夹具下恒 skip 的旧迁移用例。
+
+### 验证（writer root）
+
+```bash
+python3 -m unittest tests.test_plan_amendment -v                                                                                                   # 29 例 OK（新增 6 例）
+python3 -m unittest tests.test_plan_amendment_recovery tests.test_local_commit_authorization tests.test_dag tests.test_planner tests.test_prd_guide_publish_path tests.test_authorization_card_options tests.test_empty_decisions_authorize tests.test_auto_scope_files tests.test_scope_landing tests.test_node_scoped_blocking tests.test_v310_plan_repair   # 265 例 OK
+python3 -m unittest tests.test_monitor tests.test_monitor_binding_transaction tests.test_cli_supervisor_commands tests.test_rework_prompt_auto_scope   # 180 例 OK
+python3 -m vibe_guide --help; git diff --check                                                                                                       # OK
+```
+
+未验证项不变：真实桌面 App、真实目标 plan/run 切换、远端 Git、发布/deploy 不在先导范围；scope_expansions 快照层语义为既有边界（reviewer 已记录非缺陷）。

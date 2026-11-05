@@ -54,11 +54,17 @@ from .authorize_entry import (
     _atomic_json,
     materialize_workflow_evidence,
 )
-from .dag import dependency_graph, dependency_graph_digest
+from .dag import (
+    INTEGRATION_REVIEW_NODE_ID,
+    dependency_graph,
+    dependency_graph_digest,
+    integration_review_scope,
+    is_integration_review_node,
+)
 from .digests import sha256_file as _artifact_hash
 from .fsio import JsonCorruptError, JsonMissingError, read_json as _fsio_read_json
 from .diagnostics import assert_planning_gate, require_execution_ready
-from .models import DAGNode, Plan
+from .models import DAGNode, Plan, node_branch, node_worktree
 from .node_spec import (
     complete_node_contracts,
     reject_engineering_fields,
@@ -205,7 +211,12 @@ def _validate_amendment_spec(
         contract = item.get("contract")
         if not isinstance(contract, dict):
             raise ValueError("every amendment node needs a contract object")
-        unknown = set(contract) - set(_BUSINESS_CONTRACT_KEYS)
+        allowed = set(_BUSINESS_CONTRACT_KEYS)
+        if item.get("id") == INTEGRATION_REVIEW_NODE_ID:
+            # The final reviewer owns nothing: its ``files`` is the derived
+            # union of the business write scopes, not a business claim.
+            allowed.discard("files")
+        unknown = set(contract) - allowed
         if unknown:
             raise ValueError(
                 "以下字段由系统自动生成，请从产品 spec 中删除：contract."
@@ -249,7 +260,59 @@ def _merge_nodes(spec: Dict[str, Any],
             contract["worker_profile"] = dict(
                 contract["worker_profile"], allowlist=derived)
         merged.append(DAGNode.from_dict(node_dict))
+    _rederive_integration_review(merged)
     return merged
+
+
+def _rederive_integration_review(merged: List[DAGNode]) -> None:
+    """Re-project the final reviewer's read scope onto the merged nodes.
+
+    Publish derives ``integration-review.contract["files"]`` as
+    ``integration_review_scope(business_nodes)`` -- the union of every
+    business write scope, since the reviewer reads the whole delivery but
+    owns nothing.  A files amendment must re-derive it or the stored
+    projection disagrees with the candidate card's ``file_scope`` and
+    dispatch would bind the reviewer to the stale union.  The spec cannot
+    declare it: ``_validate_amendment_spec`` treats it as an engineering
+    field on this node, so the value written here is deterministic.  The
+    empty-union case mirrors publish too: ``files=[]`` plus the
+    whole-project fallback profile, without which dispatch can never bind
+    a reviewer session to the node.
+    """
+    for node in merged:
+        if not is_integration_review_node(node):
+            continue
+        business = [item for item in merged
+                    if not is_integration_review_node(item)]
+        scope = integration_review_scope(business)
+        contract = node.contract if isinstance(node.contract, dict) else {}
+        contract["files"] = list(scope)
+        profile = contract.get("worker_profile")
+        if scope:
+            if isinstance(profile, dict):
+                # A plan published before the scope was derived can carry a
+                # stale whole-project profile; narrow it to the union so the
+                # stored contract keeps one projection.
+                contract["worker_profile"] = dict(profile,
+                                                  allowlist=list(scope))
+        elif not isinstance(profile, dict):
+            contract["worker_profile"] = {
+                "worker": str(contract.get("worker", "worker")),
+                "model": "default",
+                "reasoning": "normal",
+                "fallbacks": [],
+                "selection_basis": {
+                    "issue_complexity_ref": INTEGRATION_REVIEW_NODE_ID,
+                    "complexity_band": "standard",
+                    "risk_tags": ["integration", "read-only"],
+                    "availability_evidence": "configured",
+                },
+                "writer": str(contract.get("writer", "worker")),
+                "worktree": node_worktree(INTEGRATION_REVIEW_NODE_ID),
+                "branch": node_branch(INTEGRATION_REVIEW_NODE_ID),
+                "allowlist": ["."],
+            }
+        return
 
 
 def _derived_allowlist(files: Any) -> Optional[List[str]]:

@@ -565,6 +565,169 @@ class AmendmentTokenEvidenceTests(_PreparedTransfer):
                 '"', '"') or "")
 
 
+def _multi_authorized_probe(case):
+    """Two business nodes with disjoint files, so the derived
+    ``integration-review.contract.files`` union is observable.  Publishes
+    through the real ``vibe plan`` CLI exactly like ``_authorized_probe``."""
+    import copy as _copy
+    import shutil
+    from tests import support_v45_authorize as support
+
+    spec = _copy.deepcopy(support._NODE_SPEC)
+    first = spec["nodes"][0]
+    first["files"] = ["alpha/one.py"]
+    second = _copy.deepcopy(first)
+    second["id"] = "probe-node-b"
+    second["title"] = "探针节点 B"
+    second["files"] = ["beta/two.py"]
+    spec["nodes"] = [first, second]
+
+    root = Path(tempfile.mkdtemp(prefix="v45-amend-multi-"))
+    case.addCleanup(shutil.rmtree, str(root), True)
+    init = run_cli(["init", "--confirm", "--json"], root)
+    assert init.payload.get("status") == "ok", init.payload
+    store = root / ".vibe" / "provider-actions"
+    store.mkdir(parents=True, exist_ok=True)
+    (store / "capabilities.json").write_text(
+        json.dumps(support._CAPABILITIES, ensure_ascii=False),
+        encoding="utf-8")
+    (root / "node-spec.json").write_text(
+        json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    published = run_cli(
+        ["plan", "--json", "--request", support._REQUEST, "--s1",
+         "5,5,5,5,5", "--plan-id", "probe-plan",
+         "--node-spec", "node-spec.json"], root)
+    assert published.payload.get("status") == "ok", published.payload
+    support.show_card(root, "probe-plan")
+
+    paths = plan_amendment.project_paths(root)
+    plan_root = paths.vibe / "plans" / "probe-plan"
+    from vibe_guide.authorize_entry import materialize_workflow_evidence
+    materialize_workflow_evidence(paths, "probe-plan", "AUTHORIZE")
+    card = _authorization_card(_read(plan_root, "authorization-card.json"))
+    record = authorize(card, "AUTHORIZE")
+    (plan_root / "authorization.json").write_text(
+        json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True),
+        encoding="utf-8")
+    return root, paths, plan_root, record
+
+
+class IntegrationReviewScopeTests(unittest.TestCase):
+    """P1-6: ``integration-review.contract.files`` is the derived union of
+    the business write scopes (``dag.integration_review_scope``).  A files
+    amendment must re-derive it or the stored projection disagrees with the
+    candidate card's file_scope and the reviewer loses sight of moved/new
+    paths; declaring it in the spec is an engineering claim and refused."""
+
+    def setUp(self):
+        (self.root, self.paths, self.plan_root,
+         self.record) = _multi_authorized_probe(self)
+        self.snapshot, _runner = _start_run(
+            self.paths, self.plan_root, self.record, quiesce=True)
+        self.spec = _amendment_spec(self.plan_root)
+
+    def _merged(self, candidate):
+        directory = plan_amendment.candidate_dir(
+            self.paths, "probe-plan", candidate["amendment_digest"])
+        return {n["id"]: n for n in _read(directory, "nodes.json")}
+
+    def _set_files(self, node_id, files):
+        for item in self.spec["nodes"]:
+            if item["id"] == node_id:
+                item["contract"]["files"] = list(files)
+
+    def test_ir_files_starts_as_business_union(self):
+        nodes = _read(self.plan_root, "nodes.json")
+        ir = next(n for n in nodes if n["id"] == "integration-review")
+        self.assertEqual(sorted(ir["contract"]["files"]),
+                         ["alpha/one.py", "beta/two.py"])
+
+    def test_ir_files_rederived_on_business_files_amendment(self):
+        self._set_files("probe-node-a", ["gamma/new_a.py"])
+        candidate = plan_amendment.propose(
+            self.paths, "probe-plan", self.spec, "迁移节点 A 文件")
+        merged = self._merged(candidate)
+        self.assertEqual(
+            sorted(merged["integration-review"]["contract"]["files"]),
+            ["beta/two.py", "gamma/new_a.py"])
+        self.assertIn("gamma/new_a.py",
+                      candidate["candidate_card"]["file_scope"])
+
+    def test_files_migration_between_nodes_refreshes_all_projections(self):
+        # The real-plan case: moving paths between business nodes refreshes
+        # each node's profile allowlist and the IR union stays the same set.
+        self._set_files("probe-node-a", ["beta/two.py"])
+        self._set_files("probe-node-b", ["alpha/one.py"])
+        candidate = plan_amendment.propose(
+            self.paths, "probe-plan", self.spec, "节点间迁移文件")
+        merged = self._merged(candidate)
+        node_a, node_b = merged["probe-node-a"], merged["probe-node-b"]
+        self.assertEqual(node_a["contract"]["files"], ["beta/two.py"])
+        self.assertEqual(node_b["contract"]["files"], ["alpha/one.py"])
+        self.assertEqual(
+            node_a["contract"]["worker_profile"]["allowlist"],
+            ["beta/two.py"])
+        self.assertEqual(
+            node_b["contract"]["worker_profile"]["allowlist"],
+            ["alpha/one.py"])
+        self.assertEqual(
+            sorted(merged["integration-review"]["contract"]["files"]),
+            ["alpha/one.py", "beta/two.py"])
+
+    def test_ir_files_declaration_is_engineering_and_refused(self):
+        ir = next(n for n in self.spec["nodes"]
+                  if n["id"] == "integration-review")
+        ir["contract"]["files"] = ["forged/scope.py"]
+        with self.assertRaises(ValueError) as context:
+            plan_amendment.propose(
+                self.paths, "probe-plan", self.spec, "伪造 IR 视野")
+        self.assertIn("files", str(context.exception))
+
+    def _serialize_nodes(self):
+        """Legalise identical write scopes: B depends on A and leaves the
+        parallel group, so the ["."] scopes are serialized, not racing."""
+        for item in self.spec["nodes"]:
+            if item["id"] == "probe-node-b":
+                item["depends_on"] = ["probe-node-a"]
+                item["parallel_group"] = None
+                item["contract"]["dependency_reasons"] = {
+                    "probe-node-a":
+                        "verified_fact: B 需要 A 的交付物作为输入"}
+
+    def test_business_files_emptied_narrows_ir_union(self):
+        # An empty business ``files`` derives the ["."] profile allowlist
+        # exactly like at publish, and contributes nothing to the IR union.
+        # ["."] covers beta/ too, so the two nodes must serialize first.
+        self._serialize_nodes()
+        self._set_files("probe-node-a", [])
+        self._set_files("probe-node-b", ["beta/two.py"])
+        candidate = plan_amendment.propose(
+            self.paths, "probe-plan", self.spec, "清空节点 A 文件范围")
+        merged = self._merged(candidate)
+        node_a = merged["probe-node-a"]["contract"]
+        self.assertEqual(node_a["files"], [])
+        self.assertEqual(node_a["worker_profile"]["allowlist"], ["."])
+        self.assertEqual(
+            merged["integration-review"]["contract"]["files"],
+            ["beta/two.py"])
+
+    def test_ir_empty_union_gets_publish_fallback_profile(self):
+        # Publish parity: when every business files list empties the IR
+        # node needs files=[] plus the whole-project fallback profile or
+        # dispatch can never bind a reviewer session to it.  Identical
+        # ["."] scopes must be serialized first.
+        self._serialize_nodes()
+        self._set_files("probe-node-a", [])
+        self._set_files("probe-node-b", [])
+        candidate = plan_amendment.propose(
+            self.paths, "probe-plan", self.spec, "清空全部文件范围")
+        merged = self._merged(candidate)
+        contract = merged["integration-review"]["contract"]
+        self.assertEqual(contract["files"], [])
+        profile = contract.get("worker_profile") or {}
+        self.assertEqual(profile.get("allowlist"), ["."])
+
+
 class FilesScopeProjectionTests(unittest.TestCase):
     """contract.files is the business field; worker_profile.allowlist is its
     derived engineering projection and must be refreshed together or the
@@ -606,28 +769,6 @@ class FilesScopeProjectionTests(unittest.TestCase):
         # The candidate card's file scope agrees with the new projection.
         self.assertIn(new_files[0],
                       candidate["candidate_card"]["file_scope"])
-
-    def test_files_migration_between_nodes_refreshes_both_profiles(self):
-        old_nodes = _read(self.plan_root, "nodes.json")
-        business = [n for n in old_nodes if n["id"] != "integration-review"]
-        if len(business) < 2:
-            self.skipTest("fixture has one business node")
-        first, second = business[0], business[1]
-        first_files, second_files = self._files(first), self._files(second)
-        for item in self.spec["nodes"]:
-            if item["id"] == first["id"]:
-                item["contract"]["files"] = list(second_files)
-            if item["id"] == second["id"]:
-                item["contract"]["files"] = list(first_files)
-        candidate = plan_amendment.propose(
-            self.paths, "probe-plan", self.spec, "节点间迁移文件")
-        directory = plan_amendment.candidate_dir(
-            self.paths, "probe-plan", candidate["amendment_digest"])
-        merged = {n["id"]: n for n in _read(directory, "nodes.json")}
-        self.assertEqual(
-            self._files(merged[first["id"]]), second_files)
-        self.assertEqual(
-            self._files(merged[second["id"]]), first_files)
 
     def test_other_worker_profile_fields_still_rejected(self):
         # A profile change that is not exactly allowlist==new files still
