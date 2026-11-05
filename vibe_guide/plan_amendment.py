@@ -327,8 +327,70 @@ def _static_tool_invocations(source, names):
     return invocations
 
 
+def _audit_static_exec(tokens):
+    """Accept only straight-line calls to known host functions with static data.
+
+    Member access, arbitrary functions, computed expressions and assignments
+    are not a proof of non-invocation. In particular, constructor chains must
+    never be interpreted as inert text merely because ``tools`` is quoted.
+    """
+    host_names = {"exec_command", "mcp__codex_app__create_thread",
+                  "svc__codex_app__create_thread", "codex_app__create_thread",
+                  "create_thread"}
+
+    def expression(pos):
+        if pos < len(tokens) and tokens[pos] == ("id", "await"):
+            pos += 1
+        if pos < len(tokens) and tokens[pos][1] == "(":
+            pos = expression(pos + 1)
+            if pos >= len(tokens) or tokens[pos][1] != ")":
+                raise ValueError("unknown grouped JavaScript expression")
+            pos += 1
+            # Only this result field of the known exec_command call is
+            # supported; property chains and computed access remain unknown.
+            if tokens[pos:pos + 2] == [("punct", "."), ("id", "output")]:
+                pos += 2
+            return pos
+        if pos >= len(tokens):
+            raise ValueError("missing JavaScript expression")
+        if (tokens[pos][0] == "regex"
+                and tokens[pos + 1:pos + 4] == [("punct", "."), ("id", "test"), ("punct", "(")]):
+            if (pos + 5 >= len(tokens) or tokens[pos + 4][0] != "string"
+                    or tokens[pos + 5][1] != ")"):
+                raise ValueError("unknown regex test argument")
+            return pos + 6
+        if tokens[pos][0] in {"string", "regex"}:
+            return pos + 1
+        if tokens[pos:pos + 2] == [("id", "text"), ("punct", "(")]:
+            pos = expression(pos + 2)
+            if pos >= len(tokens) or tokens[pos][1] != ")":
+                raise ValueError("unknown text argument")
+            return pos + 1
+        if tokens[pos:pos + 2] == [("id", "tools"), ("punct", ".")]:
+            if (pos + 3 >= len(tokens) or tokens[pos + 2][0] != "id"
+                    or tokens[pos + 2][1] not in host_names
+                    or tokens[pos + 3][1] != "("):
+                raise ValueError("unknown host function")
+            pos += 4
+            if pos < len(tokens) and tokens[pos][1] != ")":
+                _value, pos = _static_js_value(tokens, pos, {})
+            if pos >= len(tokens) or tokens[pos][1] != ")":
+                raise ValueError("unknown host call argument")
+            return pos + 1
+        raise ValueError("JavaScript expression is outside the static audit subset")
+
+    pos = 0
+    while pos < len(tokens):
+        pos = expression(pos)
+        if pos < len(tokens) and tokens[pos][1] == ";":
+            pos += 1
+        elif pos < len(tokens):
+            raise ValueError("unknown JavaScript statement")
+
+
 def _embedded_create_invocations(text: str) -> int:
     tokens = _js_tokens(text)
+    _audit_static_exec(tokens)
     if any(kind == "id" and value in {"globalThis", "global", "window", "self"}
            for kind, value in tokens):
         raise ValueError("indirect global access has unknown native effects")

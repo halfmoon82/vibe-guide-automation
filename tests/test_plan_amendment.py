@@ -1755,7 +1755,7 @@ class RetireBaseCorrectionTests(_LegacyUninvokedFixture):
             {"type": "response_item",
              "payload": {"type": "custom_tool_call", "name": "exec",
                          "call_id": "call-add",
-                         "input": command}},
+                         "input": "text(await tools.exec_command({cmd:" + json.dumps(command) + "}))"}},
             {"type": "response_item",
              "payload": {"type": "custom_tool_call_output",
                          "call_id": "call-add",
@@ -2115,11 +2115,13 @@ class R9ReviewTests(_LegacyUninvokedFixture):
             'text(await tools.exec_command({cmd:"echo \\+"}));',
             'text(await tools.exec_command({cmd:"echo \\."}));',
             'text(await tools.exec_command({cmd:"echo \\|"}));',
-            'const found = ALL_TOOLS.filter(t => /create_thread|read_thread/.test(t.name));',
         ]
         for source in cases:
             with self.subTest(source=source):
                 self.assertEqual(plan_amendment._embedded_create_invocations(source), 0)
+        with self.assertRaises(ValueError):
+            plan_amendment._embedded_create_invocations(
+                'const found = ALL_TOOLS.filter(t => /create_thread|read_thread/.test(t.name));')
         source = 'text(await tools.exec_command({cmd:"bad\nstring"}));'
         bad = self._rollout([
             {"type": "response_item", "payload": {"type": "custom_tool_call",
@@ -2205,6 +2207,38 @@ class R10ReviewTests(_LegacyUninvokedFixture):
                 consumer = self._exec_consumer(source, output, "runtime-{}".format(i))
                 with self.assertRaises(ValueError):
                     plan_amendment._rollout_native_calls(Path(consumer["rollout_path"]))
+
+
+class R11ReviewTests(_LegacyUninvokedFixture):
+    _exec_consumer = R10ReviewTests._exec_consumer
+    def test_dynamic_indirection_cannot_retire_create(self):
+        sources = [
+            'await ({}).constructor["constructor"]("return tools")()["mcp__codex_app__create"+"_thread"]({prompt:"unrelated"})',
+            'const key="constructor"; await ([])[key][key]("return tools")()["mcp__codex_app__create_thread"]({})',
+            'const get = async () => tools; await (await get())["mcp__codex_app__create_thread"]({})',
+            'const proxy = new Proxy({}, {}); proxy["call"]()',
+        ]
+        for i, source in enumerate(sources):
+            with self.subTest(source=source):
+                fixture = R10ReviewTests(methodName="runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                consumer = fixture._exec_consumer(source,
+                    [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                     {"type": "input_text", "text": json.dumps({"threadId": "spawned", "hostId": "local"})}],
+                    "indirect-{}".format(i))
+                fixture.evidence["retired_consumers"].append(consumer)
+                with self.assertRaises((ValueError, PermissionError)):
+                    fixture._retire()
+                self.assertTrue(fixture.lease_file.exists())
+                self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                                     for e in load_events(fixture.paths, fixture.run_id)))
+
+    def test_inert_strings_comments_and_regex_stay_classifiable(self):
+        source = '/* constructor and tools["x"]() */ text("constructor"); text(/constructor/.test("x")); // tools\n'
+        consumer = self._exec_consumer(source, "ok", "inert-r11")
+        self.evidence["retired_consumers"].append(consumer)
+        self.assertEqual(self._retire()["status"], "retired")
 
 
 class R8ReceiptTests(_LegacyUninvokedFixture):
