@@ -219,7 +219,9 @@ python3 -m vibe_guide --help; git diff --check   # OK
 ### 验证
 
 - `python3 -m unittest discover -s tests -p 'test_plan_amendment*.py' -v`：80 例 OK
-- `python3 -m unittest discover -s tests`：冻结时仍在运行（runner PID 45404，日志 /tmp/r4_full_v2.log；早前一次 runner 无 summary 中道终止已作废，按未完成/未知记录，不按通过）。最终结果以交付汇报为准，与本交付代码同源同 HEAD。
+- `python3 -m unittest discover -s tests`：Ran 4164 tests，FAILED (failures=51, errors=20, skipped=3, expected failures=4)（并行 discover 全量，日志 /tmp/r4_full_v2.log）。
+  - 与冻结基线 `c745254` 同法串行对照：本树失败集 = 基线失败集（self_report_recovery/hybrid_state_recovery/legacy_run_guard/worker_questions/stale_session_276/release_5_2_4_review_fixes/sensitive_identity_durability/worktree_preflight_235/supervisor_* 及 adopt_orphan_dispatch/claude_bg_*/workbuddy/handoff_* 等环境性失败，基线 8852367/c745254 两树逐字一致）。
+  - 全量并行中额外出现的差异项（platform_handoff_contract_refresh、scope_reconcile_entry、supervisor_rotation_cost 1 例）经单文件串行重跑均 OK，判为负载敏感 flake，非回归；本树失败数不多于基线。
 - `python3 -m vibe_guide --help`：exit 0；`git diff --check`：干净。
 - 真实只读 proof（不写 run）：动态取 supervisor-registry/lease（current epoch3=01a1aa87，history epoch1 01a1a449+epoch2 01a1aa72），6 份归档 rollout 解析 550 calls 全配对（fork1/fork2 各 1 条继承 start_helper 经 owner 同 call_id 配对；epoch2 12 条无 call_id host 注入计 skipped；epoch2 唯一内嵌 create 声明绑定返回 threadId=01a1aa87），3 pending requests 摘要绑定，3 worktree 精确 add/HEAD/reflog Created/干净 + snapshot 误投影纠偏，_verify_retire_evidence 全链 PASS。脚本 /tmp/r4_proof.py，证据 JSON /tmp/r4_evidence_dryrun.json（sha 37f4c812…b6bd28，不含真实 run 写入）。
 
