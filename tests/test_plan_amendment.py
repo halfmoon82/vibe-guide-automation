@@ -10,6 +10,7 @@ side effects.  Nothing about the live card, record or run changes before
 that token.
 """
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -866,3 +867,911 @@ class FilesScopeProjectionTests(unittest.TestCase):
         # Missing/new types: rejected.
         self.assertEqual(diff(old_profile, {"model": "m"}),
                          "worker_profile.allowlist")
+
+
+class _LegacyUninvokedFixture(unittest.TestCase):
+    """The real-run shape the r4 amendment confirm hit: a dispatcg-generation
+    node left ``running`` with a provider-pending retryable action, one
+    unclaimed create request, an active writer lease -- while the native
+    create was provably never invoked and the consuming supervisor shift is
+    dead and fenced by a successor registration.
+    """
+
+    NODE = "probe-node-a"
+    OLD_OWNER = "old-owner-session"
+    NEW_OWNER = "01a1aa72-4b33-70c1-9138-a6776b3fc293"
+
+    def setUp(self):
+        self.root, self.paths, self.plan_root, self.record = _authorized_probe(self)
+        self.snapshot, _runner = _start_run(
+            self.paths, self.plan_root, self.record, quiesce=True)
+        self.spec = _amendment_spec(self.plan_root)
+        self.candidate = plan_amendment.propose(
+            self.paths, "probe-plan", self.spec, "修订验收")
+        plan_amendment.show(
+            self.paths, "probe-plan", self.candidate["amendment_digest"])
+        self.digest = self.candidate["amendment_digest"]
+        self.token = plan_amendment.confirmation_token(self.digest)
+        self.run_id = self.snapshot.run_id
+        self.auth_digest = self.record.digest
+        self._legacy_state()
+
+    # -- fixture builders ------------------------------------------------
+
+    def _git_init_branch(self, worktree, branch):
+        import subprocess
+        worktree.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", str(worktree)], check=True,
+                       capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(worktree), "symbolic-ref", "HEAD",
+             "refs/heads/" + branch],
+            check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(worktree), "commit", "--allow-empty",
+             "-m", "base", "-q"], check=True, capture_output=True)
+        return subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True).stdout.strip()
+
+    def _write_lease(self):
+        from vibe_guide.state import acquire_writer_lease
+        self.assertTrue(acquire_writer_lease(
+            self.paths, self.NODE, self.node["worktree"], self.run_id))
+        [lease_file] = list((self.paths.vibe / "leases").glob("*.json"))
+        return lease_file
+
+    def _write_registry(self, history=None, owner_session=None,
+                        current_session=None, epoch=2):
+        run_dir = self.paths.vibe / "runs" / self.run_id
+        registry = {
+            "current": {
+                "provider": "codex",
+                "session_id": current_session or self.NEW_OWNER,
+                "host": "local",
+                "lease_epoch": epoch,
+            },
+            "history": list(history if history is not None else [
+                {"provider": "codex", "session_id": self.OLD_OWNER,
+                 "host": "local", "lease_epoch": 1},
+            ]),
+            "rejected": [],
+        }
+        (run_dir / "supervisor-registry.json").write_text(
+            json.dumps(registry, sort_keys=True), encoding="utf-8")
+        (run_dir / "supervisor.lease").write_text(json.dumps({
+            "lease_epoch": epoch,
+            "owner": {"provider": "codex",
+                      "session_id": owner_session or self.NEW_OWNER},
+        }, sort_keys=True), encoding="utf-8")
+
+    def _rollout(self, entries, name="rollout-owner.jsonl"):
+        path = Path(tempfile.mkdtemp(prefix="r4-rollout-")) / name
+        self.addCleanup(lambda: path.parent.exists() and None)
+        with path.open("w", encoding="utf-8") as stream:
+            for entry in entries:
+                stream.write(json.dumps(entry) + "\n")
+        return path
+
+    def _receipt(self, session_id, archive="archived", read="archived"):
+        path = Path(tempfile.mkdtemp(prefix="r4-receipt-")) / (
+            "receipt-" + session_id + ".json")
+        payload = {
+            "kind": "native_termination_receipt",
+            "session_id": session_id,
+            "read_thread_status": read,
+            "archive_status": archive,
+            "receipt_ref": "native read_thread/set_thread_archived",
+        }
+        path.write_text(json.dumps(payload, sort_keys=True),
+                        encoding="utf-8")
+        return path
+
+    def _consumer(self, session_id, path, calls=None, archive="archived",
+                  read="archived", kind="owner"):
+        receipt = self._receipt(session_id, archive, read)
+        return {
+            "session_id": session_id,
+            "kind": kind,
+            "rollout_path": str(path),
+            "rollout_sha256": self._sha(path),
+            "native_terminal": {
+                "archive_status": archive,
+                "read_thread_status": read,
+                "receipt_path": str(receipt),
+                "receipt_sha256": self._sha(receipt),
+            },
+            "native_calls": list(calls if calls is not None else []),
+        }
+
+    def _sha(self, path):
+        return plan_amendment._artifact_hash(path)
+
+    def _legacy_state(self):
+        """Freeze the node into the exact pending-create shape."""
+        self.node = dict(self.snapshot.nodes[self.NODE])
+        self.head = self._git_init_branch(
+            self.root / self.node["worktree"], self.node["branch"])
+        self.node["status"] = "running"
+        self.node["worktree_base"] = self.head
+        self.node["user_status"] = "自动修复中"
+        self.node["reason"] = "provider action pending"
+        self.node["retryable_action"] = {
+            "role": "developer", "phase": "develop",
+            "last_observation_ref": "provider-pending",
+            "same_task": True, "same_task_required": True,
+            "successor": False,
+        }
+        snapshot = load_snapshot(self.paths, self.run_id)
+        snapshot.nodes[self.NODE] = self.node
+        save_snapshot(self.paths, snapshot)
+        self.lease_file = self._write_lease()
+        self._write_registry()
+        # Real Codex rollout encoding (archived supervisor logs): native
+        # work appears as custom_tool_call(name="exec", input=<JS>) with a
+        # matching custom_tool_call_output; event_msg lines interleave and
+        # are not calls.
+        owner_log = self._rollout([
+            {"type": "session_meta", "payload": {"id": self.OLD_OWNER,
+                                                 "cwd": str(self.root)}},
+            {"type": "response_item",
+             "payload": {"type": "custom_tool_call",
+                         "name": "exec", "call_id": "call-1",
+                         "input": "text(await tools.exec_command({cmd: \"ls\"}))"}},
+            {"type": "response_item",
+             "payload": {"type": "custom_tool_call_output",
+                         "call_id": "call-1", "output": "ok"}},
+            {"type": "event_msg", "payload": {"type": "turn_context"}},
+            {"type": "item_completed",
+             "payload": {"type": "function_call",
+                         "name": "exec_command",
+                         "call_id": "call-2"}},
+            {"type": "item_completed",
+             "payload": {"type": "function_call_output",
+                         "call_id": "call-2", "output": "done"}},
+        ])
+        aux_log = self._rollout([
+            {"type": "session_meta", "payload": {"id": "aux-1"}},
+            {"type": "event_msg", "payload": {"type": "token_count"}},
+        ], name="rollout-aux.jsonl")
+        self.consumers = [
+            self._consumer(self.OLD_OWNER, owner_log, calls=[
+                {"name": "exec", "call_id": "call-1", "returned": True},
+                {"name": "exec_command", "call_id": "call-2",
+                 "returned": True},
+            ]),
+            self._consumer("aux-1", aux_log, kind="auxiliary"),
+        ]
+        # The request must satisfy ProviderActionStore.action()'s identity
+        # proof: action_id and request_digest are canonical digests of the
+        # immutable record, not hand-picked strings.
+        basis = {
+            "operation": "create",
+            "provider": "codex-app-visible",
+            "run_id": self.run_id,
+            "issue_id": self.NODE,
+            "role": "developer",
+            "generation": 1,
+            "sequence": 0,
+        }
+        self.action_id = (
+            "action-" + plan_amendment._canonical_digest(basis)[:32])
+        self.request = {
+            "schema_version": 1,
+            "action_id": self.action_id,
+            "native_tool": "codex_app__create_thread",
+            "request": {
+                "authorization_digest": self.auth_digest,
+                "child_binding": {
+                    "node_id": self.NODE, "role": "developer",
+                    "worktree": self.node["worktree"],
+                    "branch": self.node["branch"],
+                },
+            },
+            **basis,
+        }
+        self.request["request_digest"] = plan_amendment._canonical_digest(
+            dict(self.request))
+        request_dir = self.paths.vibe / "provider-actions" / "requests"
+        request_dir.mkdir(parents=True, exist_ok=True)
+        request_path = request_dir / (self.action_id + ".json")
+        request_path.write_text(
+            json.dumps(self.request, sort_keys=True), encoding="utf-8")
+        self.request_path = request_path
+        self.evidence = {
+            "schema_version": 1,
+            "kind": "retire_uninvoked_legacy",
+            "plan_id": "probe-plan",
+            "run_id": self.run_id,
+            "amendment_digest": self.digest,
+            "authorization_digest": self.auth_digest,
+            "owner_takeover": {
+                "old_session_id": self.OLD_OWNER,
+                "old_lease_epoch": 1,
+                "new_session_id": self.NEW_OWNER,
+                "new_lease_epoch": 2,
+            },
+            "retired_consumers": self.consumers,
+            "requests": [{
+                "action_id": self.action_id,
+                "request_digest": self.request["request_digest"],
+                "request_sha256": self._sha(request_path),
+                "issue_id": self.NODE,
+                "role": "developer",
+                "generation": 1,
+            }],
+            "worktrees": [{
+                "node_id": self.NODE,
+                "worktree": self.node["worktree"],
+                "branch": self.node["branch"],
+                "head": self.head,
+            }],
+        }
+
+    def _mutate(self, mutate):
+        evidence = copy.deepcopy(self.evidence)
+        mutate(evidence)
+        return evidence
+
+    def _retire(self, evidence=None):
+        return plan_amendment.retire_uninvoked_legacy(
+            self.paths, "probe-plan", self.digest,
+            evidence if evidence is not None else self.evidence)
+
+    def _confirm_blocked(self):
+        with self.assertRaises(PermissionError):
+            plan_amendment.confirm(
+                self.paths, "probe-plan", self.digest, self.token)
+
+
+class RetireUninvokedLegacyTests(_LegacyUninvokedFixture):
+    """The legacy pending-create shape blocks confirm until every link of the
+    uninvoked proof chain verifies; then retirement converges and confirm
+    passes on the same run."""
+
+    def test_pending_create_shape_blocks_confirm_before_retire(self):
+        self._confirm_blocked()
+
+    def test_full_proof_retires_and_confirm_succeeds(self):
+        result = self._retire()
+        self.assertEqual(result["status"], "retired")
+        self.assertEqual(result["action_ids"], [self.action_id])
+        store = plan_amendment.ProviderActionStore(self.paths)
+        self.assertFalse(store.pending(self.run_id))
+        self.assertIsNone(store.result(self.action_id))
+        # The immutable request stays; only the stale audit marker sits beside it.
+        self.assertTrue(self.request_path.is_file())
+        stale = json.loads((self.paths.vibe / "provider-actions" / "stale" /
+                            (self.action_id + ".json")).read_text())
+        self.assertEqual(stale["status"], "stale")
+        self.assertEqual(
+            stale["reason"], plan_amendment.RETIRE_UNINVOKED_REASON)
+        self.assertEqual(stale["amendment_digest"], self.digest)
+        snapshot = load_snapshot(self.paths, self.run_id)
+        node = snapshot.nodes[self.NODE]
+        self.assertEqual(node["status"], "planned")
+        self.assertIsNone(node["retryable_action"])
+        self.assertFalse(list((self.paths.vibe / "leases").glob("*.json")))
+        events = [event for event in load_events(self.paths, self.run_id)
+                  if event["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT]
+        self.assertEqual(len(events), 1)
+        self.assertIn(self.action_id, json.dumps(events[0]))
+        # The same candidate-bound token now completes the transfer.
+        result = plan_amendment.confirm(
+            self.paths, "probe-plan", self.digest, self.token)
+        self.assertEqual(result["status"], "amended")
+        self.assertEqual(result["run_id"], self.run_id)
+
+    def test_rerun_is_idempotent_without_second_event(self):
+        self._retire()
+        events_before = len(load_events(self.paths, self.run_id))
+        again = self._retire()
+        self.assertEqual(again["status"], "retired")
+        self.assertTrue(again.get("converged"))
+        events_after = load_events(self.paths, self.run_id)
+        self.assertEqual(
+            len([e for e in events_after
+                 if e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT]), 1)
+        self.assertEqual(len(events_after), events_before)
+
+    def test_missing_evidence_field_refuses(self):
+        evidence = self._mutate(lambda e: e.pop("run_id"))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_wrong_run_or_digest_refuses(self):
+        for mutator in (
+            lambda e: e.update(run_id="run-other"),
+            lambda e: e.update(amendment_digest="0" * 64),
+            lambda e: e.update(authorization_digest="0" * 64),
+        ):
+            with self.subTest(mutator=mutator):
+                with self.assertRaises((PermissionError, ValueError)):
+                    self._retire(self._mutate(mutator))
+
+    def test_request_sha_mismatch_refuses(self):
+        evidence = self._mutate(
+            lambda e: e["requests"][0].update(request_sha256="0" * 64))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_request_tampered_after_evidence_refuses(self):
+        request = dict(self.request)
+        request["request"]["child_binding"]["branch"] = "node/forged"
+        self.request_path.write_text(json.dumps(request, sort_keys=True))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+    def test_owner_takeover_missing_refuses(self):
+        self._write_registry(current_session="still-old",
+                             owner_session=self.OLD_OWNER, epoch=1)
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+    def test_owner_epoch_not_advanced_refuses(self):
+        evidence = self._mutate(
+            lambda e: e["owner_takeover"].update(new_lease_epoch=3))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_registry_history_consumer_uncovered_refuses(self):
+        self._write_registry(history=[
+            {"provider": "codex", "session_id": self.OLD_OWNER,
+             "host": "local", "lease_epoch": 1},
+            {"provider": "codex", "session_id": "ghost-shift",
+             "host": "local", "lease_epoch": 1},
+        ])
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+    def test_consumer_without_archive_refuses(self):
+        evidence = self._mutate(
+            lambda e: e["retired_consumers"][0]["native_terminal"].update(
+                archive_status="active"))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_rollout_with_create_thread_call_refuses(self):
+        bad_log = self._rollout([
+            {"type": "response_item",
+             "payload": {"type": "function_call",
+                         "name": "create_thread",
+                         "call_id": "call-9"}},
+            {"type": "response_item",
+             "payload": {"type": "function_call_output",
+                         "call_id": "call-9", "output": "{}"}},
+        ], name="rollout-bad.jsonl")
+        evidence = self._mutate(lambda e: e["retired_consumers"][0].update({
+            "rollout_path": str(bad_log),
+            "rollout_sha256": self._sha(bad_log),
+            "native_calls": [{"name": "create_thread",
+                              "call_id": "call-9", "returned": True}],
+        }))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_exec_payload_embedding_create_refuses(self):
+        # A create hidden inside an exec-style input is a real invocation;
+        # only the payload is scanned, so prompt/documentation text quoting
+        # the signature does not trip this rule.
+        bad_log = self._rollout([
+            {"type": "response_item",
+             "payload": {"type": "custom_tool_call",
+                         "name": "exec", "call_id": "call-emb",
+                         "input": "text(await "
+                                  "tools.mcp__codex_app__create_thread("
+                                  "{prompt: \"x\"}))"}},
+            {"type": "response_item",
+             "payload": {"type": "custom_tool_call_output",
+                         "call_id": "call-emb", "output": "{}"}},
+        ], name="rollout-emb.jsonl")
+        evidence = self._mutate(lambda e: e["retired_consumers"][0].update({
+            "rollout_path": str(bad_log),
+            "rollout_sha256": self._sha(bad_log),
+            "native_calls": [{"name": "exec",
+                              "call_id": "call-emb", "returned": True}],
+        }))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_documentation_quoting_create_passes_audit(self):
+        # A bare mention of the tool signature in message or docs payloads
+        # is not an invocation: the audit only scans real call payloads.
+        good_log = self._rollout([
+            {"type": "response_item",
+             "payload": {"type": "message",
+                         "content": "see tools.mcp__codex_app__create_thread "
+                                    "docs"}},
+        ], name="rollout-docs.jsonl")
+        consumer = self._consumer("docs-1", good_log, kind="auxiliary")
+        evidence = self._mutate(
+            lambda e: e["retired_consumers"].append(consumer))
+        result = self._retire(evidence)
+        self.assertEqual(result["status"], "retired")
+
+    def test_unpaired_native_call_refuses(self):
+        bad_log = self._rollout([
+            {"type": "response_item",
+             "payload": {"type": "function_call",
+                         "name": "exec_command",
+                         "call_id": "call-open"}},
+        ], name="rollout-unpaired.jsonl")
+        evidence = self._mutate(lambda e: e["retired_consumers"][0].update({
+            "rollout_path": str(bad_log),
+            "rollout_sha256": self._sha(bad_log),
+            "native_calls": [{"name": "exec_command",
+                              "call_id": "call-open", "returned": True}],
+        }))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_undeclared_native_call_refuses(self):
+        evidence = self._mutate(
+            lambda e: e["retired_consumers"][0].update(native_calls=[]))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_unreadable_rollout_refuses(self):
+        evidence = self._mutate(
+            lambda e: e["retired_consumers"][0].update(
+                rollout_path=str(Path(tempfile.gettempdir()) / "absent.jsonl")))
+        with self.assertRaises((PermissionError, ValueError, OSError)):
+            self._retire(evidence)
+
+    def test_existing_result_refuses(self):
+        results_dir = self.paths.vibe / "provider-actions" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        (results_dir / (self.action_id + ".json")).write_text(json.dumps({
+            "schema_version": 1, "action_id": self.action_id,
+            "request_digest": self.request["request_digest"],
+            "payload": {"thread_id": "t-1"},
+        }), encoding="utf-8")
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+    def test_claim_evidence_refuses(self):
+        observations = self.paths.vibe / "provider-actions" / "observations"
+        observations.mkdir(parents=True, exist_ok=True)
+        (observations / (self.action_id + "-x.json")).write_text(
+            json.dumps({"action_id": self.action_id}), encoding="utf-8")
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+    def test_active_task_or_handle_refuses(self):
+        snapshot = load_snapshot(self.paths, self.run_id)
+        node = snapshot.nodes[self.NODE]
+        node["active_task"] = {"role": "developer", "task_id": "t",
+                               "handle_id": "h", "generation": 1}
+        snapshot.nodes[self.NODE] = node
+        save_snapshot(self.paths, snapshot)
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+    def test_dirty_worktree_refuses(self):
+        worktree = self.root / self.node["worktree"]
+        (worktree / "README.md").write_text("changed", encoding="utf-8")
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+    def test_worktree_head_mismatch_refuses(self):
+        evidence = self._mutate(
+            lambda e: e["worktrees"][0].update(head="0" * 40))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_node_without_pending_retry_refuses(self):
+        snapshot = load_snapshot(self.paths, self.run_id)
+        node = snapshot.nodes[self.NODE]
+        node["retryable_action"] = {"role": "developer", "phase": "develop",
+                                    "last_observation_ref": "provider-error"}
+        snapshot.nodes[self.NODE] = node
+        save_snapshot(self.paths, snapshot)
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+
+class RetireLateArrivalTests(_LegacyUninvokedFixture):
+    """A native call that was never invoked cannot produce a durable result;
+    if one arrives anyway it is surfaced as blocked_unknown -- never hidden
+    and never consumed."""
+
+    def test_late_result_after_retire_blocks_confirm(self):
+        self._retire()
+        results_dir = self.paths.vibe / "provider-actions" / "results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        (results_dir / (self.action_id + ".json")).write_text(json.dumps({
+            "schema_version": 1, "action_id": self.action_id,
+            "request_digest": self.request["request_digest"],
+            "payload": {"thread_id": "ghost"},
+        }), encoding="utf-8")
+        self._confirm_blocked()
+        # The late arrival is evidence, not consumed truth.
+        snapshot = load_snapshot(self.paths, self.run_id)
+        self.assertIsNone(snapshot.nodes[self.NODE].get("active_task"))
+
+    def test_late_observation_after_retire_blocks_confirm(self):
+        self._retire()
+        observations = self.paths.vibe / "provider-actions" / "observations"
+        observations.mkdir(parents=True, exist_ok=True)
+        (observations / (self.action_id + "-ghost.json")).write_text(
+            json.dumps({"action_id": self.action_id}), encoding="utf-8")
+        self._confirm_blocked()
+
+    def test_late_worktree_write_after_retire_blocks_confirm(self):
+        self._retire()
+        worktree = self.root / self.node["worktree"]
+        (worktree / "ghost.py").write_text("# ghost", encoding="utf-8")
+        self._confirm_blocked()
+
+
+
+class RetireCrashRecoveryTests(_LegacyUninvokedFixture):
+    """Pre/post-event crash residue must converge, never deadlock or
+    duplicate the retire boundary."""
+
+    def _retire_with_fault(self, fault):
+        return plan_amendment.retire_uninvoked_legacy(
+            self.paths, "probe-plan", self.digest, self.evidence,
+            _fault_at=fault)
+
+    def test_pre_event_crash_leaves_convergent_residue(self):
+        with self.assertRaises(RuntimeError):
+            self._retire_with_fault("before_event")
+        # Intent, held locks and stale markers all remain; no event was
+        # appended and the node is untouched.
+        locks = self.paths.vibe / "provider-actions" / "locks"
+        intents = list(locks.glob("retire-*.intent"))
+        self.assertEqual(len(intents), 1)
+        intent = json.loads(intents[0].read_text())
+        self.assertEqual(intent["phase"], "locked")
+        self.assertEqual(intent["action_ids"], [self.action_id])
+        self.assertTrue((self.paths.vibe / "provider-actions" / "stale" /
+                         (self.action_id + ".json")).is_file())
+        self.assertFalse(any(
+            event["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+            for event in load_events(self.paths, self.run_id)))
+        self.assertEqual(
+            load_snapshot(self.paths, self.run_id)
+            .nodes[self.NODE]["status"], "running")
+        # Rerun converges the same boundary -- no deadlock on its own
+        # residue, no second event, then confirm passes.
+        result = self._retire()
+        self.assertEqual(result["status"], "retired")
+        self.assertFalse(intents[0].exists())
+        self.assertFalse(list(locks.glob("*.lock")))
+        self.assertEqual(
+            len([e for e in load_events(self.paths, self.run_id)
+                 if e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT]), 1)
+        result = plan_amendment.confirm(
+            self.paths, "probe-plan", self.digest, self.token)
+        self.assertEqual(result["status"], "amended")
+
+    def test_post_event_crash_resumes_after_boundary(self):
+        with self.assertRaises(RuntimeError):
+            self._retire_with_fault("after_event")
+        # The durable boundary event exists but snapshot/lease/cleanup did
+        # not complete.
+        self.assertEqual(
+            len([e for e in load_events(self.paths, self.run_id)
+                 if e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT]), 1)
+        result = self._retire()
+        self.assertEqual(result["status"], "retired")
+        self.assertTrue(result.get("converged"))
+        self.assertEqual(
+            len([e for e in load_events(self.paths, self.run_id)
+                 if e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT]), 1)
+        snapshot = load_snapshot(self.paths, self.run_id)
+        self.assertEqual(snapshot.nodes[self.NODE]["status"], "planned")
+        self.assertFalse(list((self.paths.vibe / "leases").glob("*.json")))
+        result = plan_amendment.confirm(
+            self.paths, "probe-plan", self.digest, self.token)
+        self.assertEqual(result["status"], "amended")
+
+    def test_foreign_lock_residue_refuses(self):
+        # A lock file with no intent record is foreign claim evidence,
+        # never our residue.
+        locks = self.paths.vibe / "provider-actions" / "locks"
+        locks.mkdir(parents=True, exist_ok=True)
+        (locks / (self.action_id + ".lock")).write_text(
+            json.dumps({"pid": 1, "owner": "foreign"}), encoding="utf-8")
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+        self.assertFalse(any(
+            event["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+            for event in load_events(self.paths, self.run_id)))
+
+    def test_foreign_intent_record_refuses(self):
+        locks = self.paths.vibe / "provider-actions" / "locks"
+        locks.mkdir(parents=True, exist_ok=True)
+        (locks / "retire-{}.intent".format(self.digest[:16])).write_text(
+            json.dumps({
+                "kind": "retire_uninvoked_legacy_intent",
+                "run_id": "run-other", "plan_id": "probe-plan",
+                "amendment_digest": self.digest,
+                "action_ids": [self.action_id],
+                "phase": "locked", "lock_shas": {}}),
+            encoding="utf-8")
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+
+
+class RetireDeclaredCreatesTests(_LegacyUninvokedFixture):
+    """A retired consumer may carry declared bootstrap/successor creates;
+    undeclared, binding, unreturned or phantom creates all refuse."""
+
+    def _create_log(self, entries, name):
+        return self._rollout(entries, name=name)
+
+    def _consumer_with_create(self, payload_extra=None, returned_threads=None,
+                              output_text=None, name="create_thread",
+                              call_id="call-boot"):
+        output_text = output_text or json.dumps(
+            {"threadId": "01a1aa87-0050-78d2-a720-0df5ae6212a1",
+             "hostId": "local"})
+        call_payload = {
+            "type": "function_call", "name": name,
+            "call_id": call_id}
+        if payload_extra:
+            call_payload.update(payload_extra)
+        entries = [
+            {"type": "response_item", "payload": call_payload},
+            {"type": "response_item",
+             "payload": {"type": "function_call_output",
+                         "call_id": call_id, "output": output_text}},
+        ]
+        log = self._create_log(entries, "rollout-boot.jsonl")
+        consumer = self._consumer(
+            "boot-supervisor", log,
+            calls=[{"name": name, "call_id": call_id, "returned": True}])
+        if returned_threads is not None:
+            consumer["declared_creates"] = [{
+                "call_id": call_id,
+                "purpose": "supervisor rotation bootstrap",
+                "returned_thread_ids": returned_threads}]
+        return consumer
+
+    def test_declared_bootstrap_create_passes(self):
+        consumer = self._consumer_with_create(
+            returned_threads=["01a1aa87-0050-78d2-a720-0df5ae6212a1"])
+        evidence = self._mutate(
+            lambda e: e["retired_consumers"].append(consumer))
+        result = self._retire(evidence)
+        self.assertEqual(result["status"], "retired")
+
+    def test_undeclared_create_refuses(self):
+        consumer = self._consumer_with_create(returned_threads=None)
+        evidence = self._mutate(
+            lambda e: e["retired_consumers"].append(consumer))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+        self.assertFalse(any(
+            event["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+            for event in load_events(self.paths, self.run_id)))
+
+    def test_create_binding_retired_action_refuses(self):
+        consumer = self._consumer_with_create(
+            payload_extra={"arguments": json.dumps(
+                {"action_id": self.action_id})},
+            returned_threads=["01a1aa87-0050-78d2-a720-0df5ae6212a1"])
+        evidence = self._mutate(
+            lambda e: e["retired_consumers"].append(consumer))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_create_binding_retired_digest_refuses(self):
+        consumer = self._consumer_with_create(
+            payload_extra={"arguments": json.dumps(
+                {"request_digest": self.request["request_digest"]})},
+            returned_threads=["01a1aa87-0050-78d2-a720-0df5ae6212a1"])
+        evidence = self._mutate(
+            lambda e: e["retired_consumers"].append(consumer))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_declared_wrong_thread_refuses(self):
+        consumer = self._consumer_with_create(
+            returned_threads=["00000000-0000-0000-0000-000000000000"])
+        evidence = self._mutate(
+            lambda e: e["retired_consumers"].append(consumer))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_declared_phantom_create_refuses(self):
+        consumer = self._consumer_with_create(
+            returned_threads=["01a1aa87-0050-78d2-a720-0df5ae6212a1"])
+        consumer["declared_creates"].append({
+            "call_id": "call-ghost", "purpose": "phantom",
+            "returned_thread_ids": ["x"]})
+        evidence = self._mutate(
+            lambda e: e["retired_consumers"].append(consumer))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_host_delegation_records_are_not_tool_returns(self):
+        # epoch2-shape: delegation injections look like outputs but carry
+        # only an fco_ id and no call_id.  They are skipped, never paired.
+        log = self._rollout([
+            {"type": "response_item",
+             "payload": {"type": "function_call", "name": "exec_command",
+                         "call_id": "call-ok"}},
+            {"type": "response_item",
+             "payload": {"type": "function_call_output",
+                         "call_id": "call-ok", "output": "done"}},
+            {"type": "response_item",
+             "payload": {"type": "function_call_output",
+                         "id": "fco_delegation",
+                         "output": "<delegation>"}},
+        ], name="rollout-delegation.jsonl")
+        audit = plan_amendment._rollout_native_calls(log)
+        self.assertEqual(audit["skipped_returns"], 1)
+        self.assertEqual(audit["unpaired"], [])
+        consumer = self._consumer(
+            "delegation-session", log,
+            calls=[{"name": "exec_command", "call_id": "call-ok",
+                    "returned": True}])
+        evidence = self._mutate(
+            lambda e: e["retired_consumers"].append(consumer))
+        result = self._retire(evidence)
+        self.assertEqual(result["status"], "retired")
+
+
+class RetireBaseCorrectionTests(_LegacyUninvokedFixture):
+    """The dispatch-base correction must be proven by the audited creation
+    call, its real return output and an unmoved create-only reflog."""
+
+    def setUp(self):
+        super().setUp()
+        import shutil
+        import subprocess
+        # Replace the standalone test repo with a real linked worktree whose
+        # branch was created at a different base than the recorded snapshot
+        # base -- the exact projection drift the correction exists for.
+        stale = self.root / self.node["worktree"]
+        if stale.exists():
+            shutil.rmtree(stale)
+        source = Path(tempfile.mkdtemp(prefix="r4-source-"))
+        subprocess.run(["git", "init", str(source)], check=True,
+                       capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(source), "commit", "--allow-empty",
+             "-m", "dispatch-base", "-q"], check=True, capture_output=True)
+        self.corrected_base = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        add = subprocess.run(
+            ["git", "-C", str(source), "worktree", "add",
+             str(stale), "-b", self.node["branch"], self.corrected_base],
+            check=True, capture_output=True, text=True)
+        self.add_output = add.stdout
+        self.fake_base = "6ab87860e954704526820b58beedf6c3ce015c8b"
+        snapshot = load_snapshot(self.paths, self.run_id)
+        node = snapshot.nodes[self.NODE]
+        node["worktree_base"] = self.fake_base
+        snapshot.nodes[self.NODE] = node
+        save_snapshot(self.paths, snapshot)
+        command = (
+            "git worktree add {} -b {} {}".format(
+                self.node["worktree"], self.node["branch"],
+                self.corrected_base))
+        output = (
+            "Preparing worktree (new branch '{}')" + chr(10)
+            + "HEAD is now at {} dispatch-base" + chr(10)).format(
+                self.node["branch"], self.corrected_base[:7])
+        entries = [
+            {"type": "response_item",
+             "payload": {"type": "custom_tool_call", "name": "exec",
+                         "call_id": "call-add",
+                         "input": command}},
+            {"type": "response_item",
+             "payload": {"type": "custom_tool_call_output",
+                         "call_id": "call-add",
+                         "output": output}},
+            {"type": "response_item",
+             "payload": {"type": "custom_tool_call", "name": "exec",
+                         "call_id": "call-1",
+                         "input": "text(await tools.exec_command())"}},
+            {"type": "response_item",
+             "payload": {"type": "custom_tool_call_output",
+                         "call_id": "call-1", "output": "ok"}},
+        ]
+        owner_log = self._rollout(entries, name="rollout-owner-add.jsonl")
+        self.owner_log = owner_log
+        consumer = self._consumer(
+            self.OLD_OWNER, owner_log,
+            calls=[{"name": "exec", "call_id": "call-add",
+                    "returned": True},
+                   {"name": "exec", "call_id": "call-1",
+                    "returned": True}])
+        self.evidence["retired_consumers"] = [
+            consumer, self.consumers[1]]
+        reflog = subprocess.run(
+            ["git", "-C", str(stale), "reflog", "show",
+             self.node["branch"], "--format=%H %gs"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        payload = entries[0]["payload"]
+        self.evidence["worktrees"][0].update({
+            "head": self.corrected_base,
+            "base_correction": {
+                "old_snapshot_base": self.fake_base,
+                "corrected_base": self.corrected_base,
+                "creation_rollout_sha256": self._sha(owner_log),
+                "creation_call_id": "call-add",
+                "creation_command_digest": hashlib.sha256(
+                    json.dumps(payload, ensure_ascii=False,
+                               sort_keys=True).encode("utf-8")).hexdigest(),
+                "output_digest": hashlib.sha256(
+                    output.encode("utf-8")).hexdigest(),
+                "reflog_digest": hashlib.sha256(
+                    reflog.encode("utf-8")).hexdigest(),
+                "actual_output": output,
+            },
+        })
+
+    def test_correction_retires_and_updates_projection(self):
+        result = self._retire()
+        self.assertEqual(result["status"], "retired")
+        snapshot = load_snapshot(self.paths, self.run_id)
+        self.assertEqual(
+            snapshot.nodes[self.NODE]["worktree_base"], self.corrected_base)
+        events = [e for e in load_events(self.paths, self.run_id)
+                  if e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT]
+        self.assertEqual(len(events), 1)
+        corrections = events[0]["data"]["base_corrections"]
+        self.assertEqual(
+            corrections[self.NODE]["corrected_base_digest"],
+            self.corrected_base)
+        result = plan_amendment.confirm(
+            self.paths, "probe-plan", self.digest, self.token)
+        self.assertEqual(result["status"], "amended")
+
+    def test_forged_actual_output_refuses(self):
+        evidence = self._mutate(
+            lambda e: e["worktrees"][0]["base_correction"].update(
+                actual_output="forged output with HEAD is now at {}".format(
+                    self.corrected_base)))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_output_digest_tamper_refuses(self):
+        evidence = self._mutate(
+            lambda e: e["worktrees"][0]["base_correction"].update(
+                output_digest="0" * 64))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_creation_call_outside_audited_rollout_refuses(self):
+        evidence = self._mutate(
+            lambda e: e["worktrees"][0]["base_correction"].update(
+                creation_call_id="call-not-in-log"))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_reflog_drift_refuses(self):
+        evidence = self._mutate(
+            lambda e: e["worktrees"][0]["base_correction"].update(
+                reflog_digest="0" * 64))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_moved_branch_rejects_correction(self):
+        import subprocess
+        stale = self.root / self.node["worktree"]
+        subprocess.run(
+            ["git", "-C", str(stale), "commit", "--allow-empty",
+             "-m", "mutation", "-q"], check=True, capture_output=True)
+        new_head = subprocess.run(
+            ["git", "-C", str(stale), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        evidence = self._mutate(
+            lambda e: e["worktrees"][0].update(head=new_head))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire(evidence)
+
+    def test_correction_premise_mismatch_refuses(self):
+        snapshot = load_snapshot(self.paths, self.run_id)
+        node = snapshot.nodes[self.NODE]
+        node["worktree_base"] = self.corrected_base
+        snapshot.nodes[self.NODE] = node
+        save_snapshot(self.paths, snapshot)
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()

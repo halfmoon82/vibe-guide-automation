@@ -372,6 +372,10 @@ _EVENT_DATA_KEYS = {
     # authorization_reauthorized event applied.
     "amendment_digest",
     "superseded_creates",
+    # retire_uninvoked_legacy: proven dispatch-base corrections (old ->
+    # corrected commit digests per node); kept at data level because
+    # 'evidence' is provider-text redacted.
+    "base_corrections",
     "capability_contract_digest",
     "checkpoint_sha",
     "last_event_seq",
@@ -1220,7 +1224,12 @@ _COALESCED_ADJACENT_EVENTS = frozenset({
 })
 # A projection of the snapshot: only the latest one is ever compared, so an
 # identical one is redundant even when other events were written in between.
-_COALESCED_LATEST_EVENTS = frozenset({"execution_topology_observed"})
+_COALESCED_LATEST_EVENTS = frozenset({
+    "execution_topology_observed",
+    # retire_uninvoked_legacy is a boundary, not a stream entry: a rerun
+    # after a crash must converge on the same event, never append a twin.
+    "retire_uninvoked_legacy",
+})
 
 
 def _valid_recorded_at(value: Any) -> bool:

@@ -41,7 +41,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import hashlib
+import re
+import subprocess
+
 from .adapters.task_provider import ProviderActionStore
+from .contracts import RunEvent
 from .authorization import (
     AuthorizationCard,
     AuthorizationRecord,
@@ -72,7 +77,15 @@ from .node_spec import (
 )
 from .paths import ProjectPaths
 from .planner import PRD, DecisionCard, approve_prd
-from .state import interprocess_lock, load_events, load_snapshot, save_snapshot
+from .state import (
+    append_event,
+    interprocess_lock,
+    load_events,
+    load_snapshot,
+    read_writer_lease,
+    release_writer_lease,
+    save_snapshot,
+)
 
 AMENDMENTS_DIRNAME = "amendments"
 TRANSFER_MARKER = ".amendment-transfer.json"
@@ -96,6 +109,112 @@ _ACTIVE_NODE_STATUSES = frozenset({
 _TERMINAL_BINDING_STATUSES = frozenset({
     "archived", "complete", "terminated", "closed", "replaced",
 })
+
+#: Audit reason written on stale markers for creates that provably were
+#: never invoked.  It is deliberately distinct from
+#: ``platform_handoff_superseded`` -- this path retires legacy side
+#: effects inside the same platform and authorization, not across a
+#: handoff.
+RETIRE_UNINVOKED_REASON = "retire_uninvoked_legacy"
+#: The durable run event proving the retirement boundary.
+RETIRE_UNINVOKED_EVENT = "retire_uninvoked_legacy"
+_RETIRE_SCHEMA = 1
+_RETIRE_KIND = "retire_uninvoked_legacy"
+#: Rollout payload types that start a native tool invocation.
+_NATIVE_CALL_TYPES = frozenset({
+    "function_call", "local_shell_call", "custom_tool_call",
+})
+#: Rollout payload types that close one.
+_NATIVE_RETURN_TYPES = frozenset({
+    "function_call_output", "local_shell_call_output",
+    "custom_tool_call_output", "tool_call_output",
+})
+#: A create that must never appear in a retired consumer's own log.
+_FORBIDDEN_RETIRE_CALLS = frozenset({
+    "create_thread", "codex_app__create_thread",
+    "svc__codex_app__create_thread",
+    "tools.mcp__codex_app__create_thread",
+})
+#: Invocation shapes embedded inside an exec payload's JavaScript source.
+#: Only occurrences *outside* string literals and comments can execute; a
+#: cmd-string, prompt or audit-script quoting of the same text is a
+#: reference, not a call, and is deliberately not flagged.
+_EMBEDDED_CREATE_MARKERS = (
+    "svc__codex_app__create_thread(",
+    "codex_app__create_thread(",
+    "create_thread(",
+)
+
+
+def _embedded_create_invocations(text: str) -> int:
+    """Create invocations in exec JavaScript outside strings and comments.
+
+    A tools.mcp__codex_app__create_thread( inside a quoted cmd string (a
+    subprocess can never reach host tools), inside a prompt, or inside a
+    comment is a textual reference.  Template-literal expressions are
+    scanned as string content -- a conservative limitation of this lexical
+    pass, recorded here instead of guessed around.
+    """
+    count = 0
+    index = 0
+    state = None  # None | 'single' | 'double' | 'template' | 'line' | 'block'
+    length = len(text)
+    while index < length:
+        char = text[index]
+        nxt = text[index + 1] if index + 1 < length else ""
+        if state is None:
+            if char == "/" and nxt == "/":
+                state = "line"
+                index += 2
+                continue
+            if char == "/" and nxt == "*":
+                state = "block"
+                index += 2
+                continue
+            if char == "'":
+                state = "single"
+                index += 1
+                continue
+            if char == chr(34):
+                state = "double"
+                index += 1
+                continue
+            if char == chr(96):
+                state = "template"
+                index += 1
+                continue
+            matched = False
+            for marker in _EMBEDDED_CREATE_MARKERS:
+                if text.startswith(marker, index):
+                    count += 1
+                    index += len(marker)
+                    matched = True
+                    break
+            if not matched:
+                index += 1
+            continue
+        if state == "line":
+            if char == chr(10):
+                state = None
+            index += 1
+            continue
+        if state == "block":
+            if char == "*" and nxt == "/":
+                state = None
+                index += 2
+                continue
+            index += 1
+            continue
+        if char == chr(92):
+            index += 2
+            continue
+        if ((state == "single" and char == "'")
+                or (state == "double" and char == chr(34))
+                or (state == "template" and char == chr(96))):
+            state = None
+        index += 1
+    return count
+
 
 
 def project_paths(root: Any) -> ProjectPaths:
@@ -691,7 +810,8 @@ def _live_executors(paths: ProjectPaths, run_id: str) -> List[str]:
         if node.get("retryable_action"):
             problems.append("node {} has an unapplied retryable action".format(node_id))
     try:
-        pending = ProviderActionStore(paths).pending(run_id)
+        store = ProviderActionStore(paths)
+        pending = store.pending(run_id)
     except Exception as error:
         problems.append("provider pending scan unreadable: " + str(error))
     else:
@@ -699,6 +819,66 @@ def _live_executors(paths: ProjectPaths, run_id: str) -> List[str]:
             problems.append(
                 "pending provider side effects: "
                 + ",".join(str(item.get("action_id")) for item in pending))
+        # A retired uninvoked create must stay invisible *and* unclaimed:
+        # a late result, observation, claim or worktree write after
+        # retirement is evidence the "never invoked" proof was wrong, so
+        # the run goes back to blocked_unknown instead of consuming it.
+        stale_dir = store.root / "stale"
+        if stale_dir.is_dir():
+            for marker_path in sorted(stale_dir.glob("action-*.json")):
+                try:
+                    marker = json.loads(
+                        marker_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    problems.append(
+                        "provider stale marker unreadable: " + marker_path.name)
+                    continue
+                if (marker.get("run_id") != run_id
+                        or marker.get("reason") != RETIRE_UNINVOKED_REASON):
+                    continue
+                action_id = marker.get("action_id")
+                node_id = marker.get("issue_id")
+                if (store.root / "results" / marker_path.name).exists():
+                    problems.append(
+                        "retired action {} gained a late result".format(
+                            action_id))
+                if (store.root / "observations").is_dir() and any(
+                        (store.root / "observations").glob(
+                            str(action_id) + "-*.json")):
+                    problems.append(
+                        "retired action {} gained a late observation".format(
+                            action_id))
+                claim = _retire_claim_evidence(
+                    store, run_id, str(node_id),
+                    str(marker.get("amendment_digest") or ""))
+                if claim is not None:
+                    problems.append(
+                        "retired node {} has late claim evidence: {}".format(
+                            node_id, claim))
+                node = snapshot.nodes.get(node_id) if isinstance(
+                    getattr(snapshot, "nodes", None), dict) else None
+                base = node.get("worktree_base") if isinstance(node, dict) else None
+                wt = node.get("worktree") if isinstance(node, dict) else None
+                if isinstance(wt, str) and wt:
+                    wt_path = paths.root / wt
+                    try:
+                        if not isinstance(base, str) or len(base) != 40:
+                            raise ValueError("worktree_base missing")
+                        head = _git_probe(wt_path, "rev-parse", "HEAD")
+                        dirty = _git_probe(
+                            wt_path, "status", "--porcelain")
+                        if head != base:
+                            problems.append(
+                                "retired node {} worktree head moved".format(
+                                    node_id))
+                        if dirty:
+                            problems.append(
+                                "retired node {} worktree is dirty".format(
+                                    node_id))
+                    except (ValueError, OSError) as error:
+                        problems.append(
+                            "retired node {} worktree unverifiable: {}".format(
+                                node_id, error))
     try:
         leases_dir = paths.vibe / "leases"
         if leases_dir.is_dir():
@@ -1163,3 +1343,1108 @@ def _recover_locked(paths: ProjectPaths, plan_id: str, plan_root: Path,
         marker_path.unlink()
     return {"status": "rolled_back", "plan_id": plan_id,
             "run_id": run_id, "amendment_digest": digest}
+
+
+# ----------------------------------------------------------------------
+# retire_uninvoked_legacy
+#
+# The narrowest safe close-out for a run whose dispatch-generation creates
+# were recorded as durable provider requests but provably never invoked:
+# the consuming supervisor shift completed without the create_thread call,
+# every known consumer session was archived, a successor shift owns the
+# supervisor lease by public CAS, and the contract worktrees are bit-clean
+# at their dispatch heads.  Retirement then writes a dedicated stale audit
+# marker beside the immutable request (the request is never deleted and
+# ``pending()`` simply stops surfacing it), a single
+# ``retire_uninvoked_legacy`` run event, and resets the node projection to
+# ``planned`` while releasing the matching writer lease.  Holds are not
+# touched; this is engineering recovery, not a product or authorization
+# decision.
+#
+# Nothing here fabricates a provider result, deletes a request, edits the
+# registry, or declares an unknown consumer safe: every field of the
+# evidence bundle is re-verified against live on-disk state inside the
+# amendment lock.  A late result/observation that appears afterwards is
+# detected by ``_live_executors`` and blocks ``confirm`` -- it is never
+# hidden and never consumed.
+# ----------------------------------------------------------------------
+
+
+def _git_probe(worktree: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(worktree)] + list(args),
+        capture_output=True, text=True, timeout=15)
+    if completed.returncode != 0:
+        raise ValueError(
+            "git probe failed for {}: {}".format(
+                worktree, (completed.stderr or completed.stdout).strip()))
+    return completed.stdout.strip()
+
+
+def _rollout_native_calls(path: Path) -> List[Dict[str, Any]]:
+    """Structured call/return pairs of one rollout log; fail closed on noise.
+
+    Only a real ``function_call``/tool-call payload names a native
+    invocation -- a ``tools.mcp__codex_app__create_thread`` string inside an
+    exec command body is *not* a call, so textual grep cannot stand in for
+    this parse.  Any unparseable line, call without return, or return
+    without call raises, because an unreadable log is not proof that the
+    create was never issued.
+    """
+    calls: Dict[str, Dict[str, Any]] = {}
+    returns: Dict[str, Dict[str, Any]] = {}
+    ordered: List[Dict[str, Any]] = []
+    skipped_returns = 0
+    for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError as error:
+            raise ValueError(
+                "rollout {} line {} is not parseable JSON".format(
+                    path.name, line_number)) from error
+        if not isinstance(entry, dict):
+            raise ValueError(
+                "rollout {} line {} is not an object".format(
+                    path.name, line_number))
+        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else entry
+        kind = payload.get("type")
+        if isinstance(kind, str) and "call" in kind and (
+                kind not in _NATIVE_CALL_TYPES
+                and kind not in _NATIVE_RETURN_TYPES):
+            raise ValueError(
+                "rollout {} line {} carries an unclassifiable call type {}".format(
+                    path.name, line_number, kind))
+        if kind in _NATIVE_CALL_TYPES:
+            # An exec-style payload can *host* a native invocation: the
+            # host runtime executes ``tools.mcp__codex_app__create_thread(...)``
+            # inside its argument text.  Only the call payload is scanned
+            # for that shape -- tool documentation or prompt text quoting
+            # the same signature is not an invocation.
+            # Exec payloads are flagged, not rejected, at collection time:
+            # the JavaScript-aware classifier above separates an actual
+            # embedded invocation from a quoted reference, and
+            # _verify_declared_creates decides whether each flagged call is
+            # a declared non-legacy invocation or a retired binding.
+
+            name = payload.get("name") or payload.get("tool_name")
+            call_id = payload.get("call_id") or payload.get("id")
+            if not isinstance(name, str) or not name:
+                raise ValueError(
+                    "rollout {} line {} carries an unnamed native call".format(
+                        path.name, line_number))
+            if not isinstance(call_id, str) or not call_id:
+                raise ValueError(
+                    "rollout {} line {} carries a native call without id".format(
+                        path.name, line_number))
+            if call_id in calls:
+                raise ValueError(
+                    "rollout {} line {} repeats native call id {}".format(
+                        path.name, line_number, call_id))
+            calls[call_id] = {"name": name, "call_id": call_id,
+                              "line": line_number}
+            calls[call_id]["payload"] = payload
+            calls[call_id]["native_create"] = (
+                name in _FORBIDDEN_RETIRE_CALLS)
+            source = payload.get("input")
+            calls[call_id]["embedded_create"] = (
+                isinstance(source, str)
+                and _embedded_create_invocations(source) > 0)
+            ordered.append(calls[call_id])
+        elif kind in _NATIVE_RETURN_TYPES:
+            call_id = payload.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                # Host records like delegation injections use the output
+                # shape but carry only their own fco_/ctco_ id, never a
+                # call_id: they are not tool returns and cannot serve as
+                # pairing evidence.  They are counted, not trusted.
+                skipped_returns += 1
+                continue
+            # The matching call may live in another consumer's log (the
+            # fork-inherited shape): keep every identifiable return and
+            # let the caller pair it across the retired consumer set.
+            returns[call_id] = {"line": line_number,
+                                "payload": payload}
+    unpaired = sorted(set(calls) - set(returns))
+    # A fork/successor shift inherits the parent's *in-flight* calls into
+    # its own log without their returns (the return lives in the parent
+    # record).  Those are reported, not silently excused: the caller pairs
+    # each one against the owner log's completed call before release.
+    returned = {call_id for call_id in calls if call_id in returns}
+    for call in ordered:
+        if call["call_id"] in returns:
+            call["return_line"] = returns[call["call_id"]]["line"]
+            call["return_payload"] = returns[call["call_id"]]["payload"]
+    return {"calls": ordered, "unpaired": unpaired,
+            "returned": sorted(returned), "returns": returns,
+            "skipped_returns": skipped_returns}
+
+
+def _retire_field(evidence: Dict[str, Any], key: str) -> Any:
+    value = evidence.get(key)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        raise ValueError("retire evidence requires " + key)
+    return value
+
+
+def _retire_consumer_proof(consumer: Dict[str, Any], index: int) -> None:
+    """Re-verify one archived consumer's rollout inside the lock."""
+    session = consumer.get("session_id")
+    if not isinstance(session, str) or not session:
+        raise ValueError(
+            "retire evidence consumer {} requires session_id".format(index))
+    terminal = consumer.get("native_terminal")
+    if not isinstance(terminal, dict):
+        raise ValueError(
+            "consumer {} requires a native_terminal receipt object".format(
+                session))
+    if terminal.get("archive_status") != "archived":
+        raise PermissionError(
+            "consumer {} archive receipt is not archived".format(session))
+    if terminal.get("read_thread_status") not in {
+            "archived", "stopped", "failed", "closed", "terminated",
+            "notLoaded"}:
+        raise PermissionError(
+            "consumer {} read_thread state is not terminal".format(session))
+    receipt = terminal.get("receipt_path")
+    if not isinstance(receipt, str) or not receipt:
+        raise ValueError(
+            "consumer {} requires native_terminal.receipt_path".format(
+                session))
+    try:
+        if (_artifact_hash(Path(receipt))
+                != terminal.get("receipt_sha256")):
+            raise PermissionError(
+                "consumer {} receipt digest drifted".format(session))
+    except (OSError, ValueError) as error:
+        raise PermissionError(
+            "consumer {} receipt unreadable: {}".format(session, error))
+    rollout = consumer.get("rollout_path")
+    if not isinstance(rollout, str) or not rollout:
+        raise ValueError(
+            "consumer {} requires rollout_path".format(session))
+    rollout_path = Path(rollout)
+    try:
+        actual = _artifact_hash(rollout_path)
+    except (OSError, ValueError) as error:
+        raise PermissionError(
+            "consumer {} rollout unreadable: {}".format(session, error))
+    if actual != consumer.get("rollout_sha256"):
+        raise PermissionError(
+            "consumer {} rollout digest drifted".format(session))
+    try:
+        audit = _rollout_native_calls(rollout_path)
+    except (OSError, ValueError) as error:
+        raise PermissionError(
+            "consumer {} rollout cannot prove quiescence: {}".format(
+                session, error))
+    calls = audit["calls"]
+    # A native or embedded create is flagged, not auto-fatal: a retired
+    # supervisor legitimately creates its own successor.  The binding check
+    # in _verify_declared_creates runs after request pairing and refuses
+    # every flagged call that is not declared with its returned threads.
+    declared = consumer.get("native_calls")
+    if not isinstance(declared, list):
+        raise ValueError(
+            "consumer {} requires a native_calls list".format(session))
+    observed = sorted(
+        (item["name"], item["call_id"]) for item in calls)
+    expected = sorted(
+        (item.get("name"), item.get("call_id")) for item in declared
+        if isinstance(item, dict))
+    if observed != expected or any(
+            item.get("returned") is not True for item in declared
+            if isinstance(item, dict)) or len(declared) != len(calls):
+        raise PermissionError(
+            "consumer {} declared native calls disagree with its own log".format(
+                session))
+    # An in-flight call whose return lives in the *parent* log is the
+    # inherited-history shape (fork/successor shifts carry the parent's
+    # open calls).  It is only excused when the evidence names it and
+    # another retired consumer's own log holds the matching return --
+    # verified by the caller once every consumer was audited.
+    inherited = consumer.get("inherited_unreturned") or []
+    if not isinstance(inherited, list):
+        raise ValueError(
+            "consumer {} inherited_unreturned must be a list".format(session))
+    inherited_ids = set()
+    for item in inherited:
+        if not isinstance(item, dict) or not isinstance(
+                item.get("call_id"), str) or not item["call_id"]:
+            raise ValueError(
+                "consumer {} inherited_unreturned entries require "
+                "call_id".format(session))
+        inherited_ids.add(item["call_id"])
+    if inherited_ids != set(audit["unpaired"]):
+        raise PermissionError(
+            "consumer {} has unreturned native calls not declared as "
+            "inherited: {}".format(
+                session, ", ".join(sorted(set(audit["unpaired"])
+                                          - inherited_ids)) or "none"))
+    audit["session_id"] = session
+    audit["rollout_sha256"] = consumer["rollout_sha256"]
+    return audit
+
+
+def _retire_request_problems(
+        store: ProviderActionStore, evidence: Dict[str, Any],
+        run_id: str) -> List[Dict[str, Any]]:
+    """Validated (action, request-path) pairs; the first defect aborts all."""
+    declared = evidence.get("requests")
+    if not isinstance(declared, list) or not declared:
+        raise ValueError("retire evidence requires a non-empty requests list")
+    pairs = []
+    seen = set()
+    request_dir = store.root / "requests"
+    for index, item in enumerate(declared):
+        if not isinstance(item, dict):
+            raise ValueError("retire request {} must be an object".format(index))
+        action_id = item.get("action_id")
+        if not isinstance(action_id, str) or not action_id:
+            raise ValueError("retire request {} requires action_id".format(index))
+        if action_id in seen:
+            raise ValueError("retire request {} duplicated".format(action_id))
+        seen.add(action_id)
+        path = request_dir / (action_id + ".json")
+        if not path.is_file():
+            raise PermissionError(
+                "provider request {} is not on disk".format(action_id))
+        if _artifact_hash(path) != item.get("request_sha256"):
+            raise PermissionError(
+                "provider request {} digest drifted".format(action_id))
+        try:
+            action = store.action(action_id)
+        except (OSError, ValueError, KeyError) as error:
+            raise PermissionError(
+                "provider request {} unreadable: {}".format(action_id, error))
+        envelope = action.get("request")
+        if not isinstance(envelope, dict):
+            raise PermissionError(
+                "provider request {} has no bound request envelope".format(
+                    action_id))
+        checks = (
+            ("run_id", action.get("run_id"), run_id),
+            ("operation", action.get("operation"), "create"),
+            ("role", action.get("role"), item.get("role")),
+            ("issue_id", action.get("issue_id"), item.get("issue_id")),
+            ("generation", action.get("generation"), item.get("generation")),
+            ("request_digest", action.get("request_digest"),
+             item.get("request_digest")),
+            ("authorization_digest", envelope.get("authorization_digest"),
+             _retire_field(evidence, "authorization_digest")),
+        )
+        for field, actual, expected in checks:
+            if actual != expected:
+                raise PermissionError(
+                    "provider request {} {} disagrees with the bound "
+                    "evidence".format(action_id, field))
+        if store.result(action_id) is not None:
+            raise PermissionError(
+                "provider request {} already carries a result".format(action_id))
+        stale = _retire_stale_marker(store, action_id)
+        if stale is not None and stale.get("reason") != RETIRE_UNINVOKED_REASON:
+            raise PermissionError(
+                "provider request {} carries a foreign stale marker".format(
+                    action_id))
+        if stale is not None and (
+                stale.get("amendment_digest")
+                != _retire_field(evidence, "amendment_digest")):
+            raise PermissionError(
+                "provider request {} was retired under a different "
+                "amendment".format(action_id))
+        claim = _retire_claim_evidence(
+            store, run_id, str(action.get("issue_id")),
+            _retire_field(evidence, "amendment_digest"))
+        if claim is not None:
+            raise PermissionError(
+                "provider request {} node already has durable claim "
+                "evidence: {}".format(action_id, claim))
+        pairs.append((action_id, path, stale is not None,
+                        action))
+    return pairs
+
+
+def _verify_base_correction(
+        correction: Dict[str, Any], node: Dict[str, Any],
+        item: Dict[str, Any], node_id: str, wt_path: Path,
+        audits: List[Dict[str, Any]]) -> str:
+    """Re-verify a dispatch-head correction inside the retire lock."""
+    if not isinstance(correction, dict):
+        raise ValueError(
+            "node {} base_correction must be an object".format(node_id))
+    for key in ("old_snapshot_base", "corrected_base",
+                "creation_rollout_sha256", "creation_call_id",
+                "creation_command_digest", "output_digest",
+                "reflog_digest", "actual_output"):
+        if not isinstance(correction.get(key), str) or not correction[key]:
+            raise ValueError(
+                "node {} base_correction requires {}".format(node_id, key))
+    old_base = correction["old_snapshot_base"]
+    new_base = correction["corrected_base"]
+    for label, base in (("old_snapshot_base", old_base),
+                        ("corrected_base", new_base)):
+        if len(base) != 40 or any(
+                ch not in "0123456789abcdef" for ch in base.lower()):
+            raise PermissionError(
+                "node {} {} is not a commit digest".format(node_id, label))
+    return _verify_correction_chain(
+        correction, node, item, node_id, wt_path, audits, new_base)
+
+
+def _verify_correction_chain(
+        correction, node, item, node_id, wt_path, audits, new_base):
+    """Bind corrected_base to reflog, the creation call and its output."""
+    try:
+        reflog = _git_probe(
+            wt_path, "reflog", "show", str(node.get("branch")),
+            "--format=%H %gs")
+    except ValueError as error:
+        raise PermissionError(
+            "node {} reflog unreadable: {}".format(node_id, error))
+    entries = [line for line in reflog.splitlines() if line.strip()]
+    # The branch must have exactly one reflog entry: the initial Created
+    # from <full sha> line written by git worktree add.  Any later
+    # mutation -- a reset, commit or checkout -- produces a second entry
+    # or a different subject, and the node then has un-audited history.
+    created = ("{} branch: Created from {}".format(new_base, new_base))
+    if entries != [created]:
+        raise PermissionError(
+            "node {} branch reflog is not the single create entry: "
+            "{}".format(node_id, entries))
+    if hashlib.sha256(reflog.encode("utf-8")).hexdigest() != (
+            correction["reflog_digest"]):
+        raise PermissionError(
+            "node {} reflog digest drifted".format(node_id))
+    call = None
+    for audit in audits:
+        if audit.get("rollout_sha256") == correction[
+                "creation_rollout_sha256"]:
+            for candidate in audit["calls"]:
+                if candidate["call_id"] == correction["creation_call_id"]:
+                    call = candidate
+    if call is None:
+        raise PermissionError(
+            "node {} creation call is not inside an audited "
+            "rollout".format(node_id))
+    payload_text = json.dumps(
+        call.get("payload") or {}, ensure_ascii=False, sort_keys=True)
+    if hashlib.sha256(payload_text.encode("utf-8")).hexdigest() != (
+            correction["creation_command_digest"]):
+        raise PermissionError(
+            "node {} creation command digest drifted".format(node_id))
+    output = correction["actual_output"]
+    if hashlib.sha256(output.encode("utf-8")).hexdigest() != (
+            correction["output_digest"]):
+        raise PermissionError(
+            "node {} creation output digest drifted".format(node_id))
+    # The declared output is not trusted on its own: it must also be the
+    # exact payload the audited rollout recorded for this call's return.
+    return_payload = call.get("return_payload")
+    if not isinstance(return_payload, dict):
+        raise PermissionError(
+            "node {} creation call has no audited return payload".format(
+                node_id))
+    real_output = return_payload.get("output")
+    real_text = None
+    if isinstance(real_output, str):
+        real_text = real_output
+    elif isinstance(real_output, list):
+        parts = [
+            block.get("text") for block in real_output
+            if isinstance(block, dict) and isinstance(block.get("text"), str)]
+        if parts:
+            real_text = chr(10).join(parts)
+    if real_text is None:
+        raise PermissionError(
+            "node {} creation call return carries no textual output".format(
+                node_id))
+    if output != real_text:
+        raise PermissionError(
+            "node {} declared actual_output does not match the audited "
+            "call return".format(node_id))
+    worktree = str(node.get("worktree"))
+    branch = str(node.get("branch"))
+    expected_add = ("git worktree add {} -b {} {}".format(
+        worktree, branch, new_base))
+    if expected_add not in payload_text:
+        raise PermissionError(
+            "node {} creation call does not run the exact worktree add "
+            "for this node".format(node_id))
+    if ("Preparing worktree (new branch '{}')".format(branch)
+            not in real_text):
+        raise PermissionError(
+            "node {} creation output does not prove the branch "
+            "add".format(node_id))
+    match = re.search(r"HEAD is now at ([0-9a-f]{6,40})", real_text)
+    if match is None or not new_base.startswith(match.group(1)):
+        raise PermissionError(
+            "node {} creation output does not bind HEAD to the "
+            "corrected base".format(node_id))
+    return new_base
+
+
+def _retire_intent_path(store: ProviderActionStore,
+                        amendment_digest: str) -> Path:
+    return store.root / "locks" / (
+        "retire-{}.intent".format(amendment_digest[:16]))
+
+
+def _retire_intent(store: ProviderActionStore, run_id: str,
+                   amendment_digest: str) -> Optional[Dict[str, Any]]:
+    """This amendment's own retire intent record, or None.
+
+    The two-phase record distinguishes our crash residue from a foreign
+    claim: phase 'intent' was written before any lock was acquired, phase
+    'locked' names the exact lock-file SHAs this attempt held.  A record
+    of another amendment or run, or an unreadable one, is foreign
+    evidence -- callers fail closed on it.
+    """
+    path = _retire_intent_path(store, amendment_digest)
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise PermissionError(
+            "retire intent record unreadable: {}".format(error))
+    if not isinstance(data, dict):
+        raise PermissionError("retire intent record is not an object")
+    if (data.get("kind") != "retire_uninvoked_legacy_intent"
+            or data.get("amendment_digest") != amendment_digest
+            or data.get("run_id") != run_id):
+        raise PermissionError(
+            "a different retire attempt's intent record is present")
+    if data.get("phase") not in {"intent", "locked"}:
+        raise PermissionError("retire intent record phase is invalid")
+    return data
+
+
+def _retire_own_locks(store: ProviderActionStore, run_id: str,
+                      amendment_digest: str) -> Optional[set]:
+    """Action ids whose residual lock files belong to our own retire.
+
+    None means no intent record exists; a set (possibly empty) means the
+    listed locks are ours.  The lock SHA binds the residue to the intent,
+    so a foreign completion lock written after our crash is still seen
+    as foreign.
+    """
+    intent = _retire_intent(store, run_id, amendment_digest)
+    if intent is None:
+        return None
+    action_ids = intent.get("action_ids")
+    if not isinstance(action_ids, list):
+        raise PermissionError("retire intent record action_ids invalid")
+    if intent["phase"] == "intent":
+        # Written before the first lock acquisition: any matching lock
+        # file can only be our own residue (or a foreign claim; either
+        # way the caller re-acquires and the in-lock result check
+        # decides).
+        return {str(item) for item in action_ids
+                if isinstance(item, str)}
+    lock_shas = intent.get("lock_shas")
+    if not isinstance(lock_shas, dict):
+        raise PermissionError("retire intent record lock_shas invalid")
+    own = set()
+    locks_dir = store.root / "locks"
+    for action_id in action_ids:
+        lock_path = locks_dir / (str(action_id) + ".lock")
+        if not lock_path.is_file():
+            continue
+        try:
+            actual = _artifact_hash(lock_path)
+        except (OSError, ValueError):
+            continue
+        if actual == lock_shas.get(action_id):
+            own.add(str(action_id))
+    return own
+
+
+def _retire_claim_evidence(
+        store: ProviderActionStore, run_id: str, issue_id: str,
+        amendment_digest: str) -> Optional[str]:
+    """claim_evidence that recognizes this retire path's own lock residue.
+
+    ProviderActionStore.claim_evidence counts any locks/<action>.lock as
+    a claim mark.  retire holds the same name to fence complete() and
+    records exactly which locks it owns in the two-phase intent record;
+    a crash between marker writes and the event leaves residue that a
+    rerun converges instead of deadlocking on.  Any other lock --
+    foreign, historical, or a different amendment's -- stays 'claimed'
+    (fail closed), and every other evidence kind mirrors claim_evidence
+    exactly.
+    """
+    own_locks = _retire_own_locks(store, run_id, amendment_digest)
+    try:
+        action_ids = set()
+        request_dir = store.root / "requests"
+        if request_dir.is_dir():
+            for path in sorted(request_dir.glob("action-*.json")):
+                action = store._read(path)
+                if (action.get("run_id") == run_id
+                        and action.get("issue_id") == issue_id):
+                    action_ids.add(path.stem)
+        for action_id in sorted(action_ids):
+            if ((store.root / "locks" / (action_id + ".lock")).is_file()
+                    and (own_locks is None
+                         or action_id not in own_locks)):
+                return "lock"
+            if (store.root / "results" / (action_id + ".json")).exists():
+                return "result"
+            observations = store.root / "observations"
+            if observations.is_dir() and any(
+                    observations.glob(action_id + "-*.json")):
+                return "observation"
+        handles = store.root / "handles"
+        if handles.is_dir():
+            for path in sorted(handles.glob("*.json")):
+                meta = store._read(path)
+                if (meta.get("run_id") == run_id
+                        and meta.get("node_id") == issue_id):
+                    return "handle"
+        sessions = store.root / "claude-bg-sessions"
+        if sessions.is_dir():
+            for path in sorted(sessions.glob("*.json")):
+                claims = store._read(path).get("claims")
+                if (isinstance(claims, dict)
+                        and claims.get("run_id") == run_id
+                        and claims.get("node_id") == issue_id):
+                    return "session"
+        name = re.compile(
+            "^" + re.escape(run_id) + "-" + re.escape(issue_id)
+            + r"-(developer|reviewer)-g" + chr(92) + "d+" + chr(92)
+            + ".(json|md)$")
+        for directory in ("deliveries", "prompts"):
+            folder = store.root / directory
+            if folder.is_dir() and any(
+                    name.match(item.name) for item in folder.iterdir()):
+                return directory
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "unreadable"
+    return None
+
+
+def _retire_stale_marker(store: ProviderActionStore, action_id: str):
+    marker = store.root / "stale" / (action_id + ".json")
+    if not marker.is_file():
+        return None
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise PermissionError(
+            "provider stale marker {} unreadable".format(action_id))
+    return data if isinstance(data, dict) else None
+
+
+def _verify_retire_evidence(
+        paths: ProjectPaths, plan_id: str, amendment_digest: str,
+        evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """Fail closed unless the whole uninvoked-legacy chain verifies.
+
+    The return value is the validated context: run id, live snapshot, the
+    bound request pairs and the takeover facts the event will cite.
+    """
+    if not isinstance(evidence, dict):
+        raise ValueError("retire evidence must be an object")
+    if evidence.get("schema_version") != _RETIRE_SCHEMA:
+        raise ValueError("retire evidence schema_version must be {}".format(_RETIRE_SCHEMA))
+    if evidence.get("kind") != _RETIRE_KIND:
+        raise ValueError("retire evidence kind must be " + _RETIRE_KIND)
+    run_id = _retire_field(evidence, "run_id")
+    if _retire_field(evidence, "plan_id") != plan_id:
+        raise PermissionError("retire evidence plan_id does not match")
+    if _retire_field(evidence, "amendment_digest") != amendment_digest:
+        raise PermissionError(
+            "retire evidence is bound to a different amendment")
+    plan_root = _plan_root(paths, plan_id)
+    candidate = _load_candidate(paths, plan_id, amendment_digest)
+    lineage = _cas_lineage(paths, plan_id, plan_root, candidate)
+    if lineage["run_id"] != run_id:
+        raise PermissionError("retire evidence run is not the pinned run")
+    if (_retire_field(evidence, "authorization_digest")
+            != lineage["record"].digest):
+        raise PermissionError(
+            "retire evidence authorization does not bind the live record")
+    snapshot = lineage["snapshot"]
+    takeover = evidence.get("owner_takeover")
+    if not isinstance(takeover, dict):
+        raise ValueError("retire evidence requires owner_takeover")
+    for key in ("old_session_id", "new_session_id"):
+        if not isinstance(takeover.get(key), str) or not takeover[key]:
+            raise ValueError("owner_takeover requires " + key)
+    for key in ("old_lease_epoch", "new_lease_epoch"):
+        value = takeover.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("owner_takeover requires integer " + key)
+    if takeover["new_lease_epoch"] <= takeover["old_lease_epoch"]:
+        raise PermissionError("owner takeover epoch did not advance")
+    registry_path = paths.vibe / "runs" / run_id / "supervisor-registry.json"
+    try:
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise PermissionError("supervisor registry unreadable: " + str(error))
+    current = registry.get("current")
+    if not isinstance(current, dict) or current.get("session_id") != takeover["new_session_id"]:
+        raise PermissionError(
+            "the registered supervisor is not the takeover session")
+    from .supervisor import read_lease_epoch
+    if read_lease_epoch(paths, run_id) != takeover["new_lease_epoch"]:
+        raise PermissionError("supervisor lease epoch does not bind the takeover")
+    retired = evidence.get("retired_consumers")
+    if not isinstance(retired, list) or not retired:
+        raise ValueError("retire evidence requires retired_consumers")
+    retired_ids = set()
+    audits = []
+    for index, consumer in enumerate(retired):
+        if not isinstance(consumer, dict):
+            raise ValueError("retired consumer {} must be an object".format(index))
+        audits.append(_retire_consumer_proof(consumer, index))
+        retired_ids.add(consumer["session_id"])
+    for audit in audits:
+        for call_id in audit["unpaired"]:
+            paired = any(
+                call_id in other["returned"]
+                for other in audits
+                if other["session_id"] != audit["session_id"])
+            if not paired:
+                raise PermissionError(
+                    "consumer {} has an unreturned native call {} with no "
+                    "paired return in the retired consumer set".format(
+                        audit["session_id"], call_id))
+    if takeover["old_session_id"] not in retired_ids:
+        raise PermissionError("the outgoing supervisor is not proven retired")
+    history = registry.get("history")
+    if isinstance(history, list):
+        uncovered = [
+            item.get("session_id") for item in history
+            if isinstance(item, dict)
+            and item.get("session_id") not in retired_ids]
+        if uncovered:
+            raise PermissionError(
+                "registry history consumers are not proven retired: "
+                + ", ".join(str(item) for item in uncovered))
+    store = ProviderActionStore(paths)
+    pairs = _retire_request_problems(store, evidence, run_id)
+    _verify_declared_creates(pairs, retired, audits)
+    worktrees = evidence.get("worktrees")
+    if not isinstance(worktrees, list) or len(worktrees) != len(pairs):
+        raise ValueError(
+            "retire evidence requires one worktree entry per retired node")
+    clean_nodes = {}
+    for index, item in enumerate(worktrees):
+        if not isinstance(item, dict):
+            raise ValueError("worktree evidence {} must be an object".format(index))
+        node_id = item.get("node_id")
+        node = snapshot.nodes.get(node_id)
+        if node is None:
+            raise PermissionError(
+                "retire evidence names unknown node {}".format(node_id))
+        if node.get("active_task") or node.get("active_role") or node_id in snapshot.handles:
+            raise PermissionError(
+                "node {} still carries a live task".format(node_id))
+        retry = node.get("retryable_action")
+        node_clean = (node.get("status") == "planned" and retry is None)
+        pending_shape = (
+            node.get("status") in {"running", "retry_pending"}
+            and isinstance(retry, dict)
+            and retry.get("role") == "developer"
+            and retry.get("last_observation_ref") == "provider-pending"
+            and retry.get("successor") is not True)
+        if not (node_clean or pending_shape):
+            raise PermissionError(
+                "node {} is not the uninvoked-pending shape".format(node_id))
+        try:
+            from .task_registry import _all_bindings
+            live_bindings = [
+                binding for binding in _all_bindings(paths)
+                if getattr(binding, "run_id", None) == run_id
+                and getattr(binding, "node_id", None) == node_id
+                and str(getattr(binding, "status", "") or "")
+                not in _TERMINAL_BINDING_STATUSES]
+        except Exception as error:
+            raise PermissionError(
+                "task registry unreadable for {}: {}".format(node_id, error))
+        if live_bindings:
+            raise PermissionError(
+                "node {} has non-terminal task bindings".format(node_id))
+        worktree = item.get("worktree")
+        branch = item.get("branch")
+        head = item.get("head")
+        if worktree != node.get("worktree") or branch != node.get("branch"):
+            raise PermissionError(
+                "node {} worktree/branch evidence does not bind".format(node_id))
+        if read_writer_lease(paths, node_id, str(worktree)) is None:
+            foreign = (paths.vibe / "leases")
+            held = any(
+                json.loads(candidate.read_text(encoding="utf-8")).get("node_id") == node_id
+                for candidate in foreign.glob("*.json")
+                if candidate.is_file()) if foreign.is_dir() else False
+            if held or node.get("status") != "planned":
+                raise PermissionError(
+                    "node {} writer lease is missing or foreign".format(node_id))
+        wt_path = paths.root / str(worktree)
+        if not wt_path.is_dir():
+            raise PermissionError(
+                "node {} worktree {} is missing".format(node_id, worktree))
+        try:
+            actual_head = _git_probe(wt_path, "rev-parse", "HEAD")
+            actual_branch = _git_probe(
+                wt_path, "rev-parse", "--abbrev-ref", "HEAD")
+            dirty = _git_probe(wt_path, "status", "--porcelain")
+        except ValueError as error:
+            raise PermissionError(str(error))
+        correction = item.get("base_correction")
+        corrected_base = None
+        if correction is not None:
+            corrected_base = _verify_base_correction(
+                correction, node, item, node_id, wt_path, audits)
+        if actual_head != head:
+            raise PermissionError(
+                "node {} worktree head is not the bound head".format(node_id))
+        stored_base = node.get("worktree_base")
+        if corrected_base is not None:
+            if stored_base != correction.get("old_snapshot_base"):
+                raise PermissionError(
+                    "node {} stored worktree_base does not match the "
+                    "correction premise".format(node_id))
+            if actual_head != corrected_base:
+                raise PermissionError(
+                    "node {} worktree head is not the corrected base".format(
+                        node_id))
+        elif actual_head != stored_base:
+            raise PermissionError(
+                "node {} worktree head is not the frozen dispatch "
+                "head".format(node_id))
+        if actual_branch != branch:
+            raise PermissionError(
+                "node {} worktree is on the wrong branch".format(node_id))
+        if dirty:
+            raise PermissionError(
+                "node {} worktree is not clean".format(node_id))
+        clean_nodes[node_id] = {
+            "worktree": worktree, "head": actual_head,
+            "corrected_base": corrected_base}
+    request_nodes = {
+        str(item.get("issue_id")) for item in evidence["requests"]}
+    if set(clean_nodes) != request_nodes:
+        raise PermissionError(
+            "worktree evidence does not cover every retired node")
+    return {
+        "run_id": run_id,
+        "snapshot": snapshot,
+        "pairs": pairs,
+        "takeover": takeover,
+        "retired_consumers": retired,
+        "clean_nodes": clean_nodes,
+        "store": store,
+    }
+
+
+def _call_return_text(payload: Any) -> Optional[str]:
+    """Text of an audited return payload, or None when none exists."""
+    if not isinstance(payload, dict):
+        return None
+    output = payload.get("output")
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list):
+        parts = [
+            block.get("text") for block in output
+            if isinstance(block, dict) and isinstance(block.get("text"), str)]
+        if parts:
+            return chr(10).join(parts)
+    return None
+
+
+def _verify_declared_creates(
+        pairs: List[Any], consumers: List[Dict[str, Any]],
+        audits: List[Dict[str, Any]]) -> None:
+    """Every flagged create is declared, returned and not a retired request.
+
+    A retired supervisor legitimately invokes ``create_thread`` for its own
+    successor or for bootstrap housekeeping, so 'zero creates in every
+    consumer log' is the wrong invariant.  The right one is: a flagged
+    create call is safe only when (a) its payload provably does not carry
+    the identity of any retired pending request -- the action id, the
+    request digest, or the worker prompt verbatim that the mailbox
+    request would have delivered -- and (b) the evidence declares it with
+    the thread ids its audited return actually produced.  Undeclared,
+    undeclared-only, unreturned or binding calls all fail closed.
+    """
+    bindings = []
+    for action_id, _path, _already, action in pairs:
+        marks = {str(action_id)}
+        digest = action.get("request_digest")
+        if isinstance(digest, str) and digest:
+            marks.add(digest)
+        envelope = action.get("request")
+        if isinstance(envelope, dict):
+            prompt = envelope.get("prompt")
+            if isinstance(prompt, str) and prompt:
+                marks.add(prompt)
+        bindings.append((str(action.get("issue_id")), marks))
+    by_session = {
+        consumer.get("session_id"): consumer
+        for consumer in consumers if isinstance(consumer, dict)}
+    all_returns = {}
+    for audit in audits:
+        for call_id, entry in (audit.get("returns") or {}).items():
+            all_returns.setdefault(call_id, entry)
+    for audit in audits:
+        session = audit["session_id"]
+        consumer = by_session.get(session) or {}
+        declared = consumer.get("declared_creates")
+        if declared is None:
+            declared = []
+        if not isinstance(declared, list):
+            raise ValueError(
+                "consumer {} declared_creates must be a list".format(session))
+        declared_map = {}
+        for index, item in enumerate(declared):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    "consumer {} declared_creates[{}] must be an object".format(
+                        session, index))
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                raise ValueError(
+                    "consumer {} declared_creates[{}] requires call_id".format(
+                        session, index))
+            declared_map[call_id] = item
+        flagged = [
+            call for call in audit["calls"]
+            if call.get("native_create") or call.get("embedded_create")]
+        for call in flagged:
+            payload_text = json.dumps(
+                call.get("payload") or {}, ensure_ascii=False)
+            for node_id, marks in bindings:
+                if any(mark in payload_text for mark in marks):
+                    raise PermissionError(
+                        "consumer {} create call {} at line {} carries the "
+                        "identity of retired node {}".format(
+                            session, call["call_id"], call["line"],
+                            node_id))
+            declaration = declared_map.pop(call["call_id"], None)
+            if declaration is None:
+                raise PermissionError(
+                    "consumer {} has an undeclared create invocation {} at "
+                    "line {}".format(session, call["call_id"], call["line"]))
+            purpose = declaration.get("purpose")
+            if not isinstance(purpose, str) or not purpose.strip():
+                raise ValueError(
+                    "consumer {} declared create {} requires purpose".format(
+                        session, call["call_id"]))
+            thread_ids = declaration.get("returned_thread_ids")
+            if (not isinstance(thread_ids, list) or not thread_ids
+                    or any(not isinstance(item, str) or not item
+                           for item in thread_ids)):
+                raise ValueError(
+                    "consumer {} declared create {} requires "
+                    "returned_thread_ids".format(session, call["call_id"]))
+            ret_entry = all_returns.get(call["call_id"])
+            output_text = (
+                _call_return_text(ret_entry.get("payload"))
+                if isinstance(ret_entry, dict) else None)
+            if output_text is None:
+                raise PermissionError(
+                    "consumer {} declared create {} has no audited "
+                    "return".format(session, call["call_id"]))
+            for thread_id in thread_ids:
+                if thread_id not in output_text:
+                    raise PermissionError(
+                        "consumer {} declared create {} return does not "
+                        "contain thread {}".format(
+                            session, call["call_id"], thread_id))
+        if declared_map:
+            raise PermissionError(
+                "consumer {} declares creates absent from its own log: "
+                "{}".format(session, ", ".join(sorted(declared_map))))
+
+
+def retire_uninvoked_legacy(
+        paths: ProjectPaths, plan_id: str, amendment_digest: str,
+        evidence: Dict[str, Any],
+        _fault_at: Optional[str] = None) -> Dict[str, Any]:
+    """Retire provider creates that provably were never invoked, publicly.
+
+    Preconditions are re-verified inside the same ``.amendment.lock`` the
+    transfer uses; the durable ``retire_uninvoked_legacy`` event separates
+    rollback-allowed state from converge-only state.  The per-action
+    ``complete()`` locks are held from the stale-marker write through the
+    event, snapshot projection and lease release, so a provider callback
+    can never interleave with the boundary.  A two-phase intent record
+    (``locks/retire-<digest>.intent``) marks our own lock residue: a crash
+    before the event leaves intent+locks+markers that a rerun converges,
+    and a crash after it leaves a coalesced event plus the same residue --
+    either way the next call finishes the boundary without a twin event.
+    The intent record and our lock files are deleted once the boundary is
+    durable so nothing reads them as a foreign claim afterwards.
+    """
+    if not isinstance(amendment_digest, str) or not amendment_digest:
+        raise ValueError("retire requires the bound amendment digest")
+    plan_root = _plan_root(paths, plan_id)
+    with interprocess_lock(plan_root / ".amendment.lock"):
+        if _marker_state(paths, plan_id) is not None:
+            raise PermissionError(
+                "an amendment transfer is in progress; retire cannot "
+                "interleave with it")
+        context = _verify_retire_evidence(
+            paths, plan_id, amendment_digest, evidence)
+        run_id = context["run_id"]
+        snapshot = context["snapshot"]
+        store = context["store"]
+        pairs = context["pairs"]
+        action_ids = [item[0] for item in pairs]
+        stale_dir = store.root / "stale"
+        from contextlib import ExitStack
+        evidence_sha = hashlib.sha256(
+            json.dumps(evidence, ensure_ascii=False,
+                       sort_keys=True).encode("utf-8")).hexdigest()
+        locks_dir = store._directory("locks")
+        intent_path = _retire_intent_path(store, amendment_digest)
+        intent_base = {
+            "kind": "retire_uninvoked_legacy_intent",
+            "run_id": run_id,
+            "plan_id": plan_id,
+            "amendment_digest": amendment_digest,
+            "action_ids": sorted(action_ids),
+            "evidence_sha256": evidence_sha,
+        }
+        # Phase one -- written before the first lock is taken so that a
+        # crash leaves an explainable residue, never an anonymous lock.
+        _atomic_json(intent_path, dict(intent_base, phase="intent"))
+        with ExitStack() as stack:
+            for action_id in sorted(action_ids):
+                stack.enter_context(interprocess_lock(
+                    locks_dir / (action_id + ".lock")))
+            # Phase two -- bind each held lock's payload SHA so a foreign
+            # lock written after a crash is still foreign on rerun.
+            _atomic_json(intent_path, dict(
+                intent_base,
+                phase="locked",
+                lock_shas={
+                    action_id: _artifact_hash(
+                        locks_dir / (action_id + ".lock"))
+                    for action_id in sorted(action_ids)}))
+            for action_id, _path, already, _action in pairs:
+                if store.result(action_id) is not None:
+                    raise PermissionError(
+                        "provider request {} gained a result inside the "
+                        "retire window".format(action_id))
+                if already:
+                    continue
+                action = store.action(action_id)
+                marker = {
+                    "schema_version": _RETIRE_SCHEMA,
+                    "status": "stale",
+                    "reason": RETIRE_UNINVOKED_REASON,
+                    "action_id": action_id,
+                    "request_digest": action.get("request_digest"),
+                    "run_id": run_id,
+                    "issue_id": action.get("issue_id"),
+                    "role": action.get("role"),
+                    "generation": action.get("generation"),
+                    "amendment_digest": amendment_digest,
+                    "plan_id": plan_id,
+                    "evidence_sha256": evidence_sha,
+                }
+                _atomic_json(stale_dir / (action_id + ".json"), marker)
+            changed = snapshot.nodes
+            worktree_items = {
+                str(item.get("node_id")): item
+                for item in evidence.get("worktrees") or []
+                if isinstance(item, dict)}
+            for item in evidence["requests"]:
+                node_id = item["issue_id"]
+                node = snapshot.nodes[node_id]
+                if (node.get("status") != "planned"
+                        or node.get("retryable_action") is not None):
+                    node["status"] = "planned"
+                    node["retryable_action"] = None
+                    node["old_task_reconciled"] = True
+                    node.pop("reason", None)
+                    node["user_status"] = "准备中"
+                corrected = context["clean_nodes"].get(node_id, {}).get(
+                    "corrected_base")
+                if (corrected is not None
+                        and node.get("worktree_base") != corrected):
+                    node["worktree_base"] = corrected
+                changed[node_id] = node
+            provenance = {
+                "role": "system",
+                "task_id": None,
+                "handle_id": None,
+                "generation": 0,
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+            }
+            if _fault_at == "before_event":
+                raise RuntimeError("retire fault injected before event")
+            snapshot.event_sequence = append_event(
+                paths,
+                RunEvent(RETIRE_UNINVOKED_EVENT, {
+                    "run_id": run_id,
+                    "plan_id": plan_id,
+                    "amendment_digest": amendment_digest,
+                    "authorization_digest": _retire_field(
+                        evidence, "authorization_digest"),
+                    "superseded_creates": action_ids,
+                    "node_ids": sorted(context["clean_nodes"]),
+                    "status": "retired",
+                    "reason": RETIRE_UNINVOKED_REASON,
+                    "reason_class": "engineering",
+                    # Correction digests live at data level: everything
+                    # under the 'evidence' key is provider-text redacted
+                    # on write, which would mask the very SHAs the
+                    # correction exists to record.
+                    "base_corrections": {
+                        node_id: {
+                            "old_snapshot_digest": (
+                                (worktree_items.get(node_id) or {})
+                                .get("base_correction", {})
+                                .get("old_snapshot_base")),
+                            "corrected_base_digest": context[
+                                "clean_nodes"][node_id]["corrected_base"],
+                        }
+                        for node_id in sorted(context["clean_nodes"])
+                        if context["clean_nodes"][node_id][
+                            "corrected_base"] is not None},
+                    "evidence": {
+                        "evidence_sha256": evidence_sha,
+                        "owner_takeover": context["takeover"],
+                        "retired_consumers": [
+                            {"session_id": item["session_id"],
+                             "rollout_sha256": item["rollout_sha256"],
+                             "native_terminal": item["native_terminal"]}
+                            for item in context["retired_consumers"]],
+                    },
+                }),
+                provenance,
+            )
+            if _fault_at == "after_event":
+                raise RuntimeError("retire fault injected after event")
+            save_snapshot(paths, snapshot)
+            for node_id in sorted(context["clean_nodes"]):
+                release_writer_lease(
+                    paths, node_id,
+                    str(context["clean_nodes"][node_id]["worktree"]),
+                    run_id)
+            # The boundary is durable.  Our own residue -- the intent
+            # record and the held lock payloads -- is cleanup, not claim
+            # evidence; delete it before releasing the kernel locks so a
+            # late foreign claim is still the only lock a reader sees.
+            intent_path.unlink(missing_ok=True)
+            for action_id in action_ids:
+                residue = locks_dir / (action_id + ".lock")
+                if residue.is_file():
+                    residue.unlink()
+        return {
+            "status": "retired",
+            "plan_id": plan_id,
+            "run_id": run_id,
+            "amendment_digest": amendment_digest,
+            "action_ids": action_ids,
+            "node_ids": sorted(context["clean_nodes"]),
+            "converged": all(item[2] for item in pairs),
+        }

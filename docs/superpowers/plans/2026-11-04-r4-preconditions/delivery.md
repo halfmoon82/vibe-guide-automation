@@ -191,3 +191,41 @@ python3 -m vibe_guide --help; git diff --check   # OK
 ```
 
 未验证项不变：真实桌面 App、真实目标 plan/run 切换、远端 Git、发布/deploy 不在先导范围。
+
+## 第 7 次交付（retire_uninvoked_legacy 工程恢复路径，2026-11-05）
+
+新增公开恢复路径：证明从未原生调用的遗留 pending create 可被受保护退役，使同 run 的已批准修订 confirm 不再被 `_live_executors` 静止检查挡住。
+
+### 实现（白名单内）
+
+- `vibe_guide/plan_amendment.py`
+  - `_rollout_native_calls`：解析 rollout JSONL 的 function_call/custom_tool_call/local_shell_call 及其 *_output；不可归类 *call* 类型、无 id 调用、重复 call_id 一律 fail closed。无 call_id 的 host 注入记录（delegation/fco_ 形态）计 skipped 不作返回证据；返回 payload 保留供纠偏与配对。
+  - `_embedded_create_invocations`：对 exec 内嵌 JS 做字符串/注释感知扫描，区分 tools.mcp__codex_app__create_thread( 真实调用与 cmd 字符串/提示词/审计脚本中的文本引用；模板字符串内容按字符串处理（保守记录）。
+  - `_retire_consumer_proof`：终端回执 + 日志 SHA + 全量 native call 声明核对；未返回调用必须 `inherited_unreturned` 声明，并在其他已退役消费者日志中以同 call_id 配对（fork 继承形状）。
+  - `_verify_declared_creates`：不要求消费会话零 create；每个 flagged create（原生或内嵌）必须 declared_creates 声明 purpose + returned_thread_ids，且 audited return 实际含该 threadId；payload 含退役 action_id/request_digest/worker prompt 逐字时拒绝（绑定退役请求）；幽灵声明拒绝。
+  - `_verify_base_correction`/`_verify_correction_chain`：分支 reflog 必须为唯一 `branch: Created from <full sha>` 条目且 digest 绑定；creation call 必须在已审计 rollout 内，payload digest 绑定且含精确 `git worktree add <wt> -b <branch> <sha>`；`actual_output` 与 audited call return 的实际文本比对（不再信自报），须含 `Preparing worktree (new branch '<branch>')` 且 `HEAD is now at <短SHA>` 短 SHA 为 corrected_base 前缀。
+  - `retire_uninvoked_legacy`：.amendment.lock → 全证据锁内重验 → 两阶段 intent 记录（intent→locked，含每个 action 锁文件 SHA）→ 持有全部 action .lock 跨 stale marker、事件、快照投影、租约释放完整边界 → 事件落账后删除 intent 与自建锁残留。complete() 同锁互斥；锁内二次 result 检查；幂等重跑收敛无重复事件（state.py 已登记 coalesced latest）。
+  - `_retire_intent/_retire_own_locks/_retire_claim_evidence`：区分本路径崩溃残留的自有锁（按 intent+SHA）与外来/历史锁（fail closed）。
+- `vibe_guide/state.py`：`retire_uninvoked_legacy` 入 _COALESCED_LATEST_EVENTS；`base_corrections` 入 _EVENT_DATA_KEYS（位于 evidence 之外，避开 provider-text 脱敏对 SHA 的遮罩）。
+- `vibe_guide/cli.py`：`plan-amend retire-uninvoked --evidence <file>` 阶段接线。
+
+### 测试（tests/test_plan_amendment.py，+18 例，合计 80 例）
+
+- 崩溃收敛：before_event 留 intent+locks+stale 无事件→重跑收敛单事件+清理残留+confirm 通过；after_event 事件已写→重跑收敛不双写。
+- 外源证据：无 intent 的锁文件、他 amendment 的 intent 记录一律拒绝。
+- declared-create：已声明 bootstrap create 通过；未声明、绑定 action_id/request_digest、错 threadId、幽灵声明拒绝；无 call_id 的 host 注入输出仅计 skipped。
+- base_correction：真实 git worktree（Created from <sha> 单条目 reflog）正向纠偏并更新 worktree_base + 顶层 base_corrections 事件字段；伪造 actual_output、digest 篡改、未审计 call、reflog 漂移、分支已移动、stored_base 前提不符拒绝。
+
+### 验证
+
+- `python3 -m unittest discover -s tests -p 'test_plan_amendment*.py' -v`：80 例 OK
+- `python3 -m unittest discover -s tests`：冻结时仍在运行（runner PID 45404，日志 /tmp/r4_full_v2.log；早前一次 runner 无 summary 中道终止已作废，按未完成/未知记录，不按通过）。最终结果以交付汇报为准，与本交付代码同源同 HEAD。
+- `python3 -m vibe_guide --help`：exit 0；`git diff --check`：干净。
+- 真实只读 proof（不写 run）：动态取 supervisor-registry/lease（current epoch3=01a1aa87，history epoch1 01a1a449+epoch2 01a1aa72），6 份归档 rollout 解析 550 calls 全配对（fork1/fork2 各 1 条继承 start_helper 经 owner 同 call_id 配对；epoch2 12 条无 call_id host 注入计 skipped；epoch2 唯一内嵌 create 声明绑定返回 threadId=01a1aa87），3 pending requests 摘要绑定，3 worktree 精确 add/HEAD/reflog Created/干净 + snapshot 误投影纠偏，_verify_retire_evidence 全链 PASS。脚本 /tmp/r4_proof.py，证据 JSON /tmp/r4_evidence_dryrun.json（sha 37f4c812…b6bd28，不含真实 run 写入）。
+
+### 未验证/缺口
+
+- 真实 retire/confirm 未执行（须当前 owner 在冻结交付+独立复审后按公开路径执行）。
+- epoch2 原生终止回执为合成 shape（archive_status/read_thread_status 已由 owner 原生核验，但未有独立 receipt 文件落盘）；其余 5 消费者可用 native-consumer-termination.json 作为 receipt 源。
+- 协调者活动日志仅绑定到 prefix cut-off（audit JSON cc477f7b…f8f60b5eda96c25f55dfc2），其后的 create 仍按 unknown 处理。
+- 模板字符串内嵌入调用的 lexing 为保守边界；真实日志未出现该形态。

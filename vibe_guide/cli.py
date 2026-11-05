@@ -300,12 +300,12 @@ def _plan_amend_command(paths: ProjectPaths, args) -> CLIResult:
     from . import plan_amendment
 
     stage = args.daemon_action
-    if stage not in {"propose", "show", "confirm"}:
+    if stage not in {"propose", "show", "confirm", "retire-uninvoked"}:
         return _result(
             BLOCKED,
             {"command": "plan-amend", "status": "blocked",
-             "reason": "stage is required: propose | show | confirm"},
-            "plan-amend 需要阶段：propose | show | confirm",
+             "reason": "stage is required: propose | show | confirm | retire-uninvoked"},
+            "plan-amend 需要阶段：propose | show | confirm | retire-uninvoked",
             args.as_json,
         )
     if not args.plan:
@@ -359,6 +359,26 @@ def _plan_amend_command(paths: ProjectPaths, args) -> CLIResult:
                 SUCCESS,
                 {"command": "plan-amend", "status": "shown", **shown},
                 shown["confirmation_hint"],
+                args.as_json,
+            )
+        if stage == "retire-uninvoked":
+            if not args.evidence:
+                return _result(
+                    BLOCKED,
+                    {"command": "plan-amend", "status": "blocked",
+                     "reason": "retire-uninvoked requires --evidence"},
+                    "plan-amend retire-uninvoked 需要 --evidence",
+                    args.as_json,
+                )
+            evidence = _read_json(Path(args.evidence))
+            retired = plan_amendment.retire_uninvoked_legacy(
+                paths, args.plan, args.amendment, evidence)
+            return _result(
+                SUCCESS,
+                {"command": "plan-amend", **retired},
+                "已退役未调用的遗留 create：{}（{} → planned）".format(
+                    ",".join(retired["action_ids"]),
+                    ",".join(retired["node_ids"])),
                 args.as_json,
             )
         confirmed = plan_amendment.confirm(
