@@ -883,6 +883,21 @@ class _LegacyUninvokedFixture(unittest.TestCase):
 
     def setUp(self):
         self.root, self.paths, self.plan_root, self.record = _authorized_probe(self)
+        from unittest.mock import patch
+        self.codex_home = self.root / "codex-home"
+        self.codex_home.mkdir()
+        env = patch.dict("os.environ", {"CODEX_HOME": str(self.codex_home)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.observer_record = (self.codex_home / "sessions" / "2026" / "11" / "05" /
+                                ("rollout-2026-11-05T10-00-00-" + self.NEW_OWNER + ".jsonl"))
+        self.observer_record.parent.mkdir(parents=True)
+        self.observer_record.write_text("\n".join(json.dumps(row) for row in [
+            {"type": "session_meta", "payload": {"id": self.NEW_OWNER}, "ordinal": 0},
+            {"type": "response_item", "ordinal": 1, "payload": {"type": "message",
+             "role": "user", "content": [{"type": "input_text",
+                                              "text": "Resume this registered supervisor shift"}]}},
+        ]) + "\n")
         self.snapshot, _runner = _start_run(
             self.paths, self.plan_root, self.record, quiesce=True)
         self.spec = _amendment_spec(self.plan_root)
@@ -928,6 +943,7 @@ class _LegacyUninvokedFixture(unittest.TestCase):
 
     def _write_registry(self, history=None, owner_session=None,
                         current_session=None, epoch=2):
+        from vibe_guide.supervisor import _record_digest
         run_dir = self.paths.vibe / "runs" / self.run_id
         registry = {
             "current": {
@@ -935,6 +951,7 @@ class _LegacyUninvokedFixture(unittest.TestCase):
                 "session_id": current_session or self.NEW_OWNER,
                 "host": "local",
                 "lease_epoch": epoch,
+                "session_record_digest": _record_digest(self.observer_record),
             },
             "history": list(history if history is not None else [
                 {"provider": "codex", "session_id": self.OLD_OWNER,
@@ -965,27 +982,38 @@ class _LegacyUninvokedFixture(unittest.TestCase):
                        "status": {"type": read},
                        "latest_turn": [{"id": "terminal-turn", "status": "completed", "error": None}]}
         archive_result = {"threadId": session_id, "archived": archive == "archived"}
+        suffix = "{}-{}".format(session_id, len(self.observer_record.read_text().splitlines()))
         entries = []
         for call_id, tool, args, result in [
-            ("read-terminal", "read_thread", {"threadId": session_id}, read_result),
-            ("archive-terminal", "set_thread_archived", {"threadId": session_id, "archived": True}, archive_result),
+            ("read-terminal-" + suffix, "read_thread", {"threadId": session_id}, read_result),
+            ("archive-terminal-" + suffix, "set_thread_archived", {"threadId": session_id, "archived": True}, archive_result),
         ]:
             entries.extend([
                 {"type": "response_item", "payload": {"type": "function_call", "name": tool,
                     "call_id": call_id, "arguments": json.dumps(args)}},
                 {"type": "response_item", "payload": {"type": "function_call_output",
                     "call_id": call_id, "output": json.dumps(result)}}])
-        source = self._rollout(entries, name="native-observer.jsonl")
+        existing = self.observer_record.read_text().splitlines()
+        for entry in entries:
+            entry["ordinal"] = len(existing)
+            existing.append(json.dumps(entry))
+        self.observer_record.write_text("\n".join(existing) + "\n")
+        source = self._rollout([json.loads(line) for line in existing], name="native-observer.jsonl")
+        source.write_bytes(self.observer_record.read_bytes())
         payload = {
             "schema": 1, "kind": "native_consumer_termination_evidence",
             "plan_id": "probe-plan", "run_id": self.run_id,
             "source": "Codex App public read_thread and set_thread_archived tools",
-            "observer": {"session_record": str(source)},
+            "observer": {"session_id": self.NEW_OWNER, "lease_epoch": 2,
+                         "session_record": str(source),
+                         "original_session_record": str(self.observer_record),
+                         "source_prefix_bytes": source.stat().st_size,
+                         "source_prefix_sha256": self._sha(source)},
             "consumers": [{"thread_id": session_id,
                            "native_observation": read_result,
                            "native_archive_result": archive_result,
-                           "native_call_refs": {"read_thread": "read-terminal",
-                                                "set_thread_archived": "archive-terminal"}}],
+                           "native_call_refs": {"read_thread": "read-terminal-" + suffix,
+                                                "set_thread_archived": "archive-terminal-" + suffix}}],
         }
         path.write_text(json.dumps(payload, sort_keys=True),
                         encoding="utf-8")
@@ -997,6 +1025,16 @@ class _LegacyUninvokedFixture(unittest.TestCase):
         if not any(json.loads(line).get("type") == "session_meta" for line in lines):
             path.write_text(json.dumps({"type": "session_meta", "payload": {"id": session_id}})
                             + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows.append({"type": "event_msg", "payload": {"type": "task_complete",
+                     "turn_id": "terminal-turn"}})
+        for index, row in enumerate(rows):
+            row["ordinal"] = index
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        archive_path = self.codex_home / "archived_sessions" / (
+            "rollout-2026-11-05T10-00-00-" + session_id + ".jsonl")
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        archive_path.write_bytes(path.read_bytes())
         receipt = self._receipt(session_id, archive, read)
         return {
             "session_id": session_id,
@@ -1550,7 +1588,7 @@ class RetireDeclaredCreatesTests(_LegacyUninvokedFixture):
         from vibe_guide.supervisor import _record_digest
         registry_path = self.paths.vibe / "runs" / self.run_id / "supervisor-registry.json"
         registry = json.loads(registry_path.read_text())
-        registry["current"]["session_record_digest"] = _record_digest(successor_log)
+        registry["current"]["session_record_digest"] = _record_digest(self.observer_record)
         registry_path.write_text(json.dumps(registry))
         output_text = output_text or json.dumps(
             {"threadId": successor, "hostId": "local", "target": target})
@@ -1569,12 +1607,13 @@ class RetireDeclaredCreatesTests(_LegacyUninvokedFixture):
         consumer = self._consumer(
             "boot-supervisor", log,
             calls=[{"name": name, "call_id": call_id, "returned": True}])
+        # _consumer adds the terminal receipt to the same observer record.
         if returned_threads is not None:
             consumer["declared_creates"] = [{
                 "call_id": call_id,
                 "purpose": "supervisor rotation bootstrap",
-                "successor_record_path": str(successor_log),
-                "successor_record_sha256": self._sha(successor_log),
+                "successor_record_path": str(self.observer_record),
+                "successor_record_sha256": self._sha(self.observer_record),
                 "returned_thread_ids": returned_threads}]
         return consumer
 
@@ -1830,6 +1869,274 @@ class RetireBaseCorrectionTests(_LegacyUninvokedFixture):
         save_snapshot(self.paths, snapshot)
         with self.assertRaises((PermissionError, ValueError)):
             self._retire()
+
+
+class R9ReviewTests(_LegacyUninvokedFixture):
+    def test_truncated_consumer_with_recomputed_digest_is_not_complete(self):
+        consumer = self.evidence["retired_consumers"][0]
+        original = Path(consumer["rollout_path"])
+        truncated = self._rollout([json.loads(original.read_text().splitlines()[0])],
+                                  name="truncated.jsonl")
+        consumer.update(rollout_path=str(truncated),
+                        rollout_sha256=self._sha(truncated), native_calls=[])
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+        self.assertTrue(self.lease_file.exists())
+
+    def test_archive_middle_removal_and_terminal_mismatch_refuse(self):
+        consumer = self.evidence["retired_consumers"][0]
+        original = Path(consumer["rollout_path"])
+        archive = next((self.codex_home / "archived_sessions").glob("*" + self.OLD_OWNER + ".jsonl"))
+        original_bytes = original.read_bytes()
+        archive_bytes = archive.read_bytes()
+        rows = [json.loads(line) for line in archive_bytes.splitlines()]
+        for change in ("missing_middle", "wrong_turn", "duplicate_archive"):
+            with self.subTest(change=change):
+                original.write_bytes(original_bytes)
+                archive.write_bytes(archive_bytes)
+                altered = copy.deepcopy(rows)
+                if change == "missing_middle":
+                    del altered[1]
+                elif change == "wrong_turn":
+                    altered[-1]["payload"]["turn_id"] = "other-turn"
+                if change != "duplicate_archive":
+                    data = ("\n".join(json.dumps(row) for row in altered) + "\n").encode()
+                    original.write_bytes(data)
+                    archive.write_bytes(data)
+                    consumer["rollout_sha256"] = self._sha(original)
+                else:
+                    duplicate = archive.with_name("rollout-2026-11-05T11-00-00-" + self.OLD_OWNER + ".jsonl")
+                    duplicate.write_bytes(archive_bytes)
+                with self.assertRaises((PermissionError, ValueError)):
+                    self._retire()
+                if change == "duplicate_archive":
+                    duplicate.unlink()
+        original.write_bytes(original_bytes)
+        archive.write_bytes(archive_bytes)
+        consumer["rollout_sha256"] = self._sha(original)
+
+    def test_observer_prefix_drift_and_wrong_registered_identity_refuse(self):
+        consumer = self.evidence["retired_consumers"][0]
+        terminal = consumer["native_terminal"]
+        receipt_path = Path(terminal["receipt_path"])
+        original_receipt = json.loads(receipt_path.read_text())
+        source_path = Path(terminal["source_rollout_path"])
+        source_bytes = source_path.read_bytes()
+        for change in ("prefix_drift", "observer_identity", "observer_epoch"):
+            with self.subTest(change=change):
+                receipt = copy.deepcopy(original_receipt)
+                source_path.write_bytes(source_bytes)
+                if change == "prefix_drift":
+                    source_path.write_bytes(source_bytes.replace(b'"ordinal": 1', b'"ordinal": 9', 1))
+                    terminal["source_rollout_sha256"] = self._sha(source_path)
+                    receipt["observer"]["source_prefix_sha256"] = self._sha(source_path)
+                elif change == "observer_identity":
+                    receipt["observer"]["session_id"] = "someone-else"
+                else:
+                    receipt["observer"]["lease_epoch"] = 99
+                receipt_path.write_text(json.dumps(receipt))
+                terminal["receipt_sha256"] = self._sha(receipt_path)
+                with self.assertRaises((PermissionError, ValueError)):
+                    self._retire()
+        source_path.write_bytes(source_bytes)
+
+    def test_self_fabricated_observer_is_not_native_source(self):
+        consumer = self.evidence["retired_consumers"][0]
+        terminal = consumer["native_terminal"]
+        receipt_path = Path(terminal["receipt_path"])
+        receipt = json.loads(receipt_path.read_text())
+        forged = self._rollout([json.loads(line) for line in
+            Path(terminal["source_rollout_path"]).read_text().splitlines()[1:]],
+            name="forged-observer.jsonl")
+        receipt["observer"]["session_record"] = str(forged)
+        receipt["observer"]["original_session_record"] = str(forged)
+        receipt["observer"]["source_prefix_bytes"] = forged.stat().st_size
+        receipt["observer"]["source_prefix_sha256"] = self._sha(forged)
+        receipt_path.write_text(json.dumps(receipt))
+        terminal.update(receipt_sha256=self._sha(receipt_path),
+                        source_rollout_path=str(forged), source_rollout_sha256=self._sha(forged))
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+        self.assertTrue(self.lease_file.exists())
+
+    def test_observation_arriving_after_verification_blocks_retirement(self):
+        from unittest.mock import patch
+        from vibe_guide.adapters.task_provider import (
+            ProviderActionStore, UnresolvedNativeTool)
+        original = plan_amendment._verify_retire_evidence
+
+        def deliver_after_validation(*args):
+            context = original(*args)
+            with self.assertRaises(UnresolvedNativeTool):
+                ProviderActionStore(self.paths).complete(
+                    self.action_id,
+                    {"error": "No such tool available: codex_app__create_thread"})
+            return context
+
+        with patch.object(plan_amendment, "_verify_retire_evidence",
+                          side_effect=deliver_after_validation):
+            with self.assertRaises((PermissionError, ValueError)):
+                self._retire()
+        self.assertTrue(self.lease_file.exists())
+        self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                             for e in load_events(self.paths, self.run_id)))
+
+    def test_callback_before_retire_lock_blocks_event_and_lease_release(self):
+        import subprocess
+        import sys
+        from unittest.mock import patch
+        original = plan_amendment._verify_retire_evidence
+        for kind in ("unresolved", "fork"):
+            with self.subTest(kind=kind):
+                fixture = R9ReviewTests(methodName="runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                child = (
+                    "from pathlib import Path; import sys; "
+                    "from vibe_guide.paths import ProjectPaths; "
+                    "from vibe_guide.adapters.task_provider import ProviderActionStore; "
+                    "s=ProviderActionStore(ProjectPaths(Path(sys.argv[1]))); "
+                    "p={'error':'No such tool available: codex_app__create_thread'} "
+                    "if sys.argv[3]=='unresolved' else {'threadId':'forked-test'}; "
+                    "s.complete(sys.argv[2],p)")
+                if kind == "fork":
+                    record = fixture.codex_home / "archived_sessions" / "rollout-2026-11-05T10-00-00-forked-test.jsonl"
+                    record.write_text(json.dumps({"type": "session_meta", "payload": {
+                        "id": "forked-test", "forked_from_id": "parent"}}) + "\n")
+
+                def inject(*args):
+                    context = original(*args)
+                    process = subprocess.run([sys.executable, "-c", child, str(fixture.root),
+                                              fixture.action_id, kind], capture_output=True, text=True)
+                    self.assertNotEqual(process.returncode, 0)
+                    self.assertIn("UnresolvedNativeTool" if kind == "unresolved"
+                                  else "ForkedProviderSession", process.stderr)
+                    return context
+                with patch.object(plan_amendment, "_verify_retire_evidence", side_effect=inject):
+                    with self.assertRaises((PermissionError, ValueError)):
+                        fixture._retire()
+                self.assertTrue(fixture.lease_file.exists())
+                self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                                     for e in load_events(fixture.paths, fixture.run_id)))
+
+    def test_callback_queued_behind_retire_is_preserved_and_blocks_confirm(self):
+        import subprocess
+        import sys
+        import time
+        from unittest.mock import patch
+        original = plan_amendment.save_snapshot
+        for kind in ("unresolved", "fork"):
+            with self.subTest(kind=kind):
+                fixture = R9ReviewTests(methodName="runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                if kind == "fork":
+                    record = fixture.codex_home / "archived_sessions" / "rollout-2026-11-05T10-00-00-forked-test.jsonl"
+                    record.write_text(json.dumps({"type": "session_meta", "payload": {
+                        "id": "forked-test", "forked_from_id": "parent"}}) + "\n")
+                child = ("from pathlib import Path; import sys; "
+                    "from vibe_guide.paths import ProjectPaths; "
+                    "from vibe_guide.adapters.task_provider import ProviderActionStore; "
+                    "print('ready',flush=True); "
+                    "p={'error':'No such tool available: codex_app__create_thread'} "
+                    "if sys.argv[3]=='unresolved' else {'threadId':'forked-test'}; "
+                    "ProviderActionStore(ProjectPaths(Path(sys.argv[1]))).complete(sys.argv[2],p)")
+                spawned = []
+                def queue(*args):
+                    p = subprocess.Popen([sys.executable, "-c", child, str(fixture.root),
+                                          fixture.action_id, kind], stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True)
+                    spawned.append(p)
+                    self.assertEqual(p.stdout.readline().strip(), "ready")
+                    time.sleep(0.2)
+                    self.assertIsNone(p.poll(), "callback must wait for action lock")
+                    return original(*args)
+                with patch.object(plan_amendment, "save_snapshot", side_effect=queue):
+                    self.assertEqual(fixture._retire()["status"], "retired")
+                _stdout, stderr = spawned[0].communicate(timeout=10)
+                self.assertIn("UnresolvedNativeTool" if kind == "unresolved"
+                              else "ForkedProviderSession", stderr)
+                self.assertTrue(list((fixture.paths.vibe / "provider-actions" / "observations")
+                                     .glob(fixture.action_id + "-*.json")))
+                fixture._confirm_blocked()
+
+    def test_public_cli_status_and_resume_after_amendment(self):
+        from vibe_guide.runners.fake import FakeRunner
+        self._retire()
+        confirmed = run_cli(["plan-amend", "confirm", "--plan", "probe-plan",
+                             "--amendment", self.digest, "--confirm-token", self.token,
+                             "--json"], self.root, runner=FakeRunner())
+        self.assertEqual(confirmed.payload.get("status"), "amended", confirmed.payload)
+        for command in ("status", "resume"):
+            with self.subTest(command=command):
+                result = run_cli([command, "--plan", "probe-plan", "--run-id",
+                                  self.run_id, "--json"], self.root, runner=FakeRunner())
+                if command == "status":
+                    self.assertEqual(result.exit_code, 0, result.payload)
+                else:
+                    # This isolated fake runner may legitimately block at a
+                    # separate dispatch gate; it must reach the same run.
+                    self.assertIn(result.exit_code, (0, 4), result.payload)
+                    self.assertNotIn("amendment_revision", str(result.payload.get("reason", "")))
+                self.assertEqual(result.payload.get("run_id"), self.run_id)
+                self.assertEqual(load_snapshot(self.paths, self.run_id).authorization_digest,
+                                 confirmed.payload["authorization_digest"])
+        self.assertEqual(_read(self.plan_root, "plan.json")["amendment_revision"],
+                         self.candidate["revision"])
+
+    def test_bad_amendment_revision_is_rejected_by_public_status(self):
+        self._retire()
+        confirmed = run_cli(["plan-amend", "confirm", "--plan", "probe-plan",
+                             "--amendment", self.digest, "--confirm-token", self.token,
+                             "--json"], self.root)
+        self.assertEqual(confirmed.payload.get("status"), "amended", confirmed.payload)
+        plan_path = self.plan_root / "plan.json"
+        original = json.loads(plan_path.read_text())
+        for value in (True, 0, "1", None):
+            with self.subTest(value=value):
+                plan_path.write_text(json.dumps(dict(original, amendment_revision=value)))
+                status = run_cli(["status", "--plan", "probe-plan", "--run-id",
+                                  self.run_id, "--json"], self.root)
+                self.assertEqual(status.exit_code, 4, status.payload)
+                self.assertIn("amendment_revision", status.payload.get("reason", ""))
+
+    def test_static_exec_legal_escape_and_regex_are_not_create(self):
+        for source in (r'text(await tools.exec_command({cmd:"printf \;"}));',
+                       'text(/create_thread|read_thread/.test("read_thread"));'):
+            with self.subTest(source=source):
+                self.assertEqual(plan_amendment._embedded_create_invocations(source), 0)
+
+    def test_real_history_shapes_and_failed_compile_are_audited(self):
+        from unittest.mock import patch
+        # These are distinct, redacted forms observed in the archived calls.
+        cases = [
+            'text((await tools.exec_command({cmd:"printf \\;"})).output);',
+            'text(await tools.exec_command({cmd:"echo \\("}));',
+            'text(await tools.exec_command({cmd:"echo \\+"}));',
+            'text(await tools.exec_command({cmd:"echo \\."}));',
+            'text(await tools.exec_command({cmd:"echo \\|"}));',
+            'const found = ALL_TOOLS.filter(t => /create_thread|read_thread/.test(t.name));',
+        ]
+        for source in cases:
+            with self.subTest(source=source):
+                self.assertEqual(plan_amendment._embedded_create_invocations(source), 0)
+        source = 'text(await tools.exec_command({cmd:"bad\nstring"}));'
+        bad = self._rollout([
+            {"type": "response_item", "payload": {"type": "custom_tool_call",
+              "name": "exec", "call_id": "syntax", "input": source}},
+            {"type": "response_item", "payload": {"type": "custom_tool_call_output",
+              "call_id": "syntax", "output": [{"type": "input_text", "text":
+              "Script failed\nWall time 0.0 seconds\nOutput:\n"},
+              {"type": "input_text", "text": "Script error:\nSyntaxError: Invalid or unexpected token"}]}}
+        ], name="syntax-error.jsonl")
+        audit = plan_amendment._rollout_native_calls(bad)
+        self.assertEqual(audit["calls"][0]["call_id"], "syntax")
+        self.assertFalse(audit["calls"][0]["embedded_create"])
+        entries = [json.loads(line) for line in bad.read_text().splitlines()]
+        entries[-1]["payload"]["output"] = "Script completed\nWall time 0.0 seconds\nOutput:\n"
+        bad.write_text("\n".join(json.dumps(row) for row in entries) + "\n")
+        with self.assertRaises(ValueError):
+            plan_amendment._rollout_native_calls(bad)
 
 
 class R8ReceiptTests(_LegacyUninvokedFixture):

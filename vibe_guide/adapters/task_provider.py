@@ -832,22 +832,6 @@ class ProviderActionStore:
             raise ValueError("provider action result payload must be an object")
         if request_digest is not None and request_digest != request["request_digest"]:
             raise ValueError("provider action request digest mismatch")
-        # ``native=False``: a worker self-report, not a native tool reply.
-        called_tool = _unresolved_tool_name(payload) if native else None
-        if called_tool is not None:
-            self._record_unresolved_tool(request, called_tool, payload)
-        if native and request.get("native_tool") == "codex_app__create_thread":
-            thread_id = _result_thread_id(payload)
-            forked_from = _codex_forked_from(thread_id) if thread_id else None
-            if forked_from:
-                self._atomic(
-                    self._directory("observations") / "{}-forked-{}.json".format(
-                        action_id, _canonical_digest(payload)[:16]),
-                    {"schema_version": self.schema_version, "kind": "forked_provider_session",
-                     "action_id": action_id, "request_digest": request["request_digest"],
-                     "thread_id": thread_id, "forked_from": forked_from,
-                     "observed_at": time.time(), "payload": payload})
-                raise ForkedProviderSession(action_id, thread_id, forked_from)
         record = {
             "schema_version": self.schema_version,
             "action_id": action_id,
@@ -855,6 +839,23 @@ class ProviderActionStore:
             "payload": payload,
         }
         with interprocess_lock(self._directory("locks") / (action_id + ".lock")):
+            # Every callback observation shares the retirement boundary.
+            # ``native=False`` is a worker report, not a native reply.
+            called_tool = _unresolved_tool_name(payload) if native else None
+            if called_tool is not None:
+                self._record_unresolved_tool(request, called_tool, payload)
+            if native and request.get("native_tool") == "codex_app__create_thread":
+                thread_id = _result_thread_id(payload)
+                forked_from = _codex_forked_from(thread_id) if thread_id else None
+                if forked_from:
+                    self._atomic(
+                        self._directory("observations") / "{}-forked-{}.json".format(
+                            action_id, _canonical_digest(payload)[:16]),
+                        {"schema_version": self.schema_version, "kind": "forked_provider_session",
+                         "action_id": action_id, "request_digest": request["request_digest"],
+                         "thread_id": thread_id, "forked_from": forked_from,
+                         "observed_at": time.time(), "payload": payload})
+                    raise ForkedProviderSession(action_id, thread_id, forked_from)
             existing = self.result(action_id)
             if existing is not None:
                 if existing == payload:

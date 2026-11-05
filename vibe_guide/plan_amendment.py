@@ -168,6 +168,32 @@ def _js_tokens(source: str) -> List[Any]:
                 raise ValueError("unterminated JavaScript comment")
             index = end + 2
             continue
+        if char == "/" and (not tokens or tokens[-1][1] in {"(", "=", ":", ",", "[", "{", "=>"}
+                            or (len(tokens) >= 2 and tokens[-2][1] == "=" and tokens[-1][1] == ">")):
+            # Regex literals are inert data. Refuse ambiguous division forms
+            # rather than treating a possible native reference as text.
+            index += 1
+            in_class = False
+            while index < len(source):
+                if source[index] == "\\":
+                    index += 2
+                    continue
+                if source[index] == "[":
+                    in_class = True
+                elif source[index] == "]":
+                    in_class = False
+                elif source[index] == "/" and not in_class:
+                    break
+                elif source[index] in "\r\n":
+                    raise ValueError("unterminated JavaScript regex")
+                index += 1
+            if index >= len(source):
+                raise ValueError("unterminated JavaScript regex")
+            index += 1
+            while index < len(source) and source[index].isalpha():
+                index += 1
+            tokens.append(("regex", "<regex>"))
+            continue
         if char in {"'", '"', "`"}:
             quote, start = char, index
             index += 1
@@ -191,7 +217,16 @@ def _js_tokens(source: str) -> List[Any]:
                 try:
                     value = json.loads(raw) if quote == '"' else ast.literal_eval(raw)
                 except (ValueError, SyntaxError) as error:
-                    raise ValueError("unknown JavaScript string literal") from error
+                    # JS permits identity escapes such as \( and \; that
+                    # JSON rejects. Decode those while keeping JSON escapes
+                    # and rejecting malformed Unicode or line breaks.
+                    if quote != '"':
+                        raise ValueError("unknown JavaScript string literal") from error
+                    normalized = re.sub(r'\\([^"\\/bfnrtu0-9\r\n])', r'\1', raw)
+                    try:
+                        value = json.loads(normalized)
+                    except ValueError as nested:
+                        raise ValueError("unknown JavaScript string literal") from nested
             tokens.append(("string", value))
             index += 1
             continue
@@ -1541,10 +1576,6 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
             calls[call_id]["payload"] = payload
             calls[call_id]["native_create"] = (
                 name in _FORBIDDEN_RETIRE_CALLS)
-            source = payload.get("input")
-            calls[call_id]["embedded_create"] = (
-                isinstance(source, str)
-                and _embedded_create_invocations(source) > 0)
             ordered.append(calls[call_id])
         elif kind in _NATIVE_RETURN_TYPES:
             call_id = payload.get("call_id")
@@ -1570,6 +1601,35 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
         if call["call_id"] in returns:
             call["return_line"] = returns[call["call_id"]]["line"]
             call["return_payload"] = returns[call["call_id"]]["payload"]
+        source = call["payload"].get("input")
+        call["embedded_create"] = False
+        if not isinstance(source, str):
+            continue
+        try:
+            call["embedded_create"] = _embedded_create_invocations(source) > 0
+        except ValueError:
+            # An exact host compile-time SyntaxError has no execution phase;
+            # retain the call and its paired return, never silently drop it.
+            # Anything else remains unknown. The isolated syntax probe does
+            # not execute the source and uses an existing runtime only.
+            output = (call.get("return_payload") or {}).get("output")
+            if not (call["name"] == "exec" and isinstance(output, list)
+                    and len(output) == 2 and all(isinstance(x, dict) and x.get("type") == "input_text" for x in output)
+                    and re.fullmatch(r"Script failed\nWall time [0-9.]+ seconds\nOutput:\n", str(output[0].get("text", "")))
+                    and str(output[1].get("text", "")).startswith("Script error:\nSyntaxError:")):
+                raise
+            try:
+                check = subprocess.run(["node", "--input-type=module", "--check"],
+                    input=source, text=True, capture_output=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                raise ValueError("native syntax check unavailable")
+            if check.returncode == 0 or "SyntaxError:" not in check.stderr:
+                raise ValueError("native syntax failure could not be verified")
+            native_error = str(output[1].get("text", "")).split("SyntaxError:", 1)[1].strip()
+            local_error = check.stderr.split("SyntaxError:", 1)[1].splitlines()[0].strip()
+            if not native_error or native_error != local_error:
+                raise ValueError("native syntax failure differs from local syntax check")
+            call["syntax_rejected"] = True
     return {"calls": ordered, "unpaired": unpaired,
             "returned": sorted(returned), "returns": returns,
             "skipped_returns": skipped_returns}
@@ -1635,7 +1695,40 @@ def _native_call_arguments(call, tool):
     return [args for _name, args in _static_tool_invocations(source, aliases)]
 
 
-def _verify_terminal_receipt(consumer, plan_id, run_id, host):
+def _native_session_record(session, archived):
+    """Resolve one native Codex session record; ambiguity is not proof."""
+    if not isinstance(session, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", session):
+        raise ValueError("invalid native session identity")
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").resolve()
+    pattern = "rollout-*-{}.jsonl".format(session)
+    archive_root, active_root = home / "archived_sessions", home / "sessions"
+    if ((archive_root.exists() and (archive_root.is_symlink() or not archive_root.is_dir()))
+            or (active_root.exists() and (active_root.is_symlink() or not active_root.is_dir()))):
+        raise ValueError("native session roots are not trusted directories")
+    archives = list(archive_root.glob(pattern))
+    active = list(active_root.glob("*/*/*/" + pattern))
+    if archived and active:
+        raise ValueError("archived consumer still has an active record")
+    candidates = archives if archived else archives + active
+    if len(candidates) != 1 or candidates[0].is_symlink() or not candidates[0].is_file():
+        raise ValueError("native session record is missing or ambiguous")
+    path = candidates[0]
+    try:
+        path.resolve().relative_to(archive_root if path in archives else active_root)
+    except ValueError:
+        raise ValueError("native session record escapes provider root")
+    data = path.read_bytes()
+    if not data or not data.endswith(b"\n"):
+        raise ValueError("native session record has an incomplete final entry")
+    rows = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+    if (not rows or not all(isinstance(row, dict) for row in rows)
+            or rows[0].get("type") != "session_meta"
+            or (rows[0].get("payload") or {}).get("id") != session):
+        raise ValueError("native session record identity mismatch")
+    return path, rows
+
+
+def _verify_terminal_receipt(consumer, plan_id, run_id, host, registry):
     session, terminal = consumer["session_id"], consumer["native_terminal"]
     try:
         receipt = json.loads(Path(terminal["receipt_path"]).read_text(encoding="utf-8"))
@@ -1670,18 +1763,51 @@ def _verify_terminal_receipt(consumer, plan_id, run_id, host):
         source = terminal.get("source_rollout_path")
         if not isinstance(source, str) or not source:
             raise ValueError("native receipt requires source rollout binding")
-        if _artifact_hash(Path(source)) != terminal.get("source_rollout_sha256"):
-            raise ValueError("native receipt source digest mismatch")
         observer = receipt.get("observer") or {}
+        observer_id = observer.get("session_id")
+        native_path, _rows = _native_session_record(observer_id, archived=False)
+        source_path = Path(source)
+        if not source_path.exists() and str(observer.get("session_record") or "") == source:
+            # Provider moved the exact named session record on archival.
+            if native_path.name != source_path.name:
+                raise ValueError("observer archived record identity mismatch")
+            source_path = native_path
+        if _artifact_hash(source_path) != terminal.get("source_rollout_sha256"):
+            raise ValueError("native receipt source digest mismatch")
         if observer.get("session_record") is not None and observer["session_record"] != source:
             raise ValueError("native receipt observer source mismatch")
+        entries = [entry for entry in [registry.get("current")] + (registry.get("history") or [])
+                   if isinstance(entry, dict) and entry.get("session_id") == observer_id
+                   and entry.get("lease_epoch") == observer.get("lease_epoch")
+                   and entry.get("provider") == "codex" and entry.get("host") == host]
+        if len(entries) != 1 or not entries[0].get("session_record_digest"):
+            raise ValueError("observer is not uniquely registered")
+        original = Path(str(observer.get("original_session_record") or observer.get("session_record") or ""))
+        from .supervisor import _record_digest
+        if _record_digest(original) != entries[0]["session_record_digest"]:
+            raise ValueError("observer source is not the registered record")
+        if native_path != original and native_path.name != original.name:
+            raise ValueError("observer original and native archive do not match")
+        source_bytes = source_path.read_bytes()
+        native_bytes = native_path.read_bytes()
+        if not source_bytes or not source_bytes.endswith(b"\n") or not native_bytes.startswith(source_bytes):
+            raise ValueError("observer source is not a complete native prefix")
+        prefix_rows = [json.loads(line) for line in source_bytes.decode("utf-8").splitlines() if line.strip()]
+        if ([row.get("ordinal") for row in prefix_rows] != list(range(len(prefix_rows)))
+                or not prefix_rows or prefix_rows[0].get("type") != "session_meta"
+                or (prefix_rows[0].get("payload") or {}).get("id") != observer_id):
+            raise ValueError("observer prefix identity or sequence mismatch")
+        if observer.get("source_prefix_bytes", len(source_bytes)) != len(source_bytes):
+            raise ValueError("observer source prefix length mismatch")
+        if observer.get("source_prefix_sha256", sha256_bytes(source_bytes)) != sha256_bytes(source_bytes):
+            raise ValueError("observer source prefix digest mismatch")
         refs = row.get("native_call_refs") or terminal.get("native_call_refs")
         if not isinstance(refs, dict):
             raise ValueError("native receipt requires tool call references")
         if any(not isinstance(refs.get(tool), str) or not refs[tool]
                for tool in ("read_thread", "set_thread_archived")):
             raise ValueError("native receipt has invalid call references")
-        audit = _rollout_native_calls(Path(source), only_ids=set(refs.values()))
+        audit = _rollout_native_calls(source_path, only_ids=set(refs.values()))
         for tool in ("read_thread", "set_thread_archived"):
             [call] = [call for call in audit["calls"] if call["call_id"] == refs.get(tool)]
             args = _native_call_arguments(call, tool)
@@ -1712,7 +1838,7 @@ def _verify_terminal_receipt(consumer, plan_id, run_id, host):
 
 
 def _retire_consumer_proof(consumer: Dict[str, Any], index: int,
-                           plan_id: str, run_id: str, host: str) -> Dict[str, Any]:
+                           plan_id: str, run_id: str, host: str, registry: Dict[str, Any]) -> Dict[str, Any]:
     """Re-verify one archived consumer's rollout inside the lock."""
     session = consumer.get("session_id")
     if not isinstance(session, str) or not session:
@@ -1744,7 +1870,7 @@ def _retire_consumer_proof(consumer: Dict[str, Any], index: int,
     except (OSError, ValueError) as error:
         raise PermissionError(
             "consumer {} receipt unreadable: {}".format(session, error))
-    _verify_terminal_receipt(consumer, plan_id, run_id, host)
+    _verify_terminal_receipt(consumer, plan_id, run_id, host, registry)
     rollout = consumer.get("rollout_path")
     if not isinstance(rollout, str) or not rollout:
         raise ValueError(
@@ -1758,6 +1884,24 @@ def _retire_consumer_proof(consumer: Dict[str, Any], index: int,
     if actual != consumer.get("rollout_sha256"):
         raise PermissionError(
             "consumer {} rollout digest drifted".format(session))
+    try:
+        native_path, native_rows = _native_session_record(session, archived=True)
+        if rollout_path.read_bytes() != native_path.read_bytes():
+            raise ValueError("consumer source is not the complete native record")
+        ordinals = [row.get("ordinal") for row in native_rows]
+        if ordinals != list(range(len(native_rows))):
+            raise ValueError("consumer native record has missing or reordered entries")
+        receipt_data = json.loads(Path(receipt).read_text(encoding="utf-8"))
+        [row] = [row for row in receipt_data["consumers"] if row.get("thread_id") == session]
+        turns = row["native_observation"]["latest_turn"]
+        tail = native_rows[-1].get("payload") or {}
+        last = turns[-1]
+        expected = {"completed": "task_complete", "interrupted": "turn_aborted", "failed": "turn_aborted"}
+        if (native_rows[-1].get("type") != "event_msg" or tail.get("type") != expected.get(last.get("status"))
+                or tail.get("turn_id") != last.get("id")):
+            raise ValueError("consumer native record does not reach its terminal turn")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise PermissionError("consumer {} native archive invalid: {}".format(session, error)) from error
     try:
         metadata = [json.loads(line).get("payload") for line in rollout_path.read_text(encoding="utf-8").splitlines()
                     if line.strip() and json.loads(line).get("type") == "session_meta"]
@@ -2251,7 +2395,7 @@ def _verify_retire_evidence(
     for index, consumer in enumerate(retired):
         if not isinstance(consumer, dict):
             raise ValueError("retired consumer {} must be an object".format(index))
-        audits.append(_retire_consumer_proof(consumer, index, plan_id, run_id, current.get("host")))
+        audits.append(_retire_consumer_proof(consumer, index, plan_id, run_id, current.get("host"), registry))
         retired_ids.add(consumer["session_id"])
     for audit in audits:
         for call_id in audit["unpaired"]:
@@ -2619,6 +2763,14 @@ def retire_uninvoked_legacy(
                     action_id: _artifact_hash(
                         locks_dir / (action_id + ".lock"))
                     for action_id in sorted(action_ids)}))
+            # A callback may have completed between preflight and acquiring
+            # the action locks. Check every claim before writing any stale
+            # marker; callback observations now use these same locks.
+            for _action_id, _path, _already, action in pairs:
+                claim = _retire_claim_evidence(
+                    store, run_id, str(action.get("issue_id")), amendment_digest)
+                if claim is not None:
+                    raise PermissionError("retirement gained claim evidence: " + claim)
             for action_id, _path, already, _action in pairs:
                 if store.result(action_id) is not None:
                     raise PermissionError(

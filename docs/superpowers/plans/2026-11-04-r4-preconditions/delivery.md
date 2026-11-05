@@ -269,3 +269,19 @@ python3 -m vibe_guide --help; git diff --check   # OK
 完整证据仍须绑定 consumer 的 rollout SHA、session_meta、全部调用与请求、lease，并由独立 reviewer 核验；活动源日志持续追加时全文件 SHA 会变化，不能视为稳定。禁止合成补证。
 
 真实目标 run 的 retire、confirm、hold release、resume、daemon、mailbox 均未执行；真实跨 action 全链证据、桌面能力、远端 Git、发布与 deploy 均未验证或未授权。未创建新 worktree、任务或依赖；未 push、PR、merge。
+
+## 第 9 次交付（review9 五项返工，待独立复审）
+
+- R9-1：consumer 文件必须与当前宿主唯一原生归档逐字节一致，记录序号连续且尾部终态事件与原生回执 turn 绑定；截断、删中间记录、终态不符和重复归档均拒绝。此检查依赖本机 Codex 原生归档及其目录完整可信，来源缺失或不一致为 UNKNOWN。
+- R9-2：observer 的 session/epoch/host 与 registry 绑定，路径摘要仅用于身份关联；快照须与本机原生记录完整字节前缀一致、序号连续，来源/回执的调用与返回逐一核对。源会话被归档后支持以同名原生归档核验，缺失或漂移拒绝；伪造来源和前缀漂移回归已覆盖。
+- R9-3：经用户明确批准 `vibe_guide/adapters/task_provider.py` 单文件最小扩围，unresolved/fork 观测与 result 共用稳定 action 锁；retire 持全部 action 锁后在写 stale/event 前重查 claim。独立进程覆盖两类回调先到时阻断并保留租约、退役先持锁时回调等待、迟到观测保留并阻断 confirm。此项不覆盖未经登记的其他外部写入。
+- R9-4：CLI 只对 `amendment_revision` 验证正整数并从 Plan 加载副本移除，磁盘版本不变，未知字段仍拒绝；隔离真实 CLI confirm 后 status 同 run 可读，resume 经同一授权进入调度后因 FakeRunner 派发门返回 `blocked_unknown`，没有把它计为业务成功。旧 schema 保持原路径。
+- R9-5：支持原生日志中静态 JavaScript 合法转义与正则，动态/无法证明的调用仍拒绝；对真实 `exec` 返回的精确编译 SyntaxError，还要求调用本机现有 Node `--check` 不执行代码且错误内容匹配，无法检查即拒绝。未安装 Node 或新增依赖；此路径对 Node 可用性有运行时依赖，需独立审查。
+
+验证：`PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 -m unittest tests.test_plan_amendment tests.test_plan_amendment_recovery tests.test_local_commit_authorization tests.test_forked_worker_rejected tests.test_helper_ratchet`：166 项 OK；原始 RED `/tmp/r4-review9-red.log`；`python3 -m vibe_guide --help`、`git diff --check` 通过。固定源码完整 `python3 -m unittest discover -s tests -v`：4206 项、51 failures、20 errors、3 skipped、4 expected failures，exit 1，日志 `/tmp/r4-r9-full-final.log`，**完整测试失败**。源码四项 SHA 在全量前后不变：test `e473a8c480fb1382934d4b6639c9aa4e020296f15bfc2f568c9b595dc680b50b`、adapter `24e0ac3576ed3ac2e70bbb4c04f09b615f34cac8549cd57c947e6aeb0de1f6a7`、CLI `4a90f8a8f4fc41e2b382c49dcb3c96199cb0472b7cbaefdbd2ee57c139bc9c56`、amendment `8b5542baf55a3c458e41bc79fd74c66918e7a8e580b38ab6e0ca4df02bbad78c`。
+
+全量失败身份与 review9 `/tmp/r4-review9-full.log` 比较：71 个不同身份中 64 个相同、7 个新增、5 个不再出现。7 个新增项复跑 `/tmp/r4-r9-new7-recheck.log` 4 通过、3 失败；3 项再跑 `/tmp/r4-r9-new3-isolated.log` 2 通过、1 仍失败，该 3 项在已有干净 8852367 基线 `/tmp/r4-r9-new3-baseline.log` 通过。该差异尚未确认根因或是否回归，**UNKNOWN，须 reviewer 独立判断**；不能以间歇通过认定无问题。
+
+真实证据：七份完整原生归档逐一解析，calls 分别 352/38/90/35/35/102/302；两条继承未配对调用均在其他原生归档找到对应返回。epoch4 五份回执、epoch4 历史回执及 epoch2 回执的 observer 来源与 native read/archive 调用只读核对通过；这不代表全部 create 已排除。尤其 epoch3 `call_rUHb9rlGBpe5Yo8E6e1ybx1b` 真实创建先导 developer `01a1aae8-2756-72e0-983c-abd8847e3245`，不是登记的 supervisor successor；当前排除规则只接受登记监工继任，故真实完整 retire proof **UNKNOWN/尚不成立**。下一轮须由 owner 以先导合同、原生归档和逐 action 不重叠证据判断该调用，不得将其伪称监工继任。
+
+未执行真实 retire、confirm、hold release、resume、daemon、mailbox；未 push/PR/merge、发布或 deploy。以上为开发证据，review9 P1 是否关闭由原 reviewer 独立复审决定，工程恢复不等业务验收。

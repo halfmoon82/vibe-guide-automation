@@ -1740,6 +1740,15 @@ def _load_plan(paths: ProjectPaths, plan_id: str):
         # terms instead of failing on the missing file below.
         raise PermissionError("blocked_design: " + str(raw_plan.get("next_step") or (
             "计划仍是草案，尚无产品内容；请用 vibe plan --request <原请求> --from-prd <产品 spec 文件> 完成发布")))
+    # Amendment revision belongs to the persisted amendment history rather
+    # than the legacy Plan schema; retain it on disk but validate it before
+    # loading the executable projection. All other unknown fields still fail.
+    if isinstance(raw_plan, dict) and "amendment_revision" in raw_plan:
+        revision = raw_plan["amendment_revision"]
+        if type(revision) is not int or revision < 1:
+            raise ValueError("amendment_revision must be a positive integer")
+        raw_plan = dict(raw_plan)
+        raw_plan.pop("amendment_revision")
     plan = Plan.from_dict(raw_plan)
     nodes_data = _read_json(directory / "nodes.json")
     if not isinstance(nodes_data, list):
