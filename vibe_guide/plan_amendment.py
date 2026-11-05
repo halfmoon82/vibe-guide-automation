@@ -565,12 +565,28 @@ def _live_executors(paths: ProjectPaths, run_id: str) -> List[str]:
                     problems.append(
                         "writer lease malformed: " + lease_file.name)
                     continue
-                if (lease.get("status") == "active"
-                        and lease.get("run_id") in (None, run_id)):
+                lease_run = lease.get("run_id")
+                status = lease.get("status")
+                if lease_run is not None and lease_run != run_id:
+                    continue
+                # A released lease is unlinked, so anything on disk is an
+                # unproven writer: ``active`` is live, ``quarantined`` is
+                # "termination unproven, still owned" (state.py lease
+                # lifecycle), and any other/missing status is unknown --
+                # none of them proves the run quiescent.
+                if status in {"active", "quarantined"}:
                     problems.append(
-                        "writer lease {} is active for node {}".format(
-                            lease_file.name,
+                        "writer lease {} is {} for node {}".format(
+                            lease_file.name, status,
                             lease.get("node_id") or "?"))
+                elif not status:
+                    problems.append(
+                        "writer lease {} has no status".format(
+                            lease_file.name))
+                else:
+                    problems.append(
+                        "writer lease {} has unknown status {}".format(
+                            lease_file.name, status))
     except OSError as error:
         problems.append("writer leases unreadable: " + str(error))
     try:
@@ -825,7 +841,8 @@ def confirm(
             # event finishes the projection; an uncommitted one is rolled
             # back and the confirm below retries the whole transaction.
             if _event_committed(paths, marker.get("run_id"), amendment_digest):
-                return recover(paths, plan_id, runner=runner)
+                return _recover_locked(
+                    paths, plan_id, plan_root, runner=runner)
             _rollback_uncommitted(plan_root)
             marker_path = barrier_path(paths, plan_id)
             if marker_path.is_file():
@@ -944,8 +961,29 @@ def _rollback_uncommitted(plan_root: Path) -> None:
 
 
 def recover(paths: ProjectPaths, plan_id: str, runner: Any = None) -> Dict[str, Any]:
-    """Resolve a transfer marker: finish the committed side, undo the rest."""
+    """Resolve a transfer marker: finish the committed side, undo the rest.
+
+    The marker can only be judged under the same ``.amendment.lock`` the
+    owning ``confirm`` holds for the whole marker->event->projection
+    transaction: a marker visible while that lock is held belongs to a
+    live transfer and this call simply waits; once the lock is free any
+    remaining marker is proven crash residue.  A lock that cannot be
+    acquired in time means the transfer is still in progress -- the
+    non-owner path fails closed, it never rolls anything back.
+    """
     plan_root = _plan_root(paths, plan_id)
+    try:
+        with interprocess_lock(plan_root / ".amendment.lock"):
+            return _recover_locked(paths, plan_id, plan_root, runner=runner)
+    except TimeoutError as error:
+        raise PermissionError(
+            "amendment transfer is still in progress; this entry cannot "
+            "resolve it") from error
+
+
+def _recover_locked(paths: ProjectPaths, plan_id: str, plan_root: Path,
+                    runner: Any = None) -> Dict[str, Any]:
+    """``recover`` with ``.amendment.lock`` already held (or provably free)."""
     marker = _marker_state(paths, plan_id)
     if marker is None:
         return {"status": "clean", "plan_id": plan_id}

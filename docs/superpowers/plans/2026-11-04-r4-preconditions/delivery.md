@@ -105,3 +105,24 @@ python3 -m vibe_guide --help; git diff --check                                  
 ```
 
 `test_prd_guide_publish_path`（digest 未登记回归）修复后全绿；此前披露的基线环境性失败与计时 flake 判断不变。
+
+## 第 3 次交付（第 3 轮复审返工，2026-11-05）
+
+### P1-4（B05/P1.4）：quarantined writer 租约纳入静止证明
+
+- `_live_executors` 对本 run（或无法归属）的租约按状态分类：`active`/`quarantined` 一律判问题（quarantined 在 lease 生命周期里是「终止无法证明、仍需接管」，不是安全静止）；空状态与未知状态也判问题，不可读/畸形保持拒绝。
+- 新用例：`test_quarantined_writer_lease_blocks_confirm`；`test_active_writer_lease_blocks_confirm` 与正常 quiesce 夹具（显式 release）保持绿。
+
+### P1-5（B06/P1.4）：transfer marker 只有持锁者能判定
+
+- `recover` 拆为公共入口（先获取 `.amendment.lock`，10s 拿不到 → `PermissionError`，不回滚任何东西）与 `_recover_locked`（锁已持有或无竞争时执行原逻辑）。锁内可见的 marker 只能是崩溃残留——持锁 `confirm` 期间外部入口只会等待或拒绝，不可能删 marker/staging。
+- `confirm` 自恢复的已提交转移改走 `_recover_locked`，避免同进程自锁。
+- monitor/CLI 入口经 `require_no_pending_transfer` 同构受保护；`_require_amendment_barrier(owner_digest)` 保证 confirm 自身在 reauthorize 内不被误拦。
+- 新用例：`test_contended_lock_refuses_recovery_and_keeps_marker`（持锁窗口内 marker/staging 原样保留）、`test_free_lock_recovers_crash_residue_marker`（崩溃残留正常回滚）。
+
+### 验证（writer root）
+
+```bash
+python3 -m unittest tests.test_plan_amendment tests.test_plan_amendment_recovery -v   # 25 例 OK（新增 3 例）
+python3 -m unittest <11 个受影响文件> -v                                            # 284 例 OK
+```

@@ -480,14 +480,69 @@ class NoDispatchDuringTransferTests(_PreparedTransfer):
 class LeaseQuiescenceTests(_PreparedTransfer):
     """P1.4/§2.6: writer leases are part of the quiescence proof."""
 
-    def test_active_writer_lease_blocks_confirm(self):
+    def _lease_file(self):
         from vibe_guide.state import acquire_writer_lease
         self.assertTrue(acquire_writer_lease(
             self.paths, "probe-node-a", ".worktrees/probe-node-a",
             self.snapshot.run_id))
+        [lease_file] = list(
+            (self.paths.vibe / "leases").glob("*.json"))
+        return lease_file
+
+    def test_active_writer_lease_blocks_confirm(self):
+        self._lease_file()
         with self.assertRaises(PermissionError):
             plan_amendment.confirm(
                 self.paths, "probe-plan", self.digest, self.token)
+
+    def test_quarantined_writer_lease_blocks_confirm(self):
+        lease_file = self._lease_file()
+        payload = json.loads(lease_file.read_text(encoding="utf-8"))
+        payload["status"] = "quarantined"
+        lease_file.write_text(
+            json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(PermissionError):
+            plan_amendment.confirm(
+                self.paths, "probe-plan", self.digest, self.token)
+
+
+class TransferLockOwnershipTests(_PreparedTransfer):
+    """B06/P1.4: a non-owner entry must never roll back or consume an
+    in-flight transfer -- the marker belongs to whoever holds the
+    amendment lock."""
+
+    def test_contended_lock_refuses_recovery_and_keeps_marker(self):
+        from unittest import mock
+        marker = plan_amendment.barrier_path(self.paths, "probe-plan")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({
+            "amendment_digest": self.digest,
+            "run_id": self.snapshot.run_id}), encoding="utf-8")
+        # Another process is mid-transfer: the lock it holds never opens
+        # for this entry within the wait budget.
+        with mock.patch.object(
+                plan_amendment, "interprocess_lock",
+                side_effect=TimeoutError("locked")):
+            with self.assertRaises(PermissionError):
+                plan_amendment.require_no_pending_transfer(
+                    self.paths, "probe-plan")
+        # Nothing was rolled back: marker still there, candidate intact.
+        self.assertTrue(marker.is_file())
+        self.assertTrue(plan_amendment.transfer_pending(
+            self.paths, "probe-plan"))
+
+    def test_free_lock_recovers_crash_residue_marker(self):
+        # A marker whose owner is gone (no lock contention) is crash
+        # residue: an uncommitted transfer rolls back cleanly.
+        marker = plan_amendment.barrier_path(self.paths, "probe-plan")
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({
+            "amendment_digest": self.digest,
+            "run_id": self.snapshot.run_id}), encoding="utf-8")
+        result = plan_amendment.require_no_pending_transfer(
+            self.paths, "probe-plan")
+        self.assertIsNone(result)
+        self.assertFalse(marker.is_file())
 
 
 class AmendmentTokenEvidenceTests(_PreparedTransfer):
