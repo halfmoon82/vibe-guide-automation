@@ -2241,6 +2241,158 @@ class R11ReviewTests(_LegacyUninvokedFixture):
         self.assertEqual(self._retire()["status"], "retired")
 
 
+class R13StaticSubsetTests(_LegacyUninvokedFixture):
+    _exec_consumer = R10ReviewTests._exec_consumer
+
+    def _classified_count(self, source):
+        try:
+            return plan_amendment._embedded_create_invocations(source)
+        except ValueError as error:
+            self.fail("static form was not classified: {}".format(error))
+
+    def test_const_known_exec_call_is_safe_in_complete_retire(self):
+        source = 'const r = await tools.exec_command({cmd:"printf ok"}); text(r.output);'
+        consumer = self._exec_consumer(source, "ok", "r13-const-safe")
+        self.evidence["retired_consumers"].append(consumer)
+        self.assertEqual(self._classified_count(source), 0)
+        self.assertEqual(self._retire()["status"], "retired")
+
+    def test_const_create_call_is_counted_and_blocks_complete_retire(self):
+        source = 'const r = await tools.mcp__codex_app__create_thread({prompt:"x"}); text("done");'
+        self.assertEqual(self._classified_count(source), 1)
+        consumer = self._exec_consumer(source,
+            [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+             {"type": "input_text", "text": json.dumps({"threadId": "spawned", "hostId": "local"})}],
+            "r13-const-create")
+        self.evidence["retired_consumers"].append(consumer)
+        with self.assertRaises((ValueError, PermissionError)):
+            self._retire()
+        self.assertTrue(self.lease_file.exists())
+        self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                             for e in load_events(self.paths, self.run_id)))
+
+    def test_all_settled_known_calls_are_safe_in_complete_retire(self):
+        source = ('const results = await Promise.allSettled(['
+                  'tools.exec_command({cmd:"a"}), '
+                  'tools.exec_command({cmd:"b"})]);')
+        consumer = self._exec_consumer(source, "ok", "r13-all-safe")
+        self.evidence["retired_consumers"].append(consumer)
+        self.assertEqual(self._classified_count(source), 0)
+        self.assertEqual(self._retire()["status"], "retired")
+
+    def test_all_settled_create_is_counted_and_blocks_complete_retire(self):
+        source = ('const results = await Promise.allSettled(['
+                  'tools.exec_command({cmd:"a"}), '
+                  'tools.mcp__codex_app__create_thread({prompt:"x"})]);')
+        self.assertEqual(self._classified_count(source), 1)
+        consumer = self._exec_consumer(source,
+            [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+             {"type": "input_text", "text": json.dumps({"threadId": "spawned", "hostId": "local"})}],
+            "r13-all-create")
+        self.evidence["retired_consumers"].append(consumer)
+        with self.assertRaises((ValueError, PermissionError)):
+            self._retire()
+        self.assertTrue(self.lease_file.exists())
+        self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                             for e in load_events(self.paths, self.run_id)))
+
+    def test_all_settled_dynamic_member_is_unknown_and_blocks_complete_retire(self):
+        source = ('const key = "exec_command"; '
+                  'const results = await Promise.allSettled([tools[key]({cmd:"x"})]);')
+        with self.assertRaises(ValueError):
+            plan_amendment._embedded_create_invocations(source)
+        consumer = self._exec_consumer(source, "ok", "r13-all-dynamic")
+        self.evidence["retired_consumers"].append(consumer)
+        with self.assertRaises((ValueError, PermissionError)):
+            self._retire()
+        self.assertTrue(self.lease_file.exists())
+        self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                             for e in load_events(self.paths, self.run_id)))
+
+    def test_reserved_names_and_dynamic_result_access_refuse(self):
+        sources = [
+            'const tools = await tools.exec_command({cmd:"x"});',
+            'const text = await tools.exec_command({cmd:"x"}); text("x");',
+            'const Promise = await tools.exec_command({cmd:"x"}); '
+            'const x = await Promise.allSettled([tools.exec_command({cmd:"x"})]);',
+            'const r = await tools.exec_command({cmd:"x"}); text(r["output"]);',
+            'const r = await tools.exec_command({cmd:"x"}); r.output();',
+            'const r = await tools.mcp__codex_app__create_thread({prompt:"x"}); text(r.output);',
+            'const r = await tools.exec_command({cmd:"x"}); '
+            'text(({}).constructor["constructor"]("return tools")());',
+        ]
+        for index, source in enumerate(sources):
+            with self.subTest(source=source):
+                fixture = R13StaticSubsetTests(methodName="runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                consumer = fixture._exec_consumer(source, "ok", "r13-unknown-{}".format(index))
+                fixture.evidence["retired_consumers"].append(consumer)
+                with self.assertRaises((ValueError, PermissionError)):
+                    fixture._retire()
+                self.assertTrue(fixture.lease_file.exists())
+                self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                                     for e in load_events(fixture.paths, fixture.run_id)))
+
+    def test_all_settled_create_matching_action_is_not_excluded(self):
+        source = ('const results = await Promise.allSettled(['
+                  'tools.mcp__codex_app__create_thread({action_id:'
+                  + json.dumps(self.action_id) + '})]);')
+        self.assertEqual(self._classified_count(source), 1)
+        consumer = self._exec_consumer(source,
+            [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+             {"type": "input_text", "text": json.dumps({"threadId": "spawned", "hostId": "local"})}],
+            "r13-action-match")
+        self.evidence["retired_consumers"].append(consumer)
+        with self.assertRaises(PermissionError):
+            self._retire()
+        self.assertTrue(self.lease_file.exists())
+
+    def test_result_shadowing_text_later_cannot_hide_create(self):
+        source = ('text(await tools.mcp__codex_app__create_thread({prompt:"x"})); '
+                  'const text = await tools.exec_command({cmd:"x"});')
+        consumer = self._exec_consumer(source,
+            [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+             {"type": "input_text", "text": json.dumps({"threadId": "spawned", "hostId": "local"})}],
+            "r13-shadow-later")
+        self.evidence["retired_consumers"].append(consumer)
+        with self.assertRaises((ValueError, PermissionError)):
+            self._retire()
+        self.assertTrue(self.lease_file.exists())
+
+    def test_nested_create_in_arguments_is_not_static_data(self):
+        source = ('const r = await tools.exec_command({cmd:'
+                  'tools.mcp__codex_app__create_thread({prompt:"x"})}); text(r.output);')
+        consumer = self._exec_consumer(source, "ok", "r13-nested-create")
+        self.evidence["retired_consumers"].append(consumer)
+        with self.assertRaises((ValueError, PermissionError)):
+            self._retire()
+        self.assertTrue(self.lease_file.exists())
+
+    def test_multiple_known_creates_cannot_be_hidden_in_all_settled(self):
+        source = ('const results = await Promise.allSettled(['
+                  'tools.mcp__codex_app__create_thread({prompt:"a"}),'
+                  'tools.mcp__codex_app__create_thread({prompt:"b"})]);')
+        self.assertEqual(self._classified_count(source), 2)
+        consumer = self._exec_consumer(source, "ok", "r13-two-creates")
+        self.evidence["retired_consumers"].append(consumer)
+        with self.assertRaises((ValueError, PermissionError)):
+            self._retire()
+        self.assertTrue(self.lease_file.exists())
+
+    def test_const_declaration_cannot_treat_following_line_as_new_statement(self):
+        source = 'const r = await tools.exec_command({cmd:"x"})\ntext(r.output);'
+        with self.assertRaises(ValueError):
+            plan_amendment._embedded_create_invocations(source)
+
+    def test_reserved_keyword_is_not_a_result_binding(self):
+        for name in ("class", "return", "throw", "import", "break"):
+            with self.subTest(name=name):
+                source = 'const {} = await tools.exec_command({{cmd:"x"}});'.format(name)
+                with self.assertRaises(ValueError):
+                    plan_amendment._embedded_create_invocations(source)
+
+
 class R8ReceiptTests(_LegacyUninvokedFixture):
     def test_consumer_rollout_must_be_the_named_session(self):
         consumer = self.evidence["retired_consumers"][0]

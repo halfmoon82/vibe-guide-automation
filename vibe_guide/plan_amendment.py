@@ -337,6 +337,21 @@ def _audit_static_exec(tokens):
     host_names = {"exec_command", "mcp__codex_app__create_thread",
                   "svc__codex_app__create_thread", "codex_app__create_thread",
                   "create_thread"}
+    # Result bindings never stand for a callable tool or arbitrary expression.
+    # Only the plain exec_command output field may be passed to text().
+    output_bindings = set()
+    bindings = set()
+    reserved = host_names | {
+        "tools", "text", "Promise", "ALL_TOOLS", "globalThis", "global",
+        "window", "self", "eval", "Function", "Reflect", "String",
+        "await", "const", "let", "var", "new", "this", "null", "true", "false",
+        "break", "case", "catch", "class", "continue", "debugger", "default",
+        "delete", "do", "else", "export", "extends", "finally", "for",
+        "function", "if", "import", "in", "instanceof", "return", "super",
+        "switch", "throw", "try", "typeof", "void", "while", "with", "yield",
+        "enum", "implements", "interface", "package", "private", "protected",
+        "public", "static", "arguments",
+    }
 
     def expression(pos):
         if pos < len(tokens) and tokens[pos] == ("id", "await"):
@@ -362,7 +377,12 @@ def _audit_static_exec(tokens):
         if tokens[pos][0] in {"string", "regex"}:
             return pos + 1
         if tokens[pos:pos + 2] == [("id", "text"), ("punct", "(")]:
-            pos = expression(pos + 2)
+            if (pos + 5 < len(tokens) and tokens[pos + 2][0] == "id"
+                    and tokens[pos + 2][1] in output_bindings
+                    and tokens[pos + 3:pos + 5] == [("punct", "."), ("id", "output")]):
+                pos += 5
+            else:
+                pos = expression(pos + 2)
             if pos >= len(tokens) or tokens[pos][1] != ")":
                 raise ValueError("unknown text argument")
             return pos + 1
@@ -381,7 +401,45 @@ def _audit_static_exec(tokens):
 
     pos = 0
     while pos < len(tokens):
-        pos = expression(pos)
+        if tokens[pos] == ("id", "const"):
+            if (pos + 5 >= len(tokens) or tokens[pos + 1][0] != "id"
+                    or tokens[pos + 1][1] in reserved | bindings
+                    or tokens[pos + 2:pos + 4] != [("punct", "="), ("id", "await")]):
+                raise ValueError("unknown JavaScript const declaration")
+            name = tokens[pos + 1][1]
+            tool = None
+            if tokens[pos + 4:pos + 8] == [
+                    ("id", "Promise"), ("punct", "."),
+                    ("id", "allSettled"), ("punct", "(")]:
+                pos += 8
+                if pos >= len(tokens) or tokens[pos] != ("punct", "["):
+                    raise ValueError("unknown allSettled argument")
+                pos += 1
+                while pos < len(tokens) and tokens[pos] != ("punct", "]"):
+                    if tokens[pos:pos + 2] != [("id", "tools"), ("punct", ".")]:
+                        raise ValueError("unknown allSettled item")
+                    pos = expression(pos)
+                    if pos < len(tokens) and tokens[pos] == ("punct", ","):
+                        pos += 1
+                    elif pos >= len(tokens) or tokens[pos] != ("punct", "]"):
+                        raise ValueError("unknown allSettled separator")
+                if tokens[pos:pos + 2] != [("punct", "]"), ("punct", ")")]:
+                    raise ValueError("unterminated allSettled")
+                pos += 2
+            else:
+                if (pos + 7 >= len(tokens)
+                        or tokens[pos + 4:pos + 6] != [("id", "tools"), ("punct", ".")]
+                        or tokens[pos + 6][0] != "id"
+                        or tokens[pos + 6][1] not in host_names
+                        or tokens[pos + 7] != ("punct", "(")):
+                    raise ValueError("unknown JavaScript const initializer")
+                tool = tokens[pos + 6][1]
+                pos = expression(pos + 3)
+            bindings.add(name)
+            if tool == "exec_command":
+                output_bindings.add(name)
+        else:
+            pos = expression(pos)
         if pos < len(tokens) and tokens[pos][1] == ";":
             pos += 1
         elif pos < len(tokens):
