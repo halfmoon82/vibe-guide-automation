@@ -114,13 +114,16 @@ def _start_run(paths, plan_root, record, quiesce=False):
     runner = FakeRunner()
     snapshot = monitor.start(record, runner)
     if quiesce:
-        from vibe_guide.state import save_snapshot
+        from vibe_guide.state import release_writer_lease, save_snapshot
         snapshot.handles.clear()
-        for node in snapshot.nodes.values():
+        for node_id, node in snapshot.nodes.items():
             node["status"] = "delivered"
             node["active_task"] = None
             node["active_role"] = None
             node["retryable_action"] = None
+            release_writer_lease(
+                paths, node_id, str(node.get("worktree", "")),
+                snapshot.run_id)
         save_snapshot(paths, snapshot)
     # The CLI monitor path pins the live run on the plan; mirror that so
     # the amendment CAS can bind the same run id.
@@ -348,3 +351,160 @@ class SafetyRecheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _PreparedTransfer(unittest.TestCase):
+    """Shared fixture: published plan, authorized record, a real (quiet) run
+    and a displayed candidate ready for confirm."""
+
+    def setUp(self):
+        self.root, self.paths, self.plan_root, self.record = _authorized_probe(self)
+        self.snapshot, _runner = _start_run(
+            self.paths, self.plan_root, self.record, quiesce=True)
+        self.spec = _amendment_spec(self.plan_root)
+        self.candidate = plan_amendment.propose(
+            self.paths, "probe-plan", self.spec, "修订验收")
+        plan_amendment.show(
+            self.paths, "probe-plan", self.candidate["amendment_digest"])
+        self.digest = self.candidate["amendment_digest"]
+        self.token = plan_amendment.confirmation_token(self.digest)
+
+
+class CandidateArtifactIntegrityTests(_PreparedTransfer):
+    """B03/P1.4: every artifact the transfer installs must be bound by the
+    candidate digest -- tampering any of them fails closed."""
+
+    def _tamper(self, name):
+        """Schema-valid tampering: only a byte-level integrity check can
+        catch it -- a malformed-payload failure would prove nothing."""
+        directory = plan_amendment.candidate_dir(
+            self.paths, "probe-plan", self.digest)
+        path = directory / name
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if name == "authorization-card.json":
+            data["plan_id"] = "forged-plan"
+        elif name == "nodes.json":
+            data[0]["title"] = "forged title"
+        elif name == "spec.json":
+            data["nodes"][0]["title"] = "forged title"
+        else:
+            raise AssertionError(name)
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+    def _refuses(self, name):
+        with self.subTest(artifact=name):
+            self._tamper(name)
+            with self.assertRaises(PermissionError):
+                plan_amendment.confirm(
+                    self.paths, "probe-plan", self.digest, self.token)
+
+    def test_tampered_card_refused(self):
+        self._refuses("authorization-card.json")
+
+    def test_tampered_nodes_refused(self):
+        self._refuses("nodes.json")
+
+    def test_tampered_spec_refused(self):
+        self._refuses("spec.json")
+
+    def test_tampered_artifacts_fail_show_too(self):
+        # show loads the same directory through the candidate contract.
+        self._tamper("nodes.json")
+        with self.assertRaises(PermissionError):
+            plan_amendment.show(self.paths, "probe-plan", self.digest)
+
+
+class NoDispatchDuringTransferTests(_PreparedTransfer):
+    """B06/P1.4: confirm must never dispatch, stop or consume executors."""
+
+    def _ready_one_node(self):
+        snapshot = load_snapshot(self.paths, self.snapshot.run_id)
+        node = snapshot.nodes["probe-node-a"]
+        node["status"] = "planned"
+        node["retryable_action"] = None
+        snapshot.nodes["probe-node-a"] = node
+        save_snapshot(self.paths, snapshot)
+        return snapshot.run_id
+
+    def test_confirm_does_not_dispatch_ready_nodes(self):
+        run_id = self._ready_one_node()
+        result = plan_amendment.confirm(
+            self.paths, "probe-plan", self.digest, self.token)
+        self.assertEqual(result["status"], "amended")
+        snapshot = load_snapshot(self.paths, run_id)
+        self.assertFalse(snapshot.handles)
+        for node_id, node in snapshot.nodes.items():
+            self.assertIsNone(node.get("active_task"))
+            self.assertNotIn(node.get("status"),
+                             ("running", "blocked_unknown"),
+                             (node_id, node.get("status"), node.get("reason")))
+
+    def test_active_task_appearing_in_window_refuses_transfer(self):
+        """An executor proven active *inside* the transfer window (between
+        quiescence check and the reauthorization) aborts the amendment;
+        it must not be runner-stopped or silently consumed."""
+        from vibe_guide.models import DAGNode, Plan
+        from vibe_guide.monitor import Monitor
+        from vibe_guide.runners.fake import FakeRunner
+        plan = plan_amendment._plan_object(
+            self.plan_root, plan_amendment._plan_data(self.plan_root))
+        monitor = Monitor(self.paths, plan, list(plan.nodes))
+        run_id = self.snapshot.run_id
+        # Fabricate a live handle the way a racing monitor would leave it.
+        snapshot = load_snapshot(self.paths, run_id)
+        node = snapshot.nodes["probe-node-a"]
+        node["status"] = "running"
+        node["active_task"] = {
+            "role": "developer", "task_id": "race-task",
+            "handle_id": "race-handle", "generation": 1,
+        }
+        node["active_role"] = "developer"
+        snapshot.handles["probe-node-a"] = "race-handle"
+        save_snapshot(self.paths, snapshot)
+        new_card = _authorization_card(
+            _read(plan_amendment.candidate_dir(
+                self.paths, "probe-plan", self.digest),
+                "authorization-card.json"))
+        new_record = authorize(new_card, "AUTHORIZE")
+        with self.assertRaises((PermissionError, RuntimeError)):
+            monitor.reauthorize(
+                run_id, new_record, FakeRunner(),
+                "plan_amendment", amendment_digest=self.digest)
+        # The racing executor's state was not consumed or stopped.
+        after = load_snapshot(self.paths, run_id)
+        self.assertEqual(
+            after.nodes["probe-node-a"].get("active_task", {}).get("handle_id"),
+            "race-handle")
+
+
+class LeaseQuiescenceTests(_PreparedTransfer):
+    """P1.4/§2.6: writer leases are part of the quiescence proof."""
+
+    def test_active_writer_lease_blocks_confirm(self):
+        from vibe_guide.state import acquire_writer_lease
+        self.assertTrue(acquire_writer_lease(
+            self.paths, "probe-node-a", ".worktrees/probe-node-a",
+            self.snapshot.run_id))
+        with self.assertRaises(PermissionError):
+            plan_amendment.confirm(
+                self.paths, "probe-plan", self.digest, self.token)
+
+
+class AmendmentTokenEvidenceTests(_PreparedTransfer):
+    """P2: the recorded authorization evidence must name the token that was
+    actually required -- `AMEND <digest>`, never a fabricated `AUTHORIZE`."""
+
+    def test_amended_evidence_records_amend_token(self):
+        plan_amendment.confirm(
+            self.paths, "probe-plan", self.digest, self.token)
+        state = json.loads(
+            (self.paths.vibe / "state.json").read_text(encoding="utf-8"))
+        record = state["task_workflow"]["probe-plan"]["node_records"][
+            "user_authorization"]
+        self.assertIn(self.token, json.dumps(record, ensure_ascii=False))
+        self.assertNotIn(
+            "AUTHORIZE token", json.dumps(record, ensure_ascii=False))
+        self.assertNotIn(
+            '"granted": true, "token": "AUTHORIZE"',
+            json.dumps(record, ensure_ascii=False).replace(" ", "").replace(
+                '"', '"') or "")

@@ -232,14 +232,32 @@ def _require_display_receipt(root: Path, plan_id: str, plan: Mapping[str, Any], 
             "display_receipt_shown_at": str(receipt.get("shown_at"))}
 
 
+def _amendment_token(token: Any) -> bool:
+    """True only for a candidate-bound ``AMEND <64-hex-digest>`` token."""
+    if not isinstance(token, str) or not token.startswith("AMEND "):
+        return False
+    digest = token[len("AMEND "):]
+    if len(digest) != 64:
+        return False
+    try:
+        int(digest, 16)
+    except ValueError:
+        return False
+    return True
+
+
 def build_workflow_evidence(paths, plan_id: str, authorization_token: str) -> Dict[str, Any]:
     """Project the published plan of ``plan_id`` into verified workflow evidence.
 
     The planning gate runs first, so a plan that is not execution-ready never
     produces evidence.  Raises ``PermissionError`` when the gate blocks and
     ``ValueError`` when a required artifact is absent or self-inconsistent.
+    Two token forms are honest evidence: ``AUTHORIZE`` (initial plan
+    authorization) and ``AMEND <digest>`` (a confirmed same-plan amendment);
+    the recorded fact always names the one that was actually supplied.
     """
-    if not isinstance(authorization_token, str) or authorization_token != "AUTHORIZE":
+    is_amendment = _amendment_token(authorization_token)
+    if authorization_token != "AUTHORIZE" and not is_amendment:
         raise AuthorizationDenied("authorization required: the exact AUTHORIZE token is required")
     try:
         require_execution_ready(assert_planning_gate(paths, plan_id))
@@ -397,10 +415,17 @@ def build_workflow_evidence(paths, plan_id: str, authorization_token: str) -> Di
             # Recorded only from the token the user actually supplied; the guard
             # at the top of this function is the single place that accepts it.
             "user_authorization",
-            {"token_required": "AUTHORIZE", "authorization_digest": str(card.get("digest"))},
+            {"token_required":
+                 "AMEND <amendment_digest>" if is_amendment else "AUTHORIZE",
+             "authorization_digest": str(card.get("digest"))},
             {"granted": True, "token": authorization_token},
             {
-                "verified_fact": "the user supplied the exact AUTHORIZE token on the command line",
+                "verified_fact": (
+                    "the user supplied the candidate-bound amendment token "
+                    "AMEND <amendment_digest>"
+                    if is_amendment else
+                    "the user supplied the exact AUTHORIZE token on the "
+                    "command line"),
                 "artifact": _artifact(root, "authorization-card.json"),
                 "authorization_digest": str(card.get("digest")),
                 "authorized_plan_id": plan_id,

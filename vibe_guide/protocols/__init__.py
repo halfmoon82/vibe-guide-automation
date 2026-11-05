@@ -27,6 +27,10 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-11-05: §5.3 records the old-meaning ruling -- missing/false
+        # local_commit_allowed keeps node-branch commits, not a commit ban
+        # (r4 rework).
+        "7cd937220e995ddf9146adf3e2bed42fbdcb323989d3b6734ef8bdf5f6cf0f8f",
         # 2026-11-04: §5.1 gains local_commit_allowed? (deny-only signed
         # exception) and §5.3 asks it as a second publish-time choice (r4).
         "febe39ff42a0b89e75ef85674bb518cf2d53a5f527a0f7263f2e3a0be7fe66a2",
@@ -253,6 +257,10 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Worker protocol delivered by reference (#216): a ref-mode dispatch pins
     # the file's sha256 and only accepts a digest published here.
     "visible-sdd-worker": frozenset({
+        # 2026-11-05: close-out rule keeps the deny landing channel honest --
+        # node-branch commits stay the landing point; the signed exception
+        # only narrows the prompt (r4 rework, missing=false=old meaning).
+        "2ff3e2d070a7270b6a52c3835fef04e72c7021f52dd1a1b05245a328a055a6b3",
         # 2026-11-04: close-out rule states the deny/no-exception commit ban
         # and the signed local_commit_allowed whitelist exception (r4).
         "a300c173735dffc1fba47f948ade71a292e268b0a09aa4aef871c95fab5c4db4",

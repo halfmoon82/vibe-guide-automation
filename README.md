@@ -252,7 +252,7 @@ V4.6 起，DAG 真并行的载体是每节点一个可见 worker 会话（Codex 
 
 ### 远端 Git 禁令（remote_git_actions=deny）
 
-授权卡 `remote_git_actions` 为 `deny` 时，四个平台的 worker 提示词都会加一条固定禁令。deny 覆盖整个 commit/push/PR/MR/merge 组：无例外时连本地 commit 也禁止，交付通过会话交付通道上报；产品经理可在产品 spec 写 `local_commit_allowed: true`，签发一个仅允许「本节点分支 + 授权文件白名单 + 显式路径 git add」的本地 commit 窄例外，push/PR/MR/merge 及任何别名仍全部禁止。为 `allow` 时不加禁令，也不加任何启动参数；`allow` 与 `local_commit_allowed: true` 并存会被拒绝（两套权限来源）。各平台实际能拦到什么：
+授权卡 `remote_git_actions` 为 `deny` 时，四个平台的 worker 提示词都会加一条固定禁令。deny 禁止全部远端 Git 动作（fetch/push/pull、PR/MR、任意 merge、gh）；本节点分支上的本地 commit 不在 deny 范围内——交付落账检查本来就靠它核对改动，提交也必须在合同节点分支上。产品经理可在产品 spec 写 `local_commit_allowed: true`，把这条本地通道升级为显式签名例外：提示词改为只允许「本节点分支 + 授权文件白名单 + 显式路径 git add」，push/PR/MR/merge 及任何别名仍全部禁止。缺失/false 保持旧含义与旧摘要，不反向重解释历史；为 `allow` 时不加禁令，也不加任何启动参数；`allow` 与 `local_commit_allowed: true` 并存会被拒绝（两套权限来源）。各平台实际能拦到什么：
 
 | 平台 | 约束 |
 |---|---|

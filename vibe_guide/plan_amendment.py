@@ -392,23 +392,37 @@ def propose(
                       "dependency_graph_digest": dependency_graph_digest(graph)},
         "candidate_card": candidate_card.to_dict(),
     }
-    digest = _canonical_digest(candidate)
-    candidate["amendment_digest"] = digest
-    target = candidate_dir(paths, plan_id, digest)
-    if target.exists():
-        raise FileExistsError("amendment candidate already exists: " + digest)
-    target.mkdir(parents=True)
+    # Stage every artifact first: the candidate digest must cover the
+    # bytes the transfer will actually install (spec, card, nodes, audit,
+    # diff), not just candidate.json's embedded copies.  Tampering any of
+    # them later fails the load-time re-check (P1.4/B03).
+    staging = Path(tempfile.mkdtemp(
+        prefix=".amend-candidate-",
+        dir=str(amendments_dir(paths, plan_id).parent)))
     try:
-        _atomic_json(target / "candidate.json", candidate)
-        _atomic_json(target / "spec.json", spec)
-        _atomic_json(target / "authorization-card.json",
+        _atomic_json(staging / "spec.json", spec)
+        _atomic_json(staging / "authorization-card.json",
                      candidate_card.to_dict())
-        _atomic_json(target / "nodes.json",
+        _atomic_json(staging / "nodes.json",
                      [node.to_dict() for node in nodes])
-        _atomic_json(target / "dag-audit.json", candidate["dag_audit"])
-        _atomic_json(target / "diff.json", diff)
+        _atomic_json(staging / "dag-audit.json", candidate["dag_audit"])
+        _atomic_json(staging / "diff.json", diff)
+        candidate["artifact_digests"] = {
+            name: _fingerprint(staging / name)
+            for name in ("spec.json", "authorization-card.json",
+                         "nodes.json", "dag-audit.json", "diff.json")
+        }
+        digest = _canonical_digest(candidate)
+        candidate["amendment_digest"] = digest
+        _atomic_json(staging / "candidate.json", candidate)
+        target = candidate_dir(paths, plan_id, digest)
+        if target.exists():
+            raise FileExistsError(
+                "amendment candidate already exists: " + digest)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(str(staging), str(target))
     except BaseException:
-        shutil.rmtree(str(target), ignore_errors=True)
+        shutil.rmtree(str(staging), ignore_errors=True)
         raise
     return candidate
 
@@ -417,6 +431,10 @@ def _fingerprint(path: Path) -> str:
     if not path.is_file() or path.is_symlink():
         return ""
     return _artifact_hash(path)
+
+
+CANDIDATE_ARTIFACTS = ("spec.json", "authorization-card.json", "nodes.json",
+                       "dag-audit.json", "diff.json")
 
 
 def _load_candidate(paths: ProjectPaths, plan_id: str,
@@ -433,6 +451,16 @@ def _load_candidate(paths: ProjectPaths, plan_id: str,
             if key != "amendment_digest"}
     if _canonical_digest(body) != amendment_digest:
         raise PermissionError("amendment candidate was modified after proposal")
+    # The digest bound the installed artifact bytes at proposal time;
+    # re-verify every file the transfer (or show) will actually read.
+    recorded = candidate.get("artifact_digests")
+    if not isinstance(recorded, dict) or sorted(recorded) != sorted(
+            CANDIDATE_ARTIFACTS):
+        raise PermissionError("amendment candidate artifact ledger is invalid")
+    for name, expected in recorded.items():
+        if _fingerprint(directory / name) != expected:
+            raise PermissionError(
+                "amendment candidate artifact was modified: " + name)
     return candidate
 
 
@@ -522,6 +550,29 @@ def _live_executors(paths: ProjectPaths, run_id: str) -> List[str]:
             problems.append(
                 "pending provider side effects: "
                 + ",".join(str(item.get("action_id")) for item in pending))
+    try:
+        leases_dir = paths.vibe / "leases"
+        if leases_dir.is_dir():
+            for lease_file in sorted(leases_dir.glob("*.json")):
+                try:
+                    lease = json.loads(
+                        lease_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    problems.append(
+                        "writer lease unreadable: " + lease_file.name)
+                    continue
+                if not isinstance(lease, dict):
+                    problems.append(
+                        "writer lease malformed: " + lease_file.name)
+                    continue
+                if (lease.get("status") == "active"
+                        and lease.get("run_id") in (None, run_id)):
+                    problems.append(
+                        "writer lease {} is active for node {}".format(
+                            lease_file.name,
+                            lease.get("node_id") or "?"))
+    except OSError as error:
+        problems.append("writer leases unreadable: " + str(error))
     try:
         from .task_registry import _all_bindings
         for binding in _all_bindings(paths):
@@ -642,8 +693,8 @@ def _restore_previous(plan_root: Path, staged_dir: Path) -> None:
 
 def _write_staging(paths: ProjectPaths, plan_root: Path,
                    candidate: Dict[str, Any], run_id: str) -> Path:
-    plan_id = candidate["plan_id"]
     """Copy old artifacts aside and render the amended set under one dir."""
+    plan_id = candidate["plan_id"]
     staging = Path(tempfile.mkdtemp(
         prefix=".amend-staging-", dir=str(plan_root)))
     old_dir = staging / "old"
@@ -735,7 +786,12 @@ def _finish_projection(paths: ProjectPaths, plan_id: str, plan_root: Path,
          "publication": "plan_amendment",
          "amendment_digest": candidate["amendment_digest"]})
     _atomic_json(plan_root / "authorization.json", record.to_dict())
-    materialize_workflow_evidence(paths, plan_id, "AUTHORIZE")
+    # Evidence must name the token the user actually supplied; the
+    # candidate-bound AMEND token is derived from the verified digest, so
+    # it is the same string confirm required -- never a fabricated
+    # AUTHORIZE.
+    materialize_workflow_evidence(
+        paths, plan_id, confirmation_token(candidate["amendment_digest"]))
     return {"record": record, "candidate_card": candidate_card}
 
 
@@ -789,6 +845,15 @@ def confirm(
                 "run_id": run_id,
                 "started_at": _now(),
             })
+            # The marker now blocks every execution entry, but a dispatch
+            # that started between the earlier check and this write could
+            # still be in flight; re-prove quiescence inside the protected
+            # window and refuse instead of consuming or stopping it.
+            problems = _live_executors(paths, run_id)
+            if problems:
+                raise PermissionError(
+                    "an executor became active inside the transfer window: "
+                    + "; ".join(problems))
             if _fault_at == "before_event":
                 raise RuntimeError("fault injected before transfer event")
             _commit_transfer_event(
@@ -831,9 +896,10 @@ def _commit_transfer_event(paths: ProjectPaths, plan_id: str, plan_root: Path,
     The monitor validates previous lineage, records the
     ``authorization_reauthorized`` event with ``change_reason``
     ``plan_amendment`` and applies the new projection to the snapshot --
-    task identities, cursors and node continuity included.  Dispatching is
-    skipped by handing it an inert runner; the amended run only dispatches
-    after the caller's own next monitor/resume.
+    task identities, cursors and node continuity included.  For the
+    amendment reason the monitor refuses active executors and never
+    schedules: the amended run only dispatches after the caller's own
+    next monitor/resume.
     """
     from .cli import _authorization_card, _public_runner
     from .monitor import Monitor

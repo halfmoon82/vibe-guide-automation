@@ -55,3 +55,53 @@ git diff --check                                                                
 ## Git 状态
 
 全部改动限白名单文件，一次性白名单本地 commit 落在 `fix/v528-r4-preconditions`；未执行 push/PR/MR/merge/deploy。
+
+## 第 2 次交付（复审返工，2026-11-05）
+
+复审第 2 轮 P1×3 / P2×2 全部修复，另采纳 P2-3 建议 4 项。
+
+### P1-1（B08/B10）：`local_commit_allowed` 接入运行时门禁
+
+- `monitor._check_developer_commit_landing` 从 `_snapshot_record` 读 `remote_git_actions` 与 `local_commit_allowed` 传入 `commit_landing_gate`，硬编码 `True` 移除。
+- **裁定（None 映射）**：缺失/不显式 false → 本地 commit 允许（旧含义）。依据：① 合同「缺失/false 保持旧含义与旧摘要，不反向重解释历史」；② 旧提示原文 deny 下「只在本地分支提交」；③ `scope_landing` 的 uncommitted 拒收使 deny 节点必须提交，「deny 禁提交」会让全部默认卡交付死锁（已由 `test_landing_required_before_review` 回归证实）；④ 例外仍有意义：签名授予 + 提示词收窄为显式白名单。裁定已写进 monitor 注释。
+- 文案修正：`REMOTE_GIT_BAN_TEXT` 不再把无例外 deny 描述成「严禁提交代码」（与落账矛盾），改为只列远端动词禁令——既不承诺也不禁止本地提交，满足 B10；新增 `LOCAL_COMMIT_STRICT_TEXT` 供伪造/存量显式 `false` 的 fail-closed 提示。
+- 附带修复（同缺陷链）：`_landing_project_head` 在非 git 项目提前求值导致 base=None 静默放行 → 懒求值；`commit_landing_gate` 在 `base is None` 时禁止 commit 或有 scope 时返回 `unknown`（不可证明零提交≠零提交）。
+- 新用例：deny/allow/例外三态运行时门禁、错分支拒收、伪造 false 提示、错类型拒绝。
+
+### P1-2（B06/P1.4）：修订切换窗口内不派发
+
+- `Monitor.reauthorize` 在 `change_reason == "plan_amendment"` 时跳过 `_schedule_ready`；窗口内出现的活跃 executor 不再被 runner 停止/消费，直接 `PermissionError` 中止转移。
+- `confirm` 在 marker 写入后、事件提交前二次重验 `_live_executors`，把竞态窗口压进 `.amendment.lock`。
+- 新用例：ready 节点 confirm 不产生派发/状态污染；窗口内活跃任务中止转移且不消费其状态。
+
+### P1-3（B03）：候选工件摘要绑定
+
+- `propose` 先在临时目录写齐 5 个工件（spec/card/nodes/dag-audit/diff），逐字节 sha256 记入 `artifact_digests` 参与候选摘要，再原子改名 `amendments/<digest>/`。
+- `_load_candidate` 装载前逐一重算并比对 artifact_digests，篡改任一工件（schema 合法篡改）→ `PermissionError`；show/confirm/_write_staging/_commit_transfer_event/recover 全部经过此入口。
+- 新用例：篡改 card/nodes/spec 三个工件 confirm/show 必拒。
+
+### P2-1：修订证据如实记录令牌
+
+- `authorize_entry.build_workflow_evidence` 接受 `AMEND <digest>` 令牌形态并如实记录 `token_required`/`verified_fact`；`plan_amendment._finish_projection` 改为传 `confirmation_token(digest)`，不再伪造 AUTHORIZE。
+
+### P2-2：quiescence 纳入 writer 租约
+
+- `_live_executors` 枚举 `.vibe/leases/*.json`：本 run 的 active 租约与不可读/畸形租约均判问题；`_start_run` 测试夹具的 quiesce 同步释放租约以模拟真实交付态。
+
+### P2-3 建议采纳
+
+- `_write_staging` 游离字符串移到 docstring 位；`commit_landing_gate` dirty 判定括号化；`AuthorizationRecord.from_dict` 对非布尔 `local_commit_allowed` 拒绝（原一律归一化 None）；CLI plan-amend 把 `OSError`（含 fsio JsonMissing/Corrupt）映为 `blocked_unknown`，验证类 `ValueError/KeyError/TypeError` 保持 `blocked_design`。
+
+### 附带修复
+
+- `protocols/__init__.py` 追加 `visible-sdd-worker.md`/`prd-guide.md` 的新已发布 digest（编辑后未登记导致 dispatch `contract_error`，`test_prd_guide_publish_path` 全红）。
+
+### 验证（writer root）
+
+```bash
+python3 -m unittest tests.test_plan_amendment tests.test_plan_amendment_recovery tests.test_local_commit_authorization -v   # 43 例 OK（新增 9 例）
+python3 -m unittest <15 个受影响文件> -v                                                                              # 250 例 OK
+python3 -m vibe_guide --help; git diff --check                                                                          # OK
+```
+
+`test_prd_guide_publish_path`（digest 未登记回归）修复后全绿；此前披露的基线环境性失败与计时 flake 判断不变。

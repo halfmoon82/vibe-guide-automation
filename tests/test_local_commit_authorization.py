@@ -217,10 +217,16 @@ class RemoteDenialTests(unittest.TestCase):
 class PromptTextTests(unittest.TestCase):
     """The prompt must not promise commits a plain deny forbids (B10)."""
 
-    def test_deny_without_exception_forbids_commit(self):
+    def test_deny_without_exception_neither_promises_nor_forbids_commit(self):
         text = worker_push_ban_text(None, {"remote_git_actions": "deny"})
+        # B10: no promise of commits like the pre-r4 text had; and the
+        # prompt must not forbid the landing channel either -- an
+        # uncommitted delivery is refused by scope landing, so a worker
+        # told "严禁提交代码" could never deliver under a deny card.
         self.assertNotIn("只在本地分支提交", text)
-        self.assertIn("提交", text)
+        self.assertNotIn("严禁提交代码", text)
+        for verb in ("push", "PR", "merge"):
+            self.assertIn(verb, text)
 
     def test_deny_with_exception_scopes_commit_to_whitelist(self):
         text = worker_push_ban_text(
@@ -229,6 +235,12 @@ class PromptTextTests(unittest.TestCase):
         # Still bans every remote verb.
         for verb in ("push", "PR", "merge"):
             self.assertIn(verb, text)
+
+    def test_deny_with_forged_false_fails_closed(self):
+        text = worker_push_ban_text(
+            None, {"remote_git_actions": "deny",
+                   "local_commit_allowed": False})
+        self.assertIn("严禁提交代码", text)
 
 
 class NodeSpecFieldTests(unittest.TestCase):
@@ -329,3 +341,122 @@ class RealGitCommitGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MonitorCommitLandingRuntimeTests(unittest.TestCase):
+    """B08/B10: the monitor's delivery gate reads the signed exception
+    from the run's authorization record -- a deny card without it refuses
+    landed commits; ``allow`` and the signed exception permit them on the
+    contracted node branch.
+    """
+
+    def setUp(self):
+        from tests.test_plan_amendment import _authorized_probe
+        self.root, self.paths, self.plan_root, self.record = _authorized_probe(self)
+        self.git_dir = Path(tempfile.mkdtemp(prefix="lc-mon-"))
+        self.addCleanup(self._cleanup)
+        self._git("init", "-q")
+        self._git("config", "user.email", "t@t")
+        self._git("config", "user.name", "t")
+        (self.git_dir / "a.py").write_text("a\n", encoding="utf-8")
+        self._git("add", "a.py")
+        self._git("commit", "-qm", "base")
+        self.base = self._git("rev-parse", "HEAD").stdout.strip()
+        self._git("checkout", "-qb", "node/n1")
+        (self.git_dir / "a.py").write_text("a2\n", encoding="utf-8")
+        self._git("add", "a.py")
+        self._git("commit", "-qm", "work")
+
+    def _cleanup(self):
+        import shutil
+        shutil.rmtree(self.git_dir, ignore_errors=True)
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", "-C", str(self.git_dir)] + list(args),
+            capture_output=True, text=True, timeout=30)
+
+    def _monitor_and_snapshot(self, record):
+        """A real Monitor plus a live snapshot whose first business node is a
+        mid-delivery developer task writing a real git worktree."""
+        from vibe_guide import plan_amendment
+        from vibe_guide.monitor import Monitor
+        from vibe_guide.runners.fake import FakeRunner
+        plan = plan_amendment._plan_object(
+            self.plan_root, plan_amendment._plan_data(self.plan_root))
+        monitor = Monitor(self.paths, plan, list(plan.nodes))
+        snapshot = monitor.start(record, FakeRunner())
+        snapshot.handles.clear()
+        node_id = next(
+            nid for nid, node in snapshot.nodes.items()
+            if nid != "integration-review")
+        node = snapshot.nodes[node_id]
+        node["worktree"] = str(self.git_dir)
+        node["branch"] = "node/n1"
+        node["worktree_base"] = self.base
+        node["status"] = "running"
+        node["active_role"] = "developer"
+        node["active_task"] = {
+            "role": "developer", "task_id": "dev-1",
+            "handle_id": "h-1", "generation": 1}
+        # The refusal path flips the binding; stub the registry like the
+        # other in-memory monitor fixtures do.
+        monitor._set_binding_status = lambda *args, **kwargs: None
+        return monitor, snapshot, node_id
+
+    def test_deny_without_exception_keeps_landing_commits(self):
+        """Pre-r4 / no-exception deny records keep their old meaning: the
+        same commits still land on the contracted node branch (the landing
+        report polices the file scope)."""
+        monitor, snapshot, node_id = self._monitor_and_snapshot(self.record)
+        active = snapshot.nodes[node_id]["active_task"]
+        self.assertTrue(
+            monitor._check_developer_commit_landing(
+                snapshot, node_id, active))
+
+    def test_deny_without_exception_refuses_wrong_branch(self):
+        """The record is still consulted at runtime: commits on a branch
+        other than the contracted node branch are refused."""
+        monitor, snapshot, node_id = self._monitor_and_snapshot(self.record)
+        node = snapshot.nodes[node_id]
+        node["branch"] = "node/other"
+        active = node["active_task"]
+        self.assertFalse(
+            monitor._check_developer_commit_landing(
+                snapshot, node_id, active))
+        self.assertEqual(
+            node["status"], "awaiting_supervisor")
+
+    def test_allow_card_permits_landed_commits(self):
+        monitor, snapshot, node_id = self._monitor_and_snapshot(self.record)
+        snapshot.authorization = dict(
+            snapshot.authorization, remote_git_actions="allow")
+        active = snapshot.nodes[node_id]["active_task"]
+        self.assertTrue(
+            monitor._check_developer_commit_landing(
+                snapshot, node_id, active))
+
+    def test_deny_with_signed_exception_permits_branch_commits(self):
+        monitor, snapshot, node_id = self._monitor_and_snapshot(self.record)
+        snapshot.authorization = dict(
+            snapshot.authorization, local_commit_allowed=True)
+        active = snapshot.nodes[node_id]["active_task"]
+        self.assertTrue(
+            monitor._check_developer_commit_landing(
+                snapshot, node_id, active))
+
+
+class StrictTypeTests(unittest.TestCase):
+    """B09: a forged non-boolean exception value is refused, not normalized."""
+
+    def test_wrong_type_local_commit_allowed_refused(self):
+        plan, nodes = _plan()
+        card = build_authorization_card(
+            plan, nodes, CAPS, remote_git_actions="deny")
+        record = authorize(card, "AUTHORIZE")
+        data = record.to_dict()
+        for bad in ("yes", 1, 0, "true", [True]):
+            with self.subTest(value=bad):
+                forged = dict(data, local_commit_allowed=bad)
+                with self.assertRaises(ValueError):
+                    AuthorizationRecord.from_dict(forged)

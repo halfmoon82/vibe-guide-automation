@@ -167,7 +167,7 @@ vibe attest --adapter <claude-code|codex|...> --facts <facts.json> --provenance 
 
 ### 5.3 发布、授权、开工
 
-发布前问两件事：允许还是禁止远端 Git 动作（提交、推送、开 PR、合并），写进产品 spec 的 `remote_git_actions`（`allow` / `deny`，缺省 `deny`）；选 `deny` 时再问是否签发本地 commit 窄例外 `local_commit_allowed`（缺省 `false`：deny 下连本地 commit 也禁止；`true` 只允许本节点分支、授权文件白名单、显式路径 `git add`，push/PR/MR/merge 仍全禁）。`allow` + `local_commit_allowed: true` 会被拒绝。**不问心跳间隔与换班上限**：授权卡上的 `heartbeat_interval_minutes` 等运行参数由 vibe 推导（推送唤醒已验证的平台兜底检查为 60 分钟，未验证为 10 分钟）。
+发布前问两件事：允许还是禁止远端 Git 动作（fetch/push/pull、PR/MR、merge），写进产品 spec 的 `remote_git_actions`（`allow` / `deny`，缺省 `deny`）；选 `deny` 时可再问是否签发本地 commit 显式例外 `local_commit_allowed`（`true` 时提示词收窄为只允许本节点分支、授权文件白名单、显式路径 `git add`，push/PR/MR/merge 仍全禁；缺省/`false` 保持旧含义：本节点分支本地提交与既有落账白名单规则不变）。`allow` + `local_commit_allowed: true` 会被拒绝。**不问心跳间隔与换班上限**：授权卡上的 `heartbeat_interval_minutes` 等运行参数由 vibe 推导（推送唤醒已验证的平台兜底检查为 60 分钟，未验证为 10 分钟）。
 
 ```bash
 vibe plan --request "<产品经理的原话>" --plan-id <plan_id> --from-prd <product-spec.json> --json

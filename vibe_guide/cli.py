@@ -396,7 +396,17 @@ def _plan_amend_command(paths: ProjectPaths, args) -> CLIResult:
             "plan-amend 被拒：" + str(error),
             args.as_json,
         )
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except OSError as error:
+        # I/O and unreadable artifacts are environment faults, not design
+        # violations: report blocked_unknown like the rest of the project.
+        return _result(
+            BLOCKED,
+            {"command": "plan-amend", "status": "blocked_unknown",
+             "reason": str(error)},
+            "plan-amend 状态不可读：" + str(error),
+            args.as_json,
+        )
+    except (ValueError, KeyError, TypeError) as error:
         return _result(
             BLOCKED,
             {"command": "plan-amend", "status": "blocked_design",

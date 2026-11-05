@@ -123,11 +123,21 @@ BACKGROUND_MODE_DISCLOSURES = (
 
 
 #: Fixed worker-prompt ban, written only when the card says ``deny`` without
-#: the signed local-commit exception.  r4: a plain deny forbids the whole
-#: commit/push/PR/MR/merge group, so the prompt must not promise a commit.
+#: the signed local-commit exception.  r4 (B10): the ban names every remote
+#: verb only -- it neither promises commits (the pre-r4 text did) nor
+#: forbids them, because the landing channel still relies on local commits
+#: under the old deny cards; the signed exception is the explicit,
+#: whitelist-guided form of that same channel.
 REMOTE_GIT_BAN_TEXT = (
-    "远端 Git 禁令：授权卡禁止全部 Git 动作，包括本地 commit、git fetch、git push、git pull "
-    "以及 gh 命令；严禁提交代码，交付通过会话交付通道上报。"
+    "远端 Git 禁令：授权卡禁止全部远端 Git 动作——严禁 git fetch、git push、"
+    "git pull、创建 PR/MR、任何形式的 merge 以及 gh 命令。"
+)
+#: Extra ban appended for a deny card carrying an explicit (forged or
+#: pre-stored) ``local_commit_allowed: false`` -- the strictest shape: the
+#: local-commit channel itself is closed too.
+LOCAL_COMMIT_STRICT_TEXT = (
+    "本地提交禁令：该卡显式禁止本地 commit；严禁提交代码，"
+    "改动通过会话交付通道上报。"
 )
 #: Prompt ban for ``deny`` plus the signed ``local_commit_allowed`` exception:
 #: whitelist-only local commits on the node branch, every remote verb banned.
@@ -202,17 +212,20 @@ def local_commit_permitted(paths, contract):
 def worker_push_ban_text(paths, contract):
     """The ban line every developer/reviewer prompt carries (#379).
 
-    ``deny`` without the signed exception keeps the strictest ban -- no local
-    commit either; ``deny`` with the exception scopes commits to the node
-    file scope and branch; any other card (``allow``, none, unreadable)
-    still forbids the worker to push.
+    ``deny`` without the signed exception names only the remote ban -- the
+    prompt must not promise commits and must not forbid the landing
+    channel the delivery still needs; ``deny`` with the exception scopes
+    commits to the node file scope and branch; any other card (``allow``,
+    none, unreadable) still forbids the worker to push.  A forged explicit
+    ``false`` on a stored card fails closed with the strict ban.
     """
     switch, exception = _card_remote_git_fields(paths, contract)
     if switch == "deny":
-        return (
-            LOCAL_COMMIT_ALLOWED_BAN_TEXT if exception is True
-            else REMOTE_GIT_BAN_TEXT
-        )
+        if exception is True:
+            return LOCAL_COMMIT_ALLOWED_BAN_TEXT
+        if exception is False:
+            return REMOTE_GIT_BAN_TEXT + LOCAL_COMMIT_STRICT_TEXT
+        return REMOTE_GIT_BAN_TEXT
     return WORKER_PUSH_BAN_TEXT
 
 
@@ -281,7 +294,7 @@ def commit_landing_gate(
         dirty = [
             item[3:].strip()
             for item in (worktree_dirty.stdout or "").splitlines()
-            if item and item[0] in " MARC" or (item and item[:2].strip())
+            if item and (item[0] in " MARC" or item[:2].strip())
         ]
     except RuntimeError as error:
         return {"status": "unknown", "reason": str(error)}
@@ -298,6 +311,12 @@ def commit_landing_gate(
                           "{} (actual: {})".format(expected, actual_branch),
                 "branch": actual_branch}
     if not local_commit_allowed:
+        if base is None:
+            # No baseline means "zero landed commits" cannot be proven;
+            # unverifiable is never success under a commit ban.
+            return {"status": "unknown",
+                    "reason": "the commit baseline cannot be resolved, so "
+                              "landed commits cannot be counted"}
         if commit_count != 0 or staged or dirty:
             return {"status": "rejected",
                     "reason": "remote_git_actions=deny without the signed "
@@ -306,6 +325,10 @@ def commit_landing_gate(
                     "commits": commit_count}
         return {"status": "ok", "commits": 0}
     if file_scope is not None:
+        if base is None:
+            return {"status": "unknown",
+                    "reason": "the commit baseline cannot be resolved, so "
+                              "landed files cannot be enumerated"}
         scope = {str(item) for item in file_scope}
         outside = [item for item in sorted(set(landed) | set(staged))
                    if item not in scope]
@@ -1624,10 +1647,15 @@ class AuthorizationRecord:
         converted.setdefault("heartbeat_interval_forced_cost", None)
         converted.setdefault("daemon", DAEMON_DEFAULT)
         converted.setdefault("launchd_keepalive", LAUNCHD_KEEPALIVE_DEFAULT)
-        # Signed only when true; anything stored means an explicit choice and
-        # a deny-only combination or the digest check below refuses it.
-        if converted.get("local_commit_allowed") is not True:
+        # Signed only when true; anything stored means an explicit choice.
+        # Only the boolean ``True`` is a valid exception value -- a wrong
+        # type is a forged field and must be refused, not normalized away.
+        if converted.get("local_commit_allowed") is False:
             converted["local_commit_allowed"] = None
+        elif converted.get("local_commit_allowed") is not None \
+                and converted["local_commit_allowed"] is not True:
+            raise ValueError("local_commit_allowed must be true or unset")
+        converted.setdefault("local_commit_allowed", None)
         if converted["local_commit_allowed"] is True \
                 and converted["remote_git_actions"] != "deny":
             raise ValueError(

@@ -1846,13 +1846,13 @@ class Monitor:
     ) -> bool:
         """Enforce the commit half of the remote-Git contract before delivery.
 
-        Commits must sit on the contracted node branch inside the
-        authorized file scope, for every stored authorization: the r4
-        ``local_commit_allowed`` flag narrows what prompts *promise*, while
-        the landing rule is what the pre-r4 runtime always enforced --
-        branch identity plus scope.  Nothing here touches remote delivery:
-        pushes stay banned on every card and ``remote_delivery_required``
-        only reads ``allow``.
+        Commits may land only under a permission the signed record grants
+        -- ``allow`` outright, or ``deny`` carrying the signed
+        ``local_commit_allowed`` exception -- and only on the contracted
+        node branch.  A no-exception deny refuses landed commits (the
+        worker delivers through the session channel); nothing here
+        touches remote delivery: pushes stay banned on every card and
+        ``remote_delivery_required`` only reads ``allow``.
         """
         current = snapshot.nodes[node_id]
         raw = str(current.get("worktree") or "")
@@ -1874,6 +1874,22 @@ class Monitor:
             authorization = self._snapshot_record(snapshot)
         except (KeyError, TypeError, ValueError):
             return True  # fixture/legacy run without a record: unchanged path
+        # Ruling (r4, recorded for the reviewer): a record missing
+        # ``local_commit_allowed`` keeps its pre-r4 meaning -- local
+        # commits on the contracted node branch stay permitted, with the
+        # landing report enforcing the authorized file scope on them.
+        # Two proofs force this reading over "deny forbids commits": the
+        # contract says a missing/false flag keeps the *old* meaning and
+        # digest, and the landing/empty-landing gates require committed
+        # work under the default deny card (a forbid-commits reading
+        # deadlocks every delivery: uncommitted landings are refused, so
+        # no delivery could ever land).  The signed exception is the
+        # explicit, signed form of that same commit channel; a stored
+        # explicit ``false`` -- impossible through the builder, only via
+        # forgery -- fails closed.
+        switch = getattr(authorization, "remote_git_actions", "deny") or "deny"
+        exception = getattr(authorization, "local_commit_allowed", None)
+        permitted = switch == "allow" or exception is not False
         node = self.nodes[node_id]
         expected_branch = (
             current.get("branch")
@@ -1882,22 +1898,25 @@ class Monitor:
         )
         git = _landing_git_in(worktree)
         try:
+            project_head = _landing_project_head(self)
+        except Exception:
+            # The recorded base still verifies without the project HEAD;
+            # only the merge-base fallback needs it.
+            project_head = None
+        try:
             base, _inferred = _landing_node_base(
-                git, current.get("worktree_base"), _landing_project_head(self))
+                git, current.get("worktree_base"), project_head)
         except Exception:
             base = None
-        # Commits stay permitted on the node branch for every stored record:
-        # a card missing ``local_commit_allowed`` keeps its pre-r4 meaning,
-        # so this gate polices *where* commits land -- the contracted node
-        # branch -- while the per-node file scope, including its approved
-        # expansions, remains the landing report's own call.  The signed
-        # exception narrows prompts and card text only.
+        # Commits land only where the record allows them -- the contracted
+        # node branch -- while the per-node file scope, including its
+        # approved expansions, remains the landing report's own call.
         result = commit_landing_gate(
             worktree=worktree,
             expected_branch=expected_branch,
             base=base,
             file_scope=None,
-            local_commit_allowed=True,
+            local_commit_allowed=permitted,
         )
         if result["status"] == "ok":
             return True
@@ -2720,6 +2739,14 @@ class Monitor:
             active = current.get("active_task")
             if not isinstance(active, dict) or active.get("handle_id") != handle_id:
                 raise RuntimeError("active task cannot be reconciled for reauthorization")
+            if change_reason == "plan_amendment":
+                # The amendment CAS proved the run quiescent inside the
+                # protected window; an executor here is a race survivor
+                # that must fail the transfer closed, never be stopped
+                # through a possibly-fake runner or consumed as delivered.
+                raise PermissionError(
+                    "plan amendment cannot transfer while task {} "
+                    "(node {}) is active".format(handle_id, node_id))
             # A provider may have completed the worker and persisted the
             # terminal delivery before the supervisor received the terminal
             # callback.  In that case ``stop`` is neither necessary nor
@@ -2814,7 +2841,11 @@ class Monitor:
         self._record_topology_projection(snapshot, "monitor.reauthorize")
         if change_reason == "platform_handoff":
             self._hide_stale_handoff_creates(snapshot, runner)
-        self._schedule_ready(snapshot, runner)
+        if change_reason != "plan_amendment":
+            # An amendment transfer only re-binds the contract: ready nodes
+            # dispatch on the next ordinary monitor/resume, never inside
+            # the protected switch (P1.4/B06 no-dispatch).
+            self._schedule_ready(snapshot, runner)
         self._refresh_run_status(snapshot)
         self._record_topology_projection(snapshot, "monitor.reauthorize")
         self._save_snapshot(snapshot)

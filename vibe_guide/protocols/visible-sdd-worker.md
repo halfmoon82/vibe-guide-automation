@@ -23,7 +23,7 @@ dev 子代理实现 → review 子代理审查 →（存在 P0–P2）返工回 
 2. **review 子代理**：**独立上下文**、**只读**、**非作者视角**审查 dev 的 diff，按 P0（资金/数据正确性）、P1（逻辑缺陷/事务边界）、P2（边界条件/行为回归）、P3（建议）分级产出意见。review 子代理不得是 dev 子代理本人，不得复用 dev 的实现上下文。
 3. **返工**：存在 P0–P2 时逐条核实（reviewer 意见也要验证，不盲从）→ 由 dev 子代理修复 → 重跑定向验证（须为绿）。
 4. **复审**：返工后回到 review 子代理复审，保留审查身份与证据链；最多 3 轮。三轮仍不收敛时由监工记录 `change_reviewer_or_split_node`，换 reviewer 或拆节点并保留唯一 writer；只有分歧会改变 PRD 验收判定时才升级产品决策。
-5. **收口**：某轮复审无 P0–P2 且验证绿后，按节点合同收口（提交/开 PR 等以授权卡为准）。授权卡 `remote_git_actions=deny` 无 `local_commit_allowed` 例外时**不得本地 commit**，交付只走 `worker-deliver` 通道；有例外时只允许本节点分支、白名单内文件、显式路径 `git add`，任何 push/PR/MR/merge 仍禁止。
+5. **收口**：某轮复审无 P0–P2 且验证绿后，按节点合同收口（提交/开 PR 等以授权卡为准）。授权卡 `remote_git_actions=deny` 下，本节点分支上的本地 commit 是交付落账的唯一落点：改动必须提交到合同节点分支并限制在授权文件范围内；未提交或越界的落账会被拒收。`local_commit_allowed` 例外在提示词层把这条通道收窄为显式白名单 + 显式路径 `git add`；无论有无例外，任何 push/PR/MR/merge/fetch/pull/gh 仍全部禁止。
 
 ## 1.5 派发前提：worker 会话必须挂载 project
 
