@@ -288,6 +288,13 @@ def _rederive_integration_review(merged: List[DAGNode]) -> None:
         contract = node.contract if isinstance(node.contract, dict) else {}
         contract["files"] = list(scope)
         profile = contract.get("worker_profile")
+        if profile is not None and not isinstance(profile, dict):
+            # A profile that is not a mapping can carry no projection at
+            # all; refuse the amendment instead of passing the malformed
+            # value through to the candidate card and dispatch.
+            raise ValueError(
+                "contract amendment cannot keep malformed "
+                "contract.worker_profile on node {}".format(node.id))
         if scope:
             if isinstance(profile, dict):
                 # A plan published before the scope was derived can carry a
@@ -295,7 +302,14 @@ def _rederive_integration_review(merged: List[DAGNode]) -> None:
                 # stored contract keeps one projection.
                 contract["worker_profile"] = dict(profile,
                                                   allowlist=list(scope))
-        elif not isinstance(profile, dict):
+        elif isinstance(profile, dict):
+            # The publish-time fallback for an empty union is the
+            # whole-project allowlist.  A profile narrowed by an earlier
+            # amendment must return to it or the stale entries both block
+            # this amendment at re-verification and bind paths no business
+            # node still owns to the reviewer.
+            contract["worker_profile"] = dict(profile, allowlist=["."])
+        else:
             contract["worker_profile"] = {
                 "worker": str(contract.get("worker", "worker")),
                 "model": "default",

@@ -172,3 +172,22 @@ python3 -m vibe_guide --help; git diff --check                                  
 ```
 
 未验证项不变：真实桌面 App、真实目标 plan/run 切换、远端 Git、发布/deploy 不在先导范围；scope_expansions 快照层语义为既有边界（reviewer 已记录非缺陷）。
+
+## 第 6 次交付（第 6 轮复审返工，2026-11-05）
+
+### P1-7：空并集 + dict profile 时 allowlist 归位 ["."]
+
+- 根因：`_rederive_integration_review` 空并集回退只覆盖「IR 无 profile / profile 非 dict」形态；IR 已携收窄后 dict `worker_profile`（上一轮收窄修订留下，或旧 plan 手写形态）而本次业务 files 全空时，`contract.files` 已改写为 `[]` 但旧 `allowlist` 原样保留——该合法修订被拒/或陈旧路径继续绑给 reviewer，与发布期空并集语义（`files=[]` + `allowlist ["."]`）不一致。
+- 修复：空并集且 profile 为 dict 时 `dict(profile, allowlist=["."])`，保留 worker/writer/worktree/branch 等身份字段，与发布 fallback 等价（单行语义改动）。
+- 采纳 reviewer 建议：IR `worker_profile` 非 dict 形态在 `_rederive_integration_review` 显式 `ValueError` fail-closed——此前该损坏值会原样通过 re-verify（身份不变跳过差集校验）进入候选卡与派发，属可证伪的放行缺口；拒绝点与「工程字段不可改」共用 ValueError 语义但措辞区分 malformed。
+- 新用例 2 例：`test_ir_narrowed_dict_profile_returns_to_project_wide_on_empty_union`（收窄 profile + 全空并集 → allowlist 归位、其余字段位级不变、propose 通过）；`test_ir_malformed_profile_rejected`（非 dict profile 拒绝）。
+
+### 验证（writer root）
+
+```bash
+python3 -m unittest tests.test_plan_amendment tests.test_plan_amendment_recovery tests.test_local_commit_authorization tests.test_dag tests.test_prd_guide_publish_path tests.test_authorization_card_options tests.test_node_spec_contract tests.test_empty_decisions_authorize   # 211 例 OK
+python3 -m unittest tests.test_monitor tests.test_monitor_binding_transaction tests.test_planner tests.test_v310_plan_repair tests.test_scope_landing tests.test_auto_scope_files tests.test_node_scoped_blocking   # 265 例 OK
+python3 -m vibe_guide --help; git diff --check   # OK
+```
+
+未验证项不变：真实桌面 App、真实目标 plan/run 切换、远端 Git、发布/deploy 不在先导范围。

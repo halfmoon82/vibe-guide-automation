@@ -727,6 +727,55 @@ class IntegrationReviewScopeTests(unittest.TestCase):
         profile = contract.get("worker_profile") or {}
         self.assertEqual(profile.get("allowlist"), ["."])
 
+    def _tamper_ir_profile(self, profile):
+        """Rewrite the stored IR worker_profile as a real earlier revision
+        (or corruption) would have left it; nodes.json is the amendment
+        input, not a live artifact this test pretends to mutate."""
+        path = self.plan_root / "nodes.json"
+        nodes = _read(self.plan_root, "nodes.json")
+        for node in nodes:
+            if node["id"] == "integration-review":
+                node["contract"]["worker_profile"] = profile
+        path.write_text(json.dumps(nodes, ensure_ascii=False),
+                        encoding="utf-8")
+
+    def test_ir_narrowed_dict_profile_returns_to_project_wide_on_empty_union(self):
+        # P1-7: a dict profile left by an earlier narrowing amendment (or a
+        # plan hand-edited to that shape) must fall back to the publish-time
+        # whole-project allowlist when the business union empties; keeping
+        # the stale entries would both reject this legal amendment and bind
+        # files no business node still owns to the reviewer.
+        previous_profile = {
+            "worker": "reviewer", "writer": "reviewer",
+            "model": "m", "worktree": "wt-ir", "branch": "node/ir",
+            "allowlist": ["alpha/one.py"],
+        }
+        self._tamper_ir_profile(dict(previous_profile))
+        self._serialize_nodes()
+        self._set_files("probe-node-a", [])
+        self._set_files("probe-node-b", [])
+        candidate = plan_amendment.propose(
+            self.paths, "probe-plan", self.spec, "清空全部文件范围")
+        merged = self._merged(candidate)
+        contract = merged["integration-review"]["contract"]
+        self.assertEqual(contract["files"], [])
+        profile = contract.get("worker_profile") or {}
+        self.assertEqual(profile.get("allowlist"), ["."])
+        for key, value in previous_profile.items():
+            if key != "allowlist":
+                self.assertEqual(profile.get(key), value)
+
+    def test_ir_malformed_profile_rejected(self):
+        # A non-dict worker_profile on the integration reviewer cannot carry
+        # any derived projection; proposing must fail closed instead of
+        # passing the corrupt value to the candidate card and dispatch.
+        self._tamper_ir_profile("corrupted-profile")
+        self._set_files("probe-node-a", ["gamma/new_a.py"])
+        with self.assertRaises(ValueError) as context:
+            plan_amendment.propose(
+                self.paths, "probe-plan", self.spec, "迁移节点 A 文件")
+        self.assertIn("worker_profile", str(context.exception))
+
 
 class FilesScopeProjectionTests(unittest.TestCase):
     """contract.files is the business field; worker_profile.allowlist is its
