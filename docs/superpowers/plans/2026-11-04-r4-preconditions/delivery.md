@@ -376,3 +376,11 @@ python3 -m vibe_guide --help; git diff --check   # OK
 - 因此要闭合真实 proof，必须同时为每个剩余输入建立有限语法证明、为每个潜在 host call 建立完整 call/return、为跨归档继承调用绑定源记录和 cursor，并取得三个旧 action 的独立正向不重叠来源。当前没有满足这些条件的单一最小扩展；不再增加解析器范围，继续 **UNKNOWN**。
 - 先导 developer 原生归档 `rollout-2026-11-05T16-51-43-01a1aae8-2756-72e0-983c-abd8847e3245.jsonl` SHA `36713c47c6ea8baa6348fbdd2ec2493700f3b05ce8e9bf2d778835e774710da2`，仅在 ordinal 140/142 的输出中出现三个旧 action 文本，未形成三个 action 的独立正向来源；没有新增 bootstrap 例外。真实 retire proof 继续 UNKNOWN。
 - 本轮没有源码修改；只新增本盘点证据，不执行真实 retire、confirm、hold/lease release、resume、daemon、mailbox，不创建 task/worktree、不安装依赖、不执行远端 Git 或 deploy。
+
+## 第 18 轮返工（R18-1：结构化 host create 守卫）
+
+- 根因复现：原 `_rollout_native_calls` 只解析 `response_item` 的外层 call/return，忽略真实归档中的 `event_msg.item_completed.item.type=McpToolCall`。隔离退役夹具中，外层 exec 无 create 文本但 host item 为 `codex_app/create_thread` 时，旧代码错误写入 retire event 并释放 writer lease。
+- 最小修复：识别结构化 host `create_thread` item，校验 item/session/turn 身份和重复 item ID，并把 host item 原样保留为独立审计证据；任何结构化 host create 现阶段都阻断 `retire_uninvoked_legacy`，不伪造 outer-parent 绑定、不把 host 事件缺失当作无调用。该记录尚未成为完整 coverage 或可信 action receipt。
+- 新增回归：`test_unlisted_structured_host_create_cannot_retire`（RED→GREEN）；`test_structured_host_create_is_retained_separately_from_outer_exec`；保留原静态 JS、失败语法和 successor create 规则。
+- 首轮定向日志 `/tmp/r4-r18-targeted-final.log`：160 项中 1 项因测试断言编辑竞态失败；随后 R9 回归 `/tmp/r4-r18-r9-final.log`：13 项 OK；最终定向 `/tmp/r4-r18-targeted-final2.log`：160 项 OK。完整测试 `/tmp/r4-r18-full-final.log` 正在运行，结束后另报结果。
+- 边界：真实 host coverage、分页完整性、outer-parent 唯一绑定、并发/迟到/失败 host 调用仍未证明；因此真实 retire proof 仍 UNKNOWN，不能执行真实 run、confirm 或释放 lease。未调用 provider、未改真实 run、未扩解析器、未新增依赖或 worktree。

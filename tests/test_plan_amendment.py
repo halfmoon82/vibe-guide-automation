@@ -1872,6 +1872,45 @@ class RetireBaseCorrectionTests(_LegacyUninvokedFixture):
 
 
 class R9ReviewTests(_LegacyUninvokedFixture):
+    def test_unlisted_structured_host_create_cannot_retire(self):
+        """A host create cannot disappear when outer JS omits the call."""
+        for source in ('text("done");', None,
+                       'const cb = () => tools.mcp__codex_app__create_thread({}); cb();'):
+            with self.subTest(source=source):
+                fixture = R9ReviewTests(methodName="runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                payload = {"type": "custom_tool_call", "name": "exec",
+                           "call_id": "outer"}
+                if source is not None:
+                    payload["input"] = source
+                log = fixture._rollout([
+                    {"type": "response_item", "payload": payload},
+                    {"type": "event_msg", "payload": {
+                        "type": "item_completed", "thread_id": fixture.OLD_OWNER,
+                        "turn_id": "turn-1", "item": {
+                            "type": "McpToolCall", "id": "exec-host-1",
+                            "server": "codex_app", "tool": "create_thread",
+                            "arguments": {"action_id": fixture.action_id},
+                            "pluginId": "codex-app-tools@openai-bundled",
+                            "status": "completed", "result": {"content": [{
+                                "type": "text", "text": json.dumps({
+                                    "threadId": "spawned", "hostId": "local"})}],
+                                "isError": False}}}},
+                    {"type": "response_item", "payload": {
+                        "type": "custom_tool_call_output", "call_id": "outer",
+                        "output": "Script completed"}},
+                ], name="host-create-red.jsonl")
+                fixture.evidence["retired_consumers"][0] = fixture._consumer(
+                    fixture.OLD_OWNER, log,
+                    calls=[{"name": "exec", "call_id": "outer", "returned": True}])
+                with self.assertRaises((PermissionError, ValueError)):
+                    fixture._retire()
+                self.assertTrue(fixture.lease_file.exists())
+                self.assertFalse(any(
+                    event["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                    for event in load_events(fixture.paths, fixture.run_id)))
+
     def test_truncated_consumer_with_recomputed_digest_is_not_complete(self):
         consumer = self.evidence["retired_consumers"][0]
         original = Path(consumer["rollout_path"])
@@ -2139,6 +2178,48 @@ class R9ReviewTests(_LegacyUninvokedFixture):
         bad.write_text("\n".join(json.dumps(row) for row in entries) + "\n")
         with self.assertRaises(ValueError):
             plan_amendment._rollout_native_calls(bad)
+
+    def test_structured_host_create_is_retained_separately_from_outer_exec(self):
+        """Host item IDs are retained without inventing a parent binding."""
+        source = (
+            'const r=await Promise.allSettled([tools.mcp__codex_app__create_thread('
+            '{title:"host",target:{type:"project",projectId:"p"},prompt:"x"})]);'
+        )
+        log = self._rollout([
+            {"type": "session_meta", "payload": {"id": "host-session"}},
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "exec",
+                "call_id": "outer-exec", "input": source,
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": "turn-host"},
+            }},
+            {"type": "event_msg", "payload": {
+                "type": "item_completed", "thread_id": "host-session",
+                "turn_id": "turn-host", "item": {
+                    "type": "McpToolCall", "id": "host-create-1",
+                    "server": "codex_app", "tool": "create_thread",
+                    "arguments": {"title": "host", "target": {
+                        "type": "project", "projectId": "p"}, "prompt": "x"},
+                    "status": "completed", "result": {"content": [{
+                        "type": "text", "text": json.dumps({
+                            "threadId": "child", "hostId": "local"})}],
+                        "isError": False},
+                },
+            }},
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "call_id": "outer-exec",
+                "output": "done",
+            }},
+        ], name="structured-host.jsonl")
+        audit = plan_amendment._rollout_native_calls(log)
+        self.assertEqual(audit["calls"][0]["call_id"], "outer-exec")
+        self.assertTrue(audit["calls"][0]["embedded_create"])
+        self.assertEqual(audit["structured_host"][0]["call_id"], "host-create-1")
+        self.assertEqual(
+            audit["structured_host"][0]["item"]["arguments"]["title"],
+            "host")
+        result = audit["structured_host"][0]["item"]["result"]
+        self.assertEqual(json.loads(result["content"][0]["text"])["threadId"], "child")
 
 
 class R10ReviewTests(_LegacyUninvokedFixture):

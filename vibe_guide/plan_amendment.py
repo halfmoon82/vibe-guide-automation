@@ -1657,6 +1657,8 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
     calls: Dict[str, Dict[str, Any]] = {}
     returns: Dict[str, Dict[str, Any]] = {}
     ordered: List[Dict[str, Any]] = []
+    structured_host: List[Dict[str, Any]] = []
+    structured_host_ids = set()
     skipped_returns = 0
     for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
@@ -1674,6 +1676,37 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
                     path.name, line_number))
         payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else entry
         kind = payload.get("type")
+        # Codex archives also persist the host's structured tool boundary in
+        # ``event_msg.item_completed``.  Keep it separate from the outer
+        # response-item call until the turn ownership is known below.
+        if kind == "item_completed":
+            item = payload.get("item")
+            if (isinstance(item, dict) and item.get("type") == "McpToolCall"
+                    and item.get("server") == "codex_app"
+                    and item.get("tool") == "create_thread"):
+                item_id = item.get("id")
+                if only_ids is None or item_id in only_ids:
+                    if (not isinstance(item_id, str) or not item_id
+                            or not isinstance(payload.get("thread_id"), str)
+                            or not isinstance(payload.get("turn_id"), str)):
+                        raise ValueError(
+                            "structured host create lacks item/session/turn identity")
+                    if item_id in structured_host_ids:
+                        raise ValueError(
+                            "structured host create repeats item id {}".format(item_id))
+                    structured_host_ids.add(item_id)
+                    structured_host.append({
+                        "call_id": item_id,
+                        "line": line_number,
+                        "turn_id": payload["turn_id"],
+                        "thread_id": payload["thread_id"],
+                        "item": item,
+                        "returned": item.get("status") == "completed"
+                        and isinstance(item.get("arguments"), dict)
+                        and isinstance(item.get("result"), dict)
+                        and item["result"].get("isError") is not True,
+                    })
+                continue
         if only_ids is not None and (payload.get("call_id") or payload.get("id")) not in only_ids:
             continue
         if isinstance(kind, str) and "call" in kind and (
@@ -1761,7 +1794,8 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
             call["syntax_rejected"] = True
     return {"calls": ordered, "unpaired": unpaired,
             "returned": sorted(returned), "returns": returns,
-            "skipped_returns": skipped_returns}
+            "skipped_returns": skipped_returns,
+            "structured_host": structured_host}
 
 
 def _retire_field(evidence: Dict[str, Any], key: str) -> Any:
@@ -2044,6 +2078,16 @@ def _retire_consumer_proof(consumer: Dict[str, Any], index: int,
         raise PermissionError(
             "consumer {} rollout cannot prove quiescence: {}".format(
                 session, error))
+    # Host records provide positive evidence of calls, not a coverage
+    # guarantee.  Until an independently verifiable complete host boundary
+    # exists, any structured create requires reconciliation and blocks this
+    # no-invocation retirement path, even if the outer source looked inert.
+    if audit["structured_host"]:
+        item = audit["structured_host"][0]
+        raise PermissionError(
+            "consumer {} has structured host create {} at line {}; "
+            "host coverage and action binding require reconciliation".format(
+                session, item["call_id"], item["line"]))
     calls = audit["calls"]
     # A native or embedded create is flagged, not auto-fatal: a retired
     # supervisor legitimately creates its own successor.  The binding check
