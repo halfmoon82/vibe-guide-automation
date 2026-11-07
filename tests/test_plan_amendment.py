@@ -2746,6 +2746,310 @@ class R14StaticSubsetTests(_LegacyUninvokedFixture):
                              for e in load_events(self.paths, self.run_id)))
 
 
+class NativeTerminalHostReceiptTests(_LegacyUninvokedFixture):
+    def _same_outer_terminal_fixture(self, fault=None):
+        consumer = self.evidence["retired_consumers"][0]
+        terminal = consumer["native_terminal"]
+        receipt_path = Path(terminal["receipt_path"])
+        receipt = json.loads(receipt_path.read_text())
+        row = receipt["consumers"][0]
+        row["native_observation"]["latest_turn"][0] = {
+            "id": "terminal-turn", "status": "failed"}
+        call_id = "combined-terminal-call"
+        row["native_call_refs"] = {"read_thread": call_id,
+                                   "set_thread_archived": call_id}
+        archive_result = {"threadId": self.OLD_OWNER, "archived": True}
+        if fault == "archive-refused":
+            archive_result["archived"] = False
+        read_result = {"thread": {"id": self.OLD_OWNER, "hostId": "local",
+                                   "status": {"type": "archived"}},
+                       "turns": [{"id": "terminal-turn", "status": "failed",
+                                  "error": {"message": "provider disconnected"}}]}
+        calls = []
+        for tool, args, result in (
+                ("set_thread_archived", {"threadId": self.OLD_OWNER,
+                 "hostId": "local", "archived": True}, archive_result),
+                ("read_thread", {"threadId": self.OLD_OWNER, "hostId": "local"}, read_result)):
+            calls.append({"type": "event_msg", "payload": {
+                "type": "item_completed", "thread_id": self.NEW_OWNER,
+                "turn_id": "observer-turn", "started_at_ms": 1,
+                "completed_at_ms": 2, "item": {"type": "McpToolCall",
+                    "id": "host-" + tool, "server": "codex_app", "tool": tool,
+                    "arguments": args, "status": "completed", "result": {
+                        "isError": False, "content": [{"type": "text",
+                            "text": json.dumps(result)}]}}}})
+        if fault == "cross-turn":
+            calls[1]["payload"]["turn_id"] = "other-turn"
+        elif fault == "duplicate":
+            duplicate = copy.deepcopy(calls[1])
+            duplicate["payload"]["item"]["id"] = "host-second-read"
+            calls.append(duplicate)
+        elif fault == "error-result":
+            calls[1]["payload"]["item"]["result"]["isError"] = True
+        elif fault == "foreign":
+            calls[1]["payload"]["thread_id"] = "foreign"
+        elif fault == "nested-call":
+            calls[1]["payload"]["item"]["arguments"]["evidence"] = {"type": "function_call"}
+        elif fault == "intermediate-error":
+            calls[1]["payload"]["item"]["result"]["isError"] = True
+        source_text = (
+            'text(await tools.mcp__codex_app__set_thread_archived('
+            + json.dumps({"threadId": self.OLD_OWNER, "hostId": "local", "archived": True})
+            + ')); text(await tools.mcp__codex_app__read_thread('
+            + json.dumps({"threadId": self.OLD_OWNER, "hostId": "local"}) + '));')
+        if fault == "invented-call":
+            source_text = 'text("no native tools");'
+        elif fault == "false-branch":
+            source_text = 'if(false){' + source_text + '}'
+        elif fault == "unrelated-prefix":
+            source_text = source_text.replace(
+                "tools.mcp__codex_app__read_thread", "fake.read_thread")
+        elif fault == "indirect-alias":
+            source_text = 'const tools = fake; ' + source_text
+        elif fault == "tool-reassigned":
+            source_text = 'tools = fake; ' + source_text
+        if fault == "intermediate-error":
+            later = copy.deepcopy(calls[1])
+            later["payload"]["item"]["id"] = "host-read-retry"
+            later["payload"]["item"]["result"]["isError"] = False
+            calls.append(later)
+        source_rows = [json.loads(line) for line in self.observer_record.read_text().splitlines()]
+        source_rows += [
+            {"type": "response_item", "payload": {"type": "custom_tool_call",
+                "name": "exec", "call_id": call_id, "input": source_text,
+                "internal_chat_message_metadata_passthrough": {"turn_id": "observer-turn"}}},
+            *calls,
+            {"type": "response_item", "payload": {"type": "custom_tool_call_output",
+                "call_id": call_id, "output": [
+                    {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                    {"type": "input_text", "text": json.dumps(archive_result)},
+                    {"type": "input_text", "text": json.dumps(read_result)}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": "observer-turn"}}},
+        ]
+        if fault == "unreturned":
+            source_rows.pop()
+        for index, entry in enumerate(source_rows):
+            entry["ordinal"] = index
+        data = ("\n".join(json.dumps(entry) for entry in source_rows) + "\n").encode()
+        self.observer_record.write_bytes(data)
+        source = Path(terminal["source_rollout_path"])
+        source.write_bytes(data)
+        terminal["source_rollout_sha256"] = self._sha(source)
+        receipt["observer"]["source_prefix_bytes"] = len(data)
+        receipt["observer"]["source_prefix_sha256"] = self._sha(source)
+        receipt_path.write_text(json.dumps(receipt))
+        terminal["receipt_sha256"] = self._sha(receipt_path)
+        original = Path(consumer["rollout_path"])
+        rows = [json.loads(line) for line in original.read_text().splitlines()]
+        rows[-1]["payload"]["error"] = {"message": "provider disconnected",
+                                          "codex_error_info": "other"}
+        if fault == "wrong-error":
+            rows[-1]["payload"]["error"]["message"] = "different error"
+        rows[-1]["payload"]["type"] = "task_complete"
+        data = ("\n".join(json.dumps(entry) for entry in rows) + "\n").encode()
+        original.write_bytes(data)
+        archive, _ = plan_amendment._native_session_record(self.OLD_OWNER, archived=True)
+        archive.write_bytes(data)
+        consumer["rollout_sha256"] = self._sha(original)
+
+    def test_same_outer_host_results_with_failed_task_complete_can_retire(self):
+        self._same_outer_terminal_fixture()
+        self.assertEqual(self._retire()["status"], "retired")
+
+    def test_terminal_read_projection_binds_host_identity_status_and_error(self):
+        outer = {"thread": {"id": "old-owner-session", "hostId": "local",
+                             "status": {"type": "archived"}},
+                 "turns": [{"id": "terminal-turn", "status": "failed",
+                            "error": {"message": "provider disconnected"}}],
+                 "page": {"order": "newest_first", "limit": 1}}
+        host = copy.deepcopy(outer)
+        host["schemaVersion"] = 1
+        host["thread"]["title"] = "additional host metadata"
+        host["turns"][0]["completedAt"] = 123
+        self.assertTrue(plan_amendment._terminal_read_projection_matches(host, outer))
+        for key, value in (("id", "foreign"), ("status", "completed"),
+                           ("error", {"message": "different"})):
+            changed = copy.deepcopy(outer)
+            changed["turns"][0][key] = value
+            self.assertFalse(plan_amendment._terminal_read_projection_matches(host, changed))
+
+    def test_ambiguous_or_untrusted_host_terminal_results_block_retire(self):
+        for fault in ("cross-turn", "duplicate", "error-result", "foreign",
+                      "unreturned", "wrong-error", "invented-call", "nested-call",
+                      "unrelated-prefix", "indirect-alias", "tool-reassigned",
+                      "intermediate-error", "archive-refused", "false-branch"):
+            with self.subTest(fault=fault):
+                fixture = NativeTerminalHostReceiptTests(methodName="runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                fixture._same_outer_terminal_fixture(fault)
+                state = fixture.paths.vibe / "runs" / fixture.run_id / "state.json"
+                before = state.read_bytes()
+                with self.assertRaises((PermissionError, ValueError)):
+                    fixture._retire()
+                self.assertEqual(state.read_bytes(), before)
+                self.assertTrue(fixture.lease_file.exists())
+                self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                                     for e in load_events(fixture.paths, fixture.run_id)))
+
+
+class RawHostLedgerTests(unittest.TestCase):
+    def _rows(self):
+        return [
+            {"type": "session_meta", "payload": {"id": "session"}},
+            {"type": "response_item", "payload": {"type": "custom_tool_call",
+                "name": "exec", "call_id": "outer", "input": 'text("done");',
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn"}}},
+            {"type": "event_msg", "payload": {"type": "item_completed",
+                "thread_id": "session", "turn_id": "turn", "started_at_ms": 1,
+                "completed_at_ms": 2, "item": {"type": "McpToolCall", "id": "host",
+                    "server": "codex_app", "tool": "list_projects", "status": "completed",
+                    "arguments": {}, "result": {"isError": False, "content": [
+                        {"type": "text", "text": '{"projects":[]}'}]}}}},
+            {"type": "response_item", "payload": {"type": "custom_tool_call_output",
+                "call_id": "outer", "output": "done",
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn"}}},
+        ]
+
+    def test_raw_host_item_retained_with_unique_same_turn_outer(self):
+        result = plan_amendment._raw_host_ledger(self._rows(), "session")
+        self.assertEqual(result["items"][0]["host_id"], "host")
+        self.assertEqual(result["items"][0]["outer_call_id"], "outer")
+        self.assertEqual(result["issues"], [])
+        self.assertFalse(result["items"][0]["invocation_verified"])
+
+    def test_raw_host_ledger_rejects_ambiguous_unreturned_cross_turn_and_foreign(self):
+        for fault in ("ambiguous", "unreturned", "cross-turn", "foreign", "duplicate"):
+            with self.subTest(fault=fault):
+                rows = self._rows()
+                if fault == "ambiguous":
+                    call = copy.deepcopy(rows[1]); call["payload"]["call_id"] = "other"
+                    ret = copy.deepcopy(rows[-1]); ret["payload"]["call_id"] = "other"
+                    rows.insert(2, call); rows.append(ret)
+                elif fault == "unreturned":
+                    rows.pop()
+                elif fault == "cross-turn":
+                    rows[2]["payload"]["turn_id"] = "other"
+                elif fault == "foreign":
+                    rows[2]["payload"]["thread_id"] = "other"
+                else:
+                    rows.insert(3, copy.deepcopy(rows[2]))
+                result = plan_amendment._raw_host_ledger(rows, "session")
+                self.assertTrue(result["issues"])
+
+    def test_yielded_outer_wait_matches_only_the_returned_cell(self):
+        rows = self._rows()
+        rows[1]["payload"]["input"] = 'text(await tools.mcp__codex_app__list_projects({}));'
+        host = rows.pop(2)
+        rows[-1]["payload"]["output"] = [
+            {"type": "input_text", "text": "Script running with cell ID cell-1\nWall time 31.0 seconds\nOutput:\n"}]
+        rows.extend([
+            {"type": "response_item", "payload": {"type": "function_call", "name": "wait",
+                "call_id": "wait-call", "arguments": json.dumps({"cell_id": "cell-1"}),
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn"}}},
+            host,
+            {"type": "response_item", "payload": {"type": "function_call_output",
+                "call_id": "wait-call", "output": "done",
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn"}}},
+        ])
+        result = plan_amendment._raw_host_ledger(rows, "session")
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(result["items"][0]["outer_call_id"], "outer")
+        self.assertEqual(result["items"][0]["continuation_call_id"], "wait-call")
+        self.assertTrue(result["items"][0]["invocation_verified"])
+        bad = copy.deepcopy(rows)
+        bad[-3]["payload"]["arguments"] = json.dumps({"cell_id": "wrong"})
+        self.assertTrue(plan_amendment._raw_host_ledger(bad, "session")["issues"])
+
+    def test_multiple_waits_remain_bound_to_original_cell(self):
+        rows = self._rows()
+        host = rows.pop(2)
+        rows[-1]["payload"]["output"] = [{"type": "input_text", "text":
+            "Script running with cell ID cell-1\nWall time 31.0 seconds\nOutput:\n"}]
+        for number in (1, 2):
+            call_id = "wait-" + str(number)
+            rows.append({"type": "response_item", "payload": {"type": "function_call",
+                "name": "wait", "call_id": call_id, "arguments": json.dumps({"cell_id": "cell-1"}),
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn"}}})
+            if number == 2:
+                rows.append(host)
+            rows.append({"type": "response_item", "payload": {"type": "function_call_output",
+                "call_id": call_id, "output": ([{"type": "input_text", "text":
+                    "Script running with cell ID cell-1\nWall time 31.0 seconds\nOutput:\n"}]
+                    if number == 1 else "done"),
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn"}}})
+        result = plan_amendment._raw_host_ledger(rows, "session")
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(result["items"][0]["outer_call_id"], "outer")
+        self.assertEqual(result["items"][0]["continuation_call_id"], "wait-2")
+
+    def test_late_host_completion_before_next_wait_stays_unknown(self):
+        rows = self._rows()
+        host = rows.pop(2)
+        rows[-1]["payload"]["output"] = [{"type": "input_text", "text":
+            "Script running with cell ID cell-1\nWall time 31.0 seconds\nOutput:\n"}]
+        rows.append(host)
+        rows.extend([
+            {"type": "response_item", "payload": {"type": "function_call", "name": "wait",
+                "call_id": "wait-call", "arguments": json.dumps({"cell_id": "cell-1"}),
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn"}}},
+            {"type": "response_item", "payload": {"type": "function_call_output",
+                "call_id": "wait-call", "output": [
+                    {"type": "input_text", "text": "Script completed\nWall time 0.0 seconds\nOutput:\n"},
+                    {"type": "input_text", "text": '{"projects":[]}'}],
+                "internal_chat_message_metadata_passthrough": {"turn_id": "turn"}}},
+        ])
+        result = plan_amendment._raw_host_ledger(rows, "session")
+        self.assertTrue(result["issues"])
+        self.assertEqual(result["items"], [])
+
+    def test_direct_ordinary_host_item_enters_existing_retire_audit(self):
+        rows = self._rows()
+        rows[1]["payload"]["input"] = 'text(await tools.mcp__codex_app__list_projects({}));'
+        rows[-1]["payload"]["output"] = [
+            {"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+            {"type": "input_text", "text": '{"projects":[]}'}]
+        path = Path(tempfile.mkdtemp(prefix="r4-host-observer-")) / "observer.jsonl"
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        audit = plan_amendment._rollout_native_calls(path)
+        self.assertIn("raw_host_ledger", audit)
+        self.assertEqual(audit["raw_host_ledger"]["items"][0]["host_id"], "host")
+        self.assertTrue(audit["raw_host_ledger"]["items"][0]["invocation_verified"])
+        self.assertFalse(audit["raw_host_ledger"]["issues"])
+
+    def test_unobserved_outer_tool_source_never_proves_no_create(self):
+        rows = self._rows()
+        rows.pop(2)
+        rows[1]["payload"]["input"] = 'text(await tools.mcp__codex_app__list_projects({}));'
+        path = Path(tempfile.mkdtemp(prefix="r4-host-no-item-")) / "observer.jsonl"
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        with self.assertRaises(ValueError):
+            plan_amendment._rollout_native_calls(path)
+
+    def test_observed_host_create_is_never_erased_by_ledger(self):
+        rows = self._rows()
+        rows[1]["payload"]["input"] = 'text(await tools.mcp__codex_app__list_projects({}));'
+        rows[2]["payload"]["item"].update(tool="create_thread", arguments={"prompt": "worker"})
+        path = Path(tempfile.mkdtemp(prefix="r4-host-create-")) / "observer.jsonl"
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+        with self.assertRaises(ValueError):
+            plan_amendment._rollout_native_calls(path)
+
+    def test_failed_host_result_is_classified_by_tool_without_inventing_no_effect(self):
+        rows = self._rows()
+        item = rows[2]["payload"]["item"]
+        item.update(tool="send_message_to_thread", status="failed", arguments={})
+        item["result"] = {"isError": True, "content": [{"type": "text", "text":
+            "send_message_to_thread received invalid arguments."}]}
+        ledger = plan_amendment._raw_host_ledger(rows, "session")
+        self.assertEqual(ledger["items"][0]["outcome_class"], "validation_error")
+        self.assertFalse(ledger["items"][0]["no_side_effect_proven"])
+        item["result"]["content"][0]["text"] = "connection timed out"
+        ledger = plan_amendment._raw_host_ledger(rows, "session")
+        self.assertEqual(ledger["items"][0]["outcome_class"], "unknown_failure")
+        self.assertFalse(ledger["items"][0]["no_side_effect_proven"])
+
+
 class R8ReceiptTests(_LegacyUninvokedFixture):
     def test_consumer_rollout_must_be_the_named_session(self):
         consumer = self.evidence["retired_consumers"][0]

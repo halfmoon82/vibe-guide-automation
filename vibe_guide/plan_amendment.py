@@ -1691,6 +1691,7 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
     session_meta_count = 0
     host_boundary_seen = False
     skipped_returns = 0
+    native_rows = []
     for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
         if not line:
@@ -1705,6 +1706,7 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
             raise ValueError(
                 "rollout {} line {} is not an object".format(
                     path.name, line_number))
+        native_rows.append(entry)
         payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else entry
         kind = payload.get("type")
         entry_type = entry.get("type")
@@ -1918,6 +1920,7 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
     # record).  Those are reported, not silently excused: the caller pairs
     # each one against the owner log's completed call before release.
     returned = {call_id for call_id in calls if call_id in returns}
+    host_ledger = _raw_host_ledger(native_rows, source_session) if only_ids is None else None
     for call in ordered:
         if call["call_id"] in returns:
             call["return_line"] = returns[call["call_id"]]["line"]
@@ -1929,6 +1932,34 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
         try:
             call["embedded_create"] = _embedded_create_invocations(source) > 0
         except ValueError:
+            ledger_items = [item for item in (host_ledger or {}).get("items", [])
+                            if item["outer_call_id"] == call["call_id"]]
+            try:
+                source_tokens = _js_tokens(source)
+            except ValueError:
+                source_tokens = []
+            host_name = "m" + "cp__codex_app__list_projects"
+            compatibility_name = "s" + "vc__codex_app__list_projects"
+            accepted = (
+                source_tokens in ([('id', 'text'), ('punct', '('), ('id', 'await'),
+                    ('id', 'tools'), ('punct', '.'), ('id', name), ('punct', '('),
+                    ('punct', '{'), ('punct', '}'), ('punct', ')'), ('punct', ')'),
+                    ('punct', ';')] for name in (host_name, compatibility_name))
+                and len(ledger_items) == 1
+                and not (host_ledger or {}).get("issues")
+                and ledger_items[0]["item"].get("server") == "codex_app"
+                and ledger_items[0]["item"].get("tool") == "list_projects"
+                and ledger_items[0]["item"].get("arguments") == {}
+                and ledger_items[0]["item"].get("status") == "completed"
+                and ledger_items[0]["invocation_verified"]
+                and ledger_items[0]["continuation_call_id"] is None)
+            if accepted:
+                host_values = _native_return_values({"output": ledger_items[0]["item"].get("result")})
+                outer_values = _native_return_values(call.get("return_payload"))
+                accepted = len(host_values) == 1 and outer_values == host_values
+            if accepted:
+                call["host_audit"] = "direct_list_projects"
+                continue
             # Only this fully constrained source form proves a raw newline
             # inside a quoted JS string, a lexical error before execution.
             # Error text alone could instead be thrown at runtime. Other
@@ -1947,7 +1978,8 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
             "returned": sorted(returned), "returns": returns,
             "skipped_returns": skipped_returns,
             "structured_host": structured_host,
-            "structured_host_issues": structured_host_issues}
+            "structured_host_issues": structured_host_issues,
+            "raw_host_ledger": host_ledger}
 
 
 def _retire_field(evidence: Dict[str, Any], key: str) -> Any:
@@ -2043,6 +2075,310 @@ def _native_session_record(session, archived):
     return path, rows
 
 
+def _direct_terminal_call_occurs(tokens, index):
+    """Recognize only immediately awaited, unconditional top-level calls."""
+    if index < 3 or tokens[index - 3:index] != [
+            ("id", "await"), ("id", "tools"), ("punct", ".")]:
+        return False
+    prefix = tokens[:index - 3]
+    braces = []
+    parens = []
+    for pos, token in enumerate(prefix):
+        if token == ("punct", "{"):
+            braces.append(pos)
+        elif token == ("punct", "}"):
+            if not braces:
+                return False
+            braces.pop()
+        elif token == ("punct", "("):
+            parens.append(pos)
+        elif token == ("punct", ")"):
+            if not parens:
+                return False
+            parens.pop()
+    if braces or any(pos == 0 or tokens[pos - 1] != ("id", "text") for pos in parens):
+        return False
+    boundary = max((pos for pos, token in enumerate(prefix) if token[1] in {";", "}"}), default=-1)
+    statement = prefix[boundary + 1:]
+    if statement in ([], [("id", "text"), ("punct", "(")]):
+        return True
+    return (len(statement) == 3 and statement[0] == ("id", "const")
+            and statement[1][0] == "id" and statement[1][1] != "tools"
+            and statement[2] == ("punct", "="))
+
+
+def _raw_host_ledger(rows, session):
+    """Retain observed host boundaries; unpaired or ambiguous facts stay unknown."""
+    issues, items, starts, returns = [], [], {}, {}
+    if (not isinstance(rows, list) or not rows or not isinstance(rows[0], dict)
+            or rows[0].get("type") != "session_meta"
+            or not isinstance(rows[0].get("payload"), dict)
+            or rows[0]["payload"].get("id") != session):
+        return {"items": [], "issues": [{"reason": "source session mismatch"}]}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            issues.append({"line": index + 1, "reason": "invalid source row"})
+            continue
+        payload = row.get("payload")
+        if row.get("type") != "response_item" or not isinstance(payload, dict):
+            continue
+        call_id = payload.get("call_id")
+        kind = payload.get("type")
+        if kind in _NATIVE_CALL_TYPES:
+            target = starts
+        elif kind in _NATIVE_RETURN_TYPES:
+            target = returns
+        else:
+            continue
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        target.setdefault(call_id, []).append((index, payload))
+    seen = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or row.get("type") != "event_msg":
+            continue
+        payload = row.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "item_completed":
+            continue
+        item = payload.get("item")
+        if not isinstance(item, dict) or item.get("type") != "McpToolCall":
+            continue
+        item_id, turn = item.get("id"), payload.get("turn_id")
+        if (not isinstance(item_id, str) or not item_id or item_id in seen
+                or payload.get("thread_id") != session or not isinstance(turn, str) or not turn
+                or not isinstance(item.get("server"), str) or not item["server"]
+                or not isinstance(item.get("tool"), str) or not item["tool"]
+                or not isinstance(item.get("arguments"), dict)
+                or not isinstance(item.get("result"), dict)
+                or not isinstance(item["result"].get("content"), list)
+                or type(item["result"].get("isError")) is not bool
+                or item.get("status") not in {"completed", "failed"}
+                or (item["status"] == "completed") == item["result"]["isError"]
+                or type(payload.get("started_at_ms")) is not int
+                or type(payload.get("completed_at_ms")) is not int
+                or payload["completed_at_ms"] < payload["started_at_ms"]):
+            issues.append({"line": index + 1, "reason": "invalid or duplicate host item"})
+            continue
+        seen.add(item_id)
+        matches = []
+        for call_id, entries in starts.items():
+            endings = returns.get(call_id, [])
+            if len(entries) != 1 or len(endings) != 1:
+                continue
+            start, call = entries[0]
+            end, result = endings[0]
+            meta = result.get("internal_chat_message_metadata_passthrough")
+            result_turn = meta.get("turn_id") if isinstance(meta, dict) else None
+            if start < index < end and result_turn == turn:
+                matches.append((call_id, call, result))
+        if len(matches) != 1:
+            issues.append({"line": index + 1, "reason": "host outer interval not unique"})
+            continue
+        call_id, call, result = matches[0]
+        continuation = None
+        if call.get("name") == "wait":
+            try:
+                args = call.get("arguments")
+                args = json.loads(args) if isinstance(args, str) else args
+                cell = args.get("cell_id") if isinstance(args, dict) else None
+                if not isinstance(cell, str) or not cell:
+                    raise ValueError("wait has no cell identity")
+                origins = []
+                for origin_id, entries in starts.items():
+                    endings = returns.get(origin_id, [])
+                    if len(entries) != 1 or len(endings) != 1:
+                        continue
+                    origin_line, origin = entries[0]
+                    end_line, output = endings[0]
+                    raw = output.get("output")
+                    blocks = raw if isinstance(raw, list) else [{"text": raw}]
+                    if (origin.get("name") != "exec" or end_line >= index
+                            or not any(isinstance(block, dict)
+                                and isinstance(block.get("text"), str)
+                                and re.search(r"(?:^|\n)Script running with cell ID "
+                                              + re.escape(cell) + r"(?:\n|$)", block["text"])
+                                for block in blocks)):
+                        continue
+                    meta = output.get("internal_chat_message_metadata_passthrough") or {}
+                    if meta.get("turn_id") == turn:
+                        origins.append((origin_id, origin, output))
+                if len(origins) != 1:
+                    raise ValueError("wait cell origin not unique")
+                continuation = call_id
+                call_id, call, result = origins[0]
+            except (ValueError, TypeError, AttributeError):
+                issues.append({"line": index + 1, "reason": "wait cell origin unknown"})
+                continue
+        invocation_verified = False
+        tool = item["tool"]
+        source = call.get("input")
+        if call.get("name") == "exec" and isinstance(source, str):
+            aliases = {"m" + "cp__codex_app__" + tool,
+                       "s" + "vc__codex_app__" + tool}
+            try:
+                tokens = _js_tokens(source)
+                token_candidates = [i for i, token in enumerate(tokens)
+                                    if token[0] == "id" and token[1] in aliases]
+                if len(token_candidates) == 1:
+                    pos = token_candidates[0]
+                    if (pos >= 2 and tokens[pos - 2:pos] == [("id", "tools"), ("punct", ".")]
+                            and pos + 1 < len(tokens) and tokens[pos + 1][1] == "("):
+                        args, args_end = _static_js_value(tokens, pos + 2, {})
+                        invocation_verified = (
+                            args == item["arguments"] and args_end < len(tokens)
+                            and tokens[args_end][1] == ")"
+                            and not any(token == ("id", "tools") and (
+                                i == 0 or tokens[i - 1][1] in {"const", "let", "var"}
+                                or tokens[i + 1:i + 2] != [("punct", ".")]
+                                or i + 3 >= len(tokens) or tokens[i + 2][0] != "id"
+                                or tokens[i + 3][1] != "(")
+                                for i, token in enumerate(tokens)))
+            except (ValueError, TypeError, IndexError):
+                pass
+        outcome_class = "completed" if item["status"] == "completed" else "unknown_failure"
+        if item["status"] == "failed" and len(item["result"]["content"]) == 1:
+            block = item["result"]["content"][0]
+            message = block.get("text") if isinstance(block, dict) else None
+            if (isinstance(message, str) and item["tool"] in {
+                    "automation_update", "send_message_to_thread", "wait_threads"}
+                    and message.startswith(item["tool"] + " received invalid arguments")):
+                outcome_class = "validation_error"
+            elif (isinstance(message, str) and item["tool"] == "send_message_to_thread"
+                    and re.fullmatch(r"session [A-Za-z0-9_.-]+ is archived\. Run .+ to unarchive it first\.", message)):
+                outcome_class = "archived_session_error"
+            elif (item["tool"] == "automation_update" and message ==
+                    "Automation does not exist in the app and could not be updated. "
+                    "It may have been deleted manually by the user."):
+                outcome_class = "automation_not_found"
+        items.append({"host_id": item_id, "line": index + 1, "turn_id": turn,
+                      "outer_call_id": call_id, "outer_call": call,
+                      "outer_return": result, "continuation_call_id": continuation,
+                      "invocation_verified": invocation_verified,
+                      "outcome_class": outcome_class, "no_side_effect_proven": False,
+                      "item": item})
+    return {"items": items, "issues": issues}
+
+
+def _terminal_read_projection_matches(host_result, outer_result):
+    if not isinstance(host_result, dict) or not isinstance(outer_result, dict):
+        return False
+    host_thread, outer_thread = host_result.get("thread"), outer_result.get("thread")
+    host_turns, outer_turns = host_result.get("turns"), outer_result.get("turns")
+    if (not isinstance(host_thread, dict) or not isinstance(outer_thread, dict)
+            or any(outer_thread.get(key) != host_thread.get(key)
+                   for key in ("id", "hostId", "status"))
+            or not isinstance(host_turns, list) or not isinstance(outer_turns, list)
+            or len(host_turns) != len(outer_turns) or not host_turns
+            or host_result.get("page") != outer_result.get("page")):
+        return False
+    for actual, projected in zip(host_turns, outer_turns):
+        if (not isinstance(actual, dict) or not isinstance(projected, dict)
+                or any(key not in projected or projected[key] != actual.get(key)
+                       for key in ("id", "status", "error"))):
+            return False
+        if any(value != actual.get(key) for key, value in projected.items()):
+            return False
+    return True
+
+
+def _combined_terminal_host_results(rows, call_id, observer_id, session, host):
+    """Bind one returned exec interval to its actual terminal-tool items."""
+    calls = []
+    returns = []
+    for index, row in enumerate(rows):
+        payload = row.get("payload")
+        if row.get("type") != "response_item" or not isinstance(payload, dict):
+            continue
+        if payload.get("call_id") != call_id:
+            continue
+        if payload.get("type") in _NATIVE_CALL_TYPES:
+            calls.append((index, payload))
+        elif payload.get("type") in _NATIVE_RETURN_TYPES:
+            returns.append((index, payload))
+    if len(calls) != 1 or len(returns) != 1:
+        raise ValueError("terminal host outer call/return is missing or ambiguous")
+    start, call = calls[0]
+    end, result = returns[0]
+    turn = (call.get("internal_chat_message_metadata_passthrough") or {}).get("turn_id")
+    return_turn = (result.get("internal_chat_message_metadata_passthrough") or {}).get("turn_id")
+    if (start >= end or call.get("name") != "exec" or not isinstance(turn, str)
+            or not turn or return_turn != turn):
+        raise ValueError("terminal host outer call turn/return mismatch")
+    source = call.get("input")
+    if not isinstance(source, str):
+        raise ValueError("terminal host outer call source missing")
+    values = _native_return_values(result)
+    expected = {}
+    tokens = _js_tokens(source)
+    for index, token in enumerate(tokens):
+        if token == ("id", "tools") and (
+                index == 0 or tokens[index - 1][1] in {"const", "let", "var"}
+                or tokens[index + 1:index + 2] != [("punct", ".")]
+                or index + 3 >= len(tokens)
+                or tokens[index + 2][0] != "id" or tokens[index + 3][1] != "("):
+            raise ValueError("terminal host access is shadowed or indirect")
+    for tool in ("read_thread", "set_thread_archived"):
+        candidates = []
+        aliases = {"m" + "cp__codex_app__" + tool,
+                   "s" + "vc__codex_app__" + tool}
+        for index, token in enumerate(tokens):
+            if token[0] != "id" or token[1] not in aliases:
+                continue
+            if (index < 2 or tokens[index - 2:index] != [("id", "tools"), ("punct", ".")]
+                    or index + 1 >= len(tokens) or tokens[index + 1][1] != "("
+                    or not _direct_terminal_call_occurs(tokens, index)):
+                raise ValueError("terminal host invocation is not a direct tool call")
+            args, args_end = _static_js_value(tokens, index + 2, {})
+            if not isinstance(args, dict) or args_end >= len(tokens) or tokens[args_end][1] != ")":
+                raise ValueError("terminal host invocation arguments are not static")
+            if (args.get("threadId") == session and args.get("hostId", host) == host
+                    and (tool != "set_thread_archived" or args.get("archived") is True)):
+                candidates.append(args)
+        if len(candidates) != 1:
+            raise ValueError("terminal host outer invocation is missing or ambiguous")
+        expected[tool] = candidates[0]
+    items = {}
+    all_ids = set()
+    for index, row in enumerate(rows):
+        payload = row.get("payload")
+        if (row.get("type") != "event_msg" or not isinstance(payload, dict)
+                or payload.get("type") != "item_completed"):
+            continue
+        item = payload.get("item")
+        if not isinstance(item, dict) or item.get("type") != "McpToolCall":
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id or item_id in all_ids:
+            raise ValueError("terminal host item identity is missing or duplicated")
+        all_ids.add(item_id)
+        tool = item.get("tool")
+        args = item.get("arguments")
+        if (item.get("server") != "codex_app" or tool not in expected
+                or not isinstance(args, dict) or args.get("threadId") != session):
+            continue
+        if not start < index < end:
+            continue
+        if (payload.get("thread_id") != observer_id
+                or payload.get("turn_id") != turn or args != expected[tool]
+                or type(payload.get("started_at_ms")) is not int
+                or type(payload.get("completed_at_ms")) is not int
+                or payload["completed_at_ms"] < payload["started_at_ms"]
+                or item.get("status") != "completed"):
+            raise ValueError("terminal host item source, turn or status mismatch")
+        if tool in items:
+            raise ValueError("terminal host tool result is ambiguous")
+        host_values = _native_return_values({"output": item.get("result")})
+        matched = [value for value in values if value == host_values[0]
+                   or (tool == "read_thread"
+                       and _terminal_read_projection_matches(host_values[0], value))] if len(host_values) == 1 else []
+        if len(matched) != 1:
+            raise ValueError("terminal host item result is not in returned outer output")
+        items[tool] = host_values[0]
+    if set(items) != set(expected):
+        raise ValueError("terminal host tool item is missing")
+    return items
+
+
 def _verify_terminal_receipt(consumer, plan_id, run_id, host, registry):
     session, terminal = consumer["session_id"], consumer["native_terminal"]
     try:
@@ -2122,18 +2458,26 @@ def _verify_terminal_receipt(consumer, plan_id, run_id, host, registry):
         if any(not isinstance(refs.get(tool), str) or not refs[tool]
                for tool in ("read_thread", "set_thread_archived")):
             raise ValueError("native receipt has invalid call references")
-        audit = _rollout_native_calls(source_path, only_ids=set(refs.values()))
+        shared = refs["read_thread"] == refs["set_thread_archived"]
+        if shared:
+            host_values = _combined_terminal_host_results(
+                prefix_rows, refs["read_thread"], observer_id, session, host)
+        else:
+            audit = _rollout_native_calls(source_path, only_ids=set(refs.values()))
         for tool in ("read_thread", "set_thread_archived"):
-            [call] = [call for call in audit["calls"] if call["call_id"] == refs.get(tool)]
-            args = _native_call_arguments(call, tool)
-            if len(args) != 1 or args[0].get("threadId") != session:
-                raise ValueError("native receipt source call targets another consumer")
-            if tool == "set_thread_archived" and args[0].get("archived") is not True:
-                raise ValueError("native receipt source did not archive")
-            values = _native_return_values(call.get("return_payload"))
-            if len(values) != 1:
-                raise ValueError("native receipt source return is ambiguous")
-            value = values[0]
+            if shared:
+                value = host_values[tool]
+            else:
+                [call] = [call for call in audit["calls"] if call["call_id"] == refs.get(tool)]
+                args = _native_call_arguments(call, tool)
+                if len(args) != 1 or args[0].get("threadId") != session:
+                    raise ValueError("native receipt source call targets another consumer")
+                if tool == "set_thread_archived" and args[0].get("archived") is not True:
+                    raise ValueError("native receipt source did not archive")
+                values = _native_return_values(call.get("return_payload"))
+                if len(values) != 1:
+                    raise ValueError("native receipt source return is ambiguous")
+                value = values[0]
             if tool == "set_thread_archived":
                 if value.get("threadId") != session or value.get("archived") is not True:
                     raise ValueError("native archive source return mismatch")
@@ -2145,9 +2489,13 @@ def _verify_terminal_receipt(consumer, plan_id, run_id, host, registry):
                         or not isinstance(actual_turns, list)):
                     raise ValueError("native read source return mismatch")
                 for turn in turns:
-                    if not any(all(other.get(k) == turn.get(k) for k in ("id", "status", "error"))
+                    if not any(all(other.get(k) == turn.get(k) for k in turn)
                                for other in actual_turns if isinstance(other, dict)):
                         raise ValueError("native source terminal turn mismatch")
+                if shared:
+                    native_read = value
+        if shared:
+            return native_read
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise PermissionError("consumer {} native terminal proof invalid: {}".format(session, error)) from error
 
@@ -2185,7 +2533,7 @@ def _retire_consumer_proof(consumer: Dict[str, Any], index: int,
     except (OSError, ValueError) as error:
         raise PermissionError(
             "consumer {} receipt unreadable: {}".format(session, error))
-    _verify_terminal_receipt(consumer, plan_id, run_id, host, registry)
+    native_read = _verify_terminal_receipt(consumer, plan_id, run_id, host, registry)
     rollout = consumer.get("rollout_path")
     if not isinstance(rollout, str) or not rollout:
         raise ValueError(
@@ -2212,7 +2560,17 @@ def _retire_consumer_proof(consumer: Dict[str, Any], index: int,
         tail = native_rows[-1].get("payload") or {}
         last = turns[-1]
         expected = {"completed": "task_complete", "interrupted": "turn_aborted", "failed": "turn_aborted"}
-        if (native_rows[-1].get("type") != "event_msg" or tail.get("type") != expected.get(last.get("status"))
+        terminal_kind = expected.get(last.get("status"))
+        if last.get("status") == "failed" and isinstance(native_read, dict):
+            actual = [turn for turn in native_read.get("turns", [])
+                      if isinstance(turn, dict) and turn.get("id") == last.get("id")]
+            error = actual[0].get("error") if len(actual) == 1 else None
+            tail_error = tail.get("error")
+            if (tail.get("type") == "task_complete" and isinstance(error, dict)
+                    and isinstance(tail_error, dict) and isinstance(error.get("message"), str)
+                    and error["message"] and error["message"] == tail_error.get("message")):
+                terminal_kind = "task_complete"
+        if (native_rows[-1].get("type") != "event_msg" or tail.get("type") != terminal_kind
                 or tail.get("turn_id") != last.get("id")):
             raise ValueError("consumer native record does not reach its terminal turn")
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
