@@ -411,3 +411,10 @@ python3 -m vibe_guide --help; git diff --check   # OK
 - reviewer 复现未知字符串 `host_invocation` / `tool_execution` / `unknown_event` 且无 item 被忽略并错误退役；`/tmp/r4-r23-red.log` 三个子例失败。按已观察的原生 event schema 保留 `token_count`、`task_started`、`task_complete`、`turn_aborted`、`thread_settings_applied` 及既有 fixture `turn_context`，其他未知 event kind 进入结构化问题并阻断。
 - `/tmp/r4-r23-matrix.log` 4 项 OK；最初定向遗漏已有 fixture `turn_context` 导致 25 errors，修正兼容后 `/tmp/r4-r23-targeted-final.log` 164 项 OK。未运行完整测试；本轮仅改 `plan_amendment.py`、`tests/test_plan_amendment.py` 和本交付文件，待原 reviewer 独立复审。
 - 真正 host ledger/逐 action 强身份排除仍为后续工作；未执行真实退役、confirm、hold/lease 释放、resume、daemon、mailbox、远端 Git 或 deploy。
+
+## 第 24 轮返工（response/top-level envelope fail-closed）
+
+- 独立 reviewer 在 `7392c539` 真实 `_retire()` 事务中复现：未知字符串 `host_invocation` 放在 `response_item.payload.type` 或完全未知顶层 envelope 时，旧代码仍可 retired、释放 lease 并写 `retire_uninvoked_legacy`；正式结论为 `REVIEW_REWORK_REQUIRED`（P0=0、P1=1、P2=0）。
+- 先写 RED：`/tmp/r4-r24-red.log` 两个完整事务反例均未阻断。最小修复在 `_rollout_native_calls` 增加已登记 envelope/response-item 类型分类；未知 response item 或顶层 envelope 进入 `structured_host_issues`，沿既有退役 fail-closed。保留真实归档已观察的 message/reasoning/agent_message、native call/return、session/event/context/statistics 等类型及历史顶层 `item_completed` fixture。
+- GREEN：R19 结构化 host 边界 6 项 OK（`/tmp/r4-r24-matrix.log`）；退役与声明 create 相关 30 项 OK（`/tmp/r4-r24-related-2.log`）；合并定向套件 195 项 OK，exit 0（`/tmp/r4-r24-targeted.log`）；`git diff --check` exit 0。
+- 当前源码 SHA256：`vibe_guide/plan_amendment.py` `a8d51b116ee69db287bb716580a499d481187ddea4c24b079caf4f5620e67271`；测试 `tests/test_plan_amendment.py` `e69765da624522c95aace249ce443260e13bf915bff8bb5a35567a453232c9bd`。完整 `unittest discover`、真实 provider/host ledger、逐 action 强身份排除和业务验收仍 UNKNOWN；未执行真实 retire/confirm/hold release/resume/daemon/mailbox、远端 Git 或 deploy。

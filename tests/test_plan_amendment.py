@@ -2291,6 +2291,53 @@ class R10ReviewTests(_LegacyUninvokedFixture):
 
 
 class R19StructuredHostBoundaryTests(_LegacyUninvokedFixture):
+    def test_unknown_kind_in_response_item_blocks_retire(self):
+        log = self._rollout([
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "exec",
+                "call_id": "outer", "input": 'text("done");'}},
+            {"type": "response_item", "payload": {
+                "type": "host_invocation", "thread_id": self.OLD_OWNER,
+                "turn_id": "turn-1"}},
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "call_id": "outer",
+                "output": "Script completed"}},
+        ], name="r24-response-item-unknown.jsonl")
+        self.evidence["retired_consumers"][0] = self._consumer(
+            self.OLD_OWNER, log,
+            calls=[{"name": "exec", "call_id": "outer", "returned": True}])
+        snapshot_path = self.paths.vibe / "runs" / self.run_id / "state.json"
+        snapshot_before = snapshot_path.read_bytes()
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+        self.assertEqual(snapshot_path.read_bytes(), snapshot_before)
+        self.assertTrue(self.lease_file.exists())
+        self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                             for e in load_events(self.paths, self.run_id)))
+
+    def test_unknown_top_level_envelope_blocks_retire(self):
+        log = self._rollout([
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "exec",
+                "call_id": "outer", "input": 'text("done");'}},
+            {"type": "host_invocation", "thread_id": self.OLD_OWNER,
+             "turn_id": "turn-1"},
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "call_id": "outer",
+                "output": "Script completed"}},
+        ], name="r24-top-level-unknown.jsonl")
+        self.evidence["retired_consumers"][0] = self._consumer(
+            self.OLD_OWNER, log,
+            calls=[{"name": "exec", "call_id": "outer", "returned": True}])
+        snapshot_path = self.paths.vibe / "runs" / self.run_id / "state.json"
+        snapshot_before = snapshot_path.read_bytes()
+        with self.assertRaises((PermissionError, ValueError)):
+            self._retire()
+        self.assertEqual(snapshot_path.read_bytes(), snapshot_before)
+        self.assertTrue(self.lease_file.exists())
+        self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                             for e in load_events(self.paths, self.run_id)))
+
     def test_outer_event_schema_identity_and_lifecycle_block_retire(self):
         valid_item = {"type": "Reasoning", "id": "reasoning-1", "status": "completed"}
         valid_event = {"type": "item_completed", "thread_id": self.OLD_OWNER,

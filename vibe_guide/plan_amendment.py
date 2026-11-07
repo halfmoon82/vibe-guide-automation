@@ -154,6 +154,15 @@ _KNOWN_NON_ITEM_EVENT_TYPES = frozenset({
     "token_count", "task_started", "task_complete", "turn_aborted",
     "thread_settings_applied", "turn_context",
 })
+_KNOWN_RESPONSE_ITEM_TYPES = frozenset(
+    set(_NATIVE_CALL_TYPES) | set(_NATIVE_RETURN_TYPES)
+    | {"additional_tools", "agent_message", "message", "reasoning"}
+)
+_KNOWN_ENVELOPE_TYPES = frozenset({
+    "compacted", "event_msg", "inter_agent_communication_metadata",
+    "item_completed", "item_started", "response_item", "session_meta",
+    "token_usage_record", "turn_context", "world_state",
+})
 #: Invocation shapes embedded inside an exec payload's JavaScript source.
 #: Only occurrences *outside* string literals and comments can execute; a
 #: cmd-string, prompt or audit-script quoting of the same text is a
@@ -1698,6 +1707,20 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
                     path.name, line_number))
         payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else entry
         kind = payload.get("type")
+        entry_type = entry.get("type")
+        if entry_type == "response_item":
+            if (not isinstance(entry.get("payload"), dict)
+                    or not isinstance(kind, str)
+                    or kind not in _KNOWN_RESPONSE_ITEM_TYPES):
+                structured_host_issues.append({
+                    "line": line_number, "reason": "unknown response item type",
+                    "kind": kind})
+                continue
+        elif not isinstance(entry_type, str) or entry_type not in _KNOWN_ENVELOPE_TYPES:
+            structured_host_issues.append({
+                "line": line_number, "reason": "unknown envelope type",
+                "kind": entry_type})
+            continue
         if entry.get("type") == "session_meta":
             session_meta_count += 1
             if session_meta_count != 1 or host_boundary_seen:
