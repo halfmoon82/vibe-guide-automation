@@ -391,3 +391,10 @@ python3 -m vibe_guide --help; git diff --check   # OK
 - `_rollout_native_calls` 保留 host 边界问题；缺失/未知/未完成以及 subagent/collaboration 调用暂按未对账处理，退役路径 fail-closed。已知执行项不以其类型名证明无副作用；真实 coverage、host-parent 和回执可信性仍未闭合。
 - 定向 `/tmp/r4-r19-targeted.log`：161 项 OK（新增空字段子例后 `R19StructuredHostBoundaryTests` 在 `/tmp/r4-r19-boundary-final.log` 再验证 OK）；本轮完整测试尚未运行。R18 全量 `/tmp/r4-r18-full-final.log` 是 `98090d1` 的运行，不可套用当前源码。
 - 仅修改 `vibe_guide/plan_amendment.py`、`tests/test_plan_amendment.py` 和本交付文件；未执行真实 retire/confirm/hold 或 lease 释放、resume、daemon、mailbox、远端 Git 或 deploy；待原 reviewer 独立复审。
+
+## 第 20 轮返工（统一 host 边界，安全补洞阶段）
+
+- 在 `daa0701` 复现非 create host item 缺 result/arguments、错误结果、未知 event kind 和未对账执行项仍可退役；`/tmp/r4-r20-red.log` 7 个子例失败，均为未阻断。
+- 对 `item_*` 统一保留结构问题；缺/空 session、turn、item ID，未知 event/item 类型，未完成、错误或不完整 McpToolCall、未对账的执行类 item 均阻断。现阶段所有 McpToolCall 和执行类 item 均需后续可信 reconciliation，不能凭完整字段判为无关；仅无执行字段的已知非执行项保留隔离正例。不能声称宿主覆盖、父调用关系或真实 proof 已闭合。
+- `/tmp/r4-r20-targeted.log`：163 项 OK；新增字段 mutation 和已知非执行项隔离矩阵 `/tmp/r4-r20-boundary-matrix.log`：3 项 OK。R18 `/tmp/r4-r18-full-final.log` 运行期间工作树被后续返工修改，结果 4229 项、51 failures、23 errors、3 skipped、4 expected failures，exit 1；可能被晚加载子进程混入后续源码，**不作为任何冻结 HEAD 的完整测试证据**。本轮冻结后另跑全量。
+- 仅改 `vibe_guide/plan_amendment.py`、`tests/test_plan_amendment.py` 和本交付文件；未执行真实 run 转移、retire/confirm/hold 或 lease 释放、resume、daemon、mailbox、远端 Git 或 deploy；待原 reviewer 独立复审。

@@ -1693,14 +1693,27 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
         # Codex archives also persist the host's structured tool boundary in
         # ``event_msg.item_completed``.  Keep it separate from the outer
         # response-item call until the turn ownership is known below.
-        if kind in {"item_completed", "item_started"}:
+        if isinstance(kind, str) and kind.startswith("item_"):
             item = payload.get("item")
+            if kind not in {"item_completed", "item_started"}:
+                structured_host_issues.append({
+                    "line": line_number, "reason": "unknown host event kind"})
+                continue
             if not isinstance(item, dict):
                 structured_host_issues.append({
                     "line": line_number, "reason": "missing host item"})
                 continue
             item_type = item.get("type")
             item_id = item.get("id")
+            if (not isinstance(item_id, str) or not item_id
+                    or not isinstance(payload.get("thread_id"), str)
+                    or not payload.get("thread_id")
+                    or not isinstance(payload.get("turn_id"), str)
+                    or not payload.get("turn_id")):
+                structured_host_issues.append({
+                    "line": line_number, "reason": "host item lacks identity",
+                    "item": item_id or item_type})
+                continue
             if item_type not in _KNOWN_HOST_ITEM_TYPES:
                 structured_host_issues.append({
                     "line": line_number, "reason": "unknown item type",
@@ -1712,12 +1725,15 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
                     "item": item_type})
                 continue
             if item_type in _EXECUTING_HOST_ITEM_TYPES:
-                if (item_type in {"SubAgentActivity", "CollabAgentToolCall"}
-                        or not isinstance(item_id, str) or not item_id
-                        or item.get("status") != "completed"):
-                    structured_host_issues.append({
-                        "line": line_number, "reason": "unreconciled host item",
-                        "item": item_id or item_type})
+                structured_host_issues.append({
+                    "line": line_number, "reason": "unreconciled host item",
+                    "item": item_id or item_type})
+                continue
+            if item_type in _BENIGN_HOST_ITEM_TYPES and any(
+                    key in item for key in ("server", "tool", "arguments", "result", "parent_id")):
+                structured_host_issues.append({
+                    "line": line_number, "reason": "benign item carries execution fields",
+                    "item": item_id})
                 continue
             if item_type == "McpToolCall":
                 valid_identity = (isinstance(item_id, str) and bool(item_id)
@@ -1737,6 +1753,20 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
                 if item.get("status") != "completed":
                     structured_host_issues.append({
                         "line": line_number, "reason": "unfinished host call",
+                        "item": item_id})
+                    continue
+                result = item.get("result")
+                if (not isinstance(item.get("arguments"), dict)
+                        or not isinstance(result, dict)
+                        or result.get("isError") is not False
+                        or not isinstance(result.get("content"), list)):
+                    structured_host_issues.append({
+                        "line": line_number, "reason": "unreconciled host result",
+                        "item": item_id})
+                    continue
+                if item.get("server") != "codex_app" or item.get("tool") != "create_thread":
+                    structured_host_issues.append({
+                        "line": line_number, "reason": "unreconciled host call",
                         "item": item_id})
                     continue
                 if item.get("server") == "codex_app" and item.get("tool") == "create_thread":

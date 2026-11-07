@@ -2291,6 +2291,22 @@ class R10ReviewTests(_LegacyUninvokedFixture):
 
 
 class R19StructuredHostBoundaryTests(_LegacyUninvokedFixture):
+    def test_known_non_execution_item_without_host_effect_can_retire(self):
+        log = self._rollout([
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call", "name": "exec", "call_id": "outer",
+                "input": 'text("done");'}},
+            {"type": "event_msg", "payload": {"type": "item_completed",
+                "thread_id": self.OLD_OWNER, "turn_id": "turn-1",
+                "item": {"type": "Reasoning", "id": "reasoning-1"}}},
+            {"type": "response_item", "payload": {
+                "type": "custom_tool_call_output", "call_id": "outer",
+                "output": "Script completed"}},
+        ], name="benign-host-item.jsonl")
+        self.evidence["retired_consumers"][0] = self._consumer(
+            self.OLD_OWNER, log,
+            calls=[{"name": "exec", "call_id": "outer", "returned": True}])
+        self.assertEqual(self._retire()["status"], "retired")
     def test_malformed_or_incomplete_host_items_block_retire(self):
         cases = [
             ("missing-server", {"type": "McpToolCall", "id": "host-1",
@@ -2334,6 +2350,61 @@ class R19StructuredHostBoundaryTests(_LegacyUninvokedFixture):
                 self.assertFalse(any(
                     event["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
                     for event in load_events(fixture.paths, fixture.run_id)))
+
+    def test_unreconciled_non_create_host_items_block_retire(self):
+        complete = {"type": "McpToolCall", "id": "host-1",
+                    "server": "codex_app", "tool": "list_projects",
+                    "status": "completed", "arguments": {},
+                    "result": {"content": [], "isError": False}}
+        missing_result = dict(complete); missing_result.pop("result")
+        missing_args = dict(complete); missing_args.pop("arguments")
+        bad_result = dict(complete, result={"content": [], "isError": True})
+        bad_args = dict(complete, arguments="{}")
+        mutations = []
+        for field in ("id", "server", "tool", "status", "arguments", "result"):
+            for value in (None, "", 7):
+                mutated = dict(complete, **{field: value})
+                mutations.append(("{}-{}".format(field, repr(value)),
+                                  "item_completed", mutated))
+        cases = [
+            ("missing-result", "item_completed", missing_result),
+            ("missing-arguments", "item_completed", missing_args),
+            ("error-result", "item_completed", bad_result),
+            ("wrong-arguments", "item_completed", bad_args),
+            ("valid-unreconciled-tool", "item_completed", complete),
+            ("unknown-event", "item_updated", complete),
+            ("command", "item_completed", {"type": "CommandExecution",
+                "id": "host-1", "status": "completed"}),
+            ("function-output", "item_completed", {"type": "FunctionCallOutput",
+                "id": "host-1", "status": "completed"}),
+        ] + mutations
+        for name, kind, item in cases:
+            with self.subTest(name=name):
+                fixture = R19StructuredHostBoundaryTests(methodName="runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                log = fixture._rollout([
+                    {"type": "response_item", "payload": {
+                        "type": "custom_tool_call", "name": "exec",
+                        "call_id": "outer", "input": 'text("done");'}},
+                    {"type": "event_msg", "payload": {"type": kind,
+                        "thread_id": fixture.OLD_OWNER, "turn_id": "turn-1",
+                        "item": item}},
+                    {"type": "response_item", "payload": {
+                        "type": "custom_tool_call_output", "call_id": "outer",
+                        "output": "Script completed"}},
+                ], name="r20-{}.jsonl".format(name))
+                fixture.evidence["retired_consumers"][0] = fixture._consumer(
+                    fixture.OLD_OWNER, log,
+                    calls=[{"name": "exec", "call_id": "outer", "returned": True}])
+                snapshot_before = load_snapshot(fixture.paths, fixture.run_id).to_dict()
+                with self.assertRaises((PermissionError, ValueError)):
+                    fixture._retire()
+                self.assertTrue(fixture.lease_file.exists())
+                self.assertEqual(load_snapshot(fixture.paths, fixture.run_id).to_dict(),
+                                 snapshot_before)
+                self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                                     for e in load_events(fixture.paths, fixture.run_id)))
 
 
 class R11ReviewTests(_LegacyUninvokedFixture):
