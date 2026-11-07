@@ -384,3 +384,10 @@ python3 -m vibe_guide --help; git diff --check   # OK
 - 新增回归：`test_unlisted_structured_host_create_cannot_retire`（RED→GREEN）；`test_structured_host_create_is_retained_separately_from_outer_exec`；保留原静态 JS、失败语法和 successor create 规则。
 - 首轮定向日志 `/tmp/r4-r18-targeted-final.log`：160 项中 1 项因测试断言编辑竞态失败；随后 R9 回归 `/tmp/r4-r18-r9-final.log`：13 项 OK；最终定向 `/tmp/r4-r18-targeted-final2.log`：160 项 OK。完整测试 `/tmp/r4-r18-full-final.log` 正在运行，结束后另报结果。
 - 边界：真实 host coverage、分页完整性、outer-parent 唯一绑定、并发/迟到/失败 host 调用仍未证明；因此真实 retire proof 仍 UNKNOWN，不能执行真实 run、confirm 或释放 lease。未调用 provider、未改真实 run、未扩解析器、未新增依赖或 worktree。
+
+## 第 19 轮返工（R18-2：未知 host 边界 fail-closed）
+
+- 独立复审发现缺 server/tool/item、未知 item 类型和 started/in-progress host 记录仍被旧 R18 代码忽略，隔离退役错误释放 lease。先导 RED 由 reviewer 在 `review.md` 给出可执行复现；本轮 `R19StructuredHostBoundaryTests.test_malformed_or_incomplete_host_items_block_retire` 覆盖缺字段、空字段、未知类型、开始未完成和缺 item，拒绝时核对 lease 保留、无 retire event。
+- `_rollout_native_calls` 保留 host 边界问题；缺失/未知/未完成以及 subagent/collaboration 调用暂按未对账处理，退役路径 fail-closed。已知执行项不以其类型名证明无副作用；真实 coverage、host-parent 和回执可信性仍未闭合。
+- 定向 `/tmp/r4-r19-targeted.log`：161 项 OK（新增空字段子例后 `R19StructuredHostBoundaryTests` 在 `/tmp/r4-r19-boundary-final.log` 再验证 OK）；本轮完整测试尚未运行。R18 全量 `/tmp/r4-r18-full-final.log` 是 `98090d1` 的运行，不可套用当前源码。
+- 仅修改 `vibe_guide/plan_amendment.py`、`tests/test_plan_amendment.py` 和本交付文件；未执行真实 retire/confirm/hold 或 lease 释放、resume、daemon、mailbox、远端 Git 或 deploy；待原 reviewer 独立复审。

@@ -137,6 +137,19 @@ _FORBIDDEN_RETIRE_CALLS = frozenset({
     "svc__codex_app__create_thread",
     "tools.mcp__codex_app__create_thread",
 })
+_KNOWN_HOST_ITEM_TYPES = frozenset({
+    "CommandExecution", "Reasoning", "AgentMessage", "McpToolCall",
+    "FileChange", "FunctionCallOutput", "UserMessage", "ImageView",
+    "SubAgentActivity", "CollabAgentToolCall", "ContextCompaction",
+})
+_BENIGN_HOST_ITEM_TYPES = frozenset({
+    "Reasoning", "AgentMessage", "UserMessage", "ImageView",
+    "ContextCompaction",
+})
+_EXECUTING_HOST_ITEM_TYPES = frozenset({
+    "CommandExecution", "FileChange", "FunctionCallOutput",
+    "SubAgentActivity", "CollabAgentToolCall",
+})
 #: Invocation shapes embedded inside an exec payload's JavaScript source.
 #: Only occurrences *outside* string literals and comments can execute; a
 #: cmd-string, prompt or audit-script quoting of the same text is a
@@ -1659,6 +1672,7 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
     ordered: List[Dict[str, Any]] = []
     structured_host: List[Dict[str, Any]] = []
     structured_host_ids = set()
+    structured_host_issues: List[Dict[str, Any]] = []
     skipped_returns = 0
     for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
@@ -1679,34 +1693,69 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
         # Codex archives also persist the host's structured tool boundary in
         # ``event_msg.item_completed``.  Keep it separate from the outer
         # response-item call until the turn ownership is known below.
-        if kind == "item_completed":
+        if kind in {"item_completed", "item_started"}:
             item = payload.get("item")
-            if (isinstance(item, dict) and item.get("type") == "McpToolCall"
-                    and item.get("server") == "codex_app"
-                    and item.get("tool") == "create_thread"):
-                item_id = item.get("id")
-                if only_ids is None or item_id in only_ids:
-                    if (not isinstance(item_id, str) or not item_id
-                            or not isinstance(payload.get("thread_id"), str)
-                            or not isinstance(payload.get("turn_id"), str)):
-                        raise ValueError(
-                            "structured host create lacks item/session/turn identity")
-                    if item_id in structured_host_ids:
-                        raise ValueError(
-                            "structured host create repeats item id {}".format(item_id))
-                    structured_host_ids.add(item_id)
-                    structured_host.append({
-                        "call_id": item_id,
-                        "line": line_number,
-                        "turn_id": payload["turn_id"],
-                        "thread_id": payload["thread_id"],
-                        "item": item,
-                        "returned": item.get("status") == "completed"
-                        and isinstance(item.get("arguments"), dict)
-                        and isinstance(item.get("result"), dict)
-                        and item["result"].get("isError") is not True,
-                    })
+            if not isinstance(item, dict):
+                structured_host_issues.append({
+                    "line": line_number, "reason": "missing host item"})
                 continue
+            item_type = item.get("type")
+            item_id = item.get("id")
+            if item_type not in _KNOWN_HOST_ITEM_TYPES:
+                structured_host_issues.append({
+                    "line": line_number, "reason": "unknown item type",
+                    "item": item_type})
+                continue
+            if kind == "item_started":
+                structured_host_issues.append({
+                    "line": line_number, "reason": "unfinished host item",
+                    "item": item_type})
+                continue
+            if item_type in _EXECUTING_HOST_ITEM_TYPES:
+                if (item_type in {"SubAgentActivity", "CollabAgentToolCall"}
+                        or not isinstance(item_id, str) or not item_id
+                        or item.get("status") != "completed"):
+                    structured_host_issues.append({
+                        "line": line_number, "reason": "unreconciled host item",
+                        "item": item_id or item_type})
+                continue
+            if item_type == "McpToolCall":
+                valid_identity = (isinstance(item_id, str) and bool(item_id)
+                                  and isinstance(payload.get("thread_id"), str)
+                                  and bool(payload.get("thread_id"))
+                                  and isinstance(payload.get("turn_id"), str)
+                                  and bool(payload.get("turn_id")))
+                valid_shape = (isinstance(item.get("server"), str)
+                               and bool(item.get("server"))
+                               and isinstance(item.get("tool"), str)
+                               and bool(item.get("tool")))
+                if not valid_identity or not valid_shape:
+                    structured_host_issues.append({
+                        "line": line_number, "reason": "malformed McpToolCall",
+                        "item": item_id})
+                    continue
+                if item.get("status") != "completed":
+                    structured_host_issues.append({
+                        "line": line_number, "reason": "unfinished host call",
+                        "item": item_id})
+                    continue
+                if item.get("server") == "codex_app" and item.get("tool") == "create_thread":
+                    if only_ids is None or item_id in only_ids:
+                        if item_id in structured_host_ids:
+                            raise ValueError(
+                                "structured host create repeats item id {}".format(item_id))
+                        structured_host_ids.add(item_id)
+                        structured_host.append({
+                            "call_id": item_id,
+                            "line": line_number,
+                            "turn_id": payload["turn_id"],
+                            "thread_id": payload["thread_id"],
+                            "item": item,
+                            "returned": isinstance(item.get("arguments"), dict)
+                            and isinstance(item.get("result"), dict)
+                            and item["result"].get("isError") is not True,
+                        })
+            continue
         if only_ids is not None and (payload.get("call_id") or payload.get("id")) not in only_ids:
             continue
         if isinstance(kind, str) and "call" in kind and (
@@ -1795,7 +1844,8 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
     return {"calls": ordered, "unpaired": unpaired,
             "returned": sorted(returned), "returns": returns,
             "skipped_returns": skipped_returns,
-            "structured_host": structured_host}
+            "structured_host": structured_host,
+            "structured_host_issues": structured_host_issues}
 
 
 def _retire_field(evidence: Dict[str, Any], key: str) -> Any:
@@ -2082,12 +2132,12 @@ def _retire_consumer_proof(consumer: Dict[str, Any], index: int,
     # guarantee.  Until an independently verifiable complete host boundary
     # exists, any structured create requires reconciliation and blocks this
     # no-invocation retirement path, even if the outer source looked inert.
-    if audit["structured_host"]:
-        item = audit["structured_host"][0]
+    if audit["structured_host"] or audit.get("structured_host_issues"):
+        item = (audit["structured_host"] or audit["structured_host_issues"])[0]
         raise PermissionError(
-            "consumer {} has structured host create {} at line {}; "
+            "consumer {} has structured host boundary at line {}; "
             "host coverage and action binding require reconciliation".format(
-                session, item["call_id"], item["line"]))
+                session, item["line"]))
     calls = audit["calls"]
     # A native or embedded create is flagged, not auto-fatal: a retired
     # supervisor legitimately creates its own successor.  The binding check
