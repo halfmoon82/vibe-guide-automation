@@ -150,6 +150,10 @@ _EXECUTING_HOST_ITEM_TYPES = frozenset({
     "CommandExecution", "FileChange", "FunctionCallOutput",
     "SubAgentActivity", "CollabAgentToolCall",
 })
+_KNOWN_NON_ITEM_EVENT_TYPES = frozenset({
+    "token_count", "task_started", "task_complete", "turn_aborted",
+    "thread_settings_applied", "turn_context",
+})
 #: Invocation shapes embedded inside an exec payload's JavaScript source.
 #: Only occurrences *outside* string literals and comments can execute; a
 #: cmd-string, prompt or audit-script quoting of the same text is a
@@ -1700,6 +1704,13 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
                 structured_host_issues.append({
                     "line": line_number, "reason": "duplicate or late session metadata"})
             source_session = payload.get("id")
+        if (entry.get("type") == "event_msg" and isinstance(kind, str)
+                and kind not in _KNOWN_NON_ITEM_EVENT_TYPES
+                and kind not in {"item_completed", "item_started"}):
+            structured_host_issues.append({
+                "line": line_number, "reason": "unknown event kind",
+                "kind": kind})
+            continue
         if entry.get("type") == "event_msg" and (
                 "item" in payload or not isinstance(kind, str)):
             if not isinstance(kind, str) or kind not in {"item_completed", "item_started"}:

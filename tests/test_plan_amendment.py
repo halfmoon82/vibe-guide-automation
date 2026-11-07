@@ -2312,6 +2312,9 @@ class R19StructuredHostBoundaryTests(_LegacyUninvokedFixture):
         cases.append(("missing-status", [missing_status]))
         null_status = copy.deepcopy(valid_event); null_status["item"]["status"] = None
         cases.append(("null-status", [null_status]))
+        for kind in ("host_invocation", "tool_execution", "unknown_event"):
+            cases.append((kind, [{"type": kind, "thread_id": self.OLD_OWNER,
+                                 "turn_id": "turn-1"}]))
         for name, events in cases:
             with self.subTest(name=name):
                 fixture = R19StructuredHostBoundaryTests(methodName="runTest")
