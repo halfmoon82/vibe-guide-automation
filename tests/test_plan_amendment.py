@@ -2291,6 +2291,52 @@ class R10ReviewTests(_LegacyUninvokedFixture):
 
 
 class R19StructuredHostBoundaryTests(_LegacyUninvokedFixture):
+    def test_outer_event_schema_identity_and_lifecycle_block_retire(self):
+        valid_item = {"type": "Reasoning", "id": "reasoning-1", "status": "completed"}
+        valid_event = {"type": "item_completed", "thread_id": self.OLD_OWNER,
+                       "turn_id": "turn-1", "item": valid_item}
+        cases = []
+        for field in ("type", "thread_id", "turn_id", "item"):
+            missing = copy.deepcopy(valid_event); missing.pop(field)
+            cases.append((field + "-missing", [missing]))
+            for value in (None, "", 7, [], {}):
+                broken = copy.deepcopy(valid_event); broken[field] = value
+                cases.append((field + "-" + repr(value), [broken]))
+        for status in ("in_progress", "failed", "cancelled", "timeout"):
+            broken = copy.deepcopy(valid_event); broken["item"]["status"] = status
+            cases.append(("status-" + status, [broken]))
+        foreign = copy.deepcopy(valid_event); foreign["thread_id"] = "foreign"
+        cases.append(("foreign", [foreign]))
+        cases.append(("duplicate", [valid_event, copy.deepcopy(valid_event)]))
+        missing_status = copy.deepcopy(valid_event); missing_status["item"].pop("status")
+        cases.append(("missing-status", [missing_status]))
+        null_status = copy.deepcopy(valid_event); null_status["item"]["status"] = None
+        cases.append(("null-status", [null_status]))
+        for name, events in cases:
+            with self.subTest(name=name):
+                fixture = R19StructuredHostBoundaryTests(methodName="runTest")
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                log = fixture._rollout([
+                    {"type": "response_item", "payload": {
+                        "type": "custom_tool_call", "name": "exec",
+                        "call_id": "outer", "input": 'text("done");'}},
+                    *[{"type": "event_msg", "payload": e} for e in events],
+                    {"type": "response_item", "payload": {
+                        "type": "custom_tool_call_output", "call_id": "outer",
+                        "output": "Script completed"}},
+                ], name="r21-{}.jsonl".format(name.replace("/", "_")))
+                fixture.evidence["retired_consumers"][0] = fixture._consumer(
+                    fixture.OLD_OWNER, log,
+                    calls=[{"name": "exec", "call_id": "outer", "returned": True}])
+                snapshot_before = load_snapshot(fixture.paths, fixture.run_id).to_dict()
+                with self.assertRaises((PermissionError, ValueError)):
+                    fixture._retire()
+                self.assertEqual(load_snapshot(fixture.paths, fixture.run_id).to_dict(), snapshot_before)
+                self.assertTrue(fixture.lease_file.exists())
+                self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
+                                     for e in load_events(fixture.paths, fixture.run_id)))
+
     def test_known_non_execution_item_without_host_effect_can_retire(self):
         log = self._rollout([
             {"type": "response_item", "payload": {
@@ -2298,6 +2344,7 @@ class R19StructuredHostBoundaryTests(_LegacyUninvokedFixture):
                 "input": 'text("done");'}},
             {"type": "event_msg", "payload": {"type": "item_completed",
                 "thread_id": self.OLD_OWNER, "turn_id": "turn-1",
+                "started_at_ms": 1, "completed_at_ms": 1,
                 "item": {"type": "Reasoning", "id": "reasoning-1"}}},
             {"type": "response_item", "payload": {
                 "type": "custom_tool_call_output", "call_id": "outer",

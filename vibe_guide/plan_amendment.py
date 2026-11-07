@@ -1673,6 +1673,10 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
     structured_host: List[Dict[str, Any]] = []
     structured_host_ids = set()
     structured_host_issues: List[Dict[str, Any]] = []
+    host_item_ids = set()
+    source_session = None
+    session_meta_count = 0
+    host_boundary_seen = False
     skipped_returns = 0
     for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
@@ -1690,10 +1694,23 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
                     path.name, line_number))
         payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else entry
         kind = payload.get("type")
+        if entry.get("type") == "session_meta":
+            session_meta_count += 1
+            if session_meta_count != 1 or host_boundary_seen:
+                structured_host_issues.append({
+                    "line": line_number, "reason": "duplicate or late session metadata"})
+            source_session = payload.get("id")
+        if entry.get("type") == "event_msg" and (
+                "item" in payload or not isinstance(kind, str)):
+            if not isinstance(kind, str) or kind not in {"item_completed", "item_started"}:
+                structured_host_issues.append({
+                    "line": line_number, "reason": "invalid event schema"})
+                continue
         # Codex archives also persist the host's structured tool boundary in
         # ``event_msg.item_completed``.  Keep it separate from the outer
         # response-item call until the turn ownership is known below.
         if isinstance(kind, str) and kind.startswith("item_"):
+            host_boundary_seen = True
             item = payload.get("item")
             if kind not in {"item_completed", "item_started"}:
                 structured_host_issues.append({
@@ -1714,7 +1731,18 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
                     "line": line_number, "reason": "host item lacks identity",
                     "item": item_id or item_type})
                 continue
-            if item_type not in _KNOWN_HOST_ITEM_TYPES:
+            if source_session is None or payload.get("thread_id") != source_session:
+                structured_host_issues.append({
+                    "line": line_number, "reason": "host item session mismatch",
+                    "item": item_id})
+                continue
+            if item_id in host_item_ids:
+                structured_host_issues.append({
+                    "line": line_number, "reason": "duplicate host item",
+                    "item": item_id})
+                continue
+            host_item_ids.add(item_id)
+            if not isinstance(item_type, str) or item_type not in _KNOWN_HOST_ITEM_TYPES:
                 structured_host_issues.append({
                     "line": line_number, "reason": "unknown item type",
                     "item": item_type})
@@ -1733,6 +1761,16 @@ def _rollout_native_calls(path: Path, only_ids=None) -> Dict[str, Any]:
                     key in item for key in ("server", "tool", "arguments", "result", "parent_id")):
                 structured_host_issues.append({
                     "line": line_number, "reason": "benign item carries execution fields",
+                    "item": item_id})
+                continue
+            if (item_type in _BENIGN_HOST_ITEM_TYPES and
+                    (("status" in item and item.get("status") != "completed")
+                     or ("status" not in item and
+                         (type(payload.get("started_at_ms")) is not int
+                          or type(payload.get("completed_at_ms")) is not int
+                          or payload["completed_at_ms"] < payload["started_at_ms"])))):
+                structured_host_issues.append({
+                    "line": line_number, "reason": "unfinished benign item",
                     "item": item_id})
                 continue
             if item_type == "McpToolCall":

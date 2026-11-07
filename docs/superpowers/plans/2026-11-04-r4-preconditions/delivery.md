@@ -398,3 +398,10 @@ python3 -m vibe_guide --help; git diff --check   # OK
 - 对 `item_*` 统一保留结构问题；缺/空 session、turn、item ID，未知 event/item 类型，未完成、错误或不完整 McpToolCall、未对账的执行类 item 均阻断。现阶段所有 McpToolCall 和执行类 item 均需后续可信 reconciliation，不能凭完整字段判为无关；仅无执行字段的已知非执行项保留隔离正例。不能声称宿主覆盖、父调用关系或真实 proof 已闭合。
 - `/tmp/r4-r20-targeted.log`：163 项 OK；新增字段 mutation 和已知非执行项隔离矩阵 `/tmp/r4-r20-boundary-matrix.log`：3 项 OK。R18 `/tmp/r4-r18-full-final.log` 运行期间工作树被后续返工修改，结果 4229 项、51 failures、23 errors、3 skipped、4 expected failures，exit 1；可能被晚加载子进程混入后续源码，**不作为任何冻结 HEAD 的完整测试证据**。本轮冻结后另跑全量。
 - 仅改 `vibe_guide/plan_amendment.py`、`tests/test_plan_amendment.py` 和本交付文件；未执行真实 run 转移、retire/confirm/hold 或 lease 释放、resume、daemon、mailbox、远端 Git 或 deploy；待原 reviewer 独立复审。
+
+## 第 21 轮返工（event 外层身份与生命周期）
+
+- reviewer 对 `1497d39` 复现外层 event type 缺失/null/数字、foreign session、重复 item 和未完成 benign 项仍可退役；`/tmp/r4-r21-red.log` 有 10 失败及 2 个错误。新增表驱动完整退役矩阵，核验拒绝后 snapshot 不变、lease 保留、无 retire event。
+- 统一检查携带 item 或非字符串 type 的 event；来源 session 与唯一 `session_meta` 绑定，拒绝重复/后置 metadata、foreign/重复 item、unknown event/type 和未完成项。对于实际归档的 benign `item_completed` 无 item.status 形态，以真实 envelope 的 started/completed 时间字段检查，显式 null/无时间仍拒绝；不因无 started event 推断失败。执行类/host 调用仍需 reconciliation，不通过文本判断。
+- `/tmp/r4-r21-targeted.log`：164 项 OK（测试运行期间只调整 benign 真实 schema）；最终完整边界矩阵 `/tmp/r4-r21-final-matrix.log`：4 项 OK。`1497d39` 全量按复审指示中断，exit 130，起止 HEAD 与源码摘要一致；`/tmp/r4-r20-full-final.log` 不是验收结果。
+- 仅改 `vibe_guide/plan_amendment.py`、`tests/test_plan_amendment.py` 和本交付文件。真实 proof 仍 UNKNOWN；未执行真实 retire/confirm、hold/lease 释放、resume、daemon、mailbox、远端 Git 或 deploy。待原 reviewer 独立复审。
