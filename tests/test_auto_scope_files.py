@@ -861,6 +861,39 @@ class MonitorAutoScopeTests(unittest.TestCase):
             self._scope_events(snapshot.run_id)[0]["trigger"], "accepted_patch"
         )
 
+    def test_accepted_patch_reason_reaches_the_rework_prompt(self):
+        # run-101f5f86: the supervisor's defect text never reached the developer.
+        from vibe_guide.prompts import rework_findings_section
+        self._approve_acceptance_rule()
+        node = _node("n1")
+        plan = Plan(
+            "plan-1", 1, "docs/prd.md", [node.id], "draft",
+            decisions=[dict(DECISION, question="canonical name")],
+        )
+        monitor = Monitor(self.paths, plan, [node])
+        runner = FakeRunner(events={
+            ("n1", "developer"): [("complete", {"evidence": "delivery"})],
+            ("n1", "reviewer"): [("accepted", {"evidence": "review"})],
+        })
+        snapshot = monitor.start(
+            authorize(build_authorization_card(plan, [node], self.capabilities), "AUTHORIZE"),
+            runner,
+        )
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        snapshot = monitor.request_scope_expansion(
+            snapshot.run_id, "n1",
+            _scope_claim(["vibe_guide/protocols/__init__.py"],
+                         reason="P2 SENTINEL build_report 丢弃未登记会话 token=abc123"),
+        )
+        self.assertIn("SENTINEL", snapshot.nodes["n1"]["patch_rework_note"])
+        self.assertNotIn("abc123", snapshot.nodes["n1"]["patch_rework_note"])
+        snapshot = monitor.tick(snapshot.run_id, runner)
+        start = [c for c in runner.start_calls
+                 if c["node_id"] == "n1" and c["role"] == "developer" and c["phase"] == "rework"][-1]
+        self.assertIn("SENTINEL", rework_findings_section(start))
+        self.assertNotIn("patch_rework_note", snapshot.nodes["n1"])
+
     def test_accepted_patch_without_approved_rule_asks_product_manager(self):
         # Integrated PRD N5 / AC-B1a at the monitor level.
         node = _node("n1")

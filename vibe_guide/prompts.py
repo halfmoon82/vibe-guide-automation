@@ -233,10 +233,15 @@ def rework_findings_section(contract: Dict[str, Any]) -> str:
     if contract.get("role") != "developer" or contract.get("phase") != "rework":
         return ""
     findings = _latest_reviewer_findings(contract) + _integration_findings(contract)
+    note = contract.get("patch_rework_note")
+    note_text = ""
+    if isinstance(note, str) and note.strip():
+        # Supervisor-stated defect of an accepted-patch rework (scope-expand).
+        note_text = "监工指出的待修缺陷（必须逐条修复并在交付证据里说明）：{}\n".format(note.strip())
     if not findings:
-        return ""
+        return note_text
     projected = [durable_projection(item) for item in findings]
-    return (
+    return note_text + (
         "本轮 reviewer findings（逐条修复并在交付证据里说明每条处理结果）：{}\n".format(
             json.dumps(projected, ensure_ascii=False, sort_keys=True)
         )
