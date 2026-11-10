@@ -112,6 +112,37 @@ def read_usage(path, registered_at=None):
     return record
 
 
+def node_baseline(selected, records):
+    """Per-node cumulative uncached input+output. Any member session without
+    verified usage makes the node total unknown (never 0); the verified part is
+    kept separately as known_partial_tokens for review."""
+    by_id = {r['session_id']: r for r in records}
+    nodes = {}
+    for session_id, entry in selected.items():
+        node_id = entry.get('node_id')
+        if not node_id:
+            continue
+        record = by_id.get(session_id)
+        known = (record is not None and record.get('status') == 'ok'
+                 and 'uncached_input_tokens' in record)
+        tokens = record['uncached_input_tokens'] + record['output_tokens'] if known else None
+        node = nodes.setdefault(node_id, {'sessions': [], 'known_partial_tokens': 0,
+                                          'unknown_sessions': 0})
+        node['sessions'].append({'session_id': session_id, 'role': entry.get('role'),
+                                 'generation': entry.get('generation'),
+                                 'uncached_input_output_tokens': tokens,
+                                 'status': record['status'] if record else 'unknown_missing_log'})
+        if known:
+            node['known_partial_tokens'] += tokens
+        else:
+            node['unknown_sessions'] += 1
+    for node in nodes.values():
+        node['total_uncached_input_output_tokens'] = (
+            None if node['unknown_sessions'] else node['known_partial_tokens'])
+        node['status'] = 'unknown' if node['unknown_sessions'] else 'ok'
+    return nodes
+
+
 def build_report(registry, roots):
     registrations = registry.get('history', []) + [registry.get('current', {})]
     selected = {}
@@ -137,8 +168,11 @@ def build_report(registry, roots):
             record = matches[0]
             record['registered_at'] = entry.get('registered_at')
             record['baseline_context'] = entry.get('baseline_context')
+            for key in ('node_id', 'role', 'generation'):
+                record[key] = entry.get(key)
             records.append(record)
-    return {'schema_version': 1, 'measured_at': datetime.now(timezone.utc).isoformat(),
+    nodes = node_baseline(selected, records)
+    return {'schema_version': 2, 'nodes': nodes, 'measured_at': datetime.now(timezone.utc).isoformat(),
             'coverage': {'registered': len(selected), 'found': len(records)},
             'missing_sessions': missing, 'ambiguous_sessions': ambiguous, 'sessions': records,
             'method': 'Cumulative counters; identical repeats removed. Input includes cached input; '
