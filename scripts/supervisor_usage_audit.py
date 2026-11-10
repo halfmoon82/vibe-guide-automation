@@ -112,7 +112,7 @@ def read_usage(path, registered_at=None):
     return record
 
 
-def node_baseline(selected, records):
+def node_baseline(selected, records, expected_nodes=()):
     """Per-node cumulative uncached input+output. Any member session without
     verified usage makes the node total unknown (never 0); the verified part is
     kept separately as known_partial_tokens for review."""
@@ -136,6 +136,9 @@ def node_baseline(selected, records):
             node['known_partial_tokens'] += tokens
         else:
             node['unknown_sessions'] += 1
+    for node_id in expected_nodes:
+        # Expected node with no verifiable session: unknown, never 0.
+        nodes.setdefault(node_id, {'sessions': [], 'known_partial_tokens': 0, 'unknown_sessions': 1})
     for node in nodes.values():
         node['total_uncached_input_output_tokens'] = (
             None if node['unknown_sessions'] else node['known_partial_tokens'])
@@ -143,12 +146,18 @@ def node_baseline(selected, records):
     return nodes
 
 
-def build_report(registry, roots):
+def build_report(registry, roots, node_map=None):
+    node_map = node_map or {}
+    mapped = node_map.get('sessions', {})
     registrations = registry.get('history', []) + [registry.get('current', {})]
     selected = {}
     for entry in registrations:
         if entry.get('session_id'):
-            selected.setdefault(entry['session_id'], entry)
+            selected.setdefault(entry['session_id'], dict(entry))
+    for session_id, entry in selected.items():
+        for key, value in (mapped.get(session_id) or {}).items():
+            if key in ('node_id', 'role', 'generation') and entry.get(key) is None:
+                entry[key] = value
     records = []
     missing = []
     ambiguous = []
@@ -171,7 +180,7 @@ def build_report(registry, roots):
             for key in ('node_id', 'role', 'generation'):
                 record[key] = entry.get(key)
             records.append(record)
-    nodes = node_baseline(selected, records)
+    nodes = node_baseline(selected, records, node_map.get('expected_nodes', ()))
     return {'schema_version': 2, 'nodes': nodes, 'measured_at': datetime.now(timezone.utc).isoformat(),
             'coverage': {'registered': len(selected), 'found': len(records)},
             'missing_sessions': missing, 'ambiguous_sessions': ambiguous, 'sessions': records,
@@ -188,10 +197,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--registry', type=Path, required=True)
     parser.add_argument('--log-root', type=Path, action='append', required=True)
+    parser.add_argument('--node-map', type=Path, help='JSON: {"sessions": {session_id: {node_id, role, generation}}, "expected_nodes": [node_id]}')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     raw = args.registry.read_bytes()
-    report = build_report(json.loads(raw), args.log_root)
+    report = build_report(json.loads(raw), args.log_root,
+                          json.loads(args.node_map.read_text()) if args.node_map else None)
     report['registry_evidence'] = {'path': str(args.registry.resolve()),
                                    'sha256': hashlib.sha256(raw).hexdigest()}
     args.output.parent.mkdir(parents=True, exist_ok=True)

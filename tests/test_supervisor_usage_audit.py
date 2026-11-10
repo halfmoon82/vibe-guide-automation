@@ -79,6 +79,18 @@ class UsageAuditTests(unittest.TestCase):
             nodes = audit.build_report({'current': {'session_id': 'd0', 'node_id': 'n1'}}, [Path(root)])['nodes']
             self.assertIsNone(nodes['n1']['total_uncached_input_output_tokens'])
 
+    def test_node_map_supplies_identity_for_real_shaped_registry(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.log(root, 'rollout-d0.jsonl', 'd0', [{'input_tokens': 100, 'cached_input_tokens': 80, 'output_tokens': 20}])
+            registry = {'history': [{'session_id': 'd0'}], 'current': {}}
+            node_map = {'sessions': {'d0': {'node_id': 'n1', 'role': 'developer', 'generation': 0}},
+                        'expected_nodes': ['n1', 'n3']}
+            nodes = audit.build_report(registry, [Path(root)], node_map)['nodes']
+            self.assertEqual(nodes['n1']['total_uncached_input_output_tokens'], 40)
+            self.assertEqual(nodes['n3']['status'], 'unknown')
+            self.assertIsNone(nodes['n3']['total_uncached_input_output_tokens'])
+            self.assertEqual(audit.build_report(registry, [Path(root)])['nodes'], {})
+
 
 if __name__ == '__main__':
     unittest.main()
