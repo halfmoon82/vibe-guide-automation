@@ -56,6 +56,51 @@ class UsageAuditTests(unittest.TestCase):
             self.assertEqual(report['missing_sessions'], ['missing'])
             self.assertEqual(report['coverage']['found'], 1)
 
+    def test_node_baseline_sums_generations_and_marks_unknown(self):
+        with tempfile.TemporaryDirectory() as root:
+            a = {'input_tokens': 100, 'cached_input_tokens': 80, 'output_tokens': 20}
+            b = dict(a, input_tokens=200, cached_input_tokens=160, output_tokens=40)
+            self.log(root, 'rollout-d0.jsonl', 'd0', [a, a, b])
+            self.log(root, 'rollout-r0.jsonl', 'r0', [a])
+            registry = {'history': [
+                {'session_id': 'd0', 'node_id': 'n1', 'role': 'developer', 'generation': 0},
+                {'session_id': 'd0', 'node_id': 'n1', 'role': 'developer', 'generation': 0},
+                {'session_id': 'r0', 'node_id': 'n1', 'role': 'reviewer', 'generation': 0}],
+                'current': {'session_id': 'gone', 'node_id': 'n2', 'role': 'developer', 'generation': 1}}
+            nodes = audit.build_report(registry, [Path(root)])['nodes']
+            self.assertEqual(nodes['n1']['total_uncached_input_output_tokens'], 80 + 40)
+            self.assertEqual(len(nodes['n1']['sessions']), 2)
+            self.assertIsNone(nodes['n2']['total_uncached_input_output_tokens'])
+            self.assertEqual(nodes['n2']['status'], 'unknown')
+
+    def test_node_with_regression_stays_unknown(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.log(root, 'rollout-d0.jsonl', 'd0', [{'input_tokens': 100}, {'input_tokens': 5}])
+            nodes = audit.build_report({'current': {'session_id': 'd0', 'node_id': 'n1'}}, [Path(root)])['nodes']
+            self.assertIsNone(nodes['n1']['total_uncached_input_output_tokens'])
+
+    def test_mapped_session_missing_from_registry_makes_node_unknown(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.log(root, 'rollout-d0.jsonl', 'd0', [{'input_tokens': 100, 'cached_input_tokens': 80, 'output_tokens': 20}])
+            node_map = {'sessions': {'d0': {'node_id': 'n1', 'role': 'developer', 'generation': 0},
+                                     'r1': {'node_id': 'n1', 'role': 'reviewer', 'generation': 0}}}
+            report = audit.build_report({'history': [{'session_id': 'd0'}], 'current': {}}, [Path(root)], node_map)
+            self.assertIn('r1', report['missing_sessions'])
+            self.assertIsNone(report['nodes']['n1']['total_uncached_input_output_tokens'])
+            self.assertEqual(report['nodes']['n1']['known_partial_tokens'], 40)
+
+    def test_node_map_supplies_identity_for_real_shaped_registry(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.log(root, 'rollout-d0.jsonl', 'd0', [{'input_tokens': 100, 'cached_input_tokens': 80, 'output_tokens': 20}])
+            registry = {'history': [{'session_id': 'd0'}], 'current': {}}
+            node_map = {'sessions': {'d0': {'node_id': 'n1', 'role': 'developer', 'generation': 0}},
+                        'expected_nodes': ['n1', 'n3']}
+            nodes = audit.build_report(registry, [Path(root)], node_map)['nodes']
+            self.assertEqual(nodes['n1']['total_uncached_input_output_tokens'], 40)
+            self.assertEqual(nodes['n3']['status'], 'unknown')
+            self.assertIsNone(nodes['n3']['total_uncached_input_output_tokens'])
+            self.assertEqual(audit.build_report(registry, [Path(root)])['nodes'], {})
+
 
 if __name__ == '__main__':
     unittest.main()

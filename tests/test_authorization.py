@@ -8,7 +8,9 @@ from vibe_guide.authorization import (
     build_authorization_card,
     is_authorization_valid,
     refresh_authorization_card,
+    validate_automation_spec,
     validate_runtime_contract,
+    verify_automation_readback,
 )
 from vibe_guide.models import AgentCapabilities, DAGNode, Plan
 
@@ -473,3 +475,64 @@ class AuthorizationWorkersSchemaTests(unittest.TestCase):
             entry["limitations"],
             tuple(BACKGROUND_MODE_DISCLOSURES),
         )
+
+
+class AutomationSpecTests(unittest.TestCase):
+    HB = {"kind": "heartbeat", "target_thread_id": "t-1"}
+    CRON = {"kind": "cron", "cron": "0 * * * *"}
+
+    def test_heartbeat_with_cron_is_rejected(self):
+        for field in ("cron", "cron_expression", "rrule"):
+            spec = dict(self.HB, **{field: "x"})
+            self.assertFalse(validate_automation_spec(spec)[0], field)
+
+    def test_heartbeat_without_target_is_rejected(self):
+        self.assertFalse(validate_automation_spec({"kind": "heartbeat"})[0])
+        self.assertFalse(
+            validate_automation_spec({"kind": "heartbeat", "target_thread_id": " "})[0]
+        )
+
+    def test_unknown_or_missing_kind_is_rejected(self):
+        self.assertFalse(validate_automation_spec({"kind": "weekly"})[0])
+        self.assertFalse(validate_automation_spec({})[0])
+        self.assertFalse(validate_automation_spec("heartbeat")[0])
+
+    def test_plain_cron_and_valid_heartbeat_are_accepted(self):
+        self.assertTrue(validate_automation_spec(self.CRON)[0])
+        self.assertTrue(validate_automation_spec(self.HB)[0])
+
+    def test_cron_without_schedule_or_with_target_is_rejected(self):
+        self.assertFalse(validate_automation_spec({"kind": "cron"})[0])
+        self.assertFalse(
+            validate_automation_spec(dict(self.CRON, target_thread_id="t-1"))[0]
+        )
+
+    def test_matching_readback_is_accepted(self):
+        fired = {"kind": "heartbeat", "thread_id": "t-1"}
+        self.assertTrue(verify_automation_readback(self.HB, dict(self.HB), fired)[0])
+        self.assertTrue(
+            verify_automation_readback(self.CRON, dict(self.CRON), {"kind": "cron"})[0]
+        )
+
+    def test_readback_mismatch_is_rejected(self):
+        fired = {"kind": "heartbeat", "thread_id": "t-1"}
+        bad = dict(self.HB, target_thread_id="t-2")
+        self.assertFalse(verify_automation_readback(self.HB, bad, fired)[0])
+        self.assertFalse(
+            verify_automation_readback(self.HB, dict(self.HB, cron="0 * * * *"), fired)[0]
+        )
+
+    def test_trigger_mismatch_is_rejected(self):
+        self.assertFalse(
+            verify_automation_readback(
+                self.HB, dict(self.HB), {"kind": "heartbeat", "thread_id": "other"}
+            )[0]
+        )
+        self.assertFalse(
+            verify_automation_readback(self.HB, dict(self.HB), {"kind": "cron"})[0]
+        )
+
+    def test_missing_readback_or_trigger_is_rejected(self):
+        self.assertFalse(verify_automation_readback(self.HB, None, {"kind": "heartbeat"})[0])
+        self.assertFalse(verify_automation_readback(self.HB, dict(self.HB), None)[0])
+        self.assertFalse(verify_automation_readback({"kind": "x"}, {}, {})[0])

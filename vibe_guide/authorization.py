@@ -2519,3 +2519,50 @@ def can_auto_merge(evidence: Any, authorization: Any) -> bool:
         capability = str(evidence.get("merge_capability", "")).casefold()
         return evidence.get("provider_verified") is True and capability in {"verified_remote", "verified"}
     return True
+
+
+# --- Automation purpose validation (V6 P0a) --------------------------------
+# A same-thread heartbeat must not carry a cron schedule (it spawns independent
+# sessions) and must name its target thread. Anything unverifiable is rejected.
+_CRON_FIELDS = ("cron", "cron_expression", "rrule")
+
+
+def validate_automation_spec(spec: Any) -> Tuple[bool, str]:
+    """Return (ok, reason). Called before creating an automation."""
+    if not isinstance(spec, dict):
+        return False, "automation spec is not an object"
+    kind = spec.get("kind")
+    if kind not in ("heartbeat", "cron"):
+        return False, "cannot confirm automation kind: %r" % (kind,)
+    has_cron = any(spec.get(k) for k in _CRON_FIELDS)
+    if kind == "heartbeat":
+        target = spec.get("target_thread_id")
+        if not isinstance(target, str) or not target.strip():
+            return False, "heartbeat is missing target_thread_id"
+        if has_cron:
+            return False, "same-thread heartbeat must not use a cron schedule"
+        return True, "ok"
+    if not has_cron:
+        return False, "cron automation has no schedule"
+    if spec.get("target_thread_id"):
+        return False, "cron automation must not target an existing thread"
+    return True, "ok"
+
+
+def verify_automation_readback(spec: Any, readback: Any, fired: Any) -> Tuple[bool, str]:
+    """After creation: the stored config must equal the requested one and the
+    observed trigger (fired) must match the stored kind and target."""
+    ok, reason = validate_automation_spec(spec)
+    if not ok:
+        return False, reason
+    if not isinstance(readback, dict) or not isinstance(fired, dict):
+        return False, "readback or trigger evidence missing"
+    keys = ("kind", "target_thread_id") + _CRON_FIELDS
+    for key in keys:
+        if (spec.get(key) or None) != (readback.get(key) or None):
+            return False, "readback differs on %s" % key
+    if fired.get("kind") != spec["kind"]:
+        return False, "actual trigger kind differs"
+    if spec["kind"] == "heartbeat" and fired.get("thread_id") != spec["target_thread_id"]:
+        return False, "actual trigger thread differs"
+    return True, "ok"
