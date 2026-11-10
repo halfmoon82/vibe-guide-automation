@@ -71,6 +71,7 @@ from .supervisor import (
     register_supervisor_address,
     record_owner_gate,
     shift_model_warning,
+    wake_target_problem,
     session_cwd_warning,
     project_root_worktree_warning,
     release_supervisor_hold,
@@ -385,7 +386,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--session-id", dest="session_id")
     parser.add_argument("--host", dest="supervisor_host")
     parser.add_argument("--wake-target", dest="wake_target",
-                        help="supervisor-register: 工人唤醒本监工时 SendMessage 用的会话名（缺省用 --session-id）")
+                        help="supervisor-register: 工人唤醒本监工时 SendMessage 用的会话名（Claude Code 必填：UUID 会话 id 发不到）")
     parser.add_argument("--context-hard-cap", dest="context_hard_cap", type=int, default=None)
     parser.add_argument("--token-threshold", dest="token_threshold", type=int, default=None)
     parser.add_argument("--reason", dest="hold_reason")
@@ -2498,8 +2499,8 @@ def _first_shift_handoff(
     return (
         "首班监工还有两件事没做，做完才算开工：\n"
         "  1) 登记地址：vibe supervisor-register --run-id {} "
-        "--provider <平台> --session-id <本会话 id> --host <本机标识> "
-        "--session-record <本会话记录路径>\n"
+        "--provider <平台> --session-id <本会话 id> --wake-target <会话名，Claude Code 必填> "
+        "--host <本机标识> --session-record <本会话记录路径>\n"
         "     {}\n"
         "  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n"
         "     {}\n"
@@ -3115,7 +3116,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         worktree_warning = project_root_worktree_warning(paths)
         if worktree_warning:
             text += "；警告：" + worktree_warning
+        wake_warning = wake_target_problem(entry)
+        if wake_warning:
+            text += "；警告：" + wake_warning
         payload = {"command": args.command, "status": "ok", "current": entry}
+        if wake_warning:
+            payload["wake_target_warning"] = wake_warning
         if model_warning:
             payload["model_warning"] = model_warning
         if cwd_warning:

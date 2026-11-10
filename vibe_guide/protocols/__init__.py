@@ -27,6 +27,9 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # 2026-11-10: supervisor-register examples carry --wake-target <会话名>
+        # (a UUID target is unreachable for SendMessage).
+        "03269794c00fe329d563d45179cc417ce71e2d7b5687ef36b67a9e10fa8e8cb9",
         # 2026-11-03: §5.3 show the card with its dependency graph before
         # authorizing (--show-card receipt, D5) and one selected heartbeat
         # tier (#391) (authorization-card).
@@ -221,6 +224,8 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "4336b8a2977974248dbec483a4e8440ed60768234d76ffc0a6ac685e12ee97c5",
     }),
     "vibe-entry": frozenset({
+        # 2026-11-10: first-shift register example carries --wake-target <会话名>.
+        "fbdfab762b417d2a45198a5c640fa1fd6fba5ff41e09c4d3a2ba9e9f8995a500",
         # 2026-10-31: monitor auto-starts the daemon; launchd keep-alive is the only auto-restart path.
         "cc4c48df44d0a871cd964097ca977992653ec7858162fa2b24be994ecf948287",
         # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.

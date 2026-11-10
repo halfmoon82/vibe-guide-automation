@@ -708,8 +708,8 @@ def record_owner_gate(paths, run_id, session_record, *, command_prefix="vibe"):
     return {"state": "register_first", "reason": reason,
             "reason_code": REASON_RECORD_NOT_REGISTERED,
             "register_command": "{} supervisor-register --run-id {} --provider <平台> "
-                                "--session-id <本会话 id> --host <本机标识> "
-                                "--session-record <本会话记录路径>".format(command_prefix, run_id)}
+                                "--session-id <本会话 id> --wake-target <会话名，Claude Code 必填> "
+                                "--host <本机标识> --session-record <本会话记录路径>".format(command_prefix, run_id)}
 
 
 _MODEL_SCAN_BYTES = 1 << 20
@@ -1831,11 +1831,37 @@ def wake_channel(provider):
     return wake_channel_for(provider)
 
 
+_UUID_SHAPE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def wake_target_problem(address):
+    """Why ``address`` cannot be woken by name, or ``None`` when it can.
+
+    SendMessage reaches a Claude Code session by its name; a UUID session id
+    fails with "No agent named ... is reachable" (real-machine run-101f5f86).
+    The id is never guessed into a target: without a registered name the push
+    wake-up is unavailable and the heartbeat has to stay short.
+    """
+    channel, _reason = wake_channel(address.get("provider"))
+    if channel != "SendMessage":
+        return None
+    target = address.get("wake_target")
+    if not (isinstance(target, str) and target.strip()):
+        target = address.get("session_id")
+    if not (isinstance(target, str) and target.strip()) or _UUID_SHAPE.match(target.strip()):
+        return "目标未登记会话名，唤醒不可用，心跳保持短间隔（登记时加 --wake-target <会话名>）"
+    return None
+
+
 def wake_instruction(address, run_id, node_id=None, role=None, generation=None):
     """Return how a worker wakes ``address``: channel, target and signal."""
     channel, reason = wake_channel(address.get("provider"))
     if channel is None:
         return {"channel": None, "reason": reason}
+    problem = wake_target_problem(address)
+    if problem:
+        return {"channel": None, "reason": problem}
     return {
         "channel": channel,
         "target": address.get("wake_target") or address.get("session_id"),
@@ -2142,6 +2168,12 @@ def heartbeat_interval(paths, run_id, *, decision_only):
         return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
                 "reason": "supervisor provider unknown: " + str(address.get("reason", "no provider")),
                 "provider": None}
+    target_problem = wake_target_problem(address["current"])
+    if target_problem:
+        # The long base assumes workers can wake this session; an unreachable
+        # registered target overrides verification and even a forced choice.
+        return {"minutes": HEARTBEAT_INTERVAL_DEFAULT_MINUTES, "mode": "default",
+                "reason": target_problem, "provider": provider}
     verified, reason = _push_wake_available(paths, provider)
     choices = authorization_choices(paths, run_id)
     chosen = choices.get("heartbeat_interval_minutes")
@@ -2341,7 +2373,7 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "接班会话写不了 .vibe/ 时（session_gate_blocked: host sandbox denied access）不要重试、不要反复申请审批，"
         "停下把目录报给用户：",
         "  1) 登记：vibe supervisor-register --run-id {} --provider <平台> "
-        "--session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>".format(run_id),
+        "--session-id <本会话 id> --wake-target <会话名，Claude Code 必填> --host <本机标识> --session-record <本会话记录路径>".format(run_id),
         "     " + SESSION_RECORD_HINT,
         "  2) 自建心跳，指令逐字用下面这段，只替换 <本会话记录路径>：",
         heartbeat_command(run_id, command_prefix=command_prefix),
