@@ -99,6 +99,17 @@ class UnreachableWakeTargetTests(ClaudeCodePushWakeTests):
         got = heartbeat_interval(self.paths, "run-1", decision_only=False)
         self.assertEqual(got["minutes"], HEARTBEAT_INTERVAL_PUSH_VERIFIED_MINUTES)
 
+    def test_printed_register_commands_carry_wake_target(self):
+        # register_first and the handoff steps print the command workers copy.
+        import re
+        from vibe_guide import supervisor
+        source = Path(supervisor.__file__).read_text(encoding="utf-8")
+        commands = re.findall(r"supervisor-register --run-id[^\n]*\n[^\n]*\n?[^\n]*", source)
+        printed = [c for c in commands if "<本会话 id>" in c]
+        self.assertEqual(len(printed), 2)
+        for command in printed:
+            self.assertIn("--wake-target", command)
+
     def test_register_cli_warns_without_session_name(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

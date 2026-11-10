@@ -708,8 +708,8 @@ def record_owner_gate(paths, run_id, session_record, *, command_prefix="vibe"):
     return {"state": "register_first", "reason": reason,
             "reason_code": REASON_RECORD_NOT_REGISTERED,
             "register_command": "{} supervisor-register --run-id {} --provider <平台> "
-                                "--session-id <本会话 id> --host <本机标识> "
-                                "--session-record <本会话记录路径>".format(command_prefix, run_id)}
+                                "--session-id <本会话 id> --wake-target <会话名，Claude Code 必填> "
+                                "--host <本机标识> --session-record <本会话记录路径>".format(command_prefix, run_id)}
 
 
 _MODEL_SCAN_BYTES = 1 << 20
@@ -2373,7 +2373,7 @@ def supervisor_handoff(paths, run_id, *, command_prefix="vibe"):
         "接班会话写不了 .vibe/ 时（session_gate_blocked: host sandbox denied access）不要重试、不要反复申请审批，"
         "停下把目录报给用户：",
         "  1) 登记：vibe supervisor-register --run-id {} --provider <平台> "
-        "--session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>".format(run_id),
+        "--session-id <本会话 id> --wake-target <会话名，Claude Code 必填> --host <本机标识> --session-record <本会话记录路径>".format(run_id),
         "     " + SESSION_RECORD_HINT,
         "  2) 自建心跳，指令逐字用下面这段，只替换 <本会话记录路径>：",
         heartbeat_command(run_id, command_prefix=command_prefix),
