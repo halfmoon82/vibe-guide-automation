@@ -120,7 +120,7 @@
         "B. 指定稳定版"
       ],
       "impact": "P2b 实测前必须关闭",
-      "recommendation": "待用户定",
+      "recommendation": "A",
       "status": "approved",
       "selected": "A。接受 alpha，记录精确版本；alpha 升级后重新验收并升版矩阵。",
       "field": "matrix.codex_channel"
@@ -132,7 +132,7 @@
         "B. 否，两者都要登记"
       ],
       "impact": "P2b 实测前必须关闭",
-      "recommendation": "待用户核实",
+      "recommendation": "只登记 WorkBuddy.app（com.tencent.workbuddy.mac，5.9.3）",
       "status": "approved",
       "selected": "只登记 WorkBuddy.app（com.tencent.workbuddy.mac，5.9.3）。WorkBuddy AI.app（com.workbuddy.workbuddy-ai，5.9.4）是另一个产品，标未验证。",
       "field": "matrix.workbuddy_apps"
@@ -144,10 +144,22 @@
         "B. 只借鉴机制，不复用受保护文本/脚本"
       ],
       "impact": "P2 轻监工动工前必须有结论",
-      "recommendation": "待核查",
+      "recommendation": "B",
       "status": "approved",
       "selected": "B。只借鉴机制，不复用受保护文本或脚本。许可为 Apache 2.0 加商业条件，且 AGENTS.md 禁止把 Skill 源码复制进项目。",
       "field": "p2.akasha_license"
+    },
+    {
+      "question": "5.2.8（issue #404 #405 #406）是否已合并？",
+      "options": [
+        "A. 已合并，v6-p0b-responsibility 可开工",
+        "B. 未合并，v6-p0b-responsibility 保持阻塞"
+      ],
+      "impact": "P0b 与 5.2.8 改同一批 supervisor 文件；DAG 不能表达外部前置，所以在此登记为开工门",
+      "recommendation": "B。#404 #405 #406 截至 2026-11-10 仍开放",
+      "status": "unresolved",
+      "selected": null,
+      "field": "p0b.prerequisite_528_merged"
     }
   ],
   "prd": {
@@ -194,7 +206,7 @@
       },
       {
         "value": "同事项、同证据、同副作用的重复执行为零；执行阶段 PRD 协议读取为零；误通过、丢事项、可见性暗降级为零。",
-        "source": "user_confirmed"
+        "source": "system_inferred"
       },
       {
         "value": "正常续接文本 P95≤2KiB，beat 常态≤4KiB。节省百分比待 P0a 基线后再定，不预先承诺。",
@@ -211,6 +223,10 @@
       {
         "value": "P0b 在 5.2.8 落地后的基线上做增量；Codex 接受 alpha 并记录精确版本；provider 为 Codex、Claude Code、WorkBuddy.app；Akasha 只借鉴机制。",
         "source": "user_confirmed"
+      },
+      {
+        "value": "5.2.8 合并前，v6-p0b-responsibility（#409）不得开工。授权卡生成时核对 #404 #405 #406 已关闭。",
+        "source": "needs_confirmation"
       }
     ],
     "non_goals": [
@@ -265,11 +281,13 @@
         "input": "已注册的监工会话与 Codex 会话日志；不改任何现场自动化。",
         "output": "扩展 supervisor_usage_audit：按节点汇总累计未缓存 input+output，含各 developer 代次与 reviewer，输出可复核基线报告；新增自动化用途校验：同线程心跳误配 cron 或缺目标线程时在创建前拒绝，创建后读回配置并与实际触发核对。基线用于重标节点成本上限（初始 2M）和 Ollama 提醒阈值。",
         "error_behavior": "缺 usage 记为 unknown，不填 0；计数器回退保持 unknown；校验无法确认类型或目标时拒绝创建而不是放行。",
-        "acceptance_example": "1) 累计值只取差，重复事件不重复计。2) 缺 usage 的会话在报告中为 unknown。3) 误配 cron 的心跳规格被拒绝，合法独立 cron 不受影响。4) 创建后读回配置与实际触发一致才算成功。"
+        "acceptance_example": "1) 累计值只取差，重复事件不重复计。2) 缺 usage 的会话在报告中为 unknown。3) 误配 cron 的心跳规格被拒绝，合法独立 cron 不受影响。4) 创建后读回配置与实际触发一致才算成功。 对应设计 A8。"
       },
       "files": [
         "scripts/supervisor_usage_audit.py",
-        "tests/test_supervisor_usage_audit.py"
+        "tests/test_supervisor_usage_audit.py",
+        "vibe_guide/authorization.py",
+        "tests/test_authorization.py"
       ]
     },
     {
@@ -287,7 +305,9 @@
       "files": [
         "vibe_guide/daemon.py",
         "vibe_guide/supervisor.py",
-        "vibe_guide/supervisor_wakeup.py"
+        "vibe_guide/supervisor_wakeup.py",
+        "tests/test_daemon_heal.py",
+        "tests/test_supervisor_wakeup.py"
       ]
     },
     {
@@ -307,8 +327,13 @@
       "files": [
         "vibe_guide/protocols/prd-guide.md",
         "vibe_guide/protocols/__init__.py",
-        "vibe_guide/initializer.py"
-      ]
+        "vibe_guide/initializer.py",
+        "vibe_guide/protocols/execution.md",
+        "tests/test_protocol_copy_refresh.py"
+      ],
+      "dependency_reasons": {
+        "v6-p0b-responsibility": "执行协议要描述 P0b 定稿后的监工责任闭环（blocked_unknown 的认领、查证、推进），所以要先有 P0b 的行为合同。"
+      }
     },
     {
       "id": "v6-p1b-context",
@@ -322,14 +347,19 @@
         "input": "当前权威状态、角色/节点、投递水位。",
         "output": "新增薄模块 context_projection.py，输出规范材料、来源和预算信息；续接只发差异；返工包与持久问题账；丢水位时补齐最小合同。",
         "error_behavior": "投影失败回退为更完整的相关材料，禁止回退为空结果或已通过。",
-        "acceptance_example": "对应设计 A6、A7：三次返工加一条新决策，只上送相关新增内容；超大日志和中文不产生截断 JSON。"
+        "acceptance_example": "对应设计 A6、A7：三次返工加一条新决策，只上送相关新增内容；超大日志和中文不产生截断 JSON。 唤醒前本地过滤与上下文剪枝（设计 §7.1、§7.2）归本节点，对应 PRD B04–B06。"
       },
       "files": [
         "vibe_guide/context_projection.py",
         "vibe_guide/worker_questions.py",
         "vibe_guide/supervisor_output.py",
-        "vibe_guide/runners/provider_action.py"
-      ]
+        "vibe_guide/runners/provider_action.py",
+        "tests/test_context_projection.py",
+        "tests/test_worker_questions.py"
+      ],
+      "dependency_reasons": {
+        "v6-p1a-protocol": "上下文投影按 P1a 产出的版本化角色合同决定每个角色保留和展开什么，没有合同就无法定投影规则。"
+      }
     },
     {
       "id": "v6-p1c-rework-relay",
@@ -340,18 +370,23 @@
       "integration_after": [],
       "parallel_group": "wave4",
       "contract": {
-        "input": "某节点 developer 的实质返工；稳定的返工合同或动作 ID；复审结论；授权卡中的节点总成本上限。",
+        "input": "某节点 developer 的实质返工；稳定的返工合同或动作 ID；复审结论；授权卡中的节点总成本上限。 节点总成本上限是对 PRD §7.3 的新增承诺（PRD 原文只说遵守已授权总成本），授权卡须能写入并校验该上限；回写 PRD 时同步。",
         "output": "每个 developer 最多 3 轮实质返工，初次实现不计，复审确认后才计一轮；重启、压缩、重复消息既不重复计数也不归零。上游缺材料、环境或权限故障、纯格式更正、监工自身问题不计轮。第 3 轮复审仍失败时不发第 4 轮，直接接力：确认旧 writer 已停并释放写租约，冻结 HEAD 和未提交差异，生成接力包，在原节点血缘下登记新 developer 并移交写权，原 reviewer 保留。新 worker 轮次重新起算，节点累计返工、接力次数、失败方案和总成本继续累计。",
         "error_behavior": "旧任务终止证据未知时接力事项保持待服务，受影响写动作暂停，无关节点照常；累计成本触及上限时先做全局诊断，仍需继续则向用户申请提高预算；旧 worker 迟到结果只留证，不覆盖新代次状态。",
-        "acceptance_example": "1) 同一 finding 换 ID 重新提出，仍累计到同一节点的轮次。2) 第 3 轮复审通过：正常验收，不换人。3) 第 3 轮复审失败：不发第 4 轮，新 developer 接写权，且全程只有一个 writer。4) 返工进行中重启：不重复计数、不归零。5) 累计成本到上限：不再自动接力，转全局诊断。对应设计 A6。"
+        "acceptance_example": "1) 同一 finding 换 ID 重新提出，仍累计到同一节点的轮次。2) 第 3 轮复审通过：正常验收，不换人。3) 第 3 轮复审失败：不发第 4 轮，新 developer 接写权，且全程只有一个 writer。4) 返工进行中重启：不重复计数、不归零。5) 累计成本到上限：不再自动接力，转全局诊断。对应设计 A6。 同时对应 PRD B07–B11。"
       },
       "files": [
         "vibe_guide/monitor.py",
         "vibe_guide/supervisor.py",
         "vibe_guide/handoff_rebind.py",
         "vibe_guide/orphan_recovery.py",
-        "tests/test_monitor.py"
-      ]
+        "tests/test_monitor.py",
+        "vibe_guide/authorization.py",
+        "tests/test_authorization.py"
+      ],
+      "dependency_reasons": {
+        "v6-p1b-context": "接力包由上下文投影生成，返工包与持久问题账也在 P1b 定义，接力要消费它们。"
+      }
     },
     {
       "id": "v6-p2-entry-lean",
@@ -365,13 +400,19 @@
         "input": "新目标或实质范围变化。Akasha 只借鉴机制，不复用其文本或脚本。",
         "output": "入口改为难度画像加编排收益决策树，可靠绑定的继续、返工、心跳、接班走快路径不重评分；新增轻监工档；数值阈值经历史回放后冻结。",
         "error_behavior": "评分与规模矛盾时给档位理由而不是硬映射；许可未确认时只借鉴机制。",
-        "acceptance_example": "对应设计 A9：高分单节点和长串行不被强拆，继续消息不重规划。"
+        "acceptance_example": "对应设计 A9：高分单节点和长串行不被强拆，继续消息不重规划。 路由历史回放对应 PRD B12–B14，风险和授权遗漏为单独否决项。"
       },
       "files": [
         "vibe_guide/planner.py",
         "vibe_guide/session_entry.py",
-        "vibe_guide/protocols/vibe-entry.md"
-      ]
+        "vibe_guide/protocols/vibe-entry.md",
+        "vibe_guide/protocols/lean-supervisor.md",
+        "tests/test_planner.py",
+        "tests/test_vibe_entry_protocol.py"
+      ],
+      "dependency_reasons": {
+        "v6-p1b-context": "轻监工要复用 P1b 的薄上下文与续接差异，否则轻档仍会重放全量历史。"
+      }
     },
     {
       "id": "v6-p2a-ollama",
@@ -384,13 +425,19 @@
       "contract": {
         "input": "冻结矩阵 E1；用户授权；模型档案（影子评测后另批）。",
         "output": "installation.py 接入真实探针；首装和升级走发现→授权→安装或接入→模型准备→真实推理自检；降级继续并附状态常驻、数据驱动提醒、按原因区分三条约束；wheel/sdist/源码进入同一初始化合同。",
-        "error_behavior": "HTTP 200 或 /api/tags 有响应不算就绪；端点指向远端时不发送项目资料；拒绝、离线、资源不足记录原因和恢复位置。",
-        "acceptance_example": "对应 PRD B15–B20：干净首装、已有 Ollama、旧版升级、中断、云端端点、三种包安装各有真实证据。"
+        "error_behavior": "HTTP 200 或 /api/tags 有响应不算就绪；端点指向远端时不发送项目资料；拒绝、离线、资源不足记录原因和恢复位置。离线或下载中断后，下次联网只提示用户一键继续，沿用首次授权范围，不静默下载。",
+        "acceptance_example": "对应 PRD B15–B20：干净首装、已有 Ollama、旧版升级、中断、云端端点、三种包安装各有真实证据。 运行时回退与缓存失效对应 PRD B01–B04。"
       },
       "files": [
         "vibe_guide/installation.py",
-        "vibe_guide/cli.py"
-      ]
+        "vibe_guide/cli.py",
+        "vibe_guide/local_model.py",
+        "tests/test_installation.py",
+        "tests/test_local_model.py"
+      ],
+      "dependency_reasons": {
+        "v6-p1b-context": "Ollama 只压缩 P1b 投影后的长非结构化增量，要先有投影边界和保护字段清单。"
+      }
     },
     {
       "id": "v6-p2b-wiring",
@@ -401,7 +448,7 @@
       "integration_after": [],
       "parallel_group": "wave5",
       "contract": {
-        "input": "冻结矩阵的三个 provider；关闭 Codex alpha 与 WorkBuddy 双 App 两个确认项。",
+        "input": "冻结矩阵的三个 provider（Codex、Claude Code、WorkBuddy.app）；Codex alpha 与 WorkBuddy 双 App 两项已于 2026-11-09 关闭。",
         "output": "逐 provider 探测公开请求前 hook 或规则导入，覆盖新会话首轮、后续新需求、恢复、委派；doctor 分开报告协议存在、规则采纳、hook 注册、真实触发、动作覆盖五级。",
         "error_behavior": "无公开 hook 时标规则引导或未验证，不伪绿，不用私有 API。",
         "acceptance_example": "对应 PRD B21–B24：仅 session-start 或仅生成规则文件不算通过；统计真实首轮与后续 input。"
@@ -410,13 +457,20 @@
         "vibe_guide/doctor.py",
         "vibe_guide/scanner.py",
         "vibe_guide/host_rules.py",
-        "vibe_guide/host_detect.py"
-      ]
+        "vibe_guide/host_detect.py",
+        "tests/test_scanner.py",
+        "tests/test_host_detect.py",
+        "tests/test_host_rules.py"
+      ],
+      "dependency_reasons": {
+        "v6-p2-entry-lean": "入口接线要接入 P2 定稿的路由方法和生命周期快路径。PRD §10 第 5 条原写先接线再比较路由，这里有意调整：先有路由内核，才有可验收的接线对象；真实宿主触发矩阵仍在本节点实测，可降级不可事后挑选。"
+      }
     },
     {
       "id": "v6-p3-migration",
       "title": "迁移与实测收口（P3）",
       "depends_on": [
+        "v6-p0a-baseline",
         "v6-p1c-rework-relay",
         "v6-p2a-ollama",
         "v6-p2b-wiring"
@@ -431,8 +485,15 @@
       },
       "files": [
         "README.md",
-        "tests/"
-      ]
+        "tests/test_v6_migration.py",
+        "tests/fixtures/v6_upgrade/"
+      ],
+      "dependency_reasons": {
+        "v6-p0a-baseline": "收口实测要用 P0a 的用量基线做前后对照，并重标节点成本上限和提醒阈值。",
+        "v6-p1c-rework-relay": "迁移与回滚夹具要覆盖有界返工与接力的状态。",
+        "v6-p2a-ollama": "首装和升级实测要用 P2a 的初始化流程。",
+        "v6-p2b-wiring": "入口触发实测要用 P2b 的接线。"
+      }
     }
   ]
 }
