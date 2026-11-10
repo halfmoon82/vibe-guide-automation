@@ -2499,8 +2499,8 @@ def _first_shift_handoff(
     return (
         "首班监工还有两件事没做，做完才算开工：\n"
         "  1) 登记地址：vibe supervisor-register --run-id {} "
-        "--provider <平台> --session-id <本会话 id> --host <本机标识> "
-        "--session-record <本会话记录路径>\n"
+        "--provider <平台> --session-id <本会话 id> --wake-target <会话名，Claude Code 必填> "
+        "--host <本机标识> --session-record <本会话记录路径>\n"
         "     {}\n"
         "  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n"
         "     {}\n"

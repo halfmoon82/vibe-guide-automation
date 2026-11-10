@@ -102,11 +102,13 @@ class UnreachableWakeTargetTests(ClaudeCodePushWakeTests):
     def test_printed_register_commands_carry_wake_target(self):
         # register_first and the handoff steps print the command workers copy.
         import re
-        from vibe_guide import supervisor
-        source = Path(supervisor.__file__).read_text(encoding="utf-8")
-        commands = re.findall(r"supervisor-register --run-id[^\n]*\n[^\n]*\n?[^\n]*", source)
-        printed = [c for c in commands if "<本会话 id>" in c]
-        self.assertEqual(len(printed), 2)
+        from vibe_guide import cli, supervisor
+        printed = []
+        for module in (supervisor, cli):
+            source = Path(module.__file__).read_text(encoding="utf-8")
+            commands = re.findall(r"supervisor-register --run-id[^\n]*\n[^\n]*\n?[^\n]*", source)
+            printed += [c for c in commands if "<本会话 id>" in c]
+        self.assertEqual(len(printed), 3)
         for command in printed:
             self.assertIn("--wake-target", command)
 
