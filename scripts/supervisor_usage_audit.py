@@ -154,6 +154,9 @@ def build_report(registry, roots, node_map=None):
     for entry in registrations:
         if entry.get('session_id'):
             selected.setdefault(entry['session_id'], dict(entry))
+    for session_id in mapped:
+        # Mapped session absent from the registry: still counted; no log -> unknown.
+        selected.setdefault(session_id, {'session_id': session_id})
     for session_id, entry in selected.items():
         for key, value in (mapped.get(session_id) or {}).items():
             if key in ('node_id', 'role', 'generation') and entry.get(key) is None:
