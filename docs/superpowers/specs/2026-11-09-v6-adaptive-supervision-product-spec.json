@@ -331,7 +331,7 @@
         "input": "当前权威状态、角色/节点、投递水位。",
         "output": "新增薄模块 context_projection.py，输出规范材料、来源和预算信息；续接只发差异；返工包与持久问题账；丢水位时补齐最小合同。",
         "error_behavior": "投影失败回退为更完整的相关材料，禁止回退为空结果或已通过。",
-        "acceptance_example": "对应设计 A6、A7：三次返工加一条新决策，只上送相关新增内容；超大日志和中文不产生截断 JSON。 唤醒前本地过滤与上下文剪枝（设计 §7.1、§7.2）归本节点，对应 PRD B04–B06。"
+        "acceptance_example": "对应设计 A6、A7：三次返工加一条新决策，只上送相关新增内容；超大日志和中文不产生截断 JSON。 唤醒前本地过滤与上下文剪枝（设计 §7.1、§7.2）归本节点，对应 PRD B04–B06。 补充（B05–B06）：worker 内部反复查失败工具或长测试时，公开支持则用有界本地等待并只上报终态，不支持时限制与实际成本可见；一次规划到执行加一次原生压缩或接班后，批准边界、写权、在途动作完整，且以真实后续请求输入下降为准，只有摘要变小不算有效。"
       },
       "files": [
         "vibe_guide/context_projection.py",
@@ -359,7 +359,7 @@
         "input": "某节点 developer 的实质返工；稳定的返工合同或动作 ID；复审结论；授权卡中的节点总成本上限。 节点总成本上限是对 PRD §7.3 的新增承诺（PRD 原文只说遵守已授权总成本），授权卡须能写入并校验该上限；回写 PRD 时同步。",
         "output": "每个 developer 最多 3 轮实质返工，初次实现不计，复审确认后才计一轮；重启、压缩、重复消息既不重复计数也不归零。上游缺材料、环境或权限故障、纯格式更正、监工自身问题不计轮。第 3 轮复审仍失败时不发第 4 轮，直接接力：确认旧 writer 已停并释放写租约，冻结 HEAD 和未提交差异，生成接力包，在原节点血缘下登记新 developer 并移交写权，原 reviewer 保留。新 worker 轮次重新起算，节点累计返工、接力次数、失败方案和总成本继续累计。",
         "error_behavior": "旧任务终止证据未知时接力事项保持待服务，受影响写动作暂停，无关节点照常；累计成本触及上限时先做全局诊断，仍需继续则向用户申请提高预算；旧 worker 迟到结果只留证，不覆盖新代次状态。",
-        "acceptance_example": "1) 同一 finding 换 ID 重新提出，仍累计到同一节点的轮次。2) 第 3 轮复审通过：正常验收，不换人。3) 第 3 轮复审失败：不发第 4 轮，新 developer 接写权，且全程只有一个 writer。4) 返工进行中重启：不重复计数、不归零。5) 累计成本到上限：不再自动接力，转全局诊断。对应设计 A6。 同时对应 PRD B07–B11。"
+        "acceptance_example": "1) 同一 finding 换 ID 重新提出，仍累计到同一节点的轮次。2) 第 3 轮复审通过：正常验收，不换人。3) 第 3 轮复审失败：不发第 4 轮，新 developer 接写权，且全程只有一个 writer。4) 返工进行中重启：不重复计数、不归零。5) 累计成本到上限：不再自动接力，转全局诊断。对应设计 A6。 同时对应 PRD B07–B11。 补充（B09–B11）：6) 上游缺材料、scope 许可未落地、运输超时、仅格式重报：不计实现返工，仍有责任人和下一步。7) 到限但旧 worker 停止状态未知：不产生第二 writer，接力事项保持待服务并继续查证，迟到回报不覆盖新代次。8) 接力后继续返工：新 worker 局部计数与节点累计链同时存在，原 reviewer 继续复审，不换人求通过。"
       },
       "files": [
         "vibe_guide/monitor.py",
@@ -387,7 +387,7 @@
         "input": "新目标或实质范围变化。Akasha 只借鉴机制，不复用其文本或脚本。",
         "output": "入口改为难度画像加编排收益决策树，可靠绑定的继续、返工、心跳、接班走快路径不重评分；新增轻监工档；数值阈值经历史回放后冻结。",
         "error_behavior": "评分与规模矛盾时给档位理由而不是硬映射；许可未确认时只借鉴机制。",
-        "acceptance_example": "对应设计 A9：高分单节点和长串行不被强拆，继续消息不重规划。 路由历史回放对应 PRD B12–B14，风险和授权遗漏为单独否决项。"
+        "acceptance_example": "对应设计 A9：高分单节点和长串行不被强拆，继续消息不重规划。 路由历史回放对应 PRD B12–B13，风险和授权遗漏为单独否决项。 回放夹具放 tests/fixtures/v6_routing_replay/，历史样本与合成边界分开报告。"
       },
       "files": [
         "vibe_guide/planner.py",
@@ -395,7 +395,8 @@
         "vibe_guide/protocols/vibe-entry.md",
         "vibe_guide/protocols/lean-supervisor.md",
         "tests/test_planner.py",
-        "tests/test_vibe_entry_protocol.py"
+        "tests/test_vibe_entry_protocol.py",
+        "tests/fixtures/v6_routing_replay/"
       ],
       "dependency_reasons": {
         "v6-p1b-context": "轻监工要复用 P1b 的薄上下文与续接差异，否则轻档仍会重放全量历史。"
@@ -413,7 +414,7 @@
         "input": "冻结矩阵 E1；用户授权；模型档案（影子评测后另批）。",
         "output": "installation.py 接入真实探针；首装和升级走发现→授权→安装或接入→模型准备→真实推理自检；降级继续并附状态常驻、数据驱动提醒、按原因区分三条约束；wheel/sdist/源码进入同一初始化合同。",
         "error_behavior": "HTTP 200 或 /api/tags 有响应不算就绪；端点指向远端时不发送项目资料；拒绝、离线、资源不足记录原因和恢复位置。离线或下载中断后，下次联网只提示用户一键继续，沿用首次授权范围，不静默下载。",
-        "acceptance_example": "对应 PRD B15–B20：干净首装、已有 Ollama、旧版升级、中断、云端端点、三种包安装各有真实证据。 运行时回退与缓存失效对应 PRD B01–B04。"
+        "acceptance_example": "对应 PRD B15–B20：干净首装、已有 Ollama、旧版升级、中断、云端端点、三种包安装各有真实证据。 运行时回退与缓存失效对应 PRD B01–B03（B04 归 v6-p1b-context）。 B01–B03 四种运行时故障断言：超时、错误 JSON、无来源、服务繁忙都回退确定性材料，不得出现“无事/已通过”伪结果；摘要缓存在新增反证或授权版本变化时失效；日志中的指令文本不能改变权限。"
       },
       "files": [
         "vibe_guide/installation.py",
@@ -438,7 +439,7 @@
         "input": "冻结矩阵的三个 provider（Codex、Claude Code、WorkBuddy.app）；Codex alpha 与 WorkBuddy 双 App 两项已于 2026-11-09 关闭。",
         "output": "逐 provider 探测公开请求前 hook 或规则导入，覆盖新会话首轮、后续新需求、恢复、委派；doctor 分开报告协议存在、规则采纳、hook 注册、真实触发、动作覆盖五级。",
         "error_behavior": "无公开 hook 时标规则引导或未验证，不伪绿，不用私有 API。",
-        "acceptance_example": "对应 PRD B21–B24：仅 session-start 或仅生成规则文件不算通过；统计真实首轮与后续 input。"
+        "acceptance_example": "对应 PRD B21–B24：仅 session-start 或仅生成规则文件不算通过；统计真实首轮与后续 input。 B14：宿主不支持压缩、定向唤醒或可见接班时，用已验证能力加最小安全回退；UNKNOWN 不转为不存在或成功；不偷换成后台模式，不绕过宿主权限。"
       },
       "files": [
         "vibe_guide/doctor.py",
