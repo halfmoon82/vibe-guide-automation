@@ -148,18 +148,6 @@
       "status": "approved",
       "selected": "B。只借鉴机制，不复用受保护文本或脚本。许可为 Apache 2.0 加商业条件，且 AGENTS.md 禁止把 Skill 源码复制进项目。",
       "field": "p2.akasha_license"
-    },
-    {
-      "question": "5.2.8（issue #404 #405 #406）是否已合并？",
-      "options": [
-        "A. 已合并，v6-p0b-responsibility 可开工",
-        "B. 未合并，v6-p0b-responsibility 保持阻塞"
-      ],
-      "impact": "P0b 与 5.2.8 改同一批 supervisor 文件；DAG 不能表达外部前置，所以在此登记为开工门",
-      "recommendation": "B。#404 #405 #406 截至 2026-11-10 仍开放",
-      "status": "unresolved",
-      "selected": null,
-      "field": "p0b.prerequisite_528_merged"
     }
   ],
   "prd": {
@@ -223,10 +211,6 @@
       {
         "value": "P0b 在 5.2.8 落地后的基线上做增量；Codex 接受 alpha 并记录精确版本；provider 为 Codex、Claude Code、WorkBuddy.app；Akasha 只借鉴机制。",
         "source": "user_confirmed"
-      },
-      {
-        "value": "5.2.8 合并前，v6-p0b-responsibility（#409）不得开工。授权卡生成时核对 #404 #405 #406 已关闭。",
-        "source": "needs_confirmation"
       }
     ],
     "non_goals": [
@@ -297,7 +281,7 @@
       "integration_after": [],
       "parallel_group": "wave1",
       "contract": {
-        "input": "监工收到 blocked_unknown。5.2.8 的 F1–F6 已落地（issue #404 #405 #406 关闭）后，在其基线上做 V6 增量。",
+        "input": "监工收到 blocked_unknown。开工前提：5.2.8 已合并（issue #404 #405 #406 关闭）；这是外部事实，不是产品取舍，授权卡生成时核对，计划本身不因此停在待确认。在其基线上做 V6 增量。",
         "output": "blocked_unknown 在下一个有效服务回合被认领和查证，要么原范围修复并核验，要么有具体等待或真实边界；同因失败必须切换策略；不因宽限期结束而无人退出。",
         "error_behavior": "取证失败保持待服务并继续告警，不得当作已解决。",
         "acceptance_example": "对应设计 A1–A4、A10、A11，含故障、重放和租约测试。"
@@ -355,7 +339,8 @@
         "vibe_guide/supervisor_output.py",
         "vibe_guide/runners/provider_action.py",
         "tests/test_context_projection.py",
-        "tests/test_worker_questions.py"
+        "tests/test_worker_questions.py",
+        "vibe_guide/supervisor_wakeup.py"
       ],
       "dependency_reasons": {
         "v6-p1a-protocol": "上下文投影按 P1a 产出的版本化角色合同决定每个角色保留和展开什么，没有合同就无法定投影规则。"
@@ -365,7 +350,8 @@
       "id": "v6-p1c-rework-relay",
       "title": "有界返工与自动新 worker 接力（P1c）",
       "depends_on": [
-        "v6-p1b-context"
+        "v6-p1b-context",
+        "v6-p0a-baseline"
       ],
       "integration_after": [],
       "parallel_group": "wave4",
@@ -385,7 +371,8 @@
         "tests/test_authorization.py"
       ],
       "dependency_reasons": {
-        "v6-p1b-context": "接力包由上下文投影生成，返工包与持久问题账也在 P1b 定义，接力要消费它们。"
+        "v6-p1b-context": "接力包由上下文投影生成，返工包与持久问题账也在 P1b 定义，接力要消费它们。",
+        "v6-p0a-baseline": "两者都改 vibe_guide/authorization.py 和 tests/test_authorization.py，必须串行；成本上限字段要在 P0a 加的授权卡校验之上扩展，并用 P0a 的基线重标 2M 初始值。"
       }
     },
     {
