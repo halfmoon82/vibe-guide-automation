@@ -3684,6 +3684,12 @@ class Monitor:
             trigger,
             queue_rework=True,
         )
+        if resolution.reason:
+            # The supervisor's defect text (already length/control-checked,
+            # <=200 chars) must reach the rework developer: this path has no
+            # reviewer delivery for the prompt to read.  Scrubbed like any
+            # persisted error text; spent once the rework is dispatched.
+            current["patch_rework_note"] = bounded_error_text(resolution.reason)
         self._refresh_run_status(snapshot)
         self._save_snapshot(snapshot)
         return snapshot
@@ -6069,6 +6075,7 @@ class Monitor:
             current["waiting_for_rework"] = False
         if started and role == "developer" and phase == "rework":
             current.pop("integration_finding_ref", None)
+            current.pop("patch_rework_note", None)
         return started
 
     def _start_task_dispatch(
@@ -6219,6 +6226,9 @@ class Monitor:
             # The integration reviewer's finding that sent this node back;
             # the rework prompt reads it from the reviewer's archived report.
             contract["integration_finding_ref"] = dict(finding_ref)
+        patch_note = current.get("patch_rework_note")
+        if role == "developer" and phase == "rework" and isinstance(patch_note, str) and patch_note:
+            contract["patch_rework_note"] = patch_note
         if topology == TOPOLOGY_VISIBLE_SDD:
             contract["sdd_protocol"] = VISIBLE_SDD_PROTOCOL_REF
         elif topology == TOPOLOGY_BACKGROUND:
