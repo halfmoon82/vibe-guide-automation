@@ -2538,8 +2538,19 @@ PURPOSE_INDEPENDENT_CRON = "independent_cron"
 _PURPOSE_KIND = {PURPOSE_SAME_THREAD_HEARTBEAT: "heartbeat", PURPOSE_INDEPENDENT_CRON: "cron"}
 
 
-def validate_automation_spec(spec: Any) -> Tuple[bool, str]:
+def _project_id(target: Any) -> Optional[str]:
+    """Project id of a ``{type: project, project_id: ...}`` target, else None."""
+    if not isinstance(target, dict) or target.get("type") != "project":
+        return None
+    pid = target.get("project_id")
+    return pid.strip() if isinstance(pid, str) and pid.strip() else None
+
+
+def validate_automation_spec(spec: Any, require_purpose: bool = False) -> Tuple[bool, str]:
     """Return (ok, reason). Called before creating an automation.
+
+    ``require_purpose`` rejects a spec that does not declare its purpose, so the
+    kind/purpose mismatch check cannot be skipped by omission.
 
     ``purpose`` (same_thread_heartbeat | independent_cron) states what the
     caller means to build; a kind that cannot serve it is rejected.  Without a
@@ -2552,6 +2563,8 @@ def validate_automation_spec(spec: Any) -> Tuple[bool, str]:
     if kind not in ("heartbeat", "cron"):
         return False, "cannot confirm automation kind: %r" % (kind,)
     purpose = spec.get("purpose")
+    if purpose is None and require_purpose:
+        return False, "automation purpose is required (same_thread_heartbeat | independent_cron)"
     if purpose is not None:
         if purpose not in _PURPOSE_KIND:
             return False, "cannot confirm automation purpose: %r" % (purpose,)
@@ -2573,13 +2586,16 @@ def validate_automation_spec(spec: Any) -> Tuple[bool, str]:
         return False, "cron automation has no schedule"
     if spec.get("target_thread_id"):
         return False, "cron automation must not target an existing thread"
+    if _project_id(spec.get("target")) is None:
+        return False, "cron automation needs target {type: project, project_id}"
     return True, "ok"
 
 
-def verify_automation_readback(spec: Any, readback: Any, fired: Any) -> Tuple[bool, str]:
+def verify_automation_readback(spec: Any, readback: Any, fired: Any,
+                               require_purpose: bool = False) -> Tuple[bool, str]:
     """After creation: the stored config must equal the requested one and the
     observed trigger (fired) must match the stored kind and target."""
-    ok, reason = validate_automation_spec(spec)
+    ok, reason = validate_automation_spec(spec, require_purpose)
     if not ok:
         return False, reason
     if not isinstance(readback, dict) or not isinstance(fired, dict):
@@ -2592,4 +2608,6 @@ def verify_automation_readback(spec: Any, readback: Any, fired: Any) -> Tuple[bo
         return False, "actual trigger kind differs"
     if spec["kind"] == "heartbeat" and fired.get("thread_id") != spec["target_thread_id"]:
         return False, "actual trigger thread differs"
+    if spec["kind"] == "cron" and fired.get("project_id") != _project_id(spec.get("target")):
+        return False, "actual trigger project differs"
     return True, "ok"

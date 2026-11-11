@@ -7,8 +7,11 @@ reset cannot be distinguished from inherited/replayed history without evidence.
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import contextlib
 import json
 from pathlib import Path
+import shutil
+import subprocess
 
 
 FIELDS = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
@@ -40,15 +43,52 @@ def _window(points, start, duration=600):
     return result
 
 
+@contextlib.contextmanager
+def _open_log(path):
+    """Binary line stream of a log; .zst is decompressed via the zstd CLI
+    (no Python dependency). Missing zstd or a failed decode raises OSError so the
+    caller records unknown instead of a partial total."""
+    if path.suffix != '.zst':
+        with path.open('rb') as stream:
+            yield stream
+        return
+    exe = shutil.which('zstd')
+    if exe is None:
+        raise OSError('zstd CLI not found; cannot read ' + path.name)
+    proc = subprocess.Popen([exe, '-dc', '--', str(path)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        yield proc.stdout
+    finally:
+        proc.stdout.close()
+        if proc.wait() != 0:
+            raise OSError('zstd failed to decode ' + path.name)
+
+
+def _unreadable(path, session_id, reason):
+    return dict.fromkeys(FIELDS, 0, ) | dict(
+        session_id=session_id, status='unknown_unreadable_log', reason=reason, usage_events=0,
+        unique_usage_events=0, duplicate_usage_events=0, counter_regressions=0, malformed_lines=0,
+        invalid_records=0, source={'path': str(path.resolve())}, native_action_coverage='not_measured')
+
+
 def read_usage(path, registered_at=None):
     path = Path(path)
+    try:
+        return _read_usage(path, registered_at)
+    except OSError as error:
+        # session id of a compressed log is unknown without reading it; the
+        # filename carries the full id, which build_report matches on.
+        return _unreadable(path, None, str(error))
+
+
+def _read_usage(path, registered_at=None):
     digest = hashlib.sha256()
     events = duplicates = regressions = malformed = invalid = 0
     previous = None
     session_id = None
     points = []
     first_stamp = last_stamp = None
-    with path.open('rb') as stream:
+    with _open_log(path) as stream:
         for raw in stream:
             digest.update(raw)
             try:
@@ -169,8 +209,12 @@ def build_report(registry, roots, node_map=None):
         for root in roots:
             # Full id plus metadata prevents a similarly named child from
             # entering the supervisor ledger. Archived logs count as sources.
-            candidates.update(Path(root).rglob('*' + session_id + '*.jsonl'))
+            for pattern in ('*.jsonl', '*.jsonl.zst'):
+                candidates.update(Path(root).rglob('*' + session_id + pattern[1:]))
         matches = [read_usage(path, entry.get('registered_at')) for path in sorted(candidates)]
+        for record, path in zip(matches, sorted(candidates)):
+            if record['status'] == 'unknown_unreadable_log' and session_id in path.name:
+                record['session_id'] = session_id  # name carries the full id; usage stays unknown
         matches = [record for record in matches if record['session_id'] == session_id]
         if not matches:
             missing.append(session_id)
