@@ -421,23 +421,41 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
         """A merged PR that provably delivered *these* node branches.
 
         Equal trees alone cannot tell this delivery from an unrelated older
-        PR on the same source branch, so a candidate is accepted only when
-        every accepted node branch tip is an ancestor of the PR head and the
-        merge commit is on the target.  No node branches means nothing can be
-        proven, so nothing is reused.
+        PR on the same source branch.  A candidate is accepted only when
+        - at least one node branch tip is NOT yet in ``origin/<target>``
+          (a squash merge leaves the tip outside; a tip already in the
+          target's history proves nothing about which PR delivered it),
+        - every node branch tip is an ancestor of the PR head, and
+        - the PR merge commit is on the target.
+        Transient gh/git failures raise a retryable error instead of
+        reading as "no such PR".
         """
-        repo, timeout = self._repo, self._timeout
+        repo, timeout, target = self._repo, self._timeout, self._target
+        limit = 100
         if not branches:
             return {}
-        try:
-            entries = json.loads(_run_gh(
-                repo,
-                ["pr", "list", "--base", self._target, "--head", source, "--state", "merged",
-                 "--limit", "100", "--json", "url,number,headRefOid,mergeCommit"],
-                timeout=timeout) or "[]")
-        except (RemoteDeliveryFailed, ValueError):
+        remote_target = "origin/" + target
+
+        def contained(ancestor: str, descendant: str) -> bool:
+            try:
+                _run_git(repo, ["merge-base", "--is-ancestor", ancestor, descendant], timeout=timeout)
+                return True
+            except RemoteDeliveryFailed:
+                return False
+
+        if all(contained(branch, remote_target) for branch in branches):
             return {}
-        for entry in entries if isinstance(entries, list) else []:
+        raw = _run_gh(
+            repo,
+            ["pr", "list", "--base", target, "--head", source, "--state", "merged",
+             "--limit", str(limit), "--json", "url,number,headRefOid,mergeCommit"],
+            timeout=timeout)
+        try:
+            entries = json.loads(raw or "[]")
+        except ValueError as error:
+            raise RemoteDeliveryFailed("prepare", "merged PR list is unreadable", retryable=True) from error
+        entries = entries if isinstance(entries, list) else []
+        for entry in entries:
             if not isinstance(entry, Mapping):
                 continue
             oid = str((entry.get("mergeCommit") or {}).get("oid") or "")
@@ -445,16 +463,15 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             number = int(entry.get("number") or 0)
             if not (_SHA_RE.match(oid) and _SHA_RE.match(head) and number > 0):
                 continue
-            try:
-                _run_git(repo, ["fetch", "origin", "refs/pull/{}/head".format(number)], timeout=timeout)
-                for branch in branches:
-                    _run_git(repo, ["merge-base", "--is-ancestor", branch, head], timeout=timeout)
-                _run_git(repo, ["merge-base", "--is-ancestor", oid, "origin/" + self._target],
-                         timeout=timeout)
-            except RemoteDeliveryFailed:
-                continue
-            return {"pr_url": str(entry.get("url") or ""), "pr_number": number,
-                    "pr_head_sha": head, "merge_commit": oid}
+            # A failed fetch is a transient fault, not evidence against the PR.
+            _run_git(repo, ["fetch", "origin", "refs/pull/{}/head".format(number)], timeout=timeout)
+            if all(contained(branch, head) for branch in branches) and contained(oid, remote_target):
+                return {"pr_url": str(entry.get("url") or ""), "pr_number": number,
+                        "pr_head_sha": head, "merge_commit": oid}
+        if len(entries) >= limit:
+            raise RemoteDeliveryFailed(
+                "prepare", "merged PR list reached the {} entry limit; cannot prove delivery".format(limit),
+                retryable=False)
         return {}
 
     def _push(self, context: Mapping[str, Any]) -> Dict[str, Any]:
@@ -789,6 +806,7 @@ def _write_delivery_report(paths: Any, snapshot: Any, evidence: Mapping[str, Any
             "review_basis_text": {
                 "integration_review_evidence": "merged on integration review evidence (no GitHub review required)",
                 "github_review": "waited for and merged after a GitHub review",
+                "already_delivered": "content already merged by an earlier PR that provably carried these node branches",
                 "waiting_for_github_review": "waiting for GitHub review",
             }.get(str(evidence.get("review_basis") or ""), ""),
             "remote_verification": evidence.get("remote_verification"),
