@@ -28,6 +28,8 @@ from .authorization import (
     has_stamped_dispatch_topology,
     ruled_dispatch_topology,
     stamp_dispatch_topology,
+    validate_automation_spec,
+    verify_automation_readback,
     node_adapter_id,
     rebind_dispatch_contract,
     REMOTE_GIT_ENFORCEMENT,
@@ -336,7 +338,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon', 'run-restore'),
+        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon', 'run-restore', 'automation-check'),
     )
     parser.add_argument("daemon_action", nargs="?", choices=("start", "status", "stop", "run", "register-pm", "inbox"))
     parser.add_argument("--peek", action="store_true", help="daemon inbox: 只看不推进游标")
@@ -384,6 +386,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--accept-decision", action="store_true", dest="accept_decision")
     parser.add_argument("--provider", dest="supervisor_provider")
     parser.add_argument("--session-id", dest="session_id")
+    parser.add_argument("--spec", dest="automation_spec",
+                        help="automation-check: 自动化规格 JSON（kind=heartbeat|cron、target_thread_id、cron/rrule）")
+    parser.add_argument("--readback", dest="automation_readback",
+                        help="automation-check: 创建后读回的配置 JSON；与 --fired 同时给才做创建后核对")
+    parser.add_argument("--fired", dest="automation_fired",
+                        help="automation-check: 首次实际触发的证据 JSON（kind、thread_id）")
     parser.add_argument("--host", dest="supervisor_host")
     parser.add_argument("--wake-target", dest="wake_target",
                         help="supervisor-register: 工人唤醒本监工时 SendMessage 用的会话名（Claude Code 必填：UUID 会话 id 发不到）")
@@ -2504,6 +2512,8 @@ def _first_shift_handoff(
         "     {}\n"
         "  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n"
         "     {}\n"
+        "     建之前先过校验：vibe automation-check --spec <规格JSON，kind=heartbeat 且带 target_thread_id，不得带 cron/rrule>；"
+        "被拒绝就不要建。建好后读回配置、等首次触发，再跑 vibe automation-check --spec … --readback <读回JSON> --fired <触发JSON>，通过才算建成。\n"
         "     心跳按 {} 分钟建；命令输出会给出下一拍间隔（推送唤醒已验证或只剩未答决策时 {} 分钟），与当前周期不一致时按输出调整。\n"
         "     每拍只运行这一条；输出 idle 时只回一个字，decision 时向用户呈现未答卡片，work/unknown 时按输出分支继续；"
         "rotate 只会出现在有换班原语的平台，Claude Code 不换班，到上限也同会话继续。\n"
@@ -3060,6 +3070,35 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         payload = {**payload, "heartbeat_interval": interval}
         code = SUCCESS if payload["state"] in {"idle", "work", "decision", "rotate"} and payload.get("handoff_status") != "unknown" else UNKNOWN
         return _result(code, {"command": args.command, **payload}, "监工预检：{}".format(payload["state"]), args.as_json)
+
+    if args.command == "automation-check":
+        # V6 P0a: gate before a host creates a heartbeat/cron, and again after
+        # it reads the stored config back and sees the first real trigger.
+        # Anything unparseable or unverifiable is refused, never waved through.
+        def _load(raw):
+            return json.loads(raw) if raw is not None else None
+        try:
+            spec, readback, fired = (
+                _load(args.automation_spec), _load(args.automation_readback), _load(args.automation_fired))
+        except ValueError as error:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid",
+                                     "reason": "invalid JSON: " + str(error)}, "参数不是合法 JSON：" + str(error), args.as_json)
+        if spec is None:
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--spec required"}, "缺少 --spec", args.as_json)
+        if (readback is None) != (fired is None):
+            return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid",
+                                     "reason": "--readback and --fired must be given together"},
+                           "创建后核对需要同时给 --readback 和 --fired", args.as_json)
+        if readback is None:
+            ok, reason = validate_automation_spec(spec)
+            stage = "pre_create"
+        else:
+            ok, reason = verify_automation_readback(spec, readback, fired)
+            stage = "post_create"
+        payload = {"command": args.command, "stage": stage, "status": "ok" if ok else "rejected", "reason": reason}
+        return _result(SUCCESS if ok else BLOCKED, payload,
+                       ("自动化校验通过（{}）".format(stage) if ok else "自动化校验拒绝（{}）：{}".format(stage, reason)),
+                       args.as_json)
 
     if args.command == "supervisor-register":
         if not args.run_id:
