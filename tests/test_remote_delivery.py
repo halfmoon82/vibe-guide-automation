@@ -1289,6 +1289,18 @@ class ConfirmDeliveredTests(unittest.TestCase):
             confirm_delivered(snapshot, self._Confirming(facts=self._facts()), 371)
 
 
+class DefaultSourceBranchTests(unittest.TestCase):
+    def test_real_executor_derives_the_branch_from_the_slugged_plan_id(self):
+        from vibe_guide.remote_delivery import SubprocessRemoteDeliveryExecutor
+        executor = SubprocessRemoteDeliveryExecutor(".", plan_id="Plan 1/x")
+        self.assertEqual(executor.default_source_branch({}), "vibe/integration-candidate-Plan-1-x")
+
+    def test_an_existing_source_branch_in_context_wins(self):
+        from vibe_guide.remote_delivery import SubprocessRemoteDeliveryExecutor
+        executor = SubprocessRemoteDeliveryExecutor(".", plan_id="Plan 1/x")
+        self.assertEqual(executor.default_source_branch({"source_branch": "keep/me"}), "keep/me")
+
+
 class ConfirmCommandTests(unittest.TestCase):
     """CLI wiring of ``vibe remote-delivery-confirm`` (the proof itself is tested above)."""
 
