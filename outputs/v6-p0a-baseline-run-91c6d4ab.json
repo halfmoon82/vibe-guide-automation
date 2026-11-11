@@ -1,0 +1,612 @@
+{
+  "schema_version": 2,
+  "nodes": {
+    "delivery-gate": {
+      "sessions": [
+        {
+          "session_id": "01a18d26-8722-7ca3-9f04-9cb9ae8e802b",
+          "role": "developer",
+          "generation": 6,
+          "uncached_input_output_tokens": 1012680,
+          "status": "ok"
+        }
+      ],
+      "known_partial_tokens": 1012680,
+      "unknown_sessions": 0,
+      "total_uncached_input_output_tokens": 1012680,
+      "status": "ok"
+    },
+    "worktree-preflight": {
+      "sessions": [
+        {
+          "session_id": "01a18d25-cffd-7d83-90ec-9a2a0d6ec63a",
+          "role": "developer",
+          "generation": 3,
+          "uncached_input_output_tokens": 495409,
+          "status": "ok"
+        }
+      ],
+      "known_partial_tokens": 495409,
+      "unknown_sessions": 0,
+      "total_uncached_input_output_tokens": 495409,
+      "status": "ok"
+    },
+    "protocol-docs": {
+      "sessions": [
+        {
+          "session_id": "01a18d26-89a6-7e61-9ea2-ba146f78d982",
+          "role": "developer",
+          "generation": 3,
+          "uncached_input_output_tokens": 427527,
+          "status": "ok"
+        }
+      ],
+      "known_partial_tokens": 427527,
+      "unknown_sessions": 0,
+      "total_uncached_input_output_tokens": 427527,
+      "status": "ok"
+    },
+    "decision-reuse": {
+      "sessions": [
+        {
+          "session_id": "01a18d9a-57b0-7833-aef3-6bb7603d7b69",
+          "role": "developer",
+          "generation": 3,
+          "uncached_input_output_tokens": 455036,
+          "status": "ok"
+        }
+      ],
+      "known_partial_tokens": 455036,
+      "unknown_sessions": 0,
+      "total_uncached_input_output_tokens": 455036,
+      "status": "ok"
+    },
+    "model-routing": {
+      "sessions": [
+        {
+          "session_id": "01a18e1a-20ee-7193-b810-64dbba977b2c",
+          "role": "developer",
+          "generation": 1,
+          "uncached_input_output_tokens": 104369,
+          "status": "ok"
+        }
+      ],
+      "known_partial_tokens": 104369,
+      "unknown_sessions": 0,
+      "total_uncached_input_output_tokens": 104369,
+      "status": "ok"
+    },
+    "integration-review": {
+      "sessions": [
+        {
+          "session_id": "01a18f7e-e16a-7a61-9dd2-a478b5d7bb3f",
+          "role": "reviewer",
+          "generation": 3,
+          "uncached_input_output_tokens": null,
+          "status": "unknown_missing_log"
+        },
+        {
+          "session_id": "01a18f91-686b-73f0-9bfe-3923a679ecf2",
+          "role": "reviewer",
+          "generation": 6,
+          "uncached_input_output_tokens": 131753,
+          "status": "ok"
+        },
+        {
+          "session_id": "01a1900f-77e9-79d1-a53f-937e075e0d97",
+          "role": "reviewer",
+          "generation": 9,
+          "uncached_input_output_tokens": 224095,
+          "status": "ok"
+        },
+        {
+          "session_id": "01a19080-20ba-70d2-9e49-abf102e921e9",
+          "role": "reviewer",
+          "generation": 11,
+          "uncached_input_output_tokens": 213359,
+          "status": "ok"
+        }
+      ],
+      "known_partial_tokens": 569207,
+      "unknown_sessions": 1,
+      "total_uncached_input_output_tokens": null,
+      "status": "unknown"
+    }
+  },
+  "measured_at": "2026-11-11T02:39:00.576912+00:00",
+  "coverage": {
+    "registered": 15,
+    "found": 9
+  },
+  "missing_sessions": [
+    "01a18d23-a94b-7ce1-b96a-e8d00418ef8e",
+    "01a18e83-cec7-78f3-8cc0-201ef94d59c4",
+    "01a18f95-53e5-7b03-8b89-e9d76ea1ba48",
+    "01a18fd7-8627-74c1-b7ec-e3f9322bd384",
+    "01a18ff0-8fec-7621-b0ca-3edb4577e34b",
+    "01a18f7e-e16a-7a61-9dd2-a478b5d7bb3f"
+  ],
+  "ambiguous_sessions": [],
+  "sessions": [
+    {
+      "input_tokens": 93967860,
+      "cached_input_tokens": 92751889,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 117873,
+      "reasoning_output_tokens": 31866,
+      "session_id": "01a1902c-f406-71e0-9b44-a49bb9da8e5b",
+      "status": "ok",
+      "usage_events": 357,
+      "unique_usage_events": 355,
+      "duplicate_usage_events": 2,
+      "counter_regressions": 0,
+      "malformed_lines": 0,
+      "invalid_records": 0,
+      "source": {
+        "path": "/private/tmp/p0a/logs/rollout-2026-10-31T12-17-07-01a1902c-f406-71e0-9b44-a49bb9da8e5b.jsonl",
+        "sha256": "3b4347de7317ca81e5c219ae40de64fac2e1c2b6cbc1cb0f32e0de4eb27a524f"
+      },
+      "first_usage_at": 1793420247.509,
+      "last_usage_at": 1793442385.808,
+      "usage_events_missing_timestamp": 0,
+      "native_action_coverage": "not_measured",
+      "uncached_input_tokens": 1215971,
+      "cache_hit_ratio": 0.9870597138213002,
+      "effective_input_by_cache_ratio": {
+        "0.0": 1215971.0,
+        "0.1": 10491159.9,
+        "0.25": 24403943.25,
+        "1.0": 93967860.0
+      },
+      "first_10m": {
+        "input_tokens": 465596,
+        "cached_input_tokens": 450816,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 4151,
+        "reasoning_output_tokens": 1830,
+        "status": "partial_attribution",
+        "usage_events": 11,
+        "window_start": 1793420247.509,
+        "window_end": 1793420847.509,
+        "baseline_at": null,
+        "first_observed_at": 1793420247.509,
+        "last_observed_at": 1793420752.306,
+        "note": "Deltas are attributed to completion timestamps; boundary-straddling requests and missing timestamps prevent exact window cost. Zero with no observations is not evidence of zero usage."
+      },
+      "takeover_window_10m": {
+        "input_tokens": 454695,
+        "cached_input_tokens": 441856,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 4217,
+        "reasoning_output_tokens": 1923,
+        "status": "partial_attribution",
+        "usage_events": 10,
+        "window_start": 1793420288.09467,
+        "window_end": 1793420888.09467,
+        "baseline_at": 1793420276.722,
+        "first_observed_at": 1793420288.204,
+        "last_observed_at": 1793420886.717,
+        "note": "Deltas are attributed to completion timestamps; boundary-straddling requests and missing timestamps prevent exact window cost. Zero with no observations is not evidence of zero usage."
+      },
+      "registered_at": 1793420288.09467,
+      "baseline_context": 38029,
+      "node_id": null,
+      "role": null,
+      "generation": null
+    },
+    {
+      "input_tokens": 57124943,
+      "cached_input_tokens": 56265728,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 153465,
+      "reasoning_output_tokens": 76553,
+      "session_id": "01a18d26-8722-7ca3-9f04-9cb9ae8e802b",
+      "status": "ok",
+      "usage_events": 283,
+      "unique_usage_events": 283,
+      "duplicate_usage_events": 0,
+      "counter_regressions": 0,
+      "malformed_lines": 0,
+      "invalid_records": 0,
+      "source": {
+        "path": "/private/tmp/p0a/logs/rollout-2026-10-30T22-11-14-01a18d26-8722-7ca3-9f04-9cb9ae8e802b.jsonl",
+        "sha256": "6ee6acf17eaa676c76c80af5b73ada0e14dc91b84cd1270cdd3f713940e24b36"
+      },
+      "first_usage_at": 1793369486.47,
+      "last_usage_at": 1793428535.34,
+      "usage_events_missing_timestamp": 0,
+      "native_action_coverage": "not_measured",
+      "uncached_input_tokens": 859215,
+      "cache_hit_ratio": 0.9849590221910594,
+      "effective_input_by_cache_ratio": {
+        "0.0": 859215.0,
+        "0.1": 6485787.800000001,
+        "0.25": 14925647.0,
+        "1.0": 57124943.0
+      },
+      "first_10m": {
+        "input_tokens": 2225449,
+        "cached_input_tokens": 2127104,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 15478,
+        "reasoning_output_tokens": 10448,
+        "status": "partial_attribution",
+        "usage_events": 33,
+        "window_start": 1793369486.47,
+        "window_end": 1793370086.47,
+        "baseline_at": null,
+        "first_observed_at": 1793369486.47,
+        "last_observed_at": 1793369990.541,
+        "note": "Deltas are attributed to completion timestamps; boundary-straddling requests and missing timestamps prevent exact window cost. Zero with no observations is not evidence of zero usage."
+      },
+      "registered_at": null,
+      "baseline_context": null,
+      "node_id": "delivery-gate",
+      "role": "developer",
+      "generation": 6
+    },
+    {
+      "input_tokens": 16201194,
+      "cached_input_tokens": 15748608,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 42823,
+      "reasoning_output_tokens": 11492,
+      "session_id": "01a18d25-cffd-7d83-90ec-9a2a0d6ec63a",
+      "status": "ok",
+      "usage_events": 129,
+      "unique_usage_events": 129,
+      "duplicate_usage_events": 0,
+      "counter_regressions": 0,
+      "malformed_lines": 0,
+      "invalid_records": 0,
+      "source": {
+        "path": "/private/tmp/p0a/logs/rollout-2026-10-30T22-10-27-01a18d25-cffd-7d83-90ec-9a2a0d6ec63a.jsonl",
+        "sha256": "f970d7222c1f56eefe12ba7144e9ffc90ae9650f880f154e6b5ef3aa4964645a"
+      },
+      "first_usage_at": 1793369447.885,
+      "last_usage_at": 1793422391.033,
+      "usage_events_missing_timestamp": 0,
+      "native_action_coverage": "not_measured",
+      "uncached_input_tokens": 452586,
+      "cache_hit_ratio": 0.972064651531239,
+      "effective_input_by_cache_ratio": {
+        "0.0": 452586.0,
+        "0.1": 2027446.8,
+        "0.25": 4389738.0,
+        "1.0": 16201194.0
+      },
+      "first_10m": {
+        "input_tokens": 698582,
+        "cached_input_tokens": 664320,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 5437,
+        "reasoning_output_tokens": 1427,
+        "status": "partial_attribution",
+        "usage_events": 13,
+        "window_start": 1793369447.885,
+        "window_end": 1793370047.885,
+        "baseline_at": null,
+        "first_observed_at": 1793369447.885,
+        "last_observed_at": 1793369775.431,
+        "note": "Deltas are attributed to completion timestamps; boundary-straddling requests and missing timestamps prevent exact window cost. Zero with no observations is not evidence of zero usage."
+      },
+      "registered_at": null,
+      "baseline_context": null,
+      "node_id": "worktree-preflight",
+      "role": "developer",
+      "generation": 3
+    },
+    {
+      "input_tokens": 21529265,
+      "cached_input_tokens": 21185024,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 83286,
+      "reasoning_output_tokens": 43838,
+      "session_id": "01a18d26-89a6-7e61-9ea2-ba146f78d982",
+      "status": "ok",
+      "usage_events": 179,
+      "unique_usage_events": 179,
+      "duplicate_usage_events": 0,
+      "counter_regressions": 0,
+      "malformed_lines": 0,
+      "invalid_records": 0,
+      "source": {
+        "path": "/private/tmp/p0a/logs/rollout-2026-10-30T22-11-15-01a18d26-89a6-7e61-9ea2-ba146f78d982.jsonl",
+        "sha256": "396115a5fc03b396f097cbe768faba2c434b1644b1d560baa0eaa023b62de7a5"
+      },
+      "first_usage_at": 1793369483.95,
+      "last_usage_at": 1793413596.537,
+      "usage_events_missing_timestamp": 0,
+      "native_action_coverage": "not_measured",
+      "uncached_input_tokens": 344241,
+      "cache_hit_ratio": 0.9840105549353403,
+      "effective_input_by_cache_ratio": {
+        "0.0": 344241.0,
+        "0.1": 2462743.4,
+        "0.25": 5640497.0,
+        "1.0": 21529265.0
+      },
+      "first_10m": {
+        "input_tokens": 3336231,
+        "cached_input_tokens": 3247616,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 16762,
+        "reasoning_output_tokens": 8463,
+        "status": "partial_attribution",
+        "usage_events": 54,
+        "window_start": 1793369483.95,
+        "window_end": 1793370083.95,
+        "baseline_at": null,
+        "first_observed_at": 1793369483.95,
+        "last_observed_at": 1793369996.875,
+        "note": "Deltas are attributed to completion timestamps; boundary-straddling requests and missing timestamps prevent exact window cost. Zero with no observations is not evidence of zero usage."
+      },
+      "registered_at": null,
+      "baseline_context": null,
+      "node_id": "protocol-docs",
+      "role": "developer",
+      "generation": 3
+    },
+    {
+      "input_tokens": 11401817,
+      "cached_input_tokens": 11009024,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 62243,
+      "reasoning_output_tokens": 34258,
+      "session_id": "01a18d9a-57b0-7833-aef3-6bb7603d7b69",
+      "status": "ok",
+      "usage_events": 100,
+      "unique_usage_events": 100,
+      "duplicate_usage_events": 0,
+      "counter_regressions": 0,
+      "malformed_lines": 0,
+      "invalid_records": 0,
+      "source": {
+        "path": "/private/tmp/p0a/logs/rollout-2026-10-31T00-17-44-01a18d9a-57b0-7833-aef3-6bb7603d7b69.jsonl",
+        "sha256": "bb6181af1280757b510e644d1c27f8dd4b4aca6f8ecc7b8aeb1fe304066a981e"
+      },
+      "first_usage_at": 1793377073.223,
+      "last_usage_at": 1793416193.749,
+      "usage_events_missing_timestamp": 0,
+      "native_action_coverage": "not_measured",
+      "uncached_input_tokens": 392793,
+      "cache_hit_ratio": 0.9655499645363541,
+      "effective_input_by_cache_ratio": {
+        "0.0": 392793.0,
+        "0.1": 1493695.4000000001,
+        "0.25": 3145049.0,
+        "1.0": 11401817.0
+      },
+      "first_10m": {
+        "input_tokens": 1484698,
+        "cached_input_tokens": 1434624,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 16362,
+        "reasoning_output_tokens": 12182,
+        "status": "partial_attribution",
+        "usage_events": 26,
+        "window_start": 1793377073.223,
+        "window_end": 1793377673.223,
+        "baseline_at": null,
+        "first_observed_at": 1793377073.223,
+        "last_observed_at": 1793377595.088,
+        "note": "Deltas are attributed to completion timestamps; boundary-straddling requests and missing timestamps prevent exact window cost. Zero with no observations is not evidence of zero usage."
+      },
+      "registered_at": null,
+      "baseline_context": null,
+      "node_id": "decision-reuse",
+      "role": "developer",
+      "generation": 3
+    },
+    {
+      "input_tokens": 4020424,
+      "cached_input_tokens": 3937024,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 20969,
+      "reasoning_output_tokens": 6405,
+      "session_id": "01a18e1a-20ee-7193-b810-64dbba977b2c",
+      "status": "ok",
+      "usage_events": 53,
+      "unique_usage_events": 53,
+      "duplicate_usage_events": 0,
+      "counter_regressions": 0,
+      "malformed_lines": 0,
+      "invalid_records": 0,
+      "source": {
+        "path": "/private/tmp/p0a/logs/rollout-2026-10-31T02-37-19-01a18e1a-20ee-7193-b810-64dbba977b2c.jsonl",
+        "sha256": "a35427476f074180b14422699b1c9d6eb3852f903011cb0faf99b94550fc6163"
+      },
+      "first_usage_at": 1793385453.236,
+      "last_usage_at": 1793392339.303,
+      "usage_events_missing_timestamp": 0,
+      "native_action_coverage": "not_measured",
+      "uncached_input_tokens": 83400,
+      "cache_hit_ratio": 0.9792559192761758,
+      "effective_input_by_cache_ratio": {
+        "0.0": 83400.0,
+        "0.1": 477102.4,
+        "0.25": 1067656.0,
+        "1.0": 4020424.0
+      },
+      "first_10m": {
+        "input_tokens": 1527256,
+        "cached_input_tokens": 1480960,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 9514,
+        "reasoning_output_tokens": 3667,
+        "status": "partial_attribution",
+        "usage_events": 26,
+        "window_start": 1793385453.236,
+        "window_end": 1793386053.236,
+        "baseline_at": null,
+        "first_observed_at": 1793385453.236,
+        "last_observed_at": 1793385670.099,
+        "note": "Deltas are attributed to completion timestamps; boundary-straddling requests and missing timestamps prevent exact window cost. Zero with no observations is not evidence of zero usage."
+      },
+      "registered_at": null,
+      "baseline_context": null,
+      "node_id": "model-routing",
+      "role": "developer",
+      "generation": 1
+    },
+    {
+      "input_tokens": 3991758,
+      "cached_input_tokens": 3878656,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 18651,
+      "reasoning_output_tokens": 3482,
+      "session_id": "01a18f91-686b-73f0-9bfe-3923a679ecf2",
+      "status": "ok",
+      "usage_events": 52,
+      "unique_usage_events": 52,
+      "duplicate_usage_events": 0,
+      "counter_regressions": 0,
+      "malformed_lines": 0,
+      "invalid_records": 0,
+      "source": {
+        "path": "/private/tmp/p0a/logs/rollout-2026-10-31T09-27-13-01a18f91-686b-73f0-9bfe-3923a679ecf2.jsonl",
+        "sha256": "80d7d946fcffcaf00494fddeda6610f23cdf5ddf7feead70b29c9187021ad949"
+      },
+      "first_usage_at": 1793410049.196,
+      "last_usage_at": 1793415381.433,
+      "usage_events_missing_timestamp": 0,
+      "native_action_coverage": "not_measured",
+      "uncached_input_tokens": 113102,
+      "cache_hit_ratio": 0.9716661180362136,
+      "effective_input_by_cache_ratio": {
+        "0.0": 113102.0,
+        "0.1": 500967.60000000003,
+        "0.25": 1082766.0,
+        "1.0": 3991758.0
+      },
+      "first_10m": {
+        "input_tokens": 1100761,
+        "cached_input_tokens": 1061632,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 9480,
+        "reasoning_output_tokens": 1567,
+        "status": "partial_attribution",
+        "usage_events": 19,
+        "window_start": 1793410049.196,
+        "window_end": 1793410649.196,
+        "baseline_at": null,
+        "first_observed_at": 1793410049.196,
+        "last_observed_at": 1793410648.698,
+        "note": "Deltas are attributed to completion timestamps; boundary-straddling requests and missing timestamps prevent exact window cost. Zero with no observations is not evidence of zero usage."
+      },
+      "registered_at": null,
+      "baseline_context": null,
+      "node_id": "integration-review",
+      "role": "reviewer",
+      "generation": 6
+    },
+    {
+      "input_tokens": 7951154,
+      "cached_input_tokens": 7753984,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 26925,
+      "reasoning_output_tokens": 5010,
+      "session_id": "01a1900f-77e9-79d1-a53f-937e075e0d97",
+      "status": "ok",
+      "usage_events": 78,
+      "unique_usage_events": 78,
+      "duplicate_usage_events": 0,
+      "counter_regressions": 0,
+      "malformed_lines": 0,
+      "invalid_records": 0,
+      "source": {
+        "path": "/private/tmp/p0a/logs/rollout-2026-10-31T11-44-55-01a1900f-77e9-79d1-a53f-937e075e0d97.jsonl",
+        "sha256": "9a87039c44a730ac966db0b1946dc17e13dcb89b9c1894f68e21f75154bcb2e8"
+      },
+      "first_usage_at": 1793418310.461,
+      "last_usage_at": 1793423902.159,
+      "usage_events_missing_timestamp": 0,
+      "native_action_coverage": "not_measured",
+      "uncached_input_tokens": 197170,
+      "cache_hit_ratio": 0.9752023416978215,
+      "effective_input_by_cache_ratio": {
+        "0.0": 197170.0,
+        "0.1": 972568.4,
+        "0.25": 2135666.0,
+        "1.0": 7951154.0
+      },
+      "first_10m": {
+        "input_tokens": 2765581,
+        "cached_input_tokens": 2697216,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 10650,
+        "reasoning_output_tokens": 3002,
+        "status": "partial_attribution",
+        "usage_events": 36,
+        "window_start": 1793418310.461,
+        "window_end": 1793418910.461,
+        "baseline_at": null,
+        "first_observed_at": 1793418310.461,
+        "last_observed_at": 1793418901.065,
+        "note": "Deltas are attributed to completion timestamps; boundary-straddling requests and missing timestamps prevent exact window cost. Zero with no observations is not evidence of zero usage."
+      },
+      "registered_at": null,
+      "baseline_context": null,
+      "node_id": "integration-review",
+      "role": "reviewer",
+      "generation": 9
+    },
+    {
+      "input_tokens": 7057139,
+      "cached_input_tokens": 6871543,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 27763,
+      "reasoning_output_tokens": 7087,
+      "session_id": "01a19080-20ba-70d2-9e49-abf102e921e9",
+      "status": "ok",
+      "usage_events": 72,
+      "unique_usage_events": 71,
+      "duplicate_usage_events": 1,
+      "counter_regressions": 0,
+      "malformed_lines": 0,
+      "invalid_records": 0,
+      "source": {
+        "path": "/private/tmp/p0a/logs/rollout-2026-10-31T13-47-58-01a19080-20ba-70d2-9e49-abf102e921e9.jsonl",
+        "sha256": "bfee9b47dfb78ef6ab4e3e33bb13d92dbcacf06b5bcbbd2c7135c1b7be6963f8"
+      },
+      "first_usage_at": 1793425699.898,
+      "last_usage_at": 1793430065.933,
+      "usage_events_missing_timestamp": 0,
+      "native_action_coverage": "not_measured",
+      "uncached_input_tokens": 185596,
+      "cache_hit_ratio": 0.9737009572859483,
+      "effective_input_by_cache_ratio": {
+        "0.0": 185596.0,
+        "0.1": 872750.3,
+        "0.25": 1903481.75,
+        "1.0": 7057139.0
+      },
+      "first_10m": {
+        "input_tokens": 2276637,
+        "cached_input_tokens": 2213376,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 11773,
+        "reasoning_output_tokens": 3871,
+        "status": "partial_attribution",
+        "usage_events": 32,
+        "window_start": 1793425699.898,
+        "window_end": 1793426299.898,
+        "baseline_at": null,
+        "first_observed_at": 1793425699.898,
+        "last_observed_at": 1793426283.68,
+        "note": "Deltas are attributed to completion timestamps; boundary-straddling requests and missing timestamps prevent exact window cost. Zero with no observations is not evidence of zero usage."
+      },
+      "registered_at": null,
+      "baseline_context": null,
+      "node_id": "integration-review",
+      "role": "reviewer",
+      "generation": 11
+    }
+  ],
+  "method": "Cumulative counters; identical repeats removed. Input includes cached input; reasoning output is a subset of output. Cache-write retained separately, not added to input. First observed counter includes earlier usage if the log starts late. Ten-minute windows are attribution windows, not causal savings.",
+  "limits": "No equivalent no-rotation control or provider price evidence. Native action counts and successful DAG transitions are not measured. A changing live source is measured only through the last readable event.",
+  "registry_evidence": {
+    "path": "/Users/macmini/Desktop/vibeguide/.vibe/runs-archive/run-91c6d4ab04ff44838f7ed0f0631fc21e/supervisor-registry.json",
+    "sha256": "d361f216110d583116448390b6fbae0d2e8dd68499b31d20308c565e298384e0"
+  }
+}

@@ -2524,25 +2524,52 @@ def can_auto_merge(evidence: Any, authorization: Any) -> bool:
 # --- Automation purpose validation (V6 P0a) --------------------------------
 # A same-thread heartbeat must not carry a cron schedule (it spawns independent
 # sessions) and must name its target thread. Anything unverifiable is rejected.
-_CRON_FIELDS = ("cron", "cron_expression", "rrule")
+#
+# Field model taken from real ~/.codex/automations/*/automation.toml: BOTH kinds
+# carry ``rrule`` (for a heartbeat it is only the interval); a heartbeat names
+# ``target_thread_id``; a cron names ``target = {type: project, ...}``.  So
+# ``rrule`` is never the misconfiguration marker -- the wrong ``kind`` for the
+# declared purpose is.  ``cron``/``cron_expression`` are not Codex fields and are
+# refused on a heartbeat as an unverifiable schedule.
+_SCHEDULE_FIELDS = ("rrule", "cron", "cron_expression")
+_CRON_ONLY_FIELDS = ("cron", "cron_expression")
+PURPOSE_SAME_THREAD_HEARTBEAT = "same_thread_heartbeat"
+PURPOSE_INDEPENDENT_CRON = "independent_cron"
+_PURPOSE_KIND = {PURPOSE_SAME_THREAD_HEARTBEAT: "heartbeat", PURPOSE_INDEPENDENT_CRON: "cron"}
 
 
 def validate_automation_spec(spec: Any) -> Tuple[bool, str]:
-    """Return (ok, reason). Called before creating an automation."""
+    """Return (ok, reason). Called before creating an automation.
+
+    ``purpose`` (same_thread_heartbeat | independent_cron) states what the
+    caller means to build; a kind that cannot serve it is rejected.  Without a
+    purpose only the structural rules apply, so callers that care about the
+    same-thread case must pass it.
+    """
     if not isinstance(spec, dict):
         return False, "automation spec is not an object"
     kind = spec.get("kind")
     if kind not in ("heartbeat", "cron"):
         return False, "cannot confirm automation kind: %r" % (kind,)
-    has_cron = any(spec.get(k) for k in _CRON_FIELDS)
+    purpose = spec.get("purpose")
+    if purpose is not None:
+        if purpose not in _PURPOSE_KIND:
+            return False, "cannot confirm automation purpose: %r" % (purpose,)
+        if _PURPOSE_KIND[purpose] != kind:
+            return False, "purpose %s needs kind=%s, got kind=%s (a misconfigured kind spawns independent sessions)" % (
+                purpose, _PURPOSE_KIND[purpose], kind)
     if kind == "heartbeat":
         target = spec.get("target_thread_id")
         if not isinstance(target, str) or not target.strip():
             return False, "heartbeat is missing target_thread_id"
-        if has_cron:
-            return False, "same-thread heartbeat must not use a cron schedule"
+        if spec.get("target"):
+            return False, "heartbeat must not carry a project target"
+        if any(spec.get(k) for k in _CRON_ONLY_FIELDS):
+            return False, "same-thread heartbeat must not use a cron expression"
+        if not spec.get("rrule"):
+            return False, "heartbeat has no rrule interval"
         return True, "ok"
-    if not has_cron:
+    if not any(spec.get(k) for k in _SCHEDULE_FIELDS):
         return False, "cron automation has no schedule"
     if spec.get("target_thread_id"):
         return False, "cron automation must not target an existing thread"
@@ -2557,7 +2584,7 @@ def verify_automation_readback(spec: Any, readback: Any, fired: Any) -> Tuple[bo
         return False, reason
     if not isinstance(readback, dict) or not isinstance(fired, dict):
         return False, "readback or trigger evidence missing"
-    keys = ("kind", "target_thread_id") + _CRON_FIELDS
+    keys = ("kind", "target_thread_id", "target") + _SCHEDULE_FIELDS
     for key in keys:
         if (spec.get(key) or None) != (readback.get(key) or None):
             return False, "readback differs on %s" % key
