@@ -1053,6 +1053,45 @@ class PrepareRealGitTests(unittest.TestCase):
                 with self.assertRaises(RemoteDeliveryFailed):
                     self._confirm(repo, self._view(**good), branches=())
 
+    def test_confirm_merged_pr_requires_an_expected_source_branch(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                self._confirm(repo, self._view(headRefOid=node_tip, mergeCommit={"oid": squash}), source="")
+            self.assertFalse(caught.exception.retryable)
+
+    def test_confirm_merged_pr_reports_a_deleted_local_node_branch_as_not_retryable(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            self._git(repo, "branch", "-D", "node/sq")
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                self._confirm(repo, self._view(headRefOid=node_tip, mergeCommit={"oid": squash}))
+            self.assertFalse(caught.exception.retryable)
+            self.assertIn("node/sq", caught.exception.reason)
+
+    def test_confirm_merged_pr_fetches_the_pr_ref_and_main(self):
+        import tempfile
+        from unittest import mock
+        from vibe_guide import remote_delivery as rd
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            seen = []
+            real = rd._run_git
+
+            def spy(repo_arg, args, timeout=120):
+                seen.append(list(args))
+                return real(repo_arg, args, timeout=timeout)
+
+            with mock.patch.object(rd, "_run_git", spy):
+                self._confirm(repo, self._view(headRefOid=node_tip, mergeCommit={"oid": squash}))
+            self.assertIn(["fetch", "origin", "main"], seen)
+            self.assertIn(["fetch", "origin", "refs/pull/371/head"], seen)
+
     def test_confirm_merged_pr_treats_unreadable_pr_state_as_retryable(self):
         import tempfile
 
@@ -1222,6 +1261,16 @@ class ConfirmDeliveredTests(unittest.TestCase):
         with self.assertRaises(RemoteDeliveryFailed):
             confirm_delivered(fresh, self._Confirming(facts=self._facts()), 371)
 
+    def test_confirm_never_runs_the_proof_without_an_expected_source_branch(self):
+        from vibe_guide.remote_delivery import confirm_delivered
+
+        snapshot = self._stuck()
+        snapshot.remote_delivery_evidence = {}
+        executor = self._Confirming(facts=self._facts())
+        executor.default_source_branch = lambda context: "vibe/integration-candidate-plan-1"
+        confirm_delivered(snapshot, executor, 371)
+        self.assertEqual(executor.proof_args[1], "vibe/integration-candidate-plan-1")
+
     def test_confirm_refuses_an_already_accepted_node(self):
         from vibe_guide.remote_delivery import confirm_delivered
 
@@ -1283,6 +1332,11 @@ class ConfirmCommandTests(unittest.TestCase):
         self.assertEqual(result.payload["status"], "refused")
         self.assertFalse(result.payload["retryable"])
         self.assertIn("not merged", result.payload["reason"])
+
+    def test_a_negative_pr_number_is_rejected(self):
+        result = self._run("--run-id", "r", "--pr", "-5", monitor=SimpleNamespace())
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.payload["status"], "blocked_invalid")
 
     def test_a_transient_failure_is_reported_as_retry_later(self):
         def flaky(run_id, pr):

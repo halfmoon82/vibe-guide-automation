@@ -225,6 +225,10 @@ class RemoteDeliveryFailed(Exception):
 class RemoteDeliveryExecutor:
     """Step-execution boundary.  Implementations must be idempotent per step."""
 
+    def default_source_branch(self, context: Mapping[str, Any]) -> str:
+        existing = context.get("source_branch")
+        return existing if isinstance(existing, str) else ""
+
     def execute(self, step: str, context: Mapping[str, Any]) -> Dict[str, Any]:
         raise NotImplementedError
 
@@ -330,6 +334,9 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
         if isinstance(existing, str) and existing.strip():
             return existing
         return "vibe/integration-candidate-{}".format(_slug(self._plan_id or "run"))
+
+    def default_source_branch(self, context: Mapping[str, Any]) -> str:
+        return self._source_branch(context)
 
     def execute(self, step: str, context: Mapping[str, Any]) -> Dict[str, Any]:
         handler = {
@@ -519,7 +526,7 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             raise RemoteDeliveryFailed("confirm", "PR #{} is not merged".format(pr_number), retryable=False)
         if view.get("baseRefName") != target:
             raise RemoteDeliveryFailed("confirm", "PR #{} did not merge into {}".format(pr_number, target), retryable=False)
-        if source and view.get("headRefName") != source:
+        if not source or view.get("headRefName") != source:
             raise RemoteDeliveryFailed(
                 "confirm", "PR #{} is from {}, not this delivery's {}".format(
                     pr_number, view.get("headRefName"), source), retryable=False)
@@ -537,6 +544,20 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
                     return False
                 raise
 
+        unresolved = []
+        for branch in branches:
+            try:
+                _run_git(repo, ["rev-parse", "--verify", "--quiet", branch + "^{commit}"], timeout=timeout)
+            except RemoteDeliveryFailed as error:
+                if not error.reason.endswith(" exited 1"):
+                    raise
+                unresolved.append(branch)
+        if unresolved:
+            raise RemoteDeliveryFailed(
+                "confirm",
+                "accepted node branch(es) no longer exist locally, so containment cannot be "
+                "proven: {}".format(", ".join(unresolved)),
+                retryable=False)
         missing = [branch for branch in branches if not contained(branch, head)]
         if missing:
             raise RemoteDeliveryFailed(
@@ -1173,8 +1194,10 @@ def confirm_delivered(
     run_id = str(_snapshot_value(snapshot, "run_id", ""))
     old = _snapshot_value(snapshot, "remote_delivery_evidence", {}) or {}
     context = _context_from_evidence(old if isinstance(old, Mapping) else {}, snapshot)
-    facts = executor.confirm_merged_pr(
-        pr_number, str(context.get("source_branch") or ""), context.get("node_branches") or [])
+    # Never run the proof without an expected source branch: fall back to the
+    # name the ring itself would have used.
+    expected_source = str(context.get("source_branch") or "") or executor.default_source_branch(context)
+    facts = executor.confirm_merged_pr(pr_number, expected_source, context.get("node_branches") or [])
     context.update(facts)
     verified = executor.execute("verify", context)
     if verified.get("verified") is not True:
@@ -1203,7 +1226,6 @@ def confirm_delivered(
     node["status"] = "accepted"
     node.pop("failure", None)
     node.pop("waiting_on", None)
-    _write_delivery_report(paths, snapshot, evidence)
     _record_event(record_event, "remote_delivery_accepted", {
         "run_id": run_id,
         "node_id": REMOTE_DELIVERY_NODE_ID,
@@ -1218,4 +1240,5 @@ def confirm_delivered(
             "remote_verification": evidence["remote_verification"],
         },
     })
+    _write_delivery_report(paths, snapshot, evidence)
     return True

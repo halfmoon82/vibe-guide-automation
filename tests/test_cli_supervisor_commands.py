@@ -230,3 +230,49 @@ class PublishDefaultsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RemoteDeliveryConfirmExclusionTests(unittest.TestCase):
+    """The proof spans seconds of gh/git calls and save_snapshot has no version
+    check, so the command must exclude a live supervisor/daemon (P2-1 of #425)."""
+
+    setUp = tm.VisibleDispatchTests.setUp
+    tearDown = tm.VisibleDispatchTests.tearDown
+    authorized_monitor = tm.VisibleDispatchTests.authorized_monitor
+
+    def _run(self):
+        payload, nodes = tm.load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(nodes, topology_rulings=payload["topology_rulings"])
+        snapshot = monitor.start(record, tm.VisibleSddRunner(events={}))
+        return monitor, snapshot
+
+    def test_a_live_supervisor_makes_the_command_refuse_without_touching_state(self):
+        import os
+        from vibe_guide.remote_delivery import RemoteDeliveryFailed
+        from vibe_guide.supervisor import SupervisorLease
+
+        monitor, snapshot = self._run()
+        holder = SupervisorLease(monitor.paths, pid=os.getppid())
+        self.assertTrue(holder.acquire(snapshot.run_id))
+        before = (monitor.paths.root / ".vibe" / "runs" / snapshot.run_id / "state.json").read_bytes()
+        try:
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                monitor.confirm_remote_delivery(snapshot.run_id, 371)
+        finally:
+            holder.release(snapshot.run_id)
+        self.assertTrue(caught.exception.retryable)
+        self.assertIn("supervisor", caught.exception.reason)
+        after = (monitor.paths.root / ".vibe" / "runs" / snapshot.run_id / "state.json").read_bytes()
+        self.assertEqual(before, after)
+
+    def test_the_command_releases_the_lease_when_the_proof_is_refused(self):
+        from vibe_guide.remote_delivery import RemoteDeliveryFailed
+        from vibe_guide.supervisor import SupervisorLease
+
+        monitor, snapshot = self._run()
+        # No remote-delivery node exists, so the proof refuses -- after the lease was taken.
+        with self.assertRaises(RemoteDeliveryFailed):
+            monitor.confirm_remote_delivery(snapshot.run_id, 371)
+        again = SupervisorLease(monitor.paths)
+        self.assertTrue(again.acquire(snapshot.run_id), "lease must be released after a refusal")
+        again.release(snapshot.run_id)

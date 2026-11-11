@@ -2130,20 +2130,41 @@ class Monitor:
         """Operator close-out: accept remote-delivery on a merged PR re-proved remotely."""
         from .remote_delivery import SubprocessRemoteDeliveryExecutor, confirm_delivered
 
-        self._reset_binding_cache()
-        snapshot = load_snapshot(self.paths, run_id)
-        self._require_snapshot_authorization(snapshot)
-        executor = self._remote_delivery_executor
-        if executor is None:
-            executor = SubprocessRemoteDeliveryExecutor(self.paths.root, plan_id=self.plan.plan_id)
-        confirm_delivered(
-            snapshot, executor, pr_number,
-            record_event=lambda name, data: self._record(snapshot, name, data),
-            paths=self.paths,
-        )
-        self._refresh_run_status(snapshot)
-        self._save_snapshot(snapshot)
-        return snapshot
+        from .remote_delivery import RemoteDeliveryFailed
+        from .state import interprocess_lock, run_dir
+        from .supervisor import SupervisorLease
+
+        # The proof takes seconds of gh/git calls between load and save, and
+        # save_snapshot has no version check: a live daemon tick in that window
+        # would be overwritten and its unapplied events marked applied.  Hold
+        # the same exclusions as the adoption commands and refuse instead of
+        # racing a running supervisor.
+        supervisor = SupervisorLease(self.paths)
+        with interprocess_lock(run_dir(self.paths, run_id) / "adopt.lock"):
+            if not supervisor.acquire(run_id):
+                raise RemoteDeliveryFailed(
+                    "confirm",
+                    "a supervisor/daemon is running this run; stop it (vibe daemon stop) "
+                    "and retry, then start it again",
+                    retryable=True)
+            try:
+                self._reset_binding_cache()
+                snapshot = load_snapshot(self.paths, run_id)
+                self._require_snapshot_authorization(snapshot)
+                self._reconcile_unapplied_events(snapshot)
+                executor = self._remote_delivery_executor
+                if executor is None:
+                    executor = SubprocessRemoteDeliveryExecutor(self.paths.root, plan_id=self.plan.plan_id)
+                confirm_delivered(
+                    snapshot, executor, pr_number,
+                    record_event=lambda name, data: self._record(snapshot, name, data),
+                    paths=self.paths,
+                )
+                self._refresh_run_status(snapshot)
+                self._save_snapshot(snapshot)
+                return snapshot
+            finally:
+                supervisor.release(run_id)
 
     def merge_change_request_local(
         self,
