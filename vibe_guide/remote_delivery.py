@@ -607,6 +607,20 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             if _SHA_RE.match(merge_oid):
                 merge_commit = merge_oid
         if not _SHA_RE.match(merge_commit):
+            # ``gh pr merge --squash`` prints no SHA and the pre-merge view
+            # has no mergeCommit yet: read it back after the merge landed.
+            # Without this the merge succeeds remotely but the step fails,
+            # and the retry re-runs the whole ring against a merged branch.
+            try:
+                after = json.loads(_run_gh(
+                    repo, ["pr", "view", pr_url, "--json", "state,mergeCommit"], timeout=timeout))
+            except (RemoteDeliveryFailed, ValueError):
+                after = {}
+            if isinstance(after, Mapping) and after.get("state") == "MERGED":
+                oid = str((after.get("mergeCommit") or {}).get("oid") or "")
+                if _SHA_RE.match(oid):
+                    merge_commit = oid
+        if not _SHA_RE.match(merge_commit):
             raise RemoteDeliveryFailed("merge", "merge commit SHA is unavailable", retryable=True)
         return {"pr_url": pr_url, "merge_commit": merge_commit, "merge_method": "squash"}
 

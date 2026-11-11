@@ -469,6 +469,27 @@ class SubprocessExecutorTests(unittest.TestCase):
         self.assertTrue(facts["already_merged"])
         self.assertEqual(facts["merge_commit"], H2)
 
+    def test_merge_reads_the_merge_commit_back_when_gh_prints_no_sha(self):
+        import json as _json
+        from unittest import mock
+
+        executor = SubprocessRemoteDeliveryExecutor("/repo", plan_id="plan-1")
+        views = [
+            {"state": "OPEN", "headRefOid": H1, "mergeCommit": None},
+            {"state": "MERGED", "mergeCommit": {"oid": H2}},
+        ]
+
+        def fake_gh(repo, args, timeout=120):
+            if args[:2] == ["pr", "view"]:
+                return _json.dumps(views.pop(0))
+            if args[:2] == ["pr", "merge"]:
+                return ""
+            raise AssertionError("unexpected gh call: {}".format(args))
+
+        with mock.patch("vibe_guide.remote_delivery._run_gh", side_effect=fake_gh):
+            facts = executor.execute("merge", {"pr_url": PR_URL, "head_sha": H1})
+        self.assertEqual(facts["merge_commit"], H2)
+
     def test_merge_rejects_a_merged_pr_whose_head_differs(self):
         import json as _json
         from unittest import mock
