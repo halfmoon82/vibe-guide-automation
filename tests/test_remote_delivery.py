@@ -267,6 +267,22 @@ class RemoteDeliveryDriveTests(unittest.TestCase):
         self.assertNotIn("merge", snapshot.remote_delivery_evidence["steps"])
 
 
+class AlreadyDeliveredTests(unittest.TestCase):
+    def test_already_delivered_prepare_skips_pr_ring_and_verifies(self):
+        snapshot = _snapshot()
+        executor = FakeExecutor()
+        executor.facts["prepare"] = dict(
+            executor.facts["prepare"], already_delivered=True, pr_url=PR_URL, pr_number=371,
+            pr_head_sha=H3, merge_commit=H2)
+        drive_remote_delivery(snapshot, executor)
+        self.assertEqual(executor.calls, ["prepare", "verify"])
+        self.assertEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "accepted")
+        self.assertEqual(snapshot.remote_delivery_evidence["review_basis"], "already_delivered")
+        self.assertEqual(snapshot.remote_delivery_evidence["merge_commit"], H2)
+        self.assertEqual(snapshot.remote_delivery_evidence["head_sha"], H3)
+        self.assertTrue(evaluate_v41_closeout(snapshot).allowed)
+
+
 class ReviewGateWaiverTests(unittest.TestCase):
     def _review(self, protection, reviewers=None, approved=False, changes=False):
         facts = {"approved": approved, "changes_requested": changes, "pr_state": "OPEN",
@@ -468,6 +484,48 @@ class SubprocessExecutorTests(unittest.TestCase):
             )
         self.assertTrue(facts["already_merged"])
         self.assertEqual(facts["merge_commit"], H2)
+
+    def test_merge_reads_the_merge_commit_back_when_gh_prints_no_sha(self):
+        import json as _json
+        from unittest import mock
+
+        executor = SubprocessRemoteDeliveryExecutor("/repo", plan_id="plan-1")
+        views = [
+            {"state": "OPEN", "headRefOid": H1, "mergeCommit": None},
+            {"state": "MERGED", "mergeCommit": {"oid": H2}},
+        ]
+
+        def fake_gh(repo, args, timeout=120):
+            if args[:2] == ["pr", "view"]:
+                return _json.dumps(views.pop(0))
+            if args[:2] == ["pr", "merge"]:
+                return ""
+            raise AssertionError("unexpected gh call: {}".format(args))
+
+        with mock.patch("vibe_guide.remote_delivery._run_gh", side_effect=fake_gh):
+            facts = executor.execute("merge", {"pr_url": PR_URL, "head_sha": H1})
+        self.assertEqual(facts["merge_commit"], H2)
+
+    def test_merge_readback_failure_keeps_its_reason(self):
+        import json as _json
+        from unittest import mock
+
+        executor = SubprocessRemoteDeliveryExecutor("/repo", plan_id="plan-1")
+        calls = {"view": 0}
+
+        def fake_gh(repo, args, timeout=120):
+            if args[:2] == ["pr", "view"]:
+                calls["view"] += 1
+                if calls["view"] == 1:
+                    return _json.dumps({"state": "OPEN", "headRefOid": H1, "mergeCommit": None})
+                raise RemoteDeliveryFailed("gh", "gh pr view exited 1", retryable=True)
+            return ""
+
+        with mock.patch("vibe_guide.remote_delivery._run_gh", side_effect=fake_gh):
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                executor.execute("merge", {"pr_url": PR_URL, "head_sha": H1})
+        self.assertIn("read-back failed", caught.exception.reason)
+        self.assertTrue(caught.exception.retryable)
 
     def test_merge_rejects_a_merged_pr_whose_head_differs(self):
         import json as _json
@@ -760,6 +818,187 @@ class PrepareRealGitTests(unittest.TestCase):
                 "push", {"source_branch": prepared["source_branch"], "head_sha": prepared["head_sha"]}
             )
             self.assertTrue(again["already_pushed"])
+
+    def _commit(self, repo, message):
+        self._git(repo, "add", ".")
+        self._git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", message)
+
+    def _delivered_fixture(self, directory):
+        """A squash-merged delivery: node/sq carries sq.txt, main holds an unrelated
+        squash commit with identical content, and refs/pull/371/head is the node tip."""
+        repo, origin = self._fixture(directory)
+        self._git(repo, "checkout", "-q", "-b", "node/sq", "main")
+        (repo / "sq.txt").write_text("sq\n")
+        self._commit(repo, "node/sq")
+        node_tip = self._git(repo, "rev-parse", "HEAD")
+        self._git(repo, "checkout", "-q", "main")
+        (repo / "sq.txt").write_text("sq\n")
+        self._commit(repo, "squash of #371")
+        squash = self._git(repo, "rev-parse", "HEAD")
+        self._git(repo, "push", "-q", "origin", "main")
+        self._git(repo, "push", "-q", "origin", "node/sq:refs/pull/371/head")
+        return repo, node_tip, squash
+
+    def _merged_listing(self, head, merge, number=371):
+        import json as _json
+        return _json.dumps([{"url": PR_URL, "number": number, "headRefOid": head,
+                             "mergeCommit": {"oid": merge}}])
+
+    def _prepare_with(self, repo, listing, branches):
+        from unittest import mock
+        executor = SubprocessRemoteDeliveryExecutor(repo, plan_id="p1")
+        with mock.patch("vibe_guide.remote_delivery._run_gh", return_value=listing):
+            return executor.execute("prepare", {"node_branches": branches})
+
+    def test_prepare_reuses_a_merged_pr_that_provably_delivered_the_node_branches(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            facts = self._prepare_with(repo, self._merged_listing(node_tip, squash), ["node/sq"])
+            self.assertTrue(facts["already_delivered"])
+            self.assertEqual(facts["merge_commit"], squash)
+            self.assertEqual(facts["pr_url"], PR_URL)
+            self.assertEqual(facts["pr_head_sha"], node_tip)
+            self.assertNotEqual(facts["head_sha"], node_tip)
+
+    def test_prepare_refuses_when_the_pr_head_does_not_contain_the_node_branch(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            self._git(repo, "checkout", "-q", "--orphan", "other")
+            self._git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                      "--allow-empty", "-m", "other")
+            other = self._git(repo, "rev-parse", "HEAD")
+            self._git(repo, "push", "-q", "-f", "origin", "other:refs/pull/371/head")
+            self._git(repo, "checkout", "-q", "main")
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                self._prepare_with(repo, self._merged_listing(other, squash), ["node/sq"])
+            self.assertFalse(caught.exception.retryable)
+
+    def test_prepare_refuses_a_merge_commit_that_is_not_on_main(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                self._prepare_with(repo, self._merged_listing(node_tip, node_tip), ["node/sq"])
+            self.assertFalse(caught.exception.retryable)
+
+    def test_prepare_refuses_when_every_node_tip_is_already_in_main_history(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            # base commit: in main's history AND an ancestor of the PR head, so only
+            # the "some tip must be outside main" rule can refuse this PR.
+            self._git(repo, "branch", "node/empty", "main~1")
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                self._prepare_with(repo, self._merged_listing(node_tip, squash), ["node/empty"])
+            self.assertFalse(caught.exception.retryable)
+
+    def test_prepare_reuses_when_only_some_node_tips_are_already_in_main(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            # node/early is already in main's history; node/sq was squashed.
+            # A legitimate partial delivery must still be recognised.
+            self._git(repo, "branch", "node/early", "main~1")
+            facts = self._prepare_with(
+                repo, self._merged_listing(node_tip, squash), ["node/sq", "node/early"])
+            self.assertTrue(facts["already_delivered"])
+
+    def test_merged_pr_refuses_a_pr_head_that_carries_only_some_of_the_node_branches(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            # node/other has its own commit that the PR head does not contain.
+            self._git(repo, "checkout", "-q", "-b", "node/other", "main~1")
+            (repo / "other.txt").write_text("other\n")
+            self._commit(repo, "node/other")
+            self._git(repo, "checkout", "-q", "main")
+            executor = SubprocessRemoteDeliveryExecutor(repo, plan_id="p1")
+            with mock.patch("vibe_guide.remote_delivery._run_gh",
+                            return_value=self._merged_listing(node_tip, squash)):
+                self.assertEqual(executor._merged_pr("src", ["node/sq", "node/other"]), {})
+                self.assertTrue(executor._merged_pr("src", ["node/sq"]))
+
+    def test_prepare_skips_an_unfetchable_entry_and_still_finds_a_later_valid_pr(self):
+        import json as _json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            listing = _json.dumps([
+                {"url": PR_URL, "number": 999, "headRefOid": node_tip, "mergeCommit": {"oid": squash}},
+                {"url": PR_URL, "number": 371, "headRefOid": node_tip, "mergeCommit": {"oid": squash}},
+            ])
+            facts = self._prepare_with(repo, listing, ["node/sq"])
+            self.assertTrue(facts["already_delivered"])
+            self.assertEqual(facts["pr_number"], 371)
+
+    def test_prepare_with_no_node_branches_never_reuses_a_merged_pr(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                self._prepare_with(repo, self._merged_listing(node_tip, squash), [])
+            self.assertFalse(caught.exception.retryable)
+
+    def test_prepare_treats_a_failed_pr_ref_fetch_as_transient(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                self._prepare_with(repo, self._merged_listing(node_tip, squash, number=999), ["node/sq"])
+            self.assertTrue(caught.exception.retryable)
+
+    def test_prepare_treats_a_transient_git_failure_in_the_ancestor_check_as_retryable(self):
+        import tempfile
+        from unittest import mock
+        from vibe_guide import remote_delivery as rd
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            real = rd._run_git
+
+            def flaky(repo_arg, args, timeout=120):
+                if args[:2] == ["merge-base", "--is-ancestor"] and args[2] == "node/sq":
+                    raise RemoteDeliveryFailed("git", "git merge-base unavailable: TimeoutExpired", retryable=True)
+                return real(repo_arg, args, timeout=timeout)
+
+            with mock.patch.object(rd, "_run_git", flaky):
+                with self.assertRaises(RemoteDeliveryFailed) as caught:
+                    self._prepare_with(repo, self._merged_listing(node_tip, squash), ["node/sq"])
+            self.assertTrue(caught.exception.retryable)
+
+    def test_prepare_fails_retryably_when_the_merged_pr_list_is_unreadable(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                self._prepare_with(repo, "not json", ["node/sq"])
+            self.assertTrue(caught.exception.retryable)
+
+    def test_prepare_fails_loudly_when_the_merged_pr_list_hits_the_limit(self):
+        import json as _json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            junk = [{"url": PR_URL, "number": 1000 + n, "headRefOid": "", "mergeCommit": None}
+                    for n in range(100)]
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                self._prepare_with(repo, _json.dumps(junk), ["node/sq"])
+            self.assertIn("limit", caught.exception.reason)
+            self.assertFalse(caught.exception.retryable)
 
     def test_prepare_marks_merge_conflicts_as_non_retryable(self):
         import tempfile
