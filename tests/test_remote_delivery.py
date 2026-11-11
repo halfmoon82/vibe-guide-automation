@@ -505,6 +505,27 @@ class SubprocessExecutorTests(unittest.TestCase):
             facts = executor.execute("merge", {"pr_url": PR_URL, "head_sha": H1})
         self.assertEqual(facts["merge_commit"], H2)
 
+    def test_merge_readback_failure_keeps_its_reason(self):
+        import json as _json
+        from unittest import mock
+
+        executor = SubprocessRemoteDeliveryExecutor("/repo", plan_id="plan-1")
+        calls = {"view": 0}
+
+        def fake_gh(repo, args, timeout=120):
+            if args[:2] == ["pr", "view"]:
+                calls["view"] += 1
+                if calls["view"] == 1:
+                    return _json.dumps({"state": "OPEN", "headRefOid": H1, "mergeCommit": None})
+                raise RemoteDeliveryFailed("gh", "gh pr view exited 1", retryable=True)
+            return ""
+
+        with mock.patch("vibe_guide.remote_delivery._run_gh", side_effect=fake_gh):
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                executor.execute("merge", {"pr_url": PR_URL, "head_sha": H1})
+        self.assertIn("read-back failed", caught.exception.reason)
+        self.assertTrue(caught.exception.retryable)
+
     def test_merge_rejects_a_merged_pr_whose_head_differs(self):
         import json as _json
         from unittest import mock
@@ -797,24 +818,76 @@ class PrepareRealGitTests(unittest.TestCase):
             )
             self.assertTrue(again["already_pushed"])
 
-    def test_prepare_reuses_the_merged_pr_when_target_already_holds_the_content(self):
+    def _delivered_fixture(self, directory):
+        """node/same equals main; origin carries refs/pull/371/head at that commit."""
+        repo, origin = self._fixture(directory)
+        self._git(repo, "branch", "node/same", "main")
+        self._git(repo, "push", "-q", "origin", "main:refs/pull/371/head")
+        sha = self._git(repo, "rev-parse", "main")
+        return repo, sha
+
+    def _merged_listing(self, head, merge):
         import json as _json
+        return _json.dumps([{"url": PR_URL, "number": 371, "headRefOid": head,
+                             "mergeCommit": {"oid": merge}}])
+
+    def test_prepare_reuses_a_merged_pr_that_provably_delivered_the_node_branches(self):
         import tempfile
         from unittest import mock
 
         with tempfile.TemporaryDirectory() as directory:
-            repo, origin = self._fixture(directory)
-            self._git(repo, "branch", "node/same", "main")
+            repo, sha = self._delivered_fixture(directory)
             executor = SubprocessRemoteDeliveryExecutor(repo, plan_id="p1")
-            merged = [{"url": PR_URL, "number": 371, "headRefOid": H1, "mergeCommit": {"oid": H2}}]
-            with mock.patch("vibe_guide.remote_delivery._run_gh", return_value=_json.dumps(merged)):
+            with mock.patch("vibe_guide.remote_delivery._run_gh",
+                            return_value=self._merged_listing(sha, sha)):
                 facts = executor.execute("prepare", {"node_branches": ["node/same"]})
             self.assertTrue(facts["already_delivered"])
-            self.assertEqual(facts["merge_commit"], H2)
+            self.assertEqual(facts["merge_commit"], sha)
             self.assertEqual(facts["pr_url"], PR_URL)
-            with mock.patch("vibe_guide.remote_delivery._run_gh", return_value="[]"):
+
+    def test_prepare_refuses_an_unrelated_merged_pr(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, sha = self._delivered_fixture(directory)
+            self._git(repo, "checkout", "-q", "-b", "node/new", "main")
+            (repo / "new.txt").write_text("not in the PR\n")
+            self._git(repo, "add", ".")
+            self._git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "new")
+            self._git(repo, "checkout", "-q", "main")
+            executor = SubprocessRemoteDeliveryExecutor(repo, plan_id="p1")
+            # node/new is not contained in the old PR head, so it is not reused
+            # (and its content is not on main, so prepare would not even skip).
+            with mock.patch("vibe_guide.remote_delivery._run_gh",
+                            return_value=self._merged_listing(sha, sha)):
+                facts = executor.execute("prepare", {"node_branches": ["node/new"]})
+            self.assertNotIn("already_delivered", facts)
+            # Same tree as main but the PR head lacks node/same's ancestry check:
+            # a PR whose head is unrelated to every node branch is refused.
+            self._git(repo, "checkout", "-q", "--orphan", "other")
+            self._git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q",
+                      "--allow-empty", "-m", "other")
+            other = self._git(repo, "rev-parse", "HEAD")
+            self._git(repo, "push", "-q", "-f", "origin", "other:refs/pull/371/head")
+            self._git(repo, "checkout", "-q", "main")
+            with mock.patch("vibe_guide.remote_delivery._run_gh",
+                            return_value=self._merged_listing(other, sha)):
                 with self.assertRaises(RemoteDeliveryFailed) as caught:
                     executor.execute("prepare", {"node_branches": ["node/same"]})
+            self.assertFalse(caught.exception.retryable)
+
+    def test_prepare_with_no_node_branches_never_reuses_a_merged_pr(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, sha = self._delivered_fixture(directory)
+            executor = SubprocessRemoteDeliveryExecutor(repo, plan_id="p1")
+            with mock.patch("vibe_guide.remote_delivery._run_gh",
+                            return_value=self._merged_listing(sha, sha)):
+                with self.assertRaises(RemoteDeliveryFailed) as caught:
+                    executor.execute("prepare", {"node_branches": []})
             self.assertFalse(caught.exception.retryable)
 
     def test_prepare_marks_merge_conflicts_as_non_retryable(self):

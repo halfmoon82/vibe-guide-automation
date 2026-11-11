@@ -407,22 +407,34 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             # Nothing new to deliver: the target already holds this content
             # (a squash merge landed earlier but the ring never closed).
             # Opening another PR would be empty, so reuse the merged one.
-            delivered = self._merged_pr(source)
+            delivered = self._merged_pr(source, branches)
             if not delivered:
                 raise RemoteDeliveryFailed(
-                    "prepare", "target already holds this content but no merged PR was found",
+                    "prepare",
+                    "target already holds this content but no merged PR is provably this delivery",
                     retryable=False)
             facts.update(delivered)
             facts["already_delivered"] = True
         return facts
 
-    def _merged_pr(self, source: str) -> Dict[str, Any]:
+    def _merged_pr(self, source: str, branches: Sequence[str]) -> Dict[str, Any]:
+        """A merged PR that provably delivered *these* node branches.
+
+        Equal trees alone cannot tell this delivery from an unrelated older
+        PR on the same source branch, so a candidate is accepted only when
+        every accepted node branch tip is an ancestor of the PR head and the
+        merge commit is on the target.  No node branches means nothing can be
+        proven, so nothing is reused.
+        """
+        repo, timeout = self._repo, self._timeout
+        if not branches:
+            return {}
         try:
             entries = json.loads(_run_gh(
-                self._repo,
+                repo,
                 ["pr", "list", "--base", self._target, "--head", source, "--state", "merged",
-                 "--json", "url,number,headRefOid,mergeCommit"],
-                timeout=self._timeout) or "[]")
+                 "--limit", "100", "--json", "url,number,headRefOid,mergeCommit"],
+                timeout=timeout) or "[]")
         except (RemoteDeliveryFailed, ValueError):
             return {}
         for entry in entries if isinstance(entries, list) else []:
@@ -430,10 +442,19 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
                 continue
             oid = str((entry.get("mergeCommit") or {}).get("oid") or "")
             head = str(entry.get("headRefOid") or "")
-            if _SHA_RE.match(oid) and _SHA_RE.match(head):
-                return {"pr_url": str(entry.get("url") or ""),
-                        "pr_number": int(entry.get("number") or 0),
-                        "pr_head_sha": head, "merge_commit": oid}
+            number = int(entry.get("number") or 0)
+            if not (_SHA_RE.match(oid) and _SHA_RE.match(head) and number > 0):
+                continue
+            try:
+                _run_git(repo, ["fetch", "origin", "refs/pull/{}/head".format(number)], timeout=timeout)
+                for branch in branches:
+                    _run_git(repo, ["merge-base", "--is-ancestor", branch, head], timeout=timeout)
+                _run_git(repo, ["merge-base", "--is-ancestor", oid, "origin/" + self._target],
+                         timeout=timeout)
+            except RemoteDeliveryFailed:
+                continue
+            return {"pr_url": str(entry.get("url") or ""), "pr_number": number,
+                    "pr_head_sha": head, "merge_commit": oid}
         return {}
 
     def _push(self, context: Mapping[str, Any]) -> Dict[str, Any]:
@@ -645,17 +666,23 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             # has no mergeCommit yet: read it back after the merge landed.
             # Without this the merge succeeds remotely but the step fails,
             # and the retry re-runs the whole ring against a merged branch.
+            readback_error = ""
             try:
                 after = json.loads(_run_gh(
                     repo, ["pr", "view", pr_url, "--json", "state,mergeCommit"], timeout=timeout))
-            except (RemoteDeliveryFailed, ValueError):
-                after = {}
+            except RemoteDeliveryFailed as error:
+                after, readback_error = {}, error.reason
+            except ValueError:
+                after, readback_error = {}, "read-back reply is not JSON"
             if isinstance(after, Mapping) and after.get("state") == "MERGED":
                 oid = str((after.get("mergeCommit") or {}).get("oid") or "")
                 if _SHA_RE.match(oid):
                     merge_commit = oid
         if not _SHA_RE.match(merge_commit):
-            raise RemoteDeliveryFailed("merge", "merge commit SHA is unavailable", retryable=True)
+            reason = "merge commit SHA is unavailable"
+            if readback_error:
+                reason += " (read-back failed: {})".format(readback_error)
+            raise RemoteDeliveryFailed("merge", reason, retryable=True)
         return {"pr_url": pr_url, "merge_commit": merge_commit, "merge_method": "squash"}
 
     def _verify(self, context: Mapping[str, Any]) -> Dict[str, Any]:
@@ -907,6 +934,16 @@ def drive_remote_delivery(
                 if value not in (None, ""):
                     evidence[key] = value
             steps[step] = {"status": "succeeded", "facts": dict(facts)}
+            already = step == "prepare" and bool(facts.get("already_delivered"))
+            if already:
+                # Same write as prepare itself: a crash must never leave
+                # prepare done with the stubbed steps missing, or a resume
+                # would really push, open a PR and merge.
+                evidence["head_sha"] = facts["pr_head_sha"]
+                evidence["review_basis"] = "already_delivered"
+                for done in ("push", "create_pr", "review", "merge"):
+                    steps[done] = {"status": "succeeded", "facts": {"already_delivered": True}}
+                context["head_sha"] = facts["pr_head_sha"]
             persist()
             step_event = {
                 "run_id": run_id,
@@ -919,13 +956,7 @@ def drive_remote_delivery(
                 if value not in (None, ""):
                     step_event[key] = value
             _record_event(record_event, "remote_delivery_step_completed", step_event)
-            if step == "prepare" and facts.get("already_delivered"):
-                evidence["head_sha"] = facts["pr_head_sha"]
-                evidence["review_basis"] = "already_delivered"
-                for done in ("push", "create_pr", "review", "merge"):
-                    steps[done] = {"status": "succeeded", "facts": {"already_delivered": True}}
-                context["head_sha"] = facts["pr_head_sha"]
-                persist()
+            if already:
                 continue
             if step == "review":
                 if facts.get("changes_requested"):
