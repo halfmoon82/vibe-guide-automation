@@ -895,6 +895,49 @@ class PrepareRealGitTests(unittest.TestCase):
                 self._prepare_with(repo, self._merged_listing(node_tip, squash), ["node/empty"])
             self.assertFalse(caught.exception.retryable)
 
+    def test_prepare_reuses_when_only_some_node_tips_are_already_in_main(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            # node/early is already in main's history; node/sq was squashed.
+            # A legitimate partial delivery must still be recognised.
+            self._git(repo, "branch", "node/early", "main~1")
+            facts = self._prepare_with(
+                repo, self._merged_listing(node_tip, squash), ["node/sq", "node/early"])
+            self.assertTrue(facts["already_delivered"])
+
+    def test_merged_pr_refuses_a_pr_head_that_carries_only_some_of_the_node_branches(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            # node/other has its own commit that the PR head does not contain.
+            self._git(repo, "checkout", "-q", "-b", "node/other", "main~1")
+            (repo / "other.txt").write_text("other\n")
+            self._commit(repo, "node/other")
+            self._git(repo, "checkout", "-q", "main")
+            executor = SubprocessRemoteDeliveryExecutor(repo, plan_id="p1")
+            with mock.patch("vibe_guide.remote_delivery._run_gh",
+                            return_value=self._merged_listing(node_tip, squash)):
+                self.assertEqual(executor._merged_pr("src", ["node/sq", "node/other"]), {})
+                self.assertTrue(executor._merged_pr("src", ["node/sq"]))
+
+    def test_prepare_skips_an_unfetchable_entry_and_still_finds_a_later_valid_pr(self):
+        import json as _json
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            listing = _json.dumps([
+                {"url": PR_URL, "number": 999, "headRefOid": node_tip, "mergeCommit": {"oid": squash}},
+                {"url": PR_URL, "number": 371, "headRefOid": node_tip, "mergeCommit": {"oid": squash}},
+            ])
+            facts = self._prepare_with(repo, listing, ["node/sq"])
+            self.assertTrue(facts["already_delivered"])
+            self.assertEqual(facts["pr_number"], 371)
+
     def test_prepare_with_no_node_branches_never_reuses_a_merged_pr(self):
         import tempfile
 

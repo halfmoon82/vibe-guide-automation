@@ -411,7 +411,9 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             if not delivered:
                 raise RemoteDeliveryFailed(
                     "prepare",
-                    "target already holds this content but no merged PR is provably this delivery",
+                    "target already holds this content but no merged PR is provably this delivery "
+                    "(if the node branches were merged by a merge commit, fast-forward or rebase "
+                    "rather than squash, close this delivery manually)",
                     retryable=False)
             facts.update(delivered)
             facts["already_delivered"] = True
@@ -455,6 +457,7 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
         except ValueError as error:
             raise RemoteDeliveryFailed("prepare", "merged PR list is unreadable", retryable=True) from error
         entries = entries if isinstance(entries, list) else []
+        unreadable: List[int] = []
         for entry in entries:
             if not isinstance(entry, Mapping):
                 continue
@@ -464,10 +467,22 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
             if not (_SHA_RE.match(oid) and _SHA_RE.match(head) and number > 0):
                 continue
             # A failed fetch is a transient fault, not evidence against the PR.
-            _run_git(repo, ["fetch", "origin", "refs/pull/{}/head".format(number)], timeout=timeout)
+            # One unfetchable entry must not hide a later, valid one, so note
+            # it and keep looking; the retry below fires only if nothing matched.
+            try:
+                _run_git(repo, ["fetch", "origin", "refs/pull/{}/head".format(number)], timeout=timeout)
+            except RemoteDeliveryFailed:
+                unreadable.append(number)
+                continue
             if all(contained(branch, head) for branch in branches) and contained(oid, remote_target):
                 return {"pr_url": str(entry.get("url") or ""), "pr_number": number,
                         "pr_head_sha": head, "merge_commit": oid}
+        if unreadable:
+            raise RemoteDeliveryFailed(
+                "prepare",
+                "could not fetch PR head ref(s) {}; delivery cannot be proven yet".format(
+                    ", ".join("#{}".format(n) for n in unreadable[:5])),
+                retryable=True)
         if len(entries) >= limit:
             raise RemoteDeliveryFailed(
                 "prepare", "merged PR list reached the {} entry limit; cannot prove delivery".format(limit),
