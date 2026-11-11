@@ -273,12 +273,13 @@ class AlreadyDeliveredTests(unittest.TestCase):
         executor = FakeExecutor()
         executor.facts["prepare"] = dict(
             executor.facts["prepare"], already_delivered=True, pr_url=PR_URL, pr_number=371,
-            pr_head_sha=H1, merge_commit=H2)
+            pr_head_sha=H3, merge_commit=H2)
         drive_remote_delivery(snapshot, executor)
         self.assertEqual(executor.calls, ["prepare", "verify"])
         self.assertEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "accepted")
         self.assertEqual(snapshot.remote_delivery_evidence["review_basis"], "already_delivered")
         self.assertEqual(snapshot.remote_delivery_evidence["merge_commit"], H2)
+        self.assertEqual(snapshot.remote_delivery_evidence["head_sha"], H3)
         self.assertTrue(evaluate_v41_closeout(snapshot).allowed)
 
 
@@ -858,6 +859,8 @@ class PrepareRealGitTests(unittest.TestCase):
             self.assertTrue(facts["already_delivered"])
             self.assertEqual(facts["merge_commit"], squash)
             self.assertEqual(facts["pr_url"], PR_URL)
+            self.assertEqual(facts["pr_head_sha"], node_tip)
+            self.assertNotEqual(facts["head_sha"], node_tip)
 
     def test_prepare_refuses_when_the_pr_head_does_not_contain_the_node_branch(self):
         import tempfile
@@ -954,6 +957,34 @@ class PrepareRealGitTests(unittest.TestCase):
             repo, node_tip, squash = self._delivered_fixture(directory)
             with self.assertRaises(RemoteDeliveryFailed) as caught:
                 self._prepare_with(repo, self._merged_listing(node_tip, squash, number=999), ["node/sq"])
+            self.assertTrue(caught.exception.retryable)
+
+    def test_prepare_treats_a_transient_git_failure_in_the_ancestor_check_as_retryable(self):
+        import tempfile
+        from unittest import mock
+        from vibe_guide import remote_delivery as rd
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            real = rd._run_git
+
+            def flaky(repo_arg, args, timeout=120):
+                if args[:2] == ["merge-base", "--is-ancestor"] and args[2] == "node/sq":
+                    raise RemoteDeliveryFailed("git", "git merge-base unavailable: TimeoutExpired", retryable=True)
+                return real(repo_arg, args, timeout=timeout)
+
+            with mock.patch.object(rd, "_run_git", flaky):
+                with self.assertRaises(RemoteDeliveryFailed) as caught:
+                    self._prepare_with(repo, self._merged_listing(node_tip, squash), ["node/sq"])
+            self.assertTrue(caught.exception.retryable)
+
+    def test_prepare_fails_retryably_when_the_merged_pr_list_is_unreadable(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                self._prepare_with(repo, "not json", ["node/sq"])
             self.assertTrue(caught.exception.retryable)
 
     def test_prepare_fails_loudly_when_the_merged_pr_list_hits_the_limit(self):

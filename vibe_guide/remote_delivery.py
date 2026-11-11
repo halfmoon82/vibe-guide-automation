@@ -439,11 +439,16 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
         remote_target = "origin/" + target
 
         def contained(ancestor: str, descendant: str) -> bool:
+            # ``merge-base --is-ancestor`` exits 1 for "not an ancestor"; any
+            # other failure (timeout, lock, bad ref) is a transient fault and
+            # must not read as a verdict about the PR.
             try:
                 _run_git(repo, ["merge-base", "--is-ancestor", ancestor, descendant], timeout=timeout)
                 return True
-            except RemoteDeliveryFailed:
-                return False
+            except RemoteDeliveryFailed as error:
+                if error.reason.endswith(" exited 1"):
+                    return False
+                raise
 
         if all(contained(branch, remote_target) for branch in branches):
             return {}
