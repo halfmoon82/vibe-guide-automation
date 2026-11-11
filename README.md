@@ -118,6 +118,7 @@ vibe heal-verify --run-id <run> --node <id>   监工按排查包修完运行时�
 vibe daemon start|status|stop --run-id <run> [--plan <ID>]   授权后启动的分离本地进程（守护程序）：持监工租约，确定性地 resume、收交付、派后台 worker、拉 reviewer、一级自动重试，不调用模型；`status` 报告是否存活，崩溃或租约丢失时明确显示失活而不产生第二个写入者；`register-pm --provider <p> --session-name <名>` 登记需要拍板时推送的产品经理会话
 vibe supervisor-mailbox --run-id <run> [--template <action_id>|--complete <action_id> --result <文件或 ->]   信箱摘要、回写示例与回写；形状不对在写入前拒绝
 vibe blocked-unknown --run-id <run> --node <id> --disposition <处置> --reason <原因>   记录 blocked_unknown 处置
+vibe remote-delivery-confirm --run-id <run> --pr <已合并的 PR 编号>   远程交付卡住、但该 PR 已合并时收尾：向远端重新核验该 PR（状态、目标分支、来源分支、包含本次全部节点分支、合并提交在 main 上），通过才接受交付节点
 ```
 
 新会话入口：agent 先按 `.vibe/proposals/skills/vibe-entry/SKILL.md` 的入口协议在会话内自评 S0/S1——<=8 直接执行、9-15 轻规划，均不触碰 vibe，评分后输出一行 S1 评分与档位；>15 且能拆出 3 个以上可并行节点、又需跨会话/跨中断续跑时才 `vibe scan` + `vibe plan --request --s1` 进入正式路由（不满足则按轻规划，评分行注明未满足的条件；拿不准按轻规划；产品经理显式要求或显式 `--s1` 升级仍进复杂模式）；「授权」「选A」这类确认/续接回复延续当前档位，不重新评分。该协议完全自包含，不依赖任何外部技能。

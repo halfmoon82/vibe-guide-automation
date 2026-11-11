@@ -67,6 +67,7 @@ vibe skill-install --source <GitHub> --sha <40hex> --name <name> [--subdir <dir>
 vibe daemon start|status|stop --run-id <run> [--plan <ID>]   Detached local process started after authorization: holds the supervisor lease and deterministically resumes, collects deliveries, dispatches background workers, starts reviewers and retries once, without calling a model. `status` reports liveness; a crash or lost lease shows as inactive and never creates a second writer. `register-pm --provider <p> --session-name <name>` registers the product-manager session that receives pushes
 vibe supervisor-mailbox --run-id <run> [--template <action_id>|--complete <action_id> --result <file or ->]   Mailbox summary, write-back template and write-back; a wrong shape is rejected before anything is written
 vibe blocked-unknown --run-id <run> --node <id> --disposition <disposition> --reason <why>   Record a blocked_unknown disposition
+vibe remote-delivery-confirm --run-id <run> --pr <merged PR number>   Close a stuck remote delivery whose PR is already merged: the PR is re-proved against the remote (state, target branch, source branch, contains every accepted node branch, merge commit on main) before the delivery node is accepted
 ```
 
 Every command supports `--json`. Exit codes are `0` for success, `2` for argument errors, `3` for confirmation or design blocking, and `4` for unknown external or runtime state.

@@ -338,7 +338,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon', 'run-restore', 'automation-check'),
+        choices=('scan', 'init', 'apply-agentsmd', 'doctor', 'install', 'upgrade', 'migrate-state', 'attest', 'plan', 'authorize', 'monitor', 'reconcile', 'status', 'resume', 'change-request', 'deploy', 'skill-install', 'supervisor-beat', 'supervisor-preflight', 'supervisor-register', 'supervisor-address', 'supervisor-hold', 'supervisor-handoff', 'supervisor-output', 'supervisor-mailbox', 'blocked-unknown', 'remote-delivery-confirm', 'worker-deliver', 'decision-raise', 'decision-list', 'decision-answer', 'scope-expand', 'repair', 'requeue', 'heal-verify', 'daemon', 'run-restore', 'automation-check'),
     )
     parser.add_argument("daemon_action", nargs="?", choices=("start", "status", "stop", "run", "register-pm", "inbox"))
     parser.add_argument("--peek", action="store_true", help="daemon inbox: 只看不推进游标")
@@ -410,6 +410,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--result", dest="mailbox_result")
     parser.add_argument("--disposition", dest="blocked_disposition",
                         help="blocked-unknown: confirmed_benign|escalated_to_findings|resolved_with_facts|deferred_to_acceptance")
+    parser.add_argument("--pr", dest="confirm_pr", type=int,
+                        help="remote-delivery-confirm: 已合并的 PR 编号（会向远端重新核验，不信任口头声明）")
     parser.add_argument("--item", dest="blocked_item",
                         help="blocked-unknown: 只处置这一项（缺省处置该节点全部待处置项）")
     parser.add_argument("--role", dest="role", default="developer")
@@ -1543,6 +1545,34 @@ def _supervisor_mailbox_write(paths: ProjectPaths, args: argparse.Namespace) -> 
         return blocked(str(error)[:400])
     text = "该请求此前已回写，未重复写入" if payload["status"] == "already_completed" else "信箱回写已写入"
     return _result(SUCCESS, payload, text, args.as_json)
+
+
+def _remote_delivery_confirm_command(paths: ProjectPaths, args: argparse.Namespace) -> CLIResult:
+    """remote-delivery-confirm: close a stuck delivery whose PR is already merged."""
+    from .remote_delivery import RemoteDeliveryFailed
+
+    def blocked(reason: str, status: str = "blocked_invalid") -> CLIResult:
+        return _result(BLOCKED, {"command": "remote-delivery-confirm", "status": status, "reason": reason},
+                       "交付未收尾：" + reason, args.as_json)
+
+    if not args.run_id or not args.confirm_pr or args.confirm_pr <= 0:
+        return blocked("缺少或无效参数：--run-id 与 --pr <已合并的 PR 编号>")
+    try:
+        current = load_snapshot(paths, args.run_id)
+        _directory, plan, nodes, card = _load_plan(paths, current.plan_id)
+        monitor = Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card))
+        snapshot = monitor.confirm_remote_delivery(args.run_id, args.confirm_pr)
+    except RemoteDeliveryFailed as error:
+        result = blocked(error.reason[:400], "retry_later" if error.retryable else "refused")
+        result.payload["retryable"] = bool(error.retryable)
+        return result
+    except (FileNotFoundError, OSError, TypeError, ValueError, PermissionError) as error:
+        return blocked(str(error)[:400])
+    evidence = snapshot.remote_delivery_evidence or {}
+    payload = {"command": "remote-delivery-confirm", "status": "accepted", "run_id": args.run_id,
+               "pr_url": evidence.get("pr_url"), "merge_commit": evidence.get("merge_commit"),
+               "run_status": snapshot.status}
+    return _result(SUCCESS, payload, "交付已收尾：{} 已合并，远端核验通过".format(evidence.get("pr_url")), args.as_json)
 
 
 def _blocked_unknown_command(paths: ProjectPaths, args: argparse.Namespace) -> CLIResult:
@@ -2910,6 +2940,9 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
 
     if args.command == "blocked-unknown":
         return _blocked_unknown_command(paths, args)
+
+    if args.command == "remote-delivery-confirm":
+        return _remote_delivery_confirm_command(paths, args)
 
     if args.command == "daemon":
         return _handle_daemon(args, paths, runner, supervisor_command_prefix, v2_state)
