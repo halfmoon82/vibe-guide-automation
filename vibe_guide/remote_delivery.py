@@ -388,6 +388,8 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
                         retryable=False,
                     ) from error
             head = _run_git(worktree, ["rev-parse", "HEAD"], timeout=timeout)
+            same_tree = _run_git(worktree, ["rev-parse", "HEAD^{tree}"], timeout=timeout) == \
+                _run_git(worktree, ["rev-parse", "origin/" + target + "^{tree}"], timeout=timeout)
         finally:
             try:
                 _run_git(repo, ["worktree", "remove", "--force", str(worktree)], timeout=timeout)
@@ -395,12 +397,44 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
                 pass
         if not _SHA_RE.match(head):
             raise RemoteDeliveryFailed("prepare", "source head is not a SHA", retryable=False)
-        return {
+        facts = {
             "source_branch": source,
             "target_branch": target,
             "head_sha": head,
             "merged_node_branches": branches,
         }
+        if same_tree:
+            # Nothing new to deliver: the target already holds this content
+            # (a squash merge landed earlier but the ring never closed).
+            # Opening another PR would be empty, so reuse the merged one.
+            delivered = self._merged_pr(source)
+            if not delivered:
+                raise RemoteDeliveryFailed(
+                    "prepare", "target already holds this content but no merged PR was found",
+                    retryable=False)
+            facts.update(delivered)
+            facts["already_delivered"] = True
+        return facts
+
+    def _merged_pr(self, source: str) -> Dict[str, Any]:
+        try:
+            entries = json.loads(_run_gh(
+                self._repo,
+                ["pr", "list", "--base", self._target, "--head", source, "--state", "merged",
+                 "--json", "url,number,headRefOid,mergeCommit"],
+                timeout=self._timeout) or "[]")
+        except (RemoteDeliveryFailed, ValueError):
+            return {}
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, Mapping):
+                continue
+            oid = str((entry.get("mergeCommit") or {}).get("oid") or "")
+            head = str(entry.get("headRefOid") or "")
+            if _SHA_RE.match(oid) and _SHA_RE.match(head):
+                return {"pr_url": str(entry.get("url") or ""),
+                        "pr_number": int(entry.get("number") or 0),
+                        "pr_head_sha": head, "merge_commit": oid}
+        return {}
 
     def _push(self, context: Mapping[str, Any]) -> Dict[str, Any]:
         repo, timeout = self._repo, self._timeout
@@ -885,6 +919,14 @@ def drive_remote_delivery(
                 if value not in (None, ""):
                     step_event[key] = value
             _record_event(record_event, "remote_delivery_step_completed", step_event)
+            if step == "prepare" and facts.get("already_delivered"):
+                evidence["head_sha"] = facts["pr_head_sha"]
+                evidence["review_basis"] = "already_delivered"
+                for done in ("push", "create_pr", "review", "merge"):
+                    steps[done] = {"status": "succeeded", "facts": {"already_delivered": True}}
+                context["head_sha"] = facts["pr_head_sha"]
+                persist()
+                continue
             if step == "review":
                 if facts.get("changes_requested"):
                     evidence["status"] = "rework"

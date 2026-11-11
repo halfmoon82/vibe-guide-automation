@@ -267,6 +267,21 @@ class RemoteDeliveryDriveTests(unittest.TestCase):
         self.assertNotIn("merge", snapshot.remote_delivery_evidence["steps"])
 
 
+class AlreadyDeliveredTests(unittest.TestCase):
+    def test_already_delivered_prepare_skips_pr_ring_and_verifies(self):
+        snapshot = _snapshot()
+        executor = FakeExecutor()
+        executor.facts["prepare"] = dict(
+            executor.facts["prepare"], already_delivered=True, pr_url=PR_URL, pr_number=371,
+            pr_head_sha=H1, merge_commit=H2)
+        drive_remote_delivery(snapshot, executor)
+        self.assertEqual(executor.calls, ["prepare", "verify"])
+        self.assertEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "accepted")
+        self.assertEqual(snapshot.remote_delivery_evidence["review_basis"], "already_delivered")
+        self.assertEqual(snapshot.remote_delivery_evidence["merge_commit"], H2)
+        self.assertTrue(evaluate_v41_closeout(snapshot).allowed)
+
+
 class ReviewGateWaiverTests(unittest.TestCase):
     def _review(self, protection, reviewers=None, approved=False, changes=False):
         facts = {"approved": approved, "changes_requested": changes, "pr_state": "OPEN",
@@ -781,6 +796,26 @@ class PrepareRealGitTests(unittest.TestCase):
                 "push", {"source_branch": prepared["source_branch"], "head_sha": prepared["head_sha"]}
             )
             self.assertTrue(again["already_pushed"])
+
+    def test_prepare_reuses_the_merged_pr_when_target_already_holds_the_content(self):
+        import json as _json
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, origin = self._fixture(directory)
+            self._git(repo, "branch", "node/same", "main")
+            executor = SubprocessRemoteDeliveryExecutor(repo, plan_id="p1")
+            merged = [{"url": PR_URL, "number": 371, "headRefOid": H1, "mergeCommit": {"oid": H2}}]
+            with mock.patch("vibe_guide.remote_delivery._run_gh", return_value=_json.dumps(merged)):
+                facts = executor.execute("prepare", {"node_branches": ["node/same"]})
+            self.assertTrue(facts["already_delivered"])
+            self.assertEqual(facts["merge_commit"], H2)
+            self.assertEqual(facts["pr_url"], PR_URL)
+            with mock.patch("vibe_guide.remote_delivery._run_gh", return_value="[]"):
+                with self.assertRaises(RemoteDeliveryFailed) as caught:
+                    executor.execute("prepare", {"node_branches": ["node/same"]})
+            self.assertFalse(caught.exception.retryable)
 
     def test_prepare_marks_merge_conflicts_as_non_retryable(self):
         import tempfile
