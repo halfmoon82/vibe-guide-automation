@@ -276,3 +276,61 @@ class RemoteDeliveryConfirmExclusionTests(unittest.TestCase):
         again = SupervisorLease(monitor.paths)
         self.assertTrue(again.acquire(snapshot.run_id), "lease must be released after a refusal")
         again.release(snapshot.run_id)
+
+
+class RemoteDeliveryConfirmConcurrencyTests(unittest.TestCase):
+    """The unapplied-event replay and adopt.lock are what keep the command from
+    losing a daemon's events or racing another adoption command (#425 mutation gaps)."""
+
+    setUp = tm.VisibleDispatchTests.setUp
+    tearDown = tm.VisibleDispatchTests.tearDown
+    authorized_monitor = tm.VisibleDispatchTests.authorized_monitor
+
+    def _run(self):
+        payload, nodes = tm.load_v46_dispatch_fixture()
+        monitor, record = self.authorized_monitor(nodes, topology_rulings=payload["topology_rulings"])
+        snapshot = monitor.start(record, tm.VisibleSddRunner(events={}))
+        return monitor, snapshot
+
+    def test_events_a_daemon_wrote_but_never_applied_are_replayed_before_the_proof(self):
+        from unittest import mock
+        from vibe_guide.contracts import RunEvent
+        from vibe_guide.state import append_event, load_events, load_snapshot
+
+        monitor, snapshot = self._run()
+        stale = load_snapshot(monitor.paths, snapshot.run_id)
+        for _ in range(2):  # daemon telemetry landed after the last snapshot write
+            append_event(
+                monitor.paths, RunEvent("supervisor_heartbeat", {"run_id": snapshot.run_id}),
+                {"role": "system", "task_id": None, "handle_id": None, "generation": 0,
+                 "authorization_digest": stale.authorization_digest,
+                 "node_contract_digest": stale.node_contract_digest})
+        total = len(load_events(monitor.paths, snapshot.run_id))
+        self.assertLess(stale.event_sequence, total)
+        seen = {}
+
+        def fake_confirm(snap, executor, pr, record_event=None, paths=None):
+            seen["sequence"] = snap.event_sequence
+            record_event("remote_delivery_accepted", {"run_id": snap.run_id})
+            return True
+
+        with mock.patch("vibe_guide.remote_delivery.confirm_delivered", fake_confirm):
+            result = monitor.confirm_remote_delivery(snapshot.run_id, 371)
+        self.assertEqual(seen["sequence"], total)  # replayed before the proof ran
+        self.assertEqual(result.event_sequence, total + 1)
+        saved = load_snapshot(monitor.paths, snapshot.run_id)
+        self.assertEqual(saved.event_sequence, len(load_events(monitor.paths, snapshot.run_id)))
+
+    def test_the_command_waits_out_another_holder_of_adopt_lock(self):
+        from unittest import mock
+        from vibe_guide import state
+        from vibe_guide.state import interprocess_lock, run_dir
+
+        monitor, snapshot = self._run()
+        original = state.interprocess_lock
+        with interprocess_lock(run_dir(monitor.paths, snapshot.run_id) / "adopt.lock"):
+            with mock.patch.object(
+                    state, "interprocess_lock",
+                    lambda path, timeout=10.0: original(path, timeout=0.3)):
+                with self.assertRaises(TimeoutError):
+                    monitor.confirm_remote_delivery(snapshot.run_id, 371)
