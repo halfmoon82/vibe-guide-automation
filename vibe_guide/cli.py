@@ -2512,7 +2512,7 @@ def _first_shift_handoff(
         "     {}\n"
         "  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n"
         "     {}\n"
-        "     建之前先过校验：vibe automation-check --spec <规格JSON，kind=heartbeat 且带 target_thread_id，不得带 cron/rrule>；"
+        "     建之前先过校验：vibe automation-check --spec <规格JSON，字段取自 automation.toml：kind=heartbeat、target_thread_id、rrule（间隔），可加 purpose=same_thread_heartbeat；不得带 cron 表达式或项目 target，kind 错配成 cron 会被拒>；"
         "被拒绝就不要建。建好后读回配置、等首次触发，再跑 vibe automation-check --spec … --readback <读回JSON> --fired <触发JSON>，通过才算建成。\n"
         "     心跳按 {} 分钟建；命令输出会给出下一拍间隔（推送唤醒已验证或只剩未答决策时 {} 分钟），与当前周期不一致时按输出调整。\n"
         "     每拍只运行这一条；输出 idle 时只回一个字，decision 时向用户呈现未答卡片，work/unknown 时按输出分支继续；"

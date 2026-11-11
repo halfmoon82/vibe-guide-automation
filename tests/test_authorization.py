@@ -478,13 +478,32 @@ class AuthorizationWorkersSchemaTests(unittest.TestCase):
 
 
 class AutomationSpecTests(unittest.TestCase):
-    HB = {"kind": "heartbeat", "target_thread_id": "t-1"}
-    CRON = {"kind": "cron", "cron": "0 * * * *"}
+    # Shapes copied from real ~/.codex/automations/*/automation.toml.
+    HB = {"kind": "heartbeat", "target_thread_id": "t-1", "rrule": "FREQ=MINUTELY;INTERVAL=10"}
+    CRON = {"kind": "cron", "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=0",
+            "target": {"type": "project", "project_id": "p-1"}}
 
-    def test_heartbeat_with_cron_is_rejected(self):
-        for field in ("cron", "cron_expression", "rrule"):
-            spec = dict(self.HB, **{field: "x"})
+    def test_heartbeat_with_cron_expression_or_project_target_is_rejected(self):
+        for field, value in (("cron", "0 * * * *"), ("cron_expression", "0 * * * *"),
+                             ("target", {"type": "project", "project_id": "p-1"})):
+            spec = dict(self.HB, **{field: value})
             self.assertFalse(validate_automation_spec(spec)[0], field)
+
+    def test_heartbeat_keeps_rrule_as_its_interval(self):
+        self.assertTrue(validate_automation_spec(self.HB)[0])
+        no_interval = {k: v for k, v in self.HB.items() if k != "rrule"}
+        self.assertFalse(validate_automation_spec(no_interval)[0])
+
+    def test_purpose_must_match_kind(self):
+        # The A8 failure: a same-thread heartbeat built as a cron.
+        wrong = dict(self.CRON, purpose="same_thread_heartbeat")
+        ok, reason = validate_automation_spec(wrong)
+        self.assertFalse(ok)
+        self.assertIn("kind=heartbeat", reason)
+        self.assertFalse(validate_automation_spec(dict(self.HB, purpose="independent_cron"))[0])
+        self.assertFalse(validate_automation_spec(dict(self.HB, purpose="whatever"))[0])
+        self.assertTrue(validate_automation_spec(dict(self.HB, purpose="same_thread_heartbeat"))[0])
+        self.assertTrue(validate_automation_spec(dict(self.CRON, purpose="independent_cron"))[0])
 
     def test_heartbeat_without_target_is_rejected(self):
         self.assertFalse(validate_automation_spec({"kind": "heartbeat"})[0])

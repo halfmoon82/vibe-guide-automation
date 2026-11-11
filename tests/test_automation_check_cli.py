@@ -7,6 +7,7 @@ the first-shift handoff tells the host to run the gate before creating a beat.
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,8 +15,9 @@ from pathlib import Path
 from vibe_guide.cli import main, _first_shift_handoff
 from vibe_guide.paths import ProjectPaths
 
-HB = {"kind": "heartbeat", "target_thread_id": "t-1"}
-CRON = {"kind": "cron", "cron": "0 * * * *"}
+HB = {"kind": "heartbeat", "target_thread_id": "t-1", "rrule": "FREQ=MINUTELY;INTERVAL=10"}
+CRON = {"kind": "cron", "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=0",
+        "target": {"type": "project", "project_id": "p-1"}}
 
 
 class AutomationCheckCliTests(unittest.TestCase):
@@ -37,7 +39,8 @@ class AutomationCheckCliTests(unittest.TestCase):
             self.assertEqual((payload["stage"], payload["status"]), ("pre_create", "ok"))
 
     def test_heartbeat_with_cron_or_without_target_is_refused(self):
-        for spec in (dict(HB, cron="0 * * * *"), {"kind": "heartbeat"}, {"kind": "weekly"}):
+        for spec in (dict(HB, cron="0 * * * *"), {"kind": "heartbeat"}, {"kind": "weekly"},
+                     dict(CRON, purpose="same_thread_heartbeat")):
             code, payload = self.run_check("--spec", json.dumps(spec))
             self.assertEqual(code, 3, spec)
             self.assertEqual(payload["status"], "rejected")
@@ -62,6 +65,22 @@ class AutomationCheckCliTests(unittest.TestCase):
         code, payload = self.run_check("--spec", json.dumps(HB), "--readback", json.dumps(HB),
                                        "--fired", json.dumps(wrong))
         self.assertEqual((code, payload["status"]), (3, "rejected"))
+
+    def test_real_codex_automation_configs_pass_the_gate(self):
+        """Field names must match what Codex really stores, not our guess."""
+        try:
+            import tomllib
+        except ImportError:  # Python < 3.11
+            self.skipTest("tomllib unavailable")
+        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        files = sorted((home / "automations").glob("*/automation.toml"))
+        if not files:
+            self.skipTest("no local Codex automations to sample")
+        for path in files:
+            config = tomllib.loads(path.read_text(encoding="utf-8"))
+            spec = {key: config[key] for key in ("kind", "rrule", "target_thread_id", "target") if key in config}
+            code, payload = self.run_check("--spec", json.dumps(spec))
+            self.assertEqual(code, 0, "%s: %s" % (path.parent.name, payload.get("reason")))
 
     def test_first_shift_handoff_names_the_gate(self):
         paths = ProjectPaths(self.root)
