@@ -1000,6 +1000,68 @@ class PrepareRealGitTests(unittest.TestCase):
             self.assertIn("limit", caught.exception.reason)
             self.assertFalse(caught.exception.retryable)
 
+    def _view(self, **over):
+        import json as _json
+        base = {"url": PR_URL, "number": 371, "state": "MERGED", "baseRefName": "main",
+                "headRefName": "vibe/x", "headRefOid": "", "mergeCommit": {"oid": ""}}
+        base.update(over)
+        return _json.dumps(base)
+
+    def _confirm(self, repo, view, branches=("node/sq",), source="vibe/x"):
+        from unittest import mock
+        executor = SubprocessRemoteDeliveryExecutor(repo, plan_id="p1")
+        with mock.patch("vibe_guide.remote_delivery._run_gh", return_value=view):
+            return executor.confirm_merged_pr(371, source, list(branches))
+
+    def test_confirm_merged_pr_proves_a_squash_delivery(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            facts = self._confirm(repo, self._view(headRefOid=node_tip, mergeCommit={"oid": squash}))
+            self.assertEqual(facts["merge_commit"], squash)
+            self.assertEqual(facts["head_sha"], node_tip)
+            self.assertEqual(facts["source_branch"], "vibe/x")
+
+    def test_confirm_merged_pr_refuses_every_unproven_claim(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            good = {"headRefOid": node_tip, "mergeCommit": {"oid": squash}}
+            cases = {
+                "not merged": dict(good, state="OPEN"),
+                "wrong base": dict(good, baseRefName="develop"),
+                "wrong source branch": dict(good, headRefName="someone/else"),
+                "no merge commit": dict(good, mergeCommit=None),
+                "merge commit not on main": dict(good, mergeCommit={"oid": node_tip}),
+            }
+            for name, over in cases.items():
+                with self.subTest(name):
+                    with self.assertRaises(RemoteDeliveryFailed) as caught:
+                        self._confirm(repo, self._view(**over))
+                    self.assertFalse(caught.exception.retryable)
+            with self.subTest("head lacks a node branch"):
+                self._git(repo, "checkout", "-q", "-b", "node/other", "main~1")
+                (repo / "other.txt").write_text("other\n")
+                self._commit(repo, "node/other")
+                self._git(repo, "checkout", "-q", "main")
+                with self.assertRaises(RemoteDeliveryFailed) as caught:
+                    self._confirm(repo, self._view(**good), branches=("node/sq", "node/other"))
+                self.assertIn("node/other", caught.exception.reason)
+            with self.subTest("no node branches"):
+                with self.assertRaises(RemoteDeliveryFailed):
+                    self._confirm(repo, self._view(**good), branches=())
+
+    def test_confirm_merged_pr_treats_unreadable_pr_state_as_retryable(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, node_tip, squash = self._delivered_fixture(directory)
+            with self.assertRaises(RemoteDeliveryFailed) as caught:
+                self._confirm(repo, "not json")
+            self.assertTrue(caught.exception.retryable)
+
     def test_prepare_marks_merge_conflicts_as_non_retryable(self):
         import tempfile
 
@@ -1065,3 +1127,168 @@ class ReplayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfirmDeliveredTests(unittest.TestCase):
+    """Operator close-out: the named PR is re-proved, never trusted."""
+
+    def _stuck(self):
+        snapshot = _snapshot()
+        executor = FakeExecutor(review={"approved": False, "changes_requested": False, "pr_state": "OPEN"})
+        drive_remote_delivery(snapshot, executor)
+        self.assertEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "blocked_unknown")
+        return snapshot
+
+    class _Confirming(FakeExecutor):
+        def __init__(self, facts=None, error=None, verify=None):
+            super().__init__(verify=verify)
+            self.proof_args = None
+            self._facts = facts
+            self._error = error
+
+        def confirm_merged_pr(self, pr_number, source, branches):
+            self.proof_args = (pr_number, source, list(branches))
+            if self._error:
+                raise self._error
+            return dict(self._facts)
+
+    def _facts(self):
+        return {"pr_url": PR_URL, "pr_number": 371, "source_branch": "vibe/integration-candidate-plan-1",
+                "target_branch": "main", "head_sha": H1, "merge_commit": H2}
+
+    def test_confirm_accepts_on_reproved_facts_and_rebuilds_evidence(self):
+        from vibe_guide.remote_delivery import confirm_delivered
+
+        snapshot = self._stuck()
+        executor = self._Confirming(facts=self._facts())
+        recorded, record_event = _events()
+        self.assertTrue(confirm_delivered(snapshot, executor, 371, record_event))
+        node = snapshot.nodes[REMOTE_DELIVERY_NODE_ID]
+        self.assertEqual(node["status"], "accepted")
+        self.assertNotIn("failure", node)
+        evidence = snapshot.remote_delivery_evidence
+        self.assertEqual(evidence["review_basis"], "operator_confirmed_delivered")
+        self.assertEqual(evidence["merge_commit"], H2)
+        self.assertTrue(binding_matches(evidence["binding"], delivery_binding(snapshot)))
+        self.assertEqual(executor.proof_args[0], 371)
+        self.assertEqual(executor.proof_args[2], ["node/alpha", "node/beta"])
+        self.assertEqual(dict(recorded)["remote_delivery_accepted"]["confirmed_by"], "operator")
+        self.assertTrue(evaluate_v41_closeout(snapshot).allowed)
+
+    def test_confirm_leaves_the_snapshot_untouched_when_the_pr_is_refused(self):
+        from vibe_guide.remote_delivery import confirm_delivered
+
+        snapshot = self._stuck()
+        before = copy.deepcopy(snapshot.nodes[REMOTE_DELIVERY_NODE_ID])
+        executor = self._Confirming(error=RemoteDeliveryFailed("confirm", "PR #9 is not merged", retryable=False))
+        with self.assertRaises(RemoteDeliveryFailed):
+            confirm_delivered(snapshot, executor, 9)
+        self.assertEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID], before)
+        self.assertFalse(evaluate_v41_closeout(snapshot).allowed)
+
+    def test_confirm_refuses_evidence_whose_verification_names_another_merge_commit(self):
+        from vibe_guide.remote_delivery import confirm_delivered
+
+        snapshot = self._stuck()
+        executor = self._Confirming(
+            facts=self._facts(),
+            verify={"verified": True, "main_head_sha": H3, "merge_commit": H3, "pr_state": "MERGED"})
+        with self.assertRaises(ValueError):
+            confirm_delivered(snapshot, executor, 371)
+        self.assertNotEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "accepted")
+
+    def test_confirm_requires_verify_to_pass(self):
+        from vibe_guide.remote_delivery import confirm_delivered
+
+        snapshot = self._stuck()
+        executor = self._Confirming(
+            facts=self._facts(),
+            verify={"verified": False, "main_head_sha": H3, "merge_commit": H2, "pr_state": "OPEN"})
+        with self.assertRaises(RemoteDeliveryFailed):
+            confirm_delivered(snapshot, executor, 371)
+        self.assertNotEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "accepted")
+
+    def test_confirm_refuses_without_remote_git_authorization_or_a_node(self):
+        from vibe_guide.remote_delivery import confirm_delivered
+
+        # A node exists and everything else is fine; only the authorization differs.
+        deny = self._stuck()
+        deny.authorization = {"remote_git_actions": "deny"}
+        with self.assertRaises(RemoteDeliveryFailed) as caught:
+            confirm_delivered(deny, self._Confirming(facts=self._facts()), 371)
+        self.assertIn("remote_git_actions", caught.exception.reason)
+        self.assertNotEqual(deny.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "accepted")
+        fresh = _snapshot()
+        with self.assertRaises(RemoteDeliveryFailed):
+            confirm_delivered(fresh, self._Confirming(facts=self._facts()), 371)
+
+    def test_confirm_refuses_an_already_accepted_node(self):
+        from vibe_guide.remote_delivery import confirm_delivered
+
+        snapshot = _snapshot()
+        drive_remote_delivery(snapshot, FakeExecutor())
+        self.assertEqual(snapshot.nodes[REMOTE_DELIVERY_NODE_ID]["status"], "accepted")
+        with self.assertRaises(RemoteDeliveryFailed):
+            confirm_delivered(snapshot, self._Confirming(facts=self._facts()), 371)
+
+    def test_confirm_requires_an_accepted_integration_review(self):
+        from vibe_guide.remote_delivery import confirm_delivered
+
+        snapshot = self._stuck()
+        snapshot.nodes["integration-review"]["status"] = "rework"
+        with self.assertRaises(RemoteDeliveryFailed):
+            confirm_delivered(snapshot, self._Confirming(facts=self._facts()), 371)
+
+
+class ConfirmCommandTests(unittest.TestCase):
+    """CLI wiring of ``vibe remote-delivery-confirm`` (the proof itself is tested above)."""
+
+    def _run(self, *args, monitor=None, snapshot=None):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from vibe_guide.cli import run_cli
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch("vibe_guide.cli.load_snapshot", return_value=snapshot or SimpleNamespace(plan_id="plan-1")), \
+                mock.patch("vibe_guide.cli._load_plan", return_value=(None, object(), {}, None)), \
+                mock.patch("vibe_guide.cli._observed_topology_rulings", return_value={}), \
+                mock.patch("vibe_guide.cli.Monitor", return_value=monitor):
+            return run_cli(["remote-delivery-confirm", "--json", *args], Path(directory))
+
+    def test_missing_or_invalid_arguments_are_rejected_before_any_work(self):
+        for args in ([], ["--run-id", "r"], ["--pr", "3"], ["--run-id", "r", "--pr", "0"]):
+            with self.subTest(args=args):
+                result = self._run(*args, monitor=SimpleNamespace())
+                self.assertNotEqual(result.exit_code, 0)
+                self.assertEqual(result.payload["status"], "blocked_invalid")
+
+    def test_success_reports_the_proved_pr(self):
+        snapshot = SimpleNamespace(
+            status="complete",
+            remote_delivery_evidence={"pr_url": PR_URL, "merge_commit": H2})
+        monitor = SimpleNamespace(confirm_remote_delivery=lambda run_id, pr: snapshot)
+        result = self._run("--run-id", "r", "--pr", "371", monitor=monitor)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.payload["status"], "accepted")
+        self.assertEqual(result.payload["merge_commit"], H2)
+
+    def test_a_refused_proof_exits_nonzero_with_the_reason(self):
+        def refuse(run_id, pr):
+            raise RemoteDeliveryFailed("confirm", "PR #9 is not merged", retryable=False)
+
+        result = self._run("--run-id", "r", "--pr", "9", monitor=SimpleNamespace(confirm_remote_delivery=refuse))
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.payload["status"], "refused")
+        self.assertFalse(result.payload["retryable"])
+        self.assertIn("not merged", result.payload["reason"])
+
+    def test_a_transient_failure_is_reported_as_retry_later(self):
+        def flaky(run_id, pr):
+            raise RemoteDeliveryFailed("git", "git fetch exited 128", retryable=True)
+
+        result = self._run("--run-id", "r", "--pr", "9", monitor=SimpleNamespace(confirm_remote_delivery=flaky))
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.payload["status"], "retry_later")
+        self.assertTrue(result.payload["retryable"])

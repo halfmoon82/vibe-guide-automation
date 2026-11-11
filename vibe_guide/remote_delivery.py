@@ -494,6 +494,60 @@ class SubprocessRemoteDeliveryExecutor(RemoteDeliveryExecutor):
                 retryable=False)
         return {}
 
+    def confirm_merged_pr(self, pr_number: int, source: str, branches: Sequence[str]) -> Dict[str, Any]:
+        """Facts proving PR ``pr_number`` is a merged delivery of ``branches``.
+
+        Used by the operator close-out: the operator names the PR, but every
+        claim is re-checked against the remote instead of being trusted.
+        Raises ``RemoteDeliveryFailed`` (non-retryable) on any mismatch.
+        """
+        repo, timeout, target = self._repo, self._timeout, self._target
+        if not branches:
+            raise RemoteDeliveryFailed("confirm", "no accepted node branches to prove", retryable=False)
+        try:
+            view = json.loads(_run_gh(
+                repo, ["pr", "view", str(pr_number), "--json",
+                       "url,number,state,headRefOid,headRefName,baseRefName,mergeCommit"],
+                timeout=timeout))
+        except ValueError as error:
+            raise RemoteDeliveryFailed("confirm", "PR state is unreadable", retryable=True) from error
+        if not isinstance(view, Mapping):
+            raise RemoteDeliveryFailed("confirm", "PR state is unreadable", retryable=True)
+        head = str(view.get("headRefOid") or "")
+        oid = str((view.get("mergeCommit") or {}).get("oid") or "")
+        if view.get("state") != "MERGED":
+            raise RemoteDeliveryFailed("confirm", "PR #{} is not merged".format(pr_number), retryable=False)
+        if view.get("baseRefName") != target:
+            raise RemoteDeliveryFailed("confirm", "PR #{} did not merge into {}".format(pr_number, target), retryable=False)
+        if source and view.get("headRefName") != source:
+            raise RemoteDeliveryFailed(
+                "confirm", "PR #{} is from {}, not this delivery's {}".format(
+                    pr_number, view.get("headRefName"), source), retryable=False)
+        if not (_SHA_RE.match(head) and _SHA_RE.match(oid)):
+            raise RemoteDeliveryFailed("confirm", "PR lacks a head or merge commit SHA", retryable=False)
+        _run_git(repo, ["fetch", "origin", target], timeout=timeout)
+        _run_git(repo, ["fetch", "origin", "refs/pull/{}/head".format(pr_number)], timeout=timeout)
+
+        def contained(ancestor: str, descendant: str) -> bool:
+            try:
+                _run_git(repo, ["merge-base", "--is-ancestor", ancestor, descendant], timeout=timeout)
+                return True
+            except RemoteDeliveryFailed as error:
+                if error.reason.endswith(" exited 1"):
+                    return False
+                raise
+
+        missing = [branch for branch in branches if not contained(branch, head)]
+        if missing:
+            raise RemoteDeliveryFailed(
+                "confirm", "PR #{} head does not contain: {}".format(pr_number, ", ".join(missing)),
+                retryable=False)
+        if not contained(oid, "origin/" + target):
+            raise RemoteDeliveryFailed("confirm", "PR merge commit is not on {}".format(target), retryable=False)
+        return {"pr_url": str(view.get("url") or ""), "pr_number": int(view.get("number") or pr_number),
+                "source_branch": str(view.get("headRefName") or source), "target_branch": target,
+                "head_sha": head, "merge_commit": oid}
+
     def _push(self, context: Mapping[str, Any]) -> Dict[str, Any]:
         repo, timeout = self._repo, self._timeout
         source = str(context.get("source_branch") or self._source_branch(context))
@@ -826,6 +880,7 @@ def _write_delivery_report(paths: Any, snapshot: Any, evidence: Mapping[str, Any
             "review_basis_text": {
                 "integration_review_evidence": "merged on integration review evidence (no GitHub review required)",
                 "github_review": "waited for and merged after a GitHub review",
+                "operator_confirmed_delivered": "closed by the operator after the named PR was re-proved merged on the remote",
                 "already_delivered": "content already merged by an earlier PR that provably carried these node branches",
                 "waiting_for_github_review": "waiting for GitHub review",
             }.get(str(evidence.get("review_basis") or ""), ""),
@@ -1087,3 +1142,80 @@ def drive_remote_delivery(
             "reason": error.reason,
         })
         return True
+
+
+def confirm_delivered(
+    snapshot: Any,
+    executor: Any,
+    pr_number: int,
+    record_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    paths: Any = None,
+) -> bool:
+    """Operator close-out of a stuck delivery whose PR is already merged.
+
+    The ring cannot always recover by itself (the PR it was waiting on may
+    have been replaced, or main may have moved past a content-equal prepare).
+    The operator names the merged PR; the facts are re-proved against the
+    remote, the evidence is rebuilt under the *current* digest binding, and
+    ``verify`` must pass before the node is accepted.  Raises
+    ``RemoteDeliveryFailed`` without touching the snapshot on any mismatch.
+    """
+    if not remote_delivery_required(_snapshot_value(snapshot, "authorization", {})):
+        raise RemoteDeliveryFailed("confirm", "remote_git_actions is not allowed for this run", retryable=False)
+    nodes = _snapshot_value(snapshot, "nodes", {}) or {}
+    node = nodes.get(REMOTE_DELIVERY_NODE_ID) if isinstance(nodes, dict) else None
+    if not isinstance(node, dict) or node.get("status") == "accepted":
+        raise RemoteDeliveryFailed("confirm", "no unfinished remote-delivery node to close", retryable=False)
+    integration = nodes.get(INTEGRATION_REVIEW_NODE_ID)
+    if not isinstance(integration, dict) or integration.get("status") != "accepted" \
+            or not integration_evidence_digest(snapshot):
+        raise RemoteDeliveryFailed("confirm", "integration review is not accepted", retryable=False)
+    run_id = str(_snapshot_value(snapshot, "run_id", ""))
+    old = _snapshot_value(snapshot, "remote_delivery_evidence", {}) or {}
+    context = _context_from_evidence(old if isinstance(old, Mapping) else {}, snapshot)
+    facts = executor.confirm_merged_pr(
+        pr_number, str(context.get("source_branch") or ""), context.get("node_branches") or [])
+    context.update(facts)
+    verified = executor.execute("verify", context)
+    if verified.get("verified") is not True:
+        raise RemoteDeliveryFailed("confirm", "remote facts do not confirm the merge on main", retryable=False)
+    evidence = _initial_evidence(snapshot, context)
+    evidence.update({key: facts[key] for key in
+                     ("source_branch", "target_branch", "head_sha", "pr_url", "pr_number", "merge_commit")})
+    steps = evidence["steps"]
+    for step in REMOTE_DELIVERY_STEPS:
+        steps[step] = {"status": "succeeded", "facts": {"operator_confirmed": True}}
+    steps["verify"] = {"status": "succeeded", "facts": dict(verified)}
+    evidence["review_basis"] = "operator_confirmed_delivered"
+    evidence["remote_verification"] = {
+        "verified": True,
+        "main_head_sha": verified.get("main_head_sha", ""),
+        "merge_commit": verified.get("merge_commit", ""),
+        "pr_state": verified.get("pr_state", ""),
+    }
+    evidence["status"] = "accepted"
+    validate_remote_delivery_evidence(snapshot, evidence)
+    if isinstance(snapshot, dict):
+        snapshot["remote_delivery_evidence"] = evidence
+    else:
+        snapshot.remote_delivery_evidence = evidence
+    node["evidence"] = evidence
+    node["status"] = "accepted"
+    node.pop("failure", None)
+    node.pop("waiting_on", None)
+    _write_delivery_report(paths, snapshot, evidence)
+    _record_event(record_event, "remote_delivery_accepted", {
+        "run_id": run_id,
+        "node_id": REMOTE_DELIVERY_NODE_ID,
+        "status": "accepted",
+        "confirmed_by": "operator",
+        "delivery": {
+            "pr_url": evidence["pr_url"],
+            "source_branch": evidence["source_branch"],
+            "target_branch": evidence["target_branch"],
+            "head_sha": evidence["head_sha"],
+            "merge_commit": evidence["merge_commit"],
+            "remote_verification": evidence["remote_verification"],
+        },
+    })
+    return True

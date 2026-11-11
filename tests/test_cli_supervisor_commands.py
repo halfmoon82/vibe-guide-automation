@@ -219,6 +219,7 @@ class PublishDefaultsTests(unittest.TestCase):
                                    capture_output=True, cwd=str(Path(__file__).resolve().parents[1])).stdout
         self.assertNotIn("--authorization-token", help_text)
         self.assertIn("blocked-unknown", help_text)
+        self.assertIn("remote-delivery-confirm", help_text)
         self.assertIn("--complete", help_text)
 
     def test_legacy_executable_digest_acceptance_is_gone(self):

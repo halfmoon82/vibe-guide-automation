@@ -2126,6 +2126,25 @@ class Monitor:
             paths=self.paths,
         )
 
+    def confirm_remote_delivery(self, run_id: str, pr_number: int) -> RunSnapshot:
+        """Operator close-out: accept remote-delivery on a merged PR re-proved remotely."""
+        from .remote_delivery import SubprocessRemoteDeliveryExecutor, confirm_delivered
+
+        self._reset_binding_cache()
+        snapshot = load_snapshot(self.paths, run_id)
+        self._require_snapshot_authorization(snapshot)
+        executor = self._remote_delivery_executor
+        if executor is None:
+            executor = SubprocessRemoteDeliveryExecutor(self.paths.root, plan_id=self.plan.plan_id)
+        confirm_delivered(
+            snapshot, executor, pr_number,
+            record_event=lambda name, data: self._record(snapshot, name, data),
+            paths=self.paths,
+        )
+        self._refresh_run_status(snapshot)
+        self._save_snapshot(snapshot)
+        return snapshot
+
     def merge_change_request_local(
         self,
         run_id: str,
