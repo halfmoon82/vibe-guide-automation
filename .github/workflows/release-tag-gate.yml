@@ -71,7 +71,9 @@ jobs:
         # setup-python 的工具缓存只装 pip——3.12 起 ensurepip 不再捆绑
         # setuptools/wheel。而打包验收要跑 setup.py --version / bdist_wheel /
         # sdist，第一行 import setuptools 就会炸。本机 python3 预装了才看着是绿的。
-        run: python -m pip install --upgrade setuptools wheel
+        # setuptools 81+ removed pkg_resources; packaging acceptance intentionally
+        # audits the offline build toolchain and needs that compatibility module.
+        run: python -m pip install --upgrade 'setuptools<81' wheel
 
       - name: Tag version must equal package version
         env:
