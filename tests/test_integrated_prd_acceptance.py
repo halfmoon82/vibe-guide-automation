@@ -1457,6 +1457,26 @@ class ACE1EntryTriageTests(unittest.TestCase):
             self.assertIsInstance(report.get(key), (int, float), key)
         self.assertLessEqual(report["ece"], 0.05)
 
+    def test_public_plan_explicit_transport_failure_is_one_safe_attempt(self):
+        calls = []
+        def unavailable(request):
+            calls.append(request)
+            raise ConnectionRefusedError("sensitive transport diagnostic must not escape")
+        request = "设计并实现数据迁移与测试"
+        result = run_cli(["plan", "--request", request, "--json"], self.root,
+                         triage_hook=unavailable, triage_source="authorized-local-fixture")
+        self.assertEqual(result.exit_code, 0, result.payload)
+        self.assertEqual(calls, [request])
+        triage = result.payload["node_spec"]["triage"]
+        self.assertEqual(triage["attempts"], 1)
+        self.assertEqual(triage["reason_code"], "unavailable")
+        self.assertEqual(triage["source"], "authorized-local-fixture")
+        self.assertNotIn("sensitive transport", json.dumps(result.payload))
+        fallback = run_cli(["plan", "--request", request, "--json"], self.root)
+        self.assertEqual(result.payload["route"], fallback.payload["route"])
+        self.assertEqual(fallback.payload["node_spec"]["triage"]["attempts"], 0)
+        self.assertEqual(fallback.payload["node_spec"]["triage"]["reason_code"], "unconfigured")
+
 
 if __name__ == "__main__":
     unittest.main()

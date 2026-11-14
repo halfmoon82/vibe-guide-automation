@@ -77,8 +77,14 @@ class RunnerTest(unittest.TestCase):
 
     def test_state_mapping(self):
         for state, event in (("blocked", "needs_attention"), ("failed", "failed_retryable"), ("stopped", "stopped")):
-            self.launcher.state = state
-            self.assertEqual([e.event for e in self.runner.poll(self.start())], [event])
+            # Each state is an independent mapping example, not a new writer
+            # beside the preceding still-live session record.
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as root:
+                launcher = FakeLauncher(state)
+                runner = ClaudeBgRunner(lambda c, w: launcher,
+                    delivery_reader=lambda claims: None, paths=ProjectPaths(Path(root)))
+                handle = runner.start(dict(self.contract), Path("/tmp"))
+                self.assertEqual([e.event for e in runner.poll(handle)], [event])
 
     def test_unknown_is_blocked_unknown_with_reason(self):
         self.launcher.state = ClaudeBgUnknown("claude command not found")

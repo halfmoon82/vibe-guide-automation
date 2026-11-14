@@ -1,0 +1,40 @@
+{
+  "developer": {
+    "status": "DEVELOPER_R27_FOLLOWUP_COMPLETE"
+  },
+  "changes": [
+    {
+      "file": "vibe_guide/capability_contract.py",
+      "result": "_parse_timestamp accepts RFC3339 Z/z and normalizes to UTC"
+    },
+    {
+      "file": "vibe_guide/cli.py",
+      "result": "preview-card returns structured blocked_design visibility_downgrade_requires_reauthorization signal when signed visible capability only supports background; plan projections expose triage record"
+    },
+    {
+      "file": "tests/test_capability_contract.py",
+      "result": "RFC3339 Z regression"
+    },
+    {
+      "file": "tests/test_entry_triage.py",
+      "result": "public plan degradation reason regression"
+    }
+  ],
+  "targeted_tests": {
+    "count": 30,
+    "exit_code": 0,
+    "command": "python3.11 -m unittest -q tests.test_capability_contract tests.test_entry_triage tests.test_integrated_prd_acceptance.ACB3VisibilityDowngradePreviewTests tests.test_integrated_prd_acceptance.ACE1EntryTriageTests"
+  },
+  "checks": {
+    "py_compile": "passed",
+    "git_diff_check": "passed",
+    "triage_script": "accuracy=0.75,ece=0.0,p95_observed"
+  },
+  "unknown": [
+    "full suite remains failing as previously recorded; unrelated broad failures were not changed or reclassified"
+  ],
+  "boundaries": [
+    "no real AC evidence/run state/registry/lease/native receipt changed",
+    "no commit/push/PR/MR/merge/tag/Release/deploy"
+  ]
+}

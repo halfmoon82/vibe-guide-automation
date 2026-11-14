@@ -1,6 +1,8 @@
 """Durable provider-neutral runner backed by desktop action requests/results."""
 
 from dataclasses import replace
+from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
 import os
@@ -38,6 +40,9 @@ from ..task_registry import (
     binding_contract_enabled,
     load_task_binding,
     runtime_binding_gate,
+    protected_retirement_allows,
+    protected_writer_fence,
+    _PROTECTED_RETIREMENT,
     save_task_binding,
 )
 from ..workflow_gate import session_contract_prompt
@@ -49,6 +54,18 @@ from ..providers import (
     CODEX_PROVIDER,
     WORKBUDDY_VISIBLE_PROVIDER,
 )
+
+_RECEIPT_CALLER = ContextVar("provider_receipt_caller", default=None)
+
+
+def _supervisor_owner_projection(record):
+    """Keep only stable lease identity fields for initial create binding."""
+    if not isinstance(record, dict):
+        return None
+    projection = {key: record.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+    if projection.get("lease_epoch") == 0 and projection.get("owner") is None:
+        return None
+    return projection
 
 
 #: Native desktop tools per visible provider, one definition for the five
@@ -94,7 +111,7 @@ NATIVE_TOOL_MAP: Dict[str, Dict[str, str]] = {
 RESULT_EVENT_KEYS = (
     "evidence", "finding", "in_contract", "consistency",
     "delivery_evidence", "completion_marker", "delivery_path",
-    "thread_status", "in_session_review",
+    "thread_status", "in_session_review", "business_acceptance",
     # Integration-review routing: which accepted upstream node a finding
     # belongs to, the scope it asks for, and the defect files.
     "target_node_id", "scope_expansion", "files",
@@ -539,6 +556,288 @@ def validate_result_shape(operation, payload, *, role=None):
         )
 
 
+def _native_wait_projection(action, structured):
+    """Keep target-bound transport observations, never infer business events."""
+    def unknown(reason):
+        return {"status": "unknown", "reason": "native_wait:" + reason}
+    targets = action["request"].get("targets")
+    if not isinstance(targets, list) or len(targets) != 1 or not isinstance(targets[0], dict):
+        return unknown("single_target_required")
+    target = targets[0]
+    if any(not isinstance(target.get(key), str) or not target[key].strip()
+           for key in ("threadId", "hostId")):
+        return unknown("target_identity_required")
+    if any(key in structured and structured[key] is not False for key in ("partial", "hasMore")) or structured.get("nextCursor"):
+        return unknown("incomplete_page")
+    errors = structured.get("errors", [])
+    if not isinstance(errors, list) or errors:
+        return unknown("target_error_or_unverified_errors")
+    polls = structured.get("polls")
+    if not isinstance(polls, list) or len(polls) != 1 or not isinstance(polls[0], dict):
+        return unknown("single_poll_required")
+    poll = polls[0]
+    thread = poll.get("thread")
+    if not isinstance(thread, dict) or thread.get("id") != target["threadId"] or thread.get("hostId") != target["hostId"]:
+        return unknown("target_mismatch")
+    cursor = poll.get("cursor")
+    if not cursor_is_valid(cursor) or not cursor.strip():
+        return unknown("cursor_missing_or_invalid")
+    if "timedOut" in structured and type(structured["timedOut"]) is not bool:
+        return unknown("timeout_invalid")
+    # Preserve only structural observation facts. Assistant prose/tool markers
+    # stay in the full raw envelope and cannot become delivery/acceptance.
+    safe_poll = {"thread": {"id": thread["id"], "hostId": thread["hostId"]}, "cursor": cursor}
+    return {"status": "timeout" if structured.get("timedOut") is True else "unknown",
+            "reason": "native_wait:business_event_unproven", "cursor": cursor, "polls": [safe_poll]}
+
+
+def _native_response_body(response):
+    """Accept one unambiguous native JSON body across both public carriers."""
+    candidates = []
+    if isinstance(response.get("structuredContent"), dict):
+        candidates.append(response["structuredContent"])
+    content = response.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            try:
+                item = json.loads(block.get("text", ""))
+            except (ValueError, TypeError):
+                continue
+            if isinstance(item, dict):
+                candidates.append(item)
+    if not any(key in response for key in ("content", "structuredContent", "isError")):
+        candidates.append(response)
+    if response.get("isError") is True:
+        return None
+    return candidates[0] if candidates and all(item == candidates[0] for item in candidates) else None
+
+
+def _native_response_projection(action, response):
+    """One ingress interpretation shared by ordinary and protected consumers."""
+    structured = _native_response_body(response)
+    projection = {"status": "unknown"}
+    if response.get("isError") is True:
+        projection["reason"] = "native_response:tool_error"
+    elif structured is None:
+        projection["reason"] = "native_response:conflicting_structures"
+    elif action["operation"] in ("locate", "visibility", "resume"):
+        projection["reason"] = {
+            "locate": "native_locate:target_navigation_evidence_missing",
+            "visibility": "native_visibility:visible_direct_enter_capability_evidence_missing",
+            "resume": "native_resume:acceptance_not_execution_evidence",
+        }[action["operation"]]
+    if structured is not None and response.get("isError") is not True and action["operation"] == "create":
+        task_id, host = structured.get("threadId"), structured.get("hostId")
+        status = structured.get("status")
+        status_ready = ("status" not in structured
+                        or status in ("ready", "completed")
+                        or (isinstance(status, dict) and status.get("type") == "active"))
+        if (status_ready
+                and "clientThreadId" not in structured
+                and isinstance(task_id, str) and task_id.strip()
+                and isinstance(host, str) and host.strip()):
+            projection = {"binding": {"threadId": task_id, "hostId": host}}
+    elif response.get("isError") is not True and structured:
+        operation = action["operation"]
+        if operation == "resume" and structured.get("resumed") is True:
+            projection = {"resumed": True}
+        elif operation == "locate" and (structured.get("located") is True or (
+                action.get("provider") == CODEX_PROVIDER
+                and action.get("native_tool") == NATIVE_TOOL_MAP[CODEX_PROVIDER]["locate"]
+                and isinstance(action["request"].get("threadId"), str)
+                and action["request"]["threadId"].strip()
+                and structured == {"navigated": True})):
+            projection = {"located": True}
+        elif operation == "visibility" and all(structured.get(key) is True for key in ("visible", "direct_enter")):
+            projection = {"visible": True, "direct_enter": True}
+        elif operation == "wait" and any(key in structured for key in ("polls", "errors", "timedOut")):
+            projection = _native_wait_projection(action, structured)
+        elif operation == "wait":
+            candidate = {key: value for key, value in structured.items() if key in _WAIT_RESULT_FIELDS}
+            try:
+                validate_result_shape("wait", candidate, role=action.get("role"))
+            except (TypeError, ValueError):
+                pass
+            else:
+                projection = candidate
+    return projection
+
+
+def _native_initial_visibility_projection(store, action, response):
+    """Compose native initial visibility; this never asserts a business turn."""
+    from ..capability_contract import capability_status
+
+    def receipt(item):
+        result = store.result(item["action_id"])
+        raw = store._read(store._native_receipt_path(item["action_id"]))
+        envelope = raw.get("native_response")
+        if not isinstance(envelope, dict) or result != _native_response_projection(item, envelope):
+            raise ValueError("native visibility source is not replayable")
+        return result, _native_response_body(envelope), {
+            "action_id": item["action_id"], "request_digest": item["request_digest"],
+            "receipt_digest": raw["receipt_digest"],
+        }
+
+    unknown = {"status": "unknown", "reason": "native_visibility:initial_evidence_incomplete"}
+    try:
+        if (action["provider"] != CODEX_PROVIDER or action["operation"] != "visibility"
+                or action["native_tool"] != NATIVE_TOOL_MAP[CODEX_PROVIDER]["visibility"]):
+            return unknown
+        body = _native_response_body(response)
+        poll = _native_wait_projection(action, body or {}).get("polls", [])
+        if len(poll) != 1:
+            return unknown
+        task, host = poll[0]["thread"]["id"], poll[0]["thread"]["hostId"]
+        create = store.related_action(action, "create")
+        created, create_body, create_ref = receipt(create)
+        if created != {"binding": {"threadId": task, "hostId": host}} or not create_body:
+            return unknown
+        target = create["request"].get("target", {})
+        if not isinstance(target, dict) or not isinstance(target.get("binding_contract"), dict):
+            return unknown
+        project = target.get("projectId")
+        if (create["native_tool"] != NATIVE_TOOL_MAP[CODEX_PROVIDER]["create"]
+                or target.get("type") != "project" or not isinstance(project, str) or not project.strip()
+                or target.get("environment") != {"type": "local"}
+                or target["binding_contract"].get("project_id") != project
+                or create_body.get("mode", "visible") != "visible"
+                or create_body.get("visible", True) is not True
+                or create_body.get("projectId", project) != project):
+            return unknown
+        source = create["request"].get("initial_binding_source")
+        if not isinstance(source, dict) or not source:
+            return unknown
+        approved = source.get("consistency_binding")
+        if not isinstance(approved, dict) or not approved.get("authorization_digest"):
+            return unknown
+        wait_basis = dict(action, sequence=0)
+        wait = store.related_action(wait_basis, "wait")
+        _, _, wait_ref = receipt(wait)
+        initial_poll = native_wait_observation(store, wait)
+        if (wait["native_tool"] != NATIVE_TOOL_MAP[CODEX_PROVIDER]["wait"]
+                or wait["request"].get("initial_binding_source") != source
+                or initial_poll["thread"] != poll[0]["thread"]):
+            return unknown
+        locate = store.related_action(action, "locate")
+        located, locate_body, locate_ref = receipt(locate)
+        if (locate["native_tool"] != NATIVE_TOOL_MAP[CODEX_PROVIDER]["locate"]
+                or locate["request"].get("threadId") != task
+                or located != {"located": True} or locate_body != {"navigated": True}):
+            return unknown
+        # Inspect only transport identity/visibility metadata, never assistant
+        # prose or business payloads. Absence is allowed; a contradiction is not.
+        identities = {
+            "threadId": task, "thread_id": task, "taskId": task,
+            "task_id": task, "platform_task_id": task,
+            "hostId": host, "host": host, "host_id": host,
+            "projectId": project, "project_id": project,
+            "run_id": action["run_id"], "runId": action["run_id"],
+            "node_id": action["issue_id"], "issue_id": action["issue_id"],
+            "nodeId": action["issue_id"], "issueId": action["issue_id"],
+            "role": action["role"], "generation": action["generation"],
+        }
+
+        def agrees(metadata, kind="envelope"):
+            if not isinstance(metadata, dict):
+                return False
+            if (_reports_failure(metadata) or metadata.get("mode", "visible") != "visible"
+                    or metadata.get("background", False) is not False):
+                return False
+            for key in ("visible", "direct_enter", "directEnter", "located", "navigated"):
+                if key in metadata and metadata[key] is not True:
+                    return False
+            for key, expected in identities.items():
+                if key in metadata and (type(metadata[key]) is not type(expected) or metadata[key] != expected):
+                    return False
+            if kind in ("thread", "task", "binding", "identity", "target", "project") and "id" in metadata:
+                if metadata["id"] != (project if kind == "project" else task):
+                    return False
+            for key in ("binding", "thread", "task", "project", "identity", "metadata", "target"):
+                if key in metadata and not agrees(metadata[key], key):
+                    return False
+            if "polls" in metadata:
+                if not isinstance(metadata["polls"], list) or any(
+                        not agrees(item, "poll") for item in metadata["polls"]):
+                    return False
+            return True
+
+        for native_body in (create_body, locate_body, _native_response_body(response),
+                            _native_response_body(store._read(store._native_receipt_path(
+                                wait["action_id"]))["native_response"])):
+            if not agrees(native_body):
+                return unknown
+        capability = load_contract(store.paths)
+        digest = capability.contract_digest
+        if (capability.provider not in ("codex", CODEX_PROVIDER) or capability.host_id != host
+                or any(item["request"].get("capability_contract_digest") != digest
+                       or item["request"].get("authorization_digest") != approved["authorization_digest"]
+                       for item in (create, wait, locate, action))):
+            return unknown
+        refs = {}
+        for name, operation in (("create", "create"), ("enter", "locate"),
+                                ("resume", "resume"), ("wait", "wait")):
+            key = "codex.visible_task." + name
+            fact = capability.capabilities.get(key)
+            if (capability_status(capability, key) != "verified_available" or fact is None
+                    or fact.route != NATIVE_TOOL_MAP[CODEX_PROVIDER][operation]
+                    or not fact.evidence_ref.strip()):
+                return unknown
+            refs[key] = fact.evidence_ref
+        return {"visible": True, "direct_enter": True, "native_visibility_evidence": {
+            "create": create_ref, "initial_wait": wait_ref, "locate": locate_ref,
+            "capability_contract_digest": digest, "evidence_refs": refs}}
+    except (KeyError, OSError, TypeError, ValueError, ProviderUnavailable):
+        return unknown
+
+
+def native_wait_observation(store, action):
+    """Revalidate the durable native projection, never pick facts from rejected raw."""
+    result = store.result(action["action_id"])
+    raw = store._read(store._native_receipt_path(action["action_id"]))
+    response = raw.get("native_response")
+    if action.get("operation") != "wait" or not isinstance(response, dict):
+        raise ProviderUnavailable("protected successor requires complete native wait receipt")
+    projection = _native_response_projection(action, response)
+    polls = projection.get("polls")
+    if (result != projection or not isinstance(polls, list) or len(polls) != 1
+            or not projection.get("cursor") or polls[0].get("cursor") != projection["cursor"]):
+        raise ProviderUnavailable("protected successor native wait observation is unknown")
+    return polls[0]
+
+
+def complete_native_mailbox_action(paths, run_id, action_id, response, *, request_digest):
+    """Persist full native envelope; transport acceptance is not execution."""
+    store = ProviderActionStore(paths)
+    action = store.action(action_id)
+    if action.get("run_id") != run_id or request_digest != action["request_digest"]:
+        raise ValueError("native response request binding mismatch")
+    if not isinstance(response, dict):
+        raise ValueError("native response must be an object")
+    projection = _native_response_projection(action, response)
+    if action.get("operation") == "visibility" and "polls" in (_native_response_body(response) or {}):
+        projection = _native_initial_visibility_projection(store, action, response)
+    return store.complete(action_id, projection, request_digest=request_digest,
+                          native_response=response)
+
+
+def _revalidate_native_visibility(store, action, result):
+    """A saved positive projection cannot outlive its evidence or capabilities."""
+    path = store._native_receipt_path(action["action_id"])
+    if not path.exists():
+        if "native_visibility_evidence" in result:
+            raise ProviderUnavailable("native visibility raw evidence missing")
+        return
+    raw = store._read(path)
+    response = raw.get("native_response")
+    if isinstance(response, dict) and ("polls" in (_native_response_body(response) or {})
+            or "native_visibility_evidence" in result):
+        projected = _native_initial_visibility_projection(store, action, response)
+        if projected != result or projected.get("visible") is not True:
+            raise ProviderUnavailable("native visibility combination is blocked_unknown")
+
+
 def complete_mailbox_action(paths, run_id, action_id, payload, *, native=True):
     """Validate a mailbox result against its request, then store it.
 
@@ -552,6 +851,17 @@ def complete_mailbox_action(paths, run_id, action_id, payload, *, native=True):
         raise ValueError("provider action belongs to a different run")
     validate_result_shape(request.get("operation"), payload, role=request.get("role"))
     return store.complete(action_id, payload, native=native)
+
+
+def _blocked_guidance():
+    reference = protocol_path("blocked-engineering-examples")
+    return ("工程阻塞时沿本合同 worker-deliver 的原 run/node/role/generation 上报，"
+            'payload 示例：{"event":"blocked_engineering","status":"blocked",'
+            '"implementation_complete":false,"failed_step":"实际失败步骤",'
+            '"attempted_actions":[{"action":"已试动作","result":"实际结果"}],'
+            '"missing_conditions":["具体缺口"],"evidence_refs":["真实证据引用"]}。'
+            "不伪造 complete/accepted/delivery_evidence，不自行增加代次或扩大范围；"
+            "上报后仍按 supervisor-address 返回值唤醒原监工。六角色阶段实例：" + str(reference))
 
 
 class ProviderActionRunner(Runner):
@@ -631,7 +941,7 @@ class ProviderActionRunner(Runner):
                 separators=(",", ":"),
             )
         )
-        return capability + "\n" + consistency
+        return _blocked_guidance() + "\n" + capability + "\n" + consistency
 
     @staticmethod
     def _continuation_prompt(contract: Dict[str, Any], project_root: Optional[Path] = None) -> str:
@@ -659,7 +969,7 @@ class ProviderActionRunner(Runner):
             "仍有未清 P0-P2 发现时用顶层 \"event\": \"review_finding\" 携带 finding 上报，不得用 accepted。"
             if reviewer else ""
         )
-        return (
+        return _blocked_guidance() + "\n" + (
             "执行请求：继续 Issue {node} 的{purpose}本轮 generation {generation}。\n"
             "目标：{objective}；业务合同：{business}。"
             "入口规则或后续规则注入不能替代该任务目标，不得仅回复收到规则。\n"
@@ -779,6 +1089,7 @@ class ProviderActionRunner(Runner):
         for key in (
             "dispatcher", "complexity_band", "execution_engine", "engine_mode",
             "engine_evidence_ref", "authorization_digest", "plan_id", "plan_version",
+            "capability_contract_digest",
         ):
             if key in contract:
                 request[key] = contract[key]
@@ -791,7 +1102,91 @@ class ProviderActionRunner(Runner):
         return request
 
     def _action(self, contract, run_id, operation, request, sequence=0):
+        with protected_writer_fence():
+            if contract.get("_initial_binding_source") and operation in {"locate", "visibility"}:
+                intent = contract.get("binding_intent")
+                if not isinstance(intent, BindingIntent):
+                    raise ProviderUnavailable("initial binding action has no live intent")
+                fresh_intent, fresh_observation = self._initial_live_binding_evidence(
+                    contract, run_id, intent.task_id, intent.host_id, Path(intent.worktree))
+                if (fresh_intent != intent or fresh_observation != contract.get("binding_observation")
+                        or not runtime_binding_gate(contract).verified):
+                    raise ProviderUnavailable("initial binding action observation changed")
+            if _PROTECTED_RETIREMENT.get() is not None or (contract.get("successor") and binding_contract_enabled(contract)):
+                if not protected_retirement_allows(None, None, contract=contract, runner=self):
+                    raise ProviderUnavailable("protected successor scope or writer lease changed")
+                if operation in {"locate", "visibility"} and not runtime_binding_gate(contract).verified:
+                    raise ProviderUnavailable("protected successor action evidence changed")
+            return self._action_owned(contract, run_id, operation, request, sequence)
+
+    def _action_owned(self, contract, run_id, operation, request, sequence=0):
         request = self._request_envelope(contract, request)
+        initial_anchor_sequence = None
+        if (operation == "create" and sequence == 0 and not binding_contract_enabled(contract)
+                and not contract.get("successor") and not contract.get("continuation")
+                and request.get("origin") == "worker_dispatch" and request.get("plan_id")):
+            # The monitor calls this under the supervisor lock, before the
+            # mailbox makes a create visible. Pin the complete canonical
+            # request in the run's existing hash chain, never after visibility.
+            from ..adapters.task_provider import _canonical_digest
+            from ..state import append_event, interprocess_lock, load_events, verify_run_evidence, _lease_lock, retirement_writer_lease
+            from ..supervisor import SupervisorLease, _read_lease_record
+            basis = {"operation": operation, "provider": self.provider, "run_id": run_id,
+                     "issue_id": str(contract["node_id"]), "role": str(contract["role"]),
+                     "generation": int(contract["generation"]), "sequence": sequence}
+            action_id = "action-" + _canonical_digest(basis)[:32]
+            full_native_tool = self._native_tool(operation)
+            payload = {"schema_version": self.store.schema_version, "action_id": action_id,
+                       **basis, "native_tool": "controlled_create", "request": {
+                           "controlled": True,
+                           "executable_digest": _canonical_digest({
+                               "native_tool": full_native_tool, "request": request})}}
+            request_digest = _canonical_digest(payload)
+            payload["request_digest"] = request_digest
+            raw = (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+            lease_path = SupervisorLease(self.paths).path(run_id)
+            owner = _read_lease_record(lease_path)
+            owner_digest = _canonical_digest(_supervisor_owner_projection(owner))
+            snapshot = verify_run_evidence(self.paths, run_id)
+            with interprocess_lock(_lease_lock(self.paths)):
+                held = retirement_writer_lease(self.paths, basis["issue_id"], str(contract["worktree"]), run_id)
+                if (held is None or held["record"].get("role") != basis["role"]
+                        or held["record"].get("generation") != basis["generation"]):
+                    raise ProviderUnavailable("initial create writer lease is unknown")
+                anchor = {"run_id": run_id, "node_id": basis["issue_id"], "role": basis["role"],
+                          "generation": basis["generation"], "action_id": action_id,
+                          "request_digest": request_digest, "authorization_digest": request.get("authorization_digest"),
+                          "node_contract_digest": snapshot.node_contract_digest,
+                          "capability_contract_digest": request.get("capability_contract_digest"),
+                          "intent_digest": held["record"].get("intent_digest"), "binding_digest": owner_digest,
+                          "controlled_payload_digest": self.store._controlled_payload_digest(
+                              payload, {"native_tool": full_native_tool, "request": request}),
+                          "proof": {"request_sha256": hashlib.sha256(raw).hexdigest()}}
+                events = load_events(self.paths, run_id)
+                previous = [row for row in events if row.get("event") == "initial_create_anchored"
+                            and row.get("data", {}).get("action_id") == action_id]
+                path = self.store.root / "requests" / (action_id + ".json")
+                if previous:
+                    previous_data = previous[0].get("data", {}) if len(previous) == 1 else {}
+                    comparable_anchor = dict(anchor)
+                    if "controlled_payload_digest" not in previous_data:
+                        comparable_anchor.pop("controlled_payload_digest", None)
+                    if len(previous) != 1 or previous_data != comparable_anchor:
+                        raise ProviderUnavailable("initial create anchor differs")
+                    if path.exists() or path.is_symlink():
+                        if (self.store.action(action_id).get("request_digest") != request_digest
+                                or path.read_bytes() != raw):
+                            raise ProviderUnavailable("initial create request differs from anchor")
+                    else:
+                        # A prior visible request may have been removed; an
+                        # anchor alone cannot prove that it was never read.
+                        raise ProviderUnavailable("initial create request missing after anchor")
+                else:
+                    if path.exists() or path.is_symlink():
+                        if self.store.action(action_id) != payload or path.read_bytes() != raw:
+                            raise ProviderUnavailable("legacy initial create identity differs")
+                    else:
+                        initial_anchor_sequence = append_event(self.paths, RunEvent("initial_create_anchored", anchor))
         return self.store.request(
             operation=operation,
             provider=self.provider,
@@ -802,6 +1197,13 @@ class ProviderActionRunner(Runner):
             native_tool=self._native_tool(operation),
             request=request,
             sequence=sequence,
+            _initial_anchor_sequence=initial_anchor_sequence,
+            _controlled_create=(operation == "create" and sequence == 0
+                                and not binding_contract_enabled(contract)
+                                and not contract.get("successor")
+                                and not contract.get("continuation")
+                                and request.get("origin") == "worker_dispatch"
+                                and bool(request.get("plan_id"))),
         )
 
     @staticmethod
@@ -851,6 +1253,13 @@ class ProviderActionRunner(Runner):
         operation: str,
         request: Dict[str, Any],
     ) -> Dict[str, Any]:
+        if contract.get("successor") and binding_contract_enabled(contract):
+            live = isinstance(contract.get("binding_intent"), BindingIntent) and isinstance(
+                contract.get("binding_observation"), BindingObservation)
+            if not live and not protected_retirement_allows(None, None):
+                raise ProviderUnavailable("protected successor retirement changed before provider action")
+            # The final evidence gate belongs to _action's writer-lock
+            # transaction; a pre-read cannot fence request visibility.
         sequence = contract.get("_create_recovery_sequence", 0) if operation in {"create", "locate", "visibility"} else 0
         action = self._action(contract, run_id, operation, request, sequence=sequence)
         result = self.store.result(action["action_id"])
@@ -861,6 +1270,8 @@ class ProviderActionRunner(Runner):
             pending.action_id = action["action_id"]
             pending.request_digest = action["request_digest"]
             raise pending
+        if operation == "visibility":
+            _revalidate_native_visibility(self.store, action, result)
         if result.get("status") in ("failed", "error", "stopped") or result.get("failed") is True:
             error = result.get("reason") or result.get("error") or "provider action failed"
             if isinstance(error, dict):
@@ -1044,6 +1455,11 @@ class ProviderActionRunner(Runner):
                 "on the new platform instead of the old binding)"
             )
         v39 = binding_contract_enabled(contract)
+        protected_successor = v39 and successor and protected_retirement_allows(None, None)
+        if (v39 and successor and not protected_successor
+                and not (isinstance(contract.get("binding_intent"), BindingIntent)
+                         and isinstance(contract.get("binding_observation"), BindingObservation))):
+            raise ProviderUnavailable("protected successor retirement evidence is missing")
         live_intent = contract.get("binding_intent")
         live_observation = contract.get("binding_observation")
         if v39:
@@ -1088,6 +1504,17 @@ class ProviderActionRunner(Runner):
             "archived",
         }:
             raise ValueError("visible successor requires a stopped predecessor")
+        writer_root = str(contract.get("worktree") or worktree)
+        if successor and existing is not None:
+            old_root = Path(existing.worktree)
+            old_root = old_root if old_root.is_absolute() else self.paths.root / old_root
+            new_root = Path(writer_root)
+            new_root = new_root if new_root.is_absolute() else self.paths.root / new_root
+            if old_root.resolve() != new_root.resolve() or existing.branch != contract.get("branch"):
+                raise ValueError("successor writer root or branch changed")
+            # The immutable registry pins the predecessor's representation,
+            # not just its resolved location. Keep it after proving equality.
+            writer_root = existing.worktree
         if v39 and contract.get("binding_probe") is not True:
             raise ProviderUnavailable(
                 "V3.9 provider create requires explicit binding_probe=true"
@@ -1254,10 +1681,64 @@ class ProviderActionRunner(Runner):
                 # Durable lineage on the create action itself, so a later
                 # false-start recovery can verify it without trusting state.
                 create_request["handoff_from_provider"] = existing.provider
+        initial_bridge = v39 and not successor and not isinstance(live_intent, BindingIntent)
+        if initial_bridge:
+            from ..supervisor import SupervisorLease, _read_lease_record
+            from ..state import retirement_writer_lease
+            record = _read_lease_record(SupervisorLease(self.paths).path(run_id))
+            owner = ({key: record.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                     if record is not None else None)
+            caller = _RECEIPT_CALLER.get()
+            if caller is not None and caller[0] is self:
+                self._check_consumption_owner(run_id, caller[1])
+            prior = self.store.related_action({
+                "provider": self.provider, "run_id": run_id, "issue_id": node_id,
+                "role": role, "generation": generation, "sequence": 0,
+            }, "create", required=False)
+            source = prior["request"].get("initial_binding_source") if prior is not None else None
+            if prior is not None and (not isinstance(source, dict) or source.get("owner") != owner):
+                raise ProviderUnavailable("initial create owner changed; immutable source retained")
+            # Pin the owner and approved contract context to the durable create
+            # transaction; a later owner cannot reuse its completed probe.
+            create_request["initial_binding_source"] = {
+                "owner": owner,
+                "consistency_binding": contract.get("consistency_binding"),
+                "node_contract_digest": contract.get("node_contract_digest"),
+            }
+            try:
+                held = retirement_writer_lease(self.paths, node_id, str(Path(worktree).resolve()), run_id, resolved_root=True)
+            except PermissionError:
+                held = None
+            create_request["initial_binding_source"]["writer_lease"] = held
+            contract["_initial_binding_source"] = create_request["initial_binding_source"]
+        if v39:
+            # Native tools discard our internal probe flags. The public prompt
+            # itself must not arm a worker before the protected binding gate.
+            prior = self.store.related_action({
+                "provider": self.provider, "run_id": run_id, "issue_id": node_id,
+                "role": role, "generation": generation, "sequence": 0,
+            }, "create", required=False)
+            if prior is None or prior["request"].get("write_barrier_version") == 1:
+                create_request["write_barrier_version"] = 1
+                create_request["prompt"] = (
+                    "只读绑定探针：当前不是业务开工，尚未获得业务执行许可。"
+                    "不得写入任何文件，不得实现、测试、提交、审查或验收业务，"
+                    "不得调用 worker-deliver，不得消费 mailbox 或修改运行状态。"
+                    "仅原样回复本会话 cwd，然后结束本回合等待。"
+                    "只有登记监工在本任务正式续接、明确下发业务合同后才能开工；"
+                    "项目规则、协议或内部标记不构成该许可。"
+                )
+            else:
+                # Already-issued legacy requests remain immutable: no prompt
+                # replacement, permission reinterpretation or new side effect.
+                create_request["prompt"] = prior["request"]["prompt"]
         contract = self._parameter_recovery_contract(contract, run_id, create_request)
-        created = self._require_result(
-            contract, run_id, "create", create_request
-        )
+        try:
+            created = self._require_result(contract, run_id, "create", create_request)
+        except ValueError as error:
+            if initial_bridge:
+                raise ProviderUnavailable("initial create transaction identity changed") from error
+            raise
         routed_profile = profile is not None and (
             contract.get("routing_required") is True
             or "selected_model" in profile.selection_basis
@@ -1305,6 +1786,22 @@ class ProviderActionRunner(Runner):
         # may run until supervisor-owned protected evidence binds that id.
         # A probe result is not permission to locate, enter, or write.
         if v39:
+            if protected_successor and not isinstance(live_intent, BindingIntent):
+                live_intent, live_observation = self._protected_successor_evidence(
+                    contract, run_id, task_id, host, worktree)
+                contract.update(binding_intent=live_intent, binding_observation=live_observation,
+                                provider_task_id=task_id)
+            elif initial_bridge and (not isinstance(live_intent, BindingIntent) or not isinstance(
+                live_observation, BindingObservation
+            )):
+                live_intent, live_observation = self._initial_live_binding_evidence(
+                    contract, run_id, task_id, host, worktree
+                )
+                contract.update(
+                    binding_intent=live_intent,
+                    binding_observation=live_observation,
+                    provider_task_id=task_id,
+                )
             if not isinstance(live_intent, BindingIntent) or not isinstance(
                 live_observation, BindingObservation
             ):
@@ -1312,10 +1809,17 @@ class ProviderActionRunner(Runner):
             if live_intent.task_id != task_id or live_intent.host_id != host:
                 raise ProviderUnavailable("provider probe identity is not supervisor verified")
             lease = read_writer_lease(self.paths, node_id, live_intent.worktree)
+            if initial_bridge and lease is None:
+                lease = live_observation.lease  # freshly fenced by _initial_live_binding_evidence
             if lease is None or live_observation.lease != lease:
                 raise ProviderUnavailable("provider probe lease is not supervisor verified")
             if not runtime_binding_gate(contract).verified:
                 raise ProviderUnavailable("provider probe binding is blocked_unknown")
+            if initial_bridge:
+                for key in ("project_id", "managed_root", "worktree", "branch",
+                            "base_sha", "head_sha", "clean", "cursor"):
+                    if key in binding_data and binding_data[key] != getattr(live_observation, key):
+                        raise ProviderUnavailable("provider self-report conflicts with initial live evidence")
 
         located = self._require_result(
             contract,
@@ -1344,6 +1848,11 @@ class ProviderActionRunner(Runner):
         )
         if visible.get("visible") is not True or visible.get("direct_enter") is not True:
             raise ValueError("provider task visibility is not verified")
+        if initial_bridge:
+            fresh_intent, fresh_observation = self._initial_live_binding_evidence(
+                contract, run_id, task_id, host, worktree)
+            if fresh_intent != live_intent or fresh_observation != live_observation:
+                raise ProviderUnavailable("initial binding changed during visibility consumption")
         binding = TaskBinding(
             provider=self.provider,
             mode="visible",
@@ -1357,13 +1866,14 @@ class ProviderActionRunner(Runner):
             limitations=list(contract.get("dispatch_limitations", [])),
             task_id=task_id,
             host=host,
-            worktree=str(contract.get("worktree") or worktree),
+            worktree=writer_root,
             branch=str(contract.get("branch", "")),
             status_file=str(contract.get("status_file", "")),
             handoff_file=str(contract.get("handoff_file", "")),
             threadId=task_id if self.provider == CODEX_PROVIDER else None,
             hostId=host if self.provider == CODEX_PROVIDER else None,
             run_id=run_id,
+            cursor=live_observation.cursor if initial_bridge and isinstance(live_observation, BindingObservation) else None,
             status=status,
             visible=True,
             generation=generation,
@@ -1376,6 +1886,8 @@ class ProviderActionRunner(Runner):
             binding.route_digest = profile.route_digest
             binding.model = profile.model
             binding.reasoning = profile.reasoning
+        if initial_bridge:
+            binding.legacy["initial_binding_source"] = contract["_initial_binding_source"]
         # Provider-returned host/project/lease/cursor and nested dictionaries
         # are self-report only.  Only supervisor-injected protected objects
         # from the contract can attest this final task binding.
@@ -1407,6 +1919,138 @@ class ProviderActionRunner(Runner):
             binding.business_write_allowed = verification.business_write_allowed
         return binding
 
+    def _initial_live_binding_evidence(self, contract, run_id, task_id, host, worktree):
+        """Create supervisor-owned evidence for a newly returned task identity."""
+        from ..state import retirement_writer_lease
+        source = contract.get("_initial_binding_source")
+        if not isinstance(source, dict) or not isinstance(source.get("owner"), dict):
+            raise ProviderUnavailable("initial live binding owner is blocked_unknown")
+        consistency = source.get("consistency_binding")
+        if (not isinstance(consistency, dict) or consistency.get("schema_version") != 1
+                or not consistency.get("plan_id") or not consistency.get("plan_version")
+                or consistency.get("authorization_digest") != contract.get("authorization_digest")):
+            raise ProviderUnavailable("initial live binding approved source is blocked_unknown")
+        for key in ("project_digest", "decision_digest", "authorization_digest", "issue_contract_digest"):
+            value = consistency.get(key)
+            if (not isinstance(value, str) or len(value) != 64
+                    or any(char not in "0123456789abcdef" for char in value)):
+                raise ProviderUnavailable("initial live binding source digest is blocked_unknown")
+        self._check_consumption_owner(run_id, source["owner"])
+        request = {
+            "purpose": "binding_probe",
+            "business_write_allowed": False,
+            "targets": [{"threadId": task_id, "hostId": host}],
+            "timeoutMs": 0,
+            "initial_binding_source": source,
+        }
+        self._require_result(contract, run_id, "wait", request)
+        action = self._action(contract, run_id, "wait", request, sequence=0)
+        try:
+            poll = native_wait_observation(self.store, action)
+        except (OSError, TypeError, ValueError) as error:
+            raise ProviderUnavailable("initial live binding native wait is blocked_unknown") from error
+        thread = poll.get("thread")
+        cursor = poll.get("cursor")
+        if (not isinstance(thread, dict) or thread.get("id") != task_id
+                or thread.get("hostId") != host or not isinstance(cursor, str) or not cursor):
+            raise ProviderUnavailable("initial live binding wait identity is blocked_unknown")
+        for key, expected in (("provider_task_id", task_id), ("host_id", host)):
+            if contract.get(key) not in (None, "", expected):
+                raise ProviderUnavailable("initial live binding contract identity is blocked_unknown")
+        root = Path(worktree).resolve()
+        managed = Path(contract.get("managed_root", "")).resolve()
+        try:
+            if Path(contract["worktree"]).resolve() != root:
+                raise ValueError("writer root changed")
+            root.relative_to(managed)
+        except (KeyError, TypeError, ValueError, OSError, RuntimeError):
+            raise ProviderUnavailable("initial live binding path is blocked_unknown")
+
+        def git(*args):
+            result = subprocess.run(
+                ["git", "-C", str(root), *args],
+                check=False, capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise ProviderUnavailable("initial live binding git observation is blocked_unknown")
+            return result.stdout.strip()
+
+        branch = git("symbolic-ref", "--short", "HEAD")
+        head = git("rev-parse", "HEAD")
+        status = git("status", "--porcelain", "--untracked-files=all")
+        if branch != contract.get("branch") or head.lower() != str(contract.get("base_sha", "")).lower() or status:
+            raise ProviderUnavailable("initial live binding git state is blocked_unknown")
+        # Resolve for containment and Git observation, but preserve the exact
+        # authorized spelling for the gate and its writer-lease identity.
+        # On macOS /var and /private/var can name the same directory.
+        try:
+            held = retirement_writer_lease(self.paths, str(contract["node_id"]), str(root), run_id, resolved_root=True)
+        except PermissionError as error:
+            raise ProviderUnavailable("initial live binding writer lease identity is blocked_unknown") from error
+        if (held is None or held != source.get("writer_lease")
+                or held["record"].get("role") != contract.get("role")
+                or held["record"].get("generation") != contract.get("generation")):
+            raise ProviderUnavailable("initial live binding writer lease generation is blocked_unknown")
+        lease = read_writer_lease(self.paths, str(contract["node_id"]), held["record"]["worktree"])
+        if lease is None:
+            raise ProviderUnavailable("initial live binding writer lease is blocked_unknown")
+        if lease.worktree != contract["worktree"]:
+            from ..state import supervisor_lease_id
+            lease = replace(lease, worktree=contract["worktree"], lease_id=supervisor_lease_id(
+                str(contract["node_id"]), contract["worktree"], run_id))
+        if contract.get("head_sha") not in (None, "", head) or contract.get("clean") not in (None, "", True):
+            raise ProviderUnavailable("initial live binding Git contract is blocked_unknown")
+        if contract.get("cursor") not in (None, "", cursor):
+            raise ProviderUnavailable("initial live binding cursor contract is blocked_unknown")
+        if contract.get("lease") not in (None, "", lease):
+            raise ProviderUnavailable("initial live binding lease contract is blocked_unknown")
+        self._check_consumption_owner(run_id, source["owner"])
+        cursor_observation = WaitThreadsCursorObservation.from_wait_threads(task_id, host, cursor)
+        identity = dict(
+            project_id=contract["project_id"], task_id=task_id, host_id=host,
+            node_id=str(contract["node_id"]), worktree=contract["worktree"], managed_root=contract["managed_root"],
+            branch=branch, base_sha=str(contract["base_sha"]), head_sha=head,
+            clean=True, cursor=cursor,
+        )
+        intent = BindingIntent(**identity, lease_id=lease.lease_id)
+        observation = BindingObservation(
+            **identity, lease=lease, source="codex_app__wait_threads",
+            cursor_source="codex_app__wait_threads", cursor_task_id=task_id,
+            cursor_host_id=host, cursor_lineage=cursor_observation.lineage,
+            cursor_observation=cursor_observation,
+        )
+        return intent, observation
+
+    def _protected_successor_evidence(self, contract, run_id, task_id, host, worktree):
+        """Observe the newly created task, never bootstrap its predecessor."""
+        request = {"purpose": "binding_probe", "business_write_allowed": False,
+                   "targets": [{"threadId": task_id, "hostId": host}], "timeoutMs": 0}
+        self._require_result(contract, run_id, "wait", request)
+        action = self._action(contract, run_id, "wait", request, sequence=0)
+        poll = native_wait_observation(self.store, action)
+        cursor = WaitThreadsCursorObservation.from_wait_threads(task_id, host, poll.get("cursor"))
+        def git(*args):
+            result = subprocess.run(["git", "-C", str(worktree), *args],
+                                    check=True, capture_output=True, text=True)
+            return result.stdout.strip()
+        root = str(Path(worktree).resolve())
+        if git("symbolic-ref", "--short", "HEAD") != contract["branch"]:
+            raise ProviderUnavailable("protected successor branch drift")
+        lease = read_writer_lease(self.paths, contract["node_id"], root)
+        if lease is None:
+            raise ProviderUnavailable("protected successor live lease missing")
+        identity = dict(project_id=contract["project_id"], task_id=task_id, host_id=host,
+            node_id=contract["node_id"], worktree=root, managed_root=contract["managed_root"],
+            branch=contract["branch"], base_sha=contract["base_sha"], head_sha=git("rev-parse", "HEAD"),
+            clean=not bool(git("status", "--porcelain")), cursor=cursor.cursor)
+        intent = BindingIntent(**identity, lease_id=lease.lease_id)
+        observation = BindingObservation(**identity, lease=lease, source="codex_app__wait_threads",
+            cursor_source="codex_app__wait_threads", cursor_task_id=task_id, cursor_host_id=host,
+            cursor_lineage=cursor.lineage, cursor_observation=cursor)
+        if not protected_retirement_allows(intent, observation):
+            raise ProviderUnavailable("protected successor live retirement proof changed")
+        return intent, observation
+
     @staticmethod
     def _handle_id(contract: Dict[str, Any], run_id: str) -> str:
         basis = "\0".join(
@@ -1425,12 +2069,63 @@ class ProviderActionRunner(Runner):
 
     def binding_gate(self, contract: Dict[str, Any], binding: TaskBinding):
         """Run the V3.9 binding gate at the provider boundary."""
+        initial_source = None
+        if (binding_contract_enabled(contract) and not contract.get("continuation")
+                and not contract.get("successor") and not binding.successor_of):
+            from ..digests import canonical_json_digest
+            try:
+                # The immutable create journal, rather than a mutable registry
+                # carrier, decides whether fresh first-binding proof is due.
+                for sequence in (0, 1):
+                    action = self.store.related_action({
+                        "provider": self.provider, "run_id": binding.run_id,
+                        "issue_id": binding.issue_id, "role": binding.role,
+                        "generation": binding.generation, "sequence": sequence,
+                    }, "create", required=False)
+                    if action is None or "initial_binding_source" not in action["request"]:
+                        continue
+                    result = self.store.result(action["action_id"])
+                    returned = result.get("binding") if isinstance(result, dict) else None
+                    if (not isinstance(returned, dict)
+                            or (returned.get("threadId") or returned.get("task_id")) != binding.task_id
+                            or (returned.get("hostId") or returned.get("host")) != binding.host):
+                        continue
+                    initial_source = action["request"]["initial_binding_source"]
+                    carrier = binding.legacy.get("initial_binding_source")
+                    if (not isinstance(initial_source, dict) or not initial_source
+                            or not isinstance(carrier, dict) or not carrier
+                            or canonical_json_digest(carrier) != canonical_json_digest(initial_source)):
+                        raise ValueError("initial binding source carrier changed")
+                    visibility = self.store.related_action(action, "visibility")
+                    visible = self.store.result(visibility["action_id"])
+                    if not isinstance(visible, dict):
+                        raise ValueError("initial binding visibility missing")
+                    _revalidate_native_visibility(self.store, visibility, visible)
+                    break
+                if initial_source is None:
+                    raise ValueError("initial binding create source is unavailable")
+            except (OSError, TypeError, ValueError, PermissionError, ProviderUnavailable):
+                return BindingVerification("blocked_unknown", False, [], ["initial_binding_source"])
+        if initial_source is not None:
+            fresh_contract = dict(contract, _initial_binding_source=initial_source)
+            try:
+                intent, observation = self._initial_live_binding_evidence(
+                    fresh_contract, str(binding.run_id), binding.task_id, binding.host, Path(binding.worktree))
+            except (ProviderUnavailable, ProviderPending, PermissionError, ValueError, OSError):
+                return BindingVerification("blocked_unknown", False, [], ["initial_binding_fresh_observation"])
+            if intent != binding.binding_intent or observation != binding.binding_observation:
+                return BindingVerification("blocked_unknown", False, [], ["initial_binding_fresh_observation"])
+        if _PROTECTED_RETIREMENT.get() is not None or (contract.get("successor") and binding_contract_enabled(contract)):
+            if not protected_retirement_allows(None, None, contract=contract, runner=self):
+                return BindingVerification("blocked_unknown", False, [], ["protected_retirement_scope"])
         verification = runtime_binding_gate(contract, binding)
         if not binding_contract_enabled(contract) or not verification.verified:
             return verification
         intent = binding.binding_intent
         observation = binding.binding_observation
         lease = read_writer_lease(self.paths, str(contract["node_id"]), intent.worktree)
+        if lease is None and initial_source is not None:
+            lease = observation.lease  # fresh, source-bound evidence checked above
         if lease is None or observation.lease != lease:
             return BindingVerification("blocked_unknown", False, [], ["lease"])
         return verification
@@ -1758,6 +2453,10 @@ class ProviderActionRunner(Runner):
         return verification
 
     def start(self, contract: dict, worktree: Path) -> RunHandle:
+        with protected_writer_fence():
+            return self._start_owned(contract, worktree)
+
+    def _start_owned(self, contract: dict, worktree: Path) -> RunHandle:
         # Reject direct complex starts before task-binding reads or Provider I/O.
         require_complex_monitor_dispatch(contract, self.paths)
         run_id = str(contract.get("run_id", ""))
@@ -1813,6 +2512,53 @@ class ProviderActionRunner(Runner):
                     ",".join(verification.missing), ",".join(verification.conflicts)
                 )
             )
+        probe_start = False
+        if binding_contract_enabled(contract) and not contract.get("continuation"):
+            for sequence in (0, 1):
+                create = self.store.related_action({
+                    "provider": self.provider, "run_id": run_id,
+                    "issue_id": binding.issue_id, "role": binding.role,
+                    "generation": binding.generation, "sequence": sequence,
+                }, "create", required=False)
+                if create is None or "write_barrier_version" not in create["request"]:
+                    continue
+                if create["request"]["write_barrier_version"] != 1:
+                    raise ProviderUnavailable("unknown probe write barrier version")
+                result = self.store.result(create["action_id"])
+                identity = result.get("binding", {}) if isinstance(result, dict) else {}
+                if ((identity.get("threadId") or identity.get("task_id")) != binding.task_id
+                        or (identity.get("hostId") or identity.get("host")) != binding.host):
+                    raise ProviderUnavailable("probe business start identity changed")
+                probe_start = True
+            path = self._handle_path(handle.run_id)
+            if probe_start and path.exists():
+                previous = self.store._read(path)
+                issued = self.store.related_action({
+                    "provider": self.provider, "run_id": run_id,
+                    "issue_id": binding.issue_id, "role": binding.role,
+                    "generation": binding.generation, "sequence": 0,
+                }, "resume")
+                if (issued["request"].get("threadId") != binding.task_id
+                        or issued["request"].get("hostId") != binding.host
+                        or issued["request"].get("authorization_digest") != contract.get("authorization_digest")):
+                    raise ProviderUnavailable("probe business action replay changed")
+                if any(previous.get(key) != value for key, value in (
+                    ("run_id", run_id), ("node_id", binding.issue_id),
+                    ("role", binding.role), ("generation", binding.generation),
+                    ("task_id", binding.task_id), ("host", binding.host),
+                    ("authorization_digest", contract.get("authorization_digest")),
+                    ("intent_digest", contract.get("intent_digest")),
+                )):
+                    raise ProviderUnavailable("probe business start replay changed")
+                if "start_owner" in previous:
+                    from ..supervisor import SupervisorLease, _read_lease_record
+                    current_owner = _read_lease_record(SupervisorLease(self.paths).path(run_id))
+                    current_owner = ({key: current_owner.get(key) for key in
+                        ("run_id", "lease_epoch", "owner", "released")}
+                        if current_owner is not None else None)
+                    if previous["start_owner"] != current_owner or (current_owner or {}).get("released"):
+                        raise ProviderUnavailable("probe business start owner changed")
+                return handle
         metadata = {
             "schema_version": 1,
             "handle_id": handle.run_id,
@@ -1838,7 +2584,17 @@ class ProviderActionRunner(Runner):
             "authorization_digest": contract.get("authorization_digest"),
             "plan_id": contract.get("plan_id"),
             "plan_version": contract.get("plan_version"),
+            "intent_digest": contract.get("intent_digest"),
+            "node_contract_digest": contract.get("node_contract_digest"),
         }
+        from ..supervisor import SupervisorLease, _read_lease_record
+        owner = _read_lease_record(SupervisorLease(self.paths).path(run_id))
+        # Legacy adopted handles have no immutable start intent and follow
+        # their existing wait recovery path. Only intent-bound starts carry
+        # the owner fence used by crash-safe start recovery.
+        if contract.get("intent_digest"):
+            metadata["start_owner"] = ({key: owner.get(key) for key in
+                ("run_id", "lease_epoch", "owner", "released")} if owner is not None else None)
         route_model = profile.model if profile is not None else None
         route_reasoning = profile.reasoning if profile is not None else None
         route_digest = profile.route_digest if profile is not None else None
@@ -1871,12 +2627,19 @@ class ProviderActionRunner(Runner):
                     "route_digest": route_digest,
                 }
             )
-        if contract.get("continuation"):
+        if contract.get("continuation") or probe_start:
             request = {
                 "threadId": binding.task_id,
                 "hostId": binding.host,
                 "prompt": self._continuation_prompt(contract, self.paths.root) + self._remote_git_ban(contract) + "\n" + self._consistency_instruction(contract),
             }
+            if probe_start and binding.topology == "visible-sdd":
+                protocol = contract.get("sdd_protocol")
+                if not isinstance(protocol, str) or not protocol.strip():
+                    raise ProviderUnavailable("probe business start requires sdd_protocol")
+                request["prompt"] = (
+                    load_protocol(Path(protocol).stem) + "\n\n" + request["prompt"]
+                )
             if route_model is not None:
                 request.update({"model": route_model, "thinking": provider_thinking_for(route_reasoning)})
             action = self._action(contract, run_id, "resume", request)
@@ -1885,13 +2648,61 @@ class ProviderActionRunner(Runner):
         self.store._atomic(self._handle_path(handle.run_id), metadata)
         return handle
 
+    def recover_start(self, run_id, node_id, intent, authorization_digest):
+        """Locate an already-issued continuation; never issue a start/resume."""
+        from ..supervisor import SupervisorLease, _read_lease_record
+        handle = RunHandle(self._handle_id(dict(intent, node_id=node_id), run_id))
+        path = self._handle_path(handle.run_id)
+        if not path.exists():
+            return None
+        metadata = self.store._read(path)
+        owner = _read_lease_record(SupervisorLease(self.paths).path(run_id))
+        owner = ({key: owner.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                 if owner is not None else None)
+        if (metadata.get("start_owner") != owner or (owner or {}).get("released") is True
+                or metadata.get("authorization_digest") != authorization_digest
+                or metadata.get("intent_digest") != intent.get("intent_digest")
+                or any(metadata.get(key) != value for key, value in (
+                    ("handle_id", handle.run_id), ("run_id", run_id), ("node_id", node_id),
+                    ("role", intent["role"]), ("generation", intent["generation"]),
+                    ("task_id", intent["task_id"])))):
+            raise PermissionError("provider start recovery lineage changed")
+        if metadata.get("pending_operation") != "resume":
+            return None
+        action = self.store.action(metadata["pending_action"])
+        binding = load_task_binding(self.paths, node_id, intent["role"], run_id=run_id)
+        if (binding.provider != self.provider or binding.task_id != intent["task_id"]
+                or binding.generation != intent["generation"] or binding.host != metadata["host"]
+                or any(action.get(key) != value for key, value in (
+                    ("run_id", run_id), ("issue_id", node_id), ("role", intent["role"]),
+                    ("generation", intent["generation"]), ("provider", self.provider), ("operation", "resume")))
+                or action["request"].get("threadId") != binding.task_id
+                or action["request"].get("hostId") != binding.host
+                or action["request"].get("authorization_digest") != authorization_digest):
+            raise PermissionError("provider start recovery action changed")
+        result = self.store.result(action["action_id"])
+        return handle if result is not None and result.get("resumed") is True else None
+
     def send_notice(self, handle: RunHandle, message: str) -> None:
         """Queue a fire-and-forget message to the bound thread (advisory).
 
         Uses its own ``resume`` action sequence and leaves ``pending_action``
         untouched, so the wait/poll state machine is unaffected.
         """
-        metadata = self.store._read(self._handle_path(handle.run_id))
+        metadata = self._validated_handle_metadata(handle)
+        from ..supervisor import SupervisorLease, _read_lease_record
+        lease = SupervisorLease(self.paths)
+        with lease.lock(metadata["run_id"]):
+            self._validate_handle_source(handle, metadata)
+            record = _read_lease_record(lease.path(metadata["run_id"]))
+            owner = ({key: record.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                     if record is not None else None)
+            if "start_owner" in metadata and (metadata["start_owner"] != owner
+                    or (owner or {}).get("released") is True):
+                raise PermissionError("provider notice owner fence changed")
+            self._send_notice_owned(handle, message, metadata)
+
+    def _send_notice_owned(self, handle, message, metadata):
         sequence = int(metadata.get("notice_sequence", 0)) + 1
         contract = {
             key: metadata.get(key)
@@ -1917,15 +2728,67 @@ class ProviderActionRunner(Runner):
         action_id = metadata.get("pending_action")
         return bool(action_id and self.store.result(action_id) is None)
 
-    def poll(self, handle: RunHandle):
+    def _validated_handle_metadata(self, handle: RunHandle):
         metadata = self.store._read(self._handle_path(handle.run_id))
-        claims = {
-            "node_id": metadata["node_id"],
-            "role": metadata["role"],
-            "task_id": metadata["task_id"],
-            "handle_id": handle.run_id,
-            "generation": metadata["generation"],
-        }
+        # A handle's deterministic key pins run/node/role/generation before
+        # mutable metadata can choose a source directory or lease lock.
+        if (metadata.get("handle_id") != handle.run_id
+                or self._handle_id(metadata, metadata["run_id"]) != handle.run_id):
+            raise PermissionError("provider handle source identity changed")
+        binding = load_task_binding(self.paths, metadata["node_id"], metadata["role"],
+            run_id=metadata["run_id"])
+        if (binding.task_id != metadata.get("task_id")
+                or binding.generation != metadata.get("generation")
+                or binding.provider != self.provider
+                or binding.host != metadata.get("host")):
+            raise PermissionError("provider handle registry lineage changed")
+        pending_action = metadata.get("pending_action")
+        if pending_action:
+            action = self.store.action(pending_action)
+            request = action.get("request") or {}
+            targets = request.get("targets") or []
+            target = targets[0] if len(targets) == 1 else request
+            if (any(action.get(key) != expected for key, expected in (
+                    ("run_id", metadata["run_id"]), ("issue_id", metadata["node_id"]),
+                    ("role", metadata["role"]), ("generation", metadata["generation"]),
+                    ("provider", self.provider), ("operation", metadata.get("pending_operation"))))
+                    or target.get("threadId") != binding.task_id
+                    or target.get("hostId") != binding.host):
+                raise PermissionError("provider poll original action lineage changed")
+        return metadata
+
+    def poll(self, handle: RunHandle):
+        metadata = self._validated_handle_metadata(handle)
+        from ..supervisor import SupervisorLease, _read_lease_record
+        caller = _RECEIPT_CALLER.get()
+        if caller is not None and caller[0] is self:
+            expected_owner = caller[1]
+        elif "start_owner" in metadata:
+            expected_owner = metadata["start_owner"]
+        else:
+            record = _read_lease_record(SupervisorLease(self.paths).path(metadata["run_id"]))
+            expected_owner = ({key: record.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                              if record is not None else None)
+        with SupervisorLease(self.paths).lock(metadata["run_id"]):
+            metadata = self._validated_handle_metadata(handle)
+            self._validate_handle_source(handle, metadata)
+            self._check_consumption_owner(metadata["run_id"], expected_owner,
+                legacy_adopted="start_owner" not in metadata)
+            return self._poll_owned(handle, metadata)
+
+    @contextmanager
+    def receipt_owner(self, expected_owner, *, lock_held=False):
+        """Carry the monitor's fixed call owner, including an explicit absent lease."""
+        token = _RECEIPT_CALLER.set((self, expected_owner, lock_held))
+        try:
+            yield
+        finally:
+            _RECEIPT_CALLER.reset(token)
+
+    def _poll_owned(self, handle, metadata):
+        claims = {"node_id": metadata["node_id"], "role": metadata["role"],
+            "task_id": metadata["task_id"], "handle_id": handle.run_id,
+            "generation": metadata["generation"]}
         pending_action = metadata.get("pending_action")
         if pending_action:
             result = self.store.result(pending_action)
@@ -1939,7 +2802,7 @@ class ProviderActionRunner(Runner):
                 ]
             operation = metadata.get("pending_operation")
             if operation == "wait":
-                return self._wait_result(handle, metadata, claims, result)
+                return self._wait_result(handle, metadata, claims, result, consumption_locked=True)
             if operation != "resume" or result.get("resumed") is not True:
                 return [
                     RunEvent(
@@ -1951,7 +2814,7 @@ class ProviderActionRunner(Runner):
             metadata["pending_operation"] = None
             self.store._atomic(self._handle_path(handle.run_id), metadata)
 
-        action = self._issue_wait(handle, metadata)
+        action = self._issue_wait_owned(handle, metadata)
         result = self.store.result(action["action_id"])
         if result is None:
             return [
@@ -1960,9 +2823,74 @@ class ProviderActionRunner(Runner):
                     {**claims, "reason": "provider wait is pending"},
                 )
             ]
-        return self._wait_result(handle, metadata, claims, result)
+        return self._wait_result(handle, metadata, claims, result, consumption_locked=True)
+
+    def _check_consumption_owner(self, run_id, expected_owner, *, legacy_adopted=False):
+        from ..supervisor import SupervisorLease, _read_lease_record
+        record = _read_lease_record(SupervisorLease(self.paths).path(run_id))
+        owner = ({key: record.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                 if record is not None else None)
+        legacy_single_shot = (legacy_adopted and owner == expected_owner
+            and (owner or {}).get("lease_epoch") == 0 and (owner or {}).get("owner") is None)
+        if owner != expected_owner or ((owner or {}).get("released") is True and not legacy_single_shot):
+            raise PermissionError("provider receipt consumption owner changed")
 
     def _issue_wait(self, handle: RunHandle, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        from ..supervisor import SupervisorLease, _read_lease_record
+        from ..state import load_events
+        lease = SupervisorLease(self.paths)
+        with lease.lock(metadata["run_id"]):
+            self._validate_handle_source(handle, metadata)
+            record = _read_lease_record(lease.path(metadata["run_id"]))
+            owner = ({key: record.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                     if record is not None else None)
+            if "start_owner" in metadata and (metadata["start_owner"] != owner or (owner or {}).get("released") is True):
+                raise PermissionError("provider wait owner fence changed")
+            return self._issue_wait_owned(handle, metadata)
+
+    def _validate_handle_source(self, handle, metadata):
+        from ..state import load_events
+        # The immutable event source, not deletable metadata fields,
+        # determines whether this is an intent-bound start. Legacy
+        # adopted handles have no matching start-intent event.
+        starts = [row["data"] for row in load_events(self.paths, metadata["run_id"])
+            if row["event"] == "start_intent"
+            and self._handle_id(row["data"], metadata["run_id"]) == handle.run_id]
+        if starts:
+            source = starts[-1]
+            from ..state import run_dir
+            from ..digests import canonical_json_digest
+            dispatch = self.store._read(run_dir(self.paths, metadata["run_id"])
+                / "start-dispatches" / (source["intent_id"] + ".json"))
+            if (not source.get("intent_digest")
+                    or metadata.get("intent_digest") != source["intent_digest"]
+                    or "start_owner" not in metadata
+                    or any(metadata.get(key) != source.get(key)
+                           for key in ("run_id", "node_id", "role", "task_id", "generation"))
+                    or dispatch.get("digest") != canonical_json_digest(
+                        {key: value for key, value in dispatch.items() if key != "digest"})
+                    or dispatch.get("intent", {}).get("intent_digest") != source["intent_digest"]
+                    or "owner" not in dispatch
+                    or metadata["start_owner"] != dispatch["owner"]):
+                raise PermissionError("intent-bound wait fence evidence missing")
+        else:
+            # Legacy eligibility needs positive, task-bound adoption
+            # evidence; an empty/misdirected event lookup is not proof.
+            adopted = [row["data"] for row in load_events(self.paths, metadata["run_id"])
+                if row["event"] == "orphan_dispatch_adopted"
+                and row["data"].get("handle_id") == handle.run_id]
+            if len(adopted) != 1 or any(adopted[0].get(key) != metadata.get(key)
+                    for key in ("run_id", "node_id", "role", "task_id", "host", "generation")):
+                raise PermissionError("legacy wait adoption provenance missing")
+            original = self.store.action(adopted[0]["action_id"])
+            if (original.get("request_digest") != adopted[0].get("request_digest")
+                    or original.get("run_id") != metadata["run_id"]
+                    or original.get("issue_id") != metadata["node_id"]
+                    or original.get("role") != metadata["role"]
+                    or original.get("generation") != metadata["generation"]):
+                raise PermissionError("legacy wait original action changed")
+
+    def _issue_wait_owned(self, handle: RunHandle, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """Write the next non-blocking (``timeoutMs`` 0) wait request and record it as pending."""
         contract = {
             "node_id": metadata["node_id"],
@@ -2009,6 +2937,7 @@ class ProviderActionRunner(Runner):
         metadata: Dict[str, Any],
         claims: Dict[str, Any],
         result: Dict[str, Any],
+        consumption_locked: bool = False,
     ):
         status = result.get("status")
         cursor = result.get("cursor")
@@ -2040,7 +2969,10 @@ class ProviderActionRunner(Runner):
                 # A timeout that moved nothing is not news for the supervisor:
                 # queue the next non-blocking wait now, from the same cursor,
                 # instead of leaving the node unwatched until the next tick.
-                self._issue_wait(handle, metadata)
+                if consumption_locked:
+                    self._issue_wait_owned(handle, metadata)
+                else:
+                    self._issue_wait(handle, metadata)
             return [RunEvent("visibility_unknown", {**claims, "reason": str(status)})]
         event_name = result.get("event")
         if event_name is None and status in WAIT_STATUS_AS_EVENT:
@@ -2082,7 +3014,20 @@ class ProviderActionRunner(Runner):
         return [RunEvent(str(event_name), data)]
 
     def stop(self, handle: RunHandle) -> None:
-        metadata = self.store._read(self._handle_path(handle.run_id))
+        metadata = self._validated_handle_metadata(handle)
+        caller = _RECEIPT_CALLER.get()
+        if caller is not None and caller[0] is self and caller[2]:
+            self._check_consumption_owner(metadata["run_id"], caller[1])
+            return self._stop_owned(handle, metadata)
+        from ..supervisor import SupervisorLease
+        with SupervisorLease(self.paths).lock(metadata["run_id"]):
+            metadata = self._validated_handle_metadata(handle)
+            if caller is not None and caller[0] is self:
+                self._check_consumption_owner(metadata["run_id"], caller[1])
+            return self._stop_owned(handle, metadata)
+
+    def _stop_owned(self, handle, metadata):
+        self._validate_handle_source(handle, metadata)
         if metadata.get("terminal_confirmed") is True:
             return
         pending_action = metadata.get("pending_action")
@@ -2111,7 +3056,7 @@ class ProviderActionRunner(Runner):
             "handle_id": handle.run_id,
             "generation": metadata["generation"],
         }
-        events = self._wait_result(handle, metadata, claims, result)
+        events = self._wait_result(handle, metadata, claims, result, consumption_locked=True)
         if len(events) != 1 or events[0].event != "stopped":
             raise ProviderPending("provider terminal wait did not prove a stop")
 

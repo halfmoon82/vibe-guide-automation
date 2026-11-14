@@ -531,7 +531,8 @@ class StatusAndProcessTests(Base):
             return SimpleNamespace(pid=os.getpid(), poll=lambda: None)
         status = dm.start_daemon(self.paths, RUN, "plan-x", interval=5, spawn=spawn)
         self.assertEqual(status["status"], "started")
-        self.assertEqual(seen["command"][1:], ["-m", "vibe_guide", "daemon", "run", "--plan", "plan-x",
+        self.assertEqual(seen["command"][1], "-c")
+        self.assertEqual(seen["command"][3:], ["daemon", "run", "--plan", "plan-x",
                                                "--run-id", RUN, "--interval", "5"])
         self.assertTrue(seen["kwargs"]["start_new_session"])
 

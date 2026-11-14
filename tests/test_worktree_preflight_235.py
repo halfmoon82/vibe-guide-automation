@@ -730,6 +730,14 @@ class CliBackgroundDispatchTest(unittest.TestCase):
     REQUEST = "设计并实现探针功能，集成测试与部署 workflow pipeline 迁移"
 
     def setUp(self):
+        from tests import support_vibe_home as hermetic
+        environment = hermetic.isolated_environment()
+        environment.__enter__()
+        self.addCleanup(environment.__exit__, None, None, None)
+        daemon = mock.patch("vibe_guide.cli._auto_start_daemon",
+                            return_value={"enabled": False, "status": "test_executor_isolated"})
+        daemon.start()
+        self.addCleanup(daemon.stop)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name).resolve() / "project"

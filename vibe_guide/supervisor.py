@@ -158,19 +158,63 @@ class SupervisorLease:
                 elif pid > 0:
                     try:
                         os.kill(pid, 0)
-                        return False
+                        if not self._claimed_recovery_child(run_id, current):
+                            return False
                     except ProcessLookupError:
                         pass
                     except PermissionError:
                         return False
                     except OSError:
-                        pass
+                        return False
             epoch = _record_epoch(current)
             owner = current.get("owner") if current else None
             self._write(run_id, self._record(run_id, epoch, owner))
             self._run_id = run_id
             self.lease_epoch = epoch
             return True
+
+    def _claimed_recovery_child(self, run_id, current):
+        """Under the lease lock, admit only the current owner's spawned PID.
+
+        This changes the holder process, not the owning session or epoch. A
+        live/unknown original daemon, stale contract, or ambiguous intent is
+        never permission to steal the lease.
+        """
+        from .daemon import pid_alive
+        from .adapters.task_provider import ProviderActionStore
+        from .protocol_adoption import effective_responsibility
+        try:
+            directory = run_dir(self.paths, run_id)
+            intent = ProviderActionStore._read(directory / "daemon-start.json")
+            snapshot = verify_run_evidence(self.paths, run_id)
+            from .authorization import AuthorizationRecord, is_authorization_integrity_valid
+            from .platform_ledger import platform_for_provider
+            authorization = AuthorizationRecord.from_dict(snapshot.authorization)
+            platform = platform_for_provider(authorization.agent_id)
+            if (not is_authorization_integrity_valid(authorization)
+                    or authorization.digest != snapshot.authorization_digest or not authorization.daemon
+                    or platform is None
+                    or platform_for_provider((current.get("owner") or {}).get("provider")) != platform):
+                return False
+            expected = {"epoch": current.get("lease_epoch"),
+                "session_id": (current.get("owner") or {}).get("session_id"),
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest}
+            if (not isinstance(intent, dict) or intent.get("status") != "spawned"
+                    or intent.get("pid") != self.pid or intent.get("run_id") != run_id
+                    or intent.get("plan_id") != snapshot.plan_id or not expected["session_id"]
+                    or intent.get("recovery_owner") != expected
+                    or effective_responsibility(self.paths, snapshot).get("status") != "effective"):
+                return False
+            previous_path = directory / "daemon.json"
+            if previous_path.exists():
+                previous = ProviderActionStore._read(previous_path)
+                pid = previous.get("pid") if isinstance(previous, dict) else None
+                if type(pid) is not int or pid <= 0 or pid_alive(pid):
+                    return False
+            return True
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
 
     def ensure_current(self, run_id: str) -> None:
         if self.lease_epoch is None or self._run_id != run_id:
@@ -648,6 +692,75 @@ def _registry_current(paths, run_id):
     return current if isinstance(current, dict) else None
 
 
+def verified_initial_owner(paths, run_id, expected):
+    """Verify the current Codex caller, journal, registry and lease under the lease lock."""
+    from .plan_amendment import _native_session_record
+    from .workflow_gate import require_capability_contract
+    from .providers import CODEX_PROVIDER
+    from .host_detect import detect_host
+    from datetime import datetime, timezone
+
+    caller = detect_host(os.environ)
+    current = _registry_current(paths, run_id)
+    lease = _read_lease_record(SupervisorLease(paths).path(run_id))
+    projection = ({key: lease.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                  if isinstance(lease, dict) else None)
+    if (caller.platform != "codex" or not caller.session_id or not isinstance(current, dict)
+            or not isinstance(projection, dict) or projection != expected
+            or projection.get("run_id") != run_id or projection.get("released") is not False
+            or type(projection.get("lease_epoch")) is not int or projection["lease_epoch"] < 1):
+        raise PermissionError("initial supervisor owner is blocked_unknown")
+    owner = projection.get("owner")
+    if (not isinstance(owner, dict) or owner.get("session_id") != caller.session_id
+            or current.get("session_id") != caller.session_id
+            or owner.get("provider") != "codex" or current.get("provider") != "codex"
+            or not owner.get("host") or owner.get("host") != current.get("host")
+            or current.get("lease_epoch") != projection["lease_epoch"]):
+        raise PermissionError("initial supervisor identity is blocked_unknown")
+    capability = require_capability_contract(paths)
+    if (capability.provider not in ("codex", CODEX_PROVIDER)
+            or capability.host_id != owner["host"]
+            or datetime.fromisoformat(capability.expires_at) <= datetime.now(timezone.utc)):
+        raise PermissionError("initial supervisor capability is blocked_unknown")
+    try:
+        journal, _ = _native_session_record(caller.session_id, False)
+        active_root = (Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions").resolve()
+        journal.resolve().relative_to(active_root)
+    except (OSError, UnicodeError, TypeError, ValueError) as error:
+        raise PermissionError("initial supervisor journal is blocked_unknown") from error
+    if current.get("session_record_digest") != _record_digest(journal):
+        raise PermissionError("initial supervisor journal registration differs")
+    return projection
+
+
+def validate_initial_registration(paths, address, session_record, caller):
+    """Authenticate a first strict-run registration before its lease CAS."""
+    from .plan_amendment import _native_session_record
+    from .workflow_gate import require_capability_contract
+    from .providers import CODEX_PROVIDER
+    from datetime import datetime, timezone
+
+    if (caller.platform != "codex" or not caller.session_id
+            or address.get("session_id") != caller.session_id
+            or address.get("provider") != "codex"):
+        raise PermissionError("initial supervisor caller is blocked_unknown")
+    cap = require_capability_contract(paths)
+    if (cap.provider not in ("codex", CODEX_PROVIDER) or cap.host_id != address.get("host")
+            or datetime.fromisoformat(cap.expires_at) <= datetime.now(timezone.utc)):
+        raise PermissionError("initial supervisor capability is blocked_unknown")
+    try:
+        journal, _ = _native_session_record(caller.session_id, False)
+        active_root = (Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "sessions").resolve()
+        journal.resolve().relative_to(active_root)
+        requested = Path(session_record)
+        if not requested.is_absolute() or requested.is_symlink() or requested.resolve() != journal.resolve():
+            raise ValueError("journal differs")
+        if _session_tokens(_read_json_file(journal)) is None:
+            raise ValueError("journal usage is unknown")
+    except (OSError, UnicodeError, TypeError, ValueError) as error:
+        raise PermissionError("initial supervisor journal is blocked_unknown") from error
+
+
 #: Event written when a beat or preflight is refused; ``reason_code`` is a fixed enum.
 BEAT_REJECTED_EVENT = "supervisor_beat_rejected"
 REASON_RECORD_NOT_REGISTERED = "record_not_registered"
@@ -1008,6 +1121,11 @@ def _mailbox_state(paths, run_id, holds):
 
 def _mailbox_state_inner(paths, run_id, holds):
     try:
+        from .state import verify_run_evidence
+        snapshot = verify_run_evidence(paths, run_id)
+        fence = paths.resolve_vibe_path(Path("plans") / snapshot.plan_id / ".initial-recovery-pending.json")
+        if fence.exists() or fence.is_symlink():
+            return {"state": "unknown", "reason": "initial run recovery interrupted"}
         from .adapters.task_provider import ProviderActionStore
 
         store = ProviderActionStore(paths)
@@ -2487,6 +2605,10 @@ def _write_handoff_summary(paths, run_id, snapshot, holds, state_refs, command_p
     core_evidence = list(evidence)
     pending_summary = []
     for action in pending:
+        if action.get("operation") == "create":
+            pending_summary.append({k: action[k] for k in pending_keys
+                                    if k in action and k != "native_tool"})
+            continue
         ref = _artifact_ref(paths.vibe / "provider-actions/requests" / (action["action_id"] + ".json"))
         evidence.append(ref)
         pending_summary.append(dict({k: action[k] for k in pending_keys if k in action}, evidence=ref))
@@ -2810,20 +2932,53 @@ def supervisor_mailbox_view(paths, run_id, environ=None):
     from .adapters.task_provider import ProviderActionStore
     from .host_detect import detect_host
     try:
+        from .state import verify_run_evidence
+        snapshot = verify_run_evidence(paths, run_id)
+        fence = paths.resolve_vibe_path(
+            Path("plans") / snapshot.plan_id / ".initial-recovery-pending.json")
+        if fence.exists() or fence.is_symlink():
+            return {"command": "supervisor-mailbox", "status": "blocked_unknown", "run_id": run_id,
+                    "reason": "initial run recovery is blocked_unknown: interrupted recovery", "pending": []}
         store = ProviderActionStore(paths)
         pending = store.pending(run_id)
         detection = detect_host(os.environ if environ is None else environ)
         session_id = detection.session_id if detection.platform == "workbuddy" else None
         if session_id and any(a.get("operation") in _AUTOFILL_ANSWERS for a in pending):
             pending = [a for a in pending if not _autofill_host_session(paths, store, a, session_id)]
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, TypeError) as error:
         return {"command": "supervisor-mailbox", "status": "unknown", "run_id": run_id,
                 "reason": "provider mailbox unreadable: {}".format(str(error)[:160])}
     items = []
     for action in pending:
         item = {k: action[k] for k in _MAILBOX_KEYS if k in action}
+        consumer_action = action
+        if action.get("operation") == "create":
+            import uuid
+            exposure_id = uuid.uuid4().hex
+            try:
+                exposure = store.stage_create(action["action_id"], exposure_id,
+                                              action["request_digest"])
+            except (OSError, ValueError, TypeError, PermissionError, TimeoutError):
+                exposure = {"status": "unknown"}
+            if exposure.get("status") != "claimed":
+                item.pop("native_tool", None)
+                item["claim_status"] = exposure.get("status", "unknown")
+                items.append(item)
+                continue
+            item["exposure_id"] = exposure_id
+            # The request mailbox is a non-executable projection.  Only the
+            # successful durable claim may rehydrate the native tool and
+            # request body for this one consumer invocation.
+            item["native_tool"] = exposure["native_tool"]
+            request = exposure.get("request")
+            consumer_action = dict(action)
+            consumer_action["native_tool"] = exposure["native_tool"]
+            consumer_action["request"] = request
+        else:
+            request = action.get("request")
         path = paths.vibe / "provider-actions/requests" / (str(action.get("action_id")) + ".json")
-        request = action.get("request")
+        if action.get("operation") == "create":
+            path = paths.vibe / "provider-actions/create-payloads" / (str(action.get("action_id")) + ".json")
         if (
             action.get("operation") == "locate"
             and action.get("provider") == CODEX_PROVIDER
@@ -2834,7 +2989,7 @@ def supervisor_mailbox_view(paths, run_id, environ=None):
                 # navigate_to_codex_page accepts threadId only; copying hostId
                 # from visibility/wait requests is a native parameter error.
                 item["native_args"] = {"threadId": thread_id}
-        service = _host_session_service(paths, action)
+        service = _host_session_service(paths, consumer_action)
         if service is not None:
             item["service"] = service
         if isinstance(request, dict):
@@ -3079,7 +3234,7 @@ def _heal_pack_path(paths, run_id, node_id):
 _PACK_ROLES = ("developer", "reviewer")
 
 
-def _node_role(node, fallback="developer"):
+def _node_role(node, fallback="developer", *, events=None, node_id=None):
     """Role of the stuck session: the live task, else the pending retry marker.
 
     A retry-pending node has no ``active_task``; the monitor records the role in
@@ -3091,6 +3246,12 @@ def _node_role(node, fallback="developer"):
         role = source.get("role") if isinstance(source, dict) else None
         if role in _PACK_ROLES:
             return role
+    if node.get("reason_class") == "engineering_blocked":
+        for event in reversed(events or []):
+            if event.get("event") == "blocked_engineering" and event.get("data", {}).get("node_id") == node_id:
+                role = event.get("provenance", {}).get("role")
+                if role in _PACK_ROLES:
+                    return role
     return fallback
 
 
@@ -3371,7 +3532,8 @@ def beat_stall_report(paths, run_id, now=None):
             if tier not in _STALL_REPORT_TIERS:
                 continue
             if pack is None:
-                pack = _build_pack(paths, run_id, node_id, snapshot, events, _node_role(node))
+                pack = _build_pack(paths, run_id, node_id, snapshot, events,
+                                   _node_role(node, events=events, node_id=node_id))
                 _persist_pack(paths, run_id, node_id, pack, result["fingerprint"])
             nodes[node_id] = {
                 "tier": tier,
@@ -3752,6 +3914,41 @@ def render_beat_text(paths, run_id, payload, *, plan_id, command_prefix="vibe",
         advance, payload.get("reason", "状态未知")) + tail
 
 
+def recover_daemon(paths, run_id, *, owner_epoch, owner_session_id, starter=None):
+    """Current-owner ordinary recovery; start/unknown is never cycle proof."""
+    from .protocol_adoption import effective_responsibility
+    from .daemon import start_daemon
+    from .authorization import AuthorizationRecord, is_authorization_integrity_valid
+    lease = SupervisorLease(paths)
+    with lease.lock(run_id):
+        snapshot = verify_run_evidence(paths, run_id)
+        current = _read_lease_record(lease.path(run_id))
+        if (effective_responsibility(paths, snapshot).get("status") != "effective"
+                or type(owner_epoch) is not int or not isinstance(current, dict)
+                or current.get("released") is True or current.get("lease_epoch") != owner_epoch
+                or current.get("owner", {}).get("session_id") != owner_session_id):
+            raise PermissionError("daemon recovery owner is not current")
+        authorization = AuthorizationRecord.from_dict(snapshot.authorization)
+        if (not is_authorization_integrity_valid(authorization)
+                or authorization.digest != snapshot.authorization_digest or not authorization.daemon):
+            raise PermissionError("daemon recovery is not authorized")
+        provider = current.get("owner", {}).get("provider")
+        if not isinstance(provider, str) or not provider:
+            raise PermissionError("daemon recovery provider is unknown")
+        from .platform_ledger import platform_for_provider
+        authorized_platform = platform_for_provider(authorization.agent_id)
+        if authorized_platform is None or platform_for_provider(provider) != authorized_platform:
+            raise PermissionError("daemon recovery provider does not match the authorized platform")
+        # Spawn under the owner fence, but do not wait here: child lease
+        # registration needs this same lock. Subsequent cycles verify startup.
+        result = (starter or start_daemon)(paths, run_id, snapshot.plan_id, provider=provider, wait=0,
+            recovery_owner={"epoch": owner_epoch, "session_id": owner_session_id,
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest})
+        return {**result, "owner_epoch": owner_epoch, "owner_session_id": owner_session_id,
+                "cycle_verification": "pending_two_consecutive_cycles"}
+
+
 def dead_daemon_report(paths, run_id):
     """One line when this run's daemon is inactive or not running, else ``None``.
 
@@ -3760,15 +3957,31 @@ def dead_daemon_report(paths, run_id):
     """
     from .daemon import daemon_status
 
+    from .protocol_adoption import effective_responsibility
+    try:
+        responsibility_active = effective_responsibility(paths, load_snapshot(paths, run_id)).get("status") == "effective"
+    except (OSError, ValueError, TypeError, KeyError):
+        responsibility_active = False
+
+    def responsible_report(status, reason):
+        return {"status": status, "reason": reason, "requires_supervisor_action": True,
+                "text": "守护程序状态待原监工处理：核验进程、租约、owner和原启动事实；"
+                        "确认无并行冲突后在原授权内恢复；未知先查证，不启动第二个daemon；"
+                        "恢复后复核两个连续调度周期。原因：" + str(reason)}
+
     try:
         status = daemon_status(paths, run_id)
     except (OSError, ValueError, TypeError, KeyError) as error:
+        if responsibility_active:
+            return responsible_report("unknown", "daemon status unreadable: " + type(error).__name__)
         return {"status": "unknown", "reason": "daemon status unreadable: " + type(error).__name__,
                 "text": "守护程序失活（状态未知：读取失败，{}）；只上报，不重启，重启由 launchd 或产品经理手工处理"
                         .format(type(error).__name__)}
     if status.get("status") == "running":
         return None
     reason = status.get("reason") or status.get("status")
+    if responsibility_active:
+        return responsible_report(status.get("status"), reason)
     return {"status": status.get("status"), "reason": reason,
             "text": "守护程序失活（{}，原因：{}）；只上报，不重启，重启由 launchd 或产品经理手工处理"
                     .format(status.get("status"), reason)}
@@ -3802,6 +4015,13 @@ def _pm_inbox_waiting(paths, run_id):
 def _beat_extras(paths, run_id, payload, text):
     """Add the unread inbox messages and the dead-daemon line to a beat's text."""
     lines = []
+    pending = pending_supervisor_responsibilities(paths, run_id)
+    if pending:
+        payload["supervisor_responsibilities"] = pending
+        lines.append("监工须读取当前故障证据、诊断、帮助原任务，并复核原失败步骤；发送建议不代表解除。")
+        if payload.get("state") in {"idle", "stop"}:
+            payload.update(state="work", end_turn=False, decision_only=False)
+            text = ""
     try:
         needs, info, unknown = _pm_inbox_beat(paths, run_id)
     except (OSError, ValueError, TypeError) as error:
@@ -3824,10 +4044,115 @@ def _beat_extras(paths, run_id, payload, text):
     report = dead_daemon_report(paths, run_id)
     if report:
         payload["daemon_inactive"] = {"status": report["status"], "reason": report["reason"]}
+        if report.get("requires_supervisor_action") and payload.get("state") in {"idle", "stop"}:
+            payload.update(state="work", end_turn=False, decision_only=False)
+            text = ""
         lines.append(report["text"])
     if not lines:
         return text
     return "\n".join(([text] if text else []) + lines)
+
+
+def record_supervisor_help(paths, run_id, node_id, help_record, *, owner_epoch, owner_session_id):
+    """Retain current-owner help; advice alone never resolves the failed step."""
+    from .protocol_adoption import effective_responsibility
+    from .state import _atomic_bytes
+    required = ("diagnosis", "action", "next_action", "verification_condition", "evidence_ref", "evidence_sha256")
+    if not isinstance(help_record, dict) or set(help_record) not in (set(required), set(required) | {"original_step"}) or any(
+            not isinstance(help_record[key], str) or not help_record[key].strip() for key in required):
+        raise ValueError("supervisor help requires diagnosis, action, evidence and original-step verification")
+    lease = SupervisorLease(paths)
+    with interprocess_lock(run_dir(paths, run_id) / ".monitor.lock"), lease.lock(run_id):
+        snapshot = verify_run_evidence(paths, run_id)
+        current = _read_lease_record(lease.path(run_id))
+        if (effective_responsibility(paths, snapshot).get("status") != "effective"
+                or type(owner_epoch) is not int or not isinstance(current, dict)
+                or current.get("released") is True or current.get("lease_epoch") != owner_epoch
+                or current.get("owner", {}).get("session_id") != owner_session_id):
+            raise PermissionError("supervisor help owner is not current")
+        try:
+            evidence = paths.resolve_relative(help_record["evidence_ref"])
+            if hashlib.sha256(evidence.read_bytes()).hexdigest() != help_record["evidence_sha256"]:
+                raise ValueError("evidence changed")
+        except (OSError, ValueError) as error:
+            raise PermissionError("supervisor help evidence is unverifiable") from error
+        path = run_dir(paths, run_id) / "heal-state.json"
+        state = _read_json_file(path)
+        item = ((state or {}).get("nodes", {}).get(node_id) or {}).get("supervisor_responsibility")
+        if (not isinstance(item, dict) or item.get("status") != "pending"
+                or item.get("node_id") != node_id or node_id not in snapshot.nodes
+                or item.get("authorization_digest") != snapshot.authorization_digest
+                or item.get("node_contract_digest") != snapshot.node_contract_digest):
+            raise PermissionError("supervisor responsibility lineage is not current")
+        active = snapshot.nodes[node_id].get("active_task") or {}
+        if not active and snapshot.nodes[node_id].get("reason_class") == "engineering_blocked":
+            from .task_registry import load_task_binding
+            node = snapshot.nodes[node_id]
+            role = item.get("role")
+            if role not in _PACK_ROLES:
+                raise PermissionError("supervisor responsibility role is unknown")
+            binding = load_task_binding(paths, node_id, role, run_id=run_id)
+            generation_key = "review_generation" if role == "reviewer" else "developer_generation"
+            blocked = next((event for event in reversed(load_events(paths, run_id))
+                            if event.get("event") == "blocked_engineering"
+                            and event.get("data", {}).get("node_id") == node_id), {})
+            provenance = blocked.get("provenance") or {}
+            writer = Path(binding.worktree)
+            expected_writer = Path(node.get("worktree") or "")
+            writer = writer if writer.is_absolute() else paths.root / writer
+            expected_writer = expected_writer if expected_writer.is_absolute() else paths.root / expected_writer
+            if (node.get("status") != "blocked_unknown" or binding.status != "blocked_unknown"
+                    or not binding.task_id or binding.task_id != node.get(role + "_identity")
+                    or binding.generation != node.get(generation_key)
+                    or writer.resolve() != expected_writer.resolve() or binding.branch != node.get("branch")
+                    or provenance.get("role") != role or provenance.get("task_id") != binding.task_id
+                    or provenance.get("generation") != binding.generation
+                    or provenance.get("authorization_digest") != snapshot.authorization_digest
+                    or provenance.get("node_contract_digest") != snapshot.node_contract_digest):
+                raise PermissionError("blocked original task lineage is not current")
+            active = {"role": role, "task_id": binding.task_id, "generation": binding.generation}
+        if active.get("role") != item.get("role"):
+            raise PermissionError("supervisor responsibility role is not current")
+        body = {**help_record, "owner_epoch": owner_epoch, "owner_session_id": owner_session_id,
+                "task_id": active.get("task_id"), "generation": active.get("generation")}
+        if "original_step" in help_record:
+            from .adapters.task_provider import ProviderActionStore
+            from .task_registry import load_task_binding
+            binding = load_task_binding(paths, node_id, active["role"], run_id=run_id)
+            if (binding.provider != CODEX_PROVIDER or binding.mode != "visible"
+                    or binding.task_id != active.get("task_id")
+                    or binding.generation != active.get("generation")):
+                raise PermissionError("help original task binding is not current")
+            native = {"threadId": active.get("task_id"), "hostId": binding.host,
+                      "prompt": help_record["action"]}
+            probe = {"provider": CODEX_PROVIDER, "run_id": run_id, "issue_id": node_id,
+                     "role": active["role"], "request": {**native, "recovery": {
+                         "task_id": active["task_id"], "native_request": native,
+                         "original_step": help_record["original_step"]}}}
+            baseline = ProviderActionStore(paths)._recovery_baseline(probe, owner_session_id)
+            if baseline is None:
+                raise PermissionError("help original failed step is unverifiable")
+            body["causal_binding"] = {"original_step": help_record["original_step"],
+                "failure": baseline["worker"]["failed_step"], "task_id": active["task_id"]}
+        digest = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        attempts = item.setdefault("attempted_actions", [])
+        if not any(entry.get("help_digest") == digest for entry in attempts):
+            attempts.append({**body, "help_digest": digest, "status": "awaiting_original_step_verification"})
+            item.update({key: help_record[key] for key in ("diagnosis", "next_action", "verification_condition")})
+            _atomic_bytes(path, (json.dumps(state, sort_keys=True, ensure_ascii=False) + chr(10)).encode())
+        return {"status": "pending", "help_digest": digest, "run_id": run_id, "node_id": node_id}
+
+
+def pending_supervisor_responsibilities(paths, run_id):
+    """Durable daemon observations awaiting the original supervisor's help."""
+    record = _read_json_file(run_dir(paths, run_id) / "heal-state.json")
+    nodes = record.get("nodes") if isinstance(record, dict) else None
+    if not isinstance(nodes, dict):
+        return []
+    return [dict(item["supervisor_responsibility"]) for _, item in sorted(nodes.items())
+            if isinstance(item, dict)
+            and isinstance(item.get("supervisor_responsibility"), dict)
+            and item["supervisor_responsibility"].get("status") == "pending"]
 
 
 def _awaiting_questions(paths, run_id):
@@ -3862,6 +4187,8 @@ def supervisor_beat(paths, run_id, session_record, *, accept_decision=False,
     # ... nor a node parked for the supervisor's answer.
     awaiting = _awaiting_questions(paths, run_id)
     if stop and awaiting:
+        stop = None
+    if stop and pending_supervisor_responsibilities(paths, run_id):
         stop = None
     if stop:
         text = render_beat_text(paths, run_id, stop, plan_id="")

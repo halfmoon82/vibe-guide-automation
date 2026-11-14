@@ -17,6 +17,11 @@ from vibe_guide import __version__ as TARGET_VERSION  # noqa: E402
 
 
 def _run(command, *, cwd, env=None):
+    if len(command) >= 5 and command[1:4] == ['-m', 'pip', 'install']:
+        from tests.support_packaging import offline_build_environment
+        if env is not None:
+            raise ValueError('packaging install must use its explicit temporary toolchain')
+        env = offline_build_environment(command[0])
     return subprocess.run(
         command,
         cwd=cwd,

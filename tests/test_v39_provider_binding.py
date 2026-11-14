@@ -94,7 +94,7 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
             with patch("vibe_guide.runners.provider_action.load_task_binding",
                        return_value=self._foreign_predecessor(directory)):
                 binding = runner.task_binding(
-                    self._handoff_contract(), Path(directory), "run-a", "running"
+                        self._handoff_contract(worktree=directory), Path(directory), "run-a", "running"
                 )
             self.assertEqual(binding.provider, "workbuddy")
             self.assertEqual(binding.successor_of, "old-task")
@@ -187,7 +187,7 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
                 with self.assertRaises(ProviderUnavailable):
                     runner.start(contract, Path(worktree))
 
-    def test_provider_action_start_allows_verified_v39_binding(self):
+    def test_provider_action_start_requires_source_for_initial_binding(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = ProjectPaths(Path(directory))
             intent, observation, worktree, run_id = self._evidence(paths)
@@ -199,9 +199,10 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
                 "binding_intent": intent, "binding_observation": observation,
             }
             with patch("vibe_guide.runners.provider_action.load_task_binding", return_value=binding):
-                handle = runner.start(contract, Path(worktree))
-            self.assertTrue(handle.run_id)
-            self.assertEqual(runner.store.pending(), [])
+                with self.assertRaises(ProviderUnavailable):
+                    runner.start(contract, Path(worktree))
+                self.assertEqual(list(runner.store._directory("handles").glob("*.json")), [])
+                self.assertTrue(runner.binding_gate(dict(contract, continuation=True), binding).verified)
 
     def test_plain_dict_evidence_cannot_bypass_v39_gate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -835,7 +836,7 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
         }
         snapshot = SimpleNamespace(
             run_id="run-v39", nodes={"BUG-V3-005": current}, handles={},
-            tasks={}, capability_contract_digest="", authorization_digest="x",
+            tasks={}, capability_contract_digest="", authorization_digest="x", _dispatch_owner=None,
         )
         record = SimpleNamespace(allowed_actions=[], file_scope=[])
         monitor._require_snapshot_authorization = lambda snap: record
@@ -974,7 +975,7 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
         }
         snapshot = SimpleNamespace(
             run_id="run-v39", nodes={"BUG-V3-005": current}, handles={}, tasks={},
-            capability_contract_digest="", authorization_digest="x",
+            capability_contract_digest="", authorization_digest="x", _dispatch_owner=None,
         )
         monitor._require_snapshot_authorization = lambda snap: SimpleNamespace(allowed_actions=[], file_scope=[])
         monitor._consistency_binding = lambda rec, node: {}
@@ -1010,7 +1011,7 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
             }
             snapshot = SimpleNamespace(
                 run_id=run_id, nodes={"BUG-V3-005": current}, handles={}, tasks={},
-                capability_contract_digest="", authorization_digest="x",
+                capability_contract_digest="", authorization_digest="x", _dispatch_owner=None, node_contract_digest="fixture-contract",
             )
             monitor._require_snapshot_authorization = lambda snap: SimpleNamespace(allowed_actions=[], file_scope=[])
             monitor._consistency_binding = lambda rec, node: {}
@@ -1160,7 +1161,7 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
             }
             snapshot = SimpleNamespace(
                 run_id=run_id, nodes={"BUG-V3-005": current}, handles={}, tasks={},
-                capability_contract_digest="", authorization_digest="x",
+                capability_contract_digest="", authorization_digest="x", _dispatch_owner=None, node_contract_digest="fixture-contract",
             )
             record = SimpleNamespace(allowed_actions=[], file_scope=[])
             monitor._require_snapshot_authorization = lambda snap: record
@@ -1245,6 +1246,7 @@ class V39ProviderBindingEntryPointTests(unittest.TestCase):
                 tasks={},
                 capability_contract_digest="",
                 authorization_digest="x",
+                _dispatch_owner=None,
             )
             record = SimpleNamespace(allowed_actions=[], file_scope=[])
             monitor._require_snapshot_authorization = lambda snap: record

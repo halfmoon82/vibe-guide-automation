@@ -1,6 +1,10 @@
 """Versioned, multi-process-safe registry for provider task bindings."""
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
+from contextvars import ContextVar
+import copy
+import threading
 import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -34,6 +38,76 @@ from .providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER
 
 
 REGISTRY_SCHEMA_VERSION = 1
+_PROTECTED_RETIREMENT = ContextVar("protected_retirement", default=None)
+
+
+class _ProtectedRetirementScope:
+    """One revocable invocation, shared by copies of its Context."""
+
+    def __init__(self, validator, runner, paths, contract):
+        self.validator = validator
+        self.runner = runner
+        self.paths = paths
+        self.contract = copy.deepcopy(contract)
+        self.thread = threading.get_ident()
+        self.active = False
+        self.used = False
+        self.lease_locked = False
+
+
+@contextmanager
+def protected_retirement(scope):
+    """Revoke all copied contexts on every exit, not merely reset this one."""
+    if scope is not None and type(scope) is not _ProtectedRetirementScope:
+        raise TypeError("protected retirement requires monitor invocation scope")
+    if scope is not None:
+        if scope.used or scope.thread != threading.get_ident():
+            raise ValueError("protected retirement scope already used")
+        scope.used = True
+        scope.active = True
+    token = _PROTECTED_RETIREMENT.set(scope)
+    try:
+        yield
+    finally:
+        if scope is not None:
+            scope.active = False
+        _PROTECTED_RETIREMENT.reset(token)
+
+
+def _current_retirement():
+    scope = _PROTECTED_RETIREMENT.get()
+    if (type(scope) is _ProtectedRetirementScope and scope.active
+            and scope.thread == threading.get_ident()):
+        return scope
+    return None
+
+
+@contextmanager
+def protected_writer_fence():
+    """Explicit same-invocation nesting; supervisor lock precedes this lock."""
+    scope = _current_retirement()
+    if scope is None or scope.lease_locked:
+        yield
+        return
+    from .state import _lease_lock
+    with interprocess_lock(_lease_lock(scope.paths)):
+        scope.lease_locked = True
+        try:
+            yield
+        finally:
+            scope.lease_locked = False
+
+
+def protected_retirement_allows(intent, observation, *, contract=None, runner=None):
+    scope = _current_retirement()
+    if scope is None or (runner is not None and runner is not scope.runner):
+        return False
+    if contract is not None and any(contract.get(key) != value for key, value in scope.contract.items()):
+        return False
+    with protected_writer_fence():
+        return scope.validator(intent, observation) is True
+
+
 BINDING_SCHEMA_VERSION = 1
 _ROLES = {"developer", "reviewer"}
 _MODES = {"visible", "background"}
@@ -869,6 +943,8 @@ def validate_binding(
     conflicts: List[str] = []
     if not isinstance(intent, BindingIntent) or not isinstance(observation, BindingObservation):
         return BindingVerification("blocked_unknown", False, ["binding_observation"], [])
+    if _PROTECTED_RETIREMENT.get() is not None and not protected_retirement_allows(intent, observation):
+        return BindingVerification("blocked_unknown", False, [], ["protected_retirement"])
 
     for field in ("node_id", "lease_id", "head_sha", "clean", "cursor"):
         if getattr(intent, field, None) in (None, ""):
@@ -897,7 +973,7 @@ def validate_binding(
         conflicts.append("head_sha")
     if type(observation.clean) is not bool:
         missing.append("clean")
-    elif not observation.clean:
+    elif not observation.clean and not protected_retirement_allows(intent, observation):
         conflicts.append("clean")
     elif intent.clean is not None and observation.clean != intent.clean:
         conflicts.append("clean")
@@ -962,6 +1038,10 @@ def binding_contract_enabled(contract: Any) -> bool:
     The presence of structured evidence also opts in, while a plain mapping is
     never accepted as evidence by :func:`runtime_binding_gate`.
     """
+    # An established invocation cannot opt out by deleting its mutable
+    # consumer fields. Retain this fact even in revoked copied contexts.
+    if _PROTECTED_RETIREMENT.get() is not None:
+        return True
     if not isinstance(contract, dict):
         return False
     version = contract.get("binding_contract_version")
@@ -1008,6 +1088,14 @@ def runtime_binding_gate(
     """
     if not binding_contract_enabled(contract):
         return BindingVerification("binding_verified", True, [], [])
+    if _PROTECTED_RETIREMENT.get() is not None and (
+            not isinstance(contract, dict)
+            or not isinstance(contract.get("binding_intent"), BindingIntent)
+            or not isinstance(contract.get("binding_observation"), BindingObservation)):
+        return BindingVerification("blocked_unknown", False, ["binding_provenance"], [])
+    if (_PROTECTED_RETIREMENT.get() is not None
+            and not protected_retirement_allows(None, None, contract=contract)):
+        return BindingVerification("blocked_unknown", False, [], ["protected_retirement_scope"])
     binding_intent = getattr(binding, "binding_intent", None)
     binding_observation = getattr(binding, "binding_observation", None)
     contract_intent = contract.get("binding_intent") if isinstance(contract, dict) else None
@@ -1029,11 +1117,49 @@ def runtime_binding_gate(
     verification = validate_binding(intent, observation)
     extra_conflicts = []
     if binding is not None:
+        scope = _current_retirement()
+        actual_binding = binding
+        if scope is not None:
+            # Reject conflicting mirrors before from_dict can select an
+            # alias, then check the same normalized row persistence uses.
+            for attr, expected in (("platform_task_id", intent.task_id),
+                                   ("threadId", intent.task_id),
+                                   ("hostId", intent.host_id)):
+                actual = getattr(binding, attr, None)
+                if actual is not None and actual != expected:
+                    extra_conflicts.append(attr)
+            try:
+                actual_binding = TaskBinding.from_dict(binding.to_dict())
+            except (TypeError, ValueError):
+                return BindingVerification("blocked_unknown", False, [], ["binding_normalization"])
+            if actual_binding.cursor not in (None, "") and actual_binding.cursor != observation.cursor:
+                extra_conflicts.append("cursor")
         for attr, field in (("task_id", "task_id"), ("host", "host_id"), ("worktree", "worktree"), ("branch", "branch")):
-            actual = getattr(binding, attr, None)
+            actual = getattr(actual_binding, attr, None)
             expected = getattr(intent, field, None)
-            if actual not in (None, "") and actual != expected:
+            if (actual not in (None, "") or _PROTECTED_RETIREMENT.get() is not None) and actual != expected:
                 extra_conflicts.append(field)
+            if scope is not None and getattr(binding, attr, None) != expected:
+                extra_conflicts.append(field)
+        if scope is not None:
+            # Validate the row actually being consumed, not only its still
+            # valid proof. Persistence and start share this exact identity.
+            for attr, expected in (
+                ("run_id", scope.contract["run_id"]),
+                ("issue_id", scope.contract["node_id"]),
+                ("role", scope.contract["role"]),
+                ("provider", scope.runner.provider),
+                ("mode", "visible"),
+                ("topology", scope.contract["topology"]),
+                ("generation", scope.contract["generation"]),
+                ("successor_of", scope.contract["predecessor_task_id"]),
+                ("allowlist", scope.contract["files"]),
+                ("capability_contract_digest", scope.contract.get("capability_contract_digest")),
+            ):
+                actual = getattr(actual_binding, attr, None)
+                if (actual != expected or getattr(binding, attr, None) != expected
+                        or (attr == "generation" and type(actual) is not int)):
+                    extra_conflicts.append(attr)
     if isinstance(contract, dict):
         # ``task_id`` in a monitor contract is the logical Issue identity
         # before provider creation; the provider task id is checked through

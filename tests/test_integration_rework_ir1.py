@@ -55,5 +55,6 @@ class Ir1DocContractKeptTests(unittest.TestCase):
     def test_card_keeps_locate_and_project_root(self):
         self.assertIn("## locate", self.card)
         self.assertIn("native_args", self.card)
-        self.assertIn("## 项目根", self.card)
+        self.assertIn("## 回写", self.card)
+        self.assertIn("--project-root <绝对路径>", self.card)
         self.assertIn("--project-root", self.card)

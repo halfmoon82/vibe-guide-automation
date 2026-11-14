@@ -200,6 +200,14 @@ vibe daemon start --run-id <run-id> --plan <plan_id>
 
 ### 6.0 形态与开工
 
+**r4 职责版本门**：五份随包规则必须完整显式采纳并在同 plan/run 正式重授权绑定 ruleset_digest/adoption_digest，执行器确认 effective 后才覆盖下文冲突旧合同。部分/拒绝/未知不启用，安装或旧副本匹配不等于采纳，历史摘要/原任务及 cursor 保留，人工规则和当前项目物化副本不静默刷新。r4 登记监工负责诊断、具体帮助、协调上游、原步骤复核和 DAG 推进；CLI 提供事实及受保护动作，不以固定重试替代判断。
+
+r4 下一有效心跳/唤醒即承接未完成责任；DONT_NOTIFY 只去重通知，不结束处理。daemon 不按停滞次数另起修复 LLM，不写死 Claude、不跨平台；失活恢复先核进程、owner、原启动事实与唯一实例，未知先对账，不盲启。换班在新 owner 下验证至少两个连续调度周期及实际行动/具体合法等待，固定自身运行时不被业务 cwd 遮蔽；安装 launchd/系统权限仍单独批准。下列三级短会话/只上报正文仅对未采纳 r4 的旧合同兼容。
+
+r4 恢复复用同一 mailbox/租约唯一认领，绑定 action/request、owner epoch、角色/原任务/代次与授权/合同；send accepted、轮询、timeout、格式拒收和 review finding 不计真实失败，未决先对账。普通连续至少三次真实发起且已完成失败后才可考虑 successor，成功重置；安全失格立即隔离且独立审查失效，不凑次数。任何新 writer 都须终止/退役/写权释放、冻结 HEAD/root 及成果保护，idle/archive 不作终止证据。
+
+r4 原生完整返回用 complete_native_mailbox_action 绑定 request_digest，先保存 raw 再投影/登记；setup pending/clientThreadId 不猜就绪任务，旧 owner/旧轮次只对账，冲突与失败/wake_failed 不覆盖。业务验收须当前输入版本/轮次及必需材料证据，needs_input/技术 PASS 不 accepted；撤销先持久屏障再调度/消费/重放，无关成果保留。工程阻塞初次/续接/返工六例见 blocked-engineering-examples.md，用原角色/代次 worker-deliver，不伪造完成；scope 批准必须受保护事务实际落地，不能用聊天或全局 auto_scope 豁免代替。可见降级后台始终单独授权，平台交接无披露豁免。
+
 - **守护程序干机械活**：授权后 `vibe daemon start|status|stop --run-id <run-id>` 起分离的本地进程并持监工租约，每个 tick 确定性地 resume、收交付、派后台 worker、拉 reviewer、接受节点、一级重试。
 - **产品经理会话只保留 60 分钟兜底检查**：登记地址（`vibe supervisor-register --run-id <run-id> --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>`；`vibe daemon register-pm --run-id <run-id> --provider <平台> --session-name <会话名>` 登记推送目标），心跳指令逐字用 vibe 打印的 `vibe supervisor-beat --run-id <run-id> --accept-decision --session-record <本会话记录路径>`，每 60 分钟（推送唤醒未验证的平台 10 分钟，记录在 `.vibe/push-wake-verification.json`）一拍：先 `vibe daemon status`，失活则上报（只上报，不重启：重启归 launchd 或产品经理手工），存活就结束本轮。不要自写心跳或把信箱服务写进心跳；不登记则唤醒无处可发，`rotate` 也无接班地址。
 - **推送优先**：worker 交付后用 `vibe supervisor-address --project-root <主项目绝对路径> --run-id <run> --node <n> --role <r> --generation <g>` 回答里的 `wake`（`channel`、`target`、`signal`）原样推送；`channel` 为 null 或地址 unknown 时不发，由兜底检查领取。

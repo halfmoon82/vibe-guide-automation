@@ -1,6 +1,7 @@
 """The daemon replaces a rejected integration reviewer whose session is gone."""
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from vibe_guide import daemon as dm
 from vibe_guide.decision_boundary import decision_list
@@ -69,7 +70,7 @@ class ReviewerHealTests(_OneNodeCase):
 
     def test_second_occurrence_is_recorded_instead_of_replacing(self):
         self.set_binding("stopped")
-        daemon = self.daemon()
+        daemon = self.daemon(sessions=lambda snapshot: {"live": [], "unknown": None})
         self.heal(daemon)
         # The successor reviewer is dispatched, delivers a bad claim again and exits.
         snapshot = self.monitor.tick(self.run_id, self.runner)
@@ -95,6 +96,7 @@ class ReviewerHealTests(_OneNodeCase):
         self.assertEqual(node["status"], "review")
         self.assertNotIn("reviewer_replace", self.kinds())
 
+
     def test_unreadable_session_state_is_recorded_unknown_and_not_dispatched(self):
         self.set_binding("stopped")
         daemon = self.daemon(sessions=lambda snapshot: {"live": [], "unknown": "cannot list"})
@@ -119,6 +121,56 @@ class ReviewerHealTests(_OneNodeCase):
         node = self.heal(self.daemon())
         self.assertEqual(node["status"], "review")
         self.assertNotIn("reviewer_replace", self.kinds())
+
+class R4ReviewerHealingTests(_OneNodeCase):
+    def setUp(self):
+        super().setUp()
+        rules = patch("vibe_guide.protocol_adoption.effective_responsibility", return_value={"status": "effective"})
+        rules.start()
+        self.addCleanup(rules.stop)
+
+    def test_format_rejection_does_not_replace_a_terminal_reviewer(self):
+        snapshot, runner = self._to_review([BAD])
+        snapshot = self.monitor.tick(snapshot.run_id, runner)
+        binding = load_task_binding(self.paths, "n1", "reviewer", run_id=snapshot.run_id)
+        original = (binding.task_id, binding.generation, binding.cursor)
+        binding.status = "stopped"
+        save_task_binding(self.paths, binding)
+        daemon = dm.Daemon(self.paths, snapshot.run_id, SimpleNamespace(monitor=self.monitor),
+            dm.DaemonConfig(interval=0, heal_interval=0), sleep=lambda s: None,
+            notifier=lambda *args, **kwargs: {"status": "sent"},
+            sessions=lambda current: {"live": [], "unknown": None},
+            assess=lambda: {"status": "ok", "nodes": {}})
+        daemon.heal_pass(snapshot)
+        current = load_snapshot(self.paths, snapshot.run_id).nodes["n1"]
+        self.assertFalse(current.get("reviewer_replacement_required"))
+        self.assertFalse((current.get("retryable_action") or {}).get("successor"))
+        final = load_task_binding(self.paths, "n1", "reviewer", run_id=snapshot.run_id)
+        self.assertEqual((final.task_id, final.generation, final.cursor), original)
+
+    def test_repair_after_format_rejection_preserves_original_reviewer(self):
+        snapshot, runner = self._to_review([BAD])
+        snapshot = self.monitor.tick(snapshot.run_id, runner)
+        original = load_task_binding(self.paths, "n1", "reviewer", run_id=snapshot.run_id)
+        with patch("vibe_guide.worker_liveness.session_ended", return_value=True):
+            self.monitor.repair_node("n1", snapshot.run_id)
+        current = load_snapshot(self.paths, snapshot.run_id).nodes["n1"]
+        self.assertFalse(current.get("reviewer_replacement_required"))
+        self.assertFalse((current.get("retryable_action") or {}).get("successor"))
+        final = load_task_binding(self.paths, "n1", "reviewer", run_id=snapshot.run_id)
+        self.assertEqual((final.task_id, final.generation), (original.task_id, original.generation))
+
+    def test_three_format_rejections_are_not_three_failed_recoveries(self):
+        snapshot, runner = self._to_review([BAD, BAD, BAD])
+        original = load_task_binding(self.paths, "n1", "reviewer", run_id=snapshot.run_id)
+        for _ in range(3):
+            snapshot = self.monitor.tick(snapshot.run_id, runner)
+        current = snapshot.nodes["n1"]
+        self.assertFalse(current.get("reviewer_replacement_required"))
+        self.assertEqual(runner.stop_calls, [])
+        final = load_task_binding(self.paths, "n1", "reviewer", run_id=snapshot.run_id)
+        self.assertEqual((final.task_id, final.generation), (original.task_id, original.generation))
+
 
 
 if __name__ == "__main__":

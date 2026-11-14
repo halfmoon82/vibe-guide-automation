@@ -5,8 +5,9 @@ It deliberately has no provider, writer, or monitor side effects; execution is
 handled by the later authorization boundary.
 """
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import json
+import math
 import os
 import re
 import tempfile
@@ -119,6 +120,7 @@ class SessionEntry:
     route: RouteResult
     plan_id: str
     node_spec: Dict[str, Any]
+    triage: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -128,6 +130,7 @@ class SessionEntry:
             "route": self.route.to_dict(),
             "plan_id": self.plan_id,
             "node_spec": json.loads(json.dumps(self.node_spec, ensure_ascii=False, sort_keys=True)),
+            "triage": dict(self.triage),
         }
 
 
@@ -265,7 +268,8 @@ class ContinuationMessage(ValueError):
     """The request only confirms/selects/continues work already under way."""
 
 
-def entry_route(request: str, s1: Any = None, current_tier: Optional[str] = None) -> Dict[str, Any]:
+def entry_route(request: str, s1: Any = None, current_tier: Optional[str] = None,
+                *, triage_hook=None, triage_source: Optional[str] = None) -> Dict[str, Any]:
     """Route a message without creating a plan: simple / light_plan / complex /
     continue_current.
 
@@ -278,16 +282,81 @@ def entry_route(request: str, s1: Any = None, current_tier: Optional[str] = None
         raise ValueError("request is required")
     if s1 is None and is_continuation_message(normalized):
         return {"route": CONTINUE_CURRENT, "tier": current_tier, "score_line": None, "unmet_conditions": []}
-    entry = build_session_entry(normalized, s1)
+    entry = build_session_entry(normalized, s1, triage_hook=triage_hook, triage_source=triage_source)
     return {
         "route": entry.route.route,
         "tier": entry.route.route,
         "score_line": entry.route.score_line,
         "unmet_conditions": list(entry.route.unmet_conditions),
+        "triage": dict(entry.triage),
     }
 
 
-def build_session_entry(request: str, s1: Any = None, plan_id: Optional[str] = None) -> SessionEntry:
+def _triage_context(request, s0, context, hook, source):
+    """One optional local transport call, never configuration or network IO.
+
+    The host owns transport timeouts/authorization. A hook returns an object
+    with an existing S1 string/TaskContext and optional finite confidence for
+    that proposed route. No elapsed time or untrusted exception/body is saved.
+    """
+    if hook is not None:
+        if not callable(hook):
+            raise TypeError("triage_hook must be callable")
+        if not isinstance(source, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", source):
+            raise ValueError("triage_source must be a non-sensitive simple identifier")
+    record = {
+        "status": "degraded", "reason_code": "unconfigured",
+        "reason": "No triage hook configured; using deterministic S1 rules",
+        "source": source if hook is not None else "unconfigured",
+        "attempts": 0, "confidence": None,
+        "request_digest": sha256_bytes(request.encode("utf-8")),
+        "fallback": "default_s1_context",
+    }
+    if context is not None:
+        record.update(status="skipped", reason_code="explicit_s1",
+                      reason="Explicit S1 takes precedence", fallback=None)
+        return context, record
+    if hook is None:
+        return default_s1_context(request), record
+    if s0.simple or asks_for_complex(request):
+        record.update(status="skipped",
+                      reason_code="s0_direct" if s0.simple else "explicit_complex",
+                      reason="Existing S0 or explicit complex decision takes precedence")
+        return default_s1_context(request), record
+    record["attempts"] = 1
+    try:
+        response = hook(request)
+    except Exception as error:
+        code = "timeout" if isinstance(error, TimeoutError) else "unavailable" if isinstance(error, OSError) else "hook_error"
+        record.update(reason_code=code, reason="Triage attempt failed ({}); using deterministic S1 rules".format(code))
+        return default_s1_context(request), record
+    if isinstance(response, dict):
+        try:
+            proposed = parse_s1_context(response.get("s1"))
+        except (TypeError, ValueError, OverflowError):
+            proposed = None
+        confidence = response.get("confidence")
+        valid_confidence = confidence is None or (
+            isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+            and 0 <= confidence <= 1 and math.isfinite(confidence)
+        )
+        if proposed is not None and valid_confidence:
+            # A transport forecast is not the user's explicit --s1 upgrade.
+            # Preserve assessed parallel/resume facts but not authority flags;
+            # absent complex-mode facts retain the current uncertain fallback.
+            proposed = replace(proposed, rationale={"source": "stable_default"},
+                               force_upgrade_flags=[])
+            record.update(status="ok", reason_code="hook_result",
+                          reason="Validated triage S1 evaluated by existing routing rules",
+                          confidence=confidence, fallback=None)
+            return proposed, record
+    record.update(reason_code="invalid_response",
+                  reason="Triage response is invalid; using deterministic S1 rules")
+    return default_s1_context(request), record
+
+
+def build_session_entry(request: str, s1: Any = None, plan_id: Optional[str] = None,
+                        *, triage_hook=None, triage_source: Optional[str] = None) -> SessionEntry:
     normalized = _normalize_request(request)
     if not normalized:
         raise ValueError("request is required")
@@ -300,8 +369,7 @@ def build_session_entry(request: str, s1: Any = None, plan_id: Optional[str] = N
         # An explicit override the user typed must not silently fall back to
         # the heuristic; they would believe it took effect.
         raise ValueError("--s1 must be five integers between 0 and 5, separated by commas")
-    if context is None:
-        context = default_s1_context(normalized)
+    context, triage = _triage_context(normalized, s0, context, triage_hook, triage_source)
     if asks_for_complex(normalized) and EXPLICIT_COMPLEX_FLAG not in context.force_upgrade_flags:
         context = replace(context, force_upgrade_flags=list(context.force_upgrade_flags) + [EXPLICIT_COMPLEX_FLAG])
     score = score_s1(context)
@@ -309,4 +377,6 @@ def build_session_entry(request: str, s1: Any = None, plan_id: Optional[str] = N
     resolved_plan_id = str(plan_id).strip() if isinstance(plan_id, str) and plan_id.strip() else stable_plan_id(normalized)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", resolved_plan_id):
         raise ValueError("plan id must be a simple identifier")
-    return SessionEntry(normalized, s0, score, route, resolved_plan_id, _default_node_spec(normalized, resolved_plan_id, route))
+    node_spec = _default_node_spec(normalized, resolved_plan_id, route)
+    node_spec["triage"] = dict(triage)
+    return SessionEntry(normalized, s0, score, route, resolved_plan_id, node_spec, triage)

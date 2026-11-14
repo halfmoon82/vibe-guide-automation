@@ -11,6 +11,9 @@ from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners import provider_action
 from vibe_guide.runners.provider_action import ProviderActionRunner
 from vibe_guide.state import durable_projection, redact_provider_text
+from vibe_guide.state import append_event
+from vibe_guide.contracts import RunEvent, RunHandle
+from vibe_guide.task_registry import TaskBinding, save_task_binding
 
 RUN, NODE, ROLE = "run-1", "integration-review", "developer"
 
@@ -30,10 +33,10 @@ class _Fixture(unittest.TestCase):
 
     def action(self, operation, sequence=1, generation=1, node=NODE):
         return self.store.request(
-            operation=operation, provider="claude-code", run_id=RUN, issue_id=node,
+            operation=operation, provider="claude-code-visible", run_id=RUN, issue_id=node,
             role=ROLE, generation=generation, sequence=sequence,
             native_tool="ccd_session_mgmt__send_message",
-            request={"threadId": "t1"},
+            request={"threadId": "t1", "hostId": "local"},
         )
 
     def answer(self, action, payload):
@@ -97,12 +100,24 @@ class ResumeReceiptTests(_Fixture):
         self._seq = getattr(self, "_seq", 0) + 1
         action = self.action("resume", sequence=self._seq)
         self.answer(action, payload)
-        handle = type("Handle", (), {"run_id": "h%d" % self._seq})()
         metadata = {
             "node_id": NODE, "role": ROLE, "run_id": RUN, "task_id": "t1",
-            "generation": 1, "pending_action": action["action_id"],
+            "generation": 1, "host": "local", "pending_action": action["action_id"],
             "pending_operation": "resume",
         }
+        handle = RunHandle(runner._handle_id(metadata, RUN))
+        metadata["handle_id"] = handle.run_id
+        save_task_binding(self.paths, TaskBinding(
+            provider=runner.provider, mode="visible", issue_id=NODE, role=ROLE,
+            task_id="t1", host="local", worktree=".", branch="fixture",
+            run_id=RUN, generation=1))
+        # Each payload uses the same task/generation. Its adoption is recorded
+        # once; subsequent resume attempts retain that immutable source.
+        if self._seq == 1:
+            append_event(self.paths, RunEvent("orphan_dispatch_adopted", {
+                **{key: metadata[key] for key in ("run_id", "node_id", "role", "task_id", "host", "generation", "handle_id")},
+                "action_id": action["action_id"], "request_digest": action["request_digest"],
+            }))
         runner.store._atomic(runner._handle_path(handle.run_id), metadata)
         try:
             events = runner.poll(handle)

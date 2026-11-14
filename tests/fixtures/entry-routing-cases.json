@@ -1,0 +1,30 @@
+{
+  "source": "hand-authored-synthetic-functional-cases-v1",
+  "scope": "Four local canned forecasts and independent labels, including an intentional error; not a production calibration dataset or gateway benchmark. Confidence 0.75 is a fixed illustrative forecast, not computed from labels.",
+  "cases": [
+    {
+      "id": "small-export",
+      "request": "实现一个列表导出功能",
+      "expected_route": "simple",
+      "response": {"s1": "1,1,1,1,1", "confidence": 0.75}
+    },
+    {
+      "id": "migration-uncertain",
+      "request": "设计并实现数据迁移与测试",
+      "expected_route": "light_plan",
+      "response": {"s1": "5,3,3,3,3", "confidence": 0.75}
+    },
+    {
+      "id": "parallel-recovery",
+      "request": "开发三个独立模块并支持中断后继续",
+      "expected_route": "complex",
+      "response": {"s1": "5,3,3,3,3;parallel=3;resume=yes", "confidence": 0.75}
+    },
+    {
+      "id": "intentional-underestimate",
+      "request": "重构支付系统并迁移数据",
+      "expected_route": "light_plan",
+      "response": {"s1": "1,1,1,1,1", "confidence": 0.75}
+    }
+  ]
+}

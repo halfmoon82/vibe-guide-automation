@@ -16,10 +16,18 @@ from pathlib import Path
 
 from vibe_guide.adapters.task_provider import ProviderActionStore, _canonical_digest
 from vibe_guide.cli import run_cli
+from vibe_guide.host_detect import (
+    AGENT_ENV, CLAUDE_MARKER_ENV, CLAUDE_SESSION_ENV, CODEX_SESSION_ENV,
+    WORKBUDDY_SESSION_ENV, detect_host,
+)
 from vibe_guide.paths import ProjectPaths
 from vibe_guide.runners.provider_action import TEMPLATE_PLACEHOLDER, validate_result_shape
 from vibe_guide.supervisor import mailbox_result_template
 from tests.support_v45_authorize import with_display_receipt
+from tests import support_vibe_home as hermetic
+
+
+setUpModule, tearDownModule = hermetic.module_hooks()
 
 RUN = "run-1"
 IN_SESSION_ONLY = {
@@ -43,6 +51,32 @@ PROVENANCE = "WorkBuddy 桌面会话实测：Agent 子代理可并行；无可�
 
 def filled(example):
     return json.loads(json.dumps(example, ensure_ascii=False).replace(TEMPLATE_PLACEHOLDER, "real"))
+
+
+class HermeticHostEnvironmentTests(unittest.TestCase):
+    def test_isolation_clears_every_consumed_host_variable_and_restores_synthetic_environment(self):
+        names = (*WORKBUDDY_SESSION_ENV, *CODEX_SESSION_ENV, *CLAUDE_SESSION_ENV,
+                 CLAUDE_MARKER_ENV, AGENT_ENV)
+        synthetic = {name: "synthetic-" + name for name in names}
+        synthetic["UNCHANGED_TEST_VALUE"] = "synthetic-preserved"
+        with mock.patch.dict(os.environ, synthetic, clear=True):
+            with hermetic.isolated_environment():
+                self.assertEqual({name for name in names if name in os.environ}, set())
+                self.assertEqual(detect_host(os.environ).evidence, ())
+                self.assertEqual(os.environ["UNCHANGED_TEST_VALUE"], "synthetic-preserved")
+            self.assertEqual(dict(os.environ), synthetic)
+
+    def test_exception_exit_restores_only_the_declared_synthetic_values(self):
+        synthetic = {"CODEX_SESSION_ID": "synthetic-codex",
+                     "AI_AGENT": "codex_1-2-3_agent",
+                     "VIBE_HOME": "synthetic-original-home"}
+        with mock.patch.dict(os.environ, synthetic, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "synthetic failure"):
+                with hermetic.isolated_environment():
+                    self.assertNotIn("CODEX_SESSION_ID", os.environ)
+                    self.assertNotIn("AI_AGENT", os.environ)
+                    raise RuntimeError("synthetic failure")
+            self.assertEqual(dict(os.environ), synthetic)
 
 
 class HostSessionBase(unittest.TestCase):
@@ -183,7 +217,6 @@ class AutofillTests(HostSessionBase):
 
     def setUp(self):
         super().setUp()
-        os.environ.pop("CODEBUDDY_SESSION_ID", None)
         self.attest(IN_SESSION_ONLY)
 
     def test_matching_session_id_fills_both_and_logs_the_basis(self):
@@ -202,6 +235,18 @@ class AutofillTests(HostSessionBase):
         for action_id in ids.values():
             self.assertIn(action_id, pending)
         self.assertNotIn("host_session_autofill", self.events())
+
+    def test_conflicting_codex_identity_keeps_both_actions_unknown(self):
+        ids = self.create_done(self.SESSION)
+        store = ProviderActionStore(self.paths)
+        for name in ("CODEX_THREAD_ID", "CODEX_SESSION_ID"):
+            with self.subTest(identity_name=name):
+                pending = self.pending_with_env({"CODEBUDDY_SESSION_ID": self.SESSION,
+                                                 name: "synthetic-codex-session"})
+                for action_id in ids.values():
+                    self.assertIn(action_id, pending)
+                    self.assertIsNone(store.result(action_id))
+                self.assertNotIn("host_session_autofill", self.events())
 
     def test_unreadable_session_id_fills_nothing(self):
         ids = self.create_done(self.SESSION)

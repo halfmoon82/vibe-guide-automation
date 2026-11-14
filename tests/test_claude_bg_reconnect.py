@@ -39,13 +39,14 @@ GOOD = {
 
 
 class FakeLauncher:
-    def __init__(self, state="working"):
+    def __init__(self, state="working", task_id=UUID):
         self.state = state
+        self.task_id = task_id
         self.calls = []
 
     def launch(self, role, issue_id, contract_path):
         self.calls.append(("launch", role, issue_id))
-        return {"task_id": UUID}
+        return {"task_id": self.task_id}
 
     def status(self, task_id):
         self.calls.append(("status", task_id))
@@ -113,8 +114,13 @@ class RunnerReconnectTests(unittest.TestCase):
 
     def test_handles_are_unique_across_processes(self):
         first = self.runner(FakeLauncher()).start(dict(self.contract), Path("/tmp"))
-        second = self.runner(FakeLauncher()).start(dict(self.contract), Path("/tmp"))
+        # Independent nodes may run together; handle randomness is not a
+        # licence to start a second live writer for the same node.
+        other = FakeLauncher(task_id="2a2b3c4d-1111-4222-8333-444455556666")
+        second = self.runner(other).start(dict(self.contract, node_id="n2",
+            task_id="developer:n2"), Path("/tmp"))
         self.assertNotEqual(first.run_id, second.run_id)
+        self.assertEqual(other.calls, [("launch", "developer", "n2")])
 
     def test_resume_generation_survives_a_restart(self):
         first = self.runner(FakeLauncher())

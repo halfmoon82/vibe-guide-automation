@@ -20,6 +20,13 @@ from vibe_guide.paths import ProjectPaths
 
 
 class CapabilityContractTests(unittest.TestCase):
+    def test_rfc3339_z_timestamps_are_accepted(self):
+        fact = CapabilityFact(
+            name="codex.agent", status="verified_available", scope="project",
+            route="fixture", evidence_ref="test:timestamp",
+            checked_at="2026-11-14T00:00:00Z", expires_at="2026-11-15T00:00:00Z",
+        )
+        self.assertEqual(fact.checked_at, "2026-11-14T00:00:00+00:00")
     @staticmethod
     def _child_binding(contract_digest):
         profile = WorkerProfile(

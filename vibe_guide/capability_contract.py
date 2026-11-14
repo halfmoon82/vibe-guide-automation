@@ -106,7 +106,7 @@ def _parse_timestamp(value: Any, field: str) -> datetime:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("%s must be a timestamp" % field)
     try:
-        parsed = datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value)
     except ValueError as error:
         raise ValueError("%s is not a valid timestamp" % field) from error
     return _now(parsed)

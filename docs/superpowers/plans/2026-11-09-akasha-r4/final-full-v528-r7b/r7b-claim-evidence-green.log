@@ -1,0 +1,7 @@
+R7b claim_evidence targeted GREEN
+cwd=/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions
+command: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_audit_create_claim.LegacyCreateSafetyTests.test_legacy_request_cannot_be_superseded_after_it_was_read tests.test_audit_create_claim.ControlledCreateSafetyTests.test_published_pending_create_is_not_proof_of_non_exposure tests.test_audit_create_claim.ControlledCreateSafetyTests.test_stale_rejects_late_claim_and_retains_late_callback_without_result -q
+----------------------------------------------------------------------
+Ran 3 tests in 0.027s
+
+OK

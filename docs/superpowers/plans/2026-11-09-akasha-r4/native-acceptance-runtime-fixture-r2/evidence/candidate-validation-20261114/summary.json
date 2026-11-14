@@ -1,0 +1,53 @@
+{
+  "python3.11": {
+    "ran": 5297,
+    "duration_seconds": 1150.744,
+    "failures": [
+      132,
+      29,
+      3,
+      4
+    ],
+    "exit_code": 1
+  },
+  "python3.9": {
+    "ran": 5297,
+    "duration_seconds": 1071.229,
+    "failures": [
+      137,
+      61,
+      3,
+      4
+    ],
+    "exit_code": 1
+  },
+  "targeted_projection_fix": {
+    "tests": 72,
+    "exit_code": 0
+  },
+  "classification": {
+    "projection_fix_regression": "not established; targeted suite green and full failures span unrelated modules",
+    "candidate_existing_gaps": "broad existing failures in adoption/handoff/self-report/native root/WorkBuddy paths; retained UNKNOWN, no speculative fixes",
+    "environment_or_version": "Python 3.9 native-root and temporary-subprocess errors observed; not used to excuse 3.11 failures"
+  },
+  "build": {
+    "stage": "/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/v528-candidate-build-iqd9z238",
+    "exit_code": 0,
+    "artifacts": [
+      {
+        "path": "/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/v528-candidate-build-iqd9z238/dist/vibe_guide-5.2.8-py3-none-any.whl",
+        "sha256": "d819b712553d35a826322b91db54571369cd42ff7bdb92ce15dc73c210980504",
+        "version": "Version: 5.2.8"
+      },
+      {
+        "path": "/var/folders/lz/bh5_qbcn7kj7x5h08vpl8b140000gn/T/v528-candidate-build-iqd9z238/dist/vibe_guide-5.2.8.tar.gz",
+        "sha256": "b3800f38ae24ff3d77cb198d43d84ba1a184e734fadd578df29cf9536a25d9cd",
+        "version": "Version: 5.2.8"
+      }
+    ],
+    "wheel_help_exit": 0
+  },
+  "help_exit_code": 0,
+  "diff_check_exit_code": 0,
+  "status": "blocked_unknown"
+}

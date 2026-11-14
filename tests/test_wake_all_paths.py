@@ -247,6 +247,20 @@ class TimeoutContinuationTests(_Case):
 
     def test_issued_wait_is_non_blocking_from_the_same_cursor(self):
         runner = self._runner()
+        from vibe_guide.adapters.task_provider import ProviderActionStore
+        from vibe_guide.contracts import RunEvent
+        from vibe_guide.state import append_event
+        store = ProviderActionStore(self.paths)
+        (self.paths.vibe / "state.json").write_text("{}")
+        with patch("vibe_guide.adapters.task_provider.require_entry"):
+            action = store.request(operation="create", provider=runner.provider, run_id=RUN,
+                issue_id="n1", role="developer", generation=1,
+                native_tool="codex_app__create_thread", request={})
+        append_event(self.paths, RunEvent("orphan_dispatch_adopted", {
+            "run_id": RUN, "node_id": "n1", "role": "developer", "task_id": "t",
+            "host": "mac", "generation": 1, "handle_id": RUN,
+            "action_id": action["action_id"], "request_digest": action["request_digest"],
+        }))
         captured = {}
 
         def fake_action(contract, run_id, operation, request, sequence=None):

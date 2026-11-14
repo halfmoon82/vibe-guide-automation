@@ -115,6 +115,95 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(provider_thinking_for(resolve("claude-code", "light").reasoning), "low")
         self.assertEqual(provider_thinking_for(resolve("claude-code", "deep").reasoning), "high")
 
+    def test_malformed_directory_observations_stay_unknown(self):
+        for observed in ({"models": []}, [None], [{"slug": ""}], [{"slug": "x", "efforts": 123}]):
+            with self.subTest(observed=observed):
+                choice = resolve("codex", "deep", prober=lambda: observed)
+                self.assertEqual((choice.model, choice.status), ("default", "unknown"))
+
+    def test_malformed_cache_is_ignored_and_expired_cache_is_reprobed(self):
+        for entry in (
+            {"probed_at": 1000, "models": [None]},
+            {"probed_at": 2000, "models": [{"slug": "future"}]},
+            {"probed_at": 0, "models": [{"slug": "stale"}]},
+        ):
+            with self.subTest(entry=entry):
+                (self.home / "model_catalog.json").write_text(json.dumps({"codex": entry}))
+                now = 1000 if entry["probed_at"] else 100000
+                choice = resolve("codex", "deep", vibe_home=self.home,
+                                 prober=lambda: [{"slug": "fresh"}], now=now)
+                self.assertEqual((choice.model, choice.status), ("fresh", "ok"))
+
+    def test_provider_effort_matches_the_resolved_supported_effort(self):
+        choice = resolve('codex', 'light', prober=lambda: [
+            {'slug': 'fixed', 'efforts': ['high'], 'default': 'high'},
+        ])
+        self.assertEqual(choice.effort, 'high')
+        self.assertEqual(provider_thinking_for(choice.reasoning), 'high')
+
+    def test_unrepresentable_directory_effort_remains_unknown(self):
+        choice = resolve('codex', 'light', prober=lambda: [
+            {'slug': 'fixed', 'efforts': ['xhigh'], 'default': 'xhigh'},
+        ])
+        self.assertEqual((choice.model, choice.status), ('default', 'unknown'))
+
+    def test_invalid_probe_defaults_never_become_verified_or_cached(self):
+        observations = [
+            {'slug': 'invalid', 'efforts': ['high'], 'default': value}
+            for value in ('medium', 'low', '', ' high', 'bogus', 42)
+        ] + [{'slug': 'unrepresentable', 'efforts': ['high', 'xhigh'], 'default': 'xhigh'}]
+        for index, model in enumerate(observations):
+            for tier in ('light', 'standard', 'deep'):
+                with self.subTest(default=model['default'], tier=tier):
+                    home = self.home / ('probe-%d-%s' % (index, tier))
+                    choice = resolve('codex', tier, vibe_home=home, prober=lambda: [model], now=1000)
+                    self.assertEqual((choice.model, choice.status), ('default', 'unknown'))
+                    self.assertFalse((home / 'model_catalog.json').exists())
+
+    def test_invalid_cached_defaults_are_discarded_before_resolution(self):
+        observations = [
+            {'slug': 'invalid', 'efforts': ['high'], 'default': value}
+            for value in ('medium', 'low', '', ' high', 'bogus', 42)
+        ] + [{'slug': 'unrepresentable', 'efforts': ['high', 'xhigh'], 'default': 'xhigh'}]
+        cache = self.home / 'model_catalog.json'
+        for model in observations:
+            for tier in ('light', 'standard', 'deep'):
+                with self.subTest(default=model['default'], tier=tier):
+                    cache.write_text(json.dumps({'codex': {'probed_at': 1000, 'models': [model]}}))
+                    before = cache.read_bytes()
+                    choice = resolve('codex', tier, vibe_home=self.home,
+                                     prober=lambda: [], now=1000, cache_write=False)
+                    self.assertEqual((choice.model, choice.status, choice.source),
+                                     ('default', 'unknown', 'probe'))
+                    self.assertEqual(cache.read_bytes(), before)
+
+    def test_supported_default_fallback_is_valid_for_probe_and_cache(self):
+        cases = [
+            ({'slug': 'supported', 'efforts': ['high'], 'default': 'high'}, 'high'),
+            ({'slug': 'wanted', 'efforts': ['low', 'high'], 'default': None}, 'low'),
+            ({'slug': 'legacy-no-efforts', 'default': 'high'}, 'low'),
+        ]
+        for index, (model, effort) in enumerate(cases):
+            for source in ('probe', 'cache'):
+                with self.subTest(model=model['slug'], source=source):
+                    home = self.home / ('valid-%d-%s' % (index, source))
+                    home.mkdir()
+                    if source == 'cache':
+                        (home / 'model_catalog.json').write_text(json.dumps({
+                            'codex': {'probed_at': 1000, 'models': [model]},
+                        }))
+                    choice = resolve('codex', 'light', vibe_home=home,
+                                     prober=lambda: [model], now=1000, cache_write=False)
+                    self.assertEqual((choice.model, choice.effort, choice.status, choice.source),
+                                     (model['slug'], effort, 'ok', source))
+
+    def test_persisted_first_resolution_is_stable_across_pending_dispatch_retries(self):
+        first = resolve('codex', 'standard', vibe_home=self.home, prober=_codex_probe, now=1000)
+        second = resolve('codex', 'standard', vibe_home=self.home, prober=_codex_probe, now=1001)
+        # Monitor binds this source in the create request's selection_basis.
+        # A probe-to-cache change alone must not create another task identity.
+        self.assertEqual(first.to_dict(), second.to_dict())
+
 
 class CardAndDigestTests(_ProjectCase):
     state = V42_STATE

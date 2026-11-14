@@ -175,7 +175,9 @@ class VisibleSddReviewerViolationTests(unittest.TestCase):
     def test_three_rounds_have_a_recovery_route(self):
         self.assertIn("三轮", self.text)
         self.assertIn("换 reviewer", self.text)
-        self.assertIn("拆节点", self.text)
+        self.assertIn("change_reviewer_or_split_node", self.text)
+        self.assertIn("至少三次真实完成失败", self.text)
+        self.assertIn("安全失格独立隔离", self.text)
 
     def test_blocked_unknown_dispositions_are_supervisor_actions(self):
         self.assertIn("监工处置", self.text)

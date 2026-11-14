@@ -228,27 +228,82 @@ class RealRunnerNoticeTests(unittest.TestCase):
             self.assertFalse([c for c in launcher.calls if c[0] in ("resume", "stop")])
 
     def test_provider_action_runner_queues_resume_action_without_touching_wait_state(self):
-        import tempfile
         from unittest.mock import patch
         from vibe_guide.runners.provider_action import ProviderActionRunner
+        from vibe_guide.task_registry import load_task_binding
+        from tests.test_monitor import MonitorTests, node
+        from tests.support_vibe_home import isolated_environment
 
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / ".vibe").mkdir()
-            (root / ".vibe" / "state.json").write_text("{}", encoding="utf-8")
+        with isolated_environment():
+            fixture = MonitorTests()
+            fixture.setUp()
+            self.addCleanup(fixture.tearDown)
+            root = fixture.paths.root
+            current = node("n1")
+            current.contract.pop("worker_profile")
+            current.contract.update({"project_id": "fixture-project", "adapter_id": "claude-code"})
+            monitor, authorization = fixture.authorized_monitor([current])
             with patch("vibe_guide.adapters.task_provider.require_entry"):
-                runner = ProviderActionRunner(ProjectPaths(root), "claude-code", "claude-code-visible")
-                handle = RunHandle("h1")
-                metadata = {
-                    "node_id": "n1", "role": "reviewer", "run_id": "r1", "task_id": "t1",
-                    "host": "local", "generation": 1, "pending_action": None,
-                    "pending_operation": None,
-                }
-                runner.store._atomic(runner._handle_path("h1"), dict(metadata))
+                runner = ProviderActionRunner(fixture.paths, "claude-code", "claude-code-visible")
+                request = runner.store.request
+
+                def complete_binding(**kwargs):
+                    action = request(**kwargs)
+                    responses = {
+                        "create": {"binding": {"task_id": "t1" if kwargs["role"] == "reviewer" else "developer-t1", "host": "local"}},
+                        "locate": {"located": True},
+                        "visibility": {"visible": True, "direct_enter": True},
+                    }
+                    if kwargs["operation"] in responses:
+                        runner.store.complete(action["action_id"], responses[kwargs["operation"]],
+                                              request_digest=action["request_digest"])
+                    return action
+
+                with patch.object(runner.store, "request", side_effect=complete_binding):
+                    snapshot = monitor.start(authorization, runner)
+                    monitor.tick(snapshot.run_id, runner)
+                    developer_wait, = [action for action in runner.store.pending(snapshot.run_id)
+                                       if action["operation"] == "wait"]
+                    runner.store.complete(developer_wait["action_id"],
+                        {"status": "complete", "event": "delivered",
+                         "evidence": "developer delivery", "cursor": "developer-complete"},
+                        request_digest=developer_wait["request_digest"])
+                    snapshot = monitor.tick(snapshot.run_id, runner)
+                self.assertEqual(snapshot.nodes["n1"]["status"], "review")
+                handle = RunHandle(snapshot.handles["n1"])
+                binding = load_task_binding(fixture.paths, "n1", "reviewer", run_id=snapshot.run_id)
+                self.assertEqual((binding.provider, binding.task_id, binding.host),
+                                 ("claude-code-visible", "t1", "local"))
+                metadata = runner.store._read(runner._handle_path(handle.run_id))
+                self.assertIsNone(metadata["pending_action"])
                 runner.send_notice(handle, "fixed text")
+                self.assertIsNone(runner.store._read(runner._handle_path(handle.run_id))["pending_action"])
+                runner.poll(handle)
+                before = runner.store._read(runner._handle_path(handle.run_id))
+                self.assertEqual(before["pending_operation"], "wait")
+                wait = runner.store.action(before["pending_action"])
                 runner.send_notice(handle, "fixed text")
-                after = runner.store._read(runner._handle_path("h1"))
-            self.assertIsNone(after["pending_action"])
+                after = runner.store._read(runner._handle_path(handle.run_id))
+                self.assertEqual(after["generation"], metadata["generation"])
+                self.assertEqual(after, {**before, "notice_sequence": 2})
+                self.assertEqual(runner.store.action(before["pending_action"]), wait)
+                notices = [action for action in runner.store.pending(snapshot.run_id)
+                           if action["operation"] == "resume" and action["role"] == "reviewer"]
+                self.assertEqual(len(notices), 2)
+                self.assertEqual(sorted(action["sequence"] for action in notices), [1, 2])
+                self.assertTrue(all(action["native_tool"] == "ccd_session_mgmt__send_message"
+                                    and action["request"]["threadId"] == "t1"
+                                    and action["request"]["hostId"] == "local"
+                                    and action["request"]["prompt"] == "fixed text"
+                                    and action["generation"] == metadata["generation"]
+                                    for action in notices))
+                damaged = {**after, "intent_digest": "damaged"}
+                runner.store._atomic(runner._handle_path(handle.run_id), damaged)
+                actions_before = runner.store.pending(snapshot.run_id)
+                with self.assertRaises(PermissionError):
+                    runner.send_notice(handle, "fixed text")
+                self.assertEqual(runner.store.pending(snapshot.run_id), actions_before)
+                self.assertEqual(runner.store._read(runner._handle_path(handle.run_id)), damaged)
             requests = list((root / ".vibe" / "provider-actions").rglob("*.json"))
             texts = [p.read_text(encoding="utf-8") for p in requests]
             self.assertTrue(any("fixed text" in t and "t1" in t for t in texts))

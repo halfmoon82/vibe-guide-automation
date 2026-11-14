@@ -1,43 +1,34 @@
-# 监工卡（每班一次，短版运行手册）
+# 监工卡（每班一次）
 
-完整协议见 prd-guide §6；本卡只给每拍动作。
+见 prd-guide §6。
+
+## r4 采纳门
+仅完整规则显式采纳、同 plan/run 重授权且 effective 后覆盖旧规则；部分/未知不启用。监工在下一心跳或唤醒诊断、具体帮助并复核原失败步骤。事实/判断/未知、已试行动、责任方、下一动作及验证条件随换班保留；通知去重不停止处理。缺材料找原责任方，必需材料未知不 accepted、不解锁。撤销屏障先落盘，旧回执仅对账。
+
+daemon 只调度/记事实/消费，不另建修复 LLM、不跨平台。失活先核 owner、进程/启动事实及冲突；未知不得双启。新 owner 两个连续有效周期才算接班。产品 runtime 防同名包遮蔽，系统权限另授权。
+
+恢复唯一认领，绑定 owner epoch、角色/任务/代次及授权/合同；超时先对账，不清 active 重发。至少三次真实完成失败才考虑接续；发送接受、轮询、格式拒收、review finding 不计。失格另隔离；均须可信终止/退役、释放写权、保留成果/root，idle/archive 不足。原生结果经 complete_native_mailbox_action + request_digest 留 raw/投影，冲突追加，setup pending 不猜身份。阻塞实例见 blocked-engineering-examples.md；scope 走受保护事务。不可见降级需新外部授权，平台交接不豁免。
 
 ## 每一拍
-1. 只跑心跳指令里的 `supervisor-beat`，按输出 state 走，不自己重算。
-2. `idle`：本轮结束，不要再调用，等待下一次唤醒。
-3. `stop`：同上，立即结束本轮。
-4. `work`：服务信箱一轮（请求、交付、结果）。输出写「推进由守护程序完成」时不手工 `resume`；仅输出给出 `resume` 命令时才用。
-5. `decision`：呈现未答决策卡片等答案；心跳不暂停。`worker_questions` 工程问题自答，不呈现给用户。
-6. `unknown`：按 work 处理并写明原因；同因连续出现且只有用户能解才停下。
-7. `contract_drift`：停止推进，走同一运行的重新授权。
-8. `rotate`：新开会话接班；Claude Code 永不换班，`context_pressure` 只是提示。
+只运行给定 `supervisor-beat`，按 state：
+- `idle`/`stop`：结束本轮，等唤醒，不再 beat。
+- `work`/`unknown`：服务信箱一轮，记未知原因；仅输出给出 `resume` 时执行，否则由守护程序推进。
+- `decision`：呈现未答卡片；心跳不停，工程 worker_questions 自答。
+- `contract_drift`：停推进，同 run 重授权。
+- `rotate`：新会话接班；Claude Code 不换班，context_pressure 仅提示。
 
-## 守护程序与收件箱
-- 输出含「守护程序失活」只上报那行和原因，不 `daemon start`；重启归 launchd 或产品经理。
-- 输出里的「产品经理待处理消息」只送达一次，照 `decision` 呈现；`vibe daemon inbox` 读未读，`--peek` 只看不推进。
-
-## 项目根
-- `vibe` 子命令都带 `--project-root <绝对路径>`（或 `VIBE_PROJECT_ROOT`，参数优先），不依赖当前目录；
-  给 worker 的 `worker-deliver`、`supervisor-address` 示例必须带它。相对路径或不存在的目录被拒绝。
+## 信箱
+旧规则失活只报，重启归 launchd/产品经理；r4 按门恢复。消息只送一次；`vibe daemon inbox --peek` 只读。
 
 ## 回写
-- 信箱结果用 `complete_mailbox_action` 写；形状不对写入前被拒，错误列出缺少或多出的字段名，补齐重写。
-- 开发者交付带 `delivery_evidence`。
+vibe/worker-deliver/supervisor-address 均带 `--project-root <绝对路径>`（或 VIBE_PROJECT_ROOT，参数优先）。信箱用 complete_mailbox_action；按字段提示修形状，开发交付带 delivery_evidence。
 
 ## locate
-- 照抄信箱 `native_args` 形状，不要多传：Codex `navigate_to_codex_page` 只传 `{"threadId": <task_id>}`，多传 hostId/page 即参数错误。
-- `{"located": true}` 只在真实可定位时回写。
+照抄 native_args，不要多传。Codex navigate_to_codex_page 仅 `{"threadId": <task_id>}`；真实可定位才回 `{"located": true}`。
 
-## 决策边界
-- 只有改变 PRD 决策（产品范围、验收判定、设计）、部署发布、凭据权限、授权卡外不可撤销动作、新增第三方依赖、可见降级为后台不可见，才问用户；例外：平台交接改成后台只披露不问（先排空旧平台 worker）。
-- 其余工程问题（基线、方案取舍、重试，范围按 prd-guide §4 判据）自行决定，理由写进证据后继续；不提问、不替 worker 转问、不等人。拿不准选可回退的。
-
-## 停止会话
-- 停 claude-bg 用 vibe 的停止入口，不用 `claude stop`。vibe 自停先落盘；无记录的 stopped 视为意外，只重试一次，再 stopped 判 failed。
-- codex、kimi-code、workbuddy：未验证停止发起方，只记 vibe 自发的停止，stopped 仍判 failed。
+## 边界与停止
+产品/验收/设计变化、deploy、凭据/权限、授权外不可逆动作、新依赖、不可见降级才问；工程问题按 prd-guide §4 自决留痕。旧规则交接后台先排空并披露；r4 需授权。
+停 claude-bg 用 vibe 停止入口，不用 claude stop；自停先落盘，无记录 stopped 重试一次再 failed。codex/kimi-code/workbuddy 停止来源未验证，只记 vibe 自停；stopped 判 failed，不证明退役。
 
 ## 禁止
-- idle/stop 后不再调用 beat。
-- 自报不是证据；未知不当成功。
-- 不执行 `monitor --authorize`、`vibe authorize`、带 digest 的 `decision-answer`（产品经理命令）。
-- 整合审查 `review_finding` 带 `target_node_id`；文件在其原范围内、`scope-expand` 回“无新增文件”都直接返工，不问用户。
+自报不作证据，未知不当成功。不执行 monitor --authorize、vibe authorize、带 digest 的 decision-answer。review_finding 带 target_node_id；原范围内或 scope-expand 无新增文件直接返工。

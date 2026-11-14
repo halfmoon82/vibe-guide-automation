@@ -11,6 +11,8 @@ otherwise refuses before the first write.
 """
 import json
 import unittest
+from unittest.mock import patch
+from tests import support_vibe_home as hermetic
 
 from tests.test_self_report_recovery import NODE, TASK, SelfReportRecoveryTests as _Base
 from vibe_guide.state import load_events, load_snapshot
@@ -19,7 +21,15 @@ from vibe_guide.task_registry import load_task_binding, save_task_binding
 
 class HybridStateRecoveryTests(unittest.TestCase):
     # Borrow the fixture methods; subclassing would re-run the base cases.
-    setUp = _Base.setUp
+    def setUp(self):
+        environment = hermetic.isolated_environment()
+        environment.__enter__()
+        self.addCleanup(environment.__exit__, None, None, None)
+        daemon = patch("vibe_guide.cli._auto_start_daemon",
+                       return_value={"enabled": False, "status": "test_executor_isolated"})
+        daemon.start()
+        self.addCleanup(daemon.stop)
+        _Base.setUp(self)
     _write_action = _Base._write_action
     build_orphan = _Base.build_orphan
     adopt = _Base.adopt

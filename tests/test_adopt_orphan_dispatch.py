@@ -463,6 +463,8 @@ class AdoptOrphanDispatchTests(unittest.TestCase):
     def test_missing_create_result_fails_closed(self):
         self.build_orphan()
         (self.store.root / 'results' / (self.create['action_id'] + '.json')).unlink()
+        for receipt in (self.store.root / "native-receipts").glob(self.create["action_id"] + "-*.json"):
+            receipt.unlink()
         self.assert_untouched(self.adopt(), 'create has no bound result')
 
     def test_missing_dispatch_head_fails_closed(self):

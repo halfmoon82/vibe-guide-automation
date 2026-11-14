@@ -87,15 +87,18 @@ def _codex_rollout(directory, contexts, name="rollout.jsonl"):
 
 class _FakeSnapshot:
     def __init__(self, statuses, ready_set=()):
+        self.plan_id = "plan-1"
         self.nodes = {node: {"status": status} for node, status in statuses.items()}
         self.ready_set = list(ready_set)
 
 
 def _patch_snapshot(statuses, ready_set=()):
-    return patch(
-        "vibe_guide.supervisor.load_snapshot",
-        return_value=_FakeSnapshot(statuses, ready_set),
-    )
+    from contextlib import ExitStack
+    snapshot = _FakeSnapshot(statuses, ready_set)
+    stack = ExitStack()
+    stack.enter_context(patch("vibe_guide.supervisor.load_snapshot", return_value=snapshot))
+    stack.enter_context(patch("vibe_guide.state.verify_run_evidence", return_value=snapshot))
+    return stack
 
 
 class _Case(unittest.TestCase):

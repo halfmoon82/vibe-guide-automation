@@ -25,13 +25,16 @@ class StandaloneInstallTests(unittest.TestCase):
             self.assertEqual(self._run(sys.executable, "-m", "venv", str(venv)).returncode, 0)
             python = venv / "bin" / "python"
             vibe = venv / "bin" / "vibe"
+            from tests.support_packaging import offline_build_environment
+            build_env = offline_build_environment(python)
             built = self._run(
                 str(python), "-m", "pip", "wheel", "--no-deps",
                 "--wheel-dir", str(wheelhouse), str(ROOT),
+                env=build_env,
             )
             self.assertEqual(built.returncode, 0, built.stderr)
             wheel = next(wheelhouse.glob("vibe_guide-*.whl"))
-            installed = self._run(str(python), "-m", "pip", "install", "--no-deps", str(wheel))
+            installed = self._run(str(python), "-m", "pip", "install", "--no-deps", str(wheel), cwd=root)
             self.assertEqual(installed.returncode, 0, installed.stderr)
             help_result = self._run(str(vibe), "--help", cwd=root)
             self.assertEqual(help_result.returncode, 0, help_result.stderr)
@@ -46,12 +49,12 @@ class StandaloneInstallTests(unittest.TestCase):
             python = venv / "bin" / "python"
             source = root / "source"
             shutil.copytree(ROOT, source, ignore=shutil.ignore_patterns(".git", ".venv", "__pycache__", "build", "dist", "*.egg-info"))
-            from tests.support_packaging import ensure_setuptools
-            ensure_setuptools(self, python)
-            built = self._run(str(python), "setup.py", "sdist", "--dist-dir", str(dist), cwd=source)
+            from tests.support_packaging import offline_build_environment
+            build_env = offline_build_environment(python)
+            built = self._run(str(python), "setup.py", "sdist", "--dist-dir", str(dist), cwd=source, env=build_env)
             self.assertEqual(built.returncode, 0, built.stderr)
             archive = next(iter(sorted(dist.glob("vibe*guide-*.tar.gz"))))
-            installed = self._run(str(python), "-m", "pip", "install", "--no-deps", str(archive))
+            installed = self._run(str(python), "-m", "pip", "install", "--no-deps", str(archive), cwd=root, env=build_env)
             self.assertEqual(installed.returncode, 0, installed.stderr)
             result = self._run(str(python), "-m", "vibe_guide", "--help", cwd=root)
             self.assertEqual(result.returncode, 0, result.stderr)

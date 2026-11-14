@@ -33,18 +33,57 @@ from tests.test_self_heal_wiring import (
 from vibe_guide.cli import _snapshot_result
 from vibe_guide.runners.provider_action import ProviderActionRunner
 from vibe_guide.state import load_events, load_snapshot
+from vibe_guide.state import append_event
+from vibe_guide.contracts import RunEvent, RunHandle
+from vibe_guide.task_registry import TaskBinding, save_task_binding
+from vibe_guide.paths import ProjectPaths
 
 
 class IncidentReplayTests(IncidentFixture):
+    def setUp(self):
+        super().setUp()
+        self.action = self.store.request(
+            operation="resume", provider="claude-code", run_id=self.run_id,
+            issue_id=NODE, role="developer", generation=1, sequence=2,
+            native_tool="ccd_session_mgmt__send_message",
+            request={"threadId": "t1", "hostId": "local"})
+        self.store.complete(self.action["action_id"], {"threadId": "t1"}, native=False)
+
     def reader_refuses_receipt(self):
         """Poll a handle whose pending resume is the fixture's action with the real reader."""
-        runner = ProviderActionRunner(self.paths, "claude-code", "claude-code-visible")
-        handle = type("Handle", (), {"run_id": "replay-handle"})()
-        runner.store._atomic(runner._handle_path(handle.run_id), {
+        # Mirror the receipt in an isolated reader project with a real
+        # visible-provider registry, without replacing the run's fake writer.
+        (self.root / "receipt-reader").mkdir(exist_ok=True)
+        reader_paths = ProjectPaths(self.root / "receipt-reader")
+        reader_paths.vibe.mkdir(parents=True, exist_ok=True)
+        (reader_paths.vibe / "state.json").write_text("{}")
+        runner = ProviderActionRunner(reader_paths, "claude-code", "claude-code-visible")
+        action = runner.store.request(
+            operation="resume", provider=runner.provider, run_id=self.run_id,
+            issue_id=NODE, role="developer", generation=1,
+            sequence=getattr(self, "_reader_sequence", 0) + 1,
+            native_tool="ccd_session_mgmt__send_message",
+            request={"threadId": "t1", "hostId": "local"})
+        self._reader_sequence = action["sequence"]
+        runner.store.complete(action["action_id"], self.store.result(self.action["action_id"]), native=False)
+        metadata = {
             "node_id": NODE, "role": "developer", "run_id": self.run_id, "task_id": "t1",
-            "generation": 1, "host": "local", "pending_action": self.action["action_id"],
+            "generation": 1, "host": "local", "pending_action": action["action_id"],
             "pending_operation": "resume",
-        })
+        }
+        handle = RunHandle(runner._handle_id(metadata, self.run_id))
+        metadata["handle_id"] = handle.run_id
+        if not getattr(self, "_reader_adopted", False):
+            save_task_binding(reader_paths, TaskBinding(
+                provider=runner.provider, mode="visible", issue_id=NODE, role="developer",
+                task_id="t1", host="local", worktree=".", branch="fixture",
+                run_id=self.run_id, generation=1))
+            append_event(reader_paths, RunEvent("orphan_dispatch_adopted", {
+                **{key: metadata[key] for key in ("run_id", "node_id", "role", "task_id", "host", "generation", "handle_id")},
+                "action_id": action["action_id"], "request_digest": action["request_digest"],
+            }))
+            self._reader_adopted = True
+        runner.store._atomic(runner._handle_path(handle.run_id), metadata)
         events = runner.poll(handle)
         return any(
             e.event == "visibility_unknown" and "resume is unverified" in e.data.get("reason", "")

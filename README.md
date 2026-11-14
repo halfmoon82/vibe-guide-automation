@@ -8,7 +8,7 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 ## 安装
 
-当前发行版本为 `5.2.7`。版本真相以仓库中匹配的 `v5.2.7` tag、对应提交和 Release 资产为准；版本引用的写法约定：反引号 v 形式（如本句的 tag）只用于当前 release tag，历史版本写作 V4.5.0 这样大写、无反引号的形式，否则 release-tag-gate 会判为旧 tag 残留。`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
+当前发行版本为 `5.2.8`。这里的 `5.2.8` 仅为本地候选版本；正式发布与下载必须以远端匹配的 `v5.2.8` tag、对应提交和 Release 资产核验为准；版本引用的写法约定：反引号 v 形式（如本句的 tag）只用于当前 release tag，历史版本写作 V4.5.0 这样大写、无反引号的形式，否则 release-tag-gate 会判为旧 tag 残留。`dist/` 目录只是本地构建缓存，不是下载入口。交付验收分别覆盖 wheel、sdist 和源码安装；本地构建只生成验证用产物，不创建 tag/Release、push、merge 或 deploy。
 
 ### 安装与初始化前提
 
@@ -24,7 +24,7 @@ Vibe Guide 是一个本地 CLI：先扫描项目和规划任务，再用一次�
 
 1. 先查询最新 tag，不根据 README、`dist/` 文件名或历史记忆判断版本：
    `git ls-remote --tags --sort='-v:refname' https://github.com/halfmoon82/vibe-guide-automation.git 'refs/tags/v*'`
-2. 选择最新稳定 tag（当前应为 `v5.2.7`），核对 tag、提交和可下载 Release 资产版本一致；无法核对时保持 `unknown`，不要猜测。
+2. 选择实际查到的最新稳定 tag，核对 tag、提交和可下载 Release 资产版本一致；本地候选 `v5.2.8` 只有经远端核验后才能作为发行版本。无法核对时保持 `unknown`，不要猜测。
 3. 在目标环境安装该版本，并验证：
    `python3 -c "import vibe_guide; print(vibe_guide.__version__)"`
    `vibe --help`
@@ -74,16 +74,16 @@ python3 -m vibe_guide --help
 2. **pipx 装 wheel 必须用构建出来的原文件名**，改名后的副本（如 `cli-162b481.whl`）会被拒：
 
    ```bash
-   pipx install --force dist/vibe_guide-5.2.7-py3-none-any.whl
+   pipx install --force dist/vibe_guide-5.2.8-py3-none-any.whl
    ```
 
 3. **沙箱内 `pip install <sdist>` 会报 `EEXIST: mkdir pip-req-build-*`**（换 `TMPDIR` 仍复现），改成解包后按目录安装，新 venv 先装 setuptools / wheel：
 
    ```bash
-   tar xzf dist/vibe_guide-5.2.7.tar.gz -C /tmp
+   tar xzf dist/vibe_guide-5.2.8.tar.gz -C /tmp
    python3 -m venv /tmp/vibe-sdist-check
    /tmp/vibe-sdist-check/bin/pip install setuptools wheel
-   /tmp/vibe-sdist-check/bin/pip install --no-build-isolation --no-deps /tmp/vibe_guide-5.2.7
+   /tmp/vibe-sdist-check/bin/pip install --no-build-isolation --no-deps /tmp/vibe_guide-5.2.8
    /tmp/vibe-sdist-check/bin/vibe --help
    ```
 
@@ -202,7 +202,54 @@ V4.4 将工程故障限定在节点范围内，并保留同一任务身份。五
 
 **开机保活（launchd，授权卡选项，默认关）**：它是守护程序被杀后自动重启的唯一途径。不勾选时守护程序被杀后不会自动恢复，监工心跳只报告、不重启，需产品经理手工 `vibe daemon start`。勾选后授权会为该 run 生成并校验一份 LaunchAgent plist（`KeepAlive` 仅在非正常退出时重启），用 `launchctl` 加载；`vibe daemon stop` 会卸载并删除。四个平台走同一入口（`vibe_guide/launchd_keepalive.py`），目前**均未经真机验证**，授权卡文案同样如实标注；非 macOS 返回 `unsupported`。测试只用假 launchctl 和临时目录，不加载真实 LaunchAgent。
 
-节点连续几拍都没有任何进展（状态、代数、活跃任务、最新交付都不变）时按三级处理：
+**r4 职责规则采纳**：升级或重复初始化不会静默启用新职责。用
+init --confirm --responsibility-adoption <选择及批准证据.json> --json 记录选择；
+JSON 包含 plan_id、run_id、accepted_protocols（键/摘要取初始化输出的完整
+responsibility.manifest.protocols）、evidence_ref、evidence_sha256、authorization_digest
+和 contract_digest。完整选择也仅为 pending_reauthorization，不改物化协议或当前授权。
+使用返回的 adoption_digest 显式预览与重新授权同一运行：
+
+    vibe monitor --plan <ID> --preview-card --adoption-digest <摘要> --json
+    vibe monitor --plan <ID> --authorize AUTHORIZE --adoption-digest <摘要> --json
+
+预览只读，展示同一规则集/回执绑定；部分选择、证据变动、跨项目/计划/运行或旧授权
+不匹配均拒绝。不提供摘要不会自动挑选最新回执。完整集合经同 run 签名重新授权后
+才生效。生效后的停滞由原监工诊断、帮助原任务并复核，daemon 不另开修复 LLM；
+通知去重不结束责任。supervisor-mailbox --record-help --node <节点> --payload <JSON>
+--run-id <运行> 可留存 diagnosis/action/next_action/verification_condition/evidence_ref/
+evidence_sha256；帮助已记录不代表已发送或原故障解除。
+
+原 Codex 可见任务的恢复准备入口为 `supervisor-mailbox --prepare-recovery --node <节点>`
+`--role <developer|reviewer> --run-id <运行> --payload <JSON>`。JSON 仅含 `prompt`、
+`original_step`（`command` 与指定 writer 内绝对 `cwd`）、`evidence_ref`、`evidence_sha256`。
+入口验证当前 owner、有效规则、原任务/代次/writer 及既有复杂 DAG 门禁，再持久认领；
+返回精确 `native_tool/native_args`，不自动发送。仅 `claimed` 允许按已有授权执行一次，
+`already_claimed` 或 `unknown` 只能对账，不能重发。随后使用
+`supervisor-mailbox --reconcile-recovery <action> --run-id <运行>` 读取平台日志复核。
+只有关联本次原生调用、原任务新 turn 和原失败命令的结构化终态才计成功/失败；
+未知平台/日志结构保持 unknown。成功只结清本次匹配帮助，不代表业务验收或准许接续。
+失格 reviewer 不进入普通恢复。终止或安全退役证据不足时仍拒绝 successor。
+
+当前监工可通过 `vibe supervisor-mailbox --run-id <运行> --retire-successor <恢复action> --payload <JSON文件> --json`
+提交受保护退役；JSON 仅含 `observation`（可追溯的原生终止观察）和
+`frozen_preservation`（`Monitor.successor_preservation` 的冻结结果）。入口核对当前调用会话、
+owner epoch、授权/合同、三次原步骤真实恢复失败、原任务终止来源、writer lease 和冻结成果后，
+才退役原任务并由正常调度排队后继。重复同事务不新增事件；未提交事务阻断派发。
+后继仍须通过 create、locate、visibility 和身份绑定，setup pending、归档或单个回合完成均不算成功。
+换班后的旧观察不能复用，授权/合同或成果变化时保持 blocked_unknown。当前自动链仅由隔离
+Codex 日志夹具验证，真实 App 永久终止能力及真实后继仍未验证；本入口不证明平台已具备该能力。
+
+已授权且当前 owner 可用时，daemon start --recover-daemon --plan <ID> --run-id <运行>
+校验原监工身份与唯一启动认领。旧进程仍活着、查询未知或启动未登记时先对账，不再启动；
+启动结果不证明恢复完成，实际执行器记录同 owner/授权下两个连续公共调度周期，失败重置。
+执行器固定加载产品运行时，不受业务目录同名包遮蔽；自动夹具不代表真实 App 验收。
+
+完整原生回执用 supervisor-mailbox --complete <action> --run-id <运行> --result <JSON>
+--native-response --request-digest <请求摘要> 导入：先保存完整 raw，再生成受限投影，
+冲突另留观察，未知不猜绑定。resumed=true、排队和传输完成不等于原步骤恢复；查询/超时
+不计真实恢复失败。不能编辑 raw 或手填成功替代原生证据。
+
+**尚未采纳 r4 的旧兼容合同**：节点连续几拍都没有任何进展（状态、代数、活跃任务、最新交付都不变）时按三级处理：
 
 1. **一级**：守护程序自动重试，不耗模型。
 2. **二级**：仍空转到“需要监工排查”档，守护程序拉起一次一次性修复短会话（claude-code 用 `claude -p`，codex 用 `codex exec`，kimi-code 用 `kimi -p`；WorkBuddy 无命令行，写入信箱由其自动化每次新会话处理），输入排查包、监工卡和授权范围；会话可改排查包列出的运行时文件，不得直接改 `state.json` 和 `events.jsonl`，必须以 `vibe heal-verify` 结束，由守护程序复核，通过才推进并留下 `self_heal_attempt` 记录。每个运行同时最多一个短会话，次数与 token 有预算。

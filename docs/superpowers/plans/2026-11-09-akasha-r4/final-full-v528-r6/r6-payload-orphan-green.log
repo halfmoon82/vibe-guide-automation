@@ -1,0 +1,7 @@
+test_private_payload_without_claim_state_fails_closed (tests.test_audit_create_claim.ControlledCreateSafetyTests) ... ok
+test_controlled_callback_requires_explicit_digest (tests.test_audit_create_claim.ControlledCreateSafetyTests) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.024s
+
+OK

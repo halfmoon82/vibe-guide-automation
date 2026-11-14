@@ -27,6 +27,8 @@ VIBE_ENTRY_PROPOSAL_RELATIVE = ".vibe/proposals/skills/vibe-entry/SKILL.md"
 #: left alone.  Append the new digest whenever a protocol changes.
 SHIPPED_PROTOCOL_DIGESTS = {
     "prd-guide": frozenset({
+        # r4 explicit adoption/version gate; retain every historical digest.
+        "f01cc7e6ee54210768b03de1b0f97b1179967fa75a698852e58316f8a376f93f",
         # 2026-11-05: §5.3 records the old-meaning ruling -- missing/false
         # local_commit_allowed keeps node-branch commits, not a commit ban
         # (r4 rework).
@@ -228,6 +230,7 @@ SHIPPED_PROTOCOL_DIGESTS = {
         "4336b8a2977974248dbec483a4e8440ed60768234d76ffc0a6ac685e12ee97c5",
     }),
     "vibe-entry": frozenset({
+        "46af335bea36da10c5f13c18f98de7b95052aefc225116c718a5c571c241384e",
         # 2026-10-31: monitor auto-starts the daemon; launchd keep-alive is the only auto-restart path.
         "cc4c48df44d0a871cd964097ca977992653ec7858162fa2b24be994ecf948287",
         # 2026-10-30: dead daemon is reported only, never restarted by the supervisor session.
@@ -257,6 +260,7 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Worker protocol delivered by reference (#216): a ref-mode dispatch pins
     # the file's sha256 and only accepts a digest published here.
     "visible-sdd-worker": frozenset({
+        "7ab16fde9553869e4e8ff0aa178db7af565d3cdb0368f8800ade84b75f9a822e",
         # 2026-11-05: close-out rule keeps the deny landing channel honest --
         # node-branch commits stay the landing point; the signed exception
         # only narrows the prompt (r4 rework, missing=false=old meaning).
@@ -273,6 +277,9 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Short per-beat runbook; the beat prints it once per shift, then only
     # its path and sha256.
     "supervisor-card": frozenset({
+        # r4 short card: retain the adoption and recovery gates within 3 KiB.
+        "dfebbc8d86125e7e9f6f7e214413e9ec47112482fa41ca8d4b8c82b56ffbbabf",
+        "c7e39d03a1a52ff6c78e9e2106a76a79976cd931c8e1532538edf3d31fa85d05",
         # 2026-11-03: decision boundary names the platform-handoff disclosure
         # exception; wording trimmed to stay within 3072 bytes (card-and-handoff).
         "b26036fdbcdbcf344cbf0590d2aac3ce1fe24f68c8ef8dd49446b189e72e49c3",
@@ -314,6 +321,7 @@ SHIPPED_PROTOCOL_DIGESTS = {
     # Second-level self-heal short session (daemon): the prompt the daemon feeds
     # a one-shot repair session.
     "heal-session": frozenset({
+        "d05e01a6b89c7dc272dcd688b47d5c612f2c9d4943248e5f64840515c1bf5026",
         # 2026-10-30: unfixable engineering failures are reported, not escalated.
         "82f42d58ee688cc02f87faf5b569ec08ce04c1be86896432c00869f90ecdfc15",
         # 2026-10-30: first wording (PR #330 first commit).

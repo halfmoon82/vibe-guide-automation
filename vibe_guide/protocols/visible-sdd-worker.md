@@ -22,10 +22,12 @@ dev 子代理实现 → review 子代理审查 →（存在 P0–P2）返工回 
    dev 子代理只能经 Bash 改文件。详见 docs/workbuddy/workbuddy-in-session-dispatch-verification.md。
 2. **review 子代理**：**独立上下文**、**只读**、**非作者视角**审查 dev 的 diff，按 P0（资金/数据正确性）、P1（逻辑缺陷/事务边界）、P2（边界条件/行为回归）、P3（建议）分级产出意见。review 子代理不得是 dev 子代理本人，不得复用 dev 的实现上下文。
 3. **返工**：存在 P0–P2 时逐条核实（reviewer 意见也要验证，不盲从）→ 由 dev 子代理修复 → 重跑定向验证（须为绿）。
-4. **复审**：返工后回到 review 子代理复审，保留审查身份与证据链；最多 3 轮。三轮仍不收敛时由监工记录 `change_reviewer_or_split_node`，换 reviewer 或拆节点并保留唯一 writer；只有分歧会改变 PRD 验收判定时才升级产品决策。
+4. **复审**：返工后回到原 review 子代理复审，保留审查身份与证据链。完整职责 r4 显式采纳并同 plan/run 重授权 effective 后，格式拒收、review finding、返工轮数或材料缺口不能成为换 reviewer 求通过的理由；普通不可恢复按至少三次真实完成失败及受保护安全接续门处理，安全失格独立隔离。未采纳 r4 的旧合同仍按原三轮规则记录 change_reviewer_or_split_node，不将其视为 r4 恢复失败。
 5. **收口**：某轮复审无 P0–P2 且验证绿后，按节点合同收口（提交/开 PR 等以授权卡为准）。授权卡 `remote_git_actions=deny` 下，本节点分支上的本地 commit 是交付落账的唯一落点：改动必须提交到合同节点分支并限制在授权文件范围内；未提交或越界的落账会被拒收。`local_commit_allowed` 例外在提示词层把这条通道收窄为显式白名单 + 显式路径 `git add`；无论有无例外，任何 push/PR/MR/merge/fetch/pull/gh 仍全部禁止。
 
 ## 1.5 派发前提：worker 会话必须挂载 project
+
+初次/续接/返工的 developer/reviewer 遇工程阻塞，沿原合同角色/代次用 worker-deliver 上报 {"event":"blocked_engineering","status":"blocked","implementation_complete":false}，附实际失败步骤、已试结果、缺口及真实证据；六个可执行例子见 blocked-engineering-examples.md。无需伪造 complete/accepted 或 delivery_evidence；按 supervisor-address 返回值唤醒原监工，通知不等于解除阻塞。缺 writer 可归档事实但不授写权；scope 聊天答复不改 allowlist，须受保护许可事务落地。
 
 **worker 的写权限不来自派发负载。** 一句话记法：**worker 权限来自 project 挂载 + app 沙箱默认值，
 派发负载不能携带权限。** 沙箱档案在**会话创建那一刻**由「挂在哪个 project + app/project

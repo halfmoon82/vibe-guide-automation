@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from vibe_guide.cli import ProjectRootError, explicit_project_root, main
+from vibe_guide.cli import ProjectRootError, explicit_project_root, main, run_cli
 from vibe_guide.runners.provider_action import ProviderActionRunner
 
 from tests.test_worker_push_delivery import GOOD, _store, _wait_request
@@ -56,6 +56,21 @@ class ProjectRootFlagTests(unittest.TestCase):
         ])
         self.assertEqual(code, 0, out)
         self.assertTrue(json.loads(out)["consumed"])
+
+    def test_explicit_root_does_not_walk_up_to_parent_git_repository(self):
+        parent = Path(self.tmp.name) / "parent"
+        child = parent / "child"
+        parent.mkdir()
+        child.mkdir()
+        subprocess.run(["git", "init", "-q", str(parent)], check=True)
+        (parent / ".vibe").mkdir()
+        result = run_cli(["supervisor-register", "--project-root", str(child),
+                          "--run-id", "run-child", "--provider", "codex", "--session-id", "T",
+                          "--host", "mac", "--json"], self.root)
+        self.assertEqual(result.exit_code, 0, result.payload)
+        self.assertTrue((child / ".vibe" / "runs" / "run-child").is_dir(), result.payload)
+        self.assertFalse((parent / ".vibe" / "runs").exists())
+        self.assertFalse((self.root / ".vibe").exists())
 
     def test_supervisor_address_succeeds_when_getcwd_is_denied(self):
         code, out = _run_main([

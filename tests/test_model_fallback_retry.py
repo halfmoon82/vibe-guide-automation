@@ -200,6 +200,12 @@ class ModelFallbackDispatchTests(_ProjectCase):
         monitor, runner, snapshot = self._start_fallback_run(node, failures * 2)
         for _ in range(12):
             snapshot = monitor.tick(snapshot.run_id, runner)
+            # Every exhausted round retires its failed generation before a
+            # fresh retry acquires another lease. Never hide two writers.
+            leases = list((self.paths.root / ".vibe" / "leases").glob("*.json"))
+            self.assertLessEqual(len(leases), 1)
+            if snapshot.nodes["n1"].get("start_intent") is None:
+                self.assertEqual(leases, [])
         state = snapshot.nodes["n1"]
         self.assertEqual(state["status"], "retry_pending")
         self.assertIsNone(state.get("retryable_action"))

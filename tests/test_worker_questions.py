@@ -64,16 +64,16 @@ class QuestionLauncher:
 
 class RunnerQuestionTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.paths = ProjectPaths(Path(temporary.name))
         self.contract = {"node_id": "n1", "role": "developer", "run_id": "r1",
                          "generation": 1, "contract_path": "/c.md"}
 
     def poll(self, launcher):
-        runner = ClaudeBgRunner(lambda c, w: launcher, delivery_reader=lambda claims: None,
-                                paths=self.paths)
-        return runner.poll(runner.start(dict(self.contract), Path("/tmp")))
+        # Replies/states are independent examples, not redispatches into the
+        # previous example's live session. No real transcript is read.
+        with tempfile.TemporaryDirectory() as root:
+            runner = ClaudeBgRunner(lambda c, w: launcher, delivery_reader=lambda claims: None,
+                                    paths=ProjectPaths(Path(root)))
+            return runner.poll(runner.start(dict(self.contract), Path("/tmp")))
 
     def test_ended_session_without_delivery_reports_its_last_message(self):
         for state in ("done", "idle", "blocked"):

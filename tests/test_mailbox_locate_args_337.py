@@ -6,12 +6,32 @@ import tempfile
 import unittest
 
 from vibe_guide.cli import run_cli
+from vibe_guide.authorization import authorize, build_authorization_card
+from vibe_guide.contracts import RunEvent
+from vibe_guide.models import AgentCapabilities, Plan
+from vibe_guide.paths import ProjectPaths
+from vibe_guide.state import RunSnapshot, append_event, save_snapshot
+from tests.test_monitor import node
+
+
+def _save_run(root):
+    paths = ProjectPaths(root)
+    plan = Plan('plan-337', 1, 'docs/prd.md', ['node-a'], 'draft')
+    record = authorize(build_authorization_card(plan, [node('node-a')],
+        AgentCapabilities('fake', True, True, True, True, True, 'full')), 'AUTHORIZE')
+    append_event(paths, RunEvent('run_started', {'run_id': 'run-337', 'node_ids': ['node-a'],
+        'authorization_digest': record.digest, 'node_contract_digest': record.node_contract_digest}))
+    save_snapshot(paths, RunSnapshot('run-337', 'plan-337', 1, 'running',
+        {'node-a': {'status': 'running'}}, {}, authorization=record.to_dict(),
+        authorization_digest=record.digest, node_contract_digest=record.node_contract_digest,
+        event_sequence=1))
 
 
 class MailboxLocateNativeArgsTests(unittest.TestCase):
     def test_codex_locate_suggests_only_thread_id(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            _save_run(root)
             requests = root / ".vibe/provider-actions/requests"
             requests.mkdir(parents=True)
             action = {
@@ -43,6 +63,7 @@ class MailboxLocateNativeArgsTests(unittest.TestCase):
         for provider in ("claude-code-visible", "workbuddy-visible"):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
+                _save_run(root)
                 requests = root / ".vibe/provider-actions/requests"
                 requests.mkdir(parents=True)
                 action = {

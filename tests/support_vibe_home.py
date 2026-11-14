@@ -20,7 +20,7 @@ from pathlib import Path
 
 #: Exact host-identity names, plus the prefixes below.
 HOST_ENV_NAMES = (
-    "CLAUDECODE", "CODEX_THREAD_ID", "CODEBUDDY_SESSION_ID",
+    "CLAUDECODE", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEBUDDY_SESSION_ID", "AI_AGENT",
 )
 HOST_ENV_PREFIXES = ("CLAUDE_CODE_", "CODEBUDDY_", "CODEX_THREAD", "CLAUDE_SESSION")
 

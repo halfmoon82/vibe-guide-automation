@@ -93,10 +93,10 @@ class InitRefreshTests(_Case):
         for name, relative in COPIES:
             copy = self.age(relative)
             result = run_cli(["init", "--confirm", "--json"], self.root)
-            self.assertEqual(copy.read_text(encoding="utf-8"), load_protocol(name), name)
-            self.assertIn(relative, result.payload.get("paths", []))
-            self.assertFalse(
-                any(relative in note for note in result.payload.get("notes", [])),
+            self.assertEqual(copy.read_text(encoding="utf-8"), OLD_TEXT, name)
+            self.assertNotIn(relative, result.payload.get("paths", []))
+            self.assertTrue(
+                any(relative in note and "adoption_required" in note for note in result.payload.get("notes", [])),
                 result.payload,
             )
 
@@ -105,7 +105,7 @@ class InitRefreshTests(_Case):
         result = run_cli(["init", "--confirm", "--json"], self.root)
         self.assertEqual(copy.read_text(encoding="utf-8"), OLD_TEXT + "本地补充\n")
         self.assertTrue(
-            any(PRD_GUIDE_PROPOSAL_RELATIVE in note and "不一致" in note
+            any(PRD_GUIDE_PROPOSAL_RELATIVE in note and "保留旧副本" in note
                 for note in result.payload.get("notes", [])),
             result.payload,
         )
@@ -120,11 +120,11 @@ class CommandRefreshTests(_Case):
             for name, relative in COPIES:
                 self.assertEqual(
                     (self.root / relative).read_text(encoding="utf-8"),
-                    load_protocol(name), command,
+                    OLD_TEXT, command,
                 )
             self.assertEqual(
                 sorted(result.payload.get("protocol_refreshed", [])),
-                sorted(relative for _, relative in COPIES), command,
+                [], command,
             )
             text = run_cli(command, self.root).text
             self.assertNotIn("协议副本", text, "an already-current copy is not re-reported")
@@ -132,13 +132,14 @@ class CommandRefreshTests(_Case):
     def test_text_output_names_the_refreshed_copy(self):
         self.age(VIBE_ENTRY_PROPOSAL_RELATIVE)
         text = run_cli(["resume"], self.root).text
-        self.assertIn(VIBE_ENTRY_PROPOSAL_RELATIVE, text)
+        self.assertNotIn("已把旧版协议副本刷新", text)
+        self.assertEqual((self.root / VIBE_ENTRY_PROPOSAL_RELATIVE).read_text(), OLD_TEXT)
 
     def test_refresh_keeps_file_permissions(self):
         copy = self.age(PRD_GUIDE_PROPOSAL_RELATIVE)
         copy.chmod(0o644)
         run_cli(["resume"], self.root)
-        self.assertEqual(copy.read_text(encoding="utf-8"), load_protocol("prd-guide"))
+        self.assertEqual(copy.read_text(encoding="utf-8"), OLD_TEXT)
         self.assertEqual(copy.stat().st_mode & 0o777, 0o644)
 
     def test_local_edit_is_not_touched(self):

@@ -353,7 +353,7 @@ def _static_tool_invocations(source, names):
     return invocations
 
 
-def _audit_static_exec(tokens):
+def _audit_static_exec(tokens, extra_host_names=None):
     """Accept only straight-line calls to known host functions with static data.
 
     Member access, arbitrary functions, computed expressions and assignments
@@ -362,7 +362,7 @@ def _audit_static_exec(tokens):
     """
     host_names = {"exec_command", "mcp__codex_app__create_thread",
                   "svc__codex_app__create_thread", "codex_app__create_thread",
-                  "create_thread"}
+                  "create_thread"} | set(extra_host_names or ())
     # Result bindings never stand for a callable tool or arbitrary expression.
     # Only the plain exec_command output field may be passed to text().
     output_bindings = set()
@@ -380,18 +380,23 @@ def _audit_static_exec(tokens):
     }
 
     def expression(pos):
+        awaited = False
         if pos < len(tokens) and tokens[pos] == ("id", "await"):
+            awaited = True
             pos += 1
         if pos < len(tokens) and tokens[pos][1] == "(":
-            pos = expression(pos + 1)
+            pos, origin = expression(pos + 1)
             if pos >= len(tokens) or tokens[pos][1] != ")":
                 raise ValueError("unknown grouped JavaScript expression")
             pos += 1
             # Only this result field of the known exec_command call is
             # supported; property chains and computed access remain unknown.
             if tokens[pos:pos + 2] == [("punct", "."), ("id", "output")]:
+                if origin != "exec_result":
+                    raise ValueError("output projection requires a proven exec result")
                 pos += 2
-            return pos
+                origin = "output"
+            return pos, origin
         if pos >= len(tokens):
             raise ValueError("missing JavaScript expression")
         if (tokens[pos][0] == "regex"
@@ -399,9 +404,9 @@ def _audit_static_exec(tokens):
             if (pos + 5 >= len(tokens) or tokens[pos + 4][0] != "string"
                     or tokens[pos + 5][1] != ")"):
                 raise ValueError("unknown regex test argument")
-            return pos + 6
+            return pos + 6, "static"
         if tokens[pos][0] in {"string", "regex"}:
-            return pos + 1
+            return pos + 1, "static"
         # Only the metadata projection ``ALL_TOOLS.map(x => x.name)`` is
         # accepted. No callback body, invocation, computed member or alias
         # is admitted; the parameter must not shadow a host/builtin name.
@@ -414,28 +419,30 @@ def _audit_static_exec(tokens):
                     or tokens[pos + 7:pos + 10] != [tokens[pos + 4], ("punct", "."), ("id", "name")]
                     or pos + 10 >= len(tokens) or tokens[pos + 10] != ("punct", ")")):
                 raise ValueError("unknown metadata projection")
-            return pos + 11
+            return pos + 11, "metadata"
         if tokens[pos:pos + 2] == [("id", "text"), ("punct", "(")]:
             if (pos + 5 < len(tokens) and tokens[pos + 2][0] == "id"
                     and tokens[pos + 2][1] in output_bindings
                     and tokens[pos + 3:pos + 5] == [("punct", "."), ("id", "output")]):
                 pos += 5
             else:
-                pos = expression(pos + 2)
+                pos, _origin = expression(pos + 2)
             if pos >= len(tokens) or tokens[pos][1] != ")":
                 raise ValueError("unknown text argument")
-            return pos + 1
+            return pos + 1, "text_result"
         if tokens[pos:pos + 2] == [("id", "tools"), ("punct", ".")]:
             if (pos + 3 >= len(tokens) or tokens[pos + 2][0] != "id"
                     or tokens[pos + 2][1] not in host_names
                     or tokens[pos + 3][1] != "("):
                 raise ValueError("unknown host function")
+            tool = tokens[pos + 2][1]
             pos += 4
             if pos < len(tokens) and tokens[pos][1] != ")":
                 _value, pos = _static_js_value(tokens, pos, {})
             if pos >= len(tokens) or tokens[pos][1] != ")":
                 raise ValueError("unknown host call argument")
-            return pos + 1
+            return pos + 1, ("exec_result" if awaited and tool == "exec_command"
+                             else "host_result")
         raise ValueError("JavaScript expression is outside the static audit subset")
 
     pos = 0
@@ -457,7 +464,7 @@ def _audit_static_exec(tokens):
                 while pos < len(tokens) and tokens[pos] != ("punct", "]"):
                     if tokens[pos:pos + 2] != [("id", "tools"), ("punct", ".")]:
                         raise ValueError("unknown allSettled item")
-                    pos = expression(pos)
+                    pos, _origin = expression(pos)
                     if pos < len(tokens) and tokens[pos] == ("punct", ","):
                         pos += 1
                     elif pos >= len(tokens) or tokens[pos] != ("punct", "]"):
@@ -473,12 +480,12 @@ def _audit_static_exec(tokens):
                         or tokens[pos + 7] != ("punct", "(")):
                     raise ValueError("unknown JavaScript const initializer")
                 tool = tokens[pos + 6][1]
-                pos = expression(pos + 3)
+                pos, _origin = expression(pos + 3)
             bindings.add(name)
             if tool == "exec_command":
                 output_bindings.add(name)
         else:
-            pos = expression(pos)
+            pos, _origin = expression(pos)
         if pos < len(tokens) and tokens[pos][1] == ";":
             pos += 1
         elif pos < len(tokens):
@@ -2081,6 +2088,9 @@ def _direct_terminal_call_occurs(tokens, index):
             ("id", "await"), ("id", "tools"), ("punct", ".")]:
         return False
     prefix = tokens[:index - 3]
+    if any(candidate == ("id", keyword) for keyword in ("throw", "return")
+           for candidate in prefix):
+        return False
     braces = []
     parens = []
     for pos, token in enumerate(prefix):
@@ -2098,6 +2108,37 @@ def _direct_terminal_call_occurs(tokens, index):
             parens.pop()
     if braces or any(pos == 0 or tokens[pos - 1] != ("id", "text") for pos in parens):
         return False
+    segments = []
+    segment_start = 0
+    brace_depth = paren_depth = 0
+    for pos, token in enumerate(prefix):
+        if token == ("punct", "{"):
+            brace_depth += 1
+        elif token == ("punct", "}"):
+            brace_depth -= 1
+        elif token == ("punct", "("):
+            paren_depth += 1
+        elif token == ("punct", ")"):
+            paren_depth -= 1
+        elif token == ("punct", ";") and brace_depth == 0 and paren_depth == 0:
+            segments.append(prefix[segment_start:pos])
+            segment_start = pos + 1
+    segments.append(prefix[segment_start:])
+    for segment in segments[:-1]:
+        if segment and (len(segment) < 2
+                        or segment[0] != ("id", "text")
+                        or segment[1] != ("punct", "(")):
+            return False
+        if segment:
+            try:
+                _audit_static_exec(
+                    segment + [("punct", ";")],
+                    {"mcp__codex_app__read_thread",
+                     "mcp__codex_app__set_thread_archived",
+                     "svc__codex_app__read_thread",
+                     "svc__codex_app__set_thread_archived"})
+            except ValueError:
+                return False
     boundary = max((pos for pos, token in enumerate(prefix) if token[1] in {";", "}"}), default=-1)
     statement = prefix[boundary + 1:]
     if statement in ([], [("id", "text"), ("punct", "(")]):
@@ -2310,6 +2351,11 @@ def _combined_terminal_host_results(rows, call_id, observer_id, session, host):
     values = _native_return_values(result)
     expected = {}
     tokens = _js_tokens(source)
+    # Validate the entire script, including suffix declarations whose lexical
+    # scope affects earlier calls and suffix syntax that prevents compilation.
+    _audit_static_exec(tokens, {prefix + tool
+                               for prefix in ("svc__codex_app__", "mcp__codex_app__")
+                               for tool in ("read_thread", "set_thread_archived")})
     for index, token in enumerate(tokens):
         if token == ("id", "tools") and (
                 index == 0 or tokens[index - 1][1] in {"const", "let", "var"}
@@ -2337,8 +2383,50 @@ def _combined_terminal_host_results(rows, call_id, observer_id, session, host):
         if len(candidates) != 1:
             raise ValueError("terminal host outer invocation is missing or ambiguous")
         expected[tool] = candidates[0]
-    items = {}
     all_ids = set()
+    for index in range(start + 1, end):
+        row = rows[index]
+        if not isinstance(row, dict):
+            raise ValueError("terminal host interval contains an invalid envelope")
+        entry_type = row.get("type")
+        payload = row.get("payload")
+        if entry_type == "event_msg":
+            if not isinstance(payload, dict):
+                raise ValueError("terminal host event payload is missing")
+            kind = payload.get("type")
+            if kind in _KNOWN_NON_ITEM_EVENT_TYPES and "item" not in payload:
+                continue
+            if kind == "item_started":
+                raise ValueError("terminal host item is unfinished")
+            if kind != "item_completed":
+                raise ValueError("terminal host event kind is unknown")
+            item = payload.get("item")
+            if not isinstance(item, dict):
+                raise ValueError("terminal host item is missing")
+            item_type = item.get("type")
+            if item_type in _BENIGN_HOST_ITEM_TYPES:
+                item_id = item.get("id")
+                if (not isinstance(item_id, str) or not item_id
+                        or item_id in all_ids
+                        or payload.get("thread_id") != observer_id
+                        or payload.get("turn_id") != turn
+                        or type(payload.get("started_at_ms")) is not int
+                        or type(payload.get("completed_at_ms")) is not int
+                        or payload["completed_at_ms"] < payload["started_at_ms"]
+                        or any(key in item for key in
+                               ("server", "tool", "arguments", "result", "parent_id"))
+                        or ("status" in item and item.get("status") != "completed")):
+                    raise ValueError("terminal host benign item schema mismatch")
+                all_ids.add(item_id)
+                continue
+            if item_type != "McpToolCall":
+                raise ValueError("terminal host item type is unknown or executable")
+            continue
+        if entry_type in {"token_usage_record", "turn_context", "world_state",
+                          "compacted", "inter_agent_communication_metadata"}:
+            continue
+        raise ValueError("terminal host interval envelope is unexpected")
+    items = {}
     for index, row in enumerate(rows):
         payload = row.get("payload")
         if (row.get("type") != "event_msg" or not isinstance(payload, dict)
@@ -2351,13 +2439,14 @@ def _combined_terminal_host_results(rows, call_id, observer_id, session, host):
         if not isinstance(item_id, str) or not item_id or item_id in all_ids:
             raise ValueError("terminal host item identity is missing or duplicated")
         all_ids.add(item_id)
+        in_interval = start < index < end
+        if not in_interval:
+            continue
         tool = item.get("tool")
         args = item.get("arguments")
         if (item.get("server") != "codex_app" or tool not in expected
                 or not isinstance(args, dict) or args.get("threadId") != session):
-            continue
-        if not start < index < end:
-            continue
+            raise ValueError("terminal host item tool or arguments mismatch")
         if (payload.get("thread_id") != observer_id
                 or payload.get("turn_id") != turn or args != expected[tool]
                 or type(payload.get("started_at_ms")) is not int
@@ -2715,7 +2804,16 @@ def _retire_request_problems(
         claim = _retire_claim_evidence(
             store, run_id, str(action.get("issue_id")),
             _retire_field(evidence, "amendment_digest"))
-        if claim is not None:
+        # Legacy/unmarked creates remain UNKNOWN to ordinary callers.  This
+        # retirement path has already verified the complete consumer/native
+        # terminal evidence chain above; only that exact proof may discharge
+        # the legacy exposure marker. Controlled creates and every other
+        # evidence kind remain fail-closed.
+        legacy_retirement_proven = (
+            claim == "unknown_create_exposure"
+            and store._read_create_state(action) is None
+        )
+        if claim is not None and not legacy_retirement_proven:
             raise PermissionError(
                 "provider request {} node already has durable claim "
                 "evidence: {}".format(action_id, claim))
@@ -2936,6 +3034,7 @@ def _retire_claim_evidence(
     own_locks = _retire_own_locks(store, run_id, amendment_digest)
     try:
         action_ids = set()
+        exposed_create = False
         request_dir = store.root / "requests"
         if request_dir.is_dir():
             for path in sorted(request_dir.glob("action-*.json")):
@@ -2943,6 +3042,8 @@ def _retire_claim_evidence(
                 if (action.get("run_id") == run_id
                         and action.get("issue_id") == issue_id):
                     action_ids.add(path.stem)
+                    if action.get("operation") == "create":
+                        exposed_create = True
         for action_id in sorted(action_ids):
             if ((store.root / "locks" / (action_id + ".lock")).is_file()
                     and (own_locks is None
@@ -2980,7 +3081,7 @@ def _retire_claim_evidence(
                 return directory
     except (OSError, ValueError, TypeError, AttributeError):
         return "unreadable"
-    return None
+    return "unknown_create_exposure" if exposed_create else None
 
 
 def _retire_stale_marker(store: ProviderActionStore, action_id: str):
@@ -3452,7 +3553,11 @@ def retire_uninvoked_legacy(
             for _action_id, _path, _already, action in pairs:
                 claim = _retire_claim_evidence(
                     store, run_id, str(action.get("issue_id")), amendment_digest)
-                if claim is not None:
+                legacy_retirement_proven = (
+                    claim == "unknown_create_exposure"
+                    and store._read_create_state(action) is None
+                )
+                if claim is not None and not legacy_retirement_proven:
                     raise PermissionError("retirement gained claim evidence: " + claim)
             for action_id, _path, already, _action in pairs:
                 if store.result(action_id) is not None:

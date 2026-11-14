@@ -1343,6 +1343,18 @@ def _normalize_contract_test_commands(value: Any) -> Optional[Dict[str, Tuple[st
     return normalized
 
 
+def _validate_responsibility_binding(ruleset_digest, adoption_digest):
+    if not isinstance(ruleset_digest, str) or not isinstance(adoption_digest, str):
+        raise ValueError('responsibility digests must be strings')
+    if bool(ruleset_digest) != bool(adoption_digest):
+        raise ValueError('ruleset_digest and adoption_digest must be bound together')
+    if ruleset_digest and any(
+        len(value) != 64 or any(char not in '0123456789abcdef' for char in value)
+        for value in (ruleset_digest, adoption_digest)
+    ):
+        raise ValueError('responsibility digests must be SHA256')
+
+
 def _authorization_payload(
     plan_id: str,
     plan_version: int,
@@ -1378,7 +1390,10 @@ def _authorization_payload(
     daemon: bool = True,
     launchd_keepalive: bool = False,
     local_commit_allowed: Optional[bool] = None,
+    ruleset_digest: str = "",
+    adoption_digest: str = "",
 ) -> Dict[str, Any]:
+    _validate_responsibility_binding(ruleset_digest, adoption_digest)
     payload = {
         "schema_version": AUTHORIZATION_SCHEMA_VERSION,
         "plan_id": plan_id,
@@ -1455,6 +1470,8 @@ def _authorization_payload(
     # for bit, matching the ISSUE-209 preservation rule.
     if local_commit_allowed is True:
         payload["local_commit_allowed"] = True
+    if ruleset_digest:
+        payload.update(ruleset_digest=ruleset_digest, adoption_digest=adoption_digest)
     return payload
 
 
@@ -1518,8 +1535,13 @@ class AuthorizationCard:
     # width, critical path, reasonless serial edges.  Unsigned display; a
     # 5.2.6 card has none and the graph is derived from its nodes instead.
     dependency_graph: Optional[Dict[str, Any]] = None
+    ruleset_digest: str = ""
+    adoption_digest: str = ""
+    # Unsigned projection from C4; the paired references above are signed.
+    responsibility: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
+        _validate_responsibility_binding(self.ruleset_digest, self.adoption_digest)
         # The exception exists only inside ``deny``; ``allow`` already grants
         # commit, so ``allow`` + the flag would be two permission sources.
         if self.local_commit_allowed not in (None, False, True):
@@ -1595,6 +1617,8 @@ class AuthorizationRecord:
     local_commit_allowed: Optional[bool] = None
     daemon: bool = True
     launchd_keepalive: bool = False
+    ruleset_digest: str = ""
+    adoption_digest: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
@@ -1632,11 +1656,15 @@ class AuthorizationRecord:
             "agent_id",
         }
         allowed = required | {"node_scope_digests", "remote_git_actions", "required_workflow", "skipped_nodes", "integration_contract_digest", "integration_node_id", "integration_review_scope", "execution_engine", "engine_mode", "engine_evidence_ref", "dag_revision", "engine_authorization_digest", "explicit_execution_mode_override", "workers", "topology_summary", "contract_test_commands", "remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization", "heartbeat_interval_minutes", "rotate_hard_cap", "heartbeat_interval_forced", "heartbeat_interval_forced_cost", "heartbeat_interval_options", "rotate_hard_cap_options", "daemon", "launchd_keepalive", "local_commit_allowed"}
+        allowed.update({'ruleset_digest', 'adoption_digest'})
         if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
             raise ValueError("authorization record schema is invalid")
         if data["schema_version"] != AUTHORIZATION_SCHEMA_VERSION:
             raise ValueError("unsupported authorization record schema")
         converted = dict(data)
+        converted.setdefault('ruleset_digest', '')
+        converted.setdefault('adoption_digest', '')
+        _validate_responsibility_binding(converted['ruleset_digest'], converted['adoption_digest'])
         for key in ("remote_git_actions_options", "remote_git_actions_scope", "deploy_authorization",
                     "heartbeat_interval_options", "rotate_hard_cap_options"):
             converted.pop(key, None)
@@ -1960,7 +1988,7 @@ def _drop_unset_card_fields(result: Dict[str, Any]) -> Dict[str, Any]:
         if result.get(key) is None:
             result.pop(key, None)
     for key in ("heartbeat_interval_options", "rotate_hard_cap_options", "model_tiers",
-                "platform_capabilities"):
+                "platform_capabilities", "ruleset_digest", "adoption_digest", "responsibility"):
         if not result.get(key):
             result.pop(key, None)
     return result
@@ -1971,21 +1999,58 @@ def _model_tier_rows(nodes: List[DAGNode], platform: str) -> Tuple[Dict[str, Any
     from . import model_catalog
 
     home = model_catalog.vibe_home_path()
+    platforms = [str((node.contract or {}).get('adapter_id') or platform) for node in nodes]
+    snapshot = model_catalog.catalog_snapshot(platforms, vibe_home=home)
+    choices = {(row['platform'], row['tier']): row for row in snapshot['resolutions']}
     rows = []
     for node in sorted(nodes, key=lambda item: item.id):
         tier = model_catalog.node_tier(node)
-        choice = model_catalog.resolve(platform, tier, vibe_home=home)
+        reviewer_tier = model_catalog.node_tier(node, role="reviewer")
+        # The dispatch platform is part of the node contract, and may differ
+        # from the session that is displaying the card.
+        key = model_catalog.normalize_platform(str((node.contract or {}).get('adapter_id') or platform))
+        choice = choices[key, tier]
+        reviewer = choices[key, reviewer_tier]
+        raw_profile = (node.contract or {}).get('worker_profile')
+        if isinstance(raw_profile, dict) and raw_profile.get('model') not in (None, '', 'default'):
+            from .models import WorkerProfile
+            from .model_router import provider_thinking_for
+
+            # Dispatch preserves an existing explicit route for both roles.
+            # Directory disclosure must not advertise a different model.
+            explicit = {
+                'model': raw_profile['model'], 'effort': None, 'fallbacks': [],
+                'origin': 'contract', 'source': 'contract', 'status': 'unknown',
+                'note': 'legacy explicit worker profile; thinking effort is unverified',
+            }
+            if {'reasoning', 'fallbacks', 'selection_basis'}.issubset(raw_profile):
+                profile = WorkerProfile.from_dict(raw_profile)
+                explicit.update(
+                    effort=provider_thinking_for(profile.reasoning),
+                    fallbacks=[item['model'] for item in profile.fallbacks], status='ok',
+                    note='existing explicit worker profile; directory routing does not replace it',
+                )
+            choice = dict(choice, **explicit)
+            reviewer = dict(reviewer, **explicit)
         rows.append({
             "node_id": node.id,
             "tier": tier,
-            "reviewer_tier": model_catalog.node_tier(node, role="reviewer"),
-            "platform": choice.platform,
-            "resolved_model": choice.model,
-            "fallbacks": list(choice.fallbacks),
-            "source": choice.origin,
-            "effort": choice.effort,
-            "resolution": choice.status,
-            "note": choice.note,
+            "reviewer_tier": reviewer_tier,
+            "platform": choice['platform'],
+            "resolved_model": choice['model'],
+            "fallbacks": choice['fallbacks'],
+            "source": choice['origin'],
+            "resolution_source": choice['source'],
+            "effort": choice['effort'],
+            "resolution": choice['status'],
+            "note": choice['note'],
+            "reviewer_resolved_model": reviewer['model'],
+            "reviewer_fallbacks": reviewer['fallbacks'],
+            "reviewer_source": reviewer['origin'],
+            "reviewer_resolution_source": reviewer['source'],
+            "reviewer_effort": reviewer['effort'],
+            "reviewer_resolution": reviewer['status'],
+            "reviewer_note": reviewer['note'],
         })
     return tuple(rows)
 
@@ -2021,6 +2086,9 @@ def build_authorization_card(
     enforce_choice_availability: bool = True,
     daemon: bool = DAEMON_DEFAULT,
     launchd_keepalive: bool = LAUNCHD_KEEPALIVE_DEFAULT,
+    ruleset_digest: str = "",
+    adoption_digest: str = "",
+    responsibility: Optional[Dict[str, Any]] = None,
 ) -> AuthorizationCard:
     # The card describes dispatch from the platform capability ledger; an
     # unreadable ledger refuses publication with the reason instead of guessing.
@@ -2263,6 +2331,8 @@ def build_authorization_card(
         daemon=daemon,
         launchd_keepalive=launchd_keepalive,
         local_commit_allowed=local_commit_allowed,
+        ruleset_digest=ruleset_digest,
+        adoption_digest=adoption_digest,
     )
     digest = _canonical_digest(canonical)
     canonical["engine_authorization_digest"] = digest
@@ -2284,6 +2354,7 @@ def build_authorization_card(
         canonical["dependency_graph"] = {"error": str(error)}
     canonical["model_tiers"] = _model_tier_rows(nodes, capabilities.agent_id)
     canonical["platform_capabilities"] = card_capability_rows(capabilities.agent_id)
+    canonical['responsibility'] = responsibility
     canonical.setdefault("daemon", daemon)
     canonical.setdefault("launchd_keepalive", launchd_keepalive)
     canonical.setdefault("local_commit_allowed", None)
@@ -2306,6 +2377,9 @@ def refresh_authorization_card(
     rotate_hard_cap_options: Optional[Any] = None,
     agent_id: Optional[str] = None,
     disclosures: Optional[Dict[str, str]] = None,
+    ruleset_digest: Optional[str] = None,
+    adoption_digest: Optional[str] = None,
+    responsibility: Optional[Dict[str, Any]] = None,
 ) -> AuthorizationCard:
     """Rebuild a same-plan card while retaining its approved agent/capacity scope.
 
@@ -2406,6 +2480,9 @@ def refresh_authorization_card(
         # behaviour the PRD patch specifies.  The freshly observed availability
         # is still carried, so the reviewer sees the tier is gone.
         enforce_choice_availability=False,
+        ruleset_digest=previous.ruleset_digest if ruleset_digest is None else ruleset_digest,
+        adoption_digest=previous.adoption_digest if adoption_digest is None else adoption_digest,
+        responsibility=previous.responsibility if responsibility is None else responsibility,
     )
 
 
@@ -2455,6 +2532,8 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         daemon=card.daemon,
         launchd_keepalive=card.launchd_keepalive,
         local_commit_allowed=card.local_commit_allowed,
+        ruleset_digest=card.ruleset_digest,
+        adoption_digest=card.adoption_digest,
     )
     if card.schema_version != AUTHORIZATION_SCHEMA_VERSION:
         raise ValueError("unsupported authorization card schema")
@@ -2500,6 +2579,8 @@ def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord
         daemon=card.daemon,
         launchd_keepalive=card.launchd_keepalive,
         local_commit_allowed=card.local_commit_allowed,
+        ruleset_digest=card.ruleset_digest,
+        adoption_digest=card.adoption_digest,
     )
 
 
@@ -2542,6 +2623,10 @@ def is_authorization_valid(
 
 
 def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
+    try:
+        _validate_responsibility_binding(record.ruleset_digest, record.adoption_digest)
+    except ValueError:
+        return False
     if record.schema_version != AUTHORIZATION_SCHEMA_VERSION:
         return False
     if record.remote_git_actions not in {"allow", "deny"}:
@@ -2577,6 +2662,8 @@ def is_authorization_integrity_valid(record: AuthorizationRecord) -> bool:
         daemon=record.daemon,
         launchd_keepalive=record.launchd_keepalive,
         local_commit_allowed=record.local_commit_allowed,
+        ruleset_digest=record.ruleset_digest,
+        adoption_digest=record.adoption_digest,
     )
     if not secrets.compare_digest(record.digest, _canonical_digest(canonical)):
         # V3/V4 records pre-dating execution-engine binding remain readable

@@ -528,6 +528,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--observations")
     parser.add_argument("--watch", action="store_true", dest="watch")
     parser.add_argument("--preview-card", action="store_true", dest="preview_card")
+    parser.add_argument("--adoption-digest",
+                        help="monitor: 显式选择完整协议采纳回执，用于同一运行的授权卡预览及重新授权")
+    parser.add_argument("--responsibility-adoption",
+                        help="init --confirm: 显式采纳选择及批准证据JSON；仅记录，仍需同run重新授权")
     parser.add_argument("--show-card", action="store_true", dest="show_card",
                         help="authorize: 展示授权卡与依赖图并记录展示回执（授权前必须先展示）")
     parser.add_argument("--platform-handoff", action="store_true", dest="platform_handoff",
@@ -556,7 +560,23 @@ def _parser() -> argparse.ArgumentParser:
                         help="supervisor-mailbox: 把 --result 写成该信箱请求的回写（--result 为文件或 -）")
     parser.add_argument("--template", dest="mailbox_template", metavar="ACTION_ID",
                         help="supervisor-mailbox: 输出该请求回写的示例")
+    parser.add_argument("--claim-recovery", dest="mailbox_recovery_claim", metavar="ACTION_ID",
+                        help="supervisor-mailbox: 当前登记监工认领明确恢复动作；重复认领只对账")
+    parser.add_argument("--reconcile-recovery", dest="mailbox_recovery_reconcile", metavar="ACTION_ID",
+                        help="supervisor-mailbox: 核验原生调用、新回合及原失败命令结果，不重发动作")
+    parser.add_argument("--prepare-recovery", action="store_true",
+                        help="supervisor-mailbox: 当前监工准备并认领原任务恢复，需node/role/payload")
+    parser.add_argument("--retire-successor", metavar="ACTION_ID",
+                        help="supervisor-mailbox: 当前监工核验终止及冻结成果，退役原任务并排队后继，需payload")
     parser.add_argument("--result", dest="mailbox_result")
+    parser.add_argument("--native-response", action="store_true",
+                        help="supervisor-mailbox: --result 是完整原生工具响应，保留原文后派生安全投影")
+    parser.add_argument("--request-digest",
+                        help="supervisor-mailbox: 原生响应必须绑定的请求摘要")
+    parser.add_argument("--record-help", action="store_true",
+                        help="supervisor-mailbox: 当前监工用 --node 与 --payload 保留诊断、具体帮助和原步骤复核条件")
+    parser.add_argument("--recover-daemon", action="store_true",
+                        help="daemon start: 当前登记监工按已采纳授权恢复原运行执行器，仍需两个连续周期复核")
     parser.add_argument("--disposition", dest="blocked_disposition",
                         help="blocked-unknown: confirmed_benign|escalated_to_findings|resolved_with_facts|deferred_to_acceptance")
     parser.add_argument("--item", dest="blocked_item",
@@ -616,7 +636,7 @@ def run_install_or_upgrade(request: Any, json_output: bool = False) -> Dict[str,
     )
     was_installed = installation_state.is_file() and not installation_state.is_symlink()
     runner = run_upgrade if operation in {"upgrade", "upg"} else run_install
-    result = runner(install_request, ProjectPaths.from_cwd(install_request.project_root))
+    result = runner(install_request, ProjectPaths(install_request.project_root))
     payload = result.to_dict()
     payload["operation"] = "upgrade" if runner is run_upgrade else "install"
     if runner is run_upgrade:
@@ -1689,7 +1709,16 @@ def _supervisor_mailbox_write(paths: ProjectPaths, args: argparse.Namespace) -> 
             result = json.loads(raw)
         except json.JSONDecodeError as error:
             return blocked("--result 不是合法 JSON：{}".format(error.msg))
-        payload = mailbox_complete(paths, args.run_id, args.mailbox_complete, result)
+        if args.native_response:
+            from .runners.provider_action import complete_native_mailbox_action
+            written = complete_native_mailbox_action(
+                paths, args.run_id, args.mailbox_complete, result,
+                request_digest=args.request_digest,
+            )
+            payload = {"command": "supervisor-mailbox", "status": "completed" if written else "already_completed",
+                       "run_id": args.run_id, "action_id": args.mailbox_complete}
+        else:
+            payload = mailbox_complete(paths, args.run_id, args.mailbox_complete, result)
     except (OSError, TypeError, ValueError) as error:
         return blocked(str(error)[:400])
     text = "该请求此前已回写，未重复写入" if payload["status"] == "already_completed" else "信箱回写已写入"
@@ -2111,7 +2140,7 @@ def _engine_evidence_required(plan: Plan) -> bool:
 
 
 def _preview_authorization_card(
-    paths: ProjectPaths, plan_id: str, as_json: bool
+    paths: ProjectPaths, plan_id: str, as_json: bool, adoption_digest: Optional[str] = None
 ) -> CLIResult:
     """Render the card a reauthorization would publish, writing nothing.
 
@@ -2139,7 +2168,7 @@ def _preview_authorization_card(
     failure becomes ``blocked_design``.
     """
     try:
-        payload, card = _derive_card_preview(paths, plan_id)
+        payload, card = _derive_card_preview(paths, plan_id, adoption_digest)
     except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError) as error:
         return _result(
             BLOCKED,
@@ -2147,15 +2176,39 @@ def _preview_authorization_card(
             "授权卡预览失败：" + str(error),
             as_json,
         )
-    return _result(SUCCESS, payload, _render_card_preview(payload, card), as_json)
+    code = BLOCKED if payload.get("status") in {"blocked_design", "blocked_unknown"} else SUCCESS
+    return _result(code, payload, _render_card_preview(payload, card), as_json)
 
 
 def _derive_card_preview(
-    paths: ProjectPaths, plan_id: str
+    paths: ProjectPaths, plan_id: str, adoption_digest: Optional[str] = None
 ) -> Tuple[Dict[str, Any], AuthorizationCard]:
     """Build the preview payload and the card it describes.  Writes nothing."""
     directory, plan, nodes, card = _load_plan(paths, plan_id)
+    observed_rulings = _observed_topology_rulings(paths)
+    if (not _card_discloses_background(card)
+            and TOPOLOGY_BACKGROUND in observed_rulings.values()):
+        return {
+            "command": "monitor",
+            "status": "blocked_design",
+            "reason_code": "visibility_downgrade_requires_reauthorization",
+            "reason": "已签可见能力退化为仅后台能力，需要重新授权降级",
+            "plan_id": plan.plan_id,
+            "run_id": _run_id(directory, None) if _current_run_path(directory).exists() else None,
+            "visibility_downgrade": {
+                "from": "visible",
+                "to": "background",
+                "requires_reauthorization": True,
+                "observed_adapters": sorted(
+                    adapter for adapter, topology in observed_rulings.items()
+                    if topology == TOPOLOGY_BACKGROUND
+                ),
+            },
+            "card": card.to_dict(),
+        }, card
     if not _current_run_path(directory).exists():
+        if adoption_digest is not None:
+            raise ValueError("responsibility adoption requires an existing same run")
         # Nothing has been authorized yet, so the published card already is
         # the card the next authorization signs -- no refresh is involved and
         # the digest below is the one that will be recorded.
@@ -2174,12 +2227,18 @@ def _derive_card_preview(
         }
         return payload, card
     run_id = _run_id(directory, None)
-    workflow = load_snapshot(paths, run_id).workflow
+    snapshot = load_snapshot(paths, run_id)
+    workflow = snapshot.workflow
+    adoption_binding = {}
+    if adoption_digest is not None:
+        from .protocol_adoption import adoption_card_binding
+        adoption_binding = adoption_card_binding(paths, snapshot, adoption_digest)
     topology_rulings = _observed_topology_rulings(paths, card)
     carry_error = ""
     try:
         carried = refresh_authorization_card(
-            plan, nodes, card, workflow=workflow, topology_rulings=topology_rulings
+            plan, nodes, card, workflow=workflow, topology_rulings=topology_rulings,
+            **adoption_binding,
         )
     except (OSError, TypeError, ValueError) as error:
         # The drift check needs a refresh that names no new evidence.  A plan
@@ -2208,6 +2267,7 @@ def _derive_card_preview(
             workflow=workflow,
             topology_rulings=topology_rulings,
             engine_attestation=attestation,
+            **adoption_binding,
         )
     if published is None:
         raise ValueError(carry_error or "the refreshed card could not be derived")
@@ -2320,6 +2380,10 @@ def _render_authorization_card_text(card: AuthorizationCard, graph: Dict[str, An
 
 def _render_card_preview(payload: Dict[str, Any], card: AuthorizationCard) -> str:
     """Render the human-readable half of a card preview."""
+    if payload.get("reason_code") == "visibility_downgrade_requires_reauthorization":
+        downgrade = payload.get("visibility_downgrade", {})
+        return "授权卡预览已暂停：已签可见能力退化为后台能力，需重新授权（{}→{}）".format(
+            downgrade.get("from", "visible"), downgrade.get("to", "background"))
     summary = card.topology_summary or {}
     by_topology = summary.get("by_topology") or {}
     lines = [
@@ -2329,6 +2393,9 @@ def _render_card_preview(payload: Dict[str, Any], card: AuthorizationCard) -> st
     ]
     if payload.get("current_card_digest"):
         lines.append("当前在盘卡 digest {}".format(payload["current_card_digest"]))
+    if card.adoption_digest:
+        lines.append("职责协议规则集 {}｜采纳回执 {}；本次仍待明确重新授权生效".format(
+            card.ruleset_digest, card.adoption_digest))
     lines.append(
         "拓扑：visible-sdd {}｜dual-visible {}｜background {}".format(
             by_topology.get("visible-sdd", 0),
@@ -2469,6 +2536,13 @@ def _snapshot_result(
     paths: Optional[ProjectPaths] = None,
 ) -> CLIResult:
     display_nodes, stalled = _stalled_nodes_view(paths, snapshot)
+    recovery_interrupted = bool(
+        paths is not None
+        and (
+            paths.resolve_vibe_path(Path("plans") / snapshot.plan_id / ".initial-recovery-pending.json").exists()
+            or paths.resolve_vibe_path(Path("plans") / snapshot.plan_id / ".initial-recovery-pending.json").is_symlink()
+        )
+    )
     retry_pending = any(
         node.get("status") == "retry_pending"
         or (
@@ -2478,7 +2552,7 @@ def _snapshot_result(
         )
         for node in snapshot.nodes.values()
     )
-    result_status = "retry_pending" if retry_pending else snapshot.status
+    result_status = "blocked_unknown" if recovery_interrupted else ("retry_pending" if retry_pending else snapshot.status)
     payload = {
         "command": command,
         "dispatcher": "monitor" if command in {"monitor", "resume", "reconcile"} else None,
@@ -2493,7 +2567,7 @@ def _snapshot_result(
         payload["acceptance_pending_verification"] = pending_verification
     if handoff:
         payload["handoff"] = handoff
-    if retry_pending or snapshot.status == "blocked_unknown":
+    if recovery_interrupted or retry_pending or snapshot.status == "blocked_unknown":
         code = UNKNOWN
     elif snapshot.status == "blocked_design":
         code = BLOCKED
@@ -2501,7 +2575,9 @@ def _snapshot_result(
         code = UNKNOWN
     else:
         code = SUCCESS
-    if retry_pending and not stalled:
+    if recovery_interrupted:
+        text = "恢复已暂停：存在未完成的初始运行恢复屏障"
+    elif retry_pending and not stalled:
         text = "监工已启动并自动推进中：运行 {}".format(snapshot.run_id)
     else:
         text = render_v41_closeout_status(snapshot)
@@ -2736,6 +2812,449 @@ def _current_run_path(directory: Path) -> Path:
     return directory / "current-run.json"
 
 
+def _recover_unpublished_non_strict_start(paths, directory, plan, nodes, card):
+    """Recover only a provable initial pending-create transaction under the plan lock."""
+    from .state import interprocess_lock, verify_run_evidence
+    from .task_registry import binding_contract_enabled
+
+    pending_fence = directory / ".initial-recovery-pending.json"
+    fenced = pending_fence.exists() or pending_fence.is_symlink()
+    if _current_run_path(directory).exists() and not fenced:
+        return
+    if any(binding_contract_enabled(n.contract) for n in nodes):
+        if fenced:
+            raise PermissionError("initial run recovery is blocked_unknown: strict recovery fence")
+        # The strict recovery path accepts only an undispatched run. If it
+        # cannot prove one, a pre-existing same-plan request still forbids a
+        # fresh run even when its old snapshot is missing or ambiguous.
+        request_dir = ProviderActionStore(paths).root / "requests"
+        if request_dir.is_symlink() or (request_dir.exists() and not request_dir.is_dir()):
+            raise PermissionError("initial run recovery is blocked_unknown: requests unreadable")
+        if request_dir.is_dir():
+            store = ProviderActionStore(paths)
+            for path in request_dir.iterdir():
+                if path.is_symlink() or not path.is_file() or not path.name.startswith("action-") or path.suffix != ".json":
+                    raise PermissionError("initial run recovery is blocked_unknown: request directory differs")
+                action = store.action(path.stem)
+                if action.get("request", {}).get("plan_id") == plan.plan_id:
+                    raise PermissionError("initial run recovery is blocked_unknown: existing strict request")
+        return
+    runs = paths.vibe / "runs"
+    if not runs.exists():
+        if fenced:
+            raise PermissionError("initial run recovery is blocked_unknown: run missing")
+        return
+    candidates = []
+    for child in runs.iterdir():
+        if child.is_symlink() or not child.is_dir() or not child.name.startswith("run-"):
+            continue
+        if not (child / "state.json").exists() and not (child / "state.previous.json").exists():
+            continue
+        try:
+            snapshot = verify_run_evidence(paths, child.name)
+        except (OSError, ValueError, TypeError) as error:
+            raise PermissionError("initial run recovery is blocked_unknown: unreadable run") from error
+        if snapshot.plan_id == plan.plan_id:
+            candidates.append((child, snapshot))
+    if not candidates:
+        if fenced:
+            raise PermissionError("initial run recovery is blocked_unknown: run missing")
+        return
+    if len(candidates) != 1:
+        raise PermissionError("initial run recovery is blocked_unknown: multiple runs")
+    child, snapshot = candidates[0]
+    if fenced:
+        try:
+            pending = _read_json(pending_fence)
+        except (OSError, ValueError, TypeError) as error:
+            raise PermissionError("initial run recovery is blocked_unknown: fence unreadable") from error
+        if (not isinstance(pending, dict) or set(pending) != {"run_id", "authorization_digest", "action_ids"}
+                or pending.get("run_id") != snapshot.run_id or pending.get("authorization_digest") != card.digest
+                or not isinstance(pending.get("action_ids"), list) or not pending["action_ids"]):
+            raise PermissionError("initial run recovery is blocked_unknown: fence lineage differs")
+        pointer = _current_run_path(directory)
+        if pointer.exists() or pointer.is_symlink():
+            try:
+                published = _read_json(pointer)
+            except (OSError, ValueError, TypeError) as error:
+                raise PermissionError("initial run recovery is blocked_unknown: pointer unreadable") from error
+            if published != {"run_id": snapshot.run_id}:
+                raise PermissionError("initial run recovery is blocked_unknown: pointer differs")
+    from .supervisor import SupervisorLease
+    from .task_registry import _registry_lock
+    # Freeze same-run mutation and owner registration while checking the
+    # orphan and publishing its recovery fence. Monitor writes task bindings
+    # under this same run -> supervisor -> registry lock order.
+    with interprocess_lock(child / ".monitor.lock"), SupervisorLease(paths).lock(snapshot.run_id), \
+            interprocess_lock(_registry_lock(paths)):
+        return _recover_unpublished_non_strict_locked(paths, directory, plan, nodes, card, child, snapshot.run_id, pending if fenced else None)
+
+
+def _recover_unpublished_non_strict_locked(paths, directory, plan, nodes, card, child, run_id, pending):
+    from .authorization import executable_contract_digest, legacy_executable_contract_digest
+    from .adapters.task_provider import require_complex_monitor_dispatch, recovery_action_lock
+    from .diagnostics import validate_child_session_binding
+    from .models import WorkerProfile
+    from .runners.provider_action import NATIVE_TOOL_MAP
+    from .state import _lease_lock, interprocess_lock, retirement_writer_lease, verify_run_evidence
+    from .workflow_gate import verify_workflow
+
+    fenced = pending is not None
+    snapshot = verify_run_evidence(paths, run_id)
+    events = load_events(paths, snapshot.run_id)
+    record = AuthorizationRecord.from_dict(snapshot.authorization)
+    started = [event for event in events if event.get("event") == "run_started"]
+    monitor = Monitor(paths, plan, nodes)
+    if (snapshot.plan_version != plan.version or snapshot.authorization_digest != card.digest
+            or not is_authorization_valid(record, plan, nodes)
+            or snapshot.node_contract_digest != record.node_contract_digest
+            or snapshot.status != "running"
+            or snapshot.capability_contract_digest != require_capability_contract(paths).contract_digest
+            or (snapshot.prd_digest, snapshot.spec_digest) != monitor._current_plan_digests()
+            or snapshot.event_sequence != len(events) or len(started) != 1
+            or started[0].get("data", {}).get("authorization_digest") != record.digest
+            or started[0].get("data", {}).get("node_contract_digest") != record.node_contract_digest
+            or snapshot.handles or snapshot.tasks or (child / "supervisor.lease").exists()
+            or any(event.get("event") not in ("run_started", "execution_topology_observed", "model_tier_unresolved", "initial_create_anchored")
+                   for event in events)):
+        raise PermissionError("initial run recovery is blocked_unknown: lineage differs")
+    started_data = started[0]["data"]
+    if (started_data.get("run_id") != snapshot.run_id
+            or started_data.get("capability_contract_digest") != snapshot.capability_contract_digest
+            or started_data.get("prd_digest") != snapshot.prd_digest
+            or started_data.get("spec_digest") != snapshot.spec_digest
+            or started_data.get("node_ids") != sorted(node.id for node in nodes)
+            or started_data.get("authorized_node_contracts") != monitor._encoded_node_contracts()
+            or started_data.get("node_contract_digests") != {n.id: executable_contract_digest([n]) for n in nodes}
+            or started_data.get("node_scope_digests") != {n.id: legacy_executable_contract_digest([n]) for n in nodes}):
+        raise PermissionError("initial run recovery is blocked_unknown: start evidence differs")
+    workflow = load_live_workflow(paths, plan.plan_id)
+    if not isinstance(workflow, dict) or verify_workflow(workflow).get("status") != "complete":
+        raise PermissionError("initial run recovery is blocked_unknown: workflow missing")
+    user_authorization = workflow.get("node_records", {}).get("user_authorization", {})
+    if (workflow.get("task_id") != plan.plan_id
+            or user_authorization.get("input", {}).get("authorization_digest") != record.digest
+            or user_authorization.get("input", {}).get("token_required") != "AUTHORIZE"
+            or user_authorization.get("output", {}).get("granted") is not True
+            or user_authorization.get("output", {}).get("token") != "AUTHORIZE"
+            or user_authorization.get("evidence", {}).get("authorization_digest") != record.digest
+            or user_authorization.get("evidence", {}).get("authorized_plan_id") != plan.plan_id):
+        raise PermissionError("initial run recovery is blocked_unknown: authorization evidence differs")
+    verify_workflow_artifacts(paths, workflow, run_started=True)
+    confirmation = _read_json(directory / "plan-confirmation.json")
+    if (not isinstance(confirmation, dict) or confirmation.get("status") != "confirmed"
+            or confirmation.get("plan_id") != plan.plan_id
+            or confirmation.get("plan_revision") != str(plan.version)
+            or confirmation.get("authorization_digest") != record.digest):
+        raise PermissionError("initial run recovery is blocked_unknown: confirmation differs")
+    has_run = "run_id" in confirmation or "event_sequence" in confirmation
+    if has_run:
+        if (confirmation.get("run_id") != snapshot.run_id
+                or confirmation.get("event_sequence") != snapshot.event_sequence
+                or confirmation.get("authorization_required") is not True
+                or confirmation.get("publication") != "same_run_reauthorization"):
+            raise PermissionError("initial run recovery is blocked_unknown: confirmation lineage differs")
+    else:
+        artifact = workflow["node_records"]["plan_confirmation"]["evidence"]["artifact"]
+        if (artifact.get("ref") != "plan-confirmation.json"
+                or hashlib.sha256((directory / "plan-confirmation.json").read_bytes()).hexdigest() != artifact.get("sha256")):
+            raise PermissionError("initial run recovery is blocked_unknown: original confirmation differs")
+    authorization_path = directory / "authorization.json"
+    if authorization_path.exists() or authorization_path.is_symlink():
+        if AuthorizationRecord.from_dict(_read_json(authorization_path)) != record:
+            raise PermissionError("initial run recovery is blocked_unknown: authorization differs")
+
+    store = ProviderActionStore(paths)
+    from .task_registry import _read_registry
+    try:
+        _, bindings = _read_registry(child / "tasks.json", snapshot.run_id)
+    except (OSError, TypeError, ValueError) as error:
+        raise PermissionError("initial run recovery is blocked_unknown: task registry unreadable") from error
+    if bindings:
+        raise PermissionError("initial run recovery is blocked_unknown: task registry is not empty")
+    request_dir = store.root / "requests"
+    if request_dir.is_symlink() or not request_dir.is_dir():
+        raise PermissionError("initial run recovery is blocked_unknown: requests missing")
+    actions = []
+    for path in sorted(request_dir.iterdir()):
+        if path.is_symlink() or not path.is_file() or not path.name.startswith("action-") or path.suffix != ".json":
+            raise PermissionError("initial run recovery is blocked_unknown: request directory differs")
+        try:
+            action = store.action(path.stem)
+            effective_action = store._effective_create_action(action) if action.get("operation") == "create" else action
+        except (OSError, TypeError, ValueError) as error:
+            raise PermissionError("initial run recovery is blocked_unknown: request unreadable") from error
+        if action.get("run_id") == snapshot.run_id:
+            actions.append(action)
+        elif effective_action.get("request", {}).get("plan_id") == plan.plan_id:
+            raise PermissionError("initial run recovery is blocked_unknown: foreign plan request")
+    if not actions or len(actions) != len({a.get("issue_id") for a in actions}):
+        raise PermissionError("initial run recovery is blocked_unknown: request ambiguity")
+    if fenced and pending.get("action_ids") != sorted(a["action_id"] for a in actions):
+        raise PermissionError("initial run recovery is blocked_unknown: fence actions differ")
+    if len([row for row in events if row.get("event") == "initial_create_anchored"]) != len(actions):
+        raise PermissionError("initial run recovery is blocked_unknown: request anchors differ")
+    node_map = {node.id: node for node in nodes}
+    pending_nodes = set()
+    def require_no_recorded_claim(action):
+        import re
+        node_id = str(action["issue_id"])
+        for folder_name, identity_key in (("handles", "node_id"), ("claude-bg-sessions", "claims")):
+            folder = store.root / folder_name
+            if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+                raise PermissionError("initial run recovery is blocked_unknown: claim directory unreadable")
+            if not folder.exists():
+                continue
+            for path in folder.iterdir():
+                if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+                    raise PermissionError("initial run recovery is blocked_unknown: claim record unreadable")
+                try:
+                    data = store._read(path)
+                except (OSError, ValueError, TypeError) as error:
+                    raise PermissionError("initial run recovery is blocked_unknown: claim record unreadable") from error
+                identity = data.get(identity_key) if identity_key == "claims" else data
+                if isinstance(identity, dict) and identity.get("run_id") == snapshot.run_id and identity.get("node_id") == node_id:
+                    raise PermissionError("initial run recovery is blocked_unknown: provider claim")
+        name = re.compile("^" + re.escape(snapshot.run_id) + "-" + re.escape(node_id)
+                          + r"-(developer|reviewer)-g\d+\.(json|md)$")
+        for folder_name in ("deliveries", "prompts"):
+            folder = store.root / folder_name
+            if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
+                raise PermissionError("initial run recovery is blocked_unknown: claim directory unreadable")
+            if folder.exists() and any(name.match(path.name) for path in folder.iterdir()):
+                raise PermissionError("initial run recovery is blocked_unknown: provider claim")
+
+    with contextlib.ExitStack() as action_locks:
+        # Provider completions serialize on these same action locks. Never
+        # infer absence from our lock files: take the claim check first.
+        for action in sorted(actions, key=lambda item: item["action_id"]):
+            action_id = action["action_id"]
+            for folder in ("results", "native-receipts", "observations", "stale"):
+                evidence_dir = store.root / folder
+                if evidence_dir.is_symlink() or (evidence_dir.exists() and not evidence_dir.is_dir()):
+                    raise PermissionError("initial run recovery is blocked_unknown: side effects unreadable")
+                if evidence_dir.exists() and any(evidence_dir.glob(action_id + "*")):
+                    raise PermissionError("initial run recovery is blocked_unknown: provider side effects")
+            lock_raw = action_locks.enter_context(recovery_action_lock(store._directory("locks") / (action_id + ".lock")))
+            matching = [row for row in events if row.get("event") == "initial_create_anchored"
+                        and row.get("data", {}).get("action_id") == action_id]
+            try:
+                lock_record = json.loads(lock_raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as error:
+                raise PermissionError("initial run recovery is blocked_unknown: provider lock claim") from error
+            if len(matching) != 1 or lock_record != {
+                    "kind": "initial_create_publication", "action_id": action_id,
+                    "request_digest": action["request_digest"], "anchor_digest": matching[0]["event_digest"]}:
+                raise PermissionError("initial run recovery is blocked_unknown: provider lock claim")
+            if store.action(action_id) != action:
+                raise PermissionError("initial run recovery is blocked_unknown: request changed")
+            require_no_recorded_claim(action)
+            try:
+                claim_state = store._read_create_state(action)
+            except (OSError, ValueError, TypeError) as error:
+                raise PermissionError("initial run recovery is blocked_unknown: claim record unreadable") from error
+            if claim_state is not None and claim_state.get("status") != "pending":
+                raise PermissionError("initial run recovery is blocked_unknown: provider claim")
+            for folder in ("results", "native-receipts", "observations", "stale"):
+                evidence_dir = store.root / folder
+                if evidence_dir.is_symlink() or (evidence_dir.exists() and not evidence_dir.is_dir()):
+                    raise PermissionError("initial run recovery is blocked_unknown: side effects unreadable")
+                if evidence_dir.exists() and any(evidence_dir.glob(action_id + "*")):
+                    raise PermissionError("initial run recovery is blocked_unknown: provider side effects")
+        action_locks.enter_context(interprocess_lock(_lease_lock(paths)))
+        for action in actions:
+            node_id, role = action.get("issue_id"), action.get("role")
+            node, current = node_map.get(node_id), snapshot.nodes.get(node_id)
+            effective_action = store._effective_create_action(action) if action.get("operation") == "create" else action
+            envelope = effective_action.get("request", {})
+            child_binding = envelope.get("child_binding")
+            retry = current.get("retryable_action") if isinstance(current, dict) else None
+            profile_data = child_binding.get("worker_profile") if isinstance(child_binding, dict) else None
+            if (node is None or not isinstance(retry, dict) or not isinstance(profile_data, dict)
+                    or action.get("operation") != "create" or action.get("sequence") != 0
+                    or role not in ("developer", "reviewer") or action.get("generation") != 1
+                    or effective_action.get("native_tool") != NATIVE_TOOL_MAP.get(action.get("provider"), {}).get("create")
+                    or platform_for_provider(action.get("provider")) != record.agent_id
+                    or platform_for_provider(action.get("provider")) != node.contract.get("adapter_id")
+                    or envelope.get("dispatcher") != "monitor" or envelope.get("origin") != "worker_dispatch"
+                    or envelope.get("issue_id") not in (None, node_id)
+                    or envelope.get("plan_id") != plan.plan_id or envelope.get("plan_version") != plan.version
+                    or envelope.get("complexity_band") != plan.complexity_band
+                    or envelope.get("authorization_digest") != record.digest
+                    or envelope.get("capability_contract_digest") != snapshot.capability_contract_digest
+                    or envelope.get("execution_engine") != record.execution_engine
+                    or envelope.get("engine_mode") != record.engine_mode
+                    or envelope.get("engine_evidence_ref") != record.engine_evidence_ref
+                    or child_binding.get("parent_run_id") != snapshot.run_id
+                    or child_binding.get("plan_revision") != str(plan.version)
+                    or child_binding.get("authorization_digest") != record.digest
+                    or child_binding.get("capability_contract_digest") != snapshot.capability_contract_digest
+                    or child_binding.get("node_id") != node_id or child_binding.get("role") != role
+                    or retry.get("role") != role or retry.get("same_task") is not True
+                    or retry.get("same_task_required") is not True or retry.get("successor") is not False
+                    or retry.get("continuation") is not False or retry.get("attempt") != 1
+                    or retry.get("phase") != ("develop" if role == "developer" else "review")
+                    or retry.get("last_observation_ref") != "provider-pending"
+                    or current.get("contract_digest") != executable_contract_digest([node])
+                    or retry.get("binding_digest") != current.get("contract_digest")
+                    or child_binding.get("worktree") != current.get("worktree")
+                    or child_binding.get("branch") != current.get("branch")
+                    or current.get("status") != "running" or current.get("active_task")
+                    or current.get("active_role") or current.get("start_intent")
+                    or current.get("quarantine") or current.get("contract_overrides") or current.get("corrections")
+                    or current.get("developer_identity") or current.get("reviewer_identity")
+                    or current.get("developer_generation") or current.get("review_generation")):
+                raise PermissionError("initial run recovery is blocked_unknown: request differs")
+            require_complex_monitor_dispatch(envelope, paths)
+            profile = WorkerProfile(**profile_data)
+            validate_child_session_binding(snapshot.run_id, str(plan.version), record.digest, node_id, role, profile)
+            if (profile.worktree != current.get("worktree") or profile.branch != current.get("branch")
+                    or child_binding.get("writer") != profile.writer
+                    or child_binding.get("allowlist") != profile.allowlist
+                    or child_binding.get("model") != profile.model
+                    or child_binding.get("reasoning") != profile.reasoning
+                    or child_binding.get("route_digest") != profile.route_digest
+                    or envelope.get("worker_profile") != profile.to_dict()
+                    or profile.selection_basis.get("issue_complexity_ref") != node_id
+                    or (isinstance(node.contract.get("worker_profile"), dict)
+                        and node.contract["worker_profile"].get("writer") != profile.writer)
+                    or (isinstance(node.contract.get("worker_profile"), dict)
+                        and node.contract["worker_profile"].get("allowlist") != profile.allowlist)
+                    or profile.writer != (current.get("writer") or current.get("worker") or role)
+                    or not isinstance(envelope.get("target"), dict)
+                    or envelope["target"].get("projectId") != node.contract.get("project_id")
+                    or not set(profile.allowlist).issubset(record.file_scope)):
+                raise PermissionError("initial run recovery is blocked_unknown: scope differs")
+            try:
+                held = retirement_writer_lease(paths, node_id, str(current["worktree"]), snapshot.run_id)
+            except PermissionError as error:
+                raise PermissionError("initial run recovery is blocked_unknown: writer lease differs") from error
+            if (held is None or held["record"].get("role") != role
+                    or held["record"].get("generation") != 1
+                    or held["record"].get("intent_digest") != monitor._prospective_intent_digest(
+                        snapshot, node_id, role, 1, current)):
+                raise PermissionError("initial run recovery is blocked_unknown: writer lease differs")
+            anchors = [row for row in events if row.get("event") == "initial_create_anchored"
+                       and row.get("data", {}).get("action_id") == action["action_id"]]
+            from .adapters.task_provider import _canonical_digest
+            from .supervisor import _read_lease_record
+            owner = _read_lease_record(child / "supervisor.lease")
+            expected_anchor = {"run_id": snapshot.run_id, "node_id": node_id, "role": role,
+                "generation": action["generation"], "action_id": action["action_id"],
+                "request_digest": action["request_digest"], "authorization_digest": record.digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+                "capability_contract_digest": snapshot.capability_contract_digest,
+                "intent_digest": held["record"].get("intent_digest"), "binding_digest": _canonical_digest(owner),
+                "proof": {"request_sha256": hashlib.sha256(
+                    (request_dir / (action["action_id"] + ".json")).read_bytes()).hexdigest()}}
+            if action.get("operation") == "create" and "controlled_payload_digest" in anchors[0].get("data", {}):
+                expected_anchor["controlled_payload_digest"] = store._controlled_payload_digest(
+                    action, store._effective_create_action(action))
+            if (len(anchors) != 1 or anchors[0].get("data") != expected_anchor
+                    or anchors[0].get("provenance", {}).get("role") != "system"):
+                raise PermissionError("initial run recovery is blocked_unknown: request anchor differs")
+            # Mailbox readers can begin creating a task even before recording
+            # a result. Recover the run pointer, but never assert the create
+            # was unclaimed or send a replacement. Durable evidence that has
+            # advanced beyond the initial pending transaction needs normal
+            # reconciliation instead of this narrow automatic recovery.
+            pending_nodes.add(node_id)
+        for node_id, current in snapshot.nodes.items():
+            if node_id in pending_nodes:
+                continue
+            if (current.get("status") != "planned" or current.get("active_task")
+                    or current.get("start_intent") or current.get("retryable_action")
+                    or current.get("developer_generation") or current.get("review_generation")
+                    or current.get("developer_identity") or current.get("reviewer_identity")
+                    or store.claim_evidence(snapshot.run_id, node_id) is not None):
+                raise PermissionError("initial run recovery is blocked_unknown: other side effects")
+            try:
+                orphan = retirement_writer_lease(paths, node_id, str(current["worktree"]), snapshot.run_id)
+            except PermissionError as error:
+                raise PermissionError("initial run recovery is blocked_unknown: orphan writer lease") from error
+            if orphan is not None:
+                raise PermissionError("initial run recovery is blocked_unknown: orphan writer lease")
+        # Do not acknowledge, replace or resend provider requests. Publish a
+        # fence first so an interruption cannot let another caller dispatch
+        # between restoring the pointer and repairing its publication state.
+        fence = directory / ".initial-recovery-pending.json"
+        if not fenced:
+            _atomic_json(fence, {"run_id": snapshot.run_id, "authorization_digest": record.digest,
+                                 "action_ids": sorted(action["action_id"] for action in actions)})
+        if plan.status == "confirmed_pending_authorization":
+            published_plan = _read_json(directory / "plan.json")
+            if isinstance(published_plan, dict):
+                published_plan["status"] = "authorized"
+                _atomic_json(directory / "plan.json", published_plan)
+        _atomic_json(directory / "authorization.json", record.to_dict())
+        _atomic_json(directory / "plan-confirmation.json", {
+            "status": "confirmed", "plan_id": plan.plan_id, "plan_revision": str(plan.version),
+            "authorization_digest": record.digest, "authorization_required": True,
+            "run_id": snapshot.run_id, "event_sequence": snapshot.event_sequence,
+            "publication": "same_run_reauthorization"})
+        _atomic_json(_current_run_path(directory), {"run_id": snapshot.run_id})
+        if getattr(plan, "complexity_band", "") == "complex":
+            materialize_workflow_evidence(paths, plan.plan_id, "AUTHORIZE")
+        fence.unlink()
+    return snapshot
+
+
+def _recover_unpublished_strict_start(paths, directory, plan, nodes, card):
+    """Recover one fully saved, never-dispatched strict run under the plan lock."""
+    if _current_run_path(directory).exists():
+        return
+    from .task_registry import binding_contract_enabled
+    if not any(binding_contract_enabled(node.contract) for node in nodes):
+        return
+    runs = paths.vibe / "runs"
+    if not runs.exists():
+        return
+    candidates = []
+    for child in runs.iterdir():
+        if child.is_symlink() or not child.is_dir() or not child.name.startswith("run-"):
+            continue
+        if not (child / "state.json").exists() and not (child / "state.previous.json").exists():
+            continue  # Legacy address-only registry has no run snapshot.
+        try:
+            snapshot = load_snapshot(paths, child.name)
+        except (OSError, ValueError, TypeError):
+            raise PermissionError("initial run recovery is blocked_unknown: unreadable run")
+        if snapshot.plan_id != plan.plan_id or snapshot.status != "blocked_unknown":
+            continue
+        if not any(item.get("reason_code") == "initial_supervisor_registration_required"
+                   for item in snapshot.nodes.values()):
+            continue
+        record = AuthorizationRecord.from_dict(snapshot.authorization)
+        events = load_events(paths, snapshot.run_id)
+        started = [event for event in events if event.get("event") == "run_started"]
+        if (snapshot.plan_version != plan.version or snapshot.authorization_digest != card.digest
+                or not is_authorization_valid(record, plan, nodes)
+                or snapshot.node_contract_digest != record.node_contract_digest
+                or snapshot.capability_contract_digest != require_capability_contract(paths).contract_digest
+                or snapshot.handles or snapshot.tasks
+                or (child / "supervisor.lease").exists()
+                or any(item.get("status") != "planned" or item.get("active_task")
+                       or item.get("start_intent") or item.get("retryable_action")
+                       or item.get("developer_generation") or item.get("review_generation")
+                       for item in snapshot.nodes.values())
+                or len(started) != 1
+                or started[0].get("data", {}).get("authorization_digest") != record.digest
+                or started[0].get("data", {}).get("node_contract_digest") != record.node_contract_digest
+                or any(event.get("event") not in ("run_started", "execution_topology_observed")
+                       for event in events)
+                or ProviderActionStore(paths).pending(snapshot.run_id)):
+            raise PermissionError("initial run recovery is blocked_unknown: lineage differs")
+        workflow = load_live_workflow(paths, plan.plan_id)
+        if workflow is None:
+            raise PermissionError("initial run recovery is blocked_unknown: workflow missing")
+        verify_workflow_artifacts(paths, workflow, run_started=True)
+        candidates.append(snapshot)
+    if len(candidates) > 1:
+        raise PermissionError("initial run recovery is blocked_unknown: multiple runs")
+    if candidates:
+        _atomic_json(_current_run_path(directory), {"run_id": candidates[0].run_id})
+
+
 def _invalidation_path(directory: Path) -> Path:
     return directory / "authorization-invalidated.json"
 
@@ -2864,7 +3383,8 @@ _PROTOCOL_REFRESH_COMMANDS = {"plan", "monitor", "resume"}
 
 
 def run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_prefix="vibe",
-            environ: Optional[Mapping[str, str]] = None) -> CLIResult:
+            environ: Optional[Mapping[str, str]] = None,
+            triage_hook=None, triage_source=None) -> CLIResult:
     """Run one command.  ``environ`` is the calling host's environment.
 
     Only the command-line entry (``main``) passes the real process
@@ -2874,11 +3394,24 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_p
     # A package upgrade runs no project code, so an unedited protocol copy
     # left by an earlier release is brought current on the next working
     # command instead.
+    # A caller may provide a cwd that belongs to the host process while the
+    # command explicitly names another project.  Resolve that root once at
+    # the public boundary and carry it through refresh and execution; never
+    # let ProjectPaths.from_cwd walk back into a parent Git repository.
     refreshed: List[str] = []
     try:
         args = _parser().parse_args(list(argv))
     except SystemExit:
         args = None
+    project_paths = None
+    if args is not None and not args.show_help and args.command is not None:
+        try:
+            selected_root = explicit_project_root(argv, environ if environ is not None else os.environ)
+            project_paths = (ProjectPaths(selected_root) if selected_root is not None
+                             else ProjectPaths.from_cwd(Path(cwd)))
+        except ProjectRootError as error:
+            return _result(USAGE_ERROR, {"status": "usage_error", "reason": str(error)},
+                           "参数错误：" + str(error), args.as_json)
     if (
         args is not None
         and not args.show_help
@@ -2886,10 +3419,11 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_p
         and not (args.command == "plan" and args.print_protocol)
     ):
         try:
-            refreshed = refresh_protocol_copies(ProjectPaths.from_cwd(Path(cwd)).root)
+            refreshed = refresh_protocol_copies(project_paths.root)
         except (OSError, ValueError):
             refreshed = []
-    result = _run_cli(argv, cwd, runner, supervisor_command_prefix=supervisor_command_prefix, environ=environ)
+    result = _run_cli(argv, cwd, runner, supervisor_command_prefix=supervisor_command_prefix, environ=environ,
+                      triage_hook=triage_hook, triage_source=triage_source, project_paths=project_paths)
     if refreshed:
         result = CLIResult(
             result.exit_code,
@@ -2903,7 +3437,8 @@ def run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_p
 
 
 def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_prefix="vibe",
-             environ: Optional[Mapping[str, str]] = None) -> CLIResult:
+             environ: Optional[Mapping[str, str]] = None,
+             triage_hook=None, triage_source=None, project_paths=None) -> CLIResult:
     parser = _parser()
     try:
         args = parser.parse_args(list(argv))
@@ -2922,7 +3457,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         return _result(
             USAGE_ERROR, {"status": "usage_error"}, "参数错误", False
         )
-    paths = ProjectPaths.from_cwd(Path(cwd))
+    paths = project_paths if project_paths is not None else ProjectPaths.from_cwd(Path(cwd))
     host = detect_host(environ)
 
     v2_state = False
@@ -3061,6 +3596,85 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
     if args.command == "supervisor-mailbox":
         if not args.run_id:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": "--run-id required"}, "缺少 --run-id", args.as_json)
+        if args.retire_successor:
+            try:
+                from .supervisor import caller_session_ids, read_lease_epoch
+                if (not args.worker_payload or args.prepare_recovery or args.record_help
+                        or args.mailbox_recovery_claim or args.mailbox_recovery_reconcile
+                        or args.mailbox_complete or args.mailbox_template):
+                    raise ValueError("retire-successor requires payload and no other mailbox action")
+                callers = caller_session_ids()
+                if len(callers) != 1:
+                    raise PermissionError("successor caller is unknown")
+                body = json.loads(Path(args.worker_payload).read_text(encoding="utf-8"))
+                if not isinstance(body, dict) or set(body) != {"observation", "frozen_preservation"}:
+                    raise ValueError("retire-successor payload requires observation and frozen_preservation")
+                current = load_snapshot(paths, args.run_id)
+                _directory, plan, nodes, card = _load_plan(paths, current.plan_id)
+                payload = Monitor(paths, plan, nodes,
+                    topology_rulings=_observed_topology_rulings(paths, card)).retire_verified_successor(
+                        args.run_id, args.retire_successor, body["observation"],
+                        frozen_preservation=body["frozen_preservation"],
+                        owner_epoch=read_lease_epoch(paths, args.run_id), owner_session_id=callers[0])
+                return _result(SUCCESS, payload, json.dumps(payload, ensure_ascii=False), args.as_json)
+            except (OSError, KeyError, ValueError, TypeError, PermissionError) as error:
+                return _result(BLOCKED, {"status": "blocked_unknown", "reason": str(error)},
+                               "后继退役被拒绝：" + str(error), args.as_json)
+        if args.prepare_recovery:
+            try:
+                from .supervisor import caller_session_ids, read_lease_epoch
+                if (not args.node_id or not args.worker_payload or args.record_help
+                        or args.mailbox_recovery_claim or args.mailbox_recovery_reconcile
+                        or args.mailbox_complete or args.mailbox_template):
+                    raise ValueError("prepare-recovery needs node/role/payload and no other mailbox action")
+                callers = caller_session_ids()
+                if len(callers) != 1:
+                    raise PermissionError("recovery caller is unknown")
+                payload = ProviderActionStore(paths).prepare_recovery(args.run_id, args.node_id, args.role,
+                    json.loads(Path(args.worker_payload).read_text(encoding="utf-8")),
+                    owner_epoch=read_lease_epoch(paths, args.run_id), owner_session_id=callers[0])
+                return _result(SUCCESS if payload["status"] != "unknown" else UNKNOWN,
+                    payload, json.dumps(payload, ensure_ascii=False), args.as_json)
+            except (OSError, ValueError, TypeError) as error:
+                return _result(BLOCKED, {"status": "blocked_invalid", "reason": str(error)},
+                               "恢复准备被拒绝：" + str(error), args.as_json)
+        if args.record_help:
+            try:
+                from .supervisor import caller_session_ids, read_lease_epoch, record_supervisor_help
+                if (not args.node_id or not args.worker_payload or args.mailbox_recovery_claim or args.mailbox_recovery_reconcile
+                        or args.mailbox_complete or args.mailbox_template):
+                    raise ValueError("--record-help requires --node/--payload and no other mailbox action")
+                callers = caller_session_ids()
+                if len(callers) != 1:
+                    raise PermissionError("supervisor caller identity is unknown")
+                help_record = json.loads(Path(args.worker_payload).read_text(encoding="utf-8"))
+                payload = record_supervisor_help(paths, args.run_id, args.node_id, help_record,
+                    owner_epoch=read_lease_epoch(paths, args.run_id), owner_session_id=callers[0])
+                return _result(SUCCESS, payload, "具体帮助已留存，原失败步骤仍待复核", args.as_json)
+            except (OSError, ValueError, TypeError) as error:
+                return _result(BLOCKED, {"status": "blocked_invalid", "reason": str(error)},
+                               "监工帮助未写入：" + str(error), args.as_json)
+        if args.mailbox_recovery_claim or args.mailbox_recovery_reconcile:
+            try:
+                from .supervisor import caller_session_ids, read_lease_epoch
+                if (args.mailbox_complete or args.mailbox_template
+                        or (args.mailbox_recovery_claim and args.mailbox_recovery_reconcile)):
+                    raise ValueError("--claim-recovery cannot combine with --complete/--template")
+                callers = caller_session_ids()
+                if len(callers) != 1:
+                    raise PermissionError("current supervisor session identity is unknown")
+                store = ProviderActionStore(paths)
+                action_id = args.mailbox_recovery_claim or args.mailbox_recovery_reconcile
+                if store.action(action_id)["run_id"] != args.run_id:
+                    raise PermissionError("recovery belongs to another run")
+                operation = store.reconcile_recovery if args.mailbox_recovery_reconcile else store.claim_recovery
+                payload = operation(action_id,
+                    owner_epoch=read_lease_epoch(paths, args.run_id), owner_session_id=callers[0])
+                return _result(SUCCESS if payload["status"] != "unknown" else UNKNOWN,
+                               payload, json.dumps(payload, ensure_ascii=False), args.as_json)
+            except (OSError, ValueError, TypeError) as error:
+                return _result(BLOCKED, {"status": "blocked_invalid", "reason": str(error)},
+                               "恢复认领未写入：" + str(error), args.as_json)
         if args.mailbox_complete or args.mailbox_template:
             return _supervisor_mailbox_write(paths, args)
         payload = supervisor_mailbox_view(paths, args.run_id)
@@ -3240,13 +3854,31 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             return _with_json(refusal, args.as_json)
         args.supervisor_provider = register_provider
         try:
+            # Only a freshly initialized strict run adds this first-owner
+            # authentication; existing/legacy registrations retain their rules.
+            from .state import run_dir
+            initial_dir = run_dir(paths, args.run_id, create=False)
+            if not (initial_dir / "state.json").exists() and not (initial_dir / "state.previous.json").exists():
+                initial = None  # Legacy address registration need not have a run.
+            else:
+                initial = load_snapshot(paths, args.run_id)
+            from .task_registry import binding_contract_enabled
+            if initial is not None and any(
+                    current.get("reason_code") == "initial_supervisor_registration_required"
+                    for current in initial.nodes.values()):
+                _, _initial_plan, initial_nodes, _initial_card = _load_plan(paths, initial.plan_id)
+                if any(binding_contract_enabled(node.contract) for node in initial_nodes):
+                    from .supervisor import validate_initial_registration
+                    validate_initial_registration(paths, {
+                        "provider": args.supervisor_provider, "session_id": args.session_id,
+                        "host": args.supervisor_host}, args.session_record, host)
             entry = register_supervisor_address(paths, args.run_id, {
                 "provider": args.supervisor_provider,
                 "session_id": args.session_id,
                 "host": args.supervisor_host,
                 "wake_target": args.wake_target,
             }, session_record=args.session_record)
-        except (TypeError, ValueError, OSError) as error:
+        except (TypeError, ValueError, OSError, PermissionError) as error:
             return _result(BLOCKED, {"command": args.command, "status": "blocked_invalid", "reason": str(error)}, "登记失败：" + str(error), args.as_json)
         text = "监工地址已登记"
         if "baseline_context" in entry:
@@ -3494,7 +4126,12 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 args.as_json,
             )
         try:
-            initialized = init_project(paths, True)
+            selection = None
+            if args.responsibility_adoption:
+                selection = json.loads(Path(args.responsibility_adoption).read_text(encoding="utf-8"))
+                if not isinstance(selection, dict):
+                    raise ValueError("responsibility adoption must be an object")
+            initialized = init_project(paths, True, responsibility_adoption=selection)
         except (OSError, TypeError, ValueError) as error:
             return _result(
                 BLOCKED,
@@ -3507,6 +4144,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             "status": "ok",
             "changed": initialized.changed,
             "paths": initialized.paths,
+            "responsibility": initialized.responsibility,
         }
         summary = "初始化完成" if initialized.changed else "初始化无需变更"
         notes = list(initialized.notes)
@@ -3848,7 +4486,8 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             if refusal is not None:
                 return _with_json(refusal, args.as_json)
         try:
-            entry = build_session_entry(args.request or "", args.s1, args.plan_id)
+            entry = build_session_entry(args.request or "", args.s1, args.plan_id,
+                                        triage_hook=triage_hook, triage_source=triage_source)
             if args.from_prd and not args.s1:
                 # Publishing a draft keeps the S1 the session routed it with;
                 # re-scoring the text alone must never downgrade it.
@@ -3887,6 +4526,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 "rationale": screen.rationale,
                 "plan_id": entry.plan_id,
                 "node_spec": entry.node_spec,
+                "triage": entry.triage,
             }
             return _result(
                 SUCCESS, payload, "该请求走轻量直接执行路径", args.as_json
@@ -3902,6 +4542,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     "score": score.total,
                     "plan_id": entry.plan_id,
                     "node_spec": entry.node_spec,
+                    "triage": entry.triage,
                 }
                 return _result(
                     SUCCESS, payload, "任务已进入轻规划", args.as_json
@@ -4200,7 +4841,7 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         # only stop the user from looking at the card they are being asked to
         # confirm.
         if args.preview_card:
-            return _preview_authorization_card(paths, args.plan, args.as_json)
+            return _preview_authorization_card(paths, args.plan, args.as_json, args.adoption_digest)
         handoff_adapter: Optional[str] = None
         if args.platform_handoff:
             # The handoff target is the calling session's platform; a flag
@@ -4260,208 +4901,244 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                     args.as_json,
                 )
         try:
-            directory, plan, nodes, card = _load_plan(paths, args.plan)
-            _require_v38_preflight(paths, directory, plan, nodes, card)
-            state_path = paths.vibe / "state.json"
-            if state_path.is_file():
-                try:
-                    state_data = _read_json(state_path)
-                except ValueError:
-                    state_data = {}
-                if isinstance(state_data, dict) and state_data.get("workflow_version") == 2:
-                    _require_public_execution_gate(
-                        paths, directory, plan, nodes, card
-                    )
-            invalidation_path = _invalidation_path(directory)
-            invalidation_to_clear = None
-            reauthorizing_current_run = _current_run_path(directory).exists()
-            # A platform handoff moves the unfinished nodes and the card's
-            # agent to the new platform; everything else is untouched, and an
-            # ordinary reauthorization never reaches this.
-            handoff_agent: Optional[str] = None
-            handoff_nodes: Optional[List[DAGNode]] = None
-            handoff_accepted: Optional[frozenset] = None
-            handoff_committed: List[bool] = [False]
-            handoff_observation: Tuple[Any, ...] = ()
-            handoff_changes: List[Dict[str, Any]] = []
-            previous_agent = card.agent_id
-            if args.platform_handoff and reauthorizing_current_run:
-                nodes, handoff_agent, handoff_changes = _platform_handoff_rebind(
-                    paths, directory, nodes, card, handoff_adapter
-                )
-                # Only a handoff observes against the target platform and
-                # keeps still-current evidence; any other reauthorization
-                # observes exactly as it always did.
-                handoff_observation = (handoff_agent, True)
-                if handoff_agent is not None:
-                    handoff_nodes = nodes
-                    handoff_accepted = frozenset(
-                        node_id for node_id, current in load_snapshot(
-                            paths, _run_id(directory, None)
-                        ).nodes.items() if current.get("status") == "accepted"
-                    )
-            # Background launchers this dispatch builds, so the worktree
-            # preflight report can be persisted once the dispatch returns.
-            launchers: List[Any] = []
-            if invalidation_path.exists():
-                invalidation = _read_json(invalidation_path)
-                if not isinstance(invalidation, dict):
-                    raise ValueError("authorization invalidation record is invalid")
-                with _staged_reauthorization(
-                    paths, plan, directory, handoff_agent,
-                    handoff_committed, handoff_observation,
-                ) as engine_attestation:
-                    card = refresh_authorization_card(
-                        plan, nodes, card,
-                        workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
-                        topology_rulings=_observed_topology_rulings(paths, card),
-                        engine_attestation=engine_attestation,
-                        agent_id=handoff_agent,
-                        disclosures={item["node_id"]: item["text"] for item in handoff_changes},
-                    )
-                    record = authorize(card, args.authorize)
-                    if runner is None:
-                        runner = _public_runner(
-                            paths, card, nodes, launchers,
-                            exempt_nodes=handoff_accepted,
+            directory = _plan_root(paths, args.plan)
+            from .state import interprocess_lock
+            # Only an absent pointer needs initialization serialization.  Read
+            # the plan under that lock: the publisher also updates its files.
+            initial_fence = directory / ".initial-recovery-pending.json"
+            initializing = (not _current_run_path(directory).exists()
+                            or initial_fence.exists() or initial_fence.is_symlink())
+            if initializing and not (directory / "plan.json").is_file():
+                _load_plan(paths, args.plan)  # preserve missing-plan behavior
+            lock = (interprocess_lock(directory / ".initial-run-recovery.lock")
+                    if initializing else contextlib.nullcontext())
+            with lock:
+                directory, plan, nodes, card = _load_plan(paths, args.plan)
+                recovery_fence = directory / ".initial-recovery-pending.json"
+                recovered_initial = None
+                if not (args.platform_handoff or args.adoption_digest is not None
+                        or _invalidation_path(directory).exists()):
+                    recovered_initial = _recover_unpublished_non_strict_start(paths, directory, plan, nodes, card)
+                elif recovery_fence.exists() or recovery_fence.is_symlink():
+                    raise PermissionError("initial run recovery is blocked_unknown: conflicting operation")
+                _recover_unpublished_strict_start(paths, directory, plan, nodes, card)
+                _require_v38_preflight(paths, directory, plan, nodes, card)
+                state_path = paths.vibe / "state.json"
+                if state_path.is_file():
+                    try:
+                        state_data = _read_json(state_path)
+                    except ValueError:
+                        state_data = {}
+                    if isinstance(state_data, dict) and state_data.get("workflow_version") == 2:
+                        _require_public_execution_gate(
+                            paths, directory, plan, nodes, card
                         )
-                    monitor = Monitor(
-                        paths, plan, nodes,
-                        topology_rulings=_observed_topology_rulings(paths, card),
+                invalidation_path = _invalidation_path(directory)
+                invalidation_to_clear = None
+                reauthorizing_current_run = _current_run_path(directory).exists()
+                adoption_binding = {}
+                if args.adoption_digest is not None:
+                    if not reauthorizing_current_run:
+                        raise ValueError("responsibility adoption requires an existing same run")
+                    from .protocol_adoption import adoption_card_binding
+                    adoption_binding = adoption_card_binding(
+                        paths, load_snapshot(paths, _run_id(directory, None)), args.adoption_digest
                     )
-                    snapshot = monitor.reauthorize(
-                        _run_id(directory, None),
-                        record,
-                        runner,
-                        "platform_handoff" if args.platform_handoff else str(
-                            invalidation.get(
-                                "change_reason", "executable_contract_changed"
+                # A platform handoff moves the unfinished nodes and the card's
+                # agent to the new platform; everything else is untouched, and an
+                # ordinary reauthorization never reaches this.
+                handoff_agent: Optional[str] = None
+                handoff_nodes: Optional[List[DAGNode]] = None
+                handoff_accepted: Optional[frozenset] = None
+                handoff_committed: List[bool] = [False]
+                handoff_observation: Tuple[Any, ...] = ()
+                handoff_changes: List[Dict[str, Any]] = []
+                previous_agent = card.agent_id
+                if args.platform_handoff and reauthorizing_current_run:
+                    nodes, handoff_agent, handoff_changes = _platform_handoff_rebind(
+                        paths, directory, nodes, card, handoff_adapter
+                    )
+                    # Only a handoff observes against the target platform and
+                    # keeps still-current evidence; any other reauthorization
+                    # observes exactly as it always did.
+                    handoff_observation = (handoff_agent, True)
+                    if handoff_agent is not None:
+                        handoff_nodes = nodes
+                        handoff_accepted = frozenset(
+                            node_id for node_id, current in load_snapshot(
+                                paths, _run_id(directory, None)
+                            ).nodes.items() if current.get("status") == "accepted"
+                        )
+                # Background launchers this dispatch builds, so the worktree
+                # preflight report can be persisted once the dispatch returns.
+                launchers: List[Any] = []
+                if recovered_initial is not None:
+                    if invalidation_path.exists() or args.platform_handoff or args.adoption_digest is not None:
+                        raise PermissionError("initial run recovery is blocked_unknown: conflicting operation")
+                    record = AuthorizationRecord.from_dict(recovered_initial.authorization)
+                    snapshot = recovered_initial
+                elif invalidation_path.exists():
+                    invalidation = _read_json(invalidation_path)
+                    if not isinstance(invalidation, dict):
+                        raise ValueError("authorization invalidation record is invalid")
+                    with _staged_reauthorization(
+                        paths, plan, directory, handoff_agent,
+                        handoff_committed, handoff_observation,
+                    ) as engine_attestation:
+                        card = refresh_authorization_card(
+                            plan, nodes, card,
+                            workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
+                            topology_rulings=_observed_topology_rulings(paths, card),
+                            engine_attestation=engine_attestation,
+                            agent_id=handoff_agent,
+                            disclosures={item["node_id"]: item["text"] for item in handoff_changes},
+                            **adoption_binding,
+                        )
+                        record = authorize(card, args.authorize)
+                        if runner is None:
+                            runner = _public_runner(
+                                paths, card, nodes, launchers,
+                                exempt_nodes=handoff_accepted,
                             )
-                        ),
-                    )
-                    handoff_committed[0] = handoff_nodes is not None
+                        monitor = Monitor(
+                            paths, plan, nodes,
+                            topology_rulings=_observed_topology_rulings(paths, card),
+                        )
+                        snapshot = monitor.reauthorize(
+                            _run_id(directory, None),
+                            record,
+                            runner,
+                            "platform_handoff" if args.platform_handoff else str(
+                                invalidation.get(
+                                    "change_reason", "executable_contract_changed"
+                                )
+                            ),
+                        )
+                        handoff_committed[0] = handoff_nodes is not None
+                        if args.platform_handoff:
+                            _record_handoff_disclosure(
+                                paths, monitor, snapshot, previous_agent, card.agent_id, handoff_changes
+                            )
+                        _record_worktree_preflight(paths, monitor, snapshot, launchers)
+                        if handoff_nodes is not None:
+                            # Without this the next resume reads the old platform
+                            # back out of nodes.json.  Nodes first, then the card:
+                            # either half-written state is re-derived by a re-run.
+                            _atomic_json(
+                                directory / "nodes.json",
+                                [node.to_dict() for node in handoff_nodes],
+                            )
+                        # Publish the refreshed card inside the staged window, and
+                        # only once the reauthorization actually succeeded.  Writing
+                        # it before `reauthorize` left the card, the authorization
+                        # record and plan-confirmation.json disagreeing whenever it
+                        # raised, and the next public authorize then failed closed
+                        # with `plan-confirmation.invalid` (#159).  Writing it after
+                        # the window closed would pair fresh evidence with a card
+                        # still naming the old reference if this write failed.
+                        _atomic_json(directory / "authorization-card.json", card.to_dict())
+                    invalidation_to_clear = invalidation_path
+                elif _current_run_path(directory).exists():
+                    # A capability-only mismatch is deliberately reported as
+                    # unknown by public resume, so it has no invalidation marker
+                    # to select this branch.  An existing current run is still
+                    # authoritative: reauthorize it in place rather than
+                    # creating a second writer and colliding on the old lease.
+                    # Refresh the card as well: a delivered contract correction
+                    # may have changed the executable node digest without writing
+                    # an invalidation marker yet.
+                    with _staged_reauthorization(
+                        paths, plan, directory, handoff_agent,
+                        handoff_committed, handoff_observation,
+                    ) as engine_attestation:
+                        card = refresh_authorization_card(
+                            plan, nodes, card,
+                            workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
+                            topology_rulings=_observed_topology_rulings(paths, card),
+                            engine_attestation=engine_attestation,
+                            agent_id=handoff_agent,
+                            disclosures={item["node_id"]: item["text"] for item in handoff_changes},
+                            **adoption_binding,
+                        )
+                        record = authorize(card, args.authorize)
+                        if runner is None:
+                            runner = _public_runner(
+                                paths, card, nodes, launchers,
+                                exempt_nodes=handoff_accepted,
+                            )
+                        monitor = Monitor(
+                            paths, plan, nodes,
+                            topology_rulings=_observed_topology_rulings(paths, card),
+                        )
+                        snapshot = monitor.reauthorize(
+                            _run_id(directory, None),
+                            record,
+                            runner,
+                            "platform_handoff" if args.platform_handoff
+                            else "capability_contract_changed",
+                        )
+                        handoff_committed[0] = handoff_nodes is not None
+                        if args.platform_handoff:
+                            _record_handoff_disclosure(
+                                paths, monitor, snapshot, previous_agent, card.agent_id, handoff_changes
+                            )
+                        _record_worktree_preflight(paths, monitor, snapshot, launchers)
+                        if handoff_nodes is not None:
+                            _atomic_json(
+                                directory / "nodes.json",
+                                [node.to_dict() for node in handoff_nodes],
+                            )
+                        # See the invalidation branch above for why the card is
+                        # published here and not one line further out.
+                        _atomic_json(directory / "authorization-card.json", card.to_dict())
+                else:
                     if args.platform_handoff:
-                        _record_handoff_disclosure(
-                            paths, monitor, snapshot, previous_agent, card.agent_id, handoff_changes
-                        )
-                    _record_worktree_preflight(paths, monitor, snapshot, launchers)
-                    if handoff_nodes is not None:
-                        # Without this the next resume reads the old platform
-                        # back out of nodes.json.  Nodes first, then the card:
-                        # either half-written state is re-derived by a re-run.
-                        _atomic_json(
-                            directory / "nodes.json",
-                            [node.to_dict() for node in handoff_nodes],
-                        )
-                    # Publish the refreshed card inside the staged window, and
-                    # only once the reauthorization actually succeeded.  Writing
-                    # it before `reauthorize` left the card, the authorization
-                    # record and plan-confirmation.json disagreeing whenever it
-                    # raised, and the next public authorize then failed closed
-                    # with `plan-confirmation.invalid` (#159).  Writing it after
-                    # the window closed would pair fresh evidence with a card
-                    # still naming the old reference if this write failed.
-                    _atomic_json(directory / "authorization-card.json", card.to_dict())
-                invalidation_to_clear = invalidation_path
-            elif _current_run_path(directory).exists():
-                # A capability-only mismatch is deliberately reported as
-                # unknown by public resume, so it has no invalidation marker
-                # to select this branch.  An existing current run is still
-                # authoritative: reauthorize it in place rather than
-                # creating a second writer and colliding on the old lease.
-                # Refresh the card as well: a delivered contract correction
-                # may have changed the executable node digest without writing
-                # an invalidation marker yet.
-                with _staged_reauthorization(
-                    paths, plan, directory, handoff_agent,
-                    handoff_committed, handoff_observation,
-                ) as engine_attestation:
-                    card = refresh_authorization_card(
-                        plan, nodes, card,
-                        workflow=load_snapshot(paths, _run_id(directory, None)).workflow,
-                        topology_rulings=_observed_topology_rulings(paths, card),
-                        engine_attestation=engine_attestation,
-                        agent_id=handoff_agent,
-                        disclosures={item["node_id"]: item["text"] for item in handoff_changes},
-                    )
+                        # A handoff continues an existing run; never let the flag
+                        # silently start a fresh one.
+                        raise ValueError("platform handoff requires an existing run")
                     record = authorize(card, args.authorize)
                     if runner is None:
-                        runner = _public_runner(
-                            paths, card, nodes, launchers,
-                            exempt_nodes=handoff_accepted,
-                        )
+                        runner = _public_runner(paths, card, nodes, launchers)
                     monitor = Monitor(
                         paths, plan, nodes,
                         topology_rulings=_observed_topology_rulings(paths, card),
                     )
-                    snapshot = monitor.reauthorize(
-                        _run_id(directory, None),
-                        record,
-                        runner,
-                        "platform_handoff" if args.platform_handoff
-                        else "capability_contract_changed",
-                    )
-                    handoff_committed[0] = handoff_nodes is not None
-                    if args.platform_handoff:
-                        _record_handoff_disclosure(
-                            paths, monitor, snapshot, previous_agent, card.agent_id, handoff_changes
-                        )
+                    snapshot = monitor.start(record, runner)
                     _record_worktree_preflight(paths, monitor, snapshot, launchers)
-                    if handoff_nodes is not None:
-                        _atomic_json(
-                            directory / "nodes.json",
-                            [node.to_dict() for node in handoff_nodes],
-                        )
-                    # See the invalidation branch above for why the card is
-                    # published here and not one line further out.
-                    _atomic_json(directory / "authorization-card.json", card.to_dict())
-            else:
-                if args.platform_handoff:
-                    # A handoff continues an existing run; never let the flag
-                    # silently start a fresh one.
-                    raise ValueError("platform handoff requires an existing run")
-                record = authorize(card, args.authorize)
-                if runner is None:
-                    runner = _public_runner(paths, card, nodes, launchers)
-                monitor = Monitor(
-                    paths, plan, nodes,
-                    topology_rulings=_observed_topology_rulings(paths, card),
-                )
-                snapshot = monitor.start(record, runner)
-                _record_worktree_preflight(paths, monitor, snapshot, launchers)
-            # Publishing a plan records confirmation, not execution
-            # authorization.  Once the user supplies the exact authorization
-            # token, persist the lifecycle transition so the public execution
-            # gate can observe the same state on resume.
-            if plan.status == "confirmed_pending_authorization":
-                published_plan = _read_json(directory / "plan.json")
-                if isinstance(published_plan, dict):
-                    published_plan["status"] = "authorized"
-                    _atomic_json(directory / "plan.json", published_plan)
-            _atomic_json(directory / "authorization.json", record.to_dict())
-            _atomic_json(
-                directory / "plan-confirmation.json",
-                {
-                    "status": "confirmed",
-                    "plan_id": plan.plan_id,
-                    "plan_revision": str(plan.version),
-                    "authorization_digest": record.digest,
-                    "authorization_required": True,
-                    "run_id": snapshot.run_id,
-                    "event_sequence": snapshot.event_sequence,
-                    "publication": "same_run_reauthorization",
-                },
-            )
-            _atomic_json(
-                _current_run_path(directory), {"run_id": snapshot.run_id}
-            )
-            if reauthorizing_current_run and getattr(plan, "complexity_band", "") == "complex":
-                # Reauthorization rewrites the card and confirmation. Rebuild
-                # their live workflow evidence before resume verifies it again.
-                # Use the same explicit token; retain other plans/session gates.
-                materialize_workflow_evidence(paths, plan.plan_id, args.authorize)
-            if invalidation_to_clear is not None:
-                invalidation_to_clear.unlink()
+                # Publishing a plan records confirmation, not execution
+                # authorization.  Once the user supplies the exact authorization
+                # token, persist the lifecycle transition so the public execution
+                # gate can observe the same state on resume.
+                if recovered_initial is None and plan.status == "confirmed_pending_authorization":
+                    published_plan = _read_json(directory / "plan.json")
+                    if isinstance(published_plan, dict):
+                        published_plan["status"] = "authorized"
+                        _atomic_json(directory / "plan.json", published_plan)
+                if recovered_initial is None:
+                    _atomic_json(directory / "authorization.json", record.to_dict())
+                    _atomic_json(
+                        directory / "plan-confirmation.json",
+                        {
+                            "status": "confirmed",
+                            "plan_id": plan.plan_id,
+                            "plan_revision": str(plan.version),
+                            "authorization_digest": record.digest,
+                            "authorization_required": True,
+                            "run_id": snapshot.run_id,
+                            "event_sequence": snapshot.event_sequence,
+                            "publication": "same_run_reauthorization",
+                        },
+                    )
+                    _atomic_json(
+                        _current_run_path(directory), {"run_id": snapshot.run_id}
+                    )
+                if reauthorizing_current_run and recovered_initial is None and getattr(plan, "complexity_band", "") == "complex":
+                    # Reauthorization rewrites the card and confirmation. Rebuild
+                    # their live workflow evidence before resume verifies it again.
+                    # Use the same explicit token; retain other plans/session gates.
+                    materialize_workflow_evidence(paths, plan.plan_id, args.authorize)
+                if invalidation_to_clear is not None:
+                    invalidation_to_clear.unlink()
         except PreflightBlockedError as error:
             return _result(
                 BLOCKED,
@@ -4502,6 +5179,10 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
                 args.as_json,
             )
         except PermissionError as error:
+            if str(error).startswith("initial run recovery is blocked_unknown:"):
+                return _result(UNKNOWN, {"command": "monitor", "dispatcher": "monitor",
+                    "status": "blocked_unknown", "reason": str(error)},
+                    "初始运行恢复状态未知：" + str(error), args.as_json)
             if _is_capability_contract_unknown(error):
                 return _result(
                     UNKNOWN,
@@ -4559,10 +5240,21 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
             )
         handoff = _first_shift_handoff(paths, args.plan, snapshot.run_id, snapshot.status)
         daemon_launch = None
-        if not args.watch and not runner_injected and snapshot.status not in ("complete", "failed"):
+        from .task_registry import binding_contract_enabled
+        strict_initializing = snapshot.status == "blocked_unknown" and any(
+            current.get("reason_code") == "initial_supervisor_registration_required"
+            for current in snapshot.nodes.values()
+        ) and any(
+            binding_contract_enabled(node.contract) for node in nodes if node.id in snapshot.ready_set
+        )
+        if strict_initializing:
+            handoff += ("\n严格绑定尚未派发：请使用本会话的 provider、session-id、host 和\n"
+                        "原生 session journal 先执行 supervisor-register，再以同一会话执行 resume。")
+        if (not strict_initializing and not args.watch and not runner_injected
+                and snapshot.status not in ("complete", "failed")):
             daemon_launch = _auto_start_daemon(
                 paths, args.plan, snapshot.run_id, card, args.supervisor_provider)
-        if args.watch:
+        if args.watch and not strict_initializing:
             supervisor = Supervisor(
                 paths,
                 Monitor(paths, plan, nodes, topology_rulings=_observed_topology_rulings(paths, card)),
@@ -4683,6 +5375,11 @@ def _run_cli(argv: Sequence[str], cwd: Path, runner=None, *, supervisor_command_
         try:
             directory, plan, nodes, _card = _load_plan(paths, args.plan)
             run_id = _run_id(directory, args.run_id)
+            recovery_fence = directory / ".initial-recovery-pending.json"
+            if args.command == "resume" and (recovery_fence.exists() or recovery_fence.is_symlink()):
+                return _result(UNKNOWN, {"command": "resume", "status": "blocked_unknown",
+                    "reason": "initial run recovery is blocked_unknown: interrupted recovery"},
+                    "恢复已暂停：初始运行恢复尚未完成", args.as_json)
             if args.command == "resume" and v2_state:
                 _require_public_execution_gate(
                     paths, directory, plan, nodes, _card
@@ -4907,8 +5604,18 @@ def _handle_daemon(args, paths, runner, command_prefix, v2_state=False) -> CLIRe
             return _result(BLOCKED, {**base, "status": "blocked_invalid", "reason": "--plan is required"},
                            "缺少 --plan", args.as_json)
         if action == "start":
-            payload = daemon_module.start_daemon(paths, args.run_id, args.plan, interval=args.daemon_interval,
-                                                 model=args.daemon_model, provider=args.supervisor_provider)
+            if args.recover_daemon:
+                from .supervisor import caller_session_ids, read_lease_epoch, recover_daemon
+                if load_snapshot(paths, args.run_id).plan_id != args.plan:
+                    raise PermissionError("daemon recovery plan does not match the original run")
+                callers = caller_session_ids()
+                if len(callers) != 1:
+                    raise PermissionError("daemon recovery caller identity is unknown")
+                payload = recover_daemon(paths, args.run_id,
+                    owner_epoch=read_lease_epoch(paths, args.run_id), owner_session_id=callers[0])
+            else:
+                payload = daemon_module.start_daemon(paths, args.run_id, args.plan, interval=args.daemon_interval,
+                                                     model=args.daemon_model, provider=args.supervisor_provider)
             ok = payload["status"] in ("started", "already_running")
             return _result(SUCCESS if ok else UNKNOWN, payload, "守护程序：" + payload["status"], args.as_json)
         # run: the detached process.  Same assembly as `monitor --watch`, with the daemon loop on top.
@@ -4999,7 +5706,9 @@ def main(argv: Optional[Sequence[str]] = None, runner=None, *, supervisor_comman
         run_id = arguments[index] if index < len(arguments) else None
     if run_id and (command.startswith("supervisor-") or command in {"monitor", "resume", "status", "reconcile"}):
         try:
-            rendered = bounded_supervisor_output(ProjectPaths.from_cwd(base_dir), run_id, result.payload, rendered)
+            output_paths = (ProjectPaths(explicit_root) if explicit_root is not None
+                            else ProjectPaths.from_cwd(base_dir))
+            rendered = bounded_supervisor_output(output_paths, run_id, result.payload, rendered)
         except (OSError, ValueError, TypeError) as error:
             print(json.dumps({"status": "unknown", "reason": "output evidence unavailable: " + str(error)[:200]}))
             return result.exit_code or UNKNOWN

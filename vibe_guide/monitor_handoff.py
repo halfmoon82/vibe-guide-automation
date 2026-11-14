@@ -257,7 +257,7 @@ def handoff_drain_blockers(paths, snapshot: RunSnapshot, unfinished, to_platform
                     claim = store.claim_evidence(snapshot.run_id, node_id)
                 except (OSError, TypeError, ValueError):
                     claim = "unreadable"
-                if claim is None:
+                if claim in {None, "controlled_pending_create", "controlled_stale_create"}:
                     continue  # unclaimed create: hidden by the handoff
                 blockers.append(dict(entry, status="start_pending", provider="",
                                      reason="信箱里的创建请求已被领取（{}），会话可能已在写".format(claim)))
@@ -278,7 +278,7 @@ def handoff_drain_blockers(paths, snapshot: RunSnapshot, unfinished, to_platform
             claim = store.claim_evidence(snapshot.run_id, node_id)
         except (OSError, TypeError, ValueError):
             claim = "unreadable"
-        if claim is not None or node_id in confirmed:
+        if claim not in {None, "controlled_pending_create", "controlled_stale_create"} or node_id in confirmed:
             blockers.append({"node_id": node_id, "role": "developer", "task_id": "",
                              "status": "in_flight", "provider": "",
                              "reason": "信箱里有该节点已被领取的请求（{}），会话可能已在写".format(

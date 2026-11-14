@@ -4,6 +4,7 @@ The public Codex App calls are injected into :class:`CodexAppBridge`; this
 package never imports or fabricates the desktop tool implementation.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -13,6 +14,7 @@ import re
 import sys
 import tempfile
 import time
+from urllib.parse import unquote, urlsplit
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from ..paths import ProjectPaths
@@ -24,6 +26,79 @@ from ..workflow_gate import (
 from ..diagnostics import validate_child_session_binding
 from ..models import WorkerProfile
 from ..providers import CLAUDE_CODE_PROVIDER, CODEX_PROVIDER
+
+
+@contextmanager
+def recovery_action_lock(path: Path, timeout: float = 10.0):
+    """Lock an existing mailbox inode without erasing its claim metadata."""
+    from .._wincompat import flock_exclusive, flock_release
+    import stat
+    if path.parent.is_symlink() or path.is_symlink():
+        raise PermissionError("provider lock path is unverifiable")
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as error:
+        raise PermissionError("provider lock is missing or unreadable") from error
+    locked = False
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise PermissionError("provider lock is not a regular file")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                flock_exclusive(descriptor, blocking=False)
+                locked = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for provider action lock")
+                time.sleep(0.01)
+        metadata = os.fstat(descriptor)
+        named = os.lstat(path)
+        if (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino) or metadata.st_size > 4096:
+            raise PermissionError("provider lock identity changed")
+        yield os.read(descriptor, 4097)
+    finally:
+        if locked:
+            flock_release(descriptor)
+        os.close(descriptor)
+
+
+def _native_command_identity(item):
+    """Normalize only audited representations, not shell semantics."""
+    command, cwd = item.get("command"), item.get("cwd")
+    if isinstance(command, list):
+        if (len(command) != 3 or command[0] != "/bin/zsh"
+                or command[1] not in {"-c", "-lc"} or not isinstance(command[2], str)):
+            return None
+        command = command[2]
+    if not isinstance(command, str) or not isinstance(cwd, str):
+        return None
+    if cwd.startswith("file:"):
+        url = urlsplit(cwd)
+        if (url.scheme != "file" or url.netloc not in {"", "localhost"}
+                or url.query or url.fragment or re.search(r"%(?![0-9a-fA-F]{2})", url.path)):
+            return None
+        cwd = unquote(url.path, errors="strict")
+    if not Path(cwd).is_absolute() or "\x00" in cwd:
+        return None
+    return {"command": command, "cwd": cwd}
+
+
+def _native_command_exit(item):
+    """A completed command may fail; conflicting exit facts stay unknown."""
+    values = [item[key] for key in ("exitCode", "exit_code") if key in item]
+    if not values or any(type(value) is not int for value in values) or len(set(values)) != 1:
+        return None
+    code = values[0]
+    status = item.get("status")
+    # Historical camelCase records used completed for nonzero exits too.
+    if status == "completed" and (code == 0 or "exit_code" not in item):
+        return code
+    if status == "failed" and code != 0:
+        return code
+    return None
 
 
 class ProviderUnavailable(RuntimeError):
@@ -563,6 +638,8 @@ class ProviderActionStore:
         native_tool: str,
         request: Dict[str, Any],
         sequence: int = 0,
+        _initial_anchor_sequence: Optional[int] = None,
+        _controlled_create: bool = False,
     ) -> Dict[str, Any]:
         # Complex requests may only be emitted by Monitor after its complete
         # V4.2 state, engine attestation and authorization checks.
@@ -614,8 +691,132 @@ class ProviderActionStore:
             "request": request,
         }
         payload["request_digest"] = _canonical_digest(payload)
+        controlled_payload = None
+        if _controlled_create:
+            controlled_payload = payload
+            payload = dict(payload)
+            payload["native_tool"] = "controlled_create"
+            payload["request"] = {
+                "controlled": True,
+                "executable_digest": _canonical_digest({
+                    "native_tool": controlled_payload["native_tool"],
+                    "request": controlled_payload["request"],
+                }),
+            }
+            payload["request_digest"] = _canonical_digest({
+                key: value for key, value in payload.items() if key != "request_digest"
+            })
         directory = self._directory("requests")
         path = directory / (action_id + ".json")
+        if _controlled_create and operation != "create":
+            raise ValueError("controlled publication requires create")
+        if (operation == "create" and sequence == 0
+                and (request.get("origin") == "worker_dispatch"
+                     or native_tool == "controlled_create")
+                and not request.get("binding_probe")
+                and not request.get("successor")):
+            # A run-bound pre-publication anchor protects an initial create
+            # from both identity drift and a concurrent recovery transaction.
+            # Legacy requests and strict probe creates have no such anchor and
+            # retain their established handling outside a recovery fence.
+            from ..state import interprocess_lock, load_events
+            plan_id = request.get("plan_id")
+            fence = self.paths.resolve_vibe_path(Path("plans") / str(plan_id) / ".initial-recovery-pending.json")
+            lock_path = self._directory("locks") / (action_id + ".lock")
+            lock_context = (interprocess_lock(lock_path) if _initial_anchor_sequence is not None
+                            else recovery_action_lock(lock_path))
+            with lock_context:
+                if fence.exists() or fence.is_symlink():
+                    raise PermissionError("initial recovery fence prevents provider publication")
+                rows = load_events(self.paths, run_id)
+                anchors = [row for row in rows if row.get("event") == "initial_create_anchored"
+                           and row.get("data", {}).get("action_id") == action_id]
+                if not anchors and not request.get("binding_probe") and not request.get("successor"):
+                    if _initial_anchor_sequence is not None or not (path.exists() or path.is_symlink()):
+                        raise PermissionError("initial create request has no pre-publication anchor")
+                    if self.action(action_id) != payload:
+                        raise PermissionError("legacy initial create request cannot be replaced")
+                    return payload
+                if anchors:
+                    effective_request = request
+                    effective_native_tool = native_tool
+                    if native_tool == "controlled_create":
+                        controlled = controlled_payload or self._read_controlled_payload(payload)
+                        if controlled is not None:
+                            effective_request = controlled["request"]
+                            effective_native_tool = controlled["native_tool"]
+                    expected_raw = (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                    anchor = anchors[0].get("data", {})
+                    if (len(anchors) != 1 or anchor.get("request_digest") != payload["request_digest"]
+                            or anchor.get("proof") != {"request_sha256": hashlib.sha256(expected_raw).hexdigest()}):
+                        raise PermissionError("initial create request differs from pre-publication anchor")
+                    if (native_tool == "controlled_create"):
+                        anchored_digest = anchor.get("controlled_payload_digest")
+                        if anchored_digest is not None and anchored_digest != self._controlled_payload_digest(
+                                payload, {"native_tool": effective_native_tool, "request": effective_request}):
+                            raise PermissionError("initial create controlled payload differs from pre-publication anchor")
+                    started = [row for row in rows if row.get("event") == "run_started"]
+                    start = started[0].get("data", {}) if len(started) == 1 else {}
+                    owner = anchors[0].get("provenance", {})
+                    expected = {"run_id": run_id, "node_id": issue_id, "role": role,
+                                "generation": generation, "action_id": action_id,
+                                "request_digest": payload["request_digest"],
+                                "authorization_digest": effective_request.get("authorization_digest"),
+                                "node_contract_digest": start.get("node_contract_digest"),
+                                "capability_contract_digest": effective_request.get("capability_contract_digest")}
+                    if (any(anchor.get(key) != value for key, value in expected.items())
+                            or start.get("run_id") != run_id
+                            or start.get("authorization_digest") != expected["authorization_digest"]
+                            or start.get("capability_contract_digest") != expected["capability_contract_digest"]
+                            or owner.get("role") != "system"
+                            or owner.get("authorization_digest") != expected["authorization_digest"]
+                            or owner.get("node_contract_digest") != expected["node_contract_digest"]):
+                        raise PermissionError("initial create anchor lineage differs")
+                    if path.exists() or path.is_symlink():
+                        current = self.action(action_id)
+                        if current != payload or path.read_bytes() != expected_raw:
+                            raise PermissionError("initial create request differs from immutable mailbox")
+                        return current
+                    if _initial_anchor_sequence is None:
+                        raise PermissionError("initial create publication requires its original invocation")
+                    if (_initial_anchor_sequence != anchors[0].get("sequence")
+                            or rows[-1].get("sequence") != _initial_anchor_sequence):
+                        raise PermissionError("initial create request missing after publication window")
+                    for folder in ("results", "native-receipts", "observations", "stale"):
+                        evidence_dir = self.root / folder
+                        if (evidence_dir.is_symlink() or (evidence_dir.exists() and not evidence_dir.is_dir())
+                                or (evidence_dir.exists() and any(evidence_dir.glob(action_id + "*")))):
+                            raise PermissionError("initial create already has provider evidence")
+                    if isinstance(effective_request.get("child_binding"), dict):
+                        self._record_dispatch_head(
+                            run_id, issue_id, role, generation, effective_request["child_binding"],
+                            _requested_project_mount(effective_request, operation),
+                        )
+                    lock_path = self._directory("locks") / (action_id + ".lock")
+                    lock_record = {"kind": "initial_create_publication", "action_id": action_id,
+                                   "request_digest": payload["request_digest"],
+                                   "anchor_digest": anchors[0]["event_digest"]}
+                    with lock_path.open("wb") as stream:
+                        stream.write(json.dumps(lock_record, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    if _controlled_create:
+                        self._initialize_create_state(payload)
+                        self._write_controlled_payload(payload, controlled_payload)
+                    self._atomic(path, payload)
+                    return payload
+        if _controlled_create:
+            from ..state import interprocess_lock
+            with interprocess_lock(self._directory("locks") / (action_id + ".lock")):
+                if path.exists() or path.is_symlink():
+                    existing = self.action(action_id)
+                    if existing != payload or self._read_create_state(existing) is None:
+                        raise PermissionError("existing create is not a controlled publication")
+                    return existing
+                self._initialize_create_state(payload)
+                self._write_controlled_payload(payload, controlled_payload)
+                self._atomic(path, payload)
+                return payload
         existing = self._read(path) if path.exists() else None
         if existing is not None and existing != payload:
             if self._prompt_only_upgrade(existing, payload):
@@ -788,6 +989,188 @@ class ProviderActionStore:
             raise ValueError("provider action request identity is invalid")
         return action
 
+    def _create_state_path(self, action_id: str) -> Path:
+        if not isinstance(action_id, str) or not _SAFE_ID.fullmatch(action_id):
+            raise ValueError("provider action id is invalid")
+        return self._directory("create-claims") / (action_id + ".json")
+
+    def _create_payload_path(self, action_id: str) -> Path:
+        if not isinstance(action_id, str) or not _SAFE_ID.fullmatch(action_id):
+            raise ValueError("provider action id is invalid")
+        return self._directory("create-payloads") / (action_id + ".json")
+
+    def _write_controlled_payload(self, public: Dict[str, Any], full: Optional[Dict[str, Any]]) -> None:
+        if full is None:
+            return
+        record = {
+            "schema_version": 1,
+            "action_id": public["action_id"],
+            "public_request_digest": public["request_digest"],
+            "native_tool": full["native_tool"],
+            "request": full["request"],
+        }
+        record["payload_digest"] = _canonical_digest({key: value for key, value in record.items() if key != "payload_digest"})
+        self._atomic(self._create_payload_path(public["action_id"]), record)
+
+    @staticmethod
+    def _controlled_payload_digest(public: Dict[str, Any], full: Dict[str, Any]) -> str:
+        record = {
+            "schema_version": 1,
+            "action_id": public["action_id"],
+            "public_request_digest": public["request_digest"],
+            "native_tool": full["native_tool"],
+            "request": full["request"],
+        }
+        return _canonical_digest(record)
+
+    def _read_controlled_payload(self, public: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        path = self._create_payload_path(public["action_id"])
+        if not path.exists() and not path.is_symlink():
+            return None
+        record = self._read(path)
+        if (record.get("schema_version") != 1
+                or record.get("action_id") != public["action_id"]
+                or record.get("public_request_digest") != public["request_digest"]
+                or not isinstance(record.get("native_tool"), str)
+                or not isinstance(record.get("request"), dict)
+                or (public.get("native_tool") == "controlled_create" and
+                    public.get("request", {}).get("executable_digest") != _canonical_digest({
+                        "native_tool": record.get("native_tool"), "request": record.get("request")}))
+                or record.get("payload_digest") != _canonical_digest({key: value for key, value in record.items() if key != "payload_digest"})):
+            raise ValueError("controlled create payload is invalid")
+        return record
+
+    def _effective_create_action(self, public: Dict[str, Any]) -> Dict[str, Any]:
+        record = self._read_controlled_payload(public)
+        if record is None:
+            return public
+        action = dict(public)
+        action["native_tool"] = record["native_tool"]
+        action["request"] = record["request"]
+        return action
+
+    def _read_create_state(self, action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        path = self._create_state_path(action["action_id"])
+        if not path.exists() and not path.is_symlink():
+            return None
+        state = self._read(path)
+        if (state.get("schema_version") != 1 or state.get("action_id") != action["action_id"]
+                or state.get("request_digest") != action["request_digest"]
+                or state.get("status") not in {"pending", "claimed", "stale"}
+                or state.get("state_digest") != _canonical_digest(
+                    {key: value for key, value in state.items() if key != "state_digest"})):
+            raise ValueError("controlled create state is invalid")
+        if state.get("status") == "claimed":
+            lineage = state.get("lineage")
+            if not isinstance(lineage, dict) or lineage != self._claim_lineage(action):
+                raise PermissionError("controlled create claim lineage differs")
+        return state
+
+    def _write_create_state(self, action: Dict[str, Any], status: str, **extra) -> Dict[str, Any]:
+        state = {"schema_version": 1, "action_id": action["action_id"],
+                 "request_digest": action["request_digest"], "status": status, **extra}
+        state["state_digest"] = _canonical_digest(state)
+        self._atomic(self._create_state_path(action["action_id"]), state)
+        return state
+
+    def _claim_lineage(self, action: Dict[str, Any], executable: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        request = (executable or self._effective_create_action(action)).get("request", {})
+        binding = request.get("child_binding") if isinstance(request, dict) else None
+        return {
+            "run_id": action.get("run_id"), "node_id": action.get("issue_id"),
+            "role": action.get("role"), "generation": action.get("generation"),
+            "action_id": action.get("action_id"), "request_digest": action.get("request_digest"),
+            "authorization_digest": request.get("authorization_digest"),
+            "node_contract_digest": request.get("node_contract_digest"),
+            "capability_contract_digest": request.get("capability_contract_digest"),
+            "plan_id": request.get("plan_id"), "plan_version": request.get("plan_version"),
+            "binding_digest": _canonical_digest(binding) if isinstance(binding, dict) else None,
+        }
+
+    def _initialize_create_state(self, action: Dict[str, Any]) -> None:
+        path = self._create_state_path(action["action_id"])
+        if path.exists() or path.is_symlink():
+            raise PermissionError("controlled create state already exists")
+        self._write_create_state(action, "pending")
+
+    def stage_create(self, action_id: str, exposure_id: str, request_digest: str) -> Dict[str, Any]:
+        """Claim once before exposing a controlled create to a consumer."""
+        if not isinstance(action_id, str) or not _SAFE_ID.fullmatch(action_id):
+            raise ValueError("provider action id is invalid")
+        if not isinstance(exposure_id, str) or not exposure_id or len(exposure_id) > 200:
+            raise ValueError("invalid create exposure id")
+        lock = self._directory("locks") / (action_id + ".lock")
+        with recovery_action_lock(lock):
+            action = self.action(action_id)
+            if action.get("operation") != "create" or action["request_digest"] != request_digest:
+                raise ValueError("create claim request identity differs")
+            executable = self._effective_create_action(action)
+            state = self._read_create_state(action)
+            if state is None:
+                return {"status": "unknown", "action_id": action_id}
+            if executable["request"].get("origin") == "worker_dispatch" and not executable["request"].get("successor") and not executable["request"].get("binding_probe"):
+                from ..state import load_events
+                anchors = [row for row in load_events(self.paths, action["run_id"])
+                           if row.get("event") == "initial_create_anchored"
+                           and row.get("data", {}).get("action_id") == action_id]
+                anchor_data = anchors[0]["data"] if len(anchors) == 1 else {}
+                payload_digest_matches = (
+                    "controlled_payload_digest" not in anchor_data
+                    or anchor_data.get("controlled_payload_digest") ==
+                    self._controlled_payload_digest(action, executable)
+                )
+                if (len(anchors) != 1 or anchor_data.get("request_digest") != request_digest
+                        or anchor_data.get("proof", {}).get("request_sha256") != hashlib.sha256(
+                            (self._directory("requests") / (action_id + ".json")).read_bytes()).hexdigest()
+                        or not payload_digest_matches):
+                    raise PermissionError("controlled create anchor differs")
+            plan_id = executable["request"].get("plan_id")
+            if plan_id:
+                fence = self.paths.resolve_vibe_path(Path("plans") / str(plan_id) / ".initial-recovery-pending.json")
+                if fence.exists() or fence.is_symlink():
+                    return {"status": "unknown", "action_id": action_id}
+            if state["status"] == "stale":
+                return {"status": "stale", "action_id": action_id}
+            if state["status"] == "claimed":
+                return {"status": "already_claimed", "action_id": action_id,
+                        "request_digest": request_digest,
+                        "exposure_id": state.get("exposure_id")}
+            else:
+                self._write_create_state(action, "claimed", exposure_id=exposure_id,
+                                         claimed_at=time.time(), lineage=self._claim_lineage(action, executable))
+            return {"status": "claimed", "action_id": action_id,
+                    "request_digest": request_digest, "request": executable["request"],
+                    "native_tool": executable["native_tool"]}
+
+    def revoke_create(self, action_id: str, request_digest: str) -> Dict[str, Any]:
+        """Make an unexposed controlled create stale under its action lock."""
+        if not isinstance(action_id, str) or not _SAFE_ID.fullmatch(action_id):
+            raise ValueError("provider action id is invalid")
+        action = self.action(action_id)
+        if action.get("operation") != "create" or action["request_digest"] != request_digest:
+            raise ValueError("create revoke request identity differs")
+        # An old publication has no claim protocol and may not have a lock.
+        # Never create one after the fact as proof of non-exposure.
+        if self._read_create_state(action) is None:
+            return {"status": "unknown", "action_id": action_id}
+        lock = self._directory("locks") / (action_id + ".lock")
+        with recovery_action_lock(lock):
+            action = self.action(action_id)
+            if action.get("operation") != "create" or action["request_digest"] != request_digest:
+                raise ValueError("create revoke request identity differs")
+            state = self._read_create_state(action)
+            if state is None:
+                return {"status": "unknown", "action_id": action_id}
+            if state["status"] == "claimed":
+                return {"status": "already_claimed", "action_id": action_id}
+            if state["status"] == "pending":
+                for name in ("results", "native-receipts", "observations"):
+                    folder = self._directory(name)
+                    if any(folder.glob(action_id + "*")):
+                        return {"status": "unknown", "action_id": action_id}
+                self._write_create_state(action, "stale")
+            return {"status": "stale", "action_id": action_id}
+
     def related_action(self, action: Dict[str, Any], operation: str, *, required=True) -> Optional[Dict[str, Any]]:
         basis = {key: action[key] for key in (
             "provider", "run_id", "issue_id", "role", "generation", "sequence"
@@ -800,8 +1183,51 @@ class ProviderActionStore:
         return self.action(action_id)
 
     def result(self, action_id: str) -> Optional[Dict[str, Any]]:
+        from ..state import interprocess_lock
+        if not isinstance(action_id, str) or not _SAFE_ID.fullmatch(action_id):
+            raise ValueError("provider action id is invalid")
+        # A read of an unanswered request must not create a completion lock:
+        # claim_evidence treats that durable lock as an in-flight side effect.
+        result_path = self._directory("results") / (action_id + ".json")
+        # Legacy unanswered requests need not carry the newer canonical
+        # identity. Only authenticate a request when consuming evidence;
+        # absence is not evidence and must not create a completion lock.
+        raw_dir = self._directory("native-receipts")
+        has_raw = any(raw_dir.glob(action_id + "-*.json"))
+        if not result_path.exists() and not result_path.is_symlink() and not has_raw:
+            return None
+        with interprocess_lock(self._directory("locks") / (action_id + ".lock")):
+            return self._result_locked(action_id)
+
+    def _native_receipt_path(self, action_id: str) -> Path:
+        request = self.action(action_id)
+        if request.get("operation") == "create" and self._read_create_state(request) is not None:
+            request = self._effective_create_action(request)
+        return self._directory("native-receipts") / (
+            action_id + "-" + request["request_digest"] + ".json")
+
+    def _result_locked(self, action_id: str) -> Optional[Dict[str, Any]]:
         path = self._directory("results") / (action_id + ".json")
-        if not path.exists():
+        raw_path = self._native_receipt_path(action_id)
+        if raw_path.exists():
+            raw = self._read(raw_path)
+            body = {key: value for key, value in raw.items() if key != "receipt_digest"}
+            request = self.action(action_id)
+            if (set(raw) not in ({"schema_version", "action_id", "request_digest", "payload", "receipt_digest"},
+                                 {"schema_version", "action_id", "request_digest", "payload", "receipt_digest", "native_response"})
+                    or raw.get("receipt_digest") != _canonical_digest(body)
+                    or raw.get("action_id") != action_id
+                    or raw.get("schema_version") != self.schema_version
+                    or raw.get("request_digest") != request["request_digest"]
+                    or not isinstance(raw.get("payload"), dict)):
+                raise ValueError("native receipt integrity mismatch")
+            body.pop("native_response", None)
+            if path.exists():
+                if self._read(path) != body:
+                    raise ValueError("projection differs from native receipt")
+            else:
+                self._atomic(path, body)
+        elif not path.exists():
             return None
         result = self._read(path)
         request = self.action(action_id)
@@ -817,7 +1243,8 @@ class ProviderActionStore:
         return result["payload"]
 
     def complete(self, action_id: str, payload: Dict[str, Any], *,
-                 request_digest: Optional[str] = None, native: bool = True) -> bool:
+                 request_digest: Optional[str] = None, native: bool = True,
+                 native_response: Optional[Dict[str, Any]] = None) -> bool:
         """Keep the first bound result; retain conflicting callbacks as evidence.
 
         A new observation belongs to a new action sequence, never a rewrite
@@ -830,6 +1257,8 @@ class ProviderActionStore:
         request = self.action(action_id)
         if not isinstance(payload, dict):
             raise ValueError("provider action result payload must be an object")
+        if native_response is not None and (not native or not isinstance(native_response, dict)):
+            raise ValueError("native response requires an object and native provenance")
         if request_digest is not None and request_digest != request["request_digest"]:
             raise ValueError("provider action request digest mismatch")
         record = {
@@ -838,13 +1267,42 @@ class ProviderActionStore:
             "request_digest": request["request_digest"],
             "payload": payload,
         }
-        with interprocess_lock(self._directory("locks") / (action_id + ".lock")):
+        effective_request = self._effective_create_action(request) if request.get("operation") == "create" else request
+        controlled = self._read_create_state(request) if request.get("operation") == "create" else None
+        controlled_payload = (self._read_controlled_payload(request)
+                              if request.get("operation") == "create" else None)
+        if request.get("operation") == "create" and controlled is None and controlled_payload is not None:
+            raise PermissionError("controlled create payload exists without claim state")
+        if controlled is not None and request_digest is None:
+            # The immutable public action already carries the receipt binding.
+            # Callers using the public mailbox API may omit the optional
+            # argument; an explicitly supplied digest is still checked above.
+            request_digest = request["request_digest"]
+        lock_path = self._directory("locks") / (action_id + ".lock")
+        lock_context = recovery_action_lock(lock_path) if controlled is not None else interprocess_lock(lock_path)
+        with lock_context:
+            if controlled is not None:
+                current = self._read_create_state(request)
+                if current is None or current["status"] == "stale":
+                    observation = dict(record, kind="unclaimed_create_callback")
+                    if native_response is not None:
+                        observation["native_response"] = native_response
+                    self._atomic(self._directory("observations") /
+                                 (action_id + "-" + _canonical_digest(observation) + ".json"), observation)
+                    return False
+                if current["status"] == "pending":
+                    self._write_create_state(
+                        request, "claimed",
+                        exposure_id="receipt:" + _canonical_digest(record),
+                        claimed_at=time.time(),
+                        lineage=self._claim_lineage(request, effective_request),
+                    )
             # Every callback observation shares the retirement boundary.
             # ``native=False`` is a worker report, not a native reply.
             called_tool = _unresolved_tool_name(payload) if native else None
             if called_tool is not None:
                 self._record_unresolved_tool(request, called_tool, payload)
-            if native and request.get("native_tool") == "codex_app__create_thread":
+            if native and effective_request.get("native_tool") == "codex_app__create_thread":
                 thread_id = _result_thread_id(payload)
                 forked_from = _codex_forked_from(thread_id) if thread_id else None
                 if forked_from:
@@ -856,13 +1314,23 @@ class ProviderActionStore:
                          "thread_id": thread_id, "forked_from": forked_from,
                          "observed_at": time.time(), "payload": payload})
                     raise ForkedProviderSession(action_id, thread_id, forked_from)
-            existing = self.result(action_id)
+            existing = self._result_locked(action_id)
             if existing is not None:
-                if existing == payload:
+                prior_raw = self._read(self._native_receipt_path(action_id)) if self._native_receipt_path(action_id).exists() else {}
+                if existing == payload and (native_response is None or prior_raw.get("native_response") == native_response):
                     return True
+                observation = dict(record)
+                if native_response is not None:
+                    observation["native_response"] = native_response
                 self._atomic(self._directory("observations") /
-                             (action_id + "-" + _canonical_digest(record) + ".json"), record)
+                             (action_id + "-" + _canonical_digest(observation) + ".json"), observation)
                 return False
+            if native:
+                raw = dict(record)
+                if native_response is not None:
+                    raw["native_response"] = native_response
+                raw["receipt_digest"] = _canonical_digest(raw)
+                self._atomic(self._native_receipt_path(action_id), raw)
             self._atomic(self._directory("results") / (action_id + ".json"), record)
             return True
 
@@ -894,9 +1362,13 @@ class ProviderActionStore:
             raise ValueError("provider stale directory may not be a symlink or non-directory")
         result = []
         for path in sorted(request_dir.glob("action-*.json")):
-            if (result_dir / path.name).exists():
+            if (result_dir / path.name).exists() or self.result(path.stem) is not None:
                 continue
             action = self._read(path)
+            if action.get("operation") == "create":
+                state = self._read_create_state(action)
+                if state is not None and state["status"] == "stale":
+                    continue
             stale_path = stale_dir / path.name
             if stale_path.is_symlink():
                 # A symlink marker cannot hide an immutable request.
@@ -1003,33 +1475,767 @@ class ProviderActionStore:
             changed.append(str(action.get("action_id")))
         return changed
 
+    def _require_recovery_binding(self, snapshot, binding, *, retiring=False):
+        """Registry identity alone cannot replace the authorized current writer."""
+        node = snapshot.nodes.get(binding.issue_id) or {}
+        generation = "review_generation" if binding.role == "reviewer" else "developer_generation"
+        active = node.get("active_task") or {}
+        root = Path(binding.worktree)
+        expected = Path(node.get("worktree") or "")
+        root = root if root.is_absolute() else self.paths.root / root
+        expected = expected if expected.is_absolute() else self.paths.root / expected
+        if (binding.run_id != snapshot.run_id or not binding.task_id
+                or binding.task_id != node.get(binding.role + "_identity")
+                or binding.generation != node.get(generation)
+                or binding.branch != node.get("branch") or root.resolve() != expected.resolve()
+                or binding.status not in ({"running", "blocked_unknown", "rework", "review", "stopped"}
+                                          if retiring else {"running", "blocked_unknown", "rework", "review"})
+                or (binding.role == "reviewer" and node.get("reviewer_replacement_required") is True)
+                or node.get("status") in {"accepted", "archived"}
+                or (active and (active.get("role") != binding.role
+                    or active.get("task_id") != binding.task_id
+                    or active.get("generation") != binding.generation))):
+            raise PermissionError("original recovery task or writer is not current")
+
+    def prepare_recovery(self, run_id, issue_id, role, recovery_input, *, owner_epoch, owner_session_id):
+        """Current-owner public preparation, preserving the original task and scope.
+
+        Returns an exact native invocation only after durable claim. Repeating
+        an unresolved preparation reconciles the same action, never re-sends.
+        """
+        from ..state import interprocess_lock, run_dir, verify_run_evidence
+        from ..supervisor import SupervisorLease, _read_lease_record
+        from ..task_registry import load_task_binding
+        from ..protocol_adoption import effective_responsibility
+        required = {"prompt", "original_step", "evidence_ref", "evidence_sha256"}
+        if not isinstance(recovery_input, dict) or set(recovery_input) not in (required, required | {"help_digest"}):
+            raise ValueError("recovery input requires prompt, original_step and diagnostic evidence")
+        lease = SupervisorLease(self.paths)
+        with interprocess_lock(run_dir(self.paths, run_id) / ".monitor.lock"), lease.lock(run_id):
+            snapshot = verify_run_evidence(self.paths, run_id)
+            owner = _read_lease_record(lease.path(run_id))
+            if (not isinstance(owner, dict) or owner.get("released") is True
+                    or type(owner_epoch) is not int or owner.get("lease_epoch") != owner_epoch
+                    or (owner.get("owner") or {}).get("session_id") != owner_session_id
+                    or effective_responsibility(self.paths, snapshot).get("status") != "effective"):
+                raise PermissionError("recovery owner is not current")
+            binding = load_task_binding(self.paths, issue_id, role, run_id=run_id)
+            self._require_recovery_binding(snapshot, binding)
+            if binding.provider != CODEX_PROVIDER or binding.mode != "visible" or binding.status in {"archived", "accepted"}:
+                raise PermissionError("original visible recovery provider or eligibility is unknown")
+            native = {"threadId": binding.task_id, "hostId": binding.host, "prompt": recovery_input["prompt"]}
+            request = {**native, "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+                "recovery": {**recovery_input, "task_id": binding.task_id, "owner_epoch": owner_epoch,
+                    "action": "resume_original", "native_request": native}}
+            if snapshot.execution_engine or snapshot.engine_mode or snapshot.engine_evidence_ref:
+                from ..runners.provider_action import ProviderActionRunner
+                request = ProviderActionRunner._request_envelope({
+                    "dispatcher": "monitor", "complexity_band": "complex",
+                    "execution_engine": snapshot.execution_engine, "engine_mode": snapshot.engine_mode,
+                    "engine_evidence_ref": snapshot.engine_evidence_ref,
+                    "authorization_digest": snapshot.authorization_digest,
+                    "plan_id": snapshot.plan_id, "plan_version": snapshot.plan_version}, request)
+                require_complex_monitor_dispatch(request, self.paths)
+            sequence = 0
+            existing = None
+            for path in self._directory("requests").glob("*.json"):
+                item = self.action(path.stem)
+                if (item["run_id"] == run_id and item["issue_id"] == issue_id
+                        and item["role"] == role and item["generation"] == binding.generation
+                        and item["operation"] == "resume"):
+                    sequence = max(sequence, item["sequence"] + 1)
+                    previous = item["request"].get("recovery") or {}
+                    if all(previous.get(key) == recovery_input.get(key) for key in required | {"help_digest"}):
+                        if existing is None or existing["sequence"] < item["sequence"]:
+                            existing = item
+            if existing is None:
+                probe = {"provider": binding.provider, "run_id": run_id, "issue_id": issue_id,
+                    "role": role, "request": request}
+                if self._recovery_baseline(probe, owner_session_id) is None:
+                    raise PermissionError("failed original step or native baseline is unknown")
+                evidence = self.paths.resolve_relative(recovery_input["evidence_ref"])
+                if hashlib.sha256(evidence.read_bytes()).hexdigest() != recovery_input["evidence_sha256"]:
+                    raise PermissionError("recovery evidence is unverifiable")
+                existing = self.request(operation="resume", provider=binding.provider, run_id=run_id,
+                    issue_id=issue_id, role=role, generation=binding.generation,
+                    native_tool="codex_app__send_message_to_thread", request=request, sequence=sequence)
+        result = self.claim_recovery(existing["action_id"], owner_epoch=owner_epoch, owner_session_id=owner_session_id)
+        return {**result, "action_id": existing["action_id"], "request_digest": existing["request_digest"],
+                "native_tool": existing["native_tool"], "native_args": existing["request"]["recovery"]["native_request"]}
+
+    def claim_recovery(self, action_id: str, *, owner_epoch: int,
+                       owner_session_id: str, _existing_only=False) -> Dict[str, Any]:
+        """Claim one explicit recovery, preserving unresolved work across shifts.
+
+        A claim is permission to invoke the existing native action once. An
+        already-claimed action is reconciliation only. Counts derive from
+        immutable native receipts, never from polls, claims or worker reports.
+        """
+        from ..state import interprocess_lock, verify_run_evidence, run_dir
+        from ..supervisor import SupervisorLease, _read_lease_record
+        from ..task_registry import load_task_binding
+        from ..protocol_adoption import effective_responsibility
+
+        action = self.action(action_id)
+        run_id = action["run_id"]
+        request = action["request"]
+        recovery = request.get("recovery")
+        if (action["operation"] != "resume" or not isinstance(recovery, dict)
+                or recovery.get("action") != "resume_original"
+                or not isinstance(recovery.get("evidence_ref"), str)
+                or not recovery["evidence_ref"].strip()):
+            raise ValueError("explicit recovery action and evidence are required")
+        try:
+            evidence = self.paths.resolve_relative(recovery["evidence_ref"])
+            if (not evidence.is_file() or hashlib.sha256(evidence.read_bytes()).hexdigest()
+                    != recovery.get("evidence_sha256")):
+                raise ValueError("diagnostic digest mismatch")
+        except (OSError, ValueError) as error:
+            raise PermissionError("recovery diagnostic evidence is unverifiable") from error
+        lease = SupervisorLease(self.paths)
+        with interprocess_lock(run_dir(self.paths, run_id) / ".monitor.lock"), lease.lock(run_id):
+            current = _read_lease_record(lease.path(run_id))
+            if (type(owner_epoch) is not int or not isinstance(current, dict)
+                    or current.get("released") is True
+                    or current.get("lease_epoch") != owner_epoch
+                    or not isinstance(current.get("owner"), dict)
+                    or current["owner"].get("session_id") != owner_session_id):
+                raise PermissionError("recovery owner is not current")
+            snapshot = verify_run_evidence(self.paths, run_id)
+            if effective_responsibility(self.paths, snapshot).get("status") != "effective":
+                raise PermissionError("recovery requires effective responsibility rules")
+            binding = load_task_binding(self.paths, action["issue_id"], action["role"], run_id=run_id)
+            self._require_recovery_binding(snapshot, binding)
+            if (binding.task_id != recovery.get("task_id")
+                    or binding.task_id != request.get("threadId")
+                    or binding.provider != action["provider"]
+                    or binding.host != request.get("hostId")
+                    or binding.generation != action["generation"]
+                    or request.get("authorization_digest") != snapshot.authorization_digest
+                    or request.get("node_contract_digest") != snapshot.node_contract_digest):
+                raise PermissionError("recovery task or authorization lineage mismatch")
+            basis = {"run_id": run_id, "node_id": action["issue_id"], "role": action["role"],
+                     "task_id": binding.task_id, "generation": binding.generation,
+                     "authorization_digest": snapshot.authorization_digest,
+                     "node_contract_digest": snapshot.node_contract_digest}
+            path = self._directory("recovery-claims") / (_canonical_digest(basis) + ".json")
+            state = self._read(path) if path.exists() else {"basis": basis, "attempts": []}
+            if state.get("basis") != basis or not isinstance(state.get("attempts"), list):
+                raise ValueError("recovery claim integrity mismatch")
+            failures = 0
+            active = None
+            same = None
+            for attempt in state["attempts"]:
+                previous = self.action(attempt["action_id"])
+                if (attempt.get("request_digest") != previous["request_digest"]
+                        or any(previous.get(key) != action.get(key) for key in
+                               ("run_id", "issue_id", "role", "generation", "provider"))):
+                    raise ValueError("recovery claim request mismatch")
+                outcome = self._verified_recovery_terminal(previous, attempt)
+                # A send receipt proves neither execution nor an original-step
+                # result. Capacity/transport errors likewise do not establish
+                # a completed recovery attempt. Keep the claim in flight until
+                # a correlated terminal observation is independently verified.
+                if outcome == "success":
+                    failures = 0
+                elif outcome == "failed":
+                    failures += 1
+                else:
+                    active = attempt["action_id"]
+                if attempt["action_id"] == action_id:
+                    same = attempt
+            common = {"consecutive_failures": failures, "active_action_id": active}
+            if same:
+                return dict(common, status="already_claimed",
+                            claimed_owner_epoch=same["owner_epoch"],
+                            reconcile_only=same["owner_epoch"] != owner_epoch)
+            if active:
+                return dict(common, status="unknown", reason="reconcile the in-flight recovery before another action")
+            if _existing_only:
+                return dict(common, status="unknown", reason="recovery action has not been claimed")
+            if recovery.get("owner_epoch") != owner_epoch:
+                raise PermissionError("new recovery action owner is stale")
+            help_digest = None
+            native_baseline = self._recovery_baseline(action, owner_session_id)
+            help_path = run_dir(self.paths, run_id) / "heal-state.json"
+            if help_path.exists():
+                responsibility = (self._read(help_path).get("nodes", {}).get(action["issue_id"], {})
+                                  .get("supervisor_responsibility") or {})
+                helps = responsibility.get("attempted_actions") or []
+                matching_helps = [helped for helped in helps
+                    if helped.get("help_digest") == recovery.get("help_digest")
+                    and helped.get("causal_binding") is not None]
+                if (responsibility.get("status") == "pending" and len(matching_helps) == 1
+                        and responsibility.get("authorization_digest") == snapshot.authorization_digest
+                        and responsibility.get("node_contract_digest") == snapshot.node_contract_digest
+                        and responsibility.get("role") == action["role"]
+                        and matching_helps[0].get("task_id") == binding.task_id
+                        and matching_helps[0].get("generation") == binding.generation
+                        and isinstance(matching_helps[0].get("causal_binding"), dict)
+                        and native_baseline is not None
+                        and matching_helps[0]["causal_binding"] == {"original_step": recovery.get("original_step"),
+                            "failure": native_baseline["worker"].get("failed_step"),
+                            "task_id": binding.task_id}):
+                    help_digest = matching_helps[0]["help_digest"]
+            state["attempts"].append({"action_id": action_id,
+                "request_digest": action["request_digest"], "owner_epoch": owner_epoch,
+                "owner_session_id": owner_session_id,
+                "help_digest": help_digest,
+                "native_baseline": native_baseline})
+            self._atomic(path, state)
+            return dict(common, status="claimed", claimed_owner_epoch=owner_epoch, reconcile_only=False)
+
+    def _recovery_baseline(self, action, observer):
+        """Freeze provider-owned log prefixes before permitting a native send.
+
+        Missing logs preserve legacy claim/reconciliation but cannot establish
+        a completed attempt later. These hashes check continuity, not authorship.
+        """
+        if action.get("provider") != CODEX_PROVIDER:
+            return None
+        from ..plan_amendment import _native_session_record
+        recovery = action["request"].get("recovery") or {}
+        step = recovery.get("original_step")
+        native = recovery.get("native_request")
+        if (not isinstance(step, dict) or set(step) != {"command", "cwd"}
+                or any(not isinstance(value, str) or not value.strip() for value in step.values())
+                or not isinstance(native, dict) or set(native) != {"threadId", "hostId", "prompt"}
+                or any(native.get(key) != action["request"].get(key) for key in native)
+                or not isinstance(native.get("prompt"), str) or not native["prompt"].strip()):
+            return None
+        try:
+            from ..task_registry import load_task_binding
+            binding = load_task_binding(self.paths, action["issue_id"], action["role"], run_id=action["run_id"])
+            writer = Path(binding.worktree)
+            if not writer.is_absolute():
+                writer = self.paths.root / writer
+            cwd = Path(step["cwd"])
+            if not cwd.is_absolute():
+                return None
+            cwd.resolve().relative_to(writer.resolve())
+            result = {}
+            for role, session in (("observer", observer), ("worker", recovery["task_id"])):
+                path, rows = _native_session_record(session, False)
+                data = path.read_bytes()
+                if (not data.endswith(b"\n") or
+                        [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()] != rows):
+                    return None
+                if role == "worker":
+                    if (any(type(row.get("ordinal")) is not int for row in rows)
+                            or [row["ordinal"] for row in rows] != list(range(len(rows)))):
+                        return None
+                    matching = []
+                    for row_index, row in enumerate(rows):
+                        payload = row.get("payload") or {}
+                        if row.get("type") != "event_msg":
+                            continue
+                        item = payload.get("item") or {}
+                        if (payload.get("type") == "item_completed"
+                                and item.get("type") == "CommandExecution"
+                                and _native_command_identity(item) == step):
+                            matching.append((payload.get("turn_id"), _native_command_exit(item), row_index))
+                    if (not matching or matching[-1][1] in (None, 0)
+                            or not isinstance(matching[-1][0], str) or not matching[-1][0]
+                            or sum(row[0] == matching[-1][0] for row in matching) != 1):
+                        return None
+                    turn, _, command_index = matching[-1]
+                    starts, terminals = [], []
+                    for index, row in enumerate(rows):
+                        payload = row.get("payload") or {}
+                        if row.get("type") != "event_msg" or payload.get("turn_id") != turn:
+                            continue
+                        if payload.get("type") == "task_started":
+                            starts.append(index)
+                        elif payload.get("type") in {"task_complete", "task_completed", "turn_aborted"}:
+                            terminals.append(index)
+                    if len(starts) != 1 or len(terminals) != 1:
+                        return None
+                    start, end = starts[0], terminals[0]
+                    if (not start < command_index < end
+                            or rows[end]["payload"]["type"] == "turn_aborted"
+                            or any(row.get("type") == "event_msg"
+                                and (row.get("payload") or {}).get("type") == "task_started"
+                                for row in rows[start + 1:end])
+                            or rows[command_index]["payload"].get("thread_id") != recovery["task_id"]
+                            or any("thread_id" in rows[i]["payload"]
+                                and rows[i]["payload"]["thread_id"] != recovery["task_id"] for i in (start, end))):
+                        return None
+                    command = rows[command_index]["payload"]
+                    if (type(command.get("started_at_ms")) is not int
+                            or type(command.get("completed_at_ms")) is not int
+                            or command["completed_at_ms"] < command["started_at_ms"]):
+                        return None
+                    # Native turn clocks are seconds, command clocks milliseconds.
+                    # Legacy turns omit these clocks; verified ordinal boundaries
+                    # still establish their order. Present clocks must agree.
+                    for index, field, bound in ((start, "started_at", command["started_at_ms"]),
+                                                (end, "completed_at", command["completed_at_ms"])):
+                        payload = rows[index]["payload"]
+                        if field in payload:
+                            clock = payload[field]
+                            if (type(clock) not in (int, float)
+                                    or not (clock * 1000 <= bound if index == start else clock * 1000 >= bound)):
+                                return None
+                result[role] = {"session_id": session, "bytes": len(data),
+                                "sha256": hashlib.sha256(data).hexdigest(), "rows": len(rows)}
+                if role == "worker":
+                    result[role]["failed_step"] = {"turn_id": matching[-1][0],
+                        "exit_code": matching[-1][1], "row_index": matching[-1][2],
+                        "original_step": step}
+            return result
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+
+    def _observe_recovery_terminal(self, action, attempt):
+        """Correlate one actual native send to one new original-step execution.
+
+        Only the existing provider-owned host journal is read. Sender receipt,
+        worker prose, turn completion alone, or a different command are unknown.
+        Unrecognized providers/schemas intentionally stay unknown.
+        """
+        from ..plan_amendment import _native_session_record, _raw_host_ledger
+        baseline = attempt.get("native_baseline")
+        if not isinstance(baseline, dict) or action.get("provider") != CODEX_PROVIDER:
+            return None
+        recovery = action["request"].get("recovery") or {}
+        native, step = recovery.get("native_request"), recovery.get("original_step")
+        try:
+            journals = {}
+            prefixes = {}
+            for role in ("observer", "worker"):
+                frozen = baseline[role]
+                path, rows = _native_session_record(frozen["session_id"], False)
+                data = path.read_bytes()
+                if (not data.endswith(b"\n") or
+                        [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()] != rows):
+                    return None
+                size = frozen["bytes"]
+                if (type(size) is not int or size <= 0 or len(data) < size
+                        or hashlib.sha256(data[:size]).hexdigest() != frozen["sha256"]):
+                    return None
+                journals[role] = rows
+                prefixes[role] = {"session_id": frozen["session_id"], "bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest()}
+            ledger = _raw_host_ledger(journals["observer"], baseline["observer"]["session_id"])
+            if ledger["issues"]:
+                return None
+            calls = [item for item in ledger["items"]
+                if item["line"] > baseline["observer"]["rows"]
+                and item["invocation_verified"] and item["outcome_class"] == "completed"
+                and item["item"].get("server") == "codex_app"
+                and item["item"].get("tool") == "send_message_to_thread"
+                and item["item"].get("arguments") == native]
+            if len(calls) != 1:
+                return None
+            fresh = journals["worker"][baseline["worker"]["rows"]:]
+            turns = []
+            for index, row in enumerate(fresh):
+                payload = row.get("payload") or {}
+                if row.get("type") == "event_msg" and payload.get("type") == "task_started":
+                    turns.append((index, payload.get("turn_id")))
+            matched = []
+            for offset, (start, turn_id) in enumerate(turns):
+                end = turns[offset + 1][0] if offset + 1 < len(turns) else len(fresh)
+                rows = fresh[start:end]
+                messages = [row.get("payload") for row in rows if row.get("type") == "response_item"
+                    and (row.get("payload") or {}).get("type") == "message"
+                    and (row.get("payload") or {}).get("role") == "user"]
+                expected = [{"type": "input_text", "text": native["prompt"]}]
+                if len(messages) != 1 or messages[0].get("content") != expected:
+                    continue
+                terminals = [i for i, row in enumerate(rows) if row.get("type") == "event_msg"
+                    and (row.get("payload") or {}).get("type") in {"task_complete", "task_completed", "turn_aborted"}
+                    and row["payload"].get("turn_id") == turn_id]
+                if (not isinstance(turn_id, str) or not turn_id or len(terminals) != 1
+                        or rows[terminals[0]]["payload"]["type"] == "turn_aborted"):
+                    continue
+                commands = []
+                for i, row in enumerate(rows):
+                    payload = row.get("payload") or {}
+                    item = payload.get("item") or {}
+                    if (row.get("type") == "event_msg" and payload.get("type") == "item_completed"
+                            and payload.get("thread_id") == recovery["task_id"]
+                            and payload.get("turn_id") == turn_id and item.get("type") == "CommandExecution"
+                            and _native_command_identity(item) == step
+                            and type(payload.get("started_at_ms")) is int
+                            and type(payload.get("completed_at_ms")) is int
+                            and payload["completed_at_ms"] >= payload["started_at_ms"]
+                            and payload["started_at_ms"] >= journals["observer"][calls[0]["line"] - 1]["payload"]["started_at_ms"]
+                            and i < terminals[0]):
+                        commands.append(item)
+                if len(commands) != 1 or _native_command_exit(commands[0]) is None:
+                    return None
+                matched.append((turn_id, commands[0]))
+            if len(matched) != 1:
+                return None
+            turn_id, command = matched[0]
+            return {"outcome": "success" if _native_command_exit(command) == 0 else "failed",
+                "turn_id": turn_id, "host_item_id": command.get("id"),
+                "native_call_id": calls[0]["host_id"], "sources": prefixes}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            return None
+
+    def _verified_recovery_terminal(self, action, attempt):
+        path = self._directory("recovery-terminals") / (action["action_id"] + ".json")
+        if not path.exists():
+            return None
+        terminal = self._read(path)
+        body = {key: value for key, value in terminal.items() if key != "digest"}
+        if (terminal.get("digest") != _canonical_digest(body)
+                or terminal.get("request_digest") != action["request_digest"]
+                or terminal.get("action_id") != action["action_id"]):
+            raise ValueError("recovery terminal integrity mismatch")
+        observed = self._observe_recovery_terminal(action, attempt)
+        # Journals append normally. Re-check the exact frozen receipt prefix,
+        # not today's whole-journal digest; the raw observation remains immutable.
+        if observed is None or any(observed.get(key) != terminal.get(key) for key in
+                ("outcome", "turn_id", "host_item_id", "native_call_id")):
+            return None
+        from ..plan_amendment import _native_session_record
+        for source in terminal["sources"].values():
+            path, _ = _native_session_record(source["session_id"], False)
+            if hashlib.sha256(path.read_bytes()[:source["bytes"]]).hexdigest() != source["sha256"]:
+                return None
+        return terminal["outcome"]
+
+    def reconcile_recovery(self, action_id, *, owner_epoch, owner_session_id):
+        """Public current-owner reconciliation; never invokes a provider action."""
+        from ..state import interprocess_lock, run_dir, verify_run_evidence
+        from ..supervisor import SupervisorLease, _read_lease_record
+        from ..task_registry import load_task_binding
+        from ..protocol_adoption import effective_responsibility
+        claimed = self.claim_recovery(action_id, owner_epoch=owner_epoch,
+                                      owner_session_id=owner_session_id, _existing_only=True)
+        if claimed["status"] != "already_claimed":
+            return dict(claimed, status="unknown", outcome=None)
+        action = self.action(action_id)
+        lease = SupervisorLease(self.paths)
+        with interprocess_lock(run_dir(self.paths, action["run_id"]) / ".monitor.lock"), lease.lock(action["run_id"]):
+            owner = _read_lease_record(lease.path(action["run_id"]))
+            if (not isinstance(owner, dict) or owner.get("released") is True
+                    or owner.get("lease_epoch") != owner_epoch
+                    or (owner.get("owner") or {}).get("session_id") != owner_session_id):
+                raise PermissionError("recovery owner is not current")
+            snapshot = verify_run_evidence(self.paths, action["run_id"])
+            binding = load_task_binding(self.paths, action["issue_id"], action["role"], run_id=action["run_id"])
+            self._require_recovery_binding(snapshot, binding)
+            if (effective_responsibility(self.paths, snapshot).get("status") != "effective"
+                    or action["request"].get("authorization_digest") != snapshot.authorization_digest
+                    or action["request"].get("node_contract_digest") != snapshot.node_contract_digest
+                    or binding.generation != action["generation"] or binding.provider != action["provider"]
+                    or binding.task_id != action["request"].get("threadId")
+                    or binding.host != action["request"].get("hostId")):
+                raise PermissionError("recovery task or authorization lineage changed")
+            attempts = []
+            for path in self._directory("recovery-claims").glob("*.json"):
+                state = self._read(path)
+                attempts.extend(attempt for attempt in state["attempts"] if attempt.get("action_id") == action_id)
+            if len(attempts) != 1:
+                raise ValueError("recovery claim is missing or ambiguous")
+            attempt = attempts[0]
+            observed = self._observe_recovery_terminal(action, attempt)
+            if observed is None:
+                return dict(claimed, status="unknown", outcome=None)
+            path = self._directory("recovery-terminals") / (action_id + ".json")
+            if not path.exists():
+                body = {"action_id": action_id, "request_digest": action["request_digest"], **observed}
+                self._atomic(path, {**body, "digest": _canonical_digest(body)})
+            outcome = self._verified_recovery_terminal(action, attempt)
+            if outcome and attempt.get("help_digest"):
+                self._project_recovery_help(action, attempt, outcome)
+        result = self.claim_recovery(action_id, owner_epoch=owner_epoch, owner_session_id=owner_session_id)
+        return dict(result, status="verified" if outcome else "unknown", outcome=outcome)
+
+    def successor_failure_sequence(self, action_id, *, owner_epoch, owner_session_id, _locked=False, _retiring=False, _retired_binding=None):
+        """Verify consecutive failures; never authorize retirement or creation.
+
+        The monitor must additionally verify native termination, preservation
+        and writer-lease retirement in its protected successor transaction.
+        """
+        from ..state import interprocess_lock, run_dir, verify_run_evidence
+        from ..supervisor import SupervisorLease, _read_lease_record
+        from ..task_registry import load_task_binding
+        from ..protocol_adoption import effective_responsibility
+        from contextlib import nullcontext
+        action = self.action(action_id)
+        lease = SupervisorLease(self.paths)
+        with (nullcontext() if _locked else interprocess_lock(run_dir(self.paths, action["run_id"]) / ".monitor.lock")), (nullcontext() if _locked else lease.lock(action["run_id"])):
+            # Revalidate ownership and lineage after entering the transaction.
+            owner = _read_lease_record(lease.path(action["run_id"]))
+            if (not isinstance(owner, dict) or owner.get("released") is True
+                    or owner.get("lease_epoch") != owner_epoch
+                    or (owner.get("owner") or {}).get("session_id") != owner_session_id):
+                raise PermissionError("recovery owner is not current")
+            snapshot = verify_run_evidence(self.paths, action["run_id"])
+            binding = load_task_binding(self.paths, action["issue_id"], action["role"],
+                                        run_id=action["run_id"])
+            if _retiring and _retired_binding is not None:
+                # The protected successor transaction has already committed
+                # its new registry row. Verify the preserved historical row,
+                # not the latest writer as though it were the retired task.
+                from ..task_registry import _read_registry, _run_tasks_path
+                _, history = _read_registry(_run_tasks_path(self.paths, action["run_id"], create=False), action["run_id"])
+                matches = [item for item in history if item.to_dict() == _retired_binding]
+                if len(matches) != 1 or matches[0].status != "stopped":
+                    raise PermissionError("retired historical binding changed")
+                binding = matches[0]
+            else:
+                self._require_recovery_binding(snapshot, binding, retiring=_retiring)
+            if (effective_responsibility(self.paths, snapshot).get("status") != "effective"
+                    or binding.task_id != action["request"].get("threadId")
+                    or binding.host != action["request"].get("hostId")
+                    or binding.provider != action["provider"]
+                    or binding.generation != action["generation"]
+                    or snapshot.authorization_digest != action["request"].get("authorization_digest")
+                    or snapshot.node_contract_digest != action["request"].get("node_contract_digest")):
+                raise PermissionError("successor failure sequence lineage changed")
+            rows = []
+            seen = set()
+            active = False
+            claimed = False
+            for path in self._directory("recovery-claims").glob("*.json"):
+                state = self._read(path)
+                basis = state.get("basis") or {}
+                if any(basis.get(key) != value for key, value in (
+                        ("run_id", action["run_id"]), ("node_id", action["issue_id"]),
+                        ("role", action["role"]), ("generation", action["generation"]),
+                        ("task_id", action["request"].get("threadId")),
+                        ("authorization_digest", action["request"].get("authorization_digest")),
+                        ("node_contract_digest", action["request"].get("node_contract_digest")))):
+                    continue
+                for attempt in state["attempts"]:
+                    previous = self.action(attempt["action_id"])
+                    if (any(previous.get(key) != action.get(key) for key in
+                            ("run_id", "issue_id", "role", "generation", "provider"))
+                            or any(previous["request"].get(key) != action["request"].get(key)
+                                   for key in ("threadId", "hostId", "authorization_digest",
+                                               "node_contract_digest"))):
+                        raise ValueError("recovery claim lineage mismatch")
+                    if previous["action_id"] in seen:
+                        raise ValueError("duplicate recovery claim evidence")
+                    seen.add(previous["action_id"])
+                    claimed = claimed or previous["action_id"] == action_id
+                    if attempt.get("request_digest") != previous["request_digest"]:
+                        raise ValueError("recovery claim request mismatch")
+                    outcome = self._verified_recovery_terminal(previous, attempt)
+                    if outcome != "failed":
+                        rows = []
+                        active = active or outcome is None
+                        continue
+                    terminal = self._read(self._directory("recovery-terminals") /
+                                          (previous["action_id"] + ".json"))
+                    rows.append(terminal)
+            native_calls = [row["native_call_id"] for row in rows]
+            verified = (claimed and not active and len(rows) >= 3
+                        and len(set(native_calls)) == len(rows))
+            return {"status": "verified" if verified else "unknown",
+                    "failure_sequence": rows if verified else [],
+                    "successor_authorized": False}
+
+    def verify_successor_termination(self, action_id, observation, *,
+                                     owner_epoch, owner_session_id, _locked=False):
+        from contextlib import nullcontext
+        from ..state import interprocess_lock, run_dir
+        from ..supervisor import SupervisorLease
+        action = self.action(action_id)
+        lease = SupervisorLease(self.paths)
+        with (nullcontext() if _locked else interprocess_lock(run_dir(self.paths, action["run_id"]) / ".monitor.lock")), (nullcontext() if _locked else lease.lock(action["run_id"])):
+            return self._verify_successor_termination_locked(action_id, observation,
+                owner_epoch=owner_epoch, owner_session_id=owner_session_id)
+
+    def _verify_successor_termination_locked(self, action_id, observation, *,
+                                            owner_epoch, owner_session_id, _retiring=False, _retired_binding=None):
+        """Read-only verification of provider-owned retirement evidence.
+
+        Reuses the existing native source verifier; caller flags, mailbox
+        envelopes and archived/idle alone cannot establish quiescence.
+        This does not release a writer lease or authorize a successor.
+        """
+        from ..state import run_dir, verify_run_evidence
+        from ..plan_amendment import _verify_terminal_receipt, _native_session_record, _rollout_native_calls
+        failures = self.successor_failure_sequence(action_id, owner_epoch=owner_epoch,
+                                                   owner_session_id=owner_session_id, _locked=True, _retiring=_retiring,
+                                                   _retired_binding=_retired_binding)
+        if failures["status"] != "verified":
+            raise PermissionError("three verified recovery failures are required")
+        return self._verify_successor_termination_source(action_id, observation,
+            observer_epoch=owner_epoch, observer_session_id=owner_session_id,
+            failure_sequence=failures["failure_sequence"])
+
+    def _verify_successor_termination_source(self, action_id, observation, *,
+                                             observer_epoch, observer_session_id, failure_sequence):
+        """Authenticate one current or historical native observer, not write authority.
+
+        Historical registry membership proves source identity only. Callers
+        must separately fence the current owner and verify the failure sequence.
+        """
+        from ..state import run_dir, verify_run_evidence
+        from ..plan_amendment import _verify_terminal_receipt, _native_session_record, _rollout_native_calls
+        action = self.action(action_id)
+        if (action["provider"] != CODEX_PROVIDER or not isinstance(observation, dict)
+                or observation.get("session_id") != action["request"].get("threadId")
+                or observation.get("host") != action["request"].get("hostId")
+                or observation.get("inherited_unreturned")):
+            raise PermissionError("provider termination source is unknown")
+        snapshot = verify_run_evidence(self.paths, action["run_id"])
+        registry = self._read(run_dir(self.paths, action["run_id"]) / "supervisor-registry.json")
+        terminal = observation["native_terminal"]
+        receipt = self._read(Path(terminal["receipt_path"]))
+        observer = receipt.get("observer") or {}
+        if (observer.get("session_id") != observer_session_id
+                or observer.get("lease_epoch") != observer_epoch):
+            raise PermissionError("termination observer does not match the recorded owner")
+        if hashlib.sha256(Path(terminal["receipt_path"]).read_bytes()).hexdigest() != terminal["receipt_sha256"]:
+            raise PermissionError("termination receipt digest changed")
+        _verify_terminal_receipt(observation, snapshot.plan_id, snapshot.run_id,
+                                 observation["host"], registry)
+        native_path, native_rows = _native_session_record(observation["session_id"], True)
+        data = native_path.read_bytes()
+        if (hashlib.sha256(data).hexdigest() != observation.get("rollout_sha256")
+                or Path(observation["rollout_path"]).read_bytes() != data
+                or [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()] != native_rows
+                or [row.get("ordinal") for row in native_rows] != list(range(len(native_rows)))):
+            raise PermissionError("native retired record changed")
+        row, = [row for row in receipt["consumers"] if row.get("thread_id") == observation["session_id"]]
+        last = row["native_observation"]["latest_turn"][-1]
+        tail = native_rows[-1].get("payload") or {}
+        started_turns = [row["payload"].get("turn_id") for row in native_rows
+                         if row.get("type") == "event_msg"
+                         and (row.get("payload") or {}).get("type") == "task_started"]
+        finished_turns = [row["payload"].get("turn_id") for row in native_rows
+                          if row.get("type") == "event_msg"
+                          and (row.get("payload") or {}).get("type") in
+                          {"task_complete", "task_completed", "turn_aborted"}]
+        if (terminal.get("read_thread_status") not in {"terminated", "closed", "stopped"}
+                or terminal.get("archive_status") != "archived"
+                or not started_turns or any(not turn for turn in started_turns)
+                or len(set(started_turns)) != len(started_turns)
+                or set(started_turns) != set(finished_turns)
+                or tail.get("turn_id") != last.get("id")
+                or tail.get("type") not in {"task_complete", "turn_aborted"}):
+            raise PermissionError("permanent termination semantics are unknown")
+        audit = _rollout_native_calls(native_path)
+        unresolved = []
+        for issue in audit.get("structured_host_issues", []):
+            index = issue.get("line", 0) - 1
+            payload = (native_rows[index].get("payload") or {}) if 0 <= index < len(native_rows) else {}
+            item = payload.get("item") or {}
+            completed_command = (issue.get("reason") == "unreconciled host item"
+                and payload.get("type") == "item_completed"
+                and payload.get("thread_id") == observation["session_id"]
+                and item.get("type") == "CommandExecution"
+                and _native_command_identity(item) is not None
+                and _native_command_exit(item) is not None
+                and type(payload.get("started_at_ms")) is int
+                and type(payload.get("completed_at_ms")) is int
+                and payload["completed_at_ms"] >= payload["started_at_ms"]
+                and not any(key in item for key in ("server", "tool", "arguments", "result", "parent_id")))
+            if not completed_command:
+                unresolved.append(issue)
+        if audit.get("unpaired") or unresolved:
+            raise PermissionError("retiring task has unresolved native actions")
+        # Completed command items are execution evidence, not new task
+        # creation. Every other structured boundary remains unproven here.
+        if any((entry.get("item") or {}).get("type") != "CommandExecution"
+               or _native_command_identity(entry.get("item") or {}) is None
+               or _native_command_exit(entry.get("item") or {}) is None
+               for entry in audit.get("structured_host", [])):
+            raise PermissionError("retiring task has unresolved host side effects")
+        if native_path.read_bytes() != data:
+            raise PermissionError("retiring task record changed during verification")
+        return {"status": "verified", "successor_authorized": False,
+                "predecessor_task_id": observation["session_id"],
+                "failure_sequence": failure_sequence,
+                "termination": {"receipt_sha256": terminal["receipt_sha256"],
+                    "source_rollout_sha256": terminal["source_rollout_sha256"],
+                    "rollout_sha256": observation["rollout_sha256"]}}
+
+    def _project_recovery_help(self, action, attempt, outcome):
+        """Settle only the explicitly bound help, preserving other obligations."""
+        from ..state import run_dir, verify_run_evidence
+        snapshot = verify_run_evidence(self.paths, action["run_id"])
+        path = run_dir(self.paths, action["run_id"]) / "heal-state.json"
+        if not path.exists():
+            return
+        state = self._read(path)
+        item = (state.get("nodes", {}).get(action["issue_id"], {}).get("supervisor_responsibility") or {})
+        helps = item.get("attempted_actions") or []
+        if (not helps or item.get("status") not in {"pending", "verified"}
+                or item.get("role") != action["role"]
+                or item.get("authorization_digest") != snapshot.authorization_digest
+                or item.get("node_contract_digest") != snapshot.node_contract_digest):
+            return
+        matched = [helped for helped in helps if helped.get("help_digest") == attempt["help_digest"]]
+        if len(matched) != 1:
+            return
+        help_record = matched[0]
+        recovery = action["request"].get("recovery") or {}
+        worker = (attempt.get("native_baseline") or {}).get("worker") or {}
+        if (not worker.get("failed_step")
+                or recovery.get("help_digest") != attempt["help_digest"]
+                or help_record.get("causal_binding") != {"original_step": recovery.get("original_step"),
+                    "failure": worker["failed_step"], "task_id": recovery.get("task_id")}):
+            return  # Legacy/unbound claims remain pending; never infer causality.
+        if help_record.get("recovery_action_id") not in (None, action["action_id"]):
+            return
+        help_record.update(status="verified_effective" if outcome == "success" else "verified_ineffective",
+                           recovery_action_id=action["action_id"], recovery_request_digest=action["request_digest"])
+        item["status"] = ("verified" if all(
+            helped.get("status") == "verified_effective" or
+            (helped.get("status") == "verified_ineffective"
+             and any(later.get("status") == "verified_effective"
+                     and all(later.get(key) == helped.get(key)
+                             for key in ("original_step", "task_id", "generation"))
+                     for later in helps[index + 1:]))
+            for index, helped in enumerate(helps)) else "pending")
+        verified = [entry for entry in helps if entry.get("recovery_action_id")
+                    and entry.get("status") in {"verified_effective", "verified_ineffective"}]
+        latest = verified[-1]
+        latest_outcome = "success" if latest["status"] == "verified_effective" else "failed"
+        item["next_action"] = helps[-1]["next_action"]
+        if latest is helps[-1] and latest_outcome == "failed":
+            item["next_action"] = "原失败步骤复核仍失败；更新事实与诊断，采用有依据的不同行动"
+        item["verification"] = {"action_id": latest["recovery_action_id"], "outcome": latest_outcome,
+                                "help_digest": latest["help_digest"]}
+        self._atomic(path, state)
+
     def claim_evidence(self, run_id: str, issue_id: str) -> Optional[str]:
         """Name the first durable mark that this node's dispatch was claimed.
 
-        The mailbox has no explicit ack when a desktop session reads a
-        request, so "unclaimed" can only mean "no durable mark of progress":
-        a result, a completion lock or conflicting observation for any of the
-        node's requests, a bridge handle or claude-bg session record of the
-        node, or a delivery/prompt file of the node.  ``dispatch-heads`` is
-        deliberately not a mark: ``request()`` writes it before the request
-        is visible.  Unreadable evidence counts as claimed (fail closed).
-        A session that is mid-creation and has written nothing yet cannot be
-        seen here; that window is inherent and is reported, not guessed at.
+        A result, completion lock, conflicting observation, bridge handle,
+        session, delivery or prompt is a durable mark of progress.  A legacy
+        create without those marks remains unknown: the consumer may have
+        read it without recording an acknowledgement. Unreadable evidence
+        likewise counts as claimed (fail closed).
         """
         if not all(isinstance(value, str) and value for value in (run_id, issue_id)):
             raise ValueError("provider request identity is required")
         try:
             action_ids = set()
+            exposed_create = False
+            controlled_pending = set()
+            controlled_stale = set()
             request_dir = self.root / "requests"
             if request_dir.is_dir():
                 for path in sorted(request_dir.glob("action-*.json")):
                     action = self._read(path)
                     if action.get("run_id") == run_id and action.get("issue_id") == issue_id:
                         action_ids.add(path.stem)
+                        if action.get("operation") == "create":
+                            state = self._read_create_state(self.action(path.stem))
+                            if state is not None and state["status"] == "pending":
+                                controlled_pending.add(path.stem)
+                            elif state is not None and state["status"] == "stale":
+                                controlled_stale.add(path.stem)
+                            elif state is None:
+                                # Legacy/unmarked requests may have been read
+                                # by an old consumer without a durable claim.
+                                exposed_create = True
             for action_id in sorted(action_ids):
                 if (self.root / "results" / (action_id + ".json")).exists():
                     return "result"
-                if (self.root / "locks" / (action_id + ".lock")).exists():
+                if (self.root / "locks" / (action_id + ".lock")).exists() and action_id not in controlled_pending:
                     return "lock"
                 observations = self.root / "observations"
                 if observations.is_dir() and any(observations.glob(action_id + "-*.json")):
@@ -1056,6 +2262,14 @@ class ProviderActionStore:
                     return directory
         except (OSError, ValueError, TypeError, AttributeError):
             return "unreadable"
+        # Legacy create requests can be read without a durable pre-call claim.
+        # No receipt, lock or result proves that the consumer has not read it.
+        if controlled_pending:
+            return "controlled_pending_create"
+        if controlled_stale:
+            return "controlled_stale_create"
+        if exposed_create:
+            return "unknown_create_exposure"
         return None
 
     def unresolved_create_slots(
@@ -1074,6 +2288,8 @@ class ProviderActionStore:
                 continue
             action = self._read(path)
             envelope = action.get("request")
+            if action.get("operation") == "create" and self._read_create_state(action) is not None:
+                envelope = self._effective_create_action(action).get("request")
             if (
                 action.get("run_id") == run_id and action.get("issue_id") == issue_id
                 and action.get("operation") == "create"
@@ -1090,49 +2306,33 @@ class ProviderActionStore:
         self, run_id: str, issue_id: str, role: str, generation: int,
         previous_authorization_digest: str, except_provider: Optional[str] = None,
     ) -> List[str]:
-        """Hide this role's unclaimed create requests from before a handoff.
-
-        platform_handoff re-keys the dispatch under a new authorization, and
-        the action id embeds the provider, so the new platform emits a second
-        create beside the old one.  A create with no result, written under
-        exactly the authorization the handoff replaced (never a later one),
-        was never claimed: mark it stale (an audit marker beside the
-        immutable request; the native tool is never invoked) so only one
-        create stays pending.  Every other request is left alone.  A request
-        of ``except_provider`` (the platform now dispatching) is never hidden.
-        """
+        """Revoke only pending controlled creates; legacy requests stay unknown."""
         if not all(isinstance(value, str) and value for value in (run_id, issue_id, role, previous_authorization_digest)):
             raise ValueError("provider request identity is required")
         changed = []
-        request_dir = self._directory("requests")
-        stale_dir = self._directory("stale")
-        for path in sorted(request_dir.glob("action-*.json")):
-            if (self.root / "results" / path.name).exists() or (stale_dir / path.name).exists():
+        for path in sorted(self._directory("requests").glob("action-*.json")):
+            action = self.action(path.stem)
+            request = action["request"]
+            if action.get("operation") == "create" and self._read_create_state(action) is not None:
+                request = self._effective_create_action(action)["request"]
+            if (action.get("operation") != "create" or action.get("run_id") != run_id
+                    or action.get("issue_id") != issue_id or action.get("role") != role
+                    or action.get("generation") != generation
+                    or request.get("authorization_digest") != previous_authorization_digest
+                    or action.get("provider") == except_provider):
                 continue
-            action = self._read(path)
-            envelope = action.get("request")
-            digest = envelope.get("authorization_digest") if isinstance(envelope, Mapping) else None
-            if (
-                action.get("run_id") != run_id or action.get("issue_id") != issue_id
-                or action.get("role") != role or action.get("operation") != "create"
-                or action.get("generation") != generation
-                or digest != previous_authorization_digest
-                or action.get("provider") == except_provider
-            ):
+            state = self._read_create_state(action)
+            if state is None:
+                # Legacy/unmarked requests remain unknown forever.
                 continue
-            self._atomic(stale_dir / path.name, {
-                "schema_version": self.schema_version,
-                "status": "stale",
-                "reason": "platform_handoff_superseded",
-                "action_id": action.get("action_id"),
-                "request_digest": action.get("request_digest"),
-                "run_id": run_id,
-                "issue_id": issue_id,
-                "role": role,
-                "generation": generation,
-                "authorization_digest": digest,
-            })
-            changed.append(str(action.get("action_id")))
+            if state["status"] != "pending":
+                continue
+            effective = self._effective_create_action(action)
+            request = effective["request"]
+            if request.get("authorization_digest") != previous_authorization_digest:
+                continue
+            if self.revoke_create(action["action_id"], action["request_digest"]).get("status") == "stale":
+                changed.append(action["action_id"])
         return changed
 
     def record_worker_delivery(self, run_id, issue_id, role, payload, generation):
@@ -1184,7 +2384,7 @@ class ProviderActionStore:
                 raise ValueError('worker delivery thread_status is not terminal')
         from ..evidence import blocked_self_report_fields
         blocked = blocked_self_report_fields(payload)
-        if blocked and event in {'delivered', 'complete'}:
+        if blocked and event in {'delivered', 'complete', 'accepted'}:
             # #335: a payload that says it is blocked is not a delivery.  The
             # worker hears the format error immediately and re-reports with
             # event=blocked_engineering instead; the refusal names only the
@@ -1230,7 +2430,7 @@ class ProviderActionStore:
                 run_id, issue_id, role, generation
             )
             return self._delivery_outcome(consumed, True, warnings)
-        if role == 'developer':
+        if role == 'developer' and event != 'blocked_engineering':
             problem = self._landing_problem(run_id, issue_id, role, generation)
             if problem:
                 kind, detail = problem

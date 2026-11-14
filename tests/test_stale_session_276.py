@@ -8,11 +8,14 @@ writer when the stop cannot be proven, and marks the superseded handle
 stale so it is never polled or reported as an unregistered handle again.
 """
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from vibe_guide.adapters.claude_bg import ClaudeBgUnknown
+from vibe_guide.adapters.claude_bg import ClaudeBgUnknown, list_agent_sessions as parse_agent_sessions
+from vibe_guide.adapters import claude_bg as claude_adapter
 from vibe_guide.authorization import authorize, build_authorization_card
 from vibe_guide.capability_contract import build_contract, save_contract
 from vibe_guide.contracts import RunEvent, RunHandle
@@ -191,13 +194,47 @@ class RetirePriorSessionsTests(unittest.TestCase):
             [("launch", "developer", "n1")],
         )
 
-    def test_initial_dispatch_still_starts_beside_a_prior_session(self):
-        # Only rework/continuation pays the retirement cost; a plain start is
-        # not a second writer for the same in-flight work.
-        first = self.start()
-        second = self.start()
-        self.assertNotEqual(first.run_id, second.run_id)
-        self.assertNotIn(("stop", UUID_A), self.launcher.calls)
+    def test_initial_dispatch_refuses_a_live_or_unknown_same_node_writer(self):
+        self.start()
+        for state in ("working", "blocked", "idle", "unknown"):
+            with self.subTest(state=state):
+                def listed(config, cwd):
+                    def executor(cmd, cwd, timeout):
+                        if state == "unknown":
+                            return subprocess.CompletedProcess(cmd, 1, "", "synthetic list unavailable")
+                        return subprocess.CompletedProcess(cmd, 0, json.dumps([
+                            {"sessionId": UUID_A, "state": state}]), "")
+                    return parse_agent_sessions(config, cwd, executor=executor)
+
+                # Only the external list transport is supplied. The actual
+                # adapter parser, live probe and runner refusal all execute.
+                with patch.object(claude_adapter, "list_agent_sessions", side_effect=listed) as probe:
+                    with self.assertRaises(ClaudeBgUnknown) as caught:
+                        self.start()
+                    probe.assert_called_once()
+                self.assertIn("synthetic list unavailable" if state == "unknown"
+                              else "already has a live session", str(caught.exception))
+                self.assertEqual(self.launcher._launch_count, 1)
+                self.assertNotIn(("stop", UUID_A), self.launcher.calls)
+
+    def test_verified_retired_list_allows_a_new_handle_without_a_second_live_writer(self):
+        self.start()
+        self.launcher.states[UUID_A] = "stopped"
+
+        def listed(config, cwd):
+            def executor(cmd, cwd, timeout):
+                return subprocess.CompletedProcess(cmd, 0, json.dumps([
+                    {"sessionId": UUID_A, "state": self.launcher.states[UUID_A]}]), "")
+            return parse_agent_sessions(config, cwd, executor=executor)
+
+        with patch.object(claude_adapter, "list_agent_sessions", side_effect=listed) as probe:
+            second = self.start()
+            probe.assert_called_once()
+        self.assertEqual(self.launcher._launch_count, 2)
+        self.assertEqual([sid for sid, state in self.launcher.states.items()
+                          if state == "working"], [UUID_B])
+        self.assertIn(second.run_id, [p.stem for p in
+            self.paths.resolve_vibe_path("provider-actions/claude-bg-sessions").glob("*.json")])
 
     def test_superseded_handle_is_stale_and_silent(self):
         first = self.start()

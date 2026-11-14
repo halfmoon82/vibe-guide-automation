@@ -54,7 +54,8 @@ class PackagingAcceptanceTests(unittest.TestCase):
                 venv = Path(directory) / ("venv-" + artifact.suffix.replace(".", ""))
                 created = subprocess.run([sys.executable, "-m", "venv", str(venv)], text=True, capture_output=True, check=False)
                 self.assertEqual(created.returncode, 0, created.stderr)
-                installed = subprocess.run([str(venv / "bin/python"), "-m", "pip", "install", "--no-deps", str(artifact)], text=True, capture_output=True, check=False)
+                from tests.support_packaging import offline_build_environment
+                installed = subprocess.run([str(venv / "bin/python"), "-m", "pip", "install", "--no-deps", str(artifact)], cwd=directory, env=offline_build_environment(venv / "bin/python"), text=True, capture_output=True, check=False)
                 self.assertEqual(installed.returncode, 0, installed.stderr)
                 receiving = Path(directory) / ("receiving-" + artifact.suffix.replace(".", ""))
                 receiving.mkdir()

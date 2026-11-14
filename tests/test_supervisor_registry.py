@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 
 from vibe_guide.cli import run_cli
@@ -33,16 +34,18 @@ def _record(directory, tokens):
 
 class _FakeSnapshot:
     def __init__(self, statuses):
+        self.plan_id = "plan-1"
         self.nodes = {
             node: {"status": status} for node, status in statuses.items()
         }
 
 
 def _patch_snapshot(statuses):
-    return patch(
-        "vibe_guide.supervisor.load_snapshot",
-        return_value=_FakeSnapshot(statuses),
-    )
+    snapshot = _FakeSnapshot(statuses)
+    stack = ExitStack()
+    stack.enter_context(patch("vibe_guide.supervisor.load_snapshot", return_value=snapshot))
+    stack.enter_context(patch("vibe_guide.state.verify_run_evidence", return_value=snapshot))
+    return stack
 
 
 class PreflightTests(unittest.TestCase):

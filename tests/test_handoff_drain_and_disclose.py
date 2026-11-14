@@ -451,8 +451,10 @@ class RuleTextIsInEveryPlaceTests(unittest.TestCase):
 
     def test_supervisor_card_decision_boundary(self):
         text = load_protocol("supervisor-card")
-        line = next(item for item in text.splitlines() if item.startswith("- 只有改变 PRD 决策"))
-        self.assertIn("平台交接改成后台只披露不问", line)
+        line = next(item for item in text.splitlines() if item.startswith("产品/验收/设计变化"))
+        self.assertIn("不可见降级才问", line)
+        self.assertIn("旧规则交接后台先排空并披露；r4 需授权", line)
+        self.assertIn("不可见降级需新外部授权，平台交接不豁免", text)
 
     def test_worker_prompt_carries_the_same_rule(self):
         source = (ROOT / "vibe_guide" / "runners" / "provider_action.py").read_text(encoding="utf-8")

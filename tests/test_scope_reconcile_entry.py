@@ -24,7 +24,10 @@ class ScopeReconcileTests(unittest.TestCase):
             self.root = support.publish_complex_probe(self)
         self.paths = ProjectPaths(self.root)
         run_cli(['authorize', '--plan', 'probe-plan', '--authorize', 'AUTHORIZE'], self.root)
-        result = run_cli(['monitor', '--plan', 'probe-plan', '--authorize', 'AUTHORIZE'], self.root)
+        # Scope transactions own this fixture's state; no parallel daemon writer.
+        with patch('vibe_guide.cli._auto_start_daemon',
+                   return_value={'enabled': False, 'status': 'test_executor_isolated'}):
+            result = run_cli(['monitor', '--plan', 'probe-plan', '--authorize', 'AUTHORIZE'], self.root)
         self.run_id = result.payload['run_id']
         _, self.plan, self.nodes, _ = _load_plan(self.paths, 'probe-plan')
         self.monitor = Monitor(self.paths, self.plan, self.nodes)

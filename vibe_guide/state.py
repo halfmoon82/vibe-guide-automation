@@ -337,6 +337,11 @@ CONSISTENCY_CORRECTION_KEYS = (
     "decision",
 )
 _EVENT_DATA_KEYS = {
+    "business_barrier",
+    "business_result",
+    "business_acceptance",
+    "barrier_id",
+    "inputs_by_node",
     # Every key a ``Monitor._record`` call site writes must be here, or
     # ``_sanitize_event_data`` drops it without a word
     # (tests/test_event_key_allowlist.py scans the call sites).  ``error`` is
@@ -1376,12 +1381,77 @@ def load_events(paths: ProjectPaths, run_id: str) -> List[Dict[str, Any]]:
     return records
 
 
+_OBSERVATION_APPENDER = object()
+
+
+def append_system_observation(paths, run_id, name, *, owner_epoch, owner_session_id):
+    """Internal observer transaction, never a worker/provider payload channel."""
+    from .protocol_adoption import effective_responsibility
+    from .supervisor import SupervisorLease, _read_lease_record
+    from .telemetry import build_telemetry_data, _DEDICATED_EVENTS
+    if (name in _DEDICATED_EVENTS or name in {"verified_successor_retired", "writer_role_handed_off", "model_writer_retired"}
+            or name.startswith(("business_", "change_request_", "remote_delivery_"))):
+        raise ValueError("dedicated event cannot be a pure observation")
+    lease = SupervisorLease(paths)
+    with interprocess_lock(run_dir(paths, run_id) / ".monitor.lock"), lease.lock(run_id):
+        snapshot = load_snapshot(paths, run_id)
+        rules = effective_responsibility(paths, snapshot)
+        current = _read_lease_record(lease.path(run_id))
+        if (rules.get("status") != "effective" or not isinstance(current, dict)
+                or current.get("released") is True or type(owner_epoch) is not int
+                or current.get("lease_epoch") != owner_epoch
+                or current.get("owner", {}).get("session_id") != owner_session_id):
+            raise PermissionError("observation requires current owner and effective rules")
+        data = build_telemetry_data(name, run_id=run_id,
+            authorization_digest=snapshot.authorization_digest,
+            node_contract_digest=snapshot.node_contract_digest)
+        provenance = {"role": "system", "task_id": None, "handle_id": None,
+            "generation": 0, "authorization_digest": snapshot.authorization_digest,
+            "node_contract_digest": snapshot.node_contract_digest}
+        return append_event(paths, RunEvent(name, data), provenance,
+            _observation=(_OBSERVATION_APPENDER, {"owner_epoch": owner_epoch,
+                "owner_session_id": owner_session_id, "adoption_digest": rules.get("adoption_digest")}))
+
+
+def observation_origin(paths, snapshot, record):
+    """Restore only independently persisted, exact-record observer evidence."""
+    from .digests import canonical_json_digest
+    from .protocol_adoption import effective_responsibility
+    from .supervisor import SupervisorLease, _read_lease_record
+    from .telemetry import TelemetryOrigin, ORIGIN_PRODUCER
+    rules = effective_responsibility(paths, snapshot)
+    path = run_dir(paths, snapshot.run_id, create=False) / "observation-origins" / (record["event_id"] + ".json")
+    try:
+        if path.is_symlink() or path.parent.is_symlink():
+            return None
+        origin = json.loads(path.read_text(encoding="utf-8"))
+        lease = SupervisorLease(paths)
+        current = _read_lease_record(lease.path(snapshot.run_id))
+        if (set(origin) != {"record_digest", "owner_epoch", "owner_session_id", "adoption_digest"}
+                or rules.get("status") != "effective" or not isinstance(current, dict)
+                or current.get("released") is True
+                or origin["owner_epoch"] != current.get("lease_epoch")
+                or origin["owner_session_id"] != current.get("owner", {}).get("session_id")
+                or origin["adoption_digest"] != rules.get("adoption_digest")
+                or origin["record_digest"] != canonical_json_digest(record)):
+            return None
+        return TelemetryOrigin(origin["record_digest"], ORIGIN_PRODUCER,
+                               "observation-origins/" + path.name)
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 def append_event(
     paths: ProjectPaths,
     event: RunEvent,
     provenance: Optional[Dict[str, Any]] = None,
+    *, _observation=None,
 ) -> int:
     sanitized_data = _sanitize_event_data(event.data)
+    if _observation is not None:
+        if not isinstance(_observation, tuple) or _observation[0] is not _OBSERVATION_APPENDER:
+            raise PermissionError("observation appender identity is invalid")
+        sanitized_data["telemetry"] = copy.deepcopy(event.data["telemetry"])
     run_id = sanitized_data.get("run_id")
     validate_run_id(run_id)
     directory = run_dir(paths, run_id, create=True)
@@ -1470,6 +1540,15 @@ def append_event(
                 written = os.write(descriptor, view)
                 view = view[written:]
             os.fsync(descriptor)
+            if _observation is not None:
+                from .digests import canonical_json_digest
+                origin_dir = directory / "observation-origins"
+                if origin_dir.is_symlink():
+                    raise ValueError("observation origin directory may not be a symlink")
+                origin_dir.mkdir(mode=0o700, exist_ok=True)
+                origin = dict(_observation[1], record_digest=canonical_json_digest(record))
+                _atomic_bytes(origin_dir / (record["event_id"] + ".json"),
+                              (json.dumps(origin, sort_keys=True) + "\n").encode())
             return sequence
         finally:
             if descriptor is not None:
@@ -2031,7 +2110,9 @@ supervisor_lease_id = _lease_id
 def acquire_writer_lease(
     paths: ProjectPaths, node_id: str, worktree: str, run_id: str,
     intent_digest: Optional[str] = None, role: Optional[str] = None, generation: Optional[int] = None,
+    *, _locked: bool = False,
 ) -> bool:
+    from contextlib import nullcontext
     validate_run_id(run_id)
     lease_path = _lease_path(paths, node_id, worktree, intent_digest, role, generation)
     lease_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2045,7 +2126,7 @@ def acquire_writer_lease(
         "intent_digest": intent_digest,
         "status": "active",
     }
-    with interprocess_lock(_lease_lock(paths)):
+    with (nullcontext() if _locked else interprocess_lock(_lease_lock(paths))):
         # No second writer may claim the same node/worktree, even with a
         # different intent or run.  Exact same lease remains idempotent below.
         lease_dir = _safe_project_path(paths, ".vibe", "leases")
@@ -2207,7 +2288,7 @@ def quarantine_writer_lease(
 
 
 def retirement_writer_lease(paths: ProjectPaths, node_id: str, worktree: str,
-                            run_id: str) -> Optional[Dict[str, Any]]:
+                            run_id: str, *, resolved_root: bool = False) -> Optional[Dict[str, Any]]:
     """Exact lease/CAS identity. Caller holds _lease_lock through its use.
 
     A lease on the node OR the resolved writer root conflicts across runs.
@@ -2227,7 +2308,9 @@ def retirement_writer_lease(paths: ProjectPaths, node_id: str, worktree: str,
         if data.get("node_id") != node_id and (paths.root / data["worktree"]).resolve() != root:
             continue
         if (data.get("schema_version") != LEASE_SCHEMA_VERSION
-                or data.get("node_id") != node_id or data.get("worktree") != worktree
+                or data.get("node_id") != node_id
+                or (data.get("worktree") != worktree and not (
+                    resolved_root and (paths.root / data["worktree"]).resolve() == root))
                 or data.get("run_id") != run_id or data.get("status") != "active"):
             raise PermissionError("foreign or unknown writer lease identity")
         role, generation, intent = (data.get(key) for key in ("role", "generation", "intent_digest"))
@@ -2236,13 +2319,28 @@ def retirement_writer_lease(paths: ProjectPaths, node_id: str, worktree: str,
                            or type(generation) is not int or generation < 1
                            or not isinstance(intent, str) or not re.fullmatch(r"[0-9a-f]{64}", intent)):
             raise PermissionError("incomplete writer lease identity")
-        if (data.get("lease_id") != _lease_id(node_id, worktree, run_id, role, generation, intent)
-                or candidate != _lease_path(paths, node_id, worktree, intent, role, generation)):
+        stored_worktree = data["worktree"]
+        if (data.get("lease_id") != _lease_id(node_id, stored_worktree, run_id, role, generation, intent)
+                or candidate != _lease_path(paths, node_id, stored_worktree, intent, role, generation)):
             raise PermissionError("writer lease identity digest mismatch")
         matches.append({"filename": candidate.name, "record": data})
     if len(matches) > 1:
         raise PermissionError("multiple writer leases on the affected root")
     return matches[0] if matches else None
+
+
+def read_writer_lease_for_root(paths: ProjectPaths, node_id: str, worktree: str,
+                               run_id: str):
+    """Resolve a writer root while preserving the stored lease/CAS identity."""
+    from dataclasses import replace
+    held = retirement_writer_lease(paths, node_id, worktree, run_id, resolved_root=True)
+    if held is None:
+        return None
+    lease = read_writer_lease(paths, node_id, held["record"]["worktree"])
+    if lease is None:
+        return None
+    root = str((paths.root / worktree).resolve())
+    return replace(lease, worktree=root, lease_id=_lease_id(node_id, root, run_id))
 
 
 def release_writer_lease(

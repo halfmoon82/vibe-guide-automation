@@ -1,0 +1,7 @@
+test_controlled_callback_requires_explicit_digest (tests.test_audit_create_claim.ControlledCreateSafetyTests) ... ok
+test_unclaimed_callback_is_preserved_as_evidence_of_exposure (tests.test_audit_create_claim.ControlledCreateSafetyTests) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.027s
+
+OK

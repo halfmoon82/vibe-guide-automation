@@ -57,7 +57,9 @@ class ModelChoice:
 
     @property
     def reasoning(self) -> str:
-        return _PROFILE_REASONING[self.tier]
+        return {"low": "light", "medium": "normal", "high": "deep"}.get(
+            self.effort, _PROFILE_REASONING[self.tier]
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -197,13 +199,31 @@ def _platform_key(platform: str) -> str:
     return text
 
 
+normalize_platform = _platform_key
+
+
+def _valid_models(models: Any) -> bool:
+    return isinstance(models, list) and bool(models) and all(
+        isinstance(item, dict)
+        and isinstance(item.get("slug"), str) and bool(item["slug"].strip())
+        and isinstance(item.get("efforts", []), list)
+        and all(isinstance(level, str) and level for level in item.get("efforts", []))
+        and (item.get("default") is None or (
+            isinstance(item["default"], str)
+            and item["default"] in _EFFORT.values()
+            and (not item.get("efforts") or item["default"] in item["efforts"])
+        ))
+        for item in models
+    )
+
+
 def _read_cache(home: Optional[Path], key: str, now: float) -> Optional[List[Dict[str, Any]]]:
     if home is None:
         return None
     try:
         data = json.loads((home / CACHE_NAME).read_text(encoding="utf-8"))
         entry = data[key]
-        if now - float(entry["probed_at"]) <= CACHE_TTL_SECONDS and entry["models"]:
+        if 0 <= now - float(entry["probed_at"]) <= CACHE_TTL_SECONDS and _valid_models(entry["models"]):
             return entry["models"]
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         pass
@@ -268,6 +288,8 @@ def load_model_map(vibe_home: Optional[Path]) -> Optional[Dict[str, Dict[str, Li
         raw_text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
+    except UnicodeDecodeError as error:
+        raise ModelMapConfigError('model_map: config.json is not valid UTF-8') from error
     except OSError as error:
         raise ModelMapConfigError(
             "model_map: cannot read %s (%s)" % (path, type(error).__name__)
@@ -331,6 +353,7 @@ def resolve(
     vibe_home: Optional[Path] = None,
     prober: Optional[Callable[[], List[Dict[str, Any]]]] = None,
     now: Optional[float] = None,
+    cache_write: bool = True,
 ) -> ModelChoice:
     """The model and thinking effort ``platform`` should use for ``tier``."""
     _check_tier(tier)
@@ -364,11 +387,74 @@ def resolve(
                 key, tier, "default", None, "unknown", "probe",
                 "model probe failed (%s); using platform default" % type(error).__name__,
             )
-        if not models:
-            return ModelChoice(key, tier, "default", None, "unknown", "probe", "model probe returned nothing; using platform default")
-        _write_cache(home, key, models, stamp)
+        if not _valid_models(models):
+            return ModelChoice(key, tier, "default", None, "unknown", "probe", "model probe returned no valid directory; using platform default")
+        if cache_write:
+            _write_cache(home, key, models, stamp)
+            # Dispatch binds source into its pending create identity. Once
+            # persisted, use that durable observation from the first attempt;
+            # retrying the same cached route must not change the identity.
+            if _read_cache(home, key, stamp) == models:
+                source = "cache"
     chosen = _pick(models, tier)
-    return ModelChoice(key, tier, chosen["slug"], _pick_effort(chosen, tier), "ok", source)
+    selected_effort = _pick_effort(chosen, tier)
+    if selected_effort not in _EFFORT.values():
+        return ModelChoice(
+            key, tier, "default", None, "unknown", source,
+            "directory effort cannot be represented by the worker profile; using platform default",
+        )
+    return ModelChoice(key, tier, chosen["slug"], selected_effort, "ok", source)
+
+
+def catalog_snapshot(
+    platforms: Sequence[str] = ("codex", "claude-code"), *, vibe_home: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Read-only display of the same resolver used by dispatch.
+
+    Each platform probe is observed once, including a failed observation, so
+    tiers cannot describe different directory generations. Project tables are
+    deliberately never read here and the user cache is never written.
+    """
+    load_model_map(vibe_home)  # Invalid manual input is not a missing directory.
+    rows = []
+    for platform in sorted({_platform_key(item) for item in platforms}):
+        observed: Dict[str, Any] = {}
+        probe = _PROBES.get(platform)
+
+        def once():
+            if "models" not in observed and "error" not in observed:
+                try:
+                    observed["models"] = probe()
+                except Exception as error:
+                    observed["error"] = error
+            if "error" in observed:
+                raise observed["error"]
+            return observed["models"]
+
+        for tier in TIERS:
+            rows.append(resolve(
+                platform, tier, vibe_home=vibe_home,
+                prober=once if probe else None, cache_write=False,
+            ).to_dict())
+    return {
+        "schema_version": 1,
+        "purpose": "generated_display_only",
+        "manual_input": "$VIBE_HOME/config.json:model_map",
+        "resolutions": rows,
+    }
+
+
+def disclosure_notes(snapshot: Mapping[str, Any]) -> List[str]:
+    """Only the unresolved platform/tier combinations use the default."""
+    affected: Dict[str, List[str]] = {}
+    for row in snapshot["resolutions"]:
+        if row["status"] != "ok":
+            affected.setdefault(row["platform"], []).append(row["tier"])
+    return [
+        "%s：%s 未验证，将使用平台默认模型；模型目录缺失本身不阻断授权。"
+        % (platform, ", ".join(tiers))
+        for platform, tiers in sorted(affected.items())
+    ]
 
 
 def vibe_home_path() -> Optional[Path]:

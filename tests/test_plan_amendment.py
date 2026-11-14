@@ -2792,6 +2792,59 @@ class NativeTerminalHostReceiptTests(_LegacyUninvokedFixture):
             calls[1]["payload"]["item"]["arguments"]["evidence"] = {"type": "function_call"}
         elif fault == "intermediate-error":
             calls[1]["payload"]["item"]["result"]["isError"] = True
+        elif isinstance(fault, str) and fault.startswith("extra-"):
+            extra = copy.deepcopy(calls[1])
+            item = extra["payload"]["item"]
+            item["id"] = "host-extra"
+            item["tool"] = "create_thread"
+            item["arguments"] = {"target": {"type": "project"}, "prompt": "worker"}
+            item["result"] = {"isError": False, "content": [
+                {"type": "text", "text": json.dumps({"threadId": "new-child"})}]}
+            if fault == "extra-foreign":
+                extra["payload"]["thread_id"] = "foreign"
+            elif fault == "extra-turn":
+                extra["payload"]["turn_id"] = "other-turn"
+            elif fault == "extra-unknown":
+                item["tool"] = "unknown_tool"
+            elif fault == "extra-failed":
+                item["status"] = "failed"
+                item["result"]["isError"] = True
+            elif fault == "extra-server":
+                item["server"] = "foreign"
+            elif fault == "extra-arguments":
+                item["arguments"] = None
+            calls.append(extra)
+        elif fault in {"command-execution", "unknown-item", "started-create", "null-item"}:
+            extra = copy.deepcopy(calls[1])
+            item = extra["payload"]["item"]
+            item.update(id="review-extra", tool="create_thread",
+                        arguments={"prompt": "worker"})
+            if fault == "command-execution":
+                extra["payload"]["item"] = {
+                    "type": "CommandExecution", "id": "review-extra",
+                    "command": "touch side-effect-marker",
+                    "cwd": "/tmp/review-fixture", "status": "completed",
+                    "exitCode": 0, "output": {"text": ""}}
+            elif fault == "unknown-item":
+                item["type"] = "FutureHostInvocation"
+            elif fault == "started-create":
+                extra["payload"]["type"] = "item_started"
+            elif fault == "null-item":
+                extra["payload"]["item"] = None
+            calls.append(extra)
+        elif fault in {"benign-positive", "benign-duplicate", "benign-mcp-collision"}:
+            benign_id = "host-benign"
+            benign = {"type": "event_msg", "payload": {
+                "type": "item_completed", "thread_id": self.NEW_OWNER,
+                "turn_id": "observer-turn", "started_at_ms": 3,
+                "completed_at_ms": 4, "item": {"type": "Reasoning",
+                    "id": benign_id, "status": "completed"}}}
+            calls.insert(0, benign)
+            if fault == "benign-duplicate":
+                duplicate = copy.deepcopy(benign)
+                calls.insert(1, duplicate)
+            elif fault == "benign-mcp-collision":
+                benign["payload"]["item"]["id"] = "host-read_thread"
         source_text = (
             'text(await tools.mcp__codex_app__set_thread_archived('
             + json.dumps({"threadId": self.OLD_OWNER, "hostId": "local", "archived": True})
@@ -2799,6 +2852,22 @@ class NativeTerminalHostReceiptTests(_LegacyUninvokedFixture):
             + json.dumps({"threadId": self.OLD_OWNER, "hostId": "local"}) + '));')
         if fault == "invented-call":
             source_text = 'text("no native tools");'
+        elif fault == "throw-prefix":
+            source_text = 'throw new Error("unreachable"); ' + source_text
+        elif fault == "dynamic-text-json":
+            source_text = 'text(JSON.parse("{")); ' + source_text
+        elif fault == "dynamic-text-undefined":
+            source_text = 'text(undefined()); ' + source_text
+        elif fault == "dynamic-text-missing":
+            source_text = 'text(missing_function()); ' + source_text
+        elif fault == "suffix-syntax":
+            source_text += ' const = ;'
+        elif fault == "suffix-tdz":
+            source_text += ' const text = "shadow";'
+        elif fault == "nested-output-prefix":
+            source_text = 'text((("safe").output).output); ' + source_text
+        elif fault == "static-text-positive":
+            source_text = 'text("safe"); ' + source_text
         elif fault == "false-branch":
             source_text = 'if(false){' + source_text + '}'
         elif fault == "unrelated-prefix":
@@ -2877,7 +2946,14 @@ class NativeTerminalHostReceiptTests(_LegacyUninvokedFixture):
         for fault in ("cross-turn", "duplicate", "error-result", "foreign",
                       "unreturned", "wrong-error", "invented-call", "nested-call",
                       "unrelated-prefix", "indirect-alias", "tool-reassigned",
-                      "intermediate-error", "archive-refused", "false-branch"):
+                      "intermediate-error", "archive-refused", "false-branch",
+                      "extra-create", "extra-foreign", "extra-turn", "extra-unknown",
+                      "extra-failed", "extra-server", "extra-arguments",
+                      "command-execution", "unknown-item", "started-create",
+                      "null-item", "throw-prefix", "benign-duplicate",
+                      "benign-mcp-collision", "dynamic-text-json",
+                      "dynamic-text-undefined", "dynamic-text-missing",
+                      "suffix-syntax", "suffix-tdz", "nested-output-prefix"):
             with self.subTest(fault=fault):
                 fixture = NativeTerminalHostReceiptTests(methodName="runTest")
                 fixture.setUp()
@@ -2891,6 +2967,14 @@ class NativeTerminalHostReceiptTests(_LegacyUninvokedFixture):
                 self.assertTrue(fixture.lease_file.exists())
                 self.assertFalse(any(e["event"] == plan_amendment.RETIRE_UNINVOKED_EVENT
                                      for e in load_events(fixture.paths, fixture.run_id)))
+
+    def test_completed_only_benign_reasoning_item_is_accepted(self):
+        self._same_outer_terminal_fixture("benign-positive")
+        self.assertEqual(self._retire()["status"], "retired")
+
+    def test_static_text_before_terminal_calls_is_accepted(self):
+        self._same_outer_terminal_fixture("static-text-positive")
+        self.assertEqual(self._retire()["status"], "retired")
 
 
 class RawHostLedgerTests(unittest.TestCase):

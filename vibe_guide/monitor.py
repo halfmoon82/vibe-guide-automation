@@ -10,6 +10,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 import copy
+from functools import wraps
 
 from .authorization import (
     WORKER_TOPOLOGY_BACKGROUND,
@@ -167,6 +168,15 @@ from .providers import CODEX_PROVIDER
 from .self_report_recovery import SELF_REPORT_DELIVERY_RECONCILED, consume_parked_delivery
 from .decision_boundary import ScopedDecisionMailbox
 from .decisions import DecisionMailbox
+
+
+def _run_transaction(method):
+    """Serialize public monitor mutation and provider polling per run."""
+    @wraps(method)
+    def wrapped(self, run_id, *args, **kwargs):
+        with interprocess_lock(run_dir(self.paths, run_id, create=False) / ".monitor.lock"):
+            return method(self, run_id, *args, **kwargs)
+    return wrapped
 
 
 class ScopeDecisionRequired(PermissionError):
@@ -1020,8 +1030,17 @@ RECOVERY_FIDELITY_AUDIT = (
     },
     {
         "site": "_mark_blocked_unknown",
-        "call_sites": 55,
+        "call_sites": 57,
         "callers": (
+            {
+                "caller": "_apply_event and _accept_visible_sdd_delivery (business acceptance failure)",
+                "verdict": "different_type",
+                "rationale": (
+                    "Both new business-item gates park the node and return before "
+                    "acceptance or archive; neither reuses its block stamps as "
+                    "clearance evidence or rolls back from mutated binding state."
+                ),
+            },
             {
                 "caller": (
                     "_apply_event, _start_task, _schedule_ready, "
@@ -1169,7 +1188,7 @@ class Monitor:
         # inject a plain JSON intent into legacy contracts: its mere presence
         # opts the provider runner into the protected binding gate, where the
         # downgraded mapping is correctly rejected as untrusted evidence.
-        if binding_contract_enabled(contract):
+        if binding_contract_enabled(contract) and not isinstance(contract.get("binding_intent"), BindingIntent):
             payload["binding_intent"] = (
                 intent.to_dict() if hasattr(intent, "to_dict") else dict(intent)
             )
@@ -1263,6 +1282,8 @@ class Monitor:
             }
         # Existing runners expose RunHandle; only V4.4 contracts require
         # structured proof validation.  The call still traverses this helper.
+        if isinstance(handle, dict) and handle.get("kind") in {"retryable", "capacity_wait", "repairable"}:
+            return handle  # A typed failure is not a successful binding proof.
         if contract.get("binding_contract_version") != "4.4" and hasattr(handle, "run_id"):
             return handle
         response = handle if isinstance(handle, dict) else getattr(handle, "__dict__", None)
@@ -2036,8 +2057,21 @@ class Monitor:
                 continue
 
     def _save_task_binding(self, binding: TaskBinding) -> None:
-        self._guard_lease(binding.run_id)
-        save_task_binding(self.paths, binding)
+        from .task_registry import protected_writer_fence, validate_binding, _PROTECTED_RETIREMENT, _current_retirement
+        with protected_writer_fence():
+            self._guard_lease(binding.run_id)
+            scope = _current_retirement()
+            if _PROTECTED_RETIREMENT.get() is not None:
+                if scope is None:
+                    raise ValueError("final binding invocation is not active")
+                contract = dict(scope.contract, binding_intent=binding.binding_intent,
+                    binding_observation=binding.binding_observation, provider_task_id=binding.task_id)
+                if not runtime_binding_gate(contract, binding).verified:
+                    raise ValueError("final binding row conflicts with authorized invocation")
+            if (binding.binding_state == "binding_verified" or _PROTECTED_RETIREMENT.get() is not None) and not validate_binding(
+                    binding.binding_intent, binding.binding_observation).verified:
+                raise ValueError("final binding evidence changed before registry write")
+            save_task_binding(self.paths, binding)
         if binding.run_id is not None:
             self._binding_cache[(binding.run_id, binding.issue_id, binding.role)] = binding
 
@@ -2066,6 +2100,15 @@ class Monitor:
         # provider hook; a released/expired lease must fail closed.
         node_id = str(contract.get("node_id") or binding.issue_id)
         fresh_lease = read_writer_lease(self.paths, node_id, binding.worktree)
+        if (fresh_lease is None and Path(binding.worktree).is_absolute()
+                and binding.legacy.get("initial_binding_source")):
+            from .state import read_writer_lease_for_root
+            fresh_lease = read_writer_lease_for_root(self.paths, node_id, binding.worktree, binding.run_id)
+            if fresh_lease is not None and fresh_lease.worktree != binding.worktree:
+                from dataclasses import replace
+                from .state import supervisor_lease_id
+                fresh_lease = replace(fresh_lease, worktree=binding.worktree, lease_id=supervisor_lease_id(
+                    node_id, binding.worktree, binding.run_id))
         observed = getattr(binding, "binding_observation", None)
         if fresh_lease is None or observed is None or observed.lease != fresh_lease:
             raise ValueError("supervisor lease is stale or unavailable")
@@ -2435,6 +2478,18 @@ class Monitor:
         # now: the projection was refreshed above, so this records exactly the
         # state the validator is about to read.
         self._record_topology_projection(snapshot, "monitor.start")
+        # Strict native initial binding needs an owner before its immutable
+        # create source can be written.  The run id is only known now; leave
+        # it undispatched so the public register/resume path can establish it.
+        if any(binding_contract_enabled(self.nodes[node_id].contract)
+               for node_id in snapshot.ready_set):
+            snapshot.status = "blocked_unknown"
+            for node_id in snapshot.ready_set:
+                if binding_contract_enabled(self.nodes[node_id].contract):
+                    snapshot.nodes[node_id]["reason"] = "initial supervisor registration required"
+                    snapshot.nodes[node_id]["reason_code"] = "initial_supervisor_registration_required"
+            self._save_snapshot(snapshot)
+            return snapshot
         self._save_snapshot(snapshot)
         if not self._context_allows_dispatch(snapshot, runner):
             self._save_snapshot(snapshot)
@@ -2445,6 +2500,7 @@ class Monitor:
         self._save_snapshot(snapshot)
         return snapshot
 
+    @_run_transaction
     def resume(self, run_id: str, runner: Runner, poll_handles: bool = True) -> RunSnapshot:
         self._reset_binding_cache()
         self._archive_finished_runs()
@@ -2488,6 +2544,8 @@ class Monitor:
         self._require_snapshot_authorization(snapshot)
         self._reconcile_unapplied_events(snapshot)
         self._heal_entry_evidence(snapshot)
+        self._reconcile_model_retirements(snapshot)
+        self._reconcile_writer_handoffs(snapshot, runner)
         self._consume_answered_decisions(snapshot)
         self._route_undecided_blocked_design(snapshot)
         for node_id in list(snapshot.nodes):
@@ -2550,6 +2608,7 @@ class Monitor:
                 )
         return {}
 
+    @_run_transaction
     def reauthorize(
         self,
         run_id: str,
@@ -2568,6 +2627,7 @@ class Monitor:
         unarchive_run(self.paths, run_id)
         snapshot = load_snapshot(self.paths, run_id)
         state = self.paths.vibe / "state.json"
+        snapshot._dispatch_owner = self._current_dispatch_owner(run_id)
         current_capability_contract_digest = snapshot.capability_contract_digest
         capability_contract_changed = False
         if state.is_file():
@@ -2629,6 +2689,9 @@ class Monitor:
             return snapshot
 
         previous = self._snapshot_record(snapshot)
+        if record.adoption_digest and record.adoption_digest != previous.adoption_digest:
+            from .protocol_adoption import validate_adoption_authorization
+            validate_adoption_authorization(self.paths, snapshot, record)
         current_prd_digest, current_spec_digest = live_prd, live_spec
         integration_changed = (
             previous.integration_contract_digest != record.integration_contract_digest
@@ -2757,14 +2820,17 @@ class Monitor:
             if self._reconcile_completed_delivery_for_transition(
                 snapshot, node_id, active
             ):
-                role = str(active["role"])
-                self._set_binding_status(snapshot, node_id, role, "delivered")
-                current["old_task_reconciled"] = True
-                current["active_role"] = None
-                current["active_task"] = None
-                current["quarantine"] = None
-                snapshot.handles.pop(node_id, None)
-                self._release_node_lease(snapshot, node_id)
+                from .supervisor import SupervisorLease
+                with SupervisorLease(self.paths).lock(snapshot.run_id):
+                    self._check_dispatch_owner(snapshot.run_id, snapshot._dispatch_owner)
+                    role = str(active["role"])
+                    self._set_binding_status(snapshot, node_id, role, "delivered")
+                    current["old_task_reconciled"] = True
+                    current["active_role"] = None
+                    current["active_task"] = None
+                    current["quarantine"] = None
+                    snapshot.handles.pop(node_id, None)
+                    self._release_node_lease(snapshot, node_id)
                 continue
             if not self._stop_active_for_transition(
                 snapshot,
@@ -2828,9 +2894,13 @@ class Monitor:
         }
         # Validate the complete transition before publishing its durable event.
         # A rejected proof must not poison replay with an unappliable event.
+        from .supervisor import SupervisorLease, _read_lease_record
+        transition["proof"] = {"owner": snapshot._dispatch_owner}
         self._apply_reauthorization_transition(copy.deepcopy(snapshot), transition)
+        with SupervisorLease(self.paths).lock(snapshot.run_id):
+            self._check_dispatch_owner(snapshot.run_id, snapshot._dispatch_owner)
         self._record(snapshot, "authorization_reauthorized", transition)
-        self._apply_reauthorization_transition(snapshot, transition)
+        self._commit_reauthorization_transition(snapshot, transition)
         # The transition resets every never-started node back to ``planned``,
         # so the readiness projection the snapshot carries is stale by
         # construction.  Refresh and record it *before* dispatching:
@@ -2851,6 +2921,213 @@ class Monitor:
         self._save_snapshot(snapshot)
         return snapshot
 
+    @_run_transaction
+    def revoke_business_acceptance(
+        self, run_id: str, node_id: str, *, reason: str, evidence_ref: str,
+        impact_known: bool = True,
+    ) -> RunSnapshot:
+        """Write the invalidation barrier before projecting any node changes.
+
+        In-flight identities and leases stay intact: invalid business input
+        is not evidence that a worker stopped or may be replaced.
+        """
+        validate_run_id(run_id)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("business revocation requires a reason")
+        if not isinstance(evidence_ref, str) or not evidence_ref.strip():
+            raise ValueError("business revocation requires an evidence reference")
+        if type(impact_known) is not bool:
+            raise ValueError("impact_known must be boolean")
+        lock = run_dir(self.paths, run_id, create=False) / ".business.lock"
+        with interprocess_lock(lock):
+            snapshot = load_snapshot(self.paths, run_id)
+            self._require_snapshot_authorization(snapshot)
+            self._reconcile_unapplied_events(snapshot)
+            from .protocol_adoption import effective_responsibility
+            if effective_responsibility(self.paths, snapshot).get("status") != "effective":
+                raise PermissionError("effective responsibility rules required before business revocation")
+            if node_id not in self.nodes:
+                raise ValueError("business revocation node is unknown")
+            affected = {node_id} if impact_known else set(self.nodes)
+            if impact_known:
+                while True:
+                    expanded = affected | {
+                        key for key, node in self.nodes.items()
+                        if set(node.depends_on) & affected or set(node.integration_after) & affected
+                    }
+                    if expanded == affected:
+                        break
+                    affected = expanded
+            data = {
+                "run_id": run_id, "node_id": node_id, "reason": reason,
+                "evidence_ref": evidence_ref, "affected_nodes": sorted(affected),
+                "business_barrier": {
+                    "id": "barrier-" + uuid.uuid4().hex, "status": "invalidated",
+                    "source_node": node_id, "impact_known": impact_known,
+                    "affected_nodes": sorted(affected),
+                    "authorization_digest": snapshot.authorization_digest,
+                    "node_contract_digest": snapshot.node_contract_digest,
+                },
+            }
+            self._record(snapshot, "business_acceptance_revoked", data)
+            self._project_business_barrier(snapshot, data)
+            self._refresh_run_status(snapshot)
+            self._save_snapshot(snapshot)
+            return snapshot
+
+    @_run_transaction
+    def revalidate_business_inputs(
+        self, run_id: str, node_id: str, *, barrier_id: str,
+        inputs_by_node: Dict[str, Dict[str, str]], evidence_ref: str,
+    ) -> RunSnapshot:
+        """Clear a business barrier only after versioned input evidence is verified.
+
+        Existing task identities and handles remain in place.  Every affected
+        node moves to a new acceptance round; an old acceptance payload can
+        therefore never satisfy the reopened gate.
+        """
+        snapshot = load_snapshot(self.paths, run_id)
+        self._require_snapshot_authorization(snapshot)
+        self._reconcile_unapplied_events(snapshot)
+        from .protocol_adoption import effective_responsibility
+        if effective_responsibility(self.paths, snapshot).get("status") != "effective":
+            raise PermissionError("effective responsibility rules required before business revalidation")
+        if node_id not in snapshot.nodes or not isinstance(barrier_id, str):
+            raise ValueError("business revalidation target is invalid")
+        source = snapshot.nodes[node_id].get("business_barrier")
+        if not isinstance(source, dict) or source.get("status") != "invalidated" or source.get("id") != barrier_id:
+            raise ValueError("business barrier is not current")
+        if not isinstance(inputs_by_node, dict) or not isinstance(evidence_ref, str) or not evidence_ref.strip():
+            raise ValueError("business revalidation evidence is invalid")
+        evidence = self.paths.resolve_relative(evidence_ref)
+        if not evidence.is_file():
+            raise ValueError("business revalidation evidence is missing")
+        affected = source.get("affected_nodes") or [node_id]
+        if set(inputs_by_node) != set(affected):
+            raise ValueError("business revalidation affected inputs are incomplete")
+        if all(inputs_by_node.get(affected_id) == snapshot.nodes[affected_id].get("business_inputs", {})
+               for affected_id in affected):
+            raise ValueError("business revalidation inputs are unchanged")
+        for affected_id in affected:
+            if snapshot.nodes.get(affected_id, {}).get("business_barrier", {}).get("id") != barrier_id:
+                raise ValueError("business revalidation barrier was superseded")
+            inputs = inputs_by_node.get(affected_id)
+            if not isinstance(inputs, dict) or not inputs:
+                raise ValueError("business revalidation input versions are missing")
+            for ref, digest in inputs.items():
+                material = self.paths.resolve_relative(ref)
+                if (not material.is_file() or not isinstance(digest, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                        or digests.sha256_bytes(material.read_bytes()) != digest):
+                    raise ValueError("business revalidation input version is unverifiable")
+        data = {"run_id": run_id, "node_id": node_id, "barrier_id": barrier_id,
+                "affected_nodes": list(affected), "inputs_by_node": copy.deepcopy(inputs_by_node),
+                "evidence_ref": evidence_ref}
+        self._record(snapshot, "business_acceptance_revalidated", data)
+        self._project_business_revalidation(snapshot, data)
+        self._refresh_run_status(snapshot)
+        self._save_snapshot(snapshot)
+        return snapshot
+
+    def _project_business_revalidation(self, snapshot, data):
+        node_id = data.get("node_id")
+        barrier_id = data.get("barrier_id")
+        barrier = snapshot.nodes.get(node_id, {}).get("business_barrier")
+        inputs_by_node = data.get("inputs_by_node")
+        affected = data.get("affected_nodes")
+        if (not isinstance(barrier, dict) or barrier.get("id") != barrier_id
+                or barrier.get("status") != "invalidated"
+                or not isinstance(affected, list) or not affected
+                or set(affected) != set(barrier.get("affected_nodes", [node_id]))
+                or not isinstance(inputs_by_node, dict) or set(inputs_by_node) != set(affected)):
+            raise ValueError("business revalidation replay is invalid")
+        for affected_id in affected:
+            target = snapshot.nodes.get(affected_id)
+            if (not isinstance(target, dict) or target.get("business_barrier", {}).get("id") != barrier_id
+                    or not isinstance(inputs_by_node.get(affected_id), dict) or not inputs_by_node[affected_id]):
+                raise ValueError("business revalidation inputs or barrier are stale")
+            for ref, digest in inputs_by_node[affected_id].items():
+                material = self.paths.resolve_relative(ref)
+                if not material.is_file() or digests.sha256_bytes(material.read_bytes()) != digest:
+                    raise ValueError("business revalidation input version is unverifiable")
+        for affected_id in affected:
+            current = snapshot.nodes[affected_id]
+            current["business_inputs"] = copy.deepcopy(inputs_by_node[affected_id])
+            current["business_acceptance_round"] = int(current.get("business_acceptance_round", 1)) + 1
+            current["business_acceptance_pending"] = None
+            current["acceptance"] = None
+            barrier = current.get("business_barrier")
+            if isinstance(barrier, dict) and barrier.get("id") == barrier_id:
+                barrier["status"] = "revalidated"
+            if (current.get("active_task") is None and affected_id not in snapshot.handles
+                    and not current.get("developer_identity") and not current.get("reviewer_identity")):
+                current["status"] = "planned"
+                current["reason"] = None
+
+    def _project_business_barrier(self, snapshot, data):
+        barrier = data.get("business_barrier")
+        affected = data.get("affected_nodes")
+        if (not isinstance(barrier, dict) or barrier.get("status") != "invalidated" or
+                not isinstance(affected, list) or not affected or
+                not set(affected).issubset(snapshot.nodes) or
+                barrier.get("authorization_digest") != snapshot.authorization_digest or
+                barrier.get("node_contract_digest") != snapshot.node_contract_digest):
+            raise ValueError("business barrier proof is invalid")
+        for node_id in affected:
+            current = snapshot.nodes[node_id]
+            current.setdefault("business_barrier_history", {})[barrier["id"]] = copy.deepcopy(barrier)
+            current["business_barrier"] = copy.deepcopy(barrier)
+            if current.get("acceptance") is not None:
+                current.setdefault("invalidated_business_acceptances", []).append(copy.deepcopy(current["acceptance"]))
+                current["acceptance"] = None
+            # Preserve active state/identity; only dormant or accepted nodes
+            # must stop looking ready/valid to legacy readiness projections.
+            if node_id not in snapshot.handles:
+                current["status"] = "blocked_unknown"
+                current["reason"] = "business input invalidated; revalidation required"
+
+    def _business_acceptance_failure(self, snapshot, node_id, data):
+        from .protocol_adoption import effective_responsibility
+        if effective_responsibility(self.paths, snapshot).get("status") != "effective":
+            return None
+        current = snapshot.nodes[node_id]
+        if current.get("business_barrier", {}).get("status") == "invalidated":
+            return "business acceptance is invalidated"
+        contract = self.nodes[node_id].contract
+        examples = contract.get("acceptance_examples", contract.get("acceptance_example"))
+        if not examples:
+            return None
+        if isinstance(examples, str):
+            examples = [examples]
+        if not isinstance(examples, list) or not all(isinstance(item, str) and item.strip() for item in examples):
+            return "business acceptance examples cannot be verified"
+        proof = data.get("business_acceptance")
+        if not isinstance(proof, dict):
+            return "required business acceptance evidence is missing"
+        expected_round = current.get("business_acceptance_round", 1)
+        if type(proof.get("round")) is not int or proof["round"] != expected_round:
+            return "business acceptance round is stale"
+        if proof.get("inputs") != current.get("business_inputs", {}):
+            return "business acceptance input versions are stale"
+        items = proof.get("items")
+        if not isinstance(items, dict) or set(items) != set(examples):
+            return "required business acceptance items are missing"
+        for example in examples:
+            item = items[example]
+            if not isinstance(item, dict) or item.get("status") != "satisfied":
+                return "required business acceptance item is unmet or unknown"
+            if not isinstance(item.get("evidence_ref"), str) or not item["evidence_ref"].strip():
+                return "business acceptance item lacks evidence"
+            try:
+                material = self.paths.resolve_relative(item["evidence_ref"])
+                if (not material.is_file() or not re.fullmatch(r"[0-9a-f]{64}", str(item.get("evidence_sha256", "")))
+                        or digests.sha256_bytes(material.read_bytes()) != item["evidence_sha256"]):
+                    return "business acceptance evidence is missing or changed"
+            except (OSError, ValueError):
+                return "business acceptance evidence cannot be verified"
+        return None
+
+    @_run_transaction
     def tick(self, run_id: str, runner: Runner) -> RunSnapshot:
         self._reset_binding_cache()
         self._archive_finished_runs()
@@ -2859,7 +3136,10 @@ class Monitor:
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
         self._validate_execution_topology(snapshot)
+        self._require_retirement_committed(snapshot)
         self._reconcile_unapplied_events(snapshot)
+        self._reconcile_model_retirements(snapshot)
+        self._reconcile_writer_handoffs(snapshot, runner)
         self._consume_answered_decisions(snapshot)
         self._route_undecided_blocked_design(snapshot)
         self._poll_active_handles(snapshot, runner)
@@ -2873,11 +3153,16 @@ class Monitor:
         self._save_snapshot(snapshot)
         return snapshot
 
+    @_run_transaction
     def record_integration_review(self, run_id: str, evidence: Dict[str, Any]) -> RunSnapshot:
         """Persist a validated integration review and refresh run closeout."""
         self._reset_binding_cache()
         snapshot = load_snapshot(self.paths, run_id)
         self._require_snapshot_authorization(snapshot)
+        self._reconcile_unapplied_events(snapshot)
+        if any(node.get("business_barrier", {}).get("status") == "invalidated"
+               for node in snapshot.nodes.values()):
+            raise PermissionError("business acceptance invalidated before integration review")
         self._validate_execution_topology(snapshot)
         if any(node.get("workspace_reconciliation_required") is True for node in snapshot.nodes.values()):
             raise PermissionError("workspace reconciliation required before integration evidence")
@@ -3132,6 +3417,7 @@ class Monitor:
         except (OSError, ValueError, TypeError):
             pass
 
+    @_run_transaction
     def reconcile_evidence(self, run_id: str, package: Dict[str, Any]) -> RunSnapshot:
         """Promote a verified, same-run evidence package through normal events.
 
@@ -3492,7 +3778,12 @@ class Monitor:
                 # unregistered-handle blocked_unknown again.
                 continue
             try:
-                events = runner.poll(RunHandle(handle_id))
+                receipt_owner = getattr(runner, "receipt_owner", None)
+                if receipt_owner is not None:
+                    with receipt_owner(snapshot._dispatch_owner):
+                        events = runner.poll(RunHandle(handle_id))
+                else:
+                    events = runner.poll(RunHandle(handle_id))
             except Exception as error:
                 reason = "runner poll failed ({})".format(type(error).__name__)
                 if classify_provider_failure({"reason": reason}).get("legacy_kind") == "engineering":
@@ -3874,7 +4165,13 @@ class Monitor:
             "issue_contract_digest": executable_contract_digest([node]),
         }
 
-    def _require_snapshot_authorization(self, snapshot: RunSnapshot) -> AuthorizationRecord:
+    def _require_snapshot_authorization(self, snapshot: RunSnapshot, *, recover_transition=True) -> AuthorizationRecord:
+        recovery_fence = self.paths.resolve_vibe_path(
+            Path("plans") / snapshot.plan_id / ".initial-recovery-pending.json")
+        if recovery_fence.exists() or recovery_fence.is_symlink():
+            raise PermissionError("initial run recovery is blocked_unknown: interrupted recovery")
+        if not hasattr(snapshot, "_dispatch_owner"):
+            snapshot._dispatch_owner = self._current_dispatch_owner(snapshot.run_id)
         record = self._snapshot_record(snapshot)
         if snapshot.plan_id != self.plan.plan_id or snapshot.plan_version != self.plan.version:
             raise PermissionError("snapshot plan no longer matches monitor plan")
@@ -3882,8 +4179,74 @@ class Monitor:
             raise PermissionError("snapshot authorization digest is inconsistent")
         if snapshot.node_contract_digest != record.node_contract_digest:
             raise PermissionError("snapshot contract digest is inconsistent")
-        self._require_record(record)
+        try:
+            self._require_record(record)
+        except PermissionError:
+            if not recover_transition:
+                raise
+            # Only a durable, integrity-checked same-run authorization
+            # transition can move an old snapshot onto the current contract.
+            from .authorization import is_authorization_integrity_valid
+            pending = load_events(self.paths, snapshot.run_id)[snapshot.event_sequence:]
+            transitions = [row for row in pending if row["event"] == "authorization_reauthorized"]
+            if not is_authorization_integrity_valid(record) or len(transitions) != 1:
+                raise
+            transition = transitions[0]
+            data, provenance = transition["data"], transition["provenance"]
+            replacement = AuthorizationRecord.from_dict(data.get("new_authorization"))
+            if "proof" in data:
+                from .supervisor import SupervisorLease, _read_lease_record
+                lease = SupervisorLease(self.paths)
+                with lease.lock(snapshot.run_id):
+                    owner = _read_lease_record(lease.path(snapshot.run_id))
+                    owner = ({key: owner.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                             if owner is not None else None)
+                    if data["proof"].get("owner") != owner or (owner or {}).get("released") is True:
+                        raise PermissionError("pending reauthorization owner changed")
+            if (provenance.get("role") != "system"
+                    or provenance.get("authorization_digest") != record.digest
+                    or provenance.get("node_contract_digest") != record.node_contract_digest
+                    or data.get("run_id") != snapshot.run_id
+                    or AuthorizationRecord.from_dict(data.get("previous_authorization")).to_dict() != record.to_dict()):
+                raise PermissionError("pending reauthorization lineage changed")
+            self._require_record(replacement)
+            self._reconcile_unapplied_events(snapshot)
+            record = self._snapshot_record(snapshot)
+            self._require_record(record)
         return record
+
+    def _current_dispatch_owner(self, run_id):
+        from .supervisor import SupervisorLease, _read_lease_record
+        record = _read_lease_record(SupervisorLease(self.paths).path(run_id))
+        return ({key: record.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                if record is not None else None)
+
+    def _check_dispatch_owner(self, run_id, expected):
+        owner = self._current_dispatch_owner(run_id)
+        if owner != expected or (owner or {}).get("released") is True:
+            raise PermissionError("dispatch supervisor owner changed")
+
+    def _validate_pending_transition_owner(self, snapshot, data):
+        from .protocol_adoption import effective_responsibility
+        from .supervisor import SupervisorLease, _read_lease_record
+        proof = data.get("proof")
+        if not isinstance(proof, dict) or "owner" not in proof:
+            if effective_responsibility(self.paths, snapshot).get("status") == "effective":
+                raise PermissionError("pending reauthorization owner proof missing")
+            return  # Explicit legacy-only compatibility.
+        lease = SupervisorLease(self.paths)
+        with lease.lock(snapshot.run_id):
+            self._check_dispatch_owner(snapshot.run_id, proof["owner"])
+
+    def _commit_reauthorization_transition(self, snapshot, data, sequence=None):
+        from .supervisor import SupervisorLease
+        with SupervisorLease(self.paths).lock(snapshot.run_id):
+            if isinstance(data.get("proof"), dict) and "owner" in data["proof"]:
+                self._check_dispatch_owner(snapshot.run_id, data["proof"]["owner"])
+            self._apply_reauthorization_transition(snapshot, data)
+            if sequence is not None:
+                snapshot.event_sequence = sequence
+            self._save_snapshot(snapshot)
 
     def _apply_reauthorization_transition(
         self, snapshot: RunSnapshot, data: Dict[str, Any]
@@ -4437,12 +4800,25 @@ class Monitor:
             or authorization_epoch != snapshot.authorization_digest
         ):
             raise ValueError("unapplied acceptance contract epoch is stale")
+        archived = ProviderActionStore(self.paths).archived_payload(
+            snapshot.run_id, node_id, session_role, generation)
+        failure = self._business_acceptance_failure(snapshot, node_id, data)
+        if blocked_self_report_fields(archived) or blocked_self_report_fields(data):
+            failure = "worker self-reported a blocked engineering state"
+        if failure:
+            current["business_acceptance_pending"] = failure
+            current["acceptance"] = None
+            current["status"] = "blocked_unknown"
+            current["reason"] = failure
+            return
         self._set_binding_status(snapshot, node_id, "developer", "accepted")
         current["status"] = "accepted"
         current["acceptance"] = {
             "contract_digest": contract_digest,
             "authorization_epoch": authorization_epoch,
         }
+        if isinstance(data.get("business_acceptance"), dict):
+            current["business_acceptance"] = copy.deepcopy(data["business_acceptance"])
         # Match the live path: a replayed acceptance must not resurrect the
         # rejection text the lost snapshot still carried -- nor the #255
         # consecutive-rejection counter or the escalation recovery action the
@@ -4704,7 +5080,7 @@ class Monitor:
                     or action.get("issue_id") != node_id or action.get("role") != role
                     or action.get("generation") != generation
                     or action.get("provider") != provider
-                    or action.get("operation") not in {"create", "locate", "visibility"}):
+                    or action.get("operation") not in {"create", "locate", "visibility", "wait"}):
                 return False
             created_action = store.related_action(action, "create")
             # `authorization_digest` is deliberately not compared: `monitor
@@ -4772,6 +5148,8 @@ class Monitor:
         recover_missing_reviewer: bool = False,
     ) -> None:
         record = self._require_snapshot_authorization(snapshot)
+        self._reconcile_model_retirements(snapshot)
+        self._require_retirement_committed(snapshot)
         self._validate_execution_topology(snapshot)
         # V4.6: capacity counts active *worker sessions* (one visible-sdd
         # session or one dev/reviewer pair slot per occupied node), not
@@ -4799,6 +5177,8 @@ class Monitor:
         capacity_held = snapshot.run_id in self.__dict__.get("_capacity_hold", {})
         for node_id, node in self.nodes.items():
             current = snapshot.nodes[node_id]
+            if current.get("business_barrier", {}).get("status") == "invalidated":
+                continue
             was_active_session = not current.get("pair_archived") and (
                 int(current.get("developer_generation", 0)) > 0
                 or current.get("retryable_action") is not None
@@ -4963,8 +5343,18 @@ class Monitor:
                 ) and not reviewer_recovery:
                     continue
                 retry_role = str(retry["role"])
+                if not retry.get("successor") and not self._handoff_delivery_writer(snapshot, node_id, retry_role):
+                    continue
+                if not self._verify_retirement_dispatch(snapshot, node_id, retry, runner):
+                    continue
                 retry_generation = int(current.get("review_generation" if retry_role == "reviewer" else "developer_generation", 0)) + 1
                 retry_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, retry_role, retry_generation, current))
+                if retry.get("same_task") and (current.get("start_intent") or {}).get("role") == retry_role:
+                    from .state import retirement_writer_lease
+                    held = retirement_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id)
+                    retry_generation = current["start_intent"]["generation"]
+                    if held and held["record"].get("role") == retry_role and held["record"].get("generation") == retry_generation:
+                        retry_digest = held["record"]["intent_digest"]
                 if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, retry_role, retry_generation, retry_digest, runner):
                     self._mark_blocked_unknown(
                         snapshot,
@@ -5014,6 +5404,8 @@ class Monitor:
                     )
                     continue
                 retry_role = "reviewer"
+                if not self._handoff_delivery_writer(snapshot, node_id):
+                    continue
                 retry_generation = int(current.get("review_generation", 0)) + 1
                 retry_digest = str((current.get("start_intent") or {}).get("intent_digest") or self._prospective_intent_digest(snapshot, node_id, retry_role, retry_generation, current))
                 if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id, retry_digest, retry_role, retry_generation) and not self._adopt_unserved_handoff_lease(snapshot, node_id, retry_role, retry_generation, retry_digest, runner):
@@ -5130,7 +5522,8 @@ class Monitor:
             for event in load_events(self.paths, snapshot.run_id)[: snapshot.event_sequence]
         ):
             return False
-        return store.claim_evidence(snapshot.run_id, node_id) is None
+        evidence = store.claim_evidence(snapshot.run_id, node_id)
+        return evidence in {None, "controlled_pending_create", "controlled_stale_create"}
 
     def _handoff_replaced_authorizations(self, snapshot: RunSnapshot) -> List[str]:
         """Every authorization digest an unbroken chain of platform_handoff
@@ -5196,10 +5589,15 @@ class Monitor:
             # carries: never hide a request of the provider now dispatching
             # (a runner without a provider keeps the digest-only rule).
             provider = getattr(runner, "provider", None)
+            slots = store.unresolved_create_slots(
+                snapshot.run_id, node_id, replaced,
+                provider if isinstance(provider, str) and provider else None)
             superseded = store.supersede_unclaimed_creates(
                 snapshot.run_id, node_id, role, generation, replaced,
                 provider if isinstance(provider, str) and provider else None,
             )
+            if slots and not superseded:
+                return False
             if not rebind_writer_lease(
                 self.paths, node_id, str(current["worktree"]), snapshot.run_id,
                 role, generation, None, digest, previous_status="active",
@@ -5805,6 +6203,197 @@ class Monitor:
         node.  The durable status vocabulary is unchanged: ``state.py``
         knows no new node status.
         """
+        from .supervisor import SupervisorLease, SupervisorLeaseConflict
+        from .state import _lease_lock, retirement_writer_lease
+        with SupervisorLease(self.paths).lock(snapshot.run_id), interprocess_lock(_lease_lock(self.paths)):
+            self._guard_lease(snapshot.run_id)
+            try:
+                self._check_dispatch_owner(snapshot.run_id, snapshot._dispatch_owner)
+            except PermissionError as error:
+                raise SupervisorLeaseConflict(str(error)) from error
+            intent = current.get("start_intent") or {}
+            writer = retirement_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id)
+            if writer is None or intent.get("role") != role or any(
+                writer["record"].get(key) != intent.get(key)
+                for key in ("role", "generation", "intent_digest")
+            ):
+                raise SupervisorLeaseConflict("model fallback writer differs from failed start intent")
+            if node_id in snapshot.handles or any(
+                action.get("issue_id") == node_id
+                for action in ProviderActionStore(self.paths).pending(snapshot.run_id)
+            ):
+                raise SupervisorLeaseConflict("model fallback provider action is still pending")
+            active = current.get("active_task") or {}
+            if active and (active.get("handle_id") or any(
+                active.get(key) != intent.get(key) for key in ("role", "generation", "task_id")
+            )):
+                raise SupervisorLeaseConflict("model fallback active writer changed")
+            projected = copy.deepcopy(current)
+            self._project_model_unavailable(snapshot, node_id, projected, role, phase, continuation)
+            from .state import durable_projection
+            transaction = {"run_id": snapshot.run_id, "node_id": node_id,
+                "owner": snapshot._dispatch_owner, "writer": writer, "intent": intent,
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+                "projection": durable_projection(projected)}
+            transaction["digest"] = digests.canonical_json_digest(transaction)
+            directory = run_dir(self.paths, snapshot.run_id) / "model-retirements"
+            if directory.is_symlink():
+                raise PermissionError("unsafe model retirement directory")
+            directory.mkdir(exist_ok=True)
+            path = directory / (intent["intent_digest"] + ".json")
+            store = ProviderActionStore(self.paths)
+            if path.exists():
+                raise SupervisorLeaseConflict("model retirement already prepared")
+            store._atomic(path, {"phase": "prepared", "intent": transaction})
+            self._commit_model_retirement(snapshot, path, transaction)
+
+    def _commit_model_retirement(self, snapshot, path, transaction):
+        """Caller holds owner and writer fences; prepared intent bridges crashes."""
+        from .state import retirement_writer_lease
+        from .supervisor import SupervisorLeaseConflict
+        node_id = transaction["node_id"]
+        current = snapshot.nodes[node_id]
+        self._guard_lease(snapshot.run_id)
+        self._check_dispatch_owner(snapshot.run_id, transaction["owner"])
+        if (transaction["authorization_digest"] != snapshot.authorization_digest
+                or transaction["node_contract_digest"] != snapshot.node_contract_digest
+                or transaction["run_id"] != snapshot.run_id):
+            raise SupervisorLeaseConflict("model retirement lineage changed")
+        old = transaction["intent"]
+        active = current.get("active_task") or {}
+        if ((current.get("start_intent") not in (None, old))
+                or node_id in snapshot.handles
+                or active.get("handle_id")
+                or (active and any(active.get(k) != old.get(k) for k in ("role", "generation", "task_id")))
+                or current.get("active_role") not in (None, old["role"])
+                or any(a.get("issue_id") == node_id for a in ProviderActionStore(self.paths).pending(snapshot.run_id))):
+            raise SupervisorLeaseConflict("model retirement has pending or changed writer")
+        writer = transaction["writer"]
+        found = retirement_writer_lease(self.paths, node_id, writer["record"]["worktree"], snapshot.run_id)
+        if found not in (None, writer):
+            raise SupervisorLeaseConflict("model retirement writer changed")
+        if any(current.get(k) != transaction["projection"].get(k)
+               for k in ("worktree", "developer_generation", "review_generation")):
+            raise SupervisorLeaseConflict("model retirement generation changed")
+        current.clear()
+        current.update(copy.deepcopy(transaction["projection"]))
+        self._save_snapshot(snapshot)
+        self._check_dispatch_owner(snapshot.run_id, transaction["owner"])
+        if found is not None and not release_writer_lease(self.paths, node_id, writer["record"]["worktree"],
+                snapshot.run_id, expected=writer, _locked=True):
+            raise SupervisorLeaseConflict("model retirement release CAS failed")
+        if current.get("model_unavailable_rounds", 0) >= self._MODEL_UNAVAILABLE_MAX_ROUNDS:
+            parked = [e for e in load_events(self.paths, snapshot.run_id)
+                if e["event"] == "model_unavailable_parked"
+                and e["data"].get("node_id") == node_id
+                and e["data"].get("proof", {}).get("rounds") == current["model_unavailable_rounds"]]
+            if not parked:
+                self._record(snapshot, "model_unavailable_parked", {"run_id": snapshot.run_id,
+                    "node_id": node_id, "role": old["role"],
+                    "proof": copy.deepcopy(current["model_unavailable"])})
+        events = [e for e in load_events(self.paths, snapshot.run_id)
+            if e["event"] == "model_writer_retired" and e["data"].get("proof", {}).get("digest") == transaction["digest"]]
+        if not events:
+            self._record(snapshot, "model_writer_retired", {"run_id": snapshot.run_id,
+                "node_id": node_id, "proof": {"digest": transaction["digest"]}})
+        elif len(events) != 1:
+            raise SupervisorLeaseConflict("model retirement event ambiguous")
+        ProviderActionStore(self.paths)._atomic(path, {"phase": "committed", "intent": transaction})
+        self._save_snapshot(snapshot)
+
+    def _reconcile_model_retirements(self, snapshot):
+        from .supervisor import SupervisorLease
+        from .state import _lease_lock, retirement_writer_lease
+        directory = run_dir(self.paths, snapshot.run_id) / "model-retirements"
+        if directory.is_symlink():
+            raise PermissionError("unsafe model retirement directory")
+        with SupervisorLease(self.paths).lock(snapshot.run_id), interprocess_lock(_lease_lock(self.paths)):
+            for path in sorted(directory.glob("*.json")):
+                saved = ProviderActionStore._read(path)
+                transaction = saved.get("intent") or {}
+                body = {k: v for k, v in transaction.items() if k != "digest"}
+                if (saved.get("phase") not in {"prepared", "committed"}
+                        or transaction.get("digest") != digests.canonical_json_digest(body)
+                        or path.name != str((transaction.get("intent") or {}).get("intent_digest")) + ".json"):
+                    raise PermissionError("model retirement integrity changed")
+                if saved["phase"] == "prepared":
+                    self._commit_model_retirement(snapshot, path, transaction)
+                else:
+                    # A committed retirement may have reached durable disk
+                    # after its final snapshot.  Before scheduling, reconcile
+                    # every active lease on this node/worktree: only a lease
+                    # explicitly represented by the snapshot's active task
+                    # can be the intended next writer.  A different role,
+                    # generation, run or intent is an unresolved cross-file
+                    # commit and must fail closed without calling start.
+                    node_id = transaction["node_id"]
+                    worktree = transaction["writer"]["record"]["worktree"]
+                    active = snapshot.nodes[node_id].get("active_task") or {}
+                    held = retirement_writer_lease(self.paths, node_id, worktree, snapshot.run_id)
+                    leases = [held["record"]] if held is not None else []
+                    for lease in leases:
+                        pending = snapshot.nodes[node_id].get("start_intent") or {}
+                        represented = (
+                            lease.get("run_id") == snapshot.run_id
+                            and all(lease.get(k) == pending.get(k)
+                                    for k in ("role", "generation", "intent_digest"))
+                            and (not active or all(active.get(k) == pending.get(k)
+                                    for k in ("role", "generation", "task_id")))
+                        )
+                        if (not represented and active.get("handle_id")
+                                and snapshot.handles.get(node_id) == active["handle_id"]
+                                and lease.get("run_id") == snapshot.run_id
+                                and lease.get("role") == active.get("role")
+                                and lease.get("generation") == active.get("generation")):
+                            # Confirmation clears start_intent. Recover its
+                            # exact digest from the durable dispatch, not from
+                            # a role/generation resemblance alone.
+                            for dispatch_path in (run_dir(self.paths, snapshot.run_id) / "start-dispatches").glob("*.json"):
+                                dispatch = ProviderActionStore._read(dispatch_path)
+                                intent = dispatch.get("intent") or {}
+                                if (dispatch.get("digest") == digests.canonical_json_digest(
+                                        {k: v for k, v in dispatch.items() if k != "digest"})
+                                        and dispatch.get("run_id") == snapshot.run_id
+                                        and dispatch.get("node_id") == node_id
+                                        and dispatch.get("authorization_digest") == snapshot.authorization_digest
+                                        and dispatch.get("node_contract_digest") == snapshot.node_contract_digest
+                                        and intent.get("task_id") == active.get("task_id")
+                                        and all(intent.get(k) == lease.get(k)
+                                                for k in ("role", "generation", "intent_digest"))):
+                                    represented = True
+                        if not represented:
+                            # A durable role transfer can precede its final
+                            # snapshot. Validate its exact source or target
+                            # lease before letting the existing handoff
+                            # recovery complete it; resemblance is insufficient.
+                            for handoff_path in (run_dir(self.paths, snapshot.run_id) / "writer-handoffs").glob("*.json"):
+                                handoff = ProviderActionStore._read(handoff_path)
+                                intent = handoff.get("intent") or {}
+                                source_role = "developer" if intent.get("role") == "reviewer" else "reviewer"
+                                source = intent.get(source_role) or {}
+                                binding = load_task_binding(self.paths, node_id, source_role, run_id=snapshot.run_id)
+                                source_matches = held == intent.get("writer_lease")
+                                target_matches = all(lease.get(k) == intent.get(k)
+                                    for k in ("role", "generation", "intent_digest"))
+                                if (handoff.get("phase") in {"prepared", "committed"}
+                                        and not active.get("handle_id")
+                                        and intent.get("generation", 0) > snapshot.nodes[node_id].get(
+                                            "review_generation" if intent.get("role") == "reviewer" else "developer_generation", 0)
+                                        and intent.get("digest") == digests.canonical_json_digest(
+                                            {k: v for k, v in intent.items() if k != "digest"})
+                                        and intent.get("run_id") == snapshot.run_id
+                                        and intent.get("node_id") == node_id
+                                        and intent.get("authorization_digest") == snapshot.authorization_digest
+                                        and intent.get("node_contract_digest") == snapshot.node_contract_digest
+                                        and source == binding.to_dict()
+                                        and (source_matches or target_matches)):
+                                    self._check_dispatch_owner(snapshot.run_id, intent.get("owner"))
+                                    represented = True
+                        if not represented:
+                            raise PermissionError("committed model retirement has an unrepresented active writer")
+
+    def _project_model_unavailable(self, snapshot, node_id, current, role, phase, continuation):
         attempts = [
             item for item in (current.get("model_dispatch_attempts") or [])
             if isinstance(item, dict)
@@ -5830,19 +6419,6 @@ class Monitor:
         current["start_intent"] = None
         if rounds >= self._MODEL_UNAVAILABLE_MAX_ROUNDS:
             current["retryable_action"] = None
-            self._record(
-                snapshot,
-                "model_unavailable_parked",
-                {
-                    "run_id": snapshot.run_id,
-                    "node_id": node_id,
-                    "role": role,
-                    "proof": {
-                        "rounds": rounds,
-                        "attempts": list(attempts),
-                    },
-                },
-            )
             return
         saved = current.get("model_dispatch_chain_profile")
         if isinstance(saved, dict):
@@ -5899,11 +6475,22 @@ class Monitor:
             return
         try:
             tier = self._effective_model_tier(node, current, role)
+            from .authorization import node_adapter_id
+            adapter_id = str(contract.get("adapter_id") or node_adapter_id(node))
             choice = model_catalog.resolve(
-                str(contract.get("adapter_id") or node.contract.get("adapter_id") or ""),
+                adapter_id,
                 tier,
                 vibe_home=model_catalog.vibe_home_path(),
             )
+        except model_catalog.ModelMapConfigError as error:
+            current["status"] = "blocked_unknown"
+            current["reason"] = "invalid model_map: " + str(error)
+            current["recovery_action"] = "reconcile_model_route"
+            self._record(snapshot, "model_route_blocked", {
+                "run_id": snapshot.run_id, "node_id": node.id, "role": role,
+                "reason_code": "model_map_invalid", "error_type": type(error).__name__,
+            })
+            return
         except (model_catalog.TierError, ValueError, TypeError):
             return
         if choice.status != "ok":
@@ -6111,6 +6698,15 @@ class Monitor:
         the same task identity retryable, rewind the speculative generation,
         and release that lease before the next heartbeat.
         """
+        from .supervisor import SupervisorLease
+        with SupervisorLease(self.paths).lock(snapshot.run_id):
+            if hasattr(snapshot, "_dispatch_owner"):
+                self._check_dispatch_owner(snapshot.run_id, snapshot._dispatch_owner)
+            return self._preflight_contract_failure_owned(snapshot, node_id, role, phase,
+                continuation, generation, generation_key, error, failure_phase, successor)
+
+    def _preflight_contract_failure_owned(self, snapshot, node_id, role, phase,
+            continuation, generation, generation_key, error, failure_phase, successor=False):
         current = snapshot.nodes[node_id]
         current[generation_key] = max(0, generation - 1)
         current["active_task"] = None
@@ -6223,6 +6819,9 @@ class Monitor:
         """
         current = snapshot.nodes[node_id]
         track = role == "reviewer" and is_integration_review_node(self.nodes[node_id])
+        self._require_retirement_committed(snapshot)
+        if not successor and not self._handoff_delivery_writer(snapshot, node_id, role):
+            return False
         heads = self._reviewed_commit_set(snapshot, node_id) if track else None
         if (heads is not None and current.get("integration_findings")
                 and current.get("reviewed_commit_set") == heads):
@@ -6235,8 +6834,11 @@ class Monitor:
                     "commits": ["{}:{}".format(key, value) for key, value in sorted(heads.items())],
                 })
             return False
-        started = self._start_task_dispatch(
-            snapshot, node_id, role, phase, runner, continuation, successor)
+        from .task_registry import protected_retirement
+        with protected_retirement(self._protected_retirement_validator(snapshot, node_id, role, runner)
+                                  if successor else None):
+            started = self._start_task_dispatch(
+                snapshot, node_id, role, phase, runner, continuation, successor)
         if track and started and heads is not None:
             current["reviewed_commit_set"] = heads
             current["waiting_for_rework"] = False
@@ -6254,6 +6856,7 @@ class Monitor:
         continuation: bool,
         successor: bool = False,
     ) -> bool:
+        from .supervisor import SupervisorLeaseConflict
         record = self._require_snapshot_authorization(snapshot)
         node = self.nodes[node_id]
         current = snapshot.nodes[node_id]
@@ -6473,6 +7076,8 @@ class Monitor:
             if routing_requested:
                 contract["routing_required"] = True
         self._apply_model_tier(snapshot, node, contract, current, role)
+        if current.get("recovery_action") == "reconcile_model_route":
+            return False
         if binding_contract_enabled(contract):
             has_live_evidence = isinstance(contract.get("binding_intent"), BindingIntent) and isinstance(
                 contract.get("binding_observation"), BindingObservation
@@ -6522,37 +7127,52 @@ class Monitor:
                     snapshot, node_id, role, phase, continuation, generation,
                     generation_key, error, "runtime_contract", successor_recovery,
                 )
-            if self._binding_recovery_requested(contract):
-                self._preflight_binding_recovery(
-                    snapshot, node_id, role, contract, current
+            from .supervisor import SupervisorLease
+            with SupervisorLease(self.paths).lock(snapshot.run_id):
+                self._check_dispatch_owner(snapshot.run_id, snapshot._dispatch_owner)
+                if binding_contract_enabled(contract) and not continuation and not successor:
+                    from .supervisor import verified_initial_owner
+                    verified_initial_owner(self.paths, snapshot.run_id, snapshot._dispatch_owner)
+                    if current.get("reason_code") == "initial_supervisor_registration_required":
+                        current.pop("reason_code", None)
+                        current.pop("reason", None)
+                if self._binding_recovery_requested(contract):
+                    self._preflight_binding_recovery(
+                        snapshot, node_id, role, contract, current
+                    )
+                else:
+                    self._preflight_binding_before_provider(contract)
+                self._run_binding_bootstrap(snapshot, node_id, role, contract, runner, current)
+                binding = self._binding_for(
+                    snapshot,
+                    node_id,
+                    role,
+                    identity,
+                    generation,
+                    "start_pending",
+                    runner,
+                    contract,
+                    continuation,
+                    successor,
                 )
-            else:
-                self._preflight_binding_before_provider(contract)
-            self._run_binding_bootstrap(snapshot, node_id, role, contract, runner, current)
-            binding = self._binding_for(
-                snapshot,
-                node_id,
-                role,
-                identity,
-                generation,
-                "start_pending",
-                runner,
-                contract,
-                continuation,
-                successor,
-            )
-            self._require_binding_gate(contract, binding, runner)
-            if binding_contract_enabled(contract):
-                # Registry persistence intentionally strips private provenance
-                # tokens.  Carry the live, verified objects through this
-                # in-process call so ProviderActionRunner.start() rechecks the
-                # same evidence instead of trusting a downgraded JSON row.
-                contract["binding_intent"] = binding.binding_intent
-                contract["binding_observation"] = binding.binding_observation
+                if successor and binding_contract_enabled(contract):
+                    contract["provider_task_id"] = binding.task_id
+                    contract["binding_intent"] = binding.binding_intent
+                    contract["binding_observation"] = binding.binding_observation
+                self._require_binding_gate(contract, binding, runner)
+                if binding_contract_enabled(contract):
+                    # Registry persistence intentionally strips private provenance
+                    # tokens.  Carry the live, verified objects through this
+                    # in-process call so ProviderActionRunner.start() rechecks the
+                    # same evidence instead of trusting a downgraded JSON row.
+                    contract["binding_intent"] = binding.binding_intent
+                    contract["binding_observation"] = binding.binding_observation
             identity = str(binding.task_id)
             current[identity_key] = identity
             contract["task_id"] = identity
-            self._save_task_binding(binding)
+            with SupervisorLease(self.paths).lock(snapshot.run_id):
+                self._check_dispatch_owner(snapshot.run_id, snapshot._dispatch_owner)
+                self._save_task_binding(binding)
         except ProviderPending as error:
             # Only a durable, bound successor action permits retrying the
             # same create transaction. An unbound exception still fails
@@ -6592,6 +7212,7 @@ class Monitor:
                     "pending_provider_action": action_id,
                     "request_digest": getattr(error, "request_digest"),
                     "predecessor_task_id": contract.get("predecessor_task_id"),
+                    "retirement_digest": retry.get("retirement_digest") if isinstance(retry, dict) else None,
                 })
             if setup_identity:
                 current["retryable_action"]["setup_identity"] = str(setup_identity)
@@ -6739,6 +7360,18 @@ class Monitor:
             current["active_task"],
         )
         # The intent and lease are durable before the external side effect.
+        dispatch_path = run_dir(self.paths, snapshot.run_id) / "start-dispatches" / (intent["intent_id"] + ".json")
+        dispatch_store = ProviderActionStore(self.paths)
+        dispatch_path.parent.mkdir(exist_ok=True)
+        if not dispatch_path.exists():
+            from .supervisor import SupervisorLease, _read_lease_record
+            dispatch = {"phase": "prepared", "intent": intent,
+                "run_id": snapshot.run_id, "node_id": node_id,
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+                "owner": snapshot._dispatch_owner}
+            dispatch["digest"] = digests.canonical_json_digest(dispatch)
+            dispatch_store._atomic(dispatch_path, dispatch)
         self._save_snapshot(snapshot)
         # ISSUE-140 (expected_red): a TDD node must observe its invariant
         # commands failing before the first developer dispatch.  The flag is
@@ -6774,7 +7407,20 @@ class Monitor:
             # All starts pass through the intent transaction.  V4.4 providers
             # must return a structured proof; legacy runners retain RunHandle
             # compatibility until their contract opts into 4.4.
-            handle = self._dispatch_with_intent(runner, contract, intent)
+            dispatch = dispatch_store._read(dispatch_path)
+            dispatch["phase"] = "sending"
+            dispatch.pop("digest", None)
+            dispatch["digest"] = digests.canonical_json_digest(dispatch)
+            dispatch_store._atomic(dispatch_path.with_suffix(".sending"), dispatch)
+            dispatch_store._atomic(dispatch_path, dispatch)
+            from .supervisor import SupervisorLease, SupervisorLeaseConflict
+            with SupervisorLease(self.paths).lock(snapshot.run_id):
+                self._check_dispatch_owner(snapshot.run_id, dispatch["owner"])
+                self._check_dispatch_owner(snapshot.run_id, snapshot._dispatch_owner)
+                from .task_registry import protected_writer_fence
+                with protected_writer_fence():
+                    self._require_binding_gate(contract, binding, runner)
+                    handle = self._dispatch_with_intent(runner, contract, intent)
             if isinstance(handle, dict) and handle.get("kind") in {"binding_unknown", "provider_error", "retryable", "capacity_wait", "repairable", "contract_error"}:
                 reason = handle.get("reason", handle.get("kind"))
                 failure_kind = handle.get("reason_class")
@@ -6865,7 +7511,7 @@ class Monitor:
                     self._record(snapshot, handle.get("kind", "binding_unknown"), unknown_event)
                 current["active_task"] = None
                 current["active_role"] = None
-                current["start_intent"] = None
+                current["start_intent"] = (intent if failure["kind"] in {"retryable", "capacity_wait", "repairable"} else None)
                 self._save_snapshot(snapshot)
                 return False
             if isinstance(handle, dict):
@@ -6968,6 +7614,10 @@ class Monitor:
                 )
                 self._save_snapshot(snapshot)
                 return False
+            raise
+        except SupervisorLeaseConflict:
+            # Ownership/CAS refusal is not an unknown provider start.  Leave
+            # the current writer intact for the owner that now holds it.
             raise
         except Exception as error:
             if successor:
@@ -7642,7 +8292,9 @@ class Monitor:
             record["escalated"] = True
         role = active.get("role") if isinstance(active, dict) else None
         stopped = False
-        if role == "reviewer":
+        from .protocol_adoption import effective_responsibility
+        r4_effective = effective_responsibility(self.paths, snapshot).get("status") == "effective"
+        if role == "reviewer" and not r4_effective:
             # Only a *proven* stop may make the retired reviewer terminal: a
             # visible successor is registered over a stopped/failed/archived
             # predecessor (``provider_action.task_binding`` and
@@ -7659,9 +8311,17 @@ class Monitor:
             # while this escalation already parked it as documented.
             if runner is not None and isinstance(handle_id, str) and handle_id:
                 try:
-                    runner.stop(RunHandle(handle_id))
-                    self._set_binding_status(snapshot, node_id, "reviewer", "stopped")
-                    stopped = True
+                    from .supervisor import SupervisorLease
+                    with SupervisorLease(self.paths).lock(snapshot.run_id):
+                        self._check_dispatch_owner(snapshot.run_id, snapshot._dispatch_owner)
+                        receipt_owner = getattr(runner, "receipt_owner", None)
+                        if receipt_owner is not None:
+                            with receipt_owner(snapshot._dispatch_owner, lock_held=True):
+                                runner.stop(RunHandle(handle_id))
+                        else:
+                            runner.stop(RunHandle(handle_id))
+                        self._set_binding_status(snapshot, node_id, "reviewer", "stopped")
+                        stopped = True
                 except Exception:
                     stopped = False
         if role in {"developer", "reviewer"} and not stopped:
@@ -7733,6 +8393,21 @@ class Monitor:
             self._mark_blocked_unknown(
                 snapshot, node_id, "event provenance conflicts with the registered task"
             )
+            return
+        barrier = current.get("business_barrier")
+        if isinstance(barrier, dict) and barrier.get("status") == "invalidated":
+            # Keep native/worker facts, but do not turn them into effective
+            # delivery, review clearance or a successor dispatch.
+            observed = {"event": event.event, "data": copy.deepcopy(event.data),
+                        "barrier_id": barrier["id"], "task_id": active.get("task_id"),
+                        "generation": active.get("generation")}
+            bucket = current.setdefault("quarantined_business_results", [])
+            if observed not in bucket:
+                self._record(snapshot, "business_result_quarantined", {
+                    "run_id": snapshot.run_id, "node_id": node_id,
+                    "business_result": observed,
+                }, active)
+                bucket.append(observed)
             return
 
         if current.get("workspace_reconciliation_required") is True:
@@ -7889,16 +8564,13 @@ class Monitor:
             # without an auto-retry marker claiming the block self-heals.
             self._park_blocked_engineering(snapshot, node_id, role, event, active, handle_id)
             return
-        if event.event in {"delivered", "complete"}:
-            delivery = event.data.get("delivery_evidence")
+        if event.event in {"delivered", "complete", "accepted"}:
             store_paths = getattr(self, "paths", None)
             archived = (ProviderActionStore(store_paths).archived_payload(
                 snapshot.run_id, node_id, role, active.get("generation")
             ) if store_paths is not None and isinstance(active, dict) else None)
-            blocked_fields = blocked_self_report_fields(
-                archived if archived is not None
-                else (event.data if isinstance(event.data, dict) else {})
-            )
+            blocked_fields = (blocked_self_report_fields(archived)
+                              or blocked_self_report_fields(event.data))
             if blocked_fields:
                 # Defense in depth behind the worker-deliver shape gate: a
                 # blocked self-report that still reached a delivery event
@@ -7908,6 +8580,8 @@ class Monitor:
                 # vocabulary and would hide the blocked fields.
                 self._park_blocked_engineering(snapshot, node_id, role, event, active, handle_id)
                 return
+        if event.event in {"delivered", "complete"}:
+            delivery = event.data.get("delivery_evidence")
             if snapshot.execution_engine == "vibeguide_monitor":
                 binding = self._load_task_binding(snapshot, node_id, role)
                 background_receipt = self._background_receipt(
@@ -8374,6 +9048,14 @@ class Monitor:
                     snapshot, node_id, "acceptance did not come from the reviewer"
                 )
                 return
+            failure = self._business_acceptance_failure(snapshot, node_id, event.data)
+            if failure:
+                current["business_acceptance_pending"] = failure
+                current["reason"] = failure
+                self._record(snapshot, "business_acceptance_pending", {
+                    "run_id": snapshot.run_id, "node_id": node_id, "reason": failure,
+                }, active)
+                return
             try:
                 registered = self._load_task_binding(snapshot, node_id, "reviewer")
             except (FileNotFoundError, OSError, TypeError, ValueError) as error:
@@ -8495,6 +9177,8 @@ class Monitor:
                 )
                 return
             current["status"] = "accepted"
+            if isinstance(event.data.get("business_acceptance"), dict):
+                current["business_acceptance"] = copy.deepcopy(event.data["business_acceptance"])
             current["acceptance"] = {
                 "contract_digest": current["contract_digest"],
                 "authorization_epoch": snapshot.authorization_digest,
@@ -8651,6 +9335,16 @@ class Monitor:
         """
         current = snapshot.nodes[node_id]
         code = str(event.data["reason_code"])
+        from .protocol_adoption import effective_responsibility
+        if effective_responsibility(self.paths, snapshot).get("status") == "effective":
+            # A transport rejection is neither a completed recovery attempt
+            # nor proof that the original step cannot be recovered. Preserve
+            # the task/handle for the current supervisor's reconciliation.
+            self._mark_blocked_unknown(
+                snapshot, node_id,
+                "provider request rejected; reconcile original task recovery before replacement",
+                quarantine_lease=False, retryable_same_task=False, reason_code=code)
+            return
         previous = current.get("transient_failure")
         count = int(previous.get("count", 0)) + 1 if (
             isinstance(previous, dict) and previous.get("reason_code") == code) else 1
@@ -8743,6 +9437,857 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
             "reason": reason,
         }
 
+    def _writer_handoff_records(self, snapshot):
+        """Read the same canonical evidence set at recovery and before start.
+
+        A different filename cannot conceal a second semantic transaction.
+        Reject it without deleting or rewriting either piece of evidence.
+        """
+        directory = run_dir(self.paths, snapshot.run_id) / "writer-handoffs"
+        if directory.is_symlink():
+            raise PermissionError("writer handoff directory is unsafe")
+        records = []
+        for path in sorted(directory.glob("*.json")):
+            saved = ProviderActionStore._read(path)
+            intent = saved.get("intent") or {}
+            sources = [role for role in ("developer", "reviewer")
+                       if isinstance(intent.get(role), dict)]
+            if len(sources) != 1:
+                raise PermissionError("writer handoff source is ambiguous")
+            source = sources[0]
+            expected = "{}-{}-{}-{}-{}.json".format(
+                intent.get("node_id"), source, intent[source].get("generation"),
+                intent.get("role"), intent.get("generation"))
+            if (path.name != expected or intent.get("run_id") != snapshot.run_id
+                    or intent.get("node_id") not in snapshot.nodes
+                    or intent.get("role") not in {"developer", "reviewer"}):
+                raise PermissionError("writer handoff filename or ownership changed")
+            records.append((path, saved))
+        return records
+
+    def _handoff_delivery_writer(self, snapshot, node_id, target_role="reviewer"):
+        """CAS the current role writer to the next developer/reviewer turn.
+
+        The monitor lock surrounds callers. A durable intent bridges the
+        release/acquire crash window; no provider start precedes readback.
+        """
+        from .state import _lease_lock, retirement_writer_lease
+        from .protocol_adoption import effective_responsibility
+        retirements = run_dir(self.paths, snapshot.run_id) / "model-retirements"
+        model_retired = any(ProviderActionStore._read(path).get("intent", {}).get("node_id") == node_id
+                            for path in retirements.glob("*.json"))
+        if effective_responsibility(self.paths, snapshot).get("status") != "effective" and not model_retired:
+            return True  # Preserve the unadopted legacy lease contract.
+        current = snapshot.nodes[node_id]
+        if self._node_dispatch_topology(self.nodes[node_id]) == TOPOLOGY_VISIBLE_SDD:
+            return True  # No independent reviewer is ever permitted here.
+        retry = current.get("retryable_action") or {}
+        if retry.get("same_task") is True and retry.get("role") == target_role:
+            # An unsuccessful dispatch already owns this role's generation.
+            # Its immutable start intent is reused; it is not a new handoff.
+            prior = current.get("start_intent") or {}
+            from .state import retirement_writer_lease
+            try:
+                writer = retirement_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id)
+            except (OSError, ValueError, PermissionError) as error:
+                current.update(status="blocked_unknown", reason="same-role retry lease unknown: " + str(error))
+                return False
+            if (prior.get("role") == target_role and writer is not None
+                    and writer["record"].get("role") == target_role
+                    and writer["record"].get("generation") == prior.get("generation")):
+                from .supervisor import SupervisorLease, _read_lease_record
+                lease = SupervisorLease(self.paths)
+                with lease.lock(snapshot.run_id):
+                    record = _read_lease_record(lease.path(snapshot.run_id))
+                    owner = ({key: record.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                             if record is not None else None)
+                    self._check_dispatch_owner(snapshot.run_id, snapshot._dispatch_owner)
+                    handoffs = [saved for _path, saved in self._writer_handoff_records(snapshot)
+                        if saved["intent"].get("node_id") == node_id
+                        and saved["intent"].get("role") == target_role
+                        and saved["intent"].get("generation") == prior["generation"]]
+                    handoff_events = [e for e in load_events(self.paths, snapshot.run_id)
+                        if e["event"] == "writer_role_handed_off"
+                        and e["data"].get("node_id") == node_id
+                        and e["data"].get("proof", {}).get("role") == target_role
+                        and e["data"].get("proof", {}).get("generation") == prior["generation"]]
+                    if handoff_events and not handoffs:
+                        current.update(status="blocked_unknown", reason="same-role retry handoff record missing")
+                        return False
+                    if handoffs:
+                        if len(handoffs) != 1:
+                            current.update(status="blocked_unknown", reason="same-role retry handoff is ambiguous")
+                            return False
+                        saved = handoffs[0]
+                        handoff = saved.get("intent") or {}
+                        source_role = "developer" if target_role == "reviewer" else "reviewer"
+                        source = load_task_binding(self.paths, node_id, source_role, run_id=snapshot.run_id)
+                        target = load_task_binding(self.paths, node_id, target_role, run_id=snapshot.run_id)
+                        events = [e for e in load_events(self.paths, snapshot.run_id)
+                            if e["event"] == "writer_role_handed_off"
+                            and e["data"].get("node_id") == node_id
+                            and e["data"].get("proof", {}).get("role") == target_role
+                            and e["data"].get("proof", {}).get("generation") == prior["generation"]]
+                        if (saved.get("phase") != "committed"
+                                or handoff.get("digest") != digests.canonical_json_digest(
+                                    {k: v for k, v in handoff.items() if k != "digest"})
+                                or handoff.get("owner") != owner
+                                or handoff.get("run_id") != snapshot.run_id
+                                or handoff.get("node_id") != node_id
+                                or handoff.get("authorization_digest") != snapshot.authorization_digest
+                                or handoff.get("node_contract_digest") != snapshot.node_contract_digest
+                                or handoff.get(source_role) != source.to_dict()
+                                or target.task_id != prior.get("task_id")
+                                or any(handoff.get(k) != writer["record"].get(k)
+                                    for k in ("role", "generation", "intent_digest"))
+                                or len(events) != 1
+                                or events[0]["data"]["proof"].get("digest") != handoff.get("digest")):
+                            current.update(status="blocked_unknown", reason="same-role retry handoff evidence changed")
+                            return False
+                    dispatch_path = run_dir(self.paths, snapshot.run_id) / "start-dispatches" / (str(prior.get("intent_id")) + ".json")
+                    if dispatch_path.exists():
+                        dispatch = ProviderActionStore._read(dispatch_path)
+                        if (dispatch.get("digest") == digests.canonical_json_digest(
+                                {k: v for k, v in dispatch.items() if k != "digest"})
+                                and writer["record"].get("intent_digest") == prior.get("intent_digest")
+                                and dispatch.get("intent") == prior
+                                and dispatch.get("owner") == owner
+                                and (owner or {}).get("released") is not True
+                                and dispatch.get("run_id") == snapshot.run_id
+                                and dispatch.get("node_id") == node_id
+                                and dispatch.get("authorization_digest") == snapshot.authorization_digest
+                                and dispatch.get("node_contract_digest") == snapshot.node_contract_digest):
+                            return True
+                    for _path, saved in self._writer_handoff_records(snapshot):
+                        intent = saved.get("intent") or {}
+                        if (intent.get("node_id") != node_id or intent.get("role") != target_role
+                                or intent.get("generation") != prior["generation"]):
+                            continue
+                        body = {key: value for key, value in intent.items() if key != "digest"}
+                        if (saved.get("phase") == "committed" and intent.get("owner") == owner
+                                and (owner or {}).get("released") is not True
+                                and intent.get("digest") == digests.canonical_json_digest(body)
+                                and intent.get("authorization_digest") == snapshot.authorization_digest
+                                and intent.get("node_contract_digest") == snapshot.node_contract_digest
+                                and intent.get("intent_digest") == writer["record"].get("intent_digest")):
+                            return True
+                current.update(status="blocked_unknown", reason="same-role retry writer or owner changed")
+                return False
+        source_role = "developer" if target_role == "reviewer" else "reviewer"
+        if retry.get("continuation") is True and retry.get("pending_schedule") is True:
+            # A formal same-run reauthorization stops the current writer but
+            # retains its lease. Transfer that stopped generation, not the
+            # previous opposite-role review round.
+            transitions = [row for row in load_events(self.paths, snapshot.run_id)
+                if row["event"] == "authorization_reauthorized"]
+            if transitions:
+                transition = transitions[-1]
+                data = transition["data"]
+                continuation = data.get("continuation", {}).get(node_id + ":" + target_role, {})
+                try:
+                    stopped = load_task_binding(self.paths, node_id, target_role, run_id=snapshot.run_id)
+                except FileNotFoundError:
+                    stopped = None
+                if (transition["provenance"].get("role") == "system"
+                        and data.get("authorization_digest") == snapshot.authorization_digest
+                        and data.get("node_contract_digest") == snapshot.node_contract_digest
+                        and stopped is not None and stopped.status == "stopped"
+                        and continuation.get("task_id") == stopped.task_id
+                        and current.get(target_role + "_identity") == stopped.task_id):
+                    source_role = target_role
+        from .supervisor import SupervisorLease, _read_lease_record
+        supervisor_lease = SupervisorLease(self.paths)
+        try:
+            developer = load_task_binding(self.paths, node_id, source_role, run_id=snapshot.run_id)
+        except FileNotFoundError:
+            return True  # Review-only node; normal scheduler owns its lease.
+        source_generation = current.get("developer_generation" if source_role == "developer" else "review_generation")
+        if target_role == "reviewer" and source_role == "developer" and developer.status != "delivered":
+            return True
+        generation = int(current.get("review_generation" if target_role == "reviewer" else "developer_generation", 0)) + 1
+        prior = current.get("start_intent") or {}
+        if prior.get("role") == target_role:
+            generation = int(prior.get("generation", generation))
+        digest = str(prior.get("intent_digest") if prior.get("role") == target_role
+                     else self._prospective_intent_digest(snapshot, node_id, target_role, generation, current))
+        directory = run_dir(self.paths, snapshot.run_id) / "writer-handoffs"
+        path = directory / (node_id + "-" + source_role + "-" + str(developer.generation)
+            + "-" + target_role + "-" + str(generation) + ".json")
+        store = ProviderActionStore(self.paths)
+        try:
+            with supervisor_lease.lock(snapshot.run_id), interprocess_lock(_lease_lock(self.paths)):
+                self._check_dispatch_owner(snapshot.run_id, snapshot._dispatch_owner)
+                record = _read_lease_record(supervisor_lease.path(snapshot.run_id))
+                owner = ({key: record.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                         if record is not None else None)
+                if record is not None and record.get("released") is True:
+                    raise PermissionError("writer handoff supervisor owner released")
+                if developer.task_id != current.get(source_role + "_identity") or developer.generation != source_generation:
+                    raise PermissionError("writer handoff source identity or generation changed")
+                if directory.is_symlink():
+                    raise PermissionError("writer handoff directory is unsafe")
+                saved = store._read(path) if path.exists() or path.is_symlink() else None
+                writer = retirement_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id)
+                target_matches = (writer is not None and writer["record"].get("role") == target_role
+                    and writer["record"].get("generation") == generation
+                    and writer["record"].get("intent_digest") == digest)
+                if saved is None and target_matches:
+                    return True
+                if saved is None:
+                    if (writer is None or writer["record"].get("role") not in (None, source_role)
+                            or writer["record"].get("generation") not in (None, developer.generation)):
+                        raise PermissionError("delivered developer writer lease is unknown")
+                    intent = {"run_id": snapshot.run_id, "node_id": node_id,
+                        "authorization_digest": snapshot.authorization_digest,
+                        "node_contract_digest": snapshot.node_contract_digest,
+                        "owner": owner,
+                        source_role: developer.to_dict(), "writer_lease": writer,
+                        "role": target_role, "generation": generation, "intent_digest": digest}
+                    intent["digest"] = digests.canonical_json_digest(intent)
+                    directory.mkdir(exist_ok=True)
+                    store._atomic(path, {"phase": "prepared", "intent": intent})
+                else:
+                    intent = saved.get("intent") or {}
+                    body = {key: value for key, value in intent.items() if key != "digest"}
+                    if (saved.get("phase") not in {"prepared", "committed"}
+                            or intent.get("digest") != digests.canonical_json_digest(body)
+                            or intent.get(source_role) != developer.to_dict()
+                            or intent.get("owner", owner) != owner
+                            or any(intent.get(key) != value for key, value in (
+                                ("run_id", snapshot.run_id), ("node_id", node_id),
+                                ("authorization_digest", snapshot.authorization_digest),
+                                ("node_contract_digest", snapshot.node_contract_digest),
+                                ("role", target_role),
+                                ("generation", generation), ("intent_digest", digest)))):
+                        raise PermissionError("writer handoff intent changed")
+                    if writer is not None and writer != intent["writer_lease"] and not target_matches:
+                        raise PermissionError("writer handoff lease changed")
+                if writer == intent["writer_lease"]:
+                    if not release_writer_lease(self.paths, node_id, str(current["worktree"]),
+                            snapshot.run_id, expected=writer, _locked=True):
+                        raise PermissionError("writer handoff release CAS failed")
+                if not target_matches:
+                    if not acquire_writer_lease(self.paths, node_id, str(current["worktree"]),
+                            snapshot.run_id, digest, target_role, generation, _locked=True):
+                        raise PermissionError("writer handoff acquire failed")
+                observed = retirement_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id)
+                if (observed is None or observed["record"].get("role") != target_role
+                        or observed["record"].get("generation") != generation
+                        or observed["record"].get("intent_digest") != digest):
+                    raise PermissionError("writer handoff readback failed")
+                events = [row for row in load_events(self.paths, snapshot.run_id)
+                    if row["event"] == "writer_role_handed_off"
+                    and row["data"].get("proof", {}).get("digest") == intent["digest"]]
+                if not events:
+                    self._record(snapshot, "writer_role_handed_off", {"run_id": snapshot.run_id,
+                        "node_id": node_id, "proof": {"digest": intent["digest"],
+                            "role": target_role, "generation": generation,
+                            "source_role": source_role, "source_generation": developer.generation,
+                            "developer_generation": developer.generation}})
+                elif len(events) != 1:
+                    raise PermissionError("writer handoff event is ambiguous")
+                store._atomic(path, {"phase": "committed", "intent": intent})
+                self._project_role_handoff(snapshot, node_id, target_role, generation)
+                if prior.get("role") != target_role:
+                    current["start_intent"] = None
+            return True
+        except (OSError, KeyError, TypeError, ValueError, PermissionError) as error:
+            if (hasattr(snapshot, "_dispatch_owner")
+                    and self._current_dispatch_owner(snapshot.run_id) != snapshot._dispatch_owner):
+                return False  # Stale turns cannot project or clean up the new owner's writer.
+            current.update(status="blocked_unknown", reason="writer role handoff blocked_unknown: " + str(error),
+                active_task=None, active_role=None, retryable_action={"role": target_role,
+                    "phase": "review" if target_role == "reviewer" else "rework",
+                    "continuation": target_role == "developer" or bool(current.get("reviewer_started")),
+                    "pending_schedule": False, "successor": False},
+                recovery_action="reconcile_binding")
+            return False
+
+    def _reconcile_writer_handoffs(self, snapshot, runner=None):
+        """Recover prepared role transfers before polling the old role again."""
+        for path, saved in self._writer_handoff_records(snapshot):
+            intent = saved.get("intent") or {}
+            node_id, role = intent.get("node_id"), intent.get("role")
+            if node_id not in snapshot.nodes or role not in {"developer", "reviewer"}:
+                raise PermissionError("writer handoff recovery target changed")
+            body = {key: value for key, value in intent.items() if key != "digest"}
+            if (saved.get("phase") not in {"prepared", "committed"}
+                    or intent.get("digest") != digests.canonical_json_digest(body)
+                    or intent.get("run_id") != snapshot.run_id):
+                raise PermissionError("writer handoff recovery evidence changed")
+            current = snapshot.nodes[node_id]
+            generation = int(current.get("review_generation" if role == "reviewer" else "developer_generation", 0))
+            if (intent.get("authorization_digest") != snapshot.authorization_digest
+                    or intent.get("node_contract_digest") != snapshot.node_contract_digest):
+                if saved["phase"] == "committed" and intent["generation"] <= generation and self._historical_handoff_authorized(snapshot, intent):
+                    continue
+                raise PermissionError("writer handoff recovery evidence changed")
+            if intent["generation"] > generation:
+                if not self._handoff_delivery_writer(snapshot, node_id, role):
+                    snapshot.handles.pop(node_id, None)
+            elif (intent["generation"] == generation
+                    and (current.get("start_intent") or {}).get("role") == role):
+                # The write-ahead start may already have reached the provider.
+                # No replay or lease transfer can prove that it did not.
+                if (current.get("retryable_action") or {}).get("same_task") is True and current.get("status") != "start_pending":
+                    continue
+                start = current["start_intent"]
+                dispatch_path = run_dir(self.paths, snapshot.run_id) / "start-dispatches" / (str(start.get("intent_id")) + ".json")
+                if dispatch_path.exists() and current.get("business_barrier", {}).get("status") != "invalidated":
+                    dispatch = ProviderActionStore._read(dispatch_path)
+                    dispatch_body = {key: value for key, value in dispatch.items() if key != "digest"}
+                    from .supervisor import SupervisorLease, _read_lease_record
+                    owner = _read_lease_record(SupervisorLease(self.paths).path(snapshot.run_id))
+                    owner = ({key: owner.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                             if owner is not None else None)
+                    from .runners.provider_action import ProviderActionRunner
+                    probe = ProviderActionRunner(self.paths, "", "")
+                    prior_handle = probe._handle_path(probe._handle_id(dict(start, node_id=node_id), snapshot.run_id))
+                    actions = [row for row in ProviderActionStore(self.paths)._directory("requests").glob("*.json")
+                        if (lambda action: action.get("run_id") == snapshot.run_id
+                            and action.get("issue_id") == node_id and action.get("role") == role
+                            and action.get("generation") == generation)(ProviderActionStore._read(row))]
+                    if (dispatch.get("phase") == "prepared"
+                            and dispatch.get("owner") == owner and (owner or {}).get("released") is not True
+                            and not dispatch_path.with_suffix(".sending").exists()
+                            and not prior_handle.exists() and not actions
+                            and dispatch.get("digest") == digests.canonical_json_digest(dispatch_body)
+                            and dispatch.get("intent") == start
+                            and dispatch.get("run_id") == snapshot.run_id
+                            and dispatch.get("node_id") == node_id
+                            and dispatch.get("authorization_digest") == snapshot.authorization_digest
+                            and dispatch.get("node_contract_digest") == snapshot.node_contract_digest):
+                        current.update(status="rework", active_task=None, active_role=None,
+                            retryable_action={"role": role, "phase": start["phase"],
+                                "continuation": True, "same_task": True,
+                                "same_task_required": True, "successor": False})
+                        continue
+                recovered = False
+                recover = getattr(runner, "recover_start", None)
+                if callable(recover) and current.get("business_barrier", {}).get("status") != "invalidated":
+                    from .state import retirement_writer_lease
+                    writer = retirement_writer_lease(self.paths, node_id, str(current["worktree"]), snapshot.run_id)
+                    try:
+                        if (writer is None or writer["record"].get("role") != role
+                                or writer["record"].get("generation") != generation
+                                or writer["record"].get("intent_digest") != intent["intent_digest"]):
+                            raise PermissionError("start recovery writer lease changed")
+                        start = current["start_intent"]
+                        handle = recover(snapshot.run_id, node_id, start, snapshot.authorization_digest)
+                        if handle is not None:
+                            from .supervisor import SupervisorLease, _read_lease_record
+                            lease = SupervisorLease(self.paths)
+                            with lease.lock(snapshot.run_id):
+                                owner = _read_lease_record(lease.path(snapshot.run_id))
+                                owner = ({key: owner.get(key) for key in ("run_id", "lease_epoch", "owner", "released")}
+                                         if owner is not None else None)
+                                if intent.get("owner") != owner or (owner or {}).get("released") is True:
+                                    raise PermissionError("start claim owner changed")
+                                data = {"run_id": snapshot.run_id, "node_id": node_id,
+                                    **{key: start[key] for key in ("role", "phase", "task_id", "generation")},
+                                    "handle_id": handle.run_id}
+                                provenance = dict(data)
+                                self._reconcile_start_confirmed(snapshot, node_id, data, provenance)
+                                self._record(snapshot, "start_confirmed", data, current["active_task"])
+                                current["quarantine"] = None
+                                recovered = True
+                    except (OSError, ValueError, KeyError, TypeError, PermissionError) as error:
+                        current["reason"] = "provider start recovery blocked_unknown: " + str(error)
+                if not recovered:
+                    current.update(status="blocked_unknown",
+                        reason=current.get("reason") or "role handoff start intent has no provider-confirmed result",
+                        retryable_action=None)
+
+    def _historical_handoff_authorized(self, snapshot, intent):
+        """Validate a committed fact through signed same-run transitions."""
+        events = load_events(self.paths, snapshot.run_id)
+        matches = [row for row in events if row["event"] == "writer_role_handed_off"
+            and row["data"].get("proof", {}).get("digest") == intent["digest"]]
+        if len(matches) != 1:
+            return False
+        event = matches[0]
+        proof = event["data"].get("proof") or {}
+        if (event["data"].get("node_id") != intent["node_id"]
+                or proof.get("role") != intent["role"]
+                or proof.get("generation") != intent["generation"]):
+            return False
+        pair = (intent["authorization_digest"], intent["node_contract_digest"])
+        if (event["provenance"].get("role") != "system"
+                or (event["provenance"].get("authorization_digest"),
+                    event["provenance"].get("node_contract_digest")) != pair):
+            return False
+        for row in events[event["sequence"]:]:
+            if row["event"] != "authorization_reauthorized":
+                continue
+            data = row["data"]
+            confirmed = [item for item in events[event["sequence"]:row["sequence"] - 1]
+                if item["event"] == "start_confirmed"
+                and item["data"].get("node_id") == intent["node_id"]
+                and item["data"].get("role") == intent["role"]
+                and item["data"].get("generation") == intent["generation"]]
+            if not confirmed:
+                return False
+            if (data.get("previous_authorization_digest"), data.get("previous_node_contract_digest")) != pair:
+                return False
+            previous = AuthorizationRecord.from_dict(data["previous_authorization"])
+            renewed = AuthorizationRecord.from_dict(data["new_authorization"])
+            from .authorization import is_authorization_integrity_valid
+            if (not is_authorization_integrity_valid(previous) or not is_authorization_integrity_valid(renewed)
+                    or previous.digest != pair[0] or previous.node_contract_digest != pair[1]
+                    or renewed.digest != data.get("authorization_digest")
+                    or renewed.node_contract_digest != data.get("node_contract_digest")
+                    or row["provenance"].get("role") != "system"):
+                return False
+            pair = (renewed.digest, renewed.node_contract_digest)
+        return pair == (snapshot.authorization_digest, snapshot.node_contract_digest)
+
+    def _project_role_handoff(self, snapshot, node_id, role, generation):
+        current = snapshot.nodes[node_id]
+        key = "review_generation" if role == "reviewer" else "developer_generation"
+        if int(current.get(key, 0)) >= generation:
+            return
+        current.update(active_role=None, active_task=None, start_intent=None, quarantine=None,
+            status="delivered" if role == "reviewer" else "rework",
+            retryable_action={"role": role, "phase": "review" if role == "reviewer" else "rework",
+                "continuation": role == "developer" or bool(current.get("reviewer_started")),
+                "pending_schedule": False, "successor": False})
+        snapshot.handles.pop(node_id, None)
+
+    def _retirement_observation(self, saved):
+        """Resolve append-only owner observations without rewriting the intent."""
+        intent = saved.get("intent") or {}
+        body = {key: value for key, value in intent.items() if key != "digest"}
+        if intent.get("digest") != digests.canonical_json_digest(body):
+            raise PermissionError("successor retirement intent mismatch")
+        store = ProviderActionStore(self.paths)
+        from .supervisor import SupervisorLease, _read_lease_record
+        owner = _read_lease_record(SupervisorLease(self.paths).path(intent["run_id"])) or {}
+        binding = load_task_binding(self.paths, intent["node_id"], intent["role"], run_id=intent["run_id"])
+        failures = store.successor_failure_sequence(intent["action_id"],
+            owner_epoch=owner.get("lease_epoch"), owner_session_id=(owner.get("owner") or {}).get("session_id"),
+            _locked=True, _retiring=True,
+            _retired_binding=(dict(intent["binding"], status="stopped")
+                if binding.task_id != intent["binding"]["task_id"] else None))
+        if failures["status"] != "verified":
+            raise PermissionError("successor retirement historical failures are unknown")
+        registry = store._read(run_dir(self.paths, intent["run_id"]) / "supervisor-registry.json")
+        def authenticate(row, original=False):
+            entries = [entry for entry in [registry.get("current")] + (registry.get("history") or [])
+                if isinstance(entry, dict) and entry.get("lease_epoch") == row["owner_epoch"]
+                and entry.get("provider") == "codex" and entry.get("host") == intent["binding"]["host"]]
+            if len(entries) != 1 or (not original and entries[0].get("session_id") != row.get("owner_session_id")):
+                raise PermissionError("successor retirement historical owner is not registered")
+            proof = store._verify_successor_termination_source(intent["action_id"], row["observation"],
+                observer_epoch=row["owner_epoch"], observer_session_id=entries[0]["session_id"],
+                failure_sequence=failures["failure_sequence"])
+            if proof != row["proof"]:
+                raise PermissionError("successor retirement historical proof changed")
+        authenticate(intent, original=True)
+        effective = dict(intent)
+        previous = intent["digest"]
+        history = saved.get("owner_observations", [])
+        if not isinstance(history, list):
+            raise PermissionError("successor retirement owner history changed")
+        for row in history:
+            body = {key: value for key, value in row.items() if key != "digest"}
+            if (row.get("digest") != digests.canonical_json_digest(body)
+                    or row.get("previous_digest") != previous
+                    or type(row.get("owner_epoch")) is not int
+                    or row["owner_epoch"] <= effective["owner_epoch"]
+                    or not row.get("owner_session_id")
+                    or row.get("proof", {}).get("failure_sequence") != intent["proof"]["failure_sequence"]
+                    or row.get("observation", {}).get("session_id") != intent["binding"]["task_id"]
+                    or row.get("observation", {}).get("host") != intent["binding"]["host"]):
+                raise PermissionError("successor retirement owner history changed")
+            authenticate(row)
+            effective.update({key: row[key] for key in ("owner_epoch", "observation", "proof")})
+            previous = row["digest"]
+        return effective
+
+    def _require_retirement_committed(self, snapshot):
+        directory = run_dir(self.paths, snapshot.run_id) / "successor-retirements"
+        if directory.is_symlink():
+            raise PermissionError("successor retirement directory is unsafe")
+        for path in directory.glob("*.json"):
+            saved = ProviderActionStore._read(path)
+            # No migration keeps the existing dispatch-level blocked_unknown
+            # boundary; malformed or nonempty history must fail before replay.
+            if saved.get("owner_observations", []) != []:
+                self._retirement_observation(saved)
+            intent = saved.get("intent") or {}
+            body = {key: value for key, value in intent.items() if key != "digest"}
+            if (saved.get("phase") != "committed"
+                    or intent.get("digest") != digests.canonical_json_digest(body)
+                    or intent.get("run_id") != snapshot.run_id
+                    or intent.get("preservation", {}).get("authorization_digest") != snapshot.authorization_digest
+                    or intent.get("preservation", {}).get("node_contract_digest") != snapshot.node_contract_digest):
+                raise PermissionError("successor retirement pending or invalid; dispatch blocked_unknown")
+            events = [row for row in load_events(self.paths, snapshot.run_id)
+                if row["event"] == "verified_successor_retired"
+                and row["data"].get("proof", {}).get("action_id") == intent.get("action_id")]
+            if (len(events) != 1 or events[0]["data"].get("proof", {}).get("digest") != intent["digest"]
+                    or events[0]["provenance"].get("role") != "system"
+                    or events[0]["provenance"].get("authorization_digest") != snapshot.authorization_digest
+                    or events[0]["provenance"].get("node_contract_digest") != snapshot.node_contract_digest):
+                raise PermissionError("successor retirement event unknown; dispatch blocked_unknown")
+
+    def _protected_retirement_validator(self, snapshot, node_id, role, runner):
+        """Re-read the frozen transaction for each in-process binding decision."""
+        if not binding_contract_enabled(self.nodes[node_id].contract):
+            return None
+        from .supervisor import SupervisorLease, _read_lease_record
+        retry = dict(snapshot.nodes[node_id].get("retryable_action") or {})
+        directory = run_dir(self.paths, snapshot.run_id) / "successor-retirements"
+        records = [ProviderActionStore._read(path) for path in directory.glob("*.json")]
+        matches = [row for row in records if row.get("intent", {}).get("digest") == retry.get("retirement_digest")]
+        if len(matches) != 1:
+            return None
+        frozen = matches[0]
+        intent = self._retirement_observation(frozen)
+        record_path = directory / (intent["action_id"] + ".json")
+        generation = intent["binding"]["generation"] + 1
+        from .state import _lease_lock, retirement_writer_lease
+        with interprocess_lock(_lease_lock(self.paths)):
+            writer_fence = retirement_writer_lease(self.paths, node_id, intent["preservation"]["worktree"], snapshot.run_id)
+        def validate(binding_intent, observation):
+            try:
+                from .task_registry import _current_retirement
+                if _current_retirement() is not scope:
+                    return False
+                from .state import retirement_writer_lease
+                self._require_snapshot_authorization(snapshot)
+                if (role != "developer" or intent["role"] != role or intent["node_id"] != node_id
+                        or runner.provider != intent["binding"]["provider"]
+                        or ProviderActionStore._read(record_path) != frozen
+                        or frozen.get("phase") != "committed"
+                        or self.successor_preservation(snapshot.run_id, node_id) != intent["preservation"]):
+                    return False
+                self._retirement_observation(frozen)
+                owner = _read_lease_record(SupervisorLease(self.paths).path(snapshot.run_id)) or {}
+                if (owner.get("released") is True or owner.get("lease_epoch") != intent["owner_epoch"]
+                        or self._current_dispatch_owner(snapshot.run_id) != snapshot._dispatch_owner):
+                    return False
+                proof = ProviderActionStore(self.paths)._verify_successor_termination_locked(
+                    intent["action_id"], intent["observation"], owner_epoch=intent["owner_epoch"],
+                    owner_session_id=(owner.get("owner") or {}).get("session_id"), _retiring=True,
+                    _retired_binding=dict(intent["binding"], status="stopped"))
+                if proof != intent["proof"]:
+                    return False
+                held = retirement_writer_lease(self.paths, node_id, intent["preservation"]["worktree"], snapshot.run_id)
+                if (not held or held != writer_fence or held["record"].get("generation") != generation
+                        or held["record"].get("role") != role):
+                    return False
+                if binding_intent is None and observation is None:
+                    return True
+                if (binding_intent.node_id != node_id or binding_intent.worktree != intent["preservation"]["worktree"]
+                        or binding_intent.branch != intent["preservation"]["branch"]
+                        or binding_intent.head_sha != intent["preservation"]["head"]
+                        or binding_intent.task_id == intent["binding"]["task_id"]
+                        or binding_intent.clean != observation.clean):
+                    return False
+                store = ProviderActionStore(self.paths)
+                creates = [store._read(path) for path in store._directory("requests").glob("*.json")]
+                creates = [row for row in creates if row.get("run_id") == snapshot.run_id
+                    and row.get("issue_id") == node_id and row.get("role") == role
+                    and row.get("generation") == generation and row.get("operation") == "create"]
+                if len(creates) != 1:
+                    return False
+                created = creates[0]
+                request = created["request"]
+                if (request.get("authorization_digest") != snapshot.authorization_digest
+                        or request.get("successor") is not True
+                        or request.get("predecessor_task_id") != intent["binding"]["task_id"]
+                        or request.get("topology") != intent["binding"]["topology"]):
+                    return False
+                result = store.result(created["action_id"])
+                raw = store._read(store._native_receipt_path(created["action_id"]))
+                if not isinstance(raw.get("native_response"), dict):
+                    return False
+                actual = result.get("binding", {})
+                if (actual.get("threadId", actual.get("task_id")) != binding_intent.task_id
+                        or actual.get("hostId", actual.get("host")) != binding_intent.host_id):
+                    return False
+                wait = store.related_action(created, "wait")
+                from .runners.provider_action import native_wait_observation
+                poll = native_wait_observation(store, wait)
+                if (poll.get("cursor") != observation.cursor
+                        or poll.get("thread") != {"id": binding_intent.task_id, "hostId": binding_intent.host_id}
+                        or wait["request"].get("targets") != [{"threadId": binding_intent.task_id, "hostId": binding_intent.host_id}]):
+                    return False
+                from .state import read_writer_lease
+                return observation.lease == read_writer_lease(self.paths, node_id, binding_intent.worktree)
+            except (OSError, KeyError, AttributeError, TypeError, ValueError, PermissionError):
+                return False
+        from .task_registry import _ProtectedRetirementScope
+        current = snapshot.nodes[node_id]
+        expected = {
+            "run_id": snapshot.run_id, "node_id": node_id, "role": role,
+            "generation": generation, "successor": True,
+            "predecessor_task_id": intent["binding"]["task_id"],
+            "worktree": intent["preservation"]["worktree"], "branch": current["branch"],
+            "files": self._node_scope_files(node_id, current),
+            "authorization_digest": snapshot.authorization_digest,
+            "topology": intent["binding"]["topology"],
+            "project_id": self.nodes[node_id].contract.get("project_id"),
+            "managed_root": self.nodes[node_id].contract.get("managed_root"),
+            "base_sha": self.nodes[node_id].contract.get("base_sha"),
+        }
+        if snapshot.capability_contract_digest:
+            expected["capability_contract_digest"] = snapshot.capability_contract_digest
+        for key in ("binding_contract_version", "v39_binding", "binding_required"):
+            if key in self.nodes[node_id].contract:
+                expected[key] = self.nodes[node_id].contract[key]
+        scope = _ProtectedRetirementScope(validate, runner, self.paths, expected)
+        return scope
+
+    def _verify_retirement_dispatch(self, snapshot, node_id, retry, runner):
+        """Recheck the retired original immediately before normal dispatch."""
+        from .supervisor import SupervisorLease, _read_lease_record
+        directory = run_dir(self.paths, snapshot.run_id) / "successor-retirements"
+        records = [ProviderActionStore._read(path) for path in directory.glob("*.json")]
+        matching = [row for row in records if row.get("intent", {}).get("node_id") == node_id
+            and row["intent"].get("role") == retry.get("role")
+            and row["intent"].get("binding", {}).get("task_id") == retry.get("predecessor_task_id")]
+        if not matching:
+            return True  # Existing, separately protected non-retirement paths.
+        try:
+            intents = [self._retirement_observation(row) for row in matching]
+            if len(intents) != 1:
+                raise PermissionError("successor retirement is ambiguous")
+            intent = intents[0]
+            binding = load_task_binding(self.paths, node_id, intent["role"], run_id=snapshot.run_id)
+            if (binding.to_dict() != dict(intent["binding"], status="stopped")
+                    or getattr(runner, "provider", None) != binding.provider
+                    or self.successor_preservation(snapshot.run_id, node_id) != intent["preservation"]):
+                raise PermissionError("successor retirement writer or preservation changed")
+            lease = SupervisorLease(self.paths)
+            with lease.lock(snapshot.run_id):
+                owner = _read_lease_record(lease.path(snapshot.run_id)) or {}
+                session = (owner.get("owner") or {}).get("session_id")
+                if owner.get("released") is True or owner.get("lease_epoch") != intent["owner_epoch"]:
+                    raise PermissionError("successor retirement owner changed; fresh observation required")
+                proof = ProviderActionStore(self.paths)._verify_successor_termination_locked(
+                    intent["action_id"], intent["observation"], owner_epoch=intent["owner_epoch"],
+                    owner_session_id=session, _retiring=True)
+                if proof != intent["proof"]:
+                    raise PermissionError("successor retirement source changed")
+            return True
+        except (OSError, KeyError, TypeError, ValueError, PermissionError) as error:
+            current = snapshot.nodes[node_id]
+            current["status"] = "blocked_unknown"
+            current["reason"] = "retirement successor blocked_unknown: " + str(error)
+            return False
+
+    def _project_verified_retirement(self, snapshot, intent):
+        node_id, role = intent["node_id"], intent["role"]
+        current = snapshot.nodes[node_id]
+        binding = dict(intent["binding"], status="stopped")
+        snapshot.tasks[node_id + ":" + role] = binding
+        handle = snapshot.handles.pop(node_id, None)
+        if handle and handle not in current.setdefault("stale_handles", []):
+            current["stale_handles"].append(handle)
+        current.update(active_task=None, active_role=None, start_intent=None, quarantine=None,
+            pair_archived=True, status="rework" if role == "reviewer" else "retry_pending",
+            recovery_action="repair_node", reason="verified original task retired for safe successor")
+        if role == "reviewer":
+            current["reviewer_started"] = False
+        current["retryable_action"] = {"role": role, "phase": "review" if role == "reviewer" else "develop",
+            "continuation": False, "pending_schedule": True, "successor": True,
+            "same_task": False, "same_task_required": False, "old_task_reconciled": True,
+            "predecessor_task_id": binding["task_id"], "retirement_digest": intent["digest"]}
+
+    def successor_preservation(self, run_id, node_id):
+        """Read the exact tracked/untracked writer contents, without changing Git."""
+        snapshot = load_snapshot(self.paths, run_id)
+        self._require_snapshot_authorization(snapshot)
+        current = snapshot.nodes[node_id]
+        root = self._worktree_path(current).resolve()
+        def git(*args):
+            result = subprocess.run(["git", "-C", str(root), *args], capture_output=True)
+            if result.returncode:
+                raise ValueError("successor preservation Git observation failed")
+            return result.stdout
+        branch = git("symbolic-ref", "--short", "HEAD").decode().strip()
+        if branch != current["branch"]:
+            raise PermissionError("successor preservation branch mismatch")
+        files = git("ls-files", "--others", "--exclude-standard", "-z").decode().split("\0")
+        hashes = {}
+        for name in filter(None, files):
+            path = root / name
+            if path.is_symlink() or not path.is_file():
+                raise PermissionError("successor preservation untracked file is unknown")
+            path.resolve().relative_to(root)
+            hashes[name] = digests.sha256_bytes(path.read_bytes())
+        return {"run_id": run_id, "node_id": node_id, "plan_id": snapshot.plan_id,
+            "plan_version": snapshot.plan_version, "authorization_digest": snapshot.authorization_digest,
+            "node_contract_digest": snapshot.node_contract_digest, "worktree": str(root),
+            "branch": branch, "head": git("rev-parse", "HEAD").decode().strip(),
+            "allowlist": self._node_scope_files(node_id, current),
+            "tracked_diff_sha256": digests.sha256_bytes(git("diff", "--binary", "HEAD")),
+            "index_diff_sha256": digests.sha256_bytes(git("diff", "--binary", "--cached")),
+            "untracked_hashes": hashes}
+
+    def retire_verified_successor(self, run_id, action_id, observation, *,
+                                  owner_epoch, owner_session_id, frozen_preservation):
+        """Retire a verified original task and queue its normal successor once."""
+        from .state import verify_run_evidence, _lease_lock, retirement_writer_lease
+        from .supervisor import SupervisorLease, _read_lease_record
+        store = ProviderActionStore(self.paths)
+        action = store.action(action_id)
+        if action["run_id"] != run_id:
+            raise PermissionError("successor run mismatch")
+        lease = SupervisorLease(self.paths)
+        with interprocess_lock(run_dir(self.paths, run_id) / ".monitor.lock"), lease.lock(run_id), interprocess_lock(_lease_lock(self.paths)):
+            owner = _read_lease_record(lease.path(run_id))
+            if (not isinstance(owner, dict) or owner.get("released") is True
+                    or owner.get("lease_epoch") != owner_epoch
+                    or (owner.get("owner") or {}).get("session_id") != owner_session_id):
+                raise PermissionError("successor owner is not current")
+            snapshot = verify_run_evidence(self.paths, run_id)
+            self._require_snapshot_authorization(snapshot, recover_transition=False)
+            node_id, role = action["issue_id"], action["role"]
+            current = snapshot.nodes[node_id]
+            preserved = self.successor_preservation(run_id, node_id)
+            if not frozen_preservation or preserved != frozen_preservation:
+                raise PermissionError("successor frozen preservation changed")
+            directory = run_dir(self.paths, run_id) / "successor-retirements"
+            path = directory / (action_id + ".json")
+            if directory.is_symlink():
+                raise PermissionError("successor retirement directory is unsafe")
+            saved = store._read(path) if path.exists() or path.is_symlink() else None
+            binding = load_task_binding(self.paths, node_id, role, run_id=run_id)
+            expected = binding.to_dict()
+            owner_observations = []
+            migration = None
+            if saved is not None:
+                intent = saved.get("intent") or {}
+                body = {key: value for key, value in intent.items() if key != "digest"}
+                if (saved.get("phase") not in {"prepared", "committed"}
+                        or intent.get("digest") != digests.canonical_json_digest(body)
+                        or any(intent.get(key) != value for key, value in (
+                            ("action_id", action_id), ("request_digest", action["request_digest"]),
+                            ("run_id", run_id), ("node_id", node_id), ("role", role),
+                            ("preservation", preserved)))):
+                    raise PermissionError("successor retirement intent mismatch")
+                effective = self._retirement_observation(saved)
+                owner_observations = list(saved.get("owner_observations", []))
+                changing_owner = effective["owner_epoch"] != owner_epoch
+                if (not changing_owner and effective["observation"] != observation) or (changing_owner and (
+                        saved["phase"] != "prepared" or owner_epoch <= effective["owner_epoch"]
+                        or observation == effective["observation"])):
+                    raise PermissionError("successor retirement intent mismatch")
+                expected = intent["binding"]
+                stopped = dict(expected, status="stopped")
+                if binding.to_dict() not in (expected, stopped):
+                    raise PermissionError("successor retirement binding changed")
+                proof = store._verify_successor_termination_locked(action_id, observation,
+                    owner_epoch=owner_epoch, owner_session_id=owner_session_id, _retiring=True)
+                if changing_owner:
+                    if proof["failure_sequence"] != intent["proof"]["failure_sequence"]:
+                        raise PermissionError("successor retirement failure history changed")
+                    migration = {"previous_digest": (owner_observations[-1]["digest"]
+                        if owner_observations else intent["digest"]),
+                        "owner_epoch": owner_epoch, "owner_session_id": owner_session_id,
+                        "observation": observation, "proof": proof}
+                    migration["digest"] = digests.canonical_json_digest(migration)
+                elif proof != effective.get("proof"):
+                    raise PermissionError("successor retirement proof changed")
+            else:
+                proof = store.verify_successor_termination(action_id, observation,
+                    owner_epoch=owner_epoch, owner_session_id=owner_session_id, _locked=True)
+            writer = retirement_writer_lease(self.paths, node_id, str(current["worktree"]), run_id)
+            if saved is not None:
+                if writer != intent["writer_lease"] and not (writer is None and binding.status == "stopped"):
+                    raise PermissionError("successor retirement writer lease changed")
+                if saved["phase"] == "committed":
+                    if writer is not None or binding.status != "stopped":
+                        raise PermissionError("committed successor retirement is inconsistent")
+            elif writer is None or (writer["record"].get("role") not in (None, role)
+                    or writer["record"].get("generation") not in (None, binding.generation)):
+                raise PermissionError("successor writer lease is unknown")
+            if any(other != node_id and (node.get("active_task") or other in snapshot.handles)
+                   and self._worktree_path(node).resolve() == self._worktree_path(current).resolve()
+                   for other, node in snapshot.nodes.items()):
+                raise PermissionError("successor writer root is occupied")
+            if self.successor_preservation(run_id, node_id) != preserved:
+                raise PermissionError("successor writer changed during verification")
+            # Re-read ownership at the durable boundary as well as entry.
+            if _read_lease_record(lease.path(run_id)) != owner:
+                raise PermissionError("successor owner changed during verification")
+            if migration is not None:
+                owner_observations.append(migration)
+                store._atomic(path, {"phase": "prepared", "intent": intent,
+                    "owner_observations": owner_observations})
+            if saved is None:
+                directory.mkdir(exist_ok=True)
+                intent = {"action_id": action_id, "request_digest": action["request_digest"],
+                    "run_id": run_id, "node_id": node_id, "role": role, "binding": expected,
+                    "owner_epoch": owner_epoch, "preservation": preserved, "proof": proof,
+                    "observation": observation, "writer_lease": writer}
+                intent["digest"] = digests.canonical_json_digest(intent)
+                store._atomic(path, {"phase": "prepared", "intent": intent})
+            frozen_transaction = {"phase": saved["phase"] if saved else "prepared", "intent": intent,
+                **({"owner_observations": owner_observations} if owner_observations else {})}
+            def require_history():
+                observed = store._read(path)
+                if observed != frozen_transaction:
+                    raise PermissionError("successor retirement history changed during consumption")
+                self._retirement_observation(observed)
+            require_history()
+            events = [row for row in load_events(self.paths, run_id)
+                if row["event"] == "verified_successor_retired"
+                and row["data"].get("proof", {}).get("action_id") == action_id]
+            if len(events) > 1 or any(row["data"].get("proof", {}).get("digest") != intent["digest"]
+                    or row["provenance"].get("role") != "system" for row in events):
+                raise PermissionError("successor retirement event mismatch")
+            if saved is not None and saved["phase"] == "committed" and len(events) != 1:
+                raise PermissionError("committed successor retirement event missing")
+            if (saved is not None and saved["phase"] == "committed"
+                    and snapshot.event_sequence >= events[0]["sequence"]):
+                retry = current.get("retryable_action") or {}
+                if (current.get("active_task") or node_id in snapshot.handles
+                        or retry.get("retirement_digest") != intent["digest"]
+                        or retry.get("predecessor_task_id") != binding.task_id
+                        or retry.get("role") != role or retry.get("pending_schedule") is not True):
+                    raise PermissionError("committed successor retirement projection changed")
+                return {"status": "retired", "successor_queued": True, "retirement_digest": intent["digest"]}
+            if _read_lease_record(lease.path(run_id)) != owner:
+                raise PermissionError("successor owner changed before retirement")
+            require_history()
+            if binding.status != "stopped":
+                binding.status = "stopped"
+                save_task_binding(self.paths, binding, expected_binding=expected)
+            snapshot.tasks[node_id + ":" + role] = binding.to_dict()
+            if _read_lease_record(lease.path(run_id)) != owner:
+                raise PermissionError("successor owner changed before writer release")
+            require_history()
+            if writer is not None and not release_writer_lease(self.paths, node_id, str(current["worktree"]), run_id,
+                                        expected=writer, _locked=True):
+                raise PermissionError("successor writer lease CAS failed")
+            if retirement_writer_lease(self.paths, node_id, str(current["worktree"]), run_id) is not None:
+                raise PermissionError("successor writer lease release is unknown")
+            self._project_verified_retirement(snapshot, intent)
+            if _read_lease_record(lease.path(run_id)) != owner:
+                raise PermissionError("successor owner changed before retirement event")
+            require_history()
+            if not events:
+                self._record(snapshot, "verified_successor_retired", {"run_id": run_id, "node_id": node_id,
+                    "role": role, "predecessor_task_id": binding.task_id, "proof": {"digest": intent["digest"], "action_id": action_id}})
+            self._reconcile_unapplied_events(snapshot)
+            self._record_topology_projection(snapshot, "monitor.retire_verified_successor")
+            self._refresh_run_status(snapshot)
+            if _read_lease_record(lease.path(run_id)) != owner:
+                raise PermissionError("successor owner changed before retirement snapshot")
+            require_history()
+            self._save_snapshot(snapshot)
+            if _read_lease_record(lease.path(run_id)) != owner:
+                raise PermissionError("successor owner changed before retirement commit")
+            require_history()
+            store._atomic(path, {"phase": "committed", "intent": intent,
+                **({"owner_observations": owner_observations} if owner_observations else {})})
+            self._reset_binding_cache()
+            return {"status": "retired", "successor_queued": True, "retirement_digest": intent["digest"]}
+
     def retire_dead_session(
         self, node_id: str, run_id: str, runner: Any,
     ) -> Dict[str, Any]:
@@ -8780,6 +10325,13 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
                 type(error).__name__))
         if state not in {"failed", "stopped", "done"}:
             return refuse("session is still {!r}; not retired".format(state))
+        from .protocol_adoption import effective_responsibility
+        if effective_responsibility(self.paths, snapshot).get("status") == "effective":
+            # Provider termination alone does not establish three correlated
+            # original-step recovery failures (or a safety disqualification).
+            # Until that evidence is verified, this legacy repair shortcut
+            # must not release the writer or queue a successor.
+            return refuse("recovery terminal evidence is unknown; original task retained, no successor authorized")
         try:
             binding = self._set_binding_status(snapshot, node_id, role, "failed")
         except (FileNotFoundError, OSError, TypeError, ValueError):
@@ -8805,8 +10357,22 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
         runner: Runner,
         terminal_status: str,
     ) -> bool:
+        from .supervisor import SupervisorLease
+        with SupervisorLease(self.paths).lock(snapshot.run_id):
+            self._check_dispatch_owner(snapshot.run_id, snapshot._dispatch_owner)
+            return self._stop_active_for_transition_owned(
+                snapshot, node_id, role, handle_id, runner, terminal_status)
+
+    def _stop_active_for_transition_owned(
+        self, snapshot, node_id, role, handle_id, runner, terminal_status
+    ) -> bool:
         try:
-            runner.stop(RunHandle(handle_id))
+            receipt_owner = getattr(runner, "receipt_owner", None)
+            if receipt_owner is not None:
+                with receipt_owner(snapshot._dispatch_owner, lock_held=True):
+                    runner.stop(RunHandle(handle_id))
+            else:
+                runner.stop(RunHandle(handle_id))
             self._set_binding_status(snapshot, node_id, role, terminal_status)
         except Exception as error:
             self._mark_blocked_unknown(
@@ -9052,6 +10618,10 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
         the fail-closed checks are kept here so a direct or replay-adjacent
         caller can never write an acceptance the validator would refuse.
         """
+        failure = self._business_acceptance_failure(snapshot, node_id, event.data)
+        if failure:
+            self._mark_blocked_unknown(snapshot, node_id, failure)
+            return
         review = event.data.get("in_session_review")
         evidence_ref = review.get("evidence_ref") if isinstance(review, dict) else None
         failure = self._validate_visible_sdd_review(snapshot, node_id, event, current)
@@ -9127,6 +10697,8 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
                 "node_id": node_id,
                 "evidence": evidence_ref.strip(),
                 "topology": TOPOLOGY_VISIBLE_SDD,
+                **({"business_acceptance": copy.deepcopy(event.data["business_acceptance"])}
+                   if isinstance(event.data.get("business_acceptance"), dict) else {}),
                 "clearance": {"p0": 0, "p1": 0, "p2": 0},
                 **acceptance.to_dict(),
                 "authorization_epoch": snapshot.authorization_digest,
@@ -9139,6 +10711,8 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
             },
         )
         current["status"] = "accepted"
+        if isinstance(event.data.get("business_acceptance"), dict):
+            current["business_acceptance"] = copy.deepcopy(event.data["business_acceptance"])
         current["acceptance"] = {
             "contract_digest": current["contract_digest"],
             "authorization_epoch": snapshot.authorization_digest,
@@ -9508,6 +11082,34 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
         self._reset_binding_cache()
         snapshot = self._recovery_snapshot(node_id, run_id)
         current = snapshot.nodes[node_id]
+        if current.get("start_intent") and node_id not in snapshot.handles:
+            with interprocess_lock(run_dir(self.paths, snapshot.run_id) / ".monitor.lock"):
+                snapshot = load_snapshot(self.paths, snapshot.run_id)
+                self._require_snapshot_authorization(snapshot)
+                self._reconcile_unapplied_events(snapshot)
+                role = (snapshot.nodes[node_id].get("start_intent") or {}).get("role")
+                if role in {"developer", "reviewer"}:
+                    binding = load_task_binding(self.paths, node_id, role, run_id=snapshot.run_id)
+                    from .runners.provider_action import ProviderActionRunner
+                    runner = ProviderActionRunner(self.paths, binding.provider, CODEX_PROVIDER)
+                    self._reconcile_writer_handoffs(snapshot, runner)
+                    self._save_snapshot(snapshot)
+                    if node_id in snapshot.handles:
+                        return {"run_id": snapshot.run_id, "node_id": node_id,
+                            "kind": "start_reconciled", "preserved_identity": True,
+                            "handle_id": snapshot.handles[node_id]}
+                current = snapshot.nodes[node_id]
+        from .protocol_adoption import effective_responsibility
+        if (self._acceptance_format_rejection_count(current) > 0
+                and effective_responsibility(self.paths, snapshot).get("status") == "effective"):
+            current["reviewer_replacement_required"] = False
+            current["retryable_action"] = None
+            current["recovery_action"] = "reconcile_binding"
+            current["reason"] = "correct the original reviewer report; format rejection is not a failed recovery"
+            self._save_snapshot(snapshot)
+            return {"run_id": snapshot.run_id, "node_id": node_id, "status": current["status"],
+                    "kind": "format_correction", "preserved_identity": True,
+                    "recovery_action": current["recovery_action"]}
         before = {key: current.get(key) for key in ("task_id", "generation", "writer", "lease", "cursor", "intent_digest", "contract_digest")}
         reason = str(current.get("reason") or "repair requested")
         if (
@@ -10602,7 +12204,7 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
         current["active_role"] = role
         current["start_intent"] = {
             key: data[key]
-            for key in ("intent_id", "role", "phase", "task_id", "generation")
+            for key in ("intent_id", "role", "phase", "task_id", "generation", "intent_digest") if key in data
         }
         current["active_task"] = {
             "role": role,
@@ -10661,6 +12263,29 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
         records = load_events(self.paths, snapshot.run_id)
         pending = records[snapshot.event_sequence :]
         for record in pending:
+            if record["event"] == "supervisor_beat_rejected":
+                from .telemetry import classify_event
+                from .protocol_adoption import effective_responsibility
+                legacy = classify_event(record, run_id=snapshot.run_id,
+                    authorization_digest=snapshot.authorization_digest,
+                    node_contract_digest=snapshot.node_contract_digest)
+                if (effective_responsibility(self.paths, snapshot).get("status") != "effective"
+                        or not legacy.consume):
+                    raise ValueError("legacy telemetry semantics or lineage is unknown")
+                snapshot.event_sequence = record["sequence"]
+                continue
+            if "telemetry" in record["data"]:
+                from .state import observation_origin
+                from .telemetry import classify_event
+                result = classify_event(record, run_id=snapshot.run_id,
+                    authorization_digest=snapshot.authorization_digest,
+                    node_contract_digest=snapshot.node_contract_digest,
+                    origin=observation_origin(self.paths, snapshot, record))
+                if result.consume:
+                    snapshot.event_sequence = record["sequence"]
+                    continue
+                if not result.side_effect:
+                    raise ValueError("telemetry origin or lineage is unknown: " + result.reason)
             if record.get("event") in {
                 "supervisor_heartbeat",
                 "run_archived",
@@ -10693,6 +12318,99 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
             data = record["data"]
             if data.get("run_id") != snapshot.run_id:
                 raise ValueError("unapplied event run lineage is inconsistent")
+            if record["event"] == "model_writer_retired":
+                matches = []
+                for path in (run_dir(self.paths, snapshot.run_id) / "model-retirements").glob("*.json"):
+                    saved = ProviderActionStore._read(path)
+                    transaction = saved.get("intent") or {}
+                    if transaction.get("digest") == (data.get("proof") or {}).get("digest"):
+                        matches.append(transaction)
+                if (provenance.get("role") != "system" or len(matches) != 1
+                        or matches[0].get("digest") != digests.canonical_json_digest(
+                            {k: v for k, v in matches[0].items() if k != "digest"})
+                        or matches[0].get("node_id") != data.get("node_id")
+                        or matches[0].get("run_id") != snapshot.run_id
+                        or matches[0].get("authorization_digest") != snapshot.authorization_digest
+                        or matches[0].get("node_contract_digest") != snapshot.node_contract_digest):
+                    raise PermissionError("model retirement replay evidence changed")
+                current = snapshot.nodes[data["node_id"]]
+                if current.get("start_intent") not in (None, matches[0]["intent"]):
+                    raise PermissionError("model retirement replay writer changed")
+                if any(current.get(k) != matches[0]["projection"].get(k)
+                       for k in ("worktree", "developer_generation", "review_generation")):
+                    raise PermissionError("model retirement replay generation changed")
+                current.clear()
+                current.update(copy.deepcopy(matches[0]["projection"]))
+                snapshot.event_sequence = record["sequence"]
+                continue
+            if record["event"] == "writer_role_handed_off":
+                proof = data.get("proof") or {}
+                path = run_dir(self.paths, snapshot.run_id) / "writer-handoffs" / (
+                    str(data.get("node_id")) + "-" + str(proof.get("source_role", "developer")) + "-"
+                    + str(proof.get("source_generation", proof.get("developer_generation")))
+                    + "-" + str(proof.get("role")) + "-" + str(proof.get("generation")) + ".json")
+                saved = ProviderActionStore._read(path)
+                intent = saved.get("intent") or {}
+                body = {key: value for key, value in intent.items() if key != "digest"}
+                if (provenance.get("role") != "system" or proof.get("digest") != intent.get("digest")
+                        or intent.get("digest") != digests.canonical_json_digest(body)
+                        or intent.get("run_id") != snapshot.run_id
+                        or intent.get("node_id") != data.get("node_id")
+                        or intent.get("authorization_digest") != snapshot.authorization_digest
+                        or intent.get("node_contract_digest") != snapshot.node_contract_digest):
+                    raise PermissionError("writer handoff replay evidence changed")
+                self._project_role_handoff(snapshot, data["node_id"], intent["role"], intent["generation"])
+                snapshot.event_sequence = record["sequence"]
+                continue
+            if record["event"] == "verified_successor_retired":
+                proof = data.get("proof") or {}
+                action = ProviderActionStore(self.paths).action(proof.get("action_id", ""))
+                saved = ProviderActionStore._read(run_dir(self.paths, snapshot.run_id) /
+                    "successor-retirements" / (action["action_id"] + ".json"))
+                self._retirement_observation(saved)
+                intent = saved.get("intent") or {}
+                body = {key: value for key, value in intent.items() if key != "digest"}
+                if (provenance.get("role") != "system"
+                        or intent.get("digest") != digests.canonical_json_digest(body)
+                        or intent.get("digest") != proof.get("digest")
+                        or intent.get("run_id") != snapshot.run_id
+                        or intent.get("request_digest") != action["request_digest"]
+                        or intent.get("node_id") != data.get("node_id")
+                        or intent.get("role") != data.get("role")
+                        or intent.get("preservation", {}).get("authorization_digest") != snapshot.authorization_digest
+                        or intent.get("preservation", {}).get("node_contract_digest") != snapshot.node_contract_digest):
+                    raise PermissionError("successor retirement event intent mismatch")
+                binding = load_task_binding(self.paths, intent["node_id"], intent["role"], run_id=snapshot.run_id)
+                if binding.to_dict() != dict(intent["binding"], status="stopped"):
+                    raise PermissionError("successor retirement replay binding changed")
+                self._project_verified_retirement(snapshot, intent)
+                snapshot.event_sequence = record["sequence"]
+                continue
+            if record["event"] == "business_acceptance_revoked":
+                if provenance.get("role") != "system":
+                    raise ValueError("business barrier requires system provenance")
+                self._project_business_barrier(snapshot, data)
+                snapshot.event_sequence = record["sequence"]
+                continue
+            if record["event"] == "business_result_quarantined":
+                node_id = data.get("node_id")
+                if node_id not in snapshot.nodes or not isinstance(data.get("business_result"), dict):
+                    raise ValueError("quarantined business result is invalid")
+                current = snapshot.nodes[node_id]
+                result = data["business_result"]
+                if result.get("barrier_id") != current.get("business_barrier", {}).get("id"):
+                    raise ValueError("quarantined result barrier mismatch")
+                bucket = current.setdefault("quarantined_business_results", [])
+                if result not in bucket:
+                    bucket.append(copy.deepcopy(result))
+                snapshot.event_sequence = record["sequence"]
+                continue
+            if record["event"] == "business_acceptance_revalidated":
+                if provenance.get("role") != "system":
+                    raise ValueError("business revalidation requires system provenance")
+                self._project_business_revalidation(snapshot, data)
+                snapshot.event_sequence = record["sequence"]
+                continue
             if record["event"] in {
                 "execution_topology_observed",
                 "monitor_entry_evidence_reconciled",
@@ -10707,8 +12425,8 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
                 snapshot.event_sequence = record["sequence"]
                 continue
             if record["event"] == "authorization_reauthorized":
-                self._apply_reauthorization_transition(snapshot, data)
-                snapshot.event_sequence = record["sequence"]
+                self._validate_pending_transition_owner(snapshot, data)
+                self._commit_reauthorization_transition(snapshot, data, record["sequence"])
                 continue
             if str(record["event"]).startswith("change_request_"):
                 # Change-request evidence is a system-level, target-bound
@@ -10984,6 +12702,20 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
                     or registered.generation != provenance["generation"]
                 ):
                     raise ValueError("unapplied acceptance registry generation is stale")
+                archived = ProviderActionStore(self.paths).archived_payload(
+                    snapshot.run_id, node_id, "reviewer", provenance["generation"])
+                if blocked_self_report_fields(archived) or blocked_self_report_fields(data):
+                    self._park_blocked_engineering(
+                        snapshot, node_id, "reviewer", RunEvent("accepted", data),
+                        current.get("active_task"), provenance.get("handle_id"))
+                    snapshot.event_sequence = record["sequence"]
+                    continue
+                failure = self._business_acceptance_failure(snapshot, node_id, data)
+                if failure:
+                    current["business_acceptance_pending"] = failure
+                    current["reason"] = failure
+                    snapshot.event_sequence = record["sequence"]
+                    continue
                 self._set_binding_status(
                     snapshot, node_id, "reviewer", "accepted"
                 )
@@ -11015,6 +12747,8 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
                     "contract_digest": contract_digest,
                     "authorization_epoch": authorization_epoch,
                 }
+                if isinstance(data.get("business_acceptance"), dict):
+                    current["business_acceptance"] = copy.deepcopy(data["business_acceptance"])
                 # Match the live path: a replayed acceptance must not
                 # resurrect the rejection text the lost snapshot carried -- nor
                 # the #255 consecutive-rejection counter it raised, nor the
@@ -11305,6 +13039,12 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
                 # crash-window snapshot saved before that pass is restored to
                 # the same completed state; the rescue pass re-verifies the
                 # signature on the next schedule either way.
+                if current.get("business_barrier", {}).get("status") == "invalidated":
+                    current["status"] = "blocked_unknown"
+                    current["reason"] = "business acceptance barrier is invalidated"
+                    current["acceptance"] = None
+                    snapshot.event_sequence = record["sequence"]
+                    continue
                 current["status"] = "accepted"
                 current["reason"] = None
                 current["recovery_action"] = None
@@ -11524,6 +13264,10 @@ escalation, quarantine_lease=False, retryable_same_task=False, reason_code=code)
                 current["active_task"] = None
                 current["start_intent"] = None
                 current["retryable_action"] = None
+            elif record["event"] == "initial_create_anchored":
+                # Audit-only write-ahead record; the mailbox remains the
+                # source for the pending request and its callback.
+                pass
             elif record["event"] == "empty_landing_allowed":
                 # Audit-only event: the delivery transition that follows is
                 # authoritative.  Recognise it so a crash before the snapshot

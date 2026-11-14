@@ -5,6 +5,8 @@
 
 ## 0. 分工与适用边界
 
+职责 r4 只在完整规则集合显式采纳、同 plan/run 重授权绑定 ruleset_digest/adoption_digest 且 effective 后启用；部分/拒绝/未知或升级安装不启用，不静默覆盖旧物化规则。该版本门不改变本入口 S0/S1/GUI 设计稿门。有效 r4 的监工心跳/唤醒/接班继承诊断、具体帮助及结果复核责任，daemon 不另建修复 LLM；细则见 prd-guide §6、supervisor-card 与 heal-session。
+
 - 本协议只做一件事：**新会话收到请求后的入口自评与路由**——会话内完成 S0/S1 判断，只有确认为复杂的请求才调用 vibe CLI。
 - 被判为复杂之后的路径（PRD 引导、节点拆分、授权卡、监工）按 `.vibe/proposals/skills/prd-guide/SKILL.md` 执行；本协议不重复其内容。
 - 宿主已装 `complex-task-methodology` 技能时，可（可选）用其完整评分表替代 §2 的速查表；未装不影响本协议任何一步。

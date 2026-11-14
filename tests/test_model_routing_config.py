@@ -21,7 +21,8 @@ from vibe_guide import model_catalog
 from vibe_guide.authorization import authorize, build_authorization_card
 from vibe_guide.models import AgentCapabilities, Plan
 
-from tests.test_integrated_prd_acceptance import _isolate_user_dirs, _node as _fixture_node
+from tests.test_integrated_prd_acceptance import _isolate_user_dirs
+from tests.test_model_tiers import _node as _fixture_node
 
 CODEX_CAPABILITIES = AgentCapabilities("codex", True, True, True, True, True, "full")
 
@@ -104,6 +105,11 @@ class ResolveModelMapTests(unittest.TestCase):
 
 
 class ModelMapValidationTests(unittest.TestCase):
+    def test_non_utf8_config_is_reported_as_invalid_manual_input(self):
+        (self.home / 'config.json').write_bytes(b'\xff\xfe')
+        with self.assertRaises(model_catalog.ModelMapConfigError):
+            model_catalog.load_model_map(self.home)
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

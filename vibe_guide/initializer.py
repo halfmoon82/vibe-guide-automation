@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field
 from pathlib import Path
+from datetime import datetime, timezone
+import hashlib
+import importlib
 import os
 import json, tempfile
 
@@ -30,6 +33,7 @@ from .protocols import (
     VIBE_ENTRY_PROPOSAL_RELATIVE,
     is_shipped_protocol,
     load_protocol,
+    published_protocol_digest,
 )
 from .capability_contract import build_contract, contract_path, load_contract, save_contract
 from .migration import _backup, _payload_is_complete
@@ -38,6 +42,7 @@ from .config import (
     DEFAULT_MAX_ACTIVE_WORKER_SESSIONS,
     FIELD_MAX_ACTIVE_WORKER_SESSIONS,
 )
+from . import model_catalog
 
 # Newer rule blocks land here when a reviewed proposal.md already exists; both
 # the writer (init) and the reader (apply-agentsmd) name it from here.
@@ -63,6 +68,7 @@ class InitResult:
     #: a state file that could not be read.  Kept out of `paths`, which lists
     #: what was written.
     notes: list = field(default_factory=list)
+    responsibility: dict = field(default_factory=dict)
 
 
 def _is_within(root, path):
@@ -91,6 +97,7 @@ def _validate_initialization_paths(root):
         root / '.vibe' / 'state.json',
         root / '.vibe' / 'session-contract.json',
         root / '.vibe' / 'host-rules.json',
+        root / '.vibe' / 'model-catalog.json',
         root / '.vibe' / 'proposals' / 'agentsmd' / 'proposal.md',
         root / '.vibe' / 'proposals' / 'skills' / 'proposal.md',
         root / PRD_GUIDE_PROPOSAL_RELATIVE,
@@ -206,6 +213,56 @@ PROTOCOL_COPIES = (
 )
 
 
+def responsibility_proposal(paths):
+    """Compare copies with C4's authoritative manifest, without adopting it.
+
+    No independent ruleset record is written by the initializer. Older
+    packages without C4 retain their unrelated protocol refresh behavior.
+    """
+    try:
+        interface = importlib.import_module('vibe_guide.protocol_adoption')
+        manifest = interface.responsibility_manifest()
+        if not isinstance(manifest, dict) or set(manifest) != {'schema', 'version', 'protocols', 'digest'}:
+            raise ValueError('invalid responsibility manifest')
+        # Validate C4's complete published set, without creating another
+        # adoption record or treating a partial interface as a legacy package.
+        published = {
+            'vibe_guide/protocols/' + name + '.md': published_protocol_digest(name)
+            for name in (PRD_GUIDE_NAME, VIBE_ENTRY_NAME, 'supervisor-card', 'heal-session', 'visible-sdd-worker')
+        }
+        body = {key: manifest[key] for key in ('schema', 'version', 'protocols')}
+        digest = hashlib.sha256(json.dumps(
+            body, sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+        ).encode('utf-8')).hexdigest()
+        if (type(manifest['schema']) is not int or manifest['schema'] != 1
+                or manifest['version'] != 'r4' or not isinstance(manifest['protocols'], dict)
+                or manifest['protocols'] != published or manifest['digest'] != digest):
+            raise ValueError('invalid responsibility manifest')
+    except ModuleNotFoundError as error:
+        if error.name == 'vibe_guide.protocol_adoption':
+            return {'status': 'unavailable', 'differences': []}
+        return {'status': 'unknown', 'differences': [], 'reason': type(error).__name__}
+    except Exception as error:
+        return {'status': 'unknown', 'differences': [], 'reason': type(error).__name__}
+    differences = []
+    for relative, name in PROTOCOL_COPIES:
+        package_path = 'vibe_guide/protocols/' + name + '.md'
+        if package_path not in manifest['protocols']:
+            continue
+        copy = Path(paths.root) / relative
+        try:
+            current = hashlib.sha256(copy.read_bytes()).hexdigest() if copy.is_file() and not copy.is_symlink() else None
+        except OSError:
+            current = None
+        expected = manifest['protocols'][package_path]
+        if current != expected:
+            differences.append({'path': relative, 'current_sha256': current, 'proposed_sha256': expected})
+    return {
+        'status': 'adoption_required' if differences else 'current',
+        'manifest': manifest, 'differences': differences,
+    }
+
+
 def refresh_protocol_copy(root, relative, name):
     """Replace a project's protocol copy when it is an unedited old release.
 
@@ -230,6 +287,13 @@ def refresh_protocol_copy(root, relative, name):
     shipped = load_protocol(name)
     if text == shipped:
         return 'current'
+    from .paths import ProjectPaths
+
+    proposal = responsibility_proposal(ProjectPaths(root))
+    if proposal['status'] == 'unknown':
+        return 'adoption_unknown'
+    if 'vibe_guide/protocols/' + name + '.md' in proposal.get('manifest', {}).get('protocols', {}):
+        return 'adoption_required'
     if not is_shipped_protocol(name, text):
         return 'edited'
     mode = copy.stat().st_mode & 0o777
@@ -247,15 +311,73 @@ def refresh_protocol_copies(root):
     ]
 
 
-def init_project(paths, confirm):
+def _model_display_digest(data):
+    payload = {key: value for key, value in data.items() if key != 'generated_sha256'}
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _refresh_model_display(root, snapshot, created, notes):
+    # A manually configured local model path can be a valid legacy input,
+    # but personal absolute paths must not be copied into a project artifact.
+    def redacted(value):
+        if isinstance(value, str):
+            candidate = value.lstrip()
+            if candidate.startswith(('/', '~/', '~\\')) or (len(candidate) > 2 and candidate[1:3] in (':/', ':\\')):
+                return '[redacted path]'
+        if isinstance(value, dict):
+            return {key: redacted(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [redacted(item) for item in value]
+        return value
+
+    snapshot = redacted(snapshot)
+    relative = '.vibe/model-catalog.json'
+    path = root / relative
+    if path.exists():
+        try:
+            previous = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            previous = None
+        if (
+            not isinstance(previous, dict)
+            or previous.get('purpose') != 'generated_display_only'
+            or previous.get('generated_sha256') != _model_display_digest(previous)
+        ):
+            notes.append(relative + ' 已人工编辑或无法验证，保留原文件；此表不是派发输入，人工映射请维护 $VIBE_HOME/config.json 的 model_map。')
+            return
+        content = {key: value for key, value in previous.items() if key not in ('generated_at', 'generated_sha256')}
+        if content == snapshot:
+            return
+    display = dict(snapshot, generated_at=datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
+    display['generated_sha256'] = _model_display_digest(display)
+    _atomic_write(path, display)
+    created.append(relative)
+
+
+def init_project(paths, confirm, *, responsibility_adoption=None):
     if not confirm:
         return InitResult(False, [])
     root = Path(paths.root).resolve()
     _validate_initialization_paths(root)
-    _migrate_state(root / '.vibe' / 'state.json')
     report = scan_project(paths)
+    # Reject illegal manual input before any project writes. This snapshot
+    # only reads the directory/configuration and never refreshes user files.
+    platforms = ('codex', 'claude-code') + tuple(name for name, available in report.agent_commands.items() if available)
+    models = model_catalog.catalog_snapshot(platforms, vibe_home=model_catalog.vibe_home_path())
+    _migrate_state(root / '.vibe' / 'state.json')
     created = []
     notes = []
+    notes.extend(model_catalog.disclosure_notes(models))
+    responsibility = responsibility_proposal(paths)
+    if responsibility_adoption is not None:
+        if 'manifest' not in responsibility:
+            raise ValueError('responsibility adoption interface is unknown')
+        # Only an explicit evidence-bound request reaches the protected core
+        # writer. A complete proposal is still pending reauthorization.
+        interface = importlib.import_module('vibe_guide.protocol_adoption')
+        responsibility['adoption'] = interface.record_adoption(
+            paths, manifest=responsibility['manifest'], **responsibility_adoption,
+        )
     for relative in (
         '.vibe',
         '.vibe/knowledge',
@@ -397,6 +519,8 @@ def init_project(paths, confirm):
         outcome = refresh_protocol_copy(root, relative, name)
         if outcome == 'refreshed':
             created.append(relative)
+        elif outcome in ('adoption_required', 'adoption_unknown'):
+            notes.append(relative + ' 与随包协议不一致；本轮职责规则差异待显式采纳及同 plan/run 重授权；保留旧副本，不静默刷新（' + outcome + '）。')
         elif outcome == 'unreadable':
             notes.append(
                 relative
@@ -435,7 +559,8 @@ def init_project(paths, confirm):
             '.vibe/proposals/agentsmd/ 的既有提案也可能同样是旧版。'
             '请人工对照包内最新块（python -c "from vibe_guide.scanner import ENGINEERING_PRINCIPLES; print(ENGINEERING_PRINCIPLES)"）手动更新。'
         )
-    return InitResult(bool(created), created, notes)
+    _refresh_model_display(root, models, created, notes)
+    return InitResult(bool(created), created, notes, responsibility)
 
 
 def _offered_headings(path):

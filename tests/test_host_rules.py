@@ -183,15 +183,32 @@ class ApplyTests(HostRulesTestBase):
         for entry in record["applied"]:
             self.assertTrue(entry["path"].startswith("~/"))
             self.assertTrue(entry["backup"].startswith("~/"))
-        doc = doctor(scan_project(ProjectPaths.from_cwd(self.project)))
+        with mock.patch.dict("vibe_guide.model_catalog._PROBES", {"codex": lambda: []}):
+            doc = doctor(scan_project(ProjectPaths.from_cwd(self.project)))
         files = doc.facts["host_rules"]["files"]
         self.assertEqual(doc.facts["host_rules"]["decision"], "apply")
         self.assertEqual(files["~/.claude/CLAUDE.md"], "current")
         self.assertEqual(files["~/.codex/AGENTS.md"], "absent")
         self.assertFalse(any("监工会话例外" in issue for issue in doc.issues))
-        self.assertEqual(doc.warnings, [])
+        model_advisories = [warning for warning in doc.warnings if warning.startswith("codex：")]
+        self.assertEqual(len(model_advisories), 1)
+        self.assertIn("未验证，将使用平台默认模型", model_advisories[0])
+        self.assertEqual(doc.warnings, model_advisories)
         for entry in record["applied"]:
             self.assertRegex(entry["backup_sha256"], "^[0-9a-f]{64}$")
+
+        # A model advisory must not hide an actual host rule modification.
+        self.claude.write_text(
+            self.claude.read_text(encoding="utf-8").replace(
+                "vibe supervisor-beat", "vibe modified-beat", 1
+            ), encoding="utf-8",
+        )
+        with mock.patch.dict("vibe_guide.model_catalog._PROBES", {"codex": lambda: []}):
+            modified = doctor(scan_project(ProjectPaths.from_cwd(self.project)))
+        self.assertEqual(modified.facts["host_rules"]["files"]["~/.claude/CLAUDE.md"], "modified")
+        self.assertEqual(modified.warnings, model_advisories + [
+            "~/.claude/CLAUDE.md: vibe 监工会话例外标记块被人工改过"
+        ])
 
     def test_reapply_and_reinit_are_idempotent(self):
         self.apply()

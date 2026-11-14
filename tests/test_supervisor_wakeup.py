@@ -27,6 +27,7 @@ class WakeupTests(unittest.TestCase):
         (self.paths.vibe / 'state.json').write_text('{}')
         self.addCleanup(patch.stopall)
         patch('vibe_guide.supervisor.load_snapshot', return_value=self.snapshot).start()
+        patch('vibe_guide.state.verify_run_evidence', return_value=self.snapshot).start()
         patch('vibe_guide.adapters.task_provider.require_entry').start()
         self.append('session_meta', {'id': 'shift-1'})
         self.turn('turn-1')
@@ -171,6 +172,7 @@ class HeartbeatIntervalTests(unittest.TestCase):
             {'n1': {'status': 'blocked_design'}}, {},
             authorization_digest='a' * 64, node_contract_digest='b' * 64)
         patch('vibe_guide.supervisor.load_snapshot', return_value=self.snapshot).start()
+        patch('vibe_guide.state.verify_run_evidence', return_value=self.snapshot).start()
         patch('vibe_guide.adapters.task_provider.require_entry').start()
         self.clock = lambda: 1000.0
 

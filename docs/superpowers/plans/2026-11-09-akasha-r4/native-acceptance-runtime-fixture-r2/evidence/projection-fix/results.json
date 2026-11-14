@@ -1,0 +1,9 @@
+{
+  "developer": {"status": "DEVELOPER_PROJECTION_FIX_COMPLETE"},
+  "targeted_tests": {"command": "tests.test_strict_first_owner_cli tests.test_audit_create_claim", "count": 72, "exit_code": 0},
+  "help_exit_code": 0,
+  "py_compile_exit_code": 0,
+  "diff_check_exit_code": 0,
+  "full_suite": {"status": "UNKNOWN", "reason": "long-running existing test; stopped after approximately 2m43s without a final suite exit code"},
+  "acceptance": "blocked_unknown"
+}

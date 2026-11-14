@@ -360,10 +360,25 @@ class ParkedSelfReportTests(_Base):
         monitor._reset_binding_cache()
         runner = ProviderActionRunner(self.paths, "codex-app-visible", "codex-app-visible")
         store = runner.store
-        store._atomic(runner._handle_path(handle_id), {
+        metadata = {
             "run_id": snapshot.run_id, "node_id": IR, "role": "reviewer", "task_id": task_id,
             "generation": generation, "host": "host-1", "wait_sequence": 0,
-            "pending_action": None, "pending_operation": None})
+            "pending_action": None, "pending_operation": None}
+        # This is the fake runner's legacy handle, adopted explicitly below;
+        # it is not an intent-bound ProviderActionRunner dispatch.
+        metadata["handle_id"] = handle_id
+        store._atomic(runner._handle_path(handle_id), metadata)
+        from vibe_guide.contracts import RunEvent
+        from vibe_guide.state import append_event
+        with (patch("vibe_guide.adapters.task_provider.require_entry"),
+              patch("vibe_guide.adapters.task_provider.require_complex_monitor_dispatch")):
+            action = store.request(operation="create", provider=runner.provider,
+                run_id=snapshot.run_id, issue_id=IR, role="reviewer", generation=generation,
+                native_tool="codex_app__create_thread", request={})
+        append_event(self.paths, RunEvent("orphan_dispatch_adopted", {
+            **{key: metadata[key] for key in ("run_id", "node_id", "role", "task_id", "host", "generation", "handle_id")},
+            "action_id": action["action_id"], "request_digest": action["request_digest"],
+        }))
         store._directory("deliveries")
         store._atomic(store._delivery_path(snapshot.run_id, IR, "reviewer", generation), {
             "run_id": snapshot.run_id, "issue_id": IR, "role": "reviewer",

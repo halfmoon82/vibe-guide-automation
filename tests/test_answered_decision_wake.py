@@ -6,10 +6,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from vibe_guide.cli import run_cli
+from vibe_guide.authorization import authorize, build_authorization_card
+from vibe_guide.contracts import RunEvent
 from vibe_guide.decisions import DecisionMailbox
+from vibe_guide.models import AgentCapabilities, Plan
 from vibe_guide.paths import ProjectPaths
-from vibe_guide.state import RunSnapshot
+from vibe_guide.state import RunSnapshot, append_event, save_snapshot
 from vibe_guide.supervisor import set_supervisor_hold, supervisor_preflight
+from tests.test_monitor import node
 
 
 class AnsweredDecisionWakeTests(unittest.TestCase):
@@ -28,12 +32,22 @@ class AnsweredDecisionWakeTests(unittest.TestCase):
         patch('vibe_guide.adapters.task_provider.require_entry').start()
         self.request = DecisionMailbox(self.paths).raise_decision(
             run_id='run-1', node_id='n1', question='Pick', options=['A', 'B'])
+        plan = Plan('plan-1', 1, 'docs/prd.md', ['n1'], 'draft')
+        self.authorization = authorize(build_authorization_card(
+            plan, [node('n1')], AgentCapabilities('fake', True, True, True, True, True, 'full')), 'AUTHORIZE')
+        append_event(self.paths, RunEvent('run_started', {
+            'run_id': 'run-1', 'node_ids': ['n1'],
+            'authorization_digest': self.authorization.digest,
+            'node_contract_digest': self.authorization.node_contract_digest}))
         self.use_status('blocked_design')
 
     def use_status(self, status):
         snapshot = RunSnapshot('run-1', 'plan-1', 1, 'running',
             {'n1': {'status': status, 'decision_ids': [self.request['decision_id']]}}, {},
-            authorization_digest='a' * 64, node_contract_digest='b' * 64)
+            authorization=self.authorization.to_dict(),
+            authorization_digest=self.authorization.digest,
+            node_contract_digest=self.authorization.node_contract_digest, event_sequence=1)
+        save_snapshot(self.paths, snapshot)
         patch('vibe_guide.supervisor.load_snapshot', return_value=snapshot).start()
 
     def answer(self):

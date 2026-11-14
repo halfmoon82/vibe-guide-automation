@@ -500,11 +500,12 @@ class CliContractTests(unittest.TestCase):
                 text=True,
                 capture_output=True,
             )
-            from tests.support_packaging import ensure_setuptools
-            ensure_setuptools(self, environment / "bin/python")
+            from tests.support_packaging import offline_build_environment
+            build_env = offline_build_environment(environment / "bin/python")
             installed = subprocess.run(
                 [str(environment / "bin/python"), "setup.py", "develop"],
                 cwd=str(source),
+                env=build_env,
                 text=True,
                 capture_output=True,
             )

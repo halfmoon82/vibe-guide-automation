@@ -3,7 +3,7 @@ from pathlib import Path
 import re
 import sys
 import sysconfig
-from . import host_rules
+from . import host_rules, model_catalog
 from .diagnostics import diagnose_skill, build_skill_reference_proposal, build_agentsmd_proposal, check_agents_contract
 from .scanner import WORKBUDDY_ORIGIN, legacy_entry_rule_lines
 
@@ -180,6 +180,13 @@ def doctor(report):
     if not available_agents:
         issues.append('no candidate Agent command found')
 
+    try:
+        platforms = ('codex', 'claude-code') + tuple(name for name, available in report.agent_commands.items() if available)
+        models = model_catalog.catalog_snapshot(platforms, vibe_home=model_catalog.vibe_home_path())
+    except model_catalog.ModelMapConfigError as error:
+        models = {'status': 'invalid', 'reason': str(error), 'resolutions': []}
+        issues.append(str(error))
+
     facts = {
         'python': {
             'available': python_available,
@@ -213,8 +220,9 @@ def doctor(report):
         # Advisory only: whether a version assertion run from here would prove
         # anything about the installed release (#257).
         'install': install_source_facts(),
+        'models': models,
     }
-    warnings = []
+    warnings = model_catalog.disclosure_notes(facts['models'])
     for label, state in sorted(facts['host_rules'].get('files', {}).items()):
         # An unanswered decision stays a fact only; a hand-edited or
         # outdated block means the exception no longer says what vibe wrote.
@@ -228,7 +236,7 @@ def doctor(report):
             warnings.append(label + ': 符号链接指向候选文件之外，vibe 不会写入')
         elif state == 'permission':
             warnings.append(label + ': 没有读取权限')
-    malformed = bool(report.skill_records_error or len(valid_skills) != len(report.skills))
+    malformed = bool(report.skill_records_error or len(valid_skills) != len(report.skills) or models.get('status') == 'invalid')
     status = 'blocked' if malformed else ('attention' if issues else 'ready')
     proposals = []
     skill_diag = diagnose_skill(_REQUIRED_SKILL, report, {"global_skills": []})

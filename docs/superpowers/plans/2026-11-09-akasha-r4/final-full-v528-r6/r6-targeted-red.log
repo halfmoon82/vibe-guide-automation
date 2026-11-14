@@ -1,0 +1,64 @@
+test_codex (tests.test_platform_e2e.EveryPlatformMatchesItsCardTests) ... FAIL
+test_missing_business_proof_is_refused (tests.test_integration_rework_r1.IntegrationProbes) ... ERROR
+test_completed_only_benign_reasoning_item_is_accepted (tests.test_plan_amendment.NativeTerminalHostReceiptTests) ... ERROR
+test_a_structured_reviewer_acceptance_closes_the_run (tests.test_integration_review_closeout_entry.MailboxClosesTheRunTests) ... /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/subprocess.py:1052: ResourceWarning: subprocess 97171 is still running
+  _warn("subprocess %s is still running" % self.pid,
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+FAIL
+
+======================================================================
+ERROR: test_missing_business_proof_is_refused (tests.test_integration_rework_r1.IntegrationProbes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/tests/test_integration_rework_r1.py", line 584, in test_missing_business_proof_is_refused
+    self.check_business_transport(variant="missing")
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/tests/test_integration_rework_r1.py", line 655, in check_business_transport
+    wait, = [a for a in runner.store.pending(snapshot.run_id) if a["operation"] == "wait"]
+ValueError: not enough values to unpack (expected 1, got 0)
+
+======================================================================
+ERROR: test_completed_only_benign_reasoning_item_is_accepted (tests.test_plan_amendment.NativeTerminalHostReceiptTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/tests/test_plan_amendment.py", line 2973, in test_completed_only_benign_reasoning_item_is_accepted
+    self.assertEqual(self._retire()["status"], "retired")
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/tests/test_plan_amendment.py", line 1188, in _retire
+    return plan_amendment.retire_uninvoked_legacy(
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/vibe_guide/plan_amendment.py", line 3504, in retire_uninvoked_legacy
+    context = _verify_retire_evidence(
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/vibe_guide/plan_amendment.py", line 3199, in _verify_retire_evidence
+    pairs = _retire_request_problems(store, evidence, run_id)
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/vibe_guide/plan_amendment.py", line 2808, in _retire_request_problems
+    raise PermissionError(
+PermissionError: provider request action-4218079b612677a168a4addbbd3f6ac1 node already has durable claim evidence: unknown_create_exposure
+
+======================================================================
+FAIL: test_codex (tests.test_platform_e2e.EveryPlatformMatchesItsCardTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/tests/test_platform_e2e.py", line 201, in test_codex
+    self.run_two_nodes("codex")
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/tests/test_platform_e2e.py", line 190, in run_two_nodes
+    self.serve(node_id)
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/tests/test_platform_e2e.py", line 120, in serve
+    self.fail("node never reached accepted: {} {} {}".format(node_id, self.snapshot().nodes[node_id], [(a["issue_id"], a["operation"]) for a in self.store.pending()]))
+AssertionError: node never reached accepted: export-button {'acceptance': None, 'active_role': None, 'active_task': None, 'binding_phase': None, 'branch': 'node/export-button-b474cfc3', 'contract_digest': 'f814915bd2491d74adb4bd313876e5ae1e778e13be5e3dfeae190722d09dc341', 'contract_overrides': {}, 'corrections': [], 'developer_generation': 0, 'developer_identity': None, 'error_type': 'ProviderUnavailable', 'evidence': [], 'handoff_file': '', 'old_task_reconciled': False, 'pair_archived': False, 'quarantine': {'handle_id': None, 'reason': '[REDACTED_PROVIDER_TEXT]', 'run_id': 'run-ca41133c06094703a4111678acecf384'}, 'reason': '[REDACTED_PROVIDER_TEXT]', 'reason_class': 'binding_unknown', 'recovery_action': 'reconcile_binding', 'retryable_action': {'action_ref': 'dispatch-d081da6cd52ad215f5df5a28', 'attempt': 1, 'binding_digest': 'f814915bd2491d74adb4bd313876e5ae1e778e13be5e3dfeae190722d09dc341', 'continuation': False, 'last_observation_ref': 'dispatch-d081da6cd52ad215f5df5a28', 'next_retry_at': 1794500716.1438432, 'phase': 'develop', 'reason_class': 'contract_error', 'reason_code': 'dispatch_contract_invalid', 'role': 'developer', 'same_task': True, 'same_task_required': True, 'successor': False}, 'review_generation': 0, 'reviewer_identity': None, 'reviewer_started': False, 'start_intent': None, 'status': 'blocked_unknown', 'status_file': '', 'user_status': '自动修复中', 'worker': 'worker', 'worktree': '.worktrees/export-button-b474cfc3'} [('date-range-filter', 'create')]
+
+======================================================================
+FAIL: test_a_structured_reviewer_acceptance_closes_the_run (tests.test_integration_review_closeout_entry.MailboxClosesTheRunTests)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/tests/test_integration_review_closeout_entry.py", line 500, in test_a_structured_reviewer_acceptance_closes_the_run
+    self.assertEqual(result.payload["status"], "complete", result.payload)
+AssertionError: 'blocked_unknown' != 'complete'
+- blocked_unknown
++ complete
+ : {'command': 'resume', 'dispatcher': 'monitor', 'status': 'blocked_unknown', 'run_id': 'run-d2108edb5d234108b039cd6899864a82', 'nodes': {'date-range-filter': {'acceptance': None, 'active_role': None, 'active_task': None, 'binding_phase': None, 'branch': 'node/date-range-filter-60466cae', 'contract_digest': '76cacecf3118546f9cd19f2f5cb83840db5317ff30e5508fae1b5aa687fe2b29', 'contract_overrides': {}, 'corrections': [], 'developer_generation': 0, 'developer_identity': None, 'error_type': 'ProviderUnavailable', 'evidence': [], 'handoff_file': '', 'old_task_reconciled': False, 'pair_archived': False, 'quarantine': {'run_id': 'run-d2108edb5d234108b039cd6899864a82', 'handle_id': None, 'reason': 'initial create anchor differs'}, 'reason': 'initial create anchor differs', 'reason_class': 'binding_unknown', 'recovery_action': 'reconcile_binding', 'retryable_action': {'role': 'developer', 'phase': 'develop', 'continuation': False, 'successor': False, 'same_task': True, 'same_task_required': True, 'attempt': 1, 'reason_class': 'binding_unknown', 'next_retry_at': 1794500724.935914, 'binding_digest': '76cacecf3118546f9cd19f2f5cb83840db5317ff30e5508fae1b5aa687fe2b29', 'last_observation_ref': '34cacc3e86386ed506d341cf9613864347144106b7033a73bba6e12be5494f8c'}, 'review_generation': 0, 'reviewer_identity': None, 'reviewer_started': False, 'start_intent': None, 'status': 'blocked_unknown', 'status_file': '', 'user_status': '自动修复中', 'worker': 'worker', 'worktree': '.worktrees/date-range-filter-60466cae'}, 'export-button': {'acceptance': None, 'active_role': None, 'active_task': None, 'binding_phase': None, 'branch': 'node/export-button-b474cfc3', 'contract_digest': 'bd85d9568030602c692b8b7f3692283524ae3d0635d34946c89b64db5215608f', 'contract_overrides': {}, 'corrections': [], 'developer_generation': 0, 'developer_identity': None, 'error_type': 'ProviderUnavailable', 'evidence': [], 'handoff_file': '', 'old_task_reconciled': False, 'pair_archived': False, 'quarantine': {'run_id': 'run-d2108edb5d234108b039cd6899864a82', 'handle_id': None, 'reason': 'initial create anchor differs'}, 'reason': 'initial create anchor differs', 'reason_class': 'binding_unknown', 'recovery_action': 'reconcile_binding', 'retryable_action': {'role': 'developer', 'phase': 'develop', 'continuation': False, 'successor': False, 'same_task': True, 'same_task_required': True, 'attempt': 1, 'reason_class': 'binding_unknown', 'next_retry_at': 1794500724.910385, 'binding_digest': 'bd85d9568030602c692b8b7f3692283524ae3d0635d34946c89b64db5215608f', 'last_observation_ref': '34cacc3e86386ed506d341cf9613864347144106b7033a73bba6e12be5494f8c'}, 'review_generation': 0, 'reviewer_identity': None, 'reviewer_started': False, 'start_intent': None, 'status': 'blocked_unknown', 'status_file': '', 'user_status': '自动修复中', 'worker': 'worker', 'worktree': '.worktrees/export-button-b474cfc3'}, 'integration-review': {'acceptance': None, 'active_role': None, 'active_task': None, 'binding_phase': None, 'branch': 'node/integration-review-96e4fece', 'contract_digest': '761a0fae73433c983218f622ebfa04730fd9e1d318d4344f9b702a5dd16a387a', 'contract_overrides': {}, 'corrections': [], 'developer_generation': 0, 'developer_identity': None, 'evidence': [], 'handoff_file': '', 'old_task_reconciled': False, 'pair_archived': False, 'quarantine': None, 'retryable_action': None, 'review_generation': 0, 'reviewer_identity': None, 'reviewer_started': False, 'start_intent': None, 'status': 'planned', 'status_file': '', 'user_status': '准备中', 'worker': 'integration-reviewer', 'worktree': '.worktrees/integration-review-96e4fece'}}, 'closeout_status': '整合 Review 未闭合/不可验收', 'continuation': 'manual', 'handoff': '首班监工还有两件事没做，做完才算开工：\n  1) 登记地址：vibe supervisor-register --run-id run-d2108edb5d234108b039cd6899864a82 --provider <平台> --session-id <本会话 id> --host <本机标识> --session-record <本会话记录路径>\n     <本会话记录路径> 是本会话自己的日志文件，不要另写记录文件：Codex 为 ~/.codex/sessions/<年>/<月>/<日>/rollout-…-<本会话 id>.jsonl，Claude Code 为 ~/.claude/projects/<项目>/<本会话 id>.jsonl，WorkBuddy 为 ~/.workbuddy-ai/projects/<项目路径把 / 换成 ->/<本会话 id>.jsonl（<本会话 id> 就是 $CODEBUDDY_SESSION_ID）；用 ls 确认。\n  2) 自建心跳：用宿主平台原语建周期任务，心跳指令逐字用下面这段（vibe 生成，不要自己另写）：\n     vibe supervisor-beat --run-id run-d2108edb5d234108b039cd6899864a82 --accept-decision --session-record <本会话记录路径>\n     心跳按 10 分钟建；命令输出会给出下一拍间隔（推送唤醒已验证或只剩未答决策时 60 分钟），与当前周期不一致时按输出调整。\n     每拍只运行这一条；输出 idle 时只回一个字，decision 时向用户呈现未答卡片，work/unknown 时按输出分支继续；rotate 只会出现在有换班原语的平台，Claude Code 不换班，到上限也同会话继续。\n没登记地址，worker 的完工唤醒信号无处可发；没心跳，空转与换班的检测不会发生。\n宿主差异：Codex 桌面两条都能自动建；Claude Code 没有换班原语，心跳降级为兜底机制；WorkBuddy 两条都得在本会话里手动做（登记地址、建心跳），不会自己发生，且没有合法的无焦点自动换班入口——rotate 只能由用户在本项目新开会话接班（Jobs detached 子进程拿不到模型 run identity，凭证边界为宿主设计使然）。'}
+
+----------------------------------------------------------------------
+Ran 4 tests in 12.211s
+
+FAILED (failures=2, errors=2)
+[loaded vibe_guide: /Users/smy/Desktop/CFO/黑客松/开发辅助/.worktrees/v528-r4-preconditions/vibe_guide/__init__.py version=5.2.8 head=78ee5bb17374438d5e87a016353f0f180aeffd11 frozen=885236783e1a680d7165ee2ee2c4e0002430a30a]
+
+exit_code=1

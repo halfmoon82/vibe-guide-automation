@@ -173,7 +173,7 @@ def pid_alive(pid: Any) -> bool:
     except PermissionError:
         return True
     except OSError:
-        return False
+        return True  # unknown process state must never authorize a second daemon
     return True
 
 
@@ -229,7 +229,13 @@ def register_pm_address(paths, run_id: str, provider: str, session_name: str) ->
 def build_run_command(run_id: str, plan_id: str, *, interval: Optional[float] = None,
                       model: Optional[str] = None, provider: Optional[str] = None) -> List[str]:
     """argv of the detached ``daemon run`` process; launchd uses the very same one."""
-    command = [sys.executable, "-m", "vibe_guide", "daemon", "run", "--plan", plan_id, "--run-id", run_id]
+    runtime = Path(__file__).resolve().parent.parent
+    package = runtime / "vibe_guide"
+    if not all((package / name).is_file() for name in ("__init__.py", "__main__.py", "cli.py", "daemon.py")):
+        raise ValueError("product runtime is unverifiable")
+    bootstrap = ("import runpy,sys; sys.path.insert(0," + repr(str(runtime)) + "); "
+                 "runpy.run_module('vibe_guide',run_name='__main__')")
+    command = [sys.executable, "-c", bootstrap, "daemon", "run", "--plan", plan_id, "--run-id", run_id]
     if interval is not None:
         command += ["--interval", str(interval)]
     if model:
@@ -241,17 +247,52 @@ def build_run_command(run_id: str, plan_id: str, *, interval: Optional[float] = 
 
 def start_daemon(paths, run_id: str, plan_id: str, *, interval: Optional[float] = None,
                  model: Optional[str] = None, provider: Optional[str] = None,
-                 spawn: Optional[Callable[..., Any]] = None, wait: float = 5.0) -> Dict[str, Any]:
+                 spawn: Optional[Callable[..., Any]] = None, wait: float = 5.0,
+                 recovery_owner=None) -> Dict[str, Any]:
+    from .state import interprocess_lock
+    with interprocess_lock(run_dir(paths, run_id, create=True) / ".daemon-start.lock"):
+        return _start_daemon_locked(paths, run_id, plan_id, interval=interval, model=model,
+                                    provider=provider, spawn=spawn, wait=wait, recovery_owner=recovery_owner)
+
+
+def _start_daemon_locked(paths, run_id: str, plan_id: str, *, interval=None,
+                         model=None, provider=None, spawn=None, wait=5.0, recovery_owner=None):
     """Start the detached daemon unless one is already up for this run."""
     current = daemon_status(paths, run_id)
     if current["status"] == "running":
         return {**current, "status": "already_running"}
     directory = run_dir(paths, run_id, create=True)
+    intent_path = directory / "daemon-start.json"
+    intent = _run_record(intent_path)
+    if intent_path.exists():
+        pid = intent.get("pid") if isinstance(intent, dict) else None
+        if type(pid) is not int or pid <= 0 or pid_alive(pid):
+            return {**current, "status": "start_unknown", "reason": "claimed daemon process is unresolved; reconcile before restart"}
+    record_path = directory / DAEMON_FILE
+    previous = _run_record(record_path)
+    if record_path.exists() and previous is None:
+        return {**current, "status": "start_unknown", "reason": "original daemon process record is unreadable"}
+    if previous is not None:
+        pid = previous.get("pid")
+        if type(pid) is not int or pid <= 0:
+            return {**current, "status": "start_unknown", "reason": "original daemon process identity is unknown"}
+        try:
+            alive = pid_alive(pid)
+        except (OSError, ValueError, TypeError):
+            return {**current, "status": "start_unknown", "reason": "original daemon process query is unknown"}
+        if alive:
+            return {**current, "status": "start_unknown", "reason": "original daemon process may still be alive; reconcile before restart"}
     command = build_run_command(run_id, plan_id, interval=interval, model=model, provider=provider)
     spawn = spawn or subprocess.Popen
+    _save_run_record(intent_path, {"run_id": run_id, "plan_id": plan_id,
+                                  "status": "claimed", "pid": None, "command": command,
+                                  "recovery_owner": recovery_owner})
     with open(str(directory / DAEMON_LOG_FILE), "ab") as log:
         process = spawn(command, cwd=str(paths.root), stdin=subprocess.DEVNULL,
                         stdout=log, stderr=log, start_new_session=True)
+    _save_run_record(intent_path, {"run_id": run_id, "plan_id": plan_id,
+                                  "status": "spawned", "pid": getattr(process, "pid", None), "command": command,
+                                  "recovery_owner": recovery_owner})
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         status = daemon_status(paths, run_id)
@@ -489,6 +530,7 @@ class Daemon:
         self._error_streak = 0
         self._last_heal = None
         self._run_status: Optional[str] = None
+        self._verified_cycles = []
 
     # -- defaults wired to the real supervisor -----------------------------
     def _default_assess(self):
@@ -529,6 +571,13 @@ class Daemon:
                   "started_at": self._started_at, "heartbeat": self.clock(), "cycles": self._cycles,
                   "run_status": self._run_status, "last_error": self._last_error,
                   "stale_seconds": max(self.config.stale_seconds, 4 * self.config.interval)}
+        if self._verified_cycles:
+            record["cycle_verification"] = {
+                "status": "verified" if len(self._verified_cycles) == 2 else "pending",
+                "owner_epoch": self._verified_cycles[-1]["owner_epoch"],
+                "owner_session_id": self._verified_cycles[-1]["owner_session_id"],
+                "cycles": list(self._verified_cycles),
+            }
         _save_run_record(_file(self.paths, self.run_id, DAEMON_FILE, create=True), record)
 
     def _heal_state(self) -> Dict[str, Any]:
@@ -885,6 +934,7 @@ class Daemon:
         except (OSError, ValueError, TypeError, KeyError, AttributeError, PermissionError) as error:
             self._record_error(error)
         self._cycles += 1
+        self._observe_verified_cycle(snapshot)
         status = getattr(snapshot, "status", None) if snapshot is not None else None
         if isinstance(snapshot, dict):
             status = snapshot.get("status")
@@ -898,6 +948,37 @@ class Daemon:
                 self.heal_pass(snapshot)
         self._push_pending(snapshot)
         self._watch_deliveries()
+
+    def _observe_verified_cycle(self, snapshot):
+        from .protocol_adoption import effective_responsibility
+        from .supervisor import _read_lease_record
+        try:
+            if snapshot is None or effective_responsibility(self.paths, snapshot).get("status") != "effective":
+                self._verified_cycles = []
+                return
+            lease = self.supervisor.lease
+            lease.ensure_current(self.run_id)
+            owner = _read_lease_record(lease.path(self.run_id))
+            if (not isinstance(owner, dict) or owner.get("released") is True
+                    or owner.get("pid") != os.getpid()
+                    or not isinstance(owner.get("owner"), dict)
+                    or not owner["owner"].get("session_id")):
+                self._verified_cycles = []
+                return
+            observation = {"cycle": self._cycles, "owner_epoch": owner["lease_epoch"],
+                "owner_session_id": owner["owner"]["session_id"], "pid": os.getpid(),
+                "authorization_digest": snapshot.authorization_digest,
+                "node_contract_digest": snapshot.node_contract_digest,
+                "event_sequence": snapshot.event_sequence,
+                "result": "public_supervisor_cycle_completed"}
+            previous = self._verified_cycles[-1] if self._verified_cycles else None
+            if previous is not None and (previous["cycle"] + 1 != self._cycles or any(
+                    previous[key] != observation[key] for key in ("owner_epoch", "owner_session_id", "pid",
+                                                               "authorization_digest", "node_contract_digest"))):
+                self._verified_cycles = []
+            self._verified_cycles = (self._verified_cycles + [observation])[-2:]
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            self._verified_cycles = []
 
     def _watch_deliveries(self) -> None:
         """A report still unreceived after two cycles is made visible, not left silent."""
@@ -961,6 +1042,8 @@ class Daemon:
             return
         state = self._heal_state()
         self._heal_ended_reviewers(snapshot, state)
+        from .protocol_adoption import effective_responsibility
+        responsibility_active = effective_responsibility(self.paths, snapshot).get("status") == "effective"
         ran_session = False
         if state.get("unresolved"):
             state["unresolved"] = live_unresolved(state, snapshot)
@@ -972,6 +1055,26 @@ class Daemon:
                               "pm_notified": False}
                 state["nodes"][node_id] = node_state
                 (state.get("unresolved") or {}).pop(node_id, None)  # the node moved: no longer stuck
+            if responsibility_active:
+                # Assessment and polling are observations, never failed
+                # recovery attempts. The registered supervisor supplies the
+                # diagnosis/next action; this daemon remains the executor.
+                lineage = {
+                    "status": "pending", "node_id": node_id,
+                    "role": (entry.get("pack") or {}).get("role"),
+                    "fingerprint": fingerprint,
+                    "authorization_digest": getattr(snapshot, "authorization_digest", None),
+                    "node_contract_digest": getattr(snapshot, "node_contract_digest", None),
+                }
+                previous = node_state.get("supervisor_responsibility")
+                if (isinstance(previous, dict) and all(previous.get(key) == value
+                        for key, value in lineage.items())):
+                    # A repeated observation is not a new problem. Keep the
+                    # original supervisor's diagnosis/action/recheck evidence
+                    # across daemon reconstruction and notification dedup.
+                    lineage = {**previous, **lineage}
+                node_state["supervisor_responsibility"] = lineage
+                continue
             if node_state["escalated"]:
                 continue
             if entry.get("tier") == stall.TIER_ESCALATE or node_state["repairs"] >= _REPAIRS_BEFORE_ESCALATION:
@@ -1033,6 +1136,11 @@ class Daemon:
         never replaced.  A reviewer that was already replaced and was rejected
         again goes to the product manager instead of a second replacement.
         """
+        from .protocol_adoption import effective_responsibility
+        if effective_responsibility(self.paths, snapshot).get("status") == "effective":
+            # Format rejection is a correction request to the original task,
+            # never a completed failed recovery or evidence of disqualification.
+            return
         nodes = getattr(snapshot, "nodes", None)
         if not isinstance(nodes, dict):
             return

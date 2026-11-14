@@ -203,6 +203,8 @@ class PendingSuccessorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             paths = ProjectPaths(Path(root))
             runner = ProviderActionRunner(paths, 'codex-app-visible', 'codex-app-visible')
+            paths.vibe.mkdir(exist_ok=True)
+            (paths.vibe / "state.json").write_text("{}")
             monitor = Monitor.__new__(Monitor)
             monitor.paths = paths
             monitor.plan = SimpleNamespace(version=1)
@@ -213,7 +215,8 @@ class PendingSuccessorTests(unittest.TestCase):
                 'active_task': None, 'active_role': None, 'start_intent': None}
             snapshot = SimpleNamespace(run_id='run-1', nodes={'n1': current}, handles={}, tasks={},
                                        capability_contract_digest='', authorization_digest='x',
-                                       node_contract_digest='n', event_sequence=0)
+                                       node_contract_digest='n', event_sequence=0,
+                                       _dispatch_owner=monitor._current_dispatch_owner('run-1'))
             monitor._require_snapshot_authorization = lambda snap: SimpleNamespace(allowed_actions=[], file_scope=[])
             monitor._consistency_binding = lambda *args: {}
             records = []
