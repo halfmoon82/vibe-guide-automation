@@ -15,8 +15,8 @@ from pathlib import Path
 from vibe_guide.cli import main, _first_shift_handoff
 from vibe_guide.paths import ProjectPaths
 
-HB = {"kind": "heartbeat", "target_thread_id": "t-1", "rrule": "FREQ=MINUTELY;INTERVAL=10"}
-CRON = {"kind": "cron", "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=0",
+HB = {"kind": "heartbeat", "purpose": "same_thread_heartbeat", "target_thread_id": "t-1", "rrule": "FREQ=MINUTELY;INTERVAL=10"}
+CRON = {"kind": "cron", "purpose": "independent_cron", "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=0",
         "target": {"type": "project", "project_id": "p-1"}}
 
 
@@ -79,14 +79,23 @@ class AutomationCheckCliTests(unittest.TestCase):
         for path in files:
             config = tomllib.loads(path.read_text(encoding="utf-8"))
             spec = {key: config[key] for key in ("kind", "rrule", "target_thread_id", "target") if key in config}
+            spec["purpose"] = "same_thread_heartbeat" if spec.get("kind") == "heartbeat" else "independent_cron"
             code, payload = self.run_check("--spec", json.dumps(spec))
             self.assertEqual(code, 0, "%s: %s" % (path.parent.name, payload.get("reason")))
+
+    def test_spec_without_purpose_is_refused(self):
+        for spec in ({k: v for k, v in HB.items() if k != "purpose"},
+                     {k: v for k, v in CRON.items() if k != "purpose"}):
+            code, payload = self.run_check("--spec", json.dumps(spec))
+            self.assertEqual((code, payload["status"]), (3, "rejected"))
+            self.assertIn("purpose", payload["reason"])
 
     def test_first_shift_handoff_names_the_gate(self):
         paths = ProjectPaths(self.root)
         text = _first_shift_handoff(paths, "plan-1", "run-1")
         self.assertIn("vibe automation-check --spec", text)
         self.assertIn("--readback", text)
+        self.assertIn("必须带 purpose", text)
 
 
 if __name__ == "__main__":
