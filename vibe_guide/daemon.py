@@ -1243,8 +1243,9 @@ class Daemon:
         """A product or authorization boundary the system must not cross: ask once."""
         own_state = state is None
         state = state if state is not None else self._heal_state()
-        if node_id and state["nodes"].get(node_id, {}).get("escalated"):
-            return
+        prior = state["nodes"].get(node_id, {}) if node_id else {}
+        if prior.get("escalated") and not prior.get("engineering"):
+            return  # a real boundary was already handed over; an engineering mark must not swallow a new one
         if node_id:
             state["nodes"].setdefault(node_id, {}).update({"escalated": True, "engineering": False})
         card = None

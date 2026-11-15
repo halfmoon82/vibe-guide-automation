@@ -43,6 +43,14 @@ class BlockedUnknownClosure(Base):
         daemon._escalate("bg", "needs_decision", "需要新增依赖", "new_dependency")
         self.assertTrue(daemon._parked())
 
+    def test_real_boundary_after_engineering_unresolved_parks(self):
+        daemon = self.make_daemon(self.start())
+        daemon._unresolved("bg", "self_heal_no_progress", "修了几轮仍无进展")
+        daemon._escalate("bg", "needs_decision", "需要新增依赖", "new_dependency")
+        node = daemon._heal_state()["nodes"]["bg"]
+        self.assertFalse(node["engineering"])
+        self.assertTrue(daemon._parked())
+
     def test_unserved_blocked_node_keeps_alerting(self):
         daemon = self.make_daemon(self.start())
         daemon._parked()
