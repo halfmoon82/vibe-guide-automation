@@ -351,3 +351,41 @@ python3 -m vibe_guide --help
 python3 -m compileall -q vibe_guide tests
 git diff --check
 ```
+
+## V6.0 迁移、升级与实测收口
+
+V6.0 在 V5.2.7 的基础上加入三档入口、blocked_unknown 责任闭环、规划与执行协议分离、有界返工后自动接力，以及首装/升级内置的 Ollama 初始化。本节说明升级与回滚怎么走、验收范围怎么记、以及当前哪些项如实标为未验收。
+
+### 升级路径
+
+- 两条升级边都要单独验证：V5.2.7 → V6.0、V5.2.8 → V6.0（V5.2.8 先于 V6.0 发布）。不用「旧版」二字代替具体版本。
+- `.vibe/` 状态迁移走显式命令 `vibe migrate-state --preview`（只读预览，不写任何文件）与 `vibe migrate-state --confirm`（生成迁移证据）。旧状态、事件、授权 epoch、cursor 和活跃 run 复制进只读历史 namespace，源文件逐字节保留，不自动改写本地定制（`.vibe/proposals/skills/*/SKILL.md` 与已合入的 AGENTS 规则块），活跃 run 不迁移为当前可执行状态。
+- 安装、升级、迁移、回滚分别验证；回滚必须留下目标版本、来源构建产物和验证命令证据。
+
+### 回滚只撤销本轮自有变更
+
+`rollback_state` 把历史档案恢复到独立的 `rollback/` 目录，带 fail-closed 冲突校验：目标文件已存在且内容不同即报 `blocked_invalid` 并保留原文件，绝不覆盖；缺历史记录时如实报 `blocked_unknown`，不伪装成功。源 `state.json` 与当前 namespace 在回滚前后逐字节不变（`source_unchanged` / `current_namespace_preserved`）——也就是回滚只涉及本轮升级自己创建的隔离区，不动用户既有数据、活跃 run 与旧授权卡。重复执行升级保持幂等，不重复复制、不丢成果。
+
+### 冻结矩阵与绑定报告
+
+支持矩阵 `v6-support-matrix/1`（2026-11-09 冻结）当前状态是 **blocked_pending_scope**：精确 OS 版本、模型档案和 Ollama 版本范围待补，补入时升版、不覆写；冻结范围不等于批准安装、迁移或发布。必测集合可机械枚举：
+
+- 安装类 12 个组合：macOS/arm64（E1）×（wheel/3.9、wheel/3.12、sdist/3.12、源码/3.12）×（首装 + V5.2.7 → V6.0 + V5.2.8 → V6.0）。
+- 入口类 15 项：Codex、Claude Code、WorkBuddy ×（新会话、后续新目标、恢复、委派、授权生命周期快路径）。
+- 通用 B25：每个必需组合都要有绑定报告，缺任一组合就报该组合未验收，**不得事后删除失败组合**来凑全绿。
+
+逐组合的**绑定报告**在 `tests/fixtures/v6_upgrade/v6_binding_report.json`，冻结矩阵在 `v6_support_matrix.json`，唯一性/诚实性钉子测试在 `tests/test_v6_migration.py`。当前每个需要真机的组合都标为**未验收**、证据留空、用量记 `unknown`（不填 0）；报告整体 `complete_release_claimed = false`、`release_status = blocked_pending_scope`，不宣称 V6.0 完整发布。把某个失败组合从报告里删掉、或把用量填成 0、或在没有证据时标成已验收，契约测试都会判违规。
+
+### 已验证与未验证（如实列出）
+
+已由契约测试覆盖的是本地夹具行为：升级保留源与活跃 run、本地定制不覆盖、回滚只撤销本轮自有变更、冲突 fail-closed、幂等重试、逐组合绑定报告的完整性与诚实性。这些夹具不能单独证明真实 provider 能力。
+
+以下均未验证、不得当作已支持：
+
+- 真机干净首装、两条升级边、真实 Ollama 安装、模型下载与真实推理自检——本节点不安装 Ollama、不下载模型、不改系统配置。
+- 真实 provider（Codex、Claude Code、WorkBuddy）逐请求 hook 触发与真实首轮/后续 input 用量；覆盖级别只能实测后降级，不得事后换集合。
+- V6.0 各组合整轮 input/output、续接文本 P95、节省百分比；P0a 基线（`outputs/v6-p0a-baseline-run-*.json`）只是升级前对照，不是 V6.0 实测，缺失用量一律 `unknown`。
+- 矩阵外 OS（Windows、Linux、x86_64）与 provider（Cursor、Grok、Kimi Code、DeepSeek Harness、WorkBuddy AI.app）：不在 V6.0 验收内，不宣称已支持。
+- 契约测试、worker 自报、timeout 或本地 fixture 都不能单独证明真实登录、权限、任务可见性、merge、发布或 deploy；缺证据一律保持 unknown。
+
+设计 A1–A12 的功能场景已由各节点契约测试覆盖，但真机端到端与 A/B 用量对照未验证；绑定报告对每项标注 owner 节点与「契约测试已覆盖；真机端到端未验证」。只有冻结范围全覆盖、P0–P2 清零、所有必需组合都有绑定证据后才通过，缺一个组合就报告该组合未验收。

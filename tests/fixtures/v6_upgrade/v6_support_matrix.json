@@ -1,0 +1,519 @@
+{
+  "matrix_id": "v6-support-matrix/1",
+  "frozen_on": "2026-11-09",
+  "status": "blocked_pending_scope",
+  "source": "outputs/v6-support-matrix-proposal-2026-11-09.md；PRD r3 §4.5 B15–B25；产品决策 matrix.scope=A（2026-11-09 冻结）",
+  "status_note": "范围已冻结，但精确 OS 版本、模型档案、Ollama 版本范围待补，补入时升版、不覆写。冻结范围不等于批准源码实施、安装、迁移或发布；V6.0 发布验收仍为 blocked_pending_scope。",
+  "scope": {
+    "os_arch": "E1 macOS / arm64",
+    "install_paths": [
+      {
+        "install_path": "wheel",
+        "python": "3.9"
+      },
+      {
+        "install_path": "wheel",
+        "python": "3.12"
+      },
+      {
+        "install_path": "sdist",
+        "python": "3.12"
+      },
+      {
+        "install_path": "source",
+        "python": "3.12"
+      }
+    ],
+    "upgrade_edges": [
+      "fresh_install",
+      "V5.2.7_to_V6.0",
+      "V5.2.8_to_V6.0"
+    ],
+    "providers": [
+      "codex",
+      "claude_code",
+      "workbuddy"
+    ],
+    "entry_scenarios": [
+      "new_session",
+      "followup_new_goal",
+      "resume",
+      "delegate",
+      "auth_lifecycle_fastpath"
+    ],
+    "excluded": [
+      "E2 macOS x86_64",
+      "E3 Windows x86_64",
+      "E4 Linux x86_64",
+      "E5 Linux arm64",
+      "WorkBuddy AI.app 5.9.4",
+      "Cursor",
+      "Grok",
+      "Kimi Code",
+      "DeepSeek Harness"
+    ]
+  },
+  "scenario_coverage": {
+    "B15": "干净设备首装，无 Ollama/模型",
+    "B16": "已有 Ollama 的四种分支（有模型/缺模型/服务停止/版本不兼容）",
+    "B17": "明确旧版本升级到 V6.0，多注册项目/定制入口/活跃 run",
+    "B18": "下载中断、离线、资源不足、用户拒绝、非交互未授权",
+    "B19": "本地端口返回 200 但模型不可用 / 配置指向云端",
+    "B20": "wheel、sdist、源码三种首装与并发初始化、再回滚",
+    "B21": "公开逐请求 hook 宿主：新会话/新需求/恢复/委派",
+    "B22": "授权生命周期快路径，心跳/接班/返工/续接不重评分",
+    "B23": "无公开 hook / hook 失效 / 定制入口过期",
+    "B24": "旧入口结果跨请求误用、重复触发、部分工具覆盖",
+    "B25": "冻结后不得删除失败组合；缺任一必需组合即报该组合未验收；不宣称 V6.0 完整发布"
+  },
+  "general_gates": [
+    {
+      "ref": "B25",
+      "rule": "所有必需组合均有绑定报告后才能通过；缺任一必需组合报该组合未验收，不得事后删除失败组合。"
+    }
+  ],
+  "design_acceptance_refs": [
+    "A1",
+    "A2",
+    "A3",
+    "A4",
+    "A5",
+    "A6",
+    "A7",
+    "A8",
+    "A9",
+    "A10",
+    "A11",
+    "A12"
+  ],
+  "required_combinations": [
+    {
+      "id": "install.wheel-py39.fresh_install",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "wheel",
+        "python": "3.9",
+        "upgrade_edge": "fresh_install"
+      },
+      "scenario_refs": [
+        "B15",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "install.wheel-py39.V5.2.7_to_V6.0",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "wheel",
+        "python": "3.9",
+        "upgrade_edge": "V5.2.7_to_V6.0"
+      },
+      "scenario_refs": [
+        "B15",
+        "B17",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "install.wheel-py39.V5.2.8_to_V6.0",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "wheel",
+        "python": "3.9",
+        "upgrade_edge": "V5.2.8_to_V6.0"
+      },
+      "scenario_refs": [
+        "B15",
+        "B17",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "install.wheel-py312.fresh_install",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "wheel",
+        "python": "3.12",
+        "upgrade_edge": "fresh_install"
+      },
+      "scenario_refs": [
+        "B15",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "install.wheel-py312.V5.2.7_to_V6.0",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "wheel",
+        "python": "3.12",
+        "upgrade_edge": "V5.2.7_to_V6.0"
+      },
+      "scenario_refs": [
+        "B15",
+        "B17",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "install.wheel-py312.V5.2.8_to_V6.0",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "wheel",
+        "python": "3.12",
+        "upgrade_edge": "V5.2.8_to_V6.0"
+      },
+      "scenario_refs": [
+        "B15",
+        "B17",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "install.sdist-py312.fresh_install",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "sdist",
+        "python": "3.12",
+        "upgrade_edge": "fresh_install"
+      },
+      "scenario_refs": [
+        "B15",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "install.sdist-py312.V5.2.7_to_V6.0",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "sdist",
+        "python": "3.12",
+        "upgrade_edge": "V5.2.7_to_V6.0"
+      },
+      "scenario_refs": [
+        "B15",
+        "B17",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "install.sdist-py312.V5.2.8_to_V6.0",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "sdist",
+        "python": "3.12",
+        "upgrade_edge": "V5.2.8_to_V6.0"
+      },
+      "scenario_refs": [
+        "B15",
+        "B17",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "install.source-py312.fresh_install",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "source",
+        "python": "3.12",
+        "upgrade_edge": "fresh_install"
+      },
+      "scenario_refs": [
+        "B15",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "install.source-py312.V5.2.7_to_V6.0",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "source",
+        "python": "3.12",
+        "upgrade_edge": "V5.2.7_to_V6.0"
+      },
+      "scenario_refs": [
+        "B15",
+        "B17",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "install.source-py312.V5.2.8_to_V6.0",
+      "category": "install",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "install_path": "source",
+        "python": "3.12",
+        "upgrade_edge": "V5.2.8_to_V6.0"
+      },
+      "scenario_refs": [
+        "B15",
+        "B17",
+        "B20"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.codex.new_session",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "codex",
+        "scenario": "new_session"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.codex.followup_new_goal",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "codex",
+        "scenario": "followup_new_goal"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.codex.resume",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "codex",
+        "scenario": "resume"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.codex.delegate",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "codex",
+        "scenario": "delegate"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.codex.auth_lifecycle_fastpath",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "codex",
+        "scenario": "auth_lifecycle_fastpath"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.claude_code.new_session",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "claude_code",
+        "scenario": "new_session"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.claude_code.followup_new_goal",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "claude_code",
+        "scenario": "followup_new_goal"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.claude_code.resume",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "claude_code",
+        "scenario": "resume"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.claude_code.delegate",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "claude_code",
+        "scenario": "delegate"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.claude_code.auth_lifecycle_fastpath",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "claude_code",
+        "scenario": "auth_lifecycle_fastpath"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.workbuddy.new_session",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "workbuddy",
+        "scenario": "new_session"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.workbuddy.followup_new_goal",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "workbuddy",
+        "scenario": "followup_new_goal"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.workbuddy.resume",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "workbuddy",
+        "scenario": "resume"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.workbuddy.delegate",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "workbuddy",
+        "scenario": "delegate"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    },
+    {
+      "id": "entry.workbuddy.auth_lifecycle_fastpath",
+      "category": "entry",
+      "dimensions": {
+        "os_arch": "E1 macOS/arm64",
+        "provider": "workbuddy",
+        "scenario": "auth_lifecycle_fastpath"
+      },
+      "scenario_refs": [
+        "B21",
+        "B22",
+        "B23",
+        "B24"
+      ],
+      "requires_real_evidence": true
+    }
+  ]
+}
