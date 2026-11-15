@@ -292,15 +292,14 @@ class ParkedRunTests(LiveSessionTests):
         self.assertTrue(daemon._report_unresolved(None, state, final=True))   # retried, delivered
         self.assertEqual(len([k for k in state["pushed"] if k.startswith("unresolved:")]), 1)
 
-    def test_blocked_unknown_closes_after_the_grace_period_even_unescalated(self):
+    def test_blocked_unknown_is_not_closed_by_the_grace_period_alone(self):
+        # V6 P0b (A1): an elapsed grace period never retires a run nobody has
+        # handed to the product manager; it keeps ticking and keeps alerting.
         supervisor = Supervisor([self.blocked()])
         outcome = self.make(supervisor, blocked_grace=60).run(max_cycles=20)
-        self.assertEqual(outcome["status"], "parked")
-        self.assertEqual(outcome["run_status"], "blocked_unknown")
+        self.assertEqual(outcome["status"], "max_cycles")
         self.assertNotIn("archive", self.order)
         self.assertTrue((run_dir(self.paths, RUN) / "state.json").is_file())
-        self.assertFalse((runs_archive_dir(self.paths, RUN)).exists())
-
 
     def test_blocked_unknown_with_a_live_session_is_never_archived(self):
         self.probe = {"live": ["abcd1234"], "unknown": None}
@@ -319,6 +318,9 @@ class ParkedRunTests(LiveSessionTests):
     def test_closed_out_run_gets_no_further_ticks(self):
         supervisor = Supervisor([self.blocked()])
         daemon = self.make(supervisor, blocked_grace=60)
+        state = daemon._heal_state()
+        state["nodes"]["n"] = {"escalated": True}
+        daemon._save_heal_state(state)
         daemon.run(max_cycles=20)
         calls = supervisor.calls
         self.assertGreater(calls, 0)

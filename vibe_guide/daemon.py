@@ -665,7 +665,8 @@ class Daemon:
         # Only a real boundary (a decision card the product manager must answer)
         # lets the run park.  An engineering "unresolved" or an elapsed grace
         # period never does: the node keeps being served and keeps alerting (A1).
-        handed_over = all(recorded.get(node_id, {}).get("boundary") for node_id in blocked)
+        handed_over = all(recorded.get(node_id, {}).get("escalated")
+                          and not recorded.get(node_id, {}).get("engineering") for node_id in blocked)
         if not handed_over:
             if now - self._parked_since >= self.config.blocked_grace:
                 for node_id in blocked:
@@ -1226,6 +1227,8 @@ class Daemon:
         if node_id:
             node_state = state["nodes"].setdefault(node_id, {})
             node_state["escalated"] = True
+            if code != "run_parked":
+                node_state["engineering"] = True  # never a hand-over: the node keeps being served
             current = _node_fingerprint(self._snapshot, node_id)
             if current:
                 node_state["fingerprint"] = current  # a stale one would make live_unresolved drop this item at once
@@ -1243,7 +1246,7 @@ class Daemon:
         if node_id and state["nodes"].get(node_id, {}).get("escalated"):
             return
         if node_id:
-            state["nodes"].setdefault(node_id, {}).update({"escalated": True, "boundary": True})
+            state["nodes"].setdefault(node_id, {}).update({"escalated": True, "engineering": False})
         card = None
         try:
             from .decision_boundary import raise_decision
