@@ -660,21 +660,28 @@ class Daemon:
         now = self.clock()
         if self._parked_since is None:
             self._parked_since = now
-        recorded = self._heal_state()["nodes"]
-        handed_over = all(recorded.get(node_id, {}).get("escalated") for node_id in blocked)
-        if not (handed_over or now - self._parked_since >= self.config.blocked_grace):
+        state = self._heal_state()
+        recorded = state["nodes"]
+        # Only a real boundary (a decision card the product manager must answer)
+        # lets the run park.  An engineering "unresolved" or an elapsed grace
+        # period never does: the node keeps being served and keeps alerting (A1).
+        handed_over = all(recorded.get(node_id, {}).get("escalated")
+                          and not recorded.get(node_id, {}).get("engineering") for node_id in blocked)
+        if not handed_over:
+            if now - self._parked_since >= self.config.blocked_grace:
+                for node_id in blocked:
+                    self._unresolved(node_id, "blocked_unserved",
+                                     "节点 %s 停在 blocked_unknown，仍在查证，尚无结论" % node_id, state=state)
+                self._save_heal_state(state)
             return False
         # Parking never leaves a delivered report unreceived: while a report
         # for a node's current generation is unconsumed the ticks go on and
         # receive it, however long the run has been blocked (#382).
         if self._receivable_deliveries():
             return False
-        # Other mailbox work (requests, unpolled results) that stays unserved
-        # for the whole grace period no longer holds the run back: a run must
-        # not stay open forever on an item nobody serves.  The item stays in
-        # the mailbox and the run directory is kept, so ``run-restore`` or the
-        # next supervisor can still serve it.
-        return not self._undelivered_work() or now - self._parked_since >= self.config.blocked_grace
+        # Other mailbox work (requests, unpolled results) keeps the run open: the
+        # item stays in the mailbox and is served on the next tick.
+        return not self._undelivered_work()
 
     def _receivable_deliveries(self) -> List[str]:
         """Unconsumed worker reports addressed to a node's current generation.
@@ -1220,6 +1227,8 @@ class Daemon:
         if node_id:
             node_state = state["nodes"].setdefault(node_id, {})
             node_state["escalated"] = True
+            if code != "run_parked":
+                node_state["engineering"] = True  # never a hand-over: the node keeps being served
             current = _node_fingerprint(self._snapshot, node_id)
             if current:
                 node_state["fingerprint"] = current  # a stale one would make live_unresolved drop this item at once
@@ -1234,10 +1243,11 @@ class Daemon:
         """A product or authorization boundary the system must not cross: ask once."""
         own_state = state is None
         state = state if state is not None else self._heal_state()
-        if node_id and state["nodes"].get(node_id, {}).get("escalated"):
-            return
+        prior = state["nodes"].get(node_id, {}) if node_id else {}
+        if prior.get("escalated") and not prior.get("engineering"):
+            return  # a real boundary was already handed over; an engineering mark must not swallow a new one
         if node_id:
-            state["nodes"].setdefault(node_id, {})["escalated"] = True
+            state["nodes"].setdefault(node_id, {}).update({"escalated": True, "engineering": False})
         card = None
         try:
             from .decision_boundary import raise_decision

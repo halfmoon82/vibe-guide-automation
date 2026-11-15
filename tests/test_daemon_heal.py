@@ -628,5 +628,27 @@ class NotifierConfigTests(Base):
         self.assertEqual((config.executable, config.extra_args), ("/usr/local/bin/claude", ["--x"]))
 
 
+class StaleLeaseReplayTests(unittest.TestCase):
+    """A3: after an owner change the old holder's epoch is rejected, so a replayed
+    action from the previous owner cannot act as a second writer."""
+
+    def test_stale_epoch_is_rejected_after_takeover(self):
+        import tempfile
+        from pathlib import Path
+        from vibe_guide.paths import ProjectPaths
+        from vibe_guide.supervisor import SupervisorLease
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = ProjectPaths(Path(tmp))
+            (paths.vibe / "runs" / RUN).mkdir(parents=True)
+            old = SupervisorLease(paths)
+            self.assertTrue(old.acquire(RUN))
+            old.ensure_current(RUN)
+            SupervisorLease(paths).takeover(RUN, old.lease_epoch, owner="shift-2")
+            with self.assertRaises(SupervisorLeaseConflict):
+                old.ensure_current(RUN)
+            with self.assertRaises(SupervisorLeaseConflict):
+                SupervisorLease(paths).takeover(RUN, old.lease_epoch, owner="replay")
+
+
 if __name__ == "__main__":
     unittest.main()

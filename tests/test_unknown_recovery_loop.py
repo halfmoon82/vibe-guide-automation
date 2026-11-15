@@ -89,6 +89,19 @@ class RepeatTests(unittest.TestCase):
         two = assess([parked(1), parked(2)])[NODE]["cause_fingerprint"]
         self.assertEqual(one, two)
 
+    def test_replayed_delivery_does_not_inflate_repeats(self):
+        # A3: transport may redeliver the same event; the dossier counts rounds,
+        # not copies.  Two copies of one park are still a first park.
+        entry = assess([parked(1), parked(1)])[NODE]
+        self.assertEqual(entry["repeats"], 1)
+        self.assertFalse(entry["switch_required"])
+        replayed = assess([parked(1), parked(2), parked(2)])[NODE]
+        self.assertEqual(replayed["repeats"], 2)
+
+    def test_replayed_noise_events_do_not_extend_a_chain(self):
+        events = [parked(1), other(2, "retry_scheduled"), other(2, "retry_scheduled"), parked(3)]
+        self.assertEqual(assess(events)[NODE]["repeats"], 2)
+
 
 class LegitimateWaitTests(unittest.TestCase):
     def test_upstream_wait_is_a_wait_not_a_loop(self):

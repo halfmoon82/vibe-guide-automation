@@ -3416,10 +3416,16 @@ def unknown_loop_assessment(nodes, tasks, events):
             continue
         cause = _unknown_cause(node)
         repeats, ref = 0, "state.json#nodes/" + node_id
+        seen_sequences = set()
         for record in reversed(events or []):
             data = record.get("data") or {}
             if data.get("node_id") != node_id:
                 continue
+            sequence = record.get("sequence")
+            if sequence is not None:
+                if sequence in seen_sequences:
+                    continue  # a replayed delivery is the same event, not another round
+                seen_sequences.add(sequence)
             name = record.get("event")
             if name == "blocked_unknown":
                 if _unknown_cause(data) != cause:
