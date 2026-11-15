@@ -3369,6 +3369,107 @@ def mailbox_wait_mark_reported(paths, run_id, report):
         pass
 
 
+# --- #404: an unknown needs a dossier, and the same cause twice needs a new strategy ---
+#: Events that are recovery bookkeeping, not progress: they never break a same-cause chain.
+_UNKNOWN_NOISE_EVENTS = frozenset({
+    "blocked_unknown", "retry_scheduled", "provider_observation", "node_repaired",
+    "binding_self_healed", "successor_binding_pending", "supervisor_heartbeat",
+    "self_heal_attempt", "execution_topology_observed", "action_isolated",
+})
+#: Same cause parked this many times in a row with no progress => the next action must differ.
+UNKNOWN_SWITCH_REPEATS = 2
+#: Strategy ladder: the action a repeated cause moves to, then further down on later rounds.
+_UNKNOWN_LADDER = {
+    "requeue_same_task": ["reconcile_binding", "successor_binding_audit", "engineering_investigation"],
+    "reconcile_binding": ["successor_binding_audit", "engineering_investigation"],
+    "repair_node": ["engineering_investigation"],
+}
+_UNKNOWN_LADDER_DEFAULT = ["engineering_investigation"]
+_UNKNOWN_VERIFY = {
+    "reconcile_binding": "create/locate/visibility/正式绑定/任务接收全部有结构化结果后节点离开 blocked_unknown",
+    "requeue_same_task": "同一任务被 provider 接收且游标前进",
+    "repair_node": "修复后节点指纹变化并通过 heal-verify",
+    "successor_binding_audit": "原会话经 provider 确认终止后，继任会话 create/locate/visibility/绑定/接收闭合且仅一个 writer",
+    "engineering_investigation": "复现→最小修复→测试→独立审查→真实路径验证，节点进入可审查交付",
+    "record_blocked_unknown_disposition": "每个待处置项都有 disposition 记录",
+}
+_UNKNOWN_WAIT_OWNERS = {"capacity_wait": "upstream", "external_decision": "product_manager"}
+
+
+def _unknown_cause(node):
+    return [node.get("reason_class"), node.get("reason_code"), node.get("error_type")]
+
+
+def unknown_loop_assessment(nodes, tasks, events):
+    """``{node_id: dossier}`` for every blocked_unknown node (pure; reads nothing else).
+
+    The dossier names the gap, the evidence, the cause fingerprint, the owner,
+    the next action and its verification exit.  ``repeats`` counts the trailing
+    same-cause parks with only recovery bookkeeping between them; at
+    ``UNKNOWN_SWITCH_REPEATS`` the next action leaves the repeated one.
+    Legitimate waits (upstream capacity, an external decision) never loop.
+    """
+    from . import stall
+    result = {}
+    for node_id, node in sorted((nodes or {}).items()):
+        if not isinstance(node, dict) or node.get("status") != "blocked_unknown":
+            continue
+        cause = _unknown_cause(node)
+        repeats, ref = 0, "state.json#nodes/" + node_id
+        for record in reversed(events or []):
+            data = record.get("data") or {}
+            if data.get("node_id") != node_id:
+                continue
+            name = record.get("event")
+            if name == "blocked_unknown":
+                if _unknown_cause(data) != cause:
+                    break
+                repeats += 1
+                if repeats == 1:
+                    ref = "events.jsonl#%s" % record.get("sequence")
+            elif name not in _UNKNOWN_NOISE_EVENTS:
+                break
+        reason_class = node.get("reason_class")
+        action = node.get("recovery_action") or "reconcile_binding"
+        owner = _UNKNOWN_WAIT_OWNERS.get(reason_class)
+        wait = owner is not None
+        switch = not wait and repeats >= UNKNOWN_SWITCH_REPEATS
+        next_action = action
+        if switch:
+            ladder = _UNKNOWN_LADDER.get(action, _UNKNOWN_LADDER_DEFAULT)
+            next_action = ladder[min(repeats - UNKNOWN_SWITCH_REPEATS, len(ladder) - 1)]
+        result[node_id] = {
+            "gap": "{}:{}".format(reason_class or "unclassified", action),
+            "evidence_ref": ref,
+            "cause_fingerprint": hashlib.sha256(
+                json.dumps(cause + [action], sort_keys=True).encode("utf-8")).hexdigest()[:16],
+            "input_fingerprint": stall.node_fingerprint(node, tasks, node_id),
+            "owner": owner or "supervisor",
+            "next_action": next_action,
+            "verify": _UNKNOWN_VERIFY.get(next_action, "节点离开 blocked_unknown 且有新证据"),
+            "repeats": repeats,
+            "switch_required": switch,
+            "waiting": wait,
+        }
+    return result
+
+
+def render_unknown_loop_text(loops, progress):
+    """Beat lines for unknown nodes; business acceptance and engineering recovery stay apart."""
+    if not loops:
+        return ""
+    lines = ["业务验收 {}/{}（工程恢复动作不计入验收进度）".format(
+        progress.get("accepted", 0), progress.get("total", 0))]
+    for node_id, entry in sorted(loops.items()):
+        line = "工程恢复：节点 {} 未知缺口 {}，证据 {}，责任方 {}，下一动作 {}，验证出口：{}".format(
+            node_id, entry["gap"], entry["evidence_ref"], entry["owner"],
+            entry["next_action"], entry["verify"])
+        if entry["switch_required"]:
+            line += "；同因已连续 {} 次无进展，必须切换策略，不得再次重复同一动作".format(entry["repeats"])
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def beat_stall_report(paths, run_id, now=None):
     """Assess one beat (exactly one ``stall.record_beat``) and describe stalled nodes."""
     from . import stall
@@ -3391,6 +3492,7 @@ def beat_stall_report(paths, run_id, now=None):
             if node_id not in waiting:
                 candidates.setdefault(node_id, node)
         outcome = stall.record_beat(paths, run_id, candidates, snapshot.tasks, events)
+        unknown_loops = unknown_loop_assessment(snapshot.nodes, snapshot.tasks, events)
         nodes = {}
         for node_id, result in outcome["nodes"].items():
             node = snapshot.nodes[node_id]
@@ -3425,6 +3527,9 @@ def beat_stall_report(paths, run_id, now=None):
                           and node_id not in seen}
                 for node_id, entry in waiting.items()},
             "mailbox_unreadable": mailbox_unreadable,
+            "unknown_loops": unknown_loops,
+            "progress": {"accepted": sum(1 for n in snapshot.nodes.values() if n.get("status") == "accepted"),
+                         "total": len(snapshot.nodes)},
             "nodes": nodes}
 
 
@@ -3493,7 +3598,10 @@ def render_stall_beat_text(report, run_id, command_prefix="vibe"):
                 "修完运行时文件后复核：{} heal-verify --run-id {} --node {}{}".format(
                     node_id, since, _pack_text(entry["pack"]),
                     command_prefix, run_id, node_id, role_flag))
-    return "\n".join(waiting_lines + escalate + investigate + unknown)
+    # A first park is already in the payload's dossier; only a repeat is worth beat text.
+    repeating = {k: v for k, v in (report.get("unknown_loops") or {}).items() if v.get("switch_required")}
+    loops = render_unknown_loop_text(repeating, report.get("progress") or {})
+    return "\n".join(waiting_lines + escalate + investigate + unknown + ([loops] if loops else []))
 
 
 def _heal_verify_worker(paths, run_id, node_id, snapshot, events, base):
