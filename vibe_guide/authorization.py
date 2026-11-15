@@ -2218,9 +2218,49 @@ def is_authorization_confirmation(card: AuthorizationCard, confirmation: str) ->
     )
 
 
-def authorize(card: AuthorizationCard, confirmation: str) -> AuthorizationRecord:
+_CODEX_REQUIRED_CHOICES = (
+    ("heartbeat_interval_minutes", "heartbeat_interval_options", "minutes", "心跳间隔"),
+    ("rotate_hard_cap", "rotate_hard_cap_options", "tokens", "换班硬上限"),
+)
+
+
+def card_choice_gaps(card: AuthorizationCard) -> List[Dict[str, str]]:
+    """Choices a card must carry before it counts as a submitted authorization.
+
+    Only Codex carries the heartbeat interval and rotation hard cap (issue #405);
+    other platforms are not forced to have them.  A missing value, or a selected
+    tier the card itself records as unavailable, is a gap: a default shown on the
+    card is not a choice the product manager made.  Pure and read-only.
+    """
+    if card.agent_id != "codex":
+        return []
+    gaps: List[Dict[str, str]] = []
+    for field_name, options_name, key, label in _CODEX_REQUIRED_CHOICES:
+        value = getattr(card, field_name)
+        if value is None:
+            gaps.append({"field": field_name, "reason": label + "未明确选择"})
+            continue
+        for item in getattr(card, options_name) or ():
+            if item.get(key) == value and item.get("available") is not True:
+                gaps.append({
+                    "field": field_name,
+                    "reason": "{}所选档位不可用：{}".format(label, item.get("reason") or "未记录原因"),
+                })
+    return gaps
+
+
+def authorize(
+    card: AuthorizationCard, confirmation: str, require_explicit_choices: bool = False
+) -> AuthorizationRecord:
     if not is_authorization_confirmation(card, confirmation):
         raise ValueError("authorization requires the exact plan-bound confirmation")
+    if require_explicit_choices:
+        gaps = card_choice_gaps(card)
+        if gaps:
+            raise ValueError(
+                "authorization card is a draft, missing explicit choices: "
+                + "; ".join("{}（{}）".format(g["field"], g["reason"]) for g in gaps)
+            )
     canonical = _authorization_payload(
         card.plan_id,
         card.plan_version,
