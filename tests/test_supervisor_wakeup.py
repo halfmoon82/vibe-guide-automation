@@ -302,3 +302,63 @@ class HeartbeatIntervalTests(unittest.TestCase):
         self.assertNotEqual(after.payload['state'], 'decision')
         self.assertEqual(after.payload['heartbeat_interval']['minutes'], 10)
         self.assertEqual(read_heartbeat_interval(self.paths, 'run-1')['minutes'], 10)
+
+
+class WakeFilterTests(unittest.TestCase):
+    """Local pre-wake filter: unchanged facts never reach the model."""
+
+    BASE = {'event_cursor': 'e5', 'delivery_cursor': 'd2', 'health_digest': 'h1',
+            'contract_digest': 'c1', 'unresolved': ['u1'], 'due_actions': [],
+            'new_unknown': []}
+
+    def mark(self, **over):
+        mark = dict(self.BASE, served_unresolved=['u1'], diagnosed_unknown=[])
+        mark.update(over)
+        return mark
+
+    def decide(self, facts=None, watermark=None, now=100):
+        from vibe_guide.supervisor_wakeup import should_wake
+        return should_wake(dict(self.BASE, **(facts or {})), watermark or self.mark(), now=now)
+
+    def test_nothing_changed_stays_silent(self):
+        out = self.decide()
+        self.assertFalse(out['wake'])
+        self.assertEqual(out['reasons'], [])
+
+    def test_new_delivery_wakes_immediately(self):
+        out = self.decide({'delivery_cursor': 'd3'})
+        self.assertTrue(out['wake'])
+        self.assertIn('new_delivery', out['reasons'])
+
+    def test_new_event_wakes(self):
+        self.assertIn('new_event', self.decide({'event_cursor': 'e6'})['reasons'])
+
+    def test_due_action_wakes_but_future_action_does_not(self):
+        self.assertIn('action_due', self.decide({'due_actions': [{'id': 'a', 'due_at': 90}]})['reasons'])
+        out = self.decide({'due_actions': [{'id': 'a', 'due_at': 500}]})
+        self.assertFalse(out['wake'])
+        self.assertEqual(out['next_check_at'], 500)
+
+    def test_first_unknown_wakes_diagnosed_unknown_waits(self):
+        self.assertIn('new_unknown', self.decide({'new_unknown': ['x']})['reasons'])
+        out = self.decide({'new_unknown': ['x']}, self.mark(diagnosed_unknown=['x']))
+        self.assertFalse(out['wake'])
+
+    def test_health_or_contract_drift_wakes(self):
+        self.assertIn('health_changed', self.decide({'health_digest': 'h2'})['reasons'])
+        self.assertIn('contract_changed', self.decide({'contract_digest': 'c2'})['reasons'])
+
+    def test_unserved_business_item_is_never_swallowed(self):
+        out = self.decide({'unresolved': ['u1', 'u2']})
+        self.assertIn('unresolved_unserved', out['reasons'])
+
+    def test_missing_or_garbled_watermark_wakes_instead_of_assuming_quiet(self):
+        from vibe_guide.supervisor_wakeup import should_wake
+        for bad in (None, 'x', {}):
+            out = should_wake(dict(self.BASE), bad, now=100)
+            self.assertTrue(out['wake'], bad)
+            self.assertIn('watermark_unknown', out['reasons'])
+
+    def test_garbled_facts_wake_not_quiet(self):
+        from vibe_guide.supervisor_wakeup import should_wake
+        self.assertIn('facts_unknown', should_wake(None, self.mark(), now=1)['reasons'])

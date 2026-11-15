@@ -2,15 +2,19 @@
 import hashlib
 import json
 
+from .context_projection import safe_excerpt
 from .state import _atomic_bytes, run_dir
 
 OUTPUT_LIMIT = 8191  # Reserve one UTF-8 byte for the CLI trailing newline.
 
 
 def _brief(value):
+    # Bytes-safe and keeps both ends: the head gives context, the tail keeps
+    # the conclusion/negation that head-only truncation used to lose; the cut
+    # never lands inside a character (A7: Chinese must not split).
     if isinstance(value, (dict, list)):
         value = json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return str(value)[:200]
+    return safe_excerpt(str(value), 200)["text"]
 
 
 def _summary(output):

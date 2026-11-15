@@ -286,3 +286,97 @@ class MonitorQuestionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestContinuationPackage(unittest.TestCase):
+    """Diff material for the next generation; a lost watermark refills."""
+
+    def test_only_new_findings_and_new_decisions_are_sent(self):
+        delivered = [
+            {"id": "f1", "severity": "P1", "detail": "fixed earlier"},
+            {"id": "f2", "severity": "P2", "detail": "fixed earlier"},
+            {"id": "d-old", "question": "旧决策"},
+        ]
+        current = delivered + [
+            {"id": "f3", "severity": "P1", "detail": "本轮新 finding"},
+            {"id": "d-new", "question": "新决策：换测试基线"},
+        ]
+        package = worker_questions.continuation_package(
+            current, delivered_ids=["f1", "f2", "d-old"], role="developer", node_id="n1")
+        sent_ids = {item.get("id") for item in package["items"]}
+        self.assertEqual(sent_ids, {"f3", "d-new"})
+        self.assertFalse(package["fallback"])
+        self.assertIn("budget", package)
+
+    def test_lost_watermark_refills_minimal_contract_not_empty(self):
+        current = [{"id": "f1", "severity": "P1", "status": "fixed", "detail": "x" * 3000}]
+        package = worker_questions.continuation_package(
+            current, delivered_ids=None, role="developer", node_id="n1")
+        self.assertTrue(package["fallback"])
+        self.assertEqual(package["reason"], "watermark_missing")
+        self.assertEqual(len(package["items"]), 1)
+
+    def test_resolved_findings_send_result_and_source_only(self):
+        current = [{"id": "f1", "status": "fixed", "detail": "long old body",
+                    "source": "reviewer-g2"}]
+        package = worker_questions.continuation_package(
+            current, delivered_ids=None, role="developer", node_id="n1")
+        item = package["items"][0]
+        self.assertNotIn("detail", item)
+        self.assertEqual(item["source"], "reviewer-g2")
+
+
+class TestRunAnsweredDecisionsPruning(unittest.TestCase):
+    """Decisions for other nodes' scope drop out of this node's prompt."""
+
+    def _stub(self, items):
+        class Mail:
+            @staticmethod
+            def list_answered_scoped(run_id):
+                return items
+        return Mail
+
+    def test_only_run_scoped_decisions_are_injected(self):
+        items = [
+            {"decision_id": "d-1", "node_id": "n1", "question": "q1",
+             "choice": "c1", "scope": "run"},
+            {"decision_id": "d-2", "node_id": "n2", "question": "q2",
+             "choice": "c2", "scope": "node"},
+        ]
+        contract = {"generation": "2", "project_root": "/tmp/x", "run_id": "r",
+                    "node_id": "n1", "role": "developer"}
+        original = worker_questions.ScopedDecisionMailbox
+        worker_questions.ScopedDecisionMailbox = lambda paths: self._stub(items)()
+        try:
+            out = worker_questions.supervisor_answer_section(contract)
+        finally:
+            worker_questions.ScopedDecisionMailbox = original
+        self.assertIn("d-1", out)
+        self.assertNotIn("d-2", out)
+
+    def _section(self, contract_extra):
+        items = [
+            {"decision_id": "d-1", "node_id": "n1", "question": "q1", "choice": "c1", "scope": "run"},
+            {"decision_id": "d-3", "node_id": "n1", "question": "q3", "choice": "c3", "scope": "run"},
+        ]
+        contract = {"generation": "2", "project_root": "/tmp/x", "run_id": "r",
+                    "node_id": "n1", "role": "developer", **contract_extra}
+        original = worker_questions.ScopedDecisionMailbox
+        worker_questions.ScopedDecisionMailbox = lambda paths: self._stub(items)()
+        try:
+            return worker_questions.supervisor_answer_section(contract)
+        finally:
+            worker_questions.ScopedDecisionMailbox = original
+
+    def test_delivered_decisions_are_not_resent(self):
+        out = self._section({"delivered_decision_ids": ["d-1"]})
+        self.assertNotIn("d-1", out)
+        self.assertIn("d-3", out)
+
+    def test_lost_watermark_sends_all_run_decisions(self):
+        out = self._section({})
+        self.assertIn("d-1", out)
+        self.assertIn("d-3", out)
+
+    def test_everything_delivered_sends_nothing(self):
+        self.assertEqual(self._section({"delivered_decision_ids": ["d-1", "d-3"]}), "")

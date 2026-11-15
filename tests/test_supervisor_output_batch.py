@@ -120,3 +120,18 @@ class SupervisorOutputBatchTests(unittest.TestCase):
                 code=main(['supervisor-output','--run-id','run-1','--payload',str(self.payload),'--json'])
             self.assertEqual(code,0)
             self.assertLessEqual(len(stream.getvalue().encode()),8192)
+
+    def test_chinese_output_never_splits_a_character(self):
+        # 200-char budget met Chinese text mid-character and dropped it; the
+        # result could no longer be trusted as the failure's real conclusion.
+        out = self.output([{'name':'n','output':{'status':'完成','stderr':'中文错误'*60}}])
+        stderr = out.payload['results'][0]['stderr']
+        stderr.encode('utf-8')
+        self.assertNotIn('�', stderr)
+        self.assertLessEqual(len(stderr.encode('utf-8')), 200)
+
+    def test_tail_of_long_text_keeps_the_conclusion(self):
+        # A finding's conclusion sits at the end; head-only truncation lost it.
+        text = '过程行 ' * 200 + '结论：P1 未通过'
+        out = self.output([{'name':'n','output':{'output':text}}])
+        self.assertIn('未通过', out.payload['results'][0]['output'])
