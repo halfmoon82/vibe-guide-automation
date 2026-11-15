@@ -367,3 +367,104 @@ def evaluate_shift_closure(
             (r is not None and s == "unknown") for r, s in ((pin_receipt, pin), (archive_receipt, archive)))
         result["state"] = "unknown" if unknown_receipt else "pending"
     return result
+
+
+# ---------------------------------------------------------------------------
+# P1c: bounded rework and automatic relay to a new developer.
+#
+# Pure bookkeeping only.  ``Monitor`` owns observation (is the old writer
+# stopped, what is HEAD) and persistence; nothing here touches a file.  The
+# ledger lives on the node, so a restart neither double counts nor resets it.
+# ---------------------------------------------------------------------------
+
+import hashlib
+import json
+
+REWORK_ROUND_LIMIT = 3
+#: Reasons that never spend an implementation round: the developer was not at
+#: fault (missing upstream material, environment/permission faults, a pure
+#: format correction, or a supervisor-side problem).
+NON_COUNTING_REASONS = frozenset({
+    "upstream_missing", "environment", "permission", "format_only",
+    "supervisor", "transport_timeout", "scope_not_landed",
+})
+
+
+def new_rework_ledger() -> Dict[str, Any]:
+    """Node-lineage totals survive a relay; ``local_rounds`` restarts per worker."""
+    return {"local_rounds": 0, "total_rounds": 0, "relays": 0,
+            "counted": [], "failed_approaches": [], "cost": 0}
+
+
+def finding_fingerprint(finding: Any) -> str:
+    """Identity of a finding independent of the id the reviewer gave it."""
+    text = finding.get("finding") if isinstance(finding, Mapping) else finding
+    normal = " ".join(str(text or "").lower().split())
+    return hashlib.sha256(normal.encode("utf-8")).hexdigest()[:16]
+
+
+def _ledger(raw: Any) -> Dict[str, Any]:
+    ledger = new_rework_ledger()
+    if isinstance(raw, Mapping):
+        for key in ledger:
+            if key in raw:
+                ledger[key] = raw[key]
+    ledger["counted"] = list(ledger["counted"] or [])
+    ledger["failed_approaches"] = list(ledger["failed_approaches"] or [])
+    return ledger
+
+
+def record_review_failure(raw: Any, *, action_id: str, finding: Any,
+                          reason_class: Optional[str] = None,
+                          cost: int = 0) -> Tuple[Dict[str, Any], bool]:
+    """``(ledger, counted)``.  A repeated ``action_id`` or a non-counting
+    reason leaves the round counters untouched (cost is still accumulated once).
+    """
+    ledger = _ledger(raw)
+    if action_id in ledger["counted"]:
+        return ledger, False
+    ledger["counted"].append(action_id)
+    if isinstance(cost, int) and not isinstance(cost, bool) and cost > 0:
+        ledger["cost"] += cost
+    if reason_class in NON_COUNTING_REASONS:
+        return ledger, False
+    ledger["local_rounds"] += 1
+    ledger["total_rounds"] += 1
+    fingerprint = finding_fingerprint(finding)
+    if fingerprint not in ledger["failed_approaches"]:
+        ledger["failed_approaches"].append(fingerprint)
+    return ledger, True
+
+
+def relay_due(raw: Any) -> bool:
+    return _ledger(raw)["local_rounds"] >= REWORK_ROUND_LIMIT
+
+
+def cost_exhausted(raw: Any, cap: Optional[int]) -> bool:
+    return cap is not None and _ledger(raw)["cost"] >= cap
+
+
+def start_relay(raw: Any) -> Dict[str, Any]:
+    """Ledger after handing the write right to a new developer."""
+    ledger = _ledger(raw)
+    ledger["local_rounds"] = 0
+    ledger["relays"] += 1
+    return ledger
+
+
+def relay_pack(*, node_id: str, head: str, dirty_files: Sequence[str],
+               ledger: Mapping[str, Any], predecessor_task_id: str,
+               reviewer_identity: str) -> Dict[str, Any]:
+    """Frozen hand-over for the new developer; the reviewer stays the same."""
+    led = _ledger(ledger)
+    return {
+        "node_id": node_id,
+        "frozen_head": head,
+        "uncommitted_files": sorted(str(item) for item in dirty_files),
+        "predecessor_task_id": predecessor_task_id,
+        "reviewer_identity": reviewer_identity,
+        "total_rounds": led["total_rounds"],
+        "relays": led["relays"],
+        "failed_approaches": led["failed_approaches"],
+        "cost": led["cost"],
+    }
