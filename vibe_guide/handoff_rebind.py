@@ -296,3 +296,74 @@ def drain_report(
             stop_evidence_template(item, from_platform) for item in blockers
         ],
     }
+
+
+_CLOSURE_READY = ("new_registered", "address_verified", "heartbeat_switched", "inflight_taken")
+_CLOSURE_RECOVERY = {
+    "pin": "用宿主 advertised 的置顶工具对新班线程重试一次，拿到结构化回执后再重跑接班收口",
+    "archive": "仅对旧班线程补归档（不要另开接班会话、不要重复消费任务），拿到回执后重跑收口",
+}
+
+
+def _receipt_state(receipt: Any, tool: str, thread: str, ctx: Mapping[str, Any]) -> str:
+    """ok / unknown / mismatch for one host receipt; prose, timeouts never count as ok."""
+    if receipt is None:
+        return "unknown"
+    if not isinstance(receipt, Mapping) or receipt.get("native") is not True \
+            or receipt.get("tool") != tool or receipt.get("ok") is not True:
+        return "unknown"
+    for key, want in ctx.items():
+        if receipt.get(key) != want:
+            return "mismatch"
+    return "ok" if receipt.get("thread_id") == thread else "mismatch"
+
+
+def evaluate_shift_closure(
+    *, run_id: str, plan_id: str, epoch: int, host_id: str, project: str,
+    old_thread: str, new_thread: str, worker_threads: Iterable[str] = (),
+    new_registered: bool, address_verified: bool, heartbeat_switched: bool, inflight_taken: bool,
+    pin_receipt: Any = None, archive_receipt: Any = None,
+) -> Dict[str, Any]:
+    """Decide whether a supervisor shift is closed: new shift pinned, old shift archived.
+
+    Pure.  Only native host receipts bound to this run/epoch/host/project count;
+    the old shift may be archived only after the new one is registered, reachable,
+    owns heartbeat/wake-up routing and has taken the in-flight requests.  Missing
+    or unknown steps keep the shift open and name the recovery action.
+    """
+    result: Dict[str, Any] = {
+        "state": "pending", "archive_allowed": False, "open_new_session": False,
+        "missing": [], "recovery": [], "receipts": {}, "reason": "",
+    }
+    if not old_thread or not new_thread or old_thread == new_thread \
+            or old_thread in set(worker_threads) or new_thread in set(worker_threads):
+        result.update(state="refused", reason="目标不是旧班监工（与新班相同、或是 worker）：拒绝触碰")
+        return result
+    ctx = {"host_id": host_id, "run_id": run_id, "epoch": epoch, "project": project}
+    flags = dict(new_registered=new_registered, address_verified=address_verified,
+                 heartbeat_switched=heartbeat_switched, inflight_taken=inflight_taken)
+    not_ready = [name for name in _CLOSURE_READY if not flags[name]]
+    pin = _receipt_state(pin_receipt, "pin_thread", new_thread, ctx)
+    archive_ready = not not_ready and pin == "ok"
+    archive = _receipt_state(archive_receipt, "archive_thread", old_thread, ctx) if archive_ready else "unknown"
+    if "mismatch" in (pin, archive) and (pin_receipt is not None or archive_receipt is not None):
+        if pin == "mismatch" or (archive_ready and archive == "mismatch"):
+            result.update(state="refused", reason="回执与 run/epoch/host/项目/线程不匹配：拒绝")
+            return result
+    missing = list(not_ready)
+    if pin != "ok":
+        missing.append("pin")
+    if archive != "ok":
+        missing.append("archive")
+    result["missing"] = missing
+    result["archive_allowed"] = archive_ready
+    result["recovery"] = [_CLOSURE_RECOVERY[m] for m in missing if m in _CLOSURE_RECOVERY]
+    if not_ready:
+        result["recovery"].append("先完成：" + "、".join(not_ready) + "；之前不得归档旧班")
+    if not missing:
+        result.update(state="complete", receipts={"pin": pin_receipt, "archive": archive_receipt})
+    else:
+        unknown_receipt = any(
+            (r is not None and s == "unknown") for r, s in ((pin_receipt, pin), (archive_receipt, archive)))
+        result["state"] = "unknown" if unknown_receipt else "pending"
+    return result
