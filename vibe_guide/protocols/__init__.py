@@ -242,7 +242,13 @@ SHIPPED_PROTOCOL_DIGESTS = {
         # + --project-root 文档（IR-1 聚合修复）。
         "4336b8a2977974248dbec483a4e8440ed60768234d76ffc0a6ac685e12ee97c5",
     }),
+    "lean-supervisor": frozenset({
+        # 2026-11-15: P2 first lean-tier supervision protocol (read on demand).
+        "9d20e817525ca632864d5afe4933f6e36b069cad0142db088ceb8062fb12baa3",
+    }),
     "vibe-entry": frozenset({
+        # 2026-11-15: P2 three-tier entry (execution_tier) and bound-event fast path.
+        "f1e4a901ecb746b12063d18e6f4a25256ba8de7dae33ddfcd9377d7dbfbc8373",
         # 2026-11-15: P1a pointers to §6/§7 now name execution, not prd-guide.
         "bf7fdfadb7cf5709506035790ae7d5e13976e7ea578eb6fbbdcb8c7e37659702",
         # 2026-11-10: first-shift register example carries --wake-target <会话名>.
